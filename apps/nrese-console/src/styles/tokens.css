@@ -1,0 +1,19 @@
+:root {
+  --app-bg: #f3efe7;
+  --panel-bg: rgba(255, 252, 247, 0.88);
+  --panel-border: rgba(21, 44, 58, 0.12);
+  --text-strong: #16212b;
+  --text-muted: #4f6573;
+  --accent: #1f7894;
+  --accent-soft: #d9f2f7;
+  --accent-strong: #0f566f;
+  --success: #1f8c5f;
+  --warning: #9b6b2a;
+  --error: #b23a2a;
+  --shadow: 0 18px 42px rgba(28, 42, 51, 0.08);
+  --radius-lg: 20px;
+  --radius-md: 14px;
+  --radius-sm: 10px;
+  --sans: "IBM Plex Sans", "Segoe UI", sans-serif;
+  --mono: "Iosevka", "Fira Code", "Consolas", monospace;
+}

@@ -1,0 +1,68 @@
+[
+  {
+    "name": "query-invalid-auth-header",
+    "operation": "query",
+    "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1",
+    "accept": "application/sparql-results+json",
+    "request_headers": {
+      "authorization": "Bearer invalid-token"
+    },
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "update-invalid-auth-header",
+    "operation": "update-effect",
+    "update": "INSERT DATA { <http://example.com/policy-s> <http://example.com/policy-p> <http://example.com/policy-o> }",
+    "request_headers": {
+      "authorization": "Bearer invalid-token"
+    },
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "graph-put-invalid-auth-header",
+    "operation": "graph-put-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/policy-graph"
+    },
+    "graph_content_type": "text/turtle",
+    "graph_payload": "@prefix ex: <http://example.com/> . ex:s ex:p ex:o .",
+    "request_headers": {
+      "authorization": "Bearer invalid-token"
+    },
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "oversize-query-payload",
+    "operation": "query",
+    "accept": "application/sparql-results+json",
+    "generated_payload": {
+      "kind": "sparql-query",
+      "bytes": 131072
+    },
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "oversize-update-payload",
+    "operation": "update-effect",
+    "generated_payload": {
+      "kind": "sparql-update",
+      "bytes": 131072
+    },
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "oversize-graph-put-payload",
+    "operation": "graph-put-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/policy-graph"
+    },
+    "graph_content_type": "text/turtle",
+    "generated_payload": {
+      "kind": "rdf-turtle",
+      "bytes": 262144
+    },
+    "kind": "status-content-type-body-class"
+  }
+]

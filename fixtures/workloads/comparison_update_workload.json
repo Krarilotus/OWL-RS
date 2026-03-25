@@ -1,0 +1,12 @@
+[
+  {
+    "name": "insert_runtime_marker",
+    "update": "INSERT DATA { <http://example.com/runtime/marker> <http://example.com/p> <http://example.com/o> . }",
+    "weight": 2
+  },
+  {
+    "name": "delete_runtime_marker",
+    "update": "DELETE WHERE { <http://example.com/runtime/marker> ?p ?o . }",
+    "weight": 2
+  }
+]

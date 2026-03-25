@@ -1,0 +1,12 @@
+[
+  {
+    "name": "insert-benchmark-marker",
+    "update": "INSERT DATA { <http://example.com/bench/run> <http://example.com/updatedAt> <http://example.com/t1> }",
+    "weight": 1
+  },
+  {
+    "name": "delete-benchmark-marker",
+    "update": "DELETE DATA { <http://example.com/bench/run> <http://example.com/updatedAt> <http://example.com/t1> }",
+    "weight": 1
+  }
+]

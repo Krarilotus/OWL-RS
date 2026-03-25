@@ -1,0 +1,17 @@
+[
+  {
+    "name": "insert_runtime_marker_a",
+    "update": "INSERT DATA { <http://example.com/bench/run/a> <http://example.com/p> <http://example.com/o> . }",
+    "weight": 2
+  },
+  {
+    "name": "insert_runtime_marker_b",
+    "update": "INSERT DATA { <http://example.com/bench/run/b> <http://example.com/p> <http://example.com/o> . }",
+    "weight": 2
+  },
+  {
+    "name": "delete_runtime_marker_a",
+    "update": "DELETE WHERE { <http://example.com/bench/run/a> ?p ?o . }",
+    "weight": 1
+  }
+]

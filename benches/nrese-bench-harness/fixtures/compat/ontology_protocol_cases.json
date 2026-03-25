@@ -1,0 +1,38 @@
+[
+  {
+    "name": "ontology-declaration-present",
+    "operation": "query",
+    "query": "ASK WHERE { ?s a <http://www.w3.org/2002/07/owl#Ontology> }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "ontology-solutions-count-all-triples",
+    "operation": "query",
+    "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+    "accept": "application/sparql-results+json",
+    "kind": "solutions-count"
+  },
+  {
+    "name": "ontology-construct-classes",
+    "operation": "query",
+    "query": "CONSTRUCT { ?class a <http://www.w3.org/2002/07/owl#Class> } WHERE { ?class a <http://www.w3.org/2002/07/owl#Class> }",
+    "accept": "application/n-triples",
+    "kind": "construct-triples-set"
+  },
+  {
+    "name": "ontology-update-effect-insert-default-triple",
+    "operation": "update-effect",
+    "update": "INSERT DATA { <http://example.com/ontology-compat-s> <http://example.com/ontology-compat-p> <http://example.com/ontology-compat-o> }",
+    "verify_query": "ASK WHERE { <http://example.com/ontology-compat-s> <http://example.com/ontology-compat-p> <http://example.com/ontology-compat-o> }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "ontology-update-invalid-syntax",
+    "operation": "update-effect",
+    "update": "INSERT DATA {",
+    "accept": "application/sparql-results+json",
+    "kind": "status-content-type-body-class"
+  }
+]

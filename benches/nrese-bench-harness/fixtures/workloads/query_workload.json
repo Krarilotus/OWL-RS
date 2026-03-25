@@ -1,0 +1,20 @@
+[
+  {
+    "name": "select-all",
+    "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+    "accept": "application/sparql-results+json",
+    "weight": 2
+  },
+  {
+    "name": "ask-seeded-resource",
+    "query": "ASK WHERE { <http://example.com/alice> ?p ?o }",
+    "accept": "application/sparql-results+json",
+    "weight": 2
+  },
+  {
+    "name": "construct-subgraph",
+    "query": "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+    "accept": "application/n-triples",
+    "weight": 1
+  }
+]

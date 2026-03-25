@@ -1,0 +1,47 @@
+[[ontologies]]
+name = "foaf"
+title = "FOAF Vocabulary"
+url = "https://xmlns.com/foaf/spec/index.rdf"
+media_type = "application/rdf+xml"
+filename = "foaf.rdf"
+tier = "small"
+focus_terms = [
+  "http://xmlns.com/foaf/0.1/Person",
+  "http://xmlns.com/foaf/0.1/Agent",
+]
+
+[[ontologies]]
+name = "org"
+title = "W3C Organization Ontology"
+url = "https://www.w3.org/ns/org.ttl"
+media_type = "text/turtle"
+filename = "org.ttl"
+tier = "medium"
+focus_terms = [
+  "http://www.w3.org/ns/org#Organization",
+  "http://www.w3.org/ns/org#hasMember",
+]
+
+[[ontologies]]
+name = "time"
+title = "W3C Time Ontology in OWL"
+url = "https://www.w3.org/2006/time.ttl"
+media_type = "text/turtle"
+filename = "time.ttl"
+tier = "medium"
+focus_terms = [
+  "http://www.w3.org/2006/time#TemporalEntity",
+  "http://www.w3.org/2006/time#Interval",
+]
+
+[[ontologies]]
+name = "prov"
+title = "W3C PROV-O"
+url = "https://www.w3.org/ns/prov.ttl"
+media_type = "text/turtle"
+filename = "prov.ttl"
+tier = "broad"
+focus_terms = [
+  "http://www.w3.org/ns/prov#Entity",
+  "http://www.w3.org/ns/prov#Activity",
+]

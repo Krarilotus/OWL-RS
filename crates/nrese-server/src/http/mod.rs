@@ -1,0 +1,21 @@
+mod admin_dataset;
+mod ai;
+mod console;
+mod graph_store;
+mod guard;
+mod handlers;
+mod media;
+mod metrics;
+mod operator_api;
+mod operator_diagnostics;
+mod operator_ui;
+mod rdf_payload;
+mod reasoning_view;
+mod requests;
+mod responses;
+mod routes;
+mod service_description;
+mod sparql;
+mod tell;
+
+pub use routes::router;

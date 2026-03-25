@@ -1,0 +1,5 @@
+name = "prov-baseline"
+dataset = "../../catalog-cache/prov.ttl"
+query_workload = "../../workloads/ontology_query_workload.json"
+update_workload = "../../workloads/update_workload.json"
+compat_suites = ["../../compat/ontology_protocol_cases.json"]

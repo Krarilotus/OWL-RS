@@ -1,0 +1,20 @@
+[
+  {
+    "name": "ask_ontology_exists",
+    "query": "ASK WHERE { <http://example.com/ontology> ?p ?o }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "select_people_count",
+    "query": "SELECT ?s WHERE { ?s a <http://example.com/Person> }",
+    "accept": "application/sparql-results+json",
+    "kind": "solutions-count"
+  },
+  {
+    "name": "construct_works_on_triples",
+    "query": "CONSTRUCT { ?s <http://example.com/worksOn> ?o } WHERE { ?s <http://example.com/worksOn> ?o }",
+    "accept": "application/n-triples",
+    "kind": "construct-triples-set"
+  }
+]

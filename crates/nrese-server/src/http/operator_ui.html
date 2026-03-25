@@ -1,0 +1,643 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NRESE Operator Console</title>
+  <style>
+    :root {
+      --bg-1: #07141d;
+      --bg-2: #0f2431;
+      --bg-3: #122f3d;
+      --panel: rgba(6, 20, 28, 0.74);
+      --panel-border: rgba(173, 227, 255, 0.24);
+      --text: #e5f5ff;
+      --muted: #9bc2d8;
+      --ok: #4de2a4;
+      --warn: #ffcb70;
+      --err: #ff8f88;
+      --accent: #65d0ff;
+      --accent-2: #9cfdb3;
+      --mono: "Iosevka", "Fira Code", "Consolas", monospace;
+      --sans: "IBM Plex Sans", "Trebuchet MS", sans-serif;
+      --shadow: 0 18px 50px rgba(1, 5, 7, 0.42);
+      --radius: 16px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: var(--sans);
+      background:
+        radial-gradient(1200px 800px at 10% 0%, rgba(101, 208, 255, 0.24), transparent 65%),
+        radial-gradient(900px 700px at 85% 10%, rgba(156, 253, 179, 0.16), transparent 65%),
+        linear-gradient(160deg, var(--bg-1), var(--bg-2) 45%, var(--bg-3));
+    }
+
+    .shell {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 28px 18px 44px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .panel {
+      border: 1px solid var(--panel-border);
+      border-radius: var(--radius);
+      padding: 16px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+      animation: rise 320ms ease both;
+    }
+
+    @keyframes rise {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    h1,
+    h2 {
+      margin: 0 0 10px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+    }
+
+    h1 {
+      font-size: 1.52rem;
+    }
+
+    h2 {
+      font-size: 1.1rem;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid rgba(229, 245, 255, 0.2);
+      border-radius: 999px;
+      padding: 7px 12px;
+      font-size: 0.87rem;
+      color: var(--muted);
+      font-family: var(--mono);
+      background: rgba(2, 8, 11, 0.36);
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--warn);
+      box-shadow: 0 0 0 2px rgba(255, 203, 112, 0.2);
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .grid.cols-2 {
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    }
+
+    .facts {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .fact {
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(155, 194, 216, 0.3);
+      background: rgba(7, 26, 37, 0.4);
+    }
+
+    .fact small {
+      color: var(--muted);
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .fact strong {
+      font-size: 1.03rem;
+      font-family: var(--mono);
+      word-break: break-word;
+    }
+
+    .line {
+      margin-top: 11px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 13px;
+      color: #05202c;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      font-weight: 600;
+      font-family: var(--sans);
+      cursor: pointer;
+      transition: transform 120ms ease, filter 120ms ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.05);
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.8;
+    }
+
+    .ghost {
+      color: var(--text);
+      border: 1px solid rgba(155, 194, 216, 0.45);
+      background: rgba(2, 8, 11, 0.4);
+    }
+
+    textarea,
+    select {
+      width: 100%;
+      border: 1px solid rgba(155, 194, 216, 0.45);
+      border-radius: 10px;
+      background: rgba(3, 12, 17, 0.65);
+      color: var(--text);
+      padding: 11px 12px;
+      font-family: var(--mono);
+      font-size: 0.92rem;
+    }
+
+    textarea {
+      min-height: 164px;
+      resize: vertical;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .status-line {
+      margin-top: 10px;
+      min-height: 1.3em;
+      font-family: var(--mono);
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    pre {
+      margin: 10px 0 0;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(155, 194, 216, 0.28);
+      background: rgba(0, 8, 13, 0.6);
+      min-height: 130px;
+      max-height: 390px;
+      overflow: auto;
+      font-family: var(--mono);
+      font-size: 0.86rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .ok {
+      color: var(--ok);
+    }
+
+    .warn {
+      color: var(--warn);
+    }
+
+    .err {
+      color: var(--err);
+    }
+
+    .links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .links a {
+      color: var(--accent);
+      text-decoration: none;
+      border-bottom: 1px dashed rgba(101, 208, 255, 0.5);
+      font-family: var(--mono);
+      font-size: 0.88rem;
+    }
+
+    .links a:hover {
+      color: #b7efff;
+      border-bottom-style: solid;
+    }
+
+    @media (max-width: 620px) {
+      .shell {
+        padding: 16px 12px 26px;
+      }
+      .panel {
+        padding: 14px;
+      }
+      h1 {
+        font-size: 1.28rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="panel header">
+      <div>
+        <h1>NRESE Operator Console</h1>
+        <p>External operator endpoint for status checks, SPARQL query execution, and update workflows.</p>
+        <div class="links">
+          <a id="link-healthz" href="#" target="_blank" rel="noreferrer">/healthz</a>
+          <a id="link-readyz" href="#" target="_blank" rel="noreferrer">/readyz</a>
+          <a id="link-version" href="#" target="_blank" rel="noreferrer">/version</a>
+          <a id="link-service-description" href="#" target="_blank" rel="noreferrer">/dataset/service-description</a>
+        </div>
+      </div>
+      <div class="pill"><span class="dot" id="ready-dot"></span><span id="ready-label">loading</span></div>
+    </section>
+
+    <section class="panel">
+      <h2>Runtime Snapshot</h2>
+      <div class="facts">
+        <div class="fact"><small>Service Version</small><strong id="service-version">-</strong></div>
+        <div class="fact"><small>Reasoner Mode</small><strong id="reasoner-mode">-</strong></div>
+        <div class="fact"><small>Reasoner Profile</small><strong id="reasoner-profile">-</strong></div>
+        <div class="fact"><small>Revision</small><strong id="revision">-</strong></div>
+        <div class="fact"><small>Store Mode</small><strong id="store-mode">-</strong></div>
+        <div class="fact"><small>Durability</small><strong id="durability">-</strong></div>
+        <div class="fact"><small>Quad Count</small><strong id="quad-count">-</strong></div>
+        <div class="fact"><small>Named Graphs</small><strong id="graph-count">-</strong></div>
+        <div class="fact"><small>Ontology Source</small><strong id="ontology-path">-</strong></div>
+        <div class="fact"><small>Durable Build</small><strong id="durable-build">-</strong></div>
+      </div>
+      <div class="line">
+        <button id="refresh-btn" type="button">Refresh Status</button>
+        <button id="clear-results-btn" type="button" class="ghost">Clear Output</button>
+      </div>
+      <div class="status-line" id="status-line">Waiting for first refresh...</div>
+    </section>
+
+    <section class="grid cols-2">
+      <article class="panel">
+        <h2>SPARQL Query</h2>
+        <label for="accept-select">Response Format</label>
+        <select id="accept-select">
+          <option value="application/sparql-results+json">SPARQL JSON</option>
+          <option value="text/csv">CSV</option>
+          <option value="text/tab-separated-values">TSV</option>
+          <option value="application/sparql-results+xml">SPARQL XML</option>
+          <option value="text/turtle">Turtle (graph results)</option>
+        </select>
+        <label for="query-input">Query</label>
+        <textarea id="query-input">SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 25</textarea>
+        <div class="line">
+          <button id="query-btn" type="button">Run Query</button>
+        </div>
+        <div class="status-line" id="query-status"></div>
+      </article>
+
+      <article class="panel">
+        <h2>SPARQL Update</h2>
+        <label for="update-input">Update</label>
+        <textarea id="update-input">INSERT DATA { <http://example.com/runtime> <http://example.com/p> <http://example.com/o> . }</textarea>
+        <div class="line">
+          <button id="update-btn" type="button">Run Update</button>
+        </div>
+        <div class="status-line" id="update-status"></div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <h2>Graph Store</h2>
+      <div class="grid cols-2">
+        <div>
+          <label for="graph-target-mode">Target</label>
+          <select id="graph-target-mode">
+            <option value="default">Default Graph</option>
+            <option value="named">Named Graph</option>
+          </select>
+          <label for="graph-name-input">Named Graph IRI</label>
+          <textarea id="graph-name-input" style="min-height: 76px;">http://example.com/graph/runtime</textarea>
+        </div>
+        <div>
+          <label for="graph-input">RDF Payload (Turtle)</label>
+          <textarea id="graph-input">@prefix ex: &lt;http://example.com/&gt; .
+ex:graphSubject ex:graphPredicate ex:graphObject .</textarea>
+        </div>
+      </div>
+      <div class="line">
+        <button id="graph-load-btn" type="button" class="ghost">Load Graph</button>
+        <button id="graph-replace-btn" type="button">Replace Graph</button>
+        <button id="graph-merge-btn" type="button" class="ghost">Merge Graph</button>
+        <button id="graph-delete-btn" type="button" class="ghost">Delete Graph</button>
+      </div>
+      <div class="status-line" id="graph-status"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Response Output</h2>
+      <pre id="output">(no response yet)</pre>
+    </section>
+  </main>
+
+  <script>
+    const readyDot = document.getElementById("ready-dot");
+    const readyLabel = document.getElementById("ready-label");
+    const statusLine = document.getElementById("status-line");
+    const output = document.getElementById("output");
+    const refreshBtn = document.getElementById("refresh-btn");
+    const clearBtn = document.getElementById("clear-results-btn");
+    const queryBtn = document.getElementById("query-btn");
+    const updateBtn = document.getElementById("update-btn");
+    const graphLoadBtn = document.getElementById("graph-load-btn");
+    const graphReplaceBtn = document.getElementById("graph-replace-btn");
+    const graphMergeBtn = document.getElementById("graph-merge-btn");
+    const graphDeleteBtn = document.getElementById("graph-delete-btn");
+
+    function basePrefix() {
+      const path = window.location.pathname.replace(/\/+$/, "");
+      if (path.endsWith("/ops")) {
+        return path.slice(0, -4);
+      }
+      if (path.endsWith("/ui")) {
+        return path.slice(0, -3);
+      }
+      return "";
+    }
+
+    function apiPath(path) {
+      return basePrefix() + path;
+    }
+
+    function wireLinks() {
+      document.getElementById("link-healthz").href = apiPath("/healthz");
+      document.getElementById("link-readyz").href = apiPath("/readyz");
+      document.getElementById("link-version").href = apiPath("/version");
+      document.getElementById("link-service-description").href = apiPath("/dataset/service-description");
+    }
+
+    function setReadyVisual(status) {
+      readyDot.className = "dot";
+      if (status === "ready") {
+        readyDot.classList.add("ok");
+        readyDot.style.background = "var(--ok)";
+        readyDot.style.boxShadow = "0 0 0 2px rgba(77, 226, 164, 0.2)";
+      } else if (status === "error") {
+        readyDot.classList.add("err");
+        readyDot.style.background = "var(--err)";
+        readyDot.style.boxShadow = "0 0 0 2px rgba(255, 143, 136, 0.2)";
+      } else {
+        readyDot.classList.add("warn");
+        readyDot.style.background = "var(--warn)";
+        readyDot.style.boxShadow = "0 0 0 2px rgba(255, 203, 112, 0.2)";
+      }
+      readyLabel.textContent = status;
+    }
+
+    async function refreshStatus() {
+      const started = performance.now();
+      statusLine.textContent = "Refreshing runtime snapshot...";
+      try {
+        const [summaryRes, capabilitiesRes] = await Promise.all([
+          fetch(apiPath("/ops/api/health/extended")),
+          fetch(apiPath("/ops/api/capabilities"))
+        ]);
+
+        if (!summaryRes.ok) {
+          throw new Error("extended health failed with status " + summaryRes.status);
+        }
+        if (!capabilitiesRes.ok) {
+          throw new Error("capabilities failed with status " + capabilitiesRes.status);
+        }
+
+        const ready = await summaryRes.json();
+        const capabilities = await capabilitiesRes.json();
+
+        setReadyVisual(ready.status || "unknown");
+        document.getElementById("service-version").textContent = ready.version || "-";
+        document.getElementById("reasoner-mode").textContent = ready.reasoning_mode || "-";
+        document.getElementById("reasoner-profile").textContent = ready.reasoning_profile || "-";
+        document.getElementById("revision").textContent = String(ready.revision ?? "-");
+        document.getElementById("store-mode").textContent = ready.store_mode || "-";
+        document.getElementById("durability").textContent = ready.durability || "-";
+        document.getElementById("quad-count").textContent = String(ready.quad_count ?? "-");
+        document.getElementById("graph-count").textContent = String(ready.named_graph_count ?? "-");
+        document.getElementById("ontology-path").textContent = ready.ontology_path || "(none)";
+        document.getElementById("durable-build").textContent = capabilities.durable_storage_available ? "enabled" : "disabled";
+
+        const elapsed = Math.round(performance.now() - started);
+        statusLine.innerHTML = "<span class='ok'>OK</span> Runtime data refreshed in " + elapsed + " ms.";
+      } catch (error) {
+        setReadyVisual("error");
+        statusLine.innerHTML = "<span class='err'>ERROR</span> " + error.message;
+      }
+    }
+
+    async function runQuery() {
+      queryBtn.disabled = true;
+      const started = performance.now();
+      const query = document.getElementById("query-input").value;
+      const accept = document.getElementById("accept-select").value;
+      const statusEl = document.getElementById("query-status");
+      statusEl.textContent = "Executing query...";
+
+      try {
+        const response = await fetch(apiPath("/dataset/query"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/sparql-query",
+            "Accept": accept
+          },
+          body: query
+        });
+        const body = await response.text();
+        const elapsed = Math.round(performance.now() - started);
+        output.textContent = body || "(empty response)";
+        if (response.ok) {
+          statusEl.innerHTML = "<span class='ok'>OK</span> Query completed in " + elapsed + " ms (" + response.status + ").";
+        } else {
+          statusEl.innerHTML = "<span class='err'>ERROR</span> Query failed in " + elapsed + " ms (" + response.status + ").";
+        }
+      } catch (error) {
+        statusEl.innerHTML = "<span class='err'>ERROR</span> " + error.message;
+      } finally {
+        queryBtn.disabled = false;
+      }
+    }
+
+    async function runUpdate() {
+      updateBtn.disabled = true;
+      const started = performance.now();
+      const update = document.getElementById("update-input").value;
+      const statusEl = document.getElementById("update-status");
+      statusEl.textContent = "Executing update...";
+
+      try {
+        const response = await fetch(apiPath("/dataset/update"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/sparql-update"
+          },
+          body: update
+        });
+        const body = await response.text();
+        const elapsed = Math.round(performance.now() - started);
+        output.textContent = body || "(update completed with empty body)";
+        if (response.ok) {
+          statusEl.innerHTML = "<span class='ok'>OK</span> Update committed in " + elapsed + " ms (" + response.status + ").";
+          refreshStatus();
+        } else {
+          statusEl.innerHTML = "<span class='err'>ERROR</span> Update failed in " + elapsed + " ms (" + response.status + ").";
+        }
+      } catch (error) {
+        statusEl.innerHTML = "<span class='err'>ERROR</span> " + error.message;
+      } finally {
+        updateBtn.disabled = false;
+      }
+    }
+
+    function graphTargetQuery() {
+      const mode = document.getElementById("graph-target-mode").value;
+      if (mode === "default") {
+        return "?default";
+      }
+
+      const graphName = document.getElementById("graph-name-input").value.trim();
+      if (!graphName) {
+        throw new Error("Named graph IRI is required when target mode is named.");
+      }
+
+      return "?graph=" + encodeURIComponent(graphName);
+    }
+
+    async function loadGraph() {
+      const statusEl = document.getElementById("graph-status");
+      statusEl.textContent = "Loading graph...";
+
+      try {
+        const response = await fetch(apiPath("/dataset/data" + graphTargetQuery()), {
+          headers: {
+            "Accept": "text/turtle"
+          }
+        });
+        const body = await response.text();
+        output.textContent = body || "(empty graph)";
+        if (response.ok) {
+          statusEl.innerHTML = "<span class='ok'>OK</span> Graph loaded (" + response.status + ").";
+        } else {
+          statusEl.innerHTML = "<span class='err'>ERROR</span> Graph load failed (" + response.status + ").";
+        }
+      } catch (error) {
+        statusEl.innerHTML = "<span class='err'>ERROR</span> " + error.message;
+      }
+    }
+
+    async function writeGraph(method, successLabel) {
+      const statusEl = document.getElementById("graph-status");
+      const payload = document.getElementById("graph-input").value;
+      statusEl.textContent = successLabel + "...";
+
+      try {
+        const response = await fetch(apiPath("/dataset/data" + graphTargetQuery()), {
+          method,
+          headers: {
+            "Content-Type": "text/turtle"
+          },
+          body: payload
+        });
+        const body = await response.text();
+        output.textContent = body || "(" + successLabel.toLowerCase() + " completed with empty body)";
+        if (response.ok) {
+          statusEl.innerHTML = "<span class='ok'>OK</span> " + successLabel + " completed (" + response.status + ").";
+          refreshStatus();
+        } else {
+          statusEl.innerHTML = "<span class='err'>ERROR</span> " + successLabel + " failed (" + response.status + ").";
+        }
+      } catch (error) {
+        statusEl.innerHTML = "<span class='err'>ERROR</span> " + error.message;
+      }
+    }
+
+    async function deleteGraph() {
+      const statusEl = document.getElementById("graph-status");
+      statusEl.textContent = "Deleting graph...";
+
+      try {
+        const response = await fetch(apiPath("/dataset/data" + graphTargetQuery()), {
+          method: "DELETE"
+        });
+        const body = await response.text();
+        output.textContent = body || "(delete completed with empty body)";
+        if (response.ok) {
+          statusEl.innerHTML = "<span class='ok'>OK</span> Graph deleted (" + response.status + ").";
+          refreshStatus();
+        } else {
+          statusEl.innerHTML = "<span class='err'>ERROR</span> Graph delete failed (" + response.status + ").";
+        }
+      } catch (error) {
+        statusEl.innerHTML = "<span class='err'>ERROR</span> " + error.message;
+      }
+    }
+
+    refreshBtn.addEventListener("click", refreshStatus);
+    queryBtn.addEventListener("click", runQuery);
+    updateBtn.addEventListener("click", runUpdate);
+    graphLoadBtn.addEventListener("click", loadGraph);
+    graphReplaceBtn.addEventListener("click", () => writeGraph("PUT", "Replace graph"));
+    graphMergeBtn.addEventListener("click", () => writeGraph("POST", "Merge graph"));
+    graphDeleteBtn.addEventListener("click", deleteGraph);
+    clearBtn.addEventListener("click", () => {
+      output.textContent = "(no response yet)";
+      document.getElementById("query-status").textContent = "";
+      document.getElementById("update-status").textContent = "";
+      document.getElementById("graph-status").textContent = "";
+    });
+
+    wireLinks();
+    refreshStatus();
+    setInterval(refreshStatus, 15000);
+  </script>
+</body>
+</html>

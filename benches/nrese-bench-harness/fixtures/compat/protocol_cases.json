@@ -1,0 +1,230 @@
+[
+  {
+    "name": "ask-seeded-resource",
+    "operation": "query",
+    "query": "ASK WHERE { <http://example.com/alice> ?p ?o }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "solutions-count-all-triples",
+    "operation": "query",
+    "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+    "accept": "application/sparql-results+json",
+    "kind": "solutions-count"
+  },
+  {
+    "name": "construct-seeded-graph",
+    "operation": "query",
+    "query": "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+    "accept": "application/n-triples",
+    "kind": "construct-triples-set"
+  },
+  {
+    "name": "query-invalid-syntax",
+    "operation": "query",
+    "query": "SELECT WHERE { ?s ?p ?o }",
+    "accept": "application/sparql-results+json",
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "update-effect-insert-default-triple",
+    "operation": "update-effect",
+    "update": "INSERT DATA { <http://example.com/compat-update-s> <http://example.com/compat-update-p> <http://example.com/compat-update-o> }",
+    "verify_query": "ASK WHERE { <http://example.com/compat-update-s> <http://example.com/compat-update-p> <http://example.com/compat-update-o> }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "update-invalid-syntax",
+    "operation": "update-effect",
+    "update": "INSERT DATA {",
+    "accept": "application/sparql-results+json",
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "update-effect-insert-named-graph-triple",
+    "operation": "update-effect",
+    "update": "INSERT DATA { GRAPH <http://example.com/compat-graph> { <http://example.com/compat-graph-s> <http://example.com/compat-graph-p> <http://example.com/compat-graph-o> } }",
+    "verify_query": "ASK WHERE { GRAPH <http://example.com/compat-graph> { <http://example.com/compat-graph-s> <http://example.com/compat-graph-p> <http://example.com/compat-graph-o> } }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "update-effect-delete-data-default-triple",
+    "operation": "update-effect",
+    "update": "INSERT DATA { <http://example.com/compat-delete-s> <http://example.com/compat-delete-p> <http://example.com/compat-delete-o> } ; DELETE DATA { <http://example.com/compat-delete-s> <http://example.com/compat-delete-p> <http://example.com/compat-delete-o> }",
+    "verify_query": "ASK WHERE { <http://example.com/compat-delete-s> <http://example.com/compat-delete-p> <http://example.com/compat-delete-o> }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "update-effect-delete-insert-where-default-triple",
+    "operation": "update-effect",
+    "update": "INSERT DATA { <http://example.com/compat-rewrite-s> <http://example.com/compat-rewrite-p> <http://example.com/compat-rewrite-old> } ; DELETE { <http://example.com/compat-rewrite-s> <http://example.com/compat-rewrite-p> ?o } INSERT { <http://example.com/compat-rewrite-s> <http://example.com/compat-rewrite-p> <http://example.com/compat-rewrite-new> } WHERE { <http://example.com/compat-rewrite-s> <http://example.com/compat-rewrite-p> ?o }",
+    "verify_query": "ASK WHERE { <http://example.com/compat-rewrite-s> <http://example.com/compat-rewrite-p> <http://example.com/compat-rewrite-new> FILTER NOT EXISTS { <http://example.com/compat-rewrite-s> <http://example.com/compat-rewrite-p> <http://example.com/compat-rewrite-old> } }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "update-effect-clear-graph",
+    "operation": "update-effect",
+    "update": "DROP SILENT GRAPH <http://example.com/compat-clear-graph> ; INSERT DATA { GRAPH <http://example.com/compat-clear-graph> { <http://example.com/compat-clear-s> <http://example.com/compat-clear-p> <http://example.com/compat-clear-o> } } ; CLEAR GRAPH <http://example.com/compat-clear-graph>",
+    "verify_query": "ASK WHERE { GRAPH <http://example.com/compat-clear-graph> { <http://example.com/compat-clear-s> <http://example.com/compat-clear-p> <http://example.com/compat-clear-o> } }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "update-effect-copy-graph",
+    "operation": "update-effect",
+    "update": "DROP SILENT GRAPH <http://example.com/compat-copy-source> ; DROP SILENT GRAPH <http://example.com/compat-copy-target> ; CREATE GRAPH <http://example.com/compat-copy-source> ; INSERT DATA { GRAPH <http://example.com/compat-copy-source> { <http://example.com/compat-copy-s> <http://example.com/compat-copy-p> <http://example.com/compat-copy-o> } } ; COPY GRAPH <http://example.com/compat-copy-source> TO GRAPH <http://example.com/compat-copy-target>",
+    "verify_query": "ASK WHERE { GRAPH <http://example.com/compat-copy-source> { <http://example.com/compat-copy-s> <http://example.com/compat-copy-p> <http://example.com/compat-copy-o> } GRAPH <http://example.com/compat-copy-target> { <http://example.com/compat-copy-s> <http://example.com/compat-copy-p> <http://example.com/compat-copy-o> } }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "update-effect-move-graph",
+    "operation": "update-effect",
+    "update": "DROP SILENT GRAPH <http://example.com/compat-move-source> ; DROP SILENT GRAPH <http://example.com/compat-move-target> ; CREATE GRAPH <http://example.com/compat-move-source> ; INSERT DATA { GRAPH <http://example.com/compat-move-source> { <http://example.com/compat-move-s> <http://example.com/compat-move-p> <http://example.com/compat-move-o> } } ; MOVE GRAPH <http://example.com/compat-move-source> TO GRAPH <http://example.com/compat-move-target>",
+    "verify_query": "ASK WHERE { GRAPH <http://example.com/compat-move-target> { <http://example.com/compat-move-s> <http://example.com/compat-move-p> <http://example.com/compat-move-o> } FILTER NOT EXISTS { GRAPH <http://example.com/compat-move-source> { <http://example.com/compat-move-s> <http://example.com/compat-move-p> <http://example.com/compat-move-o> } } }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "update-effect-add-graph",
+    "operation": "update-effect",
+    "update": "DROP SILENT GRAPH <http://example.com/compat-add-source> ; DROP SILENT GRAPH <http://example.com/compat-add-target> ; CREATE GRAPH <http://example.com/compat-add-source> ; CREATE GRAPH <http://example.com/compat-add-target> ; INSERT DATA { GRAPH <http://example.com/compat-add-source> { <http://example.com/compat-add-s> <http://example.com/compat-add-p> <http://example.com/compat-add-o> } } ; ADD GRAPH <http://example.com/compat-add-source> TO GRAPH <http://example.com/compat-add-target>",
+    "verify_query": "ASK WHERE { GRAPH <http://example.com/compat-add-source> { <http://example.com/compat-add-s> <http://example.com/compat-add-p> <http://example.com/compat-add-o> } GRAPH <http://example.com/compat-add-target> { <http://example.com/compat-add-s> <http://example.com/compat-add-p> <http://example.com/compat-add-o> } }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "graph-read-default-graph",
+    "operation": "graph-read",
+    "graph_target": {
+      "type": "default-graph"
+    },
+    "accept": "application/n-triples",
+    "kind": "graph-triples-set"
+  },
+  {
+    "name": "graph-read-named-graph-roundtrip",
+    "operation": "graph-read",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-graph-http"
+    },
+    "graph_payload": "@prefix ex: <http://example.com/> . ex:compat-graph-s ex:compat-graph-p ex:compat-graph-o .",
+    "graph_content_type": "text/turtle",
+    "graph_replace": true,
+    "accept": "application/n-triples",
+    "kind": "graph-triples-set"
+  },
+  {
+    "name": "graph-read-named-graph-append",
+    "operation": "graph-read",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-graph-http"
+    },
+    "graph_payload": "@prefix ex: <http://example.com/> . ex:compat-graph-s-append ex:compat-graph-p ex:compat-graph-o-append .",
+    "graph_content_type": "text/turtle",
+    "graph_replace": false,
+    "accept": "application/n-triples",
+    "kind": "graph-triples-set"
+  },
+  {
+    "name": "graph-put-effect-named-graph-replace",
+    "operation": "graph-put-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-graph-http-write"
+    },
+    "graph_payload": "@prefix ex: <http://example.com/> . ex:compat-put-s ex:compat-put-p ex:compat-put-o .",
+    "graph_content_type": "text/turtle",
+    "kind": "graph-triples-set"
+  },
+  {
+    "name": "graph-post-effect-named-graph-append",
+    "operation": "graph-post-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-graph-http-write"
+    },
+    "graph_payload": "@prefix ex: <http://example.com/> . ex:compat-post-s ex:compat-post-p ex:compat-post-o .",
+    "graph_content_type": "text/turtle",
+    "kind": "graph-triples-set"
+  },
+  {
+    "name": "graph-put-unsupported-content-type",
+    "operation": "graph-put-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-graph-http-error"
+    },
+    "graph_payload": "{\"not\":\"rdf\"}",
+    "graph_content_type": "application/json",
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "graph-put-malformed-turtle",
+    "operation": "graph-put-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-graph-http-error"
+    },
+    "graph_payload": "@prefix ex: <http://example.com/> . ex:broken ex:p ",
+    "graph_content_type": "text/turtle",
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "graph-post-malformed-turtle",
+    "operation": "graph-post-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-graph-http-error"
+    },
+    "graph_payload": "@prefix ex: <http://example.com/> . ex:broken-post ex:p ",
+    "graph_content_type": "text/turtle",
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "graph-head-default-graph",
+    "operation": "graph-head",
+    "graph_target": {
+      "type": "default-graph"
+    },
+    "accept": "text/turtle",
+    "kind": "status-and-content-type"
+  },
+  {
+    "name": "graph-head-missing-named-graph",
+    "operation": "graph-head",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-graph-http-missing"
+    },
+    "accept": "application/n-triples",
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "graph-delete-named-graph",
+    "operation": "graph-delete-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-graph-http"
+    },
+    "accept": "application/n-triples",
+    "kind": "graph-triples-set"
+  },
+  {
+    "name": "graph-delete-missing-named-graph",
+    "operation": "graph-delete-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-graph-http-missing"
+    },
+    "accept": "application/n-triples",
+    "kind": "status-content-type-body-class"
+  }
+]

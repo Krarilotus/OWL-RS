@@ -1,0 +1,26 @@
+[
+  {
+    "name": "ask_core_ontology_resource",
+    "query": "ASK WHERE { <http://hisqu.de/rg_ontology/ontology/> ?p ?o }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "select_total_scan_limit_20",
+    "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 20",
+    "accept": "application/sparql-results+json",
+    "kind": "solutions-count"
+  },
+  {
+    "name": "select_type_scan_limit_20",
+    "query": "SELECT ?s WHERE { ?s a ?type } LIMIT 20",
+    "accept": "application/sparql-results+json",
+    "kind": "solutions-count"
+  },
+  {
+    "name": "construct_ontology_subject_triples",
+    "query": "CONSTRUCT { <http://hisqu.de/rg_ontology/ontology/> ?p ?o } WHERE { <http://hisqu.de/rg_ontology/ontology/> ?p ?o }",
+    "accept": "application/n-triples",
+    "kind": "construct-triples-set"
+  }
+]

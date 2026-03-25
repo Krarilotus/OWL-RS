@@ -1,0 +1,31 @@
+mod class_consistency;
+mod closure_index;
+pub mod config;
+mod dataset_index;
+mod effective_types;
+mod explanation;
+mod identity;
+mod materialization;
+pub mod output;
+pub mod profile;
+mod property_closure;
+mod property_consistency;
+mod property_taxonomy;
+mod rules;
+mod rules_mvp_cache;
+mod rules_mvp_policy;
+mod rules_mvp_preset;
+pub mod service;
+mod support;
+mod symbols;
+mod taxonomy;
+#[cfg(test)]
+pub(crate) mod test_support;
+mod vocabulary;
+
+pub use config::{ReasonerConfig, ReasoningMode, RulesMvpConfig};
+pub use output::{InferenceDelta, ReasoningStats, RejectBlame, RejectEvidence, RejectExplanation};
+pub use profile::{ReasonerProfile, profile_for_mode};
+pub use rules_mvp_policy::{FeatureMode, RulesMvpFeaturePolicy, UnsupportedConstructBehavior};
+pub use rules_mvp_preset::RulesMvpPreset;
+pub use service::ReasonerService;

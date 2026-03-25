@@ -1,0 +1,33 @@
+[package]
+name = "nrese-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+durable-storage = ["nrese-store/durable-storage"]
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum = { version = "0.8.8", features = ["json", "query"] }
+dotenvy = "0.15.7"
+jsonwebtoken = "9.3.1"
+nrese-core = { path = "../nrese-core" }
+nrese-reasoner = { path = "../nrese-reasoner" }
+nrese-store = { path = "../nrese-store" }
+reqwest = { version = "0.12.24", features = ["json", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+serde_urlencoded = "0.7.1"
+thiserror.workspace = true
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "net"] }
+toml = "0.9.8"
+tower-http = { version = "0.6.8", features = ["fs", "request-id", "trace"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+tower = { version = "0.5.2", features = ["util"] }

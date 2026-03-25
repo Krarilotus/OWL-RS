@@ -1,0 +1,14 @@
+@prefix ex: <http://example.com/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+ex:Child rdfs:subClassOf ex:Parent .
+ex:friendOf rdfs:subPropertyOf ex:knows .
+ex:friendOf rdf:type owl:SymmetricProperty .
+ex:likes rdfs:domain ex:Person .
+ex:likes rdfs:range ex:Document .
+
+ex:alice rdf:type ex:Child .
+ex:alice ex:friendOf ex:bob .
+ex:alice ex:likes ex:spec .

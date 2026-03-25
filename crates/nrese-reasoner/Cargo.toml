@@ -1,0 +1,13 @@
+[package]
+name = "nrese-reasoner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nrese-core = { path = "../nrese-core" }
+tracing.workspace = true
+
+[dev-dependencies]
+nrese-store = { path = "../nrese-store" }
+tempfile = "3.23.0"

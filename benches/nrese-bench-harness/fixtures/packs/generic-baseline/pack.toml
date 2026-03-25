@@ -1,0 +1,5 @@
+name = "generic-baseline"
+dataset = "../../datasets/comparison_seed.ttl"
+query_workload = "../../workloads/query_workload.json"
+update_workload = "../../workloads/update_workload.json"
+compat_suites = ["../../compat/protocol_cases.json"]

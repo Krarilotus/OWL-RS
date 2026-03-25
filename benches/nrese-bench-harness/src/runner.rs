@@ -1,0 +1,527 @@
+use std::time::{Duration, Instant};
+use std::{fs, path::Path};
+
+use anyhow::{Context, Result, bail};
+use reqwest::Client;
+
+use crate::compat_common::{
+    execute_graph_write_raw, execute_query_raw, execute_update_raw, ensure_success,
+};
+use crate::compat_graph_store;
+use crate::compat_query;
+use crate::compat_update;
+use crate::io::{
+    infer_rdf_content_type, read_dataset_payload, read_json, read_ontology_catalog,
+    read_workload_pack, write_json_report,
+};
+use crate::layout::ServiceTarget;
+use crate::model::{
+    BenchComparison, BenchConfig, BenchReport, CatalogSyncConfig, CompatCase, CompatCaseReport,
+    CompatConfig, CompatGraphTarget, CompatHeaders, CompatOperation, CompatReport,
+    OntologyFixture, PackConfig, QueryWorkloadCase, SeedConfig, ServiceBenchReport,
+    UpdateWorkloadCase,
+};
+use crate::normalize::summarize;
+
+pub async fn run_bench(config: BenchConfig) -> Result<()> {
+    let client = build_client()?;
+    let query_cases: Vec<QueryWorkloadCase> = read_json(config.query_workload_path)?;
+    let update_cases: Vec<UpdateWorkloadCase> = read_json(config.update_workload_path)?;
+    let nrese = ServiceTarget::nrese_with_headers(
+        config.nrese_base_url.clone(),
+        config.nrese_headers.clone(),
+    );
+
+    println!("== Benchmark run ==");
+    println!("nrese base: {}", nrese.base_url);
+    println!("iterations per weighted case: {}", config.iterations);
+
+    let mut services = Vec::new();
+    let nrese_query = benchmark_queries(&client, &nrese, &query_cases, config.iterations).await?;
+    let nrese_update =
+        benchmark_updates(&client, &nrese, &update_cases, config.iterations).await?;
+    print_summary("NRESE query", &nrese_query);
+    print_summary("NRESE update", &nrese_update);
+    services.push(ServiceBenchReport {
+        label: nrese.label,
+        base_url: nrese.base_url.clone(),
+        query: nrese_query.clone(),
+        update: nrese_update.clone(),
+    });
+
+    let mut comparison = None;
+    if let Some(fuseki_base_url) = &config.fuseki_base_url {
+        let fuseki = ServiceTarget::fuseki_with_headers(
+            fuseki_base_url.clone(),
+            config.fuseki_basic_auth.clone(),
+            config.fuseki_headers.clone(),
+        );
+        println!("fuseki base: {}", fuseki.base_url);
+        let fuseki_query =
+            benchmark_queries(&client, &fuseki, &query_cases, config.iterations).await?;
+        let fuseki_update =
+            benchmark_updates(&client, &fuseki, &update_cases, config.iterations).await?;
+        print_summary("Fuseki query", &fuseki_query);
+        print_summary("Fuseki update", &fuseki_update);
+        print_delta(
+            "query p95 delta (NRESE - Fuseki)",
+            nrese_query.p95_ms,
+            fuseki_query.p95_ms,
+        );
+        print_delta(
+            "update p95 delta (NRESE - Fuseki)",
+            nrese_update.p95_ms,
+            fuseki_update.p95_ms,
+        );
+        services.push(ServiceBenchReport {
+            label: fuseki.label,
+            base_url: fuseki.base_url.clone(),
+            query: fuseki_query.clone(),
+            update: fuseki_update.clone(),
+        });
+        comparison = Some(BenchComparison {
+            left_label: nrese.label,
+            right_label: fuseki.label,
+            query_p95_delta_ms: nrese_query.p95_ms as i128 - fuseki_query.p95_ms as i128,
+            update_p95_delta_ms: nrese_update.p95_ms as i128 - fuseki_update.p95_ms as i128,
+        });
+    }
+
+    if let Some(report_path) = config.report_json_path {
+        write_json_report(
+            report_path,
+            &BenchReport {
+                mode: "bench",
+                iterations: config.iterations,
+                services,
+                comparison,
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+pub async fn run_compat(config: CompatConfig) -> Result<()> {
+    let client = build_client()?;
+    let cases: Vec<CompatCase> = read_json(config.cases_path)?;
+    let nrese = ServiceTarget::nrese_with_headers(
+        config.nrese_base_url.clone(),
+        config.nrese_headers.clone(),
+    );
+    let fuseki = ServiceTarget::fuseki_with_headers(
+        config.fuseki_base_url.clone(),
+        config.fuseki_basic_auth,
+        config.fuseki_headers.clone(),
+    );
+    let mut reports = Vec::with_capacity(cases.len());
+    let mut matched_cases = 0usize;
+
+    println!("== Compatibility run ==");
+    println!("nrese base: {}", nrese.base_url);
+    println!("fuseki base: {}", fuseki.base_url);
+
+    for case in &cases {
+        let report = execute_compat_case(&client, &nrese, &fuseki, case).await?;
+        if report.matched {
+            matched_cases += 1;
+        }
+
+        println!(
+            "[{}:{}] {} => {}",
+            report.operation,
+            report.kind,
+            case.name,
+            if report.matched {
+                "match"
+            } else {
+                "mismatch"
+            }
+        );
+
+        reports.push(report);
+    }
+
+    let mismatched_cases = cases.len() - matched_cases;
+    let status = if mismatched_cases == 0 {
+        "all-matched"
+    } else {
+        "mismatches-present"
+    };
+
+    if let Some(report_path) = config.report_json_path {
+        write_json_report(
+            report_path,
+            &CompatReport {
+                mode: "compat",
+                nrese_base_url: config.nrese_base_url.clone(),
+                fuseki_base_url: config.fuseki_base_url.clone(),
+                total_cases: cases.len(),
+                matched_cases,
+                mismatched_cases,
+                status,
+                cases: reports,
+            },
+        )?;
+    }
+
+    if mismatched_cases > 0 {
+        bail!("compatibility mismatches detected");
+    }
+
+    Ok(())
+}
+
+pub async fn run_seed(config: SeedConfig) -> Result<()> {
+    let client = build_client()?;
+    let payload = read_dataset_payload(&config.dataset_path)?;
+    let content_type = config.content_type.clone().unwrap_or_else(|| {
+        infer_rdf_content_type(&config.dataset_path)
+            .unwrap_or("text/turtle")
+            .to_owned()
+    });
+    let mut targets = vec![ServiceTarget::nrese_with_headers(
+        config.nrese_base_url.clone(),
+        config.nrese_headers.clone(),
+    )];
+    if let Some(fuseki_base_url) = config.fuseki_base_url.clone() {
+        targets.push(ServiceTarget::fuseki_with_headers(
+            fuseki_base_url,
+            config.fuseki_basic_auth.clone(),
+            config.fuseki_headers.clone(),
+        ));
+    }
+
+    println!("== Dataset seed run ==");
+    println!("dataset: {}", config.dataset_path.display());
+    println!("content-type: {}", content_type);
+    println!("replace mode: {}", config.replace);
+
+    for target in targets {
+        write_dataset_raw(&client, &target, &payload, &content_type, config.replace).await?;
+        println!("seeded {} via {}", target.label, target.data_endpoint());
+    }
+
+    Ok(())
+}
+
+pub async fn run_pack(config: PackConfig) -> Result<()> {
+    let pack = read_workload_pack(&config.workload_pack_path)?;
+    ensure_report_dir(config.report_dir.as_deref())?;
+
+    println!("== Workload pack run ==");
+    println!("pack: {}", pack.name);
+    println!("manifest: {}", config.workload_pack_path.display());
+
+    run_seed(SeedConfig {
+        nrese_base_url: config.nrese_base_url.clone(),
+        nrese_headers: pack.nrese.headers.clone(),
+        fuseki_base_url: config.fuseki_base_url.clone(),
+        fuseki_headers: pack.fuseki.headers.clone(),
+        fuseki_basic_auth: config.fuseki_basic_auth.clone(),
+        dataset_path: pack.dataset.clone(),
+        content_type: None,
+        replace: true,
+    })
+    .await?;
+
+    if let Some(fuseki_base_url) = config.fuseki_base_url.clone() {
+        for suite_path in &pack.compat_suites {
+            let compat_report_path = config
+                .report_dir
+                .as_ref()
+                .map(|dir| dir.join(compat_report_filename(suite_path)));
+            run_compat(CompatConfig {
+                nrese_base_url: config.nrese_base_url.clone(),
+                nrese_headers: pack.nrese.headers.clone(),
+                fuseki_base_url: fuseki_base_url.clone(),
+                fuseki_headers: pack.fuseki.headers.clone(),
+                fuseki_basic_auth: config.fuseki_basic_auth.clone(),
+                cases_path: suite_path.clone(),
+                report_json_path: compat_report_path,
+            })
+            .await?;
+        }
+    } else {
+        println!("fuseki base not provided; skipping compat stage");
+    }
+
+    let bench_report_path = config
+        .report_dir
+        .as_ref()
+        .map(|dir| dir.join("bench-report.json"));
+    run_bench(BenchConfig {
+        nrese_base_url: config.nrese_base_url,
+        nrese_headers: pack.nrese.headers,
+        fuseki_base_url: config.fuseki_base_url,
+        fuseki_headers: pack.fuseki.headers,
+        fuseki_basic_auth: config.fuseki_basic_auth,
+        iterations: config.iterations,
+        query_workload_path: pack.query_workload,
+        update_workload_path: pack.update_workload,
+        report_json_path: bench_report_path,
+    })
+    .await
+}
+
+pub async fn run_catalog_sync(config: CatalogSyncConfig) -> Result<()> {
+    let catalog = read_ontology_catalog(&config.catalog_path)?;
+    fs::create_dir_all(&config.output_dir)
+        .with_context(|| format!("failed to create {}", config.output_dir.display()))?;
+    let client = build_client()?;
+
+    println!("== Ontology catalog sync ==");
+    println!("catalog: {}", config.catalog_path.display());
+    println!("output: {}", config.output_dir.display());
+
+    for ontology in catalog
+        .ontologies
+        .iter()
+        .filter(|item| config.tier.as_deref().is_none_or(|tier| item.tier == tier))
+    {
+        sync_ontology(&client, ontology, &config.output_dir, config.refresh).await?;
+    }
+
+    Ok(())
+}
+
+fn ensure_report_dir(report_dir: Option<&Path>) -> Result<()> {
+    if let Some(report_dir) = report_dir {
+        fs::create_dir_all(report_dir)
+            .with_context(|| format!("failed to create report dir {}", report_dir.display()))?;
+    }
+    Ok(())
+}
+
+async fn sync_ontology(
+    client: &Client,
+    ontology: &OntologyFixture,
+    output_dir: &Path,
+    refresh: bool,
+) -> Result<()> {
+    let output_path = output_dir.join(&ontology.filename);
+    if output_path.exists() && !refresh {
+        println!(
+            "cached {} ({}) [{}] at {}",
+            ontology.name,
+            ontology.title,
+            ontology.tier,
+            output_path.display()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "download {} ({}) [{}] from {}",
+        ontology.name, ontology.title, ontology.tier, ontology.url
+    );
+    let response = client
+        .get(&ontology.url)
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch {}", ontology.url))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("failed to fetch {}: HTTP {}", ontology.url, status);
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read body {}", ontology.url))?;
+    fs::write(&output_path, &bytes)
+        .with_context(|| format!("failed to write {}", output_path.display()))?;
+    println!(
+        "saved {} bytes to {} ({})",
+        bytes.len(),
+        output_path.display(),
+        ontology.media_type
+    );
+    if !ontology.focus_terms.is_empty() {
+        println!("focus terms: {}", ontology.focus_terms.join(", "));
+    }
+    Ok(())
+}
+
+async fn benchmark_queries(
+    client: &Client,
+    target: &ServiceTarget,
+    cases: &[QueryWorkloadCase],
+    iterations: usize,
+) -> Result<crate::model::LatencySummary> {
+    let mut latencies = Vec::new();
+    let mut success = 0usize;
+    let mut failure = 0usize;
+
+    for case in cases {
+        for _ in 0..(case.weight * iterations) {
+            let started = Instant::now();
+            match execute_query_raw(client, target, &case.query, &case.accept, &CompatHeaders::new()).await {
+                Ok(outcome) => match ensure_success(target, "query", &outcome) {
+                    Ok(()) => {
+                        success += 1;
+                        latencies.push(started.elapsed().as_millis());
+                    }
+                    Err(error) => {
+                        failure += 1;
+                        eprintln!(
+                            "query case '{}' failed against {}: {error}",
+                            case.name, target.label
+                        );
+                    }
+                },
+                Err(error) => {
+                    failure += 1;
+                    eprintln!("query case '{}' failed against {}: {error}", case.name, target.label);
+                }
+            }
+        }
+    }
+
+    Ok(summarize(latencies, success, failure))
+}
+
+async fn benchmark_updates(
+    client: &Client,
+    target: &ServiceTarget,
+    cases: &[UpdateWorkloadCase],
+    iterations: usize,
+) -> Result<crate::model::LatencySummary> {
+    let mut latencies = Vec::new();
+    let mut success = 0usize;
+    let mut failure = 0usize;
+
+    for case in cases {
+        for _ in 0..(case.weight * iterations) {
+            let started = Instant::now();
+            match execute_update_raw(client, target, &case.update, &CompatHeaders::new()).await {
+                Ok(outcome) => match ensure_success(target, "update", &outcome) {
+                    Ok(()) => {
+                        success += 1;
+                        latencies.push(started.elapsed().as_millis());
+                    }
+                    Err(error) => {
+                        failure += 1;
+                        eprintln!(
+                            "update case '{}' failed against {}: {error}",
+                            case.name, target.label
+                        );
+                    }
+                },
+                Err(error) => {
+                    failure += 1;
+                    eprintln!(
+                        "update case '{}' failed against {}: {error}",
+                        case.name, target.label
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(summarize(latencies, success, failure))
+}
+
+async fn execute_compat_case(
+    client: &Client,
+    left: &ServiceTarget,
+    right: &ServiceTarget,
+    case: &CompatCase,
+) -> Result<CompatCaseReport> {
+    match case.operation {
+        CompatOperation::Query => compat_query::execute_case(client, left, right, case).await,
+        CompatOperation::GraphRead
+        | CompatOperation::GraphHead
+        | CompatOperation::GraphDeleteEffect
+        | CompatOperation::GraphPutEffect
+        | CompatOperation::GraphPostEffect => {
+            compat_graph_store::execute_case(client, left, right, case).await
+        }
+        CompatOperation::UpdateEffect => compat_update::execute_case(client, left, right, case).await,
+    }
+}
+
+async fn write_dataset_raw(
+    client: &Client,
+    target: &ServiceTarget,
+    payload: &[u8],
+    content_type: &str,
+    replace: bool,
+) -> Result<()> {
+    let outcome = execute_graph_write_raw(
+        client,
+        target,
+        &CompatGraphTarget::DefaultGraph,
+        content_type,
+        payload,
+        replace,
+        &CompatHeaders::new(),
+    )
+    .await?;
+    ensure_success(target, "dataset write", &outcome)
+}
+
+fn build_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .context("failed to build HTTP client")
+}
+
+fn print_summary(label: &str, summary: &crate::model::LatencySummary) {
+    println!(
+        "{}: samples={} success={} failure={} min={}ms p50={}ms p95={}ms p99={}ms max={}ms total={}ms",
+        label,
+        summary.samples,
+        summary.success,
+        summary.failure,
+        summary.min_ms,
+        summary.p50_ms,
+        summary.p95_ms,
+        summary.p99_ms,
+        summary.max_ms,
+        summary.total_ms,
+    );
+}
+
+fn print_delta(label: &str, left_ms: u128, right_ms: u128) {
+    println!("{label}: {}ms", left_ms as i128 - right_ms as i128);
+}
+
+fn compat_report_filename(suite_path: &Path) -> String {
+    let stem = suite_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("compat");
+    format!("{stem}-report.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use crate::model::{CompatCase, CompatOperation};
+
+    use super::compat_report_filename;
+
+    #[test]
+    fn compat_case_defaults_to_query_operation() {
+        let case: CompatCase = serde_json::from_str(
+            r#"{
+                "name":"ask",
+                "query":"ASK WHERE { ?s ?p ?o }",
+                "kind":"ask-boolean"
+            }"#,
+        )
+        .expect("case");
+
+        assert!(matches!(case.operation, CompatOperation::Query));
+    }
+
+    #[test]
+    fn report_filename_uses_suite_stem() {
+        assert_eq!(
+            compat_report_filename(Path::new("fixtures/compat/policy_failure_cases.json")),
+            "policy_failure_cases-report.json"
+        );
+    }
+}

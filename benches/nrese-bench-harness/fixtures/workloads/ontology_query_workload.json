@@ -1,0 +1,20 @@
+[
+  {
+    "name": "count-all-triples",
+    "query": "SELECT (COUNT(*) AS ?count) WHERE { ?s ?p ?o }",
+    "accept": "application/sparql-results+json",
+    "weight": 2
+  },
+  {
+    "name": "ask-ontology-declaration",
+    "query": "ASK WHERE { ?s a <http://www.w3.org/2002/07/owl#Ontology> }",
+    "accept": "application/sparql-results+json",
+    "weight": 1
+  },
+  {
+    "name": "construct-class-fragment",
+    "query": "CONSTRUCT { ?class a <http://www.w3.org/2002/07/owl#Class> } WHERE { ?class a <http://www.w3.org/2002/07/owl#Class> }",
+    "accept": "application/n-triples",
+    "weight": 1
+  }
+]

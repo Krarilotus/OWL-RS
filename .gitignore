@@ -1,0 +1,34 @@
+/target/
+/target-*/
+/benches/**/target/
+**/*.rs.bk
+
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+
+# Local runtime and evidence artifacts
+/data/
+/artifacts/
+/tmp/
+/benches/nrese-bench-harness/fixtures/catalog-cache/
+*.log
+*.out
+*.err
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend / Node
+**/node_modules/
+**/.vite/
+**/coverage/
+**/dist/
+**/*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

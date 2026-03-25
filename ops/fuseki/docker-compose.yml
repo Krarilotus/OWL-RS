@@ -1,0 +1,9 @@
+services:
+  fuseki:
+    image: ${FUSEKI_IMAGE:-stain/jena-fuseki:5.1.0}
+    container_name: nrese-fuseki-compare
+    ports:
+      - "${FUSEKI_PORT:-3030}:3030"
+    environment:
+      ADMIN_PASSWORD: ${FUSEKI_ADMIN_PASSWORD:-nrese-admin}
+    command: ["/jena-fuseki/fuseki-server", "--mem", "${FUSEKI_DATASET:-/ds}"]
