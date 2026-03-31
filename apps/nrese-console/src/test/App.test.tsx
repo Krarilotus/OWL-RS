@@ -56,6 +56,7 @@ test("renders console sections", async () => {
   );
 
   expect(await screen.findByRole("heading", { name: /NRESE Console/i })).toBeInTheDocument();
+  expect(screen.getByLabelText(/Language/i)).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: /Runtime snapshot/i })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: /AI query assistant/i })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: /Guided examples/i })).toBeInTheDocument();

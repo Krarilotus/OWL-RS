@@ -4,12 +4,17 @@ export const en: AppStrings = {
   appTitle: "NRESE Console",
   subtitle:
     "User-facing workspace for exploring, querying, ingesting, and understanding the knowledge graph.",
+  localeLabel: "Language",
   examplesTitle: "Guided examples",
   examplesHint:
     "Load a small working example instead of starting from an empty editor. These examples stay close to the actual query, update, tell, and graph-store workflows.",
   applyExample: "Load example",
   runtimeTitle: "Runtime snapshot",
   assistantTitle: "AI query assistant",
+  assistantEnabled: "Uses the configured server-side AI provider.",
+  assistantProviderLabel: "Provider",
+  assistantModelLabel: "Model",
+  assistantNoSuggestions: "No suggestions returned for the current prompt.",
   assistantPlaceholder:
     "Describe what you want to learn from the graph, for example: Show the main classes and how many instances they currently have.",
   assistantButton: "Suggest queries",

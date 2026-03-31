@@ -1,6 +1,5 @@
-import { useMemo } from "react";
-
 import { useConsoleActions } from "./app/useConsoleActions";
+import { useLocale } from "./app/useLocale";
 import { useConsoleState } from "./app/useConsoleState";
 import { useRuntimeData } from "./app/useRuntimeData";
 import { WORKBENCH_EXAMPLES } from "./app/workbenchExamples";
@@ -10,10 +9,9 @@ import { OutputPanel } from "./components/OutputPanel";
 import { QueryAssistant } from "./components/QueryAssistant";
 import { RuntimePanel } from "./components/RuntimePanel";
 import { WorkbenchExamples } from "./components/WorkbenchExamples";
-import { getStrings } from "./i18n";
 
 export default function App() {
-  const strings = useMemo(() => getStrings(navigator.language), []);
+  const { locale, setLocale, strings } = useLocale();
   const state = useConsoleState(strings);
   const { runtimeQuery, capabilitiesQuery, aiStatusQuery } = useRuntimeData();
   const actions = useConsoleActions(strings, {
@@ -54,6 +52,8 @@ export default function App() {
           runtimeQuery.data?.ready ? strings.runtimeReady : strings.runtimeStarting
         }
         ready={Boolean(runtimeQuery.data?.ready)}
+        locale={locale}
+        onLocaleChange={setLocale}
       />
       <RuntimePanel
         strings={strings}
@@ -82,6 +82,7 @@ export default function App() {
         }
         suggestions={state.suggestions}
         aiEnabled={Boolean(aiStatusQuery.data?.enabled)}
+        aiStatus={aiStatusQuery.data}
         loading={state.assistantBusy}
         onUseSuggestion={state.setQuery}
       />

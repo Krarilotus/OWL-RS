@@ -1,5 +1,5 @@
 import type { AppStrings } from "../i18n/types";
-import type { QuerySuggestion } from "../lib/types";
+import type { AiStatus, QuerySuggestion } from "../lib/types";
 
 type Props = {
   strings: AppStrings;
@@ -8,6 +8,7 @@ type Props = {
   onSuggest: () => void;
   suggestions: QuerySuggestion[];
   aiEnabled: boolean;
+  aiStatus?: AiStatus;
   loading: boolean;
   onUseSuggestion: (query: string) => void;
 };
@@ -19,6 +20,7 @@ export function QueryAssistant({
   onSuggest,
   suggestions,
   aiEnabled,
+  aiStatus,
   loading,
   onUseSuggestion,
 }: Props) {
@@ -28,10 +30,23 @@ export function QueryAssistant({
         <div>
           <h2>{strings.assistantTitle}</h2>
           <p className="panel-subtitle">
-            {aiEnabled ? "Uses the configured server-side AI provider." : strings.aiDisabled}
+            {aiEnabled ? strings.assistantEnabled : strings.aiDisabled}
           </p>
         </div>
       </div>
+
+      {aiStatus?.enabled ? (
+        <div className="workbench-grid">
+          <article className="helper-card">
+            <h3>{strings.assistantProviderLabel}</h3>
+            <p>{aiStatus.provider}</p>
+          </article>
+          <article className="helper-card">
+            <h3>{strings.assistantModelLabel}</h3>
+            <p>{aiStatus.model ?? "n/a"}</p>
+          </article>
+        </div>
+      ) : null}
 
       <div className="field">
         <label htmlFor="assistant-prompt">{strings.assistantTitle}</label>
@@ -55,6 +70,7 @@ export function QueryAssistant({
       </div>
 
       <div className="suggestion-grid">
+        {suggestions.length === 0 && !loading ? <p>{strings.assistantNoSuggestions}</p> : null}
         {suggestions.map((suggestion) => (
           <article className="suggestion-card" key={suggestion.title}>
             <h3>{suggestion.title}</h3>

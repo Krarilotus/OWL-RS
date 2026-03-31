@@ -4,12 +4,17 @@ export const de: AppStrings = {
   appTitle: "NRESE Konsole",
   subtitle:
     "Nutzeroberflaeche zum Erkunden, Abfragen, Einspielen und Verstehen des Wissensgraphen.",
+  localeLabel: "Sprache",
   examplesTitle: "Gefuehrte Beispiele",
   examplesHint:
     "Lade ein kleines Arbeitsbeispiel, statt mit einem leeren Editor zu beginnen. Die Beispiele bleiben nah an Query-, Update-, Tell- und Graph-Store-Ablaufen.",
   applyExample: "Beispiel laden",
   runtimeTitle: "Laufzeitstatus",
   assistantTitle: "KI-Abfrageassistent",
+  assistantEnabled: "Verwendet den konfigurierten serverseitigen KI-Provider.",
+  assistantProviderLabel: "Provider",
+  assistantModelLabel: "Modell",
+  assistantNoSuggestions: "Fuer den aktuellen Prompt wurden keine Vorschlaege geliefert.",
   assistantPlaceholder:
     "Beschreibe, was du aus dem Graphen wissen willst, zum Beispiel: Zeige die wichtigsten Klassen und wie viele Instanzen sie aktuell haben.",
   assistantButton: "Abfragen vorschlagen",

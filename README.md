@@ -41,6 +41,7 @@ Implemented today:
 - Graph Store endpoint surface
 - user-facing `/console` frontend for query, tell, update, graph, and dataset workflows
 - guided workbench examples in `/console` so less SPARQL-native users can start from working query/update/tell/graph templates
+- frontend locale selection with persisted `en`/`de` i18n instead of browser-guess-only language handling
 - service description, health, readiness, metrics, and operator endpoints
 - staged update validation before publish
 - bounded `rules-mvp` reasoning with canonical `owl:sameAs` equality handling, bounded functional / inverse-functional equality entailment, bounded `owl:Nothing` effective-type rejection, and explicit unsupported-construct diagnostics
@@ -57,6 +58,7 @@ Implemented today:
 - bounded `oidc-introspection` auth alongside the existing bearer and proxy-terminated `mtls` modes
 - file-based `config.toml` runtime configuration with environment overrides on the same typed parser path
 - optional server-side AI query suggestions via Gemini or OpenRouter on one typed config path
+- AI assistant now surfaces configured provider/model metadata and clearer empty-state behavior in the user console
 
 Not finished yet:
 
@@ -90,6 +92,33 @@ Set-Location .\apps\nrese-console
 npm install
 npm run build
 Set-Location ..\..
+```
+
+### Run The User Frontend In Dev Mode
+
+Start the Rust server first so the frontend dev proxy has a backend to forward API calls to:
+
+```powershell
+cargo run -p nrese-server
+```
+
+Then, in a second terminal:
+
+```powershell
+Set-Location .\apps\nrese-console
+npm install
+npm run dev
+```
+
+Notes:
+
+- open the Vite app at `http://127.0.0.1:5173/console/`
+- frontend requests to `/dataset/*`, `/ops/*`, and `/api/*` are proxied to `http://127.0.0.1:8080`
+- if your backend runs elsewhere, set `VITE_API_PROXY_TARGET`, for example:
+
+```powershell
+$env:VITE_API_PROXY_TARGET = "http://127.0.0.1:9090"
+npm run dev
 ```
 
 ### Run The Server

@@ -99,9 +99,10 @@ Current coverage:
 - `/ops` UI exists
 - `/console` user-facing frontend exists for query, tell, update, graph, and dataset workflows
 - `/console` now includes guided workbench examples so non-specialist users can load explicit query/update/tell/graph templates instead of starting from empty editors
+- `/console` now supports explicit persisted locale selection for the currently shipped `en`/`de` language set instead of relying only on browser locale detection
 - operator APIs expose capabilities, dataset summary, and extended health
 - query/update/graph workflows are browser-accessible
-- optional server-side AI query suggestions exist behind typed provider config and a dedicated API surface
+- optional server-side AI query suggestions exist behind typed provider config and a dedicated API surface, with provider/model visibility and clearer frontend empty-state handling
 - reasoner presets are externally configurable and visible in the user-facing frontend/runtime metadata
 
 Still required:
@@ -111,6 +112,7 @@ Still required:
 - non-demo workflow hardening for everyday operations
 - broader user-console workflow evidence and extension/customization guidance under real project usage
 - live preset application remains external/config-driven rather than runtime-mutable
+- broader i18n coverage beyond the current shipped language set and stronger assistant UX around task templates/history under real project usage
 
 Replacement gate:
 - admin and user workflows are reliably executable in-browser behind real deployment controls

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { AppStrings } from "../i18n/types";
 import type { OutputState, QuerySuggestion } from "../lib/types";
@@ -10,6 +10,7 @@ import {
 } from "./defaults";
 
 export function useConsoleState(strings: AppStrings) {
+  const previousStrings = useRef(strings);
   const [query, setQuery] = useState(DEFAULT_QUERY);
   const [update, setUpdate] = useState(DEFAULT_UPDATE);
   const [tell, setTell] = useState(DEFAULT_TELL);
@@ -24,6 +25,22 @@ export function useConsoleState(strings: AppStrings) {
     body: strings.noOutput,
   });
   const [assistantBusy, setAssistantBusy] = useState(false);
+
+  useEffect(() => {
+    if (assistantPrompt === previousStrings.current.assistantPlaceholder) {
+      setAssistantPrompt(strings.assistantPlaceholder);
+    }
+    setOutput((current) =>
+      current.title === previousStrings.current.outputTitle && current.status === "idle"
+        ? {
+            ...current,
+            title: strings.outputTitle,
+            body: strings.noOutput,
+          }
+        : current,
+    );
+    previousStrings.current = strings;
+  }, [assistantPrompt, strings]);
 
   return {
     query,

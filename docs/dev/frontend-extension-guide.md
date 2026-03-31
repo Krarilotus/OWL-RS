@@ -36,6 +36,7 @@ This document explains how to extend the NRESE user frontend without mixing styl
 - edit `apps/nrese-console/src/i18n/en.ts`
 - edit `apps/nrese-console/src/i18n/de.ts`
 - add another language file and register it in `apps/nrese-console/src/i18n/index.ts`
+- locale selection and persistence are owned in `apps/nrese-console/src/app/useLocale.ts`
 
 ### Change Styling
 

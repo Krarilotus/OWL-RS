@@ -1,11 +1,16 @@
 export type AppStrings = {
   appTitle: string;
   subtitle: string;
+  localeLabel: string;
   examplesTitle: string;
   examplesHint: string;
   applyExample: string;
   runtimeTitle: string;
   assistantTitle: string;
+  assistantEnabled: string;
+  assistantProviderLabel: string;
+  assistantModelLabel: string;
+  assistantNoSuggestions: string;
   assistantPlaceholder: string;
   assistantButton: string;
   useSuggestion: string;
