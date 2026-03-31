@@ -249,6 +249,67 @@ fn rules_mvp_reuses_schema_cache_for_abox_only_change() {
 }
 
 #[test]
+fn rules_mvp_reuses_full_cache_after_alternating_between_two_snapshots() {
+    let service = ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::RulesMvp));
+    let first = OwnedSnapshot::with_revision_and_unsupported(
+        1,
+        vec![(
+            "http://example.com/alice",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "http://example.com/Person",
+        )],
+        0,
+    );
+    let second = OwnedSnapshot::with_revision_and_unsupported(
+        2,
+        vec![(
+            "http://example.com/bob",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "http://example.com/Person",
+        )],
+        0,
+    );
+    let first_again = OwnedSnapshot::with_revision_and_unsupported(
+        3,
+        vec![(
+            "http://example.com/alice",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            "http://example.com/Person",
+        )],
+        0,
+    );
+
+    let first_plan = service.plan(&first).expect("first plan");
+    let first_output = service.run(&first, &first_plan).expect("first run");
+    let second_plan = service.plan(&second).expect("second plan");
+    let second_output = service.run(&second, &second_plan).expect("second run");
+    let third_plan = service.plan(&first_again).expect("third plan");
+    let third_output = service.run(&first_again, &third_plan).expect("third run");
+
+    assert!(
+        !first_output
+            .report
+            .notes
+            .iter()
+            .any(|note| note.contains("reused memoized preparation and inference artifacts"))
+    );
+    assert!(
+        !second_output
+            .report
+            .notes
+            .iter()
+            .any(|note| note.contains("reused memoized preparation and inference artifacts"))
+    );
+    assert!(
+        third_output
+            .report
+            .notes
+            .iter()
+            .any(|note| note.contains("reused memoized preparation and inference artifacts"))
+    );
+}
+
+#[test]
 fn rules_mvp_can_disable_consistency_enforcement_via_policy() {
     let snapshot = OwnedSnapshot::with_revision_and_unsupported(
         13,

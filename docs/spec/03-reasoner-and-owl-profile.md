@@ -47,6 +47,7 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - staged-update delta inspection so reject reports can surface a likely commit-local trigger triple and ranked candidate set when the previewed mutation makes that isolation possible
 - snapshot-keyed memoization of prepared `rules-mvp` artifacts and inference output so repeated runs over identical snapshot content can reuse indexed closures and consistency inputs instead of rebuilding them from scratch
 - schema-keyed memoization of TBox-stable `rules-mvp` preparation artifacts so ABox-only changes can reuse taxonomy and schema-closure preparation while still recomputing ABox-sensitive equality, property-closure, effective-type, and consistency stages
+- bounded multi-entry execution and schema caches so alternating snapshot/workload patterns can reuse more than only the immediately previous run
 - prepared property-consistency indexing over effective assertions for constrained predicates so irreflexive, asymmetric, functional, inverse-functional, and property-disjoint checks share one grouped ABox view per run instead of rescanning closure data separately
 - schema-cached property-constraint planning so the set of predicates participating in property-characteristic consistency gates is prepared once with other TBox-stable artifacts and reused by ABox-sensitive consistency indexing
 - schema-cached class-consistency preparation so `owl:Nothing` and disjoint-type checks reuse precomputed class-side constraints instead of rebuilding schema-side inputs per run
@@ -61,6 +62,7 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - explicit invalidation layers:
 - full-snapshot cache key for exact dataset-state reuse
 - schema/TBox cache key for partial reuse under ABox-only change
+- bounded multi-entry cache residency for hot repeated workloads, instead of a single last-entry cache
 - next optimization target after the current prepared property-consistency index:
 - delta-aware invalidation for ABox-sensitive consistency preparation so localized changes can refresh only affected property-group slices
 - Transaction-oriented consistency gate for commit-time validation

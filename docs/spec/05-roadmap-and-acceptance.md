@@ -64,6 +64,7 @@ The canonical replacement-readiness tracking document is [06-fuseki-replacement-
 - `rules-mvp` emits deterministic unsupported diagnostics for constructs that remain out of scope in the current bounded slice
 - `rules-mvp` now memoizes prepared reasoning artifacts and inference output by snapshot content key so repeated runs over identical staged dataset state avoid rebuilding indexing, taxonomy, equality, and closure inputs
 - `rules-mvp` now also memoizes schema-stable preparation artifacts by a dedicated schema/TBox content key, so ABox-only changes can reuse taxonomy and schema-closure preparation without unsafe full-result reuse
+- `rules-mvp` now keeps a bounded multi-entry execution/schema cache so alternating hot snapshot patterns do not immediately evict each other
 - `rules-mvp` property-characteristic consistency checks now build one prepared assertion index per run for constrained predicates, so irreflexive, asymmetric, functional, inverse-functional, and property-disjoint rejection gates reuse a single grouped property view
 - `rules-mvp` now also caches a schema-stable property-constraint plan, so ABox-sensitive property-consistency indexing no longer has to rediscover the relevant constrained predicate set on each run
 - `rules-mvp` runtime behavior is now externalized behind a typed feature policy, so closure, equality, consistency gates, and unsupported-construct diagnostics can be configured without embedding product opinion into reasoner code

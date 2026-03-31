@@ -13,10 +13,13 @@ use crate::rules_mvp_policy::RulesMvpFeaturePolicy;
 use self::prepared::{PreparedRulesMvp, build_prepared};
 use self::schema::CachedPreparedSchema;
 
+const EXECUTION_CACHE_CAPACITY: usize = 8;
+const SCHEMA_CACHE_CAPACITY: usize = 8;
+
 #[derive(Debug, Default)]
 pub struct RulesMvpExecutionCache {
-    entry: Mutex<Option<CachedRulesMvpExecution>>,
-    schema_entry: Mutex<Option<CachedRulesMvpSchema>>,
+    entries: Mutex<Vec<CachedRulesMvpExecution>>,
+    schema_entries: Mutex<Vec<CachedRulesMvpSchema>>,
     hits: AtomicU64,
     misses: AtomicU64,
     schema_hits: AtomicU64,
@@ -42,16 +45,7 @@ impl RulesMvpExecutionCache {
         };
         let policy_cache_key = policy.cache_key();
 
-        if let Some(cached) = self
-            .entry
-            .lock()
-            .expect("rules-mvp cache lock poisoned")
-            .as_ref()
-            .filter(|cached| {
-                cached.cache_key == cache_key && cached.policy_cache_key == policy_cache_key
-            })
-            .cloned()
-        {
+        if let Some(cached) = self.lookup_execution_cache(cache_key, policy_cache_key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return CacheExecutionResult {
                 inferred: cached.inferred,
@@ -71,7 +65,7 @@ impl RulesMvpExecutionCache {
             policy_cache_key,
             inferred: inferred.clone(),
         };
-        *self.entry.lock().expect("rules-mvp cache lock poisoned") = Some(cached);
+        self.store_execution_cache(cached);
         self.misses.fetch_add(1, Ordering::Relaxed);
 
         CacheExecutionResult {
@@ -89,17 +83,7 @@ impl RulesMvpExecutionCache {
         let schema_cache_key = index.schema_cache_key();
         let policy_cache_key = policy.cache_key();
 
-        if let Some(cached) = self
-            .schema_entry
-            .lock()
-            .expect("rules-mvp schema cache lock poisoned")
-            .as_ref()
-            .filter(|cached| {
-                cached.schema_cache_key == schema_cache_key
-                    && cached.policy_cache_key == policy_cache_key
-            })
-            .cloned()
-        {
+        if let Some(cached) = self.lookup_schema_entry(schema_cache_key, policy_cache_key) {
             self.schema_hits.fetch_add(1, Ordering::Relaxed);
             return SchemaCacheLookup {
                 entry: Some(cached.entry),
@@ -113,15 +97,73 @@ impl RulesMvpExecutionCache {
             policy_cache_key,
             entry: entry.clone(),
         };
-        *self
-            .schema_entry
-            .lock()
-            .expect("rules-mvp schema cache lock poisoned") = Some(cached);
+        self.store_schema_entry(cached);
         self.schema_misses.fetch_add(1, Ordering::Relaxed);
 
         SchemaCacheLookup {
             entry: Some(entry),
             hit: false,
+        }
+    }
+
+    fn lookup_execution_cache(
+        &self,
+        cache_key: u64,
+        policy_cache_key: u64,
+    ) -> Option<CachedRulesMvpExecution> {
+        let mut entries = self.entries.lock().expect("rules-mvp cache lock poisoned");
+        let index = entries.iter().position(|cached| {
+            cached.cache_key == cache_key && cached.policy_cache_key == policy_cache_key
+        })?;
+        let cached = entries.remove(index);
+        let result = cached.clone();
+        entries.insert(0, cached);
+        Some(result)
+    }
+
+    fn store_execution_cache(&self, cached: CachedRulesMvpExecution) {
+        let mut entries = self.entries.lock().expect("rules-mvp cache lock poisoned");
+        entries.retain(|entry| {
+            !(entry.cache_key == cached.cache_key
+                && entry.policy_cache_key == cached.policy_cache_key)
+        });
+        entries.insert(0, cached);
+        if entries.len() > EXECUTION_CACHE_CAPACITY {
+            entries.truncate(EXECUTION_CACHE_CAPACITY);
+        }
+    }
+
+    fn lookup_schema_entry(
+        &self,
+        schema_cache_key: u64,
+        policy_cache_key: u64,
+    ) -> Option<CachedRulesMvpSchema> {
+        let mut entries = self
+            .schema_entries
+            .lock()
+            .expect("rules-mvp schema cache lock poisoned");
+        let index = entries.iter().position(|cached| {
+            cached.schema_cache_key == schema_cache_key
+                && cached.policy_cache_key == policy_cache_key
+        })?;
+        let cached = entries.remove(index);
+        let result = cached.clone();
+        entries.insert(0, cached);
+        Some(result)
+    }
+
+    fn store_schema_entry(&self, cached: CachedRulesMvpSchema) {
+        let mut entries = self
+            .schema_entries
+            .lock()
+            .expect("rules-mvp schema cache lock poisoned");
+        entries.retain(|entry| {
+            !(entry.schema_cache_key == cached.schema_cache_key
+                && entry.policy_cache_key == cached.policy_cache_key)
+        });
+        entries.insert(0, cached);
+        if entries.len() > SCHEMA_CACHE_CAPACITY {
+            entries.truncate(SCHEMA_CACHE_CAPACITY);
         }
     }
 }
