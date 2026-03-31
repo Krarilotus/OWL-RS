@@ -16,6 +16,7 @@ export type RuntimeSnapshot = {
 export type Capabilities = {
   user_console_path: string;
   operator_ui_path: string;
+  reasoning_diagnostics_endpoint: string;
   query_endpoint: string;
   update_endpoint: string;
   tell_endpoint: string;
@@ -33,6 +34,47 @@ export type AiStatus = {
   enabled: boolean;
   provider: string;
   model?: string | null;
+};
+
+export type ReasoningFeatureMode = {
+  feature: string;
+  mode: string;
+};
+
+export type ConfiguredReasoningPolicy = {
+  preset: string;
+  available_presets: string[];
+  feature_modes: ReasoningFeatureMode[];
+  unsupported_constructs: string;
+};
+
+export type ReasoningCache = {
+  execution_cache_hit: boolean;
+  schema_cache_hit: boolean;
+  execution_cache_entries: number;
+  schema_cache_entries: number;
+  execution_cache_capacity: number;
+  schema_cache_capacity: number;
+  execution_cache_hits_total: number;
+  execution_cache_misses_total: number;
+  schema_cache_hits_total: number;
+  schema_cache_misses_total: number;
+};
+
+export type LastReasoningRun = {
+  revision: number;
+  status: string;
+  inferred_triples: number;
+  consistency_violations: number;
+  cache: ReasoningCache;
+};
+
+export type ReasoningDiagnostics = {
+  revision: number;
+  mode: string;
+  profile: string;
+  configured_policy?: ConfiguredReasoningPolicy | null;
+  last_run?: LastReasoningRun | null;
 };
 
 export type QuerySuggestion = {

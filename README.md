@@ -48,6 +48,7 @@ Implemented today:
 - typed `rules-mvp` presets (`rdfs-core`, `bounded-owl`) on top of the explicit feature-policy path
 - snapshot-keyed memoization for repeated `rules-mvp` runs over identical dataset state
 - schema-keyed memoization for `rules-mvp` preparation reuse across ABox-only changes
+- cache/runtime telemetry for `rules-mvp` execution and schema reuse, exposed in reasoning diagnostics and Prometheus metrics
 - prepared property-consistency indexing so `rules-mvp` reuses one grouped assertion view per run for constrained predicates instead of rescanning property closure for each consistency gate
 - local comparison harness for NRESE vs Fuseki on seeded datasets
 - manifest-driven workload-pack execution for production-style seed + compat + bench runs
@@ -59,6 +60,7 @@ Implemented today:
 - file-based `config.toml` runtime configuration with environment overrides on the same typed parser path
 - optional server-side AI query suggestions via Gemini or OpenRouter on one typed config path
 - AI assistant now surfaces configured provider/model metadata and clearer empty-state behavior in the user console
+- the user console now reads reasoning preset/policy/cache state from the real server diagnostics surface instead of maintaining local pseudo-config state
 
 Not finished yet:
 
@@ -69,6 +71,7 @@ Not finished yet:
 - real-world replacement evidence on the full ontology and workload set
 - a project-specific production workload parity pack for replacement-grade evidence
 - broader frontend production evidence and project-specific workflow validation
+- timeout-oriented parity evidence and pack execution against the real secured Fuseki workload
 
 ## Setup
 

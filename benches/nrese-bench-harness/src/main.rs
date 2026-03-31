@@ -22,9 +22,15 @@ async fn main() -> Result<()> {
     let cli = parse_cli(env::args().collect())?;
 
     match cli.command {
-        Command::Bench(config) => runner::run_bench(config).await,
+        Command::Bench(config) => {
+            runner::run_bench(config).await?;
+            Ok(())
+        }
         Command::CatalogSync(config) => runner::run_catalog_sync(config).await,
-        Command::Compat(config) => runner::run_compat(config).await,
+        Command::Compat(config) => {
+            runner::run_compat(config).await?;
+            Ok(())
+        }
         Command::Pack(config) => runner::run_pack(config).await,
         Command::Seed(config) => runner::run_seed(config).await,
     }

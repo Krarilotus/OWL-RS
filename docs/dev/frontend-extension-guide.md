@@ -22,6 +22,7 @@ This document explains how to extend the NRESE user frontend without mixing styl
 - Add new backend calls in `src/lib/api.ts` or a focused sibling module.
 - Keep screen-level orchestration in `src/app/`, not in `App.tsx`.
 - Keep reusable editor templates and guided examples in `src/app/` as explicit data, not as inline literals inside components.
+- Keep runtime configuration and reasoning policy visibility driven by server diagnostics, not by frontend-local shadow state.
 - Keep raw `fetch` and transport details in `src/lib/http.ts`.
 - Keep language strings out of components.
 - Keep the i18n type shape in `src/i18n/types.ts`.
@@ -54,8 +55,9 @@ This document explains how to extend the NRESE user frontend without mixing styl
 1. define request/response types in `src/lib/types.ts` if needed
 2. add the API call in `src/lib/api.ts`
 3. add or extend a component in `src/components/`
-4. add or update a frontend test
-5. update README and spec/docs if the user-visible surface changed
+4. prefer capability- or diagnostics-driven endpoints over hardcoded path forks when the backend already exposes them
+5. add or update a frontend test
+6. update README and spec/docs if the user-visible surface changed
 
 ### Replace Or Extend The AI Provider Path
 

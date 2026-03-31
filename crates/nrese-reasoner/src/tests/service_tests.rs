@@ -146,6 +146,9 @@ fn rules_mvp_reuses_cached_inference_for_identical_snapshot_key() {
             .iter()
             .any(|note| note.contains("reused memoized"))
     );
+    assert!(second_output.inferred.cache.execution_cache_hit);
+    assert!(second_output.inferred.cache.schema_cache_hit);
+    assert!(second_output.inferred.cache.execution_cache_hits_total >= 1);
 }
 
 #[test]
@@ -182,6 +185,8 @@ fn rules_mvp_does_not_reuse_cache_for_different_snapshot_content() {
             .iter()
             .any(|note| note.contains("reused memoized schema preparation artifacts"))
     );
+    assert!(!second_output.inferred.cache.execution_cache_hit);
+    assert!(second_output.inferred.cache.schema_cache_hit);
     assert!(
         !second_output
             .report
@@ -307,6 +312,8 @@ fn rules_mvp_reuses_full_cache_after_alternating_between_two_snapshots() {
             .iter()
             .any(|note| note.contains("reused memoized preparation and inference artifacts"))
     );
+    assert!(third_output.inferred.cache.execution_cache_hit);
+    assert!(third_output.inferred.cache.execution_cache_entries >= 2);
 }
 
 #[test]

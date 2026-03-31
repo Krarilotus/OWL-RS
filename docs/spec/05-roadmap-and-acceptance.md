@@ -65,6 +65,7 @@ The canonical replacement-readiness tracking document is [06-fuseki-replacement-
 - `rules-mvp` now memoizes prepared reasoning artifacts and inference output by snapshot content key so repeated runs over identical staged dataset state avoid rebuilding indexing, taxonomy, equality, and closure inputs
 - `rules-mvp` now also memoizes schema-stable preparation artifacts by a dedicated schema/TBox content key, so ABox-only changes can reuse taxonomy and schema-closure preparation without unsafe full-result reuse
 - `rules-mvp` now keeps a bounded multi-entry execution/schema cache so alternating hot snapshot patterns do not immediately evict each other
+- `rules-mvp` cache reuse is now exposed as structured runtime telemetry and Prometheus metrics, so execution/schema cache behavior can be observed without parsing note strings
 - `rules-mvp` property-characteristic consistency checks now build one prepared assertion index per run for constrained predicates, so irreflexive, asymmetric, functional, inverse-functional, and property-disjoint rejection gates reuse a single grouped property view
 - `rules-mvp` now also caches a schema-stable property-constraint plan, so ABox-sensitive property-consistency indexing no longer has to rediscover the relevant constrained predicate set on each run
 - `rules-mvp` runtime behavior is now externalized behind a typed feature policy, so closure, equality, consistency gates, and unsupported-construct diagnostics can be configured without embedding product opinion into reasoner code
@@ -89,6 +90,7 @@ The canonical replacement-readiness tracking document is [06-fuseki-replacement-
 - W3C protocol conformance harness in CI
 - Benchmark suite for query/update/reasoning paths
 - Protocol-compatibility harness covers query parity, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-semantics slice, and bounded query/update failure semantics (status/content-type/body-class) against Fuseki-style dataset endpoints
+- workload-pack runs now emit a canonical `pack-report.json` index so one parity run can be treated as a coherent evidence unit instead of a loose set of per-suite report files
 
 ### R6: Enterprise Expansion
 

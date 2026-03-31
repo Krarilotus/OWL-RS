@@ -43,7 +43,7 @@ export function QueryAssistant({
           </article>
           <article className="helper-card">
             <h3>{strings.assistantModelLabel}</h3>
-            <p>{aiStatus.model ?? "n/a"}</p>
+            <p>{aiStatus.model ?? strings.notAvailableLabel}</p>
           </article>
         </div>
       ) : null}

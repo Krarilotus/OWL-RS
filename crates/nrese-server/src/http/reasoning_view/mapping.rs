@@ -2,7 +2,7 @@ use crate::reasoning_runtime::LastReasoningRun;
 use crate::reject_view::reject_view;
 
 use super::types::{
-    ConfiguredFeatureView, ConfiguredReasoningPolicyView, LastReasoningRunView,
+    ConfiguredFeatureView, ConfiguredReasoningPolicyView, LastReasoningRunView, ReasoningCacheView,
     ReasoningCapabilityView, ReasoningStatsView, RejectDiagnosticsBaseline,
 };
 
@@ -62,6 +62,18 @@ pub fn last_run_view(run: &LastReasoningRun) -> LastReasoningRunView {
             range_assertion_count: run.stats.range_assertion_count,
             taxonomy_node_count: run.stats.taxonomy_node_count,
             property_taxonomy_node_count: run.stats.property_taxonomy_node_count,
+        },
+        cache: ReasoningCacheView {
+            execution_cache_hit: run.cache.execution_cache_hit,
+            schema_cache_hit: run.cache.schema_cache_hit,
+            execution_cache_entries: run.cache.execution_cache_entries,
+            schema_cache_entries: run.cache.schema_cache_entries,
+            execution_cache_capacity: run.cache.execution_cache_capacity,
+            schema_cache_capacity: run.cache.schema_cache_capacity,
+            execution_cache_hits_total: run.cache.execution_cache_hits_total,
+            execution_cache_misses_total: run.cache.execution_cache_misses_total,
+            schema_cache_hits_total: run.cache.schema_cache_hits_total,
+            schema_cache_misses_total: run.cache.schema_cache_misses_total,
         },
         notes: run.notes.clone(),
         diagnostics: run.diagnostics.clone(),

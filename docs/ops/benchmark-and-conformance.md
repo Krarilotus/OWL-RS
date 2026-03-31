@@ -63,6 +63,7 @@ Per-case headers still win on collision, so production packs can define auth/pro
 Current example:
 
 - `benches/nrese-bench-harness/fixtures/packs/generic-baseline/pack.toml`
+- the generic baseline now bundles both `protocol_cases.json` and `policy_failure_cases.json`
 
 Example with service-level headers:
 
@@ -285,8 +286,17 @@ Execution order:
 
 Expected evidence artifacts when `--report-dir` is set:
 
+- `pack-report.json`
 - `bench-report.json`
 - one `*-report.json` artifact per configured compat suite when Fuseki is configured
+
+`pack-report.json` is the canonical index for one workload-pack run. It ties together:
+
+- manifest path
+- dataset path
+- configured compat suites
+- per-suite match status and report path
+- benchmark report path
 
 ## Current Verified Local Baseline
 

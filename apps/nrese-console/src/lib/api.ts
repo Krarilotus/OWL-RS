@@ -3,6 +3,7 @@ import type {
   AiStatus,
   Capabilities,
   QuerySuggestionResponse,
+  ReasoningDiagnostics,
   RuntimeSnapshot,
 } from "./types";
 
@@ -12,6 +13,12 @@ export async function getRuntimeSnapshot(): Promise<RuntimeSnapshot> {
 
 export async function getCapabilities(): Promise<Capabilities> {
   return fetchJson<Capabilities>("/ops/api/capabilities");
+}
+
+export async function getReasoningDiagnostics(
+  endpoint = "/ops/api/diagnostics/reasoning",
+): Promise<ReasoningDiagnostics> {
+  return fetchJson<ReasoningDiagnostics>(endpoint);
 }
 
 export async function getAiStatus(): Promise<AiStatus> {

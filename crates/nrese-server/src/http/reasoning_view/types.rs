@@ -50,6 +50,7 @@ pub struct LastReasoningRunView {
     pub inferred_triples: u64,
     pub consistency_violations: u64,
     pub stats: ReasoningStatsView,
+    pub cache: ReasoningCacheView,
     pub notes: Vec<String>,
     pub diagnostics: Vec<String>,
     pub primary_reject: Option<RejectExplanationView>,
@@ -73,4 +74,18 @@ pub struct ReasoningStatsView {
     pub range_assertion_count: usize,
     pub taxonomy_node_count: usize,
     pub property_taxonomy_node_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReasoningCacheView {
+    pub execution_cache_hit: bool,
+    pub schema_cache_hit: bool,
+    pub execution_cache_entries: usize,
+    pub schema_cache_entries: usize,
+    pub execution_cache_capacity: usize,
+    pub schema_cache_capacity: usize,
+    pub execution_cache_hits_total: u64,
+    pub execution_cache_misses_total: u64,
+    pub schema_cache_hits_total: u64,
+    pub schema_cache_misses_total: u64,
 }

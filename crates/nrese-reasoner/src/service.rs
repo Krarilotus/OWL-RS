@@ -6,7 +6,7 @@ use nrese_core::{
 };
 
 use crate::config::{ReasonerConfig, ReasoningMode};
-use crate::output::InferenceDelta;
+use crate::output::{InferenceDelta, ReasoningCacheStats};
 use crate::profile::profile_for_mode;
 use crate::rules::execute_rules_mvp_with_cache;
 use crate::rules_mvp_cache::RulesMvpExecutionCache;
@@ -43,6 +43,10 @@ impl ReasonerService {
 
     pub fn capabilities(&self) -> &'static [ReasonerCapability] {
         self.profile().capabilities
+    }
+
+    pub fn rules_mvp_cache_stats(&self) -> ReasoningCacheStats {
+        self.rules_mvp_cache.snapshot()
     }
 
     fn profile(&self) -> crate::profile::ReasonerProfile {
@@ -100,9 +104,9 @@ where
                 let inferred = cached.inferred;
                 let mut notes =
                     vec!["rules-mvp executed bounded RDFS/OWL closure and consistency checks"];
-                if cached.cache_hit {
+                if inferred.cache.execution_cache_hit {
                     notes.push("rules-mvp reused memoized preparation and inference artifacts");
-                } else if cached.schema_cache_hit {
+                } else if inferred.cache.schema_cache_hit {
                     notes.push("rules-mvp reused memoized schema preparation artifacts");
                 } else if snapshot.cache_key().is_some() {
                     notes.push("rules-mvp refreshed memoized preparation and inference artifacts");

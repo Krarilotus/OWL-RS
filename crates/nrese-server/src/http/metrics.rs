@@ -10,6 +10,7 @@ pub fn render(state: &AppState) -> Result<Response, ApiError> {
         .store()
         .stats()
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    let reasoner_cache = state.reasoner().rules_mvp_cache_stats();
     let body = format!(
         "# HELP nrese_ready Whether the server is ready.\n\
 # TYPE nrese_ready gauge\n\
@@ -28,7 +29,25 @@ nrese_store_named_graphs {}\n\
 nrese_reasoner_mode_info{{mode=\"{}\",profile=\"{}\"}} 1\n\
 # HELP nrese_store_mode_info Active store mode metadata.\n\
 # TYPE nrese_store_mode_info gauge\n\
-nrese_store_mode_info{{mode=\"{}\",durability=\"{}\"}} 1\n",
+nrese_store_mode_info{{mode=\"{}\",durability=\"{}\"}} 1\n\
+# HELP nrese_reasoner_execution_cache_entries Current number of cached full rules-mvp execution entries.\n\
+# TYPE nrese_reasoner_execution_cache_entries gauge\n\
+nrese_reasoner_execution_cache_entries {}\n\
+# HELP nrese_reasoner_schema_cache_entries Current number of cached rules-mvp schema entries.\n\
+# TYPE nrese_reasoner_schema_cache_entries gauge\n\
+nrese_reasoner_schema_cache_entries {}\n\
+# HELP nrese_reasoner_execution_cache_hits_total Total number of rules-mvp full execution cache hits.\n\
+# TYPE nrese_reasoner_execution_cache_hits_total counter\n\
+nrese_reasoner_execution_cache_hits_total {}\n\
+# HELP nrese_reasoner_execution_cache_misses_total Total number of rules-mvp full execution cache misses.\n\
+# TYPE nrese_reasoner_execution_cache_misses_total counter\n\
+nrese_reasoner_execution_cache_misses_total {}\n\
+# HELP nrese_reasoner_schema_cache_hits_total Total number of rules-mvp schema cache hits.\n\
+# TYPE nrese_reasoner_schema_cache_hits_total counter\n\
+nrese_reasoner_schema_cache_hits_total {}\n\
+# HELP nrese_reasoner_schema_cache_misses_total Total number of rules-mvp schema cache misses.\n\
+# TYPE nrese_reasoner_schema_cache_misses_total counter\n\
+nrese_reasoner_schema_cache_misses_total {}\n",
         state.store().current_revision(),
         stats.quad_count,
         stats.named_graph_count,
@@ -36,6 +55,12 @@ nrese_store_mode_info{{mode=\"{}\",durability=\"{}\"}} 1\n",
         state.reasoner_profile_name(),
         state.store_mode_name(),
         state.durability_name(),
+        reasoner_cache.execution_cache_entries,
+        reasoner_cache.schema_cache_entries,
+        reasoner_cache.execution_cache_hits_total,
+        reasoner_cache.execution_cache_misses_total,
+        reasoner_cache.schema_cache_hits_total,
+        reasoner_cache.schema_cache_misses_total,
     );
 
     let mut response = (StatusCode::OK, body).into_response();
@@ -80,5 +105,7 @@ mod tests {
         assert!(text.contains("nrese_dataset_revision"));
         assert!(text.contains("nrese_store_quads"));
         assert!(text.contains("nrese_store_mode_info"));
+        assert!(text.contains("nrese_reasoner_execution_cache_entries"));
+        assert!(text.contains("nrese_reasoner_schema_cache_hits_total"));
     }
 }

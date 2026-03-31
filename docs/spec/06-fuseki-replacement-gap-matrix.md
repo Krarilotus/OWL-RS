@@ -37,6 +37,7 @@ Still required:
 - explicit live replacement evidence for `TELL` as a project-level ingestion contract distinct from Graph Store and raw SPARQL Update usage
 - a project-specific production workload parity pack, with versioned seed/workload/case inputs and reproducible report artifacts as defined in `docs/ops/benchmark-and-conformance.md`
 - a staged real-world ontology catalog now exists to harden parity runs incrementally from small to broad official ontology sources
+- workload-pack execution now emits a canonical `pack-report.json` evidence index that ties compat suites and benchmark artifacts together
 
 Replacement gate:
 - NRESE reproduces the expected results and stable error semantics for the project's real query/update set against the same dataset used in Fuseki
@@ -61,6 +62,7 @@ Current coverage:
 - reject-path HTTP problem responses and operator diagnostics now share a structured heuristic blame payload for consistency failures
 - reject-path HTTP problem responses and operator diagnostics now also share explicit conflict evidence triples from the reasoner-owned explanation model
 - staged update previews now allow reject-path responses and operator diagnostics to surface a likely commit-local trigger triple and ranked attribution candidates when the inserted delta can be isolated heuristically
+- rules-mvp cache reuse is now surfaced as typed execution/schema telemetry in reasoning diagnostics and Prometheus metrics
 
 Still required:
 - broader unsupported-construct coverage and stronger explainability beyond the current deterministic known-construct list
@@ -100,6 +102,7 @@ Current coverage:
 - `/console` user-facing frontend exists for query, tell, update, graph, and dataset workflows
 - `/console` now includes guided workbench examples so non-specialist users can load explicit query/update/tell/graph templates instead of starting from empty editors
 - `/console` now supports explicit persisted locale selection for the currently shipped `en`/`de` language set instead of relying only on browser locale detection
+- `/console` now reads reasoning preset/policy/cache state from the server diagnostics surface instead of maintaining local pseudo-config state
 - operator APIs expose capabilities, dataset summary, and extended health
 - query/update/graph workflows are browser-accessible
 - optional server-side AI query suggestions exist behind typed provider config and a dedicated API surface, with provider/model visibility and clearer frontend empty-state handling
@@ -113,6 +116,7 @@ Still required:
 - broader user-console workflow evidence and extension/customization guidance under real project usage
 - live preset application remains external/config-driven rather than runtime-mutable
 - broader i18n coverage beyond the current shipped language set and stronger assistant UX around task templates/history under real project usage
+- timeout-oriented parity evidence against real secured stacks is still pending even though generic and policy failure suites are now pack-addressable
 
 Replacement gate:
 - admin and user workflows are reliably executable in-browser behind real deployment controls

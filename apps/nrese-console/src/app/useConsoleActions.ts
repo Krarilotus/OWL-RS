@@ -22,6 +22,7 @@ type RuntimeRefs = {
 type SuggestionState = {
   prompt: string;
   currentQuery: string;
+  locale: string;
   aiEnabled: boolean;
   setBusy: Setter<boolean>;
   setSuggestions: Setter<QuerySuggestion[]>;
@@ -61,7 +62,7 @@ export function useConsoleActions(strings: AppStrings, runtimeRefs: RuntimeRefs)
     try {
       const response = await getQuerySuggestions({
         prompt: state.prompt,
-        locale: navigator.language,
+        locale: state.locale,
         current_query: state.currentQuery,
       });
       state.setSuggestions(response.suggestions);

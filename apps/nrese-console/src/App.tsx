@@ -13,7 +13,8 @@ import { WorkbenchExamples } from "./components/WorkbenchExamples";
 export default function App() {
   const { locale, setLocale, strings } = useLocale();
   const state = useConsoleState(strings);
-  const { runtimeQuery, capabilitiesQuery, aiStatusQuery } = useRuntimeData();
+  const { runtimeQuery, capabilitiesQuery, aiStatusQuery, reasoningQuery } =
+    useRuntimeData();
   const actions = useConsoleActions(strings, {
     refetchRuntime: () => runtimeQuery.refetch(),
     refetchCapabilities: () => capabilitiesQuery.refetch(),
@@ -60,10 +61,12 @@ export default function App() {
         snapshot={runtimeQuery.data}
         capabilities={capabilitiesQuery.data}
         aiStatus={aiStatusQuery.data}
+        reasoning={reasoningQuery.data}
         onRefresh={() => {
           void runtimeQuery.refetch();
           void capabilitiesQuery.refetch();
           void aiStatusQuery.refetch();
+          void reasoningQuery.refetch();
         }}
       />
       <QueryAssistant
@@ -73,6 +76,7 @@ export default function App() {
         onSuggest={() =>
           void actions.handleSuggest({
             prompt: state.assistantPrompt,
+            locale,
             currentQuery: state.query,
             aiEnabled: Boolean(aiStatusQuery.data?.enabled),
             setBusy: state.setAssistantBusy,

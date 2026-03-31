@@ -1,6 +1,6 @@
 use crate::reject_attribution::RejectAttribution;
 use nrese_core::{ReasonerRunReport, ReasonerRunStatus};
-use nrese_reasoner::{InferenceDelta, ReasoningStats, RejectExplanation};
+use nrese_reasoner::{InferenceDelta, ReasoningCacheStats, ReasoningStats, RejectExplanation};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastReasoningRun {
@@ -9,6 +9,7 @@ pub struct LastReasoningRun {
     pub inferred_triples: u64,
     pub consistency_violations: u64,
     pub stats: ReasoningStats,
+    pub cache: ReasoningCacheStats,
     pub notes: Vec<String>,
     pub diagnostics: Vec<String>,
     pub primary_reject: Option<RejectExplanation>,
@@ -28,6 +29,7 @@ impl LastReasoningRun {
             inferred_triples: inferred.inferred_triples,
             consistency_violations: inferred.consistency_violations,
             stats: inferred.stats.clone(),
+            cache: inferred.cache.clone(),
             notes: report.notes.iter().map(|note| (*note).to_owned()).collect(),
             diagnostics: inferred.diagnostics.clone(),
             primary_reject: inferred.primary_reject.clone(),

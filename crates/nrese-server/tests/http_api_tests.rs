@@ -131,6 +131,7 @@ async fn operator_capabilities_endpoint_exposes_ops_contracts()
     let text = String::from_utf8(body.to_vec())?;
     assert!(text.contains("/ops/api/admin/dataset/backup"));
     assert!(text.contains("/ops/api/admin/dataset/restore"));
+    assert!(text.contains("/ops/api/diagnostics/reasoning"));
     assert!(text.contains("/api/ai/query-suggestions"));
     assert!(text.contains("/console"));
     Ok(())
@@ -223,9 +224,11 @@ async fn rules_mvp_update_surfaces_last_reasoning_run_in_operator_diagnostics()
     assert!(text.contains("\"completed\""));
     assert!(text.contains("http://example.com/alice"));
     assert!(text.contains("\"stats\""));
+    assert!(text.contains("\"cache\""));
     assert!(text.contains("\"supported_asserted_triples\""));
     assert!(text.contains("\"inferred_equality_link_count\""));
     assert!(text.contains("\"subclass_edge_count\""));
+    assert!(text.contains("\"execution_cache_entries\""));
     Ok(())
 }
 

@@ -18,12 +18,12 @@ use crate::layout::ServiceTarget;
 use crate::model::{
     BenchComparison, BenchConfig, BenchReport, CatalogSyncConfig, CompatCase, CompatCaseReport,
     CompatConfig, CompatGraphTarget, CompatHeaders, CompatOperation, CompatReport,
-    OntologyFixture, PackConfig, QueryWorkloadCase, SeedConfig, ServiceBenchReport,
-    UpdateWorkloadCase,
+    OntologyFixture, PackArtifactReport, PackCompatSuiteReport, PackConfig, PackReport,
+    QueryWorkloadCase, SeedConfig, ServiceBenchReport, UpdateWorkloadCase,
 };
 use crate::normalize::summarize;
 
-pub async fn run_bench(config: BenchConfig) -> Result<()> {
+pub async fn run_bench(config: BenchConfig) -> Result<BenchRunArtifact> {
     let client = build_client()?;
     let query_cases: Vec<QueryWorkloadCase> = read_json(config.query_workload_path)?;
     let update_cases: Vec<UpdateWorkloadCase> = read_json(config.update_workload_path)?;
@@ -87,9 +87,10 @@ pub async fn run_bench(config: BenchConfig) -> Result<()> {
         });
     }
 
-    if let Some(report_path) = config.report_json_path {
+    let report_json_path = config.report_json_path;
+    if let Some(report_path) = &report_json_path {
         write_json_report(
-            report_path,
+            report_path.clone(),
             &BenchReport {
                 mode: "bench",
                 iterations: config.iterations,
@@ -99,12 +100,13 @@ pub async fn run_bench(config: BenchConfig) -> Result<()> {
         )?;
     }
 
-    Ok(())
+    Ok(BenchRunArtifact { report_json_path })
 }
 
-pub async fn run_compat(config: CompatConfig) -> Result<()> {
+pub async fn run_compat(config: CompatConfig) -> Result<CompatRunArtifact> {
     let client = build_client()?;
-    let cases: Vec<CompatCase> = read_json(config.cases_path)?;
+    let cases_path = config.cases_path.clone();
+    let cases: Vec<CompatCase> = read_json(cases_path.clone())?;
     let nrese = ServiceTarget::nrese_with_headers(
         config.nrese_base_url.clone(),
         config.nrese_headers.clone(),
@@ -149,9 +151,10 @@ pub async fn run_compat(config: CompatConfig) -> Result<()> {
         "mismatches-present"
     };
 
-    if let Some(report_path) = config.report_json_path {
+    let report_json_path = config.report_json_path;
+    if let Some(report_path) = &report_json_path {
         write_json_report(
-            report_path,
+            report_path.clone(),
             &CompatReport {
                 mode: "compat",
                 nrese_base_url: config.nrese_base_url.clone(),
@@ -169,7 +172,14 @@ pub async fn run_compat(config: CompatConfig) -> Result<()> {
         bail!("compatibility mismatches detected");
     }
 
-    Ok(())
+    Ok(CompatRunArtifact {
+        cases_path,
+        report_json_path,
+        total_cases: cases.len(),
+        matched_cases,
+        mismatched_cases,
+        status,
+    })
 }
 
 pub async fn run_seed(config: SeedConfig) -> Result<()> {
@@ -208,60 +218,88 @@ pub async fn run_seed(config: SeedConfig) -> Result<()> {
 pub async fn run_pack(config: PackConfig) -> Result<()> {
     let pack = read_workload_pack(&config.workload_pack_path)?;
     ensure_report_dir(config.report_dir.as_deref())?;
+    let nrese_base_url = config.nrese_base_url.clone();
+    let fuseki_base_url = config.fuseki_base_url.clone();
+    let fuseki_basic_auth = config.fuseki_basic_auth.clone();
+    let iterations = config.iterations;
+    let manifest_path = config.workload_pack_path.display().to_string();
 
     println!("== Workload pack run ==");
     println!("pack: {}", pack.name);
-    println!("manifest: {}", config.workload_pack_path.display());
+    println!("manifest: {manifest_path}");
 
     run_seed(SeedConfig {
-        nrese_base_url: config.nrese_base_url.clone(),
+        nrese_base_url: nrese_base_url.clone(),
         nrese_headers: pack.nrese.headers.clone(),
-        fuseki_base_url: config.fuseki_base_url.clone(),
+        fuseki_base_url: fuseki_base_url.clone(),
         fuseki_headers: pack.fuseki.headers.clone(),
-        fuseki_basic_auth: config.fuseki_basic_auth.clone(),
+        fuseki_basic_auth: fuseki_basic_auth.clone(),
         dataset_path: pack.dataset.clone(),
         content_type: None,
         replace: true,
     })
     .await?;
 
-    if let Some(fuseki_base_url) = config.fuseki_base_url.clone() {
+    let bench_report_path = config
+        .report_dir
+        .as_ref()
+        .map(|dir| dir.join("bench-report.json"));
+    let mut compat_reports = Vec::new();
+    if let Some(fuseki_base_url) = fuseki_base_url.clone() {
         for suite_path in &pack.compat_suites {
             let compat_report_path = config
                 .report_dir
                 .as_ref()
                 .map(|dir| dir.join(compat_report_filename(suite_path)));
-            run_compat(CompatConfig {
-                nrese_base_url: config.nrese_base_url.clone(),
+            let compat_run = run_compat(CompatConfig {
+                nrese_base_url: nrese_base_url.clone(),
                 nrese_headers: pack.nrese.headers.clone(),
                 fuseki_base_url: fuseki_base_url.clone(),
                 fuseki_headers: pack.fuseki.headers.clone(),
-                fuseki_basic_auth: config.fuseki_basic_auth.clone(),
+                fuseki_basic_auth: fuseki_basic_auth.clone(),
                 cases_path: suite_path.clone(),
                 report_json_path: compat_report_path,
             })
             .await?;
+            compat_reports.push(pack_compat_suite_report(compat_run));
         }
     } else {
         println!("fuseki base not provided; skipping compat stage");
     }
 
-    let bench_report_path = config
-        .report_dir
-        .as_ref()
-        .map(|dir| dir.join("bench-report.json"));
-    run_bench(BenchConfig {
-        nrese_base_url: config.nrese_base_url,
+    let bench_run = run_bench(BenchConfig {
+        nrese_base_url: nrese_base_url.clone(),
         nrese_headers: pack.nrese.headers,
-        fuseki_base_url: config.fuseki_base_url,
+        fuseki_base_url: fuseki_base_url.clone(),
         fuseki_headers: pack.fuseki.headers,
-        fuseki_basic_auth: config.fuseki_basic_auth,
-        iterations: config.iterations,
+        fuseki_basic_auth,
+        iterations,
         query_workload_path: pack.query_workload,
         update_workload_path: pack.update_workload,
         report_json_path: bench_report_path,
     })
-    .await
+    .await?;
+
+    if let Some(report_dir) = config.report_dir {
+        write_json_report(
+            report_dir.join("pack-report.json"),
+            &PackReport {
+                mode: "pack",
+                pack_name: pack.name,
+                manifest_path,
+                dataset_path: pack.dataset.display().to_string(),
+                nrese_base_url,
+                fuseki_base_url,
+                iterations,
+                compat_suites: compat_reports,
+                bench_report: bench_run.report_json_path.map(|path| PackArtifactReport {
+                    path: path.display().to_string(),
+                }),
+            },
+        )?;
+    }
+
+    Ok(())
 }
 
 pub async fn run_catalog_sync(config: CatalogSyncConfig) -> Result<()> {
@@ -291,6 +329,21 @@ fn ensure_report_dir(report_dir: Option<&Path>) -> Result<()> {
             .with_context(|| format!("failed to create report dir {}", report_dir.display()))?;
     }
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct CompatRunArtifact {
+    cases_path: std::path::PathBuf,
+    report_json_path: Option<std::path::PathBuf>,
+    total_cases: usize,
+    matched_cases: usize,
+    mismatched_cases: usize,
+    status: &'static str,
+}
+
+#[derive(Debug)]
+pub struct BenchRunArtifact {
+    report_json_path: Option<std::path::PathBuf>,
 }
 
 async fn sync_ontology(
@@ -495,13 +548,34 @@ fn compat_report_filename(suite_path: &Path) -> String {
     format!("{stem}-report.json")
 }
 
+fn pack_compat_suite_report(run: CompatRunArtifact) -> PackCompatSuiteReport {
+    let suite_name = run
+        .cases_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("compat")
+        .to_owned();
+
+    PackCompatSuiteReport {
+        suite_name,
+        suite_path: run.cases_path.display().to_string(),
+        report: run.report_json_path.map(|path| PackArtifactReport {
+            path: path.display().to_string(),
+        }),
+        total_cases: run.total_cases,
+        matched_cases: run.matched_cases,
+        mismatched_cases: run.mismatched_cases,
+        status: run.status,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use crate::model::{CompatCase, CompatOperation};
 
-    use super::compat_report_filename;
+    use super::{CompatRunArtifact, compat_report_filename, pack_compat_suite_report};
 
     #[test]
     fn compat_case_defaults_to_query_operation() {
@@ -523,5 +597,21 @@ mod tests {
             compat_report_filename(Path::new("fixtures/compat/policy_failure_cases.json")),
             "policy_failure_cases-report.json"
         );
+    }
+
+    #[test]
+    fn pack_compat_suite_report_uses_suite_stem_and_status() {
+        let report = pack_compat_suite_report(CompatRunArtifact {
+            cases_path: "fixtures/compat/policy_failure_cases.json".into(),
+            report_json_path: Some("artifacts/policy-report.json".into()),
+            total_cases: 3,
+            matched_cases: 3,
+            mismatched_cases: 0,
+            status: "all-matched",
+        });
+
+        assert_eq!(report.suite_name, "policy_failure_cases");
+        assert_eq!(report.status, "all-matched");
+        assert_eq!(report.report.as_ref().map(|entry| entry.path.as_str()), Some("artifacts/policy-report.json"));
     }
 }

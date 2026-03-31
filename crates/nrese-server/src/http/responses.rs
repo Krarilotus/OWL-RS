@@ -48,6 +48,7 @@ pub struct VersionResponse {
 pub struct OperatorCapabilitiesResponse {
     pub operator_ui_path: &'static str,
     pub user_console_path: &'static str,
+    pub reasoning_diagnostics_endpoint: &'static str,
     pub query_endpoint: &'static str,
     pub update_endpoint: &'static str,
     pub tell_endpoint: &'static str,
@@ -154,6 +155,7 @@ pub fn build_operator_capabilities_response(state: &AppState) -> OperatorCapabil
     OperatorCapabilitiesResponse {
         operator_ui_path: "/ops",
         user_console_path: "/console",
+        reasoning_diagnostics_endpoint: "/ops/api/diagnostics/reasoning",
         query_endpoint: "/dataset/query",
         update_endpoint: "/dataset/update",
         tell_endpoint: "/dataset/tell",

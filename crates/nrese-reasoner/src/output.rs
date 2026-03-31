@@ -16,6 +16,20 @@ pub struct ReasoningStats {
     pub property_taxonomy_node_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReasoningCacheStats {
+    pub execution_cache_hit: bool,
+    pub schema_cache_hit: bool,
+    pub execution_cache_entries: usize,
+    pub schema_cache_entries: usize,
+    pub execution_cache_capacity: usize,
+    pub schema_cache_capacity: usize,
+    pub execution_cache_hits_total: u64,
+    pub execution_cache_misses_total: u64,
+    pub schema_cache_hits_total: u64,
+    pub schema_cache_misses_total: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RejectBlame {
     pub heuristic: &'static str,
@@ -53,4 +67,5 @@ pub struct InferenceDelta {
     pub diagnostics: Vec<String>,
     pub primary_reject: Option<RejectExplanation>,
     pub stats: ReasoningStats,
+    pub cache: ReasoningCacheStats,
 }

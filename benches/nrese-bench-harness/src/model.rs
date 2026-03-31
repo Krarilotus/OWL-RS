@@ -259,6 +259,35 @@ pub struct CompatReport {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PackReport {
+    pub mode: &'static str,
+    pub pack_name: String,
+    pub manifest_path: String,
+    pub dataset_path: String,
+    pub nrese_base_url: String,
+    pub fuseki_base_url: Option<String>,
+    pub iterations: usize,
+    pub compat_suites: Vec<PackCompatSuiteReport>,
+    pub bench_report: Option<PackArtifactReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PackCompatSuiteReport {
+    pub suite_name: String,
+    pub suite_path: String,
+    pub report: Option<PackArtifactReport>,
+    pub total_cases: usize,
+    pub matched_cases: usize,
+    pub mismatched_cases: usize,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PackArtifactReport {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CompatCaseReport {
     pub name: String,
     pub operation: &'static str,

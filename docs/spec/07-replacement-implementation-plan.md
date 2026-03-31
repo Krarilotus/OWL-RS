@@ -57,6 +57,7 @@ Implementation blocks:
 - service-level request-header profiles in workload-pack manifests so secured compare stacks stay on the same comparator path as unsecured runs
 - timeout and payload-limit comparison cases
 - manifest-driven production workload parity pack support so seed, compat, and bench runs use one versioned evidence unit instead of ad hoc fixture combinations
+- workload-pack aggregate reporting so one pack run emits a canonical `pack-report.json` evidence index alongside per-suite compat reports and benchmark output
 - broader SPARQL Update parity fixtures for the intended replacement scope before moving to live project-specific packs
 - staged real-world ontology catalog with small-to-broad official ontology sources to harden parity and performance work incrementally
 - project-realistic compatibility packs against the live Fuseki deployment
@@ -192,6 +193,7 @@ Implementation blocks:
 - frontend shell for query, tell, update, graph, and runtime visibility
 - provider-agnostic server-side AI suggestion layer
 - string/style separation and extension points
+- runtime-config and reasoning-policy visibility driven from server diagnostics instead of frontend-local shadow state
 - customization guide and frontend tests
 - production validation behind reverse proxy and auth policy
 

@@ -1,25 +1,43 @@
-import { ReasoningPresetPanel } from "./ReasoningPresetPanel";
+import { ReasoningRuntimeInspector } from "./ReasoningRuntimeInspector";
 import type { AppStrings } from "../i18n/types";
-import type { AiStatus, Capabilities, RuntimeSnapshot } from "../lib/types";
+import type {
+  AiStatus,
+  Capabilities,
+  ReasoningDiagnostics,
+  RuntimeSnapshot,
+} from "../lib/types";
 
 type Props = {
   strings: AppStrings;
   snapshot?: RuntimeSnapshot;
   capabilities?: Capabilities;
   aiStatus?: AiStatus;
+  reasoning?: ReasoningDiagnostics;
   onRefresh: () => void;
 };
 
-export function RuntimePanel({ strings, snapshot, capabilities, aiStatus, onRefresh }: Props) {
+export function RuntimePanel({
+  strings,
+  snapshot,
+  capabilities,
+  aiStatus,
+  reasoning,
+  onRefresh,
+}: Props) {
   const facts = [
-    ["Revision", snapshot?.revision ?? "-"],
-    ["Quads", snapshot?.quad_count ?? "-"],
-    ["Named Graphs", snapshot?.named_graph_count ?? "-"],
-    ["Reasoner", snapshot?.reasoning_profile ?? "-"],
-    ["Preset", snapshot?.reasoning_preset ?? "custom"],
-    ["Store", snapshot?.store_mode ?? "-"],
-    ["Durability", snapshot?.durability ?? "-"],
-    ["AI", aiStatus?.enabled ? `${aiStatus.provider} / ${aiStatus.model ?? "-"}` : "disabled"],
+    [strings.runtimeRevisionLabel, snapshot?.revision ?? "-"],
+    [strings.runtimeQuadsLabel, snapshot?.quad_count ?? "-"],
+    [strings.runtimeNamedGraphsLabel, snapshot?.named_graph_count ?? "-"],
+    [strings.runtimeReasonerLabel, snapshot?.reasoning_profile ?? "-"],
+    [strings.runtimePresetLabel, snapshot?.reasoning_preset ?? strings.reasoningPresetCustom],
+    [strings.runtimeStoreLabel, snapshot?.store_mode ?? "-"],
+    [strings.runtimeDurabilityLabel, snapshot?.durability ?? "-"],
+    [
+      strings.runtimeAiLabel,
+      aiStatus?.enabled
+        ? `${aiStatus.provider} / ${aiStatus.model ?? strings.notAvailableLabel}`
+        : strings.aiDisabled,
+    ],
   ];
 
   return (
@@ -28,7 +46,7 @@ export function RuntimePanel({ strings, snapshot, capabilities, aiStatus, onRefr
         <div>
           <h2>{strings.runtimeTitle}</h2>
           <p className="panel-subtitle">
-            {snapshot?.ontology_path ?? "No explicit ontology preload path configured."}
+            {snapshot?.ontology_path ?? strings.runtimeNoOntologyPath}
           </p>
         </div>
         <div className="button-row">
@@ -49,10 +67,9 @@ export function RuntimePanel({ strings, snapshot, capabilities, aiStatus, onRefr
           </div>
         ))}
       </div>
-      <ReasoningPresetPanel
+      <ReasoningRuntimeInspector
         strings={strings}
-        activePreset={snapshot?.reasoning_preset ?? capabilities?.reasoning_preset}
-        availablePresets={capabilities?.available_reasoning_presets ?? []}
+        reasoning={reasoning}
       />
     </section>
   );

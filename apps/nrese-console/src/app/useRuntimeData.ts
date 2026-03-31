@@ -1,6 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 
-import { getAiStatus, getCapabilities, getRuntimeSnapshot } from "../lib/api";
+import {
+  getAiStatus,
+  getCapabilities,
+  getReasoningDiagnostics,
+  getRuntimeSnapshot,
+} from "../lib/api";
 
 export function useRuntimeData() {
   const runtimeQuery = useQuery({
@@ -18,10 +23,20 @@ export function useRuntimeData() {
     queryFn: getAiStatus,
     retry: false,
   });
+  const reasoningQuery = useQuery({
+    queryKey: ["reasoning-diagnostics", capabilitiesQuery.data?.reasoning_diagnostics_endpoint],
+    enabled: Boolean(capabilitiesQuery.data?.reasoning_diagnostics_endpoint),
+    queryFn: () =>
+      getReasoningDiagnostics(
+        capabilitiesQuery.data?.reasoning_diagnostics_endpoint,
+      ),
+    staleTime: 30000,
+  });
 
   return {
     runtimeQuery,
     capabilitiesQuery,
     aiStatusQuery,
+    reasoningQuery,
   };
 }

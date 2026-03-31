@@ -99,6 +99,7 @@ impl PreparedRulesMvp {
             diagnostics,
             primary_reject,
             stats: self.stats.clone(),
+            cache: Default::default(),
         }
     }
 

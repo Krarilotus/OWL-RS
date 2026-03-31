@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nrese_core::DatasetSnapshot;
 
 use crate::dataset_index::IndexedDataset;
-use crate::output::InferenceDelta;
+use crate::output::{InferenceDelta, ReasoningCacheStats};
 use crate::rules_mvp_policy::RulesMvpFeaturePolicy;
 
 use self::prepared::{PreparedRulesMvp, build_prepared};
@@ -27,6 +27,29 @@ pub struct RulesMvpExecutionCache {
 }
 
 impl RulesMvpExecutionCache {
+    pub fn snapshot(&self) -> ReasoningCacheStats {
+        ReasoningCacheStats {
+            execution_cache_hit: false,
+            schema_cache_hit: false,
+            execution_cache_entries: self
+                .entries
+                .lock()
+                .expect("rules-mvp cache lock poisoned")
+                .len(),
+            schema_cache_entries: self
+                .schema_entries
+                .lock()
+                .expect("rules-mvp schema cache lock poisoned")
+                .len(),
+            execution_cache_capacity: EXECUTION_CACHE_CAPACITY,
+            schema_cache_capacity: SCHEMA_CACHE_CAPACITY,
+            execution_cache_hits_total: self.hits.load(Ordering::Relaxed),
+            execution_cache_misses_total: self.misses.load(Ordering::Relaxed),
+            schema_cache_hits_total: self.schema_hits.load(Ordering::Relaxed),
+            schema_cache_misses_total: self.schema_misses.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn execute<'a, S>(
         &self,
         snapshot: &'a S,
@@ -37,21 +60,17 @@ impl RulesMvpExecutionCache {
     {
         let Some(cache_key) = snapshot.cache_key() else {
             self.misses.fetch_add(1, Ordering::Relaxed);
-            return CacheExecutionResult {
-                inferred: build_prepared(snapshot, None, policy).execute(),
-                cache_hit: false,
-                schema_cache_hit: false,
-            };
+            let mut inferred = build_prepared(snapshot, None, policy).execute();
+            inferred.cache = self.execution_telemetry(false, false);
+            return CacheExecutionResult { inferred };
         };
         let policy_cache_key = policy.cache_key();
 
         if let Some(cached) = self.lookup_execution_cache(cache_key, policy_cache_key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
-            return CacheExecutionResult {
-                inferred: cached.inferred,
-                cache_hit: true,
-                schema_cache_hit: true,
-            };
+            let mut inferred = cached.inferred;
+            inferred.cache = self.execution_telemetry(true, true);
+            return CacheExecutionResult { inferred };
         }
 
         let index = IndexedDataset::from_snapshot(snapshot);
@@ -60,6 +79,7 @@ impl RulesMvpExecutionCache {
             PreparedRulesMvp::build_from_index(index, schema_lookup.entry.as_ref(), policy)
                 .execute();
 
+        let mut inferred = inferred;
         let cached = CachedRulesMvpExecution {
             cache_key,
             policy_cache_key,
@@ -67,12 +87,20 @@ impl RulesMvpExecutionCache {
         };
         self.store_execution_cache(cached);
         self.misses.fetch_add(1, Ordering::Relaxed);
+        inferred.cache = self.execution_telemetry(false, schema_lookup.hit);
 
-        CacheExecutionResult {
-            inferred,
-            cache_hit: false,
-            schema_cache_hit: schema_lookup.hit,
-        }
+        CacheExecutionResult { inferred }
+    }
+
+    fn execution_telemetry(
+        &self,
+        execution_cache_hit: bool,
+        schema_cache_hit: bool,
+    ) -> ReasoningCacheStats {
+        let mut telemetry = self.snapshot();
+        telemetry.execution_cache_hit = execution_cache_hit;
+        telemetry.schema_cache_hit = schema_cache_hit;
+        telemetry
     }
 
     fn lookup_schema_cache(
@@ -171,8 +199,6 @@ impl RulesMvpExecutionCache {
 #[derive(Debug, Clone)]
 pub struct CacheExecutionResult {
     pub inferred: InferenceDelta,
-    pub cache_hit: bool,
-    pub schema_cache_hit: bool,
 }
 
 #[derive(Debug, Clone)]
