@@ -35,6 +35,54 @@ pub fn extract_binding_count(value: &Value) -> Result<usize> {
         .ok_or_else(|| anyhow!("missing SPARQL bindings array"))
 }
 
+pub fn canonicalize_bindings_set(value: &Value) -> Result<BTreeSet<String>> {
+    let bindings = value
+        .get("results")
+        .and_then(|results| results.get("bindings"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing SPARQL bindings array"))?;
+
+    bindings
+        .iter()
+        .map(canonicalize_binding_row)
+        .collect::<Result<BTreeSet<_>>>()
+}
+
+fn canonicalize_binding_row(binding: &Value) -> Result<String> {
+    let object = binding
+        .as_object()
+        .ok_or_else(|| anyhow!("binding row is not an object"))?;
+
+    let mut entries = object
+        .iter()
+        .map(|(name, value)| canonicalize_binding_value(name, value))
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_unstable();
+
+    Ok(entries.join("|"))
+}
+
+fn canonicalize_binding_value(name: &str, value: &Value) -> Result<String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("binding value is not an object"))?;
+    let term_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("binding value missing type"))?;
+    let lexical = object
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("binding value missing lexical form"))?;
+    let datatype = object
+        .get("datatype")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let language = object.get("xml:lang").and_then(Value::as_str).unwrap_or("");
+
+    Ok(format!("{name}={term_type}|{datatype}|{language}|{lexical}"))
+}
+
 pub fn normalize_content_type(content_type: Option<&str>) -> Option<String> {
     content_type.map(|value| {
         value
@@ -103,8 +151,8 @@ pub fn percentile(sorted_latencies: &[u128], p: usize) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_ntriples_set, classify_http_body, extract_ask_boolean, extract_binding_count,
-        normalize_content_type, percentile,
+        canonicalize_bindings_set, canonicalize_ntriples_set, classify_http_body,
+        extract_ask_boolean, extract_binding_count, normalize_content_type, percentile,
     };
 
     #[test]
@@ -129,6 +177,29 @@ mod tests {
             "results": { "bindings": [{}, {}] }
         });
         assert_eq!(extract_binding_count(&value).expect("count"), 2);
+    }
+
+    #[test]
+    fn canonicalizes_bindings_set_by_variable_content() {
+        let value = serde_json::json!({
+            "results": {
+                "bindings": [
+                    {
+                        "s": { "type": "uri", "value": "http://example.com/b" },
+                        "label": { "type": "literal", "value": "B" }
+                    },
+                    {
+                        "label": { "type": "literal", "value": "A" },
+                        "s": { "type": "uri", "value": "http://example.com/a" }
+                    }
+                ]
+            }
+        });
+
+        let canonical = canonicalize_bindings_set(&value).expect("bindings set");
+        assert_eq!(canonical.len(), 2);
+        assert!(canonical.iter().any(|row| row.contains("http://example.com/a")));
+        assert!(canonical.iter().any(|row| row.contains("http://example.com/b")));
     }
 
     #[test]

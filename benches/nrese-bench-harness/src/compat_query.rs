@@ -10,7 +10,8 @@ use crate::model::{
     CompatCase, CompatCaseReport, CompatKind, compat_kind_label, compat_operation_label,
 };
 use crate::normalize::{
-    canonicalize_ntriples_set, extract_ask_boolean, extract_binding_count, parse_json,
+    canonicalize_bindings_set, canonicalize_ntriples_set, extract_ask_boolean,
+    extract_binding_count, parse_json,
 };
 use crate::payloads::query_text;
 
@@ -102,6 +103,17 @@ fn compare_payloads(kind: CompatKind, left: &[u8], right: &[u8]) -> Result<(bool
                 format!("bindings={right_count}"),
             ))
         }
+        CompatKind::SolutionsBindingsSet => {
+            let left_json = parse_json(left)?;
+            let right_json = parse_json(right)?;
+            let left_set = canonicalize_bindings_set(&left_json)?;
+            let right_set = canonicalize_bindings_set(&right_json)?;
+            Ok((
+                left_set == right_set,
+                format!("bindings={}", left_set.len()),
+                format!("bindings={}", right_set.len()),
+            ))
+        }
         CompatKind::ConstructTriplesSet | CompatKind::GraphTriplesSet => {
             let left_set = canonicalize_ntriples_set(left)?;
             let right_set = canonicalize_ntriples_set(right)?;
@@ -156,5 +168,31 @@ mod tests {
             compat_operation_label(CompatOperation::GraphPostEffect),
             "graph-post-effect"
         );
+    }
+
+    #[test]
+    fn bindings_set_comparator_detects_different_rows_with_equal_count() {
+        let left = br#"{
+            "results": {
+                "bindings": [
+                    { "s": { "type": "uri", "value": "http://example.com/a" } }
+                ]
+            }
+        }"#;
+        let right = br#"{
+            "results": {
+                "bindings": [
+                    { "s": { "type": "uri", "value": "http://example.com/b" } }
+                ]
+            }
+        }"#;
+
+        let (matched, left_summary, right_summary) =
+            super::compare_payloads(CompatKind::SolutionsBindingsSet, left, right)
+                .expect("comparison");
+
+        assert!(!matched);
+        assert_eq!(left_summary, "bindings=1");
+        assert_eq!(right_summary, "bindings=1");
     }
 }

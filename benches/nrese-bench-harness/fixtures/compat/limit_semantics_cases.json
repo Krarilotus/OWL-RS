@@ -1,0 +1,23 @@
+[
+  {
+    "name": "limit-offset-values-window",
+    "operation": "query",
+    "query": "SELECT ?value WHERE { VALUES ?value { 1 2 3 4 5 } } ORDER BY ?value LIMIT 2 OFFSET 1",
+    "accept": "application/sparql-results+json",
+    "kind": "solutions-bindings-set"
+  },
+  {
+    "name": "limit-offset-seeded-predicate-window",
+    "operation": "query",
+    "query": "PREFIX ex: <http://example.com/> SELECT ?p WHERE { ex:alice ?p ?o } ORDER BY STR(?p) LIMIT 1 OFFSET 1",
+    "accept": "application/sparql-results+json",
+    "kind": "solutions-bindings-set"
+  },
+  {
+    "name": "limit-offset-seeded-object-window",
+    "operation": "query",
+    "query": "PREFIX ex: <http://example.com/> SELECT ?s ?o WHERE { ?s ex:relatedTo ?o } ORDER BY STR(?s) STR(?o) LIMIT 1 OFFSET 0",
+    "accept": "application/sparql-results+json",
+    "kind": "solutions-bindings-set"
+  }
+]

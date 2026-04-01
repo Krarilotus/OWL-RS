@@ -4,5 +4,6 @@ query_workload = "../../workloads/query_workload.json"
 update_workload = "../../workloads/update_workload.json"
 compat_suites = [
   "../../compat/protocol_cases.json",
+  "../../compat/limit_semantics_cases.json",
   "../../compat/policy_failure_cases.json",
 ]

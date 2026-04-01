@@ -67,6 +67,7 @@ Current example:
 
 - `benches/nrese-bench-harness/fixtures/packs/generic-baseline/pack.toml`
 - the generic baseline now bundles both `protocol_cases.json` and `policy_failure_cases.json`
+- the generic baseline now also includes `limit_semantics_cases.json` so query-window semantics are exercised on the same pack path
 - secured live-deployment templates now exist under:
   - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml`
   - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-timeout-template/pack.toml`
@@ -120,8 +121,9 @@ The secured templates intentionally reuse the existing compat suites:
 - Generic comparison fixtures:
   - `benches/nrese-bench-harness/fixtures/datasets/comparison_seed.ttl`
 - Compatibility cases:
-  - `benches/nrese-bench-harness/fixtures/compat/protocol_cases.json`
-  - `benches/nrese-bench-harness/fixtures/compat/ontology_protocol_cases.json`
+- `benches/nrese-bench-harness/fixtures/compat/protocol_cases.json`
+- `benches/nrese-bench-harness/fixtures/compat/limit_semantics_cases.json`
+- `benches/nrese-bench-harness/fixtures/compat/ontology_protocol_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/policy_failure_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/timeout_failure_cases.json`
 - Workload packs:

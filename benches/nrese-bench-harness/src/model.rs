@@ -206,6 +206,7 @@ pub enum CompatGraphTarget {
 pub enum CompatKind {
     AskBoolean,
     SolutionsCount,
+    SolutionsBindingsSet,
     ConstructTriplesSet,
     GraphTriplesSet,
     StatusAndContentType,
@@ -322,6 +323,7 @@ pub fn compat_kind_label(kind: CompatKind) -> &'static str {
     match kind {
         CompatKind::AskBoolean => "ask-boolean",
         CompatKind::SolutionsCount => "solutions-count",
+        CompatKind::SolutionsBindingsSet => "solutions-bindings-set",
         CompatKind::ConstructTriplesSet => "construct-triples-set",
         CompatKind::GraphTriplesSet => "graph-triples-set",
         CompatKind::StatusAndContentType => "status-and-content-type",

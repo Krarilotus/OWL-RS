@@ -27,6 +27,7 @@ Current coverage:
 - Service description, health, readiness, version, metrics, and operator APIs exist
 - Protocol compatibility harness now covers query parity, update-effect parity, graph-store read/head/delete/put/post-effect parity, bounded graph-store failure semantics, and bounded query/update failure semantics (status/content-type/body-class) against Fuseki-style dataset endpoints
 - The generic protocol fixture set now also covers a broader SPARQL Update parity slice for `DELETE DATA`, `DELETE/INSERT WHERE`, `CLEAR`, `COPY`, `MOVE`, and `ADD`
+- query parity coverage now also includes a dedicated limit/offset semantics suite using bindings-set comparison instead of count-only summaries
 - a staged real-world ontology catalog now exists to harden parity runs incrementally from small to broad official ontology sources
 - versioned secured live-auth and secured live-auth-plus-timeout workload-pack templates now exist on the same manifest path as the generic packs
 - workload-pack headers now support env-placeholder interpolation so auth/proxy parity packs can stay versioned without committed secrets

@@ -50,6 +50,7 @@ Objective:
 Implementation blocks:
 
 - fixture-driven comparison suites for query/update/graph-store edge cases
+- stronger query result comparators where count-only parity is insufficient, starting with a dedicated limit/offset bindings-set suite
 - explicit Tell/Ask/Services contract definition so assertion ingest, query semantics, and service metadata/federation do not drift into one another
 - bounded query/update failure-parity fixtures on top of the shared response-semantics comparator
 - separate policy-failure parity fixtures for invalid-auth and oversize-payload cases on the same shared response-semantics comparator
@@ -277,6 +278,8 @@ Priority order for the next replacement-focused runs:
 - committed secured live-auth and secured live-auth-timeout pack templates on the same manifest model as generic packs
 - added env-driven pack-header interpolation so secured workload packs stay reusable without committed secrets
 - expanded the staged real-world ontology catalog to include SKOS, SOSA, SSN, and DCAT alongside the earlier official ontology set
+- added service-level timeout budgets to workload-pack target profiles so secured/live parity runs can reuse shared transport ceilings without case duplication
+- added a dedicated limit/offset semantics compat suite and a bindings-set comparator so query-window parity does not rely on count-only summaries
 - moved the class-consistency test block into a dedicated `src/tests/consistency_tests.rs` file to match the repo’s topic-adjacent unit-test convention
 - initialized git versioning for the repository and updated `.gitignore` for Rust, frontend, runtime, and local-secret artifacts
 - added a separate `/console` frontend application with modular React/TypeScript structure, separated styles/i18n, and basic build/test coverage

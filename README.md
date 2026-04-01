@@ -58,7 +58,7 @@ Implemented today:
 - env-placeholder interpolation for workload-pack headers so authenticated parity runs can stay versioned without committed secrets
 - service-level workload-pack profiles now support shared timeout budgets alongside headers, so secured/live parity runs can keep transport policy external to the fixture JSON
 - real-world ontology catalog sync for staged parity and hardening runs against FOAF, W3C ORG, W3C Time, PROV-O, SKOS, SOSA, SSN, and DCAT
-- protocol compatibility harness coverage for query parity, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-parity slice, and bounded query/update failure-parity fixtures for covered negative cases
+- protocol compatibility harness coverage for query parity, limit/offset query semantics, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-parity slice, and bounded query/update failure-parity fixtures for covered negative cases
 - bounded `bearer-jwt` auth alongside `bearer-static`
 - bounded proxy-terminated `mtls` auth alongside the existing bearer modes
 - bounded `oidc-introspection` auth alongside the existing bearer and proxy-terminated `mtls` modes
