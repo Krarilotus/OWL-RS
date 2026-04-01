@@ -52,16 +52,18 @@ Current manifest format:
   - `query_workload`
   - `update_workload`
   - `compat_suites`
-  - legacy `compat_cases` remains accepted as a compatibility alias for a single suite
   - optional `[nrese]`
   - optional `[fuseki]`
   - optional `[nrese.headers]`
   - optional `[fuseki.headers]`
+  - optional `[invocation_profiles.nrese.<name>]`
+  - optional `[invocation_profiles.fuseki.<name>]`
 
 All paths are resolved relative to the manifest directory unless they are absolute.
-Service-level default headers and timeout budgets are applied through the same target/profile path as per-case request execution.
-Per-case headers still win on collision, so production packs can define auth/proxy defaults without forking comparator logic.
-Per-case timeout budgets still override service-level defaults when a suite needs a stricter bound than the shared target profile.
+Service-level defaults and named invocation profiles are applied through the same request-normalization path as case execution.
+Invocation precedence is: service defaults, then named per-side invocation profiles, then shared case-level headers/timeouts.
+Shared case-level headers still win on collision, so production packs can define auth/proxy defaults without forking comparator logic.
+Per-case timeout budgets still override service-level and named-profile defaults when a suite needs a stricter bound than the shared target profile.
 
 Current example:
 
@@ -72,14 +74,17 @@ Current example:
   - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml`
   - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-timeout-template/pack.toml`
 
-Example with service-level headers:
+Example with service-level defaults and named per-side overrides:
 
 ```toml
 name = "secured-pack"
 dataset = "../../datasets/comparison_seed.ttl"
 query_workload = "../../workloads/query_workload.json"
 update_workload = "../../workloads/update_workload.json"
-compat_suites = ["../../compat/protocol_cases.json"]
+compat_suites = [
+  "../../compat/protocol_cases.json",
+  "../../compat/secured_auth_failure_cases.json",
+]
 
 [nrese]
 timeout_ms = 15000
@@ -92,6 +97,12 @@ timeout_ms = 15000
 
 [fuseki.headers]
 x-forwarded-proto = "https"
+
+[invocation_profiles.nrese.invalid.headers]
+authorization = "Bearer invalid-token"
+
+[invocation_profiles.fuseki.invalid.headers]
+authorization = "Bearer invalid-token"
 ```
 
 Secured live-deployment template rules:
@@ -101,12 +112,13 @@ Secured live-deployment template rules:
 - prefer CLI `--fuseki-basic-auth` for Fuseki Basic Auth instead of embedding credentials in packs
 - keep timeout parity in a separate pack so operators must opt in explicitly once both stacks have comparable timeout ceilings
 
-Environment placeholders are resolved by the harness before request execution, so service-level default headers can stay versioned while credentials and deployment-specific tokens remain external.
+Environment placeholders are resolved by the harness before request execution, so service-level and named invocation headers can stay versioned while credentials and deployment-specific tokens remain external.
 
 The secured templates intentionally reuse the existing compat suites:
 
 - `protocol_cases.json`
 - `policy_failure_cases.json`
+- `secured_auth_failure_cases.json`
 - `timeout_failure_cases.json` only in the timeout template
 
 ## Files
@@ -125,6 +137,7 @@ The secured templates intentionally reuse the existing compat suites:
 - `benches/nrese-bench-harness/fixtures/compat/limit_semantics_cases.json`
 - `benches/nrese-bench-harness/fixtures/compat/ontology_protocol_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/policy_failure_cases.json`
+  - `benches/nrese-bench-harness/fixtures/compat/secured_auth_failure_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/timeout_failure_cases.json`
 - Workload packs:
   - `benches/nrese-bench-harness/fixtures/packs/generic-baseline/pack.toml`
@@ -307,6 +320,7 @@ It also includes bounded query/update failure-parity cases for invalid SPARQL sy
 It also now includes a broader SPARQL Update parity slice for `DELETE DATA`, `DELETE/INSERT WHERE`, `CLEAR`, `COPY`, `MOVE`, and `ADD` over isolated fixture IRIs/graphs.
 It also now supports a separate policy-failure fixture family for invalid-auth and oversize-payload parity on the same shared response-semantics comparator path.
 It now also supports a dedicated timeout-failure fixture family on the same shared response-semantics comparator path, using per-case timeout budgets instead of a separate timeout-only report format.
+Secured live-deployment packs can now bind invalid-auth cases through named per-side invocation profiles instead of duplicating live auth headers inside compat JSON.
 
 Policy-failure fixtures are intentionally separate from the generic protocol baseline, because they only become meaningful when both stacks are run with comparable auth and payload-limit policy.
 Timeout-failure fixtures are also intentionally separate from the generic baseline, because meaningful timeout parity depends on comparable timeout ceilings, reverse-proxy behavior, and workload-specific slow paths.
@@ -381,7 +395,8 @@ Before using either template:
 
 - export `NRESE_COMPARE_READ_TOKEN` and `FUSEKI_COMPARE_READ_TOKEN` in the shell or CI environment
 - remove `[fuseki.headers]` if Fuseki only uses CLI-supplied Basic Auth
-- keep `policy_failure_cases.json` in the pack so invalid-auth and oversize-payload parity stays on the same shared comparator path
+- keep `policy_failure_cases.json` in the pack so oversize-payload parity stays on the same shared comparator path
+- keep `secured_auth_failure_cases.json` in secured packs so invalid-auth parity uses the same per-side invocation-profile model as the live auth defaults
 - only use the timeout template after aligning timeout ceilings and proxy behavior on both deployments
 
 ## Current Verified Local Baseline

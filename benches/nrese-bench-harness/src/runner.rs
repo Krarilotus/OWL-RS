@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use std::{fs, path::Path};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Client;
 
 use crate::compat_common::{
@@ -20,7 +21,8 @@ use crate::model::{
     BenchComparison, BenchConfig, BenchReport, CatalogSyncConfig, CompatCase, CompatCaseReport,
     CompatConfig, CompatGraphTarget, CompatHeaders, CompatOperation, CompatReport, OntologyFixture,
     PackArtifactReport, PackCompatSuiteReport, PackConfig, PackReport, QueryWorkloadCase,
-    SeedConfig, ServiceBenchReport, ServiceConnectionConfig, UpdateWorkloadCase,
+    SeedConfig, ServiceBenchReport, ServiceConnectionConfig, ServiceRequestProfile,
+    UpdateWorkloadCase,
 };
 use crate::normalize::summarize;
 
@@ -100,16 +102,32 @@ pub async fn run_compat(config: CompatConfig) -> Result<CompatRunArtifact> {
     let client = build_client()?;
     let cases_path = config.cases_path.clone();
     let cases: Vec<CompatCase> = read_json(cases_path.clone())?;
-    let nrese = ServiceTarget::nrese(config.nrese.clone());
-    let fuseki = ServiceTarget::fuseki(config.fuseki.clone());
     let mut reports = Vec::with_capacity(cases.len());
     let mut matched_cases = 0usize;
 
     println!("== Compatibility run ==");
-    println!("nrese base: {}", nrese.base_url);
-    println!("fuseki base: {}", fuseki.base_url);
+    println!("nrese base: {}", config.nrese.base_url);
+    println!("fuseki base: {}", config.fuseki.base_url);
 
     for case in &cases {
+        let nrese = ServiceTarget::nrese(resolve_service_connection(
+            &config.nrese,
+            resolve_service_profile(
+                &config.nrese_profiles,
+                case.nrese_profile.as_deref(),
+                "NRESE",
+                &case.name,
+            )?,
+        ));
+        let fuseki = ServiceTarget::fuseki(resolve_service_connection(
+            &config.fuseki,
+            resolve_service_profile(
+                &config.fuseki_profiles,
+                case.fuseki_profile.as_deref(),
+                "Fuseki",
+                &case.name,
+            )?,
+        ));
         let report = execute_compat_case(&client, &nrese, &fuseki, case).await?;
         if report.matched {
             matched_cases += 1;
@@ -246,6 +264,8 @@ pub async fn run_pack(config: PackConfig) -> Result<()> {
                     timeout_ms: pack.fuseki.timeout_ms,
                     basic_auth: fuseki_basic_auth.clone(),
                 },
+                nrese_profiles: pack.invocation_profiles.nrese.clone(),
+                fuseki_profiles: pack.invocation_profiles.fuseki.clone(),
                 cases_path: suite_path.clone(),
                 report_json_path: compat_report_path,
             })
@@ -590,13 +610,55 @@ fn pack_compat_suite_report(run: CompatRunArtifact) -> PackCompatSuiteReport {
     }
 }
 
+fn resolve_service_profile<'a>(
+    profiles: &'a BTreeMap<String, ServiceRequestProfile>,
+    profile_name: Option<&str>,
+    target_label: &str,
+    case_name: &str,
+) -> Result<Option<&'a ServiceRequestProfile>> {
+    let Some(profile_name) = profile_name else {
+        return Ok(None);
+    };
+
+    profiles.get(profile_name).map(Some).ok_or_else(|| {
+        anyhow!(
+            "{target_label} compat profile '{profile_name}' referenced by case '{case_name}' is not defined in the workload pack"
+        )
+    })
+}
+
+fn resolve_service_connection(
+    base: &ServiceConnectionConfig,
+    profile: Option<&ServiceRequestProfile>,
+) -> ServiceConnectionConfig {
+    let mut headers = base.headers.clone();
+    let timeout_ms = profile
+        .and_then(|profile| profile.timeout_ms)
+        .or(base.timeout_ms);
+
+    if let Some(profile) = profile {
+        headers.extend(profile.headers.clone());
+    }
+
+    ServiceConnectionConfig {
+        base_url: base.base_url.clone(),
+        headers,
+        timeout_ms,
+        basic_auth: base.basic_auth.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::Path;
 
-    use crate::model::{CompatCase, CompatOperation};
+    use crate::model::{CompatCase, CompatHeaders, CompatOperation, ServiceConnectionConfig, ServiceRequestProfile};
 
-    use super::{CompatRunArtifact, compat_report_filename, pack_compat_suite_report};
+    use super::{
+        CompatRunArtifact, compat_report_filename, pack_compat_suite_report,
+        resolve_service_connection, resolve_service_profile,
+    };
 
     #[test]
     fn compat_case_defaults_to_query_operation() {
@@ -628,6 +690,23 @@ mod tests {
     }
 
     #[test]
+    fn compat_case_parses_per_side_profile_refs() {
+        let case: CompatCase = serde_json::from_str(
+            r#"{
+                "name":"secured-query",
+                "query":"SELECT * WHERE { ?s ?p ?o }",
+                "nrese_profile":"read",
+                "fuseki_profile":"read",
+                "kind":"solutions-count"
+            }"#,
+        )
+        .expect("case");
+
+        assert_eq!(case.nrese_profile.as_deref(), Some("read"));
+        assert_eq!(case.fuseki_profile.as_deref(), Some("read"));
+    }
+
+    #[test]
     fn report_filename_uses_suite_stem() {
         assert_eq!(
             compat_report_filename(Path::new("fixtures/compat/policy_failure_cases.json")),
@@ -651,6 +730,52 @@ mod tests {
         assert_eq!(
             report.report.as_ref().map(|entry| entry.path.as_str()),
             Some("artifacts/policy-report.json")
+        );
+    }
+
+    #[test]
+    fn resolve_service_profile_reports_unknown_profile() {
+        let error = resolve_service_profile(
+            &BTreeMap::new(),
+            Some("missing"),
+            "NRESE",
+            "secured-query",
+        )
+        .expect_err("missing profile");
+
+        assert!(error.to_string().contains("compat profile 'missing'"));
+    }
+
+    #[test]
+    fn resolve_service_connection_merges_profile_over_base() {
+        let base = ServiceConnectionConfig {
+            base_url: "http://example.invalid".to_owned(),
+            headers: CompatHeaders::from([
+                ("authorization".to_owned(), "Bearer base".to_owned()),
+                ("x-base".to_owned(), "1".to_owned()),
+            ]),
+            timeout_ms: Some(1000),
+            basic_auth: None,
+        };
+        let profile = ServiceRequestProfile {
+            headers: CompatHeaders::from([
+                ("authorization".to_owned(), "Bearer profile".to_owned()),
+                ("x-profile".to_owned(), "1".to_owned()),
+            ]),
+            timeout_ms: Some(25),
+        };
+
+        let merged = resolve_service_connection(&base, Some(&profile));
+
+        assert_eq!(merged.timeout_ms, Some(25));
+        assert_eq!(
+            merged.headers.get("authorization").map(String::as_str),
+            Some("Bearer profile")
+        );
+        assert_eq!(merged.headers.get("x-base").map(String::as_str), Some("1"));
+        assert_eq!(
+            merged.headers.get("x-profile").map(String::as_str),
+            Some("1")
         );
     }
 }

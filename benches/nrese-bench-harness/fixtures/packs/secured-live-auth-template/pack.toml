@@ -5,6 +5,7 @@ update_workload = "../../workloads/update_workload.json"
 compat_suites = [
   "../../compat/protocol_cases.json",
   "../../compat/policy_failure_cases.json",
+  "../../compat/secured_auth_failure_cases.json",
 ]
 
 # Template only.
@@ -25,3 +26,9 @@ authorization = "Bearer ${NRESE_COMPARE_READ_TOKEN}"
 # Optional when Fuseki is fronted by the same style of bearer-auth gateway.
 # Remove this header section if Fuseki only uses CLI-supplied Basic Auth.
 authorization = "Bearer ${FUSEKI_COMPARE_READ_TOKEN}"
+
+[invocation_profiles.nrese.invalid.headers]
+authorization = "Bearer invalid-token"
+
+[invocation_profiles.fuseki.invalid.headers]
+authorization = "Bearer invalid-token"

@@ -161,12 +161,12 @@ Current coverage:
 - shared seed dataset and local Fuseki comparison stack definition now exist for reproducible dataset-parity setup
 - local compatibility and latency evidence can be emitted via report artifacts
 - authenticated local side-by-side runs against a dedicated Fuseki dataset are now supported through optional harness Basic-Auth flags
-- compatibility fixtures now support explicit per-case request-header overrides through the shared harness request path, which prepares live auth/proxy parity without endpoint-specific compare logic
-- production workload packs now support service-level default request headers for NRESE and Fuseki through one manifest/config path, so auth/proxy parity can be exercised without forking harness logic
-- production workload packs now also support service-level timeout budgets on the same profile path, so secured/live compare runs can keep transport ceilings external to case fixtures
+- compatibility fixtures now support explicit shared per-case request-header overrides through the shared harness request path, which prepares live auth/proxy parity without endpoint-specific compare logic
+- production workload packs now support service-level invocation defaults plus named per-side invocation profiles for NRESE and Fuseki through one manifest/config path
+- production workload packs now also support service-level and named-profile timeout budgets on the same profile path, so secured/live compare runs can keep transport ceilings external to case fixtures
 - production workload packs now support multiple compatibility suites in one manifest, so protocol, ontology, and policy/e2e parity can be staged without ad hoc command chaining
 - versioned secured live-auth and secured live-auth-timeout pack templates now exist on top of that manifest path
-- workload-pack headers now support env-placeholder interpolation so authenticated parity runs can be scripted without committed credentials
+- workload-pack invocation headers now support env-placeholder interpolation so authenticated parity runs can be scripted without committed credentials
 
 Still required:
 - comparisons against the real Fuseki deployment and real ontology/workload

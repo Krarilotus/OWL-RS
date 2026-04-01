@@ -86,6 +86,8 @@ mod tests {
             }),
             timeout_ms: None,
             request_headers: CompatHeaders::new(),
+            nrese_profile: None,
+            fuseki_profile: None,
             kind: CompatKind::StatusContentTypeBodyClass,
         };
 
@@ -113,6 +115,8 @@ mod tests {
             }),
             timeout_ms: None,
             request_headers: CompatHeaders::new(),
+            nrese_profile: None,
+            fuseki_profile: None,
             kind: CompatKind::StatusContentTypeBodyClass,
         };
 
@@ -140,6 +144,8 @@ mod tests {
             }),
             timeout_ms: None,
             request_headers: CompatHeaders::new(),
+            nrese_profile: None,
+            fuseki_profile: None,
             kind: CompatKind::StatusContentTypeBodyClass,
         };
 

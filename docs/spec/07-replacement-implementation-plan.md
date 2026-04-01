@@ -54,9 +54,9 @@ Implementation blocks:
 - explicit Tell/Ask/Services contract definition so assertion ingest, query semantics, and service metadata/federation do not drift into one another
 - bounded query/update failure-parity fixtures on top of the shared response-semantics comparator
 - separate policy-failure parity fixtures for invalid-auth and oversize-payload cases on the same shared response-semantics comparator
-- shared per-case request-header customization in the compat harness so auth/proxy/live comparison cases stay on the same comparator path
-- service-level request-header profiles in workload-pack manifests so secured compare stacks stay on the same comparator path as unsecured runs
-- service-level timeout budgets in workload-pack manifests so secured/live compare stacks can externalize transport ceilings without case-by-case duplication
+- shared per-case request-header customization in the compat harness plus named per-side invocation profiles so auth/proxy/live comparison cases stay on the same comparator path
+- service-level invocation profiles in workload-pack manifests so secured compare stacks stay on the same comparator path as unsecured runs
+- service-level timeout budgets in workload-pack manifests plus named profile overrides so secured/live compare stacks can externalize transport ceilings without case-by-case duplication
 - bounded secured live-deployment workload-pack templates so auth/policy/timeout parity runs reuse the same manifest model without committed secrets
 - env-placeholder interpolation for pack headers so secured templates can stay versioned without embedding credentials
 - timeout and payload-limit comparison cases
@@ -279,6 +279,7 @@ Priority order for the next replacement-focused runs:
 - added env-driven pack-header interpolation so secured workload packs stay reusable without committed secrets
 - expanded the staged real-world ontology catalog to include SKOS, SOSA, SSN, and DCAT alongside the earlier official ontology set
 - added service-level timeout budgets to workload-pack target profiles so secured/live parity runs can reuse shared transport ceilings without case duplication
+- added named per-side invocation profiles to workload-pack manifests and bound secured invalid-auth parity cases to that path instead of duplicating live auth headers inside compat JSON
 - added a dedicated limit/offset semantics compat suite and a bindings-set comparator so query-window parity does not rely on count-only summaries
 - moved the class-consistency test block into a dedicated `src/tests/consistency_tests.rs` file to match the repo’s topic-adjacent unit-test convention
 - initialized git versioning for the repository and updated `.gitignore` for Rust, frontend, runtime, and local-secret artifacts

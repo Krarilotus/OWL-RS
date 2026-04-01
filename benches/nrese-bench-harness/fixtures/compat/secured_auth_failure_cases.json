@@ -1,0 +1,32 @@
+[
+  {
+    "name": "query-invalid-auth-profile",
+    "operation": "query",
+    "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1",
+    "accept": "application/sparql-results+json",
+    "nrese_profile": "invalid",
+    "fuseki_profile": "invalid",
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "update-invalid-auth-profile",
+    "operation": "update-effect",
+    "update": "INSERT DATA { <http://example.com/policy-s> <http://example.com/policy-p> <http://example.com/policy-o> }",
+    "nrese_profile": "invalid",
+    "fuseki_profile": "invalid",
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "graph-put-invalid-auth-profile",
+    "operation": "graph-put-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/policy-graph"
+    },
+    "graph_content_type": "text/turtle",
+    "graph_payload": "@prefix ex: <http://example.com/> . ex:s ex:p ex:o .",
+    "nrese_profile": "invalid",
+    "fuseki_profile": "invalid",
+    "kind": "status-content-type-body-class"
+  }
+]

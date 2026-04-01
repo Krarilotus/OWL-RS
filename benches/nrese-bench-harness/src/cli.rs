@@ -90,6 +90,8 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     timeout_ms: None,
                     basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
                 },
+                nrese_profiles: BTreeMap::new(),
+                fuseki_profiles: BTreeMap::new(),
                 cases_path: options
                     .get("--cases")
                     .map(PathBuf::from)

@@ -39,6 +39,8 @@ pub struct BenchConfig {
 pub struct CompatConfig {
     pub nrese: ServiceConnectionConfig,
     pub fuseki: ServiceConnectionConfig,
+    pub nrese_profiles: BTreeMap<String, ServiceRequestProfile>,
+    pub fuseki_profiles: BTreeMap<String, ServiceRequestProfile>,
     pub cases_path: PathBuf,
     pub report_json_path: Option<PathBuf>,
 }
@@ -69,13 +71,13 @@ pub struct WorkloadPackManifest {
     pub query_workload: PathBuf,
     pub update_workload: PathBuf,
     #[serde(default)]
-    pub compat_cases: Option<PathBuf>,
-    #[serde(default)]
     pub compat_suites: Vec<PathBuf>,
     #[serde(default)]
     pub nrese: ServiceRequestProfile,
     #[serde(default)]
     pub fuseki: ServiceRequestProfile,
+    #[serde(default)]
+    pub invocation_profiles: ServiceInvocationProfiles,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,6 +103,14 @@ pub struct ServiceRequestProfile {
     pub headers: CompatHeaders,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ServiceInvocationProfiles {
+    #[serde(default)]
+    pub nrese: BTreeMap<String, ServiceRequestProfile>,
+    #[serde(default)]
+    pub fuseki: BTreeMap<String, ServiceRequestProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +174,10 @@ pub struct CompatCase {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub request_headers: CompatHeaders,
+    #[serde(default)]
+    pub nrese_profile: Option<String>,
+    #[serde(default)]
+    pub fuseki_profile: Option<String>,
     pub kind: CompatKind,
 }
 

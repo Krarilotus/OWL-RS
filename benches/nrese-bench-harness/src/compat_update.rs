@@ -40,22 +40,24 @@ pub async fn execute_case(
     require_success_http(left, "update", &left_update)?;
     require_success_http(right, "update", &right_update)?;
 
-    let query_case = CompatCase {
-        name: case.name.clone(),
-        operation: case.operation,
-        query: Some(verify_query.to_owned()),
-        accept: case.accept.clone(),
+        let query_case = CompatCase {
+            name: case.name.clone(),
+            operation: case.operation,
+            query: Some(verify_query.to_owned()),
+            accept: case.accept.clone(),
         update: None,
         verify_query: None,
         graph_target: None,
         graph_payload: None,
         graph_content_type: None,
         graph_replace: true,
-        generated_payload: None,
-        timeout_ms: case.timeout_ms,
-        request_headers: case.request_headers.clone(),
-        kind: case.kind,
-    };
+            generated_payload: None,
+            timeout_ms: case.timeout_ms,
+            request_headers: case.request_headers.clone(),
+            nrese_profile: case.nrese_profile.clone(),
+            fuseki_profile: case.fuseki_profile.clone(),
+            kind: case.kind,
+        };
 
     execute_query_case_from_payloads(client, left, right, &query_case).await
 }

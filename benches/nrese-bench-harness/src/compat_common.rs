@@ -437,6 +437,8 @@ mod tests {
             generated_payload: None,
             timeout_ms: None,
             request_headers: CompatHeaders::new(),
+            nrese_profile: None,
+            fuseki_profile: None,
             kind: CompatKind::StatusContentTypeBodyClass,
         };
         let outcome = HttpOutcome {
@@ -475,6 +477,8 @@ mod tests {
             generated_payload: None,
             timeout_ms: Some(25),
             request_headers: CompatHeaders::new(),
+            nrese_profile: None,
+            fuseki_profile: None,
             kind: CompatKind::StatusContentTypeBodyClass,
         };
 
