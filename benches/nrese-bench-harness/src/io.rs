@@ -110,6 +110,9 @@ query_workload = "../fixtures/query.json"
 update_workload = "../fixtures/update.json"
 compat_suites = ["../fixtures/compat.json"]
 
+[nrese]
+timeout_ms = 15000
+
 [nrese.headers]
 authorization = "Bearer local-token"
 
@@ -134,6 +137,7 @@ x-forwarded-proto = "https"
                 .map(String::as_str),
             Some("Bearer local-token")
         );
+        assert_eq!(manifest.nrese.timeout_ms, Some(15000));
         assert_eq!(
             manifest
                 .fuseki

@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::model::{
     BasicAuthConfig, BenchConfig, CatalogSyncConfig, Cli, Command, CompatConfig, CompatHeaders,
-    PackConfig, SeedConfig,
+    PackConfig, SeedConfig, ServiceConnectionConfig,
 };
 
 const DEFAULT_QUERY_WORKLOAD_PATH: &str =
@@ -29,11 +29,13 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
     match command_name {
         "bench" => Ok(Cli {
             command: Command::Bench(BenchConfig {
-                nrese_base_url: required_opt(&options, "--nrese-base-url")?,
-                nrese_headers: CompatHeaders::new(),
-                fuseki_base_url: options.get("--fuseki-base-url").cloned(),
-                fuseki_headers: CompatHeaders::new(),
-                fuseki_basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
+                nrese: ServiceConnectionConfig {
+                    base_url: required_opt(&options, "--nrese-base-url")?,
+                    headers: CompatHeaders::new(),
+                    timeout_ms: None,
+                    basic_auth: None,
+                },
+                fuseki: optional_fuseki_connection(&options)?,
                 iterations: options
                     .get("--iterations")
                     .map(|value| value.parse::<usize>())
@@ -76,11 +78,18 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
         }),
         "compat" => Ok(Cli {
             command: Command::Compat(CompatConfig {
-                nrese_base_url: required_opt(&options, "--nrese-base-url")?,
-                nrese_headers: CompatHeaders::new(),
-                fuseki_base_url: required_opt(&options, "--fuseki-base-url")?,
-                fuseki_headers: CompatHeaders::new(),
-                fuseki_basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
+                nrese: ServiceConnectionConfig {
+                    base_url: required_opt(&options, "--nrese-base-url")?,
+                    headers: CompatHeaders::new(),
+                    timeout_ms: None,
+                    basic_auth: None,
+                },
+                fuseki: ServiceConnectionConfig {
+                    base_url: required_opt(&options, "--fuseki-base-url")?,
+                    headers: CompatHeaders::new(),
+                    timeout_ms: None,
+                    basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
+                },
                 cases_path: options
                     .get("--cases")
                     .map(PathBuf::from)
@@ -107,11 +116,13 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
         }),
         "seed" => Ok(Cli {
             command: Command::Seed(SeedConfig {
-                nrese_base_url: required_opt(&options, "--nrese-base-url")?,
-                nrese_headers: CompatHeaders::new(),
-                fuseki_base_url: options.get("--fuseki-base-url").cloned(),
-                fuseki_headers: CompatHeaders::new(),
-                fuseki_basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
+                nrese: ServiceConnectionConfig {
+                    base_url: required_opt(&options, "--nrese-base-url")?,
+                    headers: CompatHeaders::new(),
+                    timeout_ms: None,
+                    basic_auth: None,
+                },
+                fuseki: optional_fuseki_connection(&options)?,
                 dataset_path: options
                     .get("--dataset")
                     .map(PathBuf::from)
@@ -190,6 +201,21 @@ fn required_opt(options: &BTreeMap<String, String>, key: &str) -> Result<String>
         .ok_or_else(|| anyhow!("missing required option {key}"))
 }
 
+fn optional_fuseki_connection(
+    options: &BTreeMap<String, String>,
+) -> Result<Option<ServiceConnectionConfig>> {
+    let Some(base_url) = options.get("--fuseki-base-url").cloned() else {
+        return Ok(None);
+    };
+
+    Ok(Some(ServiceConnectionConfig {
+        base_url,
+        headers: CompatHeaders::new(),
+        timeout_ms: None,
+        basic_auth: parse_basic_auth_opt(options, "--fuseki-basic-auth")?,
+    }))
+}
+
 pub fn print_usage() {
     println!(
         "nrese-bench-harness
@@ -227,6 +253,7 @@ mod tests {
                     config.query_workload_path.to_string_lossy(),
                     DEFAULT_QUERY_WORKLOAD_PATH
                 );
+                assert_eq!(config.nrese.base_url, "http://127.0.0.1:8080");
             }
             _ => panic!("expected bench command"),
         }
@@ -245,7 +272,10 @@ mod tests {
         .expect("cli");
 
         match cli.command {
-            Command::Seed(config) => assert!(!config.replace),
+            Command::Seed(config) => {
+                assert!(!config.replace);
+                assert_eq!(config.nrese.base_url, "http://127.0.0.1:8080");
+            }
             _ => panic!("expected seed command"),
         }
     }
@@ -310,7 +340,7 @@ mod tests {
 
         match cli.command {
             Command::Compat(config) => {
-                let auth = config.fuseki_basic_auth.expect("basic auth");
+                let auth = config.fuseki.basic_auth.expect("basic auth");
                 assert_eq!(auth.username, "admin");
                 assert_eq!(auth.password, "nrese-admin");
             }

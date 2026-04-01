@@ -55,6 +55,7 @@ Implementation blocks:
 - separate policy-failure parity fixtures for invalid-auth and oversize-payload cases on the same shared response-semantics comparator
 - shared per-case request-header customization in the compat harness so auth/proxy/live comparison cases stay on the same comparator path
 - service-level request-header profiles in workload-pack manifests so secured compare stacks stay on the same comparator path as unsecured runs
+- service-level timeout budgets in workload-pack manifests so secured/live compare stacks can externalize transport ceilings without case-by-case duplication
 - bounded secured live-deployment workload-pack templates so auth/policy/timeout parity runs reuse the same manifest model without committed secrets
 - env-placeholder interpolation for pack headers so secured templates can stay versioned without embedding credentials
 - timeout and payload-limit comparison cases

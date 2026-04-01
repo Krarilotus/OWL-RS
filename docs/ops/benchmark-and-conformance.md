@@ -53,12 +53,15 @@ Current manifest format:
   - `update_workload`
   - `compat_suites`
   - legacy `compat_cases` remains accepted as a compatibility alias for a single suite
+  - optional `[nrese]`
+  - optional `[fuseki]`
   - optional `[nrese.headers]`
   - optional `[fuseki.headers]`
 
 All paths are resolved relative to the manifest directory unless they are absolute.
-Service-level default headers are applied through the same request-normalization path as per-case `request_headers`.
+Service-level default headers and timeout budgets are applied through the same target/profile path as per-case request execution.
 Per-case headers still win on collision, so production packs can define auth/proxy defaults without forking comparator logic.
+Per-case timeout budgets still override service-level defaults when a suite needs a stricter bound than the shared target profile.
 
 Current example:
 
@@ -77,8 +80,14 @@ query_workload = "../../workloads/query_workload.json"
 update_workload = "../../workloads/update_workload.json"
 compat_suites = ["../../compat/protocol_cases.json"]
 
+[nrese]
+timeout_ms = 15000
+
 [nrese.headers]
 authorization = "Bearer nrese-read-token"
+
+[fuseki]
+timeout_ms = 15000
 
 [fuseki.headers]
 x-forwarded-proto = "https"

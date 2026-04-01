@@ -56,6 +56,7 @@ Implemented today:
 - manifest-driven workload-pack execution for production-style seed + compat + bench runs
 - versioned secured live-auth and secured live-auth-timeout workload-pack templates on the same manifest model as the generic packs
 - env-placeholder interpolation for workload-pack headers so authenticated parity runs can stay versioned without committed secrets
+- service-level workload-pack profiles now support shared timeout budgets alongside headers, so secured/live parity runs can keep transport policy external to the fixture JSON
 - real-world ontology catalog sync for staged parity and hardening runs against FOAF, W3C ORG, W3C Time, PROV-O, SKOS, SOSA, SSN, and DCAT
 - protocol compatibility harness coverage for query parity, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-parity slice, and bounded query/update failure-parity fixtures for covered negative cases
 - bounded `bearer-jwt` auth alongside `bearer-static`

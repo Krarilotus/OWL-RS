@@ -323,12 +323,16 @@ async fn send_request(
     family: &str,
     options: RequestExecutionOptions,
 ) -> Result<RequestOutcome> {
-    let request = apply_timeout(request, options);
+    let timeout_ms = effective_timeout_ms(target, options);
+    let request = apply_timeout(
+        request,
+        RequestExecutionOptions {
+            timeout_ms,
+        },
+    );
     match request.send().await {
         Ok(response) => into_http_outcome(response).await.map(RequestOutcome::Http),
-        Err(error) if error.is_timeout() => Ok(RequestOutcome::Timeout {
-            timeout_ms: options.timeout_ms,
-        }),
+        Err(error) if error.is_timeout() => Ok(RequestOutcome::Timeout { timeout_ms }),
         Err(error) => {
             Err(error).with_context(|| format!("{family} request failed against {}", target.label))
         }
@@ -340,6 +344,10 @@ fn apply_timeout(request: RequestBuilder, options: RequestExecutionOptions) -> R
         Some(timeout_ms) => request.timeout(Duration::from_millis(timeout_ms)),
         None => request,
     }
+}
+
+fn effective_timeout_ms(target: &ServiceTarget, options: RequestExecutionOptions) -> Option<u64> {
+    options.timeout_ms.or(target.default_timeout_ms)
 }
 
 fn format_response_semantics_summary(
@@ -376,7 +384,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::layout::ServiceTarget;
-    use crate::model::{CompatCase, CompatHeaders, CompatKind, CompatOperation};
+    use crate::model::{
+        CompatCase, CompatHeaders, CompatKind, CompatOperation, ServiceConnectionConfig,
+    };
     use reqwest::{Client, StatusCode};
 
     use super::{
@@ -491,10 +501,12 @@ mod tests {
         let request = client.post("http://example.invalid");
         let request = apply_case_headers(
             request,
-            &ServiceTarget::nrese_with_headers(
-                "http://example.invalid".to_owned(),
-                CompatHeaders::new(),
-            ),
+            &ServiceTarget::nrese(ServiceConnectionConfig {
+                base_url: "http://example.invalid".to_owned(),
+                headers: CompatHeaders::new(),
+                timeout_ms: None,
+                basic_auth: None,
+            }),
             [("accept", "application/sparql-results+json")],
             &CompatHeaders::from([("accept".to_owned(), "application/n-triples".to_owned())]),
         )
@@ -515,10 +527,12 @@ mod tests {
     fn target_headers_are_applied_before_case_headers() {
         let client = Client::new();
         let request = client.post("http://example.invalid");
-        let target = ServiceTarget::nrese_with_headers(
-            "http://example.invalid".to_owned(),
-            CompatHeaders::from([("x-env".to_owned(), "pack".to_owned())]),
-        );
+        let target = ServiceTarget::nrese(ServiceConnectionConfig {
+            base_url: "http://example.invalid".to_owned(),
+            headers: CompatHeaders::from([("x-env".to_owned(), "pack".to_owned())]),
+            timeout_ms: None,
+            basic_auth: None,
+        });
 
         let request = apply_case_headers(
             request,
@@ -554,8 +568,12 @@ mod tests {
         });
 
         let client = Client::builder().build().expect("client");
-        let target =
-            ServiceTarget::nrese_with_headers(format!("http://{addr}"), CompatHeaders::new());
+        let target = ServiceTarget::nrese(ServiceConnectionConfig {
+            base_url: format!("http://{addr}"),
+            headers: CompatHeaders::new(),
+            timeout_ms: None,
+            basic_auth: None,
+        });
         let outcome = execute_query_raw(
             &client,
             &target,
@@ -572,6 +590,48 @@ mod tests {
         match outcome {
             RequestOutcome::Timeout {
                 timeout_ms: Some(25),
+            } => {}
+            other => panic!("expected timeout outcome, got {other:?}"),
+        }
+
+        server.join().expect("server join");
+    }
+
+    #[tokio::test]
+    async fn execute_query_raw_uses_target_default_timeout_when_case_timeout_is_missing() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            thread::sleep(Duration::from_millis(150));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/sparql-results+json\r\nContent-Length: 16\r\n\r\n{\"boolean\":true}",
+            );
+        });
+
+        let client = Client::builder().build().expect("client");
+        let target = ServiceTarget::nrese(ServiceConnectionConfig {
+            base_url: format!("http://{addr}"),
+            headers: CompatHeaders::new(),
+            timeout_ms: Some(30),
+            basic_auth: None,
+        });
+        let outcome = execute_query_raw(
+            &client,
+            &target,
+            "ASK WHERE { ?s ?p ?o }",
+            "application/sparql-results+json",
+            &CompatHeaders::new(),
+            RequestExecutionOptions::default(),
+        )
+        .await
+        .expect("timeout outcome");
+
+        match outcome {
+            RequestOutcome::Timeout {
+                timeout_ms: Some(30),
             } => {}
             other => panic!("expected timeout outcome, got {other:?}"),
         }

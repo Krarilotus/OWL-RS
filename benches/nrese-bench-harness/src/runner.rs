@@ -20,7 +20,7 @@ use crate::model::{
     BenchComparison, BenchConfig, BenchReport, CatalogSyncConfig, CompatCase, CompatCaseReport,
     CompatConfig, CompatGraphTarget, CompatHeaders, CompatOperation, CompatReport, OntologyFixture,
     PackArtifactReport, PackCompatSuiteReport, PackConfig, PackReport, QueryWorkloadCase,
-    SeedConfig, ServiceBenchReport, UpdateWorkloadCase,
+    SeedConfig, ServiceBenchReport, ServiceConnectionConfig, UpdateWorkloadCase,
 };
 use crate::normalize::summarize;
 
@@ -28,10 +28,7 @@ pub async fn run_bench(config: BenchConfig) -> Result<BenchRunArtifact> {
     let client = build_client()?;
     let query_cases: Vec<QueryWorkloadCase> = read_json(config.query_workload_path)?;
     let update_cases: Vec<UpdateWorkloadCase> = read_json(config.update_workload_path)?;
-    let nrese = ServiceTarget::nrese_with_headers(
-        config.nrese_base_url.clone(),
-        config.nrese_headers.clone(),
-    );
+    let nrese = ServiceTarget::nrese(config.nrese.clone());
 
     println!("== Benchmark run ==");
     println!("nrese base: {}", nrese.base_url);
@@ -50,12 +47,8 @@ pub async fn run_bench(config: BenchConfig) -> Result<BenchRunArtifact> {
     });
 
     let mut comparison = None;
-    if let Some(fuseki_base_url) = &config.fuseki_base_url {
-        let fuseki = ServiceTarget::fuseki_with_headers(
-            fuseki_base_url.clone(),
-            config.fuseki_basic_auth.clone(),
-            config.fuseki_headers.clone(),
-        );
+    if let Some(fuseki_config) = &config.fuseki {
+        let fuseki = ServiceTarget::fuseki(fuseki_config.clone());
         println!("fuseki base: {}", fuseki.base_url);
         let fuseki_query =
             benchmark_queries(&client, &fuseki, &query_cases, config.iterations).await?;
@@ -107,15 +100,8 @@ pub async fn run_compat(config: CompatConfig) -> Result<CompatRunArtifact> {
     let client = build_client()?;
     let cases_path = config.cases_path.clone();
     let cases: Vec<CompatCase> = read_json(cases_path.clone())?;
-    let nrese = ServiceTarget::nrese_with_headers(
-        config.nrese_base_url.clone(),
-        config.nrese_headers.clone(),
-    );
-    let fuseki = ServiceTarget::fuseki_with_headers(
-        config.fuseki_base_url.clone(),
-        config.fuseki_basic_auth,
-        config.fuseki_headers.clone(),
-    );
+    let nrese = ServiceTarget::nrese(config.nrese.clone());
+    let fuseki = ServiceTarget::fuseki(config.fuseki.clone());
     let mut reports = Vec::with_capacity(cases.len());
     let mut matched_cases = 0usize;
 
@@ -153,8 +139,8 @@ pub async fn run_compat(config: CompatConfig) -> Result<CompatRunArtifact> {
             report_path.clone(),
             &CompatReport {
                 mode: "compat",
-                nrese_base_url: config.nrese_base_url.clone(),
-                fuseki_base_url: config.fuseki_base_url.clone(),
+                nrese_base_url: config.nrese.base_url.clone(),
+                fuseki_base_url: config.fuseki.base_url.clone(),
                 total_cases: cases.len(),
                 matched_cases,
                 mismatched_cases,
@@ -186,16 +172,9 @@ pub async fn run_seed(config: SeedConfig) -> Result<()> {
             .unwrap_or("text/turtle")
             .to_owned()
     });
-    let mut targets = vec![ServiceTarget::nrese_with_headers(
-        config.nrese_base_url.clone(),
-        config.nrese_headers.clone(),
-    )];
-    if let Some(fuseki_base_url) = config.fuseki_base_url.clone() {
-        targets.push(ServiceTarget::fuseki_with_headers(
-            fuseki_base_url,
-            config.fuseki_basic_auth.clone(),
-            config.fuseki_headers.clone(),
-        ));
+    let mut targets = vec![ServiceTarget::nrese(config.nrese.clone())];
+    if let Some(fuseki_config) = config.fuseki.clone() {
+        targets.push(ServiceTarget::fuseki(fuseki_config));
     }
 
     println!("== Dataset seed run ==");
@@ -225,11 +204,18 @@ pub async fn run_pack(config: PackConfig) -> Result<()> {
     println!("manifest: {manifest_path}");
 
     run_seed(SeedConfig {
-        nrese_base_url: nrese_base_url.clone(),
-        nrese_headers: pack.nrese.headers.clone(),
-        fuseki_base_url: fuseki_base_url.clone(),
-        fuseki_headers: pack.fuseki.headers.clone(),
-        fuseki_basic_auth: fuseki_basic_auth.clone(),
+        nrese: ServiceConnectionConfig {
+            base_url: nrese_base_url.clone(),
+            headers: pack.nrese.headers.clone(),
+            timeout_ms: pack.nrese.timeout_ms,
+            basic_auth: None,
+        },
+        fuseki: fuseki_base_url.clone().map(|base_url| ServiceConnectionConfig {
+            base_url,
+            headers: pack.fuseki.headers.clone(),
+            timeout_ms: pack.fuseki.timeout_ms,
+            basic_auth: fuseki_basic_auth.clone(),
+        }),
         dataset_path: pack.dataset.clone(),
         content_type: None,
         replace: true,
@@ -248,11 +234,18 @@ pub async fn run_pack(config: PackConfig) -> Result<()> {
                 .as_ref()
                 .map(|dir| dir.join(compat_report_filename(suite_path)));
             let compat_run = run_compat(CompatConfig {
-                nrese_base_url: nrese_base_url.clone(),
-                nrese_headers: pack.nrese.headers.clone(),
-                fuseki_base_url: fuseki_base_url.clone(),
-                fuseki_headers: pack.fuseki.headers.clone(),
-                fuseki_basic_auth: fuseki_basic_auth.clone(),
+                nrese: ServiceConnectionConfig {
+                    base_url: nrese_base_url.clone(),
+                    headers: pack.nrese.headers.clone(),
+                    timeout_ms: pack.nrese.timeout_ms,
+                    basic_auth: None,
+                },
+                fuseki: ServiceConnectionConfig {
+                    base_url: fuseki_base_url.clone(),
+                    headers: pack.fuseki.headers.clone(),
+                    timeout_ms: pack.fuseki.timeout_ms,
+                    basic_auth: fuseki_basic_auth.clone(),
+                },
                 cases_path: suite_path.clone(),
                 report_json_path: compat_report_path,
             })
@@ -264,11 +257,18 @@ pub async fn run_pack(config: PackConfig) -> Result<()> {
     }
 
     let bench_run = run_bench(BenchConfig {
-        nrese_base_url: nrese_base_url.clone(),
-        nrese_headers: pack.nrese.headers,
-        fuseki_base_url: fuseki_base_url.clone(),
-        fuseki_headers: pack.fuseki.headers,
-        fuseki_basic_auth,
+        nrese: ServiceConnectionConfig {
+            base_url: nrese_base_url.clone(),
+            headers: pack.nrese.headers,
+            timeout_ms: pack.nrese.timeout_ms,
+            basic_auth: None,
+        },
+        fuseki: fuseki_base_url.clone().map(|base_url| ServiceConnectionConfig {
+            base_url,
+            headers: pack.fuseki.headers,
+            timeout_ms: pack.fuseki.timeout_ms,
+            basic_auth: fuseki_basic_auth,
+        }),
         iterations,
         query_workload_path: pack.query_workload,
         update_workload_path: pack.update_workload,

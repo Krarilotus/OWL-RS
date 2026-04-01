@@ -1,4 +1,4 @@
-use crate::model::{BasicAuthConfig, CompatHeaders};
+use crate::model::{BasicAuthConfig, CompatHeaders, ServiceConnectionConfig};
 
 pub enum EndpointLayout {
     Nrese,
@@ -11,30 +11,29 @@ pub struct ServiceTarget {
     pub layout: EndpointLayout,
     pub basic_auth: Option<BasicAuthConfig>,
     pub default_headers: CompatHeaders,
+    pub default_timeout_ms: Option<u64>,
 }
 
 impl ServiceTarget {
-    pub fn nrese_with_headers(base_url: String, default_headers: CompatHeaders) -> Self {
+    pub fn nrese(config: ServiceConnectionConfig) -> Self {
         Self {
             label: "NRESE",
-            base_url,
+            base_url: config.base_url,
             layout: EndpointLayout::Nrese,
-            basic_auth: None,
-            default_headers,
+            basic_auth: config.basic_auth,
+            default_headers: config.headers,
+            default_timeout_ms: config.timeout_ms,
         }
     }
 
-    pub fn fuseki_with_headers(
-        base_url: String,
-        basic_auth: Option<BasicAuthConfig>,
-        default_headers: CompatHeaders,
-    ) -> Self {
+    pub fn fuseki(config: ServiceConnectionConfig) -> Self {
         Self {
             label: "Fuseki",
-            base_url,
+            base_url: config.base_url,
             layout: EndpointLayout::FusekiDataset,
-            basic_auth,
-            default_headers,
+            basic_auth: config.basic_auth,
+            default_headers: config.headers,
+            default_timeout_ms: config.timeout_ms,
         }
     }
 
@@ -91,16 +90,18 @@ fn join_url(base_url: &str, suffix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::CompatHeaders;
+    use crate::model::{CompatHeaders, ServiceConnectionConfig};
 
     use super::{EndpointLayout, ServiceTarget};
 
     #[test]
     fn nrese_layout_builds_dataset_endpoints() {
-        let target = ServiceTarget::nrese_with_headers(
-            "http://127.0.0.1:8080/".to_owned(),
-            CompatHeaders::new(),
-        );
+        let target = ServiceTarget::nrese(ServiceConnectionConfig {
+            base_url: "http://127.0.0.1:8080/".to_owned(),
+            headers: CompatHeaders::new(),
+            timeout_ms: Some(25),
+            basic_auth: None,
+        });
 
         assert_eq!(
             target.query_endpoint(),
@@ -116,6 +117,7 @@ mod tests {
         );
         assert!(target.basic_auth.is_none());
         assert!(target.default_headers.is_empty());
+        assert_eq!(target.default_timeout_ms, Some(25));
     }
 
     #[test]

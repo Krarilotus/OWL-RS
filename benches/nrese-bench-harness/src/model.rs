@@ -27,11 +27,8 @@ pub struct CatalogSyncConfig {
 
 #[derive(Debug, Clone)]
 pub struct BenchConfig {
-    pub nrese_base_url: String,
-    pub nrese_headers: CompatHeaders,
-    pub fuseki_base_url: Option<String>,
-    pub fuseki_headers: CompatHeaders,
-    pub fuseki_basic_auth: Option<BasicAuthConfig>,
+    pub nrese: ServiceConnectionConfig,
+    pub fuseki: Option<ServiceConnectionConfig>,
     pub iterations: usize,
     pub query_workload_path: PathBuf,
     pub update_workload_path: PathBuf,
@@ -40,22 +37,16 @@ pub struct BenchConfig {
 
 #[derive(Debug, Clone)]
 pub struct CompatConfig {
-    pub nrese_base_url: String,
-    pub nrese_headers: CompatHeaders,
-    pub fuseki_base_url: String,
-    pub fuseki_headers: CompatHeaders,
-    pub fuseki_basic_auth: Option<BasicAuthConfig>,
+    pub nrese: ServiceConnectionConfig,
+    pub fuseki: ServiceConnectionConfig,
     pub cases_path: PathBuf,
     pub report_json_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SeedConfig {
-    pub nrese_base_url: String,
-    pub nrese_headers: CompatHeaders,
-    pub fuseki_base_url: Option<String>,
-    pub fuseki_headers: CompatHeaders,
-    pub fuseki_basic_auth: Option<BasicAuthConfig>,
+    pub nrese: ServiceConnectionConfig,
+    pub fuseki: Option<ServiceConnectionConfig>,
     pub dataset_path: PathBuf,
     pub content_type: Option<String>,
     pub replace: bool,
@@ -108,12 +99,22 @@ pub struct OntologyFixture {
 pub struct ServiceRequestProfile {
     #[serde(default)]
     pub headers: CompatHeaders,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct BasicAuthConfig {
     pub username: String,
     pub password: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceConnectionConfig {
+    pub base_url: String,
+    pub headers: CompatHeaders,
+    pub timeout_ms: Option<u64>,
+    pub basic_auth: Option<BasicAuthConfig>,
 }
 
 pub type CompatHeaders = BTreeMap<String, String>;
