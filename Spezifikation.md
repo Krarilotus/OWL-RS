@@ -1,85 +1,111 @@
-# System-Spezifikation: Native Rust Enterprise Semantic Engine (NRESE)
+# NRESE Spezifikations-Index
 
-## Leitziel
+Diese Datei ist der kompakte Einstieg in die Spezifikation.
+Sie ist kein zweites Detail-PRD neben `docs/spec/`, sondern der Dokumentenvertrag dafuer:
 
-NRESE verfolgt ein klares Endziel:
+- welche Spec-Datei welchen Concern besitzt
+- wo der aktuelle Status verbindlich gepflegt wird
+- was als Naechstes geschlossen werden muss
 
-> Einen vollstaendig nativen, W3C-konformen Enterprise-Triplestore mit integriertem OWL-DL-Reasoner, zu 100 Prozent in Rust, ohne Python-Bruecken, ohne vermeidbare I/O-Flaschenhaelse und ohne technische Schulden in den Kernschichten.
+## Kanonische Spec-Quellen
 
-Diese Datei ist die Master-Spezifikation. Die fachlichen Details wurden in eigenstaendige Teilspezifikationen aufgeteilt, damit Architektur, Storage, Reasoning, API und Betrieb sauber getrennt weiterentwickelt werden koennen.
+Es gibt im Repository genau einen eigentlichen Gap-Tracker:
 
-## Zerlegung in Teilschritte
+- [docs/spec/06-fuseki-replacement-gap-matrix.md](docs/spec/06-fuseki-replacement-gap-matrix.md)
+  - verbindliche Statusquelle fuer `done | partial | missing`
+  - verbindliche Replacement-Gates
 
-### Schritt 0: Zielbild und Scope fixieren
+Die anderen Steuerungsdokumente haben bewusst andere Rollen:
 
-- Produktvision, harte Nicht-Ziele und Scope-Grenzen festschreiben
-- Explizit festlegen, dass OWL 2 DL das Endziel bleibt
-- Lieferphasen definieren, ohne das Endziel abzuschwaechen
+- [docs/spec/05-roadmap-and-acceptance.md](docs/spec/05-roadmap-and-acceptance.md)
+  - Release-Stufen, Akzeptanzkriterien, Governance-Regeln
+- [docs/spec/07-replacement-implementation-plan.md](docs/spec/07-replacement-implementation-plan.md)
+  - aktive Umsetzungsreihenfolge, Tracks, Ownership, Reactor-Schritte
 
-Siehe: `docs/spec/00-vision-and-scope.md`
+Die fachlichen Detail-Sources-of-Truth bleiben getrennt:
 
-### Schritt 1: Workspace- und Modularchitektur fixieren
+- [docs/spec/00-vision-and-scope.md](docs/spec/00-vision-and-scope.md)
+  - Vision, Scope, Guardrails
+- [docs/spec/01-architecture-workspace.md](docs/spec/01-architecture-workspace.md)
+  - Crate-Grenzen und Architekturregeln
+- [docs/spec/02-storage-and-transactions.md](docs/spec/02-storage-and-transactions.md)
+  - Storage-, Snapshot- und Transaktionsvertraege
+- [docs/spec/03-reasoner-and-owl-profile.md](docs/spec/03-reasoner-and-owl-profile.md)
+  - Reasoner-Profile, Supportgrenzen, Diagnostik
+- [docs/spec/04-api-and-protocols.md](docs/spec/04-api-and-protocols.md)
+  - HTTP-, SPARQL-, Tell-/Ask-/Services-Vertraege
 
-- Cargo-Workspace mit klaren Crate-Grenzen
-- `nrese-core` als vertragliche Mitte
-- Verbot direkter Querverkopplung zwischen Store, Reasoner und Server
+Ops-Dokumente sind operative Sources of Truth, nicht Spec-Ersatz:
 
-Siehe: `docs/spec/01-architecture-workspace.md`
+- [docs/ops/config-reference.md](docs/ops/config-reference.md)
+- [docs/ops/server-setup.md](docs/ops/server-setup.md)
+- [docs/ops/benchmark-and-conformance.md](docs/ops/benchmark-and-conformance.md)
+- [docs/ops/backup-restore-drills.md](docs/ops/backup-restore-drills.md)
 
-### Schritt 2: Speicherschicht und Snapshot-Semantik definieren
+## Aktueller Kurzstatus
 
-- Oxigraph-basierte oder kompatible Storage-Abstraktion
-- Commit-, Snapshot- und Overlay-Modell
-- ACID- und MVCC-orientierte Lese-/Schreibsemantik
+Aktuell ist NRESE ein fortgeschrittener Pilot mit substanzieller Server-, Store-, Reasoner- und Frontend-Basis, aber noch kein vollstaendig belegter Fuseki-Ersatz.
 
-Siehe: `docs/spec/02-storage-and-transactions.md`
+Verbindlicher Kurzstand je Track:
 
-### Schritt 3: Native Reasoning-Architektur definieren
+- Protokoll- und Fuseki-Paritaet: `partial`
+  - Query, Update, Graph Store, Tell, Service Description, Harness, Workload Packs und gesicherte Parity-Templates existieren
+  - echte Live-Evidenz gegen die Ziel-Fuseki-Umgebung fehlt noch
+- Reasoner: `partial`
+  - `rules-mvp` ist real und deckt RDFS plus einen bounded OWL-Slice ab
+  - breitere EL/RL-Abdeckung, tiefere Justifications und DL-Pfad fehlen
+- Persistenz und Recovery: `partial`
+  - durable Pfad, Backup/Restore und atomare Fehlerpfade existieren
+  - Crash-/Restart-/Drill-Evidenz ist noch offen
+- Security und Hardening: `partial`
+  - `bearer-static`, bounded `bearer-jwt`, bounded `oidc-introspection`, bounded proxy-terminated `mtls`, Limits und Rate-Limits existieren
+  - produktionsnahe Härtungs- und Rollout-Evidenz fehlt noch
+- Frontend und Operator-Flaechen: `partial`
+  - `/console` und `/ops` existieren, inklusive AI-Assistent, i18n und Runtime-/Reasoning-Sicht
+  - reale Workflow-Evidenz und weitere UX-Haertung fehlen
+- Performance- und Compatibility-Evidenz: `partial`
+  - Harness, Ontologiekatalog, Reports und Pack-Index existieren
+  - echte Ziel-Workloads, RAM/CPU/Startup/Reasoning-Kosten und CI-Gates fehlen
 
-- Rust-native Reasoning-Modi
-- TBox-/ABox-Modell
-- schrittweiser Ausbau Richtung OWL 2 DL und Tableaux
+## Naechste priorisierte Luecken
 
-Siehe: `docs/spec/03-reasoner-and-owl-profile.md`
+Die naechsten Replacement-Bloecke sind:
 
-### Schritt 4: W3C-API und Betriebsgrenzen definieren
+1. echte secured Side-by-Side-Paritaet gegen Fuseki
+   - Timeout-, Auth-, Error- und Workload-Packs gegen die echte Zielumgebung
+2. breitere Reasoner-Abdeckung auf dem bestehenden modularen Pfad
+   - ohne Supportgrenzen zu verwischen oder impliziten Code einzubauen
+3. durable Recovery- und Drill-Evidenz
+4. CI-faehige Benchmark-/Conformance-Gates
+5. weitere Frontend-Workflow-Haertung auf Basis der echten Server-/Reasoning-Flaechen
 
-- SPARQL Query Protocol
-- SPARQL Update Protocol
-- Graph Store Protocol
-- Auth, TLS, Reverse Proxy, Error-Modell und Observability
+## Dokumentationsregeln
 
-Siehe: `docs/spec/04-api-and-protocols.md`
+Wenn sich Verhalten aendert, muessen die Spec-Dateien gezielt aktualisiert werden:
 
-### Schritt 5: Roadmap, Akzeptanzkriterien und Betrieb absichern
+- Verhaltensaenderung je Concern:
+  - die owning Spec-Datei unter `docs/spec/00-04`
+- neuer/reiferer Replacement-Status:
+  - [docs/spec/06-fuseki-replacement-gap-matrix.md](docs/spec/06-fuseki-replacement-gap-matrix.md)
+- neue Reihenfolge, neuer Track oder neuer Reactor-Kandidat:
+  - [docs/spec/07-replacement-implementation-plan.md](docs/spec/07-replacement-implementation-plan.md)
+- neue Abnahme-/Release-Aussage:
+  - [docs/spec/05-roadmap-and-acceptance.md](docs/spec/05-roadmap-and-acceptance.md)
+- neue operative Knobs, Pack-Formate oder Betriebsablaeufe:
+  - entsprechendes Dokument unter `docs/ops/`
 
-- messbare Lieferphasen
-- Release-Gates
-- Setup-, Upgrade- und Wartungsdokumentation
+Wenn Dokumente widersprechen, gilt:
 
-Siehe: `docs/spec/05-roadmap-and-acceptance.md`
+1. owning Fach-Spec fuer Verhalten
+2. `06` fuer Status
+3. `07` fuer aktive Umsetzungsplanung
+4. `05` fuer Release- und Acceptance-Gates
 
-Siehe: `docs/ops/server-setup.md`
+## Lesereihenfolge
 
-Siehe: `docs/ops/server-maintenance.md`
+Fuer neue Mitarbeitende ist die kuerzeste sinnvolle Reihenfolge:
 
-## Architektur-Kernaussagen
-
-- `nrese-core` definiert Typen, Traits und Fehlervertraege.
-- `nrese-store` verwaltet persistente RDF-Daten, Snapshots und Commit-Grenzen.
-- `nrese-reasoner` berechnet Inferenzen und Konsistenzzustand ohne HTTP- oder Deployment-Wissen.
-- `nrese-server` exponiert die W3C-Schnittstellen und orchestriert Store plus Reasoner.
-
-## Aktueller Umsetzungsstand
-
-- Spezifikation in getrennte Fachdokumente zerlegt
-- Cargo-Workspace angelegt
-- Top-Level-Crates als kompilierbares Grundgeruest erzeugt
-- Modultrennung fuer `core`, `store`, `reasoner` und `server` vorbereitet
-
-## Naechster Implementierungsfokus
-
-1. `nrese-core` als vertragliche Kernschicht ausbauen.
-2. `nrese-store` mit echter Oxigraph-Adaptergrenze versehen.
-3. `nrese-server` mit Konfiguration, Health-Endpoints und Request-Grundgeruest anreichern.
-4. `nrese-reasoner` mit sauber deklariertem MVP-Profil und Testfixtures aufbauen.
+1. diese Datei
+2. [docs/spec/06-fuseki-replacement-gap-matrix.md](docs/spec/06-fuseki-replacement-gap-matrix.md)
+3. [docs/spec/07-replacement-implementation-plan.md](docs/spec/07-replacement-implementation-plan.md)
+4. die owning Detail-Spec fuer den jeweiligen Concern

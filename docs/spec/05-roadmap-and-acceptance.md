@@ -5,6 +5,7 @@
 Provide a capability-driven delivery sequence from current prototype maturity to a full Rust-native Fuseki replacement with stronger reasoning potential.
 
 The canonical replacement-readiness tracking document is [06-fuseki-replacement-gap-matrix.md](./06-fuseki-replacement-gap-matrix.md).
+The compact document map and ownership rules live in [../../Spezifikation.md](../../Spezifikation.md).
 
 ## Release Stages
 

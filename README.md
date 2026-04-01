@@ -11,7 +11,7 @@ The project is intended to replace a Fuseki-based setup over time with a Rust-na
 - an HTTP server and operator surface
 - a user-facing web console
 
-It is an active implementation project, not a finished replacement yet. The current state and remaining gaps are tracked in [docs/spec/06-fuseki-replacement-gap-matrix.md](docs/spec/06-fuseki-replacement-gap-matrix.md).
+It is an active implementation project, not a finished replacement yet. The compact spec entry point is [Spezifikation.md](Spezifikation.md), and the binding replacement-status tracker is [docs/spec/06-fuseki-replacement-gap-matrix.md](docs/spec/06-fuseki-replacement-gap-matrix.md).
 
 ## What Is In This Repository
 
