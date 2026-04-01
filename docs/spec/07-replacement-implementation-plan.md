@@ -56,6 +56,7 @@ Implementation blocks:
 - shared per-case request-header customization in the compat harness so auth/proxy/live comparison cases stay on the same comparator path
 - service-level request-header profiles in workload-pack manifests so secured compare stacks stay on the same comparator path as unsecured runs
 - bounded secured live-deployment workload-pack templates so auth/policy/timeout parity runs reuse the same manifest model without committed secrets
+- env-placeholder interpolation for pack headers so secured templates can stay versioned without embedding credentials
 - timeout and payload-limit comparison cases
 - manifest-driven production workload parity pack support so seed, compat, and bench runs use one versioned evidence unit instead of ad hoc fixture combinations
 - workload-pack aggregate reporting so one pack run emits a canonical `pack-report.json` evidence index alongside per-suite compat reports and benchmark output
@@ -96,6 +97,8 @@ Primary modules:
 - `crates/nrese-reasoner/src/rules.rs`
 - `crates/nrese-reasoner/src/class_consistency/mod.rs`
 - `crates/nrese-reasoner/src/property_consistency/`
+- `crates/nrese-reasoner/src/property_chain.rs`
+- `crates/nrese-reasoner/src/rules_mvp_cache/`
 - `crates/nrese-reasoner/src/service.rs`
 - `docs/spec/03-reasoner-and-owl-profile.md`
 
@@ -264,6 +267,10 @@ Priority order for the next replacement-focused runs:
 - grouped `rules_mvp_cache/` modules so cache policy, schema-prepared artifacts, and prepared-run assembly are no longer mixed in one file
 - externalized `rules-mvp` runtime behavior into a typed reasoner-owned feature policy with server-owned env parsing, policy-aware cache identity, and operator diagnostics that expose the configured reasoning policy
 - integrated bounded binary `owl:propertyChainAxiom` support on the same explicit feature-policy path, with named-node RDF-list planning cached at schema level and property-closure execution reusing that prepared plan
+- added dedicated timeout-failure compat suites on the shared response-semantics comparator path
+- committed secured live-auth and secured live-auth-timeout pack templates on the same manifest model as generic packs
+- added env-driven pack-header interpolation so secured workload packs stay reusable without committed secrets
+- expanded the staged real-world ontology catalog to include SKOS, SOSA, SSN, and DCAT alongside the earlier official ontology set
 - moved the class-consistency test block into a dedicated `src/tests/consistency_tests.rs` file to match the repo’s topic-adjacent unit-test convention
 - initialized git versioning for the repository and updated `.gitignore` for Rust, frontend, runtime, and local-secret artifacts
 - added a separate `/console` frontend application with modular React/TypeScript structure, separated styles/i18n, and basic build/test coverage

@@ -41,6 +41,12 @@ export type ReasoningFeatureMode = {
   mode: string;
 };
 
+export type ReasoningCapability = {
+  feature: string;
+  maturity: string;
+  enabled_by_default: boolean;
+};
+
 export type ConfiguredReasoningPolicy = {
   preset: string;
   available_presets: string[];
@@ -73,6 +79,7 @@ export type ReasoningDiagnostics = {
   revision: number;
   mode: string;
   profile: string;
+  capabilities: ReasoningCapability[];
   configured_policy?: ConfiguredReasoningPolicy | null;
   last_run?: LastReasoningRun | null;
 };

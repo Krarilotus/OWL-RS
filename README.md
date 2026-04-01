@@ -52,6 +52,8 @@ Implemented today:
 - prepared property-consistency indexing so `rules-mvp` reuses one grouped assertion view per run for constrained predicates instead of rescanning property closure for each consistency gate
 - local comparison harness for NRESE vs Fuseki on seeded datasets
 - manifest-driven workload-pack execution for production-style seed + compat + bench runs
+- versioned secured live-auth and secured live-auth-timeout workload-pack templates on the same manifest model as the generic packs
+- env-placeholder interpolation for workload-pack headers so authenticated parity runs can stay versioned without committed secrets
 - real-world ontology catalog sync for staged parity and hardening runs against FOAF, W3C ORG, W3C Time, PROV-O, SKOS, SOSA, SSN, and DCAT
 - protocol compatibility harness coverage for query parity, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-parity slice, and bounded query/update failure-parity fixtures for covered negative cases
 - bounded `bearer-jwt` auth alongside `bearer-static`
@@ -61,6 +63,7 @@ Implemented today:
 - optional server-side AI query suggestions via Gemini or OpenRouter on one typed config path
 - AI assistant now surfaces configured provider/model metadata and clearer empty-state behavior in the user console
 - the user console now reads reasoning preset/policy/cache state from the real server diagnostics surface instead of maintaining local pseudo-config state
+- the user console now exposes the server-advertised reasoning capability set, so bounded reasoning slices are visible without opening the operator UI
 
 Not finished yet:
 
@@ -71,7 +74,7 @@ Not finished yet:
 - real-world replacement evidence on the full ontology and workload set
 - a project-specific production workload parity pack for replacement-grade evidence
 - broader frontend production evidence and project-specific workflow validation
-- timeout-oriented parity evidence and pack execution against the real secured Fuseki workload
+- timeout-oriented parity evidence against the real secured Fuseki workload; the timeout suite and secured pack templates exist, but real deployment evidence is still open
 
 ## Setup
 

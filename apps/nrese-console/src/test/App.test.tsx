@@ -20,6 +20,7 @@ vi.mock("../lib/api", () => ({
   getCapabilities: async () => ({
     user_console_path: "/console",
     operator_ui_path: "/ops",
+    reasoning_diagnostics_endpoint: "/ops/api/diagnostics/reasoning",
     query_endpoint: "/dataset/query",
     update_endpoint: "/dataset/update",
     tell_endpoint: "/dataset/tell",
@@ -34,6 +35,30 @@ vi.mock("../lib/api", () => ({
     enabled: true,
     provider: "gemini",
     model: "gemini-2.5-flash",
+  }),
+  getReasoningDiagnostics: async () => ({
+    revision: 2,
+    mode: "rules-mvp",
+    profile: "rules-mvp",
+    capabilities: [
+      {
+        feature: "owl-property-chain-axioms",
+        maturity: "bounded",
+        enabled_by_default: false,
+      },
+    ],
+    configured_policy: {
+      preset: "bounded-owl",
+      available_presets: ["rdfs-core", "bounded-owl"],
+      feature_modes: [
+        {
+          feature: "owl-property-chain-axioms",
+          mode: "enabled",
+        },
+      ],
+      unsupported_constructs: "diagnose",
+    },
+    last_run: null,
   }),
   getQuerySuggestions: async () => ({
     provider: "gemini",
@@ -61,4 +86,6 @@ test("renders console sections", async () => {
   expect(screen.getByRole("heading", { name: /AI query assistant/i })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: /Guided examples/i })).toBeInTheDocument();
   expect(screen.getByRole("heading", { name: /Knowledge workbench/i })).toBeInTheDocument();
+  expect(await screen.findByText(/Reasoning capabilities/i)).toBeInTheDocument();
+  expect((await screen.findAllByText(/owl-property-chain-axioms/i)).length).toBeGreaterThan(0);
 });

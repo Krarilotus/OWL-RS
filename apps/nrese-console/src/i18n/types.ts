@@ -33,15 +33,16 @@ export type AppStrings = {
   operatorConsole: string;
   reasoningPresetTitle: string;
   reasoningPresetHint: string;
-  reasoningPresetSelectLabel: string;
   reasoningPresetActiveLabel: string;
   reasoningPresetAvailableLabel: string;
-  reasoningPresetPreviewLabel: string;
   reasoningPresetCustom: string;
   reasoningPolicyUnavailable: string;
   reasoningUnsupportedLabel: string;
   reasoningLastRunLabel: string;
   reasoningFeatureModesLabel: string;
+  reasoningCapabilitiesLabel: string;
+  reasoningCapabilityDefaultLabel: string;
+  reasoningCapabilityMaturityLabel: string;
   reasoningConfigSnippetLabel: string;
   reasoningCacheExecutionLabel: string;
   reasoningCacheSchemaLabel: string;

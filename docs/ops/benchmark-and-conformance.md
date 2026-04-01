@@ -91,6 +91,8 @@ Secured live-deployment template rules:
 - prefer CLI `--fuseki-basic-auth` for Fuseki Basic Auth instead of embedding credentials in packs
 - keep timeout parity in a separate pack so operators must opt in explicitly once both stacks have comparable timeout ceilings
 
+Environment placeholders are resolved by the harness before request execution, so service-level default headers can stay versioned while credentials and deployment-specific tokens remain external.
+
 The secured templates intentionally reuse the existing compat suites:
 
 - `protocol_cases.json`
@@ -162,6 +164,10 @@ The harness now has a staged ontology catalog for small-to-broad real-world sour
 - `org`
 - `time`
 - `prov`
+- `skos`
+- `sosa`
+- `ssn`
+- `dcat`
 
 Sync them locally:
 
@@ -376,7 +382,7 @@ The current workspace has already been exercised locally with:
 - `compat` against `benches/nrese-bench-harness/fixtures/compat/protocol_cases.json`
 - `bench` against `benches/nrese-bench-harness/fixtures/workloads/query_workload.json` and `benches/nrese-bench-harness/fixtures/workloads/update_workload.json`
 
-Latest local evidence paths:
+Example local evidence paths from a successful run:
 
 - `artifacts/protocol-compat-report.json`
 - `artifacts/bench-report.json`
@@ -397,7 +403,7 @@ These are local run artifacts, not replacement-grade proof by themselves. Full r
 ## Next Extension Steps
 
 - add write-heavy and mixed read/write workload phases
-- add compatibility suites for timeout, limit, and error-semantic equivalence
+- extend the current compatibility suites from the existing timeout and bounded error-semantic baseline to broader timeout, limit, and deployment-specific failure equivalence
 - add content-negotiation and media-type strictness comparators
 - add orchestrated external process startup for controlled Fuseki benchmark runs
 - extend the current timeout fixture family from client-observed timeout parity to broader timeout and limit coverage with deployment-specific budgets and proxy-aware cases

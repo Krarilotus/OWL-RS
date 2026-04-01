@@ -1,38 +1,20 @@
 import type { AppStrings } from "../i18n/types";
 import type { ReasoningDiagnostics } from "../lib/types";
+import {
+  buildReasoningConfigSnippet,
+  sortReasoningCapabilities,
+} from "../app/reasoningPresentation";
 
 type Props = {
   strings: AppStrings;
   reasoning?: ReasoningDiagnostics;
 };
 
-function buildConfigSnippet(reasoning?: ReasoningDiagnostics): string {
-  const policy = reasoning?.configured_policy;
-  if (!policy) {
-    return "[reasoner]\nmode = \"disabled\"";
-  }
-
-  const featureLines = policy.feature_modes
-    .map(({ feature, mode }) => `${feature} = "${mode}"`)
-    .join("\n");
-
-  return [
-    "[reasoner]",
-    `mode = "${reasoning?.mode ?? "rules-mvp"}"`,
-    "",
-    "[reasoner.rules_mvp]",
-    `preset = "${policy.preset}"`,
-    featureLines,
-    `unsupported_constructs = "${policy.unsupported_constructs}"`,
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
 export function ReasoningRuntimeInspector({ strings, reasoning }: Props) {
   const policy = reasoning?.configured_policy;
   const lastRun = reasoning?.last_run;
-  const configSnippet = buildConfigSnippet(reasoning);
+  const configSnippet = buildReasoningConfigSnippet(reasoning);
+  const capabilities = sortReasoningCapabilities(reasoning?.capabilities);
 
   return (
     <div className="preset-panel">
@@ -115,6 +97,28 @@ export function ReasoningRuntimeInspector({ strings, reasoning }: Props) {
             </div>
           ))}
           {(policy?.feature_modes ?? []).length === 0 ? (
+            <div className="fact-card">
+              <div className="fact-value mono">{strings.reasoningPolicyUnavailable}</div>
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="field">
+        <label>{strings.reasoningCapabilitiesLabel}</label>
+        <div className="fact-grid">
+          {capabilities.map((capability) => (
+            <div className="fact-card" key={capability.feature}>
+              <div className="fact-label">{capability.feature}</div>
+              <div className="fact-value mono">
+                {`${strings.reasoningCapabilityMaturityLabel}: ${capability.maturity}`}
+              </div>
+              <div className="fact-value mono">
+                {`${strings.reasoningCapabilityDefaultLabel}: ${capability.enabled_by_default ? strings.yesLabel : strings.noLabel}`}
+              </div>
+            </div>
+          ))}
+          {capabilities.length === 0 ? (
             <div className="fact-card">
               <div className="fact-value mono">{strings.reasoningPolicyUnavailable}</div>
             </div>

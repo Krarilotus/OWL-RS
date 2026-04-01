@@ -27,6 +27,10 @@ Current coverage:
 - Service description, health, readiness, version, metrics, and operator APIs exist
 - Protocol compatibility harness now covers query parity, update-effect parity, graph-store read/head/delete/put/post-effect parity, bounded graph-store failure semantics, and bounded query/update failure semantics (status/content-type/body-class) against Fuseki-style dataset endpoints
 - The generic protocol fixture set now also covers a broader SPARQL Update parity slice for `DELETE DATA`, `DELETE/INSERT WHERE`, `CLEAR`, `COPY`, `MOVE`, and `ADD`
+- a staged real-world ontology catalog now exists to harden parity runs incrementally from small to broad official ontology sources
+- versioned secured live-auth and secured live-auth-plus-timeout workload-pack templates now exist on the same manifest path as the generic packs
+- workload-pack headers now support env-placeholder interpolation so auth/proxy parity packs can stay versioned without committed secrets
+- workload-pack execution now emits a canonical `pack-report.json` evidence index that ties compat suites and benchmark artifacts together
 
 Still required:
 - formal replacement-grade validation against the live Fuseki deployment
@@ -36,8 +40,6 @@ Still required:
 - broader query/update failure coverage beyond the current invalid-syntax fixture slice
 - explicit live replacement evidence for `TELL` as a project-level ingestion contract distinct from Graph Store and raw SPARQL Update usage
 - a project-specific production workload parity pack, with versioned seed/workload/case inputs and reproducible report artifacts as defined in `docs/ops/benchmark-and-conformance.md`
-- a staged real-world ontology catalog now exists to harden parity runs incrementally from small to broad official ontology sources
-- workload-pack execution now emits a canonical `pack-report.json` evidence index that ties compat suites and benchmark artifacts together
 
 Replacement gate:
 - NRESE reproduces the expected results and stable error semantics for the project's real query/update set against the same dataset used in Fuseki
@@ -104,6 +106,7 @@ Current coverage:
 - `/console` now includes guided workbench examples so non-specialist users can load explicit query/update/tell/graph templates instead of starting from empty editors
 - `/console` now supports explicit persisted locale selection for the currently shipped `en`/`de` language set instead of relying only on browser locale detection
 - `/console` now reads reasoning preset/policy/cache state from the server diagnostics surface instead of maintaining local pseudo-config state
+- `/console` now also exposes the server-advertised reasoning capability set, so configured bounded reasoning slices are inspectable from the user-facing runtime view
 - operator APIs expose capabilities, dataset summary, and extended health
 - query/update/graph workflows are browser-accessible
 - optional server-side AI query suggestions exist behind typed provider config and a dedicated API surface, with provider/model visibility and clearer frontend empty-state handling
@@ -157,6 +160,8 @@ Current coverage:
 - compatibility fixtures now support explicit per-case request-header overrides through the shared harness request path, which prepares live auth/proxy parity without endpoint-specific compare logic
 - production workload packs now support service-level default request headers for NRESE and Fuseki through one manifest/config path, so auth/proxy parity can be exercised without forking harness logic
 - production workload packs now support multiple compatibility suites in one manifest, so protocol, ontology, and policy/e2e parity can be staged without ad hoc command chaining
+- versioned secured live-auth and secured live-auth-timeout pack templates now exist on top of that manifest path
+- workload-pack headers now support env-placeholder interpolation so authenticated parity runs can be scripted without committed credentials
 
 Still required:
 - comparisons against the real Fuseki deployment and real ontology/workload
@@ -175,6 +180,7 @@ Current coverage:
 - local protocol tests exist for selected endpoints and error contracts
 - compatibility harness exists with fixture-based equivalence cases
 - compatibility harness now includes bounded invalid-syntax parity fixtures for query and update failure paths
+- compatibility harness now includes a dedicated timeout-failure suite on the same shared response-semantics comparator path, kept as an opt-in compat suite for stacks with aligned timeout ceilings
 - benchmark/conformance documentation and workload fixtures exist
 - reproducible seed workflow exists so side-by-side comparisons can start from the same graph state
 - local side-by-side comparison against a live Fuseki dataset is now automated through the harness once parity seeding is complete, including auth-protected compare stacks
