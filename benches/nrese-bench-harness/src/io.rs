@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::interpolation::expand_headers_env_placeholders;
 use crate::model::{OntologyCatalog, WorkloadPackManifest};
 
 pub fn read_json<T: DeserializeOwned>(path: PathBuf) -> Result<T> {
@@ -54,6 +55,8 @@ pub fn read_workload_pack(path: &Path) -> Result<WorkloadPackManifest> {
     for path in &mut manifest.compat_suites {
         *path = resolve_pack_path(&base_dir, path);
     }
+    expand_headers_env_placeholders(&mut manifest.nrese.headers)?;
+    expand_headers_env_placeholders(&mut manifest.fuseki.headers)?;
 
     Ok(manifest)
 }
@@ -143,10 +146,32 @@ x-forwarded-proto = "https"
 
     #[test]
     fn secured_timeout_pack_template_parses_with_multiple_compat_suites() {
+        let previous_nrese = std::env::var("NRESE_COMPARE_READ_TOKEN").ok();
+        let previous_fuseki = std::env::var("FUSEKI_COMPARE_READ_TOKEN").ok();
+        unsafe {
+            std::env::set_var("NRESE_COMPARE_READ_TOKEN", "nrese-token");
+            std::env::set_var("FUSEKI_COMPARE_READ_TOKEN", "fuseki-token");
+        }
         let manifest = read_workload_pack(Path::new(
             "fixtures/packs/secured-live-auth-timeout-template/pack.toml",
         ))
         .expect("pack");
+        match previous_nrese {
+            Some(value) => unsafe {
+                std::env::set_var("NRESE_COMPARE_READ_TOKEN", value);
+            },
+            None => unsafe {
+                std::env::remove_var("NRESE_COMPARE_READ_TOKEN");
+            },
+        }
+        match previous_fuseki {
+            Some(value) => unsafe {
+                std::env::set_var("FUSEKI_COMPARE_READ_TOKEN", value);
+            },
+            None => unsafe {
+                std::env::remove_var("FUSEKI_COMPARE_READ_TOKEN");
+            },
+        }
 
         assert_eq!(manifest.name, "secured-live-auth-timeout-template");
         assert_eq!(manifest.compat_suites.len(), 3);
@@ -170,7 +195,7 @@ x-forwarded-proto = "https"
                 .headers
                 .get("authorization")
                 .map(String::as_str),
-            Some("Bearer REPLACE_WITH_NRESE_READ_TOKEN")
+            Some("Bearer nrese-token")
         );
     }
 

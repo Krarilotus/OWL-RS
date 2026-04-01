@@ -2,8 +2,9 @@ use anyhow::{Result, anyhow, bail};
 use reqwest::Client;
 
 use crate::compat_common::{
-    RequestExecutionOptions, build_response_semantics_report, execute_graph_delete_raw,
-    execute_graph_head_raw, execute_graph_read_raw, execute_graph_write_raw, require_success_http,
+    GraphWriteRequest, RequestExecutionOptions, build_response_semantics_report,
+    execute_graph_delete_raw, execute_graph_head_raw, execute_graph_read_raw,
+    execute_graph_write_raw, require_success_http,
 };
 use crate::layout::ServiceTarget;
 use crate::model::{
@@ -283,23 +284,27 @@ async fn build_graph_write_effect_report(
             let left_write = execute_graph_write_raw(
                 client,
                 left,
-                graph_target,
-                content_type,
-                &payload,
-                replace,
-                &case.request_headers,
-                options,
+                GraphWriteRequest {
+                    graph_target,
+                    content_type,
+                    payload: &payload,
+                    replace,
+                    extra_headers: &case.request_headers,
+                    options,
+                },
             )
             .await?;
             let right_write = execute_graph_write_raw(
                 client,
                 right,
-                graph_target,
-                content_type,
-                &payload,
-                replace,
-                &case.request_headers,
-                options,
+                GraphWriteRequest {
+                    graph_target,
+                    content_type,
+                    payload: &payload,
+                    replace,
+                    extra_headers: &case.request_headers,
+                    options,
+                },
             )
             .await?;
             let left_http = require_success_http(left, "graph write", &left_write)?;
@@ -339,23 +344,27 @@ async fn build_graph_write_effect_report(
             let left_write = execute_graph_write_raw(
                 client,
                 left,
-                graph_target,
-                content_type,
-                &payload,
-                replace,
-                &case.request_headers,
-                options,
+                GraphWriteRequest {
+                    graph_target,
+                    content_type,
+                    payload: &payload,
+                    replace,
+                    extra_headers: &case.request_headers,
+                    options,
+                },
             )
             .await?;
             let right_write = execute_graph_write_raw(
                 client,
                 right,
-                graph_target,
-                content_type,
-                &payload,
-                replace,
-                &case.request_headers,
-                options,
+                GraphWriteRequest {
+                    graph_target,
+                    content_type,
+                    payload: &payload,
+                    replace,
+                    extra_headers: &case.request_headers,
+                    options,
+                },
             )
             .await?;
 
@@ -385,12 +394,14 @@ async fn write_and_ensure_success(
     let outcome = execute_graph_write_raw(
         client,
         target,
-        graph_target,
-        content_type,
-        payload,
-        replace,
-        extra_headers,
-        RequestExecutionOptions::default(),
+        GraphWriteRequest {
+            graph_target,
+            content_type,
+            payload,
+            replace,
+            extra_headers,
+            options: RequestExecutionOptions::default(),
+        },
     )
     .await?;
     require_success_http(target, "graph write", &outcome).map(|_| ())

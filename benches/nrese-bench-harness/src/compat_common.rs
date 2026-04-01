@@ -36,6 +36,16 @@ pub enum RequestOutcome {
     Timeout { timeout_ms: Option<u64> },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct GraphWriteRequest<'a> {
+    pub graph_target: &'a CompatGraphTarget,
+    pub content_type: &'a str,
+    pub payload: &'a [u8],
+    pub replace: bool,
+    pub extra_headers: &'a CompatHeaders,
+    pub options: RequestExecutionOptions,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseSemantics {
     pub status: u16,
@@ -130,27 +140,23 @@ pub async fn execute_graph_head_raw(
 pub async fn execute_graph_write_raw(
     client: &Client,
     target: &ServiceTarget,
-    graph_target: &CompatGraphTarget,
-    content_type: &str,
-    payload: &[u8],
-    replace: bool,
-    extra_headers: &CompatHeaders,
-    options: RequestExecutionOptions,
+    request: GraphWriteRequest<'_>,
 ) -> Result<RequestOutcome> {
-    let request = if replace {
+    let request_builder = if request.replace {
         client.put(target.data_endpoint_base())
     } else {
         client.post(target.data_endpoint_base())
     };
-    let request = graph_request(request, graph_target).body(payload.to_vec());
-    let request = apply_case_headers(
-        apply_target_auth(request, target),
+    let request_builder =
+        graph_request(request_builder, request.graph_target).body(request.payload.to_vec());
+    let request_builder = apply_case_headers(
+        apply_target_auth(request_builder, target),
         target,
-        [("content-type", content_type)],
-        extra_headers,
+        [("content-type", request.content_type)],
+        request.extra_headers,
     )?;
 
-    send_request(request, target, "graph write", options).await
+    send_request(request_builder, target, "graph write", request.options).await
 }
 
 pub async fn execute_graph_delete_raw(

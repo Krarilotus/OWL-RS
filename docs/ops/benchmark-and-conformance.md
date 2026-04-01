@@ -87,7 +87,7 @@ x-forwarded-proto = "https"
 Secured live-deployment template rules:
 
 - keep real secrets out of committed pack manifests
-- use placeholder bearer values only in versioned templates
+- use environment placeholders in versioned templates and inject the real values locally or in CI
 - prefer CLI `--fuseki-basic-auth` for Fuseki Basic Auth instead of embedding credentials in packs
 - keep timeout parity in a separate pack so operators must opt in explicitly once both stacks have comparable timeout ceilings
 
@@ -362,7 +362,7 @@ cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
 
 Before using either template:
 
-- replace placeholder bearer header values locally or in CI-injected workspace copies
+- export `NRESE_COMPARE_READ_TOKEN` and `FUSEKI_COMPARE_READ_TOKEN` in the shell or CI environment
 - remove `[fuseki.headers]` if Fuseki only uses CLI-supplied Basic Auth
 - keep `policy_failure_cases.json` in the pack so invalid-auth and oversize-payload parity stays on the same shared comparator path
 - only use the timeout template after aligning timeout ceilings and proxy behavior on both deployments

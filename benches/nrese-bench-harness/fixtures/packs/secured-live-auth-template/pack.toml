@@ -14,11 +14,14 @@ compat_suites = [
 # If Fuseki is protected with HTTP Basic Auth, pass credentials on the CLI:
 #   --fuseki-basic-auth <user:pass>
 # Keep Basic Auth out of committed pack manifests.
+# Export the bearer values locally or in CI before running:
+#   $env:NRESE_COMPARE_READ_TOKEN = "..."
+#   $env:FUSEKI_COMPARE_READ_TOKEN = "..."
 
 [nrese.headers]
-authorization = "Bearer REPLACE_WITH_NRESE_READ_TOKEN"
+authorization = "Bearer ${NRESE_COMPARE_READ_TOKEN}"
 
 [fuseki.headers]
 # Optional when Fuseki is fronted by the same style of bearer-auth gateway.
 # Remove this header section if Fuseki only uses CLI-supplied Basic Auth.
-authorization = "Bearer REPLACE_WITH_FUSEKI_READ_TOKEN"
+authorization = "Bearer ${FUSEKI_COMPARE_READ_TOKEN}"

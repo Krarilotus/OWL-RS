@@ -3,6 +3,7 @@ mod compat_common;
 mod compat_graph_store;
 mod compat_query;
 mod compat_update;
+mod interpolation;
 mod io;
 mod layout;
 mod model;

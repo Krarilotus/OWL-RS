@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 
 use crate::compat_common::{
-    RequestExecutionOptions, execute_graph_write_raw, execute_query_raw, execute_update_raw,
-    require_success_http,
+    GraphWriteRequest, RequestExecutionOptions, execute_graph_write_raw, execute_query_raw,
+    execute_update_raw, require_success_http,
 };
 use crate::compat_graph_store;
 use crate::compat_query;
@@ -521,12 +521,14 @@ async fn write_dataset_raw(
     let outcome = execute_graph_write_raw(
         client,
         target,
-        &CompatGraphTarget::DefaultGraph,
-        content_type,
-        payload,
-        replace,
-        &CompatHeaders::new(),
-        RequestExecutionOptions::default(),
+        GraphWriteRequest {
+            graph_target: &CompatGraphTarget::DefaultGraph,
+            content_type,
+            payload,
+            replace,
+            extra_headers: &CompatHeaders::new(),
+            options: RequestExecutionOptions::default(),
+        },
     )
     .await?;
     require_success_http(target, "dataset write", &outcome).map(|_| ())
