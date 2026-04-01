@@ -21,9 +21,10 @@ use crate::model::{
     BenchComparison, BenchConfig, BenchReport, CatalogSyncConfig, CompatCase, CompatCaseReport,
     CompatConfig, CompatGraphTarget, CompatHeaders, CompatOperation, CompatReport, OntologyFixture,
     OntologyReasoningFeature, OntologySemanticDialect, OntologySerialization,
-    OntologyServiceSurface, PackArtifactReport, PackCompatSuiteReport, PackConfig, PackReport,
-    QueryWorkloadCase, SeedConfig, ServiceBenchReport, ServiceConnectionConfig,
-    ServiceRequestProfile, UpdateWorkloadCase,
+    OntologyServiceSurface, PackArtifactReport, PackCompatSuiteReport, PackConfig,
+    PackMatrixConfig, PackMatrixEntryReport, PackMatrixReport, PackReport, QueryWorkloadCase,
+    SeedConfig, ServiceBenchReport, ServiceConnectionConfig, ServiceRequestProfile,
+    UpdateWorkloadCase,
 };
 use crate::normalize::summarize;
 
@@ -319,6 +320,80 @@ pub async fn run_pack(config: PackConfig) -> Result<()> {
     Ok(())
 }
 
+pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
+    fs::create_dir_all(&config.report_dir)
+        .with_context(|| format!("failed to create report dir {}", config.report_dir.display()))?;
+    let catalog = read_ontology_catalog(&config.catalog_path)?;
+    let mut entries = Vec::new();
+    let mut failed = false;
+
+    println!("== Ontology pack matrix run ==");
+    println!("catalog: {}", config.catalog_path.display());
+    println!("packs dir: {}", config.packs_dir.display());
+    if let Some(tier) = &config.tier {
+        println!("tier filter: {tier}");
+    }
+
+    for ontology in catalog
+        .ontologies
+        .iter()
+        .filter(|fixture| config.tier.as_deref().is_none_or(|tier| fixture.tier == tier))
+    {
+        let manifest_path = baseline_pack_manifest_path(&config.packs_dir, ontology);
+        let pack_report_path = config.report_dir.join(&ontology.name).join("pack-report.json");
+        let pack_report = PackArtifactReport {
+            path: pack_report_path.display().to_string(),
+        };
+
+        if !manifest_path.is_file() {
+            failed = true;
+            entries.push(pack_matrix_entry_missing_manifest(ontology, &manifest_path));
+            continue;
+        }
+
+        let report_dir = config.report_dir.join(&ontology.name);
+        let result = run_pack(PackConfig {
+            nrese_base_url: config.nrese_base_url.clone(),
+            fuseki_base_url: config.fuseki_base_url.clone(),
+            fuseki_basic_auth: config.fuseki_basic_auth.clone(),
+            workload_pack_path: manifest_path.clone(),
+            iterations: config.iterations,
+            report_dir: Some(report_dir),
+        })
+        .await;
+
+        match result {
+            Ok(()) => entries.push(pack_matrix_entry_success(ontology, &manifest_path, pack_report)),
+            Err(error) => {
+                failed = true;
+                entries.push(pack_matrix_entry_failure(
+                    ontology,
+                    &manifest_path,
+                    error.to_string(),
+                    Some(pack_report),
+                ));
+            }
+        }
+    }
+
+    write_json_report(
+        config.report_dir.join("pack-matrix-report.json"),
+        &PackMatrixReport {
+            mode: "pack-matrix",
+            catalog_path: config.catalog_path.display().to_string(),
+            packs_dir: config.packs_dir.display().to_string(),
+            tier: config.tier.clone(),
+            pack_runs: entries,
+        },
+    )?;
+
+    if failed {
+        bail!("one or more ontology pack runs failed");
+    }
+
+    Ok(())
+}
+
 pub async fn run_catalog_sync(config: CatalogSyncConfig) -> Result<()> {
     let catalog = read_ontology_catalog(&config.catalog_path)?;
     fs::create_dir_all(&config.output_dir)
@@ -346,6 +421,61 @@ fn ensure_report_dir(report_dir: Option<&Path>) -> Result<()> {
             .with_context(|| format!("failed to create report dir {}", report_dir.display()))?;
     }
     Ok(())
+}
+
+fn baseline_pack_manifest_path(packs_dir: &Path, ontology: &OntologyFixture) -> std::path::PathBuf {
+    packs_dir.join(format!("{}-baseline", ontology.name)).join("pack.toml")
+}
+
+fn pack_matrix_entry_success(
+    ontology: &OntologyFixture,
+    manifest_path: &Path,
+    pack_report: PackArtifactReport,
+) -> PackMatrixEntryReport {
+    PackMatrixEntryReport {
+        ontology_name: ontology.name.clone(),
+        ontology_title: ontology.title.clone(),
+        ontology_tier: ontology.tier.clone(),
+        manifest_path: manifest_path.display().to_string(),
+        semantic_dialects: ontology.semantic_dialects.clone(),
+        reasoning_features: ontology.reasoning_features.clone(),
+        service_coverage: ontology.service_coverage.clone(),
+        status: "completed",
+        error: None,
+        pack_report: Some(pack_report),
+    }
+}
+
+fn pack_matrix_entry_failure(
+    ontology: &OntologyFixture,
+    manifest_path: &Path,
+    error: String,
+    pack_report: Option<PackArtifactReport>,
+) -> PackMatrixEntryReport {
+    PackMatrixEntryReport {
+        ontology_name: ontology.name.clone(),
+        ontology_title: ontology.title.clone(),
+        ontology_tier: ontology.tier.clone(),
+        manifest_path: manifest_path.display().to_string(),
+        semantic_dialects: ontology.semantic_dialects.clone(),
+        reasoning_features: ontology.reasoning_features.clone(),
+        service_coverage: ontology.service_coverage.clone(),
+        status: "failed",
+        error: Some(error),
+        pack_report,
+    }
+}
+
+fn pack_matrix_entry_missing_manifest(
+    ontology: &OntologyFixture,
+    manifest_path: &Path,
+) -> PackMatrixEntryReport {
+    pack_matrix_entry_failure(
+        ontology,
+        manifest_path,
+        format!("missing baseline pack manifest {}", manifest_path.display()),
+        None,
+    )
 }
 
 #[derive(Debug)]
@@ -736,10 +866,15 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use crate::model::{CompatCase, CompatHeaders, CompatOperation, ServiceConnectionConfig, ServiceRequestProfile};
+    use crate::model::{
+        CompatCase, CompatHeaders, CompatOperation, OntologyFixture, OntologyReasoningFeature,
+        OntologySemanticDialect, OntologySerialization, OntologyServiceSurface,
+        ServiceConnectionConfig, ServiceRequestProfile,
+    };
 
     use super::{
-        CompatRunArtifact, compat_report_filename, pack_compat_suite_report,
+        CompatRunArtifact, baseline_pack_manifest_path, compat_report_filename,
+        pack_compat_suite_report, pack_matrix_entry_missing_manifest,
         resolve_service_connection, resolve_service_profile,
     };
 
@@ -860,5 +995,50 @@ mod tests {
             merged.headers.get("x-profile").map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn baseline_pack_manifest_path_uses_catalog_fixture_name() {
+        let ontology = OntologyFixture {
+            name: "skos".to_owned(),
+            title: "SKOS".to_owned(),
+            url: "https://www.w3.org/2009/08/skos-reference/skos.rdf".to_owned(),
+            media_type: "application/rdf+xml".to_owned(),
+            serialization: OntologySerialization::RdfXml,
+            filename: "skos.rdf".to_owned(),
+            tier: "medium".to_owned(),
+            focus_terms: vec!["http://www.w3.org/2004/02/skos/core#Concept".to_owned()],
+            semantic_dialects: vec![OntologySemanticDialect::Skos],
+            reasoning_features: vec![OntologyReasoningFeature::TransitiveProperty],
+            service_coverage: vec![OntologyServiceSurface::Benchmark],
+        };
+
+        let manifest = baseline_pack_manifest_path(Path::new("fixtures/packs"), &ontology);
+
+        assert!(manifest.ends_with("fixtures/packs\\skos-baseline\\pack.toml") || manifest.ends_with("fixtures/packs/skos-baseline/pack.toml"));
+    }
+
+    #[test]
+    fn missing_manifest_entry_reports_failed_status() {
+        let ontology = OntologyFixture {
+            name: "prov".to_owned(),
+            title: "PROV-O".to_owned(),
+            url: "https://www.w3.org/ns/prov.ttl".to_owned(),
+            media_type: "text/turtle".to_owned(),
+            serialization: OntologySerialization::Turtle,
+            filename: "prov.ttl".to_owned(),
+            tier: "broad".to_owned(),
+            focus_terms: vec!["http://www.w3.org/ns/prov#Entity".to_owned()],
+            semantic_dialects: vec![OntologySemanticDialect::ProvO],
+            reasoning_features: vec![OntologyReasoningFeature::InverseProperty],
+            service_coverage: vec![OntologyServiceSurface::Benchmark],
+        };
+
+        let entry =
+            pack_matrix_entry_missing_manifest(&ontology, Path::new("fixtures/packs/prov-baseline/pack.toml"));
+
+        assert_eq!(entry.status, "failed");
+        assert!(entry.error.is_some());
+        assert!(entry.pack_report.is_none());
     }
 }

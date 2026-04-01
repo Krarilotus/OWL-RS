@@ -33,6 +33,7 @@ Current coverage:
 - official ontology fixtures now back explicit cross-service checks for store preload, `tell`, graph-store roundtrip, and bounded reasoner/runtime validation, including RDF/XML ingest/preload coverage
 - official ontology-backed service tests now also cover SKOS RDF/XML graph-store roundtrip on the real HTTP surface
 - ontology-backed compat/parity suites are now grouped on a dedicated harness path and include additional vocabulary-specific cases for ORG, Time, SKOS, PROV-O, and DCAT on top of the shared ontology baseline suite
+- the harness now supports catalog-driven `pack-matrix` execution over baseline ontology packs, producing an aggregate `pack-matrix-report.json` evidence index for a selected catalog tier
 - versioned secured live-auth and secured live-auth-plus-timeout workload-pack templates now exist on the same manifest path as the generic packs
 - workload-pack headers now support env-placeholder interpolation so auth/proxy parity packs can stay versioned without committed secrets
 - workload-pack execution now emits a canonical `pack-report.json` evidence index that ties compat suites and benchmark artifacts together

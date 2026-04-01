@@ -33,6 +33,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Pack(config) => runner::run_pack(config).await,
+        Command::PackMatrix(config) => runner::run_pack_matrix(config).await,
         Command::Seed(config) => runner::run_seed(config).await,
     }
 }

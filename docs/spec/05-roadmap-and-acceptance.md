@@ -77,6 +77,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - official ontology fixtures now provide bounded release-evidence for `rules-mvp` reasoning/runtime validation on FOAF, W3C Time, W3C ORG, SKOS, PROV-O, and DCAT
 - bounded official-ontology-backed service slices should ship on shared test-support helpers rather than duplicating fixture-path and setup logic per test file
 - ontology-backed compat/parity suites should grow incrementally through the catalog/pack path, with shared suite structure instead of flat one-off fixtures per ontology
+- catalog-backed parity evidence can now be executed as a tiered `pack-matrix` run, so broader ontology slices are gathered through one aggregate evidence path instead of manual one-pack-at-a-time invocation
 
 ### R5: Advanced Reasoning and Conformance
 

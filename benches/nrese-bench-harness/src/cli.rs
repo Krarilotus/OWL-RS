@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::model::{
     BasicAuthConfig, BenchConfig, CatalogSyncConfig, Cli, Command, CompatConfig, CompatHeaders,
-    PackConfig, SeedConfig, ServiceConnectionConfig,
+    PackConfig, PackMatrixConfig, SeedConfig, ServiceConnectionConfig,
 };
 
 const DEFAULT_QUERY_WORKLOAD_PATH: &str =
@@ -114,6 +114,35 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .transpose()?
                     .unwrap_or(20),
                 report_dir: options.get("--report-dir").map(PathBuf::from),
+            }),
+        }),
+        "pack-matrix" => Ok(Cli {
+            command: Command::PackMatrix(PackMatrixConfig {
+                nrese_base_url: required_opt(&options, "--nrese-base-url")?,
+                fuseki_base_url: options.get("--fuseki-base-url").cloned(),
+                fuseki_basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
+                catalog_path: options
+                    .get("--catalog")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(
+                            "benches/nrese-bench-harness/fixtures/catalog/ontologies.toml",
+                        )
+                    }),
+                packs_dir: options
+                    .get("--packs-dir")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("benches/nrese-bench-harness/fixtures/packs")),
+                tier: options.get("--tier").cloned(),
+                iterations: options
+                    .get("--iterations")
+                    .map(|value| value.parse::<usize>())
+                    .transpose()?
+                    .unwrap_or(20),
+                report_dir: options
+                    .get("--report-dir")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("artifacts/pack-matrix")),
             }),
         }),
         "seed" => Ok(Cli {
@@ -227,6 +256,7 @@ USAGE:
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- catalog-sync [--catalog <PATH>] [--output-dir <DIR>] [--tier <small|medium|broad>] [--refresh <true|false>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- compat --nrese-base-url <URL> --fuseki-base-url <URL> [--fuseki-basic-auth <user:pass>] [--cases <PATH>] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] --workload-pack <PATH> [--iterations <N>] [--report-dir <DIR>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--catalog <PATH>] [--packs-dir <DIR>] [--tier <small|medium|broad>] [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--dataset <PATH>] [--content-type <TYPE>] [--replace <true|false>]
 "
     );
@@ -258,6 +288,33 @@ mod tests {
                 assert_eq!(config.nrese.base_url, "http://127.0.0.1:8080");
             }
             _ => panic!("expected bench command"),
+        }
+    }
+
+    #[test]
+    fn parses_pack_matrix_defaults() {
+        let cli = parse_cli(vec![
+            "bench".to_owned(),
+            "pack-matrix".to_owned(),
+            "--nrese-base-url".to_owned(),
+            "http://127.0.0.1:8080".to_owned(),
+        ])
+        .expect("cli");
+
+        match cli.command {
+            Command::PackMatrix(config) => {
+                assert_eq!(config.nrese_base_url, "http://127.0.0.1:8080");
+                assert_eq!(
+                    config.catalog_path.to_string_lossy(),
+                    "benches/nrese-bench-harness/fixtures/catalog/ontologies.toml"
+                );
+                assert_eq!(
+                    config.packs_dir.to_string_lossy(),
+                    "benches/nrese-bench-harness/fixtures/packs"
+                );
+                assert_eq!(config.iterations, 20);
+            }
+            _ => panic!("expected pack-matrix command"),
         }
     }
 

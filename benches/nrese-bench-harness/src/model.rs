@@ -14,6 +14,7 @@ pub enum Command {
     CatalogSync(CatalogSyncConfig),
     Compat(CompatConfig),
     Pack(PackConfig),
+    PackMatrix(PackMatrixConfig),
     Seed(SeedConfig),
 }
 
@@ -62,6 +63,18 @@ pub struct PackConfig {
     pub workload_pack_path: PathBuf,
     pub iterations: usize,
     pub report_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackMatrixConfig {
+    pub nrese_base_url: String,
+    pub fuseki_base_url: Option<String>,
+    pub fuseki_basic_auth: Option<BasicAuthConfig>,
+    pub catalog_path: PathBuf,
+    pub packs_dir: PathBuf,
+    pub tier: Option<String>,
+    pub iterations: usize,
+    pub report_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -384,6 +397,29 @@ pub struct PackReport {
     pub iterations: usize,
     pub compat_suites: Vec<PackCompatSuiteReport>,
     pub bench_report: Option<PackArtifactReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PackMatrixReport {
+    pub mode: &'static str,
+    pub catalog_path: String,
+    pub packs_dir: String,
+    pub tier: Option<String>,
+    pub pack_runs: Vec<PackMatrixEntryReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PackMatrixEntryReport {
+    pub ontology_name: String,
+    pub ontology_title: String,
+    pub ontology_tier: String,
+    pub manifest_path: String,
+    pub semantic_dialects: Vec<OntologySemanticDialect>,
+    pub reasoning_features: Vec<OntologyReasoningFeature>,
+    pub service_coverage: Vec<OntologyServiceSurface>,
+    pub status: &'static str,
+    pub error: Option<String>,
+    pub pack_report: Option<PackArtifactReport>,
 }
 
 #[derive(Debug, Serialize)]
