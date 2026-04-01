@@ -1,16 +1,11 @@
-use std::path::PathBuf;
+mod support;
 
 use nrese_store::{
     GraphReadRequest, GraphResultFormat, GraphTarget, GraphWriteRequest, QueryResultKind,
     StoreConfig, StoreMode, StoreService,
 };
+use support::{catalog_fixture_path, in_memory_store_config};
 use tempfile::tempdir;
-
-fn catalog_fixture_path(filename: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../benches/nrese-bench-harness/fixtures/catalog-cache")
-        .join(filename)
-}
 
 #[test]
 fn store_preload_accepts_official_foaf_rdf_xml_fixture() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,13 +59,9 @@ fn store_preload_accepts_official_prov_turtle_fixture_with_relative_base_iri()
 fn store_graph_roundtrip_accepts_official_vcard_turtle_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
-    let service = StoreService::new(StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: false,
-        ontology_path: None,
-        ontology_fallbacks: Vec::new(),
-    })?;
+    let mut config = in_memory_store_config();
+    config.data_dir = temp.path().join("unused");
+    let service = StoreService::new(config)?;
 
     let payload = std::fs::read(catalog_fixture_path("vcard.ttl"))?;
     let target = GraphTarget::NamedGraph("http://example.com/catalog/vcard".to_owned());

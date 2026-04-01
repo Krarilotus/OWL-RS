@@ -140,3 +140,48 @@ async fn startup_with_official_prov_preload_supports_relative_base_iris()
     assert!(String::from_utf8(body.to_vec())?.contains("true"));
     Ok(())
 }
+
+#[tokio::test]
+async fn graph_store_roundtrip_accepts_official_skos_rdf_xml_fixture()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_settings(
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+    )?;
+    let skos_bytes = fs::read(catalog_fixture_path("skos.rdf"))?;
+
+    let put_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/data?graph=http%3A%2F%2Fexample.com%2Fontologies%2Fskos")
+                .method(Method::PUT)
+                .header("content-type", "application/rdf+xml")
+                .body(Body::from(skos_bytes))?,
+        )
+        .await?;
+    assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
+
+    let get_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/data?graph=http%3A%2F%2Fexample.com%2Fontologies%2Fskos")
+                .method(Method::GET)
+                .header("accept", "application/rdf+xml")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_response.status(), StatusCode::OK);
+    assert_eq!(
+        get_response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/rdf+xml")
+    );
+
+    let body = axum::body::to_bytes(get_response.into_body(), usize::MAX).await?;
+    let text = String::from_utf8(body.to_vec())?;
+    assert!(text.contains("broaderTransitive"));
+    Ok(())
+}
