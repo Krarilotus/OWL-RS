@@ -36,6 +36,31 @@ fn store_preload_accepts_official_foaf_rdf_xml_fixture() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn store_preload_accepts_official_prov_turtle_fixture_with_relative_base_iri()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let service = StoreService::new(StoreConfig {
+        mode: StoreMode::InMemory,
+        data_dir: temp.path().join("unused"),
+        preload_ontology: true,
+        ontology_path: Some(catalog_fixture_path("prov.ttl")),
+        ontology_fallbacks: Vec::new(),
+    })?;
+
+    let ask = service.execute_query_str(
+        "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         PREFIX prov: <http://www.w3.org/ns/prov#>
+         ASK WHERE {
+           prov:generated owl:inverseOf prov:wasGeneratedBy
+         }",
+    )?;
+
+    assert_eq!(ask.kind, QueryResultKind::Boolean);
+    assert!(String::from_utf8(ask.payload)?.contains("true"));
+    Ok(())
+}
+
+#[test]
 fn store_graph_roundtrip_accepts_official_vcard_turtle_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;

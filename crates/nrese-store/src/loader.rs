@@ -3,13 +3,13 @@ use std::io::BufReader;
 use std::path::Path;
 use std::path::PathBuf;
 
-use oxigraph::io::RdfParser;
 use oxigraph::store::Store;
 use tracing::info;
 
 use crate::config::StoreConfig;
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
+use crate::rdf_io::{file_base_iri, parser_for_graph_format};
 
 pub fn preload_ontology(store: &Store, config: &StoreConfig) -> StoreResult<Option<PathBuf>> {
     if !config.preload_ontology {
@@ -19,7 +19,9 @@ pub fn preload_ontology(store: &Store, config: &StoreConfig) -> StoreResult<Opti
     let ontology_path = resolve_ontology_path(config)?;
     let file = File::open(&ontology_path)?;
     let reader = BufReader::new(file);
-    let parser = RdfParser::from_format(infer_ontology_format(&ontology_path)?.into_oxigraph());
+    let ontology_format = infer_ontology_format(&ontology_path)?;
+    let ontology_base_iri = file_base_iri(&ontology_path)?;
+    let parser = parser_for_graph_format(ontology_format, Some(&ontology_base_iri))?;
 
     store.load_from_reader(parser, reader)?;
     info!(

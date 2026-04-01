@@ -62,7 +62,7 @@ Selection rationale:
 - `prov`
   exercises property chains, functional properties, and disjointness
 - `skos`
-  exercises transitive and symmetric vocabulary declarations in a widely used W3C thesaurus model
+  exercises transitive, inverse, and subproperty declarations in a widely used W3C thesaurus model
 - `sosa` / `ssn`
   exercise property chains plus functional / inverse-functional declarations in the sensor-observation stack
 - `dcat`
@@ -81,8 +81,17 @@ Current explicit service-validation focus:
   - subclass-driven `foaf:Person -> foaf:Agent` inference in `rules-mvp`
 - `org`
   - Graph Store roundtrip on an official Turtle ontology
+  - inverse-property plus domain/range reasoning on `org:memberOf` / `org:hasMember`
 - `time`
   - official ontology-backed inverse/transitive property reasoning
+- `skos`
+  - RDF/XML ontology-backed `skos:broader -> skos:broaderTransitive` closure
+  - inverse transitive closure on `skos:narrowerTransitive`
+- `prov`
+  - Turtle ontology preload with file-derived base IRI for official `prov.ttl`
+  - subclass, inverse-property, and domain/range reasoning on `prov:Person`, `prov:wasGeneratedBy`, and `prov:generated`
+- `dcat`
+  - domain/range reasoning on `dcat:dataset`
 - `vcard`
   - named-graph store roundtrip on an official Turtle ontology
 - `odrl`

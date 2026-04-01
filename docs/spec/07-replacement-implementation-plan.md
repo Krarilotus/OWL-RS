@@ -281,7 +281,7 @@ Priority order for the next replacement-focused runs:
 - added env-driven pack-header interpolation so secured workload packs stay reusable without committed secrets
 - expanded the staged real-world ontology catalog to include SKOS, SOSA, SSN, DCAT, vCard, DCMI Terms, and ODRL alongside the earlier official ontology set
 - added typed ontology-fixture metadata for serialization, semantic dialects, reasoning focus, and service coverage so catalog entries can drive test intent rather than only download paths
-- added cross-service ontology fixture tests that exercise official catalog inputs through Store, Server, and Reasoner paths, including RDF/XML preload/`tell` acceptance and ontology-backed inverse/transitive reasoning checks
+- added cross-service ontology fixture tests that exercise official catalog inputs through Store, Server, and Reasoner paths, including RDF/XML preload/`tell` acceptance, Turtle base-IRI preload for official PROV-O, and ontology-backed inverse/transitive/domain-range reasoning checks
 - added service-level timeout budgets to workload-pack target profiles so secured/live parity runs can reuse shared transport ceilings without case duplication
 - added named per-side invocation profiles to workload-pack manifests and bound secured invalid-auth parity cases to that path instead of duplicating live auth headers inside compat JSON
 - added a dedicated limit/offset semantics compat suite and a bindings-set comparator so query-window parity does not rely on count-only summaries

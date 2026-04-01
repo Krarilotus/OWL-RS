@@ -65,6 +65,7 @@ Current coverage:
 - `rules-mvp` now rejects `owl:Nothing` and `owl:disjointWith` conflicts over effective types and keeps rejected updates out of the live dataset through shadow-store validation
 - `rules-mvp` now rejects bounded property-characteristic conflicts for `owl:IrreflexiveProperty`, `owl:AsymmetricProperty`, and `owl:propertyDisjointWith`
 - `rules-mvp` now emits deterministic diagnostics for a known set of unsupported OWL constructs, with the remaining unsupported constructs tracked in the reasoner support boundary spec
+- official ontology-backed reasoner fixtures now validate bounded subclass, inverse-property, transitive-property, subproperty, and domain/range slices on FOAF, W3C Time, W3C ORG, SKOS, PROV-O, and DCAT
 - operator diagnostics can expose the latest reasoning run baseline
 - reject-path HTTP problem responses and operator diagnostics now share a structured heuristic blame payload for consistency failures
 - reject-path HTTP problem responses and operator diagnostics now also share explicit conflict evidence triples from the reasoner-owned explanation model
@@ -173,7 +174,7 @@ Current coverage:
 
 Still required:
 - comparisons against the real Fuseki deployment and real ontology/workload
-- broader ontology-driven cross-service validation on catalog fixtures beyond the current focused FOAF/ORG/Time/vCard coverage
+- broader ontology-driven cross-service and reasoner validation on catalog fixtures beyond the current official baseline of FOAF, ORG, Time, SKOS, PROV-O, DCAT, and vCard coverage
 - latency, startup, RAM, CPU, and reasoning cost measurements
 - regression thresholds in CI
 - production workload parity pack execution on the real ontology/workload set, rather than only generic local fixtures

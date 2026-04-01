@@ -75,7 +75,7 @@ focus_terms = [
   "http://www.w3.org/2004/02/skos/core#broaderTransitive",
 ]
 semantic_dialects = ["rdfs", "owl", "skos"]
-reasoning_features = ["subproperty-closure", "transitive-property", "domain-range-typing"]
+reasoning_features = ["subproperty-closure", "transitive-property", "inverse-property", "domain-range-typing"]
 service_coverage = ["catalog-sync", "tell", "query", "reasoner", "benchmark"]
 
 [[ontologies]]

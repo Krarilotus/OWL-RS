@@ -8,6 +8,7 @@ mod loader;
 mod on_disk;
 pub mod query;
 mod query_executor;
+mod rdf_io;
 pub mod service;
 mod snapshot;
 mod staging;

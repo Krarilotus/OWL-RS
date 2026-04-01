@@ -7,6 +7,7 @@ use crate::graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
 };
+use crate::rdf_io::parser_for_graph_format;
 
 pub fn execute_graph_read(
     store: &Store,
@@ -90,7 +91,7 @@ fn clear_target_graph_in_transaction(
 }
 
 fn parser_for_target(request: &GraphWriteRequest) -> StoreResult<RdfParser> {
-    let parser = RdfParser::from_format(request.format.into_oxigraph()).without_named_graphs();
+    let parser = parser_for_graph_format(request.format, None)?.without_named_graphs();
 
     let parser = match &request.target {
         GraphTarget::DefaultGraph => parser,

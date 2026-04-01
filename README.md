@@ -59,6 +59,7 @@ Implemented today:
 - workload-pack invocation profiles now support service-level defaults plus bounded per-side case overrides for headers and timeout budgets, so secured/live parity runs can keep transport policy external to fixture JSON
 - real-world ontology catalog sync for staged parity and hardening runs against FOAF, W3C ORG, W3C Time, PROV-O, SKOS, SOSA, SSN, DCAT, vCard, DCMI Terms, and ODRL, with typed serialization/dialect/reasoning/service metadata
 - official catalog fixtures now drive cross-service checks across Store, `tell`, Graph Store, and `rules-mvp`, including RDF/XML ingest/preload and ontology-backed reasoning/runtime validation
+- the store preload path now derives a file base IRI for ontology parsing, so official Turtle vocabularies with relative ontology IRIs like PROV-O load on the same typed ingest path as the rest of the catalog
 - protocol compatibility harness coverage for query parity, limit/offset query semantics, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-parity slice, and bounded query/update failure-parity fixtures for covered negative cases
 - graph payload parity now canonicalizes Turtle, N-Triples, and RDF/XML onto one triples-set comparator path instead of treating RDF/XML as an opaque response class
 - bounded `bearer-jwt` auth alongside `bearer-static`

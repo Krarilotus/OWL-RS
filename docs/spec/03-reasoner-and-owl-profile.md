@@ -57,6 +57,7 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - schema-cached property-constraint planning so the set of predicates participating in property-characteristic consistency gates is prepared once with other TBox-stable artifacts and reused by ABox-sensitive consistency indexing
 - schema-cached class-consistency preparation so `owl:Nothing` and disjoint-type checks reuse precomputed class-side constraints instead of rebuilding schema-side inputs per run
 - externally configurable `rules-mvp` feature policy so closure, consistency, equality, and unsupported-diagnostic behavior can be switched at runtime without changing reasoner code
+- official ontology-backed fixtures now validate the current bounded `rules-mvp` slice on FOAF, W3C Time, W3C ORG, SKOS, PROV-O, and DCAT; these fixtures are evidence for implemented reasoning slices, not a claim of full ontology semantic completeness
 
 ### Tier R2: Enterprise Rule Expansion
 
