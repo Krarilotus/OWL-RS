@@ -142,6 +142,37 @@ x-forwarded-proto = "https"
     }
 
     #[test]
+    fn secured_timeout_pack_template_parses_with_multiple_compat_suites() {
+        let manifest = read_workload_pack(Path::new(
+            "fixtures/packs/secured-live-auth-timeout-template/pack.toml",
+        ))
+        .expect("pack");
+
+        assert_eq!(manifest.name, "secured-live-auth-timeout-template");
+        assert_eq!(manifest.compat_suites.len(), 3);
+        assert!(
+            manifest.compat_suites.iter().any(|path| {
+                path.ends_with("fixtures\\compat\\policy_failure_cases.json")
+                    || path.ends_with("fixtures/compat/policy_failure_cases.json")
+            })
+        );
+        assert!(
+            manifest.compat_suites.iter().any(|path| {
+                path.ends_with("fixtures\\compat\\timeout_failure_cases.json")
+                    || path.ends_with("fixtures/compat/timeout_failure_cases.json")
+            })
+        );
+        assert_eq!(
+            manifest
+                .nrese
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer REPLACE_WITH_NRESE_READ_TOKEN")
+        );
+    }
+
+    #[test]
     fn ontology_catalog_parses_entries() {
         let temp_dir = tempdir().expect("tempdir");
         let path = temp_dir.path().join("catalog.toml");

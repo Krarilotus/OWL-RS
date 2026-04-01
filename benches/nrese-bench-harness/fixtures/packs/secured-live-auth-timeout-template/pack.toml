@@ -1,0 +1,29 @@
+name = "secured-live-auth-timeout-template"
+dataset = "../../datasets/comparison_seed.ttl"
+query_workload = "../../workloads/query_workload.json"
+update_workload = "../../workloads/update_workload.json"
+compat_suites = [
+  "../../compat/protocol_cases.json",
+  "../../compat/policy_failure_cases.json",
+  "../../compat/timeout_failure_cases.json",
+]
+
+# Template only.
+# Replace placeholder values locally or in CI-injected workspace copies.
+# Do not commit real bearer tokens or other secrets.
+#
+# Use this pack only when NRESE and Fuseki are deployed with comparable
+# timeout ceilings and proxy behavior. The timeout suite is intentionally
+# separate from the generic secured-auth baseline for that reason.
+#
+# If Fuseki is protected with HTTP Basic Auth, pass credentials on the CLI:
+#   --fuseki-basic-auth <user:pass>
+# Keep Basic Auth out of committed pack manifests.
+
+[nrese.headers]
+authorization = "Bearer REPLACE_WITH_NRESE_READ_TOKEN"
+
+[fuseki.headers]
+# Optional when Fuseki is fronted by the same style of bearer-auth gateway.
+# Remove this header section if Fuseki only uses CLI-supplied Basic Auth.
+authorization = "Bearer REPLACE_WITH_FUSEKI_READ_TOKEN"

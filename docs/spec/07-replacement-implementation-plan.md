@@ -55,6 +55,7 @@ Implementation blocks:
 - separate policy-failure parity fixtures for invalid-auth and oversize-payload cases on the same shared response-semantics comparator
 - shared per-case request-header customization in the compat harness so auth/proxy/live comparison cases stay on the same comparator path
 - service-level request-header profiles in workload-pack manifests so secured compare stacks stay on the same comparator path as unsecured runs
+- bounded secured live-deployment workload-pack templates so auth/policy/timeout parity runs reuse the same manifest model without committed secrets
 - timeout and payload-limit comparison cases
 - manifest-driven production workload parity pack support so seed, compat, and bench runs use one versioned evidence unit instead of ad hoc fixture combinations
 - workload-pack aggregate reporting so one pack run emits a canonical `pack-report.json` evidence index alongside per-suite compat reports and benchmark output

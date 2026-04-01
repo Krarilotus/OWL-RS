@@ -64,6 +64,9 @@ Current example:
 
 - `benches/nrese-bench-harness/fixtures/packs/generic-baseline/pack.toml`
 - the generic baseline now bundles both `protocol_cases.json` and `policy_failure_cases.json`
+- secured live-deployment templates now exist under:
+  - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml`
+  - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-timeout-template/pack.toml`
 
 Example with service-level headers:
 
@@ -80,6 +83,19 @@ authorization = "Bearer nrese-read-token"
 [fuseki.headers]
 x-forwarded-proto = "https"
 ```
+
+Secured live-deployment template rules:
+
+- keep real secrets out of committed pack manifests
+- use placeholder bearer values only in versioned templates
+- prefer CLI `--fuseki-basic-auth` for Fuseki Basic Auth instead of embedding credentials in packs
+- keep timeout parity in a separate pack so operators must opt in explicitly once both stacks have comparable timeout ceilings
+
+The secured templates intentionally reuse the existing compat suites:
+
+- `protocol_cases.json`
+- `policy_failure_cases.json`
+- `timeout_failure_cases.json` only in the timeout template
 
 ## Files
 
@@ -99,6 +115,8 @@ x-forwarded-proto = "https"
   - `benches/nrese-bench-harness/fixtures/compat/timeout_failure_cases.json`
 - Workload packs:
   - `benches/nrese-bench-harness/fixtures/packs/generic-baseline/pack.toml`
+  - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml`
+  - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-timeout-template/pack.toml`
 - Ontology catalog:
   - `benches/nrese-bench-harness/fixtures/catalog/ontologies.toml`
 - Seed dataset:
@@ -317,6 +335,37 @@ Expected evidence artifacts when `--report-dir` is set:
 - benchmark report path
 
 If a pack includes `timeout_failure_cases.json`, the resulting suite artifact is indexed the same way as any other compat suite. Timeout parity does not get a separate report type.
+
+Secured live-auth example:
+
+```powershell
+cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
+  --nrese-base-url https://nrese.example.com `
+  --fuseki-base-url https://fuseki.example.com/ds `
+  --fuseki-basic-auth compare-user:compare-pass `
+  --workload-pack benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml `
+  --iterations 20 `
+  --report-dir artifacts/secured-live-auth
+```
+
+Secured live-auth plus timeout example:
+
+```powershell
+cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
+  --nrese-base-url https://nrese.example.com `
+  --fuseki-base-url https://fuseki.example.com/ds `
+  --fuseki-basic-auth compare-user:compare-pass `
+  --workload-pack benches/nrese-bench-harness/fixtures/packs/secured-live-auth-timeout-template/pack.toml `
+  --iterations 20 `
+  --report-dir artifacts/secured-live-auth-timeout
+```
+
+Before using either template:
+
+- replace placeholder bearer header values locally or in CI-injected workspace copies
+- remove `[fuseki.headers]` if Fuseki only uses CLI-supplied Basic Auth
+- keep `policy_failure_cases.json` in the pack so invalid-auth and oversize-payload parity stays on the same shared comparator path
+- only use the timeout template after aligning timeout ceilings and proxy behavior on both deployments
 
 ## Current Verified Local Baseline
 
