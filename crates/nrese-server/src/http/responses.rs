@@ -4,6 +4,17 @@ use crate::error::ApiError;
 use crate::http::ai;
 use crate::state::AppState;
 
+struct SharedCapabilityFacts {
+    reasoning_preset: Option<&'static str>,
+    available_reasoning_presets: &'static [&'static str],
+    graph_store_enabled: bool,
+    sparql_update_enabled: bool,
+    tell_enabled: bool,
+    federated_service_enabled: bool,
+    ai_query_suggestions_enabled: bool,
+    ai_provider: &'static str,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub status: &'static str,
@@ -128,7 +139,7 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
 }
 
 pub fn build_version_response(state: &AppState) -> VersionResponse {
-    let ai_status = ai::ai_status(state);
+    let shared = shared_capability_facts(state);
     VersionResponse {
         service: "nrese-server",
         version: env!("CARGO_PKG_VERSION"),
@@ -138,20 +149,20 @@ pub fn build_version_response(state: &AppState) -> VersionResponse {
         durable_storage_available: durable_storage_available(),
         reasoning_mode: state.reasoner_mode_name(),
         reasoning_profile: state.reasoner_profile_name(),
-        reasoning_preset: active_reasoning_preset(state),
-        available_reasoning_presets: nrese_reasoner::RulesMvpPreset::available(),
-        graph_store_enabled: true,
-        sparql_update_enabled: true,
-        tell_enabled: true,
-        federated_service_enabled: false,
+        reasoning_preset: shared.reasoning_preset,
+        available_reasoning_presets: shared.available_reasoning_presets,
+        graph_store_enabled: shared.graph_store_enabled,
+        sparql_update_enabled: shared.sparql_update_enabled,
+        tell_enabled: shared.tell_enabled,
+        federated_service_enabled: shared.federated_service_enabled,
         user_console_path: "/console",
-        ai_query_suggestions_enabled: ai_status.enabled,
-        ai_provider: ai_status.provider,
+        ai_query_suggestions_enabled: shared.ai_query_suggestions_enabled,
+        ai_provider: shared.ai_provider,
     }
 }
 
 pub fn build_operator_capabilities_response(state: &AppState) -> OperatorCapabilitiesResponse {
-    let ai_status = ai::ai_status(state);
+    let shared = shared_capability_facts(state);
     OperatorCapabilitiesResponse {
         operator_ui_path: "/ops",
         user_console_path: "/console",
@@ -171,14 +182,14 @@ pub fn build_operator_capabilities_response(state: &AppState) -> OperatorCapabil
         store_mode: state.store_mode_name(),
         durability: state.durability_name(),
         durable_storage_available: durable_storage_available(),
-        reasoning_preset: active_reasoning_preset(state),
-        available_reasoning_presets: nrese_reasoner::RulesMvpPreset::available(),
-        graph_store_enabled: true,
-        sparql_update_enabled: true,
-        tell_enabled: true,
-        federated_service_enabled: false,
-        ai_query_suggestions_enabled: ai_status.enabled,
-        ai_provider: ai_status.provider,
+        reasoning_preset: shared.reasoning_preset,
+        available_reasoning_presets: shared.available_reasoning_presets,
+        graph_store_enabled: shared.graph_store_enabled,
+        sparql_update_enabled: shared.sparql_update_enabled,
+        tell_enabled: shared.tell_enabled,
+        federated_service_enabled: shared.federated_service_enabled,
+        ai_query_suggestions_enabled: shared.ai_query_suggestions_enabled,
+        ai_provider: shared.ai_provider,
     }
 }
 
@@ -225,4 +236,18 @@ fn active_reasoning_preset(state: &AppState) -> Option<&'static str> {
     }
 
     Some(state.reasoner().rules_mvp_preset().as_str())
+}
+
+fn shared_capability_facts(state: &AppState) -> SharedCapabilityFacts {
+    let ai_status = ai::ai_status(state);
+    SharedCapabilityFacts {
+        reasoning_preset: active_reasoning_preset(state),
+        available_reasoning_presets: nrese_reasoner::RulesMvpPreset::available(),
+        graph_store_enabled: true,
+        sparql_update_enabled: true,
+        tell_enabled: true,
+        federated_service_enabled: false,
+        ai_query_suggestions_enabled: ai_status.enabled,
+        ai_provider: ai_status.provider,
+    }
 }
