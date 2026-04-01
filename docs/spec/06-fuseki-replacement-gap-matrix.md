@@ -59,6 +59,7 @@ Current coverage:
 - `rules-mvp` now includes bounded explicit `owl:sameAs` support via canonical equality handling for named resources, plus bounded equality entailment from `owl:FunctionalProperty` and `owl:InverseFunctionalProperty`
 - `rules-mvp` now includes bounded binary `owl:propertyChainAxiom` support over named properties with well-formed named-node RDF lists, and deterministic diagnostics for longer or malformed chains
 - `rules-mvp` now includes bounded `owl:ReflexiveProperty` inference over observed named resources and commit-path `owl:differentFrom` consistency rejection against the effective equality closure
+- `rules-mvp` now expands bounded `owl:AllDifferent`, `owl:AllDisjointClasses`, and `owl:AllDisjointProperties` declarations over RDF list members into the existing equality, class-disjointness, and property-disjointness consistency gates
 - `rules-mvp` now rejects `owl:Nothing` and `owl:disjointWith` conflicts over effective types and keeps rejected updates out of the live dataset through shadow-store validation
 - `rules-mvp` now rejects bounded property-characteristic conflicts for `owl:IrreflexiveProperty`, `owl:AsymmetricProperty`, and `owl:propertyDisjointWith`
 - `rules-mvp` now emits deterministic diagnostics for a known set of unsupported OWL constructs, with the remaining unsupported constructs tracked in the reasoner support boundary spec

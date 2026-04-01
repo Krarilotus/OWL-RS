@@ -168,6 +168,7 @@ impl PreparedRulesMvp {
         let mut unsupported_diagnostics = unsupported_diagnostics;
         if policy.unsupported_construct_diagnostics_enabled() {
             unsupported_diagnostics.extend(property_chain_plan.diagnostics().iter().cloned());
+            unsupported_diagnostics.extend(index.group_axiom_diagnostics().iter().cloned());
         }
         let stats = ReasoningStats {
             supported_asserted_triples: index.supported_asserted_triples(),

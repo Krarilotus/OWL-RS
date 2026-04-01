@@ -5,8 +5,10 @@ use nrese_core::DatasetSnapshot;
 use crate::symbols::SymbolTable;
 
 mod builder;
+mod group_axioms;
 mod ids;
 mod keys;
+pub(crate) mod rdf_list;
 mod stats;
 #[cfg(test)]
 mod tests;
@@ -22,6 +24,8 @@ pub struct IndexedDataset {
     subclass_edges: HashMap<u32, BTreeSet<u32>>,
     subproperty_edges: HashMap<u32, BTreeSet<u32>>,
     property_chain_axiom_heads: HashMap<u32, BTreeSet<u32>>,
+    members_heads_by_subject: HashMap<u32, BTreeSet<u32>>,
+    distinct_members_heads_by_subject: HashMap<u32, BTreeSet<u32>>,
     list_first_by_node: HashMap<u32, BTreeSet<u32>>,
     list_rest_by_node: HashMap<u32, BTreeSet<u32>>,
     type_assertions: HashMap<u32, BTreeSet<u32>>,
@@ -41,6 +45,7 @@ pub struct IndexedDataset {
     reflexive_properties: BTreeSet<u32>,
     symmetric_properties: BTreeSet<u32>,
     transitive_properties: BTreeSet<u32>,
+    group_axiom_diagnostics: Vec<String>,
     schema_cache_key: u64,
     vocabulary: IndexedVocabulary,
     stats: DatasetIndexStats,
@@ -148,6 +153,10 @@ impl IndexedDataset {
 
     pub fn transitive_properties(&self) -> &BTreeSet<u32> {
         &self.transitive_properties
+    }
+
+    pub fn group_axiom_diagnostics(&self) -> &[String] {
+        &self.group_axiom_diagnostics
     }
 
     pub fn schema_cache_key(&self) -> u64 {

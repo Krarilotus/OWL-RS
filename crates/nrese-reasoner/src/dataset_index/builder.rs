@@ -5,6 +5,7 @@ use nrese_core::DatasetSnapshot;
 use crate::symbols::SymbolTable;
 
 use super::IndexedDataset;
+use super::group_axioms::{GroupAxiomExpansion, expand_group_axioms};
 use super::ids::IndexedVocabulary;
 use super::keys::{SchemaKeyInput, compute_schema_cache_key};
 use super::stats::{DatasetIndexStats, DatasetIndexStatsInput};
@@ -34,6 +35,8 @@ struct DatasetIndexAccumulator {
     subclass_edges: HashMap<u32, BTreeSet<u32>>,
     subproperty_edges: HashMap<u32, BTreeSet<u32>>,
     property_chain_axiom_heads: HashMap<u32, BTreeSet<u32>>,
+    members_heads_by_subject: HashMap<u32, BTreeSet<u32>>,
+    distinct_members_heads_by_subject: HashMap<u32, BTreeSet<u32>>,
     list_first_by_node: HashMap<u32, BTreeSet<u32>>,
     list_rest_by_node: HashMap<u32, BTreeSet<u32>>,
     type_assertions: HashMap<u32, BTreeSet<u32>>,
@@ -53,6 +56,7 @@ struct DatasetIndexAccumulator {
     reflexive_properties: BTreeSet<u32>,
     symmetric_properties: BTreeSet<u32>,
     transitive_properties: BTreeSet<u32>,
+    group_axiom_diagnostics: Vec<String>,
     supported_asserted_triples: u64,
 }
 
@@ -68,6 +72,8 @@ impl DatasetIndexAccumulator {
             subclass_edges: HashMap::new(),
             subproperty_edges: HashMap::new(),
             property_chain_axiom_heads: HashMap::new(),
+            members_heads_by_subject: HashMap::new(),
+            distinct_members_heads_by_subject: HashMap::new(),
             list_first_by_node: HashMap::new(),
             list_rest_by_node: HashMap::new(),
             type_assertions: HashMap::new(),
@@ -87,6 +93,7 @@ impl DatasetIndexAccumulator {
             reflexive_properties: BTreeSet::new(),
             symmetric_properties: BTreeSet::new(),
             transitive_properties: BTreeSet::new(),
+            group_axiom_diagnostics: Vec::new(),
             supported_asserted_triples: 0,
         }
     }
@@ -122,6 +129,16 @@ impl DatasetIndexAccumulator {
                 .insert(object_id);
         } else if predicate_id == self.vocabulary.owl_property_chain_axiom_id {
             self.property_chain_axiom_heads
+                .entry(subject_id)
+                .or_default()
+                .insert(object_id);
+        } else if predicate_id == self.vocabulary.owl_members_id {
+            self.members_heads_by_subject
+                .entry(subject_id)
+                .or_default()
+                .insert(object_id);
+        } else if predicate_id == self.vocabulary.owl_distinct_members_id {
+            self.distinct_members_heads_by_subject
                 .entry(subject_id)
                 .or_default()
                 .insert(object_id);
@@ -204,65 +221,83 @@ impl DatasetIndexAccumulator {
     }
 
     fn finish(self, unsupported_asserted_triples: u64) -> IndexedDataset {
+        let mut this = self;
+        expand_group_axioms(GroupAxiomExpansion {
+            symbols: &this.symbols,
+            vocabulary: &this.vocabulary,
+            type_assertions: &this.type_assertions,
+            list_first_by_node: &this.list_first_by_node,
+            list_rest_by_node: &this.list_rest_by_node,
+            members_heads_by_subject: &this.members_heads_by_subject,
+            distinct_members_heads_by_subject: &this.distinct_members_heads_by_subject,
+            different_from_pairs: &mut this.different_from_pairs,
+            disjoint_class_pairs: &mut this.disjoint_class_pairs,
+            property_disjoint_pairs: &mut this.property_disjoint_pairs,
+            diagnostics: &mut this.group_axiom_diagnostics,
+        });
+
         let stats = DatasetIndexStats::from_input(DatasetIndexStatsInput {
-            supported_asserted_triples: self.supported_asserted_triples,
+            supported_asserted_triples: this.supported_asserted_triples,
             unsupported_asserted_triples,
-            subclass_edges: &self.subclass_edges,
-            subproperty_edges: &self.subproperty_edges,
-            type_assertions: &self.type_assertions,
-            property_assertions: &self.property_assertions,
-            same_as_pairs: &self.same_as_pairs,
-            domain_by_property: &self.domain_by_property,
-            range_by_property: &self.range_by_property,
+            subclass_edges: &this.subclass_edges,
+            subproperty_edges: &this.subproperty_edges,
+            type_assertions: &this.type_assertions,
+            property_assertions: &this.property_assertions,
+            same_as_pairs: &this.same_as_pairs,
+            domain_by_property: &this.domain_by_property,
+            range_by_property: &this.range_by_property,
         });
         let schema_cache_key = compute_schema_cache_key(SchemaKeyInput {
-            symbols: &self.symbols,
-            subclass_edges: &self.subclass_edges,
-            subproperty_edges: &self.subproperty_edges,
-            property_chain_axiom_heads: &self.property_chain_axiom_heads,
-            list_first_by_node: &self.list_first_by_node,
-            list_rest_by_node: &self.list_rest_by_node,
-            domain_by_property: &self.domain_by_property,
-            range_by_property: &self.range_by_property,
-            disjoint_class_pairs: &self.disjoint_class_pairs,
-            property_disjoint_pairs: &self.property_disjoint_pairs,
-            inverse_of_pairs: &self.inverse_of_pairs,
-            functional_properties: &self.functional_properties,
-            inverse_functional_properties: &self.inverse_functional_properties,
-            irreflexive_properties: &self.irreflexive_properties,
-            asymmetric_properties: &self.asymmetric_properties,
-            reflexive_properties: &self.reflexive_properties,
-            symmetric_properties: &self.symmetric_properties,
-            transitive_properties: &self.transitive_properties,
+            symbols: &this.symbols,
+            subclass_edges: &this.subclass_edges,
+            subproperty_edges: &this.subproperty_edges,
+            property_chain_axiom_heads: &this.property_chain_axiom_heads,
+            list_first_by_node: &this.list_first_by_node,
+            list_rest_by_node: &this.list_rest_by_node,
+            domain_by_property: &this.domain_by_property,
+            range_by_property: &this.range_by_property,
+            disjoint_class_pairs: &this.disjoint_class_pairs,
+            property_disjoint_pairs: &this.property_disjoint_pairs,
+            inverse_of_pairs: &this.inverse_of_pairs,
+            functional_properties: &this.functional_properties,
+            inverse_functional_properties: &this.inverse_functional_properties,
+            irreflexive_properties: &this.irreflexive_properties,
+            asymmetric_properties: &this.asymmetric_properties,
+            reflexive_properties: &this.reflexive_properties,
+            symmetric_properties: &this.symmetric_properties,
+            transitive_properties: &this.transitive_properties,
         });
 
         IndexedDataset {
-            symbols: self.symbols,
-            asserted_triples: self.asserted_triples,
-            subclass_edges: self.subclass_edges,
-            subproperty_edges: self.subproperty_edges,
-            property_chain_axiom_heads: self.property_chain_axiom_heads,
-            list_first_by_node: self.list_first_by_node,
-            list_rest_by_node: self.list_rest_by_node,
-            type_assertions: self.type_assertions,
-            domain_by_property: self.domain_by_property,
-            range_by_property: self.range_by_property,
-            property_assertions: self.property_assertions,
-            same_as_pairs: self.same_as_pairs,
-            different_from_pairs: self.different_from_pairs,
-            observed_named_resources: self.observed_named_resources,
-            disjoint_class_pairs: self.disjoint_class_pairs,
-            property_disjoint_pairs: self.property_disjoint_pairs,
-            inverse_of_pairs: self.inverse_of_pairs,
-            functional_properties: self.functional_properties,
-            inverse_functional_properties: self.inverse_functional_properties,
-            irreflexive_properties: self.irreflexive_properties,
-            asymmetric_properties: self.asymmetric_properties,
-            reflexive_properties: self.reflexive_properties,
-            symmetric_properties: self.symmetric_properties,
-            transitive_properties: self.transitive_properties,
+            symbols: this.symbols,
+            asserted_triples: this.asserted_triples,
+            subclass_edges: this.subclass_edges,
+            subproperty_edges: this.subproperty_edges,
+            property_chain_axiom_heads: this.property_chain_axiom_heads,
+            members_heads_by_subject: this.members_heads_by_subject,
+            distinct_members_heads_by_subject: this.distinct_members_heads_by_subject,
+            list_first_by_node: this.list_first_by_node,
+            list_rest_by_node: this.list_rest_by_node,
+            type_assertions: this.type_assertions,
+            domain_by_property: this.domain_by_property,
+            range_by_property: this.range_by_property,
+            property_assertions: this.property_assertions,
+            same_as_pairs: this.same_as_pairs,
+            different_from_pairs: this.different_from_pairs,
+            observed_named_resources: this.observed_named_resources,
+            disjoint_class_pairs: this.disjoint_class_pairs,
+            property_disjoint_pairs: this.property_disjoint_pairs,
+            inverse_of_pairs: this.inverse_of_pairs,
+            functional_properties: this.functional_properties,
+            inverse_functional_properties: this.inverse_functional_properties,
+            irreflexive_properties: this.irreflexive_properties,
+            asymmetric_properties: this.asymmetric_properties,
+            reflexive_properties: this.reflexive_properties,
+            symmetric_properties: this.symmetric_properties,
+            transitive_properties: this.transitive_properties,
+            group_axiom_diagnostics: this.group_axiom_diagnostics,
             schema_cache_key,
-            vocabulary: self.vocabulary,
+            vocabulary: this.vocabulary,
             stats,
         }
     }

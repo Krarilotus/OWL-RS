@@ -1,11 +1,12 @@
 use crate::symbols::SymbolTable;
 use crate::vocabulary::{
-    OWL_ASYMMETRIC_PROPERTY, OWL_DIFFERENT_FROM, OWL_DISJOINT_WITH, OWL_EQUIVALENT_CLASS,
-    OWL_EQUIVALENT_PROPERTY, OWL_FUNCTIONAL_PROPERTY, OWL_INVERSE_FUNCTIONAL_PROPERTY,
-    OWL_INVERSE_OF, OWL_IRREFLEXIVE_PROPERTY, OWL_NOTHING, OWL_PROPERTY_CHAIN_AXIOM,
-    OWL_PROPERTY_DISJOINT_WITH, OWL_REFLEXIVE_PROPERTY, OWL_SAME_AS, OWL_SYMMETRIC_PROPERTY,
-    OWL_TRANSITIVE_PROPERTY, RDF_FIRST, RDF_NIL, RDF_REST, RDF_TYPE, RDFS_DOMAIN, RDFS_RANGE,
-    RDFS_SUBCLASS_OF, RDFS_SUBPROPERTY_OF,
+    OWL_ALL_DIFFERENT, OWL_ALL_DISJOINT_CLASSES, OWL_ALL_DISJOINT_PROPERTIES,
+    OWL_ASYMMETRIC_PROPERTY, OWL_DIFFERENT_FROM, OWL_DISJOINT_WITH, OWL_DISTINCT_MEMBERS,
+    OWL_EQUIVALENT_CLASS, OWL_EQUIVALENT_PROPERTY, OWL_FUNCTIONAL_PROPERTY,
+    OWL_INVERSE_FUNCTIONAL_PROPERTY, OWL_INVERSE_OF, OWL_IRREFLEXIVE_PROPERTY, OWL_MEMBERS,
+    OWL_NOTHING, OWL_PROPERTY_CHAIN_AXIOM, OWL_PROPERTY_DISJOINT_WITH, OWL_REFLEXIVE_PROPERTY,
+    OWL_SAME_AS, OWL_SYMMETRIC_PROPERTY, OWL_TRANSITIVE_PROPERTY, RDF_FIRST, RDF_NIL, RDF_REST,
+    RDF_TYPE, RDFS_DOMAIN, RDFS_RANGE, RDFS_SUBCLASS_OF, RDFS_SUBPROPERTY_OF,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +25,11 @@ pub(super) struct IndexedVocabulary {
     pub(super) owl_nothing_id: u32,
     pub(super) owl_same_as_id: u32,
     pub(super) owl_different_from_id: u32,
+    pub(super) owl_all_different_id: u32,
+    pub(super) owl_all_disjoint_classes_id: u32,
+    pub(super) owl_all_disjoint_properties_id: u32,
+    pub(super) owl_members_id: u32,
+    pub(super) owl_distinct_members_id: u32,
     pub(super) owl_property_chain_axiom_id: u32,
     pub(super) owl_functional_property_id: u32,
     pub(super) owl_inverse_functional_property_id: u32,
@@ -53,6 +59,11 @@ impl IndexedVocabulary {
             owl_nothing_id: symbols.get_or_intern(OWL_NOTHING),
             owl_same_as_id: symbols.get_or_intern(OWL_SAME_AS),
             owl_different_from_id: symbols.get_or_intern(OWL_DIFFERENT_FROM),
+            owl_all_different_id: symbols.get_or_intern(OWL_ALL_DIFFERENT),
+            owl_all_disjoint_classes_id: symbols.get_or_intern(OWL_ALL_DISJOINT_CLASSES),
+            owl_all_disjoint_properties_id: symbols.get_or_intern(OWL_ALL_DISJOINT_PROPERTIES),
+            owl_members_id: symbols.get_or_intern(OWL_MEMBERS),
+            owl_distinct_members_id: symbols.get_or_intern(OWL_DISTINCT_MEMBERS),
             owl_property_chain_axiom_id: symbols.get_or_intern(OWL_PROPERTY_CHAIN_AXIOM),
             owl_functional_property_id: symbols.get_or_intern(OWL_FUNCTIONAL_PROPERTY),
             owl_inverse_functional_property_id: symbols

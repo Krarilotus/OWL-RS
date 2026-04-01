@@ -64,6 +64,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - `rules-mvp` now includes bounded equality entailment from `owl:FunctionalProperty` and `owl:InverseFunctionalProperty`, with downstream rejection only if the resulting effective equality conflicts with other bounded consistency rules such as `owl:differentFrom`
 - `rules-mvp` now includes bounded binary `owl:propertyChainAxiom` support over named properties with well-formed named-node RDF lists, behind the same typed feature-policy path as the rest of `rules-mvp`
 - `rules-mvp` now includes bounded `owl:ReflexiveProperty` inference over observed named resources and commit-path `owl:differentFrom` consistency rejection against the effective equality closure
+- `rules-mvp` now expands bounded `owl:AllDifferent`, `owl:AllDisjointClasses`, and `owl:AllDisjointProperties` declarations over RDF list members into the same existing `owl:differentFrom`, `owl:disjointWith`, and `owl:propertyDisjointWith` consistency gates
 - `rules-mvp` now includes bounded `owl:Nothing` rejection over effective types, including named classes that close to `owl:Nothing` through the current taxonomy support
 - `rules-mvp` emits deterministic unsupported diagnostics for constructs that remain out of scope in the current bounded slice
 - `rules-mvp` now memoizes prepared reasoning artifacts and inference output by snapshot content key so repeated runs over identical staged dataset state avoid rebuilding indexing, taxonomy, equality, and closure inputs
@@ -89,7 +90,9 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - bounded explicit `owl:sameAs` canonical equality handling
 - bounded equality entailment from `owl:FunctionalProperty` and `owl:InverseFunctionalProperty`
 - bounded `owl:differentFrom` consistency rejection against the effective equality closure
+- bounded `owl:AllDifferent` expansion into pairwise `owl:differentFrom` constraints
 - bounded `owl:Nothing` consistency rejection over effective types
+- bounded `owl:AllDisjointClasses` and `owl:AllDisjointProperties` expansion into the existing class/property disjointness gates
 - bounded property consistency gates for `owl:IrreflexiveProperty`, `owl:AsymmetricProperty`, and `owl:propertyDisjointWith`
 - deterministic unsupported diagnostics for the remaining out-of-scope construct set
 - W3C protocol conformance harness in CI

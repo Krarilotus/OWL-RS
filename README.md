@@ -46,7 +46,7 @@ Implemented today:
 - runtime-configurable frontend API base URL so the browser frontend can be hosted separately from the backend
 - service description, health, readiness, metrics, and operator endpoints
 - staged update validation before publish
-- bounded `rules-mvp` reasoning with canonical `owl:sameAs` equality handling, bounded functional / inverse-functional equality entailment, bounded binary `owl:propertyChainAxiom` support over named-node RDF lists, bounded `owl:Nothing` effective-type rejection, and explicit unsupported-construct diagnostics
+- bounded `rules-mvp` reasoning with canonical `owl:sameAs` equality handling, bounded functional / inverse-functional equality entailment, bounded binary `owl:propertyChainAxiom` support over named-node RDF lists, bounded `owl:AllDifferent` / `owl:AllDisjointClasses` / `owl:AllDisjointProperties` expansion into the same consistency gates, bounded `owl:Nothing` effective-type rejection, and explicit unsupported-construct diagnostics
 - typed `rules-mvp` presets (`rdfs-core`, `bounded-owl`) on top of the explicit feature-policy path
 - snapshot-keyed memoization for repeated `rules-mvp` runs over identical dataset state
 - schema-keyed memoization for `rules-mvp` preparation reuse across ABox-only changes

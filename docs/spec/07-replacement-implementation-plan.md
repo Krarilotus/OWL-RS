@@ -90,6 +90,7 @@ Implementation blocks:
 - bounded identity/role slices such as `owl:differentFrom` consistency against equality closure and bounded `owl:ReflexiveProperty` inference over observed resources
 - bounded equality-entailment slices such as `owl:FunctionalProperty` / `owl:InverseFunctionalProperty` implying canonical effective `owl:sameAs`
 - bounded unsatisfiable-class slices such as `owl:Nothing` rejection over effective types and schema-cached class-consistency preparation
+- bounded grouped-disjointness slices such as `owl:AllDifferent`, `owl:AllDisjointClasses`, and `owl:AllDisjointProperties` normalized into the same existing consistency gates
 - stronger reject explanations and minimal-justification trails
 - richer unsupported-construct diagnostics
 - `owl-dl-target` replacement of scaffold-only behavior with explicit staged capability slices
@@ -274,6 +275,7 @@ Priority order for the next replacement-focused runs:
 - grouped `rules_mvp_cache/` modules so cache policy, schema-prepared artifacts, and prepared-run assembly are no longer mixed in one file
 - externalized `rules-mvp` runtime behavior into a typed reasoner-owned feature policy with server-owned env parsing, policy-aware cache identity, and operator diagnostics that expose the configured reasoning policy
 - integrated bounded binary `owl:propertyChainAxiom` support on the same explicit feature-policy path, with named-node RDF-list planning cached at schema level and property-closure execution reusing that prepared plan
+- extracted shared RDF-list parsing inside the reasoner and added bounded `owl:AllDifferent`, `owl:AllDisjointClasses`, and `owl:AllDisjointProperties` expansion onto the existing `owl:differentFrom`, class-disjointness, and property-disjointness paths, including deterministic malformed-list diagnostics
 - added dedicated timeout-failure compat suites on the shared response-semantics comparator path
 - committed secured live-auth and secured live-auth-timeout pack templates on the same manifest model as generic packs
 - added env-driven pack-header interpolation so secured workload packs stay reusable without committed secrets

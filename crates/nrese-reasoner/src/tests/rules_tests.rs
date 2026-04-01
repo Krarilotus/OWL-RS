@@ -5,11 +5,18 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const OWL_EQUIVALENT_CLASS: &str = "http://www.w3.org/2002/07/owl#equivalentClass";
 const OWL_EQUIVALENT_PROPERTY: &str = "http://www.w3.org/2002/07/owl#equivalentProperty";
 const OWL_INVERSE_OF: &str = "http://www.w3.org/2002/07/owl#inverseOf";
+const OWL_ALL_DIFFERENT: &str = "http://www.w3.org/2002/07/owl#AllDifferent";
+const OWL_ALL_DISJOINT_CLASSES: &str = "http://www.w3.org/2002/07/owl#AllDisjointClasses";
+const OWL_ALL_DISJOINT_PROPERTIES: &str = "http://www.w3.org/2002/07/owl#AllDisjointProperties";
 const OWL_DIFFERENT_FROM: &str = "http://www.w3.org/2002/07/owl#differentFrom";
+const OWL_MEMBERS: &str = "http://www.w3.org/2002/07/owl#members";
 const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
 const OWL_REFLEXIVE_PROPERTY: &str = "http://www.w3.org/2002/07/owl#ReflexiveProperty";
 const OWL_SYMMETRIC_PROPERTY: &str = "http://www.w3.org/2002/07/owl#SymmetricProperty";
 const OWL_TRANSITIVE_PROPERTY: &str = "http://www.w3.org/2002/07/owl#TransitiveProperty";
+const RDF_FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
+const RDF_REST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
+const RDF_NIL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil";
 
 #[test]
 fn rules_mvp_derives_subclass_and_type_closure() {
@@ -803,5 +810,174 @@ fn rules_mvp_rejects_instances_of_classes_closing_to_owl_nothing() {
             .diagnostics
             .iter()
             .any(|message| message.contains("owl#Nothing"))
+    );
+}
+
+#[test]
+fn rules_mvp_rejects_all_different_members_that_collapse_via_equality() {
+    let snapshot = OwnedSnapshot::new(vec![
+        ("http://example.com/group", RDF_TYPE, OWL_ALL_DIFFERENT),
+        (
+            "http://example.com/group",
+            OWL_MEMBERS,
+            "http://example.com/group-head",
+        ),
+        (
+            "http://example.com/group-head",
+            RDF_FIRST,
+            "http://example.com/alice",
+        ),
+        (
+            "http://example.com/group-head",
+            RDF_REST,
+            "http://example.com/group-tail",
+        ),
+        (
+            "http://example.com/group-tail",
+            RDF_FIRST,
+            "http://example.com/alicia",
+        ),
+        ("http://example.com/group-tail", RDF_REST, RDF_NIL),
+        (
+            "http://example.com/alice",
+            OWL_SAME_AS,
+            "http://example.com/alicia",
+        ),
+    ]);
+
+    let output = execute_rules_mvp(&snapshot);
+
+    assert_eq!(output.consistency_violations, 1);
+    let reject = output.primary_reject.expect("reject explanation");
+    assert_eq!(reject.violated_constraint, "owl:differentFrom");
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("owl:differentFrom"))
+    );
+}
+
+#[test]
+fn rules_mvp_rejects_all_disjoint_classes_members_on_same_instance() {
+    let snapshot = OwnedSnapshot::new(vec![
+        (
+            "http://example.com/group",
+            RDF_TYPE,
+            OWL_ALL_DISJOINT_CLASSES,
+        ),
+        (
+            "http://example.com/group",
+            OWL_MEMBERS,
+            "http://example.com/group-head",
+        ),
+        (
+            "http://example.com/group-head",
+            RDF_FIRST,
+            "http://example.com/Child",
+        ),
+        (
+            "http://example.com/group-head",
+            RDF_REST,
+            "http://example.com/group-tail",
+        ),
+        (
+            "http://example.com/group-tail",
+            RDF_FIRST,
+            "http://example.com/Other",
+        ),
+        ("http://example.com/group-tail", RDF_REST, RDF_NIL),
+        (
+            "http://example.com/alice",
+            RDF_TYPE,
+            "http://example.com/Child",
+        ),
+        (
+            "http://example.com/alice",
+            RDF_TYPE,
+            "http://example.com/Other",
+        ),
+    ]);
+
+    let output = execute_rules_mvp(&snapshot);
+
+    assert_eq!(output.consistency_violations, 1);
+    let reject = output.primary_reject.expect("reject explanation");
+    assert_eq!(reject.violated_constraint, "owl:disjointWith");
+}
+
+#[test]
+fn rules_mvp_rejects_all_disjoint_properties_for_same_assertion_pair() {
+    let snapshot = OwnedSnapshot::new(vec![
+        (
+            "http://example.com/group",
+            RDF_TYPE,
+            OWL_ALL_DISJOINT_PROPERTIES,
+        ),
+        (
+            "http://example.com/group",
+            OWL_MEMBERS,
+            "http://example.com/group-head",
+        ),
+        (
+            "http://example.com/group-head",
+            RDF_FIRST,
+            "http://example.com/p1",
+        ),
+        (
+            "http://example.com/group-head",
+            RDF_REST,
+            "http://example.com/group-tail",
+        ),
+        (
+            "http://example.com/group-tail",
+            RDF_FIRST,
+            "http://example.com/p2",
+        ),
+        ("http://example.com/group-tail", RDF_REST, RDF_NIL),
+        (
+            "http://example.com/alice",
+            "http://example.com/p1",
+            "http://example.com/bob",
+        ),
+        (
+            "http://example.com/alice",
+            "http://example.com/p2",
+            "http://example.com/bob",
+        ),
+    ]);
+
+    let output = execute_rules_mvp(&snapshot);
+
+    assert_eq!(output.consistency_violations, 1);
+    let reject = output.primary_reject.expect("reject explanation");
+    assert_eq!(reject.violated_constraint, "owl:propertyDisjointWith");
+}
+
+#[test]
+fn rules_mvp_reports_malformed_group_axiom_lists_deterministically() {
+    let snapshot = OwnedSnapshot::new(vec![
+        ("http://example.com/group", RDF_TYPE, OWL_ALL_DIFFERENT),
+        (
+            "http://example.com/group",
+            OWL_MEMBERS,
+            "http://example.com/group-head",
+        ),
+        (
+            "http://example.com/group-head",
+            RDF_FIRST,
+            "http://example.com/alice",
+        ),
+    ]);
+
+    let output = execute_rules_mvp(&snapshot);
+
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("owl:AllDifferent")),
+        "expected group-axiom diagnostic, got {:?}",
+        output.diagnostics
     );
 }

@@ -1,11 +1,12 @@
 use crate::dataset_index::IndexedDataset;
 use crate::test_support::OwnedSnapshot;
 use crate::vocabulary::{
+    OWL_ALL_DIFFERENT, OWL_ALL_DISJOINT_CLASSES, OWL_ALL_DISJOINT_PROPERTIES,
     OWL_ASYMMETRIC_PROPERTY, OWL_DIFFERENT_FROM, OWL_DISJOINT_WITH, OWL_EQUIVALENT_CLASS,
     OWL_EQUIVALENT_PROPERTY, OWL_FUNCTIONAL_PROPERTY, OWL_INVERSE_FUNCTIONAL_PROPERTY,
-    OWL_INVERSE_OF, OWL_IRREFLEXIVE_PROPERTY, OWL_PROPERTY_DISJOINT_WITH, OWL_REFLEXIVE_PROPERTY,
-    OWL_SAME_AS, OWL_SYMMETRIC_PROPERTY, OWL_TRANSITIVE_PROPERTY, RDF_FIRST, RDF_REST, RDF_TYPE,
-    RDFS_DOMAIN, RDFS_RANGE, RDFS_SUBCLASS_OF, RDFS_SUBPROPERTY_OF,
+    OWL_INVERSE_OF, OWL_IRREFLEXIVE_PROPERTY, OWL_MEMBERS, OWL_PROPERTY_DISJOINT_WITH,
+    OWL_REFLEXIVE_PROPERTY, OWL_SAME_AS, OWL_SYMMETRIC_PROPERTY, OWL_TRANSITIVE_PROPERTY,
+    RDF_FIRST, RDF_REST, RDF_TYPE, RDFS_DOMAIN, RDFS_RANGE, RDFS_SUBCLASS_OF, RDFS_SUBPROPERTY_OF,
 };
 
 #[test]
@@ -372,5 +373,162 @@ fn schema_cache_key_changes_when_property_chain_schema_changes() {
     assert_ne!(
         first_index.schema_cache_key(),
         second_index.schema_cache_key()
+    );
+}
+
+#[test]
+fn indexed_dataset_expands_group_axioms_into_pairwise_constraints() {
+    let snapshot = OwnedSnapshot::new(vec![
+        (
+            "http://example.com/all-different",
+            RDF_TYPE,
+            OWL_ALL_DIFFERENT,
+        ),
+        (
+            "http://example.com/all-different",
+            OWL_MEMBERS,
+            "http://example.com/diff-head",
+        ),
+        (
+            "http://example.com/diff-head",
+            RDF_FIRST,
+            "http://example.com/alice",
+        ),
+        (
+            "http://example.com/diff-head",
+            RDF_REST,
+            "http://example.com/diff-tail",
+        ),
+        (
+            "http://example.com/diff-tail",
+            RDF_FIRST,
+            "http://example.com/alicia",
+        ),
+        (
+            "http://example.com/diff-tail",
+            RDF_REST,
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
+        ),
+        (
+            "http://example.com/all-disjoint-classes",
+            RDF_TYPE,
+            OWL_ALL_DISJOINT_CLASSES,
+        ),
+        (
+            "http://example.com/all-disjoint-classes",
+            OWL_MEMBERS,
+            "http://example.com/class-head",
+        ),
+        (
+            "http://example.com/class-head",
+            RDF_FIRST,
+            "http://example.com/Child",
+        ),
+        (
+            "http://example.com/class-head",
+            RDF_REST,
+            "http://example.com/class-tail",
+        ),
+        (
+            "http://example.com/class-tail",
+            RDF_FIRST,
+            "http://example.com/Other",
+        ),
+        (
+            "http://example.com/class-tail",
+            RDF_REST,
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
+        ),
+        (
+            "http://example.com/all-disjoint-properties",
+            RDF_TYPE,
+            OWL_ALL_DISJOINT_PROPERTIES,
+        ),
+        (
+            "http://example.com/all-disjoint-properties",
+            OWL_MEMBERS,
+            "http://example.com/property-head",
+        ),
+        (
+            "http://example.com/property-head",
+            RDF_FIRST,
+            "http://example.com/p1",
+        ),
+        (
+            "http://example.com/property-head",
+            RDF_REST,
+            "http://example.com/property-tail",
+        ),
+        (
+            "http://example.com/property-tail",
+            RDF_FIRST,
+            "http://example.com/p2",
+        ),
+        (
+            "http://example.com/property-tail",
+            RDF_REST,
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
+        ),
+    ]);
+
+    let index = IndexedDataset::from_snapshot(&snapshot);
+
+    assert!(index.different_from_pairs().iter().any(|&(left, right)| {
+        matches!(
+            (
+                index.symbols().resolve(left),
+                index.symbols().resolve(right)
+            ),
+            (
+                Some("http://example.com/alice"),
+                Some("http://example.com/alicia")
+            )
+        )
+    }));
+    assert!(
+        index
+            .disjoint_class_pairs()
+            .values()
+            .flatten()
+            .filter_map(|target_id| index.symbols().resolve(*target_id))
+            .any(|iri| iri == "http://example.com/Other")
+    );
+    assert!(
+        index
+            .property_disjoint_pairs()
+            .values()
+            .flatten()
+            .filter_map(|target_id| index.symbols().resolve(*target_id))
+            .any(|iri| iri == "http://example.com/p2")
+    );
+}
+
+#[test]
+fn indexed_dataset_reports_malformed_group_axiom_lists() {
+    let snapshot = OwnedSnapshot::new(vec![
+        (
+            "http://example.com/all-different",
+            RDF_TYPE,
+            OWL_ALL_DIFFERENT,
+        ),
+        (
+            "http://example.com/all-different",
+            OWL_MEMBERS,
+            "http://example.com/diff-head",
+        ),
+        (
+            "http://example.com/diff-head",
+            RDF_FIRST,
+            "http://example.com/alice",
+        ),
+    ]);
+
+    let index = IndexedDataset::from_snapshot(&snapshot);
+
+    assert!(
+        index
+            .group_axiom_diagnostics()
+            .iter()
+            .any(|message| message.contains("owl:AllDifferent"))
     );
 }

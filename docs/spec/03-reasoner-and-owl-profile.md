@@ -38,6 +38,9 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - bounded identity entailment from `owl:FunctionalProperty` and `owl:InverseFunctionalProperty`, producing canonical effective equality links over named resources
 - bounded `owl:ReflexiveProperty` support over observed named resources, producing effective self-loop assertions for the declared reflexive properties
 - bounded `owl:propertyChainAxiom` support for named properties over well-formed named-node RDF lists of length 2
+- bounded `owl:AllDifferent` expansion into pairwise effective `owl:differentFrom` constraints over RDF list members
+- bounded `owl:AllDisjointClasses` expansion into pairwise class disjointness constraints over RDF list members
+- bounded `owl:AllDisjointProperties` expansion into pairwise property-disjointness constraints over RDF list members
 - commit-path `owl:Nothing` conflict detection over effective types, including named classes whose taxonomy closes to `owl:Nothing`
 - commit-path `owl:disjointWith` conflict detection over effective types
 - commit-path `owl:differentFrom` conflict detection against the effective `owl:sameAs` equality closure, including equality implied by bounded functional / inverse-functional property semantics
@@ -88,6 +91,9 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - `owl:SymmetricProperty`
 - `owl:TransitiveProperty`
 - bounded binary `owl:propertyChainAxiom` over named properties and well-formed named-node RDF lists
+- bounded `owl:AllDifferent` over RDF list members
+- bounded `owl:AllDisjointClasses` over RDF list members
+- bounded `owl:AllDisjointProperties` over RDF list members
 - explicit `owl:sameAs` canonical equality handling (bounded to named-node resources)
 - bounded `owl:FunctionalProperty` equality entailment
 - bounded `owl:InverseFunctionalProperty` equality entailment
@@ -100,6 +106,7 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - `owl:propertyDisjointWith`
 - Deterministic unsupported diagnostics:
 - `owl:propertyChainAxiom` beyond binary chains or over malformed / unsupported RDF list encodings
+- malformed RDF lists attached to `owl:AllDifferent`, `owl:AllDisjointClasses`, or `owl:AllDisjointProperties`
 - `owl:allValuesFrom`
 - `owl:someValuesFrom`
 - `owl:onProperty`
