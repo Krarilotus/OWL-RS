@@ -262,8 +262,9 @@ Priority order for the next replacement-focused runs:
 - centralized server env-var names in `crates/nrese-server/src/config/env_names.rs` so config parsing uses one source of truth for knob names
 - grouped `rules_mvp_cache/` modules so cache policy, schema-prepared artifacts, and prepared-run assembly are no longer mixed in one file
 - externalized `rules-mvp` runtime behavior into a typed reasoner-owned feature policy with server-owned env parsing, policy-aware cache identity, and operator diagnostics that expose the configured reasoning policy
+- integrated bounded binary `owl:propertyChainAxiom` support on the same explicit feature-policy path, with named-node RDF-list planning cached at schema level and property-closure execution reusing that prepared plan
 - moved the class-consistency test block into a dedicated `src/tests/consistency_tests.rs` file to match the repo’s topic-adjacent unit-test convention
 - initialized git versioning for the repository and updated `.gitignore` for Rust, frontend, runtime, and local-secret artifacts
 - added a separate `/console` frontend application with modular React/TypeScript structure, separated styles/i18n, and basic build/test coverage
 - added typed server-side AI provider integration for Gemini and OpenRouter plus public AI suggestion/status endpoints on the same config path as the rest of the server
-- added a staged real-world ontology catalog sync path in the harness for official FOAF, W3C ORG, W3C Time, and PROV-O sources
+- added a staged real-world ontology catalog sync path in the harness for official FOAF, W3C ORG, W3C Time, PROV-O, SKOS, SOSA, SSN, and DCAT sources

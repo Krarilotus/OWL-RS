@@ -160,6 +160,8 @@ pub struct CompatCase {
     #[serde(default)]
     pub generated_payload: Option<GeneratedPayloadSpec>,
     #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
     pub request_headers: CompatHeaders,
     pub kind: CompatKind,
 }

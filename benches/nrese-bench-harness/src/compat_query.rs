@@ -2,7 +2,8 @@ use anyhow::{Result, anyhow};
 use reqwest::Client;
 
 use crate::compat_common::{
-    HttpOutcome, build_response_semantics_report, execute_query_raw, ensure_success,
+    HttpOutcome, RequestExecutionOptions, build_response_semantics_report, execute_query_raw,
+    require_success_http,
 };
 use crate::layout::ServiceTarget;
 use crate::model::{
@@ -20,10 +21,25 @@ pub async fn execute_case(
     case: &CompatCase,
 ) -> Result<CompatCaseReport> {
     let query = query_text(case)?;
-    let left_outcome =
-        execute_query_raw(client, left, &query, &case.accept, &case.request_headers).await?;
-    let right_outcome =
-        execute_query_raw(client, right, &query, &case.accept, &case.request_headers).await?;
+    let options = RequestExecutionOptions::from_case(case);
+    let left_outcome = execute_query_raw(
+        client,
+        left,
+        &query,
+        &case.accept,
+        &case.request_headers,
+        options,
+    )
+    .await?;
+    let right_outcome = execute_query_raw(
+        client,
+        right,
+        &query,
+        &case.accept,
+        &case.request_headers,
+        options,
+    )
+    .await?;
 
     if matches!(
         case.kind,
@@ -32,10 +48,10 @@ pub async fn execute_case(
         return build_response_semantics_report(case, &left_outcome, &right_outcome);
     }
 
-    ensure_success(left, "query", &left_outcome)?;
-    ensure_success(right, "query", &right_outcome)?;
+    let left_http = require_success_http(left, "query", &left_outcome)?;
+    let right_http = require_success_http(right, "query", &right_outcome)?;
 
-    build_report(case, &left_outcome, &right_outcome)
+    build_report(case, left_http, right_http)
 }
 
 fn build_report(
@@ -43,7 +59,8 @@ fn build_report(
     left: &HttpOutcome,
     right: &HttpOutcome,
 ) -> Result<CompatCaseReport> {
-    let (matched, left_summary, right_summary) = compare_payloads(case.kind, &left.body, &right.body)?;
+    let (matched, left_summary, right_summary) =
+        compare_payloads(case.kind, &left.body, &right.body)?;
 
     Ok(CompatCaseReport {
         name: case.name.clone(),
@@ -94,9 +111,9 @@ fn compare_payloads(kind: CompatKind, left: &[u8], right: &[u8]) -> Result<(bool
                 format!("triples={}", right_set.len()),
             ))
         }
-        CompatKind::StatusAndContentType | CompatKind::StatusContentTypeBodyClass => {
-            Err(anyhow!("status-and-content-type is not a query payload comparator"))
-        }
+        CompatKind::StatusAndContentType | CompatKind::StatusContentTypeBodyClass => Err(anyhow!(
+            "status-and-content-type is not a query payload comparator"
+        )),
     }
 }
 
@@ -108,7 +125,10 @@ mod tests {
 
     #[test]
     fn kind_labels_cover_graph_mode() {
-        assert_eq!(compat_kind_label(CompatKind::GraphTriplesSet), "graph-triples-set");
+        assert_eq!(
+            compat_kind_label(CompatKind::GraphTriplesSet),
+            "graph-triples-set"
+        );
     }
 
     #[test]

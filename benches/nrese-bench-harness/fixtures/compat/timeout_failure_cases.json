@@ -1,0 +1,38 @@
+[
+  {
+    "name": "query-client-timeout-template",
+    "operation": "query",
+    "generated_payload": {
+      "kind": "sparql-query",
+      "bytes": 32768
+    },
+    "accept": "application/sparql-results+json",
+    "timeout_ms": 1,
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "update-client-timeout-template",
+    "operation": "update-effect",
+    "generated_payload": {
+      "kind": "sparql-update",
+      "bytes": 32768
+    },
+    "timeout_ms": 1,
+    "kind": "status-content-type-body-class"
+  },
+  {
+    "name": "graph-put-client-timeout-template",
+    "operation": "graph-put-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/compat-timeout-graph"
+    },
+    "graph_content_type": "text/turtle",
+    "generated_payload": {
+      "kind": "rdf-turtle",
+      "bytes": 65536
+    },
+    "timeout_ms": 1,
+    "kind": "status-content-type-body-class"
+  }
+]

@@ -24,6 +24,7 @@ pub struct RulesMvpFeaturePolicy {
     pub rdfs_domain_range_typing: FeatureMode,
     pub owl_property_assertion_closure: FeatureMode,
     pub owl_equality_reasoning: FeatureMode,
+    pub owl_property_chain_axioms: FeatureMode,
     pub owl_consistency_check: FeatureMode,
     pub unsupported_constructs: UnsupportedConstructBehavior,
 }
@@ -37,6 +38,7 @@ impl RulesMvpFeaturePolicy {
             rdfs_domain_range_typing: FeatureMode::Enabled,
             owl_property_assertion_closure: FeatureMode::Enabled,
             owl_equality_reasoning: FeatureMode::Enabled,
+            owl_property_chain_axioms: FeatureMode::Enabled,
             owl_consistency_check: FeatureMode::Enabled,
             unsupported_constructs: UnsupportedConstructBehavior::Diagnose,
         }
@@ -50,6 +52,7 @@ impl RulesMvpFeaturePolicy {
             rdfs_domain_range_typing: FeatureMode::Disabled,
             owl_property_assertion_closure: FeatureMode::Disabled,
             owl_equality_reasoning: FeatureMode::Disabled,
+            owl_property_chain_axioms: FeatureMode::Disabled,
             owl_consistency_check: FeatureMode::Disabled,
             unsupported_constructs: UnsupportedConstructBehavior::Ignore,
         }
@@ -63,10 +66,11 @@ impl RulesMvpFeaturePolicy {
         key ^= flag(self.rdfs_domain_range_typing, 3);
         key ^= flag(self.owl_property_assertion_closure, 4);
         key ^= flag(self.owl_equality_reasoning, 5);
-        key ^= flag(self.owl_consistency_check, 6);
+        key ^= flag(self.owl_property_chain_axioms, 6);
+        key ^= flag(self.owl_consistency_check, 7);
         key ^= match self.unsupported_constructs {
             UnsupportedConstructBehavior::Ignore => 0,
-            UnsupportedConstructBehavior::Diagnose => 1 << 7,
+            UnsupportedConstructBehavior::Diagnose => 1 << 8,
         };
         key
     }
@@ -95,6 +99,10 @@ impl RulesMvpFeaturePolicy {
         self.owl_equality_reasoning.is_enabled()
     }
 
+    pub const fn owl_property_chain_axioms_enabled(self) -> bool {
+        self.owl_property_chain_axioms.is_enabled()
+    }
+
     pub const fn owl_consistency_check_enabled(self) -> bool {
         self.owl_consistency_check.is_enabled()
     }
@@ -115,6 +123,7 @@ impl RulesMvpFeaturePolicy {
     pub const fn needs_property_taxonomy(self) -> bool {
         self.rdfs_subproperty_closure_enabled()
             || self.owl_property_assertion_closure_enabled()
+            || self.owl_property_chain_axioms_enabled()
             || self.rdfs_domain_range_typing_enabled()
             || self.owl_equality_reasoning_enabled()
             || self.owl_consistency_check_enabled()
@@ -130,7 +139,12 @@ impl RulesMvpFeaturePolicy {
         self.rdfs_subproperty_closure_enabled()
             || self.rdfs_domain_range_typing_enabled()
             || self.owl_equality_reasoning_enabled()
+            || self.owl_property_chain_axioms_enabled()
             || self.owl_consistency_check_enabled()
+    }
+
+    pub const fn needs_property_chain_plan(self) -> bool {
+        self.owl_property_chain_axioms_enabled() || self.unsupported_construct_diagnostics_enabled()
     }
 }
 

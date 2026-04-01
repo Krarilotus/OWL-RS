@@ -30,6 +30,7 @@ impl RulesMvpFeaturePolicy {
             rdfs_domain_range_typing: FeatureMode::Enabled,
             owl_property_assertion_closure: FeatureMode::Disabled,
             owl_equality_reasoning: FeatureMode::Disabled,
+            owl_property_chain_axioms: FeatureMode::Disabled,
             owl_consistency_check: FeatureMode::Disabled,
             unsupported_constructs: UnsupportedConstructBehavior::Diagnose,
         }
@@ -57,6 +58,7 @@ impl RulesMvpFeaturePolicy {
             && self.owl_property_assertion_closure as u8
                 == other.owl_property_assertion_closure as u8
             && self.owl_equality_reasoning as u8 == other.owl_equality_reasoning as u8
+            && self.owl_property_chain_axioms as u8 == other.owl_property_chain_axioms as u8
             && self.owl_consistency_check as u8 == other.owl_consistency_check as u8
             && self.unsupported_constructs as u8 == other.unsupported_constructs as u8
     }

@@ -5,7 +5,8 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 
 use crate::compat_common::{
-    execute_graph_write_raw, execute_query_raw, execute_update_raw, ensure_success,
+    RequestExecutionOptions, execute_graph_write_raw, execute_query_raw, execute_update_raw,
+    require_success_http,
 };
 use crate::compat_graph_store;
 use crate::compat_query;
@@ -17,9 +18,9 @@ use crate::io::{
 use crate::layout::ServiceTarget;
 use crate::model::{
     BenchComparison, BenchConfig, BenchReport, CatalogSyncConfig, CompatCase, CompatCaseReport,
-    CompatConfig, CompatGraphTarget, CompatHeaders, CompatOperation, CompatReport,
-    OntologyFixture, PackArtifactReport, PackCompatSuiteReport, PackConfig, PackReport,
-    QueryWorkloadCase, SeedConfig, ServiceBenchReport, UpdateWorkloadCase,
+    CompatConfig, CompatGraphTarget, CompatHeaders, CompatOperation, CompatReport, OntologyFixture,
+    PackArtifactReport, PackCompatSuiteReport, PackConfig, PackReport, QueryWorkloadCase,
+    SeedConfig, ServiceBenchReport, UpdateWorkloadCase,
 };
 use crate::normalize::summarize;
 
@@ -38,8 +39,7 @@ pub async fn run_bench(config: BenchConfig) -> Result<BenchRunArtifact> {
 
     let mut services = Vec::new();
     let nrese_query = benchmark_queries(&client, &nrese, &query_cases, config.iterations).await?;
-    let nrese_update =
-        benchmark_updates(&client, &nrese, &update_cases, config.iterations).await?;
+    let nrese_update = benchmark_updates(&client, &nrese, &update_cases, config.iterations).await?;
     print_summary("NRESE query", &nrese_query);
     print_summary("NRESE update", &nrese_update);
     services.push(ServiceBenchReport {
@@ -134,11 +134,7 @@ pub async fn run_compat(config: CompatConfig) -> Result<CompatRunArtifact> {
             report.operation,
             report.kind,
             case.name,
-            if report.matched {
-                "match"
-            } else {
-                "mismatch"
-            }
+            if report.matched { "match" } else { "mismatch" }
         );
 
         reports.push(report);
@@ -408,9 +404,18 @@ async fn benchmark_queries(
     for case in cases {
         for _ in 0..(case.weight * iterations) {
             let started = Instant::now();
-            match execute_query_raw(client, target, &case.query, &case.accept, &CompatHeaders::new()).await {
-                Ok(outcome) => match ensure_success(target, "query", &outcome) {
-                    Ok(()) => {
+            match execute_query_raw(
+                client,
+                target,
+                &case.query,
+                &case.accept,
+                &CompatHeaders::new(),
+                RequestExecutionOptions::default(),
+            )
+            .await
+            {
+                Ok(outcome) => match require_success_http(target, "query", &outcome) {
+                    Ok(_) => {
                         success += 1;
                         latencies.push(started.elapsed().as_millis());
                     }
@@ -424,7 +429,10 @@ async fn benchmark_queries(
                 },
                 Err(error) => {
                     failure += 1;
-                    eprintln!("query case '{}' failed against {}: {error}", case.name, target.label);
+                    eprintln!(
+                        "query case '{}' failed against {}: {error}",
+                        case.name, target.label
+                    );
                 }
             }
         }
@@ -446,9 +454,17 @@ async fn benchmark_updates(
     for case in cases {
         for _ in 0..(case.weight * iterations) {
             let started = Instant::now();
-            match execute_update_raw(client, target, &case.update, &CompatHeaders::new()).await {
-                Ok(outcome) => match ensure_success(target, "update", &outcome) {
-                    Ok(()) => {
+            match execute_update_raw(
+                client,
+                target,
+                &case.update,
+                &CompatHeaders::new(),
+                RequestExecutionOptions::default(),
+            )
+            .await
+            {
+                Ok(outcome) => match require_success_http(target, "update", &outcome) {
+                    Ok(_) => {
                         success += 1;
                         latencies.push(started.elapsed().as_millis());
                     }
@@ -489,7 +505,9 @@ async fn execute_compat_case(
         | CompatOperation::GraphPostEffect => {
             compat_graph_store::execute_case(client, left, right, case).await
         }
-        CompatOperation::UpdateEffect => compat_update::execute_case(client, left, right, case).await,
+        CompatOperation::UpdateEffect => {
+            compat_update::execute_case(client, left, right, case).await
+        }
     }
 }
 
@@ -508,9 +526,10 @@ async fn write_dataset_raw(
         payload,
         replace,
         &CompatHeaders::new(),
+        RequestExecutionOptions::default(),
     )
     .await?;
-    ensure_success(target, "dataset write", &outcome)
+    require_success_http(target, "dataset write", &outcome).map(|_| ())
 }
 
 fn build_client() -> Result<Client> {
@@ -592,6 +611,21 @@ mod tests {
     }
 
     #[test]
+    fn compat_case_parses_optional_timeout_budget() {
+        let case: CompatCase = serde_json::from_str(
+            r#"{
+                "name":"slow-query",
+                "query":"SELECT * WHERE { ?s ?p ?o }",
+                "timeout_ms": 25,
+                "kind":"status-content-type-body-class"
+            }"#,
+        )
+        .expect("case");
+
+        assert_eq!(case.timeout_ms, Some(25));
+    }
+
+    #[test]
     fn report_filename_uses_suite_stem() {
         assert_eq!(
             compat_report_filename(Path::new("fixtures/compat/policy_failure_cases.json")),
@@ -612,6 +646,9 @@ mod tests {
 
         assert_eq!(report.suite_name, "policy_failure_cases");
         assert_eq!(report.status, "all-matched");
-        assert_eq!(report.report.as_ref().map(|entry| entry.path.as_str()), Some("artifacts/policy-report.json"));
+        assert_eq!(
+            report.report.as_ref().map(|entry| entry.path.as_str()),
+            Some("artifacts/policy-report.json")
+        );
     }
 }

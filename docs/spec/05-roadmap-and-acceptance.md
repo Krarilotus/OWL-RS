@@ -59,6 +59,7 @@ The canonical replacement-readiness tracking document is [06-fuseki-replacement-
 - `rules-mvp` property-characteristic consistency checks now cover bounded `owl:IrreflexiveProperty`, `owl:AsymmetricProperty`, and `owl:propertyDisjointWith` rejection semantics
 - `rules-mvp` now includes bounded explicit `owl:sameAs` support through canonical equality handling
 - `rules-mvp` now includes bounded equality entailment from `owl:FunctionalProperty` and `owl:InverseFunctionalProperty`, with downstream rejection only if the resulting effective equality conflicts with other bounded consistency rules such as `owl:differentFrom`
+- `rules-mvp` now includes bounded binary `owl:propertyChainAxiom` support over named properties with well-formed named-node RDF lists, behind the same typed feature-policy path as the rest of `rules-mvp`
 - `rules-mvp` now includes bounded `owl:ReflexiveProperty` inference over observed named resources and commit-path `owl:differentFrom` consistency rejection against the effective equality closure
 - `rules-mvp` now includes bounded `owl:Nothing` rejection over effective types, including named classes that close to `owl:Nothing` through the current taxonomy support
 - `rules-mvp` emits deterministic unsupported diagnostics for constructs that remain out of scope in the current bounded slice
@@ -80,6 +81,7 @@ The canonical replacement-readiness tracking document is [06-fuseki-replacement-
 - `owl:equivalentProperty` / `owl:equivalentClass`
 - `owl:inverseOf`
 - bounded `owl:SymmetricProperty` / `owl:TransitiveProperty`
+- bounded binary `owl:propertyChainAxiom` over named properties with named-node RDF lists
 - bounded `owl:ReflexiveProperty` inference over observed named resources
 - bounded explicit `owl:sameAs` canonical equality handling
 - bounded equality entailment from `owl:FunctionalProperty` and `owl:InverseFunctionalProperty`

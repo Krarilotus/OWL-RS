@@ -11,7 +11,7 @@ pub struct ReasonerProfile {
 
 const DISABLED_CAPABILITIES: [ReasonerCapability; 0] = [];
 
-const RULES_MVP_CAPABILITIES: [ReasonerCapability; 6] = [
+const RULES_MVP_CAPABILITIES: [ReasonerCapability; 7] = [
     ReasonerCapability {
         feature: ReasonerFeature::RdfsSubclassClosure,
         maturity: CapabilityMaturity::Mvp,
@@ -34,6 +34,11 @@ const RULES_MVP_CAPABILITIES: [ReasonerCapability; 6] = [
     },
     ReasonerCapability {
         feature: ReasonerFeature::OwlEqualityReasoning,
+        maturity: CapabilityMaturity::Mvp,
+        enabled_by_default: true,
+    },
+    ReasonerCapability {
+        feature: ReasonerFeature::OwlPropertyChainAxioms,
         maturity: CapabilityMaturity::Mvp,
         enabled_by_default: true,
     },

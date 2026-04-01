@@ -4,8 +4,8 @@ use crate::vocabulary::{
     OWL_ASYMMETRIC_PROPERTY, OWL_DIFFERENT_FROM, OWL_DISJOINT_WITH, OWL_EQUIVALENT_CLASS,
     OWL_EQUIVALENT_PROPERTY, OWL_FUNCTIONAL_PROPERTY, OWL_INVERSE_FUNCTIONAL_PROPERTY,
     OWL_INVERSE_OF, OWL_IRREFLEXIVE_PROPERTY, OWL_PROPERTY_DISJOINT_WITH, OWL_REFLEXIVE_PROPERTY,
-    OWL_SAME_AS, OWL_SYMMETRIC_PROPERTY, OWL_TRANSITIVE_PROPERTY, RDF_TYPE, RDFS_DOMAIN,
-    RDFS_RANGE, RDFS_SUBCLASS_OF, RDFS_SUBPROPERTY_OF,
+    OWL_SAME_AS, OWL_SYMMETRIC_PROPERTY, OWL_TRANSITIVE_PROPERTY, RDF_FIRST, RDF_REST, RDF_TYPE,
+    RDFS_DOMAIN, RDFS_RANGE, RDFS_SUBCLASS_OF, RDFS_SUBPROPERTY_OF,
 };
 
 #[test]
@@ -257,6 +257,114 @@ fn schema_cache_key_changes_when_schema_changes() {
         "http://www.w3.org/2000/01/rdf-schema#subClassOf",
         "http://example.com/Ancestor",
     )]);
+
+    let first_index = IndexedDataset::from_snapshot(&first);
+    let second_index = IndexedDataset::from_snapshot(&second);
+
+    assert_ne!(
+        first_index.schema_cache_key(),
+        second_index.schema_cache_key()
+    );
+}
+
+#[test]
+fn indexed_dataset_collects_property_chain_axiom_schema_artifacts() {
+    let snapshot = OwnedSnapshot::new(vec![
+        (
+            "http://example.com/composed",
+            "http://www.w3.org/2002/07/owl#propertyChainAxiom",
+            "http://example.com/chain-head",
+        ),
+        (
+            "http://example.com/chain-head",
+            RDF_FIRST,
+            "http://example.com/p1",
+        ),
+        (
+            "http://example.com/chain-head",
+            RDF_REST,
+            "http://example.com/chain-tail",
+        ),
+        (
+            "http://example.com/chain-tail",
+            RDF_FIRST,
+            "http://example.com/p2",
+        ),
+        (
+            "http://example.com/chain-tail",
+            RDF_REST,
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
+        ),
+    ]);
+
+    let index = IndexedDataset::from_snapshot(&snapshot);
+
+    assert_eq!(
+        index.property_chain_axiom_heads().len(),
+        1,
+        "expected one composed property entry"
+    );
+    assert_eq!(index.list_first_by_node().len(), 2);
+    assert_eq!(index.list_rest_by_node().len(), 2);
+    assert_eq!(index.property_assertion_count(), 0);
+}
+
+#[test]
+fn schema_cache_key_changes_when_property_chain_schema_changes() {
+    let first = OwnedSnapshot::new(vec![
+        (
+            "http://example.com/composed",
+            "http://www.w3.org/2002/07/owl#propertyChainAxiom",
+            "http://example.com/chain-head",
+        ),
+        (
+            "http://example.com/chain-head",
+            RDF_FIRST,
+            "http://example.com/p1",
+        ),
+        (
+            "http://example.com/chain-head",
+            RDF_REST,
+            "http://example.com/chain-tail",
+        ),
+        (
+            "http://example.com/chain-tail",
+            RDF_FIRST,
+            "http://example.com/p2",
+        ),
+        (
+            "http://example.com/chain-tail",
+            RDF_REST,
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
+        ),
+    ]);
+    let second = OwnedSnapshot::new(vec![
+        (
+            "http://example.com/composed",
+            "http://www.w3.org/2002/07/owl#propertyChainAxiom",
+            "http://example.com/chain-head",
+        ),
+        (
+            "http://example.com/chain-head",
+            RDF_FIRST,
+            "http://example.com/p1",
+        ),
+        (
+            "http://example.com/chain-head",
+            RDF_REST,
+            "http://example.com/chain-tail",
+        ),
+        (
+            "http://example.com/chain-tail",
+            RDF_FIRST,
+            "http://example.com/p3",
+        ),
+        (
+            "http://example.com/chain-tail",
+            RDF_REST,
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
+        ),
+    ]);
 
     let first_index = IndexedDataset::from_snapshot(&first);
     let second_index = IndexedDataset::from_snapshot(&second);

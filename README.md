@@ -44,7 +44,7 @@ Implemented today:
 - frontend locale selection with persisted `en`/`de` i18n instead of browser-guess-only language handling
 - service description, health, readiness, metrics, and operator endpoints
 - staged update validation before publish
-- bounded `rules-mvp` reasoning with canonical `owl:sameAs` equality handling, bounded functional / inverse-functional equality entailment, bounded `owl:Nothing` effective-type rejection, and explicit unsupported-construct diagnostics
+- bounded `rules-mvp` reasoning with canonical `owl:sameAs` equality handling, bounded functional / inverse-functional equality entailment, bounded binary `owl:propertyChainAxiom` support over named-node RDF lists, bounded `owl:Nothing` effective-type rejection, and explicit unsupported-construct diagnostics
 - typed `rules-mvp` presets (`rdfs-core`, `bounded-owl`) on top of the explicit feature-policy path
 - snapshot-keyed memoization for repeated `rules-mvp` runs over identical dataset state
 - schema-keyed memoization for `rules-mvp` preparation reuse across ABox-only changes
@@ -52,7 +52,7 @@ Implemented today:
 - prepared property-consistency indexing so `rules-mvp` reuses one grouped assertion view per run for constrained predicates instead of rescanning property closure for each consistency gate
 - local comparison harness for NRESE vs Fuseki on seeded datasets
 - manifest-driven workload-pack execution for production-style seed + compat + bench runs
-- real-world ontology catalog sync for staged parity and hardening runs against FOAF, W3C ORG, W3C Time, and PROV-O
+- real-world ontology catalog sync for staged parity and hardening runs against FOAF, W3C ORG, W3C Time, PROV-O, SKOS, SOSA, SSN, and DCAT
 - protocol compatibility harness coverage for query parity, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-parity slice, and bounded query/update failure-parity fixtures for covered negative cases
 - bounded `bearer-jwt` auth alongside `bearer-static`
 - bounded proxy-terminated `mtls` auth alongside the existing bearer modes

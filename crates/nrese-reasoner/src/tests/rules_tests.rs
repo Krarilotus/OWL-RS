@@ -86,10 +86,116 @@ fn rules_mvp_reports_skipped_triples_in_diagnostics() {
 #[test]
 fn rules_mvp_reports_remaining_unsupported_construct_diagnostics() {
     let snapshot = OwnedSnapshot::new(vec![(
-        "http://example.com/p",
-        "http://www.w3.org/2002/07/owl#propertyChainAxiom",
-        "http://example.com/chain",
+        "http://example.com/restriction",
+        "http://www.w3.org/2002/07/owl#allValuesFrom",
+        "http://example.com/Target",
     )]);
+
+    let output = execute_rules_mvp(&snapshot);
+
+    assert_eq!(output.consistency_violations, 0);
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("owl:allValuesFrom"))
+    );
+}
+
+#[test]
+fn rules_mvp_derives_binary_property_chain_axiom_assertions() {
+    let snapshot = OwnedSnapshot::new(vec![
+        (
+            "http://example.com/ancestorLocatedIn",
+            "http://www.w3.org/2002/07/owl#propertyChainAxiom",
+            "http://example.com/chain-head",
+        ),
+        (
+            "http://example.com/chain-head",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#first",
+            "http://example.com/parentOf",
+        ),
+        (
+            "http://example.com/chain-head",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest",
+            "http://example.com/chain-tail",
+        ),
+        (
+            "http://example.com/chain-tail",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#first",
+            "http://example.com/locatedIn",
+        ),
+        (
+            "http://example.com/chain-tail",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
+        ),
+        (
+            "http://example.com/alice",
+            "http://example.com/parentOf",
+            "http://example.com/bob",
+        ),
+        (
+            "http://example.com/bob",
+            "http://example.com/locatedIn",
+            "http://example.com/paris",
+        ),
+    ]);
+
+    let output = execute_rules_mvp(&snapshot);
+
+    assert!(output.derived_triples.contains(&(
+        "http://example.com/alice".to_owned(),
+        "http://example.com/ancestorLocatedIn".to_owned(),
+        "http://example.com/paris".to_owned()
+    )));
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .all(|message| !message.contains("owl:propertyChainAxiom"))
+    );
+}
+
+#[test]
+fn rules_mvp_reports_unsupported_longer_property_chains() {
+    let snapshot = OwnedSnapshot::new(vec![
+        (
+            "http://example.com/p",
+            "http://www.w3.org/2002/07/owl#propertyChainAxiom",
+            "http://example.com/chain-1",
+        ),
+        (
+            "http://example.com/chain-1",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#first",
+            "http://example.com/p1",
+        ),
+        (
+            "http://example.com/chain-1",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest",
+            "http://example.com/chain-2",
+        ),
+        (
+            "http://example.com/chain-2",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#first",
+            "http://example.com/p2",
+        ),
+        (
+            "http://example.com/chain-2",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest",
+            "http://example.com/chain-3",
+        ),
+        (
+            "http://example.com/chain-3",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#first",
+            "http://example.com/p3",
+        ),
+        (
+            "http://example.com/chain-3",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest",
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil",
+        ),
+    ]);
 
     let output = execute_rules_mvp(&snapshot);
 

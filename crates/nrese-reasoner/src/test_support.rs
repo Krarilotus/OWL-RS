@@ -5,6 +5,7 @@ use nrese_core::{DatasetSnapshot, IriRef, TripleRef, TripleSource};
 use crate::dataset_index::IndexedDataset;
 use crate::effective_types::EffectiveTypeSet;
 use crate::identity::EqualityIndex;
+use crate::property_chain::PropertyChainPlan;
 use crate::property_closure::PropertyClosure;
 use crate::property_taxonomy::PropertyTaxonomyIndex;
 use crate::rules_mvp_policy::RulesMvpFeaturePolicy;
@@ -58,10 +59,12 @@ pub fn default_rules_mvp_policy() -> RulesMvpFeaturePolicy {
 pub fn build_property_closure(index: &IndexedDataset) -> PropertyClosure {
     let property_taxonomy = PropertyTaxonomyIndex::from_edges(index.subproperty_edges());
     let equality = EqualityIndex::build(index);
+    let property_chain_plan = PropertyChainPlan::build(index);
     PropertyClosure::build(
         index,
         &property_taxonomy,
         &equality,
+        &property_chain_plan,
         &default_rules_mvp_policy(),
     )
 }

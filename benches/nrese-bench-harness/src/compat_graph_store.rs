@@ -2,8 +2,8 @@ use anyhow::{Result, anyhow, bail};
 use reqwest::Client;
 
 use crate::compat_common::{
-    build_response_semantics_report, execute_graph_delete_raw, execute_graph_head_raw, execute_graph_read_raw,
-    execute_graph_write_raw, ensure_success,
+    RequestExecutionOptions, build_response_semantics_report, execute_graph_delete_raw,
+    execute_graph_head_raw, execute_graph_read_raw, execute_graph_write_raw, require_success_http,
 };
 use crate::layout::ServiceTarget;
 use crate::model::{
@@ -23,25 +23,28 @@ pub async fn execute_case(
         .graph_target
         .as_ref()
         .ok_or_else(|| anyhow!("graph operation requires graph_target"))?;
+    let options = RequestExecutionOptions::from_case(case);
 
     match case.operation {
         CompatOperation::GraphRead => {
             maybe_prepare_graph(client, left, right, case, graph_target).await?;
-            build_graph_read_report(client, left, right, case, graph_target).await
+            build_graph_read_report(client, left, right, case, graph_target, options).await
         }
         CompatOperation::GraphHead => {
             maybe_prepare_graph(client, left, right, case, graph_target).await?;
-            build_graph_head_report(client, left, right, case, graph_target).await
+            build_graph_head_report(client, left, right, case, graph_target, options).await
         }
         CompatOperation::GraphDeleteEffect => {
             maybe_prepare_graph(client, left, right, case, graph_target).await?;
-            build_graph_delete_effect_report(client, left, right, case, graph_target).await
+            build_graph_delete_effect_report(client, left, right, case, graph_target, options).await
         }
         CompatOperation::GraphPutEffect => {
-            build_graph_write_effect_report(client, left, right, case, graph_target, true).await
+            build_graph_write_effect_report(client, left, right, case, graph_target, true, options)
+                .await
         }
         CompatOperation::GraphPostEffect => {
-            build_graph_write_effect_report(client, left, right, case, graph_target, false).await
+            build_graph_write_effect_report(client, left, right, case, graph_target, false, options)
+                .await
         }
         _ => bail!("graph store module received a non-graph operation"),
     }
@@ -89,29 +92,42 @@ async fn build_graph_read_report(
     right: &ServiceTarget,
     case: &CompatCase,
     graph_target: &crate::model::CompatGraphTarget,
+    options: RequestExecutionOptions,
 ) -> Result<CompatCaseReport> {
     match case.kind {
         CompatKind::GraphTriplesSet => {
-            let left_outcome =
-                execute_graph_read_raw(client, left, graph_target, &case.accept, &case.request_headers)
-                    .await?;
-            let right_outcome =
-                execute_graph_read_raw(client, right, graph_target, &case.accept, &case.request_headers)
-                    .await?;
-            ensure_success(left, "graph read", &left_outcome)?;
-            ensure_success(right, "graph read", &right_outcome)?;
+            let left_outcome = execute_graph_read_raw(
+                client,
+                left,
+                graph_target,
+                &case.accept,
+                &case.request_headers,
+                options,
+            )
+            .await?;
+            let right_outcome = execute_graph_read_raw(
+                client,
+                right,
+                graph_target,
+                &case.accept,
+                &case.request_headers,
+                options,
+            )
+            .await?;
+            let left_http = require_success_http(left, "graph read", &left_outcome)?;
+            let right_http = require_success_http(right, "graph read", &right_outcome)?;
 
-            let left_set = canonicalize_ntriples_set(&left_outcome.body)?;
-            let right_set = canonicalize_ntriples_set(&right_outcome.body)?;
+            let left_set = canonicalize_ntriples_set(&left_http.body)?;
+            let right_set = canonicalize_ntriples_set(&right_http.body)?;
 
             Ok(CompatCaseReport {
                 name: case.name.clone(),
                 operation: compat_operation_label(case.operation),
                 kind: compat_kind_label(case.kind),
-                left_status: left_outcome.status.as_u16(),
-                right_status: right_outcome.status.as_u16(),
-                left_content_type: left_outcome.content_type.clone(),
-                right_content_type: right_outcome.content_type.clone(),
+                left_status: left_http.status.as_u16(),
+                right_status: right_http.status.as_u16(),
+                left_content_type: left_http.content_type.clone(),
+                right_content_type: right_http.content_type.clone(),
                 left_body_class: None,
                 right_body_class: None,
                 matched: left_set == right_set,
@@ -129,15 +145,28 @@ async fn build_graph_head_report(
     right: &ServiceTarget,
     case: &CompatCase,
     graph_target: &crate::model::CompatGraphTarget,
+    options: RequestExecutionOptions,
 ) -> Result<CompatCaseReport> {
     match case.kind {
         CompatKind::StatusAndContentType | CompatKind::StatusContentTypeBodyClass => {
-            let left_outcome =
-                execute_graph_head_raw(client, left, graph_target, &case.accept, &case.request_headers)
-                    .await?;
-            let right_outcome =
-                execute_graph_head_raw(client, right, graph_target, &case.accept, &case.request_headers)
-                    .await?;
+            let left_outcome = execute_graph_head_raw(
+                client,
+                left,
+                graph_target,
+                &case.accept,
+                &case.request_headers,
+                options,
+            )
+            .await?;
+            let right_outcome = execute_graph_head_raw(
+                client,
+                right,
+                graph_target,
+                &case.accept,
+                &case.request_headers,
+                options,
+            )
+            .await?;
             build_response_semantics_report(case, &left_outcome, &right_outcome)
         }
         _ => bail!("graph-head operation only supports status-and-content-type in this build"),
@@ -150,15 +179,28 @@ async fn build_graph_delete_effect_report(
     right: &ServiceTarget,
     case: &CompatCase,
     graph_target: &crate::model::CompatGraphTarget,
+    options: RequestExecutionOptions,
 ) -> Result<CompatCaseReport> {
     match case.kind {
         CompatKind::GraphTriplesSet => {
-            let left_delete =
-                execute_graph_delete_raw(client, left, graph_target, &case.request_headers).await?;
-            let right_delete =
-                execute_graph_delete_raw(client, right, graph_target, &case.request_headers).await?;
-            ensure_success(left, "graph delete", &left_delete)?;
-            ensure_success(right, "graph delete", &right_delete)?;
+            let left_delete = execute_graph_delete_raw(
+                client,
+                left,
+                graph_target,
+                &case.request_headers,
+                options,
+            )
+            .await?;
+            let right_delete = execute_graph_delete_raw(
+                client,
+                right,
+                graph_target,
+                &case.request_headers,
+                options,
+            )
+            .await?;
+            require_success_http(left, "graph delete", &left_delete)?;
+            require_success_http(right, "graph delete", &right_delete)?;
 
             let left_outcome = execute_graph_read_raw(
                 client,
@@ -166,6 +208,7 @@ async fn build_graph_delete_effect_report(
                 graph_target,
                 "application/n-triples",
                 &case.request_headers,
+                RequestExecutionOptions::default(),
             )
             .await?;
             let right_outcome = execute_graph_read_raw(
@@ -174,22 +217,23 @@ async fn build_graph_delete_effect_report(
                 graph_target,
                 "application/n-triples",
                 &case.request_headers,
+                RequestExecutionOptions::default(),
             )
             .await?;
-            ensure_success(left, "graph read", &left_outcome)?;
-            ensure_success(right, "graph read", &right_outcome)?;
+            let left_http = require_success_http(left, "graph read", &left_outcome)?;
+            let right_http = require_success_http(right, "graph read", &right_outcome)?;
 
-            let left_set = canonicalize_ntriples_set(&left_outcome.body)?;
-            let right_set = canonicalize_ntriples_set(&right_outcome.body)?;
+            let left_set = canonicalize_ntriples_set(&left_http.body)?;
+            let right_set = canonicalize_ntriples_set(&right_http.body)?;
 
             Ok(CompatCaseReport {
                 name: case.name.clone(),
                 operation: compat_operation_label(case.operation),
                 kind: compat_kind_label(case.kind),
-                left_status: left_outcome.status.as_u16(),
-                right_status: right_outcome.status.as_u16(),
-                left_content_type: left_outcome.content_type.clone(),
-                right_content_type: right_outcome.content_type.clone(),
+                left_status: left_http.status.as_u16(),
+                right_status: right_http.status.as_u16(),
+                left_content_type: left_http.content_type.clone(),
+                right_content_type: right_http.content_type.clone(),
                 left_body_class: None,
                 right_body_class: None,
                 matched: left_set == right_set,
@@ -198,13 +242,27 @@ async fn build_graph_delete_effect_report(
             })
         }
         CompatKind::StatusAndContentType | CompatKind::StatusContentTypeBodyClass => {
-            let left_delete =
-                execute_graph_delete_raw(client, left, graph_target, &case.request_headers).await?;
-            let right_delete =
-                execute_graph_delete_raw(client, right, graph_target, &case.request_headers).await?;
+            let left_delete = execute_graph_delete_raw(
+                client,
+                left,
+                graph_target,
+                &case.request_headers,
+                options,
+            )
+            .await?;
+            let right_delete = execute_graph_delete_raw(
+                client,
+                right,
+                graph_target,
+                &case.request_headers,
+                options,
+            )
+            .await?;
             build_response_semantics_report(case, &left_delete, &right_delete)
         }
-        _ => bail!("graph-delete-effect operation only supports graph-triples-set or response-semantics comparators in this build"),
+        _ => bail!(
+            "graph-delete-effect operation only supports graph-triples-set or response-semantics comparators in this build"
+        ),
     }
 }
 
@@ -215,6 +273,7 @@ async fn build_graph_write_effect_report(
     case: &CompatCase,
     graph_target: &crate::model::CompatGraphTarget,
     replace: bool,
+    options: RequestExecutionOptions,
 ) -> Result<CompatCaseReport> {
     match case.kind {
         CompatKind::GraphTriplesSet => {
@@ -229,6 +288,7 @@ async fn build_graph_write_effect_report(
                 &payload,
                 replace,
                 &case.request_headers,
+                options,
             )
             .await?;
             let right_write = execute_graph_write_raw(
@@ -239,33 +299,36 @@ async fn build_graph_write_effect_report(
                 &payload,
                 replace,
                 &case.request_headers,
+                options,
             )
             .await?;
-            ensure_success(left, "graph write", &left_write)?;
-            ensure_success(right, "graph write", &right_write)?;
+            let left_http = require_success_http(left, "graph write", &left_write)?;
+            let right_http = require_success_http(right, "graph write", &right_write)?;
 
-            let left_set = read_graph_set(client, left, graph_target, &case.request_headers).await?;
-            let right_set = read_graph_set(client, right, graph_target, &case.request_headers).await?;
+            let left_set =
+                read_graph_set(client, left, graph_target, &case.request_headers).await?;
+            let right_set =
+                read_graph_set(client, right, graph_target, &case.request_headers).await?;
 
             Ok(CompatCaseReport {
                 name: case.name.clone(),
                 operation: compat_operation_label(case.operation),
                 kind: compat_kind_label(case.kind),
-                left_status: left_write.status.as_u16(),
-                right_status: right_write.status.as_u16(),
-                left_content_type: left_write.content_type.clone(),
-                right_content_type: right_write.content_type.clone(),
+                left_status: left_http.status.as_u16(),
+                right_status: right_http.status.as_u16(),
+                left_content_type: left_http.content_type.clone(),
+                right_content_type: right_http.content_type.clone(),
                 left_body_class: None,
                 right_body_class: None,
-                matched: left_write.status == right_write.status && left_set == right_set,
+                matched: left_http.status == right_http.status && left_set == right_set,
                 left_summary: format!(
                     "write-status={} triples={}",
-                    left_write.status.as_u16(),
+                    left_http.status.as_u16(),
                     left_set.len()
                 ),
                 right_summary: format!(
                     "write-status={} triples={}",
-                    right_write.status.as_u16(),
+                    right_http.status.as_u16(),
                     right_set.len()
                 ),
             })
@@ -281,6 +344,7 @@ async fn build_graph_write_effect_report(
                 &payload,
                 replace,
                 &case.request_headers,
+                options,
             )
             .await?;
             let right_write = execute_graph_write_raw(
@@ -291,19 +355,22 @@ async fn build_graph_write_effect_report(
                 &payload,
                 replace,
                 &case.request_headers,
+                options,
             )
             .await?;
 
             build_response_semantics_report(case, &left_write, &right_write)
         }
-        _ => bail!("graph-write-effect operation only supports graph-triples-set or response-semantics comparators in this build"),
+        _ => bail!(
+            "graph-write-effect operation only supports graph-triples-set or response-semantics comparators in this build"
+        ),
     }
 }
 
 fn graph_content_type(case: &CompatCase) -> Result<&str> {
-    case.graph_content_type
-        .as_deref()
-        .ok_or_else(|| anyhow!("graph operation requires graph_content_type when graph_payload is set"))
+    case.graph_content_type.as_deref().ok_or_else(|| {
+        anyhow!("graph operation requires graph_content_type when graph_payload is set")
+    })
 }
 
 async fn write_and_ensure_success(
@@ -315,10 +382,18 @@ async fn write_and_ensure_success(
     replace: bool,
     extra_headers: &CompatHeaders,
 ) -> Result<()> {
-    let outcome =
-        execute_graph_write_raw(client, target, graph_target, content_type, payload, replace, extra_headers)
-            .await?;
-    ensure_success(target, "graph write", &outcome)
+    let outcome = execute_graph_write_raw(
+        client,
+        target,
+        graph_target,
+        content_type,
+        payload,
+        replace,
+        extra_headers,
+        RequestExecutionOptions::default(),
+    )
+    .await?;
+    require_success_http(target, "graph write", &outcome).map(|_| ())
 }
 
 async fn read_graph_set(
@@ -327,9 +402,15 @@ async fn read_graph_set(
     graph_target: &crate::model::CompatGraphTarget,
     extra_headers: &CompatHeaders,
 ) -> Result<std::collections::BTreeSet<String>> {
-    let outcome =
-        execute_graph_read_raw(client, target, graph_target, "application/n-triples", extra_headers)
-            .await?;
-    ensure_success(target, "graph read", &outcome)?;
-    canonicalize_ntriples_set(&outcome.body)
+    let outcome = execute_graph_read_raw(
+        client,
+        target,
+        graph_target,
+        "application/n-triples",
+        extra_headers,
+        RequestExecutionOptions::default(),
+    )
+    .await?;
+    let http = require_success_http(target, "graph read", &outcome)?;
+    canonicalize_ntriples_set(&http.body)
 }

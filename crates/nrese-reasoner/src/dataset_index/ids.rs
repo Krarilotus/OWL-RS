@@ -2,14 +2,18 @@ use crate::symbols::SymbolTable;
 use crate::vocabulary::{
     OWL_ASYMMETRIC_PROPERTY, OWL_DIFFERENT_FROM, OWL_DISJOINT_WITH, OWL_EQUIVALENT_CLASS,
     OWL_EQUIVALENT_PROPERTY, OWL_FUNCTIONAL_PROPERTY, OWL_INVERSE_FUNCTIONAL_PROPERTY,
-    OWL_INVERSE_OF, OWL_IRREFLEXIVE_PROPERTY, OWL_NOTHING, OWL_PROPERTY_DISJOINT_WITH,
-    OWL_REFLEXIVE_PROPERTY, OWL_SAME_AS, OWL_SYMMETRIC_PROPERTY, OWL_TRANSITIVE_PROPERTY, RDF_TYPE,
-    RDFS_DOMAIN, RDFS_RANGE, RDFS_SUBCLASS_OF, RDFS_SUBPROPERTY_OF,
+    OWL_INVERSE_OF, OWL_IRREFLEXIVE_PROPERTY, OWL_NOTHING, OWL_PROPERTY_CHAIN_AXIOM,
+    OWL_PROPERTY_DISJOINT_WITH, OWL_REFLEXIVE_PROPERTY, OWL_SAME_AS, OWL_SYMMETRIC_PROPERTY,
+    OWL_TRANSITIVE_PROPERTY, RDF_FIRST, RDF_NIL, RDF_REST, RDF_TYPE, RDFS_DOMAIN, RDFS_RANGE,
+    RDFS_SUBCLASS_OF, RDFS_SUBPROPERTY_OF,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct IndexedVocabulary {
     pub(super) rdf_type_id: u32,
+    pub(super) rdf_first_id: u32,
+    pub(super) rdf_rest_id: u32,
+    pub(super) rdf_nil_id: u32,
     pub(super) rdfs_subclass_of_id: u32,
     pub(super) rdfs_subproperty_of_id: u32,
     pub(super) rdfs_domain_id: u32,
@@ -20,6 +24,7 @@ pub(super) struct IndexedVocabulary {
     pub(super) owl_nothing_id: u32,
     pub(super) owl_same_as_id: u32,
     pub(super) owl_different_from_id: u32,
+    pub(super) owl_property_chain_axiom_id: u32,
     pub(super) owl_functional_property_id: u32,
     pub(super) owl_inverse_functional_property_id: u32,
     pub(super) owl_inverse_of_id: u32,
@@ -35,6 +40,9 @@ impl IndexedVocabulary {
     pub(super) fn new(symbols: &mut SymbolTable) -> Self {
         Self {
             rdf_type_id: symbols.get_or_intern(RDF_TYPE),
+            rdf_first_id: symbols.get_or_intern(RDF_FIRST),
+            rdf_rest_id: symbols.get_or_intern(RDF_REST),
+            rdf_nil_id: symbols.get_or_intern(RDF_NIL),
             rdfs_subclass_of_id: symbols.get_or_intern(RDFS_SUBCLASS_OF),
             rdfs_subproperty_of_id: symbols.get_or_intern(RDFS_SUBPROPERTY_OF),
             rdfs_domain_id: symbols.get_or_intern(RDFS_DOMAIN),
@@ -45,6 +53,7 @@ impl IndexedVocabulary {
             owl_nothing_id: symbols.get_or_intern(OWL_NOTHING),
             owl_same_as_id: symbols.get_or_intern(OWL_SAME_AS),
             owl_different_from_id: symbols.get_or_intern(OWL_DIFFERENT_FROM),
+            owl_property_chain_axiom_id: symbols.get_or_intern(OWL_PROPERTY_CHAIN_AXIOM),
             owl_functional_property_id: symbols.get_or_intern(OWL_FUNCTIONAL_PROPERTY),
             owl_inverse_functional_property_id: symbols
                 .get_or_intern(OWL_INVERSE_FUNCTIONAL_PROPERTY),

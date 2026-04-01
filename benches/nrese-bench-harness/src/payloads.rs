@@ -84,6 +84,7 @@ mod tests {
                 kind: crate::model::GeneratedPayloadKind::SparqlQuery,
                 bytes: 128,
             }),
+            timeout_ms: None,
             request_headers: CompatHeaders::new(),
             kind: CompatKind::StatusContentTypeBodyClass,
         };
@@ -110,6 +111,7 @@ mod tests {
                 kind: crate::model::GeneratedPayloadKind::SparqlUpdate,
                 bytes: 128,
             }),
+            timeout_ms: None,
             request_headers: CompatHeaders::new(),
             kind: CompatKind::StatusContentTypeBodyClass,
         };
@@ -136,6 +138,7 @@ mod tests {
                 kind: crate::model::GeneratedPayloadKind::RdfTurtle,
                 bytes: 128,
             }),
+            timeout_ms: None,
             request_headers: CompatHeaders::new(),
             kind: CompatKind::StatusContentTypeBodyClass,
         };

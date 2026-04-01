@@ -56,7 +56,9 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .get("--catalog")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
-                        PathBuf::from("benches/nrese-bench-harness/fixtures/catalog/ontologies.toml")
+                        PathBuf::from(
+                            "benches/nrese-bench-harness/fixtures/catalog/ontologies.toml",
+                        )
                     }),
                 output_dir: options
                     .get("--output-dir")
@@ -161,7 +163,10 @@ fn parse_basic_auth_opt(
     options: &BTreeMap<String, String>,
     key: &str,
 ) -> Result<Option<BasicAuthConfig>> {
-    options.get(key).map(|value| parse_basic_auth(value)).transpose()
+    options
+        .get(key)
+        .map(|value| parse_basic_auth(value))
+        .transpose()
 }
 
 fn parse_basic_auth(value: &str) -> Result<BasicAuthConfig> {
@@ -319,8 +324,14 @@ mod tests {
 
         match cli.command {
             Command::CatalogSync(config) => {
-                assert!(config.catalog_path.ends_with("fixtures\\catalog\\ontologies.toml")
-                    || config.catalog_path.ends_with("fixtures/catalog/ontologies.toml"));
+                assert!(
+                    config
+                        .catalog_path
+                        .ends_with("fixtures\\catalog\\ontologies.toml")
+                        || config
+                            .catalog_path
+                            .ends_with("fixtures/catalog/ontologies.toml")
+                );
                 assert!(!config.refresh);
             }
             _ => panic!("expected catalog-sync command"),

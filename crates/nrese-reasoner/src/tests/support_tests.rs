@@ -6,9 +6,9 @@ use crate::test_support::OwnedSnapshot;
 #[test]
 fn unsupported_constructs_are_reported_deterministically() {
     let snapshot = OwnedSnapshot::new(vec![(
-        "http://example.com/r",
-        "http://www.w3.org/2002/07/owl#propertyChainAxiom",
-        "http://example.com/chain",
+        "http://example.com/restriction",
+        "http://www.w3.org/2002/07/owl#allValuesFrom",
+        "http://example.com/Target",
     )]);
 
     let index = IndexedDataset::from_snapshot(&snapshot);
@@ -21,7 +21,7 @@ fn unsupported_constructs_are_reported_deterministically() {
     assert!(
         diagnostics
             .iter()
-            .any(|message| message.contains("owl:propertyChainAxiom"))
+            .any(|message| message.contains("owl:allValuesFrom"))
     );
     assert!(
         !diagnostics

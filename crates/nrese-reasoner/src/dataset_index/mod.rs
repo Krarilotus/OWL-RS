@@ -21,6 +21,9 @@ pub struct IndexedDataset {
     asserted_triples: HashSet<(u32, u32, u32)>,
     subclass_edges: HashMap<u32, BTreeSet<u32>>,
     subproperty_edges: HashMap<u32, BTreeSet<u32>>,
+    property_chain_axiom_heads: HashMap<u32, BTreeSet<u32>>,
+    list_first_by_node: HashMap<u32, BTreeSet<u32>>,
+    list_rest_by_node: HashMap<u32, BTreeSet<u32>>,
     type_assertions: HashMap<u32, BTreeSet<u32>>,
     domain_by_property: HashMap<u32, BTreeSet<u32>>,
     range_by_property: HashMap<u32, BTreeSet<u32>>,
@@ -65,6 +68,18 @@ impl IndexedDataset {
 
     pub fn subproperty_edges(&self) -> &HashMap<u32, BTreeSet<u32>> {
         &self.subproperty_edges
+    }
+
+    pub fn property_chain_axiom_heads(&self) -> &HashMap<u32, BTreeSet<u32>> {
+        &self.property_chain_axiom_heads
+    }
+
+    pub fn list_first_by_node(&self) -> &HashMap<u32, BTreeSet<u32>> {
+        &self.list_first_by_node
+    }
+
+    pub fn list_rest_by_node(&self) -> &HashMap<u32, BTreeSet<u32>> {
+        &self.list_rest_by_node
     }
 
     pub fn type_assertions(&self) -> &HashMap<u32, BTreeSet<u32>> {
@@ -141,6 +156,10 @@ impl IndexedDataset {
 
     pub fn rdf_type_id(&self) -> u32 {
         self.vocabulary.rdf_type_id
+    }
+
+    pub fn rdf_nil_id(&self) -> u32 {
+        self.vocabulary.rdf_nil_id
     }
 
     pub fn rdfs_subclass_of_id(&self) -> u32 {

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::dataset_index::IndexedDataset;
+use crate::property_chain::PropertyChainPlan;
 use crate::property_closure::PropertyClosure;
 use crate::property_consistency::{PreparedPropertyAssertions, PropertyCharacteristicPlan};
 use crate::property_taxonomy::PropertyTaxonomyIndex;
@@ -28,6 +29,7 @@ impl IdentityPreparation {
 pub(crate) fn prepare_identity(
     index: &IndexedDataset,
     property_taxonomy: &PropertyTaxonomyIndex,
+    property_chain_plan: &PropertyChainPlan,
     plan: &PropertyCharacteristicPlan,
     policy: &RulesMvpFeaturePolicy,
 ) -> IdentityPreparation {
@@ -40,7 +42,13 @@ pub(crate) fn prepare_identity(
     let mut iterations = 0;
 
     loop {
-        let property_closure = PropertyClosure::build(index, property_taxonomy, &equality, policy);
+        let property_closure = PropertyClosure::build(
+            index,
+            property_taxonomy,
+            &equality,
+            property_chain_plan,
+            policy,
+        );
         let prepared = PreparedPropertyAssertions::build(plan, &property_closure);
         let next_pairs = derive_property_implied_same_as_pairs(plan, &prepared, &equality);
         if next_pairs.is_empty() {

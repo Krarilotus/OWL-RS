@@ -37,6 +37,7 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - bounded explicit `owl:sameAs` support with canonical equality handling over named resources
 - bounded identity entailment from `owl:FunctionalProperty` and `owl:InverseFunctionalProperty`, producing canonical effective equality links over named resources
 - bounded `owl:ReflexiveProperty` support over observed named resources, producing effective self-loop assertions for the declared reflexive properties
+- bounded `owl:propertyChainAxiom` support for named properties over well-formed named-node RDF lists of length 2
 - commit-path `owl:Nothing` conflict detection over effective types, including named classes whose taxonomy closes to `owl:Nothing`
 - commit-path `owl:disjointWith` conflict detection over effective types
 - commit-path `owl:differentFrom` conflict detection against the effective `owl:sameAs` equality closure, including equality implied by bounded functional / inverse-functional property semantics
@@ -86,6 +87,7 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - `owl:ReflexiveProperty` over observed named resources
 - `owl:SymmetricProperty`
 - `owl:TransitiveProperty`
+- bounded binary `owl:propertyChainAxiom` over named properties and well-formed named-node RDF lists
 - explicit `owl:sameAs` canonical equality handling (bounded to named-node resources)
 - bounded `owl:FunctionalProperty` equality entailment
 - bounded `owl:InverseFunctionalProperty` equality entailment
@@ -97,7 +99,7 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - `owl:AsymmetricProperty`
 - `owl:propertyDisjointWith`
 - Deterministic unsupported diagnostics:
-- `owl:propertyChainAxiom`
+- `owl:propertyChainAxiom` beyond binary chains or over malformed / unsupported RDF list encodings
 - `owl:allValuesFrom`
 - `owl:someValuesFrom`
 - `owl:onProperty`

@@ -1,7 +1,10 @@
 use anyhow::{Result, anyhow};
 use reqwest::Client;
 
-use crate::compat_common::{build_response_semantics_report, execute_update_raw, ensure_success};
+use crate::compat_common::{
+    RequestExecutionOptions, build_response_semantics_report, execute_update_raw,
+    require_success_http,
+};
 use crate::compat_query::execute_case as execute_query_case_from_payloads;
 use crate::layout::ServiceTarget;
 use crate::model::{CompatCase, CompatCaseReport, CompatKind};
@@ -18,9 +21,12 @@ pub async fn execute_case(
         CompatKind::StatusAndContentType | CompatKind::StatusContentTypeBodyClass
     );
     let update = update_text(case)?;
+    let options = RequestExecutionOptions::from_case(case);
 
-    let left_update = execute_update_raw(client, left, &update, &case.request_headers).await?;
-    let right_update = execute_update_raw(client, right, &update, &case.request_headers).await?;
+    let left_update =
+        execute_update_raw(client, left, &update, &case.request_headers, options).await?;
+    let right_update =
+        execute_update_raw(client, right, &update, &case.request_headers, options).await?;
 
     if status_only_comparison {
         return build_response_semantics_report(case, &left_update, &right_update);
@@ -31,8 +37,8 @@ pub async fn execute_case(
         .as_deref()
         .ok_or_else(|| anyhow!("update-effect operation requires verify_query"))?;
 
-    ensure_success(left, "update", &left_update)?;
-    ensure_success(right, "update", &right_update)?;
+    require_success_http(left, "update", &left_update)?;
+    require_success_http(right, "update", &right_update)?;
 
     let query_case = CompatCase {
         name: case.name.clone(),
@@ -46,6 +52,7 @@ pub async fn execute_case(
         graph_content_type: None,
         graph_replace: true,
         generated_payload: None,
+        timeout_ms: case.timeout_ms,
         request_headers: case.request_headers.clone(),
         kind: case.kind,
     };
@@ -72,9 +79,6 @@ mod tests {
         assert!(matches!(case.operation, CompatOperation::UpdateEffect));
         assert!(case.verify_query.is_none());
         assert!(case.request_headers.is_empty());
-        assert!(matches!(
-            case.kind,
-            CompatKind::StatusContentTypeBodyClass
-        ));
+        assert!(matches!(case.kind, CompatKind::StatusContentTypeBodyClass));
     }
 }

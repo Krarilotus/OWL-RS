@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::dataset_index::IndexedDataset;
 use crate::identity::EqualityIndex;
+use crate::property_chain::PropertyChainPlan;
 use crate::property_taxonomy::PropertyTaxonomyIndex;
 use crate::rules_mvp_policy::RulesMvpFeaturePolicy;
 
@@ -25,6 +26,7 @@ impl PropertyClosureBuilder {
         index: &IndexedDataset,
         property_taxonomy: &PropertyTaxonomyIndex,
         equality: &EqualityIndex,
+        property_chain_plan: &PropertyChainPlan,
         policy: &RulesMvpFeaturePolicy,
     ) -> PropertyClosure {
         let mut builder = Self::default();
@@ -51,6 +53,14 @@ impl PropertyClosureBuilder {
             builder.expand_inverses(subject_id, predicate_id, object_id, index, equality, policy);
             builder.expand_symmetric(subject_id, predicate_id, object_id, index, equality, policy);
             builder.expand_transitive(subject_id, predicate_id, object_id, index, equality, policy);
+            builder.expand_property_chains(
+                subject_id,
+                predicate_id,
+                object_id,
+                property_chain_plan,
+                equality,
+                policy,
+            );
         }
 
         builder.closure
@@ -62,7 +72,7 @@ impl PropertyClosureBuilder {
         equality: &EqualityIndex,
         policy: &RulesMvpFeaturePolicy,
     ) {
-        if !policy.owl_property_assertion_closure_enabled() {
+        if !policy.owl_property_chain_axioms_enabled() {
             return;
         }
 
@@ -182,6 +192,58 @@ impl PropertyClosureBuilder {
                     equality,
                     policy,
                 );
+            }
+        }
+    }
+
+    fn expand_property_chains(
+        &mut self,
+        subject_id: u32,
+        predicate_id: u32,
+        object_id: u32,
+        property_chain_plan: &PropertyChainPlan,
+        equality: &EqualityIndex,
+        policy: &RulesMvpFeaturePolicy,
+    ) {
+        if !policy.owl_property_assertion_closure_enabled() {
+            return;
+        }
+
+        if let Some(chains) = property_chain_plan.chains_starting_with(predicate_id) {
+            for chain in chains {
+                if let Some(next_objects) = self
+                    .outgoing
+                    .get(&(chain.second_property_id, object_id))
+                    .cloned()
+                {
+                    for next_object_id in next_objects {
+                        self.enqueue_assertion(
+                            (subject_id, chain.super_property_id, next_object_id),
+                            true,
+                            equality,
+                            policy,
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(chains) = property_chain_plan.chains_ending_with(predicate_id) {
+            for chain in chains {
+                if let Some(previous_subjects) = self
+                    .incoming
+                    .get(&(chain.first_property_id, subject_id))
+                    .cloned()
+                {
+                    for previous_subject_id in previous_subjects {
+                        self.enqueue_assertion(
+                            (previous_subject_id, chain.super_property_id, object_id),
+                            true,
+                            equality,
+                            policy,
+                        );
+                    }
+                }
             }
         }
     }

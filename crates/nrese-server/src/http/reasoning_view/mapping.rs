@@ -35,6 +35,10 @@ pub fn configured_reasoning_policy(
                 policy.owl_property_assertion_closure,
             ),
             configured_feature("owl-equality-reasoning", policy.owl_equality_reasoning),
+            configured_feature(
+                "owl-property-chain-axioms",
+                policy.owl_property_chain_axioms,
+            ),
             configured_feature("owl-consistency-check", policy.owl_consistency_check),
         ],
         unsupported_constructs: unsupported_construct_behavior_name(policy.unsupported_constructs),
@@ -127,6 +131,7 @@ fn feature_name(feature: nrese_core::ReasonerFeature) -> &'static str {
         nrese_core::ReasonerFeature::RdfsTypePropagation => "rdfs-type-propagation",
         nrese_core::ReasonerFeature::RdfsDomainRangeTyping => "rdfs-domain-range-typing",
         nrese_core::ReasonerFeature::OwlEqualityReasoning => "owl-equality-reasoning",
+        nrese_core::ReasonerFeature::OwlPropertyChainAxioms => "owl-property-chain-axioms",
         nrese_core::ReasonerFeature::OwlClassSatisfiability => "owl-class-satisfiability",
         nrese_core::ReasonerFeature::OwlConsistencyCheck => "owl-consistency-check",
         nrese_core::ReasonerFeature::IncrementalRefresh => "incremental-refresh",

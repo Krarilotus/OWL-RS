@@ -97,12 +97,23 @@ mod tests {
 
     #[test]
     fn nrese_layout_builds_dataset_endpoints() {
-        let target =
-            ServiceTarget::nrese_with_headers("http://127.0.0.1:8080/".to_owned(), CompatHeaders::new());
+        let target = ServiceTarget::nrese_with_headers(
+            "http://127.0.0.1:8080/".to_owned(),
+            CompatHeaders::new(),
+        );
 
-        assert_eq!(target.query_endpoint(), "http://127.0.0.1:8080/dataset/query");
-        assert_eq!(target.update_endpoint(), "http://127.0.0.1:8080/dataset/update");
-        assert_eq!(target.data_endpoint(), "http://127.0.0.1:8080/dataset/data?default");
+        assert_eq!(
+            target.query_endpoint(),
+            "http://127.0.0.1:8080/dataset/query"
+        );
+        assert_eq!(
+            target.update_endpoint(),
+            "http://127.0.0.1:8080/dataset/update"
+        );
+        assert_eq!(
+            target.data_endpoint(),
+            "http://127.0.0.1:8080/dataset/data?default"
+        );
         assert!(target.basic_auth.is_none());
         assert!(target.default_headers.is_empty());
     }

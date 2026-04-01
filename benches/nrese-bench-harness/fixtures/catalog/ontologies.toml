@@ -45,3 +45,51 @@ focus_terms = [
   "http://www.w3.org/ns/prov#Entity",
   "http://www.w3.org/ns/prov#Activity",
 ]
+
+[[ontologies]]
+name = "skos"
+title = "SKOS Reference Vocabulary"
+url = "https://www.w3.org/2009/08/skos-reference/skos.rdf"
+media_type = "application/rdf+xml"
+filename = "skos.rdf"
+tier = "medium"
+focus_terms = [
+  "http://www.w3.org/2004/02/skos/core#Concept",
+  "http://www.w3.org/2004/02/skos/core#broaderTransitive",
+]
+
+[[ontologies]]
+name = "sosa"
+title = "W3C SOSA Ontology"
+url = "https://www.w3.org/ns/ssn/sosa.ttl"
+media_type = "text/turtle"
+filename = "sosa.ttl"
+tier = "medium"
+focus_terms = [
+  "http://www.w3.org/ns/sosa/Observation",
+  "http://www.w3.org/ns/sosa/hasFeatureOfInterest",
+]
+
+[[ontologies]]
+name = "ssn"
+title = "W3C SSN Ontology"
+url = "https://www.w3.org/ns/ssn/ssn.ttl"
+media_type = "text/turtle"
+filename = "ssn.ttl"
+tier = "broad"
+focus_terms = [
+  "http://www.w3.org/ns/ssn/System",
+  "http://www.w3.org/ns/ssn/forProperty",
+]
+
+[[ontologies]]
+name = "dcat"
+title = "W3C DCAT Vocabulary"
+url = "https://www.w3.org/ns/dcat.ttl"
+media_type = "text/turtle"
+filename = "dcat.ttl"
+tier = "medium"
+focus_terms = [
+  "http://www.w3.org/ns/dcat#Dataset",
+  "http://www.w3.org/ns/dcat#CatalogRecord",
+]

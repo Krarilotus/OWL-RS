@@ -37,7 +37,8 @@ pub fn extract_binding_count(value: &Value) -> Result<usize> {
 
 pub fn normalize_content_type(content_type: Option<&str>) -> Option<String> {
     content_type.map(|value| {
-        value.split(';')
+        value
+            .split(';')
             .next()
             .unwrap_or(value)
             .trim()
@@ -138,15 +139,17 @@ mod tests {
     #[test]
     fn normalize_content_type_strips_parameters() {
         assert_eq!(
-            normalize_content_type(Some("application/problem+json; charset=utf-8"))
-                .as_deref(),
+            normalize_content_type(Some("application/problem+json; charset=utf-8")).as_deref(),
             Some("application/problem+json")
         );
     }
 
     #[test]
     fn classify_http_body_uses_content_type_and_empty_detection() {
-        assert_eq!(classify_http_body(Some("text/plain"), b"oops"), "plain-text");
+        assert_eq!(
+            classify_http_body(Some("text/plain"), b"oops"),
+            "plain-text"
+        );
         assert_eq!(
             classify_http_body(Some("application/problem+json"), br#"{"title":"bad"}"#),
             "problem-json"

@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 use crate::dataset_index::IndexedDataset;
 use crate::identity::EqualityIndex;
+use crate::property_chain::PropertyChainPlan;
 use crate::property_taxonomy::PropertyTaxonomyIndex;
 use crate::rules_mvp_policy::RulesMvpFeaturePolicy;
 
@@ -19,9 +20,16 @@ impl PropertyClosure {
         index: &IndexedDataset,
         property_taxonomy: &PropertyTaxonomyIndex,
         equality: &EqualityIndex,
+        property_chain_plan: &PropertyChainPlan,
         policy: &RulesMvpFeaturePolicy,
     ) -> Self {
-        builder::PropertyClosureBuilder::build(index, property_taxonomy, equality, policy)
+        builder::PropertyClosureBuilder::build(
+            index,
+            property_taxonomy,
+            equality,
+            property_chain_plan,
+            policy,
+        )
     }
 
     pub fn all_assertions(&self) -> &BTreeSet<(u32, u32, u32)> {

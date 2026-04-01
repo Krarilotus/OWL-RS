@@ -112,6 +112,7 @@ impl PreparedRulesMvp {
             class_taxonomy,
             class_consistency,
             property_taxonomy,
+            property_chain_plan,
             property_characteristic_plan,
             subclass_axiom_closure,
             subproperty_axiom_closure,
@@ -120,6 +121,7 @@ impl PreparedRulesMvp {
                 schema.class_taxonomy.clone(),
                 schema.class_consistency.clone(),
                 schema.property_taxonomy.clone(),
+                schema.property_chain_plan.clone(),
                 schema.property_characteristic_plan.clone(),
                 schema.subclass_axiom_closure.clone(),
                 schema.subproperty_axiom_closure.clone(),
@@ -130,6 +132,7 @@ impl PreparedRulesMvp {
                     schema.class_taxonomy,
                     schema.class_consistency,
                     schema.property_taxonomy,
+                    schema.property_chain_plan,
                     schema.property_characteristic_plan,
                     schema.subclass_axiom_closure,
                     schema.subproperty_axiom_closure,
@@ -140,12 +143,18 @@ impl PreparedRulesMvp {
         let identity = prepare_identity(
             &index,
             &property_taxonomy,
+            &property_chain_plan,
             &property_characteristic_plan,
             policy,
         );
         let equality = identity.equality().clone();
-        let property_closure =
-            PropertyClosure::build(&index, &property_taxonomy, &equality, policy);
+        let property_closure = PropertyClosure::build(
+            &index,
+            &property_taxonomy,
+            &equality,
+            &property_chain_plan,
+            policy,
+        );
         let property_assertions =
             PreparedPropertyAssertions::build(&property_characteristic_plan, &property_closure);
         let effective_types = EffectiveTypeSet::build(
@@ -156,6 +165,10 @@ impl PreparedRulesMvp {
             policy.rdfs_domain_range_typing_enabled(),
         );
         let unsupported_diagnostics = collect_unsupported_construct_diagnostics(&index, policy);
+        let mut unsupported_diagnostics = unsupported_diagnostics;
+        if policy.unsupported_construct_diagnostics_enabled() {
+            unsupported_diagnostics.extend(property_chain_plan.diagnostics().iter().cloned());
+        }
         let stats = ReasoningStats {
             supported_asserted_triples: index.supported_asserted_triples(),
             unsupported_asserted_triples: index.unsupported_asserted_triples(),

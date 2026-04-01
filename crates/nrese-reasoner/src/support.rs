@@ -6,10 +6,6 @@ use crate::vocabulary::RDF_TYPE;
 
 const UNSUPPORTED_OWL_PREDICATES: &[(&str, &str)] = &[
     (
-        "http://www.w3.org/2002/07/owl#propertyChainAxiom",
-        "owl:propertyChainAxiom is not implemented in rules-mvp",
-    ),
-    (
         "http://www.w3.org/2002/07/owl#allValuesFrom",
         "owl:allValuesFrom is not implemented in rules-mvp",
     ),

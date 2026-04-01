@@ -138,6 +138,7 @@ api_key = "replace-me"
   - `rdfs-domain-range-typing`
   - `owl-property-assertion-closure`
   - `owl-equality-reasoning`
+  - `owl-property-chain-axioms`
   - `owl-consistency-check`
   - `unsupported-diagnostics`
 - file format:

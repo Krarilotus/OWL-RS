@@ -7,6 +7,9 @@ pub(super) struct SchemaKeyInput<'a> {
     pub(super) symbols: &'a SymbolTable,
     pub(super) subclass_edges: &'a HashMap<u32, BTreeSet<u32>>,
     pub(super) subproperty_edges: &'a HashMap<u32, BTreeSet<u32>>,
+    pub(super) property_chain_axiom_heads: &'a HashMap<u32, BTreeSet<u32>>,
+    pub(super) list_first_by_node: &'a HashMap<u32, BTreeSet<u32>>,
+    pub(super) list_rest_by_node: &'a HashMap<u32, BTreeSet<u32>>,
     pub(super) domain_by_property: &'a HashMap<u32, BTreeSet<u32>>,
     pub(super) range_by_property: &'a HashMap<u32, BTreeSet<u32>>,
     pub(super) disjoint_class_pairs: &'a HashMap<u32, BTreeSet<u32>>,
@@ -26,6 +29,9 @@ pub(super) fn compute_schema_cache_key(input: SchemaKeyInput<'_>) -> u64 {
 
     hash_edge_map(input.symbols, input.subclass_edges, &mut hasher);
     hash_edge_map(input.symbols, input.subproperty_edges, &mut hasher);
+    hash_edge_map(input.symbols, input.property_chain_axiom_heads, &mut hasher);
+    hash_edge_map(input.symbols, input.list_first_by_node, &mut hasher);
+    hash_edge_map(input.symbols, input.list_rest_by_node, &mut hasher);
     hash_edge_map(input.symbols, input.domain_by_property, &mut hasher);
     hash_edge_map(input.symbols, input.range_by_property, &mut hasher);
     hash_edge_map(input.symbols, input.disjoint_class_pairs, &mut hasher);

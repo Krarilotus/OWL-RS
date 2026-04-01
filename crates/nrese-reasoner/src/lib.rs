@@ -8,6 +8,7 @@ mod identity;
 mod materialization;
 pub mod output;
 pub mod profile;
+mod property_chain;
 mod property_closure;
 mod property_consistency;
 mod property_taxonomy;

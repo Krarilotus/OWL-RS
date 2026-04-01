@@ -33,6 +33,9 @@ struct DatasetIndexAccumulator {
     asserted_triples: HashSet<(u32, u32, u32)>,
     subclass_edges: HashMap<u32, BTreeSet<u32>>,
     subproperty_edges: HashMap<u32, BTreeSet<u32>>,
+    property_chain_axiom_heads: HashMap<u32, BTreeSet<u32>>,
+    list_first_by_node: HashMap<u32, BTreeSet<u32>>,
+    list_rest_by_node: HashMap<u32, BTreeSet<u32>>,
     type_assertions: HashMap<u32, BTreeSet<u32>>,
     domain_by_property: HashMap<u32, BTreeSet<u32>>,
     range_by_property: HashMap<u32, BTreeSet<u32>>,
@@ -64,6 +67,9 @@ impl DatasetIndexAccumulator {
             asserted_triples: HashSet::new(),
             subclass_edges: HashMap::new(),
             subproperty_edges: HashMap::new(),
+            property_chain_axiom_heads: HashMap::new(),
+            list_first_by_node: HashMap::new(),
+            list_rest_by_node: HashMap::new(),
             type_assertions: HashMap::new(),
             domain_by_property: HashMap::new(),
             range_by_property: HashMap::new(),
@@ -111,6 +117,21 @@ impl DatasetIndexAccumulator {
                 .insert(subject_id);
         } else if predicate_id == self.vocabulary.rdfs_subproperty_of_id {
             self.subproperty_edges
+                .entry(subject_id)
+                .or_default()
+                .insert(object_id);
+        } else if predicate_id == self.vocabulary.owl_property_chain_axiom_id {
+            self.property_chain_axiom_heads
+                .entry(subject_id)
+                .or_default()
+                .insert(object_id);
+        } else if predicate_id == self.vocabulary.rdf_first_id {
+            self.list_first_by_node
+                .entry(subject_id)
+                .or_default()
+                .insert(object_id);
+        } else if predicate_id == self.vocabulary.rdf_rest_id {
+            self.list_rest_by_node
                 .entry(subject_id)
                 .or_default()
                 .insert(object_id);
@@ -198,6 +219,9 @@ impl DatasetIndexAccumulator {
             symbols: &self.symbols,
             subclass_edges: &self.subclass_edges,
             subproperty_edges: &self.subproperty_edges,
+            property_chain_axiom_heads: &self.property_chain_axiom_heads,
+            list_first_by_node: &self.list_first_by_node,
+            list_rest_by_node: &self.list_rest_by_node,
             domain_by_property: &self.domain_by_property,
             range_by_property: &self.range_by_property,
             disjoint_class_pairs: &self.disjoint_class_pairs,
@@ -217,6 +241,9 @@ impl DatasetIndexAccumulator {
             asserted_triples: self.asserted_triples,
             subclass_edges: self.subclass_edges,
             subproperty_edges: self.subproperty_edges,
+            property_chain_axiom_heads: self.property_chain_axiom_heads,
+            list_first_by_node: self.list_first_by_node,
+            list_rest_by_node: self.list_rest_by_node,
             type_assertions: self.type_assertions,
             domain_by_property: self.domain_by_property,
             range_by_property: self.range_by_property,

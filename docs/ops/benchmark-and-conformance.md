@@ -96,6 +96,7 @@ x-forwarded-proto = "https"
   - `benches/nrese-bench-harness/fixtures/compat/protocol_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/ontology_protocol_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/policy_failure_cases.json`
+  - `benches/nrese-bench-harness/fixtures/compat/timeout_failure_cases.json`
 - Workload packs:
   - `benches/nrese-bench-harness/fixtures/packs/generic-baseline/pack.toml`
 - Ontology catalog:
@@ -239,6 +240,15 @@ Current compatibility comparators:
 - `graph-triples-set`: compares canonicalized N-Triples line sets for Graph Store reads
 - `status-content-type-body-class`: compares normalized failure/output semantics by HTTP status, normalized content type, and coarse body class
 
+Timeout observations stay on the same shared response-semantics comparator path.
+When the harness hits a client-side request timeout, it emits normalized semantics as:
+
+- `status = 0`
+- `content_type = null`
+- `body_class = client-timeout`
+
+This keeps timeout parity in the same report shape and avoids endpoint-specific timeout comparators.
+
 Current protocol operations covered by the compat harness:
 
 - `query`
@@ -261,8 +271,16 @@ The current fixture set now includes graph-store write failure parity cases for 
 It also includes bounded query/update failure-parity cases for invalid SPARQL syntax, compared by normalized status, content type, and body class.
 It also now includes a broader SPARQL Update parity slice for `DELETE DATA`, `DELETE/INSERT WHERE`, `CLEAR`, `COPY`, `MOVE`, and `ADD` over isolated fixture IRIs/graphs.
 It also now supports a separate policy-failure fixture family for invalid-auth and oversize-payload parity on the same shared response-semantics comparator path.
+It now also supports a dedicated timeout-failure fixture family on the same shared response-semantics comparator path, using per-case timeout budgets instead of a separate timeout-only report format.
 
 Policy-failure fixtures are intentionally separate from the generic protocol baseline, because they only become meaningful when both stacks are run with comparable auth and payload-limit policy.
+Timeout-failure fixtures are also intentionally separate from the generic baseline, because meaningful timeout parity depends on comparable timeout ceilings, reverse-proxy behavior, and workload-specific slow paths.
+
+Current timeout fixture starter:
+
+- `benches/nrese-bench-harness/fixtures/compat/timeout_failure_cases.json`
+
+Use it as an opt-in suite in a production workload parity pack once both NRESE and Fuseki are deployed with comparable timeout policy and the selected cases are known to cross the configured timeout budget.
 
 ## 4. Workload Pack Run
 
@@ -298,6 +316,8 @@ Expected evidence artifacts when `--report-dir` is set:
 - per-suite match status and report path
 - benchmark report path
 
+If a pack includes `timeout_failure_cases.json`, the resulting suite artifact is indexed the same way as any other compat suite. Timeout parity does not get a separate report type.
+
 ## Current Verified Local Baseline
 
 The current workspace has already been exercised locally with:
@@ -331,8 +351,7 @@ These are local run artifacts, not replacement-grade proof by themselves. Full r
 - add compatibility suites for timeout, limit, and error-semantic equivalence
 - add content-negotiation and media-type strictness comparators
 - add orchestrated external process startup for controlled Fuseki benchmark runs
-- extend the current graph-store failure comparator set with timeout/limit cases on top of the shared seed dataset
-- extend the bounded query/update failure slice from syntax failures to timeout/limit and broader policy-driven cases
+- extend the current timeout fixture family from client-observed timeout parity to broader timeout and limit coverage with deployment-specific budgets and proxy-aware cases
 - add cold/warm split runs and resource-capture integration for CPU/RAM evidence
 - add authenticated service startup orchestration so the harness can provision its own isolated compare stack end-to-end
 - add project-specific parity packs for the real ontology, auth model, and workload mix

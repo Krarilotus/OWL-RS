@@ -117,11 +117,18 @@ x-forwarded-proto = "https"
         .expect("pack manifest");
 
         let manifest = read_workload_pack(&pack_dir.join("pack.toml")).expect("pack");
-        assert!(manifest.dataset.ends_with("fixtures\\seed.ttl") || manifest.dataset.ends_with("fixtures/seed.ttl"));
+        assert!(
+            manifest.dataset.ends_with("fixtures\\seed.ttl")
+                || manifest.dataset.ends_with("fixtures/seed.ttl")
+        );
         assert_eq!(manifest.name, "example");
         assert_eq!(manifest.compat_suites.len(), 1);
         assert_eq!(
-            manifest.nrese.headers.get("authorization").map(String::as_str),
+            manifest
+                .nrese
+                .headers
+                .get("authorization")
+                .map(String::as_str),
             Some("Bearer local-token")
         );
         assert_eq!(

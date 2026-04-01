@@ -79,6 +79,7 @@ fn parse_rules_mvp_feature_policy(input: Option<&str>) -> Result<RulesMvpFeature
                 policy.owl_property_assertion_closure = FeatureMode::Enabled;
             }
             "owl-equality-reasoning" => policy.owl_equality_reasoning = FeatureMode::Enabled,
+            "owl-property-chain-axioms" => policy.owl_property_chain_axioms = FeatureMode::Enabled,
             "owl-consistency-check" => policy.owl_consistency_check = FeatureMode::Enabled,
             "unsupported-diagnostics" => {
                 policy.unsupported_constructs = UnsupportedConstructBehavior::Diagnose;
@@ -123,12 +124,13 @@ mod tests {
     #[test]
     fn rules_mvp_parser_accepts_explicit_feature_list() {
         let policy = parse_rules_mvp_feature_policy(Some(
-            "rdfs-subclass-closure,owl-equality-reasoning,unsupported-diagnostics",
+            "rdfs-subclass-closure,owl-equality-reasoning,owl-property-chain-axioms,unsupported-diagnostics",
         ))
         .expect("policy should parse");
 
         assert_eq!(policy.rdfs_subclass_closure, FeatureMode::Enabled);
         assert_eq!(policy.owl_equality_reasoning, FeatureMode::Enabled);
+        assert_eq!(policy.owl_property_chain_axioms, FeatureMode::Enabled);
         assert_eq!(
             policy.unsupported_constructs,
             UnsupportedConstructBehavior::Diagnose

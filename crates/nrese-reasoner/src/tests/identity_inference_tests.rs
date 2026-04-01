@@ -1,5 +1,5 @@
 use crate::{
-    dataset_index::IndexedDataset, identity::prepare_identity,
+    dataset_index::IndexedDataset, identity::prepare_identity, property_chain::PropertyChainPlan,
     property_consistency::PropertyCharacteristicPlan, property_taxonomy::PropertyTaxonomyIndex,
     test_support, test_support::OwnedSnapshot,
 };
@@ -26,10 +26,12 @@ fn functional_property_implies_equality_between_objects() {
 
     let index = IndexedDataset::from_snapshot(&snapshot);
     let property_taxonomy = PropertyTaxonomyIndex::from_edges(index.subproperty_edges());
+    let property_chain_plan = PropertyChainPlan::build(&index);
     let plan = PropertyCharacteristicPlan::build(&index);
     let identity = prepare_identity(
         &index,
         &property_taxonomy,
+        &property_chain_plan,
         &plan,
         &test_support::default_rules_mvp_policy(),
     );
@@ -68,10 +70,12 @@ fn inverse_functional_property_implies_equality_between_subjects() {
 
     let index = IndexedDataset::from_snapshot(&snapshot);
     let property_taxonomy = PropertyTaxonomyIndex::from_edges(index.subproperty_edges());
+    let property_chain_plan = PropertyChainPlan::build(&index);
     let plan = PropertyCharacteristicPlan::build(&index);
     let identity = prepare_identity(
         &index,
         &property_taxonomy,
+        &property_chain_plan,
         &plan,
         &test_support::default_rules_mvp_policy(),
     );
@@ -115,10 +119,12 @@ fn functional_property_merges_multiple_objects_into_one_cluster() {
 
     let index = IndexedDataset::from_snapshot(&snapshot);
     let property_taxonomy = PropertyTaxonomyIndex::from_edges(index.subproperty_edges());
+    let property_chain_plan = PropertyChainPlan::build(&index);
     let plan = PropertyCharacteristicPlan::build(&index);
     let identity = prepare_identity(
         &index,
         &property_taxonomy,
+        &property_chain_plan,
         &plan,
         &test_support::default_rules_mvp_policy(),
     );

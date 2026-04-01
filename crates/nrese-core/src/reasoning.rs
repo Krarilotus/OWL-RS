@@ -5,6 +5,7 @@ pub enum ReasonerFeature {
     RdfsTypePropagation,
     RdfsDomainRangeTyping,
     OwlEqualityReasoning,
+    OwlPropertyChainAxioms,
     OwlClassSatisfiability,
     OwlConsistencyCheck,
     IncrementalRefresh,
