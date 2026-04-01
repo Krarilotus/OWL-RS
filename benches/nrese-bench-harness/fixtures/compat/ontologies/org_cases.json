@@ -1,0 +1,16 @@
+[
+  {
+    "name": "org-member-inverse-declared",
+    "operation": "query",
+    "query": "PREFIX org: <http://www.w3.org/ns/org#> ASK WHERE { org:memberOf <http://www.w3.org/2002/07/owl#inverseOf> org:hasMember }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "org-member-domain-range-declared",
+    "operation": "query",
+    "query": "PREFIX org: <http://www.w3.org/ns/org#> PREFIX foaf: <http://xmlns.com/foaf/0.1/> ASK WHERE { org:memberOf <http://www.w3.org/2000/01/rdf-schema#domain> foaf:Agent ; <http://www.w3.org/2000/01/rdf-schema#range> org:Organization }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  }
+]

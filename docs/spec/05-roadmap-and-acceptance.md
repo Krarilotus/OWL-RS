@@ -76,6 +76,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - `rules-mvp` runtime behavior is now externalized behind a typed feature policy, so closure, equality, consistency gates, and unsupported-construct diagnostics can be configured without embedding product opinion into reasoner code
 - official ontology fixtures now provide bounded release-evidence for `rules-mvp` reasoning/runtime validation on FOAF, W3C Time, W3C ORG, SKOS, PROV-O, and DCAT
 - bounded official-ontology-backed service slices should ship on shared test-support helpers rather than duplicating fixture-path and setup logic per test file
+- ontology-backed compat/parity suites should grow incrementally through the catalog/pack path, with shared suite structure instead of flat one-off fixtures per ontology
 
 ### R5: Advanced Reasoning and Conformance
 

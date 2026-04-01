@@ -1,0 +1,16 @@
+[
+  {
+    "name": "time-before-after-inverse-declared",
+    "operation": "query",
+    "query": "PREFIX time: <http://www.w3.org/2006/time#> ASK WHERE { time:before <http://www.w3.org/2002/07/owl#inverseOf> time:after }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "time-before-transitive-declared",
+    "operation": "query",
+    "query": "PREFIX time: <http://www.w3.org/2006/time#> ASK WHERE { time:before a <http://www.w3.org/2002/07/owl#TransitiveProperty> }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  }
+]

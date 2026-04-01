@@ -11,11 +11,10 @@
     "operation": "graph-put-effect",
     "graph_target": {
       "type": "named-graph",
-      "iri": "http://example.com/rdfxml"
+      "iri": "http://example.com/compat/rdfxml"
     },
-    "graph_payload": "<?xml version=\"1.0\"?>\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" xmlns:ex=\"http://example.com/\">\n  <rdf:Description rdf:about=\"http://example.com/a\">\n    <ex:p rdf:resource=\"http://example.com/b\"/>\n  </rdf:Description>\n</rdf:RDF>\n",
     "graph_content_type": "application/rdf+xml",
-    "accept": "application/rdf+xml",
+    "graph_payload": "<?xml version=\"1.0\"?>\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"\n         xmlns:ex=\"http://example.com/\">\n  <rdf:Description rdf:about=\"http://example.com/a\">\n    <ex:p rdf:resource=\"http://example.com/b\"/>\n  </rdf:Description>\n</rdf:RDF>\n",
     "kind": "graph-triples-set"
   }
 ]

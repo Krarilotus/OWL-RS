@@ -1,0 +1,16 @@
+[
+  {
+    "name": "prov-generated-inverse-declared",
+    "operation": "query",
+    "query": "PREFIX prov: <http://www.w3.org/ns/prov#> ASK WHERE { prov:generated <http://www.w3.org/2002/07/owl#inverseOf> prov:wasGeneratedBy }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "prov-was-generated-by-domain-range-declared",
+    "operation": "query",
+    "query": "PREFIX prov: <http://www.w3.org/ns/prov#> ASK WHERE { prov:wasGeneratedBy <http://www.w3.org/2000/01/rdf-schema#domain> prov:Entity ; <http://www.w3.org/2000/01/rdf-schema#range> prov:Activity }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  }
+]

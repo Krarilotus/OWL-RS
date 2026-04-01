@@ -135,7 +135,7 @@ The secured templates intentionally reuse the existing compat suites:
 - Compatibility cases:
 - `benches/nrese-bench-harness/fixtures/compat/protocol_cases.json`
 - `benches/nrese-bench-harness/fixtures/compat/limit_semantics_cases.json`
-- `benches/nrese-bench-harness/fixtures/compat/ontology_protocol_cases.json`
+- `benches/nrese-bench-harness/fixtures/compat/ontologies/baseline_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/policy_failure_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/secured_auth_failure_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/timeout_failure_cases.json`
@@ -221,7 +221,7 @@ For real ontology runs, prefer:
 
 - `benches/nrese-bench-harness/fixtures/workloads/ontology_query_workload.json`
 - `benches/nrese-bench-harness/fixtures/workloads/update_workload.json`
-- `benches/nrese-bench-harness/fixtures/compat/ontology_protocol_cases.json`
+- `benches/nrese-bench-harness/fixtures/compat/ontologies/baseline_cases.json`
 
 Prebuilt ontology packs now exist for:
 

@@ -2,4 +2,4 @@ name = "sosa-baseline"
 dataset = "../../catalog-cache/sosa.ttl"
 query_workload = "../../workloads/ontology_query_workload.json"
 update_workload = "../../workloads/update_workload.json"
-compat_suites = ["../../compat/ontology_protocol_cases.json"]
+compat_suites = ["../../compat/ontologies/baseline_cases.json"]

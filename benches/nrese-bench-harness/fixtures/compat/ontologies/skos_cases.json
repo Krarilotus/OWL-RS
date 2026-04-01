@@ -1,0 +1,16 @@
+[
+  {
+    "name": "skos-broader-transitive-declared",
+    "operation": "query",
+    "query": "PREFIX skos: <http://www.w3.org/2004/02/skos/core#> ASK WHERE { skos:broader <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> skos:broaderTransitive }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "skos-transitive-inverse-declared",
+    "operation": "query",
+    "query": "PREFIX skos: <http://www.w3.org/2004/02/skos/core#> ASK WHERE { skos:broaderTransitive <http://www.w3.org/2002/07/owl#inverseOf> skos:narrowerTransitive }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  }
+]

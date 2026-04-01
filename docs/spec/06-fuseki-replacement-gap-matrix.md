@@ -32,6 +32,7 @@ Current coverage:
 - a staged real-world ontology catalog now exists to harden parity runs incrementally from small to broad official ontology sources, with typed serialization/dialect/reasoning/service metadata
 - official ontology fixtures now back explicit cross-service checks for store preload, `tell`, graph-store roundtrip, and bounded reasoner/runtime validation, including RDF/XML ingest/preload coverage
 - official ontology-backed service tests now also cover SKOS RDF/XML graph-store roundtrip on the real HTTP surface
+- ontology-backed compat/parity suites are now grouped on a dedicated harness path and include additional vocabulary-specific cases for ORG, Time, SKOS, PROV-O, and DCAT on top of the shared ontology baseline suite
 - versioned secured live-auth and secured live-auth-plus-timeout workload-pack templates now exist on the same manifest path as the generic packs
 - workload-pack headers now support env-placeholder interpolation so auth/proxy parity packs can stay versioned without committed secrets
 - workload-pack execution now emits a canonical `pack-report.json` evidence index that ties compat suites and benchmark artifacts together

@@ -1,0 +1,9 @@
+[
+  {
+    "name": "dcat-dataset-domain-range-declared",
+    "operation": "query",
+    "query": "PREFIX dcat: <http://www.w3.org/ns/dcat#> ASK WHERE { dcat:dataset <http://www.w3.org/2000/01/rdf-schema#domain> dcat:Catalog ; <http://www.w3.org/2000/01/rdf-schema#range> dcat:Dataset }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  }
+]
