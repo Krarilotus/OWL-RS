@@ -78,6 +78,9 @@ fn parse_labeled_rdf_content_format(
     if crate::http::media::media_type_matches(content_type, "application/n-triples") {
         return Ok(GraphResultFormat::NTriples);
     }
+    if crate::http::media::media_type_matches(content_type, "application/rdf+xml") {
+        return Ok(GraphResultFormat::RdfXml);
+    }
     if crate::http::media::media_type_matches(content_type, "text/turtle")
         || crate::http::media::media_type_matches(content_type, "application/x-turtle")
     {
@@ -138,6 +141,13 @@ mod tests {
         let format = parse_graph_content_format(Some("text/turtle; charset=utf-8"))
             .expect("format should parse");
         assert_eq!(format, GraphResultFormat::Turtle);
+    }
+
+    #[test]
+    fn rdf_content_type_accepts_rdf_xml() {
+        let format = parse_graph_content_format(Some("application/rdf+xml; charset=utf-8"))
+            .expect("format should parse");
+        assert_eq!(format, GraphResultFormat::RdfXml);
     }
 
     #[test]

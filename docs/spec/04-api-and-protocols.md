@@ -14,6 +14,7 @@ The API surface separates three concerns that should not be collapsed into one a
   - is a first-class assertion-ingest interface for RDF payloads
   - is separate from raw SPARQL Update text and separate from Graph Store transport semantics
   - must run through the same staged validation and publish gate as other write paths
+  - currently accepts Turtle, N-Triples, and RDF/XML on the same typed RDF-format path used by ontology preload and Graph Store writes
 - `SERVICES`
   - splits into:
   - inbound service metadata and capability advertisement

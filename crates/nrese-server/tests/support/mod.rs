@@ -44,3 +44,9 @@ pub fn minimal_fixture_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/ontologies/minimal_services.ttl")
 }
+
+pub fn catalog_fixture_path(filename: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benches/nrese-bench-harness/fixtures/catalog-cache")
+        .join(filename)
+}

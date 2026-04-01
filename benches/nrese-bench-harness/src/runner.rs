@@ -20,9 +20,10 @@ use crate::layout::ServiceTarget;
 use crate::model::{
     BenchComparison, BenchConfig, BenchReport, CatalogSyncConfig, CompatCase, CompatCaseReport,
     CompatConfig, CompatGraphTarget, CompatHeaders, CompatOperation, CompatReport, OntologyFixture,
-    PackArtifactReport, PackCompatSuiteReport, PackConfig, PackReport, QueryWorkloadCase,
-    SeedConfig, ServiceBenchReport, ServiceConnectionConfig, ServiceRequestProfile,
-    UpdateWorkloadCase,
+    OntologyReasoningFeature, OntologySemanticDialect, OntologySerialization,
+    OntologyServiceSurface, PackArtifactReport, PackCompatSuiteReport, PackConfig, PackReport,
+    QueryWorkloadCase, SeedConfig, ServiceBenchReport, ServiceConnectionConfig,
+    ServiceRequestProfile, UpdateWorkloadCase,
 };
 use crate::normalize::summarize;
 
@@ -405,6 +406,13 @@ async fn sync_ontology(
         output_path.display(),
         ontology.media_type
     );
+    println!(
+        "serialization: {} | semantic dialects: {} | reasoning features: {} | services: {}",
+        ontology_serialization_label(ontology.serialization),
+        join_semantic_dialects(&ontology.semantic_dialects),
+        join_reasoning_features(&ontology.reasoning_features),
+        join_service_surfaces(&ontology.service_coverage)
+    );
     if !ontology.focus_terms.is_empty() {
         println!("focus terms: {}", ontology.focus_terms.join(", "));
     }
@@ -608,6 +616,81 @@ fn pack_compat_suite_report(run: CompatRunArtifact) -> PackCompatSuiteReport {
         mismatched_cases: run.mismatched_cases,
         status: run.status,
     }
+}
+
+fn ontology_serialization_label(serialization: OntologySerialization) -> &'static str {
+    match serialization {
+        OntologySerialization::Turtle => "turtle",
+        OntologySerialization::RdfXml => "rdf-xml",
+    }
+}
+
+fn semantic_dialect_label(dialect: OntologySemanticDialect) -> &'static str {
+    match dialect {
+        OntologySemanticDialect::Rdfs => "rdfs",
+        OntologySemanticDialect::Owl => "owl",
+        OntologySemanticDialect::Foaf => "foaf",
+        OntologySemanticDialect::Org => "org",
+        OntologySemanticDialect::Time => "time",
+        OntologySemanticDialect::ProvO => "prov-o",
+        OntologySemanticDialect::Skos => "skos",
+        OntologySemanticDialect::Sosa => "sosa",
+        OntologySemanticDialect::Ssn => "ssn",
+        OntologySemanticDialect::Dcat => "dcat",
+        OntologySemanticDialect::Vcard => "vcard",
+        OntologySemanticDialect::Odrl => "odrl",
+        OntologySemanticDialect::DcmiTerms => "dcmi-terms",
+    }
+}
+
+fn reasoning_feature_label(feature: OntologyReasoningFeature) -> &'static str {
+    match feature {
+        OntologyReasoningFeature::SubclassClosure => "subclass-closure",
+        OntologyReasoningFeature::SubpropertyClosure => "subproperty-closure",
+        OntologyReasoningFeature::DomainRangeTyping => "domain-range-typing",
+        OntologyReasoningFeature::InverseProperty => "inverse-property",
+        OntologyReasoningFeature::TransitiveProperty => "transitive-property",
+        OntologyReasoningFeature::SymmetricProperty => "symmetric-property",
+        OntologyReasoningFeature::Disjointness => "disjointness",
+        OntologyReasoningFeature::Identity => "identity",
+        OntologyReasoningFeature::Restrictions => "restrictions",
+        OntologyReasoningFeature::ListAxioms => "list-axioms",
+    }
+}
+
+fn service_surface_label(surface: OntologyServiceSurface) -> &'static str {
+    match surface {
+        OntologyServiceSurface::CatalogSync => "catalog-sync",
+        OntologyServiceSurface::Tell => "tell",
+        OntologyServiceSurface::GraphStore => "graph-store",
+        OntologyServiceSurface::Query => "query",
+        OntologyServiceSurface::Reasoner => "reasoner",
+        OntologyServiceSurface::Benchmark => "benchmark",
+    }
+}
+
+fn join_semantic_dialects(values: &[OntologySemanticDialect]) -> String {
+    values
+        .iter()
+        .map(|value| semantic_dialect_label(*value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn join_reasoning_features(values: &[OntologyReasoningFeature]) -> String {
+    values
+        .iter()
+        .map(|value| reasoning_feature_label(*value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn join_service_surfaces(values: &[OntologyServiceSurface]) -> String {
+    values
+        .iter()
+        .map(|value| service_surface_label(*value))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn resolve_service_profile<'a>(

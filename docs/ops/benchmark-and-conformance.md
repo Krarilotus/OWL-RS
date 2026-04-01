@@ -192,6 +192,16 @@ The harness now has a staged ontology catalog for small-to-broad real-world sour
 - `sosa`
 - `ssn`
 - `dcat`
+- `vcard`
+- `dcterms`
+- `odrl`
+
+Each catalog entry now also declares typed processing metadata:
+
+- `serialization`
+- `semantic_dialects`
+- `reasoning_features`
+- `service_coverage`
 
 Sync them locally:
 
@@ -212,6 +222,20 @@ For real ontology runs, prefer:
 - `benches/nrese-bench-harness/fixtures/workloads/ontology_query_workload.json`
 - `benches/nrese-bench-harness/fixtures/workloads/update_workload.json`
 - `benches/nrese-bench-harness/fixtures/compat/ontology_protocol_cases.json`
+
+Prebuilt ontology packs now exist for:
+
+- `foaf`
+- `org`
+- `time`
+- `prov`
+- `skos`
+- `sosa`
+- `ssn`
+- `dcat`
+- `vcard`
+- `dcterms`
+- `odrl`
 
 ## 0. Reproducible Dataset Parity
 

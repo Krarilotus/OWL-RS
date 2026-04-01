@@ -62,7 +62,9 @@ fn build_query_request(query: String, accept: Option<&str>) -> SparqlQueryReques
         request.solutions_format = SolutionsResultFormat::Json;
     }
 
-    request.graph_format = if media_type_matches(accept, "text/turtle")
+    request.graph_format = if media_type_matches(accept, "application/rdf+xml") {
+        GraphResultFormat::RdfXml
+    } else if media_type_matches(accept, "text/turtle")
         || media_type_matches(accept, "application/x-turtle")
     {
         GraphResultFormat::Turtle
@@ -75,7 +77,7 @@ fn build_query_request(query: String, accept: Option<&str>) -> SparqlQueryReques
 
 #[cfg(test)]
 mod tests {
-    use nrese_store::SolutionsResultFormat;
+    use nrese_store::{GraphResultFormat, SolutionsResultFormat};
 
     use super::build_query_request;
 
@@ -93,5 +95,14 @@ mod tests {
     fn query_accept_default_is_json() {
         let request = build_query_request("ASK WHERE { ?s ?p ?o }".to_owned(), None);
         assert_eq!(request.solutions_format, SolutionsResultFormat::Json);
+    }
+
+    #[test]
+    fn query_accept_prefers_rdf_xml_for_graph_results() {
+        let request = build_query_request(
+            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }".to_owned(),
+            Some("application/rdf+xml, application/n-triples"),
+        );
+        assert_eq!(request.graph_format, GraphResultFormat::RdfXml);
     }
 }

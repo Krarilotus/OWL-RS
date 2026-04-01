@@ -91,10 +91,107 @@ pub struct OntologyFixture {
     pub title: String,
     pub url: String,
     pub media_type: String,
+    pub serialization: OntologySerialization,
     pub filename: String,
     pub tier: String,
     #[serde(default)]
     pub focus_terms: Vec<String>,
+    #[serde(default)]
+    pub semantic_dialects: Vec<OntologySemanticDialect>,
+    #[serde(default)]
+    pub reasoning_features: Vec<OntologyReasoningFeature>,
+    #[serde(default)]
+    pub service_coverage: Vec<OntologyServiceSurface>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OntologySerialization {
+    Turtle,
+    RdfXml,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OntologySemanticDialect {
+    Rdfs,
+    Owl,
+    Foaf,
+    Org,
+    Time,
+    ProvO,
+    Skos,
+    Sosa,
+    Ssn,
+    Dcat,
+    Vcard,
+    Odrl,
+    DcmiTerms,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OntologyReasoningFeature {
+    SubclassClosure,
+    SubpropertyClosure,
+    DomainRangeTyping,
+    InverseProperty,
+    TransitiveProperty,
+    SymmetricProperty,
+    Disjointness,
+    Identity,
+    Restrictions,
+    ListAxioms,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OntologyServiceSurface {
+    CatalogSync,
+    Tell,
+    GraphStore,
+    Query,
+    Reasoner,
+    Benchmark,
+}
+
+impl OntologyCatalog {
+    pub fn validate(&self) -> Result<(), String> {
+        for fixture in &self.ontologies {
+            fixture.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl OntologyFixture {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.focus_terms.is_empty() {
+            return Err(format!(
+                "ontology fixture '{}' must declare at least one focus_terms entry",
+                self.name
+            ));
+        }
+        if self.semantic_dialects.is_empty() {
+            return Err(format!(
+                "ontology fixture '{}' must declare semantic_dialects",
+                self.name
+            ));
+        }
+        if self.reasoning_features.is_empty() {
+            return Err(format!(
+                "ontology fixture '{}' must declare reasoning_features",
+                self.name
+            ));
+        }
+        if self.service_coverage.is_empty() {
+            return Err(format!(
+                "ontology fixture '{}' must declare service_coverage",
+                self.name
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

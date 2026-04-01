@@ -2,11 +2,18 @@
 
 ## Purpose
 
-This document defines the initial real-world ontology catalog used to harden NRESE and the Fuseki parity harness with non-synthetic inputs.
+This document defines the staged real-world ontology catalog used to harden NRESE and the Fuseki parity harness with non-synthetic inputs.
 
 The catalog file is:
 
 - `benches/nrese-bench-harness/fixtures/catalog/ontologies.toml`
+
+The catalog is now also typed by processing metadata, not only by URL:
+
+- serialization syntax used for ingest
+- semantic dialect families that operators should expect to parse and preserve
+- reasoning features that the ontology is useful for exercising
+- service coverage areas that should be validated with that fixture
 
 The current source set is intentionally staged from small to broader:
 
@@ -34,6 +41,15 @@ The current source set is intentionally staged from small to broader:
 - `dcat`
   - source: `https://www.w3.org/ns/dcat.ttl`
   - tier: `medium`
+- `vcard`
+  - source: `https://www.w3.org/2006/vcard/ns.ttl`
+  - tier: `medium`
+- `dcterms`
+  - source: `https://www.dublincore.org/specifications/dublin-core/dcmi-terms/dublin_core_terms.ttl`
+  - tier: `medium`
+- `odrl`
+  - source: `https://www.w3.org/ns/odrl/2/ODRL22.ttl`
+  - tier: `broad`
 
 Selection rationale:
 
@@ -51,6 +67,41 @@ Selection rationale:
   exercise property chains plus functional / inverse-functional declarations in the sensor-observation stack
 - `dcat`
   adds another official W3C source with property-chain-heavy metadata semantics
+- `vcard`
+  adds another official W3C vocabulary that is widely exchanged as Turtle and useful for Graph Store and `tell` validation
+- `dcterms`
+  adds DCMI metadata terms with broad RDF ecosystem adoption and strong subproperty/domain-range coverage
+- `odrl`
+  adds a broader OWL-heavy vocabulary that is useful for unsupported-construct diagnostics and list/restriction handling
+
+Current explicit service-validation focus:
+
+- `foaf`
+  - RDF/XML preload and `tell` ingest acceptance
+  - subclass-driven `foaf:Person -> foaf:Agent` inference in `rules-mvp`
+- `org`
+  - Graph Store roundtrip on an official Turtle ontology
+- `time`
+  - official ontology-backed inverse/transitive property reasoning
+- `vcard`
+  - named-graph store roundtrip on an official Turtle ontology
+- `odrl`
+  - currently cataloged for unsupported-construct and list/restriction hardening, not yet used as a positive inference fixture
+
+## Catalog Metadata
+
+Each ontology entry in `ontologies.toml` must define:
+
+- `serialization`
+  - current typed values: `turtle`, `rdf-xml`
+- `semantic_dialects`
+  - current typed values include `rdfs`, `owl`, `foaf`, `org`, `time`, `prov-o`, `skos`, `sosa`, `ssn`, `dcat`, `vcard`, `dcmi-terms`, `odrl`
+- `reasoning_features`
+  - current typed values include `subclass-closure`, `subproperty-closure`, `domain-range-typing`, `inverse-property`, `transitive-property`, `symmetric-property`, `disjointness`, `identity`, `restrictions`, `list-axioms`
+- `service_coverage`
+  - current typed values include `catalog-sync`, `tell`, `graph-store`, `query`, `reasoner`, `benchmark`
+
+The harness validates that these fields are present when reading the catalog, so the catalog remains a real source of truth instead of a loose download list.
 
 ## Sync Ontologies Locally
 
@@ -97,6 +148,9 @@ Prebuilt workload packs:
 - `benches/nrese-bench-harness/fixtures/packs/sosa-baseline/pack.toml`
 - `benches/nrese-bench-harness/fixtures/packs/ssn-baseline/pack.toml`
 - `benches/nrese-bench-harness/fixtures/packs/dcat-baseline/pack.toml`
+- `benches/nrese-bench-harness/fixtures/packs/vcard-baseline/pack.toml`
+- `benches/nrese-bench-harness/fixtures/packs/dcterms-baseline/pack.toml`
+- `benches/nrese-bench-harness/fixtures/packs/odrl-baseline/pack.toml`
 
 Example:
 

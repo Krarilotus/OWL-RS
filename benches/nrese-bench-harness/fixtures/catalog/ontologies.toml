@@ -3,93 +3,173 @@ name = "foaf"
 title = "FOAF Vocabulary"
 url = "https://xmlns.com/foaf/spec/index.rdf"
 media_type = "application/rdf+xml"
+serialization = "rdf-xml"
 filename = "foaf.rdf"
 tier = "small"
 focus_terms = [
   "http://xmlns.com/foaf/0.1/Person",
   "http://xmlns.com/foaf/0.1/Agent",
 ]
+semantic_dialects = ["rdfs", "owl", "foaf"]
+reasoning_features = ["subclass-closure", "domain-range-typing"]
+service_coverage = ["catalog-sync", "tell", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "org"
 title = "W3C Organization Ontology"
 url = "https://www.w3.org/ns/org.ttl"
 media_type = "text/turtle"
+serialization = "turtle"
 filename = "org.ttl"
 tier = "medium"
 focus_terms = [
   "http://www.w3.org/ns/org#Organization",
   "http://www.w3.org/ns/org#hasMember",
 ]
+semantic_dialects = ["rdfs", "owl", "org"]
+reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "time"
 title = "W3C Time Ontology in OWL"
 url = "https://www.w3.org/2006/time.ttl"
 media_type = "text/turtle"
+serialization = "turtle"
 filename = "time.ttl"
 tier = "medium"
 focus_terms = [
   "http://www.w3.org/2006/time#TemporalEntity",
   "http://www.w3.org/2006/time#Interval",
 ]
+semantic_dialects = ["rdfs", "owl", "time"]
+reasoning_features = ["subclass-closure", "transitive-property", "inverse-property"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "prov"
 title = "W3C PROV-O"
 url = "https://www.w3.org/ns/prov.ttl"
 media_type = "text/turtle"
+serialization = "turtle"
 filename = "prov.ttl"
 tier = "broad"
 focus_terms = [
   "http://www.w3.org/ns/prov#Entity",
   "http://www.w3.org/ns/prov#Activity",
 ]
+semantic_dialects = ["rdfs", "owl", "prov-o"]
+reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "skos"
 title = "SKOS Reference Vocabulary"
 url = "https://www.w3.org/2009/08/skos-reference/skos.rdf"
 media_type = "application/rdf+xml"
+serialization = "rdf-xml"
 filename = "skos.rdf"
 tier = "medium"
 focus_terms = [
   "http://www.w3.org/2004/02/skos/core#Concept",
   "http://www.w3.org/2004/02/skos/core#broaderTransitive",
 ]
+semantic_dialects = ["rdfs", "owl", "skos"]
+reasoning_features = ["subproperty-closure", "transitive-property", "domain-range-typing"]
+service_coverage = ["catalog-sync", "tell", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "sosa"
 title = "W3C SOSA Ontology"
 url = "https://www.w3.org/ns/ssn/sosa.ttl"
 media_type = "text/turtle"
+serialization = "turtle"
 filename = "sosa.ttl"
 tier = "medium"
 focus_terms = [
   "http://www.w3.org/ns/sosa/Observation",
   "http://www.w3.org/ns/sosa/hasFeatureOfInterest",
 ]
+semantic_dialects = ["rdfs", "owl", "sosa"]
+reasoning_features = ["subclass-closure", "domain-range-typing"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "ssn"
 title = "W3C SSN Ontology"
 url = "https://www.w3.org/ns/ssn/ssn.ttl"
 media_type = "text/turtle"
+serialization = "turtle"
 filename = "ssn.ttl"
 tier = "broad"
 focus_terms = [
   "http://www.w3.org/ns/ssn/System",
   "http://www.w3.org/ns/ssn/forProperty",
 ]
+semantic_dialects = ["rdfs", "owl", "ssn"]
+reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "dcat"
 title = "W3C DCAT Vocabulary"
 url = "https://www.w3.org/ns/dcat.ttl"
 media_type = "text/turtle"
+serialization = "turtle"
 filename = "dcat.ttl"
 tier = "medium"
 focus_terms = [
   "http://www.w3.org/ns/dcat#Dataset",
   "http://www.w3.org/ns/dcat#CatalogRecord",
 ]
+semantic_dialects = ["rdfs", "owl", "dcat"]
+reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+
+[[ontologies]]
+name = "vcard"
+title = "W3C vCard Ontology"
+url = "https://www.w3.org/2006/vcard/ns.ttl"
+media_type = "text/turtle"
+serialization = "turtle"
+filename = "vcard.ttl"
+tier = "medium"
+focus_terms = [
+  "http://www.w3.org/2006/vcard/ns#Individual",
+  "http://www.w3.org/2006/vcard/ns#hasAddress",
+]
+semantic_dialects = ["rdfs", "owl", "vcard"]
+reasoning_features = ["subclass-closure", "domain-range-typing", "inverse-property"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+
+[[ontologies]]
+name = "dcterms"
+title = "DCMI Terms"
+url = "https://www.dublincore.org/specifications/dublin-core/dcmi-terms/dublin_core_terms.ttl"
+media_type = "text/turtle"
+serialization = "turtle"
+filename = "dcterms.ttl"
+tier = "medium"
+focus_terms = [
+  "http://purl.org/dc/terms/BibliographicResource",
+  "http://purl.org/dc/terms/creator",
+]
+semantic_dialects = ["rdfs", "owl", "dcmi-terms"]
+reasoning_features = ["subproperty-closure", "domain-range-typing"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+
+[[ontologies]]
+name = "odrl"
+title = "W3C ODRL Vocabulary"
+url = "https://www.w3.org/ns/odrl/2/ODRL22.ttl"
+media_type = "text/turtle"
+serialization = "turtle"
+filename = "odrl.ttl"
+tier = "broad"
+focus_terms = [
+  "http://www.w3.org/ns/odrl/2/Policy",
+  "http://www.w3.org/ns/odrl/2/permission",
+]
+semantic_dialects = ["rdfs", "owl", "odrl"]
+reasoning_features = ["subclass-closure", "restrictions", "list-axioms"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]

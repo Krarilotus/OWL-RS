@@ -146,7 +146,9 @@ async fn write_graph(
 }
 
 fn parse_graph_accept_format(accept: Option<&str>) -> nrese_store::GraphResultFormat {
-    if media_type_matches(accept, "text/turtle")
+    if media_type_matches(accept, "application/rdf+xml") {
+        nrese_store::GraphResultFormat::RdfXml
+    } else if media_type_matches(accept, "text/turtle")
         || media_type_matches(accept, "application/x-turtle")
     {
         nrese_store::GraphResultFormat::Turtle
@@ -194,5 +196,12 @@ mod tests {
     fn graph_accept_format_handles_parameterized_accept_values() {
         let format = parse_graph_accept_format(Some("application/n-triples, text/turtle; q=0.9"));
         assert_eq!(format, GraphResultFormat::Turtle);
+    }
+
+    #[test]
+    fn graph_accept_format_prefers_rdf_xml_when_present() {
+        let format =
+            parse_graph_accept_format(Some("application/n-triples, application/rdf+xml; q=0.9"));
+        assert_eq!(format, GraphResultFormat::RdfXml);
     }
 }

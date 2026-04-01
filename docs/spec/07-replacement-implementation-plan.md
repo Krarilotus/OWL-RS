@@ -63,7 +63,7 @@ Implementation blocks:
 - manifest-driven production workload parity pack support so seed, compat, and bench runs use one versioned evidence unit instead of ad hoc fixture combinations
 - workload-pack aggregate reporting so one pack run emits a canonical `pack-report.json` evidence index alongside per-suite compat reports and benchmark output
 - broader SPARQL Update parity fixtures for the intended replacement scope before moving to live project-specific packs
-- staged real-world ontology catalog with small-to-broad official ontology sources to harden parity and performance work incrementally
+- staged real-world ontology catalog with small-to-broad official ontology sources plus typed processing metadata to harden parity and performance work incrementally
 - project-realistic compatibility packs against the live Fuseki deployment
 - CI wiring for repeatable compatibility execution
 - keep response-semantics normalization in one harness path so failure-parity checks do not fork into endpoint-specific comparators
@@ -279,7 +279,9 @@ Priority order for the next replacement-focused runs:
 - added dedicated timeout-failure compat suites on the shared response-semantics comparator path
 - committed secured live-auth and secured live-auth-timeout pack templates on the same manifest model as generic packs
 - added env-driven pack-header interpolation so secured workload packs stay reusable without committed secrets
-- expanded the staged real-world ontology catalog to include SKOS, SOSA, SSN, and DCAT alongside the earlier official ontology set
+- expanded the staged real-world ontology catalog to include SKOS, SOSA, SSN, DCAT, vCard, DCMI Terms, and ODRL alongside the earlier official ontology set
+- added typed ontology-fixture metadata for serialization, semantic dialects, reasoning focus, and service coverage so catalog entries can drive test intent rather than only download paths
+- added cross-service ontology fixture tests that exercise official catalog inputs through Store, Server, and Reasoner paths, including RDF/XML preload/`tell` acceptance and ontology-backed inverse/transitive reasoning checks
 - added service-level timeout budgets to workload-pack target profiles so secured/live parity runs can reuse shared transport ceilings without case duplication
 - added named per-side invocation profiles to workload-pack manifests and bound secured invalid-auth parity cases to that path instead of duplicating live auth headers inside compat JSON
 - added a dedicated limit/offset semantics compat suite and a bindings-set comparator so query-window parity does not rely on count-only summaries

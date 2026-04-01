@@ -28,7 +28,8 @@ Current coverage:
 - Protocol compatibility harness now covers query parity, update-effect parity, graph-store read/head/delete/put/post-effect parity, bounded graph-store failure semantics, and bounded query/update failure semantics (status/content-type/body-class) against Fuseki-style dataset endpoints
 - The generic protocol fixture set now also covers a broader SPARQL Update parity slice for `DELETE DATA`, `DELETE/INSERT WHERE`, `CLEAR`, `COPY`, `MOVE`, and `ADD`
 - query parity coverage now also includes a dedicated limit/offset semantics suite using bindings-set comparison instead of count-only summaries
-- a staged real-world ontology catalog now exists to harden parity runs incrementally from small to broad official ontology sources
+- a staged real-world ontology catalog now exists to harden parity runs incrementally from small to broad official ontology sources, with typed serialization/dialect/reasoning/service metadata
+- official ontology fixtures now back explicit cross-service checks for store preload, `tell`, graph-store roundtrip, and bounded reasoner/runtime validation, including RDF/XML ingest/preload coverage
 - versioned secured live-auth and secured live-auth-plus-timeout workload-pack templates now exist on the same manifest path as the generic packs
 - workload-pack headers now support env-placeholder interpolation so auth/proxy parity packs can stay versioned without committed secrets
 - workload-pack execution now emits a canonical `pack-report.json` evidence index that ties compat suites and benchmark artifacts together
@@ -171,6 +172,7 @@ Current coverage:
 
 Still required:
 - comparisons against the real Fuseki deployment and real ontology/workload
+- broader ontology-driven cross-service validation on catalog fixtures beyond the current focused FOAF/ORG/Time/vCard coverage
 - latency, startup, RAM, CPU, and reasoning cost measurements
 - regression thresholds in CI
 - production workload parity pack execution on the real ontology/workload set, rather than only generic local fixtures

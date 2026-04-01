@@ -33,6 +33,7 @@ impl SolutionsResultFormat {
 pub enum GraphResultFormat {
     NTriples,
     Turtle,
+    RdfXml,
 }
 
 impl GraphResultFormat {
@@ -40,6 +41,7 @@ impl GraphResultFormat {
         match self {
             Self::NTriples => "application/n-triples",
             Self::Turtle => "text/turtle",
+            Self::RdfXml => "application/rdf+xml",
         }
     }
 
@@ -47,6 +49,16 @@ impl GraphResultFormat {
         match self {
             Self::NTriples => RdfFormat::NTriples,
             Self::Turtle => RdfFormat::Turtle,
+            Self::RdfXml => RdfFormat::RdfXml,
+        }
+    }
+
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        match extension.to_ascii_lowercase().as_str() {
+            "ttl" => Some(Self::Turtle),
+            "nt" => Some(Self::NTriples),
+            "rdf" | "xml" => Some(Self::RdfXml),
+            _ => None,
         }
     }
 }

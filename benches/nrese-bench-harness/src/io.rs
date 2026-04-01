@@ -27,12 +27,13 @@ pub fn infer_rdf_content_type(path: &Path) -> Result<&'static str> {
         bail!("cannot infer RDF content type for {:?}", path);
     };
 
+    if let Some(format) = nrese_store::GraphResultFormat::from_extension(extension) {
+        return Ok(format.media_type());
+    }
+
     match extension.to_ascii_lowercase().as_str() {
-        "ttl" => Ok("text/turtle"),
-        "nt" => Ok("application/n-triples"),
         "nq" => Ok("application/n-quads"),
         "trig" => Ok("application/trig"),
-        "rdf" | "xml" => Ok("application/rdf+xml"),
         _ => bail!("unsupported RDF file extension: {extension}"),
     }
 }
@@ -66,7 +67,13 @@ pub fn read_workload_pack(path: &Path) -> Result<WorkloadPackManifest> {
 
 pub fn read_ontology_catalog(path: &Path) -> Result<OntologyCatalog> {
     let text = fs::read_to_string(path).with_context(|| format!("failed to read {:?}", path))?;
-    toml::from_str(&text).with_context(|| format!("failed to parse {:?}", path))
+    let catalog: OntologyCatalog =
+        toml::from_str(&text).with_context(|| format!("failed to parse {:?}", path))?;
+    catalog
+        .validate()
+        .map_err(anyhow::Error::msg)
+        .with_context(|| format!("invalid ontology catalog {:?}", path))?;
+    Ok(catalog)
 }
 
 fn resolve_pack_path(base_dir: &Path, candidate: &Path) -> PathBuf {
@@ -249,9 +256,13 @@ name = "prov"
 title = "PROV-O"
 url = "https://www.w3.org/ns/prov.ttl"
 media_type = "text/turtle"
+serialization = "turtle"
 filename = "prov.ttl"
 tier = "broad"
 focus_terms = ["http://www.w3.org/ns/prov#Entity"]
+semantic_dialects = ["rdfs", "owl", "prov-o"]
+reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing"]
+service_coverage = ["catalog-sync", "tell", "query", "reasoner", "benchmark"]
 "#,
         )
         .expect("catalog");
@@ -259,5 +270,34 @@ focus_terms = ["http://www.w3.org/ns/prov#Entity"]
         let catalog = read_ontology_catalog(&path).expect("catalog");
         assert_eq!(catalog.ontologies.len(), 1);
         assert_eq!(catalog.ontologies[0].name, "prov");
+        assert_eq!(
+            catalog.ontologies[0].semantic_dialects.len(),
+            3,
+            "catalog metadata should parse semantic dialects"
+        );
+    }
+
+    #[test]
+    fn ontology_catalog_rejects_missing_processing_metadata() {
+        let temp_dir = tempdir().expect("tempdir");
+        let path = temp_dir.path().join("catalog.toml");
+        fs::write(
+            &path,
+            r#"
+[[ontologies]]
+name = "invalid"
+title = "Invalid"
+url = "https://example.com/invalid.ttl"
+media_type = "text/turtle"
+serialization = "turtle"
+filename = "invalid.ttl"
+tier = "small"
+focus_terms = ["http://example.com/Thing"]
+"#,
+        )
+        .expect("catalog");
+
+        let error = read_ontology_catalog(&path).expect_err("invalid catalog");
+        assert!(format!("{error:#}").contains("semantic_dialects"));
     }
 }
