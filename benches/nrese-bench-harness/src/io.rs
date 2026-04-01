@@ -152,14 +152,16 @@ x-forwarded-proto = "https"
         assert_eq!(manifest.compat_suites.len(), 3);
         assert!(
             manifest.compat_suites.iter().any(|path| {
-                path.ends_with("fixtures\\compat\\policy_failure_cases.json")
-                    || path.ends_with("fixtures/compat/policy_failure_cases.json")
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value == "policy_failure_cases.json")
             })
         );
         assert!(
             manifest.compat_suites.iter().any(|path| {
-                path.ends_with("fixtures\\compat\\timeout_failure_cases.json")
-                    || path.ends_with("fixtures/compat/timeout_failure_cases.json")
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value == "timeout_failure_cases.json")
             })
         );
         assert_eq!(
