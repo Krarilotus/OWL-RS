@@ -8,13 +8,14 @@ mod builder;
 mod group_axioms;
 mod ids;
 mod keys;
-pub(crate) mod rdf_list;
+mod rdf_list;
 mod stats;
 #[cfg(test)]
 mod tests;
 
 use builder::build_from_snapshot;
 use ids::IndexedVocabulary;
+pub(crate) use rdf_list::parse_list as parse_rdf_list;
 use stats::DatasetIndexStats;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

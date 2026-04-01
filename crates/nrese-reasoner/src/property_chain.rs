@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::dataset_index::IndexedDataset;
-use crate::dataset_index::rdf_list::parse_list;
+use crate::dataset_index::{IndexedDataset, parse_rdf_list};
 
 const MAX_SUPPORTED_CHAIN_LENGTH: usize = 2;
 
@@ -90,7 +89,7 @@ impl PropertyChainPlan {
 }
 
 fn parse_chain(index: &IndexedDataset, head_id: u32) -> Result<Vec<u32>, &'static str> {
-    parse_list(
+    parse_rdf_list(
         index.list_first_by_node(),
         index.list_rest_by_node(),
         index.rdf_nil_id(),
