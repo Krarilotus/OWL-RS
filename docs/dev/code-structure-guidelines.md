@@ -41,6 +41,7 @@ Examples in this repository:
 - Frontend language strings should live in one i18n boundary rather than component-local literals.
 - Frontend string types should live in one i18n type module rather than one concrete language file.
 - Frontend design tokens should live in one style-token boundary rather than repeated inline values.
+- Frontend endpoint paths and request construction should live in one client boundary rather than being reimplemented across components, scripts, and CLI wrappers.
 - Topic-folder facades should re-export only the items that are part of the external boundary, not every internal type by default.
 
 ## Configuration Ownership
@@ -93,6 +94,7 @@ Every bounded implementation block should end with a reactor pass:
 - if similar logic exists elsewhere, extract a shared source before adding more copies
 - keep runtime files focused on runtime behavior, and move growing test blocks into dedicated test files
 - keep frontend API clients, components, strings, and styling in separate folders
+- keep frontend CLI entry points on top of the same client boundary instead of adding standalone transport code
 - update README/spec/ops docs when behavior, config, or bounded scope changes
 - finish the slice with formatter, lints, and the relevant test set
 

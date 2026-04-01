@@ -8,10 +8,25 @@ import "./styles/layout.css";
 
 const queryClient = new QueryClient();
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <App />
-    </QueryClientProvider>
-  </React.StrictMode>,
-);
+async function bootstrap(): Promise<void> {
+  await loadRuntimeConfig();
+
+  ReactDOM.createRoot(document.getElementById("root")!).render(
+    <React.StrictMode>
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>
+    </React.StrictMode>,
+  );
+}
+
+async function loadRuntimeConfig(): Promise<void> {
+  const runtimeConfigModule = `${import.meta.env.BASE_URL}console-config.js`;
+  try {
+    await import(/* @vite-ignore */ runtimeConfigModule);
+  } catch {
+    window.__NRESE_CONSOLE_CONFIG__ = window.__NRESE_CONSOLE_CONFIG__ ?? {};
+  }
+}
+
+void bootstrap();

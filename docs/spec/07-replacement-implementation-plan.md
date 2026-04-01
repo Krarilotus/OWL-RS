@@ -195,6 +195,9 @@ Objective:
 Implementation blocks:
 
 - frontend shell for query, tell, update, graph, and runtime visibility
+- one frontend-owned TypeScript client boundary for browser and CLI access
+- runtime-configured frontend API base support so frontend and backend hosting can be separated cleanly
+- small CLI wrapper on the same TypeScript client boundary for fast operational and developer workflows
 - provider-agnostic server-side AI suggestion layer
 - string/style separation and extension points
 - runtime-config and reasoning-policy visibility driven from server diagnostics instead of frontend-local shadow state
@@ -204,6 +207,8 @@ Implementation blocks:
 Primary modules:
 
 - `apps/nrese-console`
+- `apps/nrese-console/src/lib/`
+- `apps/nrese-console/src/cli/`
 - `crates/nrese-server/src/ai/`
 - `crates/nrese-server/src/http/ai.rs`
 - `docs/dev/frontend-extension-guide.md`

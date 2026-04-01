@@ -117,9 +117,12 @@ Primary conformance targets:
 
 - `/console` MUST serve a user-facing browser interface for query, tell, update, graph-store, and dataset inspection workflows.
 - `/console` MUST stay API-driven and same-origin with documented HTTP contracts.
+- The frontend package MUST also be able to target a non-same-origin backend through explicit frontend-owned runtime configuration, so browser hosting and backend hosting remain separable concerns.
 - Styling, language strings, and API transport code MUST remain separated so the frontend is customizable without rewriting behavior.
+- Frontend endpoint paths, request construction, and connector logic MUST remain frontend-owned in one explicit client boundary rather than being reimplemented across components or scripts.
 - AI-assisted query suggestion support MUST remain optional and provider-agnostic at the server boundary.
 - The frontend MUST continue working when AI suggestions are disabled.
+- Fast operator and developer access SHOULD also be available through a frontend-owned CLI wrapper that uses the same typed HTTP client boundary as the browser frontend.
 
 ## Deployment Durability Requirements
 

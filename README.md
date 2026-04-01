@@ -40,8 +40,10 @@ Implemented today:
 - first-class `TELL` assertion ingest endpoint for RDF payloads
 - Graph Store endpoint surface
 - user-facing `/console` frontend for query, tell, update, graph, and dataset workflows
+- explicit frontend-owned TypeScript client boundary for browser and CLI access to the backend API
 - guided workbench examples in `/console` so less SPARQL-native users can start from working query/update/tell/graph templates
 - frontend locale selection with persisted `en`/`de` i18n instead of browser-guess-only language handling
+- runtime-configurable frontend API base URL so the browser frontend can be hosted separately from the backend
 - service description, health, readiness, metrics, and operator endpoints
 - staged update validation before publish
 - bounded `rules-mvp` reasoning with canonical `owl:sameAs` equality handling, bounded functional / inverse-functional equality entailment, bounded binary `owl:propertyChainAxiom` support over named-node RDF lists, bounded `owl:Nothing` effective-type rejection, and explicit unsupported-construct diagnostics
@@ -64,6 +66,7 @@ Implemented today:
 - AI assistant now surfaces configured provider/model metadata and clearer empty-state behavior in the user console
 - the user console now reads reasoning preset/policy/cache state from the real server diagnostics surface instead of maintaining local pseudo-config state
 - the user console now exposes the server-advertised reasoning capability set, so bounded reasoning slices are visible without opening the operator UI
+- the frontend package now also ships a small CLI on the same TypeScript client boundary for fast query/update/tell/graph/runtime workflows
 
 Not finished yet:
 
@@ -127,6 +130,25 @@ $env:VITE_API_PROXY_TARGET = "http://127.0.0.1:9090"
 npm run dev
 ```
 
+### Run The Frontend Against A Separate Backend
+
+For a built frontend, prefer runtime configuration over hardcoding API URLs into components:
+
+```js
+window.__NRESE_CONSOLE_CONFIG__ = {
+  apiBaseUrl: "https://nrese.example.com",
+};
+```
+
+This lives in:
+
+- `apps/nrese-console/public/console-config.js`
+
+You can also bind at build time with:
+
+- `VITE_NRESE_API_BASE_URL`
+- `VITE_CONSOLE_BASE_PATH`
+
 ### Run The Server
 
 ```powershell
@@ -147,6 +169,26 @@ cargo run -p nrese-server -- --config .\config.toml
   Operator-facing console and diagnostics surface.
 - `/`
   Redirects to `/console`.
+
+### Frontend CLI
+
+The frontend package also ships a small CLI on top of the same TypeScript client boundary:
+
+```powershell
+Set-Location .\apps\nrese-console
+npm install
+npm run cli -- runtime
+npm run cli -- capabilities
+npm run cli -- query --text "SELECT * WHERE { ?s ?p ?o } LIMIT 5"
+```
+
+Useful options:
+
+- `--base-url <url>` or `NRESE_API_BASE_URL`
+- `--token <token>` or `NRESE_API_TOKEN`
+- repeated `--header name:value`
+- `--file <path>` for query/update/tell/graph payloads
+- `--graph default|named` and `--graph-iri <iri>` for graph operations
 
 Optional environment variables:
 
@@ -218,7 +260,12 @@ If you want to work on HTTP, auth, or operator surfaces:
 If you want to work on the user frontend:
 
 - start in `apps/nrese-console/src/App.tsx`
+- the frontend/backend contract is documented in [docs/dev/frontend-backend-contract.md](docs/dev/frontend-backend-contract.md)
 - API calls and frontend transport helpers are under `apps/nrese-console/src/lib/`
+- endpoint ownership is centralized in `apps/nrese-console/src/lib/endpoints.ts`
+- the shared frontend TypeScript client is in `apps/nrese-console/src/lib/client.ts`
+- browser runtime config is in `apps/nrese-console/src/lib/runtimeConfig.ts`
+- CLI entry points are in `apps/nrese-console/src/cli/`
 - UI components are under `apps/nrese-console/src/components/`
 - language strings are under `apps/nrese-console/src/i18n/`
 - styling tokens and layout files are under `apps/nrese-console/src/styles/`
@@ -334,3 +381,4 @@ Seed and compare against Fuseki:
 - [docs/ops/backup-restore-drills.md](docs/ops/backup-restore-drills.md)
 - [docs/dev/code-structure-guidelines.md](docs/dev/code-structure-guidelines.md)
 - [docs/dev/frontend-extension-guide.md](docs/dev/frontend-extension-guide.md)
+- [docs/dev/frontend-backend-contract.md](docs/dev/frontend-backend-contract.md)

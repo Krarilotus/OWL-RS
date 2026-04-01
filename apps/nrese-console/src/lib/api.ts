@@ -1,4 +1,5 @@
-import { fetchJson, fetchText } from "./http";
+import { NreseClient } from "./client";
+import { resolveBrowserApiBaseUrl } from "./runtimeConfig";
 import type {
   AiStatus,
   Capabilities,
@@ -7,22 +8,31 @@ import type {
   RuntimeSnapshot,
 } from "./types";
 
+let browserClient: NreseClient | undefined;
+
+export function getBrowserClient(): NreseClient {
+  browserClient ??= new NreseClient({
+    baseUrl: resolveBrowserApiBaseUrl(),
+  });
+  return browserClient;
+}
+
 export async function getRuntimeSnapshot(): Promise<RuntimeSnapshot> {
-  return fetchJson<RuntimeSnapshot>("/ops/api/health/extended");
+  return getBrowserClient().getRuntimeSnapshot();
 }
 
 export async function getCapabilities(): Promise<Capabilities> {
-  return fetchJson<Capabilities>("/ops/api/capabilities");
+  return getBrowserClient().getCapabilities();
 }
 
 export async function getReasoningDiagnostics(
   endpoint = "/ops/api/diagnostics/reasoning",
 ): Promise<ReasoningDiagnostics> {
-  return fetchJson<ReasoningDiagnostics>(endpoint);
+  return getBrowserClient().getReasoningDiagnostics(endpoint);
 }
 
 export async function getAiStatus(): Promise<AiStatus> {
-  return fetchJson<AiStatus>("/api/ai/status");
+  return getBrowserClient().getAiStatus();
 }
 
 export async function getQuerySuggestions(payload: {
@@ -30,34 +40,15 @@ export async function getQuerySuggestions(payload: {
   locale: string;
   current_query?: string;
 }): Promise<QuerySuggestionResponse> {
-  return fetchJson<QuerySuggestionResponse>("/api/ai/query-suggestions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
+  return getBrowserClient().getQuerySuggestions(payload);
 }
 
 export async function runQuery(query: string, accept: string) {
-  return fetchText("/dataset/query", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/sparql-query",
-      Accept: accept,
-    },
-    body: query,
-  });
+  return getBrowserClient().runQuery(query, accept);
 }
 
 export async function runUpdate(update: string) {
-  return fetchText("/dataset/update", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/sparql-update",
-    },
-    body: update,
-  });
+  return getBrowserClient().runUpdate(update);
 }
 
 export async function runTell(
@@ -65,28 +56,14 @@ export async function runTell(
   graphMode: "default" | "named",
   graphIri: string,
 ) {
-  const suffix =
-    graphMode === "default" ? "?default" : `?graph=${encodeURIComponent(graphIri)}`;
-  return fetchText(`/dataset/tell${suffix}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/turtle",
-    },
-    body,
-  });
+  return getBrowserClient().runTell(body, graphMode, graphIri);
 }
 
 export async function readGraph(
   graphMode: "default" | "named",
   graphIri: string,
 ) {
-  const suffix =
-    graphMode === "default" ? "?default" : `?graph=${encodeURIComponent(graphIri)}`;
-  return fetchText(`/dataset/data${suffix}`, {
-    headers: {
-      Accept: "text/turtle",
-    },
-  });
+  return getBrowserClient().readGraph(graphMode, graphIri);
 }
 
 export async function writeGraph(
@@ -95,24 +72,12 @@ export async function writeGraph(
   graphMode: "default" | "named",
   graphIri: string,
 ) {
-  const suffix =
-    graphMode === "default" ? "?default" : `?graph=${encodeURIComponent(graphIri)}`;
-  return fetchText(`/dataset/data${suffix}`, {
-    method,
-    headers: {
-      "Content-Type": "text/turtle",
-    },
-    body,
-  });
+  return getBrowserClient().writeGraph(method, body, graphMode, graphIri);
 }
 
 export async function deleteGraph(
   graphMode: "default" | "named",
   graphIri: string,
 ) {
-  const suffix =
-    graphMode === "default" ? "?default" : `?graph=${encodeURIComponent(graphIri)}`;
-  return fetchText(`/dataset/data${suffix}`, {
-    method: "DELETE",
-  });
+  return getBrowserClient().deleteGraph(graphMode, graphIri);
 }

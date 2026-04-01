@@ -44,6 +44,8 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - Initial rate-limit buckets for read, write, and admin traffic are enforced from the same policy path as auth
 - Server runtime configuration now supports file-based `config.toml` input with environment overrides on the same typed parser path, so deployment policy stays external to handler/runtime logic
 - User-facing `/console` frontend exists as a separate browser surface from `/ops`, with optional server-side AI query suggestions through a typed provider abstraction
+- `/console` frontend now owns an explicit TypeScript client boundary and runtime-configurable backend base URL, so browser hosting and backend hosting can be separated without rewriting components
+- `/console` frontend now also ships a small CLI on the same TypeScript client boundary for fast query/update/tell/graph/runtime access without separate backend scripts
 - `rules-mvp` now supports explicit presets on top of the feature-policy path, so runtime defaults can be standardized without hard-coding product opinion into the engine
 
 ### R4: Reasoning Integration
@@ -114,6 +116,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - Default and named graph semantics are preserved.
 - Operator workflows (query, update, graph management, diagnostics) run through documented public contracts.
 - User-facing browser workflows run through documented public contracts and remain usable with AI assistance disabled.
+- Browser and CLI access paths reuse the same frontend-owned typed client contract.
 
 ### Performance
 
@@ -156,6 +159,7 @@ Drill execution procedure and evidence format are normative in [docs/ops/backup-
 - Cross-crate boundary changes require spec updates.
 - Server code does not bypass store internals through raw backend access.
 - Operator frontend behavior stays API-driven and spec-aligned, preventing undocumented divergence.
+- Frontend endpoint ownership, runtime config, and CLI wrappers stay in the frontend package instead of leaking transport helpers into backend modules.
 
 ## Risk Register
 

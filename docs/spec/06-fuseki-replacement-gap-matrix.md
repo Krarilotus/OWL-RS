@@ -103,6 +103,8 @@ Status: `partial`
 Current coverage:
 - `/ops` UI exists
 - `/console` user-facing frontend exists for query, tell, update, graph, and dataset workflows
+- `/console` now owns an explicit frontend-side TypeScript client boundary plus runtime-configurable backend base URL instead of relying only on implicit same-origin transport assumptions
+- `/console` now also ships a small CLI on the same typed client boundary for query, update, tell, graph, runtime, and capability workflows
 - `/console` now includes guided workbench examples so non-specialist users can load explicit query/update/tell/graph templates instead of starting from empty editors
 - `/console` now supports explicit persisted locale selection for the currently shipped `en`/`de` language set instead of relying only on browser locale detection
 - `/console` now reads reasoning preset/policy/cache state from the server diagnostics surface instead of maintaining local pseudo-config state
@@ -121,6 +123,7 @@ Still required:
 - live preset application remains external/config-driven rather than runtime-mutable
 - broader i18n coverage beyond the current shipped language set and stronger assistant UX around task templates/history under real project usage
 - timeout-oriented parity evidence against real secured stacks is still pending even though generic and policy failure suites are now pack-addressable
+- real deployment evidence for standalone frontend hosting against a separately hosted backend is still pending even though runtime-configured API base support now exists
 
 Replacement gate:
 - admin and user workflows are reliably executable in-browser behind real deployment controls
