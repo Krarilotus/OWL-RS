@@ -10,7 +10,7 @@ use crate::model::{
     CompatCase, CompatCaseReport, CompatKind, compat_kind_label, compat_operation_label,
 };
 use crate::normalize::{
-    canonicalize_bindings_set, canonicalize_ntriples_set, extract_ask_boolean,
+    canonicalize_bindings_set, canonicalize_rdf_graph_set, extract_ask_boolean,
     extract_binding_count, parse_json,
 };
 use crate::payloads::query_text;
@@ -60,8 +60,13 @@ fn build_report(
     left: &HttpOutcome,
     right: &HttpOutcome,
 ) -> Result<CompatCaseReport> {
-    let (matched, left_summary, right_summary) =
-        compare_payloads(case.kind, &left.body, &right.body)?;
+    let (matched, left_summary, right_summary) = compare_payloads(
+        case.kind,
+        left.content_type.as_deref(),
+        &left.body,
+        right.content_type.as_deref(),
+        &right.body,
+    )?;
 
     Ok(CompatCaseReport {
         name: case.name.clone(),
@@ -79,7 +84,13 @@ fn build_report(
     })
 }
 
-fn compare_payloads(kind: CompatKind, left: &[u8], right: &[u8]) -> Result<(bool, String, String)> {
+fn compare_payloads(
+    kind: CompatKind,
+    left_content_type: Option<&str>,
+    left: &[u8],
+    right_content_type: Option<&str>,
+    right: &[u8],
+) -> Result<(bool, String, String)> {
     match kind {
         CompatKind::AskBoolean => {
             let left_json = parse_json(left)?;
@@ -115,8 +126,8 @@ fn compare_payloads(kind: CompatKind, left: &[u8], right: &[u8]) -> Result<(bool
             ))
         }
         CompatKind::ConstructTriplesSet | CompatKind::GraphTriplesSet => {
-            let left_set = canonicalize_ntriples_set(left)?;
-            let right_set = canonicalize_ntriples_set(right)?;
+            let left_set = canonicalize_rdf_graph_set(left_content_type, left)?;
+            let right_set = canonicalize_rdf_graph_set(right_content_type, right)?;
             Ok((
                 left_set == right_set,
                 format!("triples={}", left_set.len()),
@@ -188,7 +199,13 @@ mod tests {
         }"#;
 
         let (matched, left_summary, right_summary) =
-            super::compare_payloads(CompatKind::SolutionsBindingsSet, left, right)
+            super::compare_payloads(
+                CompatKind::SolutionsBindingsSet,
+                Some("application/sparql-results+json"),
+                left,
+                Some("application/sparql-results+json"),
+                right,
+            )
                 .expect("comparison");
 
         assert!(!matched);

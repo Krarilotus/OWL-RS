@@ -756,6 +756,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "nrese-store",
+ "oxigraph",
  "reqwest",
  "serde",
  "serde_json",

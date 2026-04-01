@@ -65,3 +65,52 @@ async fn graph_put_rejects_malformed_turtle_with_problem_json()
 
     Ok(())
 }
+
+#[tokio::test]
+async fn graph_roundtrip_supports_rdf_xml() -> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app()?;
+    let put_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/data?graph=http%3A%2F%2Fexample.com%2Frdfxml")
+                .method(Method::PUT)
+                .header("content-type", "application/rdf+xml")
+                .body(Body::from(
+                    r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:ex="http://example.com/">
+  <rdf:Description rdf:about="http://example.com/a">
+    <ex:p rdf:resource="http://example.com/b"/>
+  </rdf:Description>
+</rdf:RDF>
+"#,
+                ))?,
+        )
+        .await?;
+    assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
+
+    let get_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/data?graph=http%3A%2F%2Fexample.com%2Frdfxml")
+                .method(Method::GET)
+                .header("accept", "application/rdf+xml")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_response.status(), StatusCode::OK);
+    assert_eq!(
+        get_response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/rdf+xml")
+    );
+    let body = axum::body::to_bytes(get_response.into_body(), usize::MAX).await?;
+    let text = String::from_utf8(body.to_vec())?;
+    assert!(text.contains("rdf:RDF"));
+    assert!(text.contains("http://example.com/a"));
+
+    Ok(())
+}

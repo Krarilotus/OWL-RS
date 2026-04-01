@@ -2,4 +2,7 @@ name = "foaf-baseline"
 dataset = "../../catalog-cache/foaf.rdf"
 query_workload = "../../workloads/ontology_query_workload.json"
 update_workload = "../../workloads/update_workload.json"
-compat_suites = ["../../compat/ontology_protocol_cases.json"]
+compat_suites = [
+  "../../compat/ontology_protocol_cases.json",
+  "../../compat/rdf_xml_protocol_cases.json",
+]

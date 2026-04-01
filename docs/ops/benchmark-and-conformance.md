@@ -331,6 +331,12 @@ Current protocol operations covered by the compat harness:
 - `graph-put-effect`
 - `graph-post-effect`
 
+Graph payload comparators canonicalize supported RDF syntaxes onto one triples-set path:
+
+- `text/turtle`
+- `application/n-triples`
+- `application/rdf+xml`
+
 Fixture authoring rules for compatibility cases:
 
 - `request_headers` may be set per case and are applied through one shared request-normalization path for query, update, and graph-store operations
@@ -345,6 +351,7 @@ It also now includes a broader SPARQL Update parity slice for `DELETE DATA`, `DE
 It also now supports a separate policy-failure fixture family for invalid-auth and oversize-payload parity on the same shared response-semantics comparator path.
 It now also supports a dedicated timeout-failure fixture family on the same shared response-semantics comparator path, using per-case timeout budgets instead of a separate timeout-only report format.
 Secured live-deployment packs can now bind invalid-auth cases through named per-side invocation profiles instead of duplicating live auth headers inside compat JSON.
+RDF/XML protocol cases can now stay on the same graph/query comparator path as Turtle and N-Triples instead of needing a response-semantics-only fallback.
 
 Policy-failure fixtures are intentionally separate from the generic protocol baseline, because they only become meaningful when both stacks are run with comparable auth and payload-limit policy.
 Timeout-failure fixtures are also intentionally separate from the generic baseline, because meaningful timeout parity depends on comparable timeout ceilings, reverse-proxy behavior, and workload-specific slow paths.

@@ -11,7 +11,7 @@ use crate::model::{
     CompatCase, CompatCaseReport, CompatHeaders, CompatKind, CompatOperation, compat_kind_label,
     compat_operation_label,
 };
-use crate::normalize::canonicalize_ntriples_set;
+use crate::normalize::canonicalize_rdf_graph_set;
 use crate::payloads::graph_payload;
 
 pub async fn execute_case(
@@ -118,8 +118,10 @@ async fn build_graph_read_report(
             let left_http = require_success_http(left, "graph read", &left_outcome)?;
             let right_http = require_success_http(right, "graph read", &right_outcome)?;
 
-            let left_set = canonicalize_ntriples_set(&left_http.body)?;
-            let right_set = canonicalize_ntriples_set(&right_http.body)?;
+            let left_set =
+                canonicalize_rdf_graph_set(left_http.content_type.as_deref(), &left_http.body)?;
+            let right_set =
+                canonicalize_rdf_graph_set(right_http.content_type.as_deref(), &right_http.body)?;
 
             Ok(CompatCaseReport {
                 name: case.name.clone(),
@@ -224,8 +226,10 @@ async fn build_graph_delete_effect_report(
             let left_http = require_success_http(left, "graph read", &left_outcome)?;
             let right_http = require_success_http(right, "graph read", &right_outcome)?;
 
-            let left_set = canonicalize_ntriples_set(&left_http.body)?;
-            let right_set = canonicalize_ntriples_set(&right_http.body)?;
+            let left_set =
+                canonicalize_rdf_graph_set(left_http.content_type.as_deref(), &left_http.body)?;
+            let right_set =
+                canonicalize_rdf_graph_set(right_http.content_type.as_deref(), &right_http.body)?;
 
             Ok(CompatCaseReport {
                 name: case.name.clone(),
@@ -423,5 +427,5 @@ async fn read_graph_set(
     )
     .await?;
     let http = require_success_http(target, "graph read", &outcome)?;
-    canonicalize_ntriples_set(&http.body)
+    canonicalize_rdf_graph_set(http.content_type.as_deref(), &http.body)
 }

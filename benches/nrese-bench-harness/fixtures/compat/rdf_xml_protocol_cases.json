@@ -1,0 +1,21 @@
+[
+  {
+    "name": "rdfxml-construct-classes",
+    "operation": "query",
+    "query": "CONSTRUCT { ?class a <http://www.w3.org/2002/07/owl#Class> } WHERE { ?class a <http://www.w3.org/2002/07/owl#Class> }",
+    "accept": "application/rdf+xml",
+    "kind": "construct-triples-set"
+  },
+  {
+    "name": "rdfxml-graph-put-effect",
+    "operation": "graph-put-effect",
+    "graph_target": {
+      "type": "named-graph",
+      "iri": "http://example.com/rdfxml"
+    },
+    "graph_payload": "<?xml version=\"1.0\"?>\n<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" xmlns:ex=\"http://example.com/\">\n  <rdf:Description rdf:about=\"http://example.com/a\">\n    <ex:p rdf:resource=\"http://example.com/b\"/>\n  </rdf:Description>\n</rdf:RDF>\n",
+    "graph_content_type": "application/rdf+xml",
+    "accept": "application/rdf+xml",
+    "kind": "graph-triples-set"
+  }
+]

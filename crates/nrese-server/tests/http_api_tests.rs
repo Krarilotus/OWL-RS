@@ -68,6 +68,36 @@ async fn service_description_endpoint_serves_turtle() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
+async fn construct_query_supports_rdf_xml_accept() -> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app()?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query")
+                .method(Method::POST)
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/rdf+xml")
+                .body(Body::from(
+                    "CONSTRUCT { <http://example.com/s> <http://example.com/p> <http://example.com/o> } WHERE {}",
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/rdf+xml")
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let text = String::from_utf8(body.to_vec())?;
+    assert!(text.contains("rdf:RDF"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn operator_ui_endpoint_serves_html() -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app()?;
     let response = app

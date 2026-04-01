@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, anyhow};
+use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
+use oxigraph::model::GraphNameRef;
+use oxigraph::store::Store;
 use serde_json::Value;
 
 use crate::model::LatencySummary;
@@ -17,6 +20,32 @@ pub fn canonicalize_ntriples_set(payload: &[u8]) -> Result<BTreeSet<String>> {
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
         .collect())
+}
+
+pub fn canonicalize_rdf_graph_set(
+    content_type: Option<&str>,
+    payload: &[u8],
+) -> Result<BTreeSet<String>> {
+    let format = infer_rdf_format_from_content_type(content_type)
+        .ok_or_else(|| anyhow!("unsupported RDF graph content type for canonicalization"))?;
+    let store = Store::new().context("failed to allocate temporary RDF canonicalization store")?;
+    let parser = RdfParser::from_format(format).without_named_graphs();
+    store
+        .load_from_slice(parser, payload)
+        .context("failed to parse RDF graph payload")?;
+
+    let mut writer = RdfSerializer::from_format(RdfFormat::NTriples).for_writer(Vec::new());
+    for quad in store.quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph)) {
+        writer
+            .serialize_triple(quad?.as_ref())
+            .context("failed to serialize canonical graph triple")?;
+    }
+
+    canonicalize_ntriples_set(
+        &writer
+            .finish()
+            .context("failed to finish canonical graph serializer")?,
+    )
 }
 
 pub fn extract_ask_boolean(value: &Value) -> Result<bool> {
@@ -94,6 +123,15 @@ pub fn normalize_content_type(content_type: Option<&str>) -> Option<String> {
     })
 }
 
+fn infer_rdf_format_from_content_type(content_type: Option<&str>) -> Option<RdfFormat> {
+    match normalize_content_type(content_type).as_deref() {
+        Some("text/turtle") | Some("application/x-turtle") => Some(RdfFormat::Turtle),
+        Some("application/n-triples") => Some(RdfFormat::NTriples),
+        Some("application/rdf+xml") => Some(RdfFormat::RdfXml),
+        _ => None,
+    }
+}
+
 pub fn classify_http_body(content_type: Option<&str>, payload: &[u8]) -> &'static str {
     if payload.is_empty() {
         return "empty";
@@ -151,8 +189,9 @@ pub fn percentile(sorted_latencies: &[u128], p: usize) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonicalize_bindings_set, canonicalize_ntriples_set, classify_http_body,
-        extract_ask_boolean, extract_binding_count, normalize_content_type, percentile,
+        canonicalize_bindings_set, canonicalize_ntriples_set, canonicalize_rdf_graph_set,
+        classify_http_body, extract_ask_boolean, extract_binding_count, normalize_content_type,
+        percentile,
     };
 
     #[test]
@@ -163,6 +202,24 @@ mod tests {
         .expect("canonical");
 
         assert_eq!(canonical.len(), 1);
+    }
+
+    #[test]
+    fn canonicalizes_rdf_xml_to_graph_set() {
+        let payload = br#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:ex="http://example.com/">
+  <rdf:Description rdf:about="http://example.com/a">
+    <ex:p rdf:resource="http://example.com/b"/>
+  </rdf:Description>
+</rdf:RDF>
+"#;
+
+        let canonical = canonicalize_rdf_graph_set(Some("application/rdf+xml"), payload)
+            .expect("canonical graph");
+        assert!(canonical.contains(
+            "<http://example.com/a> <http://example.com/p> <http://example.com/b> ."
+        ));
     }
 
     #[test]
