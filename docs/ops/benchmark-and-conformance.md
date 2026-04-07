@@ -137,6 +137,7 @@ The secured templates intentionally reuse the existing compat suites:
 - `benches/nrese-bench-harness/fixtures/compat/limit_semantics_cases.json`
 - `benches/nrese-bench-harness/fixtures/compat/ontologies/baseline_cases.json`
 - `cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix --nrese-base-url <URL> [--fuseki-base-url <URL>] [--tier <small|medium|broad>] [--report-dir <DIR>]`
+- `cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix --nrese-base-url <URL> [--fuseki-base-url <URL>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--report-dir <DIR>]`
   - `benches/nrese-bench-harness/fixtures/compat/policy_failure_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/secured_auth_failure_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/timeout_failure_cases.json`
@@ -224,6 +225,7 @@ For real ontology runs, prefer:
 - `benches/nrese-bench-harness/fixtures/workloads/update_workload.json`
 - `benches/nrese-bench-harness/fixtures/compat/ontologies/baseline_cases.json`
 - `pack-matrix` can execute all catalog-backed baseline packs for one tier and emits a top-level `pack-matrix-report.json` alongside per-pack `pack-report.json` evidence
+- `pack-matrix` filters operate on the typed ontology catalog metadata, so the same catalog now acts as both fixture inventory and execution selector for targeted evidence runs
 
 Prebuilt ontology packs now exist for:
 

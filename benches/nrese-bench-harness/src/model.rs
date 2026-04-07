@@ -73,6 +73,9 @@ pub struct PackMatrixConfig {
     pub catalog_path: PathBuf,
     pub packs_dir: PathBuf,
     pub tier: Option<String>,
+    pub semantic_dialect: Option<OntologySemanticDialect>,
+    pub reasoning_feature: Option<OntologyReasoningFeature>,
+    pub service_coverage: Option<OntologyServiceSurface>,
     pub iterations: usize,
     pub report_dir: PathBuf,
 }
@@ -405,6 +408,9 @@ pub struct PackMatrixReport {
     pub catalog_path: String,
     pub packs_dir: String,
     pub tier: Option<String>,
+    pub semantic_dialect: Option<OntologySemanticDialect>,
+    pub reasoning_feature: Option<OntologyReasoningFeature>,
+    pub service_coverage: Option<OntologyServiceSurface>,
     pub pack_runs: Vec<PackMatrixEntryReport>,
 }
 

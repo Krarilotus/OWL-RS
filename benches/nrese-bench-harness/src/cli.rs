@@ -5,7 +5,8 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::model::{
     BasicAuthConfig, BenchConfig, CatalogSyncConfig, Cli, Command, CompatConfig, CompatHeaders,
-    PackConfig, PackMatrixConfig, SeedConfig, ServiceConnectionConfig,
+    OntologyReasoningFeature, OntologySemanticDialect, OntologyServiceSurface, PackConfig,
+    PackMatrixConfig, SeedConfig, ServiceConnectionConfig,
 };
 
 const DEFAULT_QUERY_WORKLOAD_PATH: &str =
@@ -134,6 +135,18 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from("benches/nrese-bench-harness/fixtures/packs")),
                 tier: options.get("--tier").cloned(),
+                semantic_dialect: options
+                    .get("--semantic-dialect")
+                    .map(|value| parse_semantic_dialect(value))
+                    .transpose()?,
+                reasoning_feature: options
+                    .get("--reasoning-feature")
+                    .map(|value| parse_reasoning_feature(value))
+                    .transpose()?,
+                service_coverage: options
+                    .get("--service-coverage")
+                    .map(|value| parse_service_coverage(value))
+                    .transpose()?,
                 iterations: options
                     .get("--iterations")
                     .map(|value| value.parse::<usize>())
@@ -201,6 +214,53 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
+fn parse_semantic_dialect(value: &str) -> Result<OntologySemanticDialect> {
+    match value {
+        "rdfs" => Ok(OntologySemanticDialect::Rdfs),
+        "owl" => Ok(OntologySemanticDialect::Owl),
+        "foaf" => Ok(OntologySemanticDialect::Foaf),
+        "org" => Ok(OntologySemanticDialect::Org),
+        "time" => Ok(OntologySemanticDialect::Time),
+        "prov-o" => Ok(OntologySemanticDialect::ProvO),
+        "skos" => Ok(OntologySemanticDialect::Skos),
+        "sosa" => Ok(OntologySemanticDialect::Sosa),
+        "ssn" => Ok(OntologySemanticDialect::Ssn),
+        "dcat" => Ok(OntologySemanticDialect::Dcat),
+        "vcard" => Ok(OntologySemanticDialect::Vcard),
+        "dcmi-terms" => Ok(OntologySemanticDialect::DcmiTerms),
+        "odrl" => Ok(OntologySemanticDialect::Odrl),
+        _ => bail!("invalid semantic dialect: {value}"),
+    }
+}
+
+fn parse_reasoning_feature(value: &str) -> Result<OntologyReasoningFeature> {
+    match value {
+        "subclass-closure" => Ok(OntologyReasoningFeature::SubclassClosure),
+        "subproperty-closure" => Ok(OntologyReasoningFeature::SubpropertyClosure),
+        "domain-range-typing" => Ok(OntologyReasoningFeature::DomainRangeTyping),
+        "inverse-property" => Ok(OntologyReasoningFeature::InverseProperty),
+        "transitive-property" => Ok(OntologyReasoningFeature::TransitiveProperty),
+        "symmetric-property" => Ok(OntologyReasoningFeature::SymmetricProperty),
+        "disjointness" => Ok(OntologyReasoningFeature::Disjointness),
+        "identity" => Ok(OntologyReasoningFeature::Identity),
+        "restrictions" => Ok(OntologyReasoningFeature::Restrictions),
+        "list-axioms" => Ok(OntologyReasoningFeature::ListAxioms),
+        _ => bail!("invalid reasoning feature: {value}"),
+    }
+}
+
+fn parse_service_coverage(value: &str) -> Result<OntologyServiceSurface> {
+    match value {
+        "catalog-sync" => Ok(OntologyServiceSurface::CatalogSync),
+        "tell" => Ok(OntologyServiceSurface::Tell),
+        "graph-store" => Ok(OntologyServiceSurface::GraphStore),
+        "query" => Ok(OntologyServiceSurface::Query),
+        "reasoner" => Ok(OntologyServiceSurface::Reasoner),
+        "benchmark" => Ok(OntologyServiceSurface::Benchmark),
+        _ => bail!("invalid service coverage: {value}"),
+    }
+}
+
 fn parse_basic_auth_opt(
     options: &BTreeMap<String, String>,
     key: &str,
@@ -256,7 +316,7 @@ USAGE:
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- catalog-sync [--catalog <PATH>] [--output-dir <DIR>] [--tier <small|medium|broad>] [--refresh <true|false>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- compat --nrese-base-url <URL> --fuseki-base-url <URL> [--fuseki-basic-auth <user:pass>] [--cases <PATH>] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] --workload-pack <PATH> [--iterations <N>] [--report-dir <DIR>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--catalog <PATH>] [--packs-dir <DIR>] [--tier <small|medium|broad>] [--iterations <N>] [--report-dir <DIR>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--catalog <PATH>] [--packs-dir <DIR>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--dataset <PATH>] [--content-type <TYPE>] [--replace <true|false>]
 "
     );
@@ -312,6 +372,9 @@ mod tests {
                     config.packs_dir.to_string_lossy(),
                     "benches/nrese-bench-harness/fixtures/packs"
                 );
+                assert!(config.semantic_dialect.is_none());
+                assert!(config.reasoning_feature.is_none());
+                assert!(config.service_coverage.is_none());
                 assert_eq!(config.iterations, 20);
             }
             _ => panic!("expected pack-matrix command"),

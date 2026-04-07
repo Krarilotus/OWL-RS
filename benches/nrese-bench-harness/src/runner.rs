@@ -333,11 +333,20 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
     if let Some(tier) = &config.tier {
         println!("tier filter: {tier}");
     }
+    if let Some(dialect) = config.semantic_dialect {
+        println!("semantic-dialect filter: {:?}", dialect);
+    }
+    if let Some(feature) = config.reasoning_feature {
+        println!("reasoning-feature filter: {:?}", feature);
+    }
+    if let Some(surface) = config.service_coverage {
+        println!("service-coverage filter: {:?}", surface);
+    }
 
     for ontology in catalog
         .ontologies
         .iter()
-        .filter(|fixture| config.tier.as_deref().is_none_or(|tier| fixture.tier == tier))
+        .filter(|fixture| pack_matrix_matches_filters(fixture, &config))
     {
         let manifest_path = baseline_pack_manifest_path(&config.packs_dir, ontology);
         let pack_report_path = config.report_dir.join(&ontology.name).join("pack-report.json");
@@ -383,6 +392,9 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
             catalog_path: config.catalog_path.display().to_string(),
             packs_dir: config.packs_dir.display().to_string(),
             tier: config.tier.clone(),
+            semantic_dialect: config.semantic_dialect,
+            reasoning_feature: config.reasoning_feature,
+            service_coverage: config.service_coverage,
             pack_runs: entries,
         },
     )?;
@@ -425,6 +437,22 @@ fn ensure_report_dir(report_dir: Option<&Path>) -> Result<()> {
 
 fn baseline_pack_manifest_path(packs_dir: &Path, ontology: &OntologyFixture) -> std::path::PathBuf {
     packs_dir.join(format!("{}-baseline", ontology.name)).join("pack.toml")
+}
+
+fn pack_matrix_matches_filters(ontology: &OntologyFixture, config: &PackMatrixConfig) -> bool {
+    config
+        .tier
+        .as_deref()
+        .is_none_or(|tier| ontology.tier == tier)
+        && config.semantic_dialect.is_none_or(|dialect| {
+            ontology.semantic_dialects.contains(&dialect)
+        })
+        && config.reasoning_feature.is_none_or(|feature| {
+            ontology.reasoning_features.contains(&feature)
+        })
+        && config
+            .service_coverage
+            .is_none_or(|surface| ontology.service_coverage.contains(&surface))
 }
 
 fn pack_matrix_entry_success(
@@ -868,12 +896,13 @@ mod tests {
 
     use crate::model::{
         CompatCase, CompatHeaders, CompatOperation, OntologyFixture, OntologyReasoningFeature,
-        OntologySemanticDialect, OntologySerialization, OntologyServiceSurface,
+        OntologySemanticDialect, OntologySerialization, OntologyServiceSurface, PackMatrixConfig,
         ServiceConnectionConfig, ServiceRequestProfile,
     };
 
     use super::{
         CompatRunArtifact, baseline_pack_manifest_path, compat_report_filename,
+        pack_matrix_matches_filters,
         pack_compat_suite_report, pack_matrix_entry_missing_manifest,
         resolve_service_connection, resolve_service_profile,
     };
@@ -1040,5 +1069,40 @@ mod tests {
         assert_eq!(entry.status, "failed");
         assert!(entry.error.is_some());
         assert!(entry.pack_report.is_none());
+    }
+
+    #[test]
+    fn pack_matrix_filter_matches_reasoning_feature() {
+        let ontology = OntologyFixture {
+            name: "time".to_owned(),
+            title: "Time".to_owned(),
+            url: "https://www.w3.org/2006/time.ttl".to_owned(),
+            media_type: "text/turtle".to_owned(),
+            serialization: OntologySerialization::Turtle,
+            filename: "time.ttl".to_owned(),
+            tier: "medium".to_owned(),
+            focus_terms: vec!["http://www.w3.org/2006/time#Interval".to_owned()],
+            semantic_dialects: vec![OntologySemanticDialect::Time],
+            reasoning_features: vec![
+                OntologyReasoningFeature::TransitiveProperty,
+                OntologyReasoningFeature::InverseProperty,
+            ],
+            service_coverage: vec![OntologyServiceSurface::Benchmark],
+        };
+        let config = PackMatrixConfig {
+            nrese_base_url: "http://127.0.0.1:8080".to_owned(),
+            fuseki_base_url: None,
+            fuseki_basic_auth: None,
+            catalog_path: "catalog.toml".into(),
+            packs_dir: "packs".into(),
+            tier: Some("medium".to_owned()),
+            semantic_dialect: Some(OntologySemanticDialect::Time),
+            reasoning_feature: Some(OntologyReasoningFeature::TransitiveProperty),
+            service_coverage: Some(OntologyServiceSurface::Benchmark),
+            iterations: 20,
+            report_dir: "artifacts".into(),
+        };
+
+        assert!(pack_matrix_matches_filters(&ontology, &config));
     }
 }
