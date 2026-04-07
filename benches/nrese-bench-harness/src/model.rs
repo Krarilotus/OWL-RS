@@ -14,6 +14,7 @@ pub enum Command {
     CatalogSync(CatalogSyncConfig),
     Compat(CompatConfig),
     Pack(PackConfig),
+    ValidatePack(ValidatePackConfig),
     PackMatrix(PackMatrixConfig),
     Seed(SeedConfig),
 }
@@ -57,21 +58,37 @@ pub struct SeedConfig {
 
 #[derive(Debug, Clone)]
 pub struct PackConfig {
-    pub nrese_base_url: String,
+    pub nrese_base_url: Option<String>,
     pub fuseki_base_url: Option<String>,
     pub fuseki_basic_auth: Option<BasicAuthConfig>,
+    pub connection_profiles_path: Option<PathBuf>,
+    pub connection_profile_name: Option<String>,
     pub workload_pack_path: PathBuf,
     pub iterations: usize,
     pub report_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
-pub struct PackMatrixConfig {
-    pub nrese_base_url: String,
+pub struct ValidatePackConfig {
+    pub nrese_base_url: Option<String>,
     pub fuseki_base_url: Option<String>,
     pub fuseki_basic_auth: Option<BasicAuthConfig>,
+    pub connection_profiles_path: Option<PathBuf>,
+    pub connection_profile_name: Option<String>,
+    pub workload_pack_path: PathBuf,
+    pub report_json_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackMatrixConfig {
+    pub nrese_base_url: Option<String>,
+    pub fuseki_base_url: Option<String>,
+    pub fuseki_basic_auth: Option<BasicAuthConfig>,
+    pub connection_profiles_path: Option<PathBuf>,
+    pub connection_profile_name: Option<String>,
     pub catalog_path: PathBuf,
     pub packs_dir: PathBuf,
+    pub ontology_name: Option<String>,
     pub tier: Option<String>,
     pub semantic_dialect: Option<OntologySemanticDialect>,
     pub reasoning_feature: Option<OntologyReasoningFeature>,
@@ -210,7 +227,7 @@ impl OntologyFixture {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct ServiceRequestProfile {
     #[serde(default)]
     pub headers: CompatHeaders,
@@ -218,12 +235,43 @@ pub struct ServiceRequestProfile {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct ServiceInvocationProfiles {
     #[serde(default)]
     pub nrese: BTreeMap<String, ServiceRequestProfile>,
     #[serde(default)]
     pub fuseki: BTreeMap<String, ServiceRequestProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ServiceConnectionProfile {
+    pub base_url: String,
+    #[serde(default)]
+    pub headers: CompatHeaders,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub basic_auth: Option<BasicAuthFile>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BasicAuthFile {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ConnectionProfilesRegistry {
+    pub profiles: BTreeMap<String, LiveConnectionProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct LiveConnectionProfile {
+    pub nrese: ServiceConnectionProfile,
+    #[serde(default)]
+    pub fuseki: Option<ServiceConnectionProfile>,
+    #[serde(default)]
+    pub invocation_profiles: ServiceInvocationProfiles,
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +442,8 @@ pub struct PackReport {
     pub mode: &'static str,
     pub pack_name: String,
     pub manifest_path: String,
+    pub connection_profiles_path: Option<String>,
+    pub connection_profile_name: Option<String>,
     pub dataset_path: String,
     pub nrese_base_url: String,
     pub fuseki_base_url: Option<String>,
@@ -403,10 +453,28 @@ pub struct PackReport {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PackValidationReport {
+    pub mode: &'static str,
+    pub pack_name: String,
+    pub manifest_path: String,
+    pub connection_profiles_path: Option<String>,
+    pub connection_profile_name: Option<String>,
+    pub dataset_path: String,
+    pub nrese_base_url: String,
+    pub fuseki_base_url: Option<String>,
+    pub compat_suites: Vec<String>,
+    pub nrese_invocation_profiles: Vec<String>,
+    pub fuseki_invocation_profiles: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct PackMatrixReport {
     pub mode: &'static str,
     pub catalog_path: String,
     pub packs_dir: String,
+    pub connection_profiles_path: Option<String>,
+    pub connection_profile_name: Option<String>,
+    pub ontology_name: Option<String>,
     pub tier: Option<String>,
     pub semantic_dialect: Option<OntologySemanticDialect>,
     pub reasoning_feature: Option<OntologyReasoningFeature>,

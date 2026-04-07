@@ -1,8 +1,12 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-use crate::model::{OntologyFixture, OntologySerialization, WorkloadPackManifest};
+use crate::io::read_json;
+use crate::model::{
+    CompatCase, OntologyFixture, OntologySerialization, ServiceInvocationProfiles,
+    WorkloadPackManifest,
+};
 
 pub fn validate_catalog_baseline_pack(
     ontology: &OntologyFixture,
@@ -69,6 +73,33 @@ pub fn validate_catalog_baseline_pack(
     Ok(())
 }
 
+pub fn validate_pack_invocation_profiles(
+    suite_paths: &[PathBuf],
+    invocation_profiles: &ServiceInvocationProfiles,
+) -> Result<()> {
+    for suite_path in suite_paths {
+        let cases: Vec<CompatCase> = read_json(suite_path.clone())?;
+        for case in &cases {
+            require_profile(
+                &invocation_profiles.nrese,
+                case.nrese_profile.as_deref(),
+                "NRESE",
+                &case.name,
+                suite_path,
+            )?;
+            require_profile(
+                &invocation_profiles.fuseki,
+                case.fuseki_profile.as_deref(),
+                "Fuseki",
+                &case.name,
+                suite_path,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 fn require_suite(
     suite_filenames: &[&str],
     required_suite: &str,
@@ -87,17 +118,41 @@ fn require_suite(
     )
 }
 
+fn require_profile(
+    profiles: &std::collections::BTreeMap<String, crate::model::ServiceRequestProfile>,
+    profile_name: Option<&str>,
+    target_label: &str,
+    case_name: &str,
+    suite_path: &Path,
+) -> Result<()> {
+    let Some(profile_name) = profile_name else {
+        return Ok(());
+    };
+
+    if profiles.contains_key(profile_name) {
+        return Ok(());
+    }
+
+    bail!(
+        "{target_label} invocation profile '{profile_name}' referenced by case '{case_name}' in suite {} is not defined by the selected live connection profile or workload pack",
+        suite_path.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use crate::io::{read_ontology_catalog, read_workload_pack};
-    use crate::model::{
-        OntologyFixture, OntologyReasoningFeature, OntologySemanticDialect,
-        OntologySerialization, OntologyServiceSurface, WorkloadPackManifest,
-    };
+    use tempfile::tempdir;
 
-    use super::validate_catalog_baseline_pack;
+    use crate::model::{
+        CompatHeaders, OntologyFixture, OntologyReasoningFeature, OntologySemanticDialect,
+        OntologySerialization, OntologyServiceSurface, ServiceInvocationProfiles,
+        ServiceRequestProfile, WorkloadPackManifest,
+    };
+    use crate::io::{read_ontology_catalog, read_workload_pack};
+
+    use super::{validate_catalog_baseline_pack, validate_pack_invocation_profiles};
 
     fn ontology_fixture(name: &str, serialization: OntologySerialization, filename: &str) -> OntologyFixture {
         OntologyFixture {
@@ -190,18 +245,73 @@ mod tests {
 
     #[test]
     fn checked_in_catalog_baseline_packs_validate_against_catalog_metadata() {
-        let catalog = read_ontology_catalog(Path::new(
-            "benches/nrese-bench-harness/fixtures/catalog/ontologies.toml",
-        ))
+        let catalog = read_ontology_catalog(Path::new("fixtures/catalog/ontologies.toml"))
         .expect("catalog");
 
         for ontology in &catalog.ontologies {
-            let manifest_path = Path::new("benches/nrese-bench-harness/fixtures/packs")
+            let manifest_path = Path::new("fixtures/packs")
                 .join(format!("{}-baseline", ontology.name))
                 .join("pack.toml");
             let manifest = read_workload_pack(&manifest_path).expect("pack");
             validate_catalog_baseline_pack(ontology, &manifest_path, &manifest)
                 .expect("catalog baseline pack");
         }
+    }
+
+    #[test]
+    fn pack_invocation_profiles_accept_defined_profile_references() {
+        let temp_dir = tempdir().expect("tempdir");
+        let suite_path = temp_dir.path().join("secured_auth_failure_cases.json");
+        std::fs::write(
+            &suite_path,
+            r#"[
+  {
+    "name": "query-invalid-auth-profile",
+    "operation": "query",
+    "query": "SELECT * WHERE { ?s ?p ?o } LIMIT 1",
+    "nrese_profile": "invalid",
+    "fuseki_profile": "invalid",
+    "kind": "status-content-type-body-class"
+  }
+]"#,
+        )
+        .expect("suite");
+
+        let mut profiles = ServiceInvocationProfiles::default();
+        let invalid = ServiceRequestProfile {
+            headers: CompatHeaders::from([("authorization".to_owned(), "Bearer invalid".to_owned())]),
+            timeout_ms: None,
+        };
+        profiles.nrese.insert("invalid".to_owned(), invalid.clone());
+        profiles.fuseki.insert("invalid".to_owned(), invalid);
+
+        validate_pack_invocation_profiles(&[suite_path], &profiles).expect("valid profiles");
+    }
+
+    #[test]
+    fn pack_invocation_profiles_reject_missing_profile_reference() {
+        let temp_dir = tempdir().expect("tempdir");
+        let suite_path = temp_dir.path().join("secured_auth_failure_cases.json");
+        std::fs::write(
+            &suite_path,
+            r#"[
+  {
+    "name": "query-invalid-auth-profile",
+    "operation": "query",
+    "query": "SELECT * WHERE { ?s ?p ?o } LIMIT 1",
+    "nrese_profile": "invalid",
+    "kind": "status-content-type-body-class"
+  }
+]"#,
+        )
+        .expect("suite");
+
+        let error = validate_pack_invocation_profiles(std::slice::from_ref(&suite_path), &ServiceInvocationProfiles::default())
+            .expect_err("missing profile");
+
+        assert!(error.to_string().contains("selected live connection profile or workload pack"));
+        assert!(error.to_string().contains("invalid"));
+        assert!(error.to_string().contains("query-invalid-auth-profile"));
+        assert!(error.to_string().contains(&suite_path.display().to_string()));
     }
 }

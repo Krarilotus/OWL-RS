@@ -49,7 +49,8 @@ Aktuell ist NRESE ein fortgeschrittener Pilot mit substanzieller Server-, Store-
 Verbindlicher Kurzstand je Track:
 
 - Protokoll- und Fuseki-Paritaet: `partial`
-  - Query, Update, Graph Store, Tell, Service Description, Harness, Workload Packs und gesicherte Parity-Templates existieren
+  - Query, Update, Graph Store, Tell, Service Description, Harness, Workload Packs und eine wiederverwendbare Connection-Profile-Registry fuer gesicherte Live-Parity existieren
+  - kataloggetriebene `pack-matrix`-Laeufe koennen jetzt auch gezielt eine einzelne offizielle Ontologie selektieren, statt nur Tier- oder Metadatenfilter zu verwenden
   - echte Live-Evidenz gegen die Ziel-Fuseki-Umgebung fehlt noch
 - Reasoner: `partial`
   - `rules-mvp` ist real und deckt RDFS plus einen bounded OWL-Slice ab
@@ -72,7 +73,7 @@ Verbindlicher Kurzstand je Track:
 Die naechsten Replacement-Bloecke sind:
 
 1. echte secured Side-by-Side-Paritaet gegen Fuseki
-   - Timeout-, Auth-, Error- und Workload-Packs gegen die echte Zielumgebung
+   - Timeout-, Auth-, Error- und Workload-Packs gegen die echte Zielumgebung, gebunden an eine konkrete Live-Connection-Profile-Auswahl
 2. breitere Reasoner-Abdeckung auf dem bestehenden modularen Pfad
    - ohne Supportgrenzen zu verwischen oder impliziten Code einzubauen
 3. durable Recovery- und Drill-Evidenz

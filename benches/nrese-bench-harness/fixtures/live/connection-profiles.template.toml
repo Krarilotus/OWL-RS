@@ -1,0 +1,49 @@
+[profiles.secured-live.nrese]
+base_url = "${NRESE_LIVE_BASE_URL}"
+timeout_ms = 15000
+
+[profiles.secured-live.nrese.headers]
+authorization = "Bearer ${NRESE_COMPARE_READ_TOKEN}"
+
+[profiles.secured-live.fuseki]
+base_url = "${FUSEKI_LIVE_BASE_URL}"
+timeout_ms = 15000
+
+[profiles.secured-live.fuseki.headers]
+# Optional when Fuseki is fronted by the same style of bearer-auth gateway.
+# Remove this block if Fuseki only uses the basic_auth block below.
+authorization = "Bearer ${FUSEKI_COMPARE_READ_TOKEN}"
+
+#[profiles.secured-live.fuseki.basic_auth]
+#username = "${FUSEKI_BASIC_AUTH_USER}"
+#password = "${FUSEKI_BASIC_AUTH_PASS}"
+
+[profiles.secured-live.invocation_profiles.nrese.invalid.headers]
+authorization = "Bearer invalid-token"
+
+[profiles.secured-live.invocation_profiles.fuseki.invalid.headers]
+authorization = "Bearer invalid-token"
+
+[profiles.secured-live-timeout.nrese]
+base_url = "${NRESE_LIVE_BASE_URL}"
+timeout_ms = 500
+
+[profiles.secured-live-timeout.nrese.headers]
+authorization = "Bearer ${NRESE_COMPARE_READ_TOKEN}"
+
+[profiles.secured-live-timeout.fuseki]
+base_url = "${FUSEKI_LIVE_BASE_URL}"
+timeout_ms = 500
+
+[profiles.secured-live-timeout.fuseki.headers]
+authorization = "Bearer ${FUSEKI_COMPARE_READ_TOKEN}"
+
+#[profiles.secured-live-timeout.fuseki.basic_auth]
+#username = "${FUSEKI_BASIC_AUTH_USER}"
+#password = "${FUSEKI_BASIC_AUTH_PASS}"
+
+[profiles.secured-live-timeout.invocation_profiles.nrese.invalid.headers]
+authorization = "Bearer invalid-token"
+
+[profiles.secured-live-timeout.invocation_profiles.fuseki.invalid.headers]
+authorization = "Bearer invalid-token"

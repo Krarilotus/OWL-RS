@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use crate::model::{
     BasicAuthConfig, BenchConfig, CatalogSyncConfig, Cli, Command, CompatConfig, CompatHeaders,
     OntologyReasoningFeature, OntologySemanticDialect, OntologyServiceSurface, PackConfig,
-    PackMatrixConfig, SeedConfig, ServiceConnectionConfig,
+    PackMatrixConfig, SeedConfig, ServiceConnectionConfig, ValidatePackConfig,
 };
 
 const DEFAULT_QUERY_WORKLOAD_PATH: &str =
@@ -102,9 +102,11 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
         }),
         "pack" => Ok(Cli {
             command: Command::Pack(PackConfig {
-                nrese_base_url: required_opt(&options, "--nrese-base-url")?,
+                nrese_base_url: options.get("--nrese-base-url").cloned(),
                 fuseki_base_url: options.get("--fuseki-base-url").cloned(),
                 fuseki_basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
+                connection_profiles_path: options.get("--connection-profiles").map(PathBuf::from),
+                connection_profile_name: options.get("--connection-profile").cloned(),
                 workload_pack_path: options
                     .get("--workload-pack")
                     .map(PathBuf::from)
@@ -117,11 +119,27 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                 report_dir: options.get("--report-dir").map(PathBuf::from),
             }),
         }),
-        "pack-matrix" => Ok(Cli {
-            command: Command::PackMatrix(PackMatrixConfig {
-                nrese_base_url: required_opt(&options, "--nrese-base-url")?,
+        "pack-validate" => Ok(Cli {
+            command: Command::ValidatePack(ValidatePackConfig {
+                nrese_base_url: options.get("--nrese-base-url").cloned(),
                 fuseki_base_url: options.get("--fuseki-base-url").cloned(),
                 fuseki_basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
+                connection_profiles_path: options.get("--connection-profiles").map(PathBuf::from),
+                connection_profile_name: options.get("--connection-profile").cloned(),
+                workload_pack_path: options
+                    .get("--workload-pack")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow!("missing required option --workload-pack"))?,
+                report_json_path: options.get("--report-json").map(PathBuf::from),
+            }),
+        }),
+        "pack-matrix" => Ok(Cli {
+            command: Command::PackMatrix(PackMatrixConfig {
+                nrese_base_url: options.get("--nrese-base-url").cloned(),
+                fuseki_base_url: options.get("--fuseki-base-url").cloned(),
+                fuseki_basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
+                connection_profiles_path: options.get("--connection-profiles").map(PathBuf::from),
+                connection_profile_name: options.get("--connection-profile").cloned(),
                 catalog_path: options
                     .get("--catalog")
                     .map(PathBuf::from)
@@ -134,6 +152,7 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .get("--packs-dir")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from("benches/nrese-bench-harness/fixtures/packs")),
+                ontology_name: options.get("--ontology").cloned(),
                 tier: options.get("--tier").cloned(),
                 semantic_dialect: options
                     .get("--semantic-dialect")
@@ -315,8 +334,9 @@ USAGE:
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- bench --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--iterations <N>] [--query-workload <PATH>] [--update-workload <PATH>] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- catalog-sync [--catalog <PATH>] [--output-dir <DIR>] [--tier <small|medium|broad>] [--refresh <true|false>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- compat --nrese-base-url <URL> --fuseki-base-url <URL> [--fuseki-basic-auth <user:pass>] [--cases <PATH>] [--report-json <PATH>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] --workload-pack <PATH> [--iterations <N>] [--report-dir <DIR>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--catalog <PATH>] [--packs-dir <DIR>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--iterations <N>] [--report-dir <DIR>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validate [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--report-json <PATH>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--dataset <PATH>] [--content-type <TYPE>] [--replace <true|false>]
 "
     );
@@ -356,14 +376,24 @@ mod tests {
         let cli = parse_cli(vec![
             "bench".to_owned(),
             "pack-matrix".to_owned(),
-            "--nrese-base-url".to_owned(),
-            "http://127.0.0.1:8080".to_owned(),
+            "--connection-profiles".to_owned(),
+            "profiles.toml".to_owned(),
+            "--connection-profile".to_owned(),
+            "secured-live".to_owned(),
         ])
         .expect("cli");
 
         match cli.command {
             Command::PackMatrix(config) => {
-                assert_eq!(config.nrese_base_url, "http://127.0.0.1:8080");
+                assert_eq!(config.nrese_base_url, None);
+                assert_eq!(
+                    config
+                        .connection_profiles_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string()),
+                    Some("profiles.toml".to_owned())
+                );
+                assert_eq!(config.connection_profile_name.as_deref(), Some("secured-live"));
                 assert_eq!(
                     config.catalog_path.to_string_lossy(),
                     "benches/nrese-bench-harness/fixtures/catalog/ontologies.toml"
@@ -372,10 +402,33 @@ mod tests {
                     config.packs_dir.to_string_lossy(),
                     "benches/nrese-bench-harness/fixtures/packs"
                 );
+                assert!(config.ontology_name.is_none());
                 assert!(config.semantic_dialect.is_none());
                 assert!(config.reasoning_feature.is_none());
                 assert!(config.service_coverage.is_none());
                 assert_eq!(config.iterations, 20);
+            }
+            _ => panic!("expected pack-matrix command"),
+        }
+    }
+
+    #[test]
+    fn parses_pack_matrix_ontology_filter() {
+        let cli = parse_cli(vec![
+            "bench".to_owned(),
+            "pack-matrix".to_owned(),
+            "--connection-profiles".to_owned(),
+            "profiles.toml".to_owned(),
+            "--connection-profile".to_owned(),
+            "secured-live".to_owned(),
+            "--ontology".to_owned(),
+            "skos".to_owned(),
+        ])
+        .expect("cli");
+
+        match cli.command {
+            Command::PackMatrix(config) => {
+                assert_eq!(config.ontology_name.as_deref(), Some("skos"));
             }
             _ => panic!("expected pack-matrix command"),
         }
@@ -407,8 +460,10 @@ mod tests {
         let cli = parse_cli(vec![
             "bench".to_owned(),
             "pack".to_owned(),
-            "--nrese-base-url".to_owned(),
-            "http://127.0.0.1:8080".to_owned(),
+            "--connection-profiles".to_owned(),
+            "profiles.toml".to_owned(),
+            "--connection-profile".to_owned(),
+            "secured-live".to_owned(),
             "--workload-pack".to_owned(),
             "benches/nrese-bench-harness/fixtures/packs/generic-baseline/pack.toml".to_owned(),
             "--iterations".to_owned(),
@@ -420,8 +475,55 @@ mod tests {
             Command::Pack(config) => {
                 assert_eq!(config.iterations, 5);
                 assert!(config.report_dir.is_none());
+                assert_eq!(
+                    config
+                        .connection_profiles_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string()),
+                    Some("profiles.toml".to_owned())
+                );
+                assert_eq!(config.connection_profile_name.as_deref(), Some("secured-live"));
             }
             _ => panic!("expected pack command"),
+        }
+    }
+
+    #[test]
+    fn parses_pack_validate_command() {
+        let cli = parse_cli(vec![
+            "bench".to_owned(),
+            "pack-validate".to_owned(),
+            "--connection-profiles".to_owned(),
+            "profiles.toml".to_owned(),
+            "--connection-profile".to_owned(),
+            "secured-live".to_owned(),
+            "--workload-pack".to_owned(),
+            "benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml"
+                .to_owned(),
+            "--report-json".to_owned(),
+            "artifacts/pack-validation-report.json".to_owned(),
+        ])
+        .expect("cli");
+
+        match cli.command {
+            Command::ValidatePack(config) => {
+                assert_eq!(
+                    config
+                        .connection_profiles_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string()),
+                    Some("profiles.toml".to_owned())
+                );
+                assert_eq!(config.connection_profile_name.as_deref(), Some("secured-live"));
+                assert_eq!(
+                    config
+                        .report_json_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().to_string()),
+                    Some("artifacts/pack-validation-report.json".to_owned())
+                );
+            }
+            _ => panic!("expected pack-validate command"),
         }
     }
 

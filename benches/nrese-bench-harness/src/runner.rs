@@ -12,6 +12,10 @@ use crate::compat_common::{
 use crate::compat_graph_store;
 use crate::compat_query;
 use crate::compat_update;
+use crate::connection_profile::{
+    merge_invocation_profiles, read_connection_profiles_registry, resolve_live_connection_profile,
+    resolve_optional_service_connection, resolve_required_service_connection,
+};
 use crate::io::{
     infer_rdf_content_type, read_dataset_payload, read_json, read_ontology_catalog,
     read_workload_pack, write_json_report,
@@ -22,12 +26,15 @@ use crate::model::{
     CompatConfig, CompatGraphTarget, CompatHeaders, CompatOperation, CompatReport, OntologyFixture,
     OntologyReasoningFeature, OntologySemanticDialect, OntologySerialization,
     OntologyServiceSurface, PackArtifactReport, PackCompatSuiteReport, PackConfig,
-    PackMatrixConfig, PackMatrixEntryReport, PackMatrixReport, PackReport, QueryWorkloadCase,
-    SeedConfig, ServiceBenchReport, ServiceConnectionConfig, ServiceRequestProfile,
-    UpdateWorkloadCase,
+    PackMatrixConfig, PackMatrixEntryReport, PackMatrixReport, PackReport,
+    PackValidationReport, QueryWorkloadCase, SeedConfig, ServiceBenchReport,
+    ServiceConnectionConfig, ServiceRequestProfile, UpdateWorkloadCase, ValidatePackConfig,
+    WorkloadPackManifest,
 };
 use crate::normalize::summarize;
-use crate::pack_validation::validate_catalog_baseline_pack;
+use crate::pack_validation::{
+    validate_catalog_baseline_pack, validate_pack_invocation_profiles,
+};
 
 pub async fn run_bench(config: BenchConfig) -> Result<BenchRunArtifact> {
     let client = build_client()?;
@@ -212,35 +219,84 @@ pub async fn run_seed(config: SeedConfig) -> Result<()> {
 }
 
 pub async fn run_pack(config: PackConfig) -> Result<()> {
-    let pack = read_workload_pack(&config.workload_pack_path)?;
     ensure_report_dir(config.report_dir.as_deref())?;
-    run_loaded_pack(&config, pack).await
+    let prepared = prepare_pack_run(
+        &config.workload_pack_path,
+        config.connection_profiles_path.as_deref(),
+        config.connection_profile_name.as_deref(),
+        config.nrese_base_url.as_deref(),
+        config.fuseki_base_url.as_deref(),
+        config.fuseki_basic_auth.as_ref(),
+    )?;
+    run_loaded_pack(&config, prepared).await
 }
 
-async fn run_loaded_pack(config: &PackConfig, pack: crate::model::WorkloadPackManifest) -> Result<()> {
-    let nrese_base_url = config.nrese_base_url.clone();
-    let fuseki_base_url = config.fuseki_base_url.clone();
-    let fuseki_basic_auth = config.fuseki_basic_auth.clone();
-    let iterations = config.iterations;
-    let manifest_path = config.workload_pack_path.display().to_string();
+pub async fn run_validate_pack(config: ValidatePackConfig) -> Result<()> {
+    let prepared = prepare_pack_run(
+        &config.workload_pack_path,
+        config.connection_profiles_path.as_deref(),
+        config.connection_profile_name.as_deref(),
+        config.nrese_base_url.as_deref(),
+        config.fuseki_base_url.as_deref(),
+        config.fuseki_basic_auth.as_ref(),
+    )?;
+    print_pack_header("Workload pack validation", &prepared);
 
-    println!("== Workload pack run ==");
-    println!("pack: {}", pack.name);
-    println!("manifest: {manifest_path}");
+    if let Some(report_json_path) = &config.report_json_path {
+        write_json_report(
+            report_json_path.clone(),
+            &PackValidationReport {
+                mode: "pack-validate",
+                pack_name: prepared.pack.name.clone(),
+                manifest_path: prepared.manifest_path.clone(),
+                connection_profiles_path: prepared.connection_profiles_path.clone(),
+                connection_profile_name: prepared.connection_profile_name.clone(),
+                dataset_path: prepared.pack.dataset.display().to_string(),
+                nrese_base_url: prepared.nrese_connection.base_url.clone(),
+                fuseki_base_url: prepared
+                    .fuseki_connection
+                    .as_ref()
+                    .map(|connection| connection.base_url.clone()),
+                compat_suites: prepared
+                    .pack
+                    .compat_suites
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+                nrese_invocation_profiles: prepared
+                    .merged_invocation_profiles
+                    .nrese
+                    .keys()
+                    .cloned()
+                    .collect(),
+                fuseki_invocation_profiles: prepared
+                    .merged_invocation_profiles
+                    .fuseki
+                    .keys()
+                    .cloned()
+                    .collect(),
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+async fn run_loaded_pack(config: &PackConfig, prepared: PreparedPackRun) -> Result<()> {
+    print_pack_header("Workload pack run", &prepared);
+
+    let pack = prepared.pack;
+    let nrese_connection = prepared.nrese_connection;
+    let fuseki_connection = prepared.fuseki_connection;
+    let merged_invocation_profiles = prepared.merged_invocation_profiles;
+    let iterations = config.iterations;
+    let manifest_path = prepared.manifest_path;
 
     run_seed(SeedConfig {
-        nrese: ServiceConnectionConfig {
-            base_url: nrese_base_url.clone(),
-            headers: pack.nrese.headers.clone(),
-            timeout_ms: pack.nrese.timeout_ms,
-            basic_auth: None,
-        },
-        fuseki: fuseki_base_url.clone().map(|base_url| ServiceConnectionConfig {
-            base_url,
-            headers: pack.fuseki.headers.clone(),
-            timeout_ms: pack.fuseki.timeout_ms,
-            basic_auth: fuseki_basic_auth.clone(),
-        }),
+        nrese: merge_pack_service_profile(&nrese_connection, &pack.nrese),
+        fuseki: fuseki_connection
+            .as_ref()
+            .map(|connection| merge_pack_service_profile(connection, &pack.fuseki)),
         dataset_path: pack.dataset.clone(),
         content_type: None,
         replace: true,
@@ -252,27 +308,17 @@ async fn run_loaded_pack(config: &PackConfig, pack: crate::model::WorkloadPackMa
         .as_ref()
         .map(|dir| dir.join("bench-report.json"));
     let mut compat_reports = Vec::new();
-    if let Some(fuseki_base_url) = fuseki_base_url.clone() {
+    if let Some(fuseki_connection) = fuseki_connection.as_ref() {
         for suite_path in &pack.compat_suites {
             let compat_report_path = config
                 .report_dir
                 .as_ref()
                 .map(|dir| dir.join(compat_report_filename(suite_path)));
             let compat_run = run_compat(CompatConfig {
-                nrese: ServiceConnectionConfig {
-                    base_url: nrese_base_url.clone(),
-                    headers: pack.nrese.headers.clone(),
-                    timeout_ms: pack.nrese.timeout_ms,
-                    basic_auth: None,
-                },
-                fuseki: ServiceConnectionConfig {
-                    base_url: fuseki_base_url.clone(),
-                    headers: pack.fuseki.headers.clone(),
-                    timeout_ms: pack.fuseki.timeout_ms,
-                    basic_auth: fuseki_basic_auth.clone(),
-                },
-                nrese_profiles: pack.invocation_profiles.nrese.clone(),
-                fuseki_profiles: pack.invocation_profiles.fuseki.clone(),
+                nrese: merge_pack_service_profile(&nrese_connection, &pack.nrese),
+                fuseki: merge_pack_service_profile(fuseki_connection, &pack.fuseki),
+                nrese_profiles: merged_invocation_profiles.nrese.clone(),
+                fuseki_profiles: merged_invocation_profiles.fuseki.clone(),
                 cases_path: suite_path.clone(),
                 report_json_path: compat_report_path,
             })
@@ -284,18 +330,10 @@ async fn run_loaded_pack(config: &PackConfig, pack: crate::model::WorkloadPackMa
     }
 
     let bench_run = run_bench(BenchConfig {
-        nrese: ServiceConnectionConfig {
-            base_url: nrese_base_url.clone(),
-            headers: pack.nrese.headers,
-            timeout_ms: pack.nrese.timeout_ms,
-            basic_auth: None,
-        },
-        fuseki: fuseki_base_url.clone().map(|base_url| ServiceConnectionConfig {
-            base_url,
-            headers: pack.fuseki.headers,
-            timeout_ms: pack.fuseki.timeout_ms,
-            basic_auth: fuseki_basic_auth,
-        }),
+        nrese: merge_pack_service_profile(&nrese_connection, &pack.nrese),
+        fuseki: fuseki_connection
+            .as_ref()
+            .map(|connection| merge_pack_service_profile(connection, &pack.fuseki)),
         iterations,
         query_workload_path: pack.query_workload,
         update_workload_path: pack.update_workload,
@@ -310,9 +348,11 @@ async fn run_loaded_pack(config: &PackConfig, pack: crate::model::WorkloadPackMa
                 mode: "pack",
                 pack_name: pack.name,
                 manifest_path,
+                connection_profiles_path: prepared.connection_profiles_path,
+                connection_profile_name: prepared.connection_profile_name,
                 dataset_path: pack.dataset.display().to_string(),
-                nrese_base_url,
-                fuseki_base_url,
+                nrese_base_url: nrese_connection.base_url,
+                fuseki_base_url: fuseki_connection.map(|connection| connection.base_url),
                 iterations,
                 compat_suites: compat_reports,
                 bench_report: bench_run.report_json_path.map(|path| PackArtifactReport {
@@ -329,12 +369,32 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
     fs::create_dir_all(&config.report_dir)
         .with_context(|| format!("failed to create report dir {}", config.report_dir.display()))?;
     let catalog = read_ontology_catalog(&config.catalog_path)?;
+    let live_connections = resolve_live_connections(
+        config.connection_profiles_path.as_deref(),
+        config.connection_profile_name.as_deref(),
+        config.nrese_base_url.as_deref(),
+        config.fuseki_base_url.as_deref(),
+        config.fuseki_basic_auth.as_ref(),
+    )?;
     let mut entries = Vec::new();
     let mut failed = false;
 
     println!("== Ontology pack matrix run ==");
     println!("catalog: {}", config.catalog_path.display());
     println!("packs dir: {}", config.packs_dir.display());
+    println!("nrese base: {}", live_connections.nrese.base_url);
+    if let Some(fuseki) = &live_connections.fuseki {
+        println!("fuseki base: {}", fuseki.base_url);
+    }
+    if let Some(connection_profiles_path) = &config.connection_profiles_path {
+        println!("connection profiles: {}", connection_profiles_path.display());
+    }
+    if let Some(connection_profile_name) = &config.connection_profile_name {
+        println!("connection profile: {connection_profile_name}");
+    }
+    if let Some(ontology_name) = &config.ontology_name {
+        println!("ontology filter: {ontology_name}");
+    }
     if let Some(tier) = &config.tier {
         println!("tier filter: {tier}");
     }
@@ -390,16 +450,45 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
             continue;
         }
 
+        let prepared = match prepare_pack_run(
+            &manifest_path,
+            config.connection_profiles_path.as_deref(),
+            config.connection_profile_name.as_deref(),
+            Some(live_connections.nrese.base_url.as_str()),
+            live_connections
+                .fuseki
+                .as_ref()
+                .map(|connection| connection.base_url.as_str()),
+            config.fuseki_basic_auth.as_ref(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                failed = true;
+                entries.push(pack_matrix_entry_failure(
+                    ontology,
+                    &manifest_path,
+                    error.to_string(),
+                    Some(pack_report),
+                ));
+                continue;
+            }
+        };
+
         let report_dir = config.report_dir.join(&ontology.name);
         let pack_config = PackConfig {
-            nrese_base_url: config.nrese_base_url.clone(),
-            fuseki_base_url: config.fuseki_base_url.clone(),
+            nrese_base_url: Some(live_connections.nrese.base_url.clone()),
+            fuseki_base_url: live_connections
+                .fuseki
+                .as_ref()
+                .map(|connection| connection.base_url.clone()),
             fuseki_basic_auth: config.fuseki_basic_auth.clone(),
+            connection_profiles_path: config.connection_profiles_path.clone(),
+            connection_profile_name: config.connection_profile_name.clone(),
             workload_pack_path: manifest_path.clone(),
             iterations: config.iterations,
             report_dir: Some(report_dir),
         };
-        let result = run_loaded_pack(&pack_config, pack).await;
+        let result = run_loaded_pack(&pack_config, prepared).await;
 
         match result {
             Ok(()) => entries.push(pack_matrix_entry_success(ontology, &manifest_path, pack_report)),
@@ -421,6 +510,12 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
             mode: "pack-matrix",
             catalog_path: config.catalog_path.display().to_string(),
             packs_dir: config.packs_dir.display().to_string(),
+            connection_profiles_path: config
+                .connection_profiles_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            connection_profile_name: config.connection_profile_name.clone(),
+            ontology_name: config.ontology_name.clone(),
             tier: config.tier.clone(),
             semantic_dialect: config.semantic_dialect,
             reasoning_feature: config.reasoning_feature,
@@ -465,12 +560,157 @@ fn ensure_report_dir(report_dir: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedLiveConnections {
+    nrese: ServiceConnectionConfig,
+    fuseki: Option<ServiceConnectionConfig>,
+    invocation_profiles: crate::model::ServiceInvocationProfiles,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedPackRun {
+    pack: WorkloadPackManifest,
+    manifest_path: String,
+    connection_profiles_path: Option<String>,
+    connection_profile_name: Option<String>,
+    nrese_connection: ServiceConnectionConfig,
+    fuseki_connection: Option<ServiceConnectionConfig>,
+    merged_invocation_profiles: crate::model::ServiceInvocationProfiles,
+}
+
+fn resolve_live_connections(
+    connection_profiles_path: Option<&Path>,
+    connection_profile_name: Option<&str>,
+    nrese_base_url: Option<&str>,
+    fuseki_base_url: Option<&str>,
+    fuseki_basic_auth: Option<&crate::model::BasicAuthConfig>,
+) -> Result<ResolvedLiveConnections> {
+    let selected_profile = match (connection_profiles_path, connection_profile_name) {
+        (Some(path), Some(name)) => {
+            let registry = read_connection_profiles_registry(path)?;
+            Some(resolve_live_connection_profile(&registry, name)?.clone())
+        }
+        (None, Some(_)) => bail!("--connection-profile requires --connection-profiles"),
+        (Some(_), None) => bail!("--connection-profiles requires --connection-profile"),
+        (None, None) => None,
+    };
+
+    let nrese = resolve_required_service_connection(
+        "NRESE",
+        selected_profile.as_ref().map(|profile| &profile.nrese),
+        nrese_base_url,
+        None,
+    )?;
+    let fuseki = resolve_optional_service_connection(
+        "Fuseki",
+        selected_profile.as_ref().and_then(|profile| profile.fuseki.as_ref()),
+        fuseki_base_url,
+        fuseki_basic_auth,
+    )?;
+
+    Ok(ResolvedLiveConnections {
+        nrese,
+        fuseki,
+        invocation_profiles: selected_profile
+            .map(|profile| profile.invocation_profiles)
+            .unwrap_or_default(),
+    })
+}
+
+fn prepare_pack_run(
+    workload_pack_path: &Path,
+    connection_profiles_path: Option<&Path>,
+    connection_profile_name: Option<&str>,
+    nrese_base_url: Option<&str>,
+    fuseki_base_url: Option<&str>,
+    fuseki_basic_auth: Option<&crate::model::BasicAuthConfig>,
+) -> Result<PreparedPackRun> {
+    let pack = read_workload_pack(workload_pack_path)?;
+    prepare_loaded_pack_run(
+        workload_pack_path,
+        pack,
+        connection_profiles_path,
+        connection_profile_name,
+        nrese_base_url,
+        fuseki_base_url,
+        fuseki_basic_auth,
+    )
+}
+
+fn prepare_loaded_pack_run(
+    workload_pack_path: &Path,
+    pack: WorkloadPackManifest,
+    connection_profiles_path: Option<&Path>,
+    connection_profile_name: Option<&str>,
+    nrese_base_url: Option<&str>,
+    fuseki_base_url: Option<&str>,
+    fuseki_basic_auth: Option<&crate::model::BasicAuthConfig>,
+) -> Result<PreparedPackRun> {
+    let live_connections = resolve_live_connections(
+        connection_profiles_path,
+        connection_profile_name,
+        nrese_base_url,
+        fuseki_base_url,
+        fuseki_basic_auth,
+    )?;
+    let merged_invocation_profiles =
+        merge_invocation_profiles(&live_connections.invocation_profiles, &pack.invocation_profiles)?;
+    if live_connections.fuseki.is_some() {
+        validate_pack_invocation_profiles(&pack.compat_suites, &merged_invocation_profiles)?;
+    }
+
+    Ok(PreparedPackRun {
+        pack,
+        manifest_path: workload_pack_path.display().to_string(),
+        connection_profiles_path: connection_profiles_path.map(|path| path.display().to_string()),
+        connection_profile_name: connection_profile_name.map(str::to_owned),
+        nrese_connection: live_connections.nrese,
+        fuseki_connection: live_connections.fuseki,
+        merged_invocation_profiles,
+    })
+}
+
+fn merge_pack_service_profile(
+    connection: &ServiceConnectionConfig,
+    profile: &ServiceRequestProfile,
+) -> ServiceConnectionConfig {
+    let mut headers = connection.headers.clone();
+    headers.extend(profile.headers.clone());
+
+    ServiceConnectionConfig {
+        base_url: connection.base_url.clone(),
+        headers,
+        timeout_ms: profile.timeout_ms.or(connection.timeout_ms),
+        basic_auth: connection.basic_auth.clone(),
+    }
+}
+
+fn print_pack_header(label: &str, prepared: &PreparedPackRun) {
+    println!("== {label} ==");
+    println!("pack: {}", prepared.pack.name);
+    println!("manifest: {}", prepared.manifest_path);
+    println!("nrese base: {}", prepared.nrese_connection.base_url);
+    if let Some(fuseki_connection) = &prepared.fuseki_connection {
+        println!("fuseki base: {}", fuseki_connection.base_url);
+    }
+    if let Some(connection_profiles_path) = &prepared.connection_profiles_path {
+        println!("connection profiles: {connection_profiles_path}");
+    }
+    if let Some(connection_profile_name) = &prepared.connection_profile_name {
+        println!("connection profile: {connection_profile_name}");
+    }
+}
+
 fn baseline_pack_manifest_path(packs_dir: &Path, ontology: &OntologyFixture) -> std::path::PathBuf {
     packs_dir.join(format!("{}-baseline", ontology.name)).join("pack.toml")
 }
 
 fn pack_matrix_matches_filters(ontology: &OntologyFixture, config: &PackMatrixConfig) -> bool {
     config
+        .ontology_name
+        .as_deref()
+        .is_none_or(|name| ontology.name == name)
+        && config
         .tier
         .as_deref()
         .is_none_or(|tier| ontology.tier == tier)
@@ -1120,11 +1360,14 @@ mod tests {
             service_coverage: vec![OntologyServiceSurface::Benchmark],
         };
         let config = PackMatrixConfig {
-            nrese_base_url: "http://127.0.0.1:8080".to_owned(),
+            nrese_base_url: Some("http://127.0.0.1:8080".to_owned()),
             fuseki_base_url: None,
             fuseki_basic_auth: None,
+            connection_profiles_path: None,
+            connection_profile_name: None,
             catalog_path: "catalog.toml".into(),
             packs_dir: "packs".into(),
+            ontology_name: None,
             tier: Some("medium".to_owned()),
             semantic_dialect: Some(OntologySemanticDialect::Time),
             reasoning_feature: Some(OntologyReasoningFeature::TransitiveProperty),
@@ -1134,5 +1377,45 @@ mod tests {
         };
 
         assert!(pack_matrix_matches_filters(&ontology, &config));
+    }
+
+    #[test]
+    fn pack_matrix_filter_matches_explicit_ontology_name() {
+        let ontology = OntologyFixture {
+            name: "skos".to_owned(),
+            title: "SKOS".to_owned(),
+            url: "https://www.w3.org/2009/08/skos-reference/skos.rdf".to_owned(),
+            media_type: "application/rdf+xml".to_owned(),
+            serialization: OntologySerialization::RdfXml,
+            filename: "skos.rdf".to_owned(),
+            tier: "medium".to_owned(),
+            focus_terms: vec!["http://www.w3.org/2004/02/skos/core#Concept".to_owned()],
+            semantic_dialects: vec![OntologySemanticDialect::Skos],
+            reasoning_features: vec![OntologyReasoningFeature::SubpropertyClosure],
+            service_coverage: vec![OntologyServiceSurface::Benchmark],
+        };
+        let matching = PackMatrixConfig {
+            nrese_base_url: Some("http://127.0.0.1:8080".to_owned()),
+            fuseki_base_url: None,
+            fuseki_basic_auth: None,
+            connection_profiles_path: None,
+            connection_profile_name: None,
+            catalog_path: "catalog.toml".into(),
+            packs_dir: "packs".into(),
+            ontology_name: Some("skos".to_owned()),
+            tier: None,
+            semantic_dialect: None,
+            reasoning_feature: None,
+            service_coverage: None,
+            iterations: 20,
+            report_dir: "artifacts".into(),
+        };
+        let non_matching = PackMatrixConfig {
+            ontology_name: Some("foaf".to_owned()),
+            ..matching.clone()
+        };
+
+        assert!(pack_matrix_matches_filters(&ontology, &matching));
+        assert!(!pack_matrix_matches_filters(&ontology, &non_matching));
     }
 }

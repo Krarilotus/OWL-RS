@@ -54,14 +54,15 @@ Current manifest format:
   - `compat_suites`
   - optional `[nrese]`
   - optional `[fuseki]`
-  - optional `[nrese.headers]`
-  - optional `[fuseki.headers]`
   - optional `[invocation_profiles.nrese.<name>]`
   - optional `[invocation_profiles.fuseki.<name>]`
 
 All paths are resolved relative to the manifest directory unless they are absolute.
-Service-level defaults and named invocation profiles are applied through the same request-normalization path as case execution.
-Invocation precedence is: service defaults, then named per-side invocation profiles, then shared case-level headers/timeouts.
+For production-style live parity, transport policy is separated from workload intent.
+Selected connection profiles own live NRESE/Fuseki base URLs, auth headers, timeout defaults, and reusable invalid-auth invocation profiles.
+Workload packs keep ownership of dataset, workloads, compat suites, and pack-local service defaults.
+Invocation precedence is: selected connection-profile defaults, then pack-local service defaults, then named invocation profiles, then shared case-level headers/timeouts.
+Profile-name collisions between a selected connection profile and a workload pack are rejected instead of silently overridden.
 Shared case-level headers still win on collision, so production packs can define auth/proxy defaults without forking comparator logic.
 Per-case timeout budgets still override service-level and named-profile defaults when a suite needs a stricter bound than the shared target profile.
 
@@ -73,8 +74,9 @@ Current example:
 - secured live-deployment templates now exist under:
   - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml`
   - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-timeout-template/pack.toml`
+  - `benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml`
 
-Example with service-level defaults and named per-side overrides:
+Example workload pack:
 
 ```toml
 name = "secured-pack"
@@ -89,30 +91,37 @@ compat_suites = [
 [nrese]
 timeout_ms = 15000
 
-[nrese.headers]
-authorization = "Bearer nrese-read-token"
-
 [fuseki]
 timeout_ms = 15000
+```
 
-[fuseki.headers]
-x-forwarded-proto = "https"
+Example connection-profile registry:
 
-[invocation_profiles.nrese.invalid.headers]
-authorization = "Bearer invalid-token"
+```toml
+[profiles.secured-live.nrese]
+base_url = "${NRESE_LIVE_BASE_URL}"
+timeout_ms = 15000
 
-[invocation_profiles.fuseki.invalid.headers]
+[profiles.secured-live.nrese.headers]
+authorization = "Bearer ${NRESE_COMPARE_READ_TOKEN}"
+
+[profiles.secured-live.fuseki]
+base_url = "${FUSEKI_LIVE_BASE_URL}"
+timeout_ms = 15000
+
+[profiles.secured-live.invocation_profiles.nrese.invalid.headers]
 authorization = "Bearer invalid-token"
 ```
 
 Secured live-deployment template rules:
 
 - keep real secrets out of committed pack manifests
-- use environment placeholders in versioned templates and inject the real values locally or in CI
-- prefer CLI `--fuseki-basic-auth` for Fuseki Basic Auth instead of embedding credentials in packs
+- keep live URLs, auth headers, and timeout defaults in a selected connection profile instead of embedding them in packs
+- use environment placeholders in the connection-profile registry and inject the real values locally or in CI
+- prefer CLI `--fuseki-basic-auth` only when intentionally overriding the selected connection profile
 - keep timeout parity in a separate pack so operators must opt in explicitly once both stacks have comparable timeout ceilings
 
-Environment placeholders are resolved by the harness before request execution, so service-level and named invocation headers can stay versioned while credentials and deployment-specific tokens remain external.
+Environment placeholders are resolved by the harness before request execution, so selected connection profiles can stay versioned while credentials and deployment-specific tokens remain external.
 
 The secured templates intentionally reuse the existing compat suites:
 
@@ -133,11 +142,9 @@ The secured templates intentionally reuse the existing compat suites:
 - Generic comparison fixtures:
   - `benches/nrese-bench-harness/fixtures/datasets/comparison_seed.ttl`
 - Compatibility cases:
-- `benches/nrese-bench-harness/fixtures/compat/protocol_cases.json`
-- `benches/nrese-bench-harness/fixtures/compat/limit_semantics_cases.json`
-- `benches/nrese-bench-harness/fixtures/compat/ontologies/baseline_cases.json`
-- `cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix --nrese-base-url <URL> [--fuseki-base-url <URL>] [--tier <small|medium|broad>] [--report-dir <DIR>]`
-- `cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix --nrese-base-url <URL> [--fuseki-base-url <URL>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--report-dir <DIR>]`
+  - `benches/nrese-bench-harness/fixtures/compat/protocol_cases.json`
+  - `benches/nrese-bench-harness/fixtures/compat/limit_semantics_cases.json`
+  - `benches/nrese-bench-harness/fixtures/compat/ontologies/baseline_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/policy_failure_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/secured_auth_failure_cases.json`
   - `benches/nrese-bench-harness/fixtures/compat/timeout_failure_cases.json`
@@ -145,6 +152,8 @@ The secured templates intentionally reuse the existing compat suites:
   - `benches/nrese-bench-harness/fixtures/packs/generic-baseline/pack.toml`
   - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml`
   - `benches/nrese-bench-harness/fixtures/packs/secured-live-auth-timeout-template/pack.toml`
+- Live connection profiles:
+  - `benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml`
 - Ontology catalog:
   - `benches/nrese-bench-harness/fixtures/catalog/ontologies.toml`
 - Seed dataset:
@@ -226,6 +235,7 @@ For real ontology runs, prefer:
 - `benches/nrese-bench-harness/fixtures/compat/ontologies/baseline_cases.json`
 - `pack-matrix` can execute all catalog-backed baseline packs for one tier and emits a top-level `pack-matrix-report.json` alongside per-pack `pack-report.json` evidence
 - `pack-matrix` filters operate on the typed ontology catalog metadata, so the same catalog now acts as both fixture inventory and execution selector for targeted evidence runs
+- `pack-matrix` can also target one exact ontology name on the same selector path when a live parity run needs to stay narrowly scoped
 - `pack-matrix` also validates each catalog-backed baseline pack before execution so pack identity, dataset path, and required compat suites stay aligned with the ontology catalog
 
 Prebuilt ontology packs now exist for:
@@ -375,6 +385,25 @@ Current timeout fixture starter:
 
 Use it as an opt-in suite in a production workload parity pack once both NRESE and Fuseki are deployed with comparable timeout policy and the selected cases are known to cross the configured timeout budget.
 
+## 3.1 Workload Pack Preflight
+
+Use `pack-validate` before a real secured live run when you want the harness to resolve the selected connection profile, merge pack-local invocation profiles, and fail early on missing profile references without seeding or benchmarking.
+
+```powershell
+cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validate `
+  --connection-profiles benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml `
+  --connection-profile secured-live `
+  --workload-pack benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml `
+  --report-json artifacts/secured-live-auth-validation.json
+```
+
+When `--report-json` is set, the harness emits a machine-readable validation report with:
+
+- selected connection-profile registry path and profile name
+- resolved NRESE/Fuseki base URLs
+- compat suites
+- merged NRESE/Fuseki invocation-profile names
+
 ## 4. Workload Pack Run
 
 This is the preferred production-style execution path when you want one coherent evidence run instead of manually chaining `seed`, `compat`, and `bench`.
@@ -404,20 +433,21 @@ Expected evidence artifacts when `--report-dir` is set:
 `pack-report.json` is the canonical index for one workload-pack run. It ties together:
 
 - manifest path
+- selected connection-profile registry path and profile name when used
 - dataset path
 - configured compat suites
 - per-suite match status and report path
 - benchmark report path
 
 If a pack includes `timeout_failure_cases.json`, the resulting suite artifact is indexed the same way as any other compat suite. Timeout parity does not get a separate report type.
+If a pack references named invocation profiles through its compat suites, the harness validates those references before seeding or benchmarking so a selected connection profile and a workload pack cannot drift silently.
 
 Secured live-auth example:
 
 ```powershell
 cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
-  --nrese-base-url https://nrese.example.com `
-  --fuseki-base-url https://fuseki.example.com/ds `
-  --fuseki-basic-auth compare-user:compare-pass `
+  --connection-profiles benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml `
+  --connection-profile secured-live `
   --workload-pack benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml `
   --iterations 20 `
   --report-dir artifacts/secured-live-auth
@@ -427,9 +457,8 @@ Secured live-auth plus timeout example:
 
 ```powershell
 cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
-  --nrese-base-url https://nrese.example.com `
-  --fuseki-base-url https://fuseki.example.com/ds `
-  --fuseki-basic-auth compare-user:compare-pass `
+  --connection-profiles benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml `
+  --connection-profile secured-live-timeout `
   --workload-pack benches/nrese-bench-harness/fixtures/packs/secured-live-auth-timeout-template/pack.toml `
   --iterations 20 `
   --report-dir artifacts/secured-live-auth-timeout
@@ -437,11 +466,34 @@ cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
 
 Before using either template:
 
-- export `NRESE_COMPARE_READ_TOKEN` and `FUSEKI_COMPARE_READ_TOKEN` in the shell or CI environment
-- remove `[fuseki.headers]` if Fuseki only uses CLI-supplied Basic Auth
+- create a local copy of `benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml` or use it directly in CI
+- export `NRESE_LIVE_BASE_URL`, `FUSEKI_LIVE_BASE_URL`, `NRESE_COMPARE_READ_TOKEN`, and `FUSEKI_COMPARE_READ_TOKEN` in the shell or CI environment
+- uncomment or override the `basic_auth` block only when Fuseki really uses Basic Auth, or supply `--fuseki-basic-auth` to override the selected connection profile on the CLI
+- use `--nrese-base-url` or `--fuseki-base-url` only when you intentionally want to override the selected connection profile at invocation time
 - keep `policy_failure_cases.json` in the pack so oversize-payload parity stays on the same shared comparator path
 - keep `secured_auth_failure_cases.json` in secured packs so invalid-auth parity uses the same per-side invocation-profile model as the live auth defaults
 - only use the timeout template after aligning timeout ceilings and proxy behavior on both deployments
+
+Catalog-driven live parity example:
+
+```powershell
+cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix `
+  --connection-profiles benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml `
+  --connection-profile secured-live `
+  --tier medium `
+  --service-coverage graph-store `
+  --report-dir artifacts/live-pack-matrix
+```
+
+Single-ontology live parity example:
+
+```powershell
+cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix `
+  --connection-profiles benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml `
+  --connection-profile secured-live `
+  --ontology skos `
+  --report-dir artifacts/live-skos-pack-matrix
+```
 
 ## Current Verified Local Baseline
 
@@ -480,6 +532,7 @@ These are local run artifacts, not replacement-grade proof by themselves. Full r
 - add cold/warm split runs and resource-capture integration for CPU/RAM evidence
 - add authenticated service startup orchestration so the harness can provision its own isolated compare stack end-to-end
 - add project-specific parity packs for the real ontology, auth model, and workload mix
+- add preflight report gating in CI before authenticated live parity runs are allowed to publish benchmark/compat evidence
 - add ontology-specific workload packs on top of the staged real-world ontology catalog
 
 ## Isolated Side-by-Side Stack

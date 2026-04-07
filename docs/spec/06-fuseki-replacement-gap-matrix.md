@@ -35,9 +35,13 @@ Current coverage:
 - ontology-backed compat/parity suites are now grouped on a dedicated harness path and baseline packs now carry ontology-specific suites across the checked-in official catalog set on top of the shared ontology baseline suite
 - the harness now supports catalog-driven `pack-matrix` execution over baseline ontology packs, producing an aggregate `pack-matrix-report.json` evidence index for a selected catalog tier
 - `pack-matrix` execution can now also be filtered by typed ontology metadata such as semantic dialect, reasoning feature, and service coverage, so catalog metadata drives targeted parity evidence instead of only catalog descriptions
+- `pack-matrix` can now also be scoped to one exact ontology name on the same selector path, so secured live replacement runs can narrow to a single official ontology without cloning pack manifests
 - `pack-matrix` now also validates catalog-backed baseline packs before execution so dataset identity and required compat-suite coverage cannot drift silently from the ontology catalog
-- versioned secured live-auth and secured live-auth-plus-timeout workload-pack templates now exist on the same manifest path as the generic packs
-- workload-pack headers now support env-placeholder interpolation so auth/proxy parity packs can stay versioned without committed secrets
+- the harness now also exposes `pack-validate` as a dedicated preflight command so live connection-profile wiring and invocation-profile references can be verified before seed/compat/bench execution
+- a reusable live connection-profile registry now exists for secured parity runs, owning NRESE/Fuseki base URLs, auth, timeout defaults, and invalid-auth invocation profiles outside workload-pack manifests
+- versioned secured live-auth and secured live-auth-plus-timeout workload-pack templates now exist on the same manifest path as the generic packs and bind to that connection-profile registry instead of carrying live transport settings directly
+- secured workload-pack compat suites are now preflight-validated against the selected connection profile plus pack-local invocation profiles, so profile drift fails before seed/bench execution
+- the harness now exposes that preflight as a first-class `pack-validate` step with optional machine-readable report output for CI and deployment workflows
 - workload-pack execution now emits a canonical `pack-report.json` evidence index that ties compat suites and benchmark artifacts together
 
 Still required:
@@ -171,10 +175,10 @@ Current coverage:
 - local compatibility and latency evidence can be emitted via report artifacts
 - authenticated local side-by-side runs against a dedicated Fuseki dataset are now supported through optional harness Basic-Auth flags
 - compatibility fixtures now support explicit shared per-case request-header overrides through the shared harness request path, which prepares live auth/proxy parity without endpoint-specific compare logic
-- production workload packs now support service-level invocation defaults plus named per-side invocation profiles for NRESE and Fuseki through one manifest/config path
+- production workload packs now support service-level invocation defaults plus named invocation profiles, and live secured parity can select reusable connection profiles instead of copying transport/auth settings into each pack
 - production workload packs now also support service-level and named-profile timeout budgets on the same profile path, so secured/live compare runs can keep transport ceilings external to case fixtures
 - production workload packs now support multiple compatibility suites in one manifest, so protocol, ontology, and policy/e2e parity can be staged without ad hoc command chaining
-- versioned secured live-auth and secured live-auth-timeout pack templates now exist on top of that manifest path
+- versioned secured live-auth and secured live-auth-timeout pack templates now exist on top of that manifest path and are designed to run with a selected connection profile
 - workload-pack invocation headers now support env-placeholder interpolation so authenticated parity runs can be scripted without committed credentials
 
 Still required:

@@ -184,32 +184,10 @@ authorization = "Bearer ${NRESE_INVALID_TOKEN}"
 
     #[test]
     fn secured_timeout_pack_template_parses_with_multiple_compat_suites() {
-        let previous_nrese = std::env::var("NRESE_COMPARE_READ_TOKEN").ok();
-        let previous_fuseki = std::env::var("FUSEKI_COMPARE_READ_TOKEN").ok();
-        unsafe {
-            std::env::set_var("NRESE_COMPARE_READ_TOKEN", "nrese-token");
-            std::env::set_var("FUSEKI_COMPARE_READ_TOKEN", "fuseki-token");
-        }
         let manifest = read_workload_pack(Path::new(
             "fixtures/packs/secured-live-auth-timeout-template/pack.toml",
         ))
         .expect("pack");
-        match previous_nrese {
-            Some(value) => unsafe {
-                std::env::set_var("NRESE_COMPARE_READ_TOKEN", value);
-            },
-            None => unsafe {
-                std::env::remove_var("NRESE_COMPARE_READ_TOKEN");
-            },
-        }
-        match previous_fuseki {
-            Some(value) => unsafe {
-                std::env::set_var("FUSEKI_COMPARE_READ_TOKEN", value);
-            },
-            None => unsafe {
-                std::env::remove_var("FUSEKI_COMPARE_READ_TOKEN");
-            },
-        }
 
         assert_eq!(manifest.name, "secured-live-auth-timeout-template");
         assert_eq!(manifest.compat_suites.len(), 4);
@@ -234,14 +212,10 @@ authorization = "Bearer ${NRESE_INVALID_TOKEN}"
                     .is_some_and(|value| value == "timeout_failure_cases.json")
             })
         );
-        assert_eq!(
-            manifest
-                .nrese
-                .headers
-                .get("authorization")
-                .map(String::as_str),
-            Some("Bearer nrese-token")
-        );
+        assert!(manifest.nrese.headers.is_empty());
+        assert!(manifest.fuseki.headers.is_empty());
+        assert!(manifest.invocation_profiles.nrese.is_empty());
+        assert!(manifest.invocation_profiles.fuseki.is_empty());
     }
 
     #[test]

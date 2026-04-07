@@ -54,9 +54,12 @@ Implemented today:
 - prepared property-consistency indexing so `rules-mvp` reuses one grouped assertion view per run for constrained predicates instead of rescanning property closure for each consistency gate
 - local comparison harness for NRESE vs Fuseki on seeded datasets
 - manifest-driven workload-pack execution for production-style seed + compat + bench runs
-- versioned secured live-auth and secured live-auth-timeout workload-pack templates on the same manifest model as the generic packs
-- env-placeholder interpolation for workload-pack headers so authenticated parity runs can stay versioned without committed secrets
-- workload-pack invocation profiles now support service-level defaults plus bounded per-side case overrides for headers and timeout budgets, so secured/live parity runs can keep transport policy external to fixture JSON
+- dedicated `pack-validate` preflight runs for workload-pack wiring before live parity execution
+- reusable live connection-profile registry for parity harness runs, so real NRESE/Fuseki URLs, auth, and timeout defaults stay outside workload-pack manifests
+- versioned secured live-auth and secured live-auth-timeout workload-pack templates on the same manifest model as the generic packs, paired with the connection-profile registry instead of carrying live transport details directly
+- invocation precedence for live parity is explicit: selected connection-profile defaults, then pack-local service defaults, then named invocation profiles, then case-level headers/timeouts
+- workload-pack compat suites are now preflight-validated against the selected connection profile and pack-local invocation profiles, so secured live runs fail early on profile drift
+- `pack-validate` now exposes that preflight as a first-class harness step and can emit a machine-readable validation report before any live seed/compat/bench execution
 - real-world ontology catalog sync for staged parity and hardening runs against FOAF, W3C ORG, W3C Time, PROV-O, SKOS, SOSA, SSN, DCAT, vCard, DCMI Terms, and ODRL, with typed serialization/dialect/reasoning/service metadata
 - official catalog fixtures now drive cross-service checks across Store, `tell`, Graph Store, and `rules-mvp`, including RDF/XML ingest/preload and ontology-backed reasoning/runtime validation
 - official catalog reasoner fixtures now cover bounded supported slices across FOAF, ORG, Time, SKOS, PROV-O, DCAT, vCard, DCMI Terms, SOSA, SSN, and ODRL using the same `rules-mvp` path the server runs in production
@@ -65,6 +68,7 @@ Implemented today:
 - RDF/XML catalog baseline packs now also carry the shared `rdf_xml_cases.json` suite, so syntax-specific graph/query parity stays on the same pack path as ontology-specific schema parity
 - the benchmark harness now also supports a catalog-driven `pack-matrix` run that executes all baseline ontology packs for a selected catalog tier and writes one aggregate `pack-matrix-report.json` evidence index
 - `pack-matrix` can now also filter by ontology semantic dialect, reasoning feature, and service coverage, so catalog metadata drives targeted evidence runs instead of only describing fixtures
+- `pack-matrix` can now also target one exact ontology name on the same selector path, so secured live parity can be narrowed to a single official ontology without forking pack manifests
 - `pack-matrix` now validates catalog-backed baseline packs before execution, so pack naming, dataset alignment, and required compat-suite coverage stay consistent with the ontology catalog instead of drifting silently
 - the store preload path now derives a file base IRI for ontology parsing, so official Turtle vocabularies with relative ontology IRIs like PROV-O load on the same typed ingest path as the rest of the catalog
 - protocol compatibility harness coverage for query parity, limit/offset query semantics, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-parity slice, and bounded query/update failure-parity fixtures for covered negative cases

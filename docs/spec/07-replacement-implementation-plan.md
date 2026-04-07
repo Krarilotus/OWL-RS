@@ -54,8 +54,9 @@ Implementation blocks:
 - explicit Tell/Ask/Services contract definition so assertion ingest, query semantics, and service metadata/federation do not drift into one another
 - bounded query/update failure-parity fixtures on top of the shared response-semantics comparator
 - separate policy-failure parity fixtures for invalid-auth and oversize-payload cases on the same shared response-semantics comparator
-- shared per-case request-header customization in the compat harness plus named per-side invocation profiles so auth/proxy/live comparison cases stay on the same comparator path
-- service-level invocation profiles in workload-pack manifests so secured compare stacks stay on the same comparator path as unsecured runs
+- shared per-case request-header customization in the compat harness plus named invocation profiles so auth/proxy/live comparison cases stay on the same comparator path
+- reusable connection-profile registry for pack and pack-matrix runs so secured compare stacks keep transport/auth policy outside workload-pack manifests
+- exact ontology-name selection on top of the catalog-driven `pack-matrix` path so secured live parity can narrow to one official ontology without cloning workload packs
 - service-level timeout budgets in workload-pack manifests plus named profile overrides so secured/live compare stacks can externalize transport ceilings without case-by-case duplication
 - bounded secured live-deployment workload-pack templates so auth/policy/timeout parity runs reuse the same manifest model without committed secrets
 - env-placeholder interpolation for pack headers so secured templates can stay versioned without embedding credentials
@@ -278,7 +279,8 @@ Priority order for the next replacement-focused runs:
 - extracted shared RDF-list parsing inside the reasoner and added bounded `owl:AllDifferent`, `owl:AllDisjointClasses`, and `owl:AllDisjointProperties` expansion onto the existing `owl:differentFrom`, class-disjointness, and property-disjointness paths, including deterministic malformed-list diagnostics
 - added dedicated timeout-failure compat suites on the shared response-semantics comparator path
 - committed secured live-auth and secured live-auth-timeout pack templates on the same manifest model as generic packs
-- added env-driven pack-header interpolation so secured workload packs stay reusable without committed secrets
+- added a reusable connection-profile registry path for pack and pack-matrix runs so real NRESE/Fuseki URLs, auth, timeout defaults, and invalid-auth invocation profiles stay outside workload-pack manifests
+- exposed `pack-validate` as the explicit preflight command for selected connection-profile wiring and invocation-profile reference checks before live parity runs
 - expanded the staged real-world ontology catalog to include SKOS, SOSA, SSN, DCAT, vCard, DCMI Terms, and ODRL alongside the earlier official ontology set
 - added typed ontology-fixture metadata for serialization, semantic dialects, reasoning focus, and service coverage so catalog entries can drive test intent rather than only download paths
 - added cross-service ontology fixture tests that exercise official catalog inputs through Store, Server, and Reasoner paths, including RDF/XML preload/`tell` acceptance, Turtle base-IRI preload for official PROV-O, and ontology-backed inverse/transitive/domain-range reasoning checks
@@ -286,10 +288,13 @@ Priority order for the next replacement-focused runs:
 - grouped ontology-backed compat suites under a dedicated harness path and completed ontology-specific asserted-schema parity suites across the checked-in official baseline ontology packs
 - added catalog-driven `pack-matrix` execution so baseline ontology packs can be run per tier through one aggregate evidence path with a top-level matrix report
 - extended `pack-matrix` so typed ontology catalog metadata can select execution subsets by semantic dialect, reasoning feature, and service coverage
+- extended `pack-matrix` again so one exact ontology name can be selected on the same metadata-driven path for narrower secured live parity runs
 - added catalog-backed baseline-pack validation so pack naming, dataset alignment, and required compat-suite coverage are enforced before matrix evidence runs
 - expanded official ontology-backed reasoner fixture coverage to the remaining catalog vocabularies so the current bounded `rules-mvp` slice is now exercised against vCard, DCMI Terms, SOSA, SSN, and ODRL in addition to the earlier official ontology set
 - added service-level timeout budgets to workload-pack target profiles so secured/live parity runs can reuse shared transport ceilings without case duplication
-- added named per-side invocation profiles to workload-pack manifests and bound secured invalid-auth parity cases to that path instead of duplicating live auth headers inside compat JSON
+- added named invocation-profile merging with collision rejection, so selected live connection profiles and workload packs share one request-normalization path without silent override drift
+- added preflight validation of compat-suite invocation-profile references against the selected live connection profile and workload-pack overlays, so secured parity runs fail before seed/bench execution when profile wiring drifts
+- added a dedicated `pack-validate` command and report shape so deployment workflows can gate live parity runs on the same connection-profile and pack-resolution path used by real execution
 - added a dedicated limit/offset semantics compat suite and a bindings-set comparator so query-window parity does not rely on count-only summaries
 - moved the class-consistency test block into a dedicated `src/tests/consistency_tests.rs` file to match the repo’s topic-adjacent unit-test convention
 - initialized git versioning for the repository and updated `.gitignore` for Rust, frontend, runtime, and local-secret artifacts

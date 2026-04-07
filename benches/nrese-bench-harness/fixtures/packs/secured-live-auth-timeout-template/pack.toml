@@ -9,31 +9,17 @@ compat_suites = [
   "../../compat/timeout_failure_cases.json",
 ]
 
-# Template only.
-# Replace placeholder values locally or in CI-injected workspace copies.
-# Do not commit real bearer tokens or other secrets.
+# Template only. Pair this pack with a selected connection profile from
+# ../../live/connection-profiles.template.toml or a local workspace copy.
+# Keep all live URLs, auth headers, and basic auth values in the connection profile.
 #
 # Use this pack only when NRESE and Fuseki are deployed with comparable
 # timeout ceilings and proxy behavior. The timeout suite is intentionally
 # separate from the generic secured-auth baseline for that reason.
 #
-# If Fuseki is protected with HTTP Basic Auth, pass credentials on the CLI:
-#   --fuseki-basic-auth <user:pass>
-# Keep Basic Auth out of committed pack manifests.
-# Export the bearer values locally or in CI before running:
-#   $env:NRESE_COMPARE_READ_TOKEN = "..."
-#   $env:FUSEKI_COMPARE_READ_TOKEN = "..."
-
-[nrese.headers]
-authorization = "Bearer ${NRESE_COMPARE_READ_TOKEN}"
-
-[fuseki.headers]
-# Optional when Fuseki is fronted by the same style of bearer-auth gateway.
-# Remove this header section if Fuseki only uses CLI-supplied Basic Auth.
-authorization = "Bearer ${FUSEKI_COMPARE_READ_TOKEN}"
-
-[invocation_profiles.nrese.invalid.headers]
-authorization = "Bearer invalid-token"
-
-[invocation_profiles.fuseki.invalid.headers]
-authorization = "Bearer invalid-token"
+# Example:
+#   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
+#     --connection-profiles benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml `
+#     --connection-profile secured-live-timeout `
+#     --workload-pack benches/nrese-bench-harness/fixtures/packs/secured-live-auth-timeout-template/pack.toml `
+#     --report-dir artifacts/secured-live-auth-timeout

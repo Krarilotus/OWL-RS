@@ -9,7 +9,7 @@ pub fn expand_headers_env_placeholders(headers: &mut CompatHeaders) -> Result<()
     Ok(())
 }
 
-fn expand_env_placeholders(input: &str) -> Result<String> {
+pub fn expand_env_placeholders(input: &str) -> Result<String> {
     expand_with_lookup(input, |name| std::env::var(name).ok())
 }
 
@@ -47,7 +47,7 @@ fn expand_with_lookup(
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_headers_env_placeholders, expand_with_lookup};
+    use super::{expand_env_placeholders, expand_headers_env_placeholders, expand_with_lookup};
     use crate::model::CompatHeaders;
 
     #[test]
@@ -76,6 +76,25 @@ mod tests {
         .expect("rendered");
 
         assert_eq!(rendered, "Bearer secret");
+    }
+
+    #[test]
+    fn expands_plain_string_placeholders() {
+        let previous = std::env::var("BASE_URL").ok();
+        unsafe {
+            std::env::set_var("BASE_URL", "http://127.0.0.1:8080");
+        }
+        let rendered = expand_env_placeholders("${BASE_URL}").expect("rendered");
+        match previous {
+            Some(value) => unsafe {
+                std::env::set_var("BASE_URL", value);
+            },
+            None => unsafe {
+                std::env::remove_var("BASE_URL");
+            },
+        }
+
+        assert_eq!(rendered, "http://127.0.0.1:8080");
     }
 
     #[test]

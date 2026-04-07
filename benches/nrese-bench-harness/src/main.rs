@@ -3,6 +3,7 @@ mod compat_common;
 mod compat_graph_store;
 mod compat_query;
 mod compat_update;
+mod connection_profile;
 mod interpolation;
 mod io;
 mod layout;
@@ -34,6 +35,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Pack(config) => runner::run_pack(config).await,
+        Command::ValidatePack(config) => runner::run_validate_pack(config).await,
         Command::PackMatrix(config) => runner::run_pack_matrix(config).await,
         Command::Seed(config) => runner::run_seed(config).await,
     }
