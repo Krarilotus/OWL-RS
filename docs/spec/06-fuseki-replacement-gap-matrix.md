@@ -70,7 +70,7 @@ Current coverage:
 - `rules-mvp` now rejects `owl:Nothing` and `owl:disjointWith` conflicts over effective types and keeps rejected updates out of the live dataset through shadow-store validation
 - `rules-mvp` now rejects bounded property-characteristic conflicts for `owl:IrreflexiveProperty`, `owl:AsymmetricProperty`, and `owl:propertyDisjointWith`
 - `rules-mvp` now emits deterministic diagnostics for a known set of unsupported OWL constructs, with the remaining unsupported constructs tracked in the reasoner support boundary spec
-- official ontology-backed reasoner fixtures now validate bounded subclass, inverse-property, transitive-property, subproperty, and domain/range slices on FOAF, W3C Time, W3C ORG, SKOS, PROV-O, and DCAT
+- official ontology-backed reasoner fixtures now validate bounded subclass, inverse-property, transitive-property, subproperty, equivalent-property, and domain/range slices on FOAF, W3C Time, W3C ORG, SKOS, PROV-O, DCAT, vCard, DCMI Terms, SOSA, SSN, and ODRL; bounded property-chain support remains covered by dedicated rule tests because the official SOSA/SSN encodings use broader RDF-list forms than the current named-node bounded slice
 - operator diagnostics can expose the latest reasoning run baseline
 - reject-path HTTP problem responses and operator diagnostics now share a structured heuristic blame payload for consistency failures
 - reject-path HTTP problem responses and operator diagnostics now also share explicit conflict evidence triples from the reasoner-owned explanation model

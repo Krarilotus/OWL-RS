@@ -194,3 +194,137 @@ fn rules_mvp_infers_dcat_domain_and_range_types_from_official_fixture()
     );
     Ok(())
 }
+
+#[test]
+fn rules_mvp_infers_vcard_range_and_subproperty_closure_from_official_fixture()
+-> Result<(), Box<dyn std::error::Error>> {
+    let inferred = run_rules_mvp_catalog_fixture(
+        "vcard.ttl",
+        "PREFIX vcard: <http://www.w3.org/2006/vcard/ns#>
+         INSERT DATA {
+           <http://example.com/person> vcard:hasAddress <http://example.com/address1> .
+         }",
+    )?;
+
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/address1",
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+        "http://www.w3.org/2006/vcard/ns#Address",
+    );
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/person",
+        "http://www.w3.org/2006/vcard/ns#adr",
+        "http://example.com/address1",
+    );
+    Ok(())
+}
+
+#[test]
+fn rules_mvp_infers_dcterms_subproperty_and_equivalent_property_from_official_fixture()
+-> Result<(), Box<dyn std::error::Error>> {
+    let inferred = run_rules_mvp_catalog_fixture(
+        "dcterms.ttl",
+        "PREFIX dcterms: <http://purl.org/dc/terms/>
+         INSERT DATA {
+           <http://example.com/resource> dcterms:creator <http://example.com/agent> .
+         }",
+    )?;
+
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/resource",
+        "http://purl.org/dc/terms/contributor",
+        "http://example.com/agent",
+    );
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/resource",
+        "http://xmlns.com/foaf/0.1/maker",
+        "http://example.com/agent",
+    );
+    Ok(())
+}
+
+#[test]
+fn rules_mvp_infers_sosa_subproperty_closure_from_official_fixture()
+-> Result<(), Box<dyn std::error::Error>> {
+    let inferred = run_rules_mvp_catalog_fixture(
+        "sosa.ttl",
+        "PREFIX sosa: <http://www.w3.org/ns/sosa/>
+         PREFIX ssn: <http://www.w3.org/ns/ssn/>
+         INSERT DATA {
+           <http://example.com/sensor1> sosa:observes <http://example.com/property1> .
+         }",
+    )?;
+
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/sensor1",
+        "http://www.w3.org/ns/ssn/forProperty",
+        "http://example.com/property1",
+    );
+    Ok(())
+}
+
+#[test]
+fn rules_mvp_infers_ssn_inverse_and_subproperty_closure_from_official_fixture()
+-> Result<(), Box<dyn std::error::Error>> {
+    let inferred = run_rules_mvp_catalog_fixture(
+        "ssn.ttl",
+        "PREFIX sosa: <http://www.w3.org/ns/sosa/>
+         PREFIX ssn: <http://www.w3.org/ns/ssn/>
+         INSERT DATA {
+           <http://example.com/system1> ssn:implements <http://example.com/procedure1> .
+           <http://example.com/sensor1> sosa:observes <http://example.com/property1> .
+         }",
+    )?;
+
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/procedure1",
+        "http://www.w3.org/ns/ssn/implementedBy",
+        "http://example.com/system1",
+    );
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/sensor1",
+        "http://www.w3.org/ns/ssn/forProperty",
+        "http://example.com/property1",
+    );
+    Ok(())
+}
+
+#[test]
+fn rules_mvp_infers_odrl_domain_range_and_subproperty_from_official_fixture()
+-> Result<(), Box<dyn std::error::Error>> {
+    let inferred = run_rules_mvp_catalog_fixture(
+        "odrl.ttl",
+        "PREFIX odrl: <http://www.w3.org/ns/odrl/2/>
+         INSERT DATA {
+           <http://example.com/policy1> odrl:permission <http://example.com/permission1> .
+           <http://example.com/rule1> odrl:assignee <http://example.com/party1> .
+         }",
+    )?;
+
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/policy1",
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+        "http://www.w3.org/ns/odrl/2/Policy",
+    );
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/permission1",
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+        "http://www.w3.org/ns/odrl/2/Permission",
+    );
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/rule1",
+        "http://www.w3.org/ns/odrl/2/function",
+        "http://example.com/party1",
+    );
+    Ok(())
+}
