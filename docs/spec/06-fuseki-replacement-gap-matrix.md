@@ -38,6 +38,7 @@ Current coverage:
 - `pack-matrix` can now also be scoped to one exact ontology name on the same selector path, so secured live replacement runs can narrow to a single official ontology without cloning pack manifests
 - `pack-matrix` now also validates catalog-backed baseline packs before execution so dataset identity and required compat-suite coverage cannot drift silently from the ontology catalog
 - the harness now also exposes `pack-validate` as a dedicated preflight command so live connection-profile wiring and invocation-profile references can be verified before seed/compat/bench execution
+- workload-pack execution now has explicit `full` and `compat-only` modes so real secured parity runs can compare existing deployments without forcing seed or benchmark stages on the same path
 - a reusable live connection-profile registry now exists for secured parity runs, owning NRESE/Fuseki base URLs, auth, timeout defaults, and invalid-auth invocation profiles outside workload-pack manifests
 - versioned secured live-auth and secured live-auth-plus-timeout workload-pack templates now exist on the same manifest path as the generic packs and bind to that connection-profile registry instead of carrying live transport settings directly
 - secured workload-pack compat suites are now preflight-validated against the selected connection profile plus pack-local invocation profiles, so profile drift fails before seed/bench execution

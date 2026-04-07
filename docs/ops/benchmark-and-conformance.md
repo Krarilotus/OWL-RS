@@ -65,6 +65,7 @@ Invocation precedence is: selected connection-profile defaults, then pack-local 
 Profile-name collisions between a selected connection profile and a workload pack are rejected instead of silently overridden.
 Shared case-level headers still win on collision, so production packs can define auth/proxy defaults without forking comparator logic.
 Per-case timeout budgets still override service-level and named-profile defaults when a suite needs a stricter bound than the shared target profile.
+Pack execution mode is explicit: `full` runs seed + compat + bench, while `compat-only` runs only compatibility suites against the selected live targets.
 
 Current example:
 
@@ -441,6 +442,17 @@ Expected evidence artifacts when `--report-dir` is set:
 
 If a pack includes `timeout_failure_cases.json`, the resulting suite artifact is indexed the same way as any other compat suite. Timeout parity does not get a separate report type.
 If a pack references named invocation profiles through its compat suites, the harness validates those references before seeding or benchmarking so a selected connection profile and a workload pack cannot drift silently.
+
+For existing secured deployments where reseeding or benchmarking is not appropriate, reuse the same pack with `--execution-mode compat-only`:
+
+```powershell
+cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
+  --connection-profiles benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml `
+  --connection-profile secured-live `
+  --execution-mode compat-only `
+  --workload-pack benches/nrese-bench-harness/fixtures/packs/secured-live-auth-template/pack.toml `
+  --report-dir artifacts/secured-live-auth-compat-only
+```
 
 Secured live-auth example:
 

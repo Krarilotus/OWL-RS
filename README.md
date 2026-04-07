@@ -55,6 +55,7 @@ Implemented today:
 - local comparison harness for NRESE vs Fuseki on seeded datasets
 - manifest-driven workload-pack execution for production-style seed + compat + bench runs
 - dedicated `pack-validate` preflight runs for workload-pack wiring before live parity execution
+- typed pack execution modes now let live parity runs stay `full` or opt into `compat-only` when an existing deployment should be compared without seed/bench side effects
 - reusable live connection-profile registry for parity harness runs, so real NRESE/Fuseki URLs, auth, and timeout defaults stay outside workload-pack manifests
 - versioned secured live-auth and secured live-auth-timeout workload-pack templates on the same manifest model as the generic packs, paired with the connection-profile registry instead of carrying live transport details directly
 - invocation precedence for live parity is explicit: selected connection-profile defaults, then pack-local service defaults, then named invocation profiles, then case-level headers/timeouts

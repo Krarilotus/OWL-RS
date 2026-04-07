@@ -26,6 +26,7 @@ use crate::model::{
     CompatConfig, CompatGraphTarget, CompatHeaders, CompatOperation, CompatReport, OntologyFixture,
     OntologyReasoningFeature, OntologySemanticDialect, OntologySerialization,
     OntologyServiceSurface, PackArtifactReport, PackCompatSuiteReport, PackConfig,
+    PackExecutionMode,
     PackMatrixConfig, PackMatrixEntryReport, PackMatrixReport, PackReport,
     PackValidationReport, QueryWorkloadCase, SeedConfig, ServiceBenchReport,
     ServiceConnectionConfig, ServiceRequestProfile, UpdateWorkloadCase, ValidatePackConfig,
@@ -284,6 +285,7 @@ pub async fn run_validate_pack(config: ValidatePackConfig) -> Result<()> {
 
 async fn run_loaded_pack(config: &PackConfig, prepared: PreparedPackRun) -> Result<()> {
     print_pack_header("Workload pack run", &prepared);
+    println!("execution mode: {:?}", config.execution_mode);
 
     let pack = prepared.pack;
     let nrese_connection = prepared.nrese_connection;
@@ -291,55 +293,85 @@ async fn run_loaded_pack(config: &PackConfig, prepared: PreparedPackRun) -> Resu
     let merged_invocation_profiles = prepared.merged_invocation_profiles;
     let iterations = config.iterations;
     let manifest_path = prepared.manifest_path;
+    validate_pack_execution_mode(config.execution_mode, fuseki_connection.is_some())?;
 
-    run_seed(SeedConfig {
-        nrese: merge_pack_service_profile(&nrese_connection, &pack.nrese),
-        fuseki: fuseki_connection
-            .as_ref()
-            .map(|connection| merge_pack_service_profile(connection, &pack.fuseki)),
-        dataset_path: pack.dataset.clone(),
-        content_type: None,
-        replace: true,
-    })
-    .await?;
-
-    let bench_report_path = config
-        .report_dir
-        .as_ref()
-        .map(|dir| dir.join("bench-report.json"));
     let mut compat_reports = Vec::new();
-    if let Some(fuseki_connection) = fuseki_connection.as_ref() {
-        for suite_path in &pack.compat_suites {
-            let compat_report_path = config
-                .report_dir
-                .as_ref()
-                .map(|dir| dir.join(compat_report_filename(suite_path)));
-            let compat_run = run_compat(CompatConfig {
+    let bench_report = match config.execution_mode {
+        PackExecutionMode::Full => {
+            run_seed(SeedConfig {
                 nrese: merge_pack_service_profile(&nrese_connection, &pack.nrese),
-                fuseki: merge_pack_service_profile(fuseki_connection, &pack.fuseki),
-                nrese_profiles: merged_invocation_profiles.nrese.clone(),
-                fuseki_profiles: merged_invocation_profiles.fuseki.clone(),
-                cases_path: suite_path.clone(),
-                report_json_path: compat_report_path,
+                fuseki: fuseki_connection
+                    .as_ref()
+                    .map(|connection| merge_pack_service_profile(connection, &pack.fuseki)),
+                dataset_path: pack.dataset.clone(),
+                content_type: None,
+                replace: true,
             })
             .await?;
-            compat_reports.push(pack_compat_suite_report(compat_run));
-        }
-    } else {
-        println!("fuseki base not provided; skipping compat stage");
-    }
 
-    let bench_run = run_bench(BenchConfig {
-        nrese: merge_pack_service_profile(&nrese_connection, &pack.nrese),
-        fuseki: fuseki_connection
-            .as_ref()
-            .map(|connection| merge_pack_service_profile(connection, &pack.fuseki)),
-        iterations,
-        query_workload_path: pack.query_workload,
-        update_workload_path: pack.update_workload,
-        report_json_path: bench_report_path,
-    })
-    .await?;
+            if let Some(fuseki_connection) = fuseki_connection.as_ref() {
+                for suite_path in &pack.compat_suites {
+                    let compat_report_path = config
+                        .report_dir
+                        .as_ref()
+                        .map(|dir| dir.join(compat_report_filename(suite_path)));
+                    let compat_run = run_compat(CompatConfig {
+                        nrese: merge_pack_service_profile(&nrese_connection, &pack.nrese),
+                        fuseki: merge_pack_service_profile(fuseki_connection, &pack.fuseki),
+                        nrese_profiles: merged_invocation_profiles.nrese.clone(),
+                        fuseki_profiles: merged_invocation_profiles.fuseki.clone(),
+                        cases_path: suite_path.clone(),
+                        report_json_path: compat_report_path,
+                    })
+                    .await?;
+                    compat_reports.push(pack_compat_suite_report(compat_run));
+                }
+            } else {
+                println!("fuseki base not provided; skipping compat stage");
+            }
+
+            let bench_run = run_bench(BenchConfig {
+                nrese: merge_pack_service_profile(&nrese_connection, &pack.nrese),
+                fuseki: fuseki_connection
+                    .as_ref()
+                    .map(|connection| merge_pack_service_profile(connection, &pack.fuseki)),
+                iterations,
+                query_workload_path: pack.query_workload,
+                update_workload_path: pack.update_workload,
+                report_json_path: config
+                    .report_dir
+                    .as_ref()
+                    .map(|dir| dir.join("bench-report.json")),
+            })
+            .await?;
+
+            bench_run.report_json_path.map(|path| PackArtifactReport {
+                path: path.display().to_string(),
+            })
+        }
+        PackExecutionMode::CompatOnly => {
+            let fuseki_connection = fuseki_connection
+                .as_ref()
+                .expect("compat-only mode requires a Fuseki connection");
+            for suite_path in &pack.compat_suites {
+                let compat_report_path = config
+                    .report_dir
+                    .as_ref()
+                    .map(|dir| dir.join(compat_report_filename(suite_path)));
+                let compat_run = run_compat(CompatConfig {
+                    nrese: merge_pack_service_profile(&nrese_connection, &pack.nrese),
+                    fuseki: merge_pack_service_profile(fuseki_connection, &pack.fuseki),
+                    nrese_profiles: merged_invocation_profiles.nrese.clone(),
+                    fuseki_profiles: merged_invocation_profiles.fuseki.clone(),
+                    cases_path: suite_path.clone(),
+                    report_json_path: compat_report_path,
+                })
+                .await?;
+                compat_reports.push(pack_compat_suite_report(compat_run));
+            }
+            None
+        }
+    };
 
     if let Some(report_dir) = config.report_dir.as_ref() {
         write_json_report(
@@ -350,14 +382,13 @@ async fn run_loaded_pack(config: &PackConfig, prepared: PreparedPackRun) -> Resu
                 manifest_path,
                 connection_profiles_path: prepared.connection_profiles_path,
                 connection_profile_name: prepared.connection_profile_name,
+                execution_mode: config.execution_mode,
                 dataset_path: pack.dataset.display().to_string(),
                 nrese_base_url: nrese_connection.base_url,
                 fuseki_base_url: fuseki_connection.map(|connection| connection.base_url),
                 iterations,
                 compat_suites: compat_reports,
-                bench_report: bench_run.report_json_path.map(|path| PackArtifactReport {
-                    path: path.display().to_string(),
-                }),
+                bench_report,
             },
         )?;
     }
@@ -395,6 +426,7 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
     if let Some(ontology_name) = &config.ontology_name {
         println!("ontology filter: {ontology_name}");
     }
+    println!("execution mode: {:?}", config.execution_mode);
     if let Some(tier) = &config.tier {
         println!("tier filter: {tier}");
     }
@@ -485,6 +517,7 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
             connection_profiles_path: config.connection_profiles_path.clone(),
             connection_profile_name: config.connection_profile_name.clone(),
             workload_pack_path: manifest_path.clone(),
+            execution_mode: config.execution_mode,
             iterations: config.iterations,
             report_dir: Some(report_dir),
         };
@@ -516,6 +549,7 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
                 .map(|path| path.display().to_string()),
             connection_profile_name: config.connection_profile_name.clone(),
             ontology_name: config.ontology_name.clone(),
+            execution_mode: config.execution_mode,
             tier: config.tier.clone(),
             semantic_dialect: config.semantic_dialect,
             reasoning_feature: config.reasoning_feature,
@@ -668,6 +702,16 @@ fn prepare_loaded_pack_run(
         fuseki_connection: live_connections.fuseki,
         merged_invocation_profiles,
     })
+}
+
+fn validate_pack_execution_mode(mode: PackExecutionMode, has_fuseki: bool) -> Result<()> {
+    match mode {
+        PackExecutionMode::Full => Ok(()),
+        PackExecutionMode::CompatOnly if has_fuseki => Ok(()),
+        PackExecutionMode::CompatOnly => {
+            bail!("compat-only execution mode requires a Fuseki connection")
+        }
+    }
 }
 
 fn merge_pack_service_profile(
@@ -1166,13 +1210,13 @@ mod tests {
 
     use crate::model::{
         CompatCase, CompatHeaders, CompatOperation, OntologyFixture, OntologyReasoningFeature,
-        OntologySemanticDialect, OntologySerialization, OntologyServiceSurface, PackMatrixConfig,
-        ServiceConnectionConfig, ServiceRequestProfile,
+        OntologySemanticDialect, OntologySerialization, OntologyServiceSurface,
+        PackExecutionMode, PackMatrixConfig, ServiceConnectionConfig, ServiceRequestProfile,
     };
 
     use super::{
         CompatRunArtifact, baseline_pack_manifest_path, compat_report_filename,
-        pack_matrix_matches_filters,
+        pack_matrix_matches_filters, validate_pack_execution_mode,
         pack_compat_suite_report, pack_matrix_entry_missing_manifest,
         resolve_service_connection, resolve_service_profile,
     };
@@ -1368,6 +1412,7 @@ mod tests {
             catalog_path: "catalog.toml".into(),
             packs_dir: "packs".into(),
             ontology_name: None,
+            execution_mode: PackExecutionMode::Full,
             tier: Some("medium".to_owned()),
             semantic_dialect: Some(OntologySemanticDialect::Time),
             reasoning_feature: Some(OntologyReasoningFeature::TransitiveProperty),
@@ -1403,6 +1448,7 @@ mod tests {
             catalog_path: "catalog.toml".into(),
             packs_dir: "packs".into(),
             ontology_name: Some("skos".to_owned()),
+            execution_mode: PackExecutionMode::Full,
             tier: None,
             semantic_dialect: None,
             reasoning_feature: None,
@@ -1417,5 +1463,16 @@ mod tests {
 
         assert!(pack_matrix_matches_filters(&ontology, &matching));
         assert!(!pack_matrix_matches_filters(&ontology, &non_matching));
+    }
+
+    #[test]
+    fn compat_only_mode_requires_fuseki() {
+        assert!(validate_pack_execution_mode(PackExecutionMode::Full, false).is_ok());
+        assert!(validate_pack_execution_mode(PackExecutionMode::CompatOnly, true).is_ok());
+        let error = validate_pack_execution_mode(PackExecutionMode::CompatOnly, false)
+            .expect_err("compat-only without fuseki should fail");
+        assert!(error
+            .to_string()
+            .contains("compat-only execution mode requires a Fuseki connection"));
     }
 }

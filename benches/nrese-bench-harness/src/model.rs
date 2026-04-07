@@ -64,6 +64,7 @@ pub struct PackConfig {
     pub connection_profiles_path: Option<PathBuf>,
     pub connection_profile_name: Option<String>,
     pub workload_pack_path: PathBuf,
+    pub execution_mode: PackExecutionMode,
     pub iterations: usize,
     pub report_dir: Option<PathBuf>,
 }
@@ -79,6 +80,13 @@ pub struct ValidatePackConfig {
     pub report_json_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PackExecutionMode {
+    Full,
+    CompatOnly,
+}
+
 #[derive(Debug, Clone)]
 pub struct PackMatrixConfig {
     pub nrese_base_url: Option<String>,
@@ -89,6 +97,7 @@ pub struct PackMatrixConfig {
     pub catalog_path: PathBuf,
     pub packs_dir: PathBuf,
     pub ontology_name: Option<String>,
+    pub execution_mode: PackExecutionMode,
     pub tier: Option<String>,
     pub semantic_dialect: Option<OntologySemanticDialect>,
     pub reasoning_feature: Option<OntologyReasoningFeature>,
@@ -444,6 +453,7 @@ pub struct PackReport {
     pub manifest_path: String,
     pub connection_profiles_path: Option<String>,
     pub connection_profile_name: Option<String>,
+    pub execution_mode: PackExecutionMode,
     pub dataset_path: String,
     pub nrese_base_url: String,
     pub fuseki_base_url: Option<String>,
@@ -475,6 +485,7 @@ pub struct PackMatrixReport {
     pub connection_profiles_path: Option<String>,
     pub connection_profile_name: Option<String>,
     pub ontology_name: Option<String>,
+    pub execution_mode: PackExecutionMode,
     pub tier: Option<String>,
     pub semantic_dialect: Option<OntologySemanticDialect>,
     pub reasoning_feature: Option<OntologyReasoningFeature>,

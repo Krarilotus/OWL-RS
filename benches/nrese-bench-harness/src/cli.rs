@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow, bail};
 use crate::model::{
     BasicAuthConfig, BenchConfig, CatalogSyncConfig, Cli, Command, CompatConfig, CompatHeaders,
     OntologyReasoningFeature, OntologySemanticDialect, OntologyServiceSurface, PackConfig,
-    PackMatrixConfig, SeedConfig, ServiceConnectionConfig, ValidatePackConfig,
+    PackExecutionMode, PackMatrixConfig, SeedConfig, ServiceConnectionConfig, ValidatePackConfig,
 };
 
 const DEFAULT_QUERY_WORKLOAD_PATH: &str =
@@ -111,6 +111,11 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .get("--workload-pack")
                     .map(PathBuf::from)
                     .ok_or_else(|| anyhow!("missing required option --workload-pack"))?,
+                execution_mode: options
+                    .get("--execution-mode")
+                    .map(|value| parse_pack_execution_mode(value))
+                    .transpose()?
+                    .unwrap_or(PackExecutionMode::Full),
                 iterations: options
                     .get("--iterations")
                     .map(|value| value.parse::<usize>())
@@ -153,6 +158,11 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from("benches/nrese-bench-harness/fixtures/packs")),
                 ontology_name: options.get("--ontology").cloned(),
+                execution_mode: options
+                    .get("--execution-mode")
+                    .map(|value| parse_pack_execution_mode(value))
+                    .transpose()?
+                    .unwrap_or(PackExecutionMode::Full),
                 tier: options.get("--tier").cloned(),
                 semantic_dialect: options
                     .get("--semantic-dialect")
@@ -230,6 +240,14 @@ fn parse_bool(value: &str) -> Result<bool> {
         "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" => Ok(false),
         _ => bail!("invalid boolean value: {value}"),
+    }
+}
+
+fn parse_pack_execution_mode(value: &str) -> Result<PackExecutionMode> {
+    match value {
+        "full" => Ok(PackExecutionMode::Full),
+        "compat-only" => Ok(PackExecutionMode::CompatOnly),
+        _ => bail!("invalid pack execution mode: {value}"),
     }
 }
 
@@ -334,9 +352,9 @@ USAGE:
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- bench --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--iterations <N>] [--query-workload <PATH>] [--update-workload <PATH>] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- catalog-sync [--catalog <PATH>] [--output-dir <DIR>] [--tier <small|medium|broad>] [--refresh <true|false>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- compat --nrese-base-url <URL> --fuseki-base-url <URL> [--fuseki-basic-auth <user:pass>] [--cases <PATH>] [--report-json <PATH>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--iterations <N>] [--report-dir <DIR>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--execution-mode <full|compat-only>] --workload-pack <PATH> [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validate [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--report-json <PATH>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--execution-mode <full|compat-only>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--dataset <PATH>] [--content-type <TYPE>] [--replace <true|false>]
 "
     );
@@ -344,7 +362,7 @@ USAGE:
 
 #[cfg(test)]
 mod tests {
-    use crate::model::Command;
+    use crate::model::{Command, PackExecutionMode};
 
     use super::{DEFAULT_COMPAT_CASES_PATH, DEFAULT_QUERY_WORKLOAD_PATH, parse_cli};
 
@@ -403,6 +421,7 @@ mod tests {
                     "benches/nrese-bench-harness/fixtures/packs"
                 );
                 assert!(config.ontology_name.is_none());
+                assert_eq!(config.execution_mode, PackExecutionMode::Full);
                 assert!(config.semantic_dialect.is_none());
                 assert!(config.reasoning_feature.is_none());
                 assert!(config.service_coverage.is_none());
@@ -466,6 +485,8 @@ mod tests {
             "secured-live".to_owned(),
             "--workload-pack".to_owned(),
             "benches/nrese-bench-harness/fixtures/packs/generic-baseline/pack.toml".to_owned(),
+            "--execution-mode".to_owned(),
+            "compat-only".to_owned(),
             "--iterations".to_owned(),
             "5".to_owned(),
         ])
@@ -475,6 +496,7 @@ mod tests {
             Command::Pack(config) => {
                 assert_eq!(config.iterations, 5);
                 assert!(config.report_dir.is_none());
+                assert_eq!(config.execution_mode, PackExecutionMode::CompatOnly);
                 assert_eq!(
                     config
                         .connection_profiles_path

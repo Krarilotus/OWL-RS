@@ -281,6 +281,7 @@ Priority order for the next replacement-focused runs:
 - committed secured live-auth and secured live-auth-timeout pack templates on the same manifest model as generic packs
 - added a reusable connection-profile registry path for pack and pack-matrix runs so real NRESE/Fuseki URLs, auth, timeout defaults, and invalid-auth invocation profiles stay outside workload-pack manifests
 - exposed `pack-validate` as the explicit preflight command for selected connection-profile wiring and invocation-profile reference checks before live parity runs
+- added explicit `full` and `compat-only` pack execution modes so secured live parity can reuse the same pack format without always reseeding or benchmarking a target deployment
 - expanded the staged real-world ontology catalog to include SKOS, SOSA, SSN, DCAT, vCard, DCMI Terms, and ODRL alongside the earlier official ontology set
 - added typed ontology-fixture metadata for serialization, semantic dialects, reasoning focus, and service coverage so catalog entries can drive test intent rather than only download paths
 - added cross-service ontology fixture tests that exercise official catalog inputs through Store, Server, and Reasoner paths, including RDF/XML preload/`tell` acceptance, Turtle base-IRI preload for official PROV-O, and ontology-backed inverse/transitive/domain-range reasoning checks
