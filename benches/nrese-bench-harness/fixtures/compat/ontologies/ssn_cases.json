@@ -1,0 +1,16 @@
+[
+  {
+    "name": "ssn-implements-inverse-declared",
+    "operation": "query",
+    "query": "PREFIX ssn: <http://www.w3.org/ns/ssn/> ASK WHERE { ssn:implements <http://www.w3.org/2002/07/owl#inverseOf> ssn:implementedBy }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "ssn-observes-subproperty-of-for-property",
+    "operation": "query",
+    "query": "PREFIX sosa: <http://www.w3.org/ns/sosa/> PREFIX ssn: <http://www.w3.org/ns/ssn/> ASK WHERE { sosa:observes <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> ssn:forProperty }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  }
+]

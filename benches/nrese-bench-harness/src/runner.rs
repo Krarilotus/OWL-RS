@@ -27,6 +27,7 @@ use crate::model::{
     UpdateWorkloadCase,
 };
 use crate::normalize::summarize;
+use crate::pack_validation::validate_catalog_baseline_pack;
 
 pub async fn run_bench(config: BenchConfig) -> Result<BenchRunArtifact> {
     let client = build_client()?;
@@ -213,6 +214,10 @@ pub async fn run_seed(config: SeedConfig) -> Result<()> {
 pub async fn run_pack(config: PackConfig) -> Result<()> {
     let pack = read_workload_pack(&config.workload_pack_path)?;
     ensure_report_dir(config.report_dir.as_deref())?;
+    run_loaded_pack(&config, pack).await
+}
+
+async fn run_loaded_pack(config: &PackConfig, pack: crate::model::WorkloadPackManifest) -> Result<()> {
     let nrese_base_url = config.nrese_base_url.clone();
     let fuseki_base_url = config.fuseki_base_url.clone();
     let fuseki_basic_auth = config.fuseki_basic_auth.clone();
@@ -298,7 +303,7 @@ pub async fn run_pack(config: PackConfig) -> Result<()> {
     })
     .await?;
 
-    if let Some(report_dir) = config.report_dir {
+    if let Some(report_dir) = config.report_dir.as_ref() {
         write_json_report(
             report_dir.join("pack-report.json"),
             &PackReport {
@@ -360,16 +365,41 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
             continue;
         }
 
+        let pack = match read_workload_pack(&manifest_path) {
+            Ok(pack) => pack,
+            Err(error) => {
+                failed = true;
+                entries.push(pack_matrix_entry_failure(
+                    ontology,
+                    &manifest_path,
+                    error.to_string(),
+                    None,
+                ));
+                continue;
+            }
+        };
+
+        if let Err(error) = validate_catalog_baseline_pack(ontology, &manifest_path, &pack) {
+            failed = true;
+            entries.push(pack_matrix_entry_failure(
+                ontology,
+                &manifest_path,
+                error.to_string(),
+                None,
+            ));
+            continue;
+        }
+
         let report_dir = config.report_dir.join(&ontology.name);
-        let result = run_pack(PackConfig {
+        let pack_config = PackConfig {
             nrese_base_url: config.nrese_base_url.clone(),
             fuseki_base_url: config.fuseki_base_url.clone(),
             fuseki_basic_auth: config.fuseki_basic_auth.clone(),
             workload_pack_path: manifest_path.clone(),
             iterations: config.iterations,
             report_dir: Some(report_dir),
-        })
-        .await;
+        };
+        let result = run_loaded_pack(&pack_config, pack).await;
 
         match result {
             Ok(()) => entries.push(pack_matrix_entry_success(ontology, &manifest_path, pack_report)),

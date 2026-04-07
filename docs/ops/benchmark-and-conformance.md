@@ -226,6 +226,7 @@ For real ontology runs, prefer:
 - `benches/nrese-bench-harness/fixtures/compat/ontologies/baseline_cases.json`
 - `pack-matrix` can execute all catalog-backed baseline packs for one tier and emits a top-level `pack-matrix-report.json` alongside per-pack `pack-report.json` evidence
 - `pack-matrix` filters operate on the typed ontology catalog metadata, so the same catalog now acts as both fixture inventory and execution selector for targeted evidence runs
+- `pack-matrix` also validates each catalog-backed baseline pack before execution so pack identity, dataset path, and required compat suites stay aligned with the ontology catalog
 
 Prebuilt ontology packs now exist for:
 
@@ -240,6 +241,14 @@ Prebuilt ontology packs now exist for:
 - `vcard`
 - `dcterms`
 - `odrl`
+
+Each checked-in ontology baseline pack is expected to include:
+
+- the shared `baseline_cases.json` suite
+- the ontology-specific `<ontology>_cases.json` suite
+- the shared `rdf_xml_cases.json` suite when the catalog serialization is RDF/XML
+
+That requirement is validated by the harness for catalog-driven pack execution.
 
 ## 0. Reproducible Dataset Parity
 

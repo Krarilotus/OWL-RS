@@ -9,6 +9,7 @@ mod layout;
 mod model;
 mod normalize;
 mod payloads;
+mod pack_validation;
 mod runner;
 
 use std::env;

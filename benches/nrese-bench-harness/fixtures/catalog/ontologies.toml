@@ -11,8 +11,8 @@ focus_terms = [
   "http://xmlns.com/foaf/0.1/Agent",
 ]
 semantic_dialects = ["rdfs", "owl", "foaf"]
-reasoning_features = ["subclass-closure", "domain-range-typing"]
-service_coverage = ["catalog-sync", "tell", "query", "reasoner", "benchmark"]
+reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "org"
@@ -76,7 +76,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "skos"]
 reasoning_features = ["subproperty-closure", "transitive-property", "inverse-property", "domain-range-typing"]
-service_coverage = ["catalog-sync", "tell", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "sosa"
@@ -91,7 +91,7 @@ focus_terms = [
   "http://www.w3.org/ns/sosa/hasFeatureOfInterest",
 ]
 semantic_dialects = ["rdfs", "owl", "sosa"]
-reasoning_features = ["subclass-closure", "domain-range-typing"]
+reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "list-axioms"]
 service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
@@ -107,7 +107,7 @@ focus_terms = [
   "http://www.w3.org/ns/ssn/forProperty",
 ]
 semantic_dialects = ["rdfs", "owl", "ssn"]
-reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property"]
+reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property", "list-axioms"]
 service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
@@ -171,5 +171,5 @@ focus_terms = [
   "http://www.w3.org/ns/odrl/2/permission",
 ]
 semantic_dialects = ["rdfs", "owl", "odrl"]
-reasoning_features = ["subclass-closure", "restrictions", "list-axioms"]
+reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "restrictions", "list-axioms"]
 service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]

@@ -1,0 +1,16 @@
+[
+  {
+    "name": "vcard-has-address-range-declared",
+    "operation": "query",
+    "query": "PREFIX vcard: <http://www.w3.org/2006/vcard/ns#> ASK WHERE { vcard:hasAddress <http://www.w3.org/2000/01/rdf-schema#range> vcard:Address }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "vcard-adr-equivalent-property-declared",
+    "operation": "query",
+    "query": "PREFIX vcard: <http://www.w3.org/2006/vcard/ns#> ASK WHERE { vcard:adr <http://www.w3.org/2002/07/owl#equivalentProperty> vcard:hasAddress }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  }
+]

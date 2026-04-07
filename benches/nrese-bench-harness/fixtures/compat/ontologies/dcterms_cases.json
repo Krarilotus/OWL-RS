@@ -1,0 +1,16 @@
+[
+  {
+    "name": "dcterms-creator-subproperty-of-contributor",
+    "operation": "query",
+    "query": "PREFIX dcterms: <http://purl.org/dc/terms/> ASK WHERE { dcterms:creator <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> dcterms:contributor }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "dcterms-creator-equivalent-foaf-maker",
+    "operation": "query",
+    "query": "PREFIX dcterms: <http://purl.org/dc/terms/> PREFIX foaf: <http://xmlns.com/foaf/0.1/> ASK WHERE { dcterms:creator <http://www.w3.org/2002/07/owl#equivalentProperty> foaf:maker }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  }
+]

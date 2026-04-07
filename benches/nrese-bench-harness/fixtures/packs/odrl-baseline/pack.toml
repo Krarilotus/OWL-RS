@@ -2,4 +2,7 @@ name = "odrl-baseline"
 dataset = "../../catalog-cache/odrl.ttl"
 query_workload = "../../workloads/ontology_query_workload.json"
 update_workload = "../../workloads/update_workload.json"
-compat_suites = ["../../compat/ontologies/baseline_cases.json"]
+compat_suites = [
+  "../../compat/ontologies/baseline_cases.json",
+  "../../compat/ontologies/odrl_cases.json",
+]

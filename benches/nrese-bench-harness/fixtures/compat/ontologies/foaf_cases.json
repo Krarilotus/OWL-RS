@@ -1,0 +1,16 @@
+[
+  {
+    "name": "foaf-maker-inverse-declared",
+    "operation": "query",
+    "query": "PREFIX foaf: <http://xmlns.com/foaf/0.1/> ASK WHERE { foaf:maker <http://www.w3.org/2002/07/owl#inverseOf> foaf:made }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "foaf-homepage-subproperties-declared",
+    "operation": "query",
+    "query": "PREFIX foaf: <http://xmlns.com/foaf/0.1/> ASK WHERE { foaf:homepage <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> foaf:page, foaf:isPrimaryTopicOf }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  }
+]

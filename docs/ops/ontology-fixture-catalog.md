@@ -161,6 +161,14 @@ Prebuilt workload packs:
 - `benches/nrese-bench-harness/fixtures/packs/dcterms-baseline/pack.toml`
 - `benches/nrese-bench-harness/fixtures/packs/odrl-baseline/pack.toml`
 
+Catalog-backed baseline packs are validated against the catalog before `pack-matrix` execution. That validation currently checks:
+
+- pack name matches `<ontology>-baseline`
+- dataset filename matches the ontology catalog entry
+- `baseline_cases.json` is present
+- `<ontology>_cases.json` is present
+- `rdf_xml_cases.json` is present for RDF/XML catalog entries
+
 Example:
 
 ```powershell

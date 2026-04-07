@@ -1,0 +1,16 @@
+[
+  {
+    "name": "odrl-permission-domain-range-declared",
+    "operation": "query",
+    "query": "PREFIX odrl: <http://www.w3.org/ns/odrl/2/> ASK WHERE { odrl:permission <http://www.w3.org/2000/01/rdf-schema#domain> odrl:Policy ; <http://www.w3.org/2000/01/rdf-schema#range> odrl:Permission }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  },
+  {
+    "name": "odrl-assignee-subproperty-of-function",
+    "operation": "query",
+    "query": "PREFIX odrl: <http://www.w3.org/ns/odrl/2/> ASK WHERE { odrl:assignee <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> odrl:function }",
+    "accept": "application/sparql-results+json",
+    "kind": "ask-boolean"
+  }
+]
