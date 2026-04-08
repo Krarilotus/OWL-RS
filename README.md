@@ -68,13 +68,14 @@ Implemented today:
 - ontology-backed compat suites in the benchmark harness are now grouped under a dedicated `fixtures/compat/ontologies/` path, and every checked-in baseline ontology pack now carries a dedicated ontology-specific suite on top of the shared ontology baseline suite
 - RDF/XML catalog baseline packs now also carry the shared `rdf_xml_cases.json` suite, so syntax-specific graph/query parity stays on the same pack path as ontology-specific schema parity
 - the benchmark harness now also supports a catalog-driven `pack-matrix` run that executes all baseline ontology packs for a selected catalog tier and writes one aggregate `pack-matrix-report.json` evidence index
-- `pack-matrix` can now also filter by ontology semantic dialect, reasoning feature, and service coverage, so catalog metadata drives targeted evidence runs instead of only describing fixtures
+- `pack-matrix` can now also filter by ontology semantic dialect, reasoning feature, and service coverage, including an explicit `compat` surface for official ontology fixtures that are curated for Fuseki parity runs
 - `pack-matrix` can now also target one exact ontology name on the same selector path, so secured live parity can be narrowed to a single official ontology without forking pack manifests
 - `pack-matrix` now validates catalog-backed baseline packs before execution, so pack naming, dataset alignment, and required compat-suite coverage stay consistent with the ontology catalog instead of drifting silently
 - the store preload path now derives a file base IRI for ontology parsing, so official Turtle vocabularies with relative ontology IRIs like PROV-O load on the same typed ingest path as the rest of the catalog
+- graph-store and `tell` RDF ingest now also honor `Content-Location` as an explicit base-IRI hint, and workload packs can carry `dataset_base_iri` so live parity seeding uses the same typed path for relative-IRI ontologies
 - protocol compatibility harness coverage for query parity, limit/offset query semantics, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-parity slice, and bounded query/update failure-parity fixtures for covered negative cases
 - graph payload parity now canonicalizes Turtle, N-Triples, and RDF/XML onto one triples-set comparator path instead of treating RDF/XML as an opaque response class
-- local live side-by-side parity has now been exercised against Apache Jena Fuseki 6.0.0 on official FOAF, ORG, and SKOS ontology packs, with report artifacts under `artifacts/manual-live-parity-*`
+- local live side-by-side parity has now been exercised against Apache Jena Fuseki 6.0.0 on official FOAF, ORG, SKOS, Time, SOSA, DCAT, vCard, DCMI Terms, PROV-O, SSN, and ODRL ontology packs, with report artifacts under `artifacts/manual-live-parity-*`
 - bounded `bearer-jwt` auth alongside `bearer-static`
 - bounded proxy-terminated `mtls` auth alongside the existing bearer modes
 - bounded `oidc-introspection` auth alongside the existing bearer and proxy-terminated `mtls` modes

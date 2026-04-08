@@ -200,6 +200,7 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .get("--dataset")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from(DEFAULT_SEED_DATASET_PATH)),
+                dataset_base_iri: options.get("--dataset-base-iri").cloned(),
                 content_type: options.get("--content-type").cloned(),
                 replace: options
                     .get("--replace")
@@ -289,6 +290,7 @@ fn parse_reasoning_feature(value: &str) -> Result<OntologyReasoningFeature> {
 fn parse_service_coverage(value: &str) -> Result<OntologyServiceSurface> {
     match value {
         "catalog-sync" => Ok(OntologyServiceSurface::CatalogSync),
+        "compat" => Ok(OntologyServiceSurface::Compat),
         "tell" => Ok(OntologyServiceSurface::Tell),
         "graph-store" => Ok(OntologyServiceSurface::GraphStore),
         "query" => Ok(OntologyServiceSurface::Query),
@@ -355,7 +357,7 @@ USAGE:
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--execution-mode <full|compat-only>] --workload-pack <PATH> [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validate [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--execution-mode <full|compat-only>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--dataset <PATH>] [--content-type <TYPE>] [--replace <true|false>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--dataset <PATH>] [--dataset-base-iri <IRI>] [--content-type <TYPE>] [--replace <true|false>]
 "
     );
 }

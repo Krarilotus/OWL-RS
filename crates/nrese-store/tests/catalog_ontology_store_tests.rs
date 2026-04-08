@@ -68,6 +68,7 @@ fn store_graph_roundtrip_accepts_official_vcard_turtle_fixture()
     service.execute_graph_write(&GraphWriteRequest {
         target: target.clone(),
         format: GraphResultFormat::Turtle,
+        base_iri: None,
         payload,
         replace: true,
     })?;

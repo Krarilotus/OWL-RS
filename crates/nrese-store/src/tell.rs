@@ -10,6 +10,7 @@ use crate::update::SparqlUpdateRequest;
 pub struct TellRequest {
     pub target: GraphTarget,
     pub format: GraphResultFormat,
+    pub base_iri: Option<String>,
     pub payload: Vec<u8>,
 }
 
@@ -20,6 +21,7 @@ pub fn compile_tell_update(request: &TellRequest) -> StoreResult<SparqlUpdateReq
         &GraphWriteRequest {
             target: request.target.clone(),
             format: request.format,
+            base_iri: request.base_iri.clone(),
             payload: request.payload.clone(),
             replace: false,
         },
@@ -58,6 +60,7 @@ mod tests {
         let request = TellRequest {
             target: GraphTarget::DefaultGraph,
             format: GraphResultFormat::Turtle,
+            base_iri: None,
             payload: br#"@prefix ex: <http://example.com/> .
 ex:s ex:p ex:o .
 "#
@@ -79,6 +82,7 @@ ex:s ex:p ex:o .
         let request = TellRequest {
             target: GraphTarget::NamedGraph("http://example.com/g".to_owned()),
             format: GraphResultFormat::Turtle,
+            base_iri: None,
             payload: br#"@prefix ex: <http://example.com/> .
 ex:s ex:p "value" .
 "#

@@ -208,11 +208,22 @@ pub async fn run_seed(config: SeedConfig) -> Result<()> {
 
     println!("== Dataset seed run ==");
     println!("dataset: {}", config.dataset_path.display());
+    if let Some(base_iri) = &config.dataset_base_iri {
+        println!("dataset base IRI: {base_iri}");
+    }
     println!("content-type: {}", content_type);
     println!("replace mode: {}", config.replace);
 
     for target in targets {
-        write_dataset_raw(&client, &target, &payload, &content_type, config.replace).await?;
+        write_dataset_raw(
+            &client,
+            &target,
+            &payload,
+            &content_type,
+            config.dataset_base_iri.as_deref(),
+            config.replace,
+        )
+        .await?;
         println!("seeded {} via {}", target.label, target.data_endpoint());
     }
 
@@ -253,6 +264,7 @@ pub async fn run_validate_pack(config: ValidatePackConfig) -> Result<()> {
                 connection_profiles_path: prepared.connection_profiles_path.clone(),
                 connection_profile_name: prepared.connection_profile_name.clone(),
                 dataset_path: prepared.pack.dataset.display().to_string(),
+                dataset_base_iri: prepared.pack.dataset_base_iri.clone(),
                 nrese_base_url: prepared.nrese_connection.base_url.clone(),
                 fuseki_base_url: prepared
                     .fuseki_connection
@@ -305,6 +317,7 @@ async fn run_loaded_pack(config: &PackConfig, prepared: PreparedPackRun) -> Resu
                     .as_ref()
                     .map(|connection| merge_pack_service_profile(connection, &pack.fuseki)),
                 dataset_path: pack.dataset.clone(),
+                dataset_base_iri: pack.dataset_base_iri.clone(),
                 content_type: None,
                 replace: true,
             })
@@ -392,6 +405,7 @@ async fn run_loaded_pack(config: &PackConfig, prepared: PreparedPackRun) -> Resu
                 connection_profile_name: prepared.connection_profile_name,
                 execution_mode: config.execution_mode,
                 dataset_path: pack.dataset.display().to_string(),
+                dataset_base_iri: pack.dataset_base_iri.clone(),
                 nrese_base_url: nrese_connection.base_url,
                 fuseki_base_url: fuseki_connection.map(|connection| connection.base_url),
                 iterations,
@@ -492,8 +506,14 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
             continue;
         }
 
-        let prepared = match prepare_pack_run(
+        let mut pack = pack;
+        if pack.dataset_base_iri.is_none() {
+            pack.dataset_base_iri = Some(ontology.url.clone());
+        }
+
+        let prepared = match prepare_loaded_pack_run(
             &manifest_path,
+            pack,
             config.connection_profiles_path.as_deref(),
             config.connection_profile_name.as_deref(),
             Some(live_connections.nrese.base_url.as_str()),
@@ -1033,8 +1053,12 @@ async fn write_dataset_raw(
     target: &ServiceTarget,
     payload: &[u8],
     content_type: &str,
+    base_iri: Option<&str>,
     replace: bool,
 ) -> Result<()> {
+    let extra_headers = base_iri
+        .map(|value| CompatHeaders::from([("content-location".to_owned(), value.to_owned())]))
+        .unwrap_or_default();
     let outcome = execute_graph_write_raw(
         client,
         target,
@@ -1043,7 +1067,7 @@ async fn write_dataset_raw(
             content_type,
             payload,
             replace,
-            extra_headers: &CompatHeaders::new(),
+            extra_headers: &extra_headers,
             options: RequestExecutionOptions::default(),
         },
     )
@@ -1150,6 +1174,7 @@ fn reasoning_feature_label(feature: OntologyReasoningFeature) -> &'static str {
 fn service_surface_label(surface: OntologyServiceSurface) -> &'static str {
     match surface {
         OntologyServiceSurface::CatalogSync => "catalog-sync",
+        OntologyServiceSurface::Compat => "compat",
         OntologyServiceSurface::Tell => "tell",
         OntologyServiceSurface::GraphStore => "graph-store",
         OntologyServiceSurface::Query => "query",
@@ -1476,6 +1501,50 @@ mod tests {
         };
         let non_matching = PackMatrixConfig {
             ontology_name: Some("foaf".to_owned()),
+            ..matching.clone()
+        };
+
+        assert!(pack_matrix_matches_filters(&ontology, &matching));
+        assert!(!pack_matrix_matches_filters(&ontology, &non_matching));
+    }
+
+    #[test]
+    fn pack_matrix_filter_matches_compat_service_coverage() {
+        let ontology = OntologyFixture {
+            name: "org".to_owned(),
+            title: "ORG".to_owned(),
+            url: "https://www.w3.org/ns/org.ttl".to_owned(),
+            media_type: "text/turtle".to_owned(),
+            serialization: OntologySerialization::Turtle,
+            filename: "org.ttl".to_owned(),
+            tier: "medium".to_owned(),
+            focus_terms: vec!["http://www.w3.org/ns/org#Organization".to_owned()],
+            semantic_dialects: vec![OntologySemanticDialect::Org],
+            reasoning_features: vec![OntologyReasoningFeature::InverseProperty],
+            service_coverage: vec![
+                OntologyServiceSurface::Compat,
+                OntologyServiceSurface::Reasoner,
+            ],
+        };
+        let matching = PackMatrixConfig {
+            nrese_base_url: Some("http://127.0.0.1:8080".to_owned()),
+            fuseki_base_url: None,
+            fuseki_basic_auth: None,
+            connection_profiles_path: None,
+            connection_profile_name: None,
+            catalog_path: "catalog.toml".into(),
+            packs_dir: "packs".into(),
+            ontology_name: None,
+            execution_mode: PackExecutionMode::Full,
+            tier: None,
+            semantic_dialect: None,
+            reasoning_feature: None,
+            service_coverage: Some(OntologyServiceSurface::Compat),
+            iterations: 20,
+            report_dir: "artifacts".into(),
+        };
+        let non_matching = PackMatrixConfig {
+            service_coverage: Some(OntologyServiceSurface::Benchmark),
             ..matching.clone()
         };
 

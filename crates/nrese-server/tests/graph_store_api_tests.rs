@@ -116,6 +116,39 @@ async fn graph_roundtrip_supports_rdf_xml() -> Result<(), Box<dyn std::error::Er
 }
 
 #[tokio::test]
+async fn graph_put_honors_content_location_as_base_iri() -> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app()?;
+    let put_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/data")
+                .method(Method::PUT)
+                .header("content-type", "text/turtle")
+                .header("content-location", "https://www.w3.org/ns/prov.ttl")
+                .body(Body::from(
+                    "@prefix : <#> . :generated <http://www.w3.org/2002/07/owl#inverseOf> :wasGeneratedBy .",
+                ))?,
+        )
+        .await?;
+    assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
+
+    let get_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query?query=PREFIX%20owl%3A%20%3Chttp%3A%2F%2Fwww.w3.org%2F2002%2F07%2Fowl%23%3E%20ASK%20WHERE%20%7B%20%3Chttps%3A%2F%2Fwww.w3.org%2Fns%2Fprov.ttl%23generated%3E%20owl%3AinverseOf%20%3Chttps%3A%2F%2Fwww.w3.org%2Fns%2Fprov.ttl%23wasGeneratedBy%3E%20%7D")
+                .method(Method::GET)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(get_response.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(body.to_vec())?.contains("true"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn graph_put_returns_ok_when_replacing_existing_named_graph()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app()?;

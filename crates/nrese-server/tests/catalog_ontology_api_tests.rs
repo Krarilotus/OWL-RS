@@ -142,6 +142,43 @@ async fn startup_with_official_prov_preload_supports_relative_base_iris()
 }
 
 #[tokio::test]
+async fn graph_store_roundtrip_accepts_official_prov_turtle_with_content_location_base_iri()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_settings(
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+    )?;
+    let prov_bytes = fs::read(catalog_fixture_path("prov.ttl"))?;
+
+    let put_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/data?graph=http%3A%2F%2Fexample.com%2Fontologies%2Fprov")
+                .method(Method::PUT)
+                .header("content-type", "text/turtle")
+                .header("content-location", "https://www.w3.org/ns/prov.ttl")
+                .body(Body::from(prov_bytes))?,
+        )
+        .await?;
+    assert_eq!(put_response.status(), StatusCode::CREATED);
+
+    let query_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query?query=PREFIX%20owl%3A%20%3Chttp%3A%2F%2Fwww.w3.org%2F2002%2F07%2Fowl%23%3E%20PREFIX%20prov%3A%20%3Chttp%3A%2F%2Fwww.w3.org%2Fns%2Fprov%23%3E%20ASK%20WHERE%20%7B%20GRAPH%20%3Chttp%3A%2F%2Fexample.com%2Fontologies%2Fprov%3E%20%7B%20prov%3Agenerated%20owl%3AinverseOf%20prov%3AwasGeneratedBy%20%7D%20%7D")
+                .method(Method::GET)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(query_response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(query_response.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(body.to_vec())?.contains("true"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn graph_store_roundtrip_accepts_official_skos_rdf_xml_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(

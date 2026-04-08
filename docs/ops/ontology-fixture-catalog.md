@@ -108,7 +108,10 @@ Each ontology entry in `ontologies.toml` must define:
 - `reasoning_features`
   - current typed values include `subclass-closure`, `subproperty-closure`, `domain-range-typing`, `inverse-property`, `transitive-property`, `symmetric-property`, `disjointness`, `identity`, `restrictions`, `list-axioms`
 - `service_coverage`
-  - current typed values include `catalog-sync`, `tell`, `graph-store`, `query`, `reasoner`, `benchmark`
+  - current typed values include `catalog-sync`, `compat`, `tell`, `graph-store`, `query`, `reasoner`, `benchmark`
+  - `compat` marks official ontology fixtures that are curated for Fuseki parity checks through baseline packs and `pack-matrix`
+
+For live parity seeding, workload packs may also carry `dataset_base_iri`. The harness forwards that value as `Content-Location` on RDF uploads so official Turtle vocabularies with relative IRIs, such as PROV-O, can be exercised on the same Graph Store parity path as the rest of the catalog.
 
 The harness validates that these fields are present when reading the catalog, so the catalog remains a real source of truth instead of a loose download list.
 

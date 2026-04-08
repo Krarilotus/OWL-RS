@@ -9,7 +9,7 @@ param(
     [string]$Ontology,
     [string]$SemanticDialect,
     [string]$ReasoningFeature,
-    [string]$ServiceCoverage,
+    [string]$ServiceCoverage = "compat",
     [string]$ReportDir = "artifacts/local-fuseki-pack-matrix",
     [string]$ReasoningMode = "rules-mvp",
     [string]$ReasonerPreset = "bounded-owl",

@@ -1,4 +1,5 @@
 use axum::extract::RawQuery;
+use axum::http::{HeaderMap, header};
 
 use nrese_store::{GraphResultFormat, GraphTarget};
 
@@ -71,6 +72,15 @@ pub fn parse_tell_content_format(
     parse_labeled_rdf_content_format(content_type, "tell")
 }
 
+pub fn parse_rdf_base_iri(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::CONTENT_LOCATION)
+        .and_then(|value| crate::http::media::header_value_str(Some(value)))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 fn parse_labeled_rdf_content_format(
     content_type: Option<&str>,
     surface: &str,
@@ -102,7 +112,12 @@ mod tests {
     use axum::extract::RawQuery;
     use nrese_store::{GraphResultFormat, GraphTarget};
 
-    use super::{parse_graph_content_format, parse_graph_target, parse_tell_content_format};
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    use super::{
+        parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
+        parse_tell_content_format,
+    };
 
     #[test]
     fn graph_target_defaults_to_default_graph() {
@@ -155,5 +170,19 @@ mod tests {
         let error = parse_tell_content_format(Some("application/json"))
             .expect_err("tell content type should fail");
         assert!(error.to_string().contains("unsupported tell content type"));
+    }
+
+    #[test]
+    fn rdf_base_iri_reads_content_location_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LOCATION,
+            HeaderValue::from_static("https://www.w3.org/ns/prov.ttl"),
+        );
+
+        assert_eq!(
+            parse_rdf_base_iri(&headers).as_deref(),
+            Some("https://www.w3.org/ns/prov.ttl")
+        );
     }
 }

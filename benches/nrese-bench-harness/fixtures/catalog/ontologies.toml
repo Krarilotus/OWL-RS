@@ -12,7 +12,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "foaf"]
 reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "org"
@@ -28,7 +28,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "org"]
 reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "time"
@@ -44,7 +44,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "time"]
 reasoning_features = ["subclass-closure", "transitive-property", "inverse-property"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "prov"
@@ -60,7 +60,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "prov-o"]
 reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "skos"
@@ -76,7 +76,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "skos"]
 reasoning_features = ["subproperty-closure", "transitive-property", "inverse-property", "domain-range-typing"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "sosa"
@@ -92,7 +92,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "sosa"]
 reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "list-axioms"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "ssn"
@@ -108,7 +108,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "ssn"]
 reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property", "list-axioms"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "dcat"
@@ -124,7 +124,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "dcat"]
 reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "inverse-property"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "vcard"
@@ -140,7 +140,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "vcard"]
 reasoning_features = ["subclass-closure", "domain-range-typing", "inverse-property"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "dcterms"
@@ -156,7 +156,7 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "dcmi-terms"]
 reasoning_features = ["subproperty-closure", "domain-range-typing"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]
 name = "odrl"
@@ -172,4 +172,4 @@ focus_terms = [
 ]
 semantic_dialects = ["rdfs", "owl", "odrl"]
 reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "restrictions", "list-axioms"]
-service_coverage = ["catalog-sync", "tell", "graph-store", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]

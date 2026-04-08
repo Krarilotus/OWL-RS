@@ -6,7 +6,9 @@ use nrese_store::{GraphReadRequest, GraphWriteRequest};
 
 use crate::error::ApiError;
 use crate::http::media::{header_value_str, media_type_matches};
-use crate::http::rdf_payload::{ensure_ready, parse_graph_content_format, parse_graph_target};
+use crate::http::rdf_payload::{
+    ensure_ready, parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
+};
 use crate::policy::PolicyAction;
 use crate::state::AppState;
 
@@ -129,6 +131,7 @@ async fn write_graph(
     let request = GraphWriteRequest {
         target,
         format,
+        base_iri: parse_rdf_base_iri(&headers),
         payload: body.to_vec(),
         replace,
     };

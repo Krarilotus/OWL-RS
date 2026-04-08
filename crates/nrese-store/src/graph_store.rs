@@ -22,6 +22,7 @@ pub struct GraphReadResult {
 pub struct GraphWriteRequest {
     pub target: GraphTarget,
     pub format: GraphResultFormat,
+    pub base_iri: Option<String>,
     pub payload: Vec<u8>,
     pub replace: bool,
 }

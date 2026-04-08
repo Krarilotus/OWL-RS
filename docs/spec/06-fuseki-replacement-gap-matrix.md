@@ -44,8 +44,9 @@ Current coverage:
 - secured workload-pack compat suites are now preflight-validated against the selected connection profile plus pack-local invocation profiles, so profile drift fails before seed/bench execution
 - the harness now exposes that preflight as a first-class `pack-validate` step with optional machine-readable report output for CI and deployment workflows
 - workload-pack execution now emits a canonical `pack-report.json` evidence index that ties compat suites and benchmark artifacts together
-- local live side-by-side parity has now been demonstrated against a local Apache Jena Fuseki 6.0.0 install on official FOAF, ORG, and SKOS packs, with report artifacts emitted from the same `pack-matrix` / `pack-report.json` path used for the generic harness runs
+- local live side-by-side parity has now been demonstrated against a local Apache Jena Fuseki 6.0.0 install on official FOAF, ORG, SKOS, Time, SOSA, DCAT, vCard, DCMI Terms, PROV-O, SSN, and ODRL packs, with report artifacts emitted from the same `pack-matrix` / `pack-report.json` path used for the generic harness runs
 - graph-result parity now canonicalizes blank nodes before triples-set comparison, so official ontology `CONSTRUCT` cases compare graph isomorphism instead of raw blank-node labels
+- official ontology live seeding now supports explicit RDF base IRIs through `Content-Location` and harness-side `dataset_base_iri`, so relative-IRI vocabularies such as PROV-O run on the same live Graph Store parity path as the rest of the catalog
 
 Still required:
 - formal replacement-grade validation against the live Fuseki deployment
@@ -186,7 +187,7 @@ Current coverage:
 
 Still required:
 - comparisons against the real Fuseki deployment and real ontology/workload
-- broader live parity coverage across the remaining official ontology packs beyond the currently verified FOAF, ORG, and SKOS local side-by-side runs
+- broader live parity coverage across the remaining official ontology packs beyond the currently verified small/medium/broad local side-by-side runs
 - broader ontology-driven cross-service and reasoner validation on catalog fixtures beyond the current official baseline packs and asserted-schema parity slices now checked across FOAF, ORG, Time, SKOS, PROV-O, DCAT, SOSA, SSN, vCard, DCMI Terms, and ODRL
 - latency, startup, RAM, CPU, and reasoning cost measurements
 - regression thresholds in CI

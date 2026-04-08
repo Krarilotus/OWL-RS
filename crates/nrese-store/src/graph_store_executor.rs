@@ -93,7 +93,8 @@ fn clear_target_graph_in_transaction(
 }
 
 fn parser_for_target(request: &GraphWriteRequest) -> StoreResult<RdfParser> {
-    let parser = parser_for_graph_format(request.format, None)?.without_named_graphs();
+    let parser = parser_for_graph_format(request.format, request.base_iri.as_deref())?
+        .without_named_graphs();
 
     let parser = match &request.target {
         GraphTarget::DefaultGraph => parser,

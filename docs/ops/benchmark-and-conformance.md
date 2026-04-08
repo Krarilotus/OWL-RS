@@ -214,6 +214,7 @@ Each catalog entry now also declares typed processing metadata:
 - `semantic_dialects`
 - `reasoning_features`
 - `service_coverage`
+  - `compat` is the canonical selector for official ontology fixtures that should participate in Fuseki parity runs
 
 Sync them locally:
 
@@ -238,6 +239,8 @@ For real ontology runs, prefer:
 - `pack-matrix` filters operate on the typed ontology catalog metadata, so the same catalog now acts as both fixture inventory and execution selector for targeted evidence runs
 - `pack-matrix` can also target one exact ontology name on the same selector path when a live parity run needs to stay narrowly scoped
 - `pack-matrix` also validates each catalog-backed baseline pack before execution so pack identity, dataset path, and required compat suites stay aligned with the ontology catalog
+- `pack-matrix` uses the explicit `compat` service surface to select official ontology fixtures that are curated for Fuseki parity runs
+- workload packs can carry `dataset_base_iri`; the live seed path forwards that value as `Content-Location`, so relative-IRI ontologies like PROV-O stay on the same Graph Store parity path as the rest of the catalog
 
 Prebuilt ontology packs now exist for:
 
@@ -537,6 +540,12 @@ Additional verified local side-by-side evidence now exists against a locally unp
 - SKOS:
   - `artifacts/manual-live-parity-skos/pack-matrix-report.json`
   - `artifacts/manual-live-parity-skos/skos/pack-report.json`
+- Medium official ontology matrix:
+  - `artifacts/manual-live-parity-medium-inline/pack-matrix-report.json`
+  - includes ORG, Time, SKOS, SOSA, DCAT, vCard, and DCMI Terms
+- Broad official ontology matrix:
+  - `artifacts/manual-live-parity-broad-inline-3/pack-matrix-report.json`
+  - includes PROV-O, SSN, and ODRL
 
 Those local runs were executed with:
 
@@ -546,7 +555,7 @@ Those local runs were executed with:
 
 Observed local benchmark trend in those artifact sets:
 
-- NRESE query p95 was lower than Fuseki on FOAF, ORG, and SKOS in these in-memory local runs
+- NRESE query p95 was lower than Fuseki on the previously captured FOAF, ORG, and SKOS single-pack local runs
 - NRESE update p95 was higher than Fuseki on the same runs
 
 These numbers are informative, not release gates. Replacement-grade evidence still requires the secured live workload packs against the project-specific deployment.
@@ -609,9 +618,9 @@ Example:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\ops\fuseki\run-local-pack-matrix.ps1 `
-  -Ontology skos `
+  -Tier medium `
   -ExecutionMode full `
-  -ReportDir artifacts\local-fuseki-skos
+  -ReportDir artifacts\local-fuseki-medium
 ```
 
-The helper keeps the external Fuseki process outside the git repo, starts NRESE on an isolated local port, and writes logs plus harness reports into the chosen artifact directory.
+The helper keeps the external Fuseki process outside the git repo, starts NRESE on an isolated local port, defaults `-ServiceCoverage compat`, and writes logs plus harness reports into the chosen artifact directory.

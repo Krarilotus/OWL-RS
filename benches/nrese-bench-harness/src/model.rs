@@ -52,6 +52,7 @@ pub struct SeedConfig {
     pub nrese: ServiceConnectionConfig,
     pub fuseki: Option<ServiceConnectionConfig>,
     pub dataset_path: PathBuf,
+    pub dataset_base_iri: Option<String>,
     pub content_type: Option<String>,
     pub replace: bool,
 }
@@ -110,6 +111,8 @@ pub struct PackMatrixConfig {
 pub struct WorkloadPackManifest {
     pub name: String,
     pub dataset: PathBuf,
+    #[serde(default)]
+    pub dataset_base_iri: Option<String>,
     pub query_workload: PathBuf,
     pub update_workload: PathBuf,
     #[serde(default)]
@@ -190,6 +193,7 @@ pub enum OntologyReasoningFeature {
 #[serde(rename_all = "kebab-case")]
 pub enum OntologyServiceSurface {
     CatalogSync,
+    Compat,
     Tell,
     GraphStore,
     Query,
@@ -455,6 +459,7 @@ pub struct PackReport {
     pub connection_profile_name: Option<String>,
     pub execution_mode: PackExecutionMode,
     pub dataset_path: String,
+    pub dataset_base_iri: Option<String>,
     pub nrese_base_url: String,
     pub fuseki_base_url: Option<String>,
     pub iterations: usize,
@@ -472,6 +477,7 @@ pub struct PackValidationReport {
     pub connection_profiles_path: Option<String>,
     pub connection_profile_name: Option<String>,
     pub dataset_path: String,
+    pub dataset_base_iri: Option<String>,
     pub nrese_base_url: String,
     pub fuseki_base_url: Option<String>,
     pub compat_suites: Vec<String>,

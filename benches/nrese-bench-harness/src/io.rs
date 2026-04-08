@@ -116,6 +116,7 @@ mod tests {
             r#"
 name = "example"
 dataset = "../fixtures/seed.ttl"
+dataset_base_iri = "https://example.com/seed.ttl"
 query_workload = "../fixtures/query.json"
 update_workload = "../fixtures/update.json"
 compat_suites = ["../fixtures/compat.json"]
@@ -154,6 +155,10 @@ authorization = "Bearer ${NRESE_INVALID_TOKEN}"
         );
         assert_eq!(manifest.name, "example");
         assert_eq!(manifest.compat_suites.len(), 1);
+        assert_eq!(
+            manifest.dataset_base_iri.as_deref(),
+            Some("https://example.com/seed.ttl")
+        );
         assert_eq!(
             manifest
                 .nrese
@@ -236,7 +241,7 @@ tier = "broad"
 focus_terms = ["http://www.w3.org/ns/prov#Entity"]
 semantic_dialects = ["rdfs", "owl", "prov-o"]
 reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing"]
-service_coverage = ["catalog-sync", "tell", "query", "reasoner", "benchmark"]
+service_coverage = ["catalog-sync", "compat", "tell", "query", "reasoner", "benchmark"]
 "#,
         )
         .expect("catalog");

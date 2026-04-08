@@ -172,6 +172,7 @@ fn graph_store_named_graph_roundtrip() -> Result<(), Box<dyn std::error::Error>>
     let write_report = service.execute_graph_write(&GraphWriteRequest {
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:s ex:p ex:o .".to_vec(),
         replace: true,
     })?;
@@ -216,6 +217,7 @@ fn revision_increments_monotonically_across_mutations() -> Result<(), Box<dyn st
     let write_report = service.execute_graph_write(&GraphWriteRequest {
         target: GraphTarget::DefaultGraph,
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:s ex:p ex:o .".to_vec(),
         replace: true,
     })?;
@@ -237,18 +239,21 @@ fn graph_write_replace_true_replaces_only_target_graph() -> Result<(), Box<dyn s
     service.execute_graph_write(&GraphWriteRequest {
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:old ex:p ex:one .".to_vec(),
         replace: true,
     })?;
     service.execute_graph_write(&GraphWriteRequest {
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:new ex:p ex:two .".to_vec(),
         replace: true,
     })?;
     service.execute_graph_write(&GraphWriteRequest {
         target: GraphTarget::DefaultGraph,
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:default ex:p ex:v .".to_vec(),
         replace: true,
     })?;
@@ -274,18 +279,45 @@ fn graph_write_reports_existing_named_graph_replacements_as_not_created()
     let first = service.execute_graph_write(&GraphWriteRequest {
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:first ex:p ex:one .".to_vec(),
         replace: true,
     })?;
     let second = service.execute_graph_write(&GraphWriteRequest {
         target: named_graph,
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:second ex:p ex:two .".to_vec(),
         replace: true,
     })?;
 
     assert!(first.created);
     assert!(!second.created);
+
+    Ok(())
+}
+
+#[test]
+fn graph_write_accepts_relative_iris_when_base_iri_is_provided()
+-> Result<(), Box<dyn std::error::Error>> {
+    let service = new_in_memory_service()?;
+
+    service.execute_graph_write(&GraphWriteRequest {
+        target: GraphTarget::DefaultGraph,
+        format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: Some("https://www.w3.org/ns/prov.ttl".to_owned()),
+        payload: b"@prefix : <#> . :generated <http://www.w3.org/2002/07/owl#inverseOf> :wasGeneratedBy ."
+            .to_vec(),
+        replace: true,
+    })?;
+
+    let ask = service.execute_query_str(
+        "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         ASK WHERE {
+           <https://www.w3.org/ns/prov.ttl#generated> owl:inverseOf <https://www.w3.org/ns/prov.ttl#wasGeneratedBy>
+         }",
+    )?;
+    assert!(String::from_utf8(ask.payload)?.contains("true"));
 
     Ok(())
 }
@@ -298,12 +330,14 @@ fn graph_write_replace_false_appends_to_existing_graph() -> Result<(), Box<dyn s
     service.execute_graph_write(&GraphWriteRequest {
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:a ex:p ex:one .".to_vec(),
         replace: true,
     })?;
     service.execute_graph_write(&GraphWriteRequest {
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:b ex:p ex:two .".to_vec(),
         replace: false,
     })?;
@@ -328,12 +362,14 @@ fn graph_delete_only_affects_target_named_graph() -> Result<(), Box<dyn std::err
     service.execute_graph_write(&GraphWriteRequest {
         target: graph_one.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:g1 ex:p ex:o .".to_vec(),
         replace: true,
     })?;
     service.execute_graph_write(&GraphWriteRequest {
         target: graph_two.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
+        base_iri: None,
         payload: b"@prefix ex: <http://example.com/> . ex:g2 ex:p ex:o .".to_vec(),
         replace: true,
     })?;

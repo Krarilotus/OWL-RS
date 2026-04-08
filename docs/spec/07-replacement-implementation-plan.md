@@ -67,6 +67,7 @@ Implementation blocks:
 - broader SPARQL Update parity fixtures for the intended replacement scope before moving to live project-specific packs
 - bnode-isomorphic graph canonicalization for graph-producing parity cases so official ontology `CONSTRUCT` outputs compare semantics instead of raw blank-node labels
 - staged real-world ontology catalog with small-to-broad official ontology sources plus typed processing metadata to harden parity and performance work incrementally
+- explicit RDF base-IRI propagation for live ontology seeding so relative-IRI vocabularies stay on the same Graph Store parity path as the rest of the pack matrix
 - project-realistic compatibility packs against the live Fuseki deployment
 - CI wiring for repeatable compatibility execution
 - keep response-semantics normalization in one harness path so failure-parity checks do not fork into endpoint-specific comparators
@@ -301,7 +302,7 @@ Priority order for the next replacement-focused runs:
 - added a dedicated limit/offset semantics compat suite and a bindings-set comparator so query-window parity does not rely on count-only summaries
 - replaced the harness-local blank-node canonicalization path with upstream oxrdf graph canonicalization, which reduced custom comparison code while fixing local ORG `CONSTRUCT` parity against Fuseki
 - extended compat reports with optional result-count and diff-sample fields, and ensured `pack-report.json` is written even when a pack fails mid-run
-- verified local live side-by-side parity against a local Apache Jena Fuseki 6.0.0 install for the official FOAF, ORG, and SKOS packs on the standard `pack-matrix` evidence path
+- verified local live side-by-side parity against a local Apache Jena Fuseki 6.0.0 install for the official FOAF pack plus medium/broad official ontology pack-matrix runs on the standard `pack-matrix` evidence path
 - moved the class-consistency test block into a dedicated `src/tests/consistency_tests.rs` file to match the repo’s topic-adjacent unit-test convention
 - initialized git versioning for the repository and updated `.gitignore` for Rust, frontend, runtime, and local-secret artifacts
 - added a separate `/console` frontend application with modular React/TypeScript structure, separated styles/i18n, and basic build/test coverage

@@ -176,6 +176,7 @@ mod tests {
         let manifest = WorkloadPackManifest {
             name: "foaf-baseline".to_owned(),
             dataset: "fixtures/catalog-cache/foaf.rdf".into(),
+            dataset_base_iri: None,
             query_workload: "fixtures/workloads/query.json".into(),
             update_workload: "fixtures/workloads/update.json".into(),
             compat_suites: vec![
@@ -198,6 +199,7 @@ mod tests {
         let manifest = WorkloadPackManifest {
             name: "sosa-baseline".to_owned(),
             dataset: "fixtures/catalog-cache/sosa.ttl".into(),
+            dataset_base_iri: None,
             query_workload: "fixtures/workloads/query.json".into(),
             update_workload: "fixtures/workloads/update.json".into(),
             compat_suites: vec!["fixtures/compat/ontologies/baseline_cases.json".into()],
@@ -222,6 +224,7 @@ mod tests {
         let manifest = WorkloadPackManifest {
             name: "skos-baseline".to_owned(),
             dataset: "fixtures/catalog-cache/skos.rdf".into(),
+            dataset_base_iri: None,
             query_workload: "fixtures/workloads/query.json".into(),
             update_workload: "fixtures/workloads/update.json".into(),
             compat_suites: vec![

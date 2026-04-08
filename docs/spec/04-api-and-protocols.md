@@ -15,6 +15,7 @@ The API surface separates three concerns that should not be collapsed into one a
   - is separate from raw SPARQL Update text and separate from Graph Store transport semantics
   - must run through the same staged validation and publish gate as other write paths
   - currently accepts Turtle, N-Triples, and RDF/XML on the same typed RDF-format path used by ontology preload and Graph Store writes
+  - accepts `Content-Location` as an explicit base-IRI hint when relative IRIs are present in RDF payloads
 - `SERVICES`
   - splits into:
   - inbound service metadata and capability advertisement
@@ -72,6 +73,7 @@ Primary conformance targets:
 - Full graph store method coverage
 - Content negotiation for query and graph responses
 - Stable status code/error class behavior
+- Explicit base-IRI handling for RDF upload paths through `Content-Location`
 - Durable deployment profile support (persistent store mode, startup validation, recovery signaling)
 
 ### API Tier A3
