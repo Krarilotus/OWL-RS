@@ -8,7 +8,7 @@ use nrese_server::policy::{PolicyConfig, RateLimitConfig};
 use nrese_store::{StoreConfig, StoreMode};
 use tower::util::ServiceExt;
 
-use support::{test_app_with_policy, test_app_with_store_config};
+use support::{body_text, readyz_text, test_app_with_policy, test_app_with_store_config};
 
 fn admin_policy() -> PolicyConfig {
     PolicyConfig {
@@ -77,8 +77,7 @@ async fn backup_endpoint_returns_dataset_payload_with_expected_headers()
             .and_then(|value| value.to_str().ok()),
         Some("n-quads")
     );
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
+    let text = body_text(response).await?;
     assert!(text.contains("http://example.com/alice"));
 
     Ok(())
@@ -103,8 +102,7 @@ async fn restore_endpoint_replaces_dataset_and_updates_ready_surface()
         .await?;
 
     assert_eq!(restore.status(), StatusCode::OK);
-    let restore_body = axum::body::to_bytes(restore.into_body(), usize::MAX).await?;
-    let restore_text = String::from_utf8(restore_body.to_vec())?;
+    let restore_text = body_text(restore).await?;
     assert!(restore_text.contains("\"status\":\"restored\""));
     assert!(restore_text.contains("\"revision\":1"));
 
@@ -118,19 +116,9 @@ async fn restore_endpoint_replaces_dataset_and_updates_ready_surface()
                 .body(Body::empty())?,
         )
         .await?;
-    let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ask_body.to_vec())?.contains("true"));
+    assert!(body_text(ask).await?.contains("true"));
 
-    let ready = app
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    let ready_body = axum::body::to_bytes(ready.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ready_body.to_vec())?.contains("\"revision\":1"));
+    assert!(readyz_text(app).await?.contains("\"revision\":1"));
 
     Ok(())
 }
@@ -185,8 +173,7 @@ async fn restore_endpoint_rejects_invalid_payload_with_problem_json()
                 .body(Body::empty())?,
         )
         .await?;
-    let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ask_body.to_vec())?.contains("true"));
+    assert!(body_text(ask).await?.contains("true"));
 
     Ok(())
 }
@@ -217,8 +204,7 @@ async fn restore_endpoint_uses_reasoner_gate_and_rejects_without_publish()
         .await?;
 
     assert_eq!(restore.status(), StatusCode::BAD_REQUEST);
-    let restore_body = axum::body::to_bytes(restore.into_body(), usize::MAX).await?;
-    let restore_text = String::from_utf8(restore_body.to_vec())?;
+    let restore_text = body_text(restore).await?;
     assert!(restore_text.contains("reasoner_reject"));
     assert!(restore_text.contains("owl:disjointWith"));
 
@@ -232,19 +218,8 @@ async fn restore_endpoint_uses_reasoner_gate_and_rejects_without_publish()
                 .body(Body::empty())?,
         )
         .await?;
-    let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ask_body.to_vec())?.contains("false"));
-
-    let ready = app
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    let ready_body = axum::body::to_bytes(ready.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ready_body.to_vec())?.contains("\"revision\":0"));
+    assert!(body_text(ask).await?.contains("false"));
+    assert!(readyz_text(app).await?.contains("\"revision\":0"));
 
     Ok(())
 }

@@ -6,24 +6,14 @@ use nrese_reasoner::ReasonerConfig;
 use nrese_server::policy::PolicyConfig;
 use tower::util::ServiceExt;
 
-use support::{test_app, test_app_with_settings};
+use support::{query_text, readyz_text, test_app, test_app_with_settings};
 
 #[tokio::test]
 async fn malformed_update_keeps_ready_revision_unchanged() -> Result<(), Box<dyn std::error::Error>>
 {
     let app = test_app()?;
 
-    let initial_ready = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    let initial_body = axum::body::to_bytes(initial_ready.into_body(), usize::MAX).await?;
-    let initial_text = String::from_utf8(initial_body.to_vec())?;
+    let initial_text = readyz_text(app.clone()).await?;
     assert!(initial_text.contains("\"revision\":0"));
 
     let response = app
@@ -38,16 +28,7 @@ async fn malformed_update_keeps_ready_revision_unchanged() -> Result<(), Box<dyn
         .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let final_ready = app
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    let final_body = axum::body::to_bytes(final_ready.into_body(), usize::MAX).await?;
-    let final_text = String::from_utf8(final_body.to_vec())?;
+    let final_text = readyz_text(app).await?;
     assert!(final_text.contains("\"revision\":0"));
     assert!(final_text.contains("\"status\":\"ready\""));
 
@@ -80,34 +61,18 @@ async fn reasoner_reject_keeps_ready_revision_unchanged_and_data_unpublished()
         .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let ready = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    let ready_body = axum::body::to_bytes(ready.into_body(), usize::MAX).await?;
-    let ready_text = String::from_utf8(ready_body.to_vec())?;
+    let ready_text = readyz_text(app.clone()).await?;
     assert!(ready_text.contains("\"revision\":0"));
     assert!(ready_text.contains("\"status\":\"ready\""));
 
-    let ask = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-query")
-                .body(Body::from(
-                    "ASK WHERE { <http://example.com/alice> a <http://example.com/Other> }",
-                ))?,
+    assert!(
+        query_text(
+            app,
+            "ASK WHERE { <http://example.com/alice> a <http://example.com/Other> }",
         )
-        .await?;
-    assert_eq!(ask.status(), StatusCode::OK);
-    let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ask_body.to_vec())?.contains("false"));
+        .await?
+        .contains("false")
+    );
 
     Ok(())
 }
@@ -145,34 +110,18 @@ async fn malformed_graph_replace_keeps_revision_unchanged_and_data_published()
         .await?;
     assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
 
-    let ready = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    let ready_body = axum::body::to_bytes(ready.into_body(), usize::MAX).await?;
-    let ready_text = String::from_utf8(ready_body.to_vec())?;
+    let ready_text = readyz_text(app.clone()).await?;
     assert!(ready_text.contains("\"revision\":1"));
     assert!(ready_text.contains("\"status\":\"ready\""));
 
-    let ask = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-query")
-                .body(Body::from(
-                    "ASK WHERE { <http://example.com/live-s> <http://example.com/p> <http://example.com/live-o> }",
-                ))?,
+    assert!(
+        query_text(
+            app,
+            "ASK WHERE { <http://example.com/live-s> <http://example.com/p> <http://example.com/live-o> }",
         )
-        .await?;
-    assert_eq!(ask.status(), StatusCode::OK);
-    let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ask_body.to_vec())?.contains("true"));
+        .await?
+        .contains("true")
+    );
 
     Ok(())
 }

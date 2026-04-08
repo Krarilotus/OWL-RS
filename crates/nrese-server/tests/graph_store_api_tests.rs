@@ -6,7 +6,7 @@ use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::policy::PolicyConfig;
 use tower::util::ServiceExt;
 
-use support::{test_app, test_app_with_settings};
+use support::{body_text, query_text, readyz_text, test_app, test_app_with_settings};
 
 #[tokio::test]
 async fn graph_put_rejects_unsupported_content_type_with_problem_json()
@@ -30,8 +30,7 @@ async fn graph_put_rejects_unsupported_content_type_with_problem_json()
             .and_then(|value| value.to_str().ok()),
         Some("application/problem+json")
     );
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
+    let text = body_text(response).await?;
     assert!(text.contains("unsupported graph content type"));
 
     Ok(())
@@ -61,8 +60,7 @@ async fn graph_put_rejects_malformed_turtle_with_problem_json()
             .and_then(|value| value.to_str().ok()),
         Some("application/problem+json")
     );
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
+    let text = body_text(response).await?;
     assert!(text.contains("Bad Request"));
 
     Ok(())
@@ -109,8 +107,7 @@ async fn graph_roundtrip_supports_rdf_xml() -> Result<(), Box<dyn std::error::Er
             .and_then(|value| value.to_str().ok()),
         Some("application/rdf+xml")
     );
-    let body = axum::body::to_bytes(get_response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
+    let text = body_text(get_response).await?;
     assert!(text.contains("rdf:RDF"));
     assert!(text.contains("http://example.com/a"));
 
@@ -144,8 +141,7 @@ async fn graph_put_honors_content_location_as_base_iri() -> Result<(), Box<dyn s
         )
         .await?;
     assert_eq!(get_response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(get_response.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(body.to_vec())?.contains("true"));
+    assert!(body_text(get_response).await?.contains("true"));
 
     Ok(())
 }
@@ -209,36 +205,20 @@ async fn graph_put_uses_reasoner_gate_and_rejects_without_publish()
         .await?;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
+    let text = body_text(response).await?;
     assert!(text.contains("reasoner_reject"));
     assert!(text.contains("owl:disjointWith"));
 
-    let ask = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-query")
-                .body(Body::from(
-                    "ASK WHERE { <http://example.com/alice> a <http://example.com/Other> }",
-                ))?,
+    assert!(
+        query_text(
+            app.clone(),
+            "ASK WHERE { <http://example.com/alice> a <http://example.com/Other> }",
         )
-        .await?;
-    let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ask_body.to_vec())?.contains("false"));
+        .await?
+        .contains("false")
+    );
 
-    let ready = app
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    let ready_body = axum::body::to_bytes(ready.into_body(), usize::MAX).await?;
-    let ready_text = String::from_utf8(ready_body.to_vec())?;
+    let ready_text = readyz_text(app).await?;
     assert!(ready_text.contains("\"revision\":0"));
 
     Ok(())

@@ -6,7 +6,7 @@ use nrese_reasoner::ReasonerConfig;
 use nrese_server::policy::PolicyConfig;
 use tower::util::ServiceExt;
 
-use support::test_app_with_settings;
+use support::{query_text, readyz_text, test_app_with_settings};
 
 #[tokio::test]
 async fn invalid_update_does_not_mutate_dataset_or_revision()
@@ -27,17 +27,7 @@ async fn invalid_update_does_not_mutate_dataset_or_revision()
         .await?;
     assert_eq!(seed.status(), StatusCode::NO_CONTENT);
 
-    let ready_before = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    let ready_before_body = axum::body::to_bytes(ready_before.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ready_before_body.to_vec())?.contains("\"revision\":1"));
+    assert!(readyz_text(app.clone()).await?.contains("\"revision\":1"));
 
     let invalid = app
         .clone()
@@ -51,28 +41,16 @@ async fn invalid_update_does_not_mutate_dataset_or_revision()
         .await?;
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 
-    let ask = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query?query=ASK%20WHERE%20%7B%20%3Chttp%3A%2F%2Fexample.com%2Flive-s%3E%20%3Chttp%3A%2F%2Fexample.com%2Fp%3E%20%3Chttp%3A%2F%2Fexample.com%2Flive-o%3E%20%7D")
-                .method(Method::GET)
-                .body(Body::empty())?,
+    assert!(
+        query_text(
+            app.clone(),
+            "ASK WHERE { <http://example.com/live-s> <http://example.com/p> <http://example.com/live-o> }",
         )
-        .await?;
-    let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ask_body.to_vec())?.contains("true"));
+        .await?
+        .contains("true")
+    );
 
-    let ready_after = app
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    let ready_after_body = axum::body::to_bytes(ready_after.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ready_after_body.to_vec())?.contains("\"revision\":1"));
+    assert!(readyz_text(app).await?.contains("\"revision\":1"));
 
     Ok(())
 }
@@ -104,28 +82,16 @@ async fn reasoner_reject_does_not_publish_data_or_advance_revision()
         .await?;
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
-    let ask = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query?query=ASK%20WHERE%20%7B%20%3Chttp%3A%2F%2Fexample.com%2Falice%3E%20a%20%3Chttp%3A%2F%2Fexample.com%2FOther%3E%20%7D")
-                .method(Method::GET)
-                .body(Body::empty())?,
+    assert!(
+        query_text(
+            app.clone(),
+            "ASK WHERE { <http://example.com/alice> a <http://example.com/Other> }",
         )
-        .await?;
-    let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ask_body.to_vec())?.contains("false"));
+        .await?
+        .contains("false")
+    );
 
-    let ready = app
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    let ready_body = axum::body::to_bytes(ready.into_body(), usize::MAX).await?;
-    assert!(String::from_utf8(ready_body.to_vec())?.contains("\"revision\":0"));
+    assert!(readyz_text(app).await?.contains("\"revision\":0"));
 
     Ok(())
 }

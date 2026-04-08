@@ -7,7 +7,9 @@ use nrese_store::{StoreConfig, StoreMode};
 use tower::util::ServiceExt;
 
 use nrese_server::policy::PolicyConfig;
-use support::{minimal_fixture_path, test_app_with_settings, test_app_with_store_config};
+use support::{
+    body_text, minimal_fixture_path, query_text, test_app_with_settings, test_app_with_store_config,
+};
 
 #[tokio::test]
 async fn tell_endpoint_accepts_default_graph_turtle() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,21 +33,11 @@ async fn tell_endpoint_accepts_default_graph_turtle() -> Result<(), Box<dyn std:
 
     assert_eq!(tell_response.status(), StatusCode::NO_CONTENT);
 
-    let ask_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-query")
-                .body(Body::from(
-                    "ASK WHERE { <http://example.com/s> <http://example.com/p> <http://example.com/o> }",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(ask_response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(ask_response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
+    let text = query_text(
+        app,
+        "ASK WHERE { <http://example.com/s> <http://example.com/p> <http://example.com/o> }",
+    )
+    .await?;
     assert!(text.contains("true"));
     Ok(())
 }
@@ -72,21 +64,11 @@ async fn tell_endpoint_supports_named_graph_ingest() -> Result<(), Box<dyn std::
 
     assert_eq!(tell_response.status(), StatusCode::NO_CONTENT);
 
-    let ask_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-query")
-                .body(Body::from(
-                    "ASK WHERE { GRAPH <http://example.com/g> { <http://example.com/s> <http://example.com/p> \"v\" } }",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(ask_response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(ask_response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
+    let text = query_text(
+        app,
+        "ASK WHERE { GRAPH <http://example.com/g> { <http://example.com/s> <http://example.com/p> \"v\" } }",
+    )
+    .await?;
     assert!(text.contains("true"));
     Ok(())
 }
@@ -126,26 +108,15 @@ async fn tell_endpoint_uses_reasoner_gate_and_rejects_without_publish()
         .await?;
 
     assert_eq!(tell_response.status(), StatusCode::BAD_REQUEST);
-    let tell_body = axum::body::to_bytes(tell_response.into_body(), usize::MAX).await?;
-    let tell_text = String::from_utf8(tell_body.to_vec())?;
+    let tell_text = body_text(tell_response).await?;
     assert!(tell_text.contains("reasoner_reject"));
     assert!(tell_text.contains("owl:disjointWith"));
 
-    let ask_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-query")
-                .body(Body::from(
-                    "ASK WHERE { <http://example.com/carol> a <http://example.com/Other> }",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(ask_response.status(), StatusCode::OK);
-    let ask_body = axum::body::to_bytes(ask_response.into_body(), usize::MAX).await?;
-    let ask_text = String::from_utf8(ask_body.to_vec())?;
+    let ask_text = query_text(
+        app,
+        "ASK WHERE { <http://example.com/carol> a <http://example.com/Other> }",
+    )
+    .await?;
     assert!(ask_text.contains("false"));
     Ok(())
 }
