@@ -41,6 +41,54 @@ Current priority candidates:
 - `crates/nrese-server/tests/http_api_tests.rs`
 - `apps/nrese-console/src/App.tsx`
 
+## Current Hard Priorities
+
+These are the highest-value structural blocks after the latest whole-system audit. They are not optional polish; they are the next constraints on replacement-grade credibility.
+
+1. One mutation pipeline
+- Graph Store writes, restore/import, SPARQL Update, and `TELL` must converge on one mutation orchestration path.
+- Today, reasoner gating, cache visibility, and reject diagnostics are strongest on the update/tell path and weaker on direct graph/import paths.
+- Target ownership:
+  - `crates/nrese-server/src/update_pipeline.rs`
+  - `crates/nrese-server/src/http/graph_store.rs`
+  - `crates/nrese-server/src/http/admin_dataset.rs`
+  - `crates/nrese-store/src/staging.rs`
+
+2. Deployment posture layer
+- The repo must distinguish `local-demo`, `internal-authenticated`, and `replacement-grade` postures explicitly, and startup should validate unsafe combinations instead of serving them silently.
+- Capability reporting, service description, and request guards must derive from the same posture object.
+- Target ownership:
+  - `crates/nrese-server/src/config/`
+  - `crates/nrese-server/src/policy.rs`
+  - `crates/nrese-server/src/http/`
+
+3. Canonical replacement evidence index
+- Harness reports, official ontology parity, and live pack runs need one machine-readable evidence index instead of being discoverable only through scattered artifact paths and docs.
+- This evidence should become user- and operator-visible.
+- Target ownership:
+  - `benches/nrese-bench-harness`
+  - `crates/nrese-server/src/http/`
+  - `apps/nrese-console`
+
+4. Quad-aware snapshot/index model
+- The current reasoner snapshot model is still asserted-triple-centric and drops parts of true RDF dataset semantics.
+- Replacement-grade reasoning requires an explicit decision about quad-awareness, named graphs, and non-named-node terms, then one index model built around that decision.
+- Target ownership:
+  - `crates/nrese-store/src/snapshot.rs`
+  - `crates/nrese-reasoner/src/dataset_index/`
+  - `crates/nrese-reasoner/src/rules_mvp_cache/`
+
+5. Explicit reasoning read model
+- The system must decide and implement one honest model for how inferred state participates in reads:
+  - persisted materialization
+  - query-time augmentation
+  - or an explicit split between asserted-store reads and reasoning views
+- Until this is explicit, reasoning remains primarily a write gate plus diagnostics.
+- Target ownership:
+  - `crates/nrese-server/src/http/sparql.rs`
+  - `crates/nrese-store/src/query_executor.rs`
+  - `crates/nrese-reasoner/src/service.rs`
+
 ## Track A: Protocol Replacement Evidence
 
 Objective:

@@ -56,6 +56,7 @@ Still required:
 - broader query/update failure coverage beyond the current invalid-syntax fixture slice
 - explicit live replacement evidence for `TELL` as a project-level ingestion contract distinct from Graph Store and raw SPARQL Update usage
 - a project-specific production workload parity pack, with versioned seed/workload/case inputs and reproducible report artifacts as defined in `docs/ops/benchmark-and-conformance.md`
+- one machine-readable replacement evidence index so verified ontology parity is not tracked only through scattered artifact directories and prose
 
 Replacement gate:
 - NRESE reproduces the expected results and stable error semantics for the project's real query/update set against the same dataset used in Fuseki
@@ -90,6 +91,8 @@ Still required:
 - deeper minimal-justification and commit-delta blame beyond the current heuristic baseline, explicit conflict evidence triples, and bounded ranked preview attribution
 - on-demand deeper justifications beyond the synchronous heuristic path
 - broader EL/RL rule coverage beyond the current RDFS + bounded OWL-property baseline
+- an explicit replacement-grade read model for inferred state instead of relying primarily on write-time validation and diagnostics
+- a fuller RDF dataset/snapshot model for reasoning, especially around named-graph and term coverage
 
 Replacement gate:
 - inferred knowledge is materially produced, isolated from asserted knowledge, and validated through reproducible fixtures
@@ -163,6 +166,7 @@ Still required:
 - rate limiting / quota controls
 - stronger secrets and deployment hardening validation
 - release-time security scanning and documented rollback/security process
+- explicit deployment posture validation so unsafe combinations such as external bind plus open auth or overly exposed operator surfaces do not silently serve as if replacement-grade
 
 Replacement gate:
 - documented, testable, production-grade authn/authz and hardening baseline with minimal-footprint deployment
