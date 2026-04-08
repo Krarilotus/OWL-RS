@@ -45,10 +45,10 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - commit-path `owl:disjointWith` conflict detection over effective types
 - commit-path `owl:differentFrom` conflict detection against the effective `owl:sameAs` equality closure, including equality implied by bounded functional / inverse-functional property semantics
 - commit-path consistency checks for `owl:IrreflexiveProperty` self-loops, `owl:AsymmetricProperty` reverse-pair collisions, and `owl:propertyDisjointWith` assertion collisions
-- Shadow-store validation before publish so rejected updates do not leak into the live dataset
+- Shadow-store validation before publish so rejected mutations do not leak into the live dataset
 - deterministic unsupported-construct diagnostics for explicitly known out-of-scope OWL constructs in `rules-mvp`
 - structured reject explanation payloads with heuristic blame assignment, explicit conflict evidence triples, and ranked commit-delta attribution for the current bounded reject set
-- staged-update delta inspection so reject reports can surface a likely commit-local trigger triple and ranked candidate set when the previewed mutation makes that isolation possible
+- staged-mutation delta inspection so reject reports can surface a likely commit-local trigger triple and ranked candidate set when the previewed mutation makes that isolation possible
 - snapshot-keyed memoization of prepared `rules-mvp` artifacts and inference output so repeated runs over identical snapshot content can reuse indexed closures and consistency inputs instead of rebuilding them from scratch
 - schema-keyed memoization of TBox-stable `rules-mvp` preparation artifacts so ABox-only changes can reuse taxonomy and schema-closure preparation while still recomputing ABox-sensitive equality, property-closure, effective-type, and consistency stages
 - bounded multi-entry execution and schema caches so alternating snapshot/workload patterns can reuse more than only the immediately previous run

@@ -2,9 +2,11 @@ mod support;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+use nrese_server::policy::PolicyConfig;
 use tower::util::ServiceExt;
 
-use support::test_app;
+use support::{test_app, test_app_with_settings};
 
 #[tokio::test]
 async fn graph_put_rejects_unsupported_content_type_with_problem_json()
@@ -176,6 +178,68 @@ async fn graph_put_returns_ok_when_replacing_existing_named_graph()
         )
         .await?;
     assert_eq!(second.status(), StatusCode::OK);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_put_uses_reasoner_gate_and_rejects_without_publish()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_settings(
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+    )?;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/data?default")
+                .method(Method::PUT)
+                .header("content-type", "text/turtle")
+                .body(Body::from(
+                    "@prefix ex: <http://example.com/> .
+                     @prefix owl: <http://www.w3.org/2002/07/owl#> .
+                     @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+                     ex:Parent owl:disjointWith ex:Other .
+                     ex:alice rdf:type ex:Parent .
+                     ex:alice rdf:type ex:Other .",
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let text = String::from_utf8(body.to_vec())?;
+    assert!(text.contains("reasoner_reject"));
+    assert!(text.contains("owl:disjointWith"));
+
+    let ask = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query")
+                .method(Method::POST)
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(
+                    "ASK WHERE { <http://example.com/alice> a <http://example.com/Other> }",
+                ))?,
+        )
+        .await?;
+    let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(ask_body.to_vec())?.contains("false"));
+
+    let ready = app
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .method(Method::GET)
+                .body(Body::empty())?,
+        )
+        .await?;
+    let ready_body = axum::body::to_bytes(ready.into_body(), usize::MAX).await?;
+    let ready_text = String::from_utf8(ready_body.to_vec())?;
+    assert!(ready_text.contains("\"revision\":0"));
 
     Ok(())
 }

@@ -4,8 +4,8 @@ use nrese_store::{GraphResultFormat, SolutionsResultFormat, SparqlQueryRequest};
 
 use crate::error::ApiError;
 use crate::http::media::media_type_matches;
+use crate::mutation_pipeline;
 use crate::state::AppState;
-use crate::update_pipeline;
 
 pub async fn execute_query(
     state: AppState,
@@ -43,7 +43,7 @@ pub async fn execute_update(state: AppState, update: String) -> Result<StatusCod
     state.policy().enforce_update_bytes(update.len())?;
     tokio::time::timeout(
         state.policy().timeouts.update,
-        update_pipeline::execute(state, update),
+        mutation_pipeline::execute_update(state, update),
     )
     .await
     .map_err(|_| ApiError::timeout("update execution exceeded policy timeout"))??;

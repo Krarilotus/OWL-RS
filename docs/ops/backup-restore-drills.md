@@ -26,6 +26,9 @@ Every restore drill must record these checks:
 - readiness reaches `ready`
 - restored revision is recorded
 - critical parity query pack pass/fail is recorded
+- semantic restore outcome is recorded explicitly:
+  - accepted and published
+  - or rejected by the shared mutation gate without partial publication
 
 ## Evidence Schema
 

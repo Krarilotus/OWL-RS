@@ -10,8 +10,8 @@ use crate::http::media::header_value_str;
 use crate::http::rdf_payload::{
     ensure_ready, parse_graph_target, parse_rdf_base_iri, parse_tell_content_format,
 };
+use crate::mutation_pipeline;
 use crate::state::AppState;
-use crate::tell_pipeline;
 
 pub async fn execute_tell(
     state: AppState,
@@ -31,7 +31,7 @@ pub async fn execute_tell(
 
     tokio::time::timeout(
         state.policy().timeouts.update,
-        tell_pipeline::execute(state, request),
+        mutation_pipeline::execute_tell(state, request),
     )
     .await
     .map_err(|_| ApiError::timeout("tell execution exceeded policy timeout"))??;

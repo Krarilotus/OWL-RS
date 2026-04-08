@@ -2,7 +2,7 @@ mod support;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use nrese_reasoner::ReasonerConfig;
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::auth::{AuthConfig, StaticBearerConfig};
 use nrese_server::policy::{PolicyConfig, RateLimitConfig};
 use nrese_store::{StoreConfig, StoreMode};
@@ -187,6 +187,64 @@ async fn restore_endpoint_rejects_invalid_payload_with_problem_json()
         .await?;
     let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
     assert!(String::from_utf8(ask_body.to_vec())?.contains("true"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_endpoint_uses_reasoner_gate_and_rejects_without_publish()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_store_config(
+        StoreConfig::default(),
+        admin_policy(),
+        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+    )?;
+
+    let restore = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ops/api/admin/dataset/restore")
+                .method(Method::POST)
+                .header("authorization", "Bearer admin")
+                .header("content-type", "application/n-quads")
+                .body(Body::from(
+                    "<http://example.com/Parent> <http://www.w3.org/2002/07/owl#disjointWith> <http://example.com/Other> .\n\
+                     <http://example.com/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Parent> .\n\
+                     <http://example.com/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Other> .\n",
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(restore.status(), StatusCode::BAD_REQUEST);
+    let restore_body = axum::body::to_bytes(restore.into_body(), usize::MAX).await?;
+    let restore_text = String::from_utf8(restore_body.to_vec())?;
+    assert!(restore_text.contains("reasoner_reject"));
+    assert!(restore_text.contains("owl:disjointWith"));
+
+    let ask = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query?query=ASK%20WHERE%20%7B%20%3Chttp%3A%2F%2Fexample.com%2Falice%3E%20a%20%3Chttp%3A%2F%2Fexample.com%2FOther%3E%20%7D")
+                .method(Method::GET)
+                .header("authorization", "Bearer reader")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let ask_body = axum::body::to_bytes(ask.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(ask_body.to_vec())?.contains("false"));
+
+    let ready = app
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .method(Method::GET)
+                .body(Body::empty())?,
+        )
+        .await?;
+    let ready_body = axum::body::to_bytes(ready.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(ready_body.to_vec())?.contains("\"revision\":0"));
 
     Ok(())
 }

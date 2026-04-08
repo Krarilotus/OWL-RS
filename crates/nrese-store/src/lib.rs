@@ -32,7 +32,7 @@ pub use query::{
 };
 pub use service::StoreService;
 pub use snapshot::StoreDatasetSnapshot;
-pub use staging::{StagedUpdatePreview, UpdateDeltaPreview};
+pub use staging::{MutationDeltaPreview, StagedMutationPreview};
 pub use stats::StoreStats;
 pub use tell::{TellRequest, compile_tell_update};
 pub use update::{SparqlUpdateRequest, UpdateExecutionReport};

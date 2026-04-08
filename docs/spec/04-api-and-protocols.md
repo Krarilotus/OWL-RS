@@ -65,6 +65,7 @@ Primary conformance targets:
 
 - Query + update parsing and execution
 - First-class `TELL` assertion ingest on the same staged publish path as update
+- Graph Store writes/deletes and admin restore now also run through that same shared mutation gate, while preserving their own HTTP status contracts
 - Typed error model
 - Basic health/readiness
 
@@ -99,6 +100,7 @@ Primary conformance targets:
 - Errors SHOULD use `application/problem+json`.
 - Reasoner-gated consistency rejects SHOULD include a structured `reasoner_reject` payload with violated constraint, focus resource, heuristic blame fields, explicit conflict evidence triples, and a likely commit-local trigger triple when the staged delta admits a high-confidence attribution.
 - `TELL` failures MUST use the same typed reject/error surface as the staged update pipeline, rather than inventing a separate ingest-only reject shape.
+- Graph Store and restore failures that reach the reasoner gate MUST use the same typed reject/error surface as update and `TELL`, rather than inventing transport-specific semantic reject shapes.
 - AI query suggestion responses MUST be explicitly treated as assistive UX output, not authoritative execution results.
 - All requests SHOULD carry correlation IDs.
 - Protocol and policy failures must map to deterministic status codes.
@@ -133,6 +135,7 @@ Primary conformance targets:
 - On startup, the service MUST validate dataset integrity and expose degraded readiness if recovery is required.
 - Backup and restore interfaces MUST be documented and scriptable through stable endpoints or CLI wrappers.
 - Backup export/import endpoints MUST stay transport-thin, with dataset artifact semantics owned by the store layer.
+- Restore remains an admin-scoped transport surface, but semantic accept/reject behavior now follows the same shared mutation gate as the other write paths.
 - Version/capability endpoints MUST clearly indicate whether runtime is ephemeral or durable.
 
 ## Conformance Requirements
@@ -164,7 +167,7 @@ Primary conformance targets:
 
 ## Acceptance Criteria
 
-- Query, update, and data operations are independently testable.
+- Query, update, tell, graph-store, and restore operations are independently testable while still sharing one mutation orchestration path for semantic validation.
 - `TELL` ingest is independently testable from Graph Store writes and SPARQL Update text.
 - Media-type negotiation behavior is deterministic and documented.
 - Endpoint-level policy enforcement is explicit, not hidden in storage code.
@@ -173,4 +176,4 @@ Primary conformance targets:
 - Operator frontend can perform core admin workflows against public API endpoints without privileged bypasses.
 - Durable deployment behavior is test-covered for restart/recovery and accurately reflected in readiness/capability endpoints.
 - Policy controls for auth, exposure, payload size, and timeouts are test-covered at HTTP level, including bounded `bearer-jwt` and bounded proxy-terminated `mtls` authorization behavior for the covered role mappings.
-- Admin backup/restore endpoints are auth-restricted, return stable media types, and preserve no-partial-publication semantics on restore failure.
+- Admin backup/restore endpoints are auth-restricted, return stable media types, preserve no-partial-publication semantics on restore failure, and surface semantic restore rejects through the same typed reasoner-gate error model as the other write paths.

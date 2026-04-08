@@ -3,35 +3,85 @@ use std::collections::BTreeSet;
 use nrese_core::TripleSource;
 use oxigraph::store::Store;
 
+use crate::backup::{DatasetRestoreRequest, restore_dataset};
 use crate::error::StoreResult;
+use crate::graph_store::{GraphTarget, GraphWriteRequest};
+use crate::graph_store_executor::{execute_graph_delete, execute_graph_write};
 use crate::snapshot::StoreDatasetSnapshot;
 use crate::update::SparqlUpdateRequest;
 use crate::update_executor::execute_update;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct UpdateDeltaPreview {
+pub struct MutationDeltaPreview {
     pub inserted_triples: Vec<(String, String, String)>,
     pub removed_triples: Vec<(String, String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedUpdatePreview {
+pub struct StagedMutationPreview {
     pub snapshot: StoreDatasetSnapshot,
-    pub delta: UpdateDeltaPreview,
+    pub delta: MutationDeltaPreview,
 }
 
 pub fn snapshot_after_update(
     source: &Store,
     request: &SparqlUpdateRequest,
     revision: u64,
-) -> StoreResult<StagedUpdatePreview> {
+) -> StoreResult<StagedMutationPreview> {
+    preview_store_mutation(source, revision, |staged| {
+        let _ = execute_update(staged, request)?;
+        Ok(())
+    })
+}
+
+pub fn snapshot_after_graph_write(
+    source: &Store,
+    request: &GraphWriteRequest,
+    revision: u64,
+) -> StoreResult<StagedMutationPreview> {
+    preview_store_mutation(source, revision, |staged| {
+        let _ = execute_graph_write(staged, request)?;
+        Ok(())
+    })
+}
+
+pub fn snapshot_after_graph_delete(
+    source: &Store,
+    target: &GraphTarget,
+    revision: u64,
+) -> StoreResult<StagedMutationPreview> {
+    preview_store_mutation(source, revision, |staged| {
+        let _ = execute_graph_delete(staged, target)?;
+        Ok(())
+    })
+}
+
+pub fn snapshot_after_restore(
+    source: &Store,
+    request: &DatasetRestoreRequest,
+    revision: u64,
+) -> StoreResult<StagedMutationPreview> {
+    preview_store_mutation(source, revision, |staged| {
+        let _ = restore_dataset(staged, request, revision)?;
+        Ok(())
+    })
+}
+
+fn preview_store_mutation<F>(
+    source: &Store,
+    revision: u64,
+    apply: F,
+) -> StoreResult<StagedMutationPreview>
+where
+    F: FnOnce(&Store) -> StoreResult<()>,
+{
     let baseline = StoreDatasetSnapshot::capture(source, revision.saturating_sub(1))?;
     let staged = clone_store(source)?;
-    let _ = execute_update(&staged, request)?;
+    apply(&staged)?;
     let snapshot = StoreDatasetSnapshot::capture(&staged, revision)?;
     let delta = diff_snapshots(&baseline, &snapshot);
 
-    Ok(StagedUpdatePreview { snapshot, delta })
+    Ok(StagedMutationPreview { snapshot, delta })
 }
 
 fn clone_store(source: &Store) -> StoreResult<Store> {
@@ -48,11 +98,11 @@ fn clone_store(source: &Store) -> StoreResult<Store> {
 fn diff_snapshots(
     baseline: &StoreDatasetSnapshot,
     updated: &StoreDatasetSnapshot,
-) -> UpdateDeltaPreview {
+) -> MutationDeltaPreview {
     let baseline_triples = snapshot_triples(baseline);
     let updated_triples = snapshot_triples(updated);
 
-    UpdateDeltaPreview {
+    MutationDeltaPreview {
         inserted_triples: updated_triples
             .difference(&baseline_triples)
             .cloned()

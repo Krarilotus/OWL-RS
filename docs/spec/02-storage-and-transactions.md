@@ -9,7 +9,7 @@ Provide a high-throughput, low-latency RDF storage layer with explicit transacti
 - Typed query and update execution APIs
 - Default graph + named graph lifecycle operations
 - Snapshot-aware read consistency
-- Atomic commit boundaries for update batches
+- Atomic commit boundaries for mutation batches
 - Reasoner overlay compatibility
 - Operational controls for backup, restore, and retention
 
@@ -49,12 +49,12 @@ Provide a high-throughput, low-latency RDF storage layer with explicit transacti
 
 ## Transaction Lifecycle (Target)
 
-1. Parse and validate request payload.
-2. Build candidate change set.
-3. Execute update against candidate revision.
-4. Trigger reasoner planning/execution if enabled.
+1. Parse and validate mutation payload.
+2. Normalize the request into one canonical mutation command.
+3. Build a candidate revision through a side-effect-free preview path.
+4. Trigger reasoner planning/execution on the preview snapshot if enabled.
 5. Validate post-reasoning constraints.
-6. Commit and publish revision atomically.
+6. Apply the canonical mutation to the live store and publish the new revision atomically.
 7. Emit metrics + audit event.
 
 ## Query Visibility Model
@@ -85,8 +85,8 @@ Provide a high-throughput, low-latency RDF storage layer with explicit transacti
 
 ## Acceptance Criteria
 
-- Failed update or reasoning stage cannot leak partial state.
+- Failed mutation or reasoning stage cannot leak partial state.
 - Graph-level operations preserve default vs named graph semantics.
-- Restore path yields a consistent queryable dataset.
+- Restore path yields a consistent queryable dataset and shares the same atomic publish gate as the other write paths.
 - Backup artifacts and restore reports expose revision and checksum metadata.
 - Revision publication and rollback paths are test-covered.

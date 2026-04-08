@@ -9,6 +9,7 @@ use crate::http::media::{header_value_str, media_type_matches};
 use crate::http::rdf_payload::{
     ensure_ready, parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
 };
+use crate::mutation_pipeline;
 use crate::policy::PolicyAction;
 use crate::state::AppState;
 
@@ -100,15 +101,12 @@ pub async fn delete_graph(
         .enforce_policy_action(PolicyAction::GraphWrite, &headers)
         .await?;
     let target = parse_graph_target(&raw_query)?;
-    let store = state.store();
     tokio::time::timeout(
         state.policy().timeouts.graph_write,
-        tokio::task::spawn_blocking(move || store.execute_graph_delete(&target)),
+        mutation_pipeline::execute_graph_delete(state, target),
     )
     .await
-    .map_err(|_| ApiError::timeout("graph delete exceeded policy timeout"))?
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    .map_err(|_| ApiError::timeout("graph delete exceeded policy timeout"))??;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -135,25 +133,18 @@ async fn write_graph(
         payload: body.to_vec(),
         replace,
     };
-    let status_target = request.target.clone();
-    let store = state.store();
     let report = tokio::time::timeout(
         state.policy().timeouts.graph_write,
-        tokio::task::spawn_blocking(move || store.execute_graph_write(&request)),
+        mutation_pipeline::execute_graph_write(state, request),
     )
     .await
-    .map_err(|_| ApiError::timeout("graph write exceeded policy timeout"))?
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    .map_err(|_| ApiError::timeout("graph write exceeded policy timeout"))??;
 
-    Ok(write_graph_status(&status_target, report))
+    Ok(write_graph_status(&report))
 }
 
-fn write_graph_status(
-    target: &nrese_store::GraphTarget,
-    report: nrese_store::GraphWriteReport,
-) -> StatusCode {
-    match target {
+fn write_graph_status(report: &nrese_store::GraphWriteReport) -> StatusCode {
+    match &report.target {
         nrese_store::GraphTarget::NamedGraph(_) if report.created => StatusCode::CREATED,
         nrese_store::GraphTarget::NamedGraph(_) => StatusCode::OK,
         nrese_store::GraphTarget::DefaultGraph => StatusCode::NO_CONTENT,
@@ -224,42 +215,36 @@ mod tests {
 
     #[test]
     fn write_graph_status_returns_created_for_new_named_graphs() {
-        let status = write_graph_status(
-            &nrese_store::GraphTarget::NamedGraph("http://example.com/g".to_owned()),
-            GraphWriteReport {
-                modified: true,
-                created: true,
-                revision: 1,
-            },
-        );
+        let status = write_graph_status(&GraphWriteReport {
+            target: nrese_store::GraphTarget::NamedGraph("http://example.com/g".to_owned()),
+            modified: true,
+            created: true,
+            revision: 1,
+        });
 
         assert_eq!(status, StatusCode::CREATED);
     }
 
     #[test]
     fn write_graph_status_returns_ok_for_existing_named_graphs() {
-        let status = write_graph_status(
-            &nrese_store::GraphTarget::NamedGraph("http://example.com/g".to_owned()),
-            GraphWriteReport {
-                modified: true,
-                created: false,
-                revision: 2,
-            },
-        );
+        let status = write_graph_status(&GraphWriteReport {
+            target: nrese_store::GraphTarget::NamedGraph("http://example.com/g".to_owned()),
+            modified: true,
+            created: false,
+            revision: 2,
+        });
 
         assert_eq!(status, StatusCode::OK);
     }
 
     #[test]
     fn write_graph_status_returns_no_content_for_default_graph() {
-        let status = write_graph_status(
-            &nrese_store::GraphTarget::DefaultGraph,
-            GraphWriteReport {
-                modified: true,
-                created: false,
-                revision: 3,
-            },
-        );
+        let status = write_graph_status(&GraphWriteReport {
+            target: nrese_store::GraphTarget::DefaultGraph,
+            modified: true,
+            created: false,
+            revision: 3,
+        });
 
         assert_eq!(status, StatusCode::NO_CONTENT);
     }

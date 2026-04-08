@@ -59,6 +59,7 @@ Verbindlicher Kurzstand je Track:
   - breitere EL/RL-Abdeckung, tiefere Justifications und DL-Pfad fehlen
 - Persistenz und Recovery: `partial`
   - durable Pfad, Backup/Restore und atomare Fehlerpfade existieren
+  - Update, Tell, Graph Store und Restore laufen jetzt ueber einen gemeinsamen Mutationspfad mit gemeinsamem Reasoner-Gate und gemeinsamer Revisions-/Runtime-Buchfuehrung
   - Crash-/Restart-/Drill-Evidenz ist noch offen
 - Security und Hardening: `partial`
   - `bearer-static`, bounded `bearer-jwt`, bounded `oidc-introspection`, bounded proxy-terminated `mtls`, Limits und Rate-Limits existieren
@@ -76,11 +77,13 @@ Die naechsten Replacement-Bloecke sind:
 
 1. echte secured Side-by-Side-Paritaet gegen Fuseki
    - Timeout-, Auth-, Error- und Workload-Packs gegen die echte Zielumgebung, gebunden an eine konkrete Live-Connection-Profile-Auswahl
-2. breitere Reasoner-Abdeckung auf dem bestehenden modularen Pfad
+2. Mutation-Pipeline-Nacharbeiten auf derselben gemeinsamen Architektur
+   - gemeinsame Mutationstest-Matrix, weitere Store-seitige Preview-/Apply-Evidenz und konsequente Runtime-/Capability-Sicht
+3. breitere Reasoner-Abdeckung auf dem bestehenden modularen Pfad
    - ohne Supportgrenzen zu verwischen oder impliziten Code einzubauen
-3. durable Recovery- und Drill-Evidenz
-4. CI-faehige Benchmark-/Conformance-Gates
-5. weitere Frontend-Workflow-Haertung auf Basis der echten Server-/Reasoning-Flaechen
+4. durable Recovery- und Drill-Evidenz
+5. CI-faehige Benchmark-/Conformance-Gates
+6. weitere Frontend-Workflow-Haertung auf Basis der echten Server-/Reasoning-Flaechen
 
 ## Dokumentationsregeln
 

@@ -7,6 +7,7 @@ use nrese_store::{DatasetBackupFormat, DatasetRestoreRequest, StoreError};
 use crate::error::ApiError;
 use crate::http::media::{header_value_str, media_type_matches};
 use crate::http::responses::build_admin_restore_response;
+use crate::mutation_pipeline;
 use crate::state::AppState;
 
 const BACKUP_FORMAT_HEADER: &str = "x-nrese-backup-format";
@@ -61,11 +62,12 @@ pub async fn restore(
         payload: body.to_vec(),
     };
 
-    let store = state.store();
-    let report = tokio::task::spawn_blocking(move || store.restore_dataset(&request))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?
-        .map_err(map_restore_error)?;
+    let report = tokio::time::timeout(
+        state.policy().timeouts.update,
+        mutation_pipeline::execute_restore(state, request),
+    )
+    .await
+    .map_err(|_| ApiError::timeout("dataset restore exceeded policy timeout"))??;
 
     Ok((StatusCode::OK, Json(build_admin_restore_response(&report))).into_response())
 }
@@ -98,13 +100,6 @@ fn parse_restore_format(
 
 fn map_backup_error(error: StoreError) -> ApiError {
     ApiError::internal(error.to_string())
-}
-
-fn map_restore_error(error: StoreError) -> ApiError {
-    match error {
-        StoreError::Loader(_) | StoreError::RdfParse(_) => ApiError::bad_request(error.to_string()),
-        other => ApiError::internal(other.to_string()),
-    }
 }
 
 fn insert_header(

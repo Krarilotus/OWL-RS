@@ -50,10 +50,11 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 
 ### R4: Reasoning Integration
 
-- Reasoner plans/reports integrated in update pipeline
+- Reasoner plans/reports integrated in the shared mutation pipeline
 - Inference visibility modes documented and test-covered
 - Consistency gate semantics enforced
 - Update path no longer bypasses reasoner orchestration semantics
+- Graph Store writes/deletes and admin restore no longer bypass reasoner orchestration semantics
 - Hybrid explanation model available: fast commit-path diagnostics plus deeper justification retrieval
 - Reject-path staging prevents inconsistent updates from being published before validation completes
 - Commit-path reasoner rejects now expose structured problem details and operator diagnostics from the same reasoner-owned explanation payload
@@ -147,6 +148,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - Interrupted update recovery shows no partial publish.
 - Failed mutation paths keep revision stable and leave previously committed data queryable.
 - Graph replace with malformed RDF is atomic and does not clear previously committed data.
+- Graph Store and restore semantic rejects now use the same mutation gate as update and `TELL`, so reject-path invariants are no longer entry-point-specific.
 - Each drill run produces evidence artifacts defined in [docs/ops/backup-restore-drills.md](../ops/backup-restore-drills.md).
 
 Drill execution procedure and evidence format are normative in [docs/ops/backup-restore-drills.md](../ops/backup-restore-drills.md).

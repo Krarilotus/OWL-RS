@@ -24,6 +24,7 @@ Current coverage:
 - Update endpoint exists and is wired through the reasoner-aware update pipeline
 - A first-class `TELL` assertion-ingest endpoint exists for RDF payloads on the same staged reasoner-aware publish path as update
 - Graph Store HTTP endpoint exists for default and named graph operations including `GET`, `PUT`, `POST`, `DELETE`, and `HEAD`
+- Graph Store writes/deletes and admin restore now also converge on the same reasoner-aware mutation pipeline as update and `TELL`, so semantic reject behavior, revision publication, and runtime bookkeeping do not drift by write entry point
 - Service description, health, readiness, version, metrics, and operator APIs exist
 - Protocol compatibility harness now covers query parity, update-effect parity, graph-store read/head/delete/put/post-effect parity, bounded graph-store failure semantics, and bounded query/update failure semantics (status/content-type/body-class) against Fuseki-style dataset endpoints
 - graph-producing parity comparators now canonicalize Turtle, N-Triples, and RDF/XML payloads onto one triples-set comparison path
@@ -107,6 +108,7 @@ Current coverage:
 - store-level backup/export and restore/import flows exist with admin-scoped HTTP control paths
 - metrics, readiness, and update-path contracts are in place
 - failed store/server mutation paths are test-covered for revision stability and no partial publication on parse/reasoner failure
+- Graph Store semantic rejects and restore semantic rejects are now HTTP-test-covered on the same shared mutation gate as update and `TELL`
 
 Still required:
 - restart-after-restore validation on the target durable mode

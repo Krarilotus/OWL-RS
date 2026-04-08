@@ -1,45 +1,107 @@
+mod command;
+
 use nrese_core::{ReasonerEngine, ReasonerRunStatus};
 use nrese_reasoner::{InferenceDelta, ReasonerService};
-use nrese_store::{SparqlUpdateRequest, StoreService};
+use nrese_store::{
+    DatasetRestoreReport, DatasetRestoreRequest, GraphDeleteReport, GraphTarget, GraphWriteReport,
+    GraphWriteRequest, SparqlUpdateRequest, StoreService, TellRequest, compile_tell_update,
+};
 
 use crate::error::ApiError;
+use crate::mutation_pipeline::command::{MutationCommand, MutationCommitReport};
 use crate::reasoning_runtime::LastReasoningRun;
-use crate::reject_attribution::attribute_reject_delta;
+use crate::reject_attribution::{RejectAttribution, attribute_reject_delta};
 use crate::state::AppState;
 
-pub async fn execute(state: AppState, update: String) -> Result<(), ApiError> {
+pub async fn execute_update(state: AppState, update: String) -> Result<(), ApiError> {
+    execute(
+        state,
+        MutationCommand::Update(SparqlUpdateRequest::new(update)),
+    )
+    .await
+    .map(|_| ())
+}
+
+pub async fn execute_tell(state: AppState, request: TellRequest) -> Result<(), ApiError> {
+    let update = tokio::task::spawn_blocking(move || compile_tell_update(&request))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+
+    execute(state, MutationCommand::Update(update))
+        .await
+        .map(|_| ())
+}
+
+pub async fn execute_graph_write(
+    state: AppState,
+    request: GraphWriteRequest,
+) -> Result<GraphWriteReport, ApiError> {
+    match execute(state, MutationCommand::GraphWrite(request)).await? {
+        MutationCommitReport::GraphWrite(report) => Ok(report),
+        other => Err(ApiError::internal(format!(
+            "unexpected graph write mutation result: {other:?}"
+        ))),
+    }
+}
+
+pub async fn execute_graph_delete(
+    state: AppState,
+    target: GraphTarget,
+) -> Result<GraphDeleteReport, ApiError> {
+    match execute(state, MutationCommand::GraphDelete(target)).await? {
+        MutationCommitReport::GraphDelete(report) => Ok(report),
+        other => Err(ApiError::internal(format!(
+            "unexpected graph delete mutation result: {other:?}"
+        ))),
+    }
+}
+
+pub async fn execute_restore(
+    state: AppState,
+    request: DatasetRestoreRequest,
+) -> Result<DatasetRestoreReport, ApiError> {
+    match execute(state, MutationCommand::Restore(request)).await? {
+        MutationCommitReport::Restore(report) => Ok(report),
+        other => Err(ApiError::internal(format!(
+            "unexpected restore mutation result: {other:?}"
+        ))),
+    }
+}
+
+async fn execute(
+    state: AppState,
+    command: MutationCommand,
+) -> Result<MutationCommitReport, ApiError> {
     if !state.is_ready() {
         return Err(ApiError::unavailable("server is not ready yet"));
     }
 
     let store = state.store();
     let reasoner = state.reasoner();
-    let request = SparqlUpdateRequest::new(update);
     let runtime_state = state.clone();
 
     tokio::task::spawn_blocking(move || {
-        execute_blocking(&store, &reasoner, request, &runtime_state)
+        execute_blocking(&store, &reasoner, command, &runtime_state)
     })
     .await
-    .map_err(|error| ApiError::internal(error.to_string()))??;
-
-    Ok(())
+    .map_err(|error| ApiError::internal(error.to_string()))?
 }
 
 fn execute_blocking(
     store: &StoreService,
     reasoner: &ReasonerService,
-    request: SparqlUpdateRequest,
+    command: MutationCommand,
     state: &AppState,
-) -> Result<(), ApiError> {
+) -> Result<MutationCommitReport, ApiError> {
     let update_lock = state.update_lock();
     let policy = state.policy().clone();
     let _guard = update_lock
         .lock()
         .map_err(|_| ApiError::internal("update lock is poisoned"))?;
-    let preview = store
-        .preview_update(&request)
-        .map_err(|error| policy.bad_request_for_sparql_parse_error(error.to_string()))?;
+    let preview = command
+        .preview(store)
+        .map_err(|error| command.map_store_error(&policy, error))?;
     let snapshot = &preview.snapshot;
     let plan = reasoner
         .plan(snapshot)
@@ -51,7 +113,7 @@ fn execute_blocking(
         .inferred
         .primary_reject
         .as_ref()
-        .and_then(|reject| attribute_reject_delta(reject, &preview.delta));
+        .and_then(|reject| attribute_reject_delta(reject, command.delta(&preview)));
     state.set_last_reasoning_run(LastReasoningRun::from_report(
         &output.report,
         &output.inferred,
@@ -63,23 +125,22 @@ fn execute_blocking(
         output.report.status,
         commit_attribution.as_ref(),
     )?;
-    let _update_report = store
-        .execute_update(&request)
-        .map_err(|error| policy.bad_request_for_sparql_parse_error(error.to_string()))?;
 
-    Ok(())
+    command
+        .commit(store)
+        .map_err(|error| command.map_store_error(&policy, error))
 }
 
 fn enforce_reasoner_gate(
     inferred: &InferenceDelta,
     status: ReasonerRunStatus,
-    commit_attribution: Option<&crate::reject_attribution::RejectAttribution>,
+    commit_attribution: Option<&RejectAttribution>,
 ) -> Result<(), ApiError> {
     if matches!(status, ReasonerRunStatus::Rejected) {
         return Err(reasoner_gate_error(
             inferred,
             commit_attribution,
-            "update rejected by reasoner consistency gate".to_owned(),
+            "mutation rejected by reasoner consistency gate".to_owned(),
         ));
     }
 
@@ -88,7 +149,7 @@ fn enforce_reasoner_gate(
             inferred,
             commit_attribution,
             format!(
-                "update violates {} consistency checks",
+                "mutation violates {} consistency checks",
                 inferred.consistency_violations
             ),
         ));
@@ -99,7 +160,7 @@ fn enforce_reasoner_gate(
 
 fn reasoner_gate_error(
     inferred: &InferenceDelta,
-    commit_attribution: Option<&crate::reject_attribution::RejectAttribution>,
+    commit_attribution: Option<&RejectAttribution>,
     fallback: String,
 ) -> ApiError {
     let mut detail = inferred

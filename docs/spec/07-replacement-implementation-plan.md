@@ -45,11 +45,11 @@ Current priority candidates:
 
 These are the highest-value structural blocks after the latest whole-system audit. They are not optional polish; they are the next constraints on replacement-grade credibility.
 
-1. One mutation pipeline
-- Graph Store writes, restore/import, SPARQL Update, and `TELL` must converge on one mutation orchestration path.
-- Today, reasoner gating, cache visibility, and reject diagnostics are strongest on the update/tell path and weaker on direct graph/import paths.
+1. One mutation pipeline follow-through
+- Base convergence is now implemented: Graph Store writes/deletes, restore/import, SPARQL Update, and `TELL` share one mutation orchestration path.
+- The follow-through work is now to keep tests, diagnostics, and store previews equally unified so the new path stays the only write-semantic source of truth.
 - Target ownership:
-  - `crates/nrese-server/src/update_pipeline.rs`
+  - `crates/nrese-server/src/mutation_pipeline/`
   - `crates/nrese-server/src/http/graph_store.rs`
   - `crates/nrese-server/src/http/admin_dataset.rs`
   - `crates/nrese-store/src/staging.rs`
@@ -348,6 +348,8 @@ Priority order for the next replacement-focused runs:
 - added preflight validation of compat-suite invocation-profile references against the selected live connection profile and workload-pack overlays, so secured parity runs fail before seed/bench execution when profile wiring drifts
 - added a dedicated `pack-validate` command and report shape so deployment workflows can gate live parity runs on the same connection-profile and pack-resolution path used by real execution
 - added a dedicated limit/offset semantics compat suite and a bindings-set comparator so query-window parity does not rely on count-only summaries
+- converged SPARQL Update, `TELL`, Graph Store writes/deletes, and admin restore on one shared server-side mutation pipeline, with shared reasoner gating, revision publication, runtime bookkeeping, and reject attribution flow
+- generalized store-side staged previews from update-only naming to mutation-wide preview semantics and extended them to Graph Store writes/deletes and restore
 - replaced the harness-local blank-node canonicalization path with upstream oxrdf graph canonicalization, which reduced custom comparison code while fixing local ORG `CONSTRUCT` parity against Fuseki
 - extended compat reports with optional result-count and diff-sample fields, and ensured `pack-report.json` is written even when a pack fails mid-run
 - verified local live side-by-side parity against a local Apache Jena Fuseki 6.0.0 install for the official FOAF pack plus medium/broad official ontology pack-matrix runs on the standard `pack-matrix` evidence path

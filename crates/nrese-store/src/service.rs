@@ -21,7 +21,10 @@ use crate::loader::preload_ontology;
 use crate::query::{SerializedQueryResult, SparqlQueryRequest};
 use crate::query_executor::execute_query;
 use crate::snapshot::StoreDatasetSnapshot;
-use crate::staging::{StagedUpdatePreview, snapshot_after_update};
+use crate::staging::{
+    StagedMutationPreview, snapshot_after_graph_delete, snapshot_after_graph_write,
+    snapshot_after_restore, snapshot_after_update,
+};
 use crate::stats::{StoreStats, collect_stats};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 use crate::update_executor::execute_update;
@@ -132,8 +135,26 @@ impl StoreService {
     pub fn preview_update(
         &self,
         request: &SparqlUpdateRequest,
-    ) -> StoreResult<StagedUpdatePreview> {
+    ) -> StoreResult<StagedMutationPreview> {
         snapshot_after_update(&self.store, request, self.current_revision() + 1)
+    }
+
+    pub fn preview_graph_write(
+        &self,
+        request: &GraphWriteRequest,
+    ) -> StoreResult<StagedMutationPreview> {
+        snapshot_after_graph_write(&self.store, request, self.current_revision() + 1)
+    }
+
+    pub fn preview_graph_delete(&self, target: &GraphTarget) -> StoreResult<StagedMutationPreview> {
+        snapshot_after_graph_delete(&self.store, target, self.current_revision() + 1)
+    }
+
+    pub fn preview_restore(
+        &self,
+        request: &DatasetRestoreRequest,
+    ) -> StoreResult<StagedMutationPreview> {
+        snapshot_after_restore(&self.store, request, self.current_revision() + 1)
     }
 
     pub fn execute_graph_read(&self, request: &GraphReadRequest) -> StoreResult<GraphReadResult> {

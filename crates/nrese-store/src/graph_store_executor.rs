@@ -53,6 +53,7 @@ pub fn execute_graph_write(
     transaction.commit()?;
 
     Ok(GraphWriteReport {
+        target: request.target.clone(),
         modified: true,
         created,
         revision: 0,
