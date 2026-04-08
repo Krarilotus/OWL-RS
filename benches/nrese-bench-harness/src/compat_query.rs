@@ -10,8 +10,8 @@ use crate::model::{
     CompatCase, CompatCaseReport, CompatKind, compat_kind_label, compat_operation_label,
 };
 use crate::normalize::{
-    canonicalize_bindings_set, canonicalize_rdf_graph_set, extract_ask_boolean,
-    extract_binding_count, parse_json,
+    canonicalize_bindings_set, canonicalize_rdf_graph_set, compare_canonical_sets,
+    extract_ask_boolean, extract_binding_count, parse_json,
 };
 use crate::payloads::query_text;
 
@@ -67,6 +67,13 @@ fn build_report(
         right.content_type.as_deref(),
         &right.body,
     )?;
+    let result_diff = build_result_diff(
+        case.kind,
+        left.content_type.as_deref(),
+        &left.body,
+        right.content_type.as_deref(),
+        &right.body,
+    )?;
 
     Ok(CompatCaseReport {
         name: case.name.clone(),
@@ -81,6 +88,10 @@ fn build_report(
         matched,
         left_summary,
         right_summary,
+        left_result_count: result_diff.left_result_count,
+        right_result_count: result_diff.right_result_count,
+        left_only_sample: result_diff.left_only_sample,
+        right_only_sample: result_diff.right_only_sample,
     })
 }
 
@@ -119,24 +130,72 @@ fn compare_payloads(
             let right_json = parse_json(right)?;
             let left_set = canonicalize_bindings_set(&left_json)?;
             let right_set = canonicalize_bindings_set(&right_json)?;
+            let comparison = compare_canonical_sets(&left_set, &right_set);
             Ok((
-                left_set == right_set,
-                format!("bindings={}", left_set.len()),
-                format!("bindings={}", right_set.len()),
+                comparison.matched,
+                format!("bindings={}", comparison.left_count),
+                format!("bindings={}", comparison.right_count),
             ))
         }
         CompatKind::ConstructTriplesSet | CompatKind::GraphTriplesSet => {
             let left_set = canonicalize_rdf_graph_set(left_content_type, left)?;
             let right_set = canonicalize_rdf_graph_set(right_content_type, right)?;
+            let comparison = compare_canonical_sets(&left_set, &right_set);
             Ok((
-                left_set == right_set,
-                format!("triples={}", left_set.len()),
-                format!("triples={}", right_set.len()),
+                comparison.matched,
+                format!("triples={}", comparison.left_count),
+                format!("triples={}", comparison.right_count),
             ))
         }
         CompatKind::StatusAndContentType | CompatKind::StatusContentTypeBodyClass => Err(anyhow!(
             "status-and-content-type is not a query payload comparator"
         )),
+    }
+}
+
+struct ResultDiff {
+    left_result_count: Option<usize>,
+    right_result_count: Option<usize>,
+    left_only_sample: Vec<String>,
+    right_only_sample: Vec<String>,
+}
+
+fn build_result_diff(
+    kind: CompatKind,
+    left_content_type: Option<&str>,
+    left: &[u8],
+    right_content_type: Option<&str>,
+    right: &[u8],
+) -> Result<ResultDiff> {
+    match kind {
+        CompatKind::SolutionsBindingsSet => {
+            let left_set = canonicalize_bindings_set(&parse_json(left)?)?;
+            let right_set = canonicalize_bindings_set(&parse_json(right)?)?;
+            let comparison = compare_canonical_sets(&left_set, &right_set);
+            Ok(ResultDiff {
+                left_result_count: Some(comparison.left_count),
+                right_result_count: Some(comparison.right_count),
+                left_only_sample: comparison.left_only_sample,
+                right_only_sample: comparison.right_only_sample,
+            })
+        }
+        CompatKind::ConstructTriplesSet | CompatKind::GraphTriplesSet => {
+            let left_set = canonicalize_rdf_graph_set(left_content_type, left)?;
+            let right_set = canonicalize_rdf_graph_set(right_content_type, right)?;
+            let comparison = compare_canonical_sets(&left_set, &right_set);
+            Ok(ResultDiff {
+                left_result_count: Some(comparison.left_count),
+                right_result_count: Some(comparison.right_count),
+                left_only_sample: comparison.left_only_sample,
+                right_only_sample: comparison.right_only_sample,
+            })
+        }
+        _ => Ok(ResultDiff {
+            left_result_count: None,
+            right_result_count: None,
+            left_only_sample: Vec::new(),
+            right_only_sample: Vec::new(),
+        }),
     }
 }
 

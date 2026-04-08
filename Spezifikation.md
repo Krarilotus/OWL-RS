@@ -52,6 +52,7 @@ Verbindlicher Kurzstand je Track:
   - Query, Update, Graph Store, Tell, Service Description, Harness, Workload Packs und eine wiederverwendbare Connection-Profile-Registry fuer gesicherte Live-Parity existieren
   - kataloggetriebene `pack-matrix`-Laeufe koennen jetzt auch gezielt eine einzelne offizielle Ontologie selektieren, statt nur Tier- oder Metadatenfilter zu verwenden
   - Live-Parity-Packs koennen jetzt explizit als `compat-only` laufen, wenn bestehende Deployments ohne Seed-/Bench-Nebenwirkungen verglichen werden sollen
+  - lokale Side-by-Side-Evidenz gegen Apache Jena Fuseki 6.0.0 liegt jetzt fuer FOAF, ORG und SKOS auf dem normalen `pack-report.json`-/`pack-matrix-report.json`-Pfad vor
   - echte Live-Evidenz gegen die Ziel-Fuseki-Umgebung fehlt noch
 - Reasoner: `partial`
   - `rules-mvp` ist real und deckt RDFS plus einen bounded OWL-Slice ab

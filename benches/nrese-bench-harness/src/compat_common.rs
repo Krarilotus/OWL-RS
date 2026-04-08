@@ -242,6 +242,10 @@ pub fn build_response_semantics_report(
                 matched,
                 left_summary: format_response_semantics_summary(&left_semantics, left),
                 right_summary: format_response_semantics_summary(&right_semantics, right),
+                left_result_count: None,
+                right_result_count: None,
+                left_only_sample: Vec::new(),
+                right_only_sample: Vec::new(),
             })
         }
         _ => Err(anyhow!(

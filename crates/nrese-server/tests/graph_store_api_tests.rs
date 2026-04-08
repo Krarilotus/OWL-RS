@@ -88,7 +88,7 @@ async fn graph_roundtrip_supports_rdf_xml() -> Result<(), Box<dyn std::error::Er
                 ))?,
         )
         .await?;
-    assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(put_response.status(), StatusCode::CREATED);
 
     let get_response = app
         .oneshot(
@@ -111,6 +111,38 @@ async fn graph_roundtrip_supports_rdf_xml() -> Result<(), Box<dyn std::error::Er
     let text = String::from_utf8(body.to_vec())?;
     assert!(text.contains("rdf:RDF"));
     assert!(text.contains("http://example.com/a"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn graph_put_returns_ok_when_replacing_existing_named_graph()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app()?;
+    let payload = r#"@prefix ex: <http://example.com/> . ex:a ex:p ex:b ."#;
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/data?graph=http%3A%2F%2Fexample.com%2Fexisting")
+                .method(Method::PUT)
+                .header("content-type", "text/turtle")
+                .body(Body::from(payload))?,
+        )
+        .await?;
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/data?graph=http%3A%2F%2Fexample.com%2Fexisting")
+                .method(Method::PUT)
+                .header("content-type", "text/turtle")
+                .body(Body::from(payload))?,
+        )
+        .await?;
+    assert_eq!(second.status(), StatusCode::OK);
 
     Ok(())
 }

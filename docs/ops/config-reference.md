@@ -73,6 +73,9 @@ update_ms = 60000
 graph_read_ms = 30000
 graph_write_ms = 60000
 
+[policy]
+sparql_parse_error_profile = "problem-json"
+
 [policy.exposure]
 operator_ui = true
 metrics = true
@@ -173,6 +176,17 @@ api_key = "replace-me"
 - `policy.timeouts.update_ms` -> `NRESE_UPDATE_TIMEOUT_MS`
 - `policy.timeouts.graph_read_ms` -> `NRESE_GRAPH_READ_TIMEOUT_MS`
 - `policy.timeouts.graph_write_ms` -> `NRESE_GRAPH_WRITE_TIMEOUT_MS`
+
+## SPARQL Parse Error Profile
+
+- `policy.sparql_parse_error_profile` -> `NRESE_SPARQL_PARSE_ERROR_PROFILE`
+- values:
+  - `problem-json`
+  - `plain-text`
+  - `fuseki-plain-text`
+- default: `problem-json`
+
+Use `fuseki-plain-text` when you want local or live parity runs to match Fuseki-style plain-text parse errors for invalid SPARQL syntax while keeping the rest of the API on the normal problem+json path.
 
 ## Endpoint Exposure
 

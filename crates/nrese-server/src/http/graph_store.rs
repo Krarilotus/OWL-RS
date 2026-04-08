@@ -132,8 +132,9 @@ async fn write_graph(
         payload: body.to_vec(),
         replace,
     };
+    let status_target = request.target.clone();
     let store = state.store();
-    tokio::time::timeout(
+    let report = tokio::time::timeout(
         state.policy().timeouts.graph_write,
         tokio::task::spawn_blocking(move || store.execute_graph_write(&request)),
     )
@@ -142,7 +143,18 @@ async fn write_graph(
     .map_err(|error| ApiError::internal(error.to_string()))?
     .map_err(|error| ApiError::bad_request(error.to_string()))?;
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(write_graph_status(&status_target, report))
+}
+
+fn write_graph_status(
+    target: &nrese_store::GraphTarget,
+    report: nrese_store::GraphWriteReport,
+) -> StatusCode {
+    match target {
+        nrese_store::GraphTarget::NamedGraph(_) if report.created => StatusCode::CREATED,
+        nrese_store::GraphTarget::NamedGraph(_) => StatusCode::OK,
+        nrese_store::GraphTarget::DefaultGraph => StatusCode::NO_CONTENT,
+    }
 }
 
 fn parse_graph_accept_format(accept: Option<&str>) -> nrese_store::GraphResultFormat {
@@ -160,11 +172,13 @@ fn parse_graph_accept_format(accept: Option<&str>) -> nrese_store::GraphResultFo
 #[cfg(test)]
 mod tests {
     use axum::extract::RawQuery;
+    use axum::http::StatusCode;
     use nrese_store::GraphResultFormat;
+    use nrese_store::GraphWriteReport;
 
     use crate::http::rdf_payload::parse_graph_target;
 
-    use super::parse_graph_accept_format;
+    use super::{parse_graph_accept_format, write_graph_status};
 
     #[test]
     fn graph_target_defaults_to_default_graph() {
@@ -203,5 +217,47 @@ mod tests {
         let format =
             parse_graph_accept_format(Some("application/n-triples, application/rdf+xml; q=0.9"));
         assert_eq!(format, GraphResultFormat::RdfXml);
+    }
+
+    #[test]
+    fn write_graph_status_returns_created_for_new_named_graphs() {
+        let status = write_graph_status(
+            &nrese_store::GraphTarget::NamedGraph("http://example.com/g".to_owned()),
+            GraphWriteReport {
+                modified: true,
+                created: true,
+                revision: 1,
+            },
+        );
+
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    #[test]
+    fn write_graph_status_returns_ok_for_existing_named_graphs() {
+        let status = write_graph_status(
+            &nrese_store::GraphTarget::NamedGraph("http://example.com/g".to_owned()),
+            GraphWriteReport {
+                modified: true,
+                created: false,
+                revision: 2,
+            },
+        );
+
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn write_graph_status_returns_no_content_for_default_graph() {
+        let status = write_graph_status(
+            &nrese_store::GraphTarget::DefaultGraph,
+            GraphWriteReport {
+                modified: true,
+                created: false,
+                revision: 3,
+            },
+        );
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
     }
 }

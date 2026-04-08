@@ -33,12 +33,13 @@ fn execute_blocking(
     state: &AppState,
 ) -> Result<(), ApiError> {
     let update_lock = state.update_lock();
+    let policy = state.policy().clone();
     let _guard = update_lock
         .lock()
         .map_err(|_| ApiError::internal("update lock is poisoned"))?;
     let preview = store
         .preview_update(&request)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        .map_err(|error| policy.bad_request_for_sparql_parse_error(error.to_string()))?;
     let snapshot = &preview.snapshot;
     let plan = reasoner
         .plan(snapshot)
@@ -64,7 +65,7 @@ fn execute_blocking(
     )?;
     let _update_report = store
         .execute_update(&request)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        .map_err(|error| policy.bad_request_for_sparql_parse_error(error.to_string()))?;
 
     Ok(())
 }

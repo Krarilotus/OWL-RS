@@ -439,9 +439,12 @@ Expected evidence artifacts when `--report-dir` is set:
 - configured compat suites
 - per-suite match status and report path
 - benchmark report path
+- overall pack `status` and `error`, so failed live parity runs still emit one top-level evidence index instead of leaving only partial suite files
 
 If a pack includes `timeout_failure_cases.json`, the resulting suite artifact is indexed the same way as any other compat suite. Timeout parity does not get a separate report type.
 If a pack references named invocation profiles through its compat suites, the harness validates those references before seeding or benchmarking so a selected connection profile and a workload pack cannot drift silently.
+
+For graph-producing cases, the harness now canonicalizes blank nodes before triples-set comparison instead of comparing raw blank-node labels. This keeps official ontology `CONSTRUCT` parity stable across NRESE and Fuseki when both outputs are graph-isomorphic but use different blank-node identifiers.
 
 For existing secured deployments where reseeding or benchmarking is not appropriate, reuse the same pack with `--execution-mode compat-only`:
 
@@ -523,6 +526,31 @@ Example local evidence paths from a successful run:
 
 These are local run artifacts, not replacement-grade proof by themselves. Full replacement evidence still requires the real ontology/workloads, richer resource measurements, and automated CI gating.
 
+Additional verified local side-by-side evidence now exists against a locally unpacked Apache Jena Fuseki 6.0.0 installation outside the git repo:
+
+- FOAF:
+  - `artifacts/manual-live-parity-foaf/pack-matrix-report.json`
+  - `artifacts/manual-live-parity-foaf/foaf/pack-report.json`
+- ORG:
+  - `artifacts/manual-live-parity-org-4/pack-matrix-report.json`
+  - `artifacts/manual-live-parity-org-4/org/pack-report.json`
+- SKOS:
+  - `artifacts/manual-live-parity-skos/pack-matrix-report.json`
+  - `artifacts/manual-live-parity-skos/skos/pack-report.json`
+
+Those local runs were executed with:
+
+- NRESE in `rules-mvp` mode with preset `bounded-owl`
+- `NRESE_SPARQL_PARSE_ERROR_PROFILE=fuseki-plain-text`
+- external Fuseki started from `../Apache_Fuseki/apache-jena-fuseki-6.0.0`
+
+Observed local benchmark trend in those artifact sets:
+
+- NRESE query p95 was lower than Fuseki on FOAF, ORG, and SKOS in these in-memory local runs
+- NRESE update p95 was higher than Fuseki on the same runs
+
+These numbers are informative, not release gates. Replacement-grade evidence still requires the secured live workload packs against the project-specific deployment.
+
 ## Reproducibility Rules
 
 - Keep fixture files in version control.
@@ -570,3 +598,20 @@ Then use:
 
 - NRESE: `http://127.0.0.1:18080`
 - Fuseki: `http://127.0.0.1:3031/ds`
+
+## Local External Fuseki Helper
+
+If you keep a local Apache Fuseki install one directory above the repo at `../Apache_Fuseki/apache-jena-fuseki-6.0.0`, you can use:
+
+- `ops/fuseki/run-local-pack-matrix.ps1`
+
+Example:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\ops\fuseki\run-local-pack-matrix.ps1 `
+  -Ontology skos `
+  -ExecutionMode full `
+  -ReportDir artifacts\local-fuseki-skos
+```
+
+The helper keeps the external Fuseki process outside the git repo, starts NRESE on an isolated local port, and writes logs plus harness reports into the chosen artifact directory.

@@ -39,6 +39,9 @@ site_url = "https://example.com"
 [policy.limits]
 max_query_bytes = 2048
 
+[policy]
+sparql_parse_error_profile = "plain-text"
+
 [auth]
 mode = "mtls"
 
@@ -75,5 +78,9 @@ admin_subjects = ["CN=admin,O=Test"]
     assert_eq!(
         source.get(names::AUTH_MTLS_ADMIN_SUBJECTS).as_deref(),
         Some("CN=admin,O=Test")
+    );
+    assert_eq!(
+        source.get(names::SPARQL_PARSE_ERROR_PROFILE).as_deref(),
+        Some("plain-text")
     );
 }

@@ -15,7 +15,7 @@ use tower::util::ServiceExt;
 use nrese_server::auth::{
     AuthConfig, JwtBearerConfig, MtlsConfig, OidcIntrospectionConfig, StaticBearerConfig,
 };
-use nrese_server::policy::{PolicyConfig, RateLimitConfig, RequestLimits};
+use nrese_server::policy::{PolicyConfig, RateLimitConfig, RequestLimits, SparqlParseErrorProfile};
 
 use support::{test_app, test_app_with_policy};
 
@@ -271,6 +271,62 @@ async fn invalid_update_returns_problem_json() -> Result<(), Box<dyn std::error:
             .get("content-type")
             .and_then(|v| v.to_str().ok()),
         Some("application/problem+json")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_sparql_update_can_return_plain_text_for_fuseki_compat()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_policy(PolicyConfig {
+        sparql_parse_error_profile: SparqlParseErrorProfile::PlainText,
+        ..PolicyConfig::default()
+    })?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/update")
+                .method(Method::POST)
+                .header("content-type", "application/sparql-update")
+                .body(Body::from("INSERT DATA {"))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_sparql_query_can_return_plain_text_for_fuseki_compat()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_policy(PolicyConfig {
+        sparql_parse_error_profile: SparqlParseErrorProfile::PlainText,
+        ..PolicyConfig::default()
+    })?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query")
+                .method(Method::POST)
+                .header("content-type", "application/sparql-query")
+                .body(Body::from("SELECT WHERE {"))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain")
     );
     Ok(())
 }

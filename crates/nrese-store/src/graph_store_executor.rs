@@ -42,6 +42,7 @@ pub fn execute_graph_write(
     request: &GraphWriteRequest,
 ) -> StoreResult<GraphWriteReport> {
     let parser = parser_for_target(request)?;
+    let created = target_will_be_created(store, &request.target)?;
     let mut transaction = store.start_transaction()?;
 
     if request.replace {
@@ -53,6 +54,7 @@ pub fn execute_graph_write(
 
     Ok(GraphWriteReport {
         modified: true,
+        created,
         revision: 0,
     })
 }
@@ -102,6 +104,16 @@ fn parser_for_target(request: &GraphWriteRequest) -> StoreResult<RdfParser> {
     };
 
     Ok(parser)
+}
+
+fn target_will_be_created(store: &Store, target: &GraphTarget) -> StoreResult<bool> {
+    match target {
+        GraphTarget::DefaultGraph => Ok(false),
+        GraphTarget::NamedGraph(iri) => {
+            let named = parse_named_graph_iri(iri)?;
+            Ok(!store.contains_named_graph(named.as_ref())?)
+        }
+    }
 }
 
 fn parse_named_graph_iri(iri: &str) -> StoreResult<NamedNode> {

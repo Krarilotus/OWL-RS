@@ -57,6 +57,8 @@ pub(super) struct RawPolicyConfig {
     #[serde(default)]
     pub timeouts: RawTimeoutConfig,
     #[serde(default)]
+    pub sparql_parse_error_profile: Option<String>,
+    #[serde(default)]
     pub exposure: RawExposureConfig,
 }
 

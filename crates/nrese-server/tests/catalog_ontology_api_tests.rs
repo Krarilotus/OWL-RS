@@ -92,7 +92,7 @@ async fn graph_store_roundtrip_accepts_official_org_turtle_fixture()
                 .body(Body::from(org_bytes))?,
         )
         .await?;
-    assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(put_response.status(), StatusCode::CREATED);
 
     let get_response = app
         .oneshot(
@@ -160,7 +160,7 @@ async fn graph_store_roundtrip_accepts_official_skos_rdf_xml_fixture()
                 .body(Body::from(skos_bytes))?,
         )
         .await?;
-    assert_eq!(put_response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(put_response.status(), StatusCode::CREATED);
 
     let get_response = app
         .oneshot(

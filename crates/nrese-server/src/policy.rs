@@ -12,6 +12,7 @@ pub struct PolicyConfig {
     pub limits: RequestLimits,
     pub rate_limits: RateLimitConfig,
     pub timeouts: RequestTimeouts,
+    pub sparql_parse_error_profile: SparqlParseErrorProfile,
     pub expose_operator_ui: bool,
     pub expose_metrics: bool,
 }
@@ -23,6 +24,7 @@ impl Default for PolicyConfig {
             limits: RequestLimits::default(),
             rate_limits: RateLimitConfig::default(),
             timeouts: RequestTimeouts::default(),
+            sparql_parse_error_profile: SparqlParseErrorProfile::default(),
             expose_operator_ui: true,
             expose_metrics: true,
         }
@@ -67,6 +69,20 @@ impl PolicyConfig {
     pub fn enforce_rdf_upload_bytes(&self, size: usize) -> Result<(), ApiError> {
         enforce_size_limit("RDF upload", size, self.limits.max_rdf_upload_bytes)
     }
+
+    pub fn bad_request_for_sparql_parse_error(&self, message: impl Into<String>) -> ApiError {
+        match self.sparql_parse_error_profile {
+            SparqlParseErrorProfile::ProblemJson => ApiError::bad_request(message),
+            SparqlParseErrorProfile::PlainText => ApiError::bad_request_plain_text(message),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SparqlParseErrorProfile {
+    #[default]
+    ProblemJson,
+    PlainText,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

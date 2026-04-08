@@ -74,6 +74,7 @@ Implemented today:
 - the store preload path now derives a file base IRI for ontology parsing, so official Turtle vocabularies with relative ontology IRIs like PROV-O load on the same typed ingest path as the rest of the catalog
 - protocol compatibility harness coverage for query parity, limit/offset query semantics, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-parity slice, and bounded query/update failure-parity fixtures for covered negative cases
 - graph payload parity now canonicalizes Turtle, N-Triples, and RDF/XML onto one triples-set comparator path instead of treating RDF/XML as an opaque response class
+- local live side-by-side parity has now been exercised against Apache Jena Fuseki 6.0.0 on official FOAF, ORG, and SKOS ontology packs, with report artifacts under `artifacts/manual-live-parity-*`
 - bounded `bearer-jwt` auth alongside `bearer-static`
 - bounded proxy-terminated `mtls` auth alongside the existing bearer modes
 - bounded `oidc-introspection` auth alongside the existing bearer and proxy-terminated `mtls` modes
@@ -216,6 +217,8 @@ Optional environment variables:
   Example: `rdfs-subclass-closure,rdfs-subproperty-closure,rdfs-type-propagation,rdfs-domain-range-typing,owl-property-assertion-closure,owl-equality-reasoning,owl-consistency-check,unsupported-diagnostics`
 - `NRESE_REASONER_RULES_MVP_PRESET`
   Example: `bounded-owl`
+- `NRESE_SPARQL_PARSE_ERROR_PROFILE`
+  Example: `problem-json` or `fuseki-plain-text`
 - `NRESE_STORE_MODE`
   Example: `in-memory`
 - `NRESE_BIND_ADDR`
@@ -228,6 +231,25 @@ Optional environment variables:
   Used as Gemini API key fallback if `NRESE_AI_GOOGLE_API_KEY` is not set.
 
 The canonical runtime configuration reference is [docs/ops/config-reference.md](docs/ops/config-reference.md). README only lists the common entry points.
+
+### Run Local Side-By-Side Parity Against A Local Fuseki Install
+
+If you have Apache Fuseki unpacked one directory above the repository at `../Apache_Fuseki/apache-jena-fuseki-6.0.0`, you can run the local compare helper:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\ops\fuseki\run-local-pack-matrix.ps1 `
+  -Ontology foaf `
+  -ExecutionMode full `
+  -ReportDir artifacts\local-fuseki-foaf
+```
+
+The helper:
+
+- starts `nrese-server` on an isolated local port
+- starts the external Fuseki install outside the git repo
+- applies `NRESE_SPARQL_PARSE_ERROR_PROFILE=fuseki-plain-text` for syntax-error parity
+- runs the harness `pack-matrix` command
+- writes logs and reports under the chosen artifact directory
 
 ### Run With Durable Storage
 

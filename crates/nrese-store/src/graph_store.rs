@@ -29,6 +29,7 @@ pub struct GraphWriteRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GraphWriteReport {
     pub modified: bool,
+    pub created: bool,
     pub revision: u64,
 }
 

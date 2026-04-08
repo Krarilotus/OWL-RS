@@ -176,6 +176,7 @@ fn graph_store_named_graph_roundtrip() -> Result<(), Box<dyn std::error::Error>>
         replace: true,
     })?;
     assert!(write_report.modified);
+    assert!(write_report.created);
     assert_eq!(write_report.revision, 1);
 
     let read = service.execute_graph_read(&GraphReadRequest {
@@ -260,6 +261,31 @@ fn graph_write_replace_true_replaces_only_target_graph() -> Result<(), Box<dyn s
     assert!(named_text.contains("http://example.com/new"));
     assert!(!named_text.contains("http://example.com/old"));
     assert!(!named_text.contains("http://example.com/default"));
+
+    Ok(())
+}
+
+#[test]
+fn graph_write_reports_existing_named_graph_replacements_as_not_created()
+-> Result<(), Box<dyn std::error::Error>> {
+    let service = new_in_memory_service()?;
+    let named_graph = GraphTarget::NamedGraph("http://example.com/graph/existing".to_owned());
+
+    let first = service.execute_graph_write(&GraphWriteRequest {
+        target: named_graph.clone(),
+        format: nrese_store::GraphResultFormat::Turtle,
+        payload: b"@prefix ex: <http://example.com/> . ex:first ex:p ex:one .".to_vec(),
+        replace: true,
+    })?;
+    let second = service.execute_graph_write(&GraphWriteRequest {
+        target: named_graph,
+        format: nrese_store::GraphResultFormat::Turtle,
+        payload: b"@prefix ex: <http://example.com/> . ex:second ex:p ex:two .".to_vec(),
+        replace: true,
+    })?;
+
+    assert!(first.created);
+    assert!(!second.created);
 
     Ok(())
 }

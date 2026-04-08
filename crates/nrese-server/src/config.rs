@@ -126,6 +126,9 @@ api_key = "test-key"
 [policy.exposure]
 metrics = false
 
+[policy]
+sparql_parse_error_profile = "plain-text"
+
 [auth]
 mode = "none"
 "#,
@@ -137,6 +140,10 @@ mode = "none"
         assert_eq!(config.bind_address.to_string(), "0.0.0.0:9191");
         assert_eq!(config.store.data_dir.to_string_lossy(), "./runtime-data");
         assert!(!config.policy.expose_metrics);
+        assert_eq!(
+            config.policy.sparql_parse_error_profile,
+            crate::policy::SparqlParseErrorProfile::PlainText
+        );
         assert!(config.ai.enabled);
     }
 
@@ -225,6 +232,7 @@ mode = "none"
             (names::UPDATE_TIMEOUT_MS, None),
             (names::GRAPH_READ_TIMEOUT_MS, None),
             (names::GRAPH_WRITE_TIMEOUT_MS, None),
+            (names::SPARQL_PARSE_ERROR_PROFILE, None),
             (names::ENABLE_OPERATOR_UI, None),
             (names::ENABLE_METRICS, None),
             (names::AI_ENABLED, None),

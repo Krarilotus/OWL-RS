@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::GraphNameRef;
 use oxigraph::store::Store;
+use oxrdf::graph::{CanonicalizationAlgorithm, Graph};
 use serde_json::Value;
 
 use crate::model::LatencySummary;
@@ -12,6 +13,7 @@ pub fn parse_json(payload: &[u8]) -> Result<Value> {
     serde_json::from_slice(payload).context("failed to parse JSON payload")
 }
 
+#[cfg(test)]
 pub fn canonicalize_ntriples_set(payload: &[u8]) -> Result<BTreeSet<String>> {
     let text = std::str::from_utf8(payload).context("graph payload is not valid utf-8")?;
     Ok(text
@@ -34,18 +36,62 @@ pub fn canonicalize_rdf_graph_set(
         .load_from_slice(parser, payload)
         .context("failed to parse RDF graph payload")?;
 
-    let mut writer = RdfSerializer::from_format(RdfFormat::NTriples).for_writer(Vec::new());
+    let mut graph = Graph::new();
     for quad in store.quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph)) {
+        graph.insert(quad?.as_ref());
+    }
+    graph.canonicalize(CanonicalizationAlgorithm::Unstable);
+
+    let mut writer = RdfSerializer::from_format(RdfFormat::NTriples).for_writer(Vec::new());
+    for triple in &graph {
         writer
-            .serialize_triple(quad?.as_ref())
+            .serialize_triple(triple)
             .context("failed to serialize canonical graph triple")?;
     }
 
-    canonicalize_ntriples_set(
-        &writer
-            .finish()
-            .context("failed to finish canonical graph serializer")?,
-    )
+    let canonical = writer
+        .finish()
+        .context("failed to finish canonical graph serializer")?;
+    let text = std::str::from_utf8(&canonical).context("graph payload is not valid utf-8")?;
+
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetComparisonSummary {
+    pub matched: bool,
+    pub left_count: usize,
+    pub right_count: usize,
+    pub left_only_sample: Vec<String>,
+    pub right_only_sample: Vec<String>,
+}
+
+pub fn compare_canonical_sets(
+    left: &BTreeSet<String>,
+    right: &BTreeSet<String>,
+) -> SetComparisonSummary {
+    const SAMPLE_LIMIT: usize = 5;
+
+    SetComparisonSummary {
+        matched: left == right,
+        left_count: left.len(),
+        right_count: right.len(),
+        left_only_sample: left
+            .difference(right)
+            .take(SAMPLE_LIMIT)
+            .cloned()
+            .collect(),
+        right_only_sample: right
+            .difference(left)
+            .take(SAMPLE_LIMIT)
+            .cloned()
+            .collect(),
+    }
 }
 
 pub fn extract_ask_boolean(value: &Value) -> Result<bool> {
@@ -190,9 +236,10 @@ pub fn percentile(sorted_latencies: &[u128], p: usize) -> u128 {
 mod tests {
     use super::{
         canonicalize_bindings_set, canonicalize_ntriples_set, canonicalize_rdf_graph_set,
-        classify_http_body, extract_ask_boolean, extract_binding_count, normalize_content_type,
-        percentile,
+        classify_http_body, compare_canonical_sets, extract_ask_boolean, extract_binding_count,
+        normalize_content_type, percentile,
     };
+    use std::collections::BTreeSet;
 
     #[test]
     fn canonicalizes_ntriples_lines() {
@@ -220,6 +267,25 @@ mod tests {
         assert!(canonical.contains(
             "<http://example.com/a> <http://example.com/p> <http://example.com/b> ."
         ));
+    }
+
+    #[test]
+    fn canonicalizes_isomorphic_blank_nodes_to_the_same_graph_set() {
+        let left = br#"
+<http://example.com/a> <http://example.com/p> _:b0 .
+_:b0 <http://example.com/p> <http://example.com/c> .
+"#;
+        let right = br#"
+<http://example.com/a> <http://example.com/p> _:other .
+_:other <http://example.com/p> <http://example.com/c> .
+"#;
+
+        let left_set = canonicalize_rdf_graph_set(Some("application/n-triples"), left)
+            .expect("left graph");
+        let right_set = canonicalize_rdf_graph_set(Some("application/n-triples"), right)
+            .expect("right graph");
+
+        assert_eq!(left_set, right_set);
     }
 
     #[test]
@@ -283,5 +349,25 @@ mod tests {
             "problem-json"
         );
         assert_eq!(classify_http_body(Some("text/turtle"), b""), "empty");
+    }
+
+    #[test]
+    fn compare_canonical_sets_returns_diff_samples() {
+        let left = BTreeSet::from([
+            "<http://example.com/a> <http://example.com/p> <http://example.com/b> .".to_owned(),
+            "<http://example.com/a> <http://example.com/p> <http://example.com/c> .".to_owned(),
+        ]);
+        let right = BTreeSet::from([
+            "<http://example.com/a> <http://example.com/p> <http://example.com/b> .".to_owned(),
+            "<http://example.com/a> <http://example.com/p> <http://example.com/d> .".to_owned(),
+        ]);
+
+        let summary = compare_canonical_sets(&left, &right);
+
+        assert!(!summary.matched);
+        assert_eq!(summary.left_count, 2);
+        assert_eq!(summary.right_count, 2);
+        assert_eq!(summary.left_only_sample.len(), 1);
+        assert_eq!(summary.right_only_sample.len(), 1);
     }
 }

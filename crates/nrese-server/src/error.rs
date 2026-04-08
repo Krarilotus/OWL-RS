@@ -12,6 +12,8 @@ use crate::reject_view::RejectExplanationView;
 pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("bad request: {0}")]
+    BadRequestPlainText(String),
     #[error("reasoner reject: {detail}")]
     ReasonerReject {
         detail: String,
@@ -38,6 +40,10 @@ pub enum ApiError {
 impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::BadRequest(message.into())
+    }
+
+    pub fn bad_request_plain_text(message: impl Into<String>) -> Self {
+        Self::BadRequestPlainText(message.into())
     }
 
     pub fn unauthorized(message: impl Into<String>) -> Self {
@@ -96,6 +102,13 @@ impl IntoResponse for ApiError {
                 detail,
                 None,
             ),
+            Self::BadRequestPlainText(detail) => {
+                let mut response = (StatusCode::BAD_REQUEST, detail).into_response();
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+                return response;
+            }
             Self::ReasonerReject { detail, reject } => (
                 StatusCode::BAD_REQUEST,
                 "https://nrese.dev/problems/reasoner-reject",

@@ -19,6 +19,7 @@ pub async fn execute_query(
 
     let request = build_query_request(query, accept);
     let store = state.store();
+    let policy = state.policy().clone();
     let result = tokio::time::timeout(
         state.policy().timeouts.query,
         tokio::task::spawn_blocking(move || store.execute_query(&request)),
@@ -26,7 +27,7 @@ pub async fn execute_query(
     .await
     .map_err(|_| ApiError::timeout("query execution exceeded policy timeout"))?
     .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    .map_err(|error| policy.bad_request_for_sparql_parse_error(error.to_string()))?;
 
     let mut response = (StatusCode::OK, result.payload).into_response();
     response.headers_mut().insert(

@@ -296,7 +296,8 @@ async fn run_loaded_pack(config: &PackConfig, prepared: PreparedPackRun) -> Resu
     validate_pack_execution_mode(config.execution_mode, fuseki_connection.is_some())?;
 
     let mut compat_reports = Vec::new();
-    let bench_report = match config.execution_mode {
+    let mut bench_report = None;
+    let run_result: Result<()> = match config.execution_mode {
         PackExecutionMode::Full => {
             run_seed(SeedConfig {
                 nrese: merge_pack_service_profile(&nrese_connection, &pack.nrese),
@@ -345,9 +346,10 @@ async fn run_loaded_pack(config: &PackConfig, prepared: PreparedPackRun) -> Resu
             })
             .await?;
 
-            bench_run.report_json_path.map(|path| PackArtifactReport {
+            bench_report = bench_run.report_json_path.map(|path| PackArtifactReport {
                 path: path.display().to_string(),
-            })
+            });
+            Ok(())
         }
         PackExecutionMode::CompatOnly => {
             let fuseki_connection = fuseki_connection
@@ -369,9 +371,15 @@ async fn run_loaded_pack(config: &PackConfig, prepared: PreparedPackRun) -> Resu
                 .await?;
                 compat_reports.push(pack_compat_suite_report(compat_run));
             }
-            None
+            Ok(())
         }
     };
+    let status = if run_result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    };
+    let error = run_result.as_ref().err().map(ToString::to_string);
 
     if let Some(report_dir) = config.report_dir.as_ref() {
         write_json_report(
@@ -387,13 +395,15 @@ async fn run_loaded_pack(config: &PackConfig, prepared: PreparedPackRun) -> Resu
                 nrese_base_url: nrese_connection.base_url,
                 fuseki_base_url: fuseki_connection.map(|connection| connection.base_url),
                 iterations,
+                status,
+                error,
                 compat_suites: compat_reports,
                 bench_report,
             },
         )?;
     }
 
-    Ok(())
+    run_result
 }
 
 pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
@@ -506,7 +516,7 @@ pub async fn run_pack_matrix(config: PackMatrixConfig) -> Result<()> {
             }
         };
 
-        let report_dir = config.report_dir.join(&ontology.name);
+        let report_dir = prepare_pack_matrix_entry_report_dir(&config.report_dir, &ontology.name)?;
         let pack_config = PackConfig {
             nrese_base_url: Some(live_connections.nrese.base_url.clone()),
             fuseki_base_url: live_connections
@@ -584,6 +594,13 @@ pub async fn run_catalog_sync(config: CatalogSyncConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn prepare_pack_matrix_entry_report_dir(report_root: &Path, ontology_name: &str) -> Result<std::path::PathBuf> {
+    let report_dir = report_root.join(ontology_name);
+    fs::create_dir_all(&report_dir)
+        .with_context(|| format!("failed to create pack report dir {}", report_dir.display()))?;
+    Ok(report_dir)
 }
 
 fn ensure_report_dir(report_dir: Option<&Path>) -> Result<()> {
@@ -1216,7 +1233,8 @@ mod tests {
 
     use super::{
         CompatRunArtifact, baseline_pack_manifest_path, compat_report_filename,
-        pack_matrix_matches_filters, validate_pack_execution_mode,
+        pack_matrix_matches_filters, prepare_pack_matrix_entry_report_dir,
+        validate_pack_execution_mode,
         pack_compat_suite_report, pack_matrix_entry_missing_manifest,
         resolve_service_connection, resolve_service_profile,
     };
@@ -1474,5 +1492,15 @@ mod tests {
         assert!(error
             .to_string()
             .contains("compat-only execution mode requires a Fuseki connection"));
+    }
+
+    #[test]
+    fn prepare_pack_matrix_entry_report_dir_creates_nested_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let report_dir = prepare_pack_matrix_entry_report_dir(temp_dir.path(), "foaf")
+            .expect("report dir");
+
+        assert!(report_dir.is_dir());
+        assert!(report_dir.ends_with("foaf"));
     }
 }

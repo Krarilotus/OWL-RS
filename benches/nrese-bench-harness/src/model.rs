@@ -458,6 +458,8 @@ pub struct PackReport {
     pub nrese_base_url: String,
     pub fuseki_base_url: Option<String>,
     pub iterations: usize,
+    pub status: &'static str,
+    pub error: Option<String>,
     pub compat_suites: Vec<PackCompatSuiteReport>,
     pub bench_report: Option<PackArtifactReport>,
 }
@@ -537,6 +539,14 @@ pub struct CompatCaseReport {
     pub matched: bool,
     pub left_summary: String,
     pub right_summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left_result_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_result_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left_only_sample: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub right_only_sample: Vec<String>,
 }
 
 pub fn default_query_accept() -> String {

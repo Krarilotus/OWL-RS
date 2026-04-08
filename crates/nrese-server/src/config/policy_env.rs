@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::policy::{PolicyConfig, RateLimitConfig, RequestLimits, RequestTimeouts};
+use crate::policy::{
+    PolicyConfig, RateLimitConfig, RequestLimits, RequestTimeouts, SparqlParseErrorProfile,
+};
 
 use super::auth_env::parse_auth_config;
 use super::env_names as names;
@@ -37,7 +39,39 @@ pub(super) fn parse_policy_config(source: &dyn ConfigSource) -> Result<PolicyCon
                 60_000,
             )?),
         },
+        sparql_parse_error_profile: parse_sparql_parse_error_profile(
+            source.get(names::SPARQL_PARSE_ERROR_PROFILE).as_deref(),
+        )?,
         expose_operator_ui: parse_bool(source, names::ENABLE_OPERATOR_UI, true)?,
         expose_metrics: parse_bool(source, names::ENABLE_METRICS, true)?,
     })
+}
+
+fn parse_sparql_parse_error_profile(value: Option<&str>) -> Result<SparqlParseErrorProfile> {
+    match value.unwrap_or("problem-json") {
+        "problem-json" => Ok(SparqlParseErrorProfile::ProblemJson),
+        "plain-text" | "fuseki-plain-text" => Ok(SparqlParseErrorProfile::PlainText),
+        other => anyhow::bail!("invalid SPARQL parse error profile: {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::source::KeyValueSource;
+    use crate::policy::SparqlParseErrorProfile;
+
+    use super::parse_policy_config;
+
+    #[test]
+    fn parses_plain_text_sparql_parse_error_profile() {
+        let mut source = KeyValueSource::default();
+        source.insert("NRESE_SPARQL_PARSE_ERROR_PROFILE", "plain-text");
+
+        let policy = parse_policy_config(&source).expect("policy");
+
+        assert_eq!(
+            policy.sparql_parse_error_profile,
+            SparqlParseErrorProfile::PlainText
+        );
+    }
 }

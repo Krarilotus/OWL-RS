@@ -3,15 +3,15 @@ use reqwest::Client;
 
 use crate::compat_common::{
     GraphWriteRequest, RequestExecutionOptions, build_response_semantics_report,
-    execute_graph_delete_raw, execute_graph_head_raw, execute_graph_read_raw,
-    execute_graph_write_raw, require_success_http,
+    classify_response_semantics, execute_graph_delete_raw, execute_graph_head_raw,
+    execute_graph_read_raw, execute_graph_write_raw, require_success_http,
 };
 use crate::layout::ServiceTarget;
 use crate::model::{
     CompatCase, CompatCaseReport, CompatHeaders, CompatKind, CompatOperation, compat_kind_label,
     compat_operation_label,
 };
-use crate::normalize::canonicalize_rdf_graph_set;
+use crate::normalize::{canonicalize_rdf_graph_set, compare_canonical_sets};
 use crate::payloads::graph_payload;
 
 pub async fn execute_case(
@@ -122,6 +122,7 @@ async fn build_graph_read_report(
                 canonicalize_rdf_graph_set(left_http.content_type.as_deref(), &left_http.body)?;
             let right_set =
                 canonicalize_rdf_graph_set(right_http.content_type.as_deref(), &right_http.body)?;
+            let comparison = compare_canonical_sets(&left_set, &right_set);
 
             Ok(CompatCaseReport {
                 name: case.name.clone(),
@@ -133,9 +134,13 @@ async fn build_graph_read_report(
                 right_content_type: right_http.content_type.clone(),
                 left_body_class: None,
                 right_body_class: None,
-                matched: left_set == right_set,
-                left_summary: format!("triples={}", left_set.len()),
-                right_summary: format!("triples={}", right_set.len()),
+                matched: comparison.matched,
+                left_summary: format!("triples={}", comparison.left_count),
+                right_summary: format!("triples={}", comparison.right_count),
+                left_result_count: Some(comparison.left_count),
+                right_result_count: Some(comparison.right_count),
+                left_only_sample: comparison.left_only_sample,
+                right_only_sample: comparison.right_only_sample,
             })
         }
         _ => bail!("graph-read operation only supports graph-triples-set in this build"),
@@ -230,6 +235,7 @@ async fn build_graph_delete_effect_report(
                 canonicalize_rdf_graph_set(left_http.content_type.as_deref(), &left_http.body)?;
             let right_set =
                 canonicalize_rdf_graph_set(right_http.content_type.as_deref(), &right_http.body)?;
+            let comparison = compare_canonical_sets(&left_set, &right_set);
 
             Ok(CompatCaseReport {
                 name: case.name.clone(),
@@ -241,9 +247,13 @@ async fn build_graph_delete_effect_report(
                 right_content_type: right_http.content_type.clone(),
                 left_body_class: None,
                 right_body_class: None,
-                matched: left_set == right_set,
-                left_summary: format!("triples={}", left_set.len()),
-                right_summary: format!("triples={}", right_set.len()),
+                matched: comparison.matched,
+                left_summary: format!("triples={}", comparison.left_count),
+                right_summary: format!("triples={}", comparison.right_count),
+                left_result_count: Some(comparison.left_count),
+                right_result_count: Some(comparison.right_count),
+                left_only_sample: comparison.left_only_sample,
+                right_only_sample: comparison.right_only_sample,
             })
         }
         CompatKind::StatusAndContentType | CompatKind::StatusContentTypeBodyClass => {
@@ -282,6 +292,9 @@ async fn build_graph_write_effect_report(
 ) -> Result<CompatCaseReport> {
     match case.kind {
         CompatKind::GraphTriplesSet => {
+            reset_graph_target(client, left, graph_target, &case.request_headers, options).await?;
+            reset_graph_target(client, right, graph_target, &case.request_headers, options)
+                .await?;
             let payload = graph_payload(case)?;
             let content_type = graph_content_type(case)?;
 
@@ -318,6 +331,7 @@ async fn build_graph_write_effect_report(
                 read_graph_set(client, left, graph_target, &case.request_headers).await?;
             let right_set =
                 read_graph_set(client, right, graph_target, &case.request_headers).await?;
+            let comparison = compare_canonical_sets(&left_set, &right_set);
 
             Ok(CompatCaseReport {
                 name: case.name.clone(),
@@ -329,17 +343,21 @@ async fn build_graph_write_effect_report(
                 right_content_type: right_http.content_type.clone(),
                 left_body_class: None,
                 right_body_class: None,
-                matched: left_http.status == right_http.status && left_set == right_set,
+                matched: left_http.status == right_http.status && comparison.matched,
                 left_summary: format!(
                     "write-status={} triples={}",
                     left_http.status.as_u16(),
-                    left_set.len()
+                    comparison.left_count
                 ),
                 right_summary: format!(
                     "write-status={} triples={}",
                     right_http.status.as_u16(),
-                    right_set.len()
+                    comparison.right_count
                 ),
+                left_result_count: Some(comparison.left_count),
+                right_result_count: Some(comparison.right_count),
+                left_only_sample: comparison.left_only_sample,
+                right_only_sample: comparison.right_only_sample,
             })
         }
         CompatKind::StatusAndContentType | CompatKind::StatusContentTypeBodyClass => {
@@ -378,6 +396,26 @@ async fn build_graph_write_effect_report(
             "graph-write-effect operation only supports graph-triples-set or response-semantics comparators in this build"
         ),
     }
+}
+
+async fn reset_graph_target(
+    client: &Client,
+    target: &ServiceTarget,
+    graph_target: &crate::model::CompatGraphTarget,
+    extra_headers: &CompatHeaders,
+    options: RequestExecutionOptions,
+) -> Result<()> {
+    let outcome = execute_graph_delete_raw(client, target, graph_target, extra_headers, options).await?;
+    let semantics = classify_response_semantics(&outcome);
+    if (200..300).contains(&semantics.status) || semantics.status == 404 {
+        return Ok(());
+    }
+
+    bail!(
+        "graph reset failed against {} with status {}",
+        target.label,
+        semantics.status
+    );
 }
 
 fn graph_content_type(case: &CompatCase) -> Result<&str> {

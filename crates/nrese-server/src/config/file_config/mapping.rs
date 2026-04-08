@@ -82,6 +82,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> KeyValueSource {
         names::GRAPH_WRITE_TIMEOUT_MS,
         config.policy.timeouts.graph_write_ms,
     );
+    insert_option(
+        &mut source,
+        names::SPARQL_PARSE_ERROR_PROFILE,
+        config.policy.sparql_parse_error_profile,
+    );
     insert_bool(
         &mut source,
         names::ENABLE_OPERATOR_UI,

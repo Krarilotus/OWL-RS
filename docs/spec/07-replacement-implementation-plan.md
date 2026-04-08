@@ -63,7 +63,9 @@ Implementation blocks:
 - timeout and payload-limit comparison cases
 - manifest-driven production workload parity pack support so seed, compat, and bench runs use one versioned evidence unit instead of ad hoc fixture combinations
 - workload-pack aggregate reporting so one pack run emits a canonical `pack-report.json` evidence index alongside per-suite compat reports and benchmark output
+- pack-report persistence on failure so failed live parity runs still emit a top-level evidence index instead of leaving only partial suite files
 - broader SPARQL Update parity fixtures for the intended replacement scope before moving to live project-specific packs
+- bnode-isomorphic graph canonicalization for graph-producing parity cases so official ontology `CONSTRUCT` outputs compare semantics instead of raw blank-node labels
 - staged real-world ontology catalog with small-to-broad official ontology sources plus typed processing metadata to harden parity and performance work incrementally
 - project-realistic compatibility packs against the live Fuseki deployment
 - CI wiring for repeatable compatibility execution
@@ -297,6 +299,9 @@ Priority order for the next replacement-focused runs:
 - added preflight validation of compat-suite invocation-profile references against the selected live connection profile and workload-pack overlays, so secured parity runs fail before seed/bench execution when profile wiring drifts
 - added a dedicated `pack-validate` command and report shape so deployment workflows can gate live parity runs on the same connection-profile and pack-resolution path used by real execution
 - added a dedicated limit/offset semantics compat suite and a bindings-set comparator so query-window parity does not rely on count-only summaries
+- replaced the harness-local blank-node canonicalization path with upstream oxrdf graph canonicalization, which reduced custom comparison code while fixing local ORG `CONSTRUCT` parity against Fuseki
+- extended compat reports with optional result-count and diff-sample fields, and ensured `pack-report.json` is written even when a pack fails mid-run
+- verified local live side-by-side parity against a local Apache Jena Fuseki 6.0.0 install for the official FOAF, ORG, and SKOS packs on the standard `pack-matrix` evidence path
 - moved the class-consistency test block into a dedicated `src/tests/consistency_tests.rs` file to match the repo’s topic-adjacent unit-test convention
 - initialized git versioning for the repository and updated `.gitignore` for Rust, frontend, runtime, and local-secret artifacts
 - added a separate `/console` frontend application with modular React/TypeScript structure, separated styles/i18n, and basic build/test coverage
