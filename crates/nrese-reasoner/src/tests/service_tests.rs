@@ -339,16 +339,12 @@ fn rules_mvp_can_disable_consistency_enforcement_via_policy() {
         ],
         0,
     );
-    let service = ReasonerService::new(ReasonerConfig {
-        profile: ReasonerProfileConfig::RulesMvp(crate::RulesMvpConfig {
-            preset: crate::RulesMvpPreset::Custom,
-            feature_policy: RulesMvpFeaturePolicy {
-                owl_consistency_check: FeatureMode::Disabled,
-                ..RulesMvpFeaturePolicy::industry_default()
-            },
-        }),
-        read_model: crate::ReasoningReadModel::AssertedOnly,
-    });
+    let service = ReasonerService::new(ReasonerConfig::with_profile(
+        ReasonerProfileConfig::RulesMvp(crate::RulesMvpConfig::custom(RulesMvpFeaturePolicy {
+            owl_consistency_check: FeatureMode::Disabled,
+            ..RulesMvpFeaturePolicy::industry_default()
+        })),
+    ));
 
     let plan = service.plan(&snapshot).expect("plan");
     let output = service.run(&snapshot, &plan).expect("run");
@@ -378,16 +374,12 @@ fn rules_mvp_can_disable_unsupported_construct_diagnostics_via_policy() {
         )],
         0,
     );
-    let service = ReasonerService::new(ReasonerConfig {
-        profile: ReasonerProfileConfig::RulesMvp(crate::RulesMvpConfig {
-            preset: crate::RulesMvpPreset::Custom,
-            feature_policy: RulesMvpFeaturePolicy {
-                unsupported_constructs: UnsupportedConstructBehavior::Ignore,
-                ..RulesMvpFeaturePolicy::industry_default()
-            },
-        }),
-        read_model: crate::ReasoningReadModel::AssertedOnly,
-    });
+    let service = ReasonerService::new(ReasonerConfig::with_profile(
+        ReasonerProfileConfig::RulesMvp(crate::RulesMvpConfig::custom(RulesMvpFeaturePolicy {
+            unsupported_constructs: UnsupportedConstructBehavior::Ignore,
+            ..RulesMvpFeaturePolicy::industry_default()
+        })),
+    ));
 
     let plan = service.plan(&snapshot).expect("plan");
     let output = service.run(&snapshot, &plan).expect("run");

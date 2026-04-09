@@ -42,6 +42,18 @@ impl ReasonerConfig {
         }
     }
 
+    pub const fn with_profile(profile: ReasonerProfileConfig) -> Self {
+        Self {
+            profile,
+            read_model: ReasoningReadModel::AssertedOnly,
+        }
+    }
+
+    pub const fn with_read_model(mut self, read_model: ReasoningReadModel) -> Self {
+        self.read_model = read_model;
+        self
+    }
+
     pub const fn mode(&self) -> ReasoningMode {
         match self.profile {
             ReasonerProfileConfig::Disabled => ReasoningMode::Disabled,
@@ -83,6 +95,13 @@ impl RulesMvpConfig {
         Self {
             preset,
             feature_policy: preset.feature_policy(),
+        }
+    }
+
+    pub const fn custom(feature_policy: RulesMvpFeaturePolicy) -> Self {
+        Self {
+            preset: RulesMvpPreset::Custom,
+            feature_policy,
         }
     }
 
@@ -149,17 +168,13 @@ mod tests {
 
     #[test]
     fn rules_mvp_config_accepts_explicit_policy() {
-        let config = ReasonerConfig {
-            profile: ReasonerProfileConfig::RulesMvp(RulesMvpConfig {
-                preset: RulesMvpPreset::Custom,
-                feature_policy: RulesMvpFeaturePolicy {
-                    unsupported_constructs: UnsupportedConstructBehavior::Ignore,
-                    owl_equality_reasoning: FeatureMode::Disabled,
-                    ..RulesMvpFeaturePolicy::industry_default()
-                },
+        let config = ReasonerConfig::with_profile(ReasonerProfileConfig::RulesMvp(
+            RulesMvpConfig::custom(RulesMvpFeaturePolicy {
+                unsupported_constructs: UnsupportedConstructBehavior::Ignore,
+                owl_equality_reasoning: FeatureMode::Disabled,
+                ..RulesMvpFeaturePolicy::industry_default()
             }),
-            read_model: ReasoningReadModel::AssertedOnly,
-        };
+        ));
 
         assert!(config.validate().is_ok());
     }
