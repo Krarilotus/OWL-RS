@@ -8,6 +8,7 @@ pub fn build_service_description(state: &AppState) -> String {
     let posture = state.runtime_posture();
     let reasoning_mode = state.reasoner_mode_name();
     let reasoning_profile = state.reasoner_profile_name();
+    let reasoning_read_model = state.reasoner_read_model_name();
     let graph_store_enabled = bool_literal(posture.graph_store_enabled);
     let graph_store_write_enabled = bool_literal(posture.graph_write_enabled);
     let sparql_update_enabled = bool_literal(posture.sparql_update_enabled);
@@ -48,6 +49,7 @@ pub fn build_service_description(state: &AppState) -> String {
 {operator_endpoint}\
    nrese:reasoningMode \"{reasoning_mode}\" ;\n\
    nrese:reasoningProfile \"{reasoning_profile}\" ;\n\
+   nrese:reasoningReadModel \"{reasoning_read_model}\" ;\n\
    nrese:graphStoreEnabled \"{graph_store_enabled}\" ;\n\
    nrese:graphStoreWriteEnabled \"{graph_store_write_enabled}\" ;\n\
    nrese:sparqlUpdateEnabled \"{sparql_update_enabled}\" ;\n\
@@ -90,6 +92,7 @@ mod tests {
         assert!(ttl.contains("/dataset/data"));
         assert!(ttl.contains("/metrics"));
         assert!(ttl.contains("/ops"));
+        assert!(ttl.contains("nrese:reasoningReadModel \"asserted-only\""));
     }
 
     #[test]

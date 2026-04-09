@@ -7,6 +7,7 @@ pub struct ReasoningDiagnosticsResponse {
     pub revision: u64,
     pub mode: &'static str,
     pub profile: &'static str,
+    pub read_model: &'static str,
     pub capabilities: Vec<ReasoningCapabilityView>,
     pub configured_policy: Option<ConfiguredReasoningPolicyView>,
     pub last_run: Option<LastReasoningRunView>,

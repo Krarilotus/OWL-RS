@@ -39,6 +39,8 @@ pub(super) struct RawReasonerConfig {
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
+    pub read_model: Option<String>,
+    #[serde(default)]
     pub rules_mvp: RawRulesMvpConfig,
 }
 

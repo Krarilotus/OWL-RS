@@ -15,6 +15,7 @@ vi.mock("../lib/api", () => ({
     durability: "ephemeral",
     reasoning_mode: "rules-mvp",
     reasoning_profile: "nrese-rules-mvp",
+    reasoning_read_model: "asserted-only",
     reasoning_semantic_tier: "bounded-owl-rules",
     ontology_path: null,
     version: "0.1.0",
@@ -31,6 +32,7 @@ vi.mock("../lib/api", () => ({
     ai_status_endpoint: "/api/ai/status",
     ai_query_suggestions_endpoint: "/api/ai/query-suggestions",
     reasoning_profile: "nrese-rules-mvp",
+    reasoning_read_model: "asserted-only",
     reasoning_semantic_tier: "bounded-owl-rules",
     tell_enabled: true,
     ai_query_suggestions_enabled: true,
@@ -45,6 +47,7 @@ vi.mock("../lib/api", () => ({
     revision: 2,
     mode: "rules-mvp",
     profile: "rules-mvp",
+    read_model: "asserted-only",
     capabilities: [
       {
         feature: "owl-property-chain-axioms",

@@ -52,6 +52,7 @@ Implemented today:
 - bounded `rules-mvp` reasoning with canonical `owl:sameAs` equality handling, bounded functional / inverse-functional equality entailment, bounded binary `owl:propertyChainAxiom` support over named-node RDF lists, bounded `owl:AllDifferent` / `owl:AllDisjointClasses` / `owl:AllDisjointProperties` expansion into the same consistency gates, bounded `owl:Nothing` effective-type rejection, and explicit unsupported-construct diagnostics
 - typed `rules-mvp` presets (`rdfs-core`, `bounded-owl`) on top of the explicit feature-policy path
 - external reasoner selection is now resolved into one runtime profile/tier contract, so config parsing can still accept `mode + preset + feature overrides` while runtime diagnostics, capability payloads, and frontend state read one resolved reasoner identity
+- the current reasoning read model is now explicit and externally configurable as `asserted-only`, so query/runtime surfaces state honestly that reads expose committed asserted data while reasoning remains a mutation gate plus diagnostics
 - `rules-mvp` runtime diagnostics now also expose the resolved semantic tier for the active bounded RDFS/OWL slice, so bounded RDFS vs bounded OWL behavior is visible without reverse-engineering feature flags
 - snapshot-keyed memoization for repeated `rules-mvp` runs over identical dataset state
 - schema-keyed memoization for `rules-mvp` preparation reuse across ABox-only changes
@@ -221,6 +222,8 @@ Optional environment variables:
   Path to an ontology file to preload.
 - `NRESE_REASONING_MODE`
   Example: `rules-mvp`
+- `NRESE_REASONER_READ_MODEL`
+  Example: `asserted-only`
 - `NRESE_REASONER_RULES_MVP_FEATURES`
   Example: `rdfs-subclass-closure,rdfs-subproperty-closure,rdfs-type-propagation,rdfs-domain-range-typing,owl-property-assertion-closure,owl-equality-reasoning,owl-consistency-check,unsupported-diagnostics`
 - `NRESE_REASONER_RULES_MVP_PRESET`

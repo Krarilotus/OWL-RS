@@ -9,6 +9,7 @@ export type RuntimeSnapshot = {
   durability: string;
   reasoning_mode: string;
   reasoning_profile: string;
+  reasoning_read_model: string;
   reasoning_semantic_tier: string;
   ontology_path?: string | null;
   version: string;
@@ -29,6 +30,7 @@ export type Capabilities = {
   ai_status_endpoint: string;
   ai_query_suggestions_endpoint: string;
   reasoning_profile: string;
+  reasoning_read_model: string;
   reasoning_semantic_tier: string;
   tell_enabled: boolean;
   graph_write_enabled?: boolean;
@@ -89,6 +91,7 @@ export type ReasoningDiagnostics = {
   revision: number;
   mode: string;
   profile: string;
+  read_model: string;
   capabilities: ReasoningCapability[];
   configured_policy?: ConfiguredReasoningPolicy | null;
   last_run?: LastReasoningRun | null;

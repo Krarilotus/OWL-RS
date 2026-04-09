@@ -268,6 +268,7 @@ mode = "none"
             (names::STORE_MODE, None),
             (names::ONTOLOGY_PATH, None),
             (names::REASONING_MODE, None),
+            (names::REASONER_READ_MODEL, None),
             (names::REASONER_RULES_MVP_PRESET, None),
             (names::REASONER_RULES_MVP_FEATURES, None),
             (names::MAX_QUERY_BYTES, None),

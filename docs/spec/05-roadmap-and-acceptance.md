@@ -50,6 +50,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - `/console` frontend now also ships a small CLI on the same TypeScript client boundary for fast query/update/tell/graph/runtime access without separate backend scripts
 - `rules-mvp` now supports explicit presets on top of the feature-policy path, so runtime defaults can be standardized without hard-coding product opinion into the engine
 - external `mode + preset + feature override` inputs now resolve into one runtime reasoner profile/tier contract, so frontend/runtime payloads no longer reconstruct active reasoning identity from parallel selectors
+- the current reasoning read model is now explicitly `asserted-only`, so commit-path reasoning integration is implemented without implying an inferred query surface that does not exist yet
 
 ### R4: Reasoning Integration
 

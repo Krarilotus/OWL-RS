@@ -5,7 +5,7 @@ use nrese_core::{
     ReasonerRunReport, ReasonerRunStatus, ReasoningOutput,
 };
 
-use crate::config::{ReasonerConfig, ReasonerProfileConfig, ReasoningMode};
+use crate::config::{ReasonerConfig, ReasonerProfileConfig, ReasoningMode, ReasoningReadModel};
 use crate::output::{InferenceDelta, ReasoningCacheStats};
 use crate::profile::profile_for_config;
 use crate::rules::execute_rules_mvp_with_cache;
@@ -38,6 +38,14 @@ impl ReasonerService {
 
     pub fn mode_name(&self) -> &'static str {
         self.resolved_profile.mode
+    }
+
+    pub const fn read_model(&self) -> ReasoningReadModel {
+        self.config.read_model
+    }
+
+    pub fn read_model_name(&self) -> &'static str {
+        self.read_model().as_str()
     }
 
     pub fn semantic_tier(&self) -> &'static str {

@@ -39,4 +39,5 @@ pub struct SuggestionContext {
     pub named_graph_count: usize,
     pub reasoning_mode: &'static str,
     pub reasoning_profile: &'static str,
+    pub reasoning_read_model: &'static str,
 }

@@ -19,6 +19,7 @@ Context:\n\
 - named graph count: {named_graph_count}\n\
 - reasoning mode: {reasoning_mode}\n\
 - reasoning profile: {reasoning_profile}\n\
+- reasoning read model: {reasoning_read_model}\n\
 \n\
 Requirements:\n\
 - Prefer safe read queries.\n\
@@ -35,5 +36,6 @@ Requirements:\n\
         named_graph_count = context.named_graph_count,
         reasoning_mode = context.reasoning_mode,
         reasoning_profile = context.reasoning_profile,
+        reasoning_read_model = context.reasoning_read_model,
     )
 }

@@ -30,6 +30,7 @@ export function RuntimePanel({
     [strings.runtimeNamedGraphsLabel, snapshot?.named_graph_count ?? "-"],
     [strings.runtimeDeploymentLabel, snapshot?.deployment_posture ?? "-"],
     [strings.runtimeReasonerLabel, snapshot?.reasoning_profile ?? "-"],
+    [strings.runtimeReadModelLabel, snapshot?.reasoning_read_model ?? "-"],
     [strings.runtimeTierLabel, snapshot?.reasoning_semantic_tier ?? "-"],
     [strings.runtimeStoreLabel, snapshot?.store_mode ?? "-"],
     [strings.runtimeDurabilityLabel, snapshot?.durability ?? "-"],

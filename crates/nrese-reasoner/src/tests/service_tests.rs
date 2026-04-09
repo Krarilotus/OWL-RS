@@ -347,6 +347,7 @@ fn rules_mvp_can_disable_consistency_enforcement_via_policy() {
                 ..RulesMvpFeaturePolicy::industry_default()
             },
         }),
+        read_model: crate::ReasoningReadModel::AssertedOnly,
     });
 
     let plan = service.plan(&snapshot).expect("plan");
@@ -385,6 +386,7 @@ fn rules_mvp_can_disable_unsupported_construct_diagnostics_via_policy() {
                 ..RulesMvpFeaturePolicy::industry_default()
             },
         }),
+        read_model: crate::ReasoningReadModel::AssertedOnly,
     });
 
     let plan = service.plan(&snapshot).expect("plan");

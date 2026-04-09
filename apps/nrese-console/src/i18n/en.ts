@@ -15,6 +15,7 @@ export const en: AppStrings = {
   runtimeNamedGraphsLabel: "Named graphs",
   runtimeDeploymentLabel: "Deployment posture",
   runtimeReasonerLabel: "Reasoner",
+  runtimeReadModelLabel: "Read model",
   runtimeTierLabel: "Reasoning tier",
   runtimeStoreLabel: "Store",
   runtimeDurabilityLabel: "Durability",

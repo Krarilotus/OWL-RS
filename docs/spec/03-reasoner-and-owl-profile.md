@@ -171,6 +171,7 @@ Primary target architecture:
 
 - Reasoning mode is explicitly selectable and observable.
 - External reasoner inputs resolve to one runtime profile/tier contract that diagnostics and runtime payloads share.
+- The current read model is explicitly `asserted-only`: reasoning affects commit acceptance and diagnostics, not the default query result set.
 - Unsupported constructs return deterministic diagnostics.
 - Inference output remains isolated from asserted source facts.
 - Runtime reports expose enough data for operations and audit trails.

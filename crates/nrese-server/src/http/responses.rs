@@ -26,6 +26,7 @@ pub struct ReadyResponse {
     pub durability: &'static str,
     pub reasoning_mode: &'static str,
     pub reasoning_profile: &'static str,
+    pub reasoning_read_model: &'static str,
     pub reasoning_semantic_tier: &'static str,
 }
 
@@ -40,6 +41,7 @@ pub struct VersionResponse {
     pub durable_storage_available: bool,
     pub reasoning_mode: &'static str,
     pub reasoning_profile: &'static str,
+    pub reasoning_read_model: &'static str,
     pub reasoning_semantic_tier: &'static str,
     pub graph_store_enabled: bool,
     pub graph_write_enabled: bool,
@@ -77,6 +79,7 @@ pub struct OperatorCapabilitiesResponse {
     pub durability: &'static str,
     pub durable_storage_available: bool,
     pub reasoning_profile: &'static str,
+    pub reasoning_read_model: &'static str,
     pub reasoning_semantic_tier: &'static str,
     pub graph_store_enabled: bool,
     pub graph_write_enabled: bool,
@@ -142,6 +145,7 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
         durability: state.durability_name(),
         reasoning_mode: state.reasoner_mode_name(),
         reasoning_profile: posture.reasoning_profile,
+        reasoning_read_model: posture.reasoning_read_model,
         reasoning_semantic_tier: posture.reasoning_semantic_tier,
     })
 }
@@ -158,6 +162,7 @@ pub fn build_version_response(state: &AppState) -> VersionResponse {
         durable_storage_available: durable_storage_available(),
         reasoning_mode: state.reasoner_mode_name(),
         reasoning_profile: posture.reasoning_profile,
+        reasoning_read_model: posture.reasoning_read_model,
         reasoning_semantic_tier: posture.reasoning_semantic_tier,
         graph_store_enabled: posture.graph_store_enabled,
         graph_write_enabled: posture.graph_write_enabled,
@@ -201,6 +206,7 @@ pub fn build_operator_capabilities_response(state: &AppState) -> OperatorCapabil
         durability: state.durability_name(),
         durable_storage_available: durable_storage_available(),
         reasoning_profile: posture.reasoning_profile,
+        reasoning_read_model: posture.reasoning_read_model,
         reasoning_semantic_tier: posture.reasoning_semantic_tier,
         graph_store_enabled: posture.graph_store_enabled,
         graph_write_enabled: posture.graph_write_enabled,

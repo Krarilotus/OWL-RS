@@ -316,6 +316,7 @@ Priority order for the next replacement-focused runs:
 - bounded reasoner/runtime consistency cleanup and TTL-based service fixtures
 - typed `rules-mvp` presets on top of the explicit feature-policy path
 - resolved external reasoner selection into one runtime profile/tier contract while keeping explicit feature overrides available at config-parse time
+- introduced an explicit `asserted-only` reasoning read-model contract so runtime/capability surfaces state the current query semantics honestly while leaving future inferred reads as a separate architecture block
 - test/file separation improvements in the reasoner slice
 - shared minimal TTL fixture for Store, Reasoner, and Server service-level tests
 - in-memory rate limiting in the server policy path as the first concrete quota-control step

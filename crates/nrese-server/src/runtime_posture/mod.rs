@@ -54,6 +54,7 @@ impl DeploymentPosture {
 pub struct RuntimePosture {
     pub deployment_posture: &'static str,
     pub reasoning_profile: &'static str,
+    pub reasoning_read_model: &'static str,
     pub reasoning_semantic_tier: &'static str,
     pub query_enabled: bool,
     pub graph_store_enabled: bool,
@@ -78,6 +79,7 @@ impl RuntimePosture {
         Self {
             deployment_posture: deployment_posture.as_str(),
             reasoning_profile: state.reasoner_profile_name(),
+            reasoning_read_model: state.reasoner_read_model_name(),
             reasoning_semantic_tier: state.reasoner().semantic_tier(),
             query_enabled: true,
             graph_store_enabled: true,

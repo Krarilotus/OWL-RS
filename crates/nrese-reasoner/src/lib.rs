@@ -24,7 +24,9 @@ mod taxonomy;
 pub(crate) mod test_support;
 mod vocabulary;
 
-pub use config::{ReasonerConfig, ReasonerProfileConfig, ReasoningMode, RulesMvpConfig};
+pub use config::{
+    ReasonerConfig, ReasonerProfileConfig, ReasoningMode, ReasoningReadModel, RulesMvpConfig,
+};
 pub use output::{
     InferenceDelta, ReasoningCacheStats, ReasoningStats, RejectBlame, RejectEvidence,
     RejectExplanation,

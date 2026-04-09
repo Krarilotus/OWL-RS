@@ -8,9 +8,24 @@ pub enum ReasoningMode {
     OwlDlTarget,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningReadModel {
+    #[default]
+    AssertedOnly,
+}
+
+impl ReasoningReadModel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AssertedOnly => "asserted-only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReasonerConfig {
     pub profile: ReasonerProfileConfig,
+    pub read_model: ReasoningReadModel,
 }
 
 impl ReasonerConfig {
@@ -23,6 +38,7 @@ impl ReasonerConfig {
                 }
                 ReasoningMode::OwlDlTarget => ReasonerProfileConfig::OwlDlTarget,
             },
+            read_model: ReasoningReadModel::AssertedOnly,
         }
     }
 
@@ -95,13 +111,16 @@ impl Default for ReasonerConfig {
     fn default() -> Self {
         Self {
             profile: ReasonerProfileConfig::Disabled,
+            read_model: ReasoningReadModel::AssertedOnly,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ReasonerConfig, ReasonerProfileConfig, ReasoningMode, RulesMvpConfig};
+    use super::{
+        ReasonerConfig, ReasonerProfileConfig, ReasoningMode, ReasoningReadModel, RulesMvpConfig,
+    };
     use crate::RulesMvpPreset;
     use crate::rules_mvp_policy::{
         FeatureMode, RulesMvpFeaturePolicy, UnsupportedConstructBehavior,
@@ -125,6 +144,7 @@ mod tests {
             config.rules_mvp().expect("rules-mvp config").preset,
             RulesMvpPreset::BoundedOwl
         );
+        assert_eq!(config.read_model, ReasoningReadModel::AssertedOnly);
     }
 
     #[test]
@@ -138,6 +158,7 @@ mod tests {
                     ..RulesMvpFeaturePolicy::industry_default()
                 },
             }),
+            read_model: ReasoningReadModel::AssertedOnly,
         };
 
         assert!(config.validate().is_ok());

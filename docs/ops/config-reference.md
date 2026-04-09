@@ -44,6 +44,7 @@ ontology_path = "C:/data/rg_ontology.ttl"
 
 [reasoner]
 mode = "rules-mvp"
+read_model = "asserted-only"
 
 [reasoner.rules_mvp]
 tier = "bounded-owl"
@@ -143,6 +144,14 @@ api_key = "replace-me"
 - file key: `reasoner.mode`
 - env override: `NRESE_REASONING_MODE`
 - values: `disabled`, `rules-mvp`, `owl-dl-target`
+
+- file key: `reasoner.read_model`
+- env override: `NRESE_REASONER_READ_MODEL`
+- values:
+  - `asserted-only`
+- current semantics:
+  - query and graph-read surfaces expose the latest committed asserted dataset state
+  - reasoning currently affects mutation acceptance and diagnostics, not the default query result set
 
 - file key: `reasoner.rules_mvp.features`
 - env override: `NRESE_REASONER_RULES_MVP_FEATURES`

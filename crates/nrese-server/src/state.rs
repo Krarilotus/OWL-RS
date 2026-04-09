@@ -69,6 +69,10 @@ impl AppState {
         self.reasoner.mode_name()
     }
 
+    pub fn reasoner_read_model_name(&self) -> &'static str {
+        self.reasoner.read_model_name()
+    }
+
     pub fn reasoner(&self) -> Arc<ReasonerService> {
         Arc::clone(&self.reasoner)
     }

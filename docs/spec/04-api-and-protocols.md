@@ -60,6 +60,7 @@ Primary conformance targets:
 - `GET /metrics` (configurable exposure)
 
 Write/admin/optional surfaces remain part of the documented contract, but they may be disabled by deployment posture. The runtime source of truth for that posture MUST drive startup validation, request guards, JSON capability payloads, and service-description advertising together.
+The current reasoning read model is `asserted-only`: `/dataset/query`, `/dataset/info`, and Graph Store reads expose asserted committed store state, while reasoning surfaces today are mutation rejects plus runtime/operator diagnostics.
 
 ## Capability Tiers
 
@@ -141,6 +142,7 @@ Write/admin/optional surfaces remain part of the documented contract, but they m
 - Restore remains an admin-scoped transport surface, but semantic accept/reject behavior now follows the same shared mutation gate as the other write paths.
 - Version/capability endpoints MUST clearly indicate whether runtime is ephemeral or durable.
 - Version/capability/runtime-diagnostics surfaces MUST also indicate the active deployment posture.
+- Version/capability/runtime-diagnostics surfaces MUST also indicate the active reasoning read model.
 
 ## Conformance Requirements
 

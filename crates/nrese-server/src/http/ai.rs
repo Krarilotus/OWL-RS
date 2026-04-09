@@ -40,6 +40,7 @@ pub async fn query_suggestions(
             named_graph_count: stats.named_graph_count,
             reasoning_mode: state.reasoner_mode_name(),
             reasoning_profile: state.reasoner_profile_name(),
+            reasoning_read_model: state.reasoner_read_model_name(),
         })
         .await?;
     Ok(Json(response).into_response())

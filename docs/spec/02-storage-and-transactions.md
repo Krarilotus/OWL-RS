@@ -60,10 +60,10 @@ Provide a high-throughput, low-latency RDF storage layer with explicit transacti
 ## Query Visibility Model
 
 - Queries read the latest committed revision.
-- Inference visibility is policy-controlled:
-- `explicit-only`
-- `materialized-union`
-- `profile-dependent`
+- The current read model is `asserted-only`.
+- Query and graph-read APIs expose committed asserted dataset state.
+- Reasoning currently affects commit acceptance and diagnostics, not the default query result set.
+- Future inferred/materialized read surfaces are an explicit extension point, not an implied current behavior.
 
 ## Operational Requirements
 

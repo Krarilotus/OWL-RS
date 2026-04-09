@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use nrese_reasoner::{
-    FeatureMode, ReasonerConfig, ReasonerProfileConfig, ReasoningMode, RulesMvpConfig,
-    RulesMvpFeaturePolicy, RulesMvpPreset, UnsupportedConstructBehavior,
+    FeatureMode, ReasonerConfig, ReasonerProfileConfig, ReasoningMode, ReasoningReadModel,
+    RulesMvpConfig, RulesMvpFeaturePolicy, RulesMvpPreset, UnsupportedConstructBehavior,
 };
 
 use super::env_names as names;
@@ -9,6 +9,7 @@ use super::source::ConfigSource;
 
 pub(super) fn parse_reasoner_config(source: &dyn ConfigSource) -> Result<ReasonerConfig> {
     let mode = parse_reasoning_mode(source.get(names::REASONING_MODE).as_deref());
+    let read_model = parse_reasoning_read_model(source.get(names::REASONER_READ_MODEL).as_deref())?;
     let profile = match mode {
         ReasoningMode::Disabled => ReasonerProfileConfig::Disabled,
         ReasoningMode::RulesMvp => ReasonerProfileConfig::RulesMvp(resolve_rules_mvp_config(
@@ -17,11 +18,28 @@ pub(super) fn parse_reasoner_config(source: &dyn ConfigSource) -> Result<Reasone
         )?),
         ReasoningMode::OwlDlTarget => ReasonerProfileConfig::OwlDlTarget,
     };
-    let config = ReasonerConfig { profile };
+    let config = ReasonerConfig {
+        profile,
+        read_model,
+    };
     config
         .validate()
         .map_err(|message| anyhow::anyhow!(message))?;
     Ok(config)
+}
+
+fn parse_reasoning_read_model(input: Option<&str>) -> Result<ReasoningReadModel> {
+    let Some(raw) = input.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(ReasoningReadModel::AssertedOnly);
+    };
+
+    match raw.to_ascii_lowercase().as_str() {
+        "asserted-only" | "asserted_only" | "assertedonly" => Ok(ReasoningReadModel::AssertedOnly),
+        unknown => bail!(
+            "unsupported value '{unknown}' in {}",
+            names::REASONER_READ_MODEL
+        ),
+    }
 }
 
 fn resolve_rules_mvp_config(
@@ -112,9 +130,12 @@ fn parse_reasoning_mode(input: Option<&str>) -> ReasoningMode {
 
 #[cfg(test)]
 mod tests {
-    use nrese_reasoner::{FeatureMode, UnsupportedConstructBehavior};
+    use nrese_reasoner::{FeatureMode, ReasoningReadModel, UnsupportedConstructBehavior};
 
-    use super::{parse_rules_mvp_feature_policy, parse_rules_mvp_preset, resolve_rules_mvp_config};
+    use super::{
+        parse_reasoning_read_model, parse_rules_mvp_feature_policy, parse_rules_mvp_preset,
+        resolve_rules_mvp_config,
+    };
 
     #[test]
     fn rules_mvp_parser_accepts_none() {
@@ -160,5 +181,13 @@ mod tests {
             FeatureMode::Disabled
         );
         assert_eq!(config.preset, nrese_reasoner::RulesMvpPreset::RdfsCore);
+    }
+
+    #[test]
+    fn read_model_defaults_to_asserted_only() {
+        assert_eq!(
+            parse_reasoning_read_model(None).expect("read model should parse"),
+            ReasoningReadModel::AssertedOnly
+        );
     }
 }

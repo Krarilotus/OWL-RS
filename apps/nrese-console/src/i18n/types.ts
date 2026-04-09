@@ -11,6 +11,7 @@ export type AppStrings = {
   runtimeNamedGraphsLabel: string;
   runtimeDeploymentLabel: string;
   runtimeReasonerLabel: string;
+  runtimeReadModelLabel: string;
   runtimeTierLabel: string;
   runtimeStoreLabel: string;
   runtimeDurabilityLabel: string;

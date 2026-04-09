@@ -57,6 +57,7 @@ Verbindlicher Kurzstand je Track:
 - Reasoner: `partial`
   - `rules-mvp` ist real und deckt RDFS plus einen bounded OWL-Slice ab
   - externer Reasoner-Input wird jetzt auf einen einzelnen aufgeloesten Profil-/Tier-Vertrag reduziert, den Runtime-Diagnostics, Capability-Payloads und Frontend gemeinsam lesen
+  - das Read-Model ist jetzt explizit als `asserted-only` verankert; Reasoning ist damit ehrlich als Commit-Gate plus Diagnostik ausgewiesen und noch nicht als inferred Query-Oberflaeche
   - breitere EL/RL-Abdeckung, tiefere Justifications und DL-Pfad fehlen
 - Persistenz und Recovery: `partial`
   - durable Pfad, Backup/Restore und atomare Fehlerpfade existieren

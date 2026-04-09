@@ -68,6 +68,7 @@ Status: `partial`
 
 Current coverage:
 - reasoning modes are explicit and observable
+- the current read model is explicit and observable as `asserted-only`
 - update path no longer bypasses reasoner orchestration semantics
 - consistency gate contract and explanation architecture are specified
 - hybrid target architecture is now fixed: RL operational track + EL classification track + deeper DL validation track
@@ -93,11 +94,11 @@ Still required:
 - deeper minimal-justification and commit-delta blame beyond the current heuristic baseline, explicit conflict evidence triples, and bounded ranked preview attribution
 - on-demand deeper justifications beyond the synchronous heuristic path
 - broader EL/RL rule coverage beyond the current RDFS + bounded OWL-property baseline
-- an explicit replacement-grade read model for inferred state instead of relying primarily on write-time validation and diagnostics
+- a replacement-grade inferred read model beyond the current explicit `asserted-only` contract
 - a fuller RDF dataset/snapshot model for reasoning, especially around named-graph and term coverage
 
 Replacement gate:
-- inferred knowledge is materially produced, isolated from asserted knowledge, and validated through reproducible fixtures
+- reasoning behavior is materially produced, isolated from asserted knowledge, and validated through reproducible fixtures; any inferred read surface must ship as an explicit read-model contract, not be implied by mutation-time reasoning alone
 
 ## 3. Persistence and Data Safety
 
