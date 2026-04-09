@@ -86,7 +86,7 @@ Current coverage:
 - reject-path HTTP problem responses and operator diagnostics now also share explicit conflict evidence triples from the reasoner-owned explanation model
 - staged update previews now allow reject-path responses and operator diagnostics to surface a likely commit-local trigger triple and ranked attribution candidates when the inserted delta can be isolated heuristically
 - rules-mvp cache reuse is now surfaced as typed execution/schema telemetry in reasoning diagnostics and Prometheus metrics
-- rules-mvp runtime diagnostics now also surface the configured semantic tier for the active preset, so bounded RDFS vs bounded OWL slices are externally visible
+- rules-mvp runtime diagnostics plus general runtime/capability payloads now surface one resolved profile/tier contract, so bounded RDFS vs bounded OWL slices are externally visible without parallel selector interpretation
 
 Still required:
 - broader unsupported-construct coverage and stronger explainability beyond the current deterministic known-construct list
@@ -131,13 +131,13 @@ Current coverage:
 - `/console` now also ships a small CLI on the same typed client boundary for query, update, tell, graph, runtime, and capability workflows
 - `/console` now includes guided workbench examples so non-specialist users can load explicit query/update/tell/graph templates instead of starting from empty editors
 - `/console` now supports explicit persisted locale selection for the currently shipped `en`/`de` language set instead of relying only on browser locale detection
-- `/console` now reads reasoning preset/policy/cache state from the server diagnostics surface instead of maintaining local pseudo-config state
+- `/console` now reads resolved reasoning profile/tier plus policy/cache state from the server diagnostics surface instead of maintaining local pseudo-config state
 - `/console` now also exposes the server-advertised reasoning capability set, so configured bounded reasoning slices are inspectable from the user-facing runtime view
 - operator APIs expose capabilities, dataset summary, and extended health
 - `/version`, service description, and runtime diagnostics now also expose the active deployment posture and the enabled mutation/admin surface set from the same runtime-owned source
 - query/update/graph workflows are browser-accessible
 - optional server-side AI query suggestions exist behind typed provider config and a dedicated API surface, with provider/model visibility and clearer frontend empty-state handling
-- reasoner presets are externally configurable and visible in the user-facing frontend/runtime metadata
+- the resolved reasoner profile/tier is externally configurable and visible in user-facing runtime metadata, while per-feature policy detail remains on the dedicated diagnostics surface
 
 Still required:
 - operator flows for revisions, diagnostics, and deeper incident support

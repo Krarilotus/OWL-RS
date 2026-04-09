@@ -28,6 +28,7 @@ Notes:
 - CLI currently selects the config file path; individual runtime knobs are still configured through file or env.
 - Environment variables always override values loaded from `config.toml`.
 - If no config file path is provided by CLI or `NRESE_CONFIG_PATH`, the server runs from env/defaults only.
+- External reasoner input may still be expressed as `mode`, `preset`, and optional feature overrides, but the server resolves those inputs into one runtime profile/tier contract before diagnostics, capabilities, and frontend surfaces see them.
 
 ## Minimal Example
 
@@ -171,6 +172,9 @@ api_key = "replace-me"
 - precedence:
   - explicit `features` override `preset`
   - `preset` overrides the built-in default
+- runtime resolution:
+  - parsed `mode`, `preset`, and optional feature overrides collapse into one resolved runtime reasoner profile and semantic tier
+  - general runtime/capability payloads expose that resolved profile/tier, while per-feature detail stays on the dedicated reasoning-diagnostics surface
 - semantic tiers:
   - `rdfs-core`: bounded RDFS closure/type propagation only
   - `bounded-owl`: bounded OWL rule slice on top of the RDFS core

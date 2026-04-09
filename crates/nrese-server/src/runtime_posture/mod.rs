@@ -53,8 +53,8 @@ impl DeploymentPosture {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePosture {
     pub deployment_posture: &'static str,
-    pub reasoning_preset: Option<&'static str>,
-    pub available_reasoning_presets: &'static [&'static str],
+    pub reasoning_profile: &'static str,
+    pub reasoning_semantic_tier: &'static str,
     pub query_enabled: bool,
     pub graph_store_enabled: bool,
     pub graph_write_enabled: bool,
@@ -77,8 +77,8 @@ impl RuntimePosture {
 
         Self {
             deployment_posture: deployment_posture.as_str(),
-            reasoning_preset: active_reasoning_preset(state),
-            available_reasoning_presets: nrese_reasoner::RulesMvpPreset::available(),
+            reasoning_profile: state.reasoner_profile_name(),
+            reasoning_semantic_tier: state.reasoner().semantic_tier(),
             query_enabled: true,
             graph_store_enabled: true,
             graph_write_enabled,
@@ -105,14 +105,6 @@ impl RuntimePosture {
     pub fn metrics_path(&self) -> Option<&'static str> {
         self.metrics_enabled.then_some(METRICS_ENDPOINT)
     }
-}
-
-fn active_reasoning_preset(state: &AppState) -> Option<&'static str> {
-    if state.reasoner_mode_name() != "rules-mvp" {
-        return None;
-    }
-
-    Some(state.reasoner().rules_mvp_preset().as_str())
 }
 
 pub fn validate_configuration(

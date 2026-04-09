@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use nrese_reasoner::{
-    FeatureMode, ReasonerConfig, ReasoningMode, RulesMvpConfig, RulesMvpFeaturePolicy,
-    RulesMvpPreset, UnsupportedConstructBehavior,
+    FeatureMode, ReasonerConfig, ReasonerProfileConfig, ReasoningMode, RulesMvpConfig,
+    RulesMvpFeaturePolicy, RulesMvpPreset, UnsupportedConstructBehavior,
 };
 
 use super::env_names as names;
@@ -9,22 +9,35 @@ use super::source::ConfigSource;
 
 pub(super) fn parse_reasoner_config(source: &dyn ConfigSource) -> Result<ReasonerConfig> {
     let mode = parse_reasoning_mode(source.get(names::REASONING_MODE).as_deref());
-    let preset = parse_rules_mvp_preset(source.get(names::REASONER_RULES_MVP_PRESET).as_deref())?;
-    let feature_policy =
-        if let Some(features_input) = source.get(names::REASONER_RULES_MVP_FEATURES) {
-            parse_rules_mvp_feature_policy(Some(features_input.as_str()))?
-        } else {
-            policy_for_preset(preset)
-        };
-    let rules_mvp = RulesMvpConfig {
-        preset: feature_policy.preset(),
-        feature_policy,
+    let profile = match mode {
+        ReasoningMode::Disabled => ReasonerProfileConfig::Disabled,
+        ReasoningMode::RulesMvp => ReasonerProfileConfig::RulesMvp(resolve_rules_mvp_config(
+            source.get(names::REASONER_RULES_MVP_PRESET).as_deref(),
+            source.get(names::REASONER_RULES_MVP_FEATURES).as_deref(),
+        )?),
+        ReasoningMode::OwlDlTarget => ReasonerProfileConfig::OwlDlTarget,
     };
-    let config = ReasonerConfig { mode, rules_mvp };
+    let config = ReasonerConfig { profile };
     config
         .validate()
         .map_err(|message| anyhow::anyhow!(message))?;
     Ok(config)
+}
+
+fn resolve_rules_mvp_config(
+    preset_input: Option<&str>,
+    features_input: Option<&str>,
+) -> Result<RulesMvpConfig> {
+    let requested_preset = parse_rules_mvp_preset(preset_input)?;
+    match features_input
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(raw) => Ok(RulesMvpConfig::from_feature_policy(
+            parse_rules_mvp_feature_policy(Some(raw))?,
+        )),
+        None => Ok(RulesMvpConfig::for_preset(requested_preset)),
+    }
 }
 
 fn parse_rules_mvp_preset(input: Option<&str>) -> Result<RulesMvpPreset> {
@@ -40,13 +53,6 @@ fn parse_rules_mvp_preset(input: Option<&str>) -> Result<RulesMvpPreset> {
             "unsupported value '{unknown}' in {}",
             names::REASONER_RULES_MVP_PRESET
         ),
-    }
-}
-
-fn policy_for_preset(preset: RulesMvpPreset) -> RulesMvpFeaturePolicy {
-    match preset {
-        RulesMvpPreset::RdfsCore => RulesMvpFeaturePolicy::rdfs_core(),
-        RulesMvpPreset::BoundedOwl | RulesMvpPreset::Custom => RulesMvpFeaturePolicy::bounded_owl(),
     }
 }
 
@@ -108,7 +114,7 @@ fn parse_reasoning_mode(input: Option<&str>) -> ReasoningMode {
 mod tests {
     use nrese_reasoner::{FeatureMode, UnsupportedConstructBehavior};
 
-    use super::{parse_rules_mvp_feature_policy, parse_rules_mvp_preset, policy_for_preset};
+    use super::{parse_rules_mvp_feature_policy, parse_rules_mvp_preset, resolve_rules_mvp_config};
 
     #[test]
     fn rules_mvp_parser_accepts_none() {
@@ -141,10 +147,18 @@ mod tests {
     #[test]
     fn rules_mvp_parser_accepts_preset() {
         let preset = parse_rules_mvp_preset(Some("rdfs-core")).expect("preset should parse");
-        let policy = policy_for_preset(preset);
+        let config =
+            resolve_rules_mvp_config(Some("rdfs-core"), None).expect("config should resolve");
 
-        assert_eq!(policy.rdfs_subclass_closure, FeatureMode::Enabled);
-        assert_eq!(policy.owl_equality_reasoning, FeatureMode::Disabled);
-        assert_eq!(policy.preset(), nrese_reasoner::RulesMvpPreset::RdfsCore);
+        assert_eq!(preset, nrese_reasoner::RulesMvpPreset::RdfsCore);
+        assert_eq!(
+            config.feature_policy.rdfs_subclass_closure,
+            FeatureMode::Enabled
+        );
+        assert_eq!(
+            config.feature_policy.owl_equality_reasoning,
+            FeatureMode::Disabled
+        );
+        assert_eq!(config.preset, nrese_reasoner::RulesMvpPreset::RdfsCore);
     }
 }

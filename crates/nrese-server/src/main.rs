@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
         bind_address = %config.bind_address,
         deployment_posture = config.deployment_posture.as_str(),
         data_dir = %store.config().data_dir.display(),
-        reasoning_mode = ?reasoner.config().mode,
+        reasoning_mode = ?reasoner.config().mode(),
         reasoner_profile = reasoner.profile_name(),
         reasoner_capabilities = reasoner.capabilities().len(),
         ontology_path = ontology_path.as_ref().map(|path| path.display().to_string()),

@@ -9,7 +9,7 @@ export type RuntimeSnapshot = {
   durability: string;
   reasoning_mode: string;
   reasoning_profile: string;
-  reasoning_preset?: string | null;
+  reasoning_semantic_tier: string;
   ontology_path?: string | null;
   version: string;
 };
@@ -28,8 +28,8 @@ export type Capabilities = {
   deployment_posture: string;
   ai_status_endpoint: string;
   ai_query_suggestions_endpoint: string;
-  available_reasoning_presets: string[];
-  reasoning_preset?: string | null;
+  reasoning_profile: string;
+  reasoning_semantic_tier: string;
   tell_enabled: boolean;
   graph_write_enabled?: boolean;
   admin_surface_enabled?: boolean;

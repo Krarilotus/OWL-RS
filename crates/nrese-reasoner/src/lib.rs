@@ -24,12 +24,12 @@ mod taxonomy;
 pub(crate) mod test_support;
 mod vocabulary;
 
-pub use config::{ReasonerConfig, ReasoningMode, RulesMvpConfig};
+pub use config::{ReasonerConfig, ReasonerProfileConfig, ReasoningMode, RulesMvpConfig};
 pub use output::{
     InferenceDelta, ReasoningCacheStats, ReasoningStats, RejectBlame, RejectEvidence,
     RejectExplanation,
 };
-pub use profile::{ReasonerProfile, profile_for_mode};
+pub use profile::{ReasonerProfile, mode_name, profile_for_config};
 pub use rules_mvp_policy::{FeatureMode, RulesMvpFeaturePolicy, UnsupportedConstructBehavior};
 pub use rules_mvp_preset::{RulesMvpPreset, RulesMvpPresetDescriptor};
 pub use service::ReasonerService;

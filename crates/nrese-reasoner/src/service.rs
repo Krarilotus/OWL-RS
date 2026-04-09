@@ -5,22 +5,25 @@ use nrese_core::{
     ReasonerRunReport, ReasonerRunStatus, ReasoningOutput,
 };
 
-use crate::config::{ReasonerConfig, ReasoningMode};
+use crate::config::{ReasonerConfig, ReasonerProfileConfig, ReasoningMode};
 use crate::output::{InferenceDelta, ReasoningCacheStats};
-use crate::profile::profile_for_mode;
+use crate::profile::profile_for_config;
 use crate::rules::execute_rules_mvp_with_cache;
 use crate::rules_mvp_cache::RulesMvpExecutionCache;
 
 #[derive(Debug, Clone)]
 pub struct ReasonerService {
     config: ReasonerConfig,
+    resolved_profile: crate::profile::ReasonerProfile,
     rules_mvp_cache: std::sync::Arc<RulesMvpExecutionCache>,
 }
 
 impl ReasonerService {
     pub fn new(config: ReasonerConfig) -> Self {
+        let resolved_profile = profile_for_config(&config);
         Self {
             config,
+            resolved_profile,
             rules_mvp_cache: std::sync::Arc::new(RulesMvpExecutionCache::default()),
         }
     }
@@ -30,27 +33,42 @@ impl ReasonerService {
     }
 
     pub fn profile_name(&self) -> &'static str {
-        self.profile().name
+        self.resolved_profile.name
     }
 
     pub fn mode_name(&self) -> &'static str {
-        self.profile().mode
+        self.resolved_profile.mode
+    }
+
+    pub fn semantic_tier(&self) -> &'static str {
+        self.resolved_profile.semantic_tier
     }
 
     pub fn rules_mvp_preset(&self) -> crate::RulesMvpPreset {
-        self.config.rules_mvp.preset
+        self.config
+            .rules_mvp()
+            .map(|config| config.preset)
+            .unwrap_or(crate::RulesMvpPreset::Custom)
     }
 
-    pub fn capabilities(&self) -> &'static [ReasonerCapability] {
-        self.profile().capabilities
+    pub fn rules_mvp_feature_policy(&self) -> Option<crate::RulesMvpFeaturePolicy> {
+        self.config.rules_mvp().map(|config| config.feature_policy)
+    }
+
+    pub fn available_rules_mvp_presets(&self) -> &'static [crate::RulesMvpPresetDescriptor] {
+        crate::RulesMvpPreset::available_descriptors()
+    }
+
+    pub fn capabilities(&self) -> &[ReasonerCapability] {
+        &self.resolved_profile.capabilities
     }
 
     pub fn rules_mvp_cache_stats(&self) -> ReasoningCacheStats {
         self.rules_mvp_cache.snapshot()
     }
 
-    fn profile(&self) -> crate::profile::ReasonerProfile {
-        profile_for_mode(self.config.mode)
+    pub fn resolved_profile(&self) -> &crate::profile::ReasonerProfile {
+        &self.resolved_profile
     }
 }
 
@@ -68,13 +86,13 @@ where
         ReasonerService::mode_name(self)
     }
 
-    fn capabilities(&self) -> &'static [ReasonerCapability] {
+    fn capabilities(&self) -> &[ReasonerCapability] {
         ReasonerService::capabilities(self)
     }
 
     fn plan(&self, snapshot: &'a S) -> nrese_core::NreseResult<ReasonerExecutionPlan> {
         let revision = snapshot.revision();
-        let plan = match self.config.mode {
+        let plan = match self.config.mode() {
             ReasoningMode::Disabled => ReasonerExecutionPlan::validation_only(revision),
             ReasoningMode::RulesMvp | ReasoningMode::OwlDlTarget => {
                 ReasonerExecutionPlan::full_materialization(revision)
@@ -92,13 +110,13 @@ where
         let started = Instant::now();
         let asserted_triples = snapshot.asserted_triple_count();
 
-        let (status, notes, inferred) = match self.config.mode {
-            ReasoningMode::Disabled => (
+        let (status, notes, inferred) = match &self.config.profile {
+            ReasonerProfileConfig::Disabled => (
                 ReasonerRunStatus::Skipped,
                 vec!["reasoner mode disabled"],
                 InferenceDelta::default(),
             ),
-            ReasoningMode::RulesMvp => {
+            ReasonerProfileConfig::RulesMvp(rules_mvp) => {
                 let cached =
                     execute_rules_mvp_with_cache(snapshot, &self.rules_mvp_cache, &self.config);
                 let inferred = cached.inferred;
@@ -136,19 +154,12 @@ where
                         "rules-mvp derived bounded owl:sameAs links from functional or inverse-functional property semantics",
                     );
                 }
-                if !self
-                    .config
-                    .rules_mvp
-                    .feature_policy
-                    .owl_consistency_check_enabled()
-                {
+                if !rules_mvp.feature_policy.owl_consistency_check_enabled() {
                     notes.push(
                         "rules-mvp consistency gates were disabled by external configuration",
                     );
                 }
-                if !self
-                    .config
-                    .rules_mvp
+                if !rules_mvp
                     .feature_policy
                     .unsupported_construct_diagnostics_enabled()
                 {
@@ -158,7 +169,7 @@ where
                 }
                 (status, notes, inferred)
             }
-            ReasoningMode::OwlDlTarget => (
+            ReasonerProfileConfig::OwlDlTarget => (
                 ReasonerRunStatus::Skipped,
                 vec!["owl-dl target mode scaffolded but not implemented"],
                 InferenceDelta::default(),
@@ -170,7 +181,7 @@ where
             consistency_violations: inferred.consistency_violations,
             elapsed_millis: started.elapsed().as_millis() as u64,
         };
-        let profile = self.profile();
+        let profile = self.resolved_profile();
 
         Ok(ReasoningOutput {
             inferred,

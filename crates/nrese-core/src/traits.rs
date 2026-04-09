@@ -34,7 +34,7 @@ where
 
     fn mode_name(&self) -> &'static str;
 
-    fn capabilities(&self) -> &'static [ReasonerCapability];
+    fn capabilities(&self) -> &[ReasonerCapability];
 
     fn plan(&self, snapshot: &'a S) -> NreseResult<ReasonerExecutionPlan>;
 

@@ -56,6 +56,13 @@ impl RulesMvpPreset {
     pub const fn available_descriptors() -> &'static [RulesMvpPresetDescriptor] {
         &AVAILABLE_PRESET_DESCRIPTORS
     }
+
+    pub const fn feature_policy(self) -> RulesMvpFeaturePolicy {
+        match self {
+            Self::RdfsCore => RulesMvpFeaturePolicy::rdfs_core(),
+            Self::BoundedOwl | Self::Custom => RulesMvpFeaturePolicy::bounded_owl(),
+        }
+    }
 }
 
 impl RulesMvpFeaturePolicy {

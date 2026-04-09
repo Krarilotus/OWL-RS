@@ -141,7 +141,6 @@ Objective:
 Implementation blocks:
 
 - broader EL/RL-oriented rule coverage
-- collapse external reasoner selection from `mode + preset + features` into one resolved profile/tier contract without losing explicit feature control
 - bounded identity/role slices such as `owl:differentFrom` consistency against equality closure and bounded `owl:ReflexiveProperty` inference over observed resources
 - bounded equality-entailment slices such as `owl:FunctionalProperty` / `owl:InverseFunctionalProperty` implying canonical effective `owl:sameAs`
 - bounded unsatisfiable-class slices such as `owl:Nothing` rejection over effective types and schema-cached class-consistency preparation
@@ -316,6 +315,7 @@ Priority order for the next replacement-focused runs:
 - grouped `class_consistency/` modules so `owl:Nothing` and disjoint-type checks now share one schema-cached class-side preparation path instead of living in a root file
 - bounded reasoner/runtime consistency cleanup and TTL-based service fixtures
 - typed `rules-mvp` presets on top of the explicit feature-policy path
+- resolved external reasoner selection into one runtime profile/tier contract while keeping explicit feature overrides available at config-parse time
 - test/file separation improvements in the reasoner slice
 - shared minimal TTL fixture for Store, Reasoner, and Server service-level tests
 - in-memory rate limiting in the server policy path as the first concrete quota-control step

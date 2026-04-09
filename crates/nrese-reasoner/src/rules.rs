@@ -27,7 +27,13 @@ pub fn execute_rules_mvp_with_cache<'a, S>(
 where
     S: DatasetSnapshot<'a>,
 {
-    cache.execute(snapshot, &config.rules_mvp.feature_policy)
+    cache.execute(
+        snapshot,
+        &config
+            .rules_mvp()
+            .expect("rules-mvp execution requires a rules-mvp profile")
+            .feature_policy,
+    )
 }
 
 #[cfg(test)]

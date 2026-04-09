@@ -11,7 +11,7 @@ export type AppStrings = {
   runtimeNamedGraphsLabel: string;
   runtimeDeploymentLabel: string;
   runtimeReasonerLabel: string;
-  runtimePresetLabel: string;
+  runtimeTierLabel: string;
   runtimeStoreLabel: string;
   runtimeDurabilityLabel: string;
   runtimeAiLabel: string;
@@ -37,7 +37,6 @@ export type AppStrings = {
   reasoningPresetActiveLabel: string;
   reasoningPresetTierLabel: string;
   reasoningPresetAvailableLabel: string;
-  reasoningPresetCustom: string;
   reasoningPolicyUnavailable: string;
   reasoningUnsupportedLabel: string;
   reasoningLastRunLabel: string;

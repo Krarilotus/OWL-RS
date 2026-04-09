@@ -26,7 +26,7 @@ pub struct ReadyResponse {
     pub durability: &'static str,
     pub reasoning_mode: &'static str,
     pub reasoning_profile: &'static str,
-    pub reasoning_preset: Option<&'static str>,
+    pub reasoning_semantic_tier: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,8 +40,7 @@ pub struct VersionResponse {
     pub durable_storage_available: bool,
     pub reasoning_mode: &'static str,
     pub reasoning_profile: &'static str,
-    pub reasoning_preset: Option<&'static str>,
-    pub available_reasoning_presets: &'static [&'static str],
+    pub reasoning_semantic_tier: &'static str,
     pub graph_store_enabled: bool,
     pub graph_write_enabled: bool,
     pub sparql_update_enabled: bool,
@@ -77,8 +76,8 @@ pub struct OperatorCapabilitiesResponse {
     pub store_mode: &'static str,
     pub durability: &'static str,
     pub durable_storage_available: bool,
-    pub reasoning_preset: Option<&'static str>,
-    pub available_reasoning_presets: &'static [&'static str],
+    pub reasoning_profile: &'static str,
+    pub reasoning_semantic_tier: &'static str,
     pub graph_store_enabled: bool,
     pub graph_write_enabled: bool,
     pub sparql_update_enabled: bool,
@@ -142,8 +141,8 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
         store_mode: state.store_mode_name(),
         durability: state.durability_name(),
         reasoning_mode: state.reasoner_mode_name(),
-        reasoning_profile: state.reasoner_profile_name(),
-        reasoning_preset: state.runtime_posture().reasoning_preset,
+        reasoning_profile: posture.reasoning_profile,
+        reasoning_semantic_tier: posture.reasoning_semantic_tier,
     })
 }
 
@@ -158,9 +157,8 @@ pub fn build_version_response(state: &AppState) -> VersionResponse {
         durability: state.durability_name(),
         durable_storage_available: durable_storage_available(),
         reasoning_mode: state.reasoner_mode_name(),
-        reasoning_profile: state.reasoner_profile_name(),
-        reasoning_preset: posture.reasoning_preset,
-        available_reasoning_presets: posture.available_reasoning_presets,
+        reasoning_profile: posture.reasoning_profile,
+        reasoning_semantic_tier: posture.reasoning_semantic_tier,
         graph_store_enabled: posture.graph_store_enabled,
         graph_write_enabled: posture.graph_write_enabled,
         sparql_update_enabled: posture.sparql_update_enabled,
@@ -202,8 +200,8 @@ pub fn build_operator_capabilities_response(state: &AppState) -> OperatorCapabil
         store_mode: state.store_mode_name(),
         durability: state.durability_name(),
         durable_storage_available: durable_storage_available(),
-        reasoning_preset: posture.reasoning_preset,
-        available_reasoning_presets: posture.available_reasoning_presets,
+        reasoning_profile: posture.reasoning_profile,
+        reasoning_semantic_tier: posture.reasoning_semantic_tier,
         graph_store_enabled: posture.graph_store_enabled,
         graph_write_enabled: posture.graph_write_enabled,
         sparql_update_enabled: posture.sparql_update_enabled,

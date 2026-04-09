@@ -56,6 +56,7 @@ Verbindlicher Kurzstand je Track:
   - echte Live-Evidenz gegen die Ziel-Fuseki-Umgebung fehlt noch
 - Reasoner: `partial`
   - `rules-mvp` ist real und deckt RDFS plus einen bounded OWL-Slice ab
+  - externer Reasoner-Input wird jetzt auf einen einzelnen aufgeloesten Profil-/Tier-Vertrag reduziert, den Runtime-Diagnostics, Capability-Payloads und Frontend gemeinsam lesen
   - breitere EL/RL-Abdeckung, tiefere Justifications und DL-Pfad fehlen
 - Persistenz und Recovery: `partial`
   - durable Pfad, Backup/Restore und atomare Fehlerpfade existieren
@@ -81,9 +82,9 @@ Die naechsten Replacement-Bloecke sind:
    - Timeout-, Auth-, Error- und Workload-Packs gegen die echte Zielumgebung, gebunden an eine konkrete Live-Connection-Profile-Auswahl
 2. Mutation-Pipeline-Nacharbeiten auf derselben gemeinsamen Architektur
    - gemeinsame Mutationstest-Matrix, weitere Store-seitige Preview-/Apply-Evidenz und konsequente Runtime-/Capability-Sicht
-3. expliziterer externer Reasoner-Profilvertrag
-   - `mode + preset + features` weiter auf einen einzelnen, resolvebaren Profil-/Tier-Vertrag reduzieren
-   - derselbe Profilvertrag muss Config, Runtime-Diagnostics, Frontend und Spec tragen
+3. expliziterer Reasoner-Read-/Dataset-Vertrag
+   - den jetzt aufgeloesten Profil-/Tier-Vertrag auf Read-Model, Snapshot-Modell und weitere Runtime-Surfaces konsequent durchziehen
+   - keine zweite Wahrheit fuer Reasoning-Verhalten neben Diagnostics und Config aufbauen
 4. breitere Reasoner-Abdeckung auf dem bestehenden modularen Pfad
    - ohne Supportgrenzen zu verwischen oder impliziten Code einzubauen
 5. durable Recovery- und Drill-Evidenz

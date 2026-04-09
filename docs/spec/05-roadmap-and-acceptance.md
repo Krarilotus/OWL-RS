@@ -49,6 +49,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - `/console` frontend now owns an explicit TypeScript client boundary and runtime-configurable backend base URL, so browser hosting and backend hosting can be separated without rewriting components
 - `/console` frontend now also ships a small CLI on the same TypeScript client boundary for fast query/update/tell/graph/runtime access without separate backend scripts
 - `rules-mvp` now supports explicit presets on top of the feature-policy path, so runtime defaults can be standardized without hard-coding product opinion into the engine
+- external `mode + preset + feature override` inputs now resolve into one runtime reasoner profile/tier contract, so frontend/runtime payloads no longer reconstruct active reasoning identity from parallel selectors
 
 ### R4: Reasoning Integration
 
@@ -77,7 +78,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - `rules-mvp` property-characteristic consistency checks now build one prepared assertion index per run for constrained predicates, so irreflexive, asymmetric, functional, inverse-functional, and property-disjoint rejection gates reuse a single grouped property view
 - `rules-mvp` now also caches a schema-stable property-constraint plan, so ABox-sensitive property-consistency indexing no longer has to rediscover the relevant constrained predicate set on each run
 - `rules-mvp` runtime behavior is now externalized behind a typed feature policy, so closure, equality, consistency gates, and unsupported-construct diagnostics can be configured without embedding product opinion into reasoner code
-- `rules-mvp` preset/tier metadata is now surfaced in runtime diagnostics so the active bounded RDFS/OWL slice is visible without reconstructing it from individual feature flags
+- `rules-mvp` resolved profile/tier metadata is now surfaced in runtime diagnostics and general runtime payloads so the active bounded RDFS/OWL slice is visible without reconstructing it from individual feature flags
 - official ontology fixtures now provide bounded release-evidence for `rules-mvp` reasoning/runtime validation on FOAF, W3C Time, W3C ORG, SKOS, PROV-O, DCAT, vCard, DCMI Terms, SOSA, SSN, and ODRL
 - bounded official-ontology-backed service slices should ship on shared test-support helpers rather than duplicating fixture-path and setup logic per test file
 - ontology-backed compat/parity suites should grow incrementally through the catalog/pack path, with shared suite structure instead of flat one-off fixtures per ontology

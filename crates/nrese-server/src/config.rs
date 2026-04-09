@@ -71,7 +71,7 @@ impl ServerConfig {
         let policy = parse_policy_config(source)?;
         let ai = parse_ai_config(source)?;
 
-        validate_configuration(deployment_posture, store.mode, reasoner.mode, &policy)
+        validate_configuration(deployment_posture, store.mode, reasoner.mode(), &policy)
             .map_err(anyhow::Error::msg)?;
 
         Ok(Self {
@@ -211,7 +211,7 @@ mode = "none"
         let config = ServerConfig::load(Some(&path)).expect("server config");
 
         assert_eq!(config.bind_address.to_string(), "127.0.0.1:9898");
-        assert_eq!(config.reasoner.mode, ReasoningMode::Disabled);
+        assert_eq!(config.reasoner.mode(), ReasoningMode::Disabled);
     }
 
     #[test]
