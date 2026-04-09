@@ -99,7 +99,7 @@ Immediate rollback is required when one or more conditions hold:
 - persistent semantic mismatch on critical queries
 - sustained error-rate breach above accepted threshold
 - data integrity uncertainty
-- update pipeline instability with integrity risk
+- mutation pipeline instability with integrity risk
 - inability to meet minimum service availability objective
 
 Rollback execution:

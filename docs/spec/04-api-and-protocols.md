@@ -145,6 +145,7 @@ Primary conformance targets:
 - Covered query/update failure-parity fixtures and graph-store failure-parity fixtures MUST be automated.
 - Unsupported protocol features MUST return explicit, stable diagnostics.
 - `/version` and service-description surfaces MUST reflect actual enabled capabilities, not aspirational ones.
+- Optional surfaces such as operator UI and metrics MUST be advertised from the same runtime posture source used by request guards, so service description, JSON capability payloads, and actual endpoint exposure cannot drift apart.
 - Capability surfaces MUST distinguish between:
 - SPARQL query/update support
 - first-class `TELL` ingest support

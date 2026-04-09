@@ -28,7 +28,7 @@ pub fn runtime(state: AppState) -> Result<Response, ApiError> {
         .store()
         .stats()
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    let policy = state.policy();
+    let posture = state.runtime_posture();
 
     Ok((
         StatusCode::OK,
@@ -43,8 +43,8 @@ pub fn runtime(state: AppState) -> Result<Response, ApiError> {
             durability: state.durability_name(),
             reasoning_mode: state.reasoner_mode_name(),
             reasoning_profile: state.reasoner_profile_name(),
-            operator_ui_enabled: policy.expose_operator_ui,
-            metrics_enabled: policy.expose_metrics,
+            operator_ui_enabled: posture.operator_surface_enabled,
+            metrics_enabled: posture.metrics_enabled,
         }),
     )
         .into_response())

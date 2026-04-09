@@ -22,6 +22,34 @@ async fn version_endpoint_exposes_capabilities() -> Result<(), Box<dyn std::erro
 }
 
 #[tokio::test]
+async fn version_endpoint_reflects_disabled_optional_surfaces()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_settings(
+        PolicyConfig {
+            expose_operator_ui: false,
+            expose_metrics: false,
+            ..PolicyConfig::default()
+        },
+        ReasonerConfig::default(),
+    )?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .method(Method::GET)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let text = String::from_utf8(body.to_vec())?;
+    assert!(text.contains("\"operator_surface_enabled\":false"));
+    assert!(text.contains("\"metrics_enabled\":false"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn metrics_endpoint_exposes_prometheus_text() -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app()?;
     let response = app
@@ -64,6 +92,34 @@ async fn service_description_endpoint_serves_turtle() -> Result<(), Box<dyn std:
             .and_then(|v| v.to_str().ok()),
         Some("text/turtle; charset=utf-8")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_description_omits_disabled_optional_endpoints()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_settings(
+        PolicyConfig {
+            expose_operator_ui: false,
+            expose_metrics: false,
+            ..PolicyConfig::default()
+        },
+        ReasonerConfig::default(),
+    )?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/service-description")
+                .method(Method::GET)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let text = String::from_utf8(body.to_vec())?;
+    assert!(!text.contains("nrese:metricsEndpoint"));
+    assert!(!text.contains("nrese:operatorEndpoint"));
     Ok(())
 }
 

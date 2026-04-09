@@ -40,24 +40,6 @@ impl PolicyConfig {
         self.auth.authorize(action, headers).await
     }
 
-    pub fn ensure_operator_ui_enabled(&self) -> Result<(), ApiError> {
-        if self.expose_operator_ui {
-            Ok(())
-        } else {
-            Err(ApiError::not_found("operator UI is disabled by policy"))
-        }
-    }
-
-    pub fn ensure_metrics_enabled(&self) -> Result<(), ApiError> {
-        if self.expose_metrics {
-            Ok(())
-        } else {
-            Err(ApiError::not_found(
-                "metrics endpoint is disabled by policy",
-            ))
-        }
-    }
-
     pub fn enforce_query_bytes(&self, size: usize) -> Result<(), ApiError> {
         enforce_size_limit("query", size, self.limits.max_query_bytes)
     }

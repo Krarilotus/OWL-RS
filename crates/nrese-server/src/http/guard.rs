@@ -13,7 +13,9 @@ pub async fn enforce(
 }
 
 pub async fn enforce_operator_read(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    state.policy().ensure_operator_ui_enabled()?;
+    if !state.runtime_posture().operator_surface_enabled {
+        return Err(ApiError::not_found("operator UI is disabled by policy"));
+    }
     enforce(state, PolicyAction::OperatorRead, headers).await
 }
 
@@ -41,6 +43,10 @@ pub async fn enforce_service_description_read(
 }
 
 pub async fn enforce_metrics_read(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    state.policy().ensure_metrics_enabled()?;
+    if !state.runtime_posture().metrics_enabled {
+        return Err(ApiError::not_found(
+            "metrics endpoint is disabled by policy",
+        ));
+    }
     enforce(state, PolicyAction::MetricsRead, headers).await
 }

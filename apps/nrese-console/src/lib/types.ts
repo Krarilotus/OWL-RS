@@ -15,17 +15,20 @@ export type RuntimeSnapshot = {
 
 export type Capabilities = {
   user_console_path: string;
-  operator_ui_path: string;
-  reasoning_diagnostics_endpoint: string;
+  operator_ui_path?: string | null;
+  reasoning_diagnostics_endpoint?: string | null;
   query_endpoint: string;
   update_endpoint: string;
   tell_endpoint: string;
   graph_store_endpoint: string;
+  metrics_endpoint?: string | null;
   ai_status_endpoint: string;
   ai_query_suggestions_endpoint: string;
   available_reasoning_presets: string[];
   reasoning_preset?: string | null;
   tell_enabled: boolean;
+  operator_surface_enabled?: boolean;
+  metrics_enabled?: boolean;
   ai_query_suggestions_enabled: boolean;
   ai_provider: string;
 };

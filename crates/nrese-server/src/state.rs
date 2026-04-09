@@ -12,6 +12,7 @@ use crate::policy::PolicyAction;
 use crate::policy::PolicyConfig;
 use crate::rate_limit::RateLimiter;
 use crate::reasoning_runtime::LastReasoningRun;
+use crate::runtime_posture::RuntimePosture;
 use axum::http::HeaderMap;
 
 #[derive(Clone)]
@@ -75,6 +76,10 @@ impl AppState {
 
     pub fn ai(&self) -> Arc<AiSuggestionService> {
         Arc::clone(&self.ai)
+    }
+
+    pub fn runtime_posture(&self) -> RuntimePosture {
+        RuntimePosture::from_state(self)
     }
 
     pub async fn enforce_policy_action(

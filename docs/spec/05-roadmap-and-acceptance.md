@@ -40,6 +40,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - Host-specific development shortcuts removed from committed runtime configuration
 - Durable deployment profile validated (restart persistence, startup integrity checks, recovery signaling)
 - External operator exposure model documented (auth, TLS, proxy, CSP, path prefix)
+- Optional operator/metrics exposure and capability reporting now derive from one shared runtime posture source instead of separate handler-local hardcodings
 - Central policy layer enforces auth, request size limits, timeout ceilings, and endpoint exposure, with bounded `bearer-jwt`, bounded `oidc-introspection`, and bounded proxy-terminated `mtls` support added alongside `bearer-static`
 - Initial rate-limit buckets for read, write, and admin traffic are enforced from the same policy path as auth
 - Server runtime configuration now supports file-based `config.toml` input with environment overrides on the same typed parser path, so deployment policy stays external to handler/runtime logic

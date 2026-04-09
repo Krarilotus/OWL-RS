@@ -53,9 +53,11 @@ export function RuntimePanel({
           <button className="button-secondary" onClick={onRefresh} type="button">
             {strings.refresh}
           </button>
-          <a className="button-secondary" href={capabilities?.operator_ui_path ?? "/ops"}>
-            {strings.operatorConsole}
-          </a>
+          {capabilities?.operator_ui_path ? (
+            <a className="button-secondary" href={capabilities.operator_ui_path}>
+              {strings.operatorConsole}
+            </a>
+          ) : null}
         </div>
       </div>
 

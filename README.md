@@ -47,6 +47,7 @@ Implemented today:
 - service description, health, readiness, metrics, and operator endpoints
 - staged update validation before publish
 - one shared mutation pipeline for SPARQL Update, `TELL`, Graph Store writes/deletes, and admin restore, so reasoning gates, revision publication, and reject diagnostics stay aligned across write paths
+- service-description and capability reporting for optional operator/metrics surfaces now derive from one shared runtime posture path instead of hard-coded per-endpoint advertising
 - bounded `rules-mvp` reasoning with canonical `owl:sameAs` equality handling, bounded functional / inverse-functional equality entailment, bounded binary `owl:propertyChainAxiom` support over named-node RDF lists, bounded `owl:AllDifferent` / `owl:AllDisjointClasses` / `owl:AllDisjointProperties` expansion into the same consistency gates, bounded `owl:Nothing` effective-type rejection, and explicit unsupported-construct diagnostics
 - typed `rules-mvp` presets (`rdfs-core`, `bounded-owl`) on top of the explicit feature-policy path
 - snapshot-keyed memoization for repeated `rules-mvp` runs over identical dataset state

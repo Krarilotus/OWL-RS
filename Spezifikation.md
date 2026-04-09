@@ -63,6 +63,7 @@ Verbindlicher Kurzstand je Track:
   - Crash-/Restart-/Drill-Evidenz ist noch offen
 - Security und Hardening: `partial`
   - `bearer-static`, bounded `bearer-jwt`, bounded `oidc-introspection`, bounded proxy-terminated `mtls`, Limits und Rate-Limits existieren
+  - optionale Operator-/Metrics-Exposition und Capability-/Service-Description-Reporting laufen jetzt ueber eine gemeinsame Runtime-Posture-Ableitung statt ueber verteilte Hardcodings
   - produktionsnahe Härtungs- und Rollout-Evidenz fehlt noch
 - Frontend und Operator-Flaechen: `partial`
   - `/console` und `/ops` existieren, inklusive AI-Assistent, i18n und Runtime-/Reasoning-Sicht

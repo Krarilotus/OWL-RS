@@ -17,6 +17,7 @@ export function useRuntimeData() {
     queryKey: ["capabilities"],
     queryFn: getCapabilities,
     staleTime: 30000,
+    retry: false,
   });
   const aiStatusQuery = useQuery({
     queryKey: ["ai-status"],

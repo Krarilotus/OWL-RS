@@ -10,6 +10,7 @@ mod rate_limit;
 mod reasoning_runtime;
 mod reject_attribution;
 mod reject_view;
+mod runtime_posture;
 pub mod state;
 
 pub use app::build_app;

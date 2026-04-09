@@ -162,6 +162,7 @@ Current coverage:
 - request correlation via `X-Request-Id`
 - `oidc-introspection` auth now exists as a bounded introspection-backed mode on the same policy/auth path as the existing static bearer, JWT, and proxy-terminated mTLS modes
 - file-based `config.toml` runtime configuration now exists with environment overrides on the same parser path as env-only startup, which reduces deployment-specific duplication and keeps runtime opinion external to the implementation
+- runtime posture for optional operator/metrics exposure is now derived through one shared server-owned source that feeds guards, capability payloads, service description, and runtime diagnostics
 
 Still required:
 - broader production auth beyond the current bounded `bearer-jwt`, bounded `oidc-introspection`, and bounded proxy-terminated `mtls` slices, including stronger JWT/OIDC integration depth and direct/in-process mTLS if required
