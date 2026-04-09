@@ -69,6 +69,20 @@ impl ReasonerConfig {
         }
     }
 
+    pub const fn rules_mvp_preset(&self) -> Option<RulesMvpPreset> {
+        match &self.profile {
+            ReasonerProfileConfig::RulesMvp(config) => Some(config.preset),
+            _ => None,
+        }
+    }
+
+    pub const fn rules_mvp_feature_policy(&self) -> Option<RulesMvpFeaturePolicy> {
+        match &self.profile {
+            ReasonerProfileConfig::RulesMvp(config) => Some(config.feature_policy),
+            _ => None,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if let Some(config) = self.rules_mvp() {
             config.validate()?;
@@ -156,11 +170,11 @@ mod tests {
 
         assert_eq!(config.mode(), ReasoningMode::RulesMvp);
         assert_eq!(
-            config.rules_mvp().expect("rules-mvp config").feature_policy,
+            config.rules_mvp_feature_policy().expect("rules-mvp config"),
             RulesMvpFeaturePolicy::industry_default()
         );
         assert_eq!(
-            config.rules_mvp().expect("rules-mvp config").preset,
+            config.rules_mvp_preset().expect("rules-mvp config"),
             RulesMvpPreset::BoundedOwl
         );
         assert_eq!(config.read_model, ReasoningReadModel::AssertedOnly);

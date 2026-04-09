@@ -54,13 +54,12 @@ impl ReasonerService {
 
     pub fn rules_mvp_preset(&self) -> crate::RulesMvpPreset {
         self.config
-            .rules_mvp()
-            .map(|config| config.preset)
+            .rules_mvp_preset()
             .unwrap_or(crate::RulesMvpPreset::Custom)
     }
 
     pub fn rules_mvp_feature_policy(&self) -> Option<crate::RulesMvpFeaturePolicy> {
-        self.config.rules_mvp().map(|config| config.feature_policy)
+        self.config.rules_mvp_feature_policy()
     }
 
     pub fn available_rules_mvp_presets(&self) -> &'static [crate::RulesMvpPresetDescriptor] {
