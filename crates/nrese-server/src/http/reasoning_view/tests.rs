@@ -16,6 +16,7 @@ async fn reasoning_diagnostics_includes_reject_diagnostics_baseline() {
         reasoner,
         PolicyConfig::default(),
         AiSuggestionService::disabled(),
+        crate::runtime_posture::DeploymentPosture::OpenWorkbench,
     );
     let response = operator_diagnostics::reasoning(state);
     let body = to_bytes(response.into_body(), usize::MAX)

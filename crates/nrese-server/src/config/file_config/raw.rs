@@ -20,6 +20,8 @@ pub(super) struct RawFileConfig {
 pub(super) struct RawServerConfig {
     #[serde(default, alias = "bind_addr")]
     pub bind_address: Option<String>,
+    #[serde(default)]
+    pub deployment_posture: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -42,7 +44,7 @@ pub(super) struct RawReasonerConfig {
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct RawRulesMvpConfig {
-    #[serde(default)]
+    #[serde(default, alias = "tier")]
     pub preset: Option<String>,
     #[serde(default)]
     pub features: Option<StringOrMany>,

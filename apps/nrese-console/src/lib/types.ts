@@ -4,6 +4,7 @@ export type RuntimeSnapshot = {
   revision: number;
   quad_count: number;
   named_graph_count: number;
+  deployment_posture: string;
   store_mode: string;
   durability: string;
   reasoning_mode: string;
@@ -21,12 +22,17 @@ export type Capabilities = {
   update_endpoint: string;
   tell_endpoint: string;
   graph_store_endpoint: string;
+  admin_backup_endpoint?: string | null;
+  admin_restore_endpoint?: string | null;
   metrics_endpoint?: string | null;
+  deployment_posture: string;
   ai_status_endpoint: string;
   ai_query_suggestions_endpoint: string;
   available_reasoning_presets: string[];
   reasoning_preset?: string | null;
   tell_enabled: boolean;
+  graph_write_enabled?: boolean;
+  admin_surface_enabled?: boolean;
   operator_surface_enabled?: boolean;
   metrics_enabled?: boolean;
   ai_query_suggestions_enabled: boolean;
@@ -52,6 +58,7 @@ export type ReasoningCapability = {
 
 export type ConfiguredReasoningPolicy = {
   preset: string;
+  semantic_tier: string;
   available_presets: string[];
   feature_modes: ReasoningFeatureMode[];
   unsupported_constructs: string;

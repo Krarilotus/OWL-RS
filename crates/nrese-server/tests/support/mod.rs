@@ -8,7 +8,7 @@ use nrese_store::{StoreConfig, StoreService};
 use tower::util::ServiceExt;
 
 use nrese_server::policy::PolicyConfig;
-use nrese_server::{AppState, build_app};
+use nrese_server::{AppState, DeploymentPosture, build_app};
 
 pub fn test_app() -> Result<axum::Router, Box<dyn std::error::Error>> {
     test_app_with_settings(PolicyConfig::default(), ReasonerConfig::default())
@@ -24,9 +24,23 @@ pub fn test_app_with_settings(
     policy: PolicyConfig,
     reasoner_config: ReasonerConfig,
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    test_app_with_posture(policy, reasoner_config, DeploymentPosture::OpenWorkbench)
+}
+
+pub fn test_app_with_posture(
+    policy: PolicyConfig,
+    reasoner_config: ReasonerConfig,
+    deployment_posture: DeploymentPosture,
+) -> Result<axum::Router, Box<dyn std::error::Error>> {
     let store = StoreService::new(StoreConfig::default())?;
     let reasoner = ReasonerService::new(reasoner_config);
-    let state = AppState::new(store, reasoner, policy, AiSuggestionService::disabled());
+    let state = AppState::new(
+        store,
+        reasoner,
+        policy,
+        AiSuggestionService::disabled(),
+        deployment_posture,
+    );
     state.mark_ready();
     Ok(build_app(state))
 }
@@ -38,7 +52,13 @@ pub fn test_app_with_store_config(
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
     let store = StoreService::new(store_config)?;
     let reasoner = ReasonerService::new(reasoner_config);
-    let state = AppState::new(store, reasoner, policy, AiSuggestionService::disabled());
+    let state = AppState::new(
+        store,
+        reasoner,
+        policy,
+        AiSuggestionService::disabled(),
+        DeploymentPosture::OpenWorkbench,
+    );
     state.mark_ready();
     Ok(build_app(state))
 }

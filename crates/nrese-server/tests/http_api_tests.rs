@@ -6,8 +6,12 @@ use nrese_reasoner::ReasonerConfig;
 use nrese_store::{StoreConfig, StoreMode};
 use tower::util::ServiceExt;
 
+use nrese_server::DeploymentPosture;
 use nrese_server::policy::PolicyConfig;
-use support::{minimal_fixture_path, test_app, test_app_with_settings, test_app_with_store_config};
+use support::{
+    minimal_fixture_path, test_app, test_app_with_posture, test_app_with_settings,
+    test_app_with_store_config,
+};
 
 #[tokio::test]
 async fn version_endpoint_exposes_capabilities() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,6 +50,34 @@ async fn version_endpoint_reflects_disabled_optional_surfaces()
     let text = String::from_utf8(body.to_vec())?;
     assert!(text.contains("\"operator_surface_enabled\":false"));
     assert!(text.contains("\"metrics_enabled\":false"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_demo_reports_disabled_write_surfaces() -> Result<(), Box<dyn std::error::Error>>
+{
+    let app = test_app_with_posture(
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+        DeploymentPosture::ReadOnlyDemo,
+    )?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .method(Method::GET)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let text = String::from_utf8(body.to_vec())?;
+    assert!(text.contains("\"deployment_posture\":\"read-only-demo\""));
+    assert!(text.contains("\"graph_write_enabled\":false"));
+    assert!(text.contains("\"sparql_update_enabled\":false"));
+    assert!(text.contains("\"tell_enabled\":false"));
+    assert!(text.contains("\"admin_surface_enabled\":false"));
     Ok(())
 }
 
@@ -120,6 +152,84 @@ async fn service_description_omits_disabled_optional_endpoints()
     let text = String::from_utf8(body.to_vec())?;
     assert!(!text.contains("nrese:metricsEndpoint"));
     assert!(!text.contains("nrese:operatorEndpoint"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_demo_service_description_omits_mutation_endpoints()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_posture(
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+        DeploymentPosture::ReadOnlyDemo,
+    )?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/service-description")
+                .method(Method::GET)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let text = String::from_utf8(body.to_vec())?;
+    assert!(!text.contains("nrese:updateEndpoint"));
+    assert!(!text.contains("nrese:tellEndpoint"));
+    assert!(text.contains("nrese:graphStoreWriteEnabled \"false\""));
+    assert!(text.contains("nrese:sparqlUpdateEnabled \"false\""));
+    assert!(text.contains("nrese:tellEnabled \"false\""));
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_demo_returns_not_found_for_mutation_surfaces()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_posture(
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+        DeploymentPosture::ReadOnlyDemo,
+    )?;
+
+    let update_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/update")
+                .method(Method::POST)
+                .header("content-type", "application/sparql-update")
+                .body(Body::from("INSERT DATA {}"))?,
+        )
+        .await?;
+    assert_eq!(update_response.status(), StatusCode::NOT_FOUND);
+
+    let tell_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/tell")
+                .method(Method::POST)
+                .header("content-type", "text/turtle")
+                .body(Body::from(
+                    "<http://example.com/s> <http://example.com/p> <http://example.com/o> .",
+                ))?,
+        )
+        .await?;
+    assert_eq!(tell_response.status(), StatusCode::NOT_FOUND);
+
+    let graph_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/data?default")
+                .method(Method::PUT)
+                .header("content-type", "text/turtle")
+                .body(Body::from(
+                    "<http://example.com/s> <http://example.com/p> <http://example.com/o> .",
+                ))?,
+        )
+        .await?;
+    assert_eq!(graph_response.status(), StatusCode::NOT_FOUND);
     Ok(())
 }
 

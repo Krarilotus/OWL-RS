@@ -10,6 +10,7 @@ vi.mock("../lib/api", () => ({
     revision: 2,
     quad_count: 42,
     named_graph_count: 1,
+    deployment_posture: "open-workbench",
     store_mode: "in-memory",
     durability: "ephemeral",
     reasoning_mode: "rules-mvp",
@@ -25,6 +26,7 @@ vi.mock("../lib/api", () => ({
     update_endpoint: "/dataset/update",
     tell_endpoint: "/dataset/tell",
     graph_store_endpoint: "/dataset/data",
+    deployment_posture: "open-workbench",
     ai_status_endpoint: "/api/ai/status",
     ai_query_suggestions_endpoint: "/api/ai/query-suggestions",
     tell_enabled: true,
@@ -49,6 +51,7 @@ vi.mock("../lib/api", () => ({
     ],
     configured_policy: {
       preset: "bounded-owl",
+      semantic_tier: "bounded-owl-rules",
       available_presets: ["rdfs-core", "bounded-owl"],
       feature_modes: [
         {

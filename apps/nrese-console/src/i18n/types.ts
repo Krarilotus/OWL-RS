@@ -9,6 +9,7 @@ export type AppStrings = {
   runtimeRevisionLabel: string;
   runtimeQuadsLabel: string;
   runtimeNamedGraphsLabel: string;
+  runtimeDeploymentLabel: string;
   runtimeReasonerLabel: string;
   runtimePresetLabel: string;
   runtimeStoreLabel: string;
@@ -34,6 +35,7 @@ export type AppStrings = {
   reasoningPresetTitle: string;
   reasoningPresetHint: string;
   reasoningPresetActiveLabel: string;
+  reasoningPresetTierLabel: string;
   reasoningPresetAvailableLabel: string;
   reasoningPresetCustom: string;
   reasoningPolicyUnavailable: string;

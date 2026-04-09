@@ -59,6 +59,8 @@ Primary conformance targets:
 - `GET /version`
 - `GET /metrics` (configurable exposure)
 
+Write/admin/optional surfaces remain part of the documented contract, but they may be disabled by deployment posture. The runtime source of truth for that posture MUST drive startup validation, request guards, JSON capability payloads, and service-description advertising together.
+
 ## Capability Tiers
 
 ### API Tier A1
@@ -86,6 +88,7 @@ Primary conformance targets:
 - Structured request correlation and tracing
 - Operator endpoint exposure model (edge/TLS/proxy-aware headers and trusted-forwarded strategy)
 - Centralized policy configuration for endpoint exposure, auth mode, timeouts, and payload limits
+- Centralized deployment-posture configuration for `open-workbench`, `read-only-demo`, `internal-authenticated`, and `replacement-grade`
 
 ### API Tier A4
 
@@ -137,6 +140,7 @@ Primary conformance targets:
 - Backup export/import endpoints MUST stay transport-thin, with dataset artifact semantics owned by the store layer.
 - Restore remains an admin-scoped transport surface, but semantic accept/reject behavior now follows the same shared mutation gate as the other write paths.
 - Version/capability endpoints MUST clearly indicate whether runtime is ephemeral or durable.
+- Version/capability/runtime-diagnostics surfaces MUST also indicate the active deployment posture.
 
 ## Conformance Requirements
 
@@ -146,6 +150,10 @@ Primary conformance targets:
 - Unsupported protocol features MUST return explicit, stable diagnostics.
 - `/version` and service-description surfaces MUST reflect actual enabled capabilities, not aspirational ones.
 - Optional surfaces such as operator UI and metrics MUST be advertised from the same runtime posture source used by request guards, so service description, JSON capability payloads, and actual endpoint exposure cannot drift apart.
+- Deployment posture MUST be validated before serving requests. At minimum:
+- `internal-authenticated` MUST reject `auth = none`
+- `replacement-grade` MUST reject in-memory storage and non-`problem-json` SPARQL parse-error mode
+- `read-only-demo` MUST disable SPARQL Update, `TELL`, Graph Store writes, and admin mutation surfaces through the same runtime posture source used for advertising
 - Capability surfaces MUST distinguish between:
 - SPARQL query/update support
 - first-class `TELL` ingest support
@@ -160,6 +168,7 @@ Primary conformance targets:
 - Audit-friendly request logging with sensitive data redaction policy
 - CSRF/session considerations documented for browser-based operator flows
 - Operator endpoint may be exposed externally only with explicit auth policy and transport hardening enabled
+- Deployment posture MUST remain explicit and external to handler logic; runtime defaults MUST not silently claim replacement-grade semantics
 - Minimum baseline implementation must support:
 - configurable payload ceilings for query/update/RDF upload
 - configurable timeout ceilings for query/update/graph operations
@@ -174,6 +183,7 @@ Primary conformance targets:
 - Endpoint-level policy enforcement is explicit, not hidden in storage code.
 - Covered query/update failure cases are parity-tested through the compatibility harness, while payload/rate/auth policy contracts remain explicitly HTTP-test-covered in the server crate.
 - Operational endpoints reflect true runtime readiness.
+- Deployment posture and enabled mutation surfaces are visible and test-covered through `/version`, service description, and operator/runtime diagnostics.
 - Operator frontend can perform core admin workflows against public API endpoints without privileged bypasses.
 - Durable deployment behavior is test-covered for restart/recovery and accurately reflected in readiness/capability endpoints.
 - Policy controls for auth, exposure, payload size, and timeouts are test-covered at HTTP level, including bounded `bearer-jwt` and bounded proxy-terminated `mtls` authorization behavior for the covered role mappings.

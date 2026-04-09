@@ -23,6 +23,7 @@ pub struct ReasoningCapabilityView {
 #[derive(Debug, Serialize)]
 pub struct ConfiguredReasoningPolicyView {
     pub preset: &'static str,
+    pub semantic_tier: &'static str,
     pub available_presets: &'static [&'static str],
     pub feature_modes: Vec<ConfiguredFeatureView>,
     pub unsupported_constructs: &'static str,

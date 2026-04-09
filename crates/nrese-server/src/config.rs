@@ -7,6 +7,7 @@ use nrese_reasoner::ReasonerConfig;
 use nrese_store::StoreConfig;
 
 use crate::policy::PolicyConfig;
+use crate::runtime_posture::{DeploymentPosture, validate_configuration};
 
 mod ai_env;
 mod auth_env;
@@ -34,6 +35,7 @@ use store_env::parse_store_config;
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind_address: SocketAddr,
+    pub deployment_posture: DeploymentPosture,
     pub store: StoreConfig,
     pub reasoner: ReasonerConfig,
     pub policy: PolicyConfig,
@@ -62,18 +64,49 @@ impl ServerConfig {
         let bind_address = bind_address_raw
             .parse()
             .context("failed to parse bind address")?;
+        let deployment_posture =
+            parse_deployment_posture(source.get(names::DEPLOYMENT_POSTURE).as_deref())?;
         let store = parse_store_config(source);
         let reasoner = parse_reasoner_config(source)?;
         let policy = parse_policy_config(source)?;
         let ai = parse_ai_config(source)?;
 
+        validate_configuration(deployment_posture, store.mode, reasoner.mode, &policy)
+            .map_err(anyhow::Error::msg)?;
+
         Ok(Self {
             bind_address,
+            deployment_posture,
             store,
             reasoner,
             policy,
             ai,
         })
+    }
+}
+
+fn parse_deployment_posture(input: Option<&str>) -> Result<DeploymentPosture> {
+    let Some(raw) = input.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DeploymentPosture::OpenWorkbench);
+    };
+
+    match raw.to_ascii_lowercase().as_str() {
+        "open-workbench" | "open_workbench" | "development" | "dev" => {
+            Ok(DeploymentPosture::OpenWorkbench)
+        }
+        "read-only-demo" | "read_only_demo" | "readonlydemo" | "demo" => {
+            Ok(DeploymentPosture::ReadOnlyDemo)
+        }
+        "internal-authenticated" | "internal_authenticated" | "internal" => {
+            Ok(DeploymentPosture::InternalAuthenticated)
+        }
+        "replacement-grade" | "replacement_grade" | "replacement" => {
+            Ok(DeploymentPosture::ReplacementGrade)
+        }
+        unknown => anyhow::bail!(
+            "unsupported value '{unknown}' in {}",
+            names::DEPLOYMENT_POSTURE
+        ),
     }
 }
 
@@ -94,7 +127,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::test_support::{EnvGuard, env_lock};
-    use super::{CliConfig, ServerConfig, env_names as names};
+    use super::{CliConfig, DeploymentPosture, ServerConfig, env_names as names};
 
     #[test]
     fn server_config_loads_from_file() {
@@ -107,6 +140,7 @@ mod tests {
             r#"
 [server]
 bind_address = "0.0.0.0:9191"
+deployment_posture = "open-workbench"
 
 [store]
 mode = "in-memory"
@@ -138,6 +172,7 @@ mode = "none"
         let config = ServerConfig::load(Some(&path)).expect("server config");
 
         assert_eq!(config.bind_address.to_string(), "0.0.0.0:9191");
+        assert_eq!(config.deployment_posture, DeploymentPosture::OpenWorkbench);
         assert_eq!(config.store.data_dir.to_string_lossy(), "./runtime-data");
         assert!(!config.policy.expose_metrics);
         assert_eq!(
@@ -162,6 +197,7 @@ mode = "none"
             r#"
 [server]
 bind_address = "0.0.0.0:9191"
+deployment_posture = "open-workbench"
 
 [reasoner]
 mode = "rules-mvp"
@@ -188,6 +224,7 @@ mode = "none"
             r#"
 [server]
 bind_address = "127.0.0.1:9393"
+deployment_posture = "open-workbench"
 
 [auth]
 mode = "none"
@@ -209,12 +246,24 @@ mode = "none"
         assert!(CliConfig::from_args(["nrese-server".into(), "--verbose".into()]).is_err());
     }
 
+    #[test]
+    fn deployment_posture_rejects_unauthenticated_internal_mode() {
+        let _lock = env_lock().lock().expect("env lock");
+        let _guard = EnvGuard::set(&clean_runtime_env_overrides(&[
+            (names::DEPLOYMENT_POSTURE, Some("internal-authenticated")),
+            (names::AUTH_MODE, Some("none")),
+        ]));
+
+        assert!(ServerConfig::from_env().is_err());
+    }
+
     fn clean_runtime_env_overrides<'a>(
         overrides: &'a [(&'static str, Option<&'a str>)],
     ) -> Vec<(&'static str, Option<&'a str>)> {
         let mut values = vec![
             (names::CONFIG_PATH, None),
             (names::BIND_ADDR, None),
+            (names::DEPLOYMENT_POSTURE, None),
             (names::DATA_DIR, None),
             (names::STORE_MODE, None),
             (names::ONTOLOGY_PATH, None),

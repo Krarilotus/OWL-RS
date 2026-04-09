@@ -1,11 +1,29 @@
 use crate::rules_mvp_policy::{FeatureMode, RulesMvpFeaturePolicy, UnsupportedConstructBehavior};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RulesMvpPresetDescriptor {
+    pub name: &'static str,
+    pub semantic_tier: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RulesMvpPreset {
     RdfsCore,
     BoundedOwl,
     Custom,
 }
+
+const AVAILABLE_PRESET_NAMES: [&str; 2] = ["rdfs-core", "bounded-owl"];
+const AVAILABLE_PRESET_DESCRIPTORS: [RulesMvpPresetDescriptor; 2] = [
+    RulesMvpPresetDescriptor {
+        name: "rdfs-core",
+        semantic_tier: "rdfs-core",
+    },
+    RulesMvpPresetDescriptor {
+        name: "bounded-owl",
+        semantic_tier: "bounded-owl-rules",
+    },
+];
 
 impl RulesMvpPreset {
     pub const fn as_str(self) -> &'static str {
@@ -16,8 +34,27 @@ impl RulesMvpPreset {
         }
     }
 
+    pub const fn semantic_tier(self) -> &'static str {
+        match self {
+            Self::RdfsCore => "rdfs-core",
+            Self::BoundedOwl => "bounded-owl-rules",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub const fn descriptor(self) -> RulesMvpPresetDescriptor {
+        RulesMvpPresetDescriptor {
+            name: self.as_str(),
+            semantic_tier: self.semantic_tier(),
+        }
+    }
+
     pub const fn available() -> &'static [&'static str] {
-        &["rdfs-core", "bounded-owl"]
+        &AVAILABLE_PRESET_NAMES
+    }
+
+    pub const fn available_descriptors() -> &'static [RulesMvpPresetDescriptor] {
+        &AVAILABLE_PRESET_DESCRIPTORS
     }
 }
 
@@ -67,7 +104,7 @@ impl RulesMvpFeaturePolicy {
 #[cfg(test)]
 mod tests {
     use super::RulesMvpPreset;
-    use crate::RulesMvpFeaturePolicy;
+    use crate::{RulesMvpFeaturePolicy, rules_mvp_preset::RulesMvpPresetDescriptor};
 
     #[test]
     fn recognizes_known_presets() {
@@ -78,6 +115,21 @@ mod tests {
         assert_eq!(
             RulesMvpFeaturePolicy::bounded_owl().preset(),
             RulesMvpPreset::BoundedOwl
+        );
+    }
+
+    #[test]
+    fn descriptors_expose_semantic_tiers() {
+        assert_eq!(
+            RulesMvpPreset::RdfsCore.descriptor(),
+            RulesMvpPresetDescriptor {
+                name: "rdfs-core",
+                semantic_tier: "rdfs-core",
+            }
+        );
+        assert_eq!(
+            RulesMvpPreset::BoundedOwl.semantic_tier(),
+            "bounded-owl-rules"
         );
     }
 }

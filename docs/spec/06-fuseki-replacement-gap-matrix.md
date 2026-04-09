@@ -86,6 +86,7 @@ Current coverage:
 - reject-path HTTP problem responses and operator diagnostics now also share explicit conflict evidence triples from the reasoner-owned explanation model
 - staged update previews now allow reject-path responses and operator diagnostics to surface a likely commit-local trigger triple and ranked attribution candidates when the inserted delta can be isolated heuristically
 - rules-mvp cache reuse is now surfaced as typed execution/schema telemetry in reasoning diagnostics and Prometheus metrics
+- rules-mvp runtime diagnostics now also surface the configured semantic tier for the active preset, so bounded RDFS vs bounded OWL slices are externally visible
 
 Still required:
 - broader unsupported-construct coverage and stronger explainability beyond the current deterministic known-construct list
@@ -133,6 +134,7 @@ Current coverage:
 - `/console` now reads reasoning preset/policy/cache state from the server diagnostics surface instead of maintaining local pseudo-config state
 - `/console` now also exposes the server-advertised reasoning capability set, so configured bounded reasoning slices are inspectable from the user-facing runtime view
 - operator APIs expose capabilities, dataset summary, and extended health
+- `/version`, service description, and runtime diagnostics now also expose the active deployment posture and the enabled mutation/admin surface set from the same runtime-owned source
 - query/update/graph workflows are browser-accessible
 - optional server-side AI query suggestions exist behind typed provider config and a dedicated API surface, with provider/model visibility and clearer frontend empty-state handling
 - reasoner presets are externally configurable and visible in the user-facing frontend/runtime metadata
@@ -163,13 +165,14 @@ Current coverage:
 - `oidc-introspection` auth now exists as a bounded introspection-backed mode on the same policy/auth path as the existing static bearer, JWT, and proxy-terminated mTLS modes
 - file-based `config.toml` runtime configuration now exists with environment overrides on the same parser path as env-only startup, which reduces deployment-specific duplication and keeps runtime opinion external to the implementation
 - runtime posture for optional operator/metrics exposure is now derived through one shared server-owned source that feeds guards, capability payloads, service description, and runtime diagnostics
+- deployment posture is now explicit and externally configurable, with startup validation for `internal-authenticated` and `replacement-grade` plus runtime-driven read-only mutation gating for `read-only-demo`
 
 Still required:
 - broader production auth beyond the current bounded `bearer-jwt`, bounded `oidc-introspection`, and bounded proxy-terminated `mtls` slices, including stronger JWT/OIDC integration depth and direct/in-process mTLS if required
 - rate limiting / quota controls
 - stronger secrets and deployment hardening validation
 - release-time security scanning and documented rollback/security process
-- explicit deployment posture validation so unsafe combinations such as external bind plus open auth or overly exposed operator surfaces do not silently serve as if replacement-grade
+- broader startup posture hardening beyond the current validated combinations, especially around external-bind/proxy trust constraints and stronger mTLS deployment contracts
 
 Replacement gate:
 - documented, testable, production-grade authn/authz and hardening baseline with minimal-footprint deployment

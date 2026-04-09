@@ -55,9 +55,9 @@ These are the highest-value structural blocks after the latest whole-system audi
   - `crates/nrese-store/src/staging.rs`
 
 2. Deployment posture layer
-- The repo must distinguish `local-demo`, `internal-authenticated`, and `replacement-grade` postures explicitly, and startup should validate unsafe combinations instead of serving them silently.
+- The repo must distinguish `open-workbench`, `read-only-demo`, `internal-authenticated`, and `replacement-grade` postures explicitly, and startup should validate unsafe combinations instead of serving them silently.
 - Capability reporting, service description, and request guards must derive from the same posture object.
-- Base runtime posture unification is now in place for optional operator/metrics surfaces; the remaining work is to expand this from exposure truth into startup posture validation and broader deployment-mode contracts.
+- Base runtime posture unification is now in place for optional operator/metrics surfaces, and startup validation now exists for `internal-authenticated` / `replacement-grade`; the remaining work is to deepen posture hardening around external-bind/proxy trust rules and finer operator/admin exposure contracts.
 - Target ownership:
   - `crates/nrese-server/src/config/`
   - `crates/nrese-server/src/policy.rs`
@@ -141,6 +141,7 @@ Objective:
 Implementation blocks:
 
 - broader EL/RL-oriented rule coverage
+- collapse external reasoner selection from `mode + preset + features` into one resolved profile/tier contract without losing explicit feature control
 - bounded identity/role slices such as `owl:differentFrom` consistency against equality closure and bounded `owl:ReflexiveProperty` inference over observed resources
 - bounded equality-entailment slices such as `owl:FunctionalProperty` / `owl:InverseFunctionalProperty` implying canonical effective `owl:sameAs`
 - bounded unsatisfiable-class slices such as `owl:Nothing` rejection over effective types and schema-cached class-consistency preparation
@@ -353,6 +354,9 @@ Priority order for the next replacement-focused runs:
 - converged SPARQL Update, `TELL`, Graph Store writes/deletes, and admin restore on one shared server-side mutation pipeline, with shared reasoner gating, revision publication, runtime bookkeeping, and reject attribution flow
 - generalized store-side staged previews from update-only naming to mutation-wide preview semantics and extended them to Graph Store writes/deletes and restore
 - added a shared runtime posture module for optional operator/metrics exposure so guards, service description, version payloads, capability payloads, and runtime diagnostics derive from the same runtime truth
+- added explicit deployment-posture config and startup validation, so `read-only-demo`, `internal-authenticated`, and `replacement-grade` now influence startup acceptance plus write/admin surface exposure from one runtime-owned source
+- extended runtime/version/service-description/frontend diagnostics with deployment-posture and enabled write/admin surface reporting
+- surfaced `rules-mvp` semantic-tier metadata in runtime diagnostics and the frontend reasoning inspector
 - replaced the harness-local blank-node canonicalization path with upstream oxrdf graph canonicalization, which reduced custom comparison code while fixing local ORG `CONSTRUCT` parity against Fuseki
 - extended compat reports with optional result-count and diff-sample fields, and ensured `pack-report.json` is written even when a pack fails mid-run
 - verified local live side-by-side parity against a local Apache Jena Fuseki 6.0.0 install for the official FOAF pack plus medium/broad official ontology pack-matrix runs on the standard `pack-matrix` evidence path

@@ -63,7 +63,8 @@ Verbindlicher Kurzstand je Track:
   - Crash-/Restart-/Drill-Evidenz ist noch offen
 - Security und Hardening: `partial`
   - `bearer-static`, bounded `bearer-jwt`, bounded `oidc-introspection`, bounded proxy-terminated `mtls`, Limits und Rate-Limits existieren
-  - optionale Operator-/Metrics-Exposition und Capability-/Service-Description-Reporting laufen jetzt ueber eine gemeinsame Runtime-Posture-Ableitung statt ueber verteilte Hardcodings
+  - Deployment-Postures (`open-workbench`, `read-only-demo`, `internal-authenticated`, `replacement-grade`) steuern jetzt Startup-Validierung sowie Write-/Admin-Surface-Exposition aus einer gemeinsamen Runtime-Quelle
+  - optionale Operator-/Metrics-Exposition und Capability-/Service-Description-Reporting laufen jetzt ueber diese gemeinsame Runtime-Posture-Ableitung statt ueber verteilte Hardcodings
   - produktionsnahe Härtungs- und Rollout-Evidenz fehlt noch
 - Frontend und Operator-Flaechen: `partial`
   - `/console` und `/ops` existieren, inklusive AI-Assistent, i18n und Runtime-/Reasoning-Sicht
@@ -80,11 +81,14 @@ Die naechsten Replacement-Bloecke sind:
    - Timeout-, Auth-, Error- und Workload-Packs gegen die echte Zielumgebung, gebunden an eine konkrete Live-Connection-Profile-Auswahl
 2. Mutation-Pipeline-Nacharbeiten auf derselben gemeinsamen Architektur
    - gemeinsame Mutationstest-Matrix, weitere Store-seitige Preview-/Apply-Evidenz und konsequente Runtime-/Capability-Sicht
-3. breitere Reasoner-Abdeckung auf dem bestehenden modularen Pfad
+3. expliziterer externer Reasoner-Profilvertrag
+   - `mode + preset + features` weiter auf einen einzelnen, resolvebaren Profil-/Tier-Vertrag reduzieren
+   - derselbe Profilvertrag muss Config, Runtime-Diagnostics, Frontend und Spec tragen
+4. breitere Reasoner-Abdeckung auf dem bestehenden modularen Pfad
    - ohne Supportgrenzen zu verwischen oder impliziten Code einzubauen
-4. durable Recovery- und Drill-Evidenz
-5. CI-faehige Benchmark-/Conformance-Gates
-6. weitere Frontend-Workflow-Haertung auf Basis der echten Server-/Reasoning-Flaechen
+5. durable Recovery- und Drill-Evidenz
+6. CI-faehige Benchmark-/Conformance-Gates
+7. weitere Frontend-Workflow-Haertung auf Basis der echten Server-/Reasoning-Flaechen
 
 ## Dokumentationsregeln
 

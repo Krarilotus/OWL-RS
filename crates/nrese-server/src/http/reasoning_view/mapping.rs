@@ -24,6 +24,7 @@ pub fn configured_reasoning_policy(
     let policy = &config.rules_mvp.feature_policy;
     Some(ConfiguredReasoningPolicyView {
         preset: config.rules_mvp.preset.as_str(),
+        semantic_tier: config.rules_mvp.preset.semantic_tier(),
         available_presets: nrese_reasoner::RulesMvpPreset::available(),
         feature_modes: vec![
             configured_feature("rdfs-subclass-closure", policy.rdfs_subclass_closure),

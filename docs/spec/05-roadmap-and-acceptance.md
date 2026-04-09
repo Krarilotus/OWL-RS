@@ -41,6 +41,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - Durable deployment profile validated (restart persistence, startup integrity checks, recovery signaling)
 - External operator exposure model documented (auth, TLS, proxy, CSP, path prefix)
 - Optional operator/metrics exposure and capability reporting now derive from one shared runtime posture source instead of separate handler-local hardcodings
+- Deployment posture is now explicit and externally configurable, with startup validation for `read-only-demo`, `internal-authenticated`, and `replacement-grade`
 - Central policy layer enforces auth, request size limits, timeout ceilings, and endpoint exposure, with bounded `bearer-jwt`, bounded `oidc-introspection`, and bounded proxy-terminated `mtls` support added alongside `bearer-static`
 - Initial rate-limit buckets for read, write, and admin traffic are enforced from the same policy path as auth
 - Server runtime configuration now supports file-based `config.toml` input with environment overrides on the same typed parser path, so deployment policy stays external to handler/runtime logic
@@ -76,6 +77,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - `rules-mvp` property-characteristic consistency checks now build one prepared assertion index per run for constrained predicates, so irreflexive, asymmetric, functional, inverse-functional, and property-disjoint rejection gates reuse a single grouped property view
 - `rules-mvp` now also caches a schema-stable property-constraint plan, so ABox-sensitive property-consistency indexing no longer has to rediscover the relevant constrained predicate set on each run
 - `rules-mvp` runtime behavior is now externalized behind a typed feature policy, so closure, equality, consistency gates, and unsupported-construct diagnostics can be configured without embedding product opinion into reasoner code
+- `rules-mvp` preset/tier metadata is now surfaced in runtime diagnostics so the active bounded RDFS/OWL slice is visible without reconstructing it from individual feature flags
 - official ontology fixtures now provide bounded release-evidence for `rules-mvp` reasoning/runtime validation on FOAF, W3C Time, W3C ORG, SKOS, PROV-O, DCAT, vCard, DCMI Terms, SOSA, SSN, and ODRL
 - bounded official-ontology-backed service slices should ship on shared test-support helpers rather than duplicating fixture-path and setup logic per test file
 - ontology-backed compat/parity suites should grow incrementally through the catalog/pack path, with shared suite structure instead of flat one-off fixtures per ontology
@@ -150,6 +152,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - Failed mutation paths keep revision stable and leave previously committed data queryable.
 - Graph replace with malformed RDF is atomic and does not clear previously committed data.
 - Graph Store and restore semantic rejects now use the same mutation gate as update and `TELL`, so reject-path invariants are no longer entry-point-specific.
+- Read-only deployment posture keeps query/read surfaces alive while rejecting update, `TELL`, Graph Store write, and admin mutation calls before they reach mutation orchestration.
 - Each drill run produces evidence artifacts defined in [docs/ops/backup-restore-drills.md](../ops/backup-restore-drills.md).
 
 Drill execution procedure and evidence format are normative in [docs/ops/backup-restore-drills.md](../ops/backup-restore-drills.md).
@@ -160,6 +163,7 @@ Drill execution procedure and evidence format are normative in [docs/ops/backup-
 - Sensitive payload handling has explicit logging policy.
 - Release gates require security and conformance checks.
 - External operator exposure requires explicit policy controls and hardened transport configuration.
+- Replacement-grade posture requires auth, durable storage, and normal problem+json parse-error semantics at startup.
 - Policy defaults remain benchmarked and documented against standard reverse-proxy / API hardening practice.
 - HTTP-level policy contracts for auth, payload ceilings, and rate-limit baselines stay in dedicated server integration tests instead of being folded into unrelated protocol tests.
 
@@ -171,6 +175,7 @@ Drill execution procedure and evidence format are normative in [docs/ops/backup-
 - Server code does not bypass store internals through raw backend access.
 - Operator frontend behavior stays API-driven and spec-aligned, preventing undocumented divergence.
 - Frontend endpoint ownership, runtime config, and CLI wrappers stay in the frontend package instead of leaking transport helpers into backend modules.
+- Runtime posture, capability reporting, and service-description advertising derive from one implementation source, not parallel hardcoded views.
 
 ## Risk Register
 

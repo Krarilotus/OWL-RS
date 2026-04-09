@@ -28,6 +28,7 @@ export function RuntimePanel({
     [strings.runtimeRevisionLabel, snapshot?.revision ?? "-"],
     [strings.runtimeQuadsLabel, snapshot?.quad_count ?? "-"],
     [strings.runtimeNamedGraphsLabel, snapshot?.named_graph_count ?? "-"],
+    [strings.runtimeDeploymentLabel, snapshot?.deployment_posture ?? "-"],
     [strings.runtimeReasonerLabel, snapshot?.reasoning_profile ?? "-"],
     [strings.runtimePresetLabel, snapshot?.reasoning_preset ?? strings.reasoningPresetCustom],
     [strings.runtimeStoreLabel, snapshot?.store_mode ?? "-"],

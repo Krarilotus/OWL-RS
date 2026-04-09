@@ -48,8 +48,10 @@ Implemented today:
 - staged update validation before publish
 - one shared mutation pipeline for SPARQL Update, `TELL`, Graph Store writes/deletes, and admin restore, so reasoning gates, revision publication, and reject diagnostics stay aligned across write paths
 - service-description and capability reporting for optional operator/metrics surfaces now derive from one shared runtime posture path instead of hard-coded per-endpoint advertising
+- explicit deployment postures (`open-workbench`, `read-only-demo`, `internal-authenticated`, `replacement-grade`) now drive startup validation, write-surface exposure, capability reporting, and service-description mutation advertising from one server-owned source
 - bounded `rules-mvp` reasoning with canonical `owl:sameAs` equality handling, bounded functional / inverse-functional equality entailment, bounded binary `owl:propertyChainAxiom` support over named-node RDF lists, bounded `owl:AllDifferent` / `owl:AllDisjointClasses` / `owl:AllDisjointProperties` expansion into the same consistency gates, bounded `owl:Nothing` effective-type rejection, and explicit unsupported-construct diagnostics
 - typed `rules-mvp` presets (`rdfs-core`, `bounded-owl`) on top of the explicit feature-policy path
+- `rules-mvp` presets now also expose a semantic-tier label in runtime diagnostics, so the active bounded RDFS/OWL slice is visible without reverse-engineering feature flags
 - snapshot-keyed memoization for repeated `rules-mvp` runs over identical dataset state
 - schema-keyed memoization for `rules-mvp` preparation reuse across ABox-only changes
 - cache/runtime telemetry for `rules-mvp` execution and schema reuse, exposed in reasoning diagnostics and Prometheus metrics
@@ -93,6 +95,7 @@ Not finished yet:
 - persistence is partial: durable mode and backup/restore exist, but crash-recovery and drill-evidence gates are still open
 - backup/restore now shares the same mutation gate as the other write paths, but replacement-grade recovery and drill evidence are still open
 - broader EL/RL/DL reasoning coverage
+- the reasoner still resolves `mode + preset + feature overrides`; the next cleanup step is to collapse this into one resolved external profile/tier contract instead of parallel selectors
 - full conformance and benchmark automation in CI
 - production auth is partial: `bearer-static`, bounded `bearer-jwt`, bounded proxy-terminated `mtls`, and bounded `oidc-introspection` exist, while broader hardening work remains open
 - real-world replacement evidence on the full ontology and workload set
@@ -221,6 +224,8 @@ Optional environment variables:
   Example: `rdfs-subclass-closure,rdfs-subproperty-closure,rdfs-type-propagation,rdfs-domain-range-typing,owl-property-assertion-closure,owl-equality-reasoning,owl-consistency-check,unsupported-diagnostics`
 - `NRESE_REASONER_RULES_MVP_PRESET`
   Example: `bounded-owl`
+- `NRESE_DEPLOYMENT_POSTURE`
+  Example: `read-only-demo`, `internal-authenticated`, or `replacement-grade`
 - `NRESE_SPARQL_PARSE_ERROR_PROFILE`
   Example: `problem-json` or `fuseki-plain-text`
 - `NRESE_STORE_MODE`

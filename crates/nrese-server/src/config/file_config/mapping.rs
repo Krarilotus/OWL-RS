@@ -6,6 +6,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> KeyValueSource {
     let mut source = KeyValueSource::default();
 
     insert_option(&mut source, names::BIND_ADDR, config.server.bind_address);
+    insert_option(
+        &mut source,
+        names::DEPLOYMENT_POSTURE,
+        config.server.deployment_posture,
+    );
     insert_option(&mut source, names::DATA_DIR, config.store.data_dir);
     insert_option(&mut source, names::STORE_MODE, config.store.mode);
     insert_option(

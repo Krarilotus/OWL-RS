@@ -13,6 +13,7 @@ export const de: AppStrings = {
   runtimeRevisionLabel: "Revision",
   runtimeQuadsLabel: "Quads",
   runtimeNamedGraphsLabel: "Named Graphs",
+  runtimeDeploymentLabel: "Deployment-Posture",
   runtimeReasonerLabel: "Reasoner",
   runtimePresetLabel: "Preset",
   runtimeStoreLabel: "Store",
@@ -40,6 +41,7 @@ export const de: AppStrings = {
   reasoningPresetHint:
     "Presets halten Produktentscheidungen aus der Implementierung heraus. So lassen sich Konfigurationen standardisieren, ohne die Feature-Policy zu verstecken.",
   reasoningPresetActiveLabel: "Aktives Preset",
+  reasoningPresetTierLabel: "Semantischer Tier",
   reasoningPresetAvailableLabel: "Verfuegbare Presets",
   reasoningPresetCustom: "custom",
   reasoningPolicyUnavailable: "keine Laufzeitdaten verfuegbar",

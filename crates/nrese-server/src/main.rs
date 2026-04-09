@@ -20,7 +20,13 @@ async fn main() -> Result<()> {
     let ontology_path = store
         .preloaded_ontology_path()
         .map(|path| path.to_path_buf());
-    let state = AppState::new(store.clone(), reasoner.clone(), config.policy.clone(), ai);
+    let state = AppState::new(
+        store.clone(),
+        reasoner.clone(),
+        config.policy.clone(),
+        ai,
+        config.deployment_posture,
+    );
     state.mark_ready();
     let app = build_app(state);
 
@@ -30,6 +36,7 @@ async fn main() -> Result<()> {
 
     tracing::info!(
         bind_address = %config.bind_address,
+        deployment_posture = config.deployment_posture.as_str(),
         data_dir = %store.config().data_dir.display(),
         reasoning_mode = ?reasoner.config().mode,
         reasoner_profile = reasoner.profile_name(),

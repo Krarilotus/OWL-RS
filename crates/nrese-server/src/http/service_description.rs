@@ -9,9 +9,18 @@ pub fn build_service_description(state: &AppState) -> String {
     let reasoning_mode = state.reasoner_mode_name();
     let reasoning_profile = state.reasoner_profile_name();
     let graph_store_enabled = bool_literal(posture.graph_store_enabled);
+    let graph_store_write_enabled = bool_literal(posture.graph_write_enabled);
     let sparql_update_enabled = bool_literal(posture.sparql_update_enabled);
     let tell_enabled = bool_literal(posture.tell_enabled);
     let federated_service_enabled = "false";
+    let update_endpoint = posture
+        .sparql_update_enabled
+        .then_some(format!("   nrese:updateEndpoint <{UPDATE_ENDPOINT}> ;\n"))
+        .unwrap_or_default();
+    let tell_endpoint = posture
+        .tell_enabled
+        .then_some(format!("   nrese:tellEndpoint <{TELL_ENDPOINT}> ;\n"))
+        .unwrap_or_default();
     let metrics_endpoint = posture
         .metrics_path()
         .map(|_| format!("   nrese:metricsEndpoint <{METRICS_ENDPOINT}> ;\n"))
@@ -32,14 +41,15 @@ pub fn build_service_description(state: &AppState) -> String {
    sd:supportedLanguage sd:SPARQL11Query ;\n\
    sd:resultFormat format:SPARQL_Results_JSON , format:SPARQL_Results_XML , format:SPARQL_Results_CSV , format:SPARQL_Results_TSV ;\n\
    nrese:serviceDescriptionEndpoint <{SERVICE_DESCRIPTION_ENDPOINT}> ;\n\
-   nrese:updateEndpoint <{UPDATE_ENDPOINT}> ;\n\
-   nrese:tellEndpoint <{TELL_ENDPOINT}> ;\n\
+{update_endpoint}\
+{tell_endpoint}\
    nrese:graphStoreEndpoint <{GRAPH_STORE_ENDPOINT}> ;\n\
 {metrics_endpoint}\
 {operator_endpoint}\
    nrese:reasoningMode \"{reasoning_mode}\" ;\n\
    nrese:reasoningProfile \"{reasoning_profile}\" ;\n\
    nrese:graphStoreEnabled \"{graph_store_enabled}\" ;\n\
+   nrese:graphStoreWriteEnabled \"{graph_store_write_enabled}\" ;\n\
    nrese:sparqlUpdateEnabled \"{sparql_update_enabled}\" ;\n\
    nrese:tellEnabled \"{tell_enabled}\" ;\n\
    nrese:federatedServiceEnabled \"{federated_service_enabled}\" .\n"
@@ -70,6 +80,7 @@ mod tests {
             reasoner,
             PolicyConfig::default(),
             AiSuggestionService::disabled(),
+            crate::runtime_posture::DeploymentPosture::OpenWorkbench,
         );
         let ttl = build_service_description(&state);
 
@@ -94,6 +105,7 @@ mod tests {
                 ..PolicyConfig::default()
             },
             AiSuggestionService::disabled(),
+            crate::runtime_posture::DeploymentPosture::OpenWorkbench,
         );
         let ttl = build_service_description(&state);
 

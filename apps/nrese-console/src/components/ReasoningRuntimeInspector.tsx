@@ -31,6 +31,12 @@ export function ReasoningRuntimeInspector({ strings, reasoning }: Props) {
           </div>
         </div>
         <div className="fact-card">
+          <div className="fact-label">{strings.reasoningPresetTierLabel}</div>
+          <div className="fact-value mono">
+            {policy?.semantic_tier ?? strings.reasoningPolicyUnavailable}
+          </div>
+        </div>
+        <div className="fact-card">
           <div className="fact-label">{strings.reasoningPresetAvailableLabel}</div>
           <div className="fact-value mono">
             {(policy?.available_presets ?? []).join(", ") || strings.reasoningPolicyUnavailable}

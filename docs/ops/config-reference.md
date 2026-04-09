@@ -34,6 +34,7 @@ Notes:
 ```toml
 [server]
 bind_address = "127.0.0.1:8080"
+deployment_posture = "internal-authenticated"
 
 [store]
 mode = "in-memory"
@@ -44,7 +45,7 @@ ontology_path = "C:/data/rg_ontology.ttl"
 mode = "rules-mvp"
 
 [reasoner.rules_mvp]
-preset = "bounded-owl"
+tier = "bounded-owl"
 features = [
   "rdfs-subclass-closure",
   "rdfs-subproperty-closure",
@@ -109,6 +110,19 @@ api_key = "replace-me"
 - env override: `NRESE_BIND_ADDR`
 - default: `127.0.0.1:8080`
 
+- file key: `server.deployment_posture`
+- env override: `NRESE_DEPLOYMENT_POSTURE`
+- values:
+  - `open-workbench`
+  - `read-only-demo`
+  - `internal-authenticated`
+  - `replacement-grade`
+- default: `open-workbench`
+- posture effects:
+  - `read-only-demo` disables SPARQL Update, `TELL`, Graph Store writes, and admin mutation surfaces
+  - `internal-authenticated` requires auth mode other than `none`
+  - `replacement-grade` additionally requires on-disk storage, `problem-json` SPARQL parse errors, and rejects `owl-dl-target` while it remains scaffolded
+
 ## Store
 
 - file key: `store.mode`
@@ -149,6 +163,7 @@ api_key = "replace-me"
   - list: `features = ["rdfs-subclass-closure", "owl-consistency-check"]`
 
 - file key: `reasoner.rules_mvp.preset`
+- file key alias: `reasoner.rules_mvp.tier`
 - env override: `NRESE_REASONER_RULES_MVP_PRESET`
 - values:
   - `rdfs-core`
@@ -156,6 +171,9 @@ api_key = "replace-me"
 - precedence:
   - explicit `features` override `preset`
   - `preset` overrides the built-in default
+- semantic tiers:
+  - `rdfs-core`: bounded RDFS closure/type propagation only
+  - `bounded-owl`: bounded OWL rule slice on top of the RDFS core
 
 ## Policy Limits
 

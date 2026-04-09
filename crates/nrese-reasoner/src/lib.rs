@@ -31,5 +31,5 @@ pub use output::{
 };
 pub use profile::{ReasonerProfile, profile_for_mode};
 pub use rules_mvp_policy::{FeatureMode, RulesMvpFeaturePolicy, UnsupportedConstructBehavior};
-pub use rules_mvp_preset::RulesMvpPreset;
+pub use rules_mvp_preset::{RulesMvpPreset, RulesMvpPresetDescriptor};
 pub use service::ReasonerService;

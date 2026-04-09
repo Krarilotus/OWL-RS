@@ -60,6 +60,8 @@ Current behavior:
 - CLI currently selects the config file path; per-setting overrides remain file/env based.
 - Typed runtime defaults and validation stay in the owning crates.
 - External parsing, file loading, and precedence stay in `crates/nrese-server/src/config/`.
+- `server.deployment_posture` / `NRESE_DEPLOYMENT_POSTURE` is now the explicit deployment-mode selector for `open-workbench`, `read-only-demo`, `internal-authenticated`, and `replacement-grade`.
+- Startup validation now rejects invalid `internal-authenticated` / `replacement-grade` combinations instead of silently serving them.
 
 Durable storage build note:
 
@@ -104,6 +106,7 @@ Startup behavior requirements:
 
 ```powershell
 $env:NRESE_BIND_ADDR = "127.0.0.1:8080"
+$env:NRESE_DEPLOYMENT_POSTURE = "open-workbench"
 $env:NRESE_DATA_DIR = ".\data"
 $env:RUST_LOG = "info"
 $env:NRESE_ONTOLOGY_PATH = "C:\Users\Johannes\Documents\MEPHISTO\Ontology-Development\files\processed\rg_ontology.ttl"

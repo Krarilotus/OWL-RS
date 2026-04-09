@@ -92,6 +92,7 @@ mod tests {
             reasoner,
             PolicyConfig::default(),
             AiSuggestionService::disabled(),
+            crate::runtime_posture::DeploymentPosture::OpenWorkbench,
         );
         state.mark_ready();
 

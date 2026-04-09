@@ -12,7 +12,7 @@ use crate::policy::PolicyAction;
 use crate::policy::PolicyConfig;
 use crate::rate_limit::RateLimiter;
 use crate::reasoning_runtime::LastReasoningRun;
-use crate::runtime_posture::RuntimePosture;
+use crate::runtime_posture::{DeploymentPosture, RuntimePosture};
 use axum::http::HeaderMap;
 
 #[derive(Clone)]
@@ -22,6 +22,7 @@ pub struct AppState {
     reasoner: Arc<ReasonerService>,
     policy: Arc<PolicyConfig>,
     ai: Arc<AiSuggestionService>,
+    deployment_posture: DeploymentPosture,
     rate_limiter: Arc<RateLimiter>,
     last_reasoning_run: Arc<RwLock<Option<LastReasoningRun>>>,
     update_lock: Arc<Mutex<()>>,
@@ -33,6 +34,7 @@ impl AppState {
         reasoner: ReasonerService,
         policy: PolicyConfig,
         ai: AiSuggestionService,
+        deployment_posture: DeploymentPosture,
     ) -> Self {
         Self {
             store: Arc::new(store),
@@ -40,6 +42,7 @@ impl AppState {
             reasoner: Arc::new(reasoner),
             policy: Arc::new(policy),
             ai: Arc::new(ai),
+            deployment_posture,
             rate_limiter: Arc::new(RateLimiter::default()),
             last_reasoning_run: Arc::new(RwLock::new(None)),
             update_lock: Arc::new(Mutex::new(())),
@@ -76,6 +79,10 @@ impl AppState {
 
     pub fn ai(&self) -> Arc<AiSuggestionService> {
         Arc::clone(&self.ai)
+    }
+
+    pub fn deployment_posture(&self) -> DeploymentPosture {
+        self.deployment_posture
     }
 
     pub fn runtime_posture(&self) -> RuntimePosture {

@@ -11,6 +11,7 @@ use crate::state::AppState;
 pub struct RuntimeDiagnosticsResponse {
     pub service: &'static str,
     pub version: &'static str,
+    pub deployment_posture: &'static str,
     pub ready: bool,
     pub revision: u64,
     pub quad_count: u64,
@@ -19,6 +20,8 @@ pub struct RuntimeDiagnosticsResponse {
     pub durability: &'static str,
     pub reasoning_mode: &'static str,
     pub reasoning_profile: &'static str,
+    pub graph_write_enabled: bool,
+    pub admin_surface_enabled: bool,
     pub operator_ui_enabled: bool,
     pub metrics_enabled: bool,
 }
@@ -35,6 +38,7 @@ pub fn runtime(state: AppState) -> Result<Response, ApiError> {
         Json(RuntimeDiagnosticsResponse {
             service: "nrese-server",
             version: env!("CARGO_PKG_VERSION"),
+            deployment_posture: posture.deployment_posture,
             ready: state.is_ready(),
             revision: state.store().current_revision(),
             quad_count: stats.quad_count as u64,
@@ -43,6 +47,8 @@ pub fn runtime(state: AppState) -> Result<Response, ApiError> {
             durability: state.durability_name(),
             reasoning_mode: state.reasoner_mode_name(),
             reasoning_profile: state.reasoner_profile_name(),
+            graph_write_enabled: posture.graph_write_enabled,
+            admin_surface_enabled: posture.admin_surface_enabled,
             operator_ui_enabled: posture.operator_surface_enabled,
             metrics_enabled: posture.metrics_enabled,
         }),
