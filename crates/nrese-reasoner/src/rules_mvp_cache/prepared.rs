@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use nrese_core::DatasetSnapshot;
+use nrese_core::{DatasetSnapshot, SnapshotCoverageStats};
 
 use crate::class_consistency::{PreparedClassConsistency, detect_class_consistency_conflicts};
 use crate::dataset_index::IndexedDataset;
@@ -80,6 +80,30 @@ impl PreparedRulesMvp {
                 self.index.unsupported_asserted_triples()
             ));
         }
+        if self.stats.unsupported_blank_node_subjects > 0 {
+            diagnostics.push(format!(
+                "{} asserted triples were skipped because they use blank-node subjects",
+                self.stats.unsupported_blank_node_subjects
+            ));
+        }
+        if self.stats.unsupported_blank_node_objects > 0 {
+            diagnostics.push(format!(
+                "{} asserted triples were skipped because they use blank-node objects",
+                self.stats.unsupported_blank_node_objects
+            ));
+        }
+        if self.stats.unsupported_literal_objects > 0 {
+            diagnostics.push(format!(
+                "{} asserted triples were skipped because they use literal objects",
+                self.stats.unsupported_literal_objects
+            ));
+        }
+        if self.stats.flattened_named_graph_quads > 0 {
+            diagnostics.push(format!(
+                "{} named-graph quads were flattened into the current asserted-only triple snapshot; graph names do not yet participate in reasoner indexing",
+                self.stats.flattened_named_graph_quads
+            ));
+        }
 
         let derived_triples = derived
             .into_iter()
@@ -105,6 +129,7 @@ impl PreparedRulesMvp {
 
     pub(super) fn build_from_index(
         index: IndexedDataset,
+        coverage: SnapshotCoverageStats,
         cached_schema: Option<&CachedPreparedSchema>,
         policy: &RulesMvpFeaturePolicy,
     ) -> Self {
@@ -173,6 +198,10 @@ impl PreparedRulesMvp {
         let stats = ReasoningStats {
             supported_asserted_triples: index.supported_asserted_triples(),
             unsupported_asserted_triples: index.unsupported_asserted_triples(),
+            unsupported_blank_node_subjects: coverage.unsupported_blank_node_subjects,
+            unsupported_blank_node_objects: coverage.unsupported_blank_node_objects,
+            unsupported_literal_objects: coverage.unsupported_literal_objects,
+            flattened_named_graph_quads: coverage.flattened_named_graph_quads,
             interned_terms: index.symbols().len(),
             subclass_edge_count: index.subclass_edge_count(),
             subproperty_edge_count: index.subproperty_edge_count(),
@@ -220,6 +249,7 @@ where
 {
     PreparedRulesMvp::build_from_index(
         IndexedDataset::from_snapshot(snapshot),
+        snapshot.coverage_stats(),
         cached_schema,
         policy,
     )

@@ -1,5 +1,6 @@
 use crate::rules::execute_rules_mvp;
 use crate::test_support::OwnedSnapshot;
+use nrese_core::SnapshotCoverageStats;
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const OWL_EQUIVALENT_CLASS: &str = "http://www.w3.org/2002/07/owl#equivalentClass";
@@ -58,6 +59,10 @@ fn rules_mvp_derives_subclass_and_type_closure() {
     )));
     assert_eq!(output.stats.supported_asserted_triples, 3);
     assert_eq!(output.stats.unsupported_asserted_triples, 0);
+    assert_eq!(output.stats.unsupported_blank_node_subjects, 0);
+    assert_eq!(output.stats.unsupported_blank_node_objects, 0);
+    assert_eq!(output.stats.unsupported_literal_objects, 0);
+    assert_eq!(output.stats.flattened_named_graph_quads, 0);
     assert_eq!(output.stats.subclass_edge_count, 2);
     assert_eq!(output.stats.subproperty_edge_count, 0);
     assert_eq!(output.stats.type_assertion_count, 1);
@@ -72,22 +77,46 @@ fn rules_mvp_derives_subclass_and_type_closure() {
 
 #[test]
 fn rules_mvp_reports_skipped_triples_in_diagnostics() {
-    let snapshot = OwnedSnapshot::with_revision_and_unsupported(
+    let snapshot = OwnedSnapshot::with_revision_and_coverage(
         1,
         vec![(
             "http://example.com/alice",
             RDF_TYPE,
             "http://example.com/Child",
         )],
-        2,
+        SnapshotCoverageStats {
+            unsupported_triples: 2,
+            unsupported_blank_node_subjects: 1,
+            unsupported_literal_objects: 1,
+            ..SnapshotCoverageStats::default()
+        },
     );
 
     let output = execute_rules_mvp(&snapshot);
 
     assert_eq!(output.inferred_triples, 0);
     assert_eq!(output.stats.unsupported_asserted_triples, 2);
-    assert_eq!(output.diagnostics.len(), 1);
-    assert!(output.diagnostics[0].contains("2 asserted triples were skipped"));
+    assert_eq!(output.stats.unsupported_blank_node_subjects, 1);
+    assert_eq!(output.stats.unsupported_blank_node_objects, 0);
+    assert_eq!(output.stats.unsupported_literal_objects, 1);
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("2 asserted triples were skipped"))
+    );
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("blank-node subjects"))
+    );
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("literal objects"))
+    );
 }
 
 #[test]

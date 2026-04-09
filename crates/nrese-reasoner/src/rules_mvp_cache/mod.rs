@@ -74,10 +74,15 @@ impl RulesMvpExecutionCache {
         }
 
         let index = IndexedDataset::from_snapshot(snapshot);
+        let coverage = snapshot.coverage_stats();
         let schema_lookup = self.lookup_schema_cache(&index, policy);
-        let inferred =
-            PreparedRulesMvp::build_from_index(index, schema_lookup.entry.as_ref(), policy)
-                .execute();
+        let inferred = PreparedRulesMvp::build_from_index(
+            index,
+            coverage,
+            schema_lookup.entry.as_ref(),
+            policy,
+        )
+        .execute();
 
         let mut inferred = inferred;
         let cached = CachedRulesMvpExecution {

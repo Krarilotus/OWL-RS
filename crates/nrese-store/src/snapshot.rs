@@ -1,7 +1,7 @@
 use std::hash::{Hash, Hasher};
 
-use nrese_core::{DatasetSnapshot, IriRef, TripleRef, TripleSource};
-use oxigraph::model::{NamedOrBlankNodeRef, TermRef};
+use nrese_core::{DatasetSnapshot, IriRef, SnapshotCoverageStats, TripleRef, TripleSource};
+use oxigraph::model::{GraphNameRef, NamedOrBlankNodeRef, TermRef};
 use oxigraph::store::Store;
 
 use crate::error::StoreResult;
@@ -44,7 +44,7 @@ pub struct StoreDatasetSnapshot {
     revision: u64,
     cache_key: u64,
     asserted_triple_count: u64,
-    unsupported_triple_count: u64,
+    coverage: SnapshotCoverageStats,
     triples: Vec<SnapshotTriple>,
 }
 
@@ -52,24 +52,34 @@ impl StoreDatasetSnapshot {
     pub fn capture(store: &Store, revision: u64) -> StoreResult<Self> {
         let mut triples = Vec::new();
         let mut asserted_triple_count = 0u64;
-        let mut unsupported_triple_count = 0u64;
+        let mut coverage = SnapshotCoverageStats::default();
 
         for quad in store.quads_for_pattern(None, None, None, None) {
             let quad = quad?;
             asserted_triple_count += 1;
+            if !matches!(quad.graph_name.as_ref(), GraphNameRef::DefaultGraph) {
+                coverage.flattened_named_graph_quads += 1;
+            }
 
             let subject = match quad.subject.as_ref() {
                 NamedOrBlankNodeRef::NamedNode(node) => node.as_str().to_owned(),
                 _ => {
-                    unsupported_triple_count += 1;
+                    coverage.unsupported_triples += 1;
+                    coverage.unsupported_blank_node_subjects += 1;
                     continue;
                 }
             };
             let predicate = quad.predicate.as_str().to_owned();
             let object = match quad.object.as_ref() {
                 TermRef::NamedNode(node) => node.as_str().to_owned(),
+                TermRef::BlankNode(_) => {
+                    coverage.unsupported_triples += 1;
+                    coverage.unsupported_blank_node_objects += 1;
+                    continue;
+                }
                 _ => {
-                    unsupported_triple_count += 1;
+                    coverage.unsupported_triples += 1;
+                    coverage.unsupported_literal_objects += 1;
                     continue;
                 }
             };
@@ -79,17 +89,17 @@ impl StoreDatasetSnapshot {
                 predicate,
                 object,
             });
+            coverage.supported_triples += 1;
         }
 
         triples.sort();
-        let cache_key =
-            compute_snapshot_cache_key(asserted_triple_count, unsupported_triple_count, &triples);
+        let cache_key = compute_snapshot_cache_key(asserted_triple_count, &coverage, &triples);
 
         Ok(Self {
             revision,
             cache_key,
             asserted_triple_count,
-            unsupported_triple_count,
+            coverage,
             triples,
         })
     }
@@ -126,23 +136,32 @@ impl<'a> DatasetSnapshot<'a> for StoreDatasetSnapshot {
         Some(self.cache_key)
     }
 
-    fn asserted_triple_count(&'a self) -> u64 {
+    fn asserted_triple_count(&self) -> u64 {
         self.asserted_triple_count
     }
 
     fn unsupported_triple_count(&self) -> u64 {
-        self.unsupported_triple_count
+        self.coverage.unsupported_triples
+    }
+
+    fn coverage_stats(&self) -> SnapshotCoverageStats {
+        self.coverage
     }
 }
 
 fn compute_snapshot_cache_key(
     asserted_triple_count: u64,
-    unsupported_triple_count: u64,
+    coverage: &SnapshotCoverageStats,
     triples: &[SnapshotTriple],
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     asserted_triple_count.hash(&mut hasher);
-    unsupported_triple_count.hash(&mut hasher);
+    coverage.supported_triples.hash(&mut hasher);
+    coverage.unsupported_triples.hash(&mut hasher);
+    coverage.unsupported_blank_node_subjects.hash(&mut hasher);
+    coverage.unsupported_blank_node_objects.hash(&mut hasher);
+    coverage.unsupported_literal_objects.hash(&mut hasher);
+    coverage.flattened_named_graph_quads.hash(&mut hasher);
     triples.len().hash(&mut hasher);
     for triple in triples {
         triple.subject.hash(&mut hasher);
@@ -177,10 +196,13 @@ mod tests {
 
         let snapshot = StoreDatasetSnapshot::capture(&store, 3).expect("snapshot");
         let triples: Vec<_> = nrese_core::TripleSource::triples(&snapshot).collect();
+        let coverage = snapshot.coverage_stats();
 
         assert_eq!(snapshot.revision(), 3);
         assert_eq!(snapshot.asserted_triple_count(), 2);
         assert_eq!(snapshot.unsupported_triple_count(), 1);
+        assert_eq!(coverage.supported_triples, 1);
+        assert_eq!(coverage.unsupported_literal_objects, 1);
         assert_eq!(triples.len(), 1);
         assert_eq!(triples[0].subject.as_str(), "http://example.com/s");
         assert!(snapshot.cache_key().is_some());

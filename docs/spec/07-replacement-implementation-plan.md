@@ -73,7 +73,7 @@ These are the highest-value structural blocks after the latest whole-system audi
   - `apps/nrese-console`
 
 4. Quad-aware snapshot/index model
-- The current reasoner snapshot model is still asserted-triple-centric and drops parts of true RDF dataset semantics.
+- The current reasoner snapshot model is still asserted-triple-centric and currently skips blank-node subject/object triples, skips literal-object triples, and flattens named-graph quads so graph names do not participate in indexing.
 - Replacement-grade reasoning requires an explicit decision about quad-awareness, named graphs, and non-named-node terms, then one index model built around that decision.
 - Target ownership:
   - `crates/nrese-store/src/snapshot.rs`

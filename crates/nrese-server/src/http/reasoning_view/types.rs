@@ -64,6 +64,10 @@ pub struct LastReasoningRunView {
 pub struct ReasoningStatsView {
     pub supported_asserted_triples: u64,
     pub unsupported_asserted_triples: u64,
+    pub unsupported_blank_node_subjects: u64,
+    pub unsupported_blank_node_objects: u64,
+    pub unsupported_literal_objects: u64,
+    pub flattened_named_graph_quads: u64,
     pub interned_terms: usize,
     pub subclass_edge_count: usize,
     pub subproperty_edge_count: usize,

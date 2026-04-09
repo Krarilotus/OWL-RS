@@ -79,11 +79,21 @@ export type ReasoningCache = {
   schema_cache_misses_total: number;
 };
 
+export type ReasoningStats = {
+  supported_asserted_triples: number;
+  unsupported_asserted_triples: number;
+  unsupported_blank_node_subjects: number;
+  unsupported_blank_node_objects: number;
+  unsupported_literal_objects: number;
+  flattened_named_graph_quads: number;
+};
+
 export type LastReasoningRun = {
   revision: number;
   status: string;
   inferred_triples: number;
   consistency_violations: number;
+  stats: ReasoningStats;
   cache: ReasoningCache;
 };
 

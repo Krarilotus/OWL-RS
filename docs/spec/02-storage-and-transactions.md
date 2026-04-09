@@ -63,6 +63,7 @@ Provide a high-throughput, low-latency RDF storage layer with explicit transacti
 - The current read model is `asserted-only`.
 - Query and graph-read APIs expose committed asserted dataset state.
 - Reasoning currently affects commit acceptance and diagnostics, not the default query result set.
+- The current reasoner snapshot used for mutation-time reasoning is narrower than full dataset semantics: it reasons over asserted triples, skips triples with blank-node subjects, blank-node objects, or literal objects, and currently flattens named-graph quads so graph names do not participate in indexing yet.
 - Future inferred/materialized read surfaces are an explicit extension point, not an implied current behavior.
 
 ## Operational Requirements
@@ -86,7 +87,7 @@ Provide a high-throughput, low-latency RDF storage layer with explicit transacti
 ## Acceptance Criteria
 
 - Failed mutation or reasoning stage cannot leak partial state.
-- Graph-level operations preserve default vs named graph semantics.
+- Graph-level operations preserve default vs named graph semantics for store and HTTP behavior; the current mutation-time reasoner snapshot still flattens named-graph quads and does not index graph names.
 - Restore path yields a consistent queryable dataset and shares the same atomic publish gate as the other write paths.
 - Backup artifacts and restore reports expose revision and checksum metadata.
 - Revision publication and rollback paths are test-covered.

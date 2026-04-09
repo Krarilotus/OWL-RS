@@ -9,4 +9,4 @@ pub use reasoning::{
     CapabilityMaturity, ExecutionKind, ReasonerCapability, ReasonerExecutionPlan, ReasonerFeature,
     ReasonerRunMetrics, ReasonerRunReport, ReasonerRunStatus, ReasoningOutput,
 };
-pub use traits::{DatasetSnapshot, ReasonerEngine, TripleSource};
+pub use traits::{DatasetSnapshot, ReasonerEngine, SnapshotCoverageStats, TripleSource};

@@ -422,6 +422,8 @@ async fn rules_mvp_update_surfaces_last_reasoning_run_in_operator_diagnostics()
     assert!(text.contains("\"stats\""));
     assert!(text.contains("\"cache\""));
     assert!(text.contains("\"supported_asserted_triples\""));
+    assert!(text.contains("\"unsupported_blank_node_subjects\""));
+    assert!(text.contains("\"flattened_named_graph_quads\""));
     assert!(text.contains("\"inferred_equality_link_count\""));
     assert!(text.contains("\"subclass_edge_count\""));
     assert!(text.contains("\"execution_cache_entries\""));

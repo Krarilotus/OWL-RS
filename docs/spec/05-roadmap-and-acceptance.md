@@ -127,7 +127,7 @@ The compact document map and ownership rules live in [../../Spezifikation.md](..
 - Query/update/data operations behave per documented contracts.
 - `ASK` remains standard SPARQL query semantics, while `TELL` remains a distinct assertion-ingest contract.
 - Errors are deterministic and typed.
-- Default and named graph semantics are preserved.
+- Default and named graph semantics are preserved for store and protocol behavior; this does not yet imply a quad-aware reasoner snapshot, because the current mutation-time reasoning snapshot still flattens named-graph quads and skips unsupported non-named-node terms.
 - Operator workflows (query, update, graph management, diagnostics) run through documented public contracts.
 - User-facing browser workflows run through documented public contracts and remain usable with AI assistance disabled.
 - Browser and CLI access paths reuse the same frontend-owned typed client contract.

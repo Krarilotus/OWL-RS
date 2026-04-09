@@ -72,7 +72,7 @@ Current coverage:
 - update path no longer bypasses reasoner orchestration semantics
 - consistency gate contract and explanation architecture are specified
 - hybrid target architecture is now fixed: RL operational track + EL classification track + deeper DL validation track
-- `rules-mvp` now performs real named-node `rdfs:subClassOf` and `rdfs:subPropertyOf` closure, property propagation, and `rdf:type` / `rdfs:domain` / `rdfs:range` type inference, with live snapshot capture from the store
+- `rules-mvp` now performs real named-node `rdfs:subClassOf` and `rdfs:subPropertyOf` closure, property propagation, and `rdf:type` / `rdfs:domain` / `rdfs:range` type inference, with live asserted-only triple snapshot capture from the store
 - `rules-mvp` now includes a bounded OWL standards slice for `owl:equivalentClass`, `owl:equivalentProperty`, `owl:inverseOf`, `owl:SymmetricProperty`, and `owl:TransitiveProperty`
 - `rules-mvp` now includes bounded explicit `owl:sameAs` support via canonical equality handling for named resources, plus bounded equality entailment from `owl:FunctionalProperty` and `owl:InverseFunctionalProperty`
 - `rules-mvp` now includes bounded binary `owl:propertyChainAxiom` support over named properties with well-formed named-node RDF lists, and deterministic diagnostics for longer or malformed chains
@@ -88,6 +88,7 @@ Current coverage:
 - staged update previews now allow reject-path responses and operator diagnostics to surface a likely commit-local trigger triple and ranked attribution candidates when the inserted delta can be isolated heuristically
 - rules-mvp cache reuse is now surfaced as typed execution/schema telemetry in reasoning diagnostics and Prometheus metrics
 - rules-mvp runtime diagnostics plus general runtime/capability payloads now surface one resolved profile/tier contract, so bounded RDFS vs bounded OWL slices are externally visible without parallel selector interpretation
+- runtime/operator diagnostics now also expose snapshot coverage counters for skipped blank-node subjects, skipped blank-node objects, skipped literal objects, and flattened named-graph quads, so the current reasoner support boundary is operationally visible
 
 Still required:
 - broader unsupported-construct coverage and stronger explainability beyond the current deterministic known-construct list
@@ -95,7 +96,7 @@ Still required:
 - on-demand deeper justifications beyond the synchronous heuristic path
 - broader EL/RL rule coverage beyond the current RDFS + bounded OWL-property baseline
 - a replacement-grade inferred read model beyond the current explicit `asserted-only` contract
-- a fuller RDF dataset/snapshot model for reasoning, especially around named-graph and term coverage
+- a fuller RDF dataset/snapshot model for reasoning, especially around named-graph participation plus support for blank-node and literal term shapes instead of today’s asserted-only, named-node-oriented snapshot boundary
 
 Replacement gate:
 - reasoning behavior is materially produced, isolated from asserted knowledge, and validated through reproducible fixtures; any inferred read surface must ship as an explicit read-model contract, not be implied by mutation-time reasoning alone

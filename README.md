@@ -53,6 +53,7 @@ Implemented today:
 - typed `rules-mvp` presets (`rdfs-core`, `bounded-owl`) on top of the explicit feature-policy path
 - external reasoner selection is now resolved into one runtime profile/tier contract, so config parsing can still accept `mode + preset + feature overrides` while runtime diagnostics, capability payloads, and frontend state read one resolved reasoner identity
 - the current reasoning read model is now explicit and externally configurable as `asserted-only`, so query/runtime surfaces state honestly that reads expose committed asserted data while reasoning remains a mutation gate plus diagnostics
+- the current reasoner snapshot boundary is explicit and observable: `rules-mvp` reasons over an asserted-only triple snapshot, skips triples with blank-node subjects, blank-node objects, or literal objects, and currently flattens named-graph quads so graph names do not yet participate in reasoner indexing
 - `rules-mvp` runtime diagnostics now also expose the resolved semantic tier for the active bounded RDFS/OWL slice, so bounded RDFS vs bounded OWL behavior is visible without reverse-engineering feature flags
 - snapshot-keyed memoization for repeated `rules-mvp` runs over identical dataset state
 - schema-keyed memoization for `rules-mvp` preparation reuse across ABox-only changes

@@ -411,10 +411,13 @@ fn dataset_snapshot_captures_revision_and_supported_triples()
 
     let snapshot = service.dataset_snapshot()?;
     let triples: Vec<_> = nrese_core::TripleSource::triples(&snapshot).collect();
+    let coverage = snapshot.coverage_stats();
 
     assert_eq!(snapshot.revision(), 1);
     assert_eq!(snapshot.asserted_triple_count(), 2);
     assert_eq!(snapshot.unsupported_triple_count(), 1);
+    assert_eq!(coverage.supported_triples, 1);
+    assert_eq!(coverage.unsupported_literal_objects, 1);
     assert_eq!(triples.len(), 1);
 
     Ok(())
@@ -435,10 +438,15 @@ fn dataset_snapshot_preserves_count_invariants_for_supported_and_unsupported_ter
 
     let snapshot = service.dataset_snapshot()?;
     let triples: Vec<_> = nrese_core::TripleSource::triples(&snapshot).collect();
+    let coverage = snapshot.coverage_stats();
 
     assert_eq!(snapshot.revision(), service.current_revision());
     assert_eq!(snapshot.asserted_triple_count(), 4);
     assert_eq!(snapshot.unsupported_triple_count(), 3);
+    assert_eq!(coverage.supported_triples, 1);
+    assert_eq!(coverage.unsupported_literal_objects, 1);
+    assert_eq!(coverage.unsupported_blank_node_subjects, 1);
+    assert_eq!(coverage.unsupported_blank_node_objects, 1);
     assert_eq!(triples.len(), 1);
     assert_eq!(triples[0].subject.as_str(), "http://example.com/s1");
     assert_eq!(triples[0].predicate.as_str(), "http://example.com/p1");

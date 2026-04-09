@@ -61,6 +61,7 @@ Primary conformance targets:
 
 Write/admin/optional surfaces remain part of the documented contract, but they may be disabled by deployment posture. The runtime source of truth for that posture MUST drive startup validation, request guards, JSON capability payloads, and service-description advertising together.
 The current reasoning read model is `asserted-only`: `/dataset/query`, `/dataset/info`, and Graph Store reads expose asserted committed store state, while reasoning surfaces today are mutation rejects plus runtime/operator diagnostics.
+Current reasoning diagnostics also expose snapshot coverage counters for skipped blank-node subjects, skipped blank-node objects, skipped literal objects, and flattened named-graph quads so support boundaries are observable instead of implicit.
 
 ## Capability Tiers
 

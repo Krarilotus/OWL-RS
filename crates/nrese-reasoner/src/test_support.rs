@@ -1,6 +1,6 @@
 use std::hash::{Hash, Hasher};
 
-use nrese_core::{DatasetSnapshot, IriRef, TripleRef, TripleSource};
+use nrese_core::{DatasetSnapshot, IriRef, SnapshotCoverageStats, TripleRef, TripleSource};
 
 use crate::dataset_index::IndexedDataset;
 use crate::effective_types::EffectiveTypeSet;
@@ -16,16 +16,16 @@ pub struct OwnedSnapshot {
     revision: u64,
     cache_key: u64,
     triples: Vec<(String, String, String)>,
-    unsupported: u64,
+    coverage: SnapshotCoverageStats,
 }
 
 impl OwnedSnapshot {
     pub fn empty_with_revision(revision: u64) -> Self {
         Self {
             revision,
-            cache_key: compute_snapshot_cache_key(&[], 0),
+            cache_key: compute_snapshot_cache_key(&[], &SnapshotCoverageStats::default()),
             triples: Vec::new(),
-            unsupported: 0,
+            coverage: SnapshotCoverageStats::default(),
         }
     }
 
@@ -38,16 +38,32 @@ impl OwnedSnapshot {
         triples: Vec<(&str, &str, &str)>,
         unsupported: u64,
     ) -> Self {
+        Self::with_revision_and_coverage(
+            revision,
+            triples,
+            SnapshotCoverageStats {
+                unsupported_triples: unsupported,
+                ..SnapshotCoverageStats::default()
+            },
+        )
+    }
+
+    pub fn with_revision_and_coverage(
+        revision: u64,
+        triples: Vec<(&str, &str, &str)>,
+        mut coverage: SnapshotCoverageStats,
+    ) -> Self {
         let triples = triples
             .into_iter()
             .map(|(s, p, o)| (s.to_owned(), p.to_owned(), o.to_owned()))
             .collect::<Vec<_>>();
+        coverage.supported_triples = triples.len() as u64;
 
         Self {
             revision,
-            cache_key: compute_snapshot_cache_key(&triples, unsupported),
+            cache_key: compute_snapshot_cache_key(&triples, &coverage),
             triples,
-            unsupported,
+            coverage,
         }
     }
 }
@@ -114,16 +130,28 @@ impl<'a> DatasetSnapshot<'a> for OwnedSnapshot {
     }
 
     fn unsupported_triple_count(&self) -> u64 {
-        self.unsupported
+        self.coverage.unsupported_triples
+    }
+
+    fn coverage_stats(&self) -> SnapshotCoverageStats {
+        self.coverage
     }
 }
 
-fn compute_snapshot_cache_key(triples: &[(String, String, String)], unsupported: u64) -> u64 {
+fn compute_snapshot_cache_key(
+    triples: &[(String, String, String)],
+    coverage: &SnapshotCoverageStats,
+) -> u64 {
     let mut ordered = triples.to_vec();
     ordered.sort();
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    unsupported.hash(&mut hasher);
+    coverage.supported_triples.hash(&mut hasher);
+    coverage.unsupported_triples.hash(&mut hasher);
+    coverage.unsupported_blank_node_subjects.hash(&mut hasher);
+    coverage.unsupported_blank_node_objects.hash(&mut hasher);
+    coverage.unsupported_literal_objects.hash(&mut hasher);
+    coverage.flattened_named_graph_quads.hash(&mut hasher);
     ordered.len().hash(&mut hasher);
     for (subject, predicate, object) in ordered {
         subject.hash(&mut hasher);

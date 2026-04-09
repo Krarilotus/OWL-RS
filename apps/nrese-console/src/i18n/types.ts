@@ -50,6 +50,13 @@ export type AppStrings = {
   reasoningCacheSchemaLabel: string;
   reasoningCacheExecutionTotalsLabel: string;
   reasoningCacheSchemaTotalsLabel: string;
+  reasoningCoverageTitle: string;
+  reasoningCoverageSupportedLabel: string;
+  reasoningCoverageUnsupportedLabel: string;
+  reasoningCoverageBlankSubjectLabel: string;
+  reasoningCoverageBlankObjectLabel: string;
+  reasoningCoverageLiteralObjectLabel: string;
+  reasoningCoverageFlattenedQuadsLabel: string;
   graphDefault: string;
   graphNamed: string;
   runQuery: string;

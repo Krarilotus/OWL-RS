@@ -94,6 +94,48 @@ export function ReasoningRuntimeInspector({ strings, reasoning }: Props) {
       </div>
 
       <div className="field">
+        <label>{strings.reasoningCoverageTitle}</label>
+        <div className="fact-grid">
+          <div className="fact-card">
+            <div className="fact-label">{strings.reasoningCoverageSupportedLabel}</div>
+            <div className="fact-value mono">
+              {lastRun ? lastRun.stats.supported_asserted_triples : strings.reasoningPolicyUnavailable}
+            </div>
+          </div>
+          <div className="fact-card">
+            <div className="fact-label">{strings.reasoningCoverageUnsupportedLabel}</div>
+            <div className="fact-value mono">
+              {lastRun ? lastRun.stats.unsupported_asserted_triples : strings.reasoningPolicyUnavailable}
+            </div>
+          </div>
+          <div className="fact-card">
+            <div className="fact-label">{strings.reasoningCoverageBlankSubjectLabel}</div>
+            <div className="fact-value mono">
+              {lastRun ? lastRun.stats.unsupported_blank_node_subjects : strings.reasoningPolicyUnavailable}
+            </div>
+          </div>
+          <div className="fact-card">
+            <div className="fact-label">{strings.reasoningCoverageBlankObjectLabel}</div>
+            <div className="fact-value mono">
+              {lastRun ? lastRun.stats.unsupported_blank_node_objects : strings.reasoningPolicyUnavailable}
+            </div>
+          </div>
+          <div className="fact-card">
+            <div className="fact-label">{strings.reasoningCoverageLiteralObjectLabel}</div>
+            <div className="fact-value mono">
+              {lastRun ? lastRun.stats.unsupported_literal_objects : strings.reasoningPolicyUnavailable}
+            </div>
+          </div>
+          <div className="fact-card">
+            <div className="fact-label">{strings.reasoningCoverageFlattenedQuadsLabel}</div>
+            <div className="fact-value mono">
+              {lastRun ? lastRun.stats.flattened_named_graph_quads : strings.reasoningPolicyUnavailable}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="field">
         <label>{strings.reasoningFeatureModesLabel}</label>
         <div className="fact-grid">
           {(policy?.feature_modes ?? []).map((feature) => (

@@ -55,6 +55,10 @@ pub fn last_run_view(run: &LastReasoningRun) -> LastReasoningRunView {
         stats: ReasoningStatsView {
             supported_asserted_triples: run.stats.supported_asserted_triples,
             unsupported_asserted_triples: run.stats.unsupported_asserted_triples,
+            unsupported_blank_node_subjects: run.stats.unsupported_blank_node_subjects,
+            unsupported_blank_node_objects: run.stats.unsupported_blank_node_objects,
+            unsupported_literal_objects: run.stats.unsupported_literal_objects,
+            flattened_named_graph_quads: run.stats.flattened_named_graph_quads,
             interned_terms: run.stats.interned_terms,
             subclass_edge_count: run.stats.subclass_edge_count,
             subproperty_edge_count: run.stats.subproperty_edge_count,

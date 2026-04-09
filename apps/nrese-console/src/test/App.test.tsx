@@ -67,7 +67,32 @@ vi.mock("../lib/api", () => ({
       ],
       unsupported_constructs: "diagnose",
     },
-    last_run: null,
+    last_run: {
+      revision: 2,
+      status: "completed",
+      inferred_triples: 3,
+      consistency_violations: 0,
+      stats: {
+        supported_asserted_triples: 4,
+        unsupported_asserted_triples: 2,
+        unsupported_blank_node_subjects: 1,
+        unsupported_blank_node_objects: 0,
+        unsupported_literal_objects: 1,
+        flattened_named_graph_quads: 2,
+      },
+      cache: {
+        execution_cache_hit: false,
+        schema_cache_hit: true,
+        execution_cache_entries: 1,
+        schema_cache_entries: 1,
+        execution_cache_capacity: 8,
+        schema_cache_capacity: 8,
+        execution_cache_hits_total: 0,
+        execution_cache_misses_total: 1,
+        schema_cache_hits_total: 1,
+        schema_cache_misses_total: 1,
+      },
+    },
   }),
   getQuerySuggestions: async () => ({
     provider: "gemini",
@@ -97,4 +122,6 @@ test("renders console sections", async () => {
   expect(screen.getByRole("heading", { name: /Knowledge workbench/i })).toBeInTheDocument();
   expect(await screen.findByText(/Reasoning capabilities/i)).toBeInTheDocument();
   expect((await screen.findAllByText(/owl-property-chain-axioms/i)).length).toBeGreaterThan(0);
+  expect(await screen.findByText(/Snapshot coverage/i)).toBeInTheDocument();
+  expect(screen.getByText(/Flattened named-graph quads/i)).toBeInTheDocument();
 });
