@@ -35,23 +35,27 @@ const OWL_DL_TARGET_CAPABILITIES: [ReasonerCapability; 4] = [
     },
 ];
 
+pub fn profile_for_mode(mode: ReasoningMode) -> ReasonerProfile {
+    profile_for_config(&ReasonerConfig::for_mode(mode))
+}
+
 pub fn profile_for_config(config: &ReasonerConfig) -> ReasonerProfile {
     match &config.profile {
         ReasonerProfileConfig::Disabled => ReasonerProfile {
             name: "nrese-disabled",
-            mode: "disabled",
+            mode: mode_name(ReasoningMode::Disabled),
             semantic_tier: "disabled",
             capabilities: DISABLED_CAPABILITIES.to_vec(),
         },
         ReasonerProfileConfig::RulesMvp(rules_mvp) => ReasonerProfile {
             name: "nrese-rules-mvp",
-            mode: "rules-mvp",
+            mode: mode_name(ReasoningMode::RulesMvp),
             semantic_tier: rules_mvp.preset.semantic_tier(),
             capabilities: rules_mvp_capabilities(rules_mvp),
         },
         ReasonerProfileConfig::OwlDlTarget => ReasonerProfile {
             name: "nrese-owl-dl-target",
-            mode: "owl-dl-target",
+            mode: mode_name(ReasoningMode::OwlDlTarget),
             semantic_tier: "owl-dl-target",
             capabilities: OWL_DL_TARGET_CAPABILITIES.to_vec(),
         },
@@ -105,5 +109,20 @@ pub const fn mode_name(mode: ReasoningMode) -> &'static str {
         ReasoningMode::Disabled => "disabled",
         ReasoningMode::RulesMvp => "rules-mvp",
         ReasoningMode::OwlDlTarget => "owl-dl-target",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mode_name, profile_for_config, profile_for_mode};
+    use crate::{ReasonerConfig, ReasoningMode};
+
+    #[test]
+    fn profile_for_mode_matches_config_resolution() {
+        let from_mode = profile_for_mode(ReasoningMode::RulesMvp);
+        let from_config = profile_for_config(&ReasonerConfig::for_mode(ReasoningMode::RulesMvp));
+
+        assert_eq!(from_mode, from_config);
+        assert_eq!(from_mode.mode, mode_name(ReasoningMode::RulesMvp));
     }
 }

@@ -31,7 +31,7 @@ pub use output::{
     InferenceDelta, ReasoningCacheStats, ReasoningStats, RejectBlame, RejectEvidence,
     RejectExplanation,
 };
-pub use profile::{ReasonerProfile, mode_name, profile_for_config};
+pub use profile::{ReasonerProfile, mode_name, profile_for_config, profile_for_mode};
 pub use rules_mvp_policy::{FeatureMode, RulesMvpFeaturePolicy, UnsupportedConstructBehavior};
 pub use rules_mvp_preset::{RulesMvpPreset, RulesMvpPresetDescriptor};
 pub use service::ReasonerService;

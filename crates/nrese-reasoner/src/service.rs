@@ -7,14 +7,14 @@ use nrese_core::{
 
 use crate::config::{ReasonerConfig, ReasonerProfileConfig, ReasoningMode, ReasoningReadModel};
 use crate::output::{InferenceDelta, ReasoningCacheStats};
-use crate::profile::profile_for_config;
+use crate::profile::{ReasonerProfile, profile_for_config};
 use crate::rules::execute_rules_mvp_with_cache;
 use crate::rules_mvp_cache::RulesMvpExecutionCache;
 
 #[derive(Debug, Clone)]
 pub struct ReasonerService {
     config: ReasonerConfig,
-    resolved_profile: crate::profile::ReasonerProfile,
+    resolved_profile: ReasonerProfile,
     rules_mvp_cache: std::sync::Arc<RulesMvpExecutionCache>,
 }
 
@@ -75,7 +75,7 @@ impl ReasonerService {
         self.rules_mvp_cache.snapshot()
     }
 
-    pub fn resolved_profile(&self) -> &crate::profile::ReasonerProfile {
+    pub fn resolved_profile(&self) -> &ReasonerProfile {
         &self.resolved_profile
     }
 }
