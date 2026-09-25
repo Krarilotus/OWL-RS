@@ -70,3 +70,26 @@ Recorded reference numbers that later milestones are measured against. Each file
 - **Gate P1** (< 5 ms at 10 M) is met in both modes. v1 needed 3,009 ms at 1 M and 6,790 t/s load.
 - **Crash test:** after the durable run, the server was killed with `taskkill /F` and restarted. It recovered revision 1427 with exactly 10,000,800 quads (10 M loaded plus 800 inserts).
 - **COUNT** grows linearly because spareval counts by scanning; native aggregation is Pf3/Pf4.
+
+## Engine v2 bulk load (M1 gate E5)
+
+- **What:** `nrese-server load` into an on-disk store. It parses N-Triples on all cores, interns in parallel batches, sorts once, builds the base run directly, and writes a checkpoint before publishing. The WAL isn't involved. Times are end to end, from process start to the published revision. Numbers come from the command's `bulk load published` / `bulk load complete` log lines; peak memory is the process's peak working set.
+- **Data:** the `write-scaling` entity shape (type, language-tagged label, link, `xsd:date`; four triples per entity), written by the harness's `generate` command. 100 M triples is an 11 GB N-Triples file; 10 M is its first 10 M lines.
+- **Date / machine:** 2026-09-25, same machine as above (16 threads, NVMe SSD).
+- **Reproduce:**
+
+  ```powershell
+  cargo run --release --manifest-path benches/nrese-bench-harness/Cargo.toml -- generate --triples 100000000 --out entities-100m.nt
+  $env:NRESE_STORE_MODE = "on-disk"; $env:NRESE_DATA_DIR = "store-100m"
+  cargo run --release -p nrese-server -- load entities-100m.nt
+  ```
+
+| Triples | Total | Throughput | Parse + intern | Index build | Checkpoint | Peak memory | Checkpoint file | Restart (recovery) |
+|---|---|---|---|---|---|---|---|---|
+| 10 M | 3.4 s | 2.91 M t/s | 1.8 s | 0.83 s | 0.78 s | n/m | n/m | n/m |
+| 100 M | 37.3 s | 2.68 M t/s | 21.5 s | 9.9 s | 5.9 s | 23.1 GB | 4.7 GB | 20.3 s |
+
+**Notes:**
+- For comparison, loading over HTTP through the mutation pipeline reaches about 430 k t/s (table above), and v1 reached 6,790 t/s.
+- **Not yet compared with competitors.** QLever's index builder and GraphDB's ImportRDF still have to run on this machine with the same file. Until then, no claim relative to them is made.
+- Restart time is dominated by rebuilding the six permutations and the dictionary hash table from the checkpoint. Persisted run files (Pf2) remove the rebuild.

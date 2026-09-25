@@ -23,7 +23,8 @@ pub mod term;
 
 pub use durability::{DurabilityConfig, SyncPolicy};
 pub use engine::{
-    CommitSummary, Engine, EngineConfig, EngineStats, ReadModel, Snapshot, Transaction,
+    BulkLoad, BulkMode, CommitSummary, Engine, EngineConfig, EngineStats, ReadModel, Snapshot,
+    Transaction,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::CompactionPolicy;

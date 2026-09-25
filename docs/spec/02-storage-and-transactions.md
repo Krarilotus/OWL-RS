@@ -54,6 +54,16 @@ Every write goes through the mutation pipeline:
 - **Revisions** increase by one per commit with a net change. They are persistent in on-disk mode and don't change for no-op writes.
 - **Aborts.** Any error before the commit discards the whole request. There are no partial writes.
 
+## Bulk loads
+
+Initial loads and full restores bypass the per-commit path (`Engine::bulk_load`; `nrese-server load`):
+
+- **One revision.** A bulk load holds the writer slot and publishes one revision. `Append` adds to the asserted data; `Replace` swaps it and clears the inferred stack.
+- **Durable before visible.** The load isn't written to the WAL. A checkpoint of the new revision is written before the revision is published, so a crash either loses the whole unacknowledged load or none of it. Its cost is O(dataset), which is why regular writes use transactions.
+- **Parallel.** Batches are parsed and interned from many threads. The dictionary encodes, hashes and deduplicates a batch before taking its lock.
+- **Blank nodes** are fresh per load, and consistent across the chunks of one load.
+- **No gates.** Bulk loads are operator actions and don't run validation gates.
+
 ## Durability (on-disk mode)
 
 - **Acknowledgement.** A commit is acknowledged only after its WAL record is synced (`SyncPolicy::EveryCommit`, the default).
@@ -67,7 +77,7 @@ Every write goes through the mutation pipeline:
 ## Limits (current milestone)
 
 - **Memory.** Indexes are held in memory, at about 190 bytes per quad uncompressed. Compressed and larger-than-RAM indexes are Pf1/Pf2.
-- **Commit size.** One commit holds at most 4 GiB of WAL payload, about 130 M quads. The bulk loader (E5) handles larger loads.
+- **Commit size.** One commit holds at most 4 GiB of WAL payload, about 130 M quads. Larger loads go through the bulk loader.
 - **v1 reasoner cost.** With the v1 reasoner enabled (`rules-mvp`), every write costs O(dataset) until the M3 reasoner replaces it.
 
 ## Evidence
@@ -76,6 +86,7 @@ Every write goes through the mutation pipeline:
 |---|---|
 | Visibility rule, all pattern shapes, compaction | `crates/nrese-engine/src/index/model_tests.rs` |
 | Snapshot isolation, overlay reads, concurrent readers | `crates/nrese-engine/tests/engine_tests.rs` |
+| Bulk loads equal transactional loads (parallel, append/replace, durable) | `crates/nrese-engine/tests/bulk_load_tests.rs`, `crates/nrese-store/tests/bulk_load_tests.rs` |
 | Inferred stack: read models, disjointness, both stacks against a model across compaction, checkpoints and reopening | `crates/nrese-engine/tests/inferred_stack_tests.rs` |
 | Crash recovery, torn tails, corruption, checkpoints | `crates/nrese-engine/tests/durability_tests.rs` |
 | SPARQL semantics against an oracle | `crates/nrese-sparql/tests/differential_tests.rs` |

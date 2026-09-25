@@ -18,6 +18,7 @@
 //!   Small windows are merged inside the commit; larger ones, and checkpoints, go to the
 //!   background worker.
 
+mod bulk;
 mod snapshot;
 mod transaction;
 
@@ -37,6 +38,7 @@ use crate::index::{CompactionPolicy, IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple};
 use crate::term::{Dictionary, DictionaryStats};
 
+pub use bulk::{BulkLoad, BulkMode};
 pub use snapshot::Snapshot;
 pub use transaction::{CommitSummary, Transaction};
 
@@ -215,6 +217,12 @@ struct Versions {
 impl Versions {
     fn load(&self) -> Arc<Version> {
         self.current.read().clone()
+    }
+
+    /// Replaces the current version with a prebuilt one. The caller must hold the writer slot
+    /// and the compaction slot, so that nothing was published since `version` was built.
+    fn install(&self, version: Arc<Version>) {
+        *self.current.write() = version;
     }
 
     /// Replaces the current version with `next(current)` atomically.
@@ -471,6 +479,12 @@ impl Engine {
     pub fn transaction(&self) -> Transaction<'_> {
         let slot = self.inner.writer.lock();
         Transaction::new(&self.inner, slot)
+    }
+
+    /// Starts a bulk load, waiting for the writer slot. See [`BulkLoad`].
+    pub fn bulk_load(&self, mode: BulkMode) -> BulkLoad<'_> {
+        let slot = self.inner.writer.lock();
+        BulkLoad::new(&self.inner, slot, mode)
     }
 
     /// Compacts until the policy is satisfied, waiting for any background merge.

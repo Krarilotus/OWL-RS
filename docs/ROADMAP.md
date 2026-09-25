@@ -97,7 +97,14 @@ Goal: a codebase where every concern has one owner, and the evidence tooling nee
   - The Oxigraph `Store`, RocksDB/libclang and the `durable-storage` feature are gone, and on-disk mode is always available.
   - Oxigraph remains only as the differential-test oracle (a dev-dependency of `nrese-sparql`).
   - The string snapshots remain only for the v1 reasoner when enabled, and M3 retires them.
-- **E5 open.** Restores and large loads still go through one transaction; the WAL payload cap is 4 GiB.
+- **E5 done; competitor comparison pending:**
+  - `Engine::bulk_load` holds the writer slot and interns batches from many threads. The dictionary prepares keys outside its lock.
+  - It sorts once, builds the base run directly and publishes one revision.
+  - Durable mode writes a checkpoint *before* publishing, so there is no WAL record and no 4 GiB cap.
+  - `nrese-server load` parses N-Triples and N-Quads on all cores; other formats parse on one thread with parallel interning. Blank nodes are fresh per load and consistent across chunks.
+  - Measured: 100 M triples, durable, in 37.3 s (2.68 M t/s) with a 23 GB peak; restart takes 20.3 s.
+  - The gate's comparison against QLever's and GraphDB's loaders on the same machine is still open.
+  - HTTP restore still runs through the gated pipeline.
 - **E6 done (gate passed):**
   - Every version holds an asserted and an inferred stack; the inferred one keeps three permutations, halving its index memory.
   - Both stacks commit atomically under one revision, and WAL and checkpoint format 2 carries both. Older formats are rejected with `UnsupportedFormat`.

@@ -41,6 +41,10 @@ impl Snapshot {
         }
     }
 
+    pub(crate) fn version(&self) -> &Version {
+        &self.version
+    }
+
     pub(crate) fn dictionary(&self) -> &Dictionary {
         &self.dictionary
     }

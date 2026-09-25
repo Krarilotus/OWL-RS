@@ -11,6 +11,6 @@ mod runtime_posture;
 pub mod state;
 
 pub use app::build_app;
-pub use config::{CliConfig, ServerConfig};
+pub use config::{CliCommand, CliConfig, LoadCommand, ServerConfig};
 pub use runtime_posture::DeploymentPosture;
 pub use state::AppState;

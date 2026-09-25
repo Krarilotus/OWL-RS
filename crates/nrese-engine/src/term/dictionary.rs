@@ -5,8 +5,10 @@
 //! Memory per term is the key length plus 8 bytes (end offset) plus ~9 bytes of table
 //! slot, with no per-term heap allocation.
 //!
-//! Concurrency: one writer (the engine's commit slot) interns; readers look up and decode
-//! under a shared lock. Ids are dense and assigned in insertion order, which is what the
+//! Concurrency: writers intern under an exclusive lock; readers look up and decode under a
+//! shared lock. Bulk loads intern from many threads through
+//! [`intern_quads`](Dictionary::intern_quads), which encodes, hashes and deduplicates a batch
+//! before taking the lock, so the critical section is only table probes and arena appends. Ids are dense and assigned in insertion order, which is what the
 //! write-ahead log relies on to replay dictionary growth deterministically.
 
 use std::hash::BuildHasher;
@@ -146,7 +148,11 @@ impl Dictionary {
     }
 
     fn intern_key_locked(&self, inner: &mut Inner, key: &[u8]) -> u64 {
-        let hash = self.hasher.hash_one(key);
+        self.intern_hashed_locked(inner, key, self.hasher.hash_one(key))
+    }
+
+    /// Interns `key` whose hash (with this dictionary's hasher) is `hash`.
+    fn intern_hashed_locked(&self, inner: &mut Inner, key: &[u8], hash: u64) -> u64 {
         if let Some(&index) = inner.table.find(hash, |&index| inner.key(index) == key) {
             return index;
         }
@@ -192,6 +198,52 @@ impl Dictionary {
             None => TermId::DEFAULT_GRAPH,
         };
         EncodedQuad::new(subject, predicate, object, graph)
+    }
+
+    /// Interns every term of a batch of quads. Safe to call from many threads at once: the
+    /// keys are encoded, hashed and deduplicated per batch without the lock, which is then
+    /// held once, for the distinct keys only. Ids depend on the interleaving of concurrent
+    /// batches, which is fine: they are logged by key, never recomputed.
+    pub(crate) fn intern_quads(&self, quads: &[Quad]) -> Vec<EncodedQuad> {
+        let mut batch = KeyBatch::with_capacity(quads.len());
+        let slots: Vec<[Slot; 4]> = quads
+            .iter()
+            .map(|quad| {
+                let quad = quad.as_ref();
+                let graph = match graph_term(quad.graph_name) {
+                    Some(term) => batch.slot(self, term),
+                    None => Slot::Id(TermId::DEFAULT_GRAPH),
+                };
+                [
+                    batch.slot(self, quad.subject.into()),
+                    batch.slot(self, quad.predicate.into()),
+                    batch.slot(self, quad.object),
+                    graph,
+                ]
+            })
+            .collect();
+        let indexes: Vec<u64> = {
+            let mut inner = self.inner.write();
+            batch
+                .keys
+                .iter()
+                .map(|key| {
+                    let bytes = &batch.arena[key.start..key.end];
+                    self.intern_hashed_locked(&mut inner, bytes, key.hash)
+                })
+                .collect()
+        };
+        let resolve = |slot: Slot| match slot {
+            Slot::Id(id) => id,
+            Slot::Key(key) => {
+                let key = key as usize;
+                TermId::new(batch.keys[key].kind, indexes[key])
+            }
+        };
+        slots
+            .into_iter()
+            .map(|[s, p, o, g]| EncodedQuad::new(resolve(s), resolve(p), resolve(o), resolve(g)))
+            .collect()
     }
 
     /// Encodes `quad` without interning; `None` if any term is unknown (below `limit`).
@@ -266,6 +318,66 @@ impl Dictionary {
 }
 
 /// The graph name as a term; `None` for the default graph.
+/// A term position in a batch being interned: an id known up front (inline values, the
+/// default graph) or an index into the batch's distinct keys.
+#[derive(Clone, Copy)]
+enum Slot {
+    Id(TermId),
+    Key(u32),
+}
+
+struct PreparedKey {
+    start: usize,
+    end: usize,
+    hash: u64,
+    kind: TermKind,
+}
+
+/// The distinct keys of one batch, encoded into one arena, with their hashes.
+struct KeyBatch {
+    arena: Vec<u8>,
+    keys: Vec<PreparedKey>,
+    /// Indexes into `keys`, for deduplication within the batch.
+    table: HashTable<u32>,
+}
+
+impl KeyBatch {
+    fn with_capacity(quads: usize) -> Self {
+        Self {
+            arena: Vec::with_capacity(quads * 64),
+            keys: Vec::with_capacity(quads),
+            table: HashTable::with_capacity(quads),
+        }
+    }
+
+    fn slot(&mut self, dictionary: &Dictionary, term: TermRef<'_>) -> Slot {
+        if let Some(id) = inline_id(term) {
+            return Slot::Id(id);
+        }
+        let start = self.arena.len();
+        let kind = encode_key(term, &mut self.arena);
+        let hash = dictionary.hasher.hash_one(&self.arena[start..]);
+        let Self { arena, keys, table } = self;
+        let key = &arena[start..];
+        if let Some(&index) = table.find(hash, |&i| {
+            let other = &keys[i as usize];
+            &arena[other.start..other.end] == key
+        }) {
+            arena.truncate(start);
+            return Slot::Key(index);
+        }
+        let index = u32::try_from(keys.len()).expect("batch has fewer than 2^32 distinct terms");
+        keys.push(PreparedKey {
+            start,
+            end: arena.len(),
+            hash,
+            kind,
+        });
+        table.insert_unique(hash, index, |&i| keys[i as usize].hash);
+        Slot::Key(index)
+    }
+}
+
 fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
     match graph {
         GraphNameRef::NamedNode(node) => Some(node.into()),
