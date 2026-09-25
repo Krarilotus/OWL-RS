@@ -4,7 +4,7 @@ import { NreseClient } from "./client";
 
 describe("NreseClient", () => {
   test("builds query requests against the configured base URL", async () => {
-    const fetchImpl = vi.fn(async () =>
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       new Response("{}", {
         status: 200,
         headers: {
