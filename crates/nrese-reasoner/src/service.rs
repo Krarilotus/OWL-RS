@@ -101,9 +101,7 @@ where
         let revision = snapshot.revision();
         let plan = match self.config.mode() {
             ReasoningMode::Disabled => ReasonerExecutionPlan::validation_only(revision),
-            ReasoningMode::RulesMvp | ReasoningMode::OwlDlTarget => {
-                ReasonerExecutionPlan::full_materialization(revision)
-            }
+            ReasoningMode::RulesMvp => ReasonerExecutionPlan::full_materialization(revision),
         };
 
         Ok(plan)
@@ -176,11 +174,6 @@ where
                 }
                 (status, notes, inferred)
             }
-            ReasonerProfileConfig::OwlDlTarget => (
-                ReasonerRunStatus::Skipped,
-                vec!["owl-dl target mode scaffolded but not implemented"],
-                InferenceDelta::default(),
-            ),
         };
         let metrics = ReasonerRunMetrics {
             asserted_triples_seen: asserted_triples,

@@ -1,18 +1,10 @@
 use nrese_store::{
     GraphResultFormat, GraphTarget, GraphWriteRequest, QueryResultKind, SparqlUpdateRequest,
-    StoreConfig, StoreMode, StoreService,
+    StoreConfig, StoreService,
 };
-use tempfile::tempdir;
 
 fn new_in_memory_service() -> Result<StoreService, Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    Ok(StoreService::new(StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: false,
-        ontology_path: None,
-        ontology_fallbacks: Vec::new(),
-    })?)
+    Ok(StoreService::new(StoreConfig::in_memory())?)
 }
 
 #[test]

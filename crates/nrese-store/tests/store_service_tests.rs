@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use nrese_core::DatasetSnapshot;
 use nrese_store::{
     GraphReadRequest, GraphTarget, GraphWriteRequest, QueryResultKind, SparqlQueryRequest,
-    SparqlUpdateRequest, StoreConfig, StoreError, StoreMode, StoreService,
+    SparqlUpdateRequest, StoreConfig, StoreError, StoreService,
 };
 use tempfile::tempdir;
 
@@ -19,14 +19,7 @@ fn minimal_fixture_path() -> PathBuf {
 }
 
 fn new_in_memory_service() -> Result<StoreService, Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let config = StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: false,
-        ontology_path: None,
-        ontology_fallbacks: Vec::new(),
-    };
+    let config = StoreConfig::in_memory();
 
     Ok(StoreService::new(config)?)
 }
@@ -37,13 +30,7 @@ fn preload_ontology_and_query_roundtrip() -> Result<(), Box<dyn std::error::Erro
     let ontology_path = temp.path().join("test_ontology.ttl");
     fs::write(&ontology_path, test_ontology())?;
 
-    let config = StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused-in-memory"),
-        preload_ontology: true,
-        ontology_path: Some(ontology_path),
-        ontology_fallbacks: Vec::new(),
-    };
+    let config = StoreConfig::in_memory().with_ontology(ontology_path);
 
     let service = StoreService::new(config)?;
     let stats = service.stats()?;
@@ -78,14 +65,7 @@ fn preload_ontology_and_query_roundtrip() -> Result<(), Box<dyn std::error::Erro
 #[test]
 fn preload_minimal_ttl_fixture_supports_real_query_surface()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let config = StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused-in-memory"),
-        preload_ontology: true,
-        ontology_path: Some(minimal_fixture_path()),
-        ontology_fallbacks: Vec::new(),
-    };
+    let config = StoreConfig::in_memory().with_ontology(minimal_fixture_path());
 
     let service = StoreService::new(config)?;
     let stats = service.stats()?;
@@ -110,13 +90,7 @@ fn ontology_preload_requires_existing_file() -> Result<(), Box<dyn std::error::E
     let temp = tempdir()?;
     let missing_path: PathBuf = temp.path().join("missing.ttl");
 
-    let config = StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: true,
-        ontology_path: Some(missing_path),
-        ontology_fallbacks: Vec::new(),
-    };
+    let config = StoreConfig::in_memory().with_ontology(missing_path);
 
     match StoreService::new(config) {
         Ok(_) => Err("expected ontology preload to fail".into()),
@@ -131,13 +105,7 @@ fn sparql_update_inserts_data() -> Result<(), Box<dyn std::error::Error>> {
     let ontology_path = temp.path().join("test_ontology.ttl");
     fs::write(&ontology_path, test_ontology())?;
 
-    let config = StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: true,
-        ontology_path: Some(ontology_path),
-        ontology_fallbacks: Vec::new(),
-    };
+    let config = StoreConfig::in_memory().with_ontology(ontology_path);
 
     let service = StoreService::new(config)?;
     let report = service.execute_update(&SparqlUpdateRequest::new(
@@ -158,14 +126,7 @@ fn sparql_update_inserts_data() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn graph_store_named_graph_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let config = StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: false,
-        ontology_path: None,
-        ontology_fallbacks: Vec::new(),
-    };
+    let config = StoreConfig::in_memory();
     let service = StoreService::new(config)?;
     let named_graph = GraphTarget::NamedGraph("http://example.com/graph/one".to_owned());
 
@@ -393,14 +354,7 @@ fn graph_delete_only_affects_target_named_graph() -> Result<(), Box<dyn std::err
 #[test]
 fn dataset_snapshot_captures_revision_and_supported_triples()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let config = StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: false,
-        ontology_path: None,
-        ontology_fallbacks: Vec::new(),
-    };
+    let config = StoreConfig::in_memory();
     let service = StoreService::new(config)?;
     service.execute_update(&SparqlUpdateRequest::new(
         "INSERT DATA {
@@ -459,13 +413,7 @@ fn dataset_snapshot_preserves_count_invariants_for_supported_and_unsupported_ter
 #[test]
 fn on_disk_mode_requires_durable_storage_feature() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
-    let config = StoreConfig {
-        mode: StoreMode::OnDisk,
-        data_dir: temp.path().join("nrese-store-data"),
-        preload_ontology: false,
-        ontology_path: None,
-        ontology_fallbacks: Vec::new(),
-    };
+    let config = StoreConfig::on_disk(temp.path().join("nrese-store-data"));
 
     match StoreService::new(config) {
         Ok(_) => Err("expected on-disk mode to fail without durable-storage feature".into()),
@@ -479,13 +427,7 @@ fn on_disk_mode_requires_durable_storage_feature() -> Result<(), Box<dyn std::er
 fn on_disk_mode_persists_data_across_reopen() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let data_dir = temp.path().join("nrese-store-data");
-    let config = StoreConfig {
-        mode: StoreMode::OnDisk,
-        data_dir: data_dir.clone(),
-        preload_ontology: false,
-        ontology_path: None,
-        ontology_fallbacks: Vec::new(),
-    };
+    let config = StoreConfig::on_disk(data_dir.clone());
 
     {
         let service = StoreService::new(config.clone())?;

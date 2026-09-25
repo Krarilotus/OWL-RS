@@ -8,7 +8,7 @@ use super::env_names as names;
 use super::source::ConfigSource;
 
 pub(super) fn parse_reasoner_config(source: &dyn ConfigSource) -> Result<ReasonerConfig> {
-    let mode = parse_reasoning_mode(source.get(names::REASONING_MODE).as_deref());
+    let mode = parse_reasoning_mode(source.get(names::REASONING_MODE).as_deref())?;
     let read_model = parse_reasoning_read_model(source.get(names::REASONER_READ_MODEL).as_deref())?;
     let profile = match mode {
         ReasoningMode::Disabled => ReasonerProfileConfig::Disabled,
@@ -16,7 +16,6 @@ pub(super) fn parse_reasoner_config(source: &dyn ConfigSource) -> Result<Reasone
             source.get(names::REASONER_RULES_MVP_PRESET).as_deref(),
             source.get(names::REASONER_RULES_MVP_FEATURES).as_deref(),
         )?),
-        ReasoningMode::OwlDlTarget => ReasonerProfileConfig::OwlDlTarget,
     };
     let config = ReasonerConfig {
         profile,
@@ -120,11 +119,16 @@ fn parse_rules_mvp_feature_policy(input: Option<&str>) -> Result<RulesMvpFeature
     Ok(policy)
 }
 
-fn parse_reasoning_mode(input: Option<&str>) -> ReasoningMode {
+/// Unknown values are a startup error: silently falling back to `disabled` would turn a
+/// typo into "no consistency checking at all".
+fn parse_reasoning_mode(input: Option<&str>) -> Result<ReasoningMode> {
     match input.unwrap_or("disabled").to_ascii_lowercase().as_str() {
-        "rulesmvp" | "rules_mvp" | "rules-mvp" => ReasoningMode::RulesMvp,
-        "owldltarget" | "owl_dl_target" | "owl-dl-target" => ReasoningMode::OwlDlTarget,
-        _ => ReasoningMode::Disabled,
+        "disabled" | "none" | "off" => Ok(ReasoningMode::Disabled),
+        "rulesmvp" | "rules_mvp" | "rules-mvp" => Ok(ReasoningMode::RulesMvp),
+        unknown => bail!(
+            "unsupported value '{unknown}' in {} (expected 'disabled' or 'rules-mvp')",
+            names::REASONING_MODE
+        ),
     }
 }
 
@@ -133,9 +137,19 @@ mod tests {
     use nrese_reasoner::{FeatureMode, ReasoningReadModel, UnsupportedConstructBehavior};
 
     use super::{
-        parse_reasoning_read_model, parse_rules_mvp_feature_policy, parse_rules_mvp_preset,
-        resolve_rules_mvp_config,
+        parse_reasoning_mode, parse_reasoning_read_model, parse_rules_mvp_feature_policy,
+        parse_rules_mvp_preset, resolve_rules_mvp_config,
     };
+
+    #[test]
+    fn reasoning_mode_rejects_unknown_values_instead_of_disabling() {
+        assert!(parse_reasoning_mode(Some("rule-mvp")).is_err());
+        assert!(parse_reasoning_mode(Some("owl-dl-target")).is_err());
+        assert_eq!(
+            parse_reasoning_mode(None).expect("default"),
+            nrese_reasoner::ReasoningMode::Disabled
+        );
+    }
 
     #[test]
     fn rules_mvp_parser_accepts_none() {

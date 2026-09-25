@@ -2,15 +2,15 @@ use axum::body::Bytes;
 use axum::extract::RawQuery;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_store::{GraphReadRequest, GraphWriteRequest};
+use nrese_store::{GraphReadRequest, GraphWriteRequest, MutationCommand, MutationCommitReport};
 
 use crate::error::ApiError;
 use crate::http::guard;
 use crate::http::media::{header_value_str, media_type_matches};
+use crate::http::mutation;
 use crate::http::rdf_payload::{
     ensure_ready, parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
 };
-use crate::mutation_pipeline;
 use crate::state::AppState;
 
 pub async fn get_graph(
@@ -95,12 +95,13 @@ pub async fn delete_graph(
     ensure_ready(&state)?;
     guard::enforce_graph_write(&state, &headers).await?;
     let target = parse_graph_target(&raw_query)?;
-    tokio::time::timeout(
+    mutation::run(
+        &state,
+        MutationCommand::GraphDelete(target),
         state.policy().timeouts.graph_write,
-        mutation_pipeline::execute_graph_delete(state, target),
+        "graph delete exceeded policy timeout",
     )
-    .await
-    .map_err(|_| ApiError::timeout("graph delete exceeded policy timeout"))??;
+    .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -125,12 +126,21 @@ async fn write_graph(
         payload: body.to_vec(),
         replace,
     };
-    let report = tokio::time::timeout(
+    let report = match mutation::run(
+        &state,
+        MutationCommand::GraphWrite(request),
         state.policy().timeouts.graph_write,
-        mutation_pipeline::execute_graph_write(state, request),
+        "graph write exceeded policy timeout",
     )
-    .await
-    .map_err(|_| ApiError::timeout("graph write exceeded policy timeout"))??;
+    .await?
+    {
+        MutationCommitReport::GraphWrite(report) => report,
+        other => {
+            return Err(ApiError::internal(format!(
+                "unexpected graph write result: {other:?}"
+            )));
+        }
+    };
 
     Ok(write_graph_status(&report))
 }

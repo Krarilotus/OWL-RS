@@ -31,11 +31,6 @@ pub enum StoreError {
     RdfParse(#[from] RdfParseError),
     #[error("RDF serialization error: {0}")]
     RdfSerialize(#[from] SerializerError),
-    #[error(
-        "ontology preload is enabled but no ontology file was found. configured={configured:?}, searched={searched:?}"
-    )]
-    OntologyFileNotFound {
-        configured: Option<PathBuf>,
-        searched: Vec<PathBuf>,
-    },
+    #[error("configured ontology file does not exist: {}", path.display())]
+    OntologyFileNotFound { path: PathBuf },
 }

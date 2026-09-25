@@ -1,5 +1,5 @@
-use crate::reject_attribution::{RejectAttribution, RejectAttributionCandidate};
 use nrese_reasoner::RejectExplanation;
+use nrese_store::{RejectAttribution, RejectAttributionCandidate};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]

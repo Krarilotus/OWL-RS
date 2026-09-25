@@ -2,12 +2,14 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_store::{DatasetBackupFormat, DatasetRestoreRequest, StoreError};
+use nrese_store::{
+    DatasetBackupFormat, DatasetRestoreRequest, MutationCommand, MutationCommitReport, StoreError,
+};
 
 use crate::error::ApiError;
 use crate::http::media::{header_value_str, media_type_matches};
+use crate::http::mutation;
 use crate::http::responses::build_admin_restore_response;
-use crate::mutation_pipeline;
 use crate::state::AppState;
 
 const BACKUP_FORMAT_HEADER: &str = "x-nrese-backup-format";
@@ -62,12 +64,21 @@ pub async fn restore(
         payload: body.to_vec(),
     };
 
-    let report = tokio::time::timeout(
+    let report = match mutation::run(
+        &state,
+        MutationCommand::Restore(request),
         state.policy().timeouts.update,
-        mutation_pipeline::execute_restore(state, request),
+        "dataset restore exceeded policy timeout",
     )
-    .await
-    .map_err(|_| ApiError::timeout("dataset restore exceeded policy timeout"))??;
+    .await?
+    {
+        MutationCommitReport::Restore(report) => report,
+        other => {
+            return Err(ApiError::internal(format!(
+                "unexpected restore result: {other:?}"
+            )));
+        }
+    };
 
     Ok((StatusCode::OK, Json(build_admin_restore_response(&report))).into_response())
 }

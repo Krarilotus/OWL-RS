@@ -5,7 +5,7 @@ use std::fs;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
-use nrese_store::{StoreConfig, StoreMode};
+use nrese_store::StoreConfig;
 use serde_json::Value;
 use tower::util::ServiceExt;
 
@@ -115,13 +115,7 @@ async fn graph_store_roundtrip_accepts_official_org_turtle_fixture()
 async fn startup_with_official_prov_preload_supports_relative_base_iris()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_store_config(
-        StoreConfig {
-            mode: StoreMode::InMemory,
-            data_dir: std::env::temp_dir().join("unused"),
-            preload_ontology: true,
-            ontology_path: Some(catalog_fixture_path("prov.ttl")),
-            ontology_fallbacks: Vec::new(),
-        },
+        StoreConfig::in_memory().with_ontology(catalog_fixture_path("prov.ttl")),
         PolicyConfig::default(),
         ReasonerConfig::default(),
     )?;

@@ -3,7 +3,7 @@ mod support;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::ReasonerConfig;
-use nrese_store::{StoreConfig, StoreMode};
+use nrese_store::StoreConfig;
 use tower::util::ServiceExt;
 
 use nrese_server::DeploymentPosture;
@@ -621,15 +621,8 @@ async fn graph_store_head_returns_content_type() -> Result<(), Box<dyn std::erro
 #[tokio::test]
 async fn ttl_fixture_is_loaded_and_drives_reasoner_aware_update_flow()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
     let app = test_app_with_store_config(
-        StoreConfig {
-            mode: StoreMode::InMemory,
-            data_dir: temp.path().join("unused"),
-            preload_ontology: true,
-            ontology_path: Some(minimal_fixture_path()),
-            ontology_fallbacks: Vec::new(),
-        },
+        StoreConfig::in_memory().with_ontology(minimal_fixture_path()),
         PolicyConfig::default(),
         ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::RulesMvp),
     )?;

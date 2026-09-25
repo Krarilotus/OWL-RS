@@ -2,21 +2,16 @@ mod support;
 
 use nrese_store::{
     GraphReadRequest, GraphResultFormat, GraphTarget, GraphWriteRequest, QueryResultKind,
-    StoreConfig, StoreMode, StoreService,
+    StoreConfig, StoreService,
 };
 use support::{catalog_fixture_path, in_memory_store_config};
 use tempfile::tempdir;
 
 #[test]
 fn store_preload_accepts_official_foaf_rdf_xml_fixture() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let service = StoreService::new(StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: true,
-        ontology_path: Some(catalog_fixture_path("foaf.rdf")),
-        ontology_fallbacks: Vec::new(),
-    })?;
+    let service = StoreService::new(
+        StoreConfig::in_memory().with_ontology(catalog_fixture_path("foaf.rdf")),
+    )?;
 
     let ask = service.execute_query_str(
         "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -33,14 +28,9 @@ fn store_preload_accepts_official_foaf_rdf_xml_fixture() -> Result<(), Box<dyn s
 #[test]
 fn store_preload_accepts_official_prov_turtle_fixture_with_relative_base_iri()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let service = StoreService::new(StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: true,
-        ontology_path: Some(catalog_fixture_path("prov.ttl")),
-        ontology_fallbacks: Vec::new(),
-    })?;
+    let service = StoreService::new(
+        StoreConfig::in_memory().with_ontology(catalog_fixture_path("prov.ttl")),
+    )?;
 
     let ask = service.execute_query_str(
         "PREFIX owl: <http://www.w3.org/2002/07/owl#>

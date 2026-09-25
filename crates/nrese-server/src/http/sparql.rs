@@ -1,10 +1,13 @@
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_store::{GraphResultFormat, SolutionsResultFormat, SparqlQueryRequest};
+use nrese_store::{
+    GraphResultFormat, MutationCommand, SolutionsResultFormat, SparqlQueryRequest,
+    SparqlUpdateRequest,
+};
 
 use crate::error::ApiError;
 use crate::http::media::media_type_matches;
-use crate::mutation_pipeline;
+use crate::http::mutation;
 use crate::state::AppState;
 
 pub async fn execute_query(
@@ -41,12 +44,13 @@ pub async fn execute_query(
 
 pub async fn execute_update(state: AppState, update: String) -> Result<StatusCode, ApiError> {
     state.policy().enforce_update_bytes(update.len())?;
-    tokio::time::timeout(
+    mutation::run(
+        &state,
+        MutationCommand::Update(SparqlUpdateRequest::new(update)),
         state.policy().timeouts.update,
-        mutation_pipeline::execute_update(state, update),
+        "update execution exceeded policy timeout",
     )
-    .await
-    .map_err(|_| ApiError::timeout("update execution exceeded policy timeout"))??;
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

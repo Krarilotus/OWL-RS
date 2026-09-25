@@ -11,12 +11,16 @@ use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
 use crate::rdf_io::{file_base_iri, parser_for_graph_format};
 
+/// Loads the configured ontology file, if any. A configured but missing file is an error.
 pub fn preload_ontology(store: &Store, config: &StoreConfig) -> StoreResult<Option<PathBuf>> {
-    if !config.preload_ontology {
+    let Some(ontology_path) = config.ontology_path.clone() else {
         return Ok(None);
+    };
+    if !ontology_path.is_file() {
+        return Err(StoreError::OntologyFileNotFound {
+            path: ontology_path,
+        });
     }
-
-    let ontology_path = resolve_ontology_path(config)?;
     let file = File::open(&ontology_path)?;
     let reader = BufReader::new(file);
     let ontology_format = infer_ontology_format(&ontology_path)?;
@@ -46,19 +50,5 @@ fn infer_ontology_format(path: &Path) -> StoreResult<GraphResultFormat> {
             extension,
             path.display()
         ))
-    })
-}
-
-fn resolve_ontology_path(config: &StoreConfig) -> StoreResult<PathBuf> {
-    let candidates = config.ontology_candidates();
-    for candidate in &candidates {
-        if candidate.is_file() {
-            return Ok(candidate.clone());
-        }
-    }
-
-    Err(StoreError::OntologyFileNotFound {
-        configured: config.ontology_path.clone(),
-        searched: candidates,
     })
 }
