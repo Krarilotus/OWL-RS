@@ -293,8 +293,7 @@ async fn build_graph_write_effect_report(
     match case.kind {
         CompatKind::GraphTriplesSet => {
             reset_graph_target(client, left, graph_target, &case.request_headers, options).await?;
-            reset_graph_target(client, right, graph_target, &case.request_headers, options)
-                .await?;
+            reset_graph_target(client, right, graph_target, &case.request_headers, options).await?;
             let payload = graph_payload(case)?;
             let content_type = graph_content_type(case)?;
 
@@ -405,7 +404,8 @@ async fn reset_graph_target(
     extra_headers: &CompatHeaders,
     options: RequestExecutionOptions,
 ) -> Result<()> {
-    let outcome = execute_graph_delete_raw(client, target, graph_target, extra_headers, options).await?;
+    let outcome =
+        execute_graph_delete_raw(client, target, graph_target, extra_headers, options).await?;
     let semantics = classify_response_semantics(&outcome);
     if (200..300).contains(&semantics.status) || semantics.status == 404 {
         return Ok(());
