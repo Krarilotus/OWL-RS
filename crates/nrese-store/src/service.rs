@@ -19,7 +19,7 @@ use crate::graph_store_executor::execute_graph_read;
 use crate::loader::preload_ontology;
 use crate::mutation::{MutationCommand, MutationCommitReport};
 use crate::query::{SerializedQueryResult, SparqlQueryRequest};
-use crate::query_executor::execute_query;
+use crate::query_executor::{PreparedQuery, execute_query, run_query};
 use crate::snapshot::StoreDatasetSnapshot;
 use crate::stats::{StoreStats, collect_stats};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
@@ -103,6 +103,18 @@ impl StoreService {
         request: &SparqlQueryRequest,
     ) -> StoreResult<SerializedQueryResult> {
         execute_query(&self.engine.snapshot(), request)
+    }
+
+    /// Evaluates a prepared query on the latest snapshot, writing results to `out` as they
+    /// are produced. Cancelling `cancellation` stops evaluation promptly; the output is then
+    /// incomplete.
+    pub fn run_query(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+    ) -> StoreResult<()> {
+        run_query(&self.engine.snapshot(), prepared, cancellation, out)
     }
 
     pub fn execute_query_str(&self, query: &str) -> StoreResult<SerializedQueryResult> {

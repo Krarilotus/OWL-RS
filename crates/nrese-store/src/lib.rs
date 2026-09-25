@@ -37,10 +37,12 @@ pub use mutation::{
     MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
     RejectAttributionCandidate,
 };
+pub use nrese_sparql::{CancellationToken, QueryEvaluationError};
 pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
     SparqlQueryRequest,
 };
+pub use query_executor::PreparedQuery;
 pub use service::StoreService;
 pub use snapshot::StoreDatasetSnapshot;
 pub use stats::StoreStats;

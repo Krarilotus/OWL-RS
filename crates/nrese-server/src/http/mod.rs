@@ -14,6 +14,7 @@ mod rdf_payload;
 mod reasoning_view;
 mod requests;
 mod responses;
+mod result_stream;
 mod routes;
 mod service_description;
 mod sparql;

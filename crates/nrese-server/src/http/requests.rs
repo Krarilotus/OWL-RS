@@ -6,28 +6,75 @@ use crate::error::ApiError;
 use crate::http::media::{header_value_str, media_type_matches};
 
 #[derive(Debug, Deserialize)]
-pub struct QueryRequest {
-    pub query: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct UpdateFormRequest {
     update: String,
 }
 
-pub fn extract_query(content_type: Option<&HeaderValue>, body: &Bytes) -> Result<String, ApiError> {
+/// A SPARQL 1.1 Protocol query operation: the query and its dataset parameters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryOperation {
+    pub query: String,
+    pub default_graphs: Vec<String>,
+    pub named_graphs: Vec<String>,
+}
+
+impl QueryOperation {
+    /// Collects `query`, `default-graph-uri` and `named-graph-uri` from URL-encoded pairs.
+    /// The dataset parameters may repeat; other parameters are ignored.
+    fn parse_pairs(&mut self, encoded: &[u8]) -> Result<(), ApiError> {
+        let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(encoded)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        for (key, value) in pairs {
+            match key.as_str() {
+                "query" if !self.query.is_empty() => {
+                    return Err(ApiError::bad_request(
+                        "exactly one query parameter is allowed",
+                    ));
+                }
+                "query" => self.query = value,
+                "default-graph-uri" => self.default_graphs.push(value),
+                "named-graph-uri" => self.named_graphs.push(value),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `GET /sparql?query=…`.
+pub fn query_from_url(raw_query: Option<&str>) -> Result<QueryOperation, ApiError> {
+    let mut operation = QueryOperation::default();
+    operation.parse_pairs(raw_query.unwrap_or_default().as_bytes())?;
+    operation.query = ensure_non_empty(operation.query, "query must not be empty")?;
+    Ok(operation)
+}
+
+/// `POST /sparql`: a URL-encoded form (all parameters in the body), or the query as the
+/// body with the dataset parameters in the URL.
+pub fn query_from_post(
+    raw_query: Option<&str>,
+    content_type: Option<&HeaderValue>,
+    body: &Bytes,
+) -> Result<QueryOperation, ApiError> {
+    let mut operation = QueryOperation::default();
     if media_type_matches(
         header_value_str(content_type),
         "application/x-www-form-urlencoded",
     ) {
-        let request: QueryRequest = serde_urlencoded::from_bytes(body)
-            .map_err(|error| ApiError::bad_request(error.to_string()))?;
-        return ensure_non_empty(request.query, "query must not be empty");
+        operation.parse_pairs(body)?;
+        operation.query = ensure_non_empty(operation.query, "query must not be empty")?;
+        return Ok(operation);
     }
-
+    operation.parse_pairs(raw_query.unwrap_or_default().as_bytes())?;
+    if !operation.query.is_empty() {
+        return Err(ApiError::bad_request(
+            "the query must be in the body or the URL, not both",
+        ));
+    }
     let query = String::from_utf8(body.to_vec())
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    ensure_non_empty(query, "request body must contain a SPARQL query")
+    operation.query = ensure_non_empty(query, "request body must contain a SPARQL query")?;
+    Ok(operation)
 }
 
 pub fn extract_update(
@@ -75,14 +122,59 @@ mod tests {
     use axum::body::Bytes;
     use axum::http::HeaderValue;
 
-    use super::{extract_query, extract_update};
+    use super::{QueryOperation, extract_update, query_from_post, query_from_url};
+
+    const SELECT: &str = "SELECT%20*%20WHERE%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D";
 
     #[test]
     fn query_from_form_body() {
-        let body = Bytes::from("query=SELECT%20*%20WHERE%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D");
+        let body = Bytes::from(format!(
+            "query={SELECT}&named-graph-uri=http%3A%2F%2Fex%2Fa&named-graph-uri=http%3A%2F%2Fex%2Fb"
+        ));
         let content_type = HeaderValue::from_static("application/x-www-form-urlencoded");
-        let query = extract_query(Some(&content_type), &body).expect("query should parse");
-        assert_eq!(query, "SELECT * WHERE { ?s ?p ?o }");
+        let operation = query_from_post(None, Some(&content_type), &body).expect("query");
+        assert_eq!(
+            operation,
+            QueryOperation {
+                query: "SELECT * WHERE { ?s ?p ?o }".to_owned(),
+                default_graphs: Vec::new(),
+                named_graphs: vec!["http://ex/a".to_owned(), "http://ex/b".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn query_from_url_with_dataset_parameters() {
+        let operation = query_from_url(Some(&format!(
+            "query={SELECT}&default-graph-uri=http%3A%2F%2Fex%2Fg&timeout=5"
+        )))
+        .expect("query");
+        assert_eq!(operation.default_graphs, ["http://ex/g"]);
+        assert!(
+            query_from_url(Some("default-graph-uri=x")).is_err(),
+            "query missing"
+        );
+        assert!(query_from_url(Some(&format!("query={SELECT}&query={SELECT}"))).is_err());
+    }
+
+    #[test]
+    fn direct_post_takes_dataset_parameters_from_the_url() {
+        let content_type = HeaderValue::from_static("application/sparql-query");
+        let body = Bytes::from("ASK {}");
+        let operation = query_from_post(
+            Some("named-graph-uri=http%3A%2F%2Fex%2Fn"),
+            Some(&content_type),
+            &body,
+        )
+        .expect("query");
+        assert_eq!(
+            (operation.query.as_str(), operation.named_graphs.len()),
+            ("ASK {}", 1)
+        );
+        assert!(
+            query_from_post(Some(&format!("query={SELECT}")), Some(&content_type), &body).is_err(),
+            "query in both places"
+        );
     }
 
     #[test]

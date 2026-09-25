@@ -1,45 +1,67 @@
-use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::http::StatusCode;
+use axum::response::Response;
 use nrese_store::{
-    GraphResultFormat, MutationCommand, SolutionsResultFormat, SparqlQueryRequest,
-    SparqlUpdateRequest,
+    CancellationToken, GraphResultFormat, MutationCommand, PreparedQuery, SolutionsResultFormat,
+    SparqlQueryRequest, SparqlUpdateRequest, StoreError,
 };
 
 use crate::error::ApiError;
 use crate::http::media::media_type_matches;
 use crate::http::mutation;
+use crate::http::requests::QueryOperation;
+use crate::http::result_stream::stream_blocking;
+use crate::policy::PolicyConfig;
 use crate::state::AppState;
 
+const QUERY_TIMEOUT_MESSAGE: &str = "query execution exceeded policy timeout";
+
+/// Evaluates a query and streams its results. The policy timeout is a real deadline: when
+/// it passes, evaluation is cancelled, whether or not results have started streaming.
 pub async fn execute_query(
     state: AppState,
-    query: String,
+    operation: QueryOperation,
     accept: Option<&str>,
 ) -> Result<Response, ApiError> {
     if !state.is_ready() {
         return Err(ApiError::unavailable("server is not ready yet"));
     }
-    state.policy().enforce_query_bytes(query.len())?;
-
-    let request = build_query_request(query, accept);
-    let store = state.store();
     let policy = state.policy().clone();
-    let result = tokio::time::timeout(
-        state.policy().timeouts.query,
-        tokio::task::spawn_blocking(move || store.execute_query(&request)),
+    policy.enforce_query_bytes(operation.query.len())?;
+    let deadline = tokio::time::Instant::now() + policy.timeouts.query;
+
+    let request = build_query_request(operation, accept);
+    let prepared =
+        PreparedQuery::parse(&request).map_err(|error| map_query_error(&policy, error))?;
+    let media_type = prepared.media_type();
+    let store = state.store();
+    let cancellation = CancellationToken::new();
+    let token = cancellation.clone();
+    stream_blocking(
+        deadline,
+        cancellation,
+        media_type,
+        QUERY_TIMEOUT_MESSAGE,
+        move |out| {
+            store
+                .run_query(&prepared, &token, out)
+                .map_err(|error| map_query_error(&policy, error))
+        },
     )
     .await
-    .map_err(|_| ApiError::timeout("query execution exceeded policy timeout"))?
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| policy.bad_request_for_sparql_parse_error(error.to_string()))?;
+}
 
-    let mut response = (StatusCode::OK, result.payload).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(result.media_type)
-            .map_err(|error| ApiError::internal(error.to_string()))?,
-    );
-
-    Ok(response)
+/// Query errors caused by the request are 400s; a cancelled evaluation is a timeout;
+/// anything else is the server's fault.
+fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
+    match error {
+        StoreError::SparqlEvaluation(nrese_store::QueryEvaluationError::Cancelled) => {
+            ApiError::timeout(QUERY_TIMEOUT_MESSAGE)
+        }
+        error if error.is_request_error() => {
+            policy.bad_request_for_sparql_parse_error(error.to_string())
+        }
+        error => ApiError::internal(error.to_string()),
+    }
 }
 
 pub async fn execute_update(state: AppState, update: String) -> Result<StatusCode, ApiError> {
@@ -54,8 +76,10 @@ pub async fn execute_update(state: AppState, update: String) -> Result<StatusCod
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn build_query_request(query: String, accept: Option<&str>) -> SparqlQueryRequest {
-    let mut request = SparqlQueryRequest::new(query);
+fn build_query_request(operation: QueryOperation, accept: Option<&str>) -> SparqlQueryRequest {
+    let mut request = SparqlQueryRequest::new(operation.query);
+    request.default_graphs = operation.default_graphs;
+    request.named_graphs = operation.named_graphs;
 
     if media_type_matches(accept, "application/sparql-results+xml") {
         request.solutions_format = SolutionsResultFormat::Xml;
@@ -85,11 +109,19 @@ mod tests {
     use nrese_store::{GraphResultFormat, SolutionsResultFormat};
 
     use super::build_query_request;
+    use crate::http::requests::QueryOperation;
+
+    fn operation(query: &str) -> QueryOperation {
+        QueryOperation {
+            query: query.to_owned(),
+            ..QueryOperation::default()
+        }
+    }
 
     #[test]
     fn query_accept_csv_selects_csv_format() {
         let request = build_query_request(
-            "SELECT * WHERE { ?s ?p ?o }".to_owned(),
+            operation("SELECT * WHERE { ?s ?p ?o }"),
             Some("text/csv,application/sparql-results+json"),
         );
 
@@ -98,14 +130,14 @@ mod tests {
 
     #[test]
     fn query_accept_default_is_json() {
-        let request = build_query_request("ASK WHERE { ?s ?p ?o }".to_owned(), None);
+        let request = build_query_request(operation("ASK WHERE { ?s ?p ?o }"), None);
         assert_eq!(request.solutions_format, SolutionsResultFormat::Json);
     }
 
     #[test]
     fn query_accept_prefers_rdf_xml_for_graph_results() {
         let request = build_query_request(
-            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }".to_owned(),
+            operation("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }"),
             Some("application/rdf+xml, application/n-triples"),
         );
         assert_eq!(request.graph_format, GraphResultFormat::RdfXml);
