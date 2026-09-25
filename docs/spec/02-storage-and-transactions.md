@@ -1,5 +1,7 @@
 # Storage and Transaction Model
 
+> **Scope:** describes the storage behaviour of engine **v1** (Oxigraph-backed). The engine v2 design is [ADR-0002](../adr/0002-engine-storage-lsm-permutations.md) and roadmap Milestone 1; this spec is rewritten when M1 lands.
+
 ## Objective
 
 Provide a high-throughput, low-latency RDF storage layer with explicit transaction semantics and reasoner-friendly snapshot boundaries.

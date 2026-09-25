@@ -123,13 +123,14 @@ api_key = "replace-me"
 - posture effects:
   - `read-only-demo` disables SPARQL Update, `TELL`, Graph Store writes, and admin mutation surfaces
   - `internal-authenticated` requires auth mode other than `none`
-  - `replacement-grade` additionally requires on-disk storage, `problem-json` SPARQL parse errors, and rejects `owl-dl-target` while it remains scaffolded
+  - `replacement-grade` additionally requires on-disk storage and `problem-json` SPARQL parse errors
 
 ## Store
 
 - file key: `store.mode`
 - env override: `NRESE_STORE_MODE`
-- values: `in-memory`, `on-disk`
+- values: `in-memory` (aliases `inmemory`, `memory`), `on-disk` (aliases `ondisk`, `disk`, `durable`)
+- unknown values are a startup error
 
 - file key: `store.data_dir`
 - env override: `NRESE_DATA_DIR`
@@ -137,13 +138,15 @@ api_key = "replace-me"
 
 - file key: `store.ontology_path`
 - env override: `NRESE_ONTOLOGY_PATH`
-- optional explicit preload path
+- optional; when set, the file is loaded at startup and a missing file is a startup error
+- when unset, nothing is preloaded (there are no implicit fallback locations)
 
 ## Reasoner
 
 - file key: `reasoner.mode`
 - env override: `NRESE_REASONING_MODE`
-- values: `disabled`, `rules-mvp`, `owl-dl-target`
+- values: `disabled` (aliases `none`, `off`), `rules-mvp`
+- unknown values are a startup error (a typo must not silently disable consistency checking)
 
 - file key: `reasoner.read_model`
 - env override: `NRESE_REASONER_READ_MODEL`

@@ -8,7 +8,7 @@ This document provides a minimal, repeatable smoke-test flow for local and stagi
 
 - Rust toolchain is installed
 - Repository root is `OWL-RS`
-- Ontology file exists at one of the supported discovery paths, or `NRESE_ONTOLOGY_PATH` is set
+- `NRESE_ONTOLOGY_PATH` points to the ontology file to preload (there are no implicit discovery paths)
 
 Known local processed ontology path:
 

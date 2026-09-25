@@ -1,5 +1,7 @@
 # Code Structure Guidelines
 
+The design principles (ownership, functional core / imperative shell, DRY) are defined in [ARCHITECTURE.md §6](../ARCHITECTURE.md#6-design-principles); the layer that owns each kind of fix is in [§3](../ARCHITECTURE.md#3-where-to-fix-what). This document holds the day-to-day practice rules that follow from them.
+
 This repository is organized to keep runtime behavior explicit, modular, and easy to change without duplicating logic.
 
 ## Core Rules
@@ -35,7 +37,7 @@ Examples in this repository:
 - HTTP media-type parsing belongs in one HTTP media module, not in handlers.
 - Auth backend behavior belongs in `auth/`, while policy decides routing and enforcement.
 - Environment-variable names belong in one config constants module, not as repeated raw string literals.
-- Store import/export behavior belongs in `nrese-store`; server code should stay transport-only.
+- Store import/export behavior and the mutation pipeline (write slot, validation gates, commit/cancel semantics) belong in `nrese-store`; server code stays transport-only (`http/mutation.rs` only adapts the pipeline to HTTP).
 - Reject explanation mapping should be built once and reused by HTTP and operator surfaces.
 - Reasoner preparation artifacts should be built once per execution path and reused by all dependent stages.
 - Frontend language strings should live in one i18n boundary rather than component-local literals.
