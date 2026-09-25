@@ -1,5 +1,7 @@
 # Reasoner and OWL Profile
 
+> **Scope:** describes the **v1** `rules-mvp` reasoner. The v2 reasoner (materialised, incremental, queryable) is [ADR-0003](../adr/0003-materialised-reasoning.md) and roadmap Milestone 3.
+
 ## Objective
 
 Build a Rust-native reasoning subsystem that scales from practical enterprise closure to advanced OWL capabilities with explicit profile and support boundaries.

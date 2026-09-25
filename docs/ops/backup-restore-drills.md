@@ -4,7 +4,7 @@
 
 Define repeatable backup/restore drills that prove recovery readiness under realistic failure scenarios.
 
-Status tracking for this concern lives in [docs/spec/06-fuseki-replacement-gap-matrix.md](../spec/06-fuseki-replacement-gap-matrix.md).
+Status tracking for this concern lives in [docs/spec/06-target-capability-matrix.md](../spec/06-target-capability-matrix.md). The engine v2 durability design (WAL + checkpoints) is in [ADR-0002](../adr/0002-engine-storage-lsm-permutations.md); drills are revised with roadmap WP E4.
 
 This document is the operational source of truth for backup/restore procedure and evidence.
 
