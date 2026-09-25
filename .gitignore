@@ -12,6 +12,7 @@ Thumbs.db
 /data/
 /artifacts/
 /tmp/
+/.cache/
 *.log
 *.out
 *.err
