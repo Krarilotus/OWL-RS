@@ -3,6 +3,7 @@
 //! No HTTP concerns live here. See `docs/ARCHITECTURE.md`.
 
 mod backup;
+mod bulk_load;
 pub mod config;
 mod delta;
 pub mod error;
@@ -23,6 +24,7 @@ mod view;
 pub use backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
 };
+pub use bulk_load::{BulkLoadReport, BulkLoadRequest};
 pub use config::{StoreConfig, StoreMode};
 pub use delta::{MutationDeltaPreview, StagedMutationPreview};
 pub use error::{StoreError, StoreResult};

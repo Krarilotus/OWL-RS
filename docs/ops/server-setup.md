@@ -87,7 +87,24 @@ There are no scheduled-backup or recovery-mode settings yet. Earlier versions of
 - If it is set and the file is missing, startup fails with a clear error.
 - If it is unset, nothing is preloaded. There are no implicit discovery or fallback paths, so the server behaves the same regardless of the working directory.
 
-## 5.4 Local Test-Server Startup Example (PowerShell)
+### 5.4 Bulk Loading
+
+Initial loads and full restores of large files use the offline bulk loader instead of HTTP:
+
+```powershell
+$env:NRESE_STORE_MODE = "on-disk"; $env:NRESE_DATA_DIR = ".\data"
+nrese-server load [--config .\config.toml] [--replace] [--graph <IRI>] data.nt more.nq ...
+```
+
+- **Behaviour:**
+  - The format comes from each file's extension.
+  - `--replace` swaps the dataset instead of adding to it.
+  - `--graph` sets the target graph for triple formats; quad formats keep their own graphs.
+  - Blank nodes are fresh per load.
+- **Offline only.** The server must not be running on the same data directory; the directory lock enforces this. Validation gates don't run during a bulk load.
+- **Speed.** N-Triples and N-Quads are parsed on all cores and are the fastest input: about 2.7 M triples/s on the reference machine, with 100 M triples in 37 s (`benches/baselines/README.md`). Convert other formats to N-Triples for the largest loads.
+
+## 5.5 Local Test-Server Startup Example (PowerShell)
 
 ```powershell
 $env:NRESE_BIND_ADDR = "127.0.0.1:8080"

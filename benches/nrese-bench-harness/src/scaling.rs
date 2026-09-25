@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Serialize;
 
@@ -18,7 +18,7 @@ use crate::compat_common::{
 };
 use crate::io::write_json_report;
 use crate::layout::ServiceTarget;
-use crate::model::{CompatGraphTarget, CompatHeaders, WriteScalingConfig};
+use crate::model::{CompatGraphTarget, CompatHeaders, GenerateConfig, WriteScalingConfig};
 use crate::normalize::percentile;
 
 const TRIPLES_PER_ENTITY: u64 = 4;
@@ -208,6 +208,30 @@ async fn load(client: &Client, target: &ServiceTarget, payload: &[u8]) -> Result
     )
     .await?;
     require_success_http(target, "graph write", &outcome)?;
+    Ok(())
+}
+
+/// Writes `config.triples` (rounded up to whole entities) as one N-Triples file.
+pub fn run_generate(config: &GenerateConfig) -> Result<()> {
+    use std::io::Write;
+
+    let entity_count = config.triples.div_ceil(TRIPLES_PER_ENTITY);
+    let mut out = std::io::BufWriter::with_capacity(
+        1 << 20,
+        std::fs::File::create(&config.out)
+            .with_context(|| format!("failed to create {}", config.out.display()))?,
+    );
+    const CHUNK: u64 = 100_000;
+    for start in (0..entity_count).step_by(CHUNK as usize) {
+        let count = CHUNK.min(entity_count - start);
+        out.write_all(&entities(start, count, entity_count))?;
+    }
+    out.flush()?;
+    println!(
+        "wrote {} triples ({entity_count} entities) to {}",
+        entity_count * TRIPLES_PER_ENTITY,
+        config.out.display()
+    );
     Ok(())
 }
 

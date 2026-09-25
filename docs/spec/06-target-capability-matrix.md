@@ -23,7 +23,7 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 | Multi-repository | no | yes | missing | X1 | API tests |
 | Crash-safe durability, persistent revision | yes | yes | **done**: WAL + checkpoints serving; crash-injection tests; a hard-kill restart at 10 M recovered exactly | E4, P2 | crash-injection tests |
 | Online backup | — | yes | v1 export only | O2 | drill |
-| Parallel bulk loader | yes (fast) | yes | missing | E5 | load benchmark |
+| Parallel bulk loader | yes (fast) | yes | v2 serving: `nrese-server load`, 100 M triples in 37 s (2.68 M t/s, durable); competitor runs on the same machine pending | E5 | load benchmark vs QLever / GraphDB loaders |
 | Compressed / on-disk indexes | yes | yes | missing | Pf1, Pf2 | bytes/triple, larger-than-RAM test |
 | Worst-case-optimal / merge joins | yes | partial | missing | Pf3 | query-mix benchmark vs QLever |
 | Cost-based optimiser, explain/profile | yes | yes | missing | Pf4 | explain API tests |

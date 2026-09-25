@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 use nrese_reasoner::ReasonerService;
-use nrese_store::StoreService;
+use nrese_store::{BulkLoadRequest, GraphTarget, StoreService};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 use nrese_server::ai::AiSuggestionService;
-use nrese_server::{AppState, CliConfig, ServerConfig, build_app};
+use nrese_server::{AppState, CliCommand, CliConfig, LoadCommand, ServerConfig, build_app};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -15,6 +15,9 @@ async fn main() -> Result<()> {
     let cli = CliConfig::from_args(std::env::args_os())?;
     let config = ServerConfig::load(cli.config_path.as_deref())?;
     let store = StoreService::new(config.store.clone())?;
+    if let CliCommand::Load(load) = cli.command {
+        return bulk_load(&store, load);
+    }
     let reasoner = ReasonerService::new(config.reasoner.clone());
     let ai = AiSuggestionService::new(config.ai.clone())?;
     let ontology_path = store
@@ -48,6 +51,29 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .await
         .context("nrese-server terminated unexpectedly")
+}
+
+/// `nrese-server load`: bulk-loads files into the configured store and exits.
+fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
+    let request = BulkLoadRequest {
+        files: load.files,
+        replace: load.replace,
+        graph: load
+            .graph
+            .map_or(GraphTarget::DefaultGraph, GraphTarget::NamedGraph),
+    };
+    let report = store.bulk_load(&request).context("bulk load failed")?;
+    let seconds = report.elapsed.as_secs_f64();
+    tracing::info!(
+        revision = report.revision,
+        parsed = report.parsed,
+        inserted = report.inserted,
+        deleted = report.deleted,
+        seconds,
+        quads_per_second = (report.parsed as f64 / seconds) as u64,
+        "bulk load complete"
+    );
+    Ok(())
 }
 
 fn init_tracing() {

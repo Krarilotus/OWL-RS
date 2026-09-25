@@ -5,9 +5,9 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::model::{
     BasicAuthConfig, BenchConfig, CatalogSyncConfig, Cli, Command, CompatConfig,
-    ConnectionSelection, OntologyReasoningFeature, OntologySemanticDialect, OntologyServiceSurface,
-    PackConfig, PackExecutionMode, PackMatrixConfig, ReferenceConnection, ReferenceKind,
-    SeedConfig, ServiceConnectionConfig, ValidatePackConfig, WriteScalingConfig,
+    ConnectionSelection, GenerateConfig, OntologyReasoningFeature, OntologySemanticDialect,
+    OntologyServiceSurface, PackConfig, PackExecutionMode, PackMatrixConfig, ReferenceConnection,
+    ReferenceKind, SeedConfig, ServiceConnectionConfig, ValidatePackConfig, WriteScalingConfig,
 };
 
 const DEFAULT_QUERY_WORKLOAD_PATH: &str =
@@ -192,6 +192,19 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .transpose()?
                     .unwrap_or(true),
                 report_json_path: options.get("--report-json").map(PathBuf::from),
+            }),
+        }),
+        "generate" => Ok(Cli {
+            command: Command::Generate(GenerateConfig {
+                triples: options
+                    .get("--triples")
+                    .map(|value| value.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(1_000_000),
+                out: options
+                    .get("--out")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("generate needs --out <PATH>"))?,
             }),
         }),
         "seed" => Ok(Cli {
@@ -394,6 +407,7 @@ USAGE:
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--execution-mode <full|compat-only>] --workload-pack <PATH> [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validate [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--execution-mode <full|compat-only>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- generate --out <PATH> [--triples <N>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- write-scaling --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--steps <triples,...>] [--chunk-triples <N>] [--samples <N>] [--reset <true|false>] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--dataset <PATH>] [--dataset-base-iri <IRI>] [--content-type <TYPE>] [--replace <true|false>]
 "

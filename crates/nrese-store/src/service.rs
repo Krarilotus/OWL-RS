@@ -8,6 +8,7 @@ use crate::backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
     export_dataset,
 };
+use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
 use crate::error::StoreResult;
 use crate::graph_store::{
@@ -152,6 +153,13 @@ impl StoreService {
             MutationCommitReport::GraphDelete(report) => Ok(report),
             other => unreachable!("graph delete produced {other:?}"),
         }
+    }
+
+    /// Loads RDF files through the engine's bulk path: parallel parsing and interning, one
+    /// sort, one revision, no validation gates. For initial loads and full restores; use
+    /// the mutation pipeline for regular writes.
+    pub fn bulk_load(&self, request: &BulkLoadRequest) -> StoreResult<BulkLoadReport> {
+        bulk_load(&self.engine, request)
     }
 
     pub fn restore_dataset(
