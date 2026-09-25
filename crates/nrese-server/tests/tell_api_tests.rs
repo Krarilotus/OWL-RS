@@ -3,7 +3,7 @@ mod support;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
-use nrese_store::{StoreConfig, StoreMode};
+use nrese_store::StoreConfig;
 use tower::util::ServiceExt;
 
 use nrese_server::policy::PolicyConfig;
@@ -76,15 +76,8 @@ async fn tell_endpoint_supports_named_graph_ingest() -> Result<(), Box<dyn std::
 #[tokio::test]
 async fn tell_endpoint_uses_reasoner_gate_and_rejects_without_publish()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
     let app = test_app_with_store_config(
-        StoreConfig {
-            mode: StoreMode::InMemory,
-            data_dir: temp.path().join("unused"),
-            preload_ontology: true,
-            ontology_path: Some(minimal_fixture_path()),
-            ontology_fallbacks: Vec::new(),
-        },
+        StoreConfig::in_memory().with_ontology(minimal_fixture_path()),
         PolicyConfig::default(),
         ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
     )?;

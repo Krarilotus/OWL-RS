@@ -248,12 +248,15 @@ fn rules_mvp_infers_dcterms_subproperty_and_equivalent_property_from_official_fi
 }
 
 #[test]
-fn rules_mvp_infers_sosa_subproperty_closure_from_official_fixture()
+/// SOSA itself declares `sosa:observes owl:inverseOf sosa:isObservedBy`; the
+/// `ssn:forProperty` super-property lives in SSN (covered by the SSN test below). Until
+/// 2026-09-25 the catalog URL for SOSA actually returned SSN, so this test asserted an SSN
+/// axiom; it now pins the SOSA document's own semantics.
+fn rules_mvp_infers_sosa_inverse_property_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
     let inferred = run_rules_mvp_catalog_fixture(
         "sosa.ttl",
         "PREFIX sosa: <http://www.w3.org/ns/sosa/>
-         PREFIX ssn: <http://www.w3.org/ns/ssn/>
          INSERT DATA {
            <http://example.com/sensor1> sosa:observes <http://example.com/property1> .
          }",
@@ -261,9 +264,9 @@ fn rules_mvp_infers_sosa_subproperty_closure_from_official_fixture()
 
     assert_inferred_triple(
         &inferred,
-        "http://example.com/sensor1",
-        "http://www.w3.org/ns/ssn/forProperty",
         "http://example.com/property1",
+        "http://www.w3.org/ns/sosa/isObservedBy",
+        "http://example.com/sensor1",
     );
     Ok(())
 }

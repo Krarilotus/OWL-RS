@@ -1,32 +1,18 @@
 use nrese_store::{
     DatasetBackupFormat, DatasetRestoreRequest, GraphReadRequest, GraphResultFormat, GraphTarget,
-    GraphWriteRequest, QueryResultKind, SparqlUpdateRequest, StoreConfig, StoreMode, StoreService,
+    GraphWriteRequest, QueryResultKind, SparqlUpdateRequest, StoreConfig, StoreService,
 };
-use tempfile::tempdir;
 
 #[cfg(feature = "durable-storage")]
 use std::path::PathBuf;
 
 fn new_in_memory_service() -> Result<StoreService, Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    Ok(StoreService::new(StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: false,
-        ontology_path: None,
-        ontology_fallbacks: Vec::new(),
-    })?)
+    Ok(StoreService::new(StoreConfig::in_memory())?)
 }
 
 #[cfg(feature = "durable-storage")]
 fn new_on_disk_service(data_dir: PathBuf) -> Result<StoreService, Box<dyn std::error::Error>> {
-    Ok(StoreService::new(StoreConfig {
-        mode: StoreMode::OnDisk,
-        data_dir,
-        preload_ontology: false,
-        ontology_path: None,
-        ontology_fallbacks: Vec::new(),
-    })?)
+    Ok(StoreService::new(StoreConfig::on_disk(data_dir))?)
 }
 
 #[test]

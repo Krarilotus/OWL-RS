@@ -5,7 +5,7 @@ use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::auth::{AuthConfig, StaticBearerConfig};
 use nrese_server::policy::{PolicyConfig, RateLimitConfig};
-use nrese_store::{StoreConfig, StoreMode};
+use nrese_store::StoreConfig;
 use tower::util::ServiceExt;
 
 use support::{body_text, readyz_text, test_app_with_policy, test_app_with_store_config};
@@ -39,15 +39,8 @@ async fn backup_endpoint_requires_admin_policy() -> Result<(), Box<dyn std::erro
 #[tokio::test]
 async fn backup_endpoint_returns_dataset_payload_with_expected_headers()
 -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempfile::tempdir()?;
     let app = test_app_with_store_config(
-        StoreConfig {
-            mode: StoreMode::InMemory,
-            data_dir: temp.path().join("unused"),
-            preload_ontology: true,
-            ontology_path: Some(support::minimal_fixture_path()),
-            ontology_fallbacks: Vec::new(),
-        },
+        StoreConfig::in_memory().with_ontology(support::minimal_fixture_path()),
         admin_policy(),
         ReasonerConfig::default(),
     )?;

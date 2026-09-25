@@ -2,8 +2,7 @@ use std::path::PathBuf;
 
 use nrese_core::ReasonerEngine;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-use nrese_store::{StoreConfig, StoreMode, StoreService};
-use tempfile::tempdir;
+use nrese_store::{StoreConfig, StoreService};
 
 fn minimal_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/ontologies/minimal_services.ttl")
@@ -11,14 +10,7 @@ fn minimal_fixture_path() -> PathBuf {
 
 #[test]
 fn rules_mvp_runs_against_ttl_preloaded_store_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let store = StoreService::new(StoreConfig {
-        mode: StoreMode::InMemory,
-        data_dir: temp.path().join("unused"),
-        preload_ontology: true,
-        ontology_path: Some(minimal_fixture_path()),
-        ontology_fallbacks: Vec::new(),
-    })?;
+    let store = StoreService::new(StoreConfig::in_memory().with_ontology(minimal_fixture_path()))?;
     let snapshot = store.dataset_snapshot()?;
     let reasoner = ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::RulesMvp));
 

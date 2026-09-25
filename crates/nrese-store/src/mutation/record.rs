@@ -1,9 +1,10 @@
-use crate::reject_attribution::RejectAttribution;
+use super::attribution::RejectAttribution;
 use nrese_core::{ReasonerRunReport, ReasonerRunStatus};
 use nrese_reasoner::{InferenceDelta, ReasoningCacheStats, ReasoningStats, RejectExplanation};
 
+/// Snapshot of one reasoning gate run, kept for operator diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastReasoningRun {
+pub struct ReasoningRunRecord {
     pub revision: u64,
     pub status: ReasonerRunStatus,
     pub inferred_triples: u64,
@@ -17,7 +18,7 @@ pub struct LastReasoningRun {
     pub derived_triples_sample: Vec<(String, String, String)>,
 }
 
-impl LastReasoningRun {
+impl ReasoningRunRecord {
     pub fn from_report(
         report: &ReasonerRunReport,
         inferred: &InferenceDelta,
