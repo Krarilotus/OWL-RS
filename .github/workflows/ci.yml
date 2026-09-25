@@ -40,8 +40,14 @@ jobs:
         run: cargo fmt --manifest-path ${{ matrix.target.manifest }} --all --check
       - name: clippy
         run: cargo clippy --manifest-path ${{ matrix.target.manifest }} --all-targets --locked -- -D warnings
+      - name: fetch W3C test suites (pinned)
+        if: matrix.target.name == 'workspace'
+        run: bash scripts/fetch-w3c-tests.sh
       - name: test
         run: cargo test --manifest-path ${{ matrix.target.manifest }} --all-targets --locked
+        env:
+          # The W3C suite runners fail instead of skipping when the suite is missing.
+          NRESE_W3C_REQUIRED: ${{ matrix.target.name == 'workspace' && '1' || '' }}
 
   console:
     name: Console (apps/nrese-console)

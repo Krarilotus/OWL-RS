@@ -1000,6 +1000,8 @@ dependencies = [
  "nrese-engine",
  "oxigraph",
  "oxrdf",
+ "oxrdfio",
+ "sparesults",
  "spareval",
  "spargebra",
  "thiserror",

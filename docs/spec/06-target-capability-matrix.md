@@ -12,8 +12,8 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 
 | Capability | QLever | GraphDB | NRESE status | WP | Evidence |
 |---|---|---|---|---|---|
-| SPARQL 1.1 query | yes (some deviations) | yes | v2 serving (`nrese-sparql` on engine snapshots; matches the Oxigraph oracle on 30 differential queries); W3C suite pending | Q1 | W3C query suite |
-| SPARQL 1.1 update | yes (delta layer degrades) | yes | v2 serving; write gate **passed** (1-triple insert at 10 M over HTTP: 0.22 ms in memory, 2.05 ms durable; v1: 3 s at 1 M); W3C suite pending | Q1, P1 | W3C update suite; `write-scaling` < 5 ms at 10 M |
+| SPARQL 1.1 query | yes (some deviations) | yes | **done**: W3C query evaluation 222/232, query syntax 111/111, results formats 3/3. All 10 failures are spareval behaviours that the Oxigraph oracle fails too; 7 of them are post-2013 suite additions. The oracle passes 477 of 495 overall, we pass 485 | Q1 | `nrese-sparql/tests/w3c_sparql11` (in CI) |
+| SPARQL 1.1 update | yes (delta layer degrades) | yes | **done**: W3C update evaluation 94/94, update syntax 55/55. Write gate passed (1-triple insert at 10 M over HTTP: 0.22 ms in memory, 2.05 ms durable; v1: 3 s at 1 M) | Q1, P1 | `w3c_sparql11`; `write-scaling` < 5 ms at 10 M |
 | Protocol dataset parameters | yes | yes | v2 serving for queries: `default-graph-uri` / `named-graph-uri` over GET, form POST and direct POST (`query_protocol_tests`). `using-graph-uri` for updates is engine-only | Q1 | protocol tests |
 | Graph Store Protocol | yes | yes | v2 serving (server GSP test suite green) | Q1 | GSP tests |
 | Query cancellation / real timeouts | yes | yes | **done**: a timed-out write never commits. A read query is answered 408 at its deadline and evaluation is cancelled, also on client disconnect. Known gap: spareval's in-memory join loops aren't interruptible between quad reads (0.7 s measured on a 10¹⁰-row cross product; Pf3 closes it) | Q1, P1 | timeout-commit test; `query_execution_tests`, `query_protocol_tests` |

@@ -77,7 +77,7 @@ Goal: a codebase where every concern has one owner, and the evidence tooling nee
 | **P1 Mutation pipeline** | plan → validate → deadline check → commit, all proportional to the delta. The v1 reasoner is fed through an adapter until M3. | L3 | One-triple insert at 10 M triples < 5 ms with reasoning off (audit: 2.9 s at 1 M) |
 | **P2 Reactor** | Delete the Oxigraph `Store` usage, the staging clone and the string snapshots. | all | `grep oxigraph::store` is empty |
 
-**M1 status (2026-09-25):** `nrese-engine` is in the workspace and CI.
+**M1 status (2026-09-26): complete.** Details as recorded along the way: `nrese-engine` is in the workspace and CI.
 - **E2–E4 done** and gated:
   - `index/model_tests.rs`: random operation sequences against a `BTreeSet`, all 32 pattern shapes, named-graph listing, policy and arbitrary compaction windows, old versions after compaction.
   - `tests/engine_tests.rs`: snapshot isolation, overlay, abort, readers during an open transaction, three concurrent readers never seeing a partial commit, and an RDF-term model test.
@@ -97,7 +97,12 @@ Goal: a codebase where every concern has one owner, and the evidence tooling nee
     - Read-query deadlines: 408 at the deadline, evaluation cancelled, also on client disconnect.
     - Protocol dataset parameters over HTTP.
     - Blank-node scoping for file loads is done by the bulk loader (E5).
-  - Open: the W3C suite runner.
+  - W3C suite runner done (`nrese-sparql/tests/w3c_sparql11`):
+    - It runs the pinned `w3c/rdf-tests` (`scripts/fetch-w3c-tests.sh`) in CI on engine v2 *and* on the Oxigraph oracle.
+    - Result: 485/495 passed (the oracle: 477). Query evaluation is 222/232; update evaluation 94/94; all 166 syntax tests and 3/3 result-format tests pass.
+    - All 10 failures are spareval behaviours shared with the oracle, listed with reasons in `expected-failures.txt`. A new failure or an unexpected pass fails CI.
+    - We pass 8 tests the oracle fails, because we preserve literal forms.
+  - **Q1 done. M1 is complete.**
   - **Moved to X2:** `LOAD` needs the same outbound HTTP client, allowlist and SSRF guards as federated `SERVICE`, so it is built once there.
 - **P1 done (gate passed):**
   - `nrese-store` runs every write as plan (into an engine transaction) → gates → ticket claim → commit.
