@@ -1,4 +1,5 @@
 import { NreseClient } from "./client";
+import { NRESE_ENDPOINTS } from "./endpoints";
 import { resolveBrowserApiBaseUrl } from "./runtimeConfig";
 import type {
   AiStatus,
@@ -26,7 +27,7 @@ export async function getCapabilities(): Promise<Capabilities> {
 }
 
 export async function getReasoningDiagnostics(
-  endpoint = "/ops/api/diagnostics/reasoning",
+  endpoint: string = NRESE_ENDPOINTS.reasoningDiagnostics,
 ): Promise<ReasoningDiagnostics> {
   return getBrowserClient().getReasoningDiagnostics(endpoint);
 }
