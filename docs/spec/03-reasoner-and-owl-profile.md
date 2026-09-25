@@ -1,6 +1,6 @@
 # Reasoner and OWL Profile
 
-> **Scope:** describes the **v1** `rules-mvp` reasoner. The v2 reasoner (materialised, incremental, queryable) is [ADR-0003](../adr/0003-materialised-reasoning.md) and roadmap Milestone 3.
+> **Scope:** describes the **v1** `rules-mvp` reasoner. The v2 reasoner (materialised, incremental, queryable) is [ADR-0003](../adr/0003-materialised-reasoning.md), designed and planned in [design/reasoner-v2.md](../design/reasoner-v2.md) (roadmap Milestone 3).
 
 ## Objective
 
