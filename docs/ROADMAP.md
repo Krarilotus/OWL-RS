@@ -82,7 +82,12 @@ Goal: a codebase where every concern has one owner, and the evidence tooling nee
   - `index/model_tests.rs`: random operation sequences against a `BTreeSet`, all 32 pattern shapes, named-graph listing, policy and arbitrary compaction windows, old versions after compaction.
   - `tests/engine_tests.rs`: snapshot isolation, overlay, abort, readers during an open transaction, three concurrent readers never seeing a partial commit, and an RDF-term model test.
   - `tests/durability_tests.rs`: torn tail cut at every byte of the last record, mid-log corruption reported rather than skipped, crash during a checkpoint and between the checkpoint and WAL release, dictionary continuity across aborted transactions, directory lock, and background checkpoints bounding the WAL.
-- **E1 partial:** inline `xsd:integer` and `xsd:boolean` only; `dateTime`, `date` and `decimal` are still open. Blank-node scoping per load belongs to the loader (Q1/E5).
+- **E1 done:**
+  - Canonical `xsd:integer`, `xsd:boolean`, `xsd:decimal`, `xsd:date` and `xsd:dateTime` values are inlined in the term id (`term/inline.rs`, which documents the ranges).
+  - Only XSD 1.1 canonical lexical forms are inlined, so decoding reproduces the input exactly. A fuzz test over 200 k near-miss strings checks that.
+  - Non-canonical forms (`"1.50"`, `"…+00:00"`) stay dictionary terms with their own identity; `=` still compares values. Pinned in `nrese-sparql`'s differential tests, whose oracle dataset now covers date ranges, dateTime ordering and decimal arithmetic.
+  - The term encoding change bumped the WAL and checkpoint format to 3.
+  - Blank-node scoping is per payload for requests and per load for bulk loads.
 - **Q1 partial:** the `nrese-sparql` crate exists.
   - Done: the spareval adapter over snapshots and transactions (one `ReadView` contract); SPARQL Update into one transaction without committing, so the pipeline decides; protocol dataset overrides; cancellation between and inside operations.
   - Evidence: `tests/differential_tests.rs` runs 30 queries against Oxigraph as an oracle, before and after each of 14 update scripts, with no mismatches.

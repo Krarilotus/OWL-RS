@@ -173,7 +173,11 @@ impl Dictionary {
     /// dictionary (or the default-graph marker).
     pub fn decode(&self, id: TermId) -> Option<Term> {
         match id.kind() {
-            TermKind::Integer | TermKind::Boolean => inline_to_literal(id).map(Term::from),
+            TermKind::Integer
+            | TermKind::Boolean
+            | TermKind::Decimal
+            | TermKind::Date
+            | TermKind::DateTime => inline_to_literal(id).map(Term::from),
             TermKind::DefaultGraph => None,
             TermKind::Iri | TermKind::BlankNode | TermKind::Literal => {
                 let inner = self.inner.read();
