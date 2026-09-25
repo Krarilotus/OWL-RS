@@ -1014,6 +1014,8 @@ dependencies = [
  "nrese-sparql",
  "oxrdf",
  "oxrdfio",
+ "oxttl",
+ "rayon",
  "sha2",
  "sparesults",
  "spargebra",

@@ -40,5 +40,6 @@ async fn main() -> Result<()> {
         Command::PackMatrix(config) => runner::run_pack_matrix(config).await,
         Command::Seed(config) => runner::run_seed(config).await,
         Command::WriteScaling(config) => scaling::run_write_scaling(config).await,
+        Command::Generate(config) => scaling::run_generate(&config),
     }
 }

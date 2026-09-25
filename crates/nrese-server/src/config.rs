@@ -22,7 +22,7 @@ mod store_env;
 #[cfg(test)]
 mod test_support;
 
-pub use cli::CliConfig;
+pub use cli::{CliCommand, CliConfig, LoadCommand};
 
 use ai_env::parse_ai_config;
 use env_names as names;

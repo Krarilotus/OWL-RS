@@ -26,6 +26,11 @@ pub enum StoreError {
     InvalidGraphIri(String),
     #[error("RDF parse error: {0}")]
     RdfParse(#[from] RdfParseError),
+    #[error("RDF parse error in {}: {source}", path.display())]
+    FileParse {
+        path: PathBuf,
+        source: RdfParseError,
+    },
     #[error("configured ontology file does not exist: {}", path.display())]
     OntologyFileNotFound { path: PathBuf },
 }

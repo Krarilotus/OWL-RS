@@ -20,6 +20,15 @@ pub enum Command {
     PackMatrix(PackMatrixConfig),
     Seed(SeedConfig),
     WriteScaling(WriteScalingConfig),
+    Generate(GenerateConfig),
+}
+
+/// `generate`: writes the write-scaling entity dataset as an N-Triples file, the input for
+/// bulk-load benchmarks (`nrese-server load`, and the competitors' loaders).
+#[derive(Debug, Clone)]
+pub struct GenerateConfig {
+    pub triples: u64,
+    pub out: PathBuf,
 }
 
 #[derive(Debug, Clone)]

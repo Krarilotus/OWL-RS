@@ -11,6 +11,8 @@ nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-sparql = { path = "../nrese-sparql" }
 oxrdf = "=0.3.3"
 oxrdfio = "=0.2.4"
+oxttl = "=0.2.3"
+rayon = "1.10"
 sha2 = "0.10.9"
 sparesults = "=0.3.3"
 spargebra = "=0.4.6"
