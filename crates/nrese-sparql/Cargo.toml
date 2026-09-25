@@ -15,3 +15,6 @@ thiserror.workspace = true
 [dev-dependencies]
 # Differential oracle: the same spareval evaluator over Oxigraph's own storage.
 oxigraph = { version = "0.5.6", default-features = false }
+# W3C suite runner: manifests, data files and expected results.
+oxrdfio = "=0.2.4"
+sparesults = "=0.3.3"
