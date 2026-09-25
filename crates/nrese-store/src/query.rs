@@ -1,6 +1,3 @@
-use oxigraph::io::RdfFormat;
-use oxigraph::sparql::results::QueryResultsFormat;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolutionsResultFormat {
     Json,
@@ -18,15 +15,6 @@ impl SolutionsResultFormat {
             Self::Tsv => "text/tab-separated-values",
         }
     }
-
-    pub fn into_oxigraph(self) -> QueryResultsFormat {
-        match self {
-            Self::Json => QueryResultsFormat::Json,
-            Self::Xml => QueryResultsFormat::Xml,
-            Self::Csv => QueryResultsFormat::Csv,
-            Self::Tsv => QueryResultsFormat::Tsv,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,14 +30,6 @@ impl GraphResultFormat {
             Self::NTriples => "application/n-triples",
             Self::Turtle => "text/turtle",
             Self::RdfXml => "application/rdf+xml",
-        }
-    }
-
-    pub fn into_oxigraph(self) -> RdfFormat {
-        match self {
-            Self::NTriples => RdfFormat::NTriples,
-            Self::Turtle => RdfFormat::Turtle,
-            Self::RdfXml => RdfFormat::RdfXml,
         }
     }
 

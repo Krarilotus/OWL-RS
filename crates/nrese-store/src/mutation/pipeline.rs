@@ -1,31 +1,32 @@
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use nrese_core::{ReasonerEngine, ReasonerRunStatus};
-use nrese_reasoner::{InferenceDelta, ReasonerService};
+use nrese_reasoner::{InferenceDelta, ReasonerService, ReasoningMode};
 
 use super::attribution::{RejectAttribution, attribute_reject_delta};
 use super::command::{MutationCommand, MutationCommitReport};
 use super::error::{MutationError, MutationReject};
 use super::record::ReasoningRunRecord;
 use super::ticket::MutationTicket;
+use crate::delta::{MutationDeltaPreview, gate_snapshot};
+use crate::error::StoreError;
 use crate::service::StoreService;
 
-/// The single owner of write semantics: one writer at a time, plan → validate → commit.
+/// The single owner of write semantics: plan → validate → claim → commit.
 ///
-/// Steps:
-/// 1. take the write slot (serialises writers; readers are never blocked by it)
-/// 2. normalise the command and preview its effect without publishing it
-/// 3. run the validation gates (currently the reasoner consistency gate)
-/// 4. claim the commit through the [`MutationTicket`]; abort if the caller cancelled
-/// 5. commit
+/// 1. Open an engine transaction. Its writer slot serialises writers; readers never wait.
+/// 2. Apply the command to the transaction. Nothing is visible yet, and the transaction's
+///    exact delta *is* the preview: no copy of the dataset is made.
+/// 3. Run the validation gates on the transaction's state (currently the v1 reasoner gate).
+/// 4. Claim the commit through the [`MutationTicket`]; abort if the caller cancelled.
+/// 5. Commit: WAL append (durable mode), then publish.
 ///
-/// Engine v1 note: the preview in step 2 still copies the dataset (audit finding F1). The
-/// engine v2 work package P1 replaces it with delta-proportional planning behind this API.
+/// Cost: O(delta) with reasoning disabled. The v1 reasoner reads the whole dataset as
+/// strings, so enabling it costs O(dataset) per write until the M3 reasoner replaces it.
 #[derive(Debug)]
 pub struct MutationPipeline {
     store: Arc<StoreService>,
     reasoner: Arc<ReasonerService>,
-    write_slot: Mutex<()>,
     last_reasoning_run: RwLock<Option<ReasoningRunRecord>>,
 }
 
@@ -34,7 +35,6 @@ impl MutationPipeline {
         Self {
             store,
             reasoner,
-            write_slot: Mutex::new(()),
             last_reasoning_run: RwLock::new(None),
         }
     }
@@ -63,36 +63,41 @@ impl MutationPipeline {
         ticket: &MutationTicket,
     ) -> Result<MutationCommitReport, MutationError> {
         let kind = command.kind();
-        let store_error = |source| MutationError::Store { kind, source };
-
-        let _slot = self
-            .write_slot
-            .lock()
-            .map_err(|_| MutationError::Poisoned)?;
+        let store_error = |source| {
+            if ticket.is_cancelled() {
+                MutationError::Cancelled
+            } else {
+                MutationError::Store { kind, source }
+            }
+        };
         if ticket.is_cancelled() {
             return Err(MutationError::Cancelled);
         }
 
-        let command = command.normalize().map_err(store_error)?;
-        let preview = command.preview(&self.store).map_err(store_error)?;
+        let mut tx = self.store.engine().transaction();
         if ticket.is_cancelled() {
             return Err(MutationError::Cancelled);
         }
+        let report = command
+            .apply(&mut tx, ticket.evaluation_token())
+            .map_err(store_error)?;
 
-        let snapshot = &preview.snapshot;
+        let reads_triples = self.reasoner.config().mode() != ReasoningMode::Disabled;
+        let snapshot =
+            gate_snapshot(&tx, tx.base().revision() + 1, reads_triples).map_err(store_error)?;
         let plan = self
             .reasoner
-            .plan(snapshot)
+            .plan(&snapshot)
             .map_err(|error| MutationError::Gate(error.to_string()))?;
         let output = self
             .reasoner
-            .run(snapshot, &plan)
+            .run(&snapshot, &plan)
             .map_err(|error| MutationError::Gate(error.to_string()))?;
         let attribution = output
             .inferred
             .primary_reject
             .as_ref()
-            .and_then(|reject| attribute_reject_delta(reject, &preview.delta));
+            .and_then(|reject| attribute_reject_delta(reject, &MutationDeltaPreview::of(&tx)));
         self.record_run(ReasoningRunRecord::from_report(
             &output.report,
             &output.inferred,
@@ -103,7 +108,11 @@ impl MutationPipeline {
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }
-        command.commit(&self.store).map_err(store_error)
+        let summary = tx.commit().map_err(|error| MutationError::Store {
+            kind,
+            source: StoreError::Engine(error),
+        })?;
+        Ok(report.committed(summary.revision))
     }
 
     fn record_run(&self, run: ReasoningRunRecord) {

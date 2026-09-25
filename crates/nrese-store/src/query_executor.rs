@@ -1,65 +1,63 @@
-use oxigraph::io::RdfSerializer;
-use oxigraph::sparql::results::QueryResultsSerializer;
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-use oxigraph::store::Store;
+//! Query execution: parse, evaluate on a read view (L2), serialise the results.
+
+use nrese_sparql::{QueryOptions, QueryResults, ReadView, evaluate_query};
+use sparesults::{QueryResultsFormat, QueryResultsSerializer};
+use spargebra::SparqlParser;
 
 use crate::error::StoreResult;
-use crate::query::{QueryResultKind, SerializedQueryResult, SparqlQueryRequest};
+use crate::query::{
+    QueryResultKind, SerializedQueryResult, SolutionsResultFormat, SparqlQueryRequest,
+};
+use crate::rdf_io::serialize_triples;
 
-pub fn execute_query(
-    store: &Store,
-    request: &SparqlQueryRequest,
-) -> StoreResult<SerializedQueryResult> {
-    let prepared_query = SparqlEvaluator::new().parse_query(&request.query)?;
-    let results = prepared_query.on_store(store).execute()?;
-    serialize_results(results, request)
+impl SolutionsResultFormat {
+    fn results_format(self) -> QueryResultsFormat {
+        match self {
+            Self::Json => QueryResultsFormat::Json,
+            Self::Xml => QueryResultsFormat::Xml,
+            Self::Csv => QueryResultsFormat::Csv,
+            Self::Tsv => QueryResultsFormat::Tsv,
+        }
+    }
 }
 
-fn serialize_results(
-    results: QueryResults<'static>,
+pub fn execute_query(
+    view: &impl ReadView,
     request: &SparqlQueryRequest,
 ) -> StoreResult<SerializedQueryResult> {
-    match results {
-        QueryResults::Boolean(value) => {
-            let format = request.solutions_format.into_oxigraph();
-            let serializer = QueryResultsSerializer::from_format(format);
-            let payload = serializer.serialize_boolean_to_writer(Vec::new(), value)?;
-
-            Ok(SerializedQueryResult {
-                kind: QueryResultKind::Boolean,
-                media_type: request.solutions_format.media_type(),
-                payload,
-            })
-        }
+    let query = SparqlParser::new().parse_query(&request.query)?;
+    let results = evaluate_query(view, &query, &QueryOptions::default())?;
+    let serializer = QueryResultsSerializer::from_format(request.solutions_format.results_format());
+    let (kind, media_type, payload) = match results {
+        QueryResults::Boolean(value) => (
+            QueryResultKind::Boolean,
+            request.solutions_format.media_type(),
+            serializer.serialize_boolean_to_writer(Vec::new(), value)?,
+        ),
         QueryResults::Solutions(solutions) => {
-            let format = request.solutions_format.into_oxigraph();
-            let serializer = QueryResultsSerializer::from_format(format);
             let mut writer = serializer
                 .serialize_solutions_to_writer(Vec::new(), solutions.variables().to_vec())?;
-
             for solution in solutions {
                 writer.serialize(&solution?)?;
             }
-
-            Ok(SerializedQueryResult {
-                kind: QueryResultKind::Solutions,
-                media_type: request.solutions_format.media_type(),
-                payload: writer.finish()?,
-            })
+            (
+                QueryResultKind::Solutions,
+                request.solutions_format.media_type(),
+                writer.finish()?,
+            )
         }
         QueryResults::Graph(triples) => {
-            let mut writer = RdfSerializer::from_format(request.graph_format.into_oxigraph())
-                .for_writer(Vec::new());
-
-            for triple in triples {
-                writer.serialize_triple(&triple?)?;
-            }
-
-            Ok(SerializedQueryResult {
-                kind: QueryResultKind::Graph,
-                media_type: request.graph_format.media_type(),
-                payload: writer.finish()?,
-            })
+            let triples = triples.collect::<Result<Vec<_>, _>>()?;
+            (
+                QueryResultKind::Graph,
+                request.graph_format.media_type(),
+                serialize_triples(request.graph_format, triples)?,
+            )
         }
-    }
+    };
+    Ok(SerializedQueryResult {
+        kind,
+        media_type,
+        payload,
+    })
 }

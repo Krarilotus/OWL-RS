@@ -4,15 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[features]
-default = []
-durable-storage = ["oxigraph/rocksdb"]
-
 [dependencies]
 nrese-core = { path = "../nrese-core" }
+nrese-engine = { path = "../nrese-engine" }
 nrese-reasoner = { path = "../nrese-reasoner" }
-oxigraph = { version = "0.5.6", default-features = false }
+nrese-sparql = { path = "../nrese-sparql" }
+oxrdf = "=0.3.3"
+oxrdfio = "=0.2.4"
 sha2 = "0.10.9"
+sparesults = "=0.3.3"
+spargebra = "=0.4.6"
 thiserror.workspace = true
 tracing.workspace = true
 url = "2.5.7"

@@ -255,6 +255,8 @@ pub fn build_admin_restore_response(
     }
 }
 
+/// Engine v2 always includes durable storage (WAL + checkpoints); the field stays in the
+/// capabilities API for existing clients.
 pub const fn durable_storage_available() -> bool {
-    cfg!(feature = "durable-storage")
+    true
 }

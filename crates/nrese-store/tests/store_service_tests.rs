@@ -409,22 +409,9 @@ fn dataset_snapshot_preserves_count_invariants_for_supported_and_unsupported_ter
     Ok(())
 }
 
-#[cfg(not(feature = "durable-storage"))]
 #[test]
-fn on_disk_mode_requires_durable_storage_feature() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let config = StoreConfig::on_disk(temp.path().join("nrese-store-data"));
-
-    match StoreService::new(config) {
-        Ok(_) => Err("expected on-disk mode to fail without durable-storage feature".into()),
-        Err(StoreError::DurableStorageFeatureDisabled) => Ok(()),
-        Err(other) => Err(format!("unexpected error: {other}").into()),
-    }
-}
-
-#[cfg(feature = "durable-storage")]
-#[test]
-fn on_disk_mode_persists_data_across_reopen() -> Result<(), Box<dyn std::error::Error>> {
+fn on_disk_mode_persists_data_and_revision_across_reopen() -> Result<(), Box<dyn std::error::Error>>
+{
     let temp = tempdir()?;
     let data_dir = temp.path().join("nrese-store-data");
     let config = StoreConfig::on_disk(data_dir.clone());
@@ -438,6 +425,7 @@ fn on_disk_mode_persists_data_across_reopen() -> Result<(), Box<dyn std::error::
     }
 
     let reopened = StoreService::new(config)?;
+    assert_eq!(reopened.current_revision(), 1, "revision is persistent");
     let ask = reopened.execute_query_str(
         "ASK WHERE { <http://example.com/persist/s> <http://example.com/persist/p> <http://example.com/persist/o> }",
     )?;

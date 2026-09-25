@@ -1,9 +1,12 @@
-use crate::backup::{DatasetRestoreReport, DatasetRestoreRequest};
+use nrese_engine::Transaction;
+use nrese_sparql::{CancellationToken, UpdateOptions, apply_update};
+use spargebra::SparqlParser;
+
+use crate::backup::{DatasetRestoreReport, DatasetRestoreRequest, apply_restore};
 use crate::error::StoreError;
 use crate::graph_store::{GraphDeleteReport, GraphTarget, GraphWriteReport, GraphWriteRequest};
-use crate::service::StoreService;
-use crate::staging::StagedMutationPreview;
-use crate::tell::{TellRequest, compile_tell_update};
+use crate::graph_store_executor::{apply_graph_delete, apply_graph_write};
+use crate::tell::TellRequest;
 use crate::update::SparqlUpdateRequest;
 
 /// Every write entry point of the product. All of them go through the same pipeline, so
@@ -29,7 +32,10 @@ pub enum MutationKind {
 
 #[derive(Debug, Clone)]
 pub enum MutationCommitReport {
-    Applied,
+    /// A SPARQL update or TELL; `revision` is the dataset revision after the commit.
+    Applied {
+        revision: u64,
+    },
     GraphWrite(GraphWriteReport),
     GraphDelete(GraphDeleteReport),
     Restore(DatasetRestoreReport),
@@ -46,42 +52,49 @@ impl MutationCommand {
         }
     }
 
-    /// Normalises entry-point specific requests (`TELL` becomes `INSERT DATA`).
-    pub(crate) fn normalize(self) -> Result<Self, StoreError> {
-        match self {
-            Self::Tell(request) => compile_tell_update(&request).map(Self::Update),
-            other => Ok(other),
-        }
-    }
-
-    pub(crate) fn preview(
+    /// Applies the command to `tx` without committing it; reports carry revision 0 until
+    /// [`MutationCommitReport::committed`]. The evaluation token lets the caller stop a
+    /// long-running `WHERE` clause.
+    pub(crate) fn apply(
         &self,
-        store: &StoreService,
-    ) -> Result<StagedMutationPreview, StoreError> {
+        tx: &mut Transaction<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationCommitReport, StoreError> {
         match self {
-            Self::Update(request) => store.preview_update(request),
-            Self::GraphWrite(request) => store.preview_graph_write(request),
-            Self::GraphDelete(target) => store.preview_graph_delete(target),
-            Self::Restore(request) => store.preview_restore(request),
-            Self::Tell(_) => unreachable!("TELL is normalised to an update before preview"),
+            Self::Update(request) => {
+                let update = SparqlParser::new().parse_update(&request.update)?;
+                let options = UpdateOptions {
+                    cancellation: Some(cancellation.clone()),
+                    ..UpdateOptions::default()
+                };
+                apply_update(tx, &update, &options)?;
+                Ok(MutationCommitReport::Applied { revision: 0 })
+            }
+            Self::Tell(request) => {
+                apply_graph_write(tx, &request.as_graph_write())?;
+                Ok(MutationCommitReport::Applied { revision: 0 })
+            }
+            Self::GraphWrite(request) => {
+                apply_graph_write(tx, request).map(MutationCommitReport::GraphWrite)
+            }
+            Self::GraphDelete(target) => {
+                apply_graph_delete(tx, target).map(MutationCommitReport::GraphDelete)
+            }
+            Self::Restore(request) => apply_restore(tx, request).map(MutationCommitReport::Restore),
         }
     }
+}
 
-    pub(crate) fn commit(&self, store: &StoreService) -> Result<MutationCommitReport, StoreError> {
+impl MutationCommitReport {
+    /// Stamps the revision the commit produced.
+    pub(crate) fn committed(self, revision: u64) -> Self {
         match self {
-            Self::Update(request) => store
-                .execute_update(request)
-                .map(|_| MutationCommitReport::Applied),
-            Self::GraphWrite(request) => store
-                .execute_graph_write(request)
-                .map(MutationCommitReport::GraphWrite),
-            Self::GraphDelete(target) => store
-                .execute_graph_delete(target)
-                .map(MutationCommitReport::GraphDelete),
-            Self::Restore(request) => store
-                .restore_dataset(request)
-                .map(MutationCommitReport::Restore),
-            Self::Tell(_) => unreachable!("TELL is normalised to an update before commit"),
+            Self::Applied { .. } => Self::Applied { revision },
+            Self::GraphWrite(report) => Self::GraphWrite(GraphWriteReport { revision, ..report }),
+            Self::GraphDelete(report) => {
+                Self::GraphDelete(GraphDeleteReport { revision, ..report })
+            }
+            Self::Restore(report) => Self::Restore(DatasetRestoreReport { revision, ..report }),
         }
     }
 }

@@ -1,40 +1,38 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use oxigraph::store::Store;
+use nrese_engine::{Engine, EngineConfig, QuadPattern};
+use nrese_sparql::CancellationToken;
 
-use crate::backend::initialize_store;
 use crate::backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
-    export_dataset, restore_dataset,
+    export_dataset,
 };
-use crate::config::StoreConfig;
+use crate::config::{StoreConfig, StoreMode};
 use crate::error::StoreResult;
 use crate::graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
 };
-use crate::graph_store_executor::{execute_graph_delete, execute_graph_read, execute_graph_write};
+use crate::graph_store_executor::execute_graph_read;
 use crate::loader::preload_ontology;
+use crate::mutation::{MutationCommand, MutationCommitReport};
 use crate::query::{SerializedQueryResult, SparqlQueryRequest};
 use crate::query_executor::execute_query;
 use crate::snapshot::StoreDatasetSnapshot;
-use crate::staging::{
-    StagedMutationPreview, snapshot_after_graph_delete, snapshot_after_graph_write,
-    snapshot_after_restore, snapshot_after_update,
-};
 use crate::stats::{StoreStats, collect_stats};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
-use crate::update_executor::execute_update;
+use crate::view::decoded_quads;
 
+/// The dataset and the operations on it. Reads run on an engine snapshot and never wait for
+/// writers. Production writes go through [`MutationPipeline`](crate::MutationPipeline),
+/// which adds the validation gates; the `execute_*` write methods here apply commands
+/// directly (tools, tests, bootstrapping).
 #[derive(Clone)]
 pub struct StoreService {
     config: StoreConfig,
-    store: Store,
+    engine: Engine,
     preloaded_ontology: Option<PathBuf>,
-    revision: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for StoreService {
@@ -49,20 +47,20 @@ impl fmt::Debug for StoreService {
 impl StoreService {
     pub fn new(config: StoreConfig) -> StoreResult<Self> {
         config.validate()?;
-        let store = initialize_store(&config)?;
-        let preloaded_ontology = preload_ontology(&store, &config)?;
-        let initial_revision = if collect_stats(&store)?.is_empty {
-            0
-        } else {
-            1
+        let engine = match config.mode {
+            StoreMode::InMemory => Engine::new(EngineConfig::default())?,
+            StoreMode::OnDisk => Engine::open(&config.data_dir, EngineConfig::default())?,
         };
-
+        let preloaded_ontology = preload_ontology(&engine, &config)?;
         Ok(Self {
             config,
-            store,
+            engine,
             preloaded_ontology,
-            revision: Arc::new(AtomicU64::new(initial_revision)),
         })
+    }
+
+    pub(crate) fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     pub fn config(&self) -> &StoreConfig {
@@ -73,110 +71,96 @@ impl StoreService {
         self.preloaded_ontology.as_deref()
     }
 
+    /// Revision of the latest commit. Persistent in on-disk mode; unchanged by commits
+    /// without net effect.
     pub fn current_revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
+        self.engine.snapshot().revision()
     }
 
     pub fn stats(&self) -> StoreResult<StoreStats> {
-        collect_stats(&self.store)
+        Ok(collect_stats(&self.engine.snapshot()))
     }
 
     pub fn export_dataset(
         &self,
         format: DatasetBackupFormat,
     ) -> StoreResult<DatasetBackupArtifact> {
-        export_dataset(&self.store, self.current_revision(), format)
+        export_dataset(&self.engine.snapshot(), format)
     }
 
-    pub fn restore_dataset(
-        &self,
-        request: &DatasetRestoreRequest,
-    ) -> StoreResult<DatasetRestoreReport> {
-        let mut report = restore_dataset(&self.store, request, self.current_revision() + 1)?;
-        report.revision = self.bump_revision();
-        Ok(report)
-    }
-
+    /// The whole dataset in the v1 reasoner's string form. O(dataset).
     pub fn dataset_snapshot(&self) -> StoreResult<StoreDatasetSnapshot> {
-        StoreDatasetSnapshot::capture(&self.store, self.current_revision())
+        let snapshot = self.engine.snapshot();
+        StoreDatasetSnapshot::capture(
+            decoded_quads(&snapshot, &QuadPattern::all()),
+            snapshot.revision(),
+        )
     }
 
     pub fn execute_query(
         &self,
         request: &SparqlQueryRequest,
     ) -> StoreResult<SerializedQueryResult> {
-        execute_query(&self.store, request)
+        execute_query(&self.engine.snapshot(), request)
     }
 
     pub fn execute_query_str(&self, query: &str) -> StoreResult<SerializedQueryResult> {
         self.execute_query(&SparqlQueryRequest::new(query))
     }
 
+    pub fn execute_graph_read(&self, request: &GraphReadRequest) -> StoreResult<GraphReadResult> {
+        execute_graph_read(&self.engine.snapshot(), request)
+    }
+
+    /// Applies and commits `command` without validation gates.
+    pub fn apply(&self, command: &MutationCommand) -> StoreResult<MutationCommitReport> {
+        let mut tx = self.engine.transaction();
+        let report = command.apply(&mut tx, &CancellationToken::new())?;
+        let summary = tx.commit()?;
+        Ok(report.committed(summary.revision))
+    }
+
     pub fn execute_update(
         &self,
         request: &SparqlUpdateRequest,
     ) -> StoreResult<UpdateExecutionReport> {
-        let mut report = execute_update(&self.store, request)?;
-        report.revision = self.bump_revision();
-        Ok(report)
+        match self.apply(&MutationCommand::Update(request.clone()))? {
+            MutationCommitReport::Applied { revision } => Ok(UpdateExecutionReport {
+                applied: true,
+                revision,
+            }),
+            other => unreachable!("update produced {other:?}"),
+        }
     }
 
     pub fn execute_update_str(&self, update: &str) -> StoreResult<UpdateExecutionReport> {
         self.execute_update(&SparqlUpdateRequest::new(update))
     }
 
-    pub fn preview_update_snapshot(
-        &self,
-        request: &SparqlUpdateRequest,
-    ) -> StoreResult<StoreDatasetSnapshot> {
-        Ok(self.preview_update(request)?.snapshot)
-    }
-
-    pub fn preview_update(
-        &self,
-        request: &SparqlUpdateRequest,
-    ) -> StoreResult<StagedMutationPreview> {
-        snapshot_after_update(&self.store, request, self.current_revision() + 1)
-    }
-
-    pub fn preview_graph_write(
-        &self,
-        request: &GraphWriteRequest,
-    ) -> StoreResult<StagedMutationPreview> {
-        snapshot_after_graph_write(&self.store, request, self.current_revision() + 1)
-    }
-
-    pub fn preview_graph_delete(&self, target: &GraphTarget) -> StoreResult<StagedMutationPreview> {
-        snapshot_after_graph_delete(&self.store, target, self.current_revision() + 1)
-    }
-
-    pub fn preview_restore(
-        &self,
-        request: &DatasetRestoreRequest,
-    ) -> StoreResult<StagedMutationPreview> {
-        snapshot_after_restore(&self.store, request, self.current_revision() + 1)
-    }
-
-    pub fn execute_graph_read(&self, request: &GraphReadRequest) -> StoreResult<GraphReadResult> {
-        execute_graph_read(&self.store, request)
-    }
-
     pub fn execute_graph_write(
         &self,
         request: &GraphWriteRequest,
     ) -> StoreResult<GraphWriteReport> {
-        let mut report = execute_graph_write(&self.store, request)?;
-        report.revision = self.bump_revision();
-        Ok(report)
+        match self.apply(&MutationCommand::GraphWrite(request.clone()))? {
+            MutationCommitReport::GraphWrite(report) => Ok(report),
+            other => unreachable!("graph write produced {other:?}"),
+        }
     }
 
     pub fn execute_graph_delete(&self, target: &GraphTarget) -> StoreResult<GraphDeleteReport> {
-        let mut report = execute_graph_delete(&self.store, target)?;
-        report.revision = self.bump_revision();
-        Ok(report)
+        match self.apply(&MutationCommand::GraphDelete(target.clone()))? {
+            MutationCommitReport::GraphDelete(report) => Ok(report),
+            other => unreachable!("graph delete produced {other:?}"),
+        }
     }
 
-    fn bump_revision(&self) -> u64 {
-        self.revision.fetch_add(1, Ordering::AcqRel) + 1
+    pub fn restore_dataset(
+        &self,
+        request: &DatasetRestoreRequest,
+    ) -> StoreResult<DatasetRestoreReport> {
+        match self.apply(&MutationCommand::Restore(request.clone()))? {
+            MutationCommitReport::Restore(report) => Ok(report),
+            other => unreachable!("restore produced {other:?}"),
+        }
     }
 }

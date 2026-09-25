@@ -87,7 +87,16 @@ Goal: a codebase where every concern has one owner, and the evidence tooling nee
   - Evidence: `tests/differential_tests.rs` runs 30 queries against Oxigraph as an oracle, before and after each of 14 update scripts, with no mismatches.
   - Two intentional differences, each pinned by a test: literal lexical forms are preserved, and a graph exists only while it holds quads.
   - Open: streaming result serialisation, the W3C suite runner, `LOAD` behind a policy, and blank-node scoping for file loads.
-- **E5, P1, P2 open.**
+- **P1 done (gate passed):**
+  - `nrese-store` runs every write as plan (into an engine transaction) → gates → ticket claim → commit.
+  - The transaction's exact delta is the preview; the dataset clone and full diff are gone.
+  - The mutation ticket's cancel also stops SPARQL evaluation.
+  - End to end over HTTP at 10 M triples, a one-triple insert takes 216 µs p50 in memory and 2.05 ms p50 / 3.9 ms p99 durable. A hard-kill restart recovered exactly.
+- **P2 done in substance:**
+  - The Oxigraph `Store`, RocksDB/libclang and the `durable-storage` feature are gone, and on-disk mode is always available.
+  - Oxigraph remains only as the differential-test oracle (a dev-dependency of `nrese-sparql`).
+  - The string snapshots remain only for the v1 reasoner when enabled, and M3 retires them.
+- **E5 open.** Restores and large loads still go through one transaction; the WAL payload cap is 4 GiB.
 - **Engine-level numbers** (the `insert_latency` example; 7800X3D, Windows 11, NVMe; recorded in `benches/baselines/README.md`): one-quad commit at 10 M quads is 3.8 µs p50 in memory, and 1.9 ms p50 / 4.4 ms p99 durable (fsync per commit). The P1 gate itself is end-to-end over HTTP and is measured once P1 lands.
 
 ### M2: Governance and integration (size XL). What DMW and ResearchSpace need first
