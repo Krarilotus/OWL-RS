@@ -92,7 +92,13 @@ Goal: a codebase where every concern has one owner, and the evidence tooling nee
   - Done: the spareval adapter over snapshots and transactions (one `ReadView` contract); SPARQL Update into one transaction without committing, so the pipeline decides; protocol dataset overrides; cancellation between and inside operations.
   - Evidence: `tests/differential_tests.rs` runs 30 queries against Oxigraph as an oracle, before and after each of 14 update scripts, with no mismatches.
   - Two intentional differences, each pinned by a test: literal lexical forms are preserved, and a graph exists only while it holds quads.
-  - Open: streaming result serialisation, the W3C suite runner, `LOAD` behind a policy, and blank-node scoping for file loads.
+  - Done since (2026-09-26):
+    - Streaming results: store `PreparedQuery` plus `run_query` into any writer; the server streams through a bounded channel. 10 M rows use +1.9 MiB of server memory.
+    - Read-query deadlines: 408 at the deadline, evaluation cancelled, also on client disconnect.
+    - Protocol dataset parameters over HTTP.
+    - Blank-node scoping for file loads is done by the bulk loader (E5).
+  - Open: the W3C suite runner.
+  - **Moved to X2:** `LOAD` needs the same outbound HTTP client, allowlist and SSRF guards as federated `SERVICE`, so it is built once there.
 - **P1 done (gate passed):**
   - `nrese-store` runs every write as plan (into an engine transaction) → gates → ticket claim → commit.
   - The transaction's exact delta is the preview; the dataset clone and full diff are gone.

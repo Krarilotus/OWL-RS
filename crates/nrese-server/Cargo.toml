@@ -9,6 +9,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 axum = { version = "0.8.8", features = ["json", "query"] }
 dotenvy = "0.15.7"
+futures-util = { version = "0.3", default-features = false }
 jsonwebtoken = "9.3.1"
 nrese-core = { path = "../nrese-core" }
 nrese-reasoner = { path = "../nrese-reasoner" }

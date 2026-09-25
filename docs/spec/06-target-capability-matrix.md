@@ -14,10 +14,10 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 |---|---|---|---|---|---|
 | SPARQL 1.1 query | yes (some deviations) | yes | v2 serving (`nrese-sparql` on engine snapshots; matches the Oxigraph oracle on 30 differential queries); W3C suite pending | Q1 | W3C query suite |
 | SPARQL 1.1 update | yes (delta layer degrades) | yes | v2 serving; write gate **passed** (1-triple insert at 10 M over HTTP: 0.22 ms in memory, 2.05 ms durable; v1: 3 s at 1 M); W3C suite pending | Q1, P1 | W3C update suite; `write-scaling` < 5 ms at 10 M |
-| Protocol dataset parameters | yes | yes | engine (`QueryOptions::dataset`, `UpdateOptions::using`); not yet exposed over HTTP | Q1 | protocol tests |
+| Protocol dataset parameters | yes | yes | v2 serving for queries: `default-graph-uri` / `named-graph-uri` over GET, form POST and direct POST (`query_protocol_tests`). `using-graph-uri` for updates is engine-only | Q1 | protocol tests |
 | Graph Store Protocol | yes | yes | v2 serving (server GSP test suite green) | Q1 | GSP tests |
-| Query cancellation / real timeouts | yes | yes | writes **fixed**: a timed-out write never commits, and cancel stops evaluation. Read queries aren't cancelled at the deadline yet | Q1, P1 | timeout-commit test |
-| Streaming large results | yes | yes | missing | Q1 | memory-bounded 10 M-row test |
+| Query cancellation / real timeouts | yes | yes | **done**: a timed-out write never commits. A read query is answered 408 at its deadline and evaluation is cancelled, also on client disconnect. Known gap: spareval's in-memory join loops aren't interruptible between quad reads (0.7 s measured on a 10¹⁰-row cross product; Pf3 closes it) | Q1, P1 | timeout-commit test; `query_execution_tests`, `query_protocol_tests` |
+| Streaming large results | yes | yes | **done**: results are serialised row by row into a bounded channel (64 KiB chunks, backpressure). 10 M rows (1 GB TSV) streamed in 8.5 s with +1.9 MiB server memory | Q1 | memory-bounded 10 M-row test (`benches/baselines/README.md`) |
 | Federated `SERVICE` | yes | yes | missing | X2 | W3C federation tests |
 | RDF4J protocol + transactions | no | yes | missing | X1 | RDF4J client test |
 | Multi-repository | no | yes | missing | X1 | API tests |

@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{Query, RawQuery, State};
+use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 
@@ -14,7 +14,7 @@ use crate::http::metrics;
 use crate::http::operator_api;
 use crate::http::operator_diagnostics;
 use crate::http::operator_ui;
-use crate::http::requests::{QueryRequest, accept_header_value, extract_query, extract_update};
+use crate::http::requests::{accept_header_value, extract_update, query_from_post, query_from_url};
 use crate::http::responses::{StatusResponse, build_ready_response, build_version_response};
 use crate::http::service_description::build_service_description;
 use crate::http::sparql;
@@ -161,21 +161,27 @@ pub async fn service_description(
 
 pub async fn query_get(
     State(state): State<AppState>,
-    Query(request): Query<QueryRequest>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
-    sparql::execute_query(state, request.query, accept_header_value(&headers)).await
+    let operation = query_from_url(raw_query.as_deref())?;
+    sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
 pub async fn query_post(
     State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
-    let query = extract_query(headers.get(header::CONTENT_TYPE), &body)?;
-    sparql::execute_query(state, query, accept_header_value(&headers)).await
+    let operation = query_from_post(
+        raw_query.as_deref(),
+        headers.get(header::CONTENT_TYPE),
+        &body,
+    )?;
+    sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
 pub async fn update_post(

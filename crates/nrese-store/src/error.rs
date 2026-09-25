@@ -34,3 +34,29 @@ pub enum StoreError {
     #[error("configured ontology file does not exist: {}", path.display())]
     OntologyFileNotFound { path: PathBuf },
 }
+
+impl StoreError {
+    /// True if the request is at fault (syntax, invalid IRIs or payloads, unsupported query
+    /// features) rather than the store. Transports map these to client errors. A cancelled
+    /// evaluation is neither: the transport decides what cancelled it.
+    pub fn is_request_error(&self) -> bool {
+        match self {
+            Self::SparqlSyntax(_)
+            | Self::SparqlUpdate(_)
+            | Self::InvalidGraphIri(_)
+            | Self::RdfParse(_)
+            | Self::FileParse { .. } => true,
+            Self::SparqlEvaluation(error) => !matches!(
+                error,
+                QueryEvaluationError::Dataset(_)
+                    | QueryEvaluationError::Unexpected(_)
+                    | QueryEvaluationError::Cancelled
+                    | QueryEvaluationError::UnexpectedDefaultGraph
+            ),
+            Self::Configuration(_)
+            | Self::Io(_)
+            | Self::Engine(_)
+            | Self::OntologyFileNotFound { .. } => false,
+        }
+    }
+}
