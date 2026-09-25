@@ -28,6 +28,7 @@ fn dataset() -> Vec<Quad> {
     let g2: GraphName = ex("g2").into();
     let dg = GraphName::DefaultGraph;
     let int = |v: &str| Literal::new_typed_literal(v, xsd::INTEGER);
+    let typed = |v: &str, datatype| Term::from(Literal::new_typed_literal(v, datatype));
     let q = |s: NamedNode, p: &str, o: Term, g: &GraphName| Quad::new(s, ex(p), o, g.clone());
     let mut quads = vec![
         q(ex("alice"), "knows", ex("bob").into(), &dg),
@@ -82,6 +83,35 @@ fn dataset() -> Vec<Quad> {
             &g2,
         ),
         q(ex("alice"), "knows", ex("bob").into(), &g2), // same triple in two graphs
+        // Inline value kinds (E1): canonical dates, dateTimes and decimals.
+        q(ex("alice"), "born", typed("1990-05-01", xsd::DATE), &dg),
+        q(ex("bob"), "born", typed("1991-12-31Z", xsd::DATE), &dg),
+        q(
+            ex("carol"),
+            "born",
+            typed("1985-02-28+05:30", xsd::DATE),
+            &dg,
+        ),
+        q(
+            ex("alice"),
+            "seen",
+            typed("2026-09-25T14:03:07.5+02:00", xsd::DATE_TIME),
+            &dg,
+        ),
+        q(
+            ex("bob"),
+            "seen",
+            typed("2026-09-25T09:00:00Z", xsd::DATE_TIME),
+            &dg,
+        ),
+        q(
+            ex("carol"),
+            "seen",
+            typed("2026-09-24T23:59:59", xsd::DATE_TIME),
+            &dg,
+        ),
+        q(ex("alice"), "score", typed("-0.125", xsd::DECIMAL), &dg),
+        q(ex("bob"), "score", typed("7.25", xsd::DECIMAL), &dg), // Oxigraph rewrites "7.0" to "7"
     ];
     quads.push(Quad::new(
         ex("alice"),
@@ -99,6 +129,13 @@ fn dataset() -> Vec<Quad> {
 }
 
 const QUERIES: &[&str] = &[
+    "PREFIX ex: <http://example.com/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?s WHERE { ?s ex:born \"1990-05-01\"^^xsd:date }",
+    "PREFIX ex: <http://example.com/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?s ?d WHERE { ?s ex:born ?d FILTER(?d < \"1991-01-01\"^^xsd:date) }",
+    "PREFIX ex: <http://example.com/> SELECT ?s ?t WHERE { ?s ex:seen ?t } ORDER BY ?t",
+    "PREFIX ex: <http://example.com/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?s WHERE { ?s ex:seen ?t FILTER(?t >= \"2026-09-25T00:00:00Z\"^^xsd:dateTime) }",
+    "PREFIX ex: <http://example.com/> SELECT ?s (YEAR(?d) AS ?y) (MONTH(?d) AS ?m) WHERE { ?s ex:born ?d }",
+    "PREFIX ex: <http://example.com/> SELECT ?s (?v * 2 AS ?double) WHERE { ?s ex:score ?v } ORDER BY ?v",
+    "PREFIX ex: <http://example.com/> SELECT ?s WHERE { ?s ex:score 7.25 }",
     "SELECT * WHERE { ?s ?p ?o }",
     "SELECT * WHERE { GRAPH ?g { ?s ?p ?o } }",
     "SELECT ?g WHERE { GRAPH ?g { } }",
@@ -353,6 +390,53 @@ fn protocol_dataset_overrides_from_clauses() {
         panic!("solutions")
     };
     assert_eq!(rows.len(), 3, "g2 has three quads: {rows:?}");
+}
+
+#[test]
+fn non_canonical_dates_and_decimals_keep_their_identity() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (subject, lexical, datatype) in [
+        ("a", "2026-09-25Z", xsd::DATE),      // canonical: inline
+        ("b", "2026-09-25+00:00", xsd::DATE), // same value, dictionary term
+        ("c", "1.5", xsd::DECIMAL),           // canonical: inline
+        ("d", "1.50", xsd::DECIMAL),          // same value, dictionary term
+    ] {
+        let literal = Literal::new_typed_literal(lexical, datatype);
+        tx.insert(Quad::new(ex(subject), ex("v"), literal, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let solutions = |query: &str| match ours(&engine, query) {
+        Normalized::Solutions(rows) => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        solutions("SELECT ?o WHERE { ?s ?p ?o }"),
+        vec![
+            "?o=\"1.5\"^^<http://www.w3.org/2001/XMLSchema#decimal>",
+            "?o=\"1.50\"^^<http://www.w3.org/2001/XMLSchema#decimal>",
+            "?o=\"2026-09-25+00:00\"^^<http://www.w3.org/2001/XMLSchema#date>",
+            "?o=\"2026-09-25Z\"^^<http://www.w3.org/2001/XMLSchema#date>",
+        ]
+    );
+    let date = "\"2026-09-25Z\"^^<http://www.w3.org/2001/XMLSchema#date>";
+    assert_eq!(
+        solutions(&format!(
+            "SELECT ?s WHERE {{ ?s <http://example.com/v> {date} }}"
+        )),
+        vec!["?s=<http://example.com/a>"]
+    );
+    assert_eq!(
+        solutions(&format!(
+            "SELECT ?s WHERE {{ ?s <http://example.com/v> ?o FILTER(?o = {date}) }}"
+        ))
+        .len(),
+        2
+    );
+    assert_eq!(
+        solutions("SELECT ?s WHERE { ?s <http://example.com/v> ?o FILTER(?o = 1.5) }").len(),
+        2
+    );
 }
 
 #[test]

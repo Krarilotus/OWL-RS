@@ -17,8 +17,9 @@ use super::SyncPolicy;
 use super::codec::{CommitRecord, Frame, decode_frame, encode_record};
 use crate::error::{EngineError, EngineResult};
 
-/// Version 2 added the inferred stack to commit records (roadmap E6).
-const SEGMENT_MAGIC: &[u8; 8] = b"NRESEWL2";
+/// Version 2 added the inferred stack to commit records (roadmap E6); version 3 inlines
+/// `xsd:decimal`, `xsd:date` and `xsd:dateTime` (E1), which changes the ids of such terms.
+const SEGMENT_MAGIC: &[u8; 8] = b"NRESEWL3";
 /// Magic prefix shared by every WAL format version.
 const SEGMENT_FAMILY: &[u8; 7] = b"NRESEWL";
 
