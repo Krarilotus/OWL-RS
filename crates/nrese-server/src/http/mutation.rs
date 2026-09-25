@@ -48,9 +48,7 @@ fn map_error(policy: &PolicyConfig, error: MutationError, timeout_message: &str)
                 ApiError::bad_request(source.to_string())
             }
             MutationKind::Restore => match source {
-                StoreError::Loader(_) | StoreError::RdfParse(_) => {
-                    ApiError::bad_request(source.to_string())
-                }
+                StoreError::RdfParse(_) => ApiError::bad_request(source.to_string()),
                 other => ApiError::internal(other.to_string()),
             },
         },

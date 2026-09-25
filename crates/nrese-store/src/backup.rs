@@ -1,9 +1,10 @@
-use oxigraph::io::RdfFormat;
-use oxigraph::store::Store;
+use nrese_engine::{QuadPattern, Snapshot, Transaction};
+use oxrdfio::RdfFormat;
 use sha2::{Digest, Sha256};
 
 use crate::error::StoreResult;
-use crate::stats::collect_stats;
+use crate::rdf_io::{parse_dataset, serialize_quads};
+use crate::view::decoded_quads;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatasetBackupFormat {
@@ -17,7 +18,7 @@ impl DatasetBackupFormat {
         }
     }
 
-    fn into_oxigraph(self) -> RdfFormat {
+    fn rdf_format(self) -> RdfFormat {
         match self {
             Self::NQuads => RdfFormat::NQuads,
         }
@@ -50,48 +51,38 @@ pub struct DatasetRestoreReport {
 }
 
 pub fn export_dataset(
-    store: &Store,
-    revision: u64,
+    snapshot: &Snapshot,
     format: DatasetBackupFormat,
 ) -> StoreResult<DatasetBackupArtifact> {
-    let payload = store.dump_to_writer(format.into_oxigraph(), Vec::new())?;
-    let stats = collect_stats(store)?;
-
+    let quads = decoded_quads(snapshot, &QuadPattern::all()).collect::<StoreResult<Vec<_>>>()?;
+    let payload = serialize_quads(format.rdf_format(), quads)?;
     Ok(DatasetBackupArtifact {
         format,
         media_type: format.media_type(),
         checksum_sha256: sha256_hex(&payload),
         payload,
-        source_revision: revision,
-        quad_count: stats.quad_count as u64,
+        source_revision: snapshot.revision(),
+        quad_count: snapshot.len(),
     })
 }
 
-pub fn restore_dataset(
-    store: &Store,
+/// Replaces the whole dataset with the artifact's quads. The artifact is parsed completely
+/// before the transaction is touched, so an invalid artifact changes nothing.
+pub(crate) fn apply_restore(
+    tx: &mut Transaction<'_>,
     request: &DatasetRestoreRequest,
-    next_revision: u64,
 ) -> StoreResult<DatasetRestoreReport> {
-    let checksum_sha256 = sha256_hex(&request.payload);
-    let current_stats = collect_stats(store)?;
-    let replaced_existing = !current_stats.is_empty;
-
-    // Validate and parse the whole artifact before touching the live store.
-    let validation_store = Store::new()?;
-    validation_store.load_from_slice(request.format.into_oxigraph(), &request.payload)?;
-
-    let mut transaction = store.start_transaction()?;
-    transaction.clear()?;
-    transaction.load_from_slice(request.format.into_oxigraph(), &request.payload)?;
-    transaction.commit()?;
-
-    let restored_stats = collect_stats(store)?;
-
+    let quads = parse_dataset(request.format.rdf_format(), &request.payload)?;
+    let replaced_existing = !tx.is_empty();
+    tx.remove_matching(&QuadPattern::all());
+    for quad in &quads {
+        tx.insert(quad.as_ref());
+    }
     Ok(DatasetRestoreReport {
         format: request.format,
-        checksum_sha256,
-        revision: next_revision,
-        quad_count: restored_stats.quad_count as u64,
+        checksum_sha256: sha256_hex(&request.payload),
+        revision: 0,
+        quad_count: tx.len(),
         replaced_existing,
     })
 }

@@ -63,11 +63,13 @@ Current behavior:
 - `server.deployment_posture` / `NRESE_DEPLOYMENT_POSTURE` is now the explicit deployment-mode selector for `open-workbench`, `read-only-demo`, `internal-authenticated`, and `replacement-grade`.
 - Startup validation now rejects invalid `internal-authenticated` / `replacement-grade` combinations instead of silently serving them.
 
-Durable storage build note:
+Durable storage note:
 
-- `on-disk` mode requires building with `--features durable-storage`.
-- On Windows, the current RocksDB dependency chain may require a working `libclang`/LLVM installation for `bindgen`.
-- If the durable feature is not compiled in, `NRESE_STORE_MODE=on-disk` will fail fast with a typed startup error instead of silently downgrading.
+- `NRESE_STORE_MODE=on-disk` stores a write-ahead log and checkpoints under `NRESE_DATA_DIR`.
+  - It needs no build feature and no native toolchain.
+  - Every commit is synced before it is acknowledged.
+- The data directory is locked. A second server on the same directory fails at startup with a clear error.
+- Checkpoints run in the background and delete the WAL segments they cover. For backups, use `/admin/dataset/backup` (or copy the directory while the server is stopped).
 
 External exposure note:
 

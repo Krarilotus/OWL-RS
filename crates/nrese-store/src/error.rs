@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
-use oxigraph::io::RdfParseError;
-use oxigraph::sparql::{QueryEvaluationError, SparqlSyntaxError, UpdateEvaluationError};
-use oxigraph::store::{LoaderError, SerializerError, StorageError};
+use nrese_engine::EngineError;
+use nrese_sparql::{QueryEvaluationError, UpdateError};
+use oxrdfio::RdfParseError;
+use spargebra::SparqlSyntaxError;
 use thiserror::Error;
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -11,26 +12,20 @@ pub type StoreResult<T> = Result<T, StoreError>;
 pub enum StoreError {
     #[error("invalid store configuration: {0}")]
     Configuration(String),
-    #[error("on-disk mode requires the `durable-storage` feature")]
-    DurableStorageFeatureDisabled,
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("storage error: {0}")]
-    Storage(#[from] StorageError),
-    #[error("loader error: {0}")]
-    Loader(#[from] LoaderError),
+    #[error("storage engine error: {0}")]
+    Engine(#[from] EngineError),
     #[error("SPARQL syntax error: {0}")]
     SparqlSyntax(#[from] SparqlSyntaxError),
     #[error("SPARQL evaluation error: {0}")]
     SparqlEvaluation(#[from] QueryEvaluationError),
-    #[error("SPARQL update evaluation error: {0}")]
-    SparqlUpdateEvaluation(#[from] UpdateEvaluationError),
+    #[error("SPARQL update error: {0}")]
+    SparqlUpdate(#[from] UpdateError),
     #[error("invalid graph IRI: {0}")]
     InvalidGraphIri(String),
     #[error("RDF parse error: {0}")]
     RdfParse(#[from] RdfParseError),
-    #[error("RDF serialization error: {0}")]
-    RdfSerialize(#[from] SerializerError),
     #[error("configured ontology file does not exist: {}", path.display())]
     OntologyFileNotFound { path: PathBuf },
 }

@@ -8,14 +8,28 @@ NRESE is a Rust RDF database under active redesign. The goal is a store that **r
 - **Decisions:** [docs/adr/](docs/adr/)
 - **Document index (German):** [Spezifikation.md](Spezifikation.md)
 
-## Current state (engine v1)
+## Current state (engine v2 storage, v1 reasoner)
 
-The running code is **v1**: an HTTP server over the Oxigraph store with SPARQL query/update, the Graph Store Protocol, `TELL` ingest, a bounded rule reasoner used as a write gate (`rules-mvp`), auth modes, deployment postures, an operator UI (`/ops`), a user console (`/console`) and a comparison harness.
+The server runs on **NRESE's own storage engine** (`nrese-engine`, [ADR-0002](docs/adr/0002-engine-storage-lsm-permutations.md)) with SPARQL 1.1 from `nrese-sparql` (spareval over engine snapshots). It offers:
+- SPARQL query and update, the Graph Store Protocol, and `TELL` ingest
+- a bounded rule reasoner used as a write gate (`rules-mvp`)
+- auth modes and deployment postures
+- an operator UI (`/ops`) and a user console (`/console`)
+- a comparison harness
 
-Known v1 limits, all addressed by the roadmap's Milestone 1 (engine v2):
-- Writes cost time proportional to the dataset size (the write path copies the dataset for validation).
-- The reasoner only sees triples between IRIs, and its inferences can't be queried (`asserted-only`).
-- The revision counter isn't persisted; durable mode needs RocksDB (and libclang on Windows).
+Measured over HTTP at 10 M triples (details in [benches/baselines/](benches/baselines/README.md)):
+
+| Metric | In memory | On disk (fsync per commit) | v1, for comparison |
+|---|---|---|---|
+| One-triple insert, p50 | 0.2 ms | 2.0 ms | 3 s at 1 M |
+| HTTP load throughput | ~430 k triples/s | ~400 k triples/s | — |
+
+Durable storage needs no native toolchain. The revision is persistent, and recovery after a crash restores the last acknowledged commit.
+
+Known limits, addressed by later milestones:
+- **v1 reasoner:** it only sees triples between IRIs, its inferences can't be queried, and when enabled (`rules-mvp`) it reads the whole dataset on every write. Milestone 3 replaces it.
+- **Memory:** indexes are held in memory at about 190 bytes per quad; compression and on-disk runs are Pf1/Pf2.
+- **Behaviour changes from v1:** literal lexical forms are kept exactly as written, and a named graph exists only while it holds quads. See ADR-0002.
 
 Already fixed on the way (Milestone 0):
 - A write that reports a timeout is guaranteed not to be committed.
@@ -197,13 +211,12 @@ The helper:
 ### Run With Durable Storage
 
 ```powershell
-cargo run -p nrese-server --features durable-storage
+$env:NRESE_STORE_MODE = "on-disk"
+$env:NRESE_DATA_DIR = "./data"
+cargo run -p nrese-server
 ```
 
-Note:
-
-- durable storage support exists behind a feature flag
-- on Windows, RocksDB-related dependencies may require a working LLVM / `libclang` toolchain
+On-disk mode is always available. It writes a WAL plus checkpoints under `NRESE_DATA_DIR`, locks the directory against a second process, and recovers the last committed revision on start.
 
 ## Development
 

@@ -1,7 +1,7 @@
 //! Write transactions: an exact delta over a base snapshot, published atomically on commit.
 
 use hashbrown::HashSet;
-use oxrdf::{QuadRef, Term, TermRef};
+use oxrdf::{Quad, QuadRef, Term, TermRef};
 use parking_lot::MutexGuard;
 
 use super::{Inner, Snapshot, Version};
@@ -67,6 +67,16 @@ impl<'e> Transaction<'e> {
         (self.inserts.len(), self.deletes.len())
     }
 
+    /// Pending inserts: quads absent from the base that the commit would add.
+    pub fn inserted(&self) -> impl Iterator<Item = EncodedQuad> + '_ {
+        self.inserts.iter().copied()
+    }
+
+    /// Pending deletes: quads present in the base that the commit would remove.
+    pub fn deleted(&self) -> impl Iterator<Item = EncodedQuad> + '_ {
+        self.deletes.iter().copied()
+    }
+
     pub fn contains(&self, quad: &EncodedQuad) -> bool {
         self.inserts.contains(quad) || (!self.deletes.contains(quad) && self.base.contains(quad))
     }
@@ -122,6 +132,10 @@ impl<'e> Transaction<'e> {
     /// Id of `term` if it is known. Includes terms interned by this transaction.
     pub fn lookup(&self, term: TermRef<'_>) -> Option<TermId> {
         self.engine.shared.dictionary.lookup(term)
+    }
+
+    pub fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
+        self.engine.shared.dictionary.decode_quad(quad)
     }
 
     pub fn decode(&self, id: TermId) -> Option<Term> {

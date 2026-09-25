@@ -5,7 +5,7 @@
 //! [`ReadView`], and everything above this module is written once against the trait.
 
 use nrese_engine::{EncodedQuad, QuadPattern, Snapshot, TermId, Transaction};
-use oxrdf::{Term, TermRef};
+use oxrdf::{Quad, Term, TermRef};
 
 pub trait ReadView {
     /// Quads matching `pattern`. The iterator borrows the view, not the pattern.
@@ -24,6 +24,9 @@ pub trait ReadView {
     fn lookup(&self, term: TermRef<'_>) -> Option<TermId>;
 
     fn decode(&self, id: TermId) -> Option<Term>;
+
+    /// Decodes a quad read from this view; `None` only for ids the view doesn't know.
+    fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad>;
 }
 
 impl ReadView for Snapshot {
@@ -49,6 +52,10 @@ impl ReadView for Snapshot {
     fn decode(&self, id: TermId) -> Option<Term> {
         Snapshot::decode(self, id)
     }
+
+    fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
+        Snapshot::decode_quad(self, quad)
+    }
 }
 
 impl<'e> ReadView for Transaction<'e> {
@@ -73,5 +80,9 @@ impl<'e> ReadView for Transaction<'e> {
 
     fn decode(&self, id: TermId) -> Option<Term> {
         Transaction::decode(self, id)
+    }
+
+    fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
+        Transaction::decode_quad(self, quad)
     }
 }

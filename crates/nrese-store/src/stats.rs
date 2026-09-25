@@ -1,6 +1,4 @@
-use oxigraph::store::Store;
-
-use crate::error::StoreResult;
+use nrese_engine::Snapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreStats {
@@ -9,19 +7,11 @@ pub struct StoreStats {
     pub is_empty: bool,
 }
 
-pub fn collect_stats(store: &Store) -> StoreResult<StoreStats> {
-    let quad_count = store.len()?;
-    let is_empty = store.is_empty()?;
-    let mut named_graph_count = 0usize;
-
-    for graph in store.named_graphs() {
-        graph?;
-        named_graph_count += 1;
+/// O(1) for the counts plus O(g log n) for listing g named graphs.
+pub fn collect_stats(snapshot: &Snapshot) -> StoreStats {
+    StoreStats {
+        quad_count: snapshot.len() as usize,
+        named_graph_count: snapshot.named_graphs().count(),
+        is_empty: snapshot.is_empty(),
     }
-
-    Ok(StoreStats {
-        quad_count,
-        named_graph_count,
-        is_empty,
-    })
 }

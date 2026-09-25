@@ -1,123 +1,82 @@
-use oxigraph::io::{RdfParser, RdfSerializer};
-use oxigraph::model::{GraphNameRef, NamedNode};
-use oxigraph::store::{Store, Transaction};
+//! SPARQL 1.1 Graph Store Protocol operations: read from a view, write into a transaction.
 
-use crate::error::{StoreError, StoreResult};
+use nrese_engine::Transaction;
+use nrese_sparql::ReadView;
+
+use crate::error::StoreResult;
 use crate::graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
 };
-use crate::rdf_io::parser_for_graph_format;
+use crate::rdf_io::{BlankNodes, parse_graph, serialize_triples};
+use crate::view::decoded_quads;
 
 pub fn execute_graph_read(
-    store: &Store,
+    view: &impl ReadView,
     request: &GraphReadRequest,
 ) -> StoreResult<GraphReadResult> {
-    let mut writer =
-        RdfSerializer::from_format(request.format.into_oxigraph()).for_writer(Vec::new());
-
-    match &request.target {
-        GraphTarget::DefaultGraph => {
-            for quad in store.quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph))
-            {
-                writer.serialize_triple(quad?.as_ref())?;
-            }
-        }
-        GraphTarget::NamedGraph(iri) => {
-            let named = parse_named_graph_iri(iri)?;
-            for quad in store.quads_for_pattern(None, None, None, Some(named.as_ref().into())) {
-                writer.serialize_triple(quad?.as_ref())?;
-            }
-        }
-    }
-
+    let triples = match request.target.pattern_in(view)? {
+        Some(pattern) => decoded_quads(view, &pattern)
+            .map(|quad| quad.map(Into::into))
+            .collect::<StoreResult<Vec<_>>>()?,
+        None => Vec::new(),
+    };
     Ok(GraphReadResult {
         media_type: request.format.media_type(),
-        payload: writer.finish()?,
+        payload: serialize_triples(request.format, triples)?,
     })
 }
 
-pub fn execute_graph_write(
-    store: &Store,
+/// Adds (or, with `replace`, substitutes) the payload's triples in the target graph. The
+/// payload is parsed completely before the transaction is touched.
+pub(crate) fn apply_graph_write(
+    tx: &mut Transaction<'_>,
     request: &GraphWriteRequest,
 ) -> StoreResult<GraphWriteReport> {
-    let parser = parser_for_target(request)?;
-    let created = target_will_be_created(store, &request.target)?;
-    let mut transaction = store.start_transaction()?;
-
-    if request.replace {
-        clear_target_graph_in_transaction(&mut transaction, &request.target)?;
+    let quads = parse_graph(
+        request.format,
+        request.base_iri.as_deref(),
+        request.payload.as_slice(),
+        request.target.graph_name()?,
+        BlankNodes::Fresh,
+    )?;
+    let existing = request.target.pattern_in(&*tx)?;
+    let created = match (&request.target, existing) {
+        (GraphTarget::DefaultGraph, _) => false,
+        (GraphTarget::NamedGraph(_), Some(pattern)) => {
+            tx.quads_for_pattern(&pattern).next().is_none()
+        }
+        (GraphTarget::NamedGraph(_), None) => true,
+    };
+    let before = tx.pending();
+    if request.replace
+        && let Some(pattern) = existing
+    {
+        tx.remove_matching(&pattern);
     }
-
-    transaction.load_from_slice(parser, request.payload.as_slice())?;
-    transaction.commit()?;
-
+    for quad in &quads {
+        tx.insert(quad.as_ref());
+    }
     Ok(GraphWriteReport {
         target: request.target.clone(),
-        modified: true,
-        created,
+        // Net change: replacing a graph with identical content modifies nothing.
+        modified: tx.pending() != before,
+        created: created && !quads.is_empty(),
         revision: 0,
     })
 }
 
-pub fn execute_graph_delete(store: &Store, target: &GraphTarget) -> StoreResult<GraphDeleteReport> {
-    match target {
-        GraphTarget::DefaultGraph => {
-            store.clear_graph(GraphNameRef::DefaultGraph)?;
-        }
-        GraphTarget::NamedGraph(iri) => {
-            let named = parse_named_graph_iri(iri)?;
-            store.remove_named_graph(named.as_ref())?;
-        }
-    }
-
+pub(crate) fn apply_graph_delete(
+    tx: &mut Transaction<'_>,
+    target: &GraphTarget,
+) -> StoreResult<GraphDeleteReport> {
+    let removed = match target.pattern_in(&*tx)? {
+        Some(pattern) => tx.remove_matching(&pattern),
+        None => 0,
+    };
     Ok(GraphDeleteReport {
         target: target.clone(),
-        modified: true,
+        modified: removed > 0,
         revision: 0,
     })
-}
-
-fn clear_target_graph_in_transaction(
-    transaction: &mut Transaction<'_>,
-    target: &GraphTarget,
-) -> StoreResult<()> {
-    match target {
-        GraphTarget::DefaultGraph => transaction.clear_graph(GraphNameRef::DefaultGraph)?,
-        GraphTarget::NamedGraph(iri) => {
-            let named = parse_named_graph_iri(iri)?;
-            transaction.clear_graph(named.as_ref())?;
-        }
-    }
-
-    Ok(())
-}
-
-fn parser_for_target(request: &GraphWriteRequest) -> StoreResult<RdfParser> {
-    let parser = parser_for_graph_format(request.format, request.base_iri.as_deref())?
-        .without_named_graphs();
-
-    let parser = match &request.target {
-        GraphTarget::DefaultGraph => parser,
-        GraphTarget::NamedGraph(iri) => {
-            let named = parse_named_graph_iri(iri)?;
-            parser.with_default_graph(named.as_ref())
-        }
-    };
-
-    Ok(parser)
-}
-
-fn target_will_be_created(store: &Store, target: &GraphTarget) -> StoreResult<bool> {
-    match target {
-        GraphTarget::DefaultGraph => Ok(false),
-        GraphTarget::NamedGraph(iri) => {
-            let named = parse_named_graph_iri(iri)?;
-            Ok(!store.contains_named_graph(named.as_ref())?)
-        }
-    }
-}
-
-fn parse_named_graph_iri(iri: &str) -> StoreResult<NamedNode> {
-    NamedNode::new(iri).map_err(|_| StoreError::InvalidGraphIri(iri.to_owned()))
 }

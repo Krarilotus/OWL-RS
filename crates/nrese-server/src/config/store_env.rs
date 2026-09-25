@@ -33,12 +33,7 @@ fn parse_store_mode(input: Option<&str>) -> Result<StoreMode> {
     }
 }
 
-#[cfg(feature = "durable-storage")]
-const fn default_store_mode() -> StoreMode {
-    StoreMode::OnDisk
-}
-
-#[cfg(not(feature = "durable-storage"))]
+/// In-memory unless configured otherwise, so a bare `cargo run` never writes to disk.
 const fn default_store_mode() -> StoreMode {
     StoreMode::InMemory
 }

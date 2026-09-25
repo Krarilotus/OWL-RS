@@ -1,0 +1,56 @@
+{
+  "mode": "write-scaling",
+  "samples_per_step": 200,
+  "services": [
+    {
+      "label": "NRESE",
+      "base_url": "http://127.0.0.1:18600",
+      "steps": [
+        {
+          "triples": 10000,
+          "load_ms": 19,
+          "load_triples_per_sec": 526315,
+          "insert_p50_ms": 2,
+          "insert_max_ms": 6,
+          "insert_p50_us": 2037,
+          "insert_p99_us": 3753,
+          "insert_max_us": 6013,
+          "count_query_ms": 0
+        },
+        {
+          "triples": 100000,
+          "load_ms": 189,
+          "load_triples_per_sec": 476190,
+          "insert_p50_ms": 2,
+          "insert_max_ms": 4,
+          "insert_p50_us": 2021,
+          "insert_p99_us": 3795,
+          "insert_max_us": 4380,
+          "count_query_ms": 3
+        },
+        {
+          "triples": 1000000,
+          "load_ms": 2175,
+          "load_triples_per_sec": 413793,
+          "insert_p50_ms": 2,
+          "insert_max_ms": 3,
+          "insert_p50_us": 2054,
+          "insert_p99_us": 2570,
+          "insert_max_us": 3888,
+          "count_query_ms": 37
+        },
+        {
+          "triples": 10000000,
+          "load_ms": 22466,
+          "load_triples_per_sec": 400605,
+          "insert_p50_ms": 2,
+          "insert_max_ms": 3,
+          "insert_p50_us": 2048,
+          "insert_p99_us": 3859,
+          "insert_max_us": 3948,
+          "count_query_ms": 367
+        }
+      ]
+    }
+  ]
+}
