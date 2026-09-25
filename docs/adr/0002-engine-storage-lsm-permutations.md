@@ -50,6 +50,10 @@ State of the art considered:
   - A single commit is capped at 4 GiB of WAL payload (about 130 M quads); larger loads go through the bulk loader (E5).
 - **Dictionary continuity.** Terms interned by aborted transactions stay in the dictionary and are logged with the next commit. This keeps logged ids one contiguous range, so replay is deterministic. Unused terms are a later GC concern; they're never visible as data.
 - **Platform.** On Unix, renames and segment creation are followed by a directory `fsync`. Windows can't open directories as files, so that step is skipped there and NTFS metadata journaling is relied on instead.
+- **Second stack (E6).** A version holds an asserted stack and an inferred stack (decision D2). Both use the same run, merge and compaction code. A stack's `Layout` decides which permutations its runs hold:
+  - The inferred stack holds default-graph quads only, so it keeps SPOG/POSG/OSPG.
+  - Graph-first plans over the inferred stack are rotated to the matching graph-last permutation, or answered as empty for named graphs.
+  - Disjointness of the two stacks keeps the materialised count an O(1) sum, and lets scans concatenate the stacks without deduplication.
 
 ## Observable differences from v1 (Oxigraph), confirmed by differential tests
 

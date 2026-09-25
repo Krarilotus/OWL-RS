@@ -8,6 +8,8 @@
 //!   them, which is the whole MVCC mechanism.
 //! - **Compaction** replaces a window of runs by their merge
 //!   ([`IndexVersion::with_compacted`]); the window choice is in [`compaction`].
+//! - **Layouts** ([`Layout`]): the asserted stack holds arbitrary quads in six permutations;
+//!   the inferred stack holds default-graph quads only and needs three.
 //!
 //! Ownership: this module owns the physical layout and visibility rule. It knows nothing
 //! about terms, transactions or durability.
@@ -27,16 +29,68 @@ use crate::term::TermId;
 
 pub use compaction::CompactionPolicy;
 
+/// Which quads a stack of runs may hold, and therefore which permutations it maintains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Layout {
+    /// Any quads, in all six permutations.
+    #[default]
+    Quads,
+    /// Default-graph quads only (the inferred stack), in SPOG, POSG and OSPG. A graph-first
+    /// order over one constant graph sorts exactly like the matching graph-last order, so
+    /// the graph-first permutations would be redundant copies.
+    DefaultGraph,
+}
+
+impl Layout {
+    pub(crate) const fn permutations(self) -> &'static [Permutation] {
+        match self {
+            Self::Quads => &Permutation::ALL,
+            Self::DefaultGraph => &[Permutation::Spog, Permutation::Posg, Permutation::Ospg],
+        }
+    }
+
+    /// The plan that answers `plan` over this layout, or `None` if no quad the layout can
+    /// hold matches it.
+    fn adapt(self, plan: &AccessPlan) -> Option<AccessPlan> {
+        if self == Self::Quads {
+            return Some(*plan);
+        }
+        if plan.exclude_default_graph {
+            return None;
+        }
+        let Some(permutation) = plan.permutation.graph_last() else {
+            return Some(*plan); // graph-last plans never bind the graph
+        };
+        let default = TermId::DEFAULT_GRAPH.raw();
+        // Graph-first plans come from an exact graph (or "all named graphs"); only the
+        // default graph can match. Rotate the graph from the front to the back.
+        (plan.low[0] == default && plan.high[0] == default).then_some(AccessPlan {
+            permutation,
+            low: [plan.low[1], plan.low[2], plan.low[3], default],
+            high: [plan.high[1], plan.high[2], plan.high[3], default],
+            exclude_default_graph: false,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IndexVersion {
+    layout: Layout,
     runs: Arc<[Arc<Run>]>,
     len: u64,
 }
 
 impl IndexVersion {
+    pub(crate) fn empty(layout: Layout) -> Self {
+        Self {
+            layout,
+            ..Self::default()
+        }
+    }
+
     /// A version holding exactly the (deduplicated) `quads` in one base run.
-    pub(crate) fn from_quads(quads: Vec<EncodedQuad>) -> Self {
-        Self::default().with_run(Run::from_quads(quads))
+    pub(crate) fn from_quads(layout: Layout, quads: Vec<EncodedQuad>) -> Self {
+        Self::empty(layout).with_run(Run::from_quads(layout, quads))
     }
 
     /// Number of visible quads. O(1).
@@ -76,6 +130,13 @@ impl IndexVersion {
     }
 
     fn scan_plan(&self, plan: &AccessPlan) -> QuadScan<'_> {
+        let Some(plan) = self.layout.adapt(plan) else {
+            return QuadScan {
+                merge: SignedMerge::new(std::iter::empty()),
+                permutation: plan.permutation,
+                exclude_default_graph: false,
+            };
+        };
         let parts = self.runs.iter().map(|run| {
             let perm = run.permutation(plan.permutation);
             let (start, end) = perm.range(&plan.low, &plan.high);
@@ -93,12 +154,17 @@ impl IndexVersion {
         if run.entries() == 0 {
             return self.clone();
         }
+        debug_assert_eq!(run.layout(), self.layout, "run built for another stack");
         let len = self
             .len
             .checked_add_signed(run.net())
             .expect("exact delta can't make the quad count negative");
         let runs = self.runs.iter().cloned().chain([Arc::new(run)]).collect();
-        Self { runs, len }
+        Self {
+            layout: self.layout,
+            runs,
+            len,
+        }
     }
 
     /// A new version where the runs in `window` are replaced by `merged`, which must be
@@ -111,6 +177,7 @@ impl IndexVersion {
             .chain(self.runs[window.end..].iter().cloned())
             .collect();
         Self {
+            layout: self.layout,
             runs,
             len: self.len,
         }

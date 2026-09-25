@@ -17,7 +17,10 @@ use super::SyncPolicy;
 use super::codec::{CommitRecord, Frame, decode_frame, encode_record};
 use crate::error::{EngineError, EngineResult};
 
-const SEGMENT_MAGIC: &[u8; 8] = b"NRESEWL1";
+/// Version 2 added the inferred stack to commit records (roadmap E6).
+const SEGMENT_MAGIC: &[u8; 8] = b"NRESEWL2";
+/// Magic prefix shared by every WAL format version.
+const SEGMENT_FAMILY: &[u8; 7] = b"NRESEWL";
 
 pub(crate) fn wal_dir(root: &Path) -> PathBuf {
     root.join("wal")
@@ -65,6 +68,9 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
         });
     }
     if &bytes[..SEGMENT_MAGIC.len()] != SEGMENT_MAGIC {
+        if bytes.starts_with(SEGMENT_FAMILY) {
+            return Err(EngineError::UnsupportedFormat(path.to_path_buf()));
+        }
         return Err(EngineError::Corruption(format!(
             "{} is not a WAL segment",
             path.display()

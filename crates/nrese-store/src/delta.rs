@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use nrese_engine::{EncodedQuad, Transaction};
+use nrese_engine::{EncodedQuad, QuadPattern, ReadModel, Transaction};
 use oxrdf::{NamedOrBlankNode, Quad, Term};
 
 use crate::error::StoreResult;
@@ -67,10 +67,13 @@ pub(crate) fn gate_snapshot(
     reasoning_reads_triples: bool,
 ) -> StoreResult<StoreDatasetSnapshot> {
     if !reasoning_reads_triples {
-        return Ok(StoreDatasetSnapshot::summary(revision, tx.len()));
+        return Ok(StoreDatasetSnapshot::summary(
+            revision,
+            tx.len_in(ReadModel::Asserted),
+        ));
     }
     StoreDatasetSnapshot::capture(
-        crate::view::decoded_quads(tx, &nrese_engine::QuadPattern::all()),
+        crate::view::decoded_quads(tx, ReadModel::Asserted, &QuadPattern::all()),
         revision,
     )
 }

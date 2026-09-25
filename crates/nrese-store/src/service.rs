@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use nrese_engine::{Engine, EngineConfig, QuadPattern};
+use nrese_engine::{Engine, EngineConfig, QuadPattern, ReadModel};
 use nrese_sparql::CancellationToken;
 
 use crate::backup::{
@@ -88,11 +88,11 @@ impl StoreService {
         export_dataset(&self.engine.snapshot(), format)
     }
 
-    /// The whole dataset in the v1 reasoner's string form. O(dataset).
+    /// The asserted dataset in the v1 reasoner's string form. O(dataset).
     pub fn dataset_snapshot(&self) -> StoreResult<StoreDatasetSnapshot> {
         let snapshot = self.engine.snapshot();
         StoreDatasetSnapshot::capture(
-            decoded_quads(&snapshot, &QuadPattern::all()),
+            decoded_quads(&snapshot, ReadModel::Asserted, &QuadPattern::all()),
             snapshot.revision(),
         )
     }

@@ -277,6 +277,50 @@ fn terms_from_aborted_transactions_keep_the_dictionary_contiguous() {
     assert!(!contains(label(200)));
 }
 
+/// Files of an older format version are reported as such, not as corruption, so operators
+/// know to reload rather than to restore from backup.
+#[test]
+fn older_format_versions_are_rejected_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Engine::open(dir.path(), config()).unwrap());
+    fs::write(
+        dir.path().join("wal").join("00000000000000000001.wal"),
+        b"NRESEWL1",
+    )
+    .unwrap();
+    let error = Engine::open(dir.path(), config()).unwrap_err();
+    assert!(
+        matches!(error, EngineError::UnsupportedFormat(_)),
+        "{error}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut old_checkpoint = b"NRESECK1".to_vec();
+    old_checkpoint.extend_from_slice(&crc32(&old_checkpoint).to_le_bytes());
+    fs::write(
+        dir.path().join("checkpoint-00000000000000000001.nck"),
+        old_checkpoint,
+    )
+    .unwrap();
+    let error = Engine::open(dir.path(), config()).unwrap_err();
+    assert!(
+        matches!(error, EngineError::UnsupportedFormat(_)),
+        "{error}"
+    );
+}
+
+/// CRC-32 (IEEE), bitwise; only used to frame a hand-written test file.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
 #[test]
 fn a_directory_can_only_be_opened_once() {
     let dir = tempfile::tempdir().unwrap();
