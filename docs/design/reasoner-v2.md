@@ -70,15 +70,53 @@ ruleset (data) ─► Rule IR ─► analysis ─► schema compiler ───�
 - `nrese-store` places the reasoner in the pipeline.
 - `nrese-sparql` exposes the read models.
 
-### 2.1 Where reasoning runs
+### 2.1 Where reasoning runs (the default: `timing = commit`)
 
-Reasoning runs **inside the commit** (pipeline step 3), not after it. The inferred delta is committed together with the asserted delta, under the same revision.
+By default, reasoning runs **inside the commit** (pipeline step 3). The inferred delta is committed together with the asserted delta, under the same revision.
 
 - **Read-your-writes holds for inferences**, as in GraphDB.
 - **A consistency violation rejects the write** before anything is published.
 - **Recovery never re-reasons.** The WAL record carries both deltas.
 
 The exception is large TBox changes over big extensions. When the planned work exceeds a configured budget, they run as a **reasoning job**: a long transaction that holds the writer slot, is visible in operator status and can be cancelled. Its cost is reported (T7), and it never falls back silently.
+
+Other timings are configurable (§2.2).
+
+### 2.2 What is fixed and what is configured
+
+What reasoning is needed, when it runs and what a reader sees depend on the use case. So the reasoner is **configured, not hard-wired**.
+- **Defaults** are the tuned fast path, and the §1.2 targets are measured on them.
+- **Other modes** are supported and tested, and their extra cost is documented.
+- **Configuration is parsed and validated at startup.** Unknown or contradictory settings are errors, never silent fallbacks.
+
+**Fixed invariants.** Correctness depends on these, so they don't vary:
+- **Asserted and inferred statements are stored separately and never overlap.** An explicit statement that is also derivable counts as explicit. Without this, the read models can't be correct.
+- **Whatever reasoning a commit performs is atomic with it:** both stacks, one revision, one WAL record.
+- **Inferences are always derivable from the asserted data.** They can't be written or retracted directly; retracting an asserted statement leaves re-derivation to the reasoner.
+
+**Repository settings** (a *reasoning profile*; defaults first):
+
+| Setting | Options | Notes |
+|---|---|---|
+| `ruleset` | `none`, `rdfs`, `rdfs-plus`, `owl-horst`, `owl2-rl`, `owl2-ql`, or a custom `.pie`/IR program | `none` costs nothing: no reasoning stage and an empty inferred stack |
+| `timing` | **`commit`**, `deferred`, `on-demand` | `deferred`: writes don't wait, and a background reasoner commits inferred-only revisions. Readers can require the inferences to have caught up with a given revision. `on-demand`: materialisation only when triggered (API or operator), for batch pipelines. Changing the timing of a populated repository runs a reasoning job. |
+| `consistency` | **`reject`**, `report`, `off` | `reject` requires `timing = commit`. Under `deferred`, violations are reported against the revision that caused them. |
+| `placement` | **`default-graph`**, `graph:<IRI>`, `source-graph` | Where inferences live and which graphs rules range over. The first two put inferences in one graph and read rules over the union of graphs (GraphDB); the inferred stack keeps three permutations. `source-graph` evaluates rules per named graph and keeps inferences there (RDFox/Stardog style); the inferred stack then needs six permutations, doubling its memory. Fixed at repository creation, because it sets the stack layout. |
+| `same_as` | **`rewrite`**, `off` | `rewrite` stores representatives and expands them at read time (§4.4) |
+| `maintenance` | **`auto`**, `dred`, `bf`, `counting` | For experts and benchmarks; `auto` chooses per stratum (§5) |
+| `axioms` | **`partial`**, `full` | GraphDB's `partialRDFS` distinction (§6.3) |
+| `tbox_job_budget` | a work estimate | Above it, TBox changes run as reasoning jobs (§2.1) |
+
+**Per request:**
+- **Read model:** `materialised` (default), `asserted` or `inferred`. Selected by an HTTP parameter (RDF4J's `infer=false` maps to `asserted`) or by the pseudo-graphs `onto:explicit` / `onto:implicit`.
+- **Explanations:** proofs for results or rejects.
+- **Freshness under `deferred`:** "wait until inferences cover revision r" (default: don't wait).
+
+**Per operation:**
+- **Bulk load:** `--reason` materialises through the batch executor. `--validate` runs the gates (SHACL, consistency) over the result. The default is a raw load, which marks the repository as needing reasoning when a ruleset is configured.
+- **Backup:** `--include-inferred` exports the inferred stack too, so a restore doesn't re-derive it. The default is asserted only.
+
+Every setting appears in operator diagnostics (the active profile, and the inference freshness under `deferred`). Each non-default mode has its own tests in the §7 evidence suite.
 
 ---
 
@@ -169,7 +207,9 @@ Used for typical interactive writes, where Δ is between 1 and ~10⁴ facts.
   - A union scan merges two disjoint sorted streams and never needs to deduplicate.
   - An explicit statement that is also derivable counts as explicit, as in GraphDB.
   - Deleting an asserted fact that is still derivable moves it into the inferred stack. The maintenance step does this (§5).
-- **Triples in one fixed graph.** Inferences live in the default graph (GraphDB semantics), so the inferred stack needs only **three permutations** (SPO, POS, OSP) instead of six. That halves its memory (T8) at the same key width; key-width specialisation and Pf1 compression reduce it further.
+- **The layout follows `placement` (§2.2).**
+  - `default-graph` and `graph:<IRI>` keep inferences in one constant graph, so the stack needs only **three permutations** (SPO, POS, OSP) instead of six. That halves its memory (T8) at the same key width; key-width specialisation and Pf1 compression reduce it further. E6 implements the default-graph case; generalising it to any single graph is part of R4.
+  - `source-graph` uses the six-permutation quad layout, which the engine already supports for the asserted stack.
 - **One `Version` holds both stacks.**
   - A commit publishes the asserted and inferred deltas atomically under one revision.
   - The WAL record and checkpoint carry both, and recovery never needs the reasoner.
@@ -233,8 +273,9 @@ Generic semi-naive evaluation of transitive or equality rules makes O(n·closure
 
 ### 6.2 Graph semantics
 
-- Rules match over the **union of all graphs**, and inferences go to the default graph. This is GraphDB's behaviour, and it's what ResearchSpace and DMW expect.
-- The IR's atoms keep room for a graph term. **Per-graph reasoning**, where inferences stay in the source graph (RDFox and Stardog style), is a stretch option (R8), not a default.
+- **Default (`placement = default-graph`):** rules match over the **union of all graphs**, and inferences go to the default graph. This is GraphDB's behaviour.
+- **`graph:<IRI>`** is the same, with inferences in a dedicated named graph.
+- **`source-graph`:** rules are evaluated per named graph, and inferences stay in the graph whose statements derived them. Schema statements can be shared from a configured set of graphs. The IR's atoms carry a graph term for this (R9).
 
 ### 6.3 Deliberate differences, each pinned by a test
 
@@ -287,16 +328,17 @@ Generic semi-naive evaluation of transitive or equality rules makes O(n·closure
 | WP | Scope | Size | Done when |
 |---|---|---|---|
 | **R0 Engine: inferred stack** | Second index stack in `Version` (three permutations), atomic dual-stack commits, WAL and checkpoint format carrying both stacks, separate inferred-write API on the transaction, bulk run install. **Pulled forward into M1 as E6**, while the v2 on-disk format has no deployments to migrate. | M | Engine model tests cover both stacks; crash tests recover both; the stack disjointness invariant is enforced in debug builds |
-| **R1 Rule IR, analysis, rulesets** | IR, analysis (SCCs, strata, schema atoms), built-in rulesets as data, `.pie` import/export, **naive reference evaluator** | M | `.pie` round-trip on GraphDB's published rulesets; the reference evaluator passes hand-written RDFS/RL fixtures |
+| **R1 Rule IR, analysis, rulesets, profile** | IR (atoms with a graph term), analysis (SCCs, strata, schema atoms), built-in rulesets as data, `.pie` import/export, **naive reference evaluator**; the reasoning-profile schema of §2.2, validated at startup | M | `.pie` round-trip on GraphDB's published rulesets; the reference evaluator passes hand-written RDFS/RL fixtures |
 | **R2 Schema compiler + batch executor** | TBox closure, specialisation, list-axiom compilation, the vertically partitioned working set, semi-naive evaluation, sort-merge and LFTJ joins, morsel parallelism, bulk install of the inferred stack | L | Batch equals naive (proptest); LUBM-1/10/100 counts equal GraphDB for all rulesets (T1); T3 and T4 recorded |
 | **R3 Modules** | Hierarchy, transitive, equality (rewriting plus read-time expansion), symmetric/inverse | M | Each module equals its generic rules; sameAs semantics tests; UOBM parity |
-| **R4 Read models + commit-path reasoning** | `ReadModel` in `ReadView`; `onto:explicit`/`onto:implicit`; per-request switch over HTTP; delta executor in the mutation pipeline with insert maintenance; stats | M | Query tests for all three models (audit F4 closed); T5 for inserts |
-| **R5 Truth maintenance** | DRed, then B/F / FBF; TBox deltas; sameAs maintenance; stack moves; reasoning jobs for large TBox changes; the counting evaluation | L | T6 in CI; T5 for deletes; T7 recorded |
-| **R6 Consistency + explanations** | Consistency rules, proof search, proof-carrying rejects, proof API; the v1 fixture suite on v2; **v1 `rules-mvp` deleted** | M | T2 and T9; v1 fixtures green on v2; `rules_mvp*` modules gone |
+| **R4 Read models + commit-path reasoning** | Per-request read model over HTTP (`infer`, `onto:explicit`/`onto:implicit`); delta executor in the mutation pipeline with insert maintenance (`timing = commit`); single-graph layout for any `graph:<IRI>` placement; `ruleset = none` as a zero-cost path; bulk load `--reason`; stats and diagnostics for the active profile | M | Query tests for all three models (audit F4 closed); T5 for inserts; `none` adds no measurable write cost |
+| **R5 Truth maintenance + timings** | DRed, then B/F / FBF (`maintenance` setting); TBox deltas; sameAs maintenance; stack moves; reasoning jobs for large TBox changes; `deferred` and `on-demand` timings with inference-freshness tracking; the counting evaluation | L | T6 in CI for every timing; T5 for deletes; T7 recorded; `deferred` reaches the same state as `commit` |
+| **R6 Consistency + explanations** | Consistency rules with the `consistency` setting (`reject`/`report`/`off`), proof search, proof-carrying rejects, proof API; the v1 fixture suite on v2; **v1 `rules-mvp` deleted** | M | T2 and T9; v1 fixtures green on v2; `rules_mvp*` modules gone |
 | **R7 RDF 1.2 triple terms** (D4) | `TermKind::Triple` (the dictionary key is three component ids), parsers/serialisers, SPARQL-star functions; no inference inside quoted triples (GraphDB semantics) | M | RDF 1.2 syntax and SPARQL tests |
-| **R8 Beyond GraphDB** (stretch, each an independent decision) | EL classification module (consequence-based, ELK-style: Kazakov, Krötzsch, Simančík, JAR 2014) for large terminologies like SNOMED; OWL 2 QL query rewriting (PerfectRef/Ontop style) as a zero-materialisation mode; per-graph reasoning | L each | Per item |
+| **R8 Beyond GraphDB** (stretch, each an independent decision) | EL classification module (consequence-based, ELK-style: Kazakov, Krötzsch, Simančík, JAR 2014) for large terminologies like SNOMED; OWL 2 QL query rewriting (PerfectRef/Ontop style) as a zero-materialisation mode | L each | Per item |
+| **R9 Graph-scoped reasoning** | `placement = source-graph`: per-graph rule evaluation, shared schema graphs, quad layout for the inferred stack, maintenance per graph | M | Per-graph results equal evaluating each graph separately; the memory cost is recorded |
 
-**Order:** R0 (as E6, now) → R1 → R2 → R3 → R4 → R5 → R6, with R7 anywhere in M3.
+**Order:** R0 (as E6, now) → R1 → R2 → R3 → R4 → R5 → R6, with R7 anywhere in M3. R9 follows R6, unless a ResearchSpace or DMW need moves it earlier.
 - R1 and the reference evaluator come before any optimised code, because they are the oracle (roadmap rule 2).
 - R4 comes before R5 so the product gets queryable inferences early. Until R5, deletes under reasoning use DRed through the batch executor: correct, but not yet fast.
 
