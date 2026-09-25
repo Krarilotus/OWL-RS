@@ -76,31 +76,14 @@ External exposure note:
 - In `mtls` mode, NRESE trusts authenticated client-certificate identity only through the documented trusted reverse-proxy header contract. It does not terminate client TLS certificates directly in-process in the current implementation.
 
 ### 5.2 Reliability and Storage Variables
-- `NRESE_SNAPSHOT_RETENTION` number of retained local snapshots.
-- `NRESE_BACKUP_DIR` path for scheduled backups.
-- `NRESE_BACKUP_INTERVAL` cron-like interval or duration.
-- `NRESE_BACKUP_COMPRESSION` `none|zstd|gzip`.
-- `NRESE_RECOVERY_MODE` `normal|replay|read-only`.
 
-### 5.3 Ontology Preload and Path Discovery
+There are no scheduled-backup or recovery-mode settings yet. Earlier versions of this document listed `NRESE_SNAPSHOT_RETENTION`, `NRESE_BACKUP_*` and `NRESE_RECOVERY_MODE`; none of them were ever implemented. Backups are taken through the admin API (see [backup-restore-drills.md](backup-restore-drills.md)). Checkpoint and WAL settings arrive with roadmap WP E4 and will be documented in [config-reference.md](config-reference.md), the only place config knobs are listed.
 
-`nrese-server` should resolve the ontology preload file in this order:
+### 5.3 Ontology Preload
 
-1. `NRESE_ONTOLOGY_PATH` (explicit override, highest priority)
-2. `../Ontology-Development/files/processed/rg_ontology.ttl` resolved from the `OWL-RS` working directory
-3. `../MEPHISTO/Ontology-Development/files/processed/rg_ontology.ttl` resolved from the `OWL-RS` working directory
-4. `../Ontology-Development/files/raw/rg_ontology.ttl` resolved from the `OWL-RS` working directory
-5. `../MEPHISTO/Ontology-Development/files/raw/rg_ontology.ttl` resolved from the `OWL-RS` working directory
-
-Current known local canonical processed path:
-
-- `C:\Users\Johannes\Documents\MEPHISTO\Ontology-Development\files\processed\rg_ontology.ttl`
-
-Startup behavior requirements:
-
-- If an explicit `NRESE_ONTOLOGY_PATH` is provided and missing, startup fails fast with a clear error.
-- If discovery is enabled and no fallback path exists, startup continues only if ontology preload is optional in the selected profile.
-- Readiness should remain `not ready` until required ontology preload has completed.
+- Set `NRESE_ONTOLOGY_PATH` (or `store.ontology_path`) to preload an ontology at startup.
+- If it is set and the file is missing, startup fails with a clear error.
+- If it is unset, nothing is preloaded. There are no implicit discovery or fallback paths, so the server behaves the same regardless of the working directory.
 
 ## 5.4 Local Test-Server Startup Example (PowerShell)
 

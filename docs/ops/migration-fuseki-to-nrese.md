@@ -1,5 +1,8 @@
 # Fuseki to NRESE Migration Runbook
 
+
+> **Scope note (2026-09-25):** Fuseki is no longer the parity target (ADR-0004). This runbook stays valid for moving *data* out of an existing Fuseki deployment into NRESE.
+
 ## Purpose
 
 This runbook defines a controlled migration path from Apache Fuseki to NRESE with explicit rollback safety.
@@ -31,8 +34,8 @@ Out of scope:
 - Fuseki dataset export snapshot (N-Quads preferred)
 - NRESE config bundle (`nrese.env`, config overrides, proxy config)
 - Query/update compatibility test set
-- Pilot migration report template (see `pilot-migration-report-template.md`)
-- Rollback runbook (see `rollback-runbook.md`)
+- Pilot migration report template (archived: `docs/archive/pilot-migration-report-template.md`)
+- Rollback runbook (archived: `docs/archive/fuseki-rollback-runbook.md`)
 
 ## Migration Phases
 
@@ -60,7 +63,7 @@ Acceptance:
 
 ## 3. Pilot Migration
 
-1. Execute pilot using the template from `pilot-migration-report-template.md`.
+1. Execute pilot using the template from `docs/archive/pilot-migration-report-template.md`.
 2. Route a controlled subset of client traffic to NRESE.
 3. Observe metrics, logs, and operator feedback for defined soak duration.
 4. Decide `promote` or `rollback` using agreed gates.
@@ -104,7 +107,7 @@ Immediate rollback is required when one or more conditions hold:
 
 Rollback execution:
 
-- follow `docs/ops/rollback-runbook.md`
+- follow `docs/archive/fuseki-rollback-runbook.md`
 
 ## Evidence Checklist
 

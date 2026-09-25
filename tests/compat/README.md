@@ -1,6 +1,6 @@
 # Compatibility Test Track
 
-This folder anchors compatibility-oriented validation assets for NRESE vs Fuseki behavior.
+This folder anchors compatibility-oriented validation assets for NRESE vs a reference engine (QLever, GraphDB or Fuseki; see ADR-0004).
 
 Current executable harness:
 
@@ -8,9 +8,9 @@ Current executable harness:
 
 Recommended usage:
 
-1. Start NRESE and Fuseki with equivalent dataset content.
+1. Start NRESE and the reference engine with equivalent dataset content.
 2. Run compatibility check:
-   - `cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- compat --nrese-base-url <NRESE> --fuseki-base-url <FUSEKI> --report-json artifacts/compat-report.json`
+   - `cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- compat --nrese-base-url <NRESE> --reference-kind <fuseki|graphdb|qlever> --reference-base-url <REFERENCE> --report-json artifacts/compat-report.json`
 3. Track mismatches by case name and add dedicated fixtures in `fixtures/compat/`.
 
 Supported comparators include:

@@ -1,110 +1,39 @@
 # NRESE
 
-NRESE is a Rust workspace for a semantic data server.
+NRESE is a Rust RDF database under active redesign. The goal is a store that **reads like QLever and governs data like GraphDB**: its own storage engine, materialised RDFS/OWL 2 RL reasoning, SHACL validation on commit, full-text search and the RDF4J protocol. It is built to serve ResearchSpace and the datamodel workflow.
 
-The project is intended to replace a Fuseki-based setup over time with a Rust-native codebase that covers:
+- **Architecture and ownership rules:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- **Plan:** [docs/ROADMAP.md](docs/ROADMAP.md)
+- **Status against QLever/GraphDB:** [docs/spec/06-target-capability-matrix.md](docs/spec/06-target-capability-matrix.md)
+- **Decisions:** [docs/adr/](docs/adr/)
+- **Document index (German):** [Spezifikation.md](Spezifikation.md)
 
-- SPARQL query and update handling
-- Graph Store HTTP operations
-- dataset storage and revision handling
-- bounded reasoning and consistency checks
-- an HTTP server and operator surface
-- a user-facing web console
+## Current state (engine v1)
 
-It is an active implementation project, not a finished replacement yet. The compact spec entry point is [Spezifikation.md](Spezifikation.md), and the binding replacement-status tracker is [docs/spec/06-fuseki-replacement-gap-matrix.md](docs/spec/06-fuseki-replacement-gap-matrix.md).
+The running code is **v1**: an HTTP server over the Oxigraph store with SPARQL query/update, the Graph Store Protocol, `TELL` ingest, a bounded rule reasoner used as a write gate (`rules-mvp`), auth modes, deployment postures, an operator UI (`/ops`), a user console (`/console`) and a comparison harness.
 
-## What Is In This Repository
+Known v1 limits, all addressed by the roadmap's Milestone 1 (engine v2):
+- Writes cost time proportional to the dataset size (the write path copies the dataset for validation).
+- The reasoner only sees triples between IRIs, and its inferences can't be queried (`asserted-only`).
+- The revision counter isn't persisted; durable mode needs RocksDB (and libclang on Windows).
 
-- `crates/nrese-core`
-  Shared types, contracts, and traits used across the workspace.
-- `crates/nrese-store`
-  Dataset storage, snapshot access, Graph Store behavior, SPARQL execution, and staging.
-- `crates/nrese-reasoner`
-  Rule execution, consistency checks, explanation payloads, and reasoning profiles.
-- `crates/nrese-server`
-  HTTP API, operator endpoints, policy handling, and runtime wiring.
-- `apps/nrese-console`
-  React/TypeScript user frontend for query, tell, update, graph, and AI-assisted query suggestion workflows.
-- `docs/spec`
-  Project specification, roadmap, and replacement gap tracking.
-- `docs/ops`
-  Setup, maintenance, migration, benchmarking, and operational runbooks.
-- `benches/nrese-bench-harness`
-  A Rust-native comparison and benchmark harness for NRESE and Fuseki.
+Already fixed on the way (Milestone 0):
+- A write that reports a timeout is guaranteed not to be committed.
+- Unknown config values fail at startup instead of silently changing behaviour.
+- Ontology preload happens only when `NRESE_ONTOLOGY_PATH` is set.
 
-## Current Status
+## Repository layout
 
-Implemented today:
-
-- SPARQL query/update endpoints
-- first-class `TELL` assertion ingest endpoint for RDF payloads
-- Graph Store endpoint surface
-- user-facing `/console` frontend for query, tell, update, graph, and dataset workflows
-- explicit frontend-owned TypeScript client boundary for browser and CLI access to the backend API
-- guided workbench examples in `/console` so less SPARQL-native users can start from working query/update/tell/graph templates
-- frontend locale selection with persisted `en`/`de` i18n instead of browser-guess-only language handling
-- runtime-configurable frontend API base URL so the browser frontend can be hosted separately from the backend
-- service description, health, readiness, metrics, and operator endpoints
-- staged update validation before publish
-- one shared mutation pipeline for SPARQL Update, `TELL`, Graph Store writes/deletes, and admin restore, so reasoning gates, revision publication, and reject diagnostics stay aligned across write paths
-- service-description and capability reporting for optional operator/metrics surfaces now derive from one shared runtime posture path instead of hard-coded per-endpoint advertising
-- explicit deployment postures (`open-workbench`, `read-only-demo`, `internal-authenticated`, `replacement-grade`) now drive startup validation, write-surface exposure, capability reporting, and service-description mutation advertising from one server-owned source
-- bounded `rules-mvp` reasoning with canonical `owl:sameAs` equality handling, bounded functional / inverse-functional equality entailment, bounded binary `owl:propertyChainAxiom` support over named-node RDF lists, bounded `owl:AllDifferent` / `owl:AllDisjointClasses` / `owl:AllDisjointProperties` expansion into the same consistency gates, bounded `owl:Nothing` effective-type rejection, and explicit unsupported-construct diagnostics
-- typed `rules-mvp` presets (`rdfs-core`, `bounded-owl`) on top of the explicit feature-policy path
-- external reasoner selection is now resolved into one runtime profile/tier contract, so config parsing can still accept `mode + preset + feature overrides` while runtime diagnostics, capability payloads, and frontend state read one resolved reasoner identity
-- the current reasoning read model is now explicit and externally configurable as `asserted-only`, so query/runtime surfaces state honestly that reads expose committed asserted data while reasoning remains a mutation gate plus diagnostics
-- the current reasoner snapshot boundary is explicit and observable: `rules-mvp` reasons over an asserted-only triple snapshot, skips triples with blank-node subjects, blank-node objects, or literal objects, and currently flattens named-graph quads so graph names do not yet participate in reasoner indexing
-- `rules-mvp` runtime diagnostics now also expose the resolved semantic tier for the active bounded RDFS/OWL slice, so bounded RDFS vs bounded OWL behavior is visible without reverse-engineering feature flags
-- snapshot-keyed memoization for repeated `rules-mvp` runs over identical dataset state
-- schema-keyed memoization for `rules-mvp` preparation reuse across ABox-only changes
-- cache/runtime telemetry for `rules-mvp` execution and schema reuse, exposed in reasoning diagnostics and Prometheus metrics
-- prepared property-consistency indexing so `rules-mvp` reuses one grouped assertion view per run for constrained predicates instead of rescanning property closure for each consistency gate
-- local comparison harness for NRESE vs Fuseki on seeded datasets
-- manifest-driven workload-pack execution for production-style seed + compat + bench runs
-- dedicated `pack-validate` preflight runs for workload-pack wiring before live parity execution
-- typed pack execution modes now let live parity runs stay `full` or opt into `compat-only` when an existing deployment should be compared without seed/bench side effects
-- reusable live connection-profile registry for parity harness runs, so real NRESE/Fuseki URLs, auth, and timeout defaults stay outside workload-pack manifests
-- versioned secured live-auth and secured live-auth-timeout workload-pack templates on the same manifest model as the generic packs, paired with the connection-profile registry instead of carrying live transport details directly
-- invocation precedence for live parity is explicit: selected connection-profile defaults, then pack-local service defaults, then named invocation profiles, then case-level headers/timeouts
-- workload-pack compat suites are now preflight-validated against the selected connection profile and pack-local invocation profiles, so secured live runs fail early on profile drift
-- `pack-validate` now exposes that preflight as a first-class harness step and can emit a machine-readable validation report before any live seed/compat/bench execution
-- real-world ontology catalog sync for staged parity and hardening runs against FOAF, W3C ORG, W3C Time, PROV-O, SKOS, SOSA, SSN, DCAT, vCard, DCMI Terms, and ODRL, with typed serialization/dialect/reasoning/service metadata
-- official catalog fixtures now drive cross-service checks across Store, `tell`, Graph Store, and `rules-mvp`, including RDF/XML ingest/preload and ontology-backed reasoning/runtime validation
-- official catalog reasoner fixtures now cover bounded supported slices across FOAF, ORG, Time, SKOS, PROV-O, DCAT, vCard, DCMI Terms, SOSA, SSN, and ODRL using the same `rules-mvp` path the server runs in production
-- official catalog service checks now also cover official SKOS RDF/XML Graph Store roundtrip, and the store-side catalog tests now share one support path for catalog fixture lookup and in-memory store setup instead of duplicating those helpers per file
-- ontology-backed compat suites in the benchmark harness are now grouped under a dedicated `fixtures/compat/ontologies/` path, and every checked-in baseline ontology pack now carries a dedicated ontology-specific suite on top of the shared ontology baseline suite
-- RDF/XML catalog baseline packs now also carry the shared `rdf_xml_cases.json` suite, so syntax-specific graph/query parity stays on the same pack path as ontology-specific schema parity
-- the benchmark harness now also supports a catalog-driven `pack-matrix` run that executes all baseline ontology packs for a selected catalog tier and writes one aggregate `pack-matrix-report.json` evidence index
-- `pack-matrix` can now also filter by ontology semantic dialect, reasoning feature, and service coverage, including an explicit `compat` surface for official ontology fixtures that are curated for Fuseki parity runs
-- `pack-matrix` can now also target one exact ontology name on the same selector path, so secured live parity can be narrowed to a single official ontology without forking pack manifests
-- `pack-matrix` now validates catalog-backed baseline packs before execution, so pack naming, dataset alignment, and required compat-suite coverage stay consistent with the ontology catalog instead of drifting silently
-- the store preload path now derives a file base IRI for ontology parsing, so official Turtle vocabularies with relative ontology IRIs like PROV-O load on the same typed ingest path as the rest of the catalog
-- graph-store and `tell` RDF ingest now also honor `Content-Location` as an explicit base-IRI hint, and workload packs can carry `dataset_base_iri` so live parity seeding uses the same typed path for relative-IRI ontologies
-- protocol compatibility harness coverage for query parity, limit/offset query semantics, update-effect parity, graph-store read/head/delete/put/post-effect parity, a bounded graph-store failure-parity slice, and bounded query/update failure-parity fixtures for covered negative cases
-- graph payload parity now canonicalizes Turtle, N-Triples, and RDF/XML onto one triples-set comparator path instead of treating RDF/XML as an opaque response class
-- local live side-by-side parity has now been exercised against Apache Jena Fuseki 6.0.0 on official FOAF, ORG, SKOS, Time, SOSA, DCAT, vCard, DCMI Terms, PROV-O, SSN, and ODRL ontology packs, with report artifacts under `artifacts/manual-live-parity-*`
-- bounded `bearer-jwt` auth alongside `bearer-static`
-- bounded proxy-terminated `mtls` auth alongside the existing bearer modes
-- bounded `oidc-introspection` auth alongside the existing bearer and proxy-terminated `mtls` modes
-- file-based `config.toml` runtime configuration with environment overrides on the same typed parser path
-- optional server-side AI query suggestions via Gemini or OpenRouter on one typed config path
-- AI assistant now surfaces configured provider/model metadata and clearer empty-state behavior in the user console
-- the user console now reads resolved reasoning profile/tier plus policy/cache state from the real server diagnostics surface instead of maintaining local pseudo-config state
-- the user console now exposes the server-advertised reasoning capability set, so bounded reasoning slices are visible without opening the operator UI
-- the frontend package now also ships a small CLI on the same TypeScript client boundary for fast query/update/tell/graph/runtime workflows
-
-Not finished yet:
-
-- persistence is partial: durable mode and backup/restore exist, but crash-recovery and drill-evidence gates are still open
-- backup/restore now shares the same mutation gate as the other write paths, but replacement-grade recovery and drill evidence are still open
-- broader EL/RL/DL reasoning coverage
-- the reasoner runtime contract is now resolved to one profile/tier view, while external config still accepts `mode + preset + feature overrides` for operator flexibility
-- full conformance and benchmark automation in CI
-- production auth is partial: `bearer-static`, bounded `bearer-jwt`, bounded proxy-terminated `mtls`, and bounded `oidc-introspection` exist, while broader hardening work remains open
-- real-world replacement evidence on the full ontology and workload set
-- a project-specific production workload parity pack for replacement-grade evidence
-- broader frontend production evidence and project-specific workflow validation
-- timeout-oriented parity evidence against the real secured Fuseki workload; the timeout suite and secured pack templates exist, but real deployment evidence is still open
+| Path | Layer | Owns |
+|---|---|---|
+| `crates/nrese-core` | L0 | shared report and capability contracts |
+| `crates/nrese-reasoner` | L2 | reasoning profiles, `rules-mvp`, consistency and explanations |
+| `crates/nrese-store` | L3 | operations (query, update, graph store, tell, backup) and the mutation pipeline |
+| `crates/nrese-server` | L4 | HTTP transport, auth, policy, posture, UI hosting |
+| `crates/nrese-engine` | L1 | engine v2 storage (in progress, not yet part of the workspace build) |
+| `apps/nrese-console` | L5 | React/TypeScript console and CLI |
+| `benches/nrese-bench-harness` | tooling | black-box comparison and benchmark harness |
+| `docs/` | — | architecture, ADRs, roadmap, specs, ops runbooks |
 
 ## Setup
 
@@ -282,29 +211,29 @@ Note:
 
 If you want to work on shared contracts:
 
-- start in [crates/nrese-core/src/lib.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-core/src/lib.rs)
+- start in [crates/nrese-core/src/lib.rs](crates/nrese-core/src/lib.rs)
 
 If you want to work on storage, dataset state, or SPARQL execution:
 
-- start in [crates/nrese-store/src/lib.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-store/src/lib.rs)
+- start in [crates/nrese-store/src/lib.rs](crates/nrese-store/src/lib.rs)
 - then look at the store service, staging, query, update, and graph-store modules
 
 If you want to work on reasoning:
 
-- start in [crates/nrese-reasoner/src/service.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/service.rs)
-- profile declarations are in [crates/nrese-reasoner/src/profile.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/profile.rs)
-- bounded rules are orchestrated from [crates/nrese-reasoner/src/rules.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/rules.rs)
-- typed reasoner runtime configuration is owned in [crates/nrese-reasoner/src/config.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/config.rs), while external parsing and precedence live in the grouped `crates/nrese-server/src/config/` modules
-- `rules-mvp` memoization and prepared-artifact reuse are implemented in the grouped [crates/nrese-reasoner/src/rules_mvp_cache/mod.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/rules_mvp_cache/mod.rs) module with separate schema and prepared-run files
-- dataset indexing is grouped under [crates/nrese-reasoner/src/dataset_index/mod.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/dataset_index/mod.rs) with builder, vocabulary-id, stats, and test files kept in the same topic folder
-- identity/equality handling is grouped under [crates/nrese-reasoner/src/identity/mod.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/identity/mod.rs) with separate equality, entailment, and consistency files
-- effective type derivation is grouped under [crates/nrese-reasoner/src/effective_types/mod.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/effective_types/mod.rs) with separate builder, origin, and test files
-- property closure is grouped under [crates/nrese-reasoner/src/property_closure/mod.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/property_closure/mod.rs) with separate builder, equality-expansion, and test files
-- class-side consistency checks are grouped under [crates/nrese-reasoner/src/class_consistency/mod.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/class_consistency/mod.rs), and property-side consistency checks are grouped under [crates/nrese-reasoner/src/property_consistency/mod.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-reasoner/src/property_consistency/mod.rs)
+- start in [crates/nrese-reasoner/src/service.rs](crates/nrese-reasoner/src/service.rs)
+- profile declarations are in [crates/nrese-reasoner/src/profile.rs](crates/nrese-reasoner/src/profile.rs)
+- bounded rules are orchestrated from [crates/nrese-reasoner/src/rules.rs](crates/nrese-reasoner/src/rules.rs)
+- typed reasoner runtime configuration is owned in [crates/nrese-reasoner/src/config.rs](crates/nrese-reasoner/src/config.rs), while external parsing and precedence live in the grouped `crates/nrese-server/src/config/` modules
+- `rules-mvp` memoization and prepared-artifact reuse are implemented in the grouped [crates/nrese-reasoner/src/rules_mvp_cache/mod.rs](crates/nrese-reasoner/src/rules_mvp_cache/mod.rs) module with separate schema and prepared-run files
+- dataset indexing is grouped under [crates/nrese-reasoner/src/dataset_index/mod.rs](crates/nrese-reasoner/src/dataset_index/mod.rs) with builder, vocabulary-id, stats, and test files kept in the same topic folder
+- identity/equality handling is grouped under [crates/nrese-reasoner/src/identity/mod.rs](crates/nrese-reasoner/src/identity/mod.rs) with separate equality, entailment, and consistency files
+- effective type derivation is grouped under [crates/nrese-reasoner/src/effective_types/mod.rs](crates/nrese-reasoner/src/effective_types/mod.rs) with separate builder, origin, and test files
+- property closure is grouped under [crates/nrese-reasoner/src/property_closure/mod.rs](crates/nrese-reasoner/src/property_closure/mod.rs) with separate builder, equality-expansion, and test files
+- class-side consistency checks are grouped under [crates/nrese-reasoner/src/class_consistency/mod.rs](crates/nrese-reasoner/src/class_consistency/mod.rs), and property-side consistency checks are grouped under [crates/nrese-reasoner/src/property_consistency/mod.rs](crates/nrese-reasoner/src/property_consistency/mod.rs)
 
 If you want to work on HTTP, auth, or operator surfaces:
 
-- start in [crates/nrese-server/src/lib.rs](c:/Users/Johannes/Documents/OWL-RS/crates/nrese-server/src/lib.rs)
+- start in [crates/nrese-server/src/lib.rs](crates/nrese-server/src/lib.rs)
 - routing and handlers are under `crates/nrese-server/src/http/`
 - environment-variable names and config parsing entry points are centralized under `crates/nrese-server/src/config/`
 - AI provider integrations are under `crates/nrese-server/src/ai/`
@@ -325,7 +254,7 @@ If you want to work on the user frontend:
 
 If you want to work on benchmarks or compatibility checks:
 
-- start in [benches/nrese-bench-harness/src/main.rs](c:/Users/Johannes/Documents/OWL-RS/benches/nrese-bench-harness/src/main.rs)
+- start in [benches/nrese-bench-harness/src/main.rs](benches/nrese-bench-harness/src/main.rs)
 - keep per-case request customization in the shared compat request path instead of adding endpoint-specific compare logic
 - workflow details are in [docs/ops/benchmark-and-conformance.md](docs/ops/benchmark-and-conformance.md)
 - manifest-driven production-style harness runs are also defined there; do not duplicate pack format rules elsewhere
@@ -411,26 +340,10 @@ Run the benchmark and compatibility harness:
 cargo test --manifest-path benches/nrese-bench-harness/Cargo.toml
 ```
 
-Seed and compare against Fuseki:
+Seed and compare against a reference endpoint:
 
 - see [docs/ops/benchmark-and-conformance.md](docs/ops/benchmark-and-conformance.md)
 
 ## Documentation
 
-- [Spezifikation.md](Spezifikation.md)
-- [docs/spec/01-architecture-workspace.md](docs/spec/01-architecture-workspace.md)
-- [docs/spec/02-storage-and-transactions.md](docs/spec/02-storage-and-transactions.md)
-- [docs/spec/03-reasoner-and-owl-profile.md](docs/spec/03-reasoner-and-owl-profile.md)
-- [docs/spec/04-api-and-protocols.md](docs/spec/04-api-and-protocols.md)
-- [docs/spec/05-roadmap-and-acceptance.md](docs/spec/05-roadmap-and-acceptance.md)
-- [docs/spec/06-fuseki-replacement-gap-matrix.md](docs/spec/06-fuseki-replacement-gap-matrix.md)
-- [docs/spec/07-replacement-implementation-plan.md](docs/spec/07-replacement-implementation-plan.md)
-- [docs/ops/server-setup.md](docs/ops/server-setup.md)
-- [docs/ops/config-reference.md](docs/ops/config-reference.md)
-- [docs/ops/server-maintenance.md](docs/ops/server-maintenance.md)
-- [docs/ops/benchmark-and-conformance.md](docs/ops/benchmark-and-conformance.md)
-- [docs/ops/ontology-fixture-catalog.md](docs/ops/ontology-fixture-catalog.md)
-- [docs/ops/backup-restore-drills.md](docs/ops/backup-restore-drills.md)
-- [docs/dev/code-structure-guidelines.md](docs/dev/code-structure-guidelines.md)
-- [docs/dev/frontend-extension-guide.md](docs/dev/frontend-extension-guide.md)
-- [docs/dev/frontend-backend-contract.md](docs/dev/frontend-backend-contract.md)
+The document index lives in one place: [Spezifikation.md](Spezifikation.md). Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
