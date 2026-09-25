@@ -1,0 +1,62 @@
+# Merge gate (ROADMAP F5). Every job must pass; warnings are errors.
+# The bench harness is a separate Cargo workspace, so it is checked via --manifest-path.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.target.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: workspace
+            manifest: Cargo.toml
+          - name: bench-harness
+            manifest: benches/nrese-bench-harness/Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target.name }}
+          workspaces: ${{ matrix.target.name == 'workspace' && '.' || 'benches/nrese-bench-harness' }}
+      - name: fmt
+        run: cargo fmt --manifest-path ${{ matrix.target.manifest }} --all --check
+      - name: clippy
+        run: cargo clippy --manifest-path ${{ matrix.target.manifest }} --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --manifest-path ${{ matrix.target.manifest }} --all-targets --locked
+
+  console:
+    name: Console (apps/nrese-console)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/nrese-console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/nrese-console/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npx vitest run
+      - run: npm run build

@@ -41,8 +41,9 @@ export class NreseClient {
     );
   }
 
+  /** The server advertises the diagnostics path at runtime, so any path is accepted. */
   async getReasoningDiagnostics(
-    endpoint = NRESE_ENDPOINTS.reasoningDiagnostics,
+    endpoint: string = NRESE_ENDPOINTS.reasoningDiagnostics,
   ): Promise<ReasoningDiagnostics> {
     return fetchJson<ReasoningDiagnostics>(this.fetchImpl, this.baseUrl, endpoint);
   }
