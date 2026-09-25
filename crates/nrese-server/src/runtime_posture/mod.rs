@@ -1,4 +1,3 @@
-use nrese_reasoner::ReasoningMode;
 use nrese_store::StoreMode;
 
 use crate::auth::AuthConfig;
@@ -112,7 +111,6 @@ impl RuntimePosture {
 pub fn validate_configuration(
     deployment_posture: DeploymentPosture,
     store_mode: StoreMode,
-    reasoning_mode: ReasoningMode,
     policy: &PolicyConfig,
 ) -> Result<(), &'static str> {
     match deployment_posture {
@@ -125,11 +123,6 @@ pub fn validate_configuration(
             validate_authenticated_posture(policy)?;
             if store_mode != StoreMode::OnDisk {
                 return Err("replacement-grade posture requires on-disk durable storage");
-            }
-            if reasoning_mode == ReasoningMode::OwlDlTarget {
-                return Err(
-                    "replacement-grade posture cannot use owl-dl-target while it remains scaffolded",
-                );
             }
             if policy.sparql_parse_error_profile != SparqlParseErrorProfile::ProblemJson {
                 return Err("replacement-grade posture requires problem-json SPARQL parse errors");
@@ -148,7 +141,7 @@ fn validate_authenticated_posture(policy: &PolicyConfig) -> Result<(), &'static 
 
 #[cfg(test)]
 mod tests {
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_reasoner::{ReasonerConfig, ReasonerService};
     use nrese_store::{StoreConfig, StoreMode, StoreService};
 
     use crate::ai::AiSuggestionService;
@@ -231,7 +224,6 @@ mod tests {
         let result = validate_configuration(
             DeploymentPosture::ReplacementGrade,
             StoreMode::InMemory,
-            ReasoningMode::Disabled,
             &PolicyConfig {
                 auth: AuthConfig::BearerStatic(crate::auth::StaticBearerConfig {
                     read_token: Some("read".to_owned()),
@@ -252,7 +244,6 @@ mod tests {
         let result = validate_configuration(
             DeploymentPosture::InternalAuthenticated,
             StoreMode::OnDisk,
-            ReasoningMode::RulesMvp,
             &PolicyConfig::default(),
         );
 

@@ -1,3 +1,7 @@
+//! `nrese-store` (layer L3): the operations the product offers - query, update, graph
+//! store, tell, backup/restore, stats - and the mutation pipeline that owns commit semantics.
+//! No HTTP concerns live here. See `docs/ARCHITECTURE.md`.
+
 mod backend;
 mod backup;
 pub mod config;
@@ -5,6 +9,7 @@ pub mod error;
 pub mod graph_store;
 mod graph_store_executor;
 mod loader;
+pub mod mutation;
 mod on_disk;
 pub mod query;
 mod query_executor;
@@ -25,6 +30,11 @@ pub use error::{StoreError, StoreResult};
 pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
+};
+pub use mutation::{
+    MutationCommand, MutationCommitReport, MutationError, MutationKind, MutationPipeline,
+    MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
+    RejectAttributionCandidate,
 };
 pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,

@@ -5,7 +5,6 @@ use crate::rules_mvp_preset::RulesMvpPreset;
 pub enum ReasoningMode {
     Disabled,
     RulesMvp,
-    OwlDlTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -36,7 +35,6 @@ impl ReasonerConfig {
                 ReasoningMode::RulesMvp => {
                     ReasonerProfileConfig::RulesMvp(RulesMvpConfig::default())
                 }
-                ReasoningMode::OwlDlTarget => ReasonerProfileConfig::OwlDlTarget,
             },
             read_model: ReasoningReadModel::AssertedOnly,
         }
@@ -58,7 +56,6 @@ impl ReasonerConfig {
         match self.profile {
             ReasonerProfileConfig::Disabled => ReasoningMode::Disabled,
             ReasonerProfileConfig::RulesMvp(_) => ReasoningMode::RulesMvp,
-            ReasonerProfileConfig::OwlDlTarget => ReasoningMode::OwlDlTarget,
         }
     }
 
@@ -95,7 +92,6 @@ impl ReasonerConfig {
 pub enum ReasonerProfileConfig {
     Disabled,
     RulesMvp(RulesMvpConfig),
-    OwlDlTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

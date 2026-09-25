@@ -8,6 +8,3 @@ license.workspace = true
 nrese-core = { path = "../nrese-core" }
 tracing.workspace = true
 
-[dev-dependencies]
-nrese-store = { path = "../nrese-store" }
-tempfile = "3.23.0"

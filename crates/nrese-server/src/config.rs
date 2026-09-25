@@ -66,12 +66,12 @@ impl ServerConfig {
             .context("failed to parse bind address")?;
         let deployment_posture =
             parse_deployment_posture(source.get(names::DEPLOYMENT_POSTURE).as_deref())?;
-        let store = parse_store_config(source);
+        let store = parse_store_config(source)?;
         let reasoner = parse_reasoner_config(source)?;
         let policy = parse_policy_config(source)?;
         let ai = parse_ai_config(source)?;
 
-        validate_configuration(deployment_posture, store.mode, reasoner.mode(), &policy)
+        validate_configuration(deployment_posture, store.mode, &policy)
             .map_err(anyhow::Error::msg)?;
 
         Ok(Self {

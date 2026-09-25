@@ -1,5 +1,5 @@
-use crate::reasoning_runtime::LastReasoningRun;
 use crate::reject_view::reject_view;
+use nrese_store::ReasoningRunRecord;
 
 use super::types::{
     ConfiguredFeatureView, ConfiguredReasoningPolicyView, LastReasoningRunView, ReasoningCacheView,
@@ -46,7 +46,7 @@ pub fn configured_reasoning_policy(
     })
 }
 
-pub fn last_run_view(run: &LastReasoningRun) -> LastReasoningRunView {
+pub fn last_run_view(run: &ReasoningRunRecord) -> LastReasoningRunView {
     LastReasoningRunView {
         revision: run.revision,
         status: run_status_name(run.status),
@@ -96,12 +96,12 @@ pub fn last_run_view(run: &LastReasoningRun) -> LastReasoningRunView {
 }
 
 pub fn reject_diagnostics_baseline(
-    last_run: Option<&LastReasoningRun>,
+    last_run: Option<&ReasoningRunRecord>,
 ) -> RejectDiagnosticsBaseline {
     RejectDiagnosticsBaseline {
         available: last_run.is_some(),
         strategy: "hybrid-heuristic-plus-deep-justification",
-        last_reject_reason: last_run.and_then(LastReasoningRun::primary_reject_reason),
+        last_reject_reason: last_run.and_then(ReasoningRunRecord::primary_reject_reason),
         last_reject: last_run.and_then(|run| {
             run.primary_reject
                 .as_ref()

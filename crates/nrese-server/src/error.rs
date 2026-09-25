@@ -5,8 +5,8 @@ use nrese_reasoner::RejectExplanation;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::reject_attribution::RejectAttribution;
 use crate::reject_view::RejectExplanationView;
+use nrese_store::RejectAttribution;
 
 #[derive(Debug, Error)]
 pub enum ApiError {

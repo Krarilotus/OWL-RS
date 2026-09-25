@@ -3,14 +3,14 @@ use axum::extract::RawQuery;
 use axum::http::StatusCode;
 use axum::http::{HeaderMap, header};
 
-use nrese_store::TellRequest;
+use nrese_store::{MutationCommand, TellRequest};
 
 use crate::error::ApiError;
 use crate::http::media::header_value_str;
+use crate::http::mutation;
 use crate::http::rdf_payload::{
     ensure_ready, parse_graph_target, parse_rdf_base_iri, parse_tell_content_format,
 };
-use crate::mutation_pipeline;
 use crate::state::AppState;
 
 pub async fn execute_tell(
@@ -29,12 +29,13 @@ pub async fn execute_tell(
         payload: body.to_vec(),
     };
 
-    tokio::time::timeout(
+    mutation::run(
+        &state,
+        MutationCommand::Tell(request),
         state.policy().timeouts.update,
-        mutation_pipeline::execute_tell(state, request),
+        "tell execution exceeded policy timeout",
     )
-    .await
-    .map_err(|_| ApiError::timeout("tell execution exceeded policy timeout"))??;
+    .await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

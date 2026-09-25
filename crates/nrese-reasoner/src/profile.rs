@@ -12,29 +12,6 @@ pub struct ReasonerProfile {
 
 const DISABLED_CAPABILITIES: [ReasonerCapability; 0] = [];
 
-const OWL_DL_TARGET_CAPABILITIES: [ReasonerCapability; 4] = [
-    ReasonerCapability {
-        feature: ReasonerFeature::OwlClassSatisfiability,
-        maturity: CapabilityMaturity::Target,
-        enabled_by_default: false,
-    },
-    ReasonerCapability {
-        feature: ReasonerFeature::OwlConsistencyCheck,
-        maturity: CapabilityMaturity::Target,
-        enabled_by_default: false,
-    },
-    ReasonerCapability {
-        feature: ReasonerFeature::IncrementalRefresh,
-        maturity: CapabilityMaturity::Target,
-        enabled_by_default: false,
-    },
-    ReasonerCapability {
-        feature: ReasonerFeature::ExplanationTrace,
-        maturity: CapabilityMaturity::Experimental,
-        enabled_by_default: false,
-    },
-];
-
 pub fn profile_for_mode(mode: ReasoningMode) -> ReasonerProfile {
     profile_for_config(&ReasonerConfig::for_mode(mode))
 }
@@ -52,12 +29,6 @@ pub fn profile_for_config(config: &ReasonerConfig) -> ReasonerProfile {
             mode: mode_name(ReasoningMode::RulesMvp),
             semantic_tier: rules_mvp.preset.semantic_tier(),
             capabilities: rules_mvp_capabilities(rules_mvp),
-        },
-        ReasonerProfileConfig::OwlDlTarget => ReasonerProfile {
-            name: "nrese-owl-dl-target",
-            mode: mode_name(ReasoningMode::OwlDlTarget),
-            semantic_tier: "owl-dl-target",
-            capabilities: OWL_DL_TARGET_CAPABILITIES.to_vec(),
         },
     }
 }
@@ -108,7 +79,6 @@ pub const fn mode_name(mode: ReasoningMode) -> &'static str {
     match mode {
         ReasoningMode::Disabled => "disabled",
         ReasoningMode::RulesMvp => "rules-mvp",
-        ReasoningMode::OwlDlTarget => "owl-dl-target",
     }
 }
 
