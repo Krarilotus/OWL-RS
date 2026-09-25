@@ -48,6 +48,11 @@ pub struct SparqlQueryRequest {
     pub query: String,
     pub solutions_format: SolutionsResultFormat,
     pub graph_format: GraphResultFormat,
+    /// Protocol `default-graph-uri` values. If this or `named_graphs` is non-empty, both
+    /// replace the query's `FROM` / `FROM NAMED` clauses.
+    pub default_graphs: Vec<String>,
+    /// Protocol `named-graph-uri` values.
+    pub named_graphs: Vec<String>,
 }
 
 impl SparqlQueryRequest {
@@ -56,6 +61,8 @@ impl SparqlQueryRequest {
             query: query.into(),
             solutions_format: SolutionsResultFormat::Json,
             graph_format: GraphResultFormat::NTriples,
+            default_graphs: Vec::new(),
+            named_graphs: Vec::new(),
         }
     }
 }

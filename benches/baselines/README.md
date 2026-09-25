@@ -71,6 +71,17 @@ Recorded reference numbers that later milestones are measured against. Each file
 - **Crash test:** after the durable run, the server was killed with `taskkill /F` and restarted. It recovered revision 1427 with exactly 10,000,800 quads (10 M loaded plus 800 inserts).
 - **COUNT** grows linearly because spareval counts by scanning; native aggregation is Pf3/Pf4.
 
+## Streaming a 10 M-row result (M1 gate Q1)
+
+- **What:** `SELECT * WHERE { ?s ?p ?o }` over the 10 M-triple entity dataset (bulk-loaded, on disk), fetched with `curl` as TSV from the release server. Server memory is the working set sampled every 100 ms.
+- **Date / machine:** 2026-09-26, same machine as above.
+
+| Rows | Result size | Time | Server memory before | Peak during query |
+|---|---|---|---|---|
+| 10,000,000 | 1,019 MiB | 8.5 s | 2.023 GiB | 2.025 GiB (+1.9 MiB) |
+
+Before this change, the whole serialised result (here 1 GB) was buffered in memory before the first byte was sent.
+
 ## Engine v2 bulk load (M1 gate E5)
 
 - **What:** `nrese-server load` into an on-disk store. It parses N-Triples on all cores, interns in parallel batches, sorts once, builds the base run directly, and writes a checkpoint before publishing. The WAL isn't involved. Times are end to end, from process start to the published revision. Numbers come from the command's `bulk load published` / `bulk load complete` log lines; peak memory is the process's peak working set.
