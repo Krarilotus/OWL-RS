@@ -30,6 +30,12 @@ pub enum TermKind {
     Integer = 4,
     /// Inline canonical `xsd:boolean`.
     Boolean = 5,
+    /// Inline canonical `xsd:decimal` (see `inline` for ranges).
+    Decimal = 6,
+    /// Inline canonical `xsd:date`.
+    Date = 7,
+    /// Inline canonical `xsd:dateTime`.
+    DateTime = 8,
 }
 
 impl TermKind {
@@ -41,6 +47,9 @@ impl TermKind {
             3 => Self::Literal,
             4 => Self::Integer,
             5 => Self::Boolean,
+            6 => Self::Decimal,
+            7 => Self::Date,
+            8 => Self::DateTime,
             _ => return None,
         })
     }
@@ -48,6 +57,14 @@ impl TermKind {
     /// True for kinds whose payload is a dictionary index.
     pub const fn is_dictionary(self) -> bool {
         matches!(self, Self::Iri | Self::BlankNode | Self::Literal)
+    }
+
+    /// True for kinds whose payload is the value itself.
+    pub const fn is_inline(self) -> bool {
+        matches!(
+            self,
+            Self::Integer | Self::Boolean | Self::Decimal | Self::Date | Self::DateTime
+        )
     }
 }
 

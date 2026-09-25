@@ -20,8 +20,8 @@ use crate::error::{EngineError, EngineResult};
 use crate::quad::{EncodedQuad, EncodedTriple, QuadPattern};
 use crate::term::Dictionary;
 
-/// Version 2 added the inferred stack (roadmap E6).
-const MAGIC: &[u8; 8] = b"NRESECK2";
+/// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1).
+const MAGIC: &[u8; 8] = b"NRESECK3";
 /// Magic prefix shared by every checkpoint format version.
 const FAMILY: &[u8; 7] = b"NRESECK";
 const EXTENSION: &str = "nck";
