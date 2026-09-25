@@ -257,15 +257,14 @@ mod tests {
             }
         }"#;
 
-        let (matched, left_summary, right_summary) =
-            super::compare_payloads(
-                CompatKind::SolutionsBindingsSet,
-                Some("application/sparql-results+json"),
-                left,
-                Some("application/sparql-results+json"),
-                right,
-            )
-                .expect("comparison");
+        let (matched, left_summary, right_summary) = super::compare_payloads(
+            CompatKind::SolutionsBindingsSet,
+            Some("application/sparql-results+json"),
+            left,
+            Some("application/sparql-results+json"),
+            right,
+        )
+        .expect("comparison");
 
         assert!(!matched);
         assert_eq!(left_summary, "bindings=1");

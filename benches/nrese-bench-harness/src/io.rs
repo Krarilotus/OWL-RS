@@ -54,11 +54,11 @@ pub fn read_workload_pack(path: &Path) -> Result<WorkloadPackManifest> {
         *path = resolve_pack_path(&base_dir, path);
     }
     expand_headers_env_placeholders(&mut manifest.nrese.headers)?;
-    expand_headers_env_placeholders(&mut manifest.fuseki.headers)?;
+    expand_headers_env_placeholders(&mut manifest.reference.headers)?;
     for profile in manifest.invocation_profiles.nrese.values_mut() {
         expand_headers_env_placeholders(&mut profile.headers)?;
     }
-    for profile in manifest.invocation_profiles.fuseki.values_mut() {
+    for profile in manifest.invocation_profiles.reference.values_mut() {
         expand_headers_env_placeholders(&mut profile.headers)?;
     }
 
@@ -127,7 +127,7 @@ timeout_ms = 15000
 [nrese.headers]
 authorization = "Bearer local-token"
 
-[fuseki.headers]
+[reference.headers]
 x-forwarded-proto = "https"
 
 [invocation_profiles.nrese.invalid.headers]
@@ -170,7 +170,7 @@ authorization = "Bearer ${NRESE_INVALID_TOKEN}"
         assert_eq!(manifest.nrese.timeout_ms, Some(15000));
         assert_eq!(
             manifest
-                .fuseki
+                .reference
                 .headers
                 .get("x-forwarded-proto")
                 .map(String::as_str),
@@ -196,31 +196,25 @@ authorization = "Bearer ${NRESE_INVALID_TOKEN}"
 
         assert_eq!(manifest.name, "secured-live-auth-timeout-template");
         assert_eq!(manifest.compat_suites.len(), 4);
-        assert!(
-            manifest.compat_suites.iter().any(|path| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|value| value == "policy_failure_cases.json")
-            })
-        );
-        assert!(
-            manifest.compat_suites.iter().any(|path| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|value| value == "secured_auth_failure_cases.json")
-            })
-        );
-        assert!(
-            manifest.compat_suites.iter().any(|path| {
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|value| value == "timeout_failure_cases.json")
-            })
-        );
+        assert!(manifest.compat_suites.iter().any(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value == "policy_failure_cases.json")
+        }));
+        assert!(manifest.compat_suites.iter().any(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value == "secured_auth_failure_cases.json")
+        }));
+        assert!(manifest.compat_suites.iter().any(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value == "timeout_failure_cases.json")
+        }));
         assert!(manifest.nrese.headers.is_empty());
-        assert!(manifest.fuseki.headers.is_empty());
+        assert!(manifest.reference.headers.is_empty());
         assert!(manifest.invocation_profiles.nrese.is_empty());
-        assert!(manifest.invocation_profiles.fuseki.is_empty());
+        assert!(manifest.invocation_profiles.reference.is_empty());
     }
 
     #[test]

@@ -1,0 +1,44 @@
+{
+  "mode": "write-scaling",
+  "samples_per_step": 5,
+  "services": [
+    {
+      "label": "NRESE",
+      "base_url": "http://127.0.0.1:18600",
+      "steps": [
+        {
+          "triples": 10000,
+          "load_ms": 38,
+          "load_triples_per_sec": 263157,
+          "insert_p50_ms": 19,
+          "insert_max_ms": 20,
+          "count_query_ms": 0
+        },
+        {
+          "triples": 100000,
+          "load_ms": 1078,
+          "load_triples_per_sec": 83487,
+          "insert_p50_ms": 238,
+          "insert_max_ms": 253,
+          "count_query_ms": 5
+        },
+        {
+          "triples": 500000,
+          "load_ms": 21833,
+          "load_triples_per_sec": 18320,
+          "insert_p50_ms": 1430,
+          "insert_max_ms": 1466,
+          "count_query_ms": 23
+        },
+        {
+          "triples": 1000000,
+          "load_ms": 73634,
+          "load_triples_per_sec": 6790,
+          "insert_p50_ms": 3009,
+          "insert_max_ms": 3023,
+          "count_query_ms": 46
+        }
+      ]
+    }
+  ]
+}

@@ -166,7 +166,8 @@ try {
         "--",
         "pack-matrix",
         "--nrese-base-url", "http://127.0.0.1:$NresePort",
-        "--fuseki-base-url", "http://127.0.0.1:$FusekiPort$DatasetPath",
+        "--reference-kind", "fuseki",
+        "--reference-base-url", "http://127.0.0.1:$FusekiPort$DatasetPath",
         "--execution-mode", $ExecutionMode,
         "--tier", $Tier,
         "--report-dir", $ReportDir

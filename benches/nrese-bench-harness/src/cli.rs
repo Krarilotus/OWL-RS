@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow, bail};
 
 use crate::model::{
-    BasicAuthConfig, BenchConfig, CatalogSyncConfig, Cli, Command, CompatConfig, CompatHeaders,
-    OntologyReasoningFeature, OntologySemanticDialect, OntologyServiceSurface, PackConfig,
-    PackExecutionMode, PackMatrixConfig, SeedConfig, ServiceConnectionConfig, ValidatePackConfig,
+    BasicAuthConfig, BenchConfig, CatalogSyncConfig, Cli, Command, CompatConfig,
+    ConnectionSelection, OntologyReasoningFeature, OntologySemanticDialect, OntologyServiceSurface,
+    PackConfig, PackExecutionMode, PackMatrixConfig, ReferenceConnection, ReferenceKind,
+    SeedConfig, ServiceConnectionConfig, ValidatePackConfig, WriteScalingConfig,
 };
 
 const DEFAULT_QUERY_WORKLOAD_PATH: &str =
@@ -30,13 +31,8 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
     match command_name {
         "bench" => Ok(Cli {
             command: Command::Bench(BenchConfig {
-                nrese: ServiceConnectionConfig {
-                    base_url: required_opt(&options, "--nrese-base-url")?,
-                    headers: CompatHeaders::new(),
-                    timeout_ms: None,
-                    basic_auth: None,
-                },
-                fuseki: optional_fuseki_connection(&options)?,
+                nrese: nrese_connection(&options)?,
+                reference: optional_reference_connection(&options)?,
                 iterations: options
                     .get("--iterations")
                     .map(|value| value.parse::<usize>())
@@ -79,20 +75,11 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
         }),
         "compat" => Ok(Cli {
             command: Command::Compat(CompatConfig {
-                nrese: ServiceConnectionConfig {
-                    base_url: required_opt(&options, "--nrese-base-url")?,
-                    headers: CompatHeaders::new(),
-                    timeout_ms: None,
-                    basic_auth: None,
-                },
-                fuseki: ServiceConnectionConfig {
-                    base_url: required_opt(&options, "--fuseki-base-url")?,
-                    headers: CompatHeaders::new(),
-                    timeout_ms: None,
-                    basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
-                },
+                nrese: nrese_connection(&options)?,
+                reference: optional_reference_connection(&options)?
+                    .ok_or_else(|| anyhow!("missing required option --reference-base-url"))?,
                 nrese_profiles: BTreeMap::new(),
-                fuseki_profiles: BTreeMap::new(),
+                reference_profiles: BTreeMap::new(),
                 cases_path: options
                     .get("--cases")
                     .map(PathBuf::from)
@@ -102,11 +89,7 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
         }),
         "pack" => Ok(Cli {
             command: Command::Pack(PackConfig {
-                nrese_base_url: options.get("--nrese-base-url").cloned(),
-                fuseki_base_url: options.get("--fuseki-base-url").cloned(),
-                fuseki_basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
-                connection_profiles_path: options.get("--connection-profiles").map(PathBuf::from),
-                connection_profile_name: options.get("--connection-profile").cloned(),
+                connections: connection_selection(&options)?,
                 workload_pack_path: options
                     .get("--workload-pack")
                     .map(PathBuf::from)
@@ -126,11 +109,7 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
         }),
         "pack-validate" => Ok(Cli {
             command: Command::ValidatePack(ValidatePackConfig {
-                nrese_base_url: options.get("--nrese-base-url").cloned(),
-                fuseki_base_url: options.get("--fuseki-base-url").cloned(),
-                fuseki_basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
-                connection_profiles_path: options.get("--connection-profiles").map(PathBuf::from),
-                connection_profile_name: options.get("--connection-profile").cloned(),
+                connections: connection_selection(&options)?,
                 workload_pack_path: options
                     .get("--workload-pack")
                     .map(PathBuf::from)
@@ -140,11 +119,7 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
         }),
         "pack-matrix" => Ok(Cli {
             command: Command::PackMatrix(PackMatrixConfig {
-                nrese_base_url: options.get("--nrese-base-url").cloned(),
-                fuseki_base_url: options.get("--fuseki-base-url").cloned(),
-                fuseki_basic_auth: parse_basic_auth_opt(&options, "--fuseki-basic-auth")?,
-                connection_profiles_path: options.get("--connection-profiles").map(PathBuf::from),
-                connection_profile_name: options.get("--connection-profile").cloned(),
+                connections: connection_selection(&options)?,
                 catalog_path: options
                     .get("--catalog")
                     .map(PathBuf::from)
@@ -187,15 +162,42 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .unwrap_or_else(|| PathBuf::from("artifacts/pack-matrix")),
             }),
         }),
+        "write-scaling" => Ok(Cli {
+            command: Command::WriteScaling(WriteScalingConfig {
+                nrese: nrese_connection(&options)?,
+                reference: optional_reference_connection(&options)?,
+                steps: options
+                    .get("--steps")
+                    .map(|value| {
+                        value
+                            .split(',')
+                            .map(|step| step.trim().parse::<u64>())
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| vec![10_000, 100_000, 500_000, 1_000_000]),
+                chunk_triples: options
+                    .get("--chunk-triples")
+                    .map(|value| value.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(16_000),
+                samples: options
+                    .get("--samples")
+                    .map(|value| value.parse::<usize>())
+                    .transpose()?
+                    .unwrap_or(5),
+                reset: options
+                    .get("--reset")
+                    .map(|value| parse_bool(value))
+                    .transpose()?
+                    .unwrap_or(true),
+                report_json_path: options.get("--report-json").map(PathBuf::from),
+            }),
+        }),
         "seed" => Ok(Cli {
             command: Command::Seed(SeedConfig {
-                nrese: ServiceConnectionConfig {
-                    base_url: required_opt(&options, "--nrese-base-url")?,
-                    headers: CompatHeaders::new(),
-                    timeout_ms: None,
-                    basic_auth: None,
-                },
-                fuseki: optional_fuseki_connection(&options)?,
+                nrese: nrese_connection(&options)?,
+                reference: optional_reference_connection(&options)?,
                 dataset_path: options
                     .get("--dataset")
                     .map(PathBuf::from)
@@ -331,18 +333,53 @@ fn required_opt(options: &BTreeMap<String, String>, key: &str) -> Result<String>
         .ok_or_else(|| anyhow!("missing required option {key}"))
 }
 
-fn optional_fuseki_connection(
+fn nrese_connection(options: &BTreeMap<String, String>) -> Result<ServiceConnectionConfig> {
+    Ok(ServiceConnectionConfig::new(required_opt(
+        options,
+        "--nrese-base-url",
+    )?))
+}
+
+fn connection_selection(options: &BTreeMap<String, String>) -> Result<ConnectionSelection> {
+    Ok(ConnectionSelection {
+        profiles_path: options.get("--connection-profiles").map(PathBuf::from),
+        profile_name: options.get("--connection-profile").cloned(),
+        nrese_base_url: options.get("--nrese-base-url").cloned(),
+        reference_kind: parse_reference_kind_opt(options)?,
+        reference_base_url: options.get("--reference-base-url").cloned(),
+        reference_basic_auth: parse_basic_auth_opt(options, "--reference-basic-auth")?,
+    })
+}
+
+fn parse_reference_kind_opt(options: &BTreeMap<String, String>) -> Result<Option<ReferenceKind>> {
+    options
+        .get("--reference-kind")
+        .map(|value| ReferenceKind::parse(value).map_err(|error| anyhow!(error)))
+        .transpose()
+}
+
+/// A reference endpoint needs both a URL and an engine kind; one without the other is an
+/// error rather than a guess.
+fn optional_reference_connection(
     options: &BTreeMap<String, String>,
-) -> Result<Option<ServiceConnectionConfig>> {
-    let Some(base_url) = options.get("--fuseki-base-url").cloned() else {
+) -> Result<Option<ReferenceConnection>> {
+    let kind = parse_reference_kind_opt(options)?;
+    let Some(base_url) = options.get("--reference-base-url").cloned() else {
+        if kind.is_some() {
+            bail!("--reference-kind requires --reference-base-url");
+        }
         return Ok(None);
     };
+    let kind = kind.ok_or_else(|| {
+        anyhow!("--reference-base-url requires --reference-kind <fuseki|graphdb|qlever>")
+    })?;
 
-    Ok(Some(ServiceConnectionConfig {
-        base_url,
-        headers: CompatHeaders::new(),
-        timeout_ms: None,
-        basic_auth: parse_basic_auth_opt(options, "--fuseki-basic-auth")?,
+    Ok(Some(ReferenceConnection {
+        kind,
+        connection: ServiceConnectionConfig {
+            basic_auth: parse_basic_auth_opt(options, "--reference-basic-auth")?,
+            ..ServiceConnectionConfig::new(base_url)
+        },
     }))
 }
 
@@ -351,13 +388,14 @@ pub fn print_usage() {
         "nrese-bench-harness
 
 USAGE:
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- bench --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--iterations <N>] [--query-workload <PATH>] [--update-workload <PATH>] [--report-json <PATH>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- bench --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--iterations <N>] [--query-workload <PATH>] [--update-workload <PATH>] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- catalog-sync [--catalog <PATH>] [--output-dir <DIR>] [--tier <small|medium|broad>] [--refresh <true|false>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- compat --nrese-base-url <URL> --fuseki-base-url <URL> [--fuseki-basic-auth <user:pass>] [--cases <PATH>] [--report-json <PATH>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--execution-mode <full|compat-only>] --workload-pack <PATH> [--iterations <N>] [--report-dir <DIR>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validate [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--report-json <PATH>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--execution-mode <full|compat-only>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--fuseki-base-url <URL>] [--fuseki-basic-auth <user:pass>] [--dataset <PATH>] [--dataset-base-iri <IRI>] [--content-type <TYPE>] [--replace <true|false>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- compat --nrese-base-url <URL> --reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL> [--reference-basic-auth <user:pass>] [--cases <PATH>] [--report-json <PATH>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--execution-mode <full|compat-only>] --workload-pack <PATH> [--iterations <N>] [--report-dir <DIR>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validate [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--report-json <PATH>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--execution-mode <full|compat-only>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- write-scaling --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--steps <triples,...>] [--chunk-triples <N>] [--samples <N>] [--reset <true|false>] [--report-json <PATH>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--dataset <PATH>] [--dataset-base-iri <IRI>] [--content-type <TYPE>] [--replace <true|false>]
 "
     );
 }
@@ -405,15 +443,19 @@ mod tests {
 
         match cli.command {
             Command::PackMatrix(config) => {
-                assert_eq!(config.nrese_base_url, None);
+                assert_eq!(config.connections.nrese_base_url, None);
                 assert_eq!(
                     config
-                        .connection_profiles_path
+                        .connections
+                        .profiles_path
                         .as_ref()
                         .map(|path| path.to_string_lossy().to_string()),
                     Some("profiles.toml".to_owned())
                 );
-                assert_eq!(config.connection_profile_name.as_deref(), Some("secured-live"));
+                assert_eq!(
+                    config.connections.profile_name.as_deref(),
+                    Some("secured-live")
+                );
                 assert_eq!(
                     config.catalog_path.to_string_lossy(),
                     "benches/nrese-bench-harness/fixtures/catalog/ontologies.toml"
@@ -501,12 +543,16 @@ mod tests {
                 assert_eq!(config.execution_mode, PackExecutionMode::CompatOnly);
                 assert_eq!(
                     config
-                        .connection_profiles_path
+                        .connections
+                        .profiles_path
                         .as_ref()
                         .map(|path| path.to_string_lossy().to_string()),
                     Some("profiles.toml".to_owned())
                 );
-                assert_eq!(config.connection_profile_name.as_deref(), Some("secured-live"));
+                assert_eq!(
+                    config.connections.profile_name.as_deref(),
+                    Some("secured-live")
+                );
             }
             _ => panic!("expected pack command"),
         }
@@ -533,12 +579,16 @@ mod tests {
             Command::ValidatePack(config) => {
                 assert_eq!(
                     config
-                        .connection_profiles_path
+                        .connections
+                        .profiles_path
                         .as_ref()
                         .map(|path| path.to_string_lossy().to_string()),
                     Some("profiles.toml".to_owned())
                 );
-                assert_eq!(config.connection_profile_name.as_deref(), Some("secured-live"));
+                assert_eq!(
+                    config.connections.profile_name.as_deref(),
+                    Some("secured-live")
+                );
                 assert_eq!(
                     config
                         .report_json_path
@@ -558,7 +608,9 @@ mod tests {
             "compat".to_owned(),
             "--nrese-base-url".to_owned(),
             "http://127.0.0.1:8080".to_owned(),
-            "--fuseki-base-url".to_owned(),
+            "--reference-kind".to_owned(),
+            "fuseki".to_owned(),
+            "--reference-base-url".to_owned(),
             "http://127.0.0.1:3030/ds".to_owned(),
         ])
         .expect("cli");
@@ -573,22 +625,38 @@ mod tests {
     }
 
     #[test]
-    fn parses_optional_fuseki_basic_auth() {
+    fn reference_url_without_kind_is_rejected() {
+        let result = parse_cli(vec![
+            "bench".to_owned(),
+            "compat".to_owned(),
+            "--nrese-base-url".to_owned(),
+            "http://127.0.0.1:8080".to_owned(),
+            "--reference-base-url".to_owned(),
+            "http://127.0.0.1:7200/repositories/r".to_owned(),
+        ]);
+        let error = result.expect_err("kind is required").to_string();
+        assert!(error.contains("--reference-kind"), "{error}");
+    }
+
+    #[test]
+    fn parses_optional_reference_basic_auth() {
         let cli = parse_cli(vec![
             "bench".to_owned(),
             "compat".to_owned(),
             "--nrese-base-url".to_owned(),
             "http://127.0.0.1:8080".to_owned(),
-            "--fuseki-base-url".to_owned(),
+            "--reference-kind".to_owned(),
+            "fuseki".to_owned(),
+            "--reference-base-url".to_owned(),
             "http://127.0.0.1:3030/ds".to_owned(),
-            "--fuseki-basic-auth".to_owned(),
+            "--reference-basic-auth".to_owned(),
             "admin:nrese-admin".to_owned(),
         ])
         .expect("cli");
 
         match cli.command {
             Command::Compat(config) => {
-                let auth = config.fuseki.basic_auth.expect("basic auth");
+                let auth = config.reference.connection.basic_auth.expect("basic auth");
                 assert_eq!(auth.username, "admin");
                 assert_eq!(auth.password, "nrese-admin");
             }

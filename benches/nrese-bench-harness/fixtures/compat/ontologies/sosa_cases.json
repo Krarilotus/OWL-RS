@@ -1,15 +1,15 @@
 [
   {
-    "name": "sosa-observes-subproperty-of-ssn-for-property",
+    "name": "sosa-observes-inverse-of-is-observed-by",
     "operation": "query",
-    "query": "PREFIX sosa: <http://www.w3.org/ns/sosa/> PREFIX ssn: <http://www.w3.org/ns/ssn/> ASK WHERE { sosa:observes <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> ssn:forProperty }",
+    "query": "PREFIX sosa: <http://www.w3.org/ns/sosa/> PREFIX owl: <http://www.w3.org/2002/07/owl#> ASK WHERE { sosa:observes owl:inverseOf sosa:isObservedBy }",
     "accept": "application/sparql-results+json",
     "kind": "ask-boolean"
   },
   {
-    "name": "sosa-used-procedure-sensor-chain-declared",
+    "name": "sosa-observation-class-declared",
     "operation": "query",
-    "query": "PREFIX sosa: <http://www.w3.org/ns/sosa/> PREFIX ssn: <http://www.w3.org/ns/ssn/> PREFIX owl: <http://www.w3.org/2002/07/owl#> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ASK WHERE { sosa:usedProcedure owl:propertyChainAxiom ?chain . ?chain rdf:first sosa:madeBySensor ; rdf:rest ?tail . ?tail rdf:first ssn:implements ; rdf:rest rdf:nil . }",
+    "query": "PREFIX sosa: <http://www.w3.org/ns/sosa/> PREFIX owl: <http://www.w3.org/2002/07/owl#> ASK WHERE { sosa:Observation a owl:Class }",
     "accept": "application/sparql-results+json",
     "kind": "ask-boolean"
   }
