@@ -136,6 +136,8 @@ Goal: a codebase where every concern has one owner, and the evidence tooling nee
 
 The full design, targets and evidence plan are in [design/reasoner-v2.md](design/reasoner-v2.md).
 
+Reasoning behaviour is **configured per repository and per request** (decision D7, design §2.2); the targets below apply to the tuned defaults.
+
 **Targets:**
 - inferred sets identical to GraphDB on LUBM/UOBM/SPB
 - W3C OWL 2 RL conformance
@@ -146,14 +148,15 @@ The full design, targets and evidence plan are in [design/reasoner-v2.md](design
 | WP | Scope | Layer | Done when |
 |---|---|---|---|
 | **R0 Engine: inferred stack** | Pulled into M1 as **E6** (see there). | L1 | — |
-| **R1 Rule IR & rulesets** | IR; analysis (SCCs, strata, schema atoms); built-in `rdfs`, `rdfs-plus`, `owl-horst`, `owl2-rl`, `owl2-ql` as data; `.pie` import/export; the naive reference evaluator (the oracle). | L2 | `.pie` round-trip on GraphDB's published rulesets; reference evaluator passes RDFS/RL fixtures |
+| **R1 Rule IR & rulesets** | Reasoning-profile schema (design §2.2), validated at startup; IR (SCCs, strata, schema atoms); built-in `rdfs`, `rdfs-plus`, `owl-horst`, `owl2-rl`, `owl2-ql` as data; `.pie` import/export; the naive reference evaluator (the oracle). | L2 | `.pie` round-trip on GraphDB's published rulesets; reference evaluator passes RDFS/RL fixtures |
 | **R2 Schema compiler + batch executor** | TBox closure and rule specialisation (dispatch tables); list axioms compiled to fixed-arity rules; vertically partitioned sorted working set; semi-naive evaluation; sort-merge and Leapfrog Triejoin; morsel parallelism with deterministic output; bulk install into the inferred stack. | L2 | Batch equals naive (proptest); LUBM-1/10/100 inferred sets equal GraphDB's; throughput and thread scaling recorded |
 | **R3 Modules** | Hierarchy (SCC + bitset reachability), transitive properties, equality (union-find rewriting with read-time expansion), symmetric/inverse. | L2 | Each module equals its generic rules; UOBM parity |
-| **R4 Read models + commit-path reasoning** | `Materialised` / `Asserted` / `Inferred` read models; `onto:explicit` / `onto:implicit`; per-request switch; delta executor in the mutation pipeline (inserts). | L2/L3 | Query tests for all three models (audit F4 closed); insert reasoning p50 ≤ 1 ms at 100 M |
-| **R5 Truth maintenance** | DRed, then B/F / FBF; TBox deltas; sameAs maintenance; asserted ↔ inferred moves; reasoning jobs for large TBox changes; counting evaluated. | L2 | Incremental equals rematerialisation in CI; delete latency and TBox-change cost recorded |
+| **R4 Read models + commit-path reasoning** | `Materialised` / `Asserted` / `Inferred` read models; `onto:explicit` / `onto:implicit`; per-request switch; delta executor in the mutation pipeline (inserts, `timing = commit`); single-graph placement for any graph; `ruleset = none` at zero cost; bulk load `--reason`. | L2/L3 | Query tests for all three models (audit F4 closed); insert reasoning p50 ≤ 1 ms at 100 M |
+| **R5 Truth maintenance + timings** | DRed, then B/F / FBF; TBox deltas; sameAs maintenance; asserted ↔ inferred moves; reasoning jobs for large TBox changes; `deferred` and `on-demand` timings; counting evaluated. | L2 | Incremental equals rematerialisation in CI; delete latency and TBox-change cost recorded |
 | **R6 Consistency & explanations** | Consistency rules (`false` heads, `.pie` `Consistency`), proof search, proof-carrying rejects, proof API. The v1 fixture suite passes on v2; then `rules-mvp` is deleted. | L2/L3 | W3C RL consistency tests; explanation ≤ 10 ms; v1 removed |
 | **R7 RDF 1.2 triple terms** | `TermKind::Triple`, syntax, SPARQL-star (decision D4). | L1/L2 | RDF 1.2 tests |
-| **R8 Beyond GraphDB** (stretch) | EL classification module (ELK-style), OWL 2 QL rewriting mode, per-graph reasoning. Each item is a separate decision. | L2 | per item |
+| **R8 Beyond GraphDB** (stretch) | EL classification module (ELK-style), OWL 2 QL rewriting mode. Each item is a separate decision. | L2 | per item |
+| **R9 Graph-scoped reasoning** | `placement = source-graph`: per-graph rule evaluation, shared schema graphs, quad layout for the inferred stack. | L1/L2 | per-graph results equal evaluating each graph separately |
 
 ### M4: Performance, the QLever track (size XL)
 
@@ -250,4 +253,5 @@ Benchmarks run on one documented machine profile. Numbers go into `docs/spec/06-
 | D3 | Full-text engine: tantivy, or our own inverted index? | **tantivy** (decided 2026-09-25). |
 | D4 | RDF-star / RDF 1.2 triple terms: early (M2) or with reasoning (M3)? | **M3** (decided 2026-09-25), unless a concrete DMW/RS need appears earlier. |
 | D5 | Is the v1 `rules-mvp` reasoner kept running through an adapter during M1–M2? | Default **yes**, then deleted in R5. Reversible; not yet explicitly confirmed. |
+| D7 | Are reasoning behaviours fixed or configurable? | **Configurable** (decided 2026-09-26). Tuned defaults, other modes exposed per repository (ruleset, timing, consistency, placement, sameAs, maintenance) and per request (read model, explanations, freshness). Only the stack invariants are fixed. See [design/reasoner-v2.md](design/reasoner-v2.md) §2.2. |
 | D6 | May the stray build directories in the working copy be deleted (F5)? | **Yes** (decided 2026-09-25): 23 untracked `target-*` directories (about 50 GB) were removed. |

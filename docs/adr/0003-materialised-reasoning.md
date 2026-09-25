@@ -38,8 +38,11 @@ State of the art:
 
 The plan in [design/reasoner-v2.md](../design/reasoner-v2.md) makes these decisions concrete. None of them reverses the decision above.
 
-- **Reasoning runs inside the commit.** The inferred delta is committed with the asserted delta under one revision, and the WAL carries both, so recovery never re-reasons. TBox changes over large extensions run as visible, cancellable reasoning jobs instead of silently rematerialising.
-- **The inferred stack is disjoint from the asserted one** (`inferred = Mat(P, asserted) \ asserted`). It holds triples in the default graph only, so three permutations suffice.
+- **Behaviour is configured, not hard-wired** (decision D7, [design §2.2](../design/reasoner-v2.md)).
+  - Ruleset, timing (`commit`/`deferred`/`on-demand`), consistency handling, inference placement, sameAs and maintenance strategy are repository settings. The read model and explanations are per request.
+  - The fixed invariants are: separate and disjoint stacks, atomicity of whatever a commit reasons, and inferences that can't be written directly.
+- **Default timing: reasoning runs inside the commit.** The inferred delta is committed with the asserted delta under one revision, and the WAL carries both, so recovery never re-reasons. TBox changes over large extensions run as visible, cancellable reasoning jobs instead of silently rematerialising.
+- **The inferred stack is disjoint from the asserted one** (`inferred = Mat(P, asserted) \ asserted`). With the default placement it holds one graph, so three permutations suffice; per-graph placement uses the quad layout.
 - **The TBox is compiled before the instance fixpoint.** Its closure is computed first, instance rules are specialised into dispatch tables, and RDF-list axioms are compiled into fixed-arity rules. An outer fixpoint keeps this exact when instance rules feed the schema.
 - **There are two executors for one compiled program:**
   - a sorted, vertically partitioned, parallel batch executor (sort-merge and Leapfrog Triejoin), used for loads and large deltas
