@@ -1,0 +1,327 @@
+# Reasoner v2: design and plan to state-of-the-art reasoning
+
+Status: **plan** (2026-09-25). Decision record: [ADR-0003](../adr/0003-materialised-reasoning.md). Roadmap: Milestone 3 in [ROADMAP.md](../ROADMAP.md). The v1 reasoner this replaces is described in [spec/03](../spec/03-reasoner-and-owl-profile.md).
+
+This document answers three questions:
+- what "industry-leading reasoning" means in measurable terms
+- which techniques get us there, and why each one was chosen
+- in which order we build it, and what evidence moves each step to done
+
+---
+
+## 1. Targets
+
+### 1.1 Who we measure against
+
+| System | What it's best at | Published evidence we use |
+|---|---|---|
+| **GraphDB** (Ontotext) | The semantic reference. Its rulesets (`rdfs`, `rdfs-plus`, `owl-horst`, `owl2-rl`, `owl2-ql`), `.pie` rules, `isSupported`-style retraction, explicit/implicit graphs, proof plugin. | GraphDB 11.5 benchmark page, LDBC SPB-256 (256 M explicit statements) on r6id instances. Load plus materialisation takes 206 min for RDFS-Plus-optimized at 16 cores (402 M total statements; ≈ 21 k explicit st/s) and 470 min for OWL2-RL at 8 cores (775 M total; ≈ 9 k explicit st/s). Going from 8 to 16 cores gives no speedup. Under the SPB production load it serves 23.8 writes/s. |
+| **RDFox** (Oxford Semantic) | The performance reference for materialisation. Parallel, lock-free materialisation; `owl:sameAs` by rewriting; B/F, FBF and counting maintenance. | Motik et al., AAAI 2014 and JAIR 2015 (parallel materialisation, near-linear speedup to 16 cores); AAAI 2015 (sameAs rewriting; B/F); IJCAI 2015 (maintenance with equality); AIJ 2019 (DRed vs FBF vs counting) |
+| **Inferray** | Throughput on RDFS-class rulesets: vertically partitioned sorted arrays, sort-merge joins, cache efficiency | Subercaze et al., PVLDB 9(6), 2016 |
+| **VLog / Nemo** | Column-oriented and trie-based datalog. Nemo is Rust, with worst-case-optimal joins. | Urbani, Jacobs, Krötzsch, AAAI 2016; Carral et al., ISWC 2019; Ivliev et al., ICLP 2023 and KR 2024 |
+| **Modular maintenance** | Dedicated algorithms for transitivity, symmetry and equality inside a datalog engine, with orders-of-magnitude gains on recursive rules | Hu, Motik, Horrocks, AAAI 2018; Hu, Motik, Horrocks, AIJ 2022 |
+
+**Outside the target** (tracked, not planned):
+- **GPU datalog** (column-oriented datalog on the GPU, AAAI 2025): a research direction with large speedups over Nemo. Our deployment target is a CPU server.
+- **Tableau-based OWL 2 DL:** GraphDB doesn't do it either.
+
+### 1.2 Targets
+
+The reference machine is documented in `benches/baselines/README.md`. Every comparison runs the competitor on the same machine: GraphDB Free in Docker; RDFox and Nemo where licences allow.
+
+| # | Target | Metric | Goal |
+|---|---|---|---|
+| T1 | Semantic parity | Inferred-triple sets on LUBM, UOBM and SPB versus GraphDB, per ruleset | **Identical sets**, apart from documented, deliberate differences (§6.3) |
+| T2 | Conformance | W3C OWL 2 test cases tagged for the RL profile, run as entailment and consistency tests | Pass all *approved* RL tests that the `owl2-rl` ruleset can decide |
+| T3 | Bulk materialisation | Load plus materialise, `owl2-rl` and `rdfs-plus`, at LUBM-100 and at the largest SPB size that fits in memory | **≥ 10× GraphDB** end to end on the same machine; materialisation alone within 2× of RDFox if RDFox is available |
+| T4 | Parallel scaling | Materialisation speedup with 1 → 8 → 16 threads | ≥ 6× on 8 cores; results bit-identical for every thread count |
+| T5 | Commit-path reasoning | Reasoning-stage latency of a 1-triple ABox insert or delete at 100 M asserted, `owl2-rl` | p50 ≤ 1 ms, p99 ≤ 10 ms. 1 k-triple batch ≤ 50 ms. GraphDB's per-write cost measured alongside. |
+| T6 | Maintenance correctness | Random insert/delete sequences | Incremental result equals rematerialisation in **100 %** of runs (property tests in CI) |
+| T7 | TBox changes | Adding or removing a `subClassOf`, `subPropertyOf` or `inverseOf` axiom at 100 M | Cost proportional to the affected extension, reported. Never a silent full rematerialisation. |
+| T8 | Memory | Bytes per inferred fact | ≤ 96 B/fact before Pf1 (half the asserted cost, §4.3); ≤ asserted bytes/fact after Pf1 |
+| T9 | Explanations | One derivation tree of depth ≤ 10 | ≤ 10 ms, in every reject response and on demand |
+
+**Where we go beyond GraphDB:**
+- write-path reasoning latency (T5)
+- parallel scaling (T4)
+- proof-carrying rejects
+- a verified-equivalent incremental path (T6)
+- joint incremental SHACL over the materialised view
+
+---
+
+## 2. Architecture
+
+```
+ruleset (data) ─► Rule IR ─► analysis ─► schema compiler ─────► specialised program
+ .pie import       (§3.1)    strata,      TBox closure,          ├─ batch executor (§4.1): full / large Δ
+ built-ins                   recursion    list axioms, rule      ├─ delta executor (§4.2): commit Δ
+                                          specialisation         └─ modules (§4.4): hierarchy, transitive,
+                                                                    sameAs, symmetric/inverse
+                                                   │
+                  maintenance (§5): insert = semi-naive; delete = DRed → B/F / FBF
+                                                   │
+          engine: asserted stack + inferred stack, committed atomically in one revision (§4.3)
+```
+
+**Ownership** (ARCHITECTURE §2.1):
+- `nrese-reasoner` owns everything above the engine line: pure functions of `(program, view, Δ)` that return an inferred delta, violations or explanations.
+- `nrese-engine` owns the inferred stack, but not its meaning.
+- `nrese-store` places the reasoner in the pipeline.
+- `nrese-sparql` exposes the read models.
+
+### 2.1 Where reasoning runs
+
+Reasoning runs **inside the commit** (pipeline step 3), not after it. The inferred delta is committed together with the asserted delta, under the same revision.
+
+- **Read-your-writes holds for inferences**, as in GraphDB.
+- **A consistency violation rejects the write** before anything is published.
+- **Recovery never re-reasons.** The WAL record carries both deltas.
+
+The exception is large TBox changes over big extensions. When the planned work exceeds a configured budget, they run as a **reasoning job**: a long transaction that holds the writer slot, is visible in operator status and can be cancelled. Its cost is reported (T7), and it never falls back silently.
+
+---
+
+## 3. Semantics layer
+
+### 3.1 Rule IR
+
+```text
+Rule    { id, name, body: [Atom], guards: [Guard], head: Head }
+Atom    = (Term, Term, Term)            // triple pattern; graph is the union (§6.2)
+Term    = Var(u16) | Const(TermId)
+Guard   = Neq(Term, Term) | Builtin(…)  // .pie "Constraint"; datatype tests
+Head    = Facts([Atom]) | Inconsistent(ViolationKind)
+Program { rules, strata, recursive_sccs, consistency_rules }
+```
+
+- **Rules are data.** Rulesets are values of this type. The built-in ones are defined in Rust as tables, with the W3C OWL 2 RL rule names (`prp-dom`, `cax-sco`, `eq-rep-s`, …), not as parsed text.
+- **`.pie` import.** It covers `Prefices`, `Axioms`, `Rules` and `Consistency`, `[Constraint …]` and `[Cut]`. Export exists too, so round-trip tests run against GraphDB's published rulesets.
+- **Analysis** is a pure function over the IR. It computes the predicate dependency graph, its SCCs (recursion), stratification, and which atoms are *schema atoms*: atoms whose predicates are only ever derived from TBox vocabulary.
+
+### 3.2 Schema compiler (TBox specialisation)
+
+OWL RL rules mostly join one small schema relation with one large instance relation, for example `cax-sco: (?c1 subClassOf ?c2), (?x type ?c1) → (?x type ?c2)`. Evaluating that as a join per round is the main waste in generic engines. The approach taken by WebPIE, Inferray and GraphDB's compiled rules is to evaluate the schema side once.
+
+1. **TBox closure first.** Compute the closure of the schema stratum (`scm-*`: subclass and subproperty hierarchies, equivalences, domain and range propagation, inverses) with the hierarchy module (§4.4).
+2. **Specialise instance rules** by partial evaluation over that closure.
+   - A rule with a schema atom becomes a *dispatch table*, for example `type(x, c) → type(x, c')` for every `c' ∈ sup⁺(c)`, stored as `c ↦ [c']`.
+   - After specialisation almost every instance atom has a **constant predicate**. Variable-predicate atoms (`rdfs2/3/7`, `prp-spo1`, `prp-inv`) turn into one rule per schema binding.
+3. **Compile list axioms.** `owl:propertyChainAxiom`, `owl:intersectionOf`, `owl:unionOf`, `owl:hasKey`, `owl:AllDifferent`, `owl:AllDisjointClasses`/`Properties` and `owl:oneOf` are read from the RDF lists in the TBox and compiled into rules of fixed arity. For example, a chain of length n becomes one n-atom rule.
+   - This removes the `rdf:first`/`rdf:rest` helper rules that generic `.pie` rulesets need.
+   - It fixes v1's defect of never seeing Turtle list syntax.
+   - Malformed lists produce diagnostics, never a silent skip.
+4. **Soundness condition.** Specialisation is exact as long as the TBox closure doesn't change during the instance fixpoint. If instance rules derive schema facts (for example `owl:sameAs` between classes, or punning), the analysis flags those rules as *schema-feeding*. The evaluator then runs an outer fixpoint: new schema facts → re-specialise the affected rules → continue. Correct in general, and fast in the common case.
+
+### 3.3 Rulesets
+
+| Ruleset | Content | Notes |
+|---|---|---|
+| `rdfs` | RDFS entailment rules (without the axiomatic container-membership rules, like GraphDB's `partialRDFS` default) | |
+| `rdfs-plus` | RDFS + `inverseOf`, `SymmetricProperty`, `TransitiveProperty`, `FunctionalProperty`/`InverseFunctionalProperty` equality, `equivalentClass`/`Property`, `sameAs` | GraphDB's most-used ruleset |
+| `owl-horst` | pD* (ter Horst): RDFS-plus + `hasValue`, `someValuesFrom`/`allValuesFrom` (the pD* forms), `differentFrom` consistency | |
+| `owl2-rl` | The W3C OWL 2 RL/RDF rules, all tables: eq, prp, cls, cax, dt (partial, §6.3), scm | |
+| `owl2-ql` | GraphDB's materialisable OWL 2 QL variant | Query rewriting is an optional stretch (R8) |
+| `custom` | Any `.pie` or IR program | Validated by the analysis (safety, arity) |
+
+Every ruleset has two variants, like GraphDB's "optimized" rulesets:
+- the **full** variant is the specification
+- the **optimised** variant drops rules whose consequences are rarely queried (for example `rdf:type rdfs:Resource`)
+
+Both are covered by the parity tests.
+
+---
+
+## 4. Execution layer
+
+### 4.1 Batch executor: full materialisation and large deltas
+
+Used for initial loads, restores, ruleset changes and deltas above a size threshold.
+
+- **Working set: vertical partitioning.** It is built from one snapshot scan as per-predicate binary relations of `(u64, u64)` pairs, in both **SO and OS order**. `rdf:type` is further split per class as unary sets.
+  - This is Inferray's layout, and it is also what QLever's permutations amount to per predicate.
+  - It costs 32 B per fact for two orders, versus 192 B in the engine's six-permutation runs.
+  - Building it means a parallel radix sort of u64 pairs.
+- **Semi-naive evaluation per stratum.** Each relation has `old | Δ | new` segments. A rule with n atoms runs n delta variants (atom i on Δ, atoms before i on old, atoms after i on old ∪ Δ), so no derivation is repeated across rounds.
+- **Joins:**
+  - **Binary joins** (the vast majority after specialisation) are sort-merge joins on sorted columns, or galloping when sizes differ by more than 32×.
+  - **Rules with ≥ 3 atoms** (chains, keys, intersections) use **Leapfrog Triejoin** over the sorted columns (Veldhuizen, ICDT 2014; Nemo's choice), which is worst-case-optimal for cyclic shapes.
+  - **Dispatch-table rules** (§3.2) are a scan with a table lookup and no join.
+- **Deduplication without locks.** Each worker writes derivations into thread-local buffers. At the end of a round they are partitioned by predicate, radix-sorted, merged and deduplicated against `old ∪ Δ` by one merge pass. There's no shared hash set, so there's no contention, and the output is deterministic regardless of thread count (T4).
+- **Parallelism:** morsel-driven (Leis et al., SIGMOD 2014) through rayon.
+  - Work units are (rule variant × Δ-morsel of 16–64 k facts), so skewed predicates split instead of serialising.
+  - RDFox's lock-free design is the benchmark to meet (T3). We deliberately take the sort-based route instead: it is simpler to make deterministic, and it matches our immutable-run storage.
+- **Output:** the new inferred facts are sorted once more, into the inferred stack's permutations, and installed as base runs through the bulk run builder shared with E5. They never go through the per-commit path.
+
+### 4.2 Delta executor: the commit path
+
+Used for typical interactive writes, where Δ is between 1 and ~10⁴ facts.
+
+- **Same compiled program, different access method.** Index-nested-loop joins over the engine view (asserted ∪ inferred ∪ pending), using the six permutations: `(s p ?)` → SPOG prefix, `(? p o)` → POSG, `(s ? o)` → OSPG.
+  - Rules match over the union of graphs, so a triple asserted in several graphs is deduplicated per rule instance.
+- **Dispatch tables** (§3.2) make the hot rules O(1) plus output size.
+- **Adaptive switch.** When the planner's estimate (Δ size × rule fan-out from predicate statistics) crosses a threshold, it switches to the batch executor.
+- **The oracle.** Both executors are differential-tested against each other and against the naive reference evaluator (§7.1).
+
+### 4.3 The inferred stack in the engine (decision D2, refined)
+
+- **Disjoint from asserted data.** `inferred = Mat(P, asserted) \ asserted`, and this invariant is checked by the tests.
+  - A union scan merges two disjoint sorted streams and never needs to deduplicate.
+  - An explicit statement that is also derivable counts as explicit, as in GraphDB.
+  - Deleting an asserted fact that is still derivable moves it into the inferred stack. The maintenance step does this (§5).
+- **Triples in one fixed graph.** Inferences live in the default graph (GraphDB semantics), so the inferred stack needs only **three permutations** (SPO, POS, OSP) instead of six. That halves its memory (T8) at the same key width; key-width specialisation and Pf1 compression reduce it further.
+- **One `Version` holds both stacks.**
+  - A commit publishes the asserted and inferred deltas atomically under one revision.
+  - The WAL record and checkpoint carry both, and recovery never needs the reasoner.
+  - Only the reasoner writes the inferred stack. The engine exposes inferred writes on the transaction as a separate API; `nrese-sparql` and the request paths never call it, and only the pipeline's reasoning stage in `nrese-store` does.
+- **Read models** (R4):
+  - `Materialised` = asserted ∪ inferred, the default.
+  - `Asserted`: explicit statements only.
+  - `Inferred`: implicit statements only.
+  - They are selectable per request and through GraphDB's pseudo-graphs `FROM onto:explicit` / `FROM onto:implicit`.
+  - A `ReadView` is a (snapshot, model) pair, so SPARQL, the Graph Store Protocol, export and SHACL all share one mechanism.
+
+### 4.4 Modules: dedicated algorithms for recursive shapes
+
+Generic semi-naive evaluation of transitive or equality rules makes O(n·closure) redundant derivations. Following Hu, Motik and Horrocks (AAAI 2018, AIJ 2022), recursive components with known shapes are handed to modules. Each module implements `materialise(Δ⁺)`, `maintain(Δ⁺, Δ⁻)` and `explain(fact)` behind one trait.
+
+| Module | Rules covered | Algorithm |
+|---|---|---|
+| Hierarchy | `scm-sco`, `scm-spo`, `scm-eqc*`, `scm-eqp*`, `cax-sco` fan-out | SCC condensation, then reachability over the DAG with bitsets. Produces the `sup⁺` dispatch tables. Deletes recompute only the affected sub-DAG. |
+| Transitive property | `prp-trp` per transitive property | SCC condensation plus per-component reachability; the closure is materialised (GraphDB semantics) but computed without redundant joins. Deletes: the affected components only. |
+| Equality | `eq-sym`, `eq-trans`, `eq-rep-*`, and `prp-fp`, `prp-ifp` and `prp-key` as producers | Union-find over `TermId`s with **rewriting** (Motik et al., AAAI 2015). Facts are stored over class representatives (the smallest id), and the read view expands members at scan time. The equivalence classes are persisted with the inferred stack. Deletes follow Motik et al., IJCAI 2015 (rewriting combined with maintenance). |
+| Symmetric / inverse | `prp-symp`, `prp-inv1/2` | Pairwise mirroring; no recursion beyond depth 2 |
+
+**Equality semantics.** Queries under the `Materialised` model see the fully expanded sameAs semantics, exactly as if every rewritten fact were materialised for every member. This matches GraphDB with sameAs enabled, without the O(k²) blow-up for cliques of size k. There is a per-repository switch to disable sameAs, like GraphDB's `disable-sameAs`.
+
+---
+
+## 5. Maintenance (truth maintenance)
+
+- **Insert:** semi-naive evaluation seeded with Δ⁺ (plus the facts Δ⁺ implies through modules).
+- **Delete**, in two stages. Both are required to agree with rematerialisation (T6).
+  1. **DRed** (Gupta, Mumick, Subrahmanian, SIGMOD 1993) comes first, as the simple, robust baseline. It overdeletes everything derivable from Δ⁻, then rederives what still has support.
+  2. **B/F and FBF** (Motik et al., AAAI 2015; AIJ 2019) are the default for non-module strata. Each deleted fact first gets a backward check for an alternative proof, GraphDB's `isSupported`, and only unsupported facts propagate forward. This avoids DRed's overdeletion blow-up when facts have many derivations, which is typical for type hierarchies.
+- **Counting** (per-fact derivation counts) is the AIJ 2019 winner for non-recursive strata, but it needs persistent per-fact state. It is **evaluated in R5** against FBF on the benchmark mix, and adopted only if FBF misses T5 on non-recursive strata.
+- **TBox deltas** change the specialised program itself:
+  - An added axiom evaluates the *new rule instances* against the full current state. For example, a new edge `C ⊑ D` gives every member of `C` and its subclasses the types `D` and `sup⁺(D)`.
+  - A removed axiom runs DRed or FBF seeded by the removed rule instances.
+  - Both run through the batch executor when the extension is large (§2.1).
+- **Moving facts between stacks:**
+  - Deleting an asserted fact that is still supported moves it to the inferred stack.
+  - Asserting a previously inferred fact moves it from inferred to asserted.
+  - Both follow from the disjointness invariant and are covered by the property tests.
+- **Atomicity.** Every maintenance step writes into the same transaction as the asserted delta. An error or cancellation discards both.
+
+---
+
+## 6. Consistency, explanations, semantics details
+
+### 6.1 Consistency and explanations
+
+- **Consistency rules** are `Inconsistent(kind)` heads, evaluated incrementally like any other rule, and imported from `.pie` `Consistency` sections. For `owl2-rl` they cover:
+  - `cls-nothing2`
+  - `cax-dw`, `cax-adc`
+  - `eq-diff1/2/3`
+  - `prp-irp`, `prp-asyp`, `prp-pdw`, `prp-adp`, `prp-npa1/2`
+  - `cls-com`
+  - `cls-maxc1`, `cls-maxqc1/2`
+  - `dt-not-type` (partial)
+- **Explanations:** backward proof search over the program, reusing the B/F backward step. It returns one shortest derivation tree down to asserted facts, bounded by depth and time. Explanations are recomputed rather than stored, as RDFox does, so they cost no memory.
+  - **Reject responses** carry the violation's derivation tree, which replaces v1's heuristic blame.
+  - An **on-demand API** returns the proof for any inferred fact, with a GraphDB proof-plugin-compatible SPARQL form as an extension function.
+
+### 6.2 Graph semantics
+
+- Rules match over the **union of all graphs**, and inferences go to the default graph. This is GraphDB's behaviour, and it's what ResearchSpace and DMW expect.
+- The IR's atoms keep room for a graph term. **Per-graph reasoning**, where inferences stay in the source graph (RDFox and Stardog style), is a stretch option (R8), not a default.
+
+### 6.3 Deliberate differences, each pinned by a test
+
+- **Datatype rules (`dt-*`).**
+  - Equality and difference are decided on values for inline canonical types (E1).
+  - For other datatypes they are lexical, and `dt-type2`/`dt-not-type` are applied only for datatypes we validate.
+  - This is documented per datatype; GraphDB is partial here too.
+- **Literal identity.** Literals keep their lexical form (spec 02). GraphDB may canonicalise them, and parity comparisons normalise literals before comparing.
+- **Axiomatic triples.** Axiomatic triples that are never queried (container membership `rdfs:member` axioms) follow GraphDB's `partialRDFS` default. The switch to full is per ruleset.
+
+---
+
+## 7. Evidence
+
+### 7.1 Correctness
+
+| Test | What it proves | Runs |
+|---|---|---|
+| **Naive reference evaluator** | A 200-line naive fixpoint over a `BTreeSet`: obviously correct and slow. It is the oracle for everything below. | CI |
+| Executor differential | Batch = delta = naive, on random programs × random datasets (proptest) | CI |
+| Module differential | Each module equals the generic rules it replaces, including after deletes | CI |
+| Maintenance differential | Random insert/delete sequences: incremental equals rematerialisation (T6); stack disjointness invariant | CI |
+| Specialisation soundness | Schema-feeding programs (punning, class `sameAs`) against the unspecialised evaluation | CI |
+| W3C OWL 2 RL conformance | T2 | CI |
+| v1 fixture suite | The `rules-mvp` fixtures (FOAF, Time, ORG, SKOS, PROV-O, DCAT, vCard, DCTerms, SOSA, SSN, ODRL) pass on v2, then v1 is deleted | CI |
+| GraphDB parity | LUBM, UOBM and SPB inferred sets, diffed against GraphDB Free running in Docker (T1) | recorded |
+
+### 7.2 Performance
+
+- **Harness:** a `reason` command in `nrese-bench-harness` with generators built in, so runs are hermetic:
+  - a Rust port of the LUBM UBA generator
+  - UOBM
+  - OWL2Bench (ISWC 2020; covers the EL, QL and RL profiles)
+  - an SPB sample
+  - our RG dataset
+- **Metrics:**
+  - full materialisation time and facts/s
+  - thread scaling
+  - peak memory and bytes per inferred fact
+  - commit-path latency distributions for insert and delete at Δ = 1, 10, 1 k and 100 k, against rematerialisation
+  - TBox-change cost
+  - explanation latency
+- **Recording:** results go to `benches/baselines/reasoning-*.json` together with the commit, machine and competitor versions.
+- **Memory ceiling:** until Pf1 (compressed runs), in-memory capacity is about 190 B per asserted quad. Full-scale SPB-256 with `owl2-rl` (775 M statements) therefore needs Pf1. The ladder runs LUBM-1/10/100 and SPB at sizes that fit, and the full-scale comparison follows Pf1.
+
+---
+
+## 8. Work packages (Milestone 3)
+
+| WP | Scope | Size | Done when |
+|---|---|---|---|
+| **R0 Engine: inferred stack** | Second index stack in `Version` (three permutations), atomic dual-stack commits, WAL and checkpoint format carrying both stacks, separate inferred-write API on the transaction, bulk run install. **Pulled forward into M1 as E6**, while the v2 on-disk format has no deployments to migrate. | M | Engine model tests cover both stacks; crash tests recover both; the stack disjointness invariant is enforced in debug builds |
+| **R1 Rule IR, analysis, rulesets** | IR, analysis (SCCs, strata, schema atoms), built-in rulesets as data, `.pie` import/export, **naive reference evaluator** | M | `.pie` round-trip on GraphDB's published rulesets; the reference evaluator passes hand-written RDFS/RL fixtures |
+| **R2 Schema compiler + batch executor** | TBox closure, specialisation, list-axiom compilation, the vertically partitioned working set, semi-naive evaluation, sort-merge and LFTJ joins, morsel parallelism, bulk install of the inferred stack | L | Batch equals naive (proptest); LUBM-1/10/100 counts equal GraphDB for all rulesets (T1); T3 and T4 recorded |
+| **R3 Modules** | Hierarchy, transitive, equality (rewriting plus read-time expansion), symmetric/inverse | M | Each module equals its generic rules; sameAs semantics tests; UOBM parity |
+| **R4 Read models + commit-path reasoning** | `ReadModel` in `ReadView`; `onto:explicit`/`onto:implicit`; per-request switch over HTTP; delta executor in the mutation pipeline with insert maintenance; stats | M | Query tests for all three models (audit F4 closed); T5 for inserts |
+| **R5 Truth maintenance** | DRed, then B/F / FBF; TBox deltas; sameAs maintenance; stack moves; reasoning jobs for large TBox changes; the counting evaluation | L | T6 in CI; T5 for deletes; T7 recorded |
+| **R6 Consistency + explanations** | Consistency rules, proof search, proof-carrying rejects, proof API; the v1 fixture suite on v2; **v1 `rules-mvp` deleted** | M | T2 and T9; v1 fixtures green on v2; `rules_mvp*` modules gone |
+| **R7 RDF 1.2 triple terms** (D4) | `TermKind::Triple` (the dictionary key is three component ids), parsers/serialisers, SPARQL-star functions; no inference inside quoted triples (GraphDB semantics) | M | RDF 1.2 syntax and SPARQL tests |
+| **R8 Beyond GraphDB** (stretch, each an independent decision) | EL classification module (consequence-based, ELK-style: Kazakov, Krötzsch, Simančík, JAR 2014) for large terminologies like SNOMED; OWL 2 QL query rewriting (PerfectRef/Ontop style) as a zero-materialisation mode; per-graph reasoning | L each | Per item |
+
+**Order:** R0 (as E6, now) → R1 → R2 → R3 → R4 → R5 → R6, with R7 anywhere in M3.
+- R1 and the reference evaluator come before any optimised code, because they are the oracle (roadmap rule 2).
+- R4 comes before R5 so the product gets queryable inferences early. Until R5, deletes under reasoning use DRed through the batch executor: correct, but not yet fast.
+
+---
+
+## 9. Sequencing within the whole roadmap
+
+Decision D1 stands: **governance (M2) comes before reasoning (M3).** Two adjustments follow from this plan:
+
+1. **R0 is pulled into M1 as E6.** The inferred stack changes the WAL and checkpoint formats. Doing it now, while no v2 data exists anywhere, avoids a format migration. It also lets SHACL (S2) be built against the final `ReadView`/read-model shape.
+2. **E5 (bulk load) builds the shared bulk-run installer** that R2 also uses.
+
+Resulting order: **E6 → E5 → E1 rest → Q1 rest → M2 (S1, S2, T1, X1, …) → M3 (R1 …)**.
+
+M3 depends on M2 only through the shared `ReadView`. If reasoning becomes more urgent than governance, M3 can start straight after M1 without redesign.
+
+---
+
+## 10. Risks
+
+| Risk | Mitigation |
+|---|---|
+| Specialisation is unsound for exotic TBoxes (punning, schema derived from data) | The analysis flags schema-feeding rules and an outer fixpoint covers them (§3.2). A dedicated differential test runs against unspecialised evaluation. |
+| sameAs rewriting makes maintenance hard (IJCAI 2015 is intricate) | The equality module is isolated behind the module trait. Fallback: DRed over the rewritten program, which is correct and slower, with the cost reported. |
+| Sort-based parallelism is slower than RDFox's lock-free hash approach on some workloads | Measured in T3. The dedup step is isolated in one function, so a concurrent hash-set variant can be added if the numbers demand it. |
+| Memory before Pf1 | Full-scale benchmarks wait for Pf1. The inferred stack uses three permutations (T8). |
+| GraphDB ruleset details are only partly documented | Parity is established by diffing inferred sets against a running GraphDB, not by reading documentation. Every difference is either fixed or documented in §6.3. |
+| TBox changes are expensive at scale | Reasoning jobs with visible cost and cancellation (§2.1). T7 is reported, never hidden. |

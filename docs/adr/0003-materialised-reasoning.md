@@ -33,3 +33,22 @@ State of the art:
 
 - Write-time reasoning cost becomes proportional to the consequences of the delta.
 - Memory grows with the materialised inferences, as in GraphDB. The size is reported in stats.
+
+## Refinements (2026-09-25, reasoning plan)
+
+The plan in [design/reasoner-v2.md](../design/reasoner-v2.md) makes these decisions concrete. None of them reverses the decision above.
+
+- **Reasoning runs inside the commit.** The inferred delta is committed with the asserted delta under one revision, and the WAL carries both, so recovery never re-reasons. TBox changes over large extensions run as visible, cancellable reasoning jobs instead of silently rematerialising.
+- **The inferred stack is disjoint from the asserted one** (`inferred = Mat(P, asserted) \ asserted`). It holds triples in the default graph only, so three permutations suffice.
+- **The TBox is compiled before the instance fixpoint.** Its closure is computed first, instance rules are specialised into dispatch tables, and RDF-list axioms are compiled into fixed-arity rules. An outer fixpoint keeps this exact when instance rules feed the schema.
+- **There are two executors for one compiled program:**
+  - a sorted, vertically partitioned, parallel batch executor (sort-merge and Leapfrog Triejoin), used for loads and large deltas
+  - an index-nested-loop delta executor over engine views, used on the commit path
+- **Recursive shapes go to modules:** hierarchy, transitivity, equality and symmetry, following Hu, Motik and Horrocks, AAAI 2018 / AIJ 2022.
+- **Maintenance order:**
+  1. DRed first, as the correctness baseline.
+  2. B/F and FBF as the default.
+  3. Counting only if measurements require it, because it needs persistent per-fact state.
+- **`owl:sameAs`:** facts are stored over representatives and expanded when read.
+- **Explanations are recomputed by backward proof search, not stored.**
+- **The storage part moves into M1 as E6**, before any v2 on-disk data exists.

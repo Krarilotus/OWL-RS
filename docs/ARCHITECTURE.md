@@ -48,10 +48,10 @@ Tooling outside the layer model: `benches/nrese-bench-harness` (black-box HTTP c
 **Write (mutation pipeline, owned by `nrese-store`):**
 1. Acquire the single writer slot and a snapshot of the latest revision.
 2. **Plan:** turn the request into a `Delta` (exact inserts and deletes relative to the snapshot). For SPARQL Update this evaluates `WHERE` clauses against *snapshot + pending delta*, so later operations in a request see earlier ones. Nothing is written.
-3. **Validate:** gates run against `(snapshot, delta)`: reasoner consistency, then SHACL. Gates are *delta-aware*; a gate that can't be incremental says so explicitly in its capability report.
+3. **Validate:** gates run against `(snapshot, delta)`: the reasoner first derives the inferred delta and checks consistency, then SHACL validates. Gates are *delta-aware*; a gate that can't be incremental says so explicitly in its capability report.
 4. **Deadline check:** if the request's deadline has passed or it was cancelled, abort. **Nothing is committed after a timeout.**
-5. **Commit:** the engine writes the delta to the WAL (durable mode), appends it as a new immutable run, and publishes the new version atomically. Revisions are persistent and monotonic.
-6. **Post-commit:** background compaction; reasoning materialisation maintenance.
+5. **Commit:** the engine writes the asserted and inferred deltas to the WAL (durable mode), appends it as a new immutable run, and publishes the new version atomically. Revisions are persistent and monotonic.
+6. **Post-commit:** background compaction and checkpoints. Reasoning is *not* post-commit: inferences are committed with the write that causes them, under the same revision ([design/reasoner-v2.md](design/reasoner-v2.md) §2.1).
 
 Cost of steps 2–5 is proportional to the **delta**, not the dataset. Any change that reintroduces work proportional to the dataset on the write path must be justified in an ADR.
 
@@ -86,7 +86,7 @@ See [ADR-0002](adr/0002-engine-storage-lsm-permutations.md) for the full rationa
 ## 5. Evaluation, reasoning, validation (L2)
 
 - **SPARQL:** full SPARQL 1.1 semantics come from `spargebra` + `spareval` running over the engine's `QueryableDataset` implementation ([ADR-0001](adr/0001-own-engine-reuse-oxigraph-parsers.md)). Native operators (merge join on permutation order, worst-case-optimal joins for cyclic patterns, vectorised ID tables) replace spareval's generic ones incrementally, with spareval as the correctness oracle in tests.
-- **Reasoning** ([ADR-0003](adr/0003-materialised-reasoning.md)): semi-naive datalog materialisation of RDFS / OWL 2 RL rule sets over `TermId`s, `owl:sameAs` handled by union-find rewriting, incremental maintenance for deletes. Inferred quads live in a dedicated inferred layer, so asserted and inferred data stay distinguishable and both are queryable.
+- **Reasoning** ([ADR-0003](adr/0003-materialised-reasoning.md)): semi-naive datalog materialisation of RDFS / OWL 2 RL rule sets over `TermId`s, `owl:sameAs` handled by union-find rewriting, incremental maintenance for deletes. Inferred quads live in a dedicated inferred layer, so asserted and inferred data stay distinguishable and both are queryable. Design and plan: [design/reasoner-v2.md](design/reasoner-v2.md).
 - **SHACL** ([ADR-0005](adr/0005-builtin-shacl.md)): shapes are compiled once per shapes-graph revision. On commit, only focus nodes reachable from the delta are revalidated. Full validation is available on demand.
 
 ## 6. Design principles
