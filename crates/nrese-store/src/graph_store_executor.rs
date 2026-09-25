@@ -1,6 +1,6 @@
 //! SPARQL 1.1 Graph Store Protocol operations: read from a view, write into a transaction.
 
-use nrese_engine::Transaction;
+use nrese_engine::{ReadModel, Transaction};
 use nrese_sparql::ReadView;
 
 use crate::error::StoreResult;
@@ -16,7 +16,7 @@ pub fn execute_graph_read(
     request: &GraphReadRequest,
 ) -> StoreResult<GraphReadResult> {
     let triples = match request.target.pattern_in(view)? {
-        Some(pattern) => decoded_quads(view, &pattern)
+        Some(pattern) => decoded_quads(view, ReadModel::Materialised, &pattern)
             .map(|quad| quad.map(Into::into))
             .collect::<StoreResult<Vec<_>>>()?,
         None => Vec::new(),

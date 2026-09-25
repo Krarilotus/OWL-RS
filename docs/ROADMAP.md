@@ -98,6 +98,14 @@ Goal: a codebase where every concern has one owner, and the evidence tooling nee
   - Oxigraph remains only as the differential-test oracle (a dev-dependency of `nrese-sparql`).
   - The string snapshots remain only for the v1 reasoner when enabled, and M3 retires them.
 - **E5 open.** Restores and large loads still go through one transaction; the WAL payload cap is 4 GiB.
+- **E6 done (gate passed):**
+  - Every version holds an asserted and an inferred stack; the inferred one keeps three permutations, halving its index memory.
+  - Both stacks commit atomically under one revision, and WAL and checkpoint format 2 carries both. Older formats are rejected with `UnsupportedFormat`.
+  - `ReadModel` (`Materialised`/`Asserted`/`Inferred`) is in the engine and in `nrese-sparql`'s `ReadView`.
+  - The engine enforces disjointness on the transaction's final state.
+  - Backups export asserted statements only.
+  - Evidence: `tests/inferred_stack_tests.rs` runs both stacks against a two-set model, in memory with compaction and durable across checkpoints and reopening. Removing either disjointness step makes it fail. The index model tests run for both layouts.
+  - The one-quad commit at 10 M is unchanged (2.9 µs p50 in memory).
 - **Engine-level numbers** (the `insert_latency` example; 7800X3D, Windows 11, NVMe; recorded in `benches/baselines/README.md`): one-quad commit at 10 M quads is 3.8 µs p50 in memory, and 1.9 ms p50 / 4.4 ms p99 durable (fsync per commit). The P1 gate itself is end-to-end over HTTP and is measured once P1 lands.
 
 ### M2: Governance and integration (size XL). What DMW and ResearchSpace need first

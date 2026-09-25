@@ -40,6 +40,41 @@ impl EncodedQuad {
     }
 }
 
+/// A triple: the unit the reasoner derives. Inferred triples are stored as quads in the
+/// default graph ([`in_default_graph`](Self::in_default_graph)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EncodedTriple {
+    pub subject: TermId,
+    pub predicate: TermId,
+    pub object: TermId,
+}
+
+impl EncodedTriple {
+    pub const fn new(subject: TermId, predicate: TermId, object: TermId) -> Self {
+        Self {
+            subject,
+            predicate,
+            object,
+        }
+    }
+
+    pub const fn in_default_graph(self) -> EncodedQuad {
+        EncodedQuad::new(
+            self.subject,
+            self.predicate,
+            self.object,
+            TermId::DEFAULT_GRAPH,
+        )
+    }
+}
+
+impl From<EncodedQuad> for EncodedTriple {
+    /// Drops the graph.
+    fn from(quad: EncodedQuad) -> Self {
+        Self::new(quad.subject, quad.predicate, quad.object)
+    }
+}
+
 /// Which graphs a pattern ranges over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphSelector {
@@ -125,6 +160,18 @@ impl Permutation {
             Self::Gspo => [3, 0, 1, 2],
             Self::Gpos => [3, 1, 2, 0],
             Self::Gosp => [3, 2, 0, 1],
+        }
+    }
+
+    /// For a graph-first permutation, the permutation with the same order over subject,
+    /// predicate and object and the graph last (GSPO → SPOG). Over quads that all share one
+    /// graph, both sort the same way. `None` for graph-last permutations.
+    pub(crate) const fn graph_last(self) -> Option<Self> {
+        match self {
+            Self::Gspo => Some(Self::Spog),
+            Self::Gpos => Some(Self::Posg),
+            Self::Gosp => Some(Self::Ospg),
+            Self::Spog | Self::Posg | Self::Ospg => None,
         }
     }
 

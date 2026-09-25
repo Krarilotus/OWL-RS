@@ -65,8 +65,15 @@ impl CompactionPolicy {
 /// Merges a contiguous window of runs into one. Entries whose signs cancel are dropped, so
 /// a window that includes the oldest run leaves no tombstones. O(e log k) for e entries.
 pub(crate) fn merge_runs(runs: &[Arc<Run>]) -> Run {
+    let layout = runs
+        .first()
+        .map_or_else(Default::default, |run| run.layout());
+    debug_assert!(
+        runs.iter().all(|run| run.layout() == layout),
+        "merging runs of different stacks"
+    );
     let total: u64 = runs.iter().map(|run| run.entries()).sum();
-    let perms = build_all(total as usize, |permutation| {
+    let perms = build_all(layout, total as usize, |permutation| {
         let parts = runs.iter().map(|run| {
             let perm = run.permutation(permutation);
             (perm, 0, perm.keys.len())
@@ -77,12 +84,13 @@ pub(crate) fn merge_runs(runs: &[Arc<Run>]) -> Run {
             .collect();
         PermutationRun::from_sorted(entries)
     });
-    Run::from_permutations(perms)
+    Run::from_permutations(layout, perms)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::Layout;
     use crate::quad::EncodedQuad;
     use crate::term::{TermId, TermKind};
 
@@ -92,7 +100,10 @@ mod tests {
     }
 
     fn run_of(size: u64) -> Arc<Run> {
-        Arc::new(Run::from_quads((0..size).map(quad).collect()))
+        Arc::new(Run::from_quads(
+            Layout::Quads,
+            (0..size).map(quad).collect(),
+        ))
     }
 
     #[test]
@@ -112,15 +123,19 @@ mod tests {
     #[test]
     fn merging_into_the_oldest_run_drops_tombstones() {
         let base = run_of(4);
-        let delta = Arc::new(Run::from_delta(&[quad(9)], &[quad(0), quad(1)]));
+        let delta = Arc::new(Run::from_delta(
+            Layout::Quads,
+            &[quad(9)],
+            &[quad(0), quad(1)],
+        ));
         let merged = merge_runs(&[base, delta]);
         assert_eq!((merged.inserts(), merged.deletes()), (3, 0));
     }
 
     #[test]
     fn merging_newer_runs_keeps_unmatched_tombstones() {
-        let a = Arc::new(Run::from_delta(&[quad(9)], &[quad(0)]));
-        let b = Arc::new(Run::from_delta(&[], &[quad(9)]));
+        let a = Arc::new(Run::from_delta(Layout::Quads, &[quad(9)], &[quad(0)]));
+        let b = Arc::new(Run::from_delta(Layout::Quads, &[], &[quad(9)]));
         let merged = merge_runs(&[a, b]);
         // quad(9) cancels out; the tombstone for quad(0) still shadows an older run.
         assert_eq!((merged.inserts(), merged.deletes()), (0, 1));

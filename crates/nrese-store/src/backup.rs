@@ -1,4 +1,4 @@
-use nrese_engine::{QuadPattern, Snapshot, Transaction};
+use nrese_engine::{QuadPattern, ReadModel, Snapshot, Transaction};
 use oxrdfio::RdfFormat;
 use sha2::{Digest, Sha256};
 
@@ -54,7 +54,9 @@ pub fn export_dataset(
     snapshot: &Snapshot,
     format: DatasetBackupFormat,
 ) -> StoreResult<DatasetBackupArtifact> {
-    let quads = decoded_quads(snapshot, &QuadPattern::all()).collect::<StoreResult<Vec<_>>>()?;
+    // Backups hold asserted statements only; inferences are derived again after a restore.
+    let quads = decoded_quads(snapshot, ReadModel::Asserted, &QuadPattern::all())
+        .collect::<StoreResult<Vec<_>>>()?;
     let payload = serialize_quads(format.rdf_format(), quads)?;
     Ok(DatasetBackupArtifact {
         format,
@@ -62,7 +64,7 @@ pub fn export_dataset(
         checksum_sha256: sha256_hex(&payload),
         payload,
         source_revision: snapshot.revision(),
-        quad_count: snapshot.len(),
+        quad_count: snapshot.len_in(ReadModel::Asserted),
     })
 }
 
@@ -82,7 +84,7 @@ pub(crate) fn apply_restore(
         format: request.format,
         checksum_sha256: sha256_hex(&request.payload),
         revision: 0,
-        quad_count: tx.len(),
+        quad_count: tx.len_in(ReadModel::Asserted),
         replaced_existing,
     })
 }

@@ -3,16 +3,28 @@
 //! Queries read a committed [`Snapshot`]; the `WHERE` part of an update reads the open
 //! [`Transaction`], so later operations in one request see earlier ones. Both implement
 //! [`ReadView`], and everything above this module is written once against the trait.
+//!
+//! Reads take a [`ReadModel`]: asserted and inferred statements (the default), or either
+//! stack alone.
 
-use nrese_engine::{EncodedQuad, QuadPattern, Snapshot, TermId, Transaction};
+use nrese_engine::{EncodedQuad, QuadPattern, ReadModel, Snapshot, TermId, Transaction};
 use oxrdf::{Quad, Term, TermRef};
 
 pub trait ReadView {
-    /// Quads matching `pattern`. The iterator borrows the view, not the pattern.
+    /// Quads matching `pattern` in `model`. The iterator borrows the view, not the pattern.
+    fn quads_for_pattern_in<'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, Self>;
+
+    /// Asserted and inferred quads matching `pattern`.
     fn quads_for_pattern<'a>(
         &'a self,
         pattern: &QuadPattern,
-    ) -> impl Iterator<Item = EncodedQuad> + use<'a, Self>;
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, Self> {
+        self.quads_for_pattern_in(ReadModel::Materialised, pattern)
+    }
 
     /// Non-empty named graphs.
     fn named_graphs<'a>(&'a self) -> impl Iterator<Item = TermId> + use<'a, Self>;
@@ -30,11 +42,12 @@ pub trait ReadView {
 }
 
 impl ReadView for Snapshot {
-    fn quads_for_pattern<'a>(
+    fn quads_for_pattern_in<'a>(
         &'a self,
+        model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
-        Snapshot::quads_for_pattern(self, pattern)
+        Snapshot::quads_for_pattern_in(self, model, pattern)
     }
 
     fn named_graphs<'a>(&'a self) -> impl Iterator<Item = TermId> + use<'a> {
@@ -59,11 +72,12 @@ impl ReadView for Snapshot {
 }
 
 impl<'e> ReadView for Transaction<'e> {
-    fn quads_for_pattern<'a>(
+    fn quads_for_pattern_in<'a>(
         &'a self,
+        model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a, 'e> {
-        Transaction::quads_for_pattern(self, pattern)
+        Transaction::quads_for_pattern_in(self, model, pattern)
     }
 
     fn named_graphs<'a>(&'a self) -> impl Iterator<Item = TermId> + use<'a, 'e> {

@@ -3,13 +3,15 @@
 //! The universe is kept small so inserts and deletes collide constantly, which exercises
 //! tombstones, re-inserts and cancellation in merges. Every step checks the count, point
 //! lookups and every pattern shape (8 bound/unbound combinations x 4 graph selectors).
+//! Every test runs for both layouts; the inferred stack's layout draws default-graph quads
+//! only, and is still queried with all graph selectors.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use super::IndexVersion;
 use super::compaction::{CompactionPolicy, merge_runs};
 use super::run::Run;
+use super::{IndexVersion, Layout};
 use crate::quad::{EncodedQuad, GraphSelector, QuadPattern};
 use crate::term::{TermId, TermKind};
 
@@ -45,21 +47,27 @@ fn graph(n: u64) -> TermId {
     }
 }
 
-fn random_quad(rng: &mut Rng) -> EncodedQuad {
+const LAYOUTS: [Layout; 2] = [Layout::Quads, Layout::DefaultGraph];
+
+fn random_quad(layout: Layout, rng: &mut Rng) -> EncodedQuad {
+    let graphs = match layout {
+        Layout::Quads => GRAPHS,
+        Layout::DefaultGraph => 1,
+    };
     EncodedQuad::new(
         term(rng.below(TERMS)),
         term(rng.below(TERMS)),
         term(rng.below(TERMS)),
-        graph(rng.below(GRAPHS)),
+        graph(rng.below(graphs)),
     )
 }
 
-/// Applies a random batch as an exact delta, the way the transaction layer will.
-fn random_commit(rng: &mut Rng, model: &mut BTreeSet<EncodedQuad>) -> Run {
+/// Applies a random batch as an exact delta, the way the transaction layer does.
+fn random_commit(layout: Layout, rng: &mut Rng, model: &mut BTreeSet<EncodedQuad>) -> Run {
     let mut inserts = BTreeSet::new();
     let mut deletes = BTreeSet::new();
     for _ in 0..=rng.below(12) {
-        let quad = random_quad(rng);
+        let quad = random_quad(layout, rng);
         let present =
             (model.contains(&quad) || inserts.contains(&quad)) && !deletes.contains(&quad);
         if rng.below(2) == 0 {
@@ -79,7 +87,7 @@ fn random_commit(rng: &mut Rng, model: &mut BTreeSet<EncodedQuad>) -> Run {
     }
     let inserts: Vec<_> = inserts.into_iter().collect();
     let deletes: Vec<_> = deletes.into_iter().collect();
-    Run::from_delta(&inserts, &deletes)
+    Run::from_delta(layout, &inserts, &deletes)
 }
 
 fn all_patterns() -> Vec<QuadPattern> {
@@ -147,39 +155,50 @@ fn random_commits_with_policy_compaction_match_the_model() {
         fanout: 2,
         ..CompactionPolicy::default()
     };
-    for seed in 0..40 {
-        let mut rng = Rng(seed);
-        let mut model = BTreeSet::new();
-        let mut version = IndexVersion::default();
-        for step in 0..60 {
-            version = version.with_run(random_commit(&mut rng, &mut model));
-            if let Some(plan) = policy.plan(version.runs()) {
-                let merged = merge_runs(&version.runs()[plan.window.clone()]);
-                version = version.with_compacted(plan.window, merged);
+    for layout in LAYOUTS {
+        for seed in 0..40 {
+            let mut rng = Rng(seed);
+            let mut model = BTreeSet::new();
+            let mut version = IndexVersion::empty(layout);
+            for step in 0..60 {
+                version = version.with_run(random_commit(layout, &mut rng, &mut model));
+                if let Some(plan) = policy.plan(version.runs()) {
+                    let merged = merge_runs(&version.runs()[plan.window.clone()]);
+                    version = version.with_compacted(plan.window, merged);
+                }
+                let context = format!("{layout:?} seed {seed} step {step}");
+                assert_matches_model(&version, &model, &context);
+                // Probes include named-graph quads, which the default-graph layout never holds.
+                let probe = random_quad(Layout::Quads, &mut rng);
+                assert_eq!(
+                    version.contains(&probe),
+                    model.contains(&probe),
+                    "{context}"
+                );
             }
-            assert_matches_model(&version, &model, &format!("seed {seed} step {step}"));
-            let probe = random_quad(&mut rng);
-            assert_eq!(version.contains(&probe), model.contains(&probe));
         }
     }
 }
 
 #[test]
 fn arbitrary_compaction_windows_preserve_contents() {
-    for seed in 100..140 {
-        let mut rng = Rng(seed);
-        let mut model = BTreeSet::new();
-        let mut version = IndexVersion::default();
-        for step in 0..40 {
-            version = version.with_run(random_commit(&mut rng, &mut model));
-            let runs = version.runs().len() as u64;
-            if runs >= 2 && rng.below(3) == 0 {
-                let start = rng.below(runs - 1) as usize;
-                let end = start + 2 + rng.below(runs - start as u64 - 1) as usize;
-                let merged = merge_runs(&version.runs()[start..end]);
-                version = version.with_compacted(start..end, merged);
+    for layout in LAYOUTS {
+        for seed in 100..140 {
+            let mut rng = Rng(seed);
+            let mut model = BTreeSet::new();
+            let mut version = IndexVersion::empty(layout);
+            for step in 0..40 {
+                version = version.with_run(random_commit(layout, &mut rng, &mut model));
+                let runs = version.runs().len() as u64;
+                if runs >= 2 && rng.below(3) == 0 {
+                    let start = rng.below(runs - 1) as usize;
+                    let end = start + 2 + rng.below(runs - start as u64 - 1) as usize;
+                    let merged = merge_runs(&version.runs()[start..end]);
+                    version = version.with_compacted(start..end, merged);
+                }
+                let context = format!("{layout:?} seed {seed} step {step}");
+                assert_matches_model(&version, &model, &context);
             }
-            assert_matches_model(&version, &model, &format!("seed {seed} step {step}"));
         }
     }
 }
@@ -191,7 +210,7 @@ fn old_versions_are_unaffected_by_later_writes() {
     let mut version = IndexVersion::default();
     let mut history = Vec::new();
     for _ in 0..30 {
-        version = version.with_run(random_commit(&mut rng, &mut model));
+        version = version.with_run(random_commit(Layout::Quads, &mut rng, &mut model));
         history.push((version.clone(), model.clone()));
     }
     let merged = merge_runs(version.runs());
@@ -206,7 +225,18 @@ fn old_versions_are_unaffected_by_later_writes() {
 #[test]
 fn base_run_from_quads_deduplicates() {
     let quad = EncodedQuad::new(term(0), term(1), term(2), graph(0));
-    let version = IndexVersion::from_quads(vec![quad, quad]);
+    let version = IndexVersion::from_quads(Layout::Quads, vec![quad, quad]);
     assert_eq!(version.len(), 1);
     assert_eq!(Arc::strong_count(&version.runs()[0]), 1);
+}
+
+#[test]
+fn default_graph_layout_stores_three_permutations() {
+    let quads: Vec<_> = (0..4)
+        .map(|n| EncodedQuad::new(term(n), term(1), term(2), graph(0)))
+        .collect();
+    let quads_bytes =
+        IndexVersion::from_quads(Layout::Quads, quads.clone()).runs()[0].memory_bytes();
+    let triples = IndexVersion::from_quads(Layout::DefaultGraph, quads);
+    assert_eq!(triples.runs()[0].memory_bytes() * 2, quads_bytes);
 }

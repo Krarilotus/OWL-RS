@@ -1,18 +1,19 @@
 //! Reading engine views as RDF: the store's one decoding path and graph-target mapping.
 
-use nrese_engine::{EngineError, QuadPattern, TermId};
+use nrese_engine::{EngineError, QuadPattern, ReadModel, TermId};
 use nrese_sparql::ReadView;
 use oxrdf::{GraphName, NamedNode, Quad};
 
 use crate::error::{StoreError, StoreResult};
 use crate::graph_store::GraphTarget;
 
-/// Decoded quads matching `pattern`. An undecodable id means storage corruption.
+/// Decoded quads matching `pattern` in `model`. An undecodable id means storage corruption.
 pub(crate) fn decoded_quads<'a, V: ReadView>(
     view: &'a V,
+    model: ReadModel,
     pattern: &QuadPattern,
 ) -> impl Iterator<Item = StoreResult<Quad>> + use<'a, V> {
-    view.quads_for_pattern(pattern).map(move |quad| {
+    view.quads_for_pattern_in(model, pattern).map(move |quad| {
         view.decode_quad(quad).ok_or_else(|| {
             StoreError::Engine(EngineError::Corruption(format!(
                 "undecodable quad {quad:?}"

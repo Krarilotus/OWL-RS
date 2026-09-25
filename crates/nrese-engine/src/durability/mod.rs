@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
+use crate::engine::{Stack, Version};
 use crate::error::{EngineError, EngineResult};
 use crate::index::compaction::merge_runs;
-use crate::index::run::Run;
 use crate::index::{CompactionPolicy, IndexVersion};
 use crate::term::Dictionary;
 use codec::CommitRecord;
@@ -74,8 +74,7 @@ pub(crate) struct Durable {
 /// State reconstructed by [`Durable::open`].
 pub(crate) struct Recovered {
     pub durable: Durable,
-    pub index: IndexVersion,
-    pub revision: u64,
+    pub version: Version,
 }
 
 impl Durable {
@@ -93,9 +92,21 @@ impl Durable {
             return Err(EngineError::Locked(root.to_path_buf()));
         }
         checkpoint::remove_temporaries(root)?;
-        let (mut index, mut revision) = match checkpoint::load_latest(root, dictionary)? {
-            Some(loaded) => (IndexVersion::from_quads(loaded.quads), loaded.revision),
-            None => (IndexVersion::default(), 0),
+        let mut version = match checkpoint::load_latest(root, dictionary)? {
+            Some(loaded) => Version {
+                asserted: IndexVersion::from_quads(Stack::Asserted.layout(), loaded.quads),
+                inferred: IndexVersion::from_quads(
+                    Stack::Inferred.layout(),
+                    loaded
+                        .inferred
+                        .into_iter()
+                        .map(|triple| triple.in_default_graph())
+                        .collect(),
+                ),
+                revision: loaded.revision,
+                dictionary_len: 0,
+            },
+            None => Version::empty(),
         };
 
         let wal_dir = wal::wal_dir(root);
@@ -105,19 +116,18 @@ impl Durable {
         for (position, (_, path)) in segments.iter().enumerate() {
             let contents = wal::read_segment(path)?;
             for record in contents.records {
-                if record.revision <= revision {
+                if record.revision <= version.revision {
                     continue; // covered by the checkpoint
                 }
-                if record.revision != revision + 1 {
+                if record.revision != version.revision + 1 {
                     return Err(EngineError::Corruption(format!(
                         "WAL gap: expected revision {}, found {} in {}",
-                        revision + 1,
+                        version.revision + 1,
                         record.revision,
                         path.display()
                     )));
                 }
-                index = replay(index, dictionary, policy, record)?;
-                revision += 1;
+                replay(&mut version, dictionary, policy, &record)?;
             }
             if contents.torn {
                 if Some(position) != last {
@@ -133,7 +143,7 @@ impl Durable {
 
         let wal = Wal::open(
             &wal_dir,
-            revision + 1,
+            version.revision + 1,
             config.wal_segment_bytes,
             config.sync,
         )?;
@@ -145,8 +155,7 @@ impl Durable {
                 config,
                 _lock: lock,
             },
-            index,
-            revision,
+            version,
         })
     }
 
@@ -155,23 +164,27 @@ impl Durable {
     }
 }
 
-/// Applies one logged commit. Compacts per policy as it goes, so replaying a long log keeps
-/// the run count logarithmic.
+/// Applies one logged commit to both stacks. Compacts per policy as it goes, so replaying a
+/// long log keeps the run count logarithmic.
 fn replay(
-    index: IndexVersion,
+    version: &mut Version,
     dictionary: &Dictionary,
     policy: &CompactionPolicy,
-    record: CommitRecord,
-) -> EngineResult<IndexVersion> {
+    record: &CommitRecord,
+) -> EngineResult<()> {
     for (offset, key) in record.keys.iter().enumerate() {
         dictionary.restore_key(record.dictionary_start + offset as u64, key)?;
     }
-    let mut index = index.with_run(Run::from_delta(&record.inserts, &record.deletes));
-    while let Some(plan) = policy.plan(index.runs()) {
-        let merged = merge_runs(&index.runs()[plan.window.clone()]);
-        index = index.with_compacted(plan.window, merged);
+    for (stack, run) in Stack::ALL.into_iter().zip(record.runs()) {
+        let mut index = version.stack(stack).with_run(run);
+        while let Some(plan) = policy.plan(index.runs()) {
+            let merged = merge_runs(&index.runs()[plan.window.clone()]);
+            index = index.with_compacted(plan.window, merged);
+        }
+        *version.stack_mut(stack) = index;
     }
-    Ok(index)
+    version.revision = record.revision;
+    Ok(())
 }
 
 /// Makes a rename or file creation in `dir` durable. Directories can't be opened as files on

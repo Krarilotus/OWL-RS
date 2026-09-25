@@ -1,7 +1,9 @@
-//! Checkpoints: a full image of one revision (dictionary plus quads).
+//! Checkpoints: a full image of one revision (dictionary plus both index stacks).
 //!
 //! Format (little-endian): `magic | revision u64 | dictionary_len u64 | (key_len u32, key)* |
-//! quad_count u64 | (s p o g)* | crc32 u32`, where the CRC covers everything before it.
+//! quad_count u64 | (s p o g)* | inferred_count u64 | (s p o)* | crc32 u32`, where the quads
+//! are the asserted stack, the triples the inferred stack (default graph), and the CRC
+//! covers everything before it.
 //!
 //! A checkpoint is written from a [`Snapshot`], so writers keep committing while it is being
 //! written. It is streamed to `checkpoint-<revision>.tmp`, synced, and atomically renamed
@@ -12,13 +14,16 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use super::codec::{Reader, put_quad, put_u32, put_u64};
-use crate::engine::Snapshot;
+use super::codec::{Reader, put_quad, put_triple, put_u32, put_u64};
+use crate::engine::{ReadModel, Snapshot};
 use crate::error::{EngineError, EngineResult};
-use crate::quad::{EncodedQuad, QuadPattern};
+use crate::quad::{EncodedQuad, EncodedTriple, QuadPattern};
 use crate::term::Dictionary;
 
-const MAGIC: &[u8; 8] = b"NRESECK1";
+/// Version 2 added the inferred stack (roadmap E6).
+const MAGIC: &[u8; 8] = b"NRESECK2";
+/// Magic prefix shared by every checkpoint format version.
+const FAMILY: &[u8; 7] = b"NRESECK";
 const EXTENSION: &str = "nck";
 /// Dictionary keys copied per lock acquisition, so interning is never blocked for long.
 const KEY_CHUNK: u64 = 64 * 1024;
@@ -97,9 +102,16 @@ pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
         out.flush_buffer()?;
         from = to;
     }
-    put_u64(&mut out.buffer, snapshot.len());
-    for quad in snapshot.quads_for_pattern(&QuadPattern::all()) {
+    put_u64(&mut out.buffer, snapshot.len_in(ReadModel::Asserted));
+    for quad in snapshot.quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all()) {
         put_quad(&mut out.buffer, &quad);
+        if out.buffer.len() >= 1 << 16 {
+            out.flush_buffer()?;
+        }
+    }
+    put_u64(&mut out.buffer, snapshot.len_in(ReadModel::Inferred));
+    for quad in snapshot.quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all()) {
+        put_triple(&mut out.buffer, &quad.into());
         if out.buffer.len() >= 1 << 16 {
             out.flush_buffer()?;
         }
@@ -117,10 +129,11 @@ pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
     Ok(path)
 }
 
-/// A loaded checkpoint: its revision and quads; the dictionary is restored in place.
+/// A loaded checkpoint: its revision and both stacks; the dictionary is restored in place.
 pub(crate) struct Loaded {
     pub revision: u64,
     pub quads: Vec<EncodedQuad>,
+    pub inferred: Vec<EncodedTriple>,
 }
 
 /// Loads the newest checkpoint into `dictionary`, if there is one.
@@ -140,8 +153,12 @@ pub(crate) fn load_latest(dir: &Path, dictionary: &Dictionary) -> EngineResult<O
         return Err(corrupt("checksum mismatch"));
     }
     let mut reader = Reader::new(body);
-    if reader.bytes(MAGIC.len()) != Some(MAGIC.as_slice()) {
-        return Err(corrupt("bad magic"));
+    match reader.bytes(MAGIC.len()) {
+        Some(magic) if magic == MAGIC => {}
+        Some(magic) if magic.starts_with(FAMILY) => {
+            return Err(EngineError::UnsupportedFormat(path));
+        }
+        _ => return Err(corrupt("bad magic")),
     }
     let revision = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
     let dictionary_len = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
@@ -155,14 +172,26 @@ pub(crate) fn load_latest(dir: &Path, dictionary: &Dictionary) -> EngineResult<O
         dictionary.restore_key(index, key)?;
     }
     let count = reader.u64().ok_or_else(|| corrupt("truncated quads"))?;
-    if count.saturating_mul(32) != reader.remaining() as u64 {
-        return Err(corrupt("quad count does not match file size"));
+    if count.saturating_mul(32) > reader.remaining() as u64 {
+        return Err(corrupt("quad count exceeds file size"));
     }
     let quads = (0..count)
         .map(|_| reader.quad())
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| corrupt("truncated quads"))?;
-    Ok(Some(Loaded { revision, quads }))
+    let count = reader.u64().ok_or_else(|| corrupt("truncated inferred"))?;
+    if count.saturating_mul(24) != reader.remaining() as u64 {
+        return Err(corrupt("inferred count does not match file size"));
+    }
+    let inferred = (0..count)
+        .map(|_| reader.triple())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| corrupt("truncated inferred"))?;
+    Ok(Some(Loaded {
+        revision,
+        quads,
+        inferred,
+    }))
 }
 
 /// Deletes checkpoints older than `revision`.
