@@ -1,0 +1,19 @@
+[package]
+name = "nrese-engine"
+description = "NRESE storage engine: term dictionary, quad permutation indexes, MVCC snapshots, transactions, durability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crc32fast = "1.5"
+foldhash = "0.2"
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
+oxrdf = "=0.3.3"
+parking_lot = "0.12"
+rayon = "1.10"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"

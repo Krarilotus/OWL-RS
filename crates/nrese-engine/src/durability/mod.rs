@@ -1,0 +1,185 @@
+//! Durability (E4): redo WAL, checkpoints and recovery for [`Engine::open`](crate::Engine::open).
+//!
+//! Directory layout:
+//!
+//! ```text
+//! <dir>/LOCK                                   exclusive process lock
+//! <dir>/checkpoint-<revision>.nck              newest full image (older ones are deleted)
+//! <dir>/wal/<first revision>.wal               redo log segments
+//! ```
+//!
+//! Commit protocol (in [`Transaction::commit`](crate::Transaction::commit)): build the run,
+//! append the WAL record and sync it, then publish the new version. A commit is therefore
+//! acknowledged only once it is durable, and nothing is visible that isn't in the log.
+//!
+//! Recovery = newest checkpoint + replay of all later WAL records in revision order. A torn
+//! frame at the end of the last segment is truncated (it was never acknowledged); invalid
+//! data anywhere else is reported as corruption instead of being silently skipped.
+
+pub(crate) mod checkpoint;
+pub(crate) mod codec;
+pub(crate) mod wal;
+
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+
+use parking_lot::Mutex;
+
+use crate::error::{EngineError, EngineResult};
+use crate::index::compaction::merge_runs;
+use crate::index::run::Run;
+use crate::index::{CompactionPolicy, IndexVersion};
+use crate::term::Dictionary;
+use codec::CommitRecord;
+use wal::Wal;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPolicy {
+    /// `fsync` the WAL before acknowledging each commit. Survives power loss.
+    EveryCommit,
+    /// Hand WAL writes to the OS without waiting. Survives a process crash, but the last
+    /// commits can be lost on power failure or an OS crash.
+    OsBuffered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurabilityConfig {
+    pub sync: SyncPolicy,
+    /// A new WAL segment is started once the active one reaches this size.
+    pub wal_segment_bytes: u64,
+    /// A background checkpoint is requested once this many WAL bytes were written since the
+    /// last one. Needs background maintenance; otherwise call `Engine::checkpoint`.
+    pub checkpoint_after_wal_bytes: u64,
+}
+
+impl Default for DurabilityConfig {
+    fn default() -> Self {
+        Self {
+            sync: SyncPolicy::EveryCommit,
+            wal_segment_bytes: 64 << 20,
+            checkpoint_after_wal_bytes: 256 << 20,
+        }
+    }
+}
+
+/// The durable side of an open engine.
+pub(crate) struct Durable {
+    root: PathBuf,
+    pub(crate) wal: Mutex<Wal>,
+    pub(crate) checkpoint_slot: Mutex<()>,
+    pub(crate) config: DurabilityConfig,
+    _lock: File,
+}
+
+/// State reconstructed by [`Durable::open`].
+pub(crate) struct Recovered {
+    pub durable: Durable,
+    pub index: IndexVersion,
+    pub revision: u64,
+}
+
+impl Durable {
+    /// Locks `root`, recovers checkpoint + WAL into `dictionary`, and opens the WAL for
+    /// appending.
+    pub(crate) fn open(
+        root: &Path,
+        dictionary: &Dictionary,
+        policy: &CompactionPolicy,
+        config: DurabilityConfig,
+    ) -> EngineResult<Recovered> {
+        fs::create_dir_all(root)?;
+        let lock = File::create(root.join("LOCK"))?;
+        if lock.try_lock().is_err() {
+            return Err(EngineError::Locked(root.to_path_buf()));
+        }
+        checkpoint::remove_temporaries(root)?;
+        let (mut index, mut revision) = match checkpoint::load_latest(root, dictionary)? {
+            Some(loaded) => (IndexVersion::from_quads(loaded.quads), loaded.revision),
+            None => (IndexVersion::default(), 0),
+        };
+
+        let wal_dir = wal::wal_dir(root);
+        fs::create_dir_all(&wal_dir)?;
+        let segments = wal::list_segments(&wal_dir)?;
+        let last = segments.len().checked_sub(1);
+        for (position, (_, path)) in segments.iter().enumerate() {
+            let contents = wal::read_segment(path)?;
+            for record in contents.records {
+                if record.revision <= revision {
+                    continue; // covered by the checkpoint
+                }
+                if record.revision != revision + 1 {
+                    return Err(EngineError::Corruption(format!(
+                        "WAL gap: expected revision {}, found {} in {}",
+                        revision + 1,
+                        record.revision,
+                        path.display()
+                    )));
+                }
+                index = replay(index, dictionary, policy, record)?;
+                revision += 1;
+            }
+            if contents.torn {
+                if Some(position) != last {
+                    return Err(EngineError::Corruption(format!(
+                        "invalid record in {} (not the last segment)",
+                        path.display()
+                    )));
+                }
+                tracing::warn!(segment = %path.display(), valid_len = contents.valid_len, "truncating torn WAL tail");
+                wal::truncate_segment(path, contents.valid_len)?;
+            }
+        }
+
+        let wal = Wal::open(
+            &wal_dir,
+            revision + 1,
+            config.wal_segment_bytes,
+            config.sync,
+        )?;
+        Ok(Recovered {
+            durable: Self {
+                root: root.to_path_buf(),
+                wal: Mutex::new(wal),
+                checkpoint_slot: Mutex::new(()),
+                config,
+                _lock: lock,
+            },
+            index,
+            revision,
+        })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// Applies one logged commit. Compacts per policy as it goes, so replaying a long log keeps
+/// the run count logarithmic.
+fn replay(
+    index: IndexVersion,
+    dictionary: &Dictionary,
+    policy: &CompactionPolicy,
+    record: CommitRecord,
+) -> EngineResult<IndexVersion> {
+    for (offset, key) in record.keys.iter().enumerate() {
+        dictionary.restore_key(record.dictionary_start + offset as u64, key)?;
+    }
+    let mut index = index.with_run(Run::from_delta(&record.inserts, &record.deletes));
+    while let Some(plan) = policy.plan(index.runs()) {
+        let merged = merge_runs(&index.runs()[plan.window.clone()]);
+        index = index.with_compacted(plan.window, merged);
+    }
+    Ok(index)
+}
+
+/// Makes a rename or file creation in `dir` durable. Directories can't be opened as files on
+/// Windows; there, NTFS journals the metadata change and this is a no-op.
+pub(crate) fn sync_dir(dir: &Path) -> EngineResult<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/nrese-core",
+    "crates/nrese-engine",
     "crates/nrese-store",
     "crates/nrese-reasoner",
     "crates/nrese-server",
