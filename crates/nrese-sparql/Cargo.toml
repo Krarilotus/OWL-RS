@@ -1,0 +1,17 @@
+[package]
+name = "nrese-sparql"
+description = "NRESE SPARQL layer: spareval over nrese-engine snapshots and transactions, update execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nrese-engine = { path = "../nrese-engine" }
+oxrdf = "=0.3.3"
+spareval = "=0.2.6"
+spargebra = "=0.4.6"
+thiserror.workspace = true
+
+[dev-dependencies]
+# Differential oracle: the same spareval evaluator over Oxigraph's own storage.
+oxigraph = { version = "0.5.6", default-features = false }
