@@ -72,6 +72,7 @@ Goal: a codebase where every concern has one owner, and the evidence tooling nee
 | **E3 MVCC & transactions** | `Arc` snapshots; single writer slot; exact deltas; overlay view (snapshot + pending) so later update operations see earlier ones; abort = drop. | L1 | Readers never block (tested under a concurrent writer); snapshot isolation tests |
 | **E4 Durability** | Segmented redo WAL (length + CRC32), fsync policy, checkpoints (atomic rename), recovery with torn-tail truncation; revision is persistent. RocksDB and the libclang dependency go away. | L1 | Crash-injection tests (kill at every write step) recover to the last acknowledged revision; audit F6 closed |
 | **E5 Bulk load** | Parallel parse → intern in batches → parallel sort (IPS4o-class sorting, via rayon for now) → direct base-run build, bypassing the per-commit path for restore and initial loads. | L1 | Loads 100 M triples; throughput recorded against QLever and GraphDB loaders |
+| **E6 Inferred stack** (reasoning R0, pulled forward) | A second index stack in `Version` with three permutations (SPO/POS/OSP) for inferences in the default graph; asserted and inferred deltas are committed atomically under one revision; the WAL and checkpoint formats carry both stacks; SPARQL Update and the other request paths can't reach it; only the pipeline's reasoning stage writes it. Done now, while the v2 format has no deployments to migrate. | L1 | Model tests over both stacks; crash tests recover both; disjointness `inferred ∩ asserted = ∅` checked in debug builds |
 | **Q1 SPARQL adapter** | `spareval::QueryableDataset` over snapshots. Cancellation tokens wired to request deadlines. Protocol dataset parameters (`default-graph-uri`, `named-graph-uri`, `using-*`). Streaming result serialisation. Update planning into deltas (all `GraphUpdateOperation`s, `LOAD` behind policy). | L2 | W3C SPARQL 1.1 query + update suites at spareval's pass rate; audit F2 closed (nothing commits after a timeout) |
 | **P1 Mutation pipeline** | plan → validate → deadline check → commit, all proportional to the delta. The v1 reasoner is fed through an adapter until M3. | L3 | One-triple insert at 10 M triples < 5 ms with reasoning off (audit: 2.9 s at 1 M) |
 | **P2 Reactor** | Delete the Oxigraph `Store` usage, the staging clone and the string snapshots. | all | `grep oxigraph::store` is empty |
@@ -113,13 +114,26 @@ Goal: a codebase where every concern has one owner, and the evidence tooling nee
 
 ### M3: Reasoning, the GraphDB track (size XL). Closes audit F3 (reasoner side) and F4
 
+The full design, targets and evidence plan are in [design/reasoner-v2.md](design/reasoner-v2.md).
+
+**Targets:**
+- inferred sets identical to GraphDB on LUBM/UOBM/SPB
+- W3C OWL 2 RL conformance
+- ≥ 10× GraphDB load plus materialisation on the same machine
+- commit-path reasoning p50 ≤ 1 ms at 100 M
+- incremental equals rematerialisation in 100 % of property tests
+
 | WP | Scope | Layer | Done when |
 |---|---|---|---|
-| **R1 Rule IR & rulesets** | Own rule IR. Parser for GraphDB `.pie` files as an import format. Built-in `rdfs`, `rdfs-plus`, `owl-horst`, `owl2-rl`, `owl2-ql` (GraphDB's materialisable variants). | L2 | Rulesets load; `.pie` round-trip tests on GraphDB's published rulesets |
-| **R2 Semi-naive materialisation** | Rules compiled to join plans over permutation scans (ID columns, no strings). Semi-naive delta iteration, parallel per rule/stratum (RDFox-style). `owl:sameAs` via union-find rewriting. | L2 | LUBM(1/10/100) inferred counts equal GraphDB's for each profile; throughput recorded |
-| **R3 Inferred layer & read models** | A separate inferred index stack with the same layout. Queries see asserted ∪ inferred by default. GraphDB pseudo-graphs `onto:explicit` / `onto:implicit`; per-request asserted-only switch. | L1/L2 | Query tests for all three read models; audit F4 closed |
-| **R4 Truth maintenance** | Incremental insert (semi-naive from Δ⁺); incremental delete via Backward/Forward (GraphDB's `isSupported` behaviour), with DRed as the fallback. | L2 | Differential test: incremental equals from-scratch after random insert/delete sequences |
-| **R5 Consistency & explanations** | Consistency rules (`owl:Nothing`, disjointness, `differentFrom`, irreflexive/asymmetric, property disjointness, max-cardinality 0/1 violations in owl2-rl). Derivation-tree explanations in reject responses. Atomic rollback. | L2/L3 | v1 `rules-mvp` fixture suite passes on v2; then `rules-mvp` is deleted |
+| **R0 Engine: inferred stack** | Pulled into M1 as **E6** (see there). | L1 | — |
+| **R1 Rule IR & rulesets** | IR; analysis (SCCs, strata, schema atoms); built-in `rdfs`, `rdfs-plus`, `owl-horst`, `owl2-rl`, `owl2-ql` as data; `.pie` import/export; the naive reference evaluator (the oracle). | L2 | `.pie` round-trip on GraphDB's published rulesets; reference evaluator passes RDFS/RL fixtures |
+| **R2 Schema compiler + batch executor** | TBox closure and rule specialisation (dispatch tables); list axioms compiled to fixed-arity rules; vertically partitioned sorted working set; semi-naive evaluation; sort-merge and Leapfrog Triejoin; morsel parallelism with deterministic output; bulk install into the inferred stack. | L2 | Batch equals naive (proptest); LUBM-1/10/100 inferred sets equal GraphDB's; throughput and thread scaling recorded |
+| **R3 Modules** | Hierarchy (SCC + bitset reachability), transitive properties, equality (union-find rewriting with read-time expansion), symmetric/inverse. | L2 | Each module equals its generic rules; UOBM parity |
+| **R4 Read models + commit-path reasoning** | `Materialised` / `Asserted` / `Inferred` read models; `onto:explicit` / `onto:implicit`; per-request switch; delta executor in the mutation pipeline (inserts). | L2/L3 | Query tests for all three models (audit F4 closed); insert reasoning p50 ≤ 1 ms at 100 M |
+| **R5 Truth maintenance** | DRed, then B/F / FBF; TBox deltas; sameAs maintenance; asserted ↔ inferred moves; reasoning jobs for large TBox changes; counting evaluated. | L2 | Incremental equals rematerialisation in CI; delete latency and TBox-change cost recorded |
+| **R6 Consistency & explanations** | Consistency rules (`false` heads, `.pie` `Consistency`), proof search, proof-carrying rejects, proof API. The v1 fixture suite passes on v2; then `rules-mvp` is deleted. | L2/L3 | W3C RL consistency tests; explanation ≤ 10 ms; v1 removed |
+| **R7 RDF 1.2 triple terms** | `TermKind::Triple`, syntax, SPARQL-star (decision D4). | L1/L2 | RDF 1.2 tests |
+| **R8 Beyond GraphDB** (stretch) | EL classification module (ELK-style), OWL 2 QL rewriting mode, per-graph reasoning. Each item is a separate decision. | L2 | per item |
 
 ### M4: Performance, the QLever track (size XL)
 
@@ -211,7 +225,7 @@ Benchmarks run on one documented machine profile. Numbers go into `docs/spec/06-
 
 | # | Question | Decision |
 |---|---|---|
-| D1 | After M1, what comes first: governance (SHACL, FTS, RDF4J, ResearchSpace) or reasoning? | **Governance first** (decided 2026-09-25). DMW (D18) and ResearchSpace need it; reasoning builds on the same engine afterwards. |
+| D1 | After M1, what comes first: governance (SHACL, FTS, RDF4J, ResearchSpace) or reasoning? | **Governance first** (decided 2026-09-25). DMW (D18) and ResearchSpace need it; reasoning builds on the same engine afterwards. The reasoning plan pulls only its storage part (E6) into M1, and M3 can start right after M1 if priorities change ([design/reasoner-v2.md](design/reasoner-v2.md) §9). |
 | D2 | How to mark inferred data: separate asserted/inferred index stacks, or per-entry flags? | **Separate stacks** (decided 2026-09-25; see 1.1 above). |
 | D3 | Full-text engine: tantivy, or our own inverted index? | **tantivy** (decided 2026-09-25). |
 | D4 | RDF-star / RDF 1.2 triple terms: early (M2) or with reasoning (M3)? | **M3** (decided 2026-09-25), unless a concrete DMW/RS need appears earlier. |
