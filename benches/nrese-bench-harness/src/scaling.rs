@@ -47,6 +47,10 @@ pub struct ScalingStep {
     pub load_triples_per_sec: u64,
     pub insert_p50_ms: u128,
     pub insert_max_ms: u128,
+    /// Microsecond resolution; sub-millisecond writes round to 0 in the `_ms` fields.
+    pub insert_p50_us: u128,
+    pub insert_p99_us: u128,
+    pub insert_max_us: u128,
     pub count_query_ms: u128,
 }
 
@@ -128,7 +132,7 @@ async fn scale_target(
                 ),
             )
             .await?;
-            latencies.push(started.elapsed().as_millis());
+            latencies.push(started.elapsed().as_micros());
         }
         latencies.sort_unstable();
 
@@ -149,17 +153,21 @@ async fn scale_target(
             triples: step_triples,
             load_ms,
             load_triples_per_sec: (loaded_triples as u128 * 1000 / load_ms.max(1)) as u64,
-            insert_p50_ms: percentile(&latencies, 50),
-            insert_max_ms: latencies.last().copied().unwrap_or_default(),
+            insert_p50_ms: percentile(&latencies, 50) / 1000,
+            insert_max_ms: latencies.last().copied().unwrap_or_default() / 1000,
+            insert_p50_us: percentile(&latencies, 50),
+            insert_p99_us: percentile(&latencies, 99),
+            insert_max_us: latencies.last().copied().unwrap_or_default(),
             count_query_ms,
         };
         println!(
-            "triples={:>11} load={:>7}ms ({:>8} t/s) insert p50={:>6}ms max={:>6}ms count={:>6}ms",
+            "triples={:>11} load={:>7}ms ({:>8} t/s) insert p50={:>8}us p99={:>8}us max={:>8}us count={:>6}ms",
             step.triples,
             step.load_ms,
             step.load_triples_per_sec,
-            step.insert_p50_ms,
-            step.insert_max_ms,
+            step.insert_p50_us,
+            step.insert_p99_us,
+            step.insert_max_us,
             step.count_query_ms
         );
         steps.push(step);
