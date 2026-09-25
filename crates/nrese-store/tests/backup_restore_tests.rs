@@ -3,14 +3,14 @@ use nrese_store::{
     GraphWriteRequest, QueryResultKind, SparqlUpdateRequest, StoreConfig, StoreService,
 };
 
-#[cfg(feature = "durable-storage")]
 use std::path::PathBuf;
+
+use tempfile::tempdir;
 
 fn new_in_memory_service() -> Result<StoreService, Box<dyn std::error::Error>> {
     Ok(StoreService::new(StoreConfig::in_memory())?)
 }
 
-#[cfg(feature = "durable-storage")]
 fn new_on_disk_service(data_dir: PathBuf) -> Result<StoreService, Box<dyn std::error::Error>> {
     Ok(StoreService::new(StoreConfig::on_disk(data_dir))?)
 }
@@ -170,7 +170,6 @@ fn backup_restore_roundtrip_preserves_query_results() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[cfg(feature = "durable-storage")]
 #[test]
 fn on_disk_restore_then_reopen_preserves_restored_dataset() -> Result<(), Box<dyn std::error::Error>>
 {

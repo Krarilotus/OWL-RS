@@ -1,8 +1,7 @@
 use std::hash::{Hash, Hasher};
 
 use nrese_core::{DatasetSnapshot, IriRef, SnapshotCoverageStats, TripleRef, TripleSource};
-use oxigraph::model::{GraphNameRef, NamedOrBlankNodeRef, TermRef};
-use oxigraph::store::Store;
+use oxrdf::{GraphNameRef, NamedOrBlankNodeRef, Quad, TermRef};
 
 use crate::error::StoreResult;
 
@@ -48,13 +47,19 @@ pub struct StoreDatasetSnapshot {
     triples: Vec<SnapshotTriple>,
 }
 
+/// The v1 reasoner's input: the dataset flattened to IRI-only triples as strings. Building
+/// it is O(dataset), so the mutation pipeline only does so when reasoning is enabled; the
+/// materialising reasoner of M3 works on engine ids instead and retires this type.
 impl StoreDatasetSnapshot {
-    pub fn capture(store: &Store, revision: u64) -> StoreResult<Self> {
+    pub(crate) fn capture(
+        quads: impl IntoIterator<Item = StoreResult<Quad>>,
+        revision: u64,
+    ) -> StoreResult<Self> {
         let mut triples = Vec::new();
         let mut asserted_triple_count = 0u64;
         let mut coverage = SnapshotCoverageStats::default();
 
-        for quad in store.quads_for_pattern(None, None, None, None) {
+        for quad in quads {
             let quad = quad?;
             asserted_triple_count += 1;
             if !matches!(quad.graph_name.as_ref(), GraphNameRef::DefaultGraph) {
@@ -102,6 +107,18 @@ impl StoreDatasetSnapshot {
             coverage,
             triples,
         })
+    }
+
+    /// A snapshot carrying only the revision and quad count, for runs where the reasoner
+    /// reads no triples (reasoning disabled). O(1).
+    pub(crate) fn summary(revision: u64, asserted_triple_count: u64) -> Self {
+        Self {
+            revision,
+            cache_key: asserted_triple_count,
+            asserted_triple_count,
+            coverage: SnapshotCoverageStats::default(),
+            triples: Vec::new(),
+        }
     }
 }
 
@@ -173,28 +190,33 @@ fn compute_snapshot_cache_key(
 
 #[cfg(test)]
 mod tests {
-    use oxigraph::sparql::SparqlEvaluator;
-    use oxigraph::store::Store;
+    use nrese_core::DatasetSnapshot;
+    use oxrdf::{GraphName, Literal, NamedNode, Quad};
 
     use super::StoreDatasetSnapshot;
-    use nrese_core::DatasetSnapshot;
+
+    fn iri(value: &str) -> NamedNode {
+        NamedNode::new_unchecked(format!("http://example.com/{value}"))
+    }
+
+    fn capture(quads: Vec<Quad>, revision: u64) -> StoreDatasetSnapshot {
+        StoreDatasetSnapshot::capture(quads.into_iter().map(Ok), revision).expect("snapshot")
+    }
 
     #[test]
     fn snapshot_collects_supported_iri_triples_and_counts_skipped_terms() {
-        let store = Store::new().expect("store");
-        SparqlEvaluator::new()
-            .parse_update(
-                "INSERT DATA {
-                    <http://example.com/s> <http://example.com/p> <http://example.com/o> .
-                    <http://example.com/s> <http://example.com/p2> \"literal\" .
-                }",
-            )
-            .expect("update parse")
-            .on_store(&store)
-            .execute()
-            .expect("update execute");
-
-        let snapshot = StoreDatasetSnapshot::capture(&store, 3).expect("snapshot");
+        let snapshot = capture(
+            vec![
+                Quad::new(iri("s"), iri("p"), iri("o"), GraphName::DefaultGraph),
+                Quad::new(
+                    iri("s"),
+                    iri("p2"),
+                    Literal::new_simple_literal("literal"),
+                    GraphName::DefaultGraph,
+                ),
+            ],
+            3,
+        );
         let triples: Vec<_> = nrese_core::TripleSource::triples(&snapshot).collect();
         let coverage = snapshot.coverage_stats();
 
@@ -210,35 +232,10 @@ mod tests {
 
     #[test]
     fn snapshot_cache_key_is_stable_for_equivalent_dataset_state() {
-        let first = Store::new().expect("first store");
-        let second = Store::new().expect("second store");
-
-        SparqlEvaluator::new()
-            .parse_update(
-                "INSERT DATA {
-                    <http://example.com/a> <http://example.com/p> <http://example.com/b> .
-                    <http://example.com/c> <http://example.com/p> <http://example.com/d> .
-                }",
-            )
-            .expect("first update parse")
-            .on_store(&first)
-            .execute()
-            .expect("first update execute");
-        SparqlEvaluator::new()
-            .parse_update(
-                "INSERT DATA {
-                    <http://example.com/c> <http://example.com/p> <http://example.com/d> .
-                    <http://example.com/a> <http://example.com/p> <http://example.com/b> .
-                }",
-            )
-            .expect("second update parse")
-            .on_store(&second)
-            .execute()
-            .expect("second update execute");
-
-        let first_snapshot = StoreDatasetSnapshot::capture(&first, 1).expect("first snapshot");
-        let second_snapshot = StoreDatasetSnapshot::capture(&second, 7).expect("second snapshot");
-
-        assert_eq!(first_snapshot.cache_key(), second_snapshot.cache_key());
+        let a = Quad::new(iri("a"), iri("p"), iri("b"), GraphName::DefaultGraph);
+        let c = Quad::new(iri("c"), iri("p"), iri("d"), GraphName::DefaultGraph);
+        let first = capture(vec![a.clone(), c.clone()], 1);
+        let second = capture(vec![c, a], 7);
+        assert_eq!(first.cache_key(), second.cache_key());
     }
 }

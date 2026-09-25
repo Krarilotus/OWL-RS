@@ -1,6 +1,6 @@
 //! Heuristic attribution of a gate rejection to the triples a mutation inserted.
 
-use crate::staging::MutationDeltaPreview;
+use crate::delta::MutationDeltaPreview;
 use nrese_reasoner::{RejectEvidence, RejectExplanation};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -148,7 +148,7 @@ fn dedup_sorted(values: &mut Vec<&'static str>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::staging::MutationDeltaPreview;
+    use crate::delta::MutationDeltaPreview;
     use nrese_reasoner::{RejectBlame, RejectEvidence, RejectExplanation};
 
     use super::{RDF_TYPE, attribute_reject_delta};

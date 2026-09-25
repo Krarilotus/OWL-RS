@@ -49,3 +49,24 @@ Recorded reference numbers that later milestones are measured against. Each file
 - The 240 ms maximum at 10 M coincides with the background checkpoint triggered by the 500 MB load record.
 - Index memory is about 190 bytes/quad (six uncompressed permutations); block compression is Pf1.
 - For comparison, v1 needs about 3 s per one-triple insert at 1 M (table above).
+
+## Engine v2, end to end over HTTP (M1 gate P1)
+
+- **What:** the release server on engine v2 with reasoning `disabled`, run through the same `write-scaling` command as the v1 baseline. The load goes through Graph Store POSTs; the one-triple inserts are SPARQL `INSERT DATA` requests through the full mutation pipeline. 200 samples per step; latencies in µs.
+- **Files:**
+  - `v2-write-scaling-reasoning-disabled.json` (in memory)
+  - `v2-write-scaling-durable-reasoning-disabled.json` (`NRESE_STORE_MODE=on-disk`, fsync per commit, background checkpoints on)
+- **Date / machine:** 2026-09-25, same machine as above.
+- **Reproduce:** as for v1, with `--samples 200` and, for the durable run, `NRESE_STORE_MODE=on-disk` plus `NRESE_DATA_DIR`.
+
+| Triples | Mode | HTTP load | 1-triple insert p50 | p99 | COUNT query |
+|---|---|---|---|---|---|
+| 1 M | in memory | 456 k t/s | 121 µs | 215 µs | 38 ms |
+| 10 M | in memory | 431 k t/s | 216 µs | 417 µs | 560 ms |
+| 1 M | durable | 414 k t/s | 2,054 µs | 2,570 µs | 37 ms |
+| 10 M | durable | 401 k t/s | 2,048 µs | 3,859 µs | 367 ms |
+
+**Notes:**
+- **Gate P1** (< 5 ms at 10 M) is met in both modes. v1 needed 3,009 ms at 1 M and 6,790 t/s load.
+- **Crash test:** after the durable run, the server was killed with `taskkill /F` and restarted. It recovered revision 1427 with exactly 10,000,800 quads (10 M loaded plus 800 inserts).
+- **COUNT** grows linearly because spareval counts by scanning; native aggregation is Pf3/Pf4.

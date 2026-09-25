@@ -12,16 +12,16 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 
 | Capability | QLever | GraphDB | NRESE status | WP | Evidence |
 |---|---|---|---|---|---|
-| SPARQL 1.1 query | yes (some deviations) | yes | v1 (via Oxigraph); engine: `nrese-sparql` matches the Oxigraph oracle on 30 differential queries | Q1 | W3C query suite |
-| SPARQL 1.1 update | yes (delta layer degrades) | yes | v1, O(dataset) per write (3 s per 1-triple insert at 1 M); engine commit is O(delta): 1.9 ms p50 durable at 10 M (`benches/baselines/`) | Q1, P1 | W3C update suite; `write-scaling` < 5 ms at 10 M |
+| SPARQL 1.1 query | yes (some deviations) | yes | v2 serving (`nrese-sparql` on engine snapshots; matches the Oxigraph oracle on 30 differential queries); W3C suite pending | Q1 | W3C query suite |
+| SPARQL 1.1 update | yes (delta layer degrades) | yes | v2 serving; write gate **passed** (1-triple insert at 10 M over HTTP: 0.22 ms in memory, 2.05 ms durable; v1: 3 s at 1 M); W3C suite pending | Q1, P1 | W3C update suite; `write-scaling` < 5 ms at 10 M |
 | Protocol dataset parameters | yes | yes | engine (`QueryOptions::dataset`, `UpdateOptions::using`); not yet exposed over HTTP | Q1 | protocol tests |
-| Graph Store Protocol | yes | yes | v1 | Q1 | GSP tests |
-| Query cancellation / real timeouts | yes | yes | v1 is broken (commits after 408); engine: updates never commit themselves, and cancellation is checked per operation and inside evaluation | Q1, P1 | timeout-commit test |
+| Graph Store Protocol | yes | yes | v2 serving (server GSP test suite green) | Q1 | GSP tests |
+| Query cancellation / real timeouts | yes | yes | writes **fixed**: a timed-out write never commits, and cancel stops evaluation. Read queries aren't cancelled at the deadline yet | Q1, P1 | timeout-commit test |
 | Streaming large results | yes | yes | missing | Q1 | memory-bounded 10 M-row test |
 | Federated `SERVICE` | yes | yes | missing | X2 | W3C federation tests |
 | RDF4J protocol + transactions | no | yes | missing | X1 | RDF4J client test |
 | Multi-repository | no | yes | missing | X1 | API tests |
-| Crash-safe durability, persistent revision | yes | yes | engine (WAL + checkpoints, `tests/durability_tests.rs`); v1 still serves | E4, P2 | crash-injection tests |
+| Crash-safe durability, persistent revision | yes | yes | **done**: WAL + checkpoints serving; crash-injection tests; a hard-kill restart at 10 M recovered exactly | E4, P2 | crash-injection tests |
 | Online backup | — | yes | v1 export only | O2 | drill |
 | Parallel bulk loader | yes (fast) | yes | missing | E5 | load benchmark |
 | Compressed / on-disk indexes | yes | yes | missing | Pf1, Pf2 | bytes/triple, larger-than-RAM test |
