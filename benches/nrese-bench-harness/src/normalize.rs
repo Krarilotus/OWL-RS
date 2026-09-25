@@ -81,16 +81,8 @@ pub fn compare_canonical_sets(
         matched: left == right,
         left_count: left.len(),
         right_count: right.len(),
-        left_only_sample: left
-            .difference(right)
-            .take(SAMPLE_LIMIT)
-            .cloned()
-            .collect(),
-        right_only_sample: right
-            .difference(left)
-            .take(SAMPLE_LIMIT)
-            .cloned()
-            .collect(),
+        left_only_sample: left.difference(right).take(SAMPLE_LIMIT).cloned().collect(),
+        right_only_sample: right.difference(left).take(SAMPLE_LIMIT).cloned().collect(),
     }
 }
 
@@ -149,13 +141,12 @@ fn canonicalize_binding_value(name: &str, value: &Value) -> Result<String> {
         .get("value")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("binding value missing lexical form"))?;
-    let datatype = object
-        .get("datatype")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let datatype = object.get("datatype").and_then(Value::as_str).unwrap_or("");
     let language = object.get("xml:lang").and_then(Value::as_str).unwrap_or("");
 
-    Ok(format!("{name}={term_type}|{datatype}|{language}|{lexical}"))
+    Ok(format!(
+        "{name}={term_type}|{datatype}|{language}|{lexical}"
+    ))
 }
 
 pub fn normalize_content_type(content_type: Option<&str>) -> Option<String> {
@@ -264,9 +255,10 @@ mod tests {
 
         let canonical = canonicalize_rdf_graph_set(Some("application/rdf+xml"), payload)
             .expect("canonical graph");
-        assert!(canonical.contains(
-            "<http://example.com/a> <http://example.com/p> <http://example.com/b> ."
-        ));
+        assert!(
+            canonical
+                .contains("<http://example.com/a> <http://example.com/p> <http://example.com/b> .")
+        );
     }
 
     #[test]
@@ -280,10 +272,10 @@ _:b0 <http://example.com/p> <http://example.com/c> .
 _:other <http://example.com/p> <http://example.com/c> .
 "#;
 
-        let left_set = canonicalize_rdf_graph_set(Some("application/n-triples"), left)
-            .expect("left graph");
-        let right_set = canonicalize_rdf_graph_set(Some("application/n-triples"), right)
-            .expect("right graph");
+        let left_set =
+            canonicalize_rdf_graph_set(Some("application/n-triples"), left).expect("left graph");
+        let right_set =
+            canonicalize_rdf_graph_set(Some("application/n-triples"), right).expect("right graph");
 
         assert_eq!(left_set, right_set);
     }
@@ -321,8 +313,16 @@ _:other <http://example.com/p> <http://example.com/c> .
 
         let canonical = canonicalize_bindings_set(&value).expect("bindings set");
         assert_eq!(canonical.len(), 2);
-        assert!(canonical.iter().any(|row| row.contains("http://example.com/a")));
-        assert!(canonical.iter().any(|row| row.contains("http://example.com/b")));
+        assert!(
+            canonical
+                .iter()
+                .any(|row| row.contains("http://example.com/a"))
+        );
+        assert!(
+            canonical
+                .iter()
+                .any(|row| row.contains("http://example.com/b"))
+        );
     }
 
     #[test]

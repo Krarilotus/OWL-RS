@@ -81,7 +81,7 @@ service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "r
 [[ontologies]]
 name = "sosa"
 title = "W3C SOSA Ontology"
-url = "https://www.w3.org/ns/ssn/sosa.ttl"
+url = "https://www.w3.org/ns/sosa/"
 media_type = "text/turtle"
 serialization = "turtle"
 filename = "sosa.ttl"
@@ -91,7 +91,9 @@ focus_terms = [
   "http://www.w3.org/ns/sosa/hasFeatureOfInterest",
 ]
 semantic_dialects = ["rdfs", "owl", "sosa"]
-reasoning_features = ["subclass-closure", "subproperty-closure", "domain-range-typing", "list-axioms"]
+# SOSA (2023) uses schema:domainIncludes rather than rdfs:domain and has no subclass,
+# subproperty or list axioms; its OWL content is inverse-property declarations.
+reasoning_features = ["inverse-property"]
 service_coverage = ["catalog-sync", "compat", "tell", "graph-store", "query", "reasoner", "benchmark"]
 
 [[ontologies]]

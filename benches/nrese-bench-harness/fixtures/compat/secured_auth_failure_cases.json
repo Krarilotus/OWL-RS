@@ -5,7 +5,7 @@
     "query": "SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1",
     "accept": "application/sparql-results+json",
     "nrese_profile": "invalid",
-    "fuseki_profile": "invalid",
+    "reference_profile": "invalid",
     "kind": "status-content-type-body-class"
   },
   {
@@ -13,7 +13,7 @@
     "operation": "update-effect",
     "update": "INSERT DATA { <http://example.com/policy-s> <http://example.com/policy-p> <http://example.com/policy-o> }",
     "nrese_profile": "invalid",
-    "fuseki_profile": "invalid",
+    "reference_profile": "invalid",
     "kind": "status-content-type-body-class"
   },
   {
@@ -26,7 +26,7 @@
     "graph_content_type": "text/turtle",
     "graph_payload": "@prefix ex: <http://example.com/> . ex:s ex:p ex:o .",
     "nrese_profile": "invalid",
-    "fuseki_profile": "invalid",
+    "reference_profile": "invalid",
     "kind": "status-content-type-body-class"
   }
 ]

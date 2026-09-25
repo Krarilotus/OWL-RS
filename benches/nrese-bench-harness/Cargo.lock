@@ -774,10 +774,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-reasoner"
+version = "0.1.0"
+dependencies = [
+ "nrese-core",
+ "tracing",
+]
+
+[[package]]
 name = "nrese-store"
 version = "0.1.0"
 dependencies = [
  "nrese-core",
+ "nrese-reasoner",
  "oxigraph",
  "sha2",
  "thiserror",

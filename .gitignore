@@ -12,7 +12,6 @@ Thumbs.db
 /data/
 /artifacts/
 /tmp/
-/benches/nrese-bench-harness/fixtures/catalog-cache/
 *.log
 *.out
 *.err

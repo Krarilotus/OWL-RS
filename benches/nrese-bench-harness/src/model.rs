@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::layout::{EndpointOverrides, ReferenceKind};
+
 #[derive(Debug, Clone)]
 pub struct Cli {
     pub command: Command,
@@ -17,6 +19,7 @@ pub enum Command {
     ValidatePack(ValidatePackConfig),
     PackMatrix(PackMatrixConfig),
     Seed(SeedConfig),
+    WriteScaling(WriteScalingConfig),
 }
 
 #[derive(Debug, Clone)]
@@ -30,7 +33,7 @@ pub struct CatalogSyncConfig {
 #[derive(Debug, Clone)]
 pub struct BenchConfig {
     pub nrese: ServiceConnectionConfig,
-    pub fuseki: Option<ServiceConnectionConfig>,
+    pub reference: Option<ReferenceConnection>,
     pub iterations: usize,
     pub query_workload_path: PathBuf,
     pub update_workload_path: PathBuf,
@@ -40,17 +43,33 @@ pub struct BenchConfig {
 #[derive(Debug, Clone)]
 pub struct CompatConfig {
     pub nrese: ServiceConnectionConfig,
-    pub fuseki: ServiceConnectionConfig,
+    pub reference: ReferenceConnection,
     pub nrese_profiles: BTreeMap<String, ServiceRequestProfile>,
-    pub fuseki_profiles: BTreeMap<String, ServiceRequestProfile>,
+    pub reference_profiles: BTreeMap<String, ServiceRequestProfile>,
     pub cases_path: PathBuf,
+    pub report_json_path: Option<PathBuf>,
+}
+
+/// `write-scaling`: grow the dataset in steps and measure write/query latency per step.
+#[derive(Debug, Clone)]
+pub struct WriteScalingConfig {
+    pub nrese: ServiceConnectionConfig,
+    pub reference: Option<ReferenceConnection>,
+    /// Strictly increasing dataset sizes in triples.
+    pub steps: Vec<u64>,
+    /// Triples per Graph Store upload while growing the dataset.
+    pub chunk_triples: u64,
+    /// Single-triple inserts measured per step.
+    pub samples: usize,
+    /// Run `DROP ALL` on each target before the first step.
+    pub reset: bool,
     pub report_json_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SeedConfig {
     pub nrese: ServiceConnectionConfig,
-    pub fuseki: Option<ServiceConnectionConfig>,
+    pub reference: Option<ReferenceConnection>,
     pub dataset_path: PathBuf,
     pub dataset_base_iri: Option<String>,
     pub content_type: Option<String>,
@@ -59,11 +78,7 @@ pub struct SeedConfig {
 
 #[derive(Debug, Clone)]
 pub struct PackConfig {
-    pub nrese_base_url: Option<String>,
-    pub fuseki_base_url: Option<String>,
-    pub fuseki_basic_auth: Option<BasicAuthConfig>,
-    pub connection_profiles_path: Option<PathBuf>,
-    pub connection_profile_name: Option<String>,
+    pub connections: ConnectionSelection,
     pub workload_pack_path: PathBuf,
     pub execution_mode: PackExecutionMode,
     pub iterations: usize,
@@ -72,11 +87,7 @@ pub struct PackConfig {
 
 #[derive(Debug, Clone)]
 pub struct ValidatePackConfig {
-    pub nrese_base_url: Option<String>,
-    pub fuseki_base_url: Option<String>,
-    pub fuseki_basic_auth: Option<BasicAuthConfig>,
-    pub connection_profiles_path: Option<PathBuf>,
-    pub connection_profile_name: Option<String>,
+    pub connections: ConnectionSelection,
     pub workload_pack_path: PathBuf,
     pub report_json_path: Option<PathBuf>,
 }
@@ -90,11 +101,7 @@ pub enum PackExecutionMode {
 
 #[derive(Debug, Clone)]
 pub struct PackMatrixConfig {
-    pub nrese_base_url: Option<String>,
-    pub fuseki_base_url: Option<String>,
-    pub fuseki_basic_auth: Option<BasicAuthConfig>,
-    pub connection_profiles_path: Option<PathBuf>,
-    pub connection_profile_name: Option<String>,
+    pub connections: ConnectionSelection,
     pub catalog_path: PathBuf,
     pub packs_dir: PathBuf,
     pub ontology_name: Option<String>,
@@ -120,7 +127,7 @@ pub struct WorkloadPackManifest {
     #[serde(default)]
     pub nrese: ServiceRequestProfile,
     #[serde(default)]
-    pub fuseki: ServiceRequestProfile,
+    pub reference: ServiceRequestProfile,
     #[serde(default)]
     pub invocation_profiles: ServiceInvocationProfiles,
 }
@@ -253,12 +260,17 @@ pub struct ServiceInvocationProfiles {
     #[serde(default)]
     pub nrese: BTreeMap<String, ServiceRequestProfile>,
     #[serde(default)]
-    pub fuseki: BTreeMap<String, ServiceRequestProfile>,
+    pub reference: BTreeMap<String, ServiceRequestProfile>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ServiceConnectionProfile {
+    /// Engine kind; required for the reference side, must be absent for NRESE.
+    #[serde(default)]
+    pub kind: Option<ReferenceKind>,
     pub base_url: String,
+    #[serde(default, flatten)]
+    pub endpoints: EndpointOverrides,
     #[serde(default)]
     pub headers: CompatHeaders,
     #[serde(default)]
@@ -282,7 +294,7 @@ pub struct ConnectionProfilesRegistry {
 pub struct LiveConnectionProfile {
     pub nrese: ServiceConnectionProfile,
     #[serde(default)]
-    pub fuseki: Option<ServiceConnectionProfile>,
+    pub reference: Option<ServiceConnectionProfile>,
     #[serde(default)]
     pub invocation_profiles: ServiceInvocationProfiles,
 }
@@ -299,6 +311,58 @@ pub struct ServiceConnectionConfig {
     pub headers: CompatHeaders,
     pub timeout_ms: Option<u64>,
     pub basic_auth: Option<BasicAuthConfig>,
+    pub endpoints: EndpointOverrides,
+}
+
+impl ServiceConnectionConfig {
+    /// Applies a request profile: profile headers extend the connection headers and a
+    /// profile timeout replaces the connection timeout. The one merge rule for all callers.
+    pub fn with_request_profile(&self, profile: Option<&ServiceRequestProfile>) -> Self {
+        let mut merged = self.clone();
+        if let Some(profile) = profile {
+            merged.headers.extend(profile.headers.clone());
+            merged.timeout_ms = profile.timeout_ms.or(self.timeout_ms);
+        }
+        merged
+    }
+
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            headers: CompatHeaders::new(),
+            timeout_ms: None,
+            basic_auth: None,
+            endpoints: EndpointOverrides::default(),
+        }
+    }
+}
+
+/// How the harness selects its endpoints: an optional connection-profile registry entry,
+/// overridden field by field by explicit CLI values.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionSelection {
+    pub profiles_path: Option<PathBuf>,
+    pub profile_name: Option<String>,
+    pub nrese_base_url: Option<String>,
+    pub reference_kind: Option<ReferenceKind>,
+    pub reference_base_url: Option<String>,
+    pub reference_basic_auth: Option<BasicAuthConfig>,
+}
+
+/// A reference engine connection: the engine kind decides the endpoint layout.
+#[derive(Debug, Clone)]
+pub struct ReferenceConnection {
+    pub kind: ReferenceKind,
+    pub connection: ServiceConnectionConfig,
+}
+
+impl ReferenceConnection {
+    pub fn with_request_profile(&self, profile: Option<&ServiceRequestProfile>) -> Self {
+        Self {
+            kind: self.kind,
+            connection: self.connection.with_request_profile(profile),
+        }
+    }
 }
 
 pub type CompatHeaders = BTreeMap<String, String>;
@@ -351,7 +415,7 @@ pub struct CompatCase {
     #[serde(default)]
     pub nrese_profile: Option<String>,
     #[serde(default)]
-    pub fuseki_profile: Option<String>,
+    pub reference_profile: Option<String>,
     pub kind: CompatKind,
 }
 
@@ -442,7 +506,7 @@ pub struct BenchComparison {
 pub struct CompatReport {
     pub mode: &'static str,
     pub nrese_base_url: String,
-    pub fuseki_base_url: String,
+    pub reference_base_url: String,
     pub total_cases: usize,
     pub matched_cases: usize,
     pub mismatched_cases: usize,
@@ -461,7 +525,7 @@ pub struct PackReport {
     pub dataset_path: String,
     pub dataset_base_iri: Option<String>,
     pub nrese_base_url: String,
-    pub fuseki_base_url: Option<String>,
+    pub reference_base_url: Option<String>,
     pub iterations: usize,
     pub status: &'static str,
     pub error: Option<String>,
@@ -479,10 +543,10 @@ pub struct PackValidationReport {
     pub dataset_path: String,
     pub dataset_base_iri: Option<String>,
     pub nrese_base_url: String,
-    pub fuseki_base_url: Option<String>,
+    pub reference_base_url: Option<String>,
     pub compat_suites: Vec<String>,
     pub nrese_invocation_profiles: Vec<String>,
-    pub fuseki_invocation_profiles: Vec<String>,
+    pub reference_invocation_profiles: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -588,5 +652,37 @@ pub fn compat_operation_label(operation: CompatOperation) -> &'static str {
         CompatOperation::GraphPutEffect => "graph-put-effect",
         CompatOperation::GraphPostEffect => "graph-post-effect",
         CompatOperation::UpdateEffect => "update-effect",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompatHeaders, ServiceConnectionConfig, ServiceRequestProfile};
+
+    #[test]
+    fn request_profile_merges_over_connection() {
+        let base = ServiceConnectionConfig {
+            headers: CompatHeaders::from([
+                ("authorization".to_owned(), "Bearer base".to_owned()),
+                ("x-base".to_owned(), "1".to_owned()),
+            ]),
+            timeout_ms: Some(1000),
+            ..ServiceConnectionConfig::new("http://example.invalid")
+        };
+        let profile = ServiceRequestProfile {
+            headers: CompatHeaders::from([
+                ("authorization".to_owned(), "Bearer profile".to_owned()),
+                ("x-profile".to_owned(), "1".to_owned()),
+            ]),
+            timeout_ms: Some(25),
+        };
+
+        let merged = base.with_request_profile(Some(&profile));
+
+        assert_eq!(merged.timeout_ms, Some(25));
+        assert_eq!(merged.headers["authorization"], "Bearer profile");
+        assert_eq!(merged.headers["x-base"], "1");
+        assert_eq!(merged.headers["x-profile"], "1");
+        assert_eq!(base.with_request_profile(None).timeout_ms, Some(1000));
     }
 }
