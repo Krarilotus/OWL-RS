@@ -5,6 +5,9 @@
 //! - `Versions::current` holds the latest committed [`Version`]. A [`Snapshot`] clones that
 //!   `Arc` under a read lock held for nanoseconds and afterwards touches no shared state except
 //!   the append-only dictionary. Readers are never blocked by an open transaction.
+//! - A version holds two index stacks (ADR-0003, roadmap E6): *asserted* statements and
+//!   *inferred* ones. They are disjoint, committed together under one revision, and read
+//!   through a [`ReadModel`]. The engine stores inferences; deriving them is the reasoner's job.
 //! - One [`Transaction`] at a time holds the writer slot. A commit builds its run without any
 //!   lock, appends the WAL record (durable mode) and swaps `current` under a short write lock.
 //!   The WAL mutex is held across append and publish, so a checkpoint that snapshots under the
@@ -25,10 +28,13 @@ use std::thread::JoinHandle;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::durability::codec::CommitRecord;
 use crate::durability::{DurabilityConfig, Durable, checkpoint};
 use crate::error::EngineResult;
 use crate::index::compaction::merge_runs;
-use crate::index::{CompactionPolicy, IndexVersion};
+use crate::index::run::Run;
+use crate::index::{CompactionPolicy, IndexVersion, Layout};
+use crate::quad::{EncodedQuad, EncodedTriple};
 use crate::term::{Dictionary, DictionaryStats};
 
 pub use snapshot::Snapshot;
@@ -59,28 +65,136 @@ impl Default for EngineConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineStats {
     pub revision: u64,
+    /// Asserted quads.
     pub quads: u64,
+    /// Inferred quads (all in the default graph; disjoint from the asserted ones).
+    pub inferred: u64,
+    /// Runs of both stacks.
     pub runs: usize,
+    /// Index memory of both stacks.
     pub index_bytes: u64,
     pub dictionary: DictionaryStats,
 }
 
+/// Which statements a read sees. GraphDB calls them explicit and implicit statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ReadModel {
+    /// Asserted and inferred statements (the default).
+    #[default]
+    Materialised,
+    /// Asserted (explicit) statements only.
+    Asserted,
+    /// Inferred (implicit) statements only.
+    Inferred,
+}
+
+impl ReadModel {
+    pub(crate) fn includes(self, stack: Stack) -> bool {
+        matches!(
+            (self, stack),
+            (Self::Materialised, _)
+                | (Self::Asserted, Stack::Asserted)
+                | (Self::Inferred, Stack::Inferred)
+        )
+    }
+}
+
+/// The two index stacks of a version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stack {
+    Asserted,
+    Inferred,
+}
+
+impl Stack {
+    pub(crate) const ALL: [Self; 2] = [Self::Asserted, Self::Inferred];
+
+    pub(crate) const fn layout(self) -> Layout {
+        match self {
+            Self::Asserted => Layout::Quads,
+            Self::Inferred => Layout::DefaultGraph,
+        }
+    }
+
+    /// The read model that sees exactly this stack.
+    pub(crate) const fn model(self) -> ReadModel {
+        match self {
+            Self::Asserted => ReadModel::Asserted,
+            Self::Inferred => ReadModel::Inferred,
+        }
+    }
+}
+
+impl CommitRecord {
+    /// The runs this record adds to the asserted and inferred stacks. Shared by commit and
+    /// WAL replay, so both build identical versions.
+    pub(crate) fn runs(&self) -> [Run; 2] {
+        let in_default_graph = |triples: &[EncodedTriple]| -> Vec<EncodedQuad> {
+            triples.iter().map(|t| t.in_default_graph()).collect()
+        };
+        [
+            Run::from_delta(Stack::Asserted.layout(), &self.inserts, &self.deletes),
+            Run::from_delta(
+                Stack::Inferred.layout(),
+                &in_default_graph(&self.inferred_inserts),
+                &in_default_graph(&self.inferred_deletes),
+            ),
+        ]
+    }
+}
+
 /// One committed state of the dataset. Immutable; shared by snapshots via `Arc`.
-#[derive(Debug, Default)]
+///
+/// Invariant: no quad is visible in both stacks. Transactions enforce it at commit.
+#[derive(Debug)]
 pub(crate) struct Version {
-    pub(crate) index: IndexVersion,
+    pub(crate) asserted: IndexVersion,
+    pub(crate) inferred: IndexVersion,
     pub(crate) revision: u64,
     /// Dictionary entries visible to this version; newer terms are hidden from lookups.
     pub(crate) dictionary_len: u64,
 }
 
 impl Version {
-    fn with_index(&self, index: IndexVersion) -> Self {
+    /// The empty revision 0.
+    pub(crate) fn empty() -> Self {
         Self {
-            index,
+            asserted: IndexVersion::empty(Stack::Asserted.layout()),
+            inferred: IndexVersion::empty(Stack::Inferred.layout()),
+            revision: 0,
+            dictionary_len: 0,
+        }
+    }
+
+    pub(crate) fn stack(&self, stack: Stack) -> &IndexVersion {
+        match stack {
+            Stack::Asserted => &self.asserted,
+            Stack::Inferred => &self.inferred,
+        }
+    }
+
+    pub(crate) fn stack_mut(&mut self, stack: Stack) -> &mut IndexVersion {
+        match stack {
+            Stack::Asserted => &mut self.asserted,
+            Stack::Inferred => &mut self.inferred,
+        }
+    }
+
+    fn with_stack(&self, stack: Stack, index: IndexVersion) -> Self {
+        let mut next = Self {
+            asserted: self.asserted.clone(),
+            inferred: self.inferred.clone(),
             revision: self.revision,
             dictionary_len: self.dictionary_len,
-        }
+        };
+        *next.stack_mut(stack) = index;
+        next
+    }
+
+    fn runs(&self) -> impl Iterator<Item = &Arc<Run>> {
+        Stack::ALL
+            .into_iter()
+            .flat_map(|stack| self.stack(stack).runs())
     }
 }
 
@@ -124,21 +238,30 @@ impl Versions {
         };
         loop {
             let version = self.load();
-            let Some(plan) = self.policy.plan(version.index.runs()) else {
+            let plans: Vec<_> = Stack::ALL
+                .into_iter()
+                .filter_map(|stack| Some((stack, self.policy.plan(version.stack(stack).runs())?)))
+                .collect();
+            if plans.is_empty() {
                 return CompactionOutcome::Stable;
-            };
-            if inline_only && !self.policy.is_inline(&plan) {
-                return CompactionOutcome::Deferred;
             }
-            let merged = merge_runs(&version.index.runs()[plan.window.clone()]);
+            let Some((stack, plan)) = plans
+                .into_iter()
+                .find(|(_, plan)| !inline_only || self.policy.is_inline(plan))
+            else {
+                return CompactionOutcome::Deferred;
+            };
+            let runs = version.stack(stack).runs();
+            let merged = merge_runs(&runs[plan.window.clone()]);
             self.publish(|current| {
+                let index = current.stack(stack);
                 debug_assert!(
                     plan.window
                         .clone()
-                        .all(|i| Arc::ptr_eq(&current.index.runs()[i], &version.index.runs()[i])),
+                        .all(|i| Arc::ptr_eq(&index.runs()[i], &runs[i])),
                     "compaction window changed while merging"
                 );
-                current.with_index(current.index.with_compacted(plan.window, merged))
+                current.with_stack(stack, index.with_compacted(plan.window, merged))
             });
         }
     }
@@ -279,7 +402,7 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     /// An in-memory engine.
     pub fn new(config: EngineConfig) -> EngineResult<Self> {
-        Self::build(config, Arc::default(), None, IndexVersion::default(), 0)
+        Self::build(config, Arc::default(), None, Version::empty())
     }
 
     /// Opens (or creates) a durable engine in `dir`, recovering its last committed revision.
@@ -292,32 +415,27 @@ impl Engine {
             &config.compaction,
             config.durability,
         )?;
+        let version = recovered.version;
         tracing::info!(
             dir = %dir.as_ref().display(),
-            revision = recovered.revision,
-            quads = recovered.index.len(),
+            revision = version.revision,
+            quads = version.asserted.len(),
+            inferred = version.inferred.len(),
             "engine recovered"
         );
-        Self::build(
-            config,
-            dictionary,
-            Some(recovered.durable),
-            recovered.index,
-            recovered.revision,
-        )
+        Self::build(config, dictionary, Some(recovered.durable), version)
     }
 
+    /// `version.dictionary_len` is replaced by the dictionary's actual length.
     fn build(
         config: EngineConfig,
         dictionary: Arc<Dictionary>,
         durable: Option<Durable>,
-        index: IndexVersion,
-        revision: u64,
+        version: Version,
     ) -> EngineResult<Self> {
         let version = Version {
-            index,
-            revision,
             dictionary_len: dictionary.len(),
+            ..version
         };
         let shared = Arc::new(Shared {
             dictionary,
@@ -375,14 +493,10 @@ impl Engine {
         let version = self.inner.shared.versions.load();
         EngineStats {
             revision: version.revision,
-            quads: version.index.len(),
-            runs: version.index.runs().len(),
-            index_bytes: version
-                .index
-                .runs()
-                .iter()
-                .map(|run| run.memory_bytes())
-                .sum(),
+            quads: version.asserted.len(),
+            inferred: version.inferred.len(),
+            runs: version.runs().count(),
+            index_bytes: version.runs().map(|run| run.memory_bytes()).sum(),
             dictionary: self.inner.shared.dictionary.stats(),
         }
     }

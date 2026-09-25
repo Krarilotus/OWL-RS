@@ -3,10 +3,11 @@
 //! Owns the physical representation of an RDF dataset:
 //! - [`term`]: RDF terms ⇄ 64-bit [`TermId`]s (dictionary plus inline canonical values)
 //! - [`quad`]: encoded quads, patterns, and which permutation answers which pattern
-//! - `index`: immutable sorted runs over six permutations, merged with sign-sum visibility,
-//!   and size-tiered compaction
-//! - [`engine`]: the public façade: [`Engine`], MVCC [`Snapshot`]s, single-writer
-//!   [`Transaction`]s with exact deltas, and inline/background compaction
+//! - `index`: immutable sorted runs over six permutations (three for the inferred stack),
+//!   merged with sign-sum visibility, and size-tiered compaction
+//! - [`engine`]: the public façade: [`Engine`], MVCC [`Snapshot`]s over an asserted and an
+//!   inferred stack ([`ReadModel`]), single-writer [`Transaction`]s with exact deltas, and
+//!   inline/background compaction
 //! - `durability`: redo WAL, checkpoints and crash recovery behind [`Engine::open`]
 //!
 //! Not owned here: SPARQL (L2 `nrese-sparql`), reasoning and validation (L2), mutation
@@ -21,8 +22,10 @@ pub mod quad;
 pub mod term;
 
 pub use durability::{DurabilityConfig, SyncPolicy};
-pub use engine::{CommitSummary, Engine, EngineConfig, EngineStats, Snapshot, Transaction};
+pub use engine::{
+    CommitSummary, Engine, EngineConfig, EngineStats, ReadModel, Snapshot, Transaction,
+};
 pub use error::{EngineError, EngineResult};
 pub use index::CompactionPolicy;
-pub use quad::{EncodedQuad, GraphSelector, QuadPattern};
+pub use quad::{EncodedQuad, EncodedTriple, GraphSelector, QuadPattern};
 pub use term::{Dictionary, DictionaryStats, TermId, TermKind};

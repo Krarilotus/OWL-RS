@@ -30,7 +30,7 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 | RDFS / OWL-Horst / OWL 2 RL / OWL 2 QL materialisation | no | yes | v1: bounded RDFS+OWL write gate only; inferences not queryable. v2 planned ([design/reasoner-v2.md](../design/reasoner-v2.md)) | E6, R1–R4 | LUBM/UOBM/SPB inferred sets equal GraphDB's; W3C OWL 2 RL tests; ≥ 10× GraphDB load + materialise |
 | Incremental retraction (TMS) | no | yes | missing | R5 | incremental = rematerialisation property tests |
 | Consistency checking with explanations | no | yes | v1 partial (IRI-only triples) | R6 | W3C RL consistency tests; v1 fixture suite; explanation ≤ 10 ms |
-| Explicit/implicit pseudo-graphs | no | yes | missing | E6, R4 | query tests |
+| Explicit/implicit pseudo-graphs | no | yes | engine: `ReadModel` (materialised/asserted/inferred) over separate stacks; not yet selectable per request | E6, R4 | query tests |
 | SHACL Core + paths on commit | no | yes | missing | S1, S2 | W3C SHACL suite; incremental = full |
 | SHACL-SPARQL | no | yes | missing | S3 | W3C SHACL-SPARQL tests |
 | Full-text search | yes (integrated) | yes (connectors/Lucene) | missing | T1 | ResearchSpace search; relevance tests |

@@ -11,6 +11,7 @@
 
 use rayon::prelude::*;
 
+use super::Layout;
 use crate::quad::{EncodedQuad, Key, Permutation};
 
 /// Deltas at least this large are sorted with all six permutations in parallel.
@@ -69,8 +70,10 @@ impl PermutationRun {
     }
 }
 
+/// Invariant: exactly the permutations of `layout` are populated; the others are empty.
 #[derive(Debug, Default)]
 pub(crate) struct Run {
+    layout: Layout,
     perms: [PermutationRun; 6],
     inserts: u64,
     deletes: u64,
@@ -79,7 +82,11 @@ pub(crate) struct Run {
 impl Run {
     /// Builds a run from an exact delta. `inserts` and `deletes` must be disjoint and free of
     /// duplicates (the transaction guarantees this). O(d log d).
-    pub(crate) fn from_delta(inserts: &[EncodedQuad], deletes: &[EncodedQuad]) -> Self {
+    pub(crate) fn from_delta(
+        layout: Layout,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+    ) -> Self {
         let build = |permutation: Permutation| {
             let mut entries: Vec<(Key, bool)> = Vec::with_capacity(inserts.len() + deletes.len());
             entries.extend(inserts.iter().map(|q| (permutation.to_key(q), false)));
@@ -87,13 +94,16 @@ impl Run {
             entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             PermutationRun::from_sorted(entries)
         };
-        Self::from_permutations(build_all(inserts.len() + deletes.len(), build))
+        Self::from_permutations(
+            layout,
+            build_all(layout, inserts.len() + deletes.len(), build),
+        )
     }
 
     /// Builds a tombstone-free run from arbitrary quads, removing duplicates. Used for bulk
     /// replacement and checkpoint loading. O(n log n), parallel over permutations and within
     /// each sort.
-    pub(crate) fn from_quads(mut quads: Vec<EncodedQuad>) -> Self {
+    pub(crate) fn from_quads(layout: Layout, mut quads: Vec<EncodedQuad>) -> Self {
         quads.par_sort_unstable();
         quads.dedup();
         let build = |permutation: Permutation| {
@@ -104,20 +114,26 @@ impl Run {
                 tombstones: Box::default(),
             }
         };
-        Self::from_permutations(build_all(quads.len(), build))
+        Self::from_permutations(layout, build_all(layout, quads.len(), build))
     }
 
-    /// Assembles a run from six permutation runs holding the same entries. The counts are
-    /// derived from SPOG, so they can't disagree with the data.
-    pub(crate) fn from_permutations(perms: [PermutationRun; 6]) -> Self {
+    /// Assembles a run from the permutation runs of `layout`, which hold the same entries.
+    /// The counts are derived from SPOG (part of every layout), so they can't disagree with
+    /// the data.
+    pub(crate) fn from_permutations(layout: Layout, perms: [PermutationRun; 6]) -> Self {
         let spog = &perms[Permutation::Spog as usize];
         let deletes = spog.tombstone_count();
         let inserts = spog.keys.len() as u64 - deletes;
         Self {
+            layout,
             perms,
             inserts,
             deletes,
         }
+    }
+
+    pub(crate) fn layout(&self) -> Layout {
+        self.layout
     }
 
     #[inline]
@@ -164,16 +180,24 @@ impl Run {
     }
 }
 
-/// Builds all six permutations, in parallel once `size` makes it worthwhile.
+/// Builds the permutations of `layout` (the others stay empty), in parallel once `size`
+/// makes it worthwhile.
 pub(crate) fn build_all(
+    layout: Layout,
     size: usize,
     build: impl Fn(Permutation) -> PermutationRun + Sync,
 ) -> [PermutationRun; 6] {
+    let wanted = layout.permutations();
+    let mut perms: [PermutationRun; 6] = Default::default();
     if size >= PARALLEL_BUILD_THRESHOLD {
-        let mut built: Vec<PermutationRun> =
-            Permutation::ALL.par_iter().map(|&p| build(p)).collect();
-        std::array::from_fn(|i| std::mem::take(&mut built[i]))
+        let built: Vec<PermutationRun> = wanted.par_iter().map(|&p| build(p)).collect();
+        for (&permutation, run) in wanted.iter().zip(built) {
+            perms[permutation as usize] = run;
+        }
     } else {
-        Permutation::ALL.map(build)
+        for &permutation in wanted {
+            perms[permutation as usize] = build(permutation);
+        }
     }
+    perms
 }

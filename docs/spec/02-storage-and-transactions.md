@@ -11,6 +11,11 @@ This is the contract the storage engine (`nrese-engine`, layer L1) and the mutat
 - **Named graphs exist iff they contain at least one quad.**
   - `CREATE GRAPH` stores nothing.
   - `CLEAR`/`DROP` of an empty named graph fails unless `SILENT` is given.
+- **Asserted and inferred statements are stored separately** (ADR-0003, roadmap E6).
+  - The *asserted* stack holds what clients wrote, in any graph.
+  - The *inferred* stack holds what the reasoner derived, always in the default graph.
+  - The two are **disjoint**: a statement that is both asserted and derivable counts as asserted, as in GraphDB.
+  - Backups contain asserted statements only.
 - **Blank nodes are scoped to one payload.** Every write request (update, Graph Store write, `TELL`, restore) gets fresh blank nodes. Within one payload, labels stay consistent. The startup ontology preload keeps the file's labels, so re-preloading is idempotent.
 
 ## Reads
@@ -18,7 +23,13 @@ This is the contract the storage engine (`nrese-engine`, layer L1) and the mutat
 - **Snapshot reads.** Every query, Graph Store read and export runs on one snapshot, a consistent committed revision.
   - A snapshot never observes a partial commit.
   - Readers never wait for writers, compaction or checkpoints.
-- **Pattern cost.** Every triple pattern is a contiguous range in one of six index permutations: O(r·log n + k) for k results over r runs, with r = O(log n).
+- **Read models.** Every read takes one:
+  - `Materialised` (the default): asserted plus inferred statements
+  - `Asserted`: explicit statements only
+  - `Inferred`: implicit statements only
+
+  A request-level switch and GraphDB's `onto:explicit`/`onto:implicit` pseudo-graphs come with R4.
+- **Pattern cost.** Every triple pattern is a contiguous range in one of six index permutations: O(r·log n + k) for k results over r runs, with r = O(log n). The inferred stack keeps three permutations, because a graph-first order over its single graph is the same as the matching graph-last one.
 
 ## Writes
 
@@ -32,6 +43,13 @@ Every write goes through the mutation pipeline:
 4. **Commit.** The delta is appended to the WAL and synced, then published atomically as the next revision.
 
 **Guarantees:**
+- **Atomic inferences.** Asserted and inferred changes commit together, under one revision.
+- **Disjointness is enforced by the engine.**
+  - The reasoner can't infer an asserted statement.
+  - Asserting an inferred statement makes it explicit.
+  - Retracting an asserted statement leaves the inferred stack alone. Re-deriving a statement that is still supported is the reasoner's job.
+  - These rules apply to the transaction's final state, so asserting and retracting a statement within one request changes nothing.
+- **Request paths write asserted statements only.** SPARQL Update, the Graph Store Protocol and restore can't reach the inferred stack. `DELETE`, `CLEAR` and `DROP` retract asserted statements, never inferred ones.
 - **Single writer.** Writes are serialised by the engine's writer slot. Commit cost is O(d log d) for a delta of d quads, independent of the dataset size.
 - **Revisions** increase by one per commit with a net change. They are persistent in on-disk mode and don't change for no-op writes.
 - **Aborts.** Any error before the commit discards the whole request. There are no partial writes.
@@ -44,6 +62,7 @@ Every write goes through the mutation pipeline:
   - A torn record at the end of the log (a crash mid-write) is truncated; it was never acknowledged.
   - Invalid data anywhere else is a startup error, never silently skipped.
 - **Directory lock.** The data directory is locked against a second process.
+- **Format versions.** WAL segments and checkpoints carry a format version in their magic bytes; format 2 added the inferred stack. A directory written by another version is rejected at startup with `UnsupportedFormat` instead of being reported as corrupt.
 
 ## Limits (current milestone)
 
@@ -57,6 +76,7 @@ Every write goes through the mutation pipeline:
 |---|---|
 | Visibility rule, all pattern shapes, compaction | `crates/nrese-engine/src/index/model_tests.rs` |
 | Snapshot isolation, overlay reads, concurrent readers | `crates/nrese-engine/tests/engine_tests.rs` |
+| Inferred stack: read models, disjointness, both stacks against a model across compaction, checkpoints and reopening | `crates/nrese-engine/tests/inferred_stack_tests.rs` |
 | Crash recovery, torn tails, corruption, checkpoints | `crates/nrese-engine/tests/durability_tests.rs` |
 | SPARQL semantics against an oracle | `crates/nrese-sparql/tests/differential_tests.rs` |
 | Pipeline: cancel vs. commit, gate rejection | `crates/nrese-store/tests/mutation_pipeline_tests.rs` |
