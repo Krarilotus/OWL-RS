@@ -1,0 +1,7 @@
+# Aggregate over a 3-way join: goals per team
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?team (SUM(?g) AS ?goals) WHERE { ?station a dbo:CareerStation ; dbo:team ?team ; dbo:numberOfGoals ?g } GROUP BY ?team ORDER BY DESC(?goals) LIMIT 20

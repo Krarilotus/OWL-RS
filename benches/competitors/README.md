@@ -28,9 +28,12 @@ consent. This repository is public, so **committing results counts as publishing
 
 | File | Purpose |
 |---|---|
-| `run-load-comparison.sh <triples> [runs] [systems...]` | Bulk-load comparison. It generates or stages the dataset, builds NRESE for Linux, runs each system's bulk loader, and prints `system,triples,run,wall_ms` |
+| `prepare-datasets.sh [names...]` | Downloads the real-world datasets and converts each to one validated N-Triples file in the Docker volume `nrese-bench-data`: `olympics` (1.8 M triples), `yago-tiny` (23 M), `dbpedia-core` (67 M), `wikidata-lexemes-<N>m` (first N million of 229 M) and full `wikidata-lexemes` |
+| `nt-filter.py` | Drops the few lines strict parsers reject (invalid IRIs or language tags) before any system sees the file, so all systems get identical input. Reports how many lines it drops |
+| `scorecard.sh <dataset> [systems...]` | **Pf0 scorecard** per system: load time, peak load memory, store bytes (per triple), restart time, server memory, query mix (1 warm-up + 5 runs per query, p50), and a cross-check that all systems return the same result counts. `LOAD_ONLY=1` skips the queries. Synthetic data comes from the harness: `generate --triples N` → `entities-N` |
+| `queries/<dataset>/*.rq` | Query mixes: point lookups, star and multi-hop joins, aggregates, numeric/date/text filters, OPTIONAL, negation, property paths, full scans, large streamed results |
 | `graphdb/repo-*.ttl` | GraphDB repository configs: `empty` for load comparisons; `rdfsplus-optimized` and `owl2-rl` for the reasoning comparisons (M3) |
-| `jena/Dockerfile` | Apache Jena command-line tools (TDB2 loaders) at a pinned version |
+| `jena/Dockerfile` | Apache Jena tools and Fuseki at a pinned version |
 
 ## Systems
 
@@ -53,11 +56,17 @@ consent. This repository is public, so **committing results counts as publishing
   - Virtuoso gets 16 GB of buffers.
   - Everything else runs with defaults.
 - **Timing.** Wall-clock from the start of the load until the store is durable and queryable. Container and JVM start-up are included (≈ 0.3–1 s); Virtuoso's server start-up is not.
+- **Vendor defaults changed for fairness:**
+  - QLever's query-result cache is capped at 1 MB, so repeated runs measure evaluation rather than cache hits.
+  - Virtuoso's result-row cap and cost-based query rejection are disabled, so it returns complete results.
+  - NRESE's rate limits are lifted.
+  - All systems use the same per-query timeout (`QUERY_TIMEOUT_S`, default 120 s).
+- **Same data.** Real dumps contain a few lines strict parsers reject: 29 k of 229 M in Wikidata lexemes, plus some in DBpedia. They are dropped once for all systems (`nt-filter.py`).
 - **The stores differ.** Each builds different indexes: QLever 6 permutations plus a pattern index, Virtuoso 2 full plus 3 partial indexes, TDB2 triple and quad indexes, NRESE 6 permutations plus a checkpoint. Load time alone doesn't say which store is better. It has to be read together with store size, peak memory, restart time and query speed.
 - **Still missing:**
-  - store size on disk and peak memory per system
-  - restart time and query latency after the load
-  - realistic datasets besides the synthetic one (LUBM, BSBM, a Wikidata or DBpedia slice)
+  - throughput with concurrent clients, and write latency under read load
+  - LUBM and BSBM generators, for reasoning and mixed workloads
+  - full Wikidata, which needs a large server
   - runs on a dedicated Linux reference machine instead of Docker Desktop
 
 ## Getting licences

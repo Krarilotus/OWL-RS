@@ -11,6 +11,7 @@ mod model;
 mod normalize;
 mod pack_validation;
 mod payloads;
+mod querymix;
 mod runner;
 mod scaling;
 
@@ -41,5 +42,6 @@ async fn main() -> Result<()> {
         Command::Seed(config) => runner::run_seed(config).await,
         Command::WriteScaling(config) => scaling::run_write_scaling(config).await,
         Command::Generate(config) => scaling::run_generate(&config),
+        Command::QueryMix(config) => querymix::run_query_mix(&config).await.map(drop),
     }
 }

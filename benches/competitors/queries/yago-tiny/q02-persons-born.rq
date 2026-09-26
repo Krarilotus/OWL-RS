@@ -1,0 +1,6 @@
+# Star join with date range
+PREFIX schema: <http://schema.org/>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?p ?name ?birth WHERE { ?p a schema:Person ; rdfs:label ?name ; schema:birthDate ?birth FILTER(LANG(?name) = "en" && YEAR(?birth) = 1879) }
