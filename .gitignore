@@ -32,3 +32,6 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+# Competitor benchmark results: some vendors forbid publishing them (benches/competitors/README.md)
+/benches/competitors/results/
