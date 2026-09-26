@@ -46,8 +46,11 @@ VIRTUOSO_IMAGE=${VIRTUOSO_IMAGE:-openlink/virtuoso-opensource-7:7.2.17}
 JENA_IMAGE=${JENA_IMAGE:-nrese-bench/jena:6.2.0}
 RUST_IMAGE=${RUST_IMAGE:-rust:1.91-bookworm}
 JAVA_HEAP=${JAVA_HEAP:-16g}
+# GraphDB 11 answers queries only with a licence file, even the Free edition (it loads without
+# one). Request the free licence on the Graphwise download page; see README.md.
+GRAPHDB_LICENSE=${GRAPHDB_LICENSE:-}
 PORT=${PORT:-18900}
-SYSTEMS=${*:-nrese qlever oxigraph jena virtuoso graphdb}
+SYSTEMS=${*:-nrese qlever oxigraph jena virtuoso${GRAPHDB_LICENSE:+ graphdb}}
 mkdir -p "$RESULTS"
 
 ms() { date +%s%N | cut -c1-13; }
@@ -59,8 +62,19 @@ mem_mib() {
          printf "%d", v * f }'
 }
 
-# Streams a container's memory usage (about once per second) into a file until killed.
-watch_memory() { docker stats --format '{{.MemUsage}}' "$1" >"$2" 2>/dev/null & echo $!; }
+# Samples a container's memory usage (one `docker stats` call per ~1 s) into a file while it
+# runs, then exits by itself. (A streaming `docker stats` would have to be killed, and on
+# Windows killing it from bash doesn't reliably stop the native process.)
+# Loads shorter than one sample report 0. Sets WATCHER; call directly (not in $(...)) so the
+# caller can `wait` for it.
+watch_memory() {
+  (
+    while [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; do
+      docker stats --no-stream --format '{{.MemUsage}}' "$1" 2>/dev/null
+    done
+  ) >"$2" &
+  WATCHER=$!
+}
 # The peak of a watch_memory file, in MiB (strips docker's terminal control codes).
 peak_mib() {
   sed $'s/\x1b\[[0-9;]*[A-Za-z]//g' "$1" | tr -d '\r' | grep -o '^[0-9.]*[KMG]\?i\?B' \
@@ -71,15 +85,15 @@ mem_mib_lines() { while read -r v; do echo "$v" | mem_mib; echo; done; }
 # Runs a detached container to completion. Prints "<wall_ms> <peak_mib>"; logs to $2.
 # Usage: measured <name> <log> <docker run args...>
 measured() {
-  local name=$1 log=$2 start rc watcher
+  local name=$1 log=$2 start rc
   shift 2
   docker rm -f "$name" >/dev/null 2>&1 || true
   start=$(ms)
   docker run -d --name "$name" "$@" >/dev/null
-  watcher=$(watch_memory "$name" "$log.mem")
+  watch_memory "$name" "$log.mem"
   docker wait "$name" >/dev/null
   local wall=$(( $(ms) - start ))
-  kill "$watcher" 2>/dev/null || true
+  wait "$WATCHER" 2>/dev/null || true
   local peak
   peak=$(peak_mib "$log.mem")
   rc=$(docker inspect -f '{{.State.ExitCode}}' "$name")
@@ -151,7 +165,7 @@ serve_oxigraph() {
 
 load_jena() {
   measured jena-sc-load "$2" -e JVM_ARGS="-Xmx$JAVA_HEAP" -v nrese-bench-data:/data:ro -v "$1:/tdb2" \
-    "$JENA_IMAGE" tdb2.xloader --loc /tdb2/db --tmpdir /tdb2/tmp --threads 8 "$FILE"
+    "$JENA_IMAGE" tdb2.tdbloader --loader=parallel --loc /tdb2/db "$FILE"
 }
 serve_jena() {
   ENDPOINT=http://localhost:$PORT/ds/query
@@ -180,14 +194,14 @@ load_virtuoso() {
     isql "checkpoint;"
   ) >"$2" 2>&1 &
   pid=$!
-  local watcher
-  watcher=$(watch_memory "$name" "$2.mem")
+  watch_memory "$name" "$2.mem"
   wait "$pid"
   local wall=$(( $(ms) - start ))
-  kill "$watcher" 2>/dev/null || true
+  docker stop -t 60 "$name" >/dev/null
+  wait "$WATCHER" 2>/dev/null || true # exits once the server has stopped
+  docker rm "$name" >/dev/null
   peak=$(peak_mib "$2.mem")
-  docker stop -t 60 "$name" >/dev/null && docker rm "$name" >/dev/null
-  echo "$wall $peak"
+  echo "$wall ${peak:-0}"
 }
 serve_virtuoso() {
   ENDPOINT=http://localhost:$PORT/sparql
@@ -195,14 +209,19 @@ serve_virtuoso() {
 }
 
 load_graphdb() {
-  measured graphdb-sc-load "$2" -e GDB_HEAP_SIZE="$JAVA_HEAP" -v nrese-bench-data:/data:ro \
+  # importrdf run directly defaults to the distribution's home; point it at the volume.
+  measured graphdb-sc-load "$2" -e GDB_HEAP_SIZE="$JAVA_HEAP" \
+    -e GDB_JAVA_OPTS="-Dgraphdb.home=/opt/graphdb/home" -v nrese-bench-data:/data:ro \
     -v "$(native "$ROOT/benches/competitors/graphdb"):/config:ro" -v "$1:/opt/graphdb/home" \
     --entrypoint /opt/graphdb/dist/bin/importrdf "$GRAPHDB_IMAGE" \
     preload -f -c /config/repo-empty.ttl "$FILE"
 }
 serve_graphdb() {
   ENDPOINT=http://localhost:$PORT/repositories/bench
+  [ -n "$GRAPHDB_LICENSE" ] || { echo "GraphDB needs GRAPHDB_LICENSE=/path/graphdb.license" >&2; return 1; }
   serve graphdb-sc "$ENDPOINT" -p "$PORT:7200" -e GDB_HEAP_SIZE="$JAVA_HEAP" \
+    -e GDB_JAVA_OPTS="-Dgraphdb.license.file=/license/graphdb.license" \
+    -v "$(native "$GRAPHDB_LICENSE"):/license/graphdb.license:ro" \
     -v "$1:/opt/graphdb/home" "$GRAPHDB_IMAGE"
 }
 

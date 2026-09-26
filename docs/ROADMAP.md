@@ -173,12 +173,15 @@ Reasoning behaviour is **configured per repository and per request** (decision D
 
 **Goal (2026-09-26): leave no performance on the table that is cheap to get, and make every trade-off configurable per use case** (decision D7 applies to storage as much as to reasoning).
 - **Scorecard first.** Every WP below is judged on the Pf0 scorecard, never on a single metric. Load time is one column among nine.
-- **Order within M4:**
-  1. Pf0, now, before further implementation.
-  2. Pf7, cheap wins, as soon as Pf0 can measure them.
-  3. E7, Pf1, Pf2, Pf5: storage.
-  4. Pf3, Pf4: queries.
-  5. Pf6: profiles, refined as the knobs appear.
+- **Order within M4, following the first scorecard** ([benches/competitors/SCORECARD.md](../benches/competitors/SCORECARD.md), 2026-09-26):
+  1. Pf0: done for load, size, memory, restart and queries; concurrency and write-under-load still to come.
+  2. Pf7, cheap wins.
+  3. **Pf3 and Pf4: queries, the largest gap.** QLever is 10–2000× faster on joins and aggregates.
+  4. Pf2: restart is 22 s at 67 M against QLever's 1.1 s; serving memory is 16 GiB against 0.2 GiB.
+  5. Pf1 and Pf5: 42–57 bytes per triple against QLever's 17–42.
+  6. E7: load is already the fastest of the group, 1.7–12× ahead at 67 M.
+  7. Pf6: profiles, refined as the knobs appear.
+- **Open question for decision D1:** should Pf7 and Pf3/Pf4 run before, or in parallel with, M2 (governance)?
 
 | WP | Scope | Layer | Done when |
 |---|---|---|---|
