@@ -16,7 +16,7 @@ Run of 2026-09-26: `scorecard.sh` over five datasets. Only systems whose licence
 
 ## What this means for NRESE
 
-1. **Load: the fastest of the group** on every dataset: 1.2–2× ahead of QLever and Oxigraph at 60–67 M, and 6–9× ahead of Virtuoso and Jena.
+1. **Load: the fastest of the group** on every dataset: 1.2–2.2× ahead of QLever and Oxigraph at 60–67 M, and 6–9× ahead of Virtuoso and Jena.
 2. **Queries: the largest gap.**
    - Sequentially, QLever is 10–2000× faster on joins and aggregates; at 67 M, `COUNT(*)` takes 10.7 s against 44 ms.
    - Under 8 clients, NRESE serves 4.5 queries/s at 67 M against QLever's 41.8 and Virtuoso's 25.8.
