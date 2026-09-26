@@ -16,6 +16,7 @@ consent. This repository is public, so **committing results counts as publishing
 | Virtuoso Open Source 7 | GPL v2 | free |
 | GraphDB Free | Ontotext Free licence | **only with Ontotext's written permission** (Art. 15.3). Reverse engineering, including "underlying ideas or algorithms", is prohibited (Art. 12.7); black-box timing is not reverse engineering |
 | RDFox (evaluation licence) | OST evaluation licence | **only with OST's approval**; apply ≥ 30 days before publishing (§2.2, §2.3). Results used in papers must be reported to OST (§2.4) |
+| AnzoGraph DB / Altair Graph Lakehouse (Free Edition) | Cambridge Semantics EULA | **only with CSI's prior written consent** (§3(h)). Needs their licence key (§3(j)); the Free Edition is limited to 8 GB RAM, or 16 GB if registered |
 
 **Therefore:**
 - Raw results go to `benches/competitors/results/`, which is git-ignored.
