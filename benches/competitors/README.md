@@ -48,6 +48,7 @@ Results: [SCORECARD.md](SCORECARD.md) (free-to-publish systems only).
 | Oxigraph 0.5.11 | `ghcr.io/oxigraph/oxigraph:0.5.11` | `oxigraph load` |
 | Virtuoso 7.2.17 Open Source | `openlink/virtuoso-opensource-7:7.2.17` | `ld_dir` + 6 × `rdf_loader_run` + `checkpoint`, excluding server start-up |
 | RDFox 7.6b | `oxfordsemantic/rdfox:7.6b` | sandbox `import`; needs `RDFOX_LICENSE=/path/RDFox.lic` |
+| AnzoGraph DB 3.5.0 Free (Altair Graph Lakehouse) | `cambridgesemantics/anzograph:3.5.0` | `LOAD WITH 'global' <file:...>` into the running in-memory server (start-up excluded); at most 8 GB RAM unregistered. Run explicitly: `scorecard.sh <dataset> anzograph`. Results stay local (EULA §3(h)) |
 
 ## Fairness checklist
 

@@ -220,6 +220,32 @@ serve_virtuoso() {
       exec='GRANT SPARQL_UPDATE TO "SPARQL"; DB.DBA.RDF_DEFAULT_USER_PERMS_SET('"'"'nobody'"'"', 7);' >/dev/null
 }
 
+# AnzoGraph DB (Altair Graph Lakehouse) Free: in-memory, at most 8 GB of RAM without
+# registration. Its results may not be published (EULA §3(h)); they stay in results/.
+# Loads through the running server, like Virtuoso: server start-up (~4 min) is excluded.
+# Without persistence configured it keeps data only in memory, so the loading container
+# also serves the queries; store size and restart are reported as n/a.
+ANZOGRAPH_IMAGE=${ANZOGRAPH_IMAGE:-cambridgesemantics/anzograph:3.5.0}
+load_anzograph() {
+  local name=anzograph-sc start
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  # Its own files live in /data, so the benchmark data is mounted at /bench.
+  docker run -d --name "$name" -p "$PORT:7070" -v nrese-bench-data:/bench:ro "$ANZOGRAPH_IMAGE" >/dev/null
+  until [ "$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode 'query=ASK {}' \
+    "http://localhost:$PORT/sparql")" = 200 ]; do sleep 2; done
+  start=$(ms)
+  watch_memory "$name" "$2.mem"
+  curl -s --fail --data-urlencode "update=LOAD WITH 'global' <file:/bench/$(basename "$FILE")>" \
+    "http://localhost:$PORT/sparql" >"$2" 2>&1 || { echo "load failed, see $2" >&2; return 1; }
+  local wall=$(( $(ms) - start ))
+  echo "$wall 0"
+}
+serve_anzograph() {
+  ENDPOINT=http://localhost:$PORT/sparql
+  UPDATE_ENDPOINT=$ENDPOINT
+  RESTART_MS=n/a # in memory: a restart reloads the data
+}
+
 load_graphdb() {
   # importrdf run directly defaults to the distribution's home; point it at the volume.
   measured graphdb-sc-load "$2" -e GDB_HEAP_SIZE="$JAVA_HEAP" \
@@ -270,6 +296,7 @@ for system in $SYSTEMS; do
     continue
   fi
   bytes=$(volume_bytes "$volume")
+  [ "$system" = anzograph ] && bytes=0 # in memory
   line="$system,$DATASET,$TRIPLES,$load_ms,$peak,$bytes,$(( bytes / (TRIPLES > 0 ? TRIPLES : 1) ))"
   if [ -n "${LOAD_ONLY:-}" ]; then
     echo "$line,,,,," | tee -a "$CSV"
