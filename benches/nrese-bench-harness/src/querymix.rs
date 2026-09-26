@@ -5,8 +5,18 @@
 //! the same queries run unchanged against NRESE, QLever, Fuseki, Oxigraph, Virtuoso, GraphDB
 //! and others. Result counts are recorded next to the latencies; they double as a cross-check
 //! that all systems answer the same question.
+//!
+//! Two phases:
+//! - **sequential:** every query, one at a time: warm-up, then measured runs
+//! - **throughput** (`--clients N`): N clients cycle through the *interactive* part of the
+//!   mix (queries whose sequential p50 stayed under `--interactive-ms`) for `--duration-s`.
+//!   It reports queries/s and per-query p50/p99 under load.
+//! - **writes under read load** (`--update-endpoint`): during the throughput phase, one extra
+//!   client inserts a fresh triple every `--write-interval-ms` (`INSERT DATA`) and reports the
+//!   write latency p50/p99.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -24,6 +34,36 @@ pub struct QueryMixReport {
     pub warmup: usize,
     pub runs: usize,
     pub queries: Vec<QueryResult>,
+    pub throughput: Option<ThroughputReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ThroughputReport {
+    pub clients: usize,
+    pub duration_s: f64,
+    pub completed: u64,
+    pub errors: u64,
+    pub queries_per_s: f64,
+    pub per_query: Vec<LoadedQuery>,
+    pub writes: Option<WriteReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteReport {
+    pub interval_ms: u64,
+    pub completed: u64,
+    pub errors: u64,
+    pub first_error: Option<String>,
+    pub p50_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LoadedQuery {
+    pub id: String,
+    pub completed: u64,
+    pub p50_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,17 +97,195 @@ pub async fn run_query_mix(config: &QueryMixConfig) -> Result<QueryMixReport> {
         print_row(&result);
         queries.push(result);
     }
+    let throughput = match config.clients {
+        0 => None,
+        clients => {
+            let interactive: Vec<(String, String)> = files
+                .iter()
+                .zip(&queries)
+                .filter(|(_, result)| {
+                    result.error.is_none()
+                        && result
+                            .p50_ms
+                            .is_some_and(|p50| p50 <= config.interactive_ms)
+                })
+                .filter_map(|(file, result)| {
+                    Some((result.id.clone(), std::fs::read_to_string(file).ok()?))
+                })
+                .collect();
+            Some(run_throughput(&client, config, clients, interactive).await)
+        }
+    };
     let report = QueryMixReport {
         label: config.label.clone(),
         endpoint: config.endpoint.clone(),
         warmup: config.warmup,
         runs: config.runs,
         queries,
+        throughput,
     };
     if let Some(path) = &config.report_json_path {
         write_json_report(path.clone(), &report)?;
     }
     Ok(report)
+}
+
+/// N clients cycle through `queries` until the duration is over. Each client starts at a
+/// different query so the mix is spread evenly.
+async fn run_throughput(
+    client: &Client,
+    config: &QueryMixConfig,
+    clients: usize,
+    queries: Vec<(String, String)>,
+) -> ThroughputReport {
+    let queries = Arc::new(queries);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(config.duration_s);
+    let mut tasks = tokio::task::JoinSet::new();
+    for client_index in 0..clients {
+        let (client, queries, endpoint) = (
+            client.clone(),
+            Arc::clone(&queries),
+            config.endpoint.clone(),
+        );
+        tasks.spawn(async move {
+            let mut samples: Vec<(usize, Option<f64>)> = Vec::new();
+            let mut next = client_index;
+            while !queries.is_empty() && Instant::now() < deadline {
+                let index = next % queries.len();
+                next += 1;
+                let started = Instant::now();
+                let latency = execute(&client, &endpoint, &queries[index].1)
+                    .await
+                    .ok()
+                    .map(|_| started.elapsed().as_secs_f64() * 1000.0);
+                samples.push((index, latency));
+            }
+            samples
+        });
+    }
+    let writer = config.update_endpoint.clone().map(|endpoint| {
+        let (client, interval) = (
+            client.clone(),
+            Duration::from_millis(config.write_interval_ms),
+        );
+        let graph = config.write_graph.clone();
+        tokio::spawn(async move {
+            write_loop(&client, &endpoint, graph.as_deref(), interval, deadline).await
+        })
+    });
+    let mut per_query: Vec<Vec<u128>> = vec![Vec::new(); queries.len()];
+    let mut errors = 0;
+    while let Some(Ok(samples)) = tasks.join_next().await {
+        for (index, latency) in samples {
+            match latency {
+                Some(ms) => per_query[index].push((ms * 1000.0) as u128),
+                None => errors += 1,
+            }
+        }
+    }
+    let duration_s = started.elapsed().as_secs_f64();
+    let completed: u64 = per_query.iter().map(|samples| samples.len() as u64).sum();
+    let per_query = per_query
+        .into_iter()
+        .zip(queries.iter())
+        .map(|(mut micros, (id, _))| {
+            micros.sort_unstable();
+            let at = |p| (!micros.is_empty()).then(|| percentile(&micros, p) as f64 / 1000.0);
+            LoadedQuery {
+                id: id.clone(),
+                completed: micros.len() as u64,
+                p50_ms: at(50),
+                p99_ms: at(99),
+            }
+        })
+        .collect();
+    let writes = match writer {
+        Some(task) => task.await.ok(),
+        None => None,
+    };
+    let report = ThroughputReport {
+        clients,
+        duration_s,
+        completed,
+        errors,
+        queries_per_s: completed as f64 / duration_s,
+        per_query,
+        writes: writes.map(|(micros, errors, first_error)| {
+            let at = |p| (!micros.is_empty()).then(|| percentile(&micros, p) as f64 / 1000.0);
+            WriteReport {
+                interval_ms: config.write_interval_ms,
+                completed: micros.len() as u64,
+                errors,
+                p50_ms: at(50),
+                p99_ms: at(99),
+                first_error,
+            }
+        }),
+    };
+    println!(
+        "throughput: {clients} clients, {:.1} queries/s ({} completed, {} errors)",
+        report.queries_per_s, report.completed, report.errors
+    );
+    if let Some(writes) = &report.writes {
+        println!(
+            "writes under load: {} done, {} errors, p50 {:?} ms, p99 {:?} ms",
+            writes.completed, writes.errors, writes.p50_ms, writes.p99_ms
+        );
+    }
+    report
+}
+
+/// Inserts one fresh triple per interval until the deadline. Returns the sorted latencies
+/// (µs), the error count and the first error.
+async fn write_loop(
+    client: &Client,
+    endpoint: &str,
+    graph: Option<&str>,
+    interval: Duration,
+    deadline: Instant,
+) -> (Vec<u128>, u64, Option<String>) {
+    let (mut micros, mut errors, mut first_error) = (Vec::new(), 0, None);
+    let mut n: u64 = 0;
+    while Instant::now() + interval < deadline {
+        tokio::time::sleep(interval).await;
+        n += 1;
+        let triple =
+            format!("<http://example.org/bench/write/{n}> <http://example.org/bench/p> {n}");
+        let update = match graph {
+            Some(graph) => format!("INSERT DATA {{ GRAPH <{graph}> {{ {triple} }} }}"),
+            None => format!("INSERT DATA {{ {triple} }}"),
+        };
+        let started = Instant::now();
+        let result = client
+            .post(endpoint)
+            .form(&[("update", update.as_str())])
+            .send()
+            .await;
+        match result {
+            Ok(response) if response.status().is_success() => {
+                let _ = response.bytes().await;
+                micros.push(started.elapsed().as_micros());
+            }
+            Ok(response) => {
+                errors += 1;
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                first_error.get_or_insert_with(|| {
+                    format!(
+                        "HTTP {status}: {}",
+                        body.chars().take(200).collect::<String>()
+                    )
+                });
+            }
+            Err(error) => {
+                errors += 1;
+                first_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+    }
+    micros.sort_unstable();
+    (micros, errors, first_error)
 }
 
 async fn run_one(client: &Client, config: &QueryMixConfig, file: &Path) -> QueryResult {
