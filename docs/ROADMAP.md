@@ -171,13 +171,26 @@ Reasoning behaviour is **configured per repository and per request** (decision D
 
 ### M4: Performance, the QLever track (size XL)
 
+**Goal (2026-09-26): leave no performance on the table that is cheap to get, and make every trade-off configurable per use case** (decision D7 applies to storage as much as to reasoning).
+- **Scorecard first.** Every WP below is judged on the Pf0 scorecard, never on a single metric. Load time is one column among nine.
+- **Order within M4:**
+  1. Pf0, now, before further implementation.
+  2. Pf7, cheap wins, as soon as Pf0 can measure them.
+  3. E7, Pf1, Pf2, Pf5: storage.
+  4. Pf3, Pf4: queries.
+  5. Pf6: profiles, refined as the knobs appear.
+
 | WP | Scope | Layer | Done when |
 |---|---|---|---|
+| **Pf0 Benchmark scorecard** | `nrese-bench-harness scorecard` plus the Docker comparison kit (`benches/competitors/`), covering NRESE, QLever, Jena/Fuseki, Oxigraph, Virtuoso, GraphDB, RDFox and AnzoGraph. **Datasets:** synthetic entities (10 M/100 M), Olympics, DBpedia 2022-12 core, Wikidata lexemes, YAGO 4.5 tiny; LUBM and BSBM generators (Rust ports); full Wikidata truthy only on a big server. **Metrics per system and dataset:** load time; store bytes/triple; peak RSS; restart time; latency of a per-dataset query mix (p50/p99); throughput at 1/8/32 clients; 1-triple write latency under read load; for M3, materialisation time and incremental maintenance. Results go to the git-ignored `results/`; only free-to-publish systems appear in committed docs (licence rules in `benches/competitors/README.md`). | tooling | Scorecard runs end to end for all free systems on all datasets that fit, reproducibly, on the reference machine |
+| **Pf7 Cheap wins** | Release profile (LTO, `codegen-units = 1`, `panic = "abort"` where safe); mimalloc; an optional `x86-64-v3` build; PGO on the scorecard mix; a loser tree for k-way merges wider than 4; software prefetch in merges; no term decoding for FILTERs over inline values; parallel scans for large ranges. Each change is kept only if the scorecard improves and nothing regresses. | all | Scorecard delta recorded per change |
+| **E7 Loader v2** | Zero-copy N-Triples/N-Quads tokenizer (memchr/SIMD, no per-term allocation). Batch-local vocabularies merged by parallel sort, so there is no global dictionary lock; ids are assigned in sorted order, which enables Pf5's front coding. Radix sort for permutations. The checkpoint is the run files (after Pf2) and is written pipelined with index building. | L1 | 10 M entities ≤ 1.5 s end to end (now 3.9 s in Docker); 100 M ≤ 15 s (now 44 s) |
 | **Pf1 Compressed runs** | Block layout (e.g. 64 KiB blocks, first-key directory, per-column delta + SIMD bit-packing / Stream VByte). Static search over the block directory (Eytzinger/S-tree or PGM-index). | L1 | Bytes/triple reported and compared with QLever; scan throughput not worse than uncompressed |
-| **Pf2 On-disk runs** | Memory-mapped immutable run files; the base run is no longer RAM-resident; checkpoint = write run files. | L1 | Datasets larger than RAM load and query |
+| **Pf2 On-disk runs** | Memory-mapped immutable run files; the base run is no longer RAM-resident; checkpoint = write run files; **restart maps files instead of rebuilding** (now 20 s at 100 M). | L1 | Datasets larger than RAM load and query; restart < 1 s at 100 M |
 | **Pf3 Native BGP executor** | Vectorised ID tables; merge joins on shared permutation order; worst-case-optimal joins (Leapfrog Triejoin / Free Join style) for cyclic patterns; adaptive choice between binary and WCOJ joins (Umbra-style). spareval handles the remaining operators; differential tests against spareval. | L2 | Query mix within the agreed factor of QLever; no result differences against the oracle |
 | **Pf4 Statistics & optimiser** | Per-predicate counts, characteristic sets (Neumann & Moerkotte) for cardinality estimation, DP join ordering; `EXPLAIN` / profile output with operator timings and scan counts. | L1/L2 | Estimation error tracked; plans explained in the API |
 | **Pf5 Dictionary at scale** | Sorted, front-coded or FSST-compressed main vocabulary (on disk); hash index only for the delta vocabulary; checkpoint rebuild reclaims unreferenced ids. | L1 | Dictionary bytes/term reported; lookups stay O(log n) or better |
+| **Pf6 Storage profiles** | Named, validated presets over the storage knobs, each with its scorecard:<br>- **index set:** 6 permutations; 3 when named graphs aren't used; graph-first permutations optional<br>- **compression level**<br>- **sync policy:** every commit, **group commit** (batched fsync for concurrent writers), or OS-buffered<br>- **compaction:** fanout and budget<br>- **memory budget and cache sizes**<br>Presets: `interactive` (default: lowest write latency), `write-heavy` (group commit), `read-optimised` (maximum compression, aggressive compaction), `memory-constrained`, `bulk-analytics`. They compose with the reasoning profile (D7). | L1/L4 | Each preset documented with its measured trade-offs; invalid combinations rejected at startup |
 
 ### M5: Geospatial & vectors (size L)
 
@@ -265,4 +278,5 @@ Benchmarks run on one documented machine profile. Numbers go into `docs/spec/06-
 | D4 | RDF-star / RDF 1.2 triple terms: early (M2) or with reasoning (M3)? | **M3** (decided 2026-09-25), unless a concrete DMW/RS need appears earlier. |
 | D5 | Is the v1 `rules-mvp` reasoner kept running through an adapter during M1–M2? | Default **yes**, then deleted in R5. Reversible; not yet explicitly confirmed. |
 | D7 | Are reasoning behaviours fixed or configurable? | **Configurable** (decided 2026-09-26). Tuned defaults, other modes exposed per repository (ruleset, timing, consistency, placement, sameAs, maintenance) and per request (read model, explanations, freshness). Only the stack invariants are fixed. See [design/reasoner-v2.md](design/reasoner-v2.md) §2.2. |
+| D8 | How is performance judged, and which trade-offs are fixed? | **A multi-metric scorecard (Pf0); tuned defaults with configurable presets (Pf6)** (decided 2026-09-26). The benchmark suite is finished before further implementation. Competitor results follow the vendors' licences: GraphDB, RDFox and AnzoGraph results are never published without written permission. |
 | D6 | May the stray build directories in the working copy be deleted (F5)? | **Yes** (decided 2026-09-25): 23 untracked `target-*` directories (about 50 GB) were removed. |
