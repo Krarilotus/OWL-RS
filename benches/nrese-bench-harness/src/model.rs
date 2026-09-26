@@ -33,6 +33,16 @@ pub struct QueryMixConfig {
     pub warmup: usize,
     pub runs: usize,
     pub timeout_s: u64,
+    /// Concurrent clients for the throughput phase; 0 skips it.
+    pub clients: usize,
+    pub duration_s: u64,
+    /// Queries whose sequential p50 exceeds this are left out of the throughput phase.
+    pub interactive_ms: f64,
+    /// SPARQL Update endpoint for the writer during the throughput phase; `None` = no writes.
+    pub update_endpoint: Option<String>,
+    pub write_interval_ms: u64,
+    /// Target graph for the writer (systems whose data lives in a named graph).
+    pub write_graph: Option<String>,
     pub report_json_path: Option<PathBuf>,
 }
 
