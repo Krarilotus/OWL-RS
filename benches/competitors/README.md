@@ -24,6 +24,8 @@ consent. This repository is public, so **committing results counts as publishing
 - GraphDB and RDFox numbers stay local until written permission exists. Record the permission (who, when, scope) in this file before publishing.
 - Our designs come from the published literature cited in `docs/design/`. We never derive them from observing the vendors' products.
 
+Results: [SCORECARD.md](SCORECARD.md) (free-to-publish systems only).
+
 ## What's here
 
 | File | Purpose |
@@ -41,8 +43,8 @@ consent. This repository is public, so **committing results counts as publishing
 |---|---|---|
 | NRESE | built in `rust:1.91-bookworm` | `nrese-server load` |
 | QLever | `adfreiburg/qlever:latest` | `qlever-index -p true` |
-| GraphDB 11.5.1 Free | `ontotext/graphdb:11.5.1` | `importrdf preload`, ruleset `empty` |
-| Jena 6.2.0 TDB2 (Fuseki) | `nrese-bench/jena:6.2.0` (`jena/Dockerfile`) | `tdb2.tdbloader --loader=parallel`, and `tdb2.xloader` |
+| GraphDB 11.5.1 Free | `ontotext/graphdb:11.5.1` | `importrdf preload`, ruleset `empty`; queries need `GRAPHDB_LICENSE` |
+| Jena 6.2.0 TDB2 (Fuseki) | `nrese-bench/jena:6.2.0` (`jena/Dockerfile`) | `tdb2.tdbloader --loader=parallel`. `tdb2.xloader` fails on real data in 6.2.0 (Thrift "unknown type 15" while sorting terms; the synthetic data loads) |
 | Oxigraph 0.5.11 | `ghcr.io/oxigraph/oxigraph:0.5.11` | `oxigraph load` |
 | Virtuoso 7.2.17 Open Source | `openlink/virtuoso-opensource-7:7.2.17` | `ld_dir` + 6 × `rdf_loader_run` + `checkpoint`, excluding server start-up |
 | RDFox 7.6b | `oxfordsemantic/rdfox:7.6b` | sandbox `import`; needs `RDFOX_LICENSE=/path/RDFox.lic` |
@@ -72,4 +74,5 @@ consent. This repository is public, so **committing results counts as publishing
 ## Getting licences
 
 - **RDFox:** <https://www.oxfordsemantic.tech/free-trial>. It requires an institutional email and acceptance of the [evaluation licence](https://www.oxfordsemantic.tech/rdfox-evaluation-license).
+- **GraphDB Free licence (required since GraphDB 11.0):** request GraphDB Free on the Graphwise download page and the licence arrives by email. Run the scorecard with `GRAPHDB_LICENSE=/path/graphdb.license`. Without it, GraphDB still bulk-loads but answers every query with "No license was set".
 - **GraphDB Enterprise evaluation:** email `graphdb-info@ontotext.com` and ask for an evaluation licence. It's only needed to compare against Enterprise's parallel inference in M3. Ask about publishing permission in the same email.
