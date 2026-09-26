@@ -1,0 +1,9 @@
+# Distinct + order: games per year
+PREFIX o: <http://wallscope.co.uk/ontology/olympics/>
+PREFIX r: <http://wallscope.co.uk/resource/olympics/>
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbp: <http://dbpedia.org/property/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT DISTINCT ?games ?year WHERE { ?x o:games ?games . ?games dbp:year ?year } ORDER BY ?year

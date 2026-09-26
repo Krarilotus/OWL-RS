@@ -1,0 +1,5 @@
+# Point lookup: one entity
+PREFIX e: <http://example.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?p ?o WHERE { <http://example.org/person/4242> ?p ?o }
