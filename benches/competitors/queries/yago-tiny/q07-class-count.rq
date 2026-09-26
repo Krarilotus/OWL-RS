@@ -1,0 +1,6 @@
+# Aggregate over types
+PREFIX schema: <http://schema.org/>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?c (COUNT(*) AS ?n) WHERE { ?s a ?c } GROUP BY ?c ORDER BY DESC(?n) LIMIT 20

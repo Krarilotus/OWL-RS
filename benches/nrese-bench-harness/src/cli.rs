@@ -6,8 +6,9 @@ use anyhow::{Result, anyhow, bail};
 use crate::model::{
     BasicAuthConfig, BenchConfig, CatalogSyncConfig, Cli, Command, CompatConfig,
     ConnectionSelection, GenerateConfig, OntologyReasoningFeature, OntologySemanticDialect,
-    OntologyServiceSurface, PackConfig, PackExecutionMode, PackMatrixConfig, ReferenceConnection,
-    ReferenceKind, SeedConfig, ServiceConnectionConfig, ValidatePackConfig, WriteScalingConfig,
+    OntologyServiceSurface, PackConfig, PackExecutionMode, PackMatrixConfig, QueryMixConfig,
+    ReferenceConnection, ReferenceKind, SeedConfig, ServiceConnectionConfig, ValidatePackConfig,
+    WriteScalingConfig,
 };
 
 const DEFAULT_QUERY_WORKLOAD_PATH: &str =
@@ -191,6 +192,38 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .map(|value| parse_bool(value))
                     .transpose()?
                     .unwrap_or(true),
+                report_json_path: options.get("--report-json").map(PathBuf::from),
+            }),
+        }),
+        "query-mix" => Ok(Cli {
+            command: Command::QueryMix(QueryMixConfig {
+                endpoint: options
+                    .get("--endpoint")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("query-mix needs --endpoint <URL>"))?,
+                queries: options
+                    .get("--queries")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("query-mix needs --queries <DIR>"))?,
+                label: options
+                    .get("--label")
+                    .cloned()
+                    .unwrap_or_else(|| "endpoint".to_owned()),
+                warmup: options
+                    .get("--warmup")
+                    .map(|value| value.parse::<usize>())
+                    .transpose()?
+                    .unwrap_or(1),
+                runs: options
+                    .get("--runs")
+                    .map(|value| value.parse::<usize>())
+                    .transpose()?
+                    .unwrap_or(5),
+                timeout_s: options
+                    .get("--timeout-s")
+                    .map(|value| value.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(300),
                 report_json_path: options.get("--report-json").map(PathBuf::from),
             }),
         }),
@@ -408,6 +441,7 @@ USAGE:
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validate [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--execution-mode <full|compat-only>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- generate --out <PATH> [--triples <N>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- query-mix --endpoint <URL> --queries <DIR> [--label <NAME>] [--warmup <N>] [--runs <N>] [--timeout-s <S>] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- write-scaling --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--steps <triples,...>] [--chunk-triples <N>] [--samples <N>] [--reset <true|false>] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--dataset <PATH>] [--dataset-base-iri <IRI>] [--content-type <TYPE>] [--replace <true|false>]
 "

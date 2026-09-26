@@ -21,6 +21,19 @@ pub enum Command {
     Seed(SeedConfig),
     WriteScaling(WriteScalingConfig),
     Generate(GenerateConfig),
+    QueryMix(QueryMixConfig),
+}
+
+/// `query-mix`: runs every `.rq` file of a directory against a SPARQL endpoint.
+#[derive(Debug, Clone)]
+pub struct QueryMixConfig {
+    pub endpoint: String,
+    pub queries: PathBuf,
+    pub label: String,
+    pub warmup: usize,
+    pub runs: usize,
+    pub timeout_s: u64,
+    pub report_json_path: Option<PathBuf>,
 }
 
 /// `generate`: writes the write-scaling entity dataset as an N-Triples file, the input for
