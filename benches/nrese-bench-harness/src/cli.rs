@@ -224,6 +224,28 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .map(|value| value.parse::<u64>())
                     .transpose()?
                     .unwrap_or(300),
+                clients: options
+                    .get("--clients")
+                    .map(|value| value.parse::<usize>())
+                    .transpose()?
+                    .unwrap_or(0),
+                duration_s: options
+                    .get("--duration-s")
+                    .map(|value| value.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(60),
+                interactive_ms: options
+                    .get("--interactive-ms")
+                    .map(|value| value.parse::<f64>())
+                    .transpose()?
+                    .unwrap_or(10_000.0),
+                update_endpoint: options.get("--update-endpoint").cloned(),
+                write_interval_ms: options
+                    .get("--write-interval-ms")
+                    .map(|value| value.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(100),
+                write_graph: options.get("--write-graph").cloned(),
                 report_json_path: options.get("--report-json").map(PathBuf::from),
             }),
         }),
@@ -441,7 +463,7 @@ USAGE:
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validate [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--execution-mode <full|compat-only>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- generate --out <PATH> [--triples <N>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- query-mix --endpoint <URL> --queries <DIR> [--label <NAME>] [--warmup <N>] [--runs <N>] [--timeout-s <S>] [--report-json <PATH>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- query-mix --endpoint <URL> --queries <DIR> [--label <NAME>] [--warmup <N>] [--runs <N>] [--timeout-s <S>] [--clients <N> --duration-s <S> --interactive-ms <MS> [--update-endpoint <URL> --write-interval-ms <MS> --write-graph <IRI>]] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- write-scaling --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--steps <triples,...>] [--chunk-triples <N>] [--samples <N>] [--reset <true|false>] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--dataset <PATH>] [--dataset-base-iri <IRI>] [--content-type <TYPE>] [--replace <true|false>]
 "

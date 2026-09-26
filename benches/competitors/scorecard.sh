@@ -13,7 +13,9 @@
 #   1. load into a fresh named volume, measuring wall time and peak container memory
 #   2. store size = bytes in the volume
 #   3. restart = start the server on the volume until it answers ASK {}
-#   4. query mix = harness `query-mix` (1 warm-up, 5 measured runs per query)
+#   4. query mix = harness `query-mix`: 1 warm-up and 5 measured runs per query, then
+#      $CLIENTS concurrent clients for $DURATION_S s over the interactive queries (queries/s),
+#      while one writer inserts a triple every 100 ms (write latency under read load)
 #   5. stop the server and remove the volume
 #
 # Output:
@@ -36,6 +38,8 @@ native() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 ROOT=$(native "$(cd "$(dirname "$0")/../.." && pwd)")
 RESULTS=$(native "${RESULTS:-$ROOT/benches/competitors/results/$(date +%Y-%m-%d)}")
 QUERY_TIMEOUT_S=${QUERY_TIMEOUT_S:-120}
+CLIENTS=${CLIENTS:-8}          # throughput phase: concurrent clients (0 = skip)
+DURATION_S=${DURATION_S:-60}   # throughput phase: seconds
 QUERIES=$ROOT/benches/competitors/queries/${DATASET%%-[0-9]*}
 HARNESS=$ROOT/benches/nrese-bench-harness/target/release/nrese-bench-harness
 FILE=/data/$DATASET.nt
@@ -135,6 +139,7 @@ load_nrese() {
 }
 serve_nrese() {
   ENDPOINT=http://localhost:$PORT/dataset/query
+  UPDATE_ENDPOINT=http://localhost:$PORT/dataset/update
   serve nrese-sc "$ENDPOINT" -p "$PORT:8080" -v nrese-target:/target:ro -v "$1:/store" \
     -e NRESE_STORE_MODE=on-disk -e NRESE_DATA_DIR=/store -e NRESE_BIND_ADDR=0.0.0.0:8080 \
     -e NRESE_QUERY_TIMEOUT_MS=$(( QUERY_TIMEOUT_S * 1000 )) -e NRESE_READ_REQUESTS_PER_WINDOW=100000000 \
@@ -148,6 +153,7 @@ load_qlever() {
 }
 serve_qlever() {
   ENDPOINT=http://localhost:$PORT/
+  UPDATE_ENDPOINT=$ENDPOINT # in-memory delta; -n allows updates without an access token
   serve qlever-sc "$ENDPOINT" -u root -p "$PORT:7001" -v "$1:/index" -w /index \
     --entrypoint /qlever/qlever-server "$QLEVER_IMAGE" \
     -i /index/idx -p 7001 -n -j 8 -m 16G -c 1MB -e 1MB -s "${QUERY_TIMEOUT_S}s"
@@ -159,8 +165,9 @@ load_oxigraph() {
 }
 serve_oxigraph() {
   ENDPOINT=http://localhost:$PORT/query
+  UPDATE_ENDPOINT=http://localhost:$PORT/update
   serve oxigraph-sc "$ENDPOINT" -p "$PORT:7878" -v "$1:/store" "$OXIGRAPH_IMAGE" \
-    serve-read-only --location /store --bind 0.0.0.0:7878
+    serve --location /store --bind 0.0.0.0:7878
 }
 
 load_jena() {
@@ -169,8 +176,9 @@ load_jena() {
 }
 serve_jena() {
   ENDPOINT=http://localhost:$PORT/ds/query
+  UPDATE_ENDPOINT=http://localhost:$PORT/ds/update
   serve jena-sc "$ENDPOINT" -p "$PORT:3030" -e JVM_ARGS="-Xmx$JAVA_HEAP" -v "$1:/tdb2" \
-    "$JENA_IMAGE" fuseki-server --tdb2 --loc=/tdb2/db --port 3030 /ds
+    "$JENA_IMAGE" fuseki-server --update --tdb2 --loc=/tdb2/db --port 3030 /ds
 }
 
 VIRTUOSO_ENV=(-e DBA_PASSWORD=bench
@@ -205,7 +213,11 @@ load_virtuoso() {
 }
 serve_virtuoso() {
   ENDPOINT=http://localhost:$PORT/sparql
-  serve virtuoso-sc "$ENDPOINT" -p "$PORT:8890" "${VIRTUOSO_ENV[@]}" -v "$1:/database" "$VIRTUOSO_IMAGE"
+  UPDATE_ENDPOINT=$ENDPOINT
+  WRITE_GRAPH=http://bench # Virtuoso holds the data in a named graph
+  serve virtuoso-sc "$ENDPOINT" -p "$PORT:8890" "${VIRTUOSO_ENV[@]}" -v "$1:/database" "$VIRTUOSO_IMAGE" &&
+    docker exec virtuoso-sc isql 1111 dba bench \
+      exec='GRANT SPARQL_UPDATE TO "SPARQL"; DB.DBA.RDF_DEFAULT_USER_PERMS_SET('"'"'nobody'"'"', 7);' >/dev/null
 }
 
 load_graphdb() {
@@ -218,6 +230,7 @@ load_graphdb() {
 }
 serve_graphdb() {
   ENDPOINT=http://localhost:$PORT/repositories/bench
+  UPDATE_ENDPOINT=$ENDPOINT/statements
   [ -n "$GRAPHDB_LICENSE" ] || { echo "GraphDB needs GRAPHDB_LICENSE=/path/graphdb.license" >&2; return 1; }
   serve graphdb-sc "$ENDPOINT" -p "$PORT:7200" -e GDB_HEAP_SIZE="$JAVA_HEAP" \
     -e GDB_JAVA_OPTS="-Dgraphdb.license.file=/license/graphdb.license" \
@@ -241,7 +254,7 @@ if [ -z "${SKIP_BUILD:-}" ]; then
 fi
 
 CSV=$RESULTS/scorecard-$DATASET.csv
-[ -s "$CSV" ] || echo "system,dataset,triples,load_ms,load_peak_mib,store_bytes,bytes_per_triple,restart_ms,serve_mib,queries_ok,queries_total,sum_p50_ms" >"$CSV"
+[ -s "$CSV" ] || echo "system,dataset,triples,load_ms,load_peak_mib,store_bytes,bytes_per_triple,restart_ms,serve_mib,queries_ok,queries_total,sum_p50_ms,qps,write_p50_ms,write_p99_ms,write_errors" >"$CSV"
 head -1 "$CSV"
 for system in $SYSTEMS; do
   volume=sc-$system-$DATASET
@@ -250,6 +263,7 @@ for system in $SYSTEMS; do
   docker volume rm -f "$volume" >/dev/null 2>&1 || true
   docker volume create "$volume" >/dev/null
   prefix=$RESULTS/$system-$DATASET
+  WRITE_GRAPH=
   if ! read -r load_ms peak < <("load_$system" "$volume" "$prefix-load.log"); then
     echo "$system,$DATASET,$TRIPLES,FAILED" | tee -a "$CSV"
     docker volume rm -f "$volume" >/dev/null
@@ -268,17 +282,20 @@ for system in $SYSTEMS; do
     fi
     restart=$RESTART_MS
     "$(native "$HARNESS")" query-mix --endpoint "$ENDPOINT" --queries "$QUERIES" --label "$system" \
-      --warmup 1 --runs 5 --timeout-s "$QUERY_TIMEOUT_S" --report-json "$prefix-queries.json"       >"$prefix-queries.log" 2>&1 || true
+      --warmup 1 --runs 5 --timeout-s "$QUERY_TIMEOUT_S" --clients "$CLIENTS" --duration-s "$DURATION_S" --update-endpoint "$UPDATE_ENDPOINT" ${WRITE_GRAPH:+--write-graph "$WRITE_GRAPH"} \
+      --report-json "$prefix-queries.json" >"$prefix-queries.log" 2>&1 || true
     rss=$(server_mib "$system-sc")
     summary=$(python -c "
 import json, sys
 try:
     r = json.load(open(sys.argv[1]))
 except OSError:
-    print('0,0,')
+    print('0,0,,,,,')
     sys.exit()
 ok = [q for q in r['queries'] if not q['error']]
-print(f\"{len(ok)},{len(r['queries'])},{sum(q['p50_ms'] for q in ok):.1f}\")" "$prefix-queries.json")
+t = r.get('throughput') or {}
+w = t.get('writes') or {}
+print(f\"{len(ok)},{len(r['queries'])},{sum(q['p50_ms'] for q in ok):.1f},{t.get('queries_per_s', 0):.1f},{w.get('p50_ms') or ''},{w.get('p99_ms') or ''},{w.get('errors', '')}\")" "$prefix-queries.json")
     docker rm -f "$system-sc" >/dev/null
     echo "$line,$restart,$rss,$summary" | tee -a "$CSV"
   fi
