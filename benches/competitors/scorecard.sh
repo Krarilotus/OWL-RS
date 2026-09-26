@@ -63,7 +63,8 @@ mem_mib() {
 watch_memory() { docker stats --format '{{.MemUsage}}' "$1" >"$2" 2>/dev/null & echo $!; }
 # The peak of a watch_memory file, in MiB (strips docker's terminal control codes).
 peak_mib() {
-  sed 's/\[[0-9;]*[A-Za-z]//g' "$1" | tr -d '' | grep -o '^[0-9.]*[KMG]\?i\?B'     | mem_mib_lines | sort -n | tail -1
+  sed $'s/\x1b\[[0-9;]*[A-Za-z]//g' "$1" | tr -d '\r' | grep -o '^[0-9.]*[KMG]\?i\?B' \
+    | mem_mib_lines | sort -n | tail -1
 }
 mem_mib_lines() { while read -r v; do echo "$v" | mem_mib; echo; done; }
 
