@@ -11,7 +11,7 @@
 pub(crate) mod dictionary;
 mod inline;
 
-pub use dictionary::{Dictionary, DictionaryStats};
+pub use dictionary::{Dictionary, DictionaryStats, TermView};
 
 /// Number of bits used by the payload of a [`TermId`].
 pub const PAYLOAD_BITS: u32 = 60;
