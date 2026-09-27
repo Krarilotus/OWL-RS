@@ -59,6 +59,37 @@ The user's direction: make NRESE as strong as possible as a package of its own. 
 
 Phase 4 moves earlier if memory blocks the reasoning benchmarks at LUBM(1000). **M2 (governance) follows**, unless DMW or ResearchSpace need a piece of it sooner.
 
+**Status (2026-09-27):**
+
+Phase 1 is done:
+- **Pf7a:** Rust 1.98.1 pinned; fat LTO with one codegen unit; mimalloc. Together that's 12–35% on the perf lab's query sets and 28% on loads.
+- **PL:** `benches/perf-lab.sh` with committed reports in `benches/baselines/perf-lab/`.
+
+Phase 2 is under way:
+- **XC1:** order-preserving integers, literal kinds, GPSO/PSOG, exact counts, sorted, ranged and group-counted scans; format v4.
+- **XC2:** `nrese-exec`, which holds id tables, joins, grouping, memory budgets and graph closure.
+- **XC3:** the native executor, covering BGP, FILTER (compiled id-level predicates and range pushdown), OPTIONAL, UNION, MINUS, (NOT) EXISTS, BIND, VALUES, aggregates, ORDER BY, LIMIT and property paths. Unsupported queries fall back to spareval.
+
+Evidence:
+- The Oxigraph-oracle differential suite.
+- The W3C suite, unchanged at 485/495.
+- 7,500 randomized native-versus-spareval queries.
+
+Perf lab against the same build without the native executor (sum of p50):
+
+| Dataset | Speedup |
+|---|---|
+| Olympics | 5.6× |
+| entities 10 M | 16× |
+| DBpedia 67 M | 8.9× |
+
+Single queries are up to 10³–10⁶× faster (counts, grouped counts, star joins, date ranges).
+
+Next:
+- XC4: statistics, the optimiser and EXPLAIN.
+- XC5: Leapfrog Triejoin and parallelism.
+- The Docker scorecard against QLever for the Phase 2 gate.
+
 **Execution core (XC), decision D11.** A new crate, `nrese-exec`, holds the ID-level execution machinery shared by SPARQL and reasoning:
 - **ID tables:** columnar `u64`, sorted on a key prefix
 - **Sorting:** radix sort

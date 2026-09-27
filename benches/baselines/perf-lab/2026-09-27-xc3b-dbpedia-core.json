@@ -1,0 +1,100 @@
+{
+  "label": "xc3b",
+  "open_s": 0.000,
+  "load_s": 23.154,
+  "peak_mib": 21031,
+  "sum_p50_ms": 2701.200,
+  "queries": [
+    {
+      "name": "q01-point-lookup",
+      "rows": 31,
+      "p50_ms": 0.018,
+      "min_ms": 0.018,
+      "max_ms": 0.018
+    },
+    {
+      "name": "q02-born-in-berlin",
+      "rows": 2126,
+      "p50_ms": 2.525,
+      "min_ms": 2.342,
+      "max_ms": 2.817
+    },
+    {
+      "name": "q03-top-birthplaces",
+      "rows": 20,
+      "p50_ms": 28.821,
+      "min_ms": 27.654,
+      "max_ms": 28.970
+    },
+    {
+      "name": "q04-date-range",
+      "rows": 1,
+      "p50_ms": 461.095,
+      "min_ms": 457.508,
+      "max_ms": 461.604
+    },
+    {
+      "name": "q05-population",
+      "rows": 50,
+      "p50_ms": 41.559,
+      "min_ms": 41.486,
+      "max_ms": 44.292
+    },
+    {
+      "name": "q06-film-cast",
+      "rows": 1587,
+      "p50_ms": 5.290,
+      "min_ms": 4.364,
+      "max_ms": 5.930
+    },
+    {
+      "name": "q07-subdivision-path",
+      "rows": 21,
+      "p50_ms": 0.034,
+      "min_ms": 0.031,
+      "max_ms": 0.040
+    },
+    {
+      "name": "q08-label-text",
+      "rows": 445,
+      "p50_ms": 1842.720,
+      "min_ms": 1842.272,
+      "max_ms": 1867.222
+    },
+    {
+      "name": "q09-optional-death",
+      "rows": 100000,
+      "p50_ms": 91.208,
+      "min_ms": 90.481,
+      "max_ms": 98.484
+    },
+    {
+      "name": "q10-types-count",
+      "rows": 25,
+      "p50_ms": 0.237,
+      "min_ms": 0.225,
+      "max_ms": 0.238
+    },
+    {
+      "name": "q11-count-all",
+      "rows": 1,
+      "p50_ms": 0.005,
+      "min_ms": 0.005,
+      "max_ms": 0.007
+    },
+    {
+      "name": "q12-goals-per-team",
+      "rows": 20,
+      "p50_ms": 204.545,
+      "min_ms": 197.652,
+      "max_ms": 205.398
+    },
+    {
+      "name": "q13-no-death",
+      "rows": 1,
+      "p50_ms": 23.143,
+      "min_ms": 22.736,
+      "max_ms": 23.614
+    }
+  ]
+}
