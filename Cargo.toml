@@ -2,6 +2,7 @@
 members = [
     "crates/nrese-core",
     "crates/nrese-engine",
+    "crates/nrese-exec",
     "crates/nrese-sparql",
     "crates/nrese-store",
     "crates/nrese-reasoner",

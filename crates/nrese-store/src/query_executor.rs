@@ -117,6 +117,7 @@ pub(crate) fn run_query(
     let options = QueryOptions {
         dataset: prepared.dataset.clone(),
         cancellation: Some(cancellation.clone()),
+        ..QueryOptions::default()
     };
     let alive = || match cancellation.is_cancelled() {
         true => Err(StoreError::SparqlEvaluation(
