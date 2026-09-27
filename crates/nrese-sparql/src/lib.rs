@@ -9,16 +9,18 @@
 //!
 //! - [`view`]: the read contract ([`ReadView`]) implemented by snapshots and transactions
 //! - [`dataset`]: the `spareval::QueryableDataset` adapter and its term-identity invariant
-//! - [`query`] evaluates queries ([`evaluate_query`])
+//! - [`query`] evaluates queries ([`evaluate_query`]): natively over id tables when every
+//!   operator is supported (`native`, the execution core of D11), else with spareval
 //! - [`update`] applies SPARQL Update requests ([`apply_update`])
 
 pub mod dataset;
+mod native;
 pub mod query;
 pub mod update;
 pub mod view;
 
 pub use dataset::{EngineDataset, EvalTerm};
-pub use query::{QueryOptions, evaluate_query};
+pub use query::{QueryOptions, evaluate_query, runs_natively};
 pub use spareval::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,
 };

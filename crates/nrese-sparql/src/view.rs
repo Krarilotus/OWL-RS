@@ -39,6 +39,12 @@ pub trait ReadView {
 
     /// Decodes a quad read from this view; `None` only for ids the view doesn't know.
     fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad>;
+
+    /// The committed snapshot behind this view, if it is one. The native executor needs
+    /// its exact counts and sorted scans; other views run on spareval.
+    fn snapshot(&self) -> Option<&Snapshot> {
+        None
+    }
 }
 
 impl ReadView for Snapshot {
@@ -68,6 +74,10 @@ impl ReadView for Snapshot {
 
     fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
         Snapshot::decode_quad(self, quad)
+    }
+
+    fn snapshot(&self) -> Option<&Snapshot> {
+        Some(self)
     }
 }
 

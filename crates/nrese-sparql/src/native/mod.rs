@@ -1,0 +1,1483 @@
+//! The native query executor (execution-core design, XC3): SPARQL algebra evaluated over id
+//! tables with the shared execution core (`nrese-exec`, decision D11).
+//!
+//! **Whole-query switch.** [`evaluate`] returns `None` unless every operator of the query is
+//! supported ([`supported`]); the caller then runs spareval exactly as before. A few rare
+//! semantic corners are only detectable at runtime (UNDEF in MINUS or NOT EXISTS keys); they
+//! also hand the query back to spareval ([`NativeError::Fallback`]). So native coverage can
+//! grow without ever changing results.
+//!
+//! **Execution.** Intermediate results are [`IdTable`]s of term ids; terms are decoded only
+//! for expressions and for the output. BGPs are ordered greedily by *exact* pattern counts
+//! (`Snapshot::count`), joined by index nested loops when the running result is much
+//! smaller than the next pattern, and otherwise by merge joins on sorted scans or hash joins.
+//! `COUNT(*)` over a single pattern reads the count from the index.
+
+mod expr;
+mod value;
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use nrese_engine::quad::Permutation;
+use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
+use nrese_exec::join::{
+    anti_join, join, join_keeping_left_order, join_with_undef, left_join, semi_join,
+};
+use nrese_exec::{Budget, IdTable, UNDEF, computed_id, computed_index, group::group_rows};
+use oxrdf::vocab::xsd;
+use oxrdf::{Literal, Term, Variable};
+use oxsdatatypes::{Decimal, Double, Float, Integer};
+use spareval::{CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter};
+use spargebra::Query;
+use spargebra::algebra::{
+    AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
+};
+use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
+
+use crate::query::QueryOptions;
+use expr::Evaluator;
+use value::Value;
+
+/// A right side at least this many times larger than the running result is joined by
+/// probing the index once per result row instead of scanning it.
+const PROBE_FACTOR: u64 = 32;
+
+pub(crate) enum NativeError {
+    /// Not handled natively after all: run the query on spareval.
+    Fallback,
+    Evaluation(QueryEvaluationError),
+}
+
+impl From<QueryEvaluationError> for NativeError {
+    fn from(error: QueryEvaluationError) -> Self {
+        Self::Evaluation(error)
+    }
+}
+
+type NativeResult<T> = Result<T, NativeError>;
+
+/// Runs `query` natively if it is fully supported; `None` means "use spareval".
+pub(crate) fn evaluate<'a>(
+    snapshot: &'a Snapshot,
+    query: &Query,
+    options: &QueryOptions,
+) -> Option<Result<QueryResults<'a>, QueryEvaluationError>> {
+    if options.dataset.is_some() {
+        return None;
+    }
+    let (pattern, ask) = match query {
+        Query::Select {
+            dataset: None,
+            pattern,
+            ..
+        } => (pattern, false),
+        Query::Ask {
+            dataset: None,
+            pattern,
+            ..
+        } => (pattern, true),
+        _ => return None,
+    };
+    if !supported(pattern) {
+        return None;
+    }
+    let ctx = Context::new(snapshot, options);
+    let solutions = match ctx.eval(pattern) {
+        Ok(solutions) => solutions,
+        Err(NativeError::Fallback) => return None,
+        Err(NativeError::Evaluation(error)) => return Some(Err(error)),
+    };
+    if ask {
+        return Some(Ok(QueryResults::Boolean(!solutions.table.is_empty())));
+    }
+    let variables: Arc<[Variable]> = solutions.vars.clone().into();
+    let Context {
+        snapshot, computed, ..
+    } = ctx;
+    let computed = computed.into_inner();
+    let table = solutions.table;
+    let rows = (0..table.len()).map(move |row| {
+        Ok((0..table.width())
+            .map(|column| decode(snapshot, &computed, table.get(row, column)))
+            .collect::<Vec<_>>())
+    });
+    Some(Ok(QueryResults::Solutions(QuerySolutionIter::from_tuples(
+        variables, rows,
+    ))))
+}
+
+fn decode(snapshot: &Snapshot, computed: &[Term], id: u64) -> Option<Term> {
+    if id == UNDEF {
+        return None;
+    }
+    match computed_index(id) {
+        Some(index) => computed.get(index as usize).cloned(),
+        None => snapshot.decode(TermId::from_raw(id)),
+    }
+}
+
+/// True if [`evaluate`] handles `query` (barring runtime fallbacks), with no protocol dataset.
+pub(crate) fn query_supported(query: &Query) -> bool {
+    match query {
+        Query::Select {
+            dataset: None,
+            pattern,
+            ..
+        }
+        | Query::Ask {
+            dataset: None,
+            pattern,
+            ..
+        } => supported(pattern),
+        _ => false,
+    }
+}
+
+/// True if the native executor supports every operator in `pattern`.
+pub(crate) fn supported(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Bgp { patterns } => patterns.iter().all(supported_triple),
+        GraphPattern::Join { left, right }
+        | GraphPattern::Union { left, right }
+        | GraphPattern::Minus { left, right } => supported(left) && supported(right),
+        GraphPattern::LeftJoin {
+            left,
+            right,
+            expression,
+        } => supported(left) && supported(right) && expression.as_ref().is_none_or(expr::supported),
+        GraphPattern::Filter { expr, inner } => supported(inner) && supported_filter(expr),
+        GraphPattern::Extend {
+            inner, expression, ..
+        } => supported(inner) && expr::supported(expression),
+        GraphPattern::Values { bindings, .. } => bindings
+            .iter()
+            .flatten()
+            .flatten()
+            .all(|term| matches!(term, GroundTerm::NamedNode(_) | GroundTerm::Literal(_))),
+        GraphPattern::OrderBy { inner, expression } => {
+            supported(inner)
+                && expression.iter().all(|e| match e {
+                    OrderExpression::Asc(e) | OrderExpression::Desc(e) => expr::supported(e),
+                })
+        }
+        GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::Slice { inner, .. } => supported(inner),
+        GraphPattern::Group {
+            inner, aggregates, ..
+        } => {
+            supported(inner)
+                && aggregates.iter().all(|(_, aggregate)| match aggregate {
+                    AggregateExpression::CountSolutions { .. } => true,
+                    AggregateExpression::FunctionCall { name, expr, .. } => {
+                        expr::supported(expr)
+                            && matches!(
+                                name,
+                                AggregateFunction::Count
+                                    | AggregateFunction::Sum
+                                    | AggregateFunction::Avg
+                                    | AggregateFunction::Min
+                                    | AggregateFunction::Max
+                                    | AggregateFunction::Sample
+                            )
+                    }
+                })
+        }
+        _ => false,
+    }
+}
+
+fn supported_triple(triple: &TriplePattern) -> bool {
+    let term = |t: &TermPattern| {
+        matches!(
+            t,
+            TermPattern::NamedNode(_)
+                | TermPattern::BlankNode(_)
+                | TermPattern::Literal(_)
+                | TermPattern::Variable(_)
+        )
+    };
+    term(&triple.subject) && term(&triple.object)
+}
+
+/// FILTER expressions: the supported expression language, plus (NOT) EXISTS over a supported
+/// pattern that reads no variable from outside except through the shared ones (an
+/// uncorrelated sub-pattern, which is a semi- or anti-join).
+fn supported_filter(expression: &Expression) -> bool {
+    match expression {
+        // FILTER(A && B) is FILTER(A) then FILTER(B): an error in either drops the row.
+        Expression::And(a, b) => supported_filter(a) && supported_filter(b),
+        Expression::Exists(pattern) => uncorrelated(pattern),
+        Expression::Not(inner) if matches!(**inner, Expression::Exists(_)) => {
+            supported_filter(inner)
+        }
+        other => expr::supported(other),
+    }
+}
+
+/// True if a conjunct of `expression` is an (NOT) EXISTS, which needs a join.
+fn contains_exists(expression: &Expression) -> bool {
+    match expression {
+        Expression::And(a, b) => contains_exists(a) || contains_exists(b),
+        Expression::Exists(_) => true,
+        Expression::Not(inner) => matches!(**inner, Expression::Exists(_)),
+        _ => false,
+    }
+}
+
+fn uncorrelated(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Bgp { patterns } => patterns.iter().all(supported_triple),
+        GraphPattern::Join { left, right } => uncorrelated(left) && uncorrelated(right),
+        GraphPattern::Filter { expr, inner } => {
+            let mut bound = Vec::new();
+            bound_variables(inner, &mut bound);
+            expr::supported(expr)
+                && uncorrelated(inner)
+                && expression_variables(expr).iter().all(|v| bound.contains(v))
+        }
+        _ => false,
+    }
+}
+
+fn bound_variables(pattern: &GraphPattern, out: &mut Vec<Variable>) {
+    pattern.on_in_scope_variable(|v| {
+        if !out.contains(v) {
+            out.push(v.clone());
+        }
+    });
+}
+
+fn expression_variables(expression: &Expression) -> Vec<Variable> {
+    let mut out = Vec::new();
+    fn walk(e: &Expression, out: &mut Vec<Variable>) {
+        match e {
+            Expression::Variable(v) | Expression::Bound(v) => out.push(v.clone()),
+            Expression::Or(a, b)
+            | Expression::And(a, b)
+            | Expression::Equal(a, b)
+            | Expression::SameTerm(a, b)
+            | Expression::Greater(a, b)
+            | Expression::GreaterOrEqual(a, b)
+            | Expression::Less(a, b)
+            | Expression::LessOrEqual(a, b)
+            | Expression::Add(a, b)
+            | Expression::Subtract(a, b)
+            | Expression::Multiply(a, b)
+            | Expression::Divide(a, b) => {
+                walk(a, out);
+                walk(b, out);
+            }
+            Expression::In(a, list) => {
+                walk(a, out);
+                list.iter().for_each(|e| walk(e, out));
+            }
+            Expression::Not(a) | Expression::UnaryPlus(a) | Expression::UnaryMinus(a) => {
+                walk(a, out)
+            }
+            Expression::If(a, b, c) => {
+                walk(a, out);
+                walk(b, out);
+                walk(c, out);
+            }
+            Expression::Coalesce(list) | Expression::FunctionCall(_, list) => {
+                list.iter().for_each(|e| walk(e, out));
+            }
+            _ => {}
+        }
+    }
+    walk(expression, &mut out);
+    out
+}
+
+/// Solutions: a table whose column `i` binds variable `vars[i]`. `ordered` marks a row
+/// order that matters (from ORDER BY): operators then keep it, as spareval does, so a
+/// sorted subquery stays sorted through the joins above it.
+struct Solutions {
+    vars: Vec<Variable>,
+    table: IdTable,
+    ordered: bool,
+}
+
+impl Solutions {
+    fn column(&self, variable: &Variable) -> Option<usize> {
+        self.vars.iter().position(|v| v == variable)
+    }
+
+    fn unit() -> Self {
+        Self {
+            vars: Vec::new(),
+            table: IdTable::from_rows(0, [&[][..]]),
+            ordered: false,
+        }
+    }
+}
+
+struct Context<'a> {
+    snapshot: &'a Snapshot,
+    evaluator: Evaluator,
+    computed: RefCell<Vec<Term>>,
+    computed_ids: RefCell<HashMap<Term, u64>>,
+    decoded: RefCell<HashMap<u64, Option<Term>>>,
+    cancellation: Option<CancellationToken>,
+    budget: Budget,
+}
+
+impl<'a> Context<'a> {
+    fn new(snapshot: &'a Snapshot, options: &QueryOptions) -> Self {
+        Self {
+            snapshot,
+            evaluator: Evaluator::default(),
+            computed: RefCell::default(),
+            computed_ids: RefCell::default(),
+            decoded: RefCell::default(),
+            cancellation: options.cancellation.clone(),
+            budget: options
+                .memory_limit
+                .map_or_else(Budget::unlimited, Budget::new),
+        }
+    }
+
+    fn check(&self) -> NativeResult<()> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(QueryEvaluationError::Cancelled.into());
+        }
+        Ok(())
+    }
+
+    /// Charges a produced table against the query's memory budget.
+    fn produced(&self, solutions: Solutions) -> NativeResult<Solutions> {
+        self.check()?;
+        self.budget
+            .charge(solutions.table.memory_bytes())
+            .map_err(|e| QueryEvaluationError::Dataset(Box::new(e)))?;
+        Ok(solutions)
+    }
+
+    fn consumed(&self, solutions: &Solutions) {
+        self.budget.release(solutions.table.memory_bytes());
+    }
+
+    fn term(&self, id: u64) -> Option<Term> {
+        if id == UNDEF {
+            return None;
+        }
+        if let Some(index) = computed_index(id) {
+            return self.computed.borrow().get(index as usize).cloned();
+        }
+        self.decoded
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| self.snapshot.decode(TermId::from_raw(id)))
+            .clone()
+    }
+
+    /// The id of `term`: its stored id if the snapshot knows it, else a computed id, the same
+    /// one for equal terms.
+    fn id(&self, term: &Term) -> u64 {
+        if let Some(id) = self.snapshot.lookup(term.as_ref()) {
+            return id.raw();
+        }
+        let mut ids = self.computed_ids.borrow_mut();
+        if let Some(&id) = ids.get(term) {
+            return id;
+        }
+        let mut computed = self.computed.borrow_mut();
+        let id = computed_id(computed.len() as u64);
+        computed.push(term.clone());
+        ids.insert(term.clone(), id);
+        id
+    }
+
+    fn binding<'s>(
+        &'s self,
+        solutions: &'s Solutions,
+        row: usize,
+    ) -> impl Fn(&Variable) -> Option<Term> + 's {
+        move |variable| {
+            let column = solutions.column(variable)?;
+            self.term(solutions.table.get(row, column))
+        }
+    }
+
+    fn eval(&self, pattern: &GraphPattern) -> NativeResult<Solutions> {
+        self.check()?;
+        match pattern {
+            GraphPattern::Bgp { patterns } => self.bgp(patterns),
+            GraphPattern::Join { left, right } => {
+                let (left, right) = (self.eval(left)?, self.eval(right)?);
+                self.join(left, right)
+            }
+            GraphPattern::LeftJoin {
+                left,
+                right,
+                expression,
+            } => {
+                let (left, right) = (self.eval(left)?, self.eval(right)?);
+                self.left_join(left, right, expression.as_ref())
+            }
+            GraphPattern::Filter { expr, inner } => self.filter(self.eval(inner)?, expr),
+            GraphPattern::Union { left, right } => {
+                let (left, right) = (self.eval(left)?, self.eval(right)?);
+                self.union(left, right)
+            }
+            GraphPattern::Extend {
+                inner,
+                variable,
+                expression,
+            } => {
+                let mut solutions = self.eval(inner)?;
+                let values: Vec<u64> = (0..solutions.table.len())
+                    .map(|row| {
+                        self.evaluator
+                            .eval(expression, &self.binding(&solutions, row))
+                            .map_or(UNDEF, |term| self.id(&term))
+                    })
+                    .collect();
+                let mut columns = std::mem::take(&mut solutions.table).into_columns();
+                columns.push(values);
+                solutions.vars.push(variable.clone());
+                solutions.table = IdTable::from_columns(columns);
+                self.produced(solutions)
+            }
+            GraphPattern::Minus { left, right } => {
+                let (left, right) = (self.eval(left)?, self.eval(right)?);
+                let (lk, rk) = shared_columns(&left, &right);
+                if lk.is_empty() {
+                    return Ok(left);
+                }
+                if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
+                    return Err(NativeError::Fallback);
+                }
+                let table = anti_join(&left.table, &right.table, &lk, &rk);
+                self.consumed(&right);
+                self.produced(Solutions {
+                    vars: left.vars,
+                    table,
+                    ordered: left.ordered,
+                })
+            }
+            GraphPattern::Values {
+                variables,
+                bindings,
+            } => {
+                let mut table = IdTable::new(variables.len());
+                for binding in bindings {
+                    let row: Vec<u64> = binding
+                        .iter()
+                        .map(|term| match term {
+                            Some(GroundTerm::NamedNode(n)) => self.id(&n.clone().into()),
+                            Some(GroundTerm::Literal(l)) => self.id(&l.clone().into()),
+                            _ => UNDEF,
+                        })
+                        .collect();
+                    table.push_row(&row);
+                }
+                self.produced(Solutions {
+                    vars: variables.clone(),
+                    table,
+                    ordered: false,
+                })
+            }
+            GraphPattern::OrderBy { inner, expression } => {
+                let solutions = self.eval(inner)?;
+                self.order_by(solutions, expression, None)
+            }
+            GraphPattern::Project { inner, variables } => {
+                let solutions = self.eval(inner)?;
+                Ok(self.project(solutions, variables))
+            }
+            GraphPattern::Distinct { inner } => {
+                let mut solutions = self.eval(inner)?;
+                solutions.table.dedup_preserving_order();
+                Ok(solutions)
+            }
+            GraphPattern::Reduced { inner } => self.eval(inner),
+            GraphPattern::Slice {
+                inner,
+                start,
+                length,
+            } => {
+                // ORDER BY + LIMIT: only the first start + length rows need a full order.
+                if let GraphPattern::OrderBy {
+                    inner: sorted,
+                    expression,
+                } = &**inner
+                {
+                    let solutions = self.eval(sorted)?;
+                    let mut solutions =
+                        self.order_by(solutions, expression, length.map(|l| start + l))?;
+                    solutions.table.slice(*start, *length);
+                    return Ok(solutions);
+                }
+                if let GraphPattern::Project {
+                    inner: projected,
+                    variables,
+                } = &**inner
+                    && let GraphPattern::OrderBy {
+                        inner: sorted,
+                        expression,
+                    } = &**projected
+                {
+                    let solutions = self.eval(sorted)?;
+                    let solutions =
+                        self.order_by(solutions, expression, length.map(|l| start + l))?;
+                    let mut solutions = self.project(solutions, variables);
+                    solutions.table.slice(*start, *length);
+                    return Ok(solutions);
+                }
+                let mut solutions = self.eval(inner)?;
+                solutions.table.slice(*start, *length);
+                Ok(solutions)
+            }
+            GraphPattern::Group {
+                inner,
+                variables,
+                aggregates,
+            } => self.group(inner, variables, aggregates),
+            _ => Err(NativeError::Fallback),
+        }
+    }
+
+    // --- basic graph patterns ------------------------------------------------------------
+
+    fn bgp(&self, triples: &[TriplePattern]) -> NativeResult<Solutions> {
+        let mut scans = Vec::with_capacity(triples.len());
+        for triple in triples {
+            match self.scan_pattern(triple) {
+                Some(scan) => scans.push(scan),
+                // A constant the store doesn't know: nothing can match.
+                None => {
+                    let mut vars = Vec::new();
+                    for triple in triples {
+                        for v in triple_variables(triple) {
+                            if !vars.contains(&v) {
+                                vars.push(v);
+                            }
+                        }
+                    }
+                    let width = vars.len();
+                    return Ok(Solutions {
+                        vars,
+                        table: IdTable::new(width),
+                        ordered: false,
+                    });
+                }
+            }
+        }
+        if scans.is_empty() {
+            return Ok(Solutions::unit());
+        }
+        let counts: Vec<u64> = scans
+            .iter()
+            .map(|s| self.snapshot.count(&s.quad_pattern()))
+            .collect();
+        let mut remaining: Vec<usize> = (0..scans.len()).collect();
+        // Start with the smallest pattern (ties: the one sharing most variables).
+        remaining.sort_by_key(|&i| counts[i]);
+        let first = remaining.remove(0);
+        let join_var = remaining.iter().find_map(|&i| {
+            scans[first]
+                .vars()
+                .into_iter()
+                .find(|v| scans[i].vars().contains(v))
+        });
+        let mut result = self.scan(&scans[first], join_var.as_ref())?;
+        while !remaining.is_empty() {
+            // The smallest pattern connected to the result, or the smallest overall.
+            let position = remaining
+                .iter()
+                .position(|&i| scans[i].vars().iter().any(|v| result.column(v).is_some()))
+                .unwrap_or(0);
+            let next = remaining.remove(position);
+            let shared: Vec<Variable> = scans[next]
+                .vars()
+                .into_iter()
+                .filter(|v| result.column(v).is_some())
+                .collect();
+            let probe = !shared.is_empty()
+                && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
+            result = if probe {
+                self.probe_join(result, &scans[next], &shared)?
+            } else {
+                let scanned = self.scan(&scans[next], shared.first())?;
+                self.join(result, scanned)?
+            };
+        }
+        Ok(result)
+    }
+
+    fn scan_pattern(&self, triple: &TriplePattern) -> Option<ScanPattern> {
+        let slot = |term: &TermPattern| -> Option<Slot> {
+            Some(match term {
+                TermPattern::Variable(v) => Slot::Var(v.clone()),
+                TermPattern::BlankNode(b) => {
+                    Slot::Var(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
+                }
+                TermPattern::NamedNode(n) => Slot::Const(self.snapshot.lookup(n.as_ref().into())?),
+                TermPattern::Literal(l) => Slot::Const(self.snapshot.lookup(l.as_ref().into())?),
+                #[allow(unreachable_patterns)]
+                _ => return None,
+            })
+        };
+        let predicate = match &triple.predicate {
+            NamedNodePattern::Variable(v) => Slot::Var(v.clone()),
+            NamedNodePattern::NamedNode(n) => Slot::Const(self.snapshot.lookup(n.as_ref().into())?),
+        };
+        Some(ScanPattern {
+            slots: [slot(&triple.subject)?, predicate, slot(&triple.object)?],
+        })
+    }
+
+    /// Scans one pattern into a table, sorted on `sort_var` first when some permutation can.
+    fn scan(&self, scan: &ScanPattern, sort_var: Option<&Variable>) -> NativeResult<Solutions> {
+        let pattern = scan.quad_pattern();
+        let permutation = scan.permutation_for(sort_var);
+        let vars = scan.vars();
+        let columns_of: Vec<Vec<usize>> = vars
+            .iter()
+            .map(|v| (0..3).filter(|&i| scan.slots[i].is_var(v)).collect())
+            .collect();
+        let mut table = IdTable::new(vars.len());
+        let mut row = vec![0u64; vars.len()];
+        let quads = self
+            .snapshot
+            .scan_sorted_in(ReadModel::Materialised, &pattern, permutation)
+            .expect("permutation_for returns a usable permutation");
+        'quads: for (n, quad) in quads.enumerate() {
+            if n % (1 << 16) == 0 {
+                self.check()?;
+            }
+            let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
+            for (slot, positions) in row.iter_mut().zip(&columns_of) {
+                let value = components[positions[0]];
+                // A variable used twice in one pattern must bind the same term.
+                if positions[1..].iter().any(|&p| components[p] != value) {
+                    continue 'quads;
+                }
+                *slot = value;
+            }
+            table.push_row(&row);
+        }
+        // The scan is sorted on the free components in permutation order.
+        let order: Vec<usize> = permutation
+            .order()
+            .iter()
+            .filter(|&&component| component < 3)
+            .filter_map(|&component| match &scan.slots[component] {
+                Slot::Var(v) => vars.iter().position(|x| x == v),
+                Slot::Const(_) => None,
+            })
+            .collect();
+        let mut sorted = Vec::new();
+        for column in order {
+            if !sorted.contains(&column) {
+                sorted.push(column);
+            }
+        }
+        let table = table.assume_sorted_by(sorted);
+        self.produced(Solutions {
+            vars,
+            table,
+            ordered: false,
+        })
+    }
+
+    /// Joins `result` with `scan` by probing the index once per distinct key of `result`.
+    fn probe_join(
+        &self,
+        mut result: Solutions,
+        scan: &ScanPattern,
+        shared: &[Variable],
+    ) -> NativeResult<Solutions> {
+        let key_columns: Vec<usize> = shared
+            .iter()
+            .map(|v| result.column(v).expect("shared"))
+            .collect();
+        if has_undef(&result.table, &key_columns) {
+            let scanned = self.scan(scan, shared.first())?;
+            return self.join(result, scanned);
+        }
+        if !result.ordered {
+            result.table.sort_by(&key_columns);
+        }
+        let new_vars: Vec<Variable> = scan
+            .vars()
+            .into_iter()
+            .filter(|v| result.column(v).is_none())
+            .collect();
+        let mut vars = result.vars.clone();
+        vars.extend(new_vars.iter().cloned());
+        let mut out = IdTable::new(vars.len());
+        let mut matches: Vec<Vec<u64>> = Vec::new();
+        let mut row = vec![0u64; vars.len()];
+        let width = result.table.width();
+        // Where each new variable sits in a matching quad (the shared ones become constants).
+        let positions: Vec<Vec<usize>> = new_vars
+            .iter()
+            .map(|v| (0..3).filter(|&i| scan.slots[i].is_var(v)).collect())
+            .collect();
+        let shared_positions: Vec<Vec<usize>> = shared
+            .iter()
+            .map(|v| (0..3).filter(|&i| scan.slots[i].is_var(v)).collect())
+            .collect();
+        let mut bound = scan.clone();
+        for r in 0..result.table.len() {
+            if r % 4096 == 0 {
+                self.check()?;
+            }
+            let same_key = r > 0
+                && key_columns
+                    .iter()
+                    .all(|&k| result.table.get(r, k) == result.table.get(r - 1, k));
+            if !same_key {
+                matches.clear();
+                for (slots, &k) in shared_positions.iter().zip(&key_columns) {
+                    let id = TermId::from_raw(result.table.get(r, k));
+                    for &i in slots {
+                        bound.slots[i] = Slot::Const(id);
+                    }
+                }
+                'quads: for quad in self
+                    .snapshot
+                    .quads_for_pattern_in(ReadModel::Materialised, &bound.quad_pattern())
+                {
+                    let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
+                    let mut values = Vec::with_capacity(new_vars.len());
+                    for places in &positions {
+                        let value = components[places[0]];
+                        if places[1..].iter().any(|&p| components[p] != value) {
+                            continue 'quads;
+                        }
+                        values.push(value);
+                    }
+                    matches.push(values);
+                }
+            }
+            for values in &matches {
+                for (c, slot) in row.iter_mut().enumerate().take(width) {
+                    *slot = result.table.get(r, c);
+                }
+                row[width..].copy_from_slice(values);
+                out.push_row(&row);
+            }
+        }
+        let out = if result.ordered {
+            out
+        } else {
+            out.assume_sorted_by(key_columns)
+        };
+        self.consumed(&result);
+        self.produced(Solutions {
+            vars,
+            table: out,
+            ordered: result.ordered,
+        })
+    }
+
+    // --- joins ---------------------------------------------------------------------------
+
+    fn join(&self, left: Solutions, right: Solutions) -> NativeResult<Solutions> {
+        let (lk, rk) = shared_columns(&left, &right);
+        let vars = joined_vars(&left, &right, &rk);
+        let table = if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
+            if left.ordered {
+                return Err(NativeError::Fallback);
+            }
+            join_with_undef(&left.table, &right.table, &lk, &rk)
+        } else if left.ordered {
+            join_keeping_left_order(&left.table, &right.table, &lk, &rk)
+        } else {
+            join(&left.table, &right.table, &lk, &rk)
+        };
+        self.consumed(&left);
+        self.consumed(&right);
+        self.produced(Solutions {
+            vars,
+            table,
+            ordered: left.ordered,
+        })
+    }
+
+    fn left_join(
+        &self,
+        left: Solutions,
+        right: Solutions,
+        expression: Option<&Expression>,
+    ) -> NativeResult<Solutions> {
+        let (lk, rk) = shared_columns(&left, &right);
+        if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
+            return Err(NativeError::Fallback);
+        }
+        let vars = joined_vars(&left, &right, &rk);
+        let table = match expression {
+            None => left_join(&left.table, &right.table, &lk, &rk, None),
+            Some(expression) => {
+                let accept = |row: &[u64]| {
+                    let binding = |v: &Variable| {
+                        let column = vars.iter().position(|x| x == v)?;
+                        self.term(row[column])
+                    };
+                    self.evaluator.filter(expression, &binding)
+                };
+                left_join(&left.table, &right.table, &lk, &rk, Some(&accept))
+            }
+        };
+        self.consumed(&left);
+        self.consumed(&right);
+        self.produced(Solutions {
+            vars,
+            table,
+            ordered: left.ordered,
+        })
+    }
+
+    fn union(&self, left: Solutions, right: Solutions) -> NativeResult<Solutions> {
+        let mut vars = left.vars.clone();
+        for v in &right.vars {
+            if !vars.contains(v) {
+                vars.push(v.clone());
+            }
+        }
+        let widen = |s: &Solutions| {
+            let columns: Vec<Vec<u64>> = vars
+                .iter()
+                .map(|v| match s.column(v) {
+                    Some(c) => s.table.column(c).to_vec(),
+                    None => vec![UNDEF; s.table.len()],
+                })
+                .collect();
+            IdTable::from_columns(columns)
+        };
+        let mut table = widen(&left);
+        table.append(&widen(&right));
+        self.consumed(&left);
+        self.consumed(&right);
+        self.produced(Solutions {
+            vars,
+            table,
+            ordered: false,
+        })
+    }
+
+    // --- filters -------------------------------------------------------------------------
+
+    fn filter(&self, mut solutions: Solutions, expression: &Expression) -> NativeResult<Solutions> {
+        match expression {
+            Expression::And(a, b) if contains_exists(expression) => {
+                let solutions = self.filter(solutions, a)?;
+                self.filter(solutions, b)
+            }
+            Expression::Exists(pattern) => self.exists(solutions, pattern, true),
+            Expression::Not(inner) if matches!(**inner, Expression::Exists(_)) => {
+                let Expression::Exists(pattern) = &**inner else {
+                    unreachable!()
+                };
+                self.exists(solutions, pattern, false)
+            }
+            _ => {
+                let mask: Vec<bool> = (0..solutions.table.len())
+                    .map(|row| {
+                        self.evaluator
+                            .filter(expression, &self.binding(&solutions, row))
+                    })
+                    .collect();
+                solutions.table.retain_mask(&mask);
+                Ok(solutions)
+            }
+        }
+    }
+
+    fn exists(
+        &self,
+        solutions: Solutions,
+        pattern: &GraphPattern,
+        keep_matching: bool,
+    ) -> NativeResult<Solutions> {
+        let inner = self.eval(pattern)?;
+        let (lk, rk) = shared_columns(&solutions, &inner);
+        if has_undef(&solutions.table, &lk) {
+            return Err(NativeError::Fallback);
+        }
+        let table = if keep_matching {
+            semi_join(&solutions.table, &inner.table, &lk, &rk)
+        } else {
+            anti_join(&solutions.table, &inner.table, &lk, &rk)
+        };
+        self.consumed(&inner);
+        Ok(Solutions {
+            vars: solutions.vars,
+            table,
+            ordered: solutions.ordered,
+        })
+    }
+
+    // --- modifiers -----------------------------------------------------------------------
+
+    fn project(&self, solutions: Solutions, variables: &[Variable]) -> Solutions {
+        let columns: Vec<Vec<u64>> = variables
+            .iter()
+            .map(|v| match solutions.column(v) {
+                Some(c) => solutions.table.column(c).to_vec(),
+                None => vec![UNDEF; solutions.table.len()],
+            })
+            .collect();
+        let mut table = IdTable::from_columns(columns);
+        if variables.is_empty() {
+            table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], solutions.table.len()));
+        }
+        Solutions {
+            vars: variables.to_vec(),
+            table,
+            ordered: solutions.ordered,
+        }
+    }
+
+    /// Sorts by the ORDER BY keys. With `limit`, only the first `limit` rows are guaranteed to
+    /// be in order (a partial sort), which is all `LIMIT` needs.
+    fn order_by(
+        &self,
+        mut solutions: Solutions,
+        keys: &[OrderExpression],
+        limit: Option<usize>,
+    ) -> NativeResult<Solutions> {
+        let n = solutions.table.len();
+        // A key that is a variable holding only inline integers (or UNDEF) sorts by id: inline
+        // integer ids are ordered by value (offset binary), so no term is decoded.
+        let key_values: Vec<SortKey> = keys
+            .iter()
+            .map(|key| {
+                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
+                if let Expression::Variable(v) = e
+                    && let Some(column) = solutions.column(v)
+                    && solutions.table.column(column).iter().all(|&id| {
+                        id == UNDEF
+                            || TermId::from_raw(id).kind() == nrese_engine::TermKind::Integer
+                    })
+                {
+                    // UNDEF sorts first in SPARQL; every inline integer id is above 0.
+                    return SortKey::Ids(
+                        solutions
+                            .table
+                            .column(column)
+                            .iter()
+                            .map(|&id| if id == UNDEF { 0 } else { id })
+                            .collect(),
+                    );
+                }
+                SortKey::Terms(
+                    (0..n)
+                        .map(|row| self.evaluator.eval(e, &self.binding(&solutions, row)))
+                        .collect(),
+                )
+            })
+            .collect();
+        let compare = |a: &usize, b: &usize| {
+            for (key, values) in keys.iter().zip(&key_values) {
+                let ordering = match values {
+                    SortKey::Ids(ids) => ids[*a].cmp(&ids[*b]),
+                    SortKey::Terms(terms) => value::order(terms[*a].as_ref(), terms[*b].as_ref()),
+                };
+                let ordering = match key {
+                    OrderExpression::Asc(_) => ordering,
+                    OrderExpression::Desc(_) => ordering.reverse(),
+                };
+                if ordering.is_ne() {
+                    return ordering;
+                }
+            }
+            a.cmp(b)
+        };
+        let mut order: Vec<usize> = (0..n).collect();
+        match limit {
+            Some(k) if k < n => {
+                order.select_nth_unstable_by(k, compare);
+                order.truncate(k);
+                order.sort_unstable_by(compare);
+            }
+            _ => order.sort_unstable_by(compare),
+        }
+        let columns: Vec<Vec<u64>> = solutions
+            .table
+            .columns()
+            .iter()
+            .map(|column| order.iter().map(|&row| column[row]).collect())
+            .collect();
+        let width = solutions.table.width();
+        solutions.table = if width == 0 {
+            IdTable::from_rows(0, std::iter::repeat_n(&[][..], order.len()))
+        } else {
+            IdTable::from_columns(columns)
+        };
+        solutions.ordered = true;
+        Ok(solutions)
+    }
+
+    // --- aggregation ---------------------------------------------------------------------
+
+    fn group(
+        &self,
+        inner: &GraphPattern,
+        variables: &[Variable],
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Solutions> {
+        // COUNT(*) of one triple pattern without GROUP BY: the index knows the answer.
+        if variables.is_empty()
+            && let [(target, AggregateExpression::CountSolutions { distinct: false })] = aggregates
+            && let GraphPattern::Bgp { patterns } = inner
+            && let [triple] = patterns.as_slice()
+        {
+            let count = match self.scan_pattern(triple) {
+                Some(scan) if !scan.repeats_variable() => self.snapshot.count(&scan.quad_pattern()),
+                Some(scan) => self.scan(&scan, None)?.table.len() as u64,
+                None => 0,
+            };
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(count))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // GROUP BY one variable with only row counts, over one triple pattern: the index
+        // counts each group by binary search (O(groups · log n)), without reading matches.
+        if let [key] = variables
+            && let GraphPattern::Bgp { patterns } = inner
+            && let [triple] = patterns.as_slice()
+            && let Some(scan) = self.scan_pattern(triple)
+            && !scan.repeats_variable()
+            && aggregates
+                .iter()
+                .all(|(_, aggregate)| counts_rows(aggregate, &scan))
+            && let Some(component) = (0..3).find(|&c| scan.slots[c].is_var(key))
+        {
+            let permutation = scan.permutation_for(Some(key));
+            if scan.first_free(permutation) == Some(component)
+                && let Some(groups) = self.snapshot.group_counts_in(
+                    ReadModel::Materialised,
+                    &scan.quad_pattern(),
+                    permutation,
+                )
+            {
+                let mut columns = vec![
+                    groups
+                        .iter()
+                        .map(|(value, _)| value.raw())
+                        .collect::<Vec<_>>(),
+                ];
+                let counts: Vec<u64> = groups.iter().map(|&(_, n)| self.id(&integer(n))).collect();
+                let mut vars = vec![key.clone()];
+                for (target, _) in aggregates {
+                    columns.push(counts.clone());
+                    vars.push(target.clone());
+                }
+                let table = IdTable::from_columns(columns).assume_sorted_by(vec![0]);
+                return self.produced(Solutions {
+                    vars,
+                    table,
+                    ordered: false,
+                });
+            }
+        }
+        let solutions = self.eval(inner)?;
+        let key_table = if variables.is_empty() {
+            IdTable::from_rows(0, std::iter::repeat_n(&[][..], solutions.table.len()))
+        } else {
+            let key_columns: Vec<Vec<u64>> = variables
+                .iter()
+                .map(|v| match solutions.column(v) {
+                    Some(c) => solutions.table.column(c).to_vec(),
+                    None => vec![UNDEF; solutions.table.len()],
+                })
+                .collect();
+            let key_table = IdTable::from_columns(key_columns);
+            let sorted_on: Vec<usize> = variables
+                .iter()
+                .map_while(|v| solutions.column(v))
+                .collect();
+            if sorted_on.len() == variables.len() && solutions.table.is_sorted_on(&sorted_on) {
+                key_table.assume_sorted_by((0..variables.len()).collect())
+            } else {
+                key_table
+            }
+        };
+        let keys: Vec<usize> = (0..variables.len()).collect();
+        let groups = group_rows(&key_table, &keys);
+        // Without GROUP BY, an empty input still yields one (empty) group.
+        let group_count = groups.len();
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
+        for (row, &group) in groups.group_of.iter().enumerate() {
+            members[group as usize].push(row);
+        }
+        let mut columns: Vec<Vec<u64>> = groups.keys.clone().into_columns();
+        let mut vars: Vec<Variable> = variables.to_vec();
+        for (target, aggregate) in aggregates {
+            let column: Vec<u64> = members
+                .iter()
+                .map(|rows| self.aggregate(&solutions, rows, aggregate))
+                .collect();
+            columns.push(column);
+            vars.push(target.clone());
+        }
+        let table = if columns.is_empty() {
+            IdTable::from_rows(0, std::iter::repeat_n(&[][..], group_count))
+        } else {
+            IdTable::from_columns(columns)
+        };
+        self.consumed(&solutions);
+        self.produced(Solutions {
+            vars,
+            table,
+            ordered: false,
+        })
+    }
+
+    fn aggregate(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        aggregate: &AggregateExpression,
+    ) -> u64 {
+        match aggregate {
+            AggregateExpression::CountSolutions { distinct } => {
+                let count = if *distinct {
+                    let mut seen: Vec<Vec<u64>> =
+                        rows.iter().map(|&r| solutions.table.row(r)).collect();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    seen.len()
+                } else {
+                    rows.len()
+                };
+                self.id(&integer(count as u64))
+            }
+            AggregateExpression::FunctionCall {
+                name,
+                expr,
+                distinct,
+            } => {
+                let evaluated: Vec<Option<Term>> = rows
+                    .iter()
+                    .map(|&row| self.evaluator.eval(expr, &self.binding(solutions, row)))
+                    .collect();
+                // As spareval: COUNT skips errors and SAMPLE takes the first value, but one
+                // error makes SUM, AVG, MIN and MAX unbound.
+                let fails_on_error =
+                    !matches!(name, AggregateFunction::Count | AggregateFunction::Sample);
+                if fails_on_error && evaluated.iter().any(Option::is_none) {
+                    return UNDEF;
+                }
+                let mut values: Vec<Term> = evaluated.into_iter().flatten().collect();
+                if *distinct {
+                    let mut unique = Vec::with_capacity(values.len());
+                    for value in values {
+                        if !unique.contains(&value) {
+                            unique.push(value);
+                        }
+                    }
+                    values = unique;
+                }
+                let result = match name {
+                    AggregateFunction::Count => Some(integer(values.len() as u64)),
+                    AggregateFunction::Sample => values.into_iter().next().map(value::canonical),
+                    // The first of equal extremes, as spareval keeps it.
+                    AggregateFunction::Min => values
+                        .into_iter()
+                        .reduce(|best, v| {
+                            if value::order(Some(&v), Some(&best)).is_lt() {
+                                v
+                            } else {
+                                best
+                            }
+                        })
+                        .map(value::canonical),
+                    AggregateFunction::Max => values
+                        .into_iter()
+                        .reduce(|best, v| {
+                            if value::order(Some(&v), Some(&best)).is_gt() {
+                                v
+                            } else {
+                                best
+                            }
+                        })
+                        .map(value::canonical),
+                    AggregateFunction::Sum => sum(&values),
+                    AggregateFunction::Avg => average(&values),
+                    _ => None,
+                };
+                result.map_or(UNDEF, |term| self.id(&term))
+            }
+        }
+    }
+}
+
+/// One ORDER BY key's values per row: ids where id order is value order, else terms.
+enum SortKey {
+    Ids(Vec<u64>),
+    Terms(Vec<Option<Term>>),
+}
+
+/// True if `aggregate` counts the rows of a pattern: `COUNT(*)`, or `COUNT(?v)` for a
+/// variable the pattern always binds.
+fn counts_rows(aggregate: &AggregateExpression, scan: &ScanPattern) -> bool {
+    match aggregate {
+        AggregateExpression::CountSolutions { distinct: false } => true,
+        AggregateExpression::FunctionCall {
+            name: AggregateFunction::Count,
+            expr: Expression::Variable(v),
+            distinct: false,
+        } => scan.vars().contains(v),
+        _ => false,
+    }
+}
+
+fn integer(value: u64) -> Term {
+    Literal::new_typed_literal(value.to_string(), xsd::INTEGER).into()
+}
+
+/// A running numeric sum with SPARQL type promotion; `None` once a non-number appears.
+#[derive(Clone, Copy)]
+enum Numeric {
+    Integer(Integer),
+    Decimal(Decimal),
+    Float(Float),
+    Double(Double),
+}
+
+impl Numeric {
+    fn of(term: &Term) -> Option<Self> {
+        Some(match Value::of(term) {
+            Value::Integer(i) => Self::Integer(i),
+            Value::Decimal(d) => Self::Decimal(d),
+            Value::Float(f) => Self::Float(f),
+            Value::Double(d) => Self::Double(d),
+            _ => return None,
+        })
+    }
+
+    fn add(self, other: Self) -> Option<Self> {
+        use Numeric::{Decimal as D, Double as Db, Float as F, Integer as I};
+        Some(match (self, other) {
+            (I(a), I(b)) => I(a.checked_add(b)?),
+            (I(_) | D(_), I(_) | D(_)) => D(self.decimal()?.checked_add(other.decimal()?)?),
+            (I(_) | D(_) | F(_), I(_) | D(_) | F(_)) => F(self.float()? + other.float()?),
+            _ => Db(self.double() + other.double()),
+        })
+    }
+
+    fn decimal(self) -> Option<Decimal> {
+        match self {
+            Self::Integer(i) => Some(Decimal::from(i)),
+            Self::Decimal(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    fn float(self) -> Option<Float> {
+        match self {
+            Self::Integer(i) => Some(Float::from(i)),
+            Self::Decimal(d) => Some(Float::from(d)),
+            Self::Float(f) => Some(f),
+            Self::Double(_) => None,
+        }
+    }
+
+    fn double(self) -> Double {
+        match self {
+            Self::Integer(i) => Double::from(i),
+            Self::Decimal(d) => Double::from(d),
+            Self::Float(f) => Double::from(f),
+            Self::Double(d) => d,
+        }
+    }
+
+    fn term(self) -> Term {
+        let (lexical, datatype) = match self {
+            Self::Integer(i) => (i.to_string(), xsd::INTEGER),
+            Self::Decimal(d) => (d.to_string(), xsd::DECIMAL),
+            Self::Float(f) => (f.to_string(), xsd::FLOAT),
+            Self::Double(d) => (d.to_string(), xsd::DOUBLE),
+        };
+        Literal::new_typed_literal(lexical, datatype).into()
+    }
+}
+
+fn sum(values: &[Term]) -> Option<Term> {
+    let mut total = Numeric::Integer(Integer::from(0));
+    for value in values {
+        total = total.add(Numeric::of(value)?)?;
+    }
+    Some(total.term())
+}
+
+fn average(values: &[Term]) -> Option<Term> {
+    if values.is_empty() {
+        return Some(integer(0));
+    }
+    let mut total = Numeric::Integer(Integer::from(0));
+    for value in values {
+        total = total.add(Numeric::of(value)?)?;
+    }
+    let count = values.len() as i64;
+    Some(match total {
+        // SPARQL: the average of integers or decimals is a decimal.
+        Numeric::Integer(_) | Numeric::Decimal(_) => {
+            Numeric::Decimal(total.decimal()?.checked_div(Decimal::from(count))?).term()
+        }
+        Numeric::Float(f) => Numeric::Float(f / Float::from(count as f32)).term(),
+        Numeric::Double(d) => Numeric::Double(d / Double::from(count as f64)).term(),
+    })
+}
+
+/// Columns of the variables `left` and `right` share, pairwise.
+fn shared_columns(left: &Solutions, right: &Solutions) -> (Vec<usize>, Vec<usize>) {
+    left.vars
+        .iter()
+        .enumerate()
+        .filter_map(|(l, v)| Some((l, right.column(v)?)))
+        .unzip()
+}
+
+fn joined_vars(left: &Solutions, right: &Solutions, right_keys: &[usize]) -> Vec<Variable> {
+    let mut vars = left.vars.clone();
+    vars.extend(
+        right
+            .vars
+            .iter()
+            .enumerate()
+            .filter(|(c, _)| !right_keys.contains(c))
+            .map(|(_, v)| v.clone()),
+    );
+    vars
+}
+
+fn has_undef(table: &IdTable, columns: &[usize]) -> bool {
+    columns.iter().any(|&c| table.column(c).contains(&UNDEF))
+}
+
+fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {
+    let term = |t: &TermPattern| match t {
+        TermPattern::Variable(v) => Some(v.clone()),
+        TermPattern::BlankNode(b) => {
+            Some(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
+        }
+        _ => None,
+    };
+    let predicate = match &triple.predicate {
+        NamedNodePattern::Variable(v) => Some(v.clone()),
+        NamedNodePattern::NamedNode(_) => None,
+    };
+    [term(&triple.subject), predicate, term(&triple.object)]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+enum Slot {
+    Var(Variable),
+    Const(TermId),
+}
+
+impl Slot {
+    fn is_var(&self, variable: &Variable) -> bool {
+        matches!(self, Slot::Var(v) if v == variable)
+    }
+}
+
+/// A triple pattern over the default graph, with constants resolved to ids.
+#[derive(Clone, Debug)]
+struct ScanPattern {
+    slots: [Slot; 3],
+}
+
+impl ScanPattern {
+    fn quad_pattern(&self) -> QuadPattern {
+        let constant = |slot: &Slot| match slot {
+            Slot::Const(id) => Some(*id),
+            Slot::Var(_) => None,
+        };
+        QuadPattern {
+            subject: constant(&self.slots[0]),
+            predicate: constant(&self.slots[1]),
+            object: constant(&self.slots[2]),
+            graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
+        }
+    }
+
+    /// Distinct variables in subject, predicate, object order.
+    fn vars(&self) -> Vec<Variable> {
+        let mut vars: Vec<Variable> = Vec::new();
+        for slot in &self.slots {
+            if let Slot::Var(v) = slot
+                && !vars.contains(v)
+            {
+                vars.push(v.clone());
+            }
+        }
+        vars
+    }
+
+    /// The first component of `permutation`'s order that this pattern leaves unbound (the
+    /// graph is always bound: patterns are in the default graph).
+    fn first_free(&self, permutation: Permutation) -> Option<usize> {
+        permutation
+            .order()
+            .into_iter()
+            .find(|&c| c < 3 && matches!(self.slots[c], Slot::Var(_)))
+    }
+
+    fn repeats_variable(&self) -> bool {
+        let mut names: Vec<&Variable> = self
+            .slots
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Var(v) => Some(v),
+                Slot::Const(_) => None,
+            })
+            .collect();
+        let before = names.len();
+        names.sort_by_key(|v| v.as_str());
+        names.dedup();
+        names.len() != before
+    }
+
+    /// A graph-first permutation (the pattern is in the default graph) whose free part starts
+    /// with `sort_var`, if one exists; any usable one otherwise.
+    fn permutation_for(&self, sort_var: Option<&Variable>) -> Permutation {
+        const CANDIDATES: [Permutation; 4] = [
+            Permutation::Gspo,
+            Permutation::Gpos,
+            Permutation::Gosp,
+            Permutation::Gpso,
+        ];
+        let pattern = self.quad_pattern();
+        let bound =
+            |component: usize| component == 3 || matches!(self.slots[component], Slot::Const(_));
+        let usable = |p: &Permutation| {
+            let order = p.order();
+            let prefix = order.iter().take_while(|&&c| bound(c)).count();
+            order[prefix..].iter().all(|&c| !bound(c))
+        };
+        let first_free = |p: &Permutation| p.order().into_iter().find(|&c| !bound(c));
+        let wanted = sort_var.and_then(|v| (0..3).find(|&c| self.slots[c].is_var(v)));
+        CANDIDATES
+            .iter()
+            .copied()
+            .filter(usable)
+            .find(|p| wanted.is_none() || first_free(p) == wanted)
+            .or_else(|| CANDIDATES.iter().copied().find(usable))
+            .inspect(|_| {
+                debug_assert_eq!(pattern.graph, GraphSelector::Exact(TermId::DEFAULT_GRAPH))
+            })
+            .expect("GSPO answers every default-graph pattern with a bound prefix")
+    }
+}
