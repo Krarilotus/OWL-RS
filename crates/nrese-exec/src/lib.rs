@@ -5,6 +5,7 @@
 //! - [`table`]: [`IdTable`], column-major `u64` tables with sort metadata
 //! - [`join`]: merge, hash, left (OPTIONAL) and anti (MINUS, NOT EXISTS) joins on key columns
 //! - [`group`]: grouping with aggregates over sorted or unsorted input
+//! - [`graph`]: adjacency, reachability and closures (property paths, hierarchies)
 //! - [`budget`]: per-query memory accounting
 //!
 //! Everything here works on ids: it never decodes a term. Operations that need values
@@ -16,6 +17,7 @@
 //! have no stored id.
 
 pub mod budget;
+pub mod graph;
 pub mod group;
 pub mod join;
 pub mod table;
