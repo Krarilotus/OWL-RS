@@ -163,6 +163,77 @@ impl Snapshot {
         })
     }
 
+    /// Like [`scan_sorted_in`](Self::scan_sorted_in), with the first unbound component of the
+    /// permutation's order restricted to `low..=high` (FILTER ranges over ordered ids, such
+    /// as inline integers and dates, and whole kinds via [`TermId::kind_range`]).
+    pub fn scan_range_in<'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        low: TermId,
+        high: TermId,
+    ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
+        let plan = self.range_plan(model, pattern, permutation, low, high)?;
+        let scan = move |stack: Stack| {
+            model
+                .includes(stack)
+                .then(|| self.version.stack(stack).scan_plan(&plan))
+                .into_iter()
+                .flatten()
+        };
+        Some(SortedMerge {
+            left: scan(Stack::Asserted).peekable(),
+            right: scan(Stack::Inferred).peekable(),
+            permutation,
+        })
+    }
+
+    /// Exact number of quads [`scan_range_in`](Self::scan_range_in) yields.
+    pub fn count_range_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        low: TermId,
+        high: TermId,
+    ) -> Option<u64> {
+        let plan = self.range_plan(model, pattern, permutation, low, high)?;
+        Some(
+            Stack::ALL
+                .into_iter()
+                .filter(|&stack| model.includes(stack))
+                .map(|stack| self.version.stack(stack).count_plan(&plan))
+                .sum(),
+        )
+    }
+
+    fn range_plan(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        low: TermId,
+        high: TermId,
+    ) -> Option<AccessPlan> {
+        let mut plan = AccessPlan::in_permutation(pattern, permutation)?;
+        let bound = plan
+            .low
+            .iter()
+            .zip(&plan.high)
+            .take_while(|(l, h)| l == h)
+            .count();
+        let supported = Stack::ALL
+            .into_iter()
+            .all(|stack| !model.includes(stack) || stack.layout().supports(permutation));
+        if bound >= 4 || plan.exclude_default_graph || !supported {
+            return None;
+        }
+        plan.low[bound] = low.raw();
+        plan.high[bound] = high.raw();
+        Some(plan)
+    }
+
     /// For each distinct value of the first unbound component of `pattern` in `permutation`'s
     /// order, the number of matching quads in `model`, in id order. `None` if the pattern's
     /// bound components aren't a prefix of that order, or an included stack can't answer it.

@@ -42,7 +42,21 @@ fn ex(local: &str) -> NamedNode {
 }
 
 fn random_object(rng: &mut Rng) -> Term {
-    match rng.below(9) {
+    match rng.below(12) {
+        // Range pruning edge cases: dates with timezones next to the FILTER bounds, a
+        // non-canonical integer and an xsd:int (both dictionary typed literals).
+        9 => Literal::new_typed_literal(
+            *rng.pick(&[
+                "2001-01-01Z",
+                "2000-12-31+14:00",
+                "2001-01-02-14:00",
+                "2000-01-01+05:30",
+            ]),
+            xsd::DATE,
+        )
+        .into(),
+        10 => Literal::new_typed_literal(format!("0{}", rng.below(8)), xsd::INTEGER).into(),
+        11 => Literal::new_typed_literal(rng.below(8).to_string(), xsd::INT).into(),
         0..=2 => ex(&format!("e{}", rng.below(6))).into(),
         3 => Literal::new_typed_literal(rng.below(8).to_string(), xsd::INTEGER).into(),
         4 => Literal::new_typed_literal(format!("{}.5", rng.below(5)), xsd::DECIMAL).into(),
@@ -109,7 +123,11 @@ fn bgp(rng: &mut Rng) -> String {
 fn filter(rng: &mut Rng) -> String {
     let v = rng.pick(&VARS);
     let w = rng.pick(&VARS);
-    match rng.below(17) {
+    match rng.below(19) {
+        17 => format!(
+            "FILTER({v} >= \"2000-01-02\"^^<http://www.w3.org/2001/XMLSchema#date> && {v} < \"2001-01-02\"^^<http://www.w3.org/2001/XMLSchema#date>)"
+        ),
+        18 => format!("FILTER({v} > 1 && 5 >= {v} && {w} != 2)"),
         // The compiled (id-level) shapes, alone and combined:
         10 => format!("FILTER(CONTAINS({v}, \"1\") || STRSTARTS(STR({w}), \"http\"))"),
         11 => format!("FILTER(LANGMATCHES(LANG({v}), \"EN\") && !isBlank({w}))"),
@@ -160,7 +178,12 @@ fn random_query(rng: &mut Rng) -> (String, bool) {
     if rng.below(8) == 0 {
         // LIMIT over one filtered pattern (the streamed scan); see `limited` below.
         return (
-            format!("SELECT * WHERE {{ {} {} }} LIMIT {}", triple(rng), filter(rng), 1 + rng.below(4)),
+            format!(
+                "SELECT * WHERE {{ {} {} }} LIMIT {}",
+                triple(rng),
+                filter(rng),
+                1 + rng.below(4)
+            ),
             false,
         );
     }
@@ -205,6 +228,26 @@ fn random_query(rng: &mut Rng) -> (String, bool) {
     }
 }
 
+/// Integer literals by value: spareval's ORDER BY + LIMIT path outputs `"07"` and
+/// `"7"^^xsd:int` as `"7"^^xsd:integer`, while the native executor returns the stored
+/// terms (RDF term identity). Both are the same values; the test compares values there.
+fn by_value(term: &Term) -> Term {
+    const INTEGERS: [&str; 3] = [
+        "http://www.w3.org/2001/XMLSchema#integer",
+        "http://www.w3.org/2001/XMLSchema#int",
+        "http://www.w3.org/2001/XMLSchema#long",
+    ];
+    match term {
+        Term::Literal(l) if INTEGERS.contains(&l.datatype().as_str()) => {
+            match l.value().parse::<i64>() {
+                Ok(v) => Literal::new_typed_literal(v.to_string(), xsd::INTEGER).into(),
+                Err(_) => term.clone(),
+            }
+        }
+        _ => term.clone(),
+    }
+}
+
 fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
     let QueryResults::Solutions(solutions) = results else {
         panic!("SELECT gives solutions")
@@ -218,7 +261,7 @@ fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
                 .map(|v| {
                     solution
                         .get(v)
-                        .map_or("UNDEF".to_owned(), |t| t.to_string())
+                        .map_or("UNDEF".to_owned(), |t| by_value(t).to_string())
                 })
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -245,7 +288,7 @@ fn native_results_equal_spareval_on_random_queries() {
         ..QueryOptions::default()
     };
     let (mut checked, mut fallbacks) = (0, Vec::new());
-    for dataset_case in 0..40 {
+    for dataset_case in 0..150 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {

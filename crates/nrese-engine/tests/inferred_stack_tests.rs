@@ -396,6 +396,44 @@ fn assert_snapshot(snapshot: &Snapshot, model: &Model, context: &str) {
                     got, sorted,
                     "{context}: {read_model:?} {pattern:?} {permutation:?}"
                 );
+                // A range on the first unbound component keeps exactly the quads whose value
+                // there lies in the range, in the same order; the count agrees.
+                if pattern.graph == GraphSelector::AnyNamed {
+                    continue;
+                }
+                let bound = |component: usize| match component {
+                    0 => pattern.subject.is_some(),
+                    1 => pattern.predicate.is_some(),
+                    2 => pattern.object.is_some(),
+                    _ => matches!(pattern.graph, GraphSelector::Exact(_)),
+                };
+                let position = permutation
+                    .order()
+                    .iter()
+                    .take_while(|&&c| bound(c))
+                    .count();
+                if position == 4 {
+                    continue;
+                }
+                let (low, high) = (id(3), id(10));
+                let in_range: Vec<_> = sorted
+                    .iter()
+                    .filter(|q| (low..=high).contains(&key(permutation, q)[position]))
+                    .copied()
+                    .collect();
+                let ranged: Vec<_> = snapshot
+                    .scan_range_in(read_model, &pattern, permutation, low, high)
+                    .expect("same plan as the sorted scan")
+                    .collect();
+                assert_eq!(
+                    ranged, in_range,
+                    "{context}: range {read_model:?} {pattern:?} {permutation:?}"
+                );
+                assert_eq!(
+                    snapshot.count_range_in(read_model, &pattern, permutation, low, high),
+                    Some(in_range.len() as u64),
+                    "{context}: range count {read_model:?} {pattern:?} {permutation:?}"
+                );
             }
         }
     }
