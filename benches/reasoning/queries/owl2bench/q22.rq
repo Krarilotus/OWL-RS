@@ -1,0 +1,5 @@
+# OWL2Bench Q22. Find all the students who took course taught by the Dean of the Organization. The Query performs search across all the universities.
+# Profiles: EL, QL, RL, DL
+PREFIX : <https://kracr.iiitd.edu.in/OWL2Bench#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?s ?c WHERE {?s rdf:type :Student. ?x rdf:type :Organization. ?x :hasDean ?z. ?z :teachesCourse ?c. ?s :takesCourse ?c }

@@ -13,9 +13,11 @@ import org.apache.jena.rdf.model.*;
 import org.apache.jena.reasoner.Reasoner;
 import org.apache.jena.reasoner.ReasonerRegistry;
 import org.apache.jena.riot.*;
+import org.apache.jena.sys.JenaSystem;
 
 public class Materialise {
     public static void main(String[] args) throws Exception {
+        JenaSystem.init(); // the RDFS reasoner otherwise initialises before the datatypes
         Reasoner reasoner = switch (args[0]) {
             case "rdfs" -> ReasonerRegistry.getRDFSReasoner();
             case "owl-micro" -> ReasonerRegistry.getOWLMicroReasoner();

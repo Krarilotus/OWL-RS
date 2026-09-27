@@ -2,7 +2,7 @@
 # Pinned to a commit so generated data is reproducible across machines.
 # The fork targets Java 7, which JDK 17+ no longer compiles for.
 FROM maven:3-eclipse-temurin-11 AS build
-ARG UBA_COMMIT=improved
+ARG UBA_COMMIT=48686cd616f564c8fc360dc5abbcc294678655c4
 RUN git clone --quiet https://github.com/rvesse/lubm-uba.git /src \
  && cd /src && git checkout --quiet "$UBA_COMMIT" && git rev-parse HEAD > /commit \
  && mvn -q -DskipTests clean package
