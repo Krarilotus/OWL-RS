@@ -1,0 +1,5 @@
+# OWL2Bench Q20. Find all the instances who have same home town with any other instance. The query performs search across universities.
+# Profiles: EL, QL, RL, DL
+PREFIX : <https://kracr.iiitd.edu.in/OWL2Bench#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?x ?y WHERE {?x :hasSameHomeTownWith ?y }

@@ -1,0 +1,6 @@
+# OWL2Bench Q15. Find the head of all the Organization.
+# Construct: isHeadOf is an Inverse Functional Object Property. Domain(Person), Range(Organization).
+# Profiles: RL, DL
+PREFIX : <https://kracr.iiitd.edu.in/OWL2Bench#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?x WHERE {?x :isHeadOf ?y}

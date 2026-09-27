@@ -1,0 +1,6 @@
+# OWL2Bench Q8. Find Affiliations of all the Organizations.
+# Construct: isAffiliatedOrganizationOf is an Asymmetric Object Property. Domain(Organization), Range(Organization).
+# Profiles: QL, RL, DL
+PREFIX : <https://kracr.iiitd.edu.in/OWL2Bench#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?x ?y WHERE { ?x :isAffiliatedOrganizationOf ?y }

@@ -1,0 +1,6 @@
+# OWL2Bench Q1. Find the instances who know some other instance.
+# Construct: knows is a Reflexive Object Property.
+# Profiles: EL, QL, DL
+PREFIX : <https://kracr.iiitd.edu.in/OWL2Bench#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?x ?y WHERE { ?x :knows ?y }

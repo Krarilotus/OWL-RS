@@ -1,0 +1,26 @@
+# OWL2Bench query -> the OWL 2 profiles whose TBox supports its construct
+# (Zenodo 10.5281/zenodo.3838735, CC-BY-4.0; the prefix is the generator's namespace since 2022). Queries outside a profile may
+# legitimately return fewer answers under that profile's reasoning.
+# query	profiles
+q01	EL,QL,DL
+q02	EL,RL,DL
+q03	EL,RL,DL
+q04	EL,RL,DL
+q05	EL,RL,DL
+q06	EL,DL
+q07	QL,RL,DL
+q08	QL,RL,DL
+q09	QL,RL,DL
+q10	QL,RL,DL
+q11	QL,RL,DL
+q12	RL,DL
+q13	RL,DL
+q14	RL,DL
+q15	RL,DL
+q16	RL,DL
+q17	DL
+q18	DL
+q19	EL,QL,RL,DL
+q20	EL,QL,RL,DL
+q21	EL,QL,RL,DL
+q22	EL,QL,RL,DL

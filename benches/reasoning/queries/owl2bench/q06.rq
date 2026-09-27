@@ -1,0 +1,6 @@
+# OWL2Bench Q6. Find all the instances of class SelfAwarePerson. SelfAwarePerson is a Person who knows themselves.
+# Construct: ObjectHasSelf.
+# Profiles: EL, DL
+PREFIX : <https://kracr.iiitd.edu.in/OWL2Bench#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?x ?y WHERE { ?x rdf:type :SelfAwarePerson }
