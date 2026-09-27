@@ -21,3 +21,15 @@ async-trait = "0.1.89"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.41"
+
+# Pf7a, measured with the perf lab (benches/baselines/perf-lab/2026-09-27-*): fat LTO with one
+# codegen unit cut the query sets' sum of p50 by 8-19% on top of mimalloc. Unwinding stays on:
+# the server isolates panics per request.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+# `cargo build --profile profiling`: release code with symbols, for perf/samply.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
