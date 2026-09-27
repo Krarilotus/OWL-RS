@@ -177,9 +177,14 @@ fn random_query(rng: &mut Rng) -> (String, bool) {
                 true,
             )
         }
-        2 => (
+        2 if rng.below(2) == 0 => (
             format!("SELECT DISTINCT ?a ?c WHERE {{ {pattern} }}"),
             false,
+        ),
+        // DISTINCT with ORDER BY over every projected variable: a deterministic sequence.
+        2 => (
+            format!("SELECT DISTINCT ?a ?c WHERE {{ {pattern} }} ORDER BY ?c DESC(?a)"),
+            true,
         ),
         _ => (format!("SELECT * WHERE {{ {pattern} }}"), false),
     }

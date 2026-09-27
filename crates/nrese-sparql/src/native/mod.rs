@@ -495,6 +495,27 @@ impl<'a> Context<'a> {
                 Ok(self.project(solutions, variables))
             }
             GraphPattern::Distinct { inner } => {
+                // SELECT DISTINCT … ORDER BY projected variables: deduplicate first, then sort
+                // the (usually far fewer) distinct rows: the same rows, in an order that
+                // ORDER BY permits (ties may come out differently, which SPARQL allows).
+                if let GraphPattern::Project {
+                    inner: projected,
+                    variables,
+                } = &**inner
+                    && let GraphPattern::OrderBy {
+                        inner: sorted,
+                        expression,
+                    } = &**projected
+                    && expression.iter().all(|key| {
+                        let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
+                        matches!(e, Expression::Variable(v) if variables.contains(v))
+                    })
+                {
+                    let solutions = self.eval(sorted)?;
+                    let mut solutions = self.project(solutions, variables);
+                    solutions.table.dedup_preserving_order();
+                    return self.order_by(solutions, expression, None);
+                }
                 let mut solutions = self.eval(inner)?;
                 solutions.table.dedup_preserving_order();
                 Ok(solutions)
@@ -942,6 +963,39 @@ impl<'a> Context<'a> {
 
     /// Sorts by the ORDER BY keys. With `limit`, only the first `limit` rows are guaranteed to
     /// be in order (a partial sort), which is all `LIMIT` needs.
+    /// A sort key per row of `column` whose integer order is the SPARQL `ORDER BY` order of the
+    /// bound terms. Inline integers (and UNDEF) sort by id already (offset binary). Otherwise
+    /// each distinct id is decoded once, the distinct terms are sorted, and every row gets its
+    /// term's rank: equal-ordering terms (1 and 1.0) share a rank.
+    fn order_ranks(&self, column: &[u64]) -> Vec<u64> {
+        let integer = |id: u64| TermId::from_raw(id).kind() == nrese_engine::TermKind::Integer;
+        if column.iter().all(|&id| id == UNDEF || integer(id)) {
+            // UNDEF sorts first in SPARQL; every inline integer id is above 0.
+            return column
+                .iter()
+                .map(|&id| if id == UNDEF { 0 } else { id })
+                .collect();
+        }
+        let mut distinct = column.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let terms: Vec<Option<Term>> = distinct.iter().map(|&id| self.term(id)).collect();
+        let mut by_term: Vec<usize> = (0..distinct.len()).collect();
+        by_term.sort_by(|&a, &b| value::order(terms[a].as_ref(), terms[b].as_ref()));
+        let mut rank_of = vec![0u64; distinct.len()];
+        let mut rank = 0;
+        for (i, &d) in by_term.iter().enumerate() {
+            if i > 0 && value::order(terms[by_term[i - 1]].as_ref(), terms[d].as_ref()).is_ne() {
+                rank += 1;
+            }
+            rank_of[d] = rank;
+        }
+        column
+            .iter()
+            .map(|id| rank_of[distinct.binary_search(id).expect("id is in the column")])
+            .collect()
+    }
+
     fn order_by(
         &self,
         mut solutions: Solutions,
@@ -957,20 +1011,8 @@ impl<'a> Context<'a> {
                 let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
                 if let Expression::Variable(v) = e
                     && let Some(column) = solutions.column(v)
-                    && solutions.table.column(column).iter().all(|&id| {
-                        id == UNDEF
-                            || TermId::from_raw(id).kind() == nrese_engine::TermKind::Integer
-                    })
                 {
-                    // UNDEF sorts first in SPARQL; every inline integer id is above 0.
-                    return SortKey::Ids(
-                        solutions
-                            .table
-                            .column(column)
-                            .iter()
-                            .map(|&id| if id == UNDEF { 0 } else { id })
-                            .collect(),
-                    );
+                    return SortKey::Ids(self.order_ranks(solutions.table.column(column)));
                 }
                 SortKey::Terms(
                     (0..n)
@@ -1140,6 +1182,83 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// An aggregate over one variable's ids without decoding terms, where that is exact:
+    /// COUNT always, and SUM/AVG/MIN/MAX when every value is an inline integer (whose id
+    /// order is value order). `None` means "evaluate on terms". Error semantics are
+    /// spareval's: an unbound value makes SUM/AVG/MIN/MAX unbound, and an i64 overflow
+    /// makes SUM/AVG unbound.
+    fn aggregate_ids(
+        &self,
+        name: &AggregateFunction,
+        mut ids: Vec<u64>,
+        distinct: bool,
+    ) -> Option<u64> {
+        let dedup = |ids: &mut Vec<u64>| {
+            let mut seen = std::collections::HashSet::with_capacity(ids.len());
+            ids.retain(|id| seen.insert(*id));
+        };
+        match name {
+            AggregateFunction::Count => {
+                ids.retain(|&id| id != UNDEF);
+                if distinct {
+                    dedup(&mut ids);
+                }
+                Some(self.id(&integer(ids.len() as u64)))
+            }
+            AggregateFunction::Sum
+            | AggregateFunction::Avg
+            | AggregateFunction::Min
+            | AggregateFunction::Max => {
+                if ids.contains(&UNDEF) {
+                    return Some(UNDEF);
+                }
+                let values: Option<Vec<i64>> = ids
+                    .iter()
+                    .map(|&id| TermId::from_raw(id).as_inline_integer())
+                    .collect();
+                let values = values?;
+                if distinct {
+                    dedup(&mut ids);
+                }
+                let values: Vec<i64> = if distinct {
+                    ids.iter()
+                        .filter_map(|&id| TermId::from_raw(id).as_inline_integer())
+                        .collect()
+                } else {
+                    values
+                };
+                Some(match name {
+                    AggregateFunction::Min => ids.iter().copied().min().unwrap_or(UNDEF),
+                    AggregateFunction::Max => ids.iter().copied().max().unwrap_or(UNDEF),
+                    _ => {
+                        let Some(sum) = values.iter().try_fold(0i64, |acc, &v| acc.checked_add(v))
+                        else {
+                            return Some(UNDEF);
+                        };
+                        if *name == AggregateFunction::Sum {
+                            self.id(
+                                &Literal::new_typed_literal(sum.to_string(), xsd::INTEGER).into()
+                            )
+                        } else if values.is_empty() {
+                            self.id(&integer(0))
+                        } else {
+                            match Decimal::from(sum).checked_div(Decimal::from(values.len() as i64))
+                            {
+                                Some(avg) => self.id(&Literal::new_typed_literal(
+                                    avg.to_string(),
+                                    xsd::DECIMAL,
+                                )
+                                .into()),
+                                None => UNDEF,
+                            }
+                        }
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn aggregate(
         &self,
         solutions: &Solutions,
@@ -1164,6 +1283,18 @@ impl<'a> Context<'a> {
                 expr,
                 distinct,
             } => {
+                if let Expression::Variable(variable) = expr {
+                    let ids: Vec<u64> = match solutions.column(variable) {
+                        Some(column) => rows
+                            .iter()
+                            .map(|&r| solutions.table.get(r, column))
+                            .collect(),
+                        None => vec![UNDEF; rows.len()],
+                    };
+                    if let Some(result) = self.aggregate_ids(name, ids, *distinct) {
+                        return result;
+                    }
+                }
                 let evaluated: Vec<Option<Term>> = rows
                     .iter()
                     .map(|&row| self.evaluator.eval(expr, &self.binding(solutions, row)))
