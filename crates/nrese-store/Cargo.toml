@@ -21,4 +21,9 @@ tracing.workspace = true
 url = "2.5.7"
 
 [dev-dependencies]
+mimalloc = { version = "0.1", default-features = false }
 tempfile = "3.23.0"
+
+[lints.rust]
+# `--cfg system_alloc` switches the perf lab to the system allocator (benches/perf-lab.sh).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_alloc)"] }
