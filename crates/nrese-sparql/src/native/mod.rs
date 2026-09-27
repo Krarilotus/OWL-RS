@@ -15,6 +15,7 @@
 
 mod expr;
 mod fast;
+mod paths;
 mod ranges;
 mod value;
 
@@ -144,6 +145,9 @@ pub(crate) fn query_supported(query: &Query) -> bool {
 pub(crate) fn supported(pattern: &GraphPattern) -> bool {
     match pattern {
         GraphPattern::Bgp { patterns } => patterns.iter().all(supported_triple),
+        GraphPattern::Path {
+            subject, object, ..
+        } => supported_term(subject) && supported_term(object),
         GraphPattern::Join { left, right }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => supported(left) && supported(right),
@@ -193,6 +197,16 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
         }
         _ => false,
     }
+}
+
+fn supported_term(term: &TermPattern) -> bool {
+    matches!(
+        term,
+        TermPattern::NamedNode(_)
+            | TermPattern::BlankNode(_)
+            | TermPattern::Literal(_)
+            | TermPattern::Variable(_)
+    )
 }
 
 fn supported_triple(triple: &TriplePattern) -> bool {
@@ -421,6 +435,11 @@ impl<'a> Context<'a> {
         self.check()?;
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns, &[]),
+            GraphPattern::Path {
+                subject,
+                path,
+                object,
+            } => self.path(subject, path, object),
             GraphPattern::Join { left, right } => {
                 let (left, right) = (self.eval(left)?, self.eval(right)?);
                 self.join(left, right)
@@ -593,6 +612,65 @@ impl<'a> Context<'a> {
             } => self.group(inner, variables, aggregates),
             _ => Err(NativeError::Fallback),
         }
+    }
+
+    // --- property paths ------------------------------------------------------------------
+
+    fn path(
+        &self,
+        subject: &TermPattern,
+        path: &spargebra::algebra::PropertyPathExpression,
+        object: &TermPattern,
+    ) -> NativeResult<Solutions> {
+        let resolved = paths::Path::resolve(path, self.snapshot);
+        let evaluator = paths::PathEvaluator {
+            snapshot: self.snapshot,
+        };
+        // A variable (blank nodes are variables here), or a constant's id (computed if the
+        // store doesn't know it; such an id has no edges).
+        let end = |term: &TermPattern| -> Result<Variable, u64> {
+            match term {
+                TermPattern::Variable(v) => Ok(v.clone()),
+                TermPattern::BlankNode(b) => {
+                    Ok(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
+                }
+                TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())),
+                TermPattern::Literal(l) => Err(self.id(&l.clone().into())),
+                #[allow(unreachable_patterns)]
+                _ => Err(UNDEF),
+            }
+        };
+        let column = |values: Vec<u64>| IdTable::from_columns(vec![values]);
+        let (vars, table) = match (end(subject), end(object)) {
+            (Err(start), Err(finish)) => {
+                let rows = usize::from(evaluator.connects(&resolved, start, finish));
+                (
+                    Vec::new(),
+                    IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
+                )
+            }
+            (Err(start), Ok(o)) => (vec![o], column(evaluator.from(&resolved, start))),
+            (Ok(s), Err(finish)) => (vec![s], column(evaluator.to(&resolved, finish))),
+            (Ok(s), Ok(o)) if s == o => {
+                let same: Vec<u64> = evaluator
+                    .open(&resolved)
+                    .into_iter()
+                    .filter(|(a, b)| a == b)
+                    .map(|(a, _)| a)
+                    .collect();
+                (vec![s], column(same))
+            }
+            (Ok(s), Ok(o)) => {
+                let (starts, ends): (Vec<u64>, Vec<u64>) =
+                    evaluator.open(&resolved).into_iter().unzip();
+                (vec![s, o], IdTable::from_columns(vec![starts, ends]))
+            }
+        };
+        self.produced(Solutions {
+            vars,
+            table,
+            ordered: false,
+        })
     }
 
     // --- basic graph patterns ------------------------------------------------------------
