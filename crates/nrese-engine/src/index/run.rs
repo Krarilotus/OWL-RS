@@ -91,7 +91,7 @@ impl Run {
             let mut entries: Vec<(Key, bool)> = Vec::with_capacity(inserts.len() + deletes.len());
             entries.extend(inserts.iter().map(|q| (permutation.to_key(q), false)));
             entries.extend(deletes.iter().map(|q| (permutation.to_key(q), true)));
-            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            entries.sort_unstable_by_key(|entry| entry.0);
             PermutationRun::from_sorted(entries)
         };
         Self::from_permutations(

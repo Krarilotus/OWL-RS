@@ -49,7 +49,8 @@ ORACLE_MAX_TRIPLES=${ORACLE_MAX_TRIPLES:-200000}
 ORACLE_TIMEOUT_S=${ORACLE_TIMEOUT_S:-900}  # owlrl is pure Python; past this, Nemo is the reference
 TIMEOUT_S=${TIMEOUT_S:-3600}
 JAVA_HEAP=${JAVA_HEAP:-16g}
-RUST_IMAGE=${RUST_IMAGE:-rust:1.91-bookworm}
+# The Rust image follows rust-toolchain.toml, so benchmarks build with the pinned compiler.
+RUST_IMAGE=${RUST_IMAGE:-rust:$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")-bookworm}
 DATASETS=${*:-lubm-1 lubm-10}
 mkdir -p "$RESULTS" "$ORACLE_CACHE"
 
