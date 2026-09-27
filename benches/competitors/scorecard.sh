@@ -48,7 +48,8 @@ QLEVER_IMAGE=${QLEVER_IMAGE:-adfreiburg/qlever:latest}
 OXIGRAPH_IMAGE=${OXIGRAPH_IMAGE:-ghcr.io/oxigraph/oxigraph:0.5.11}
 VIRTUOSO_IMAGE=${VIRTUOSO_IMAGE:-openlink/virtuoso-opensource-7:7.2.17}
 JENA_IMAGE=${JENA_IMAGE:-nrese-bench/jena:6.2.0}
-RUST_IMAGE=${RUST_IMAGE:-rust:1.91-bookworm}
+# The Rust image follows rust-toolchain.toml, so benchmarks build with the pinned compiler.
+RUST_IMAGE=${RUST_IMAGE:-rust:$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")-bookworm}
 JAVA_HEAP=${JAVA_HEAP:-16g}
 # GraphDB 11 answers queries only with a licence file, even the Free edition (it loads without
 # one). Request the free licence on the Graphwise download page; see README.md.
