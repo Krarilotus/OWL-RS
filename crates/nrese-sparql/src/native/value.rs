@@ -199,11 +199,20 @@ pub(crate) fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
             // otherwise by (lexical form, datatype, language).
             match compare(&Value::of_literal(x), &Value::of_literal(y)) {
                 Some(order) => order,
-                None => (x.value(), x.datatype(), x.language()).cmp(&(
-                    y.value(),
-                    y.datatype(),
-                    y.language(),
-                )),
+                // spareval compares the canonical forms of its values here ("03" as "3",
+                // an xsd:int as an xsd:integer).
+                None => {
+                    let (Term::Literal(x), Term::Literal(y)) =
+                        (canonical(x.clone().into()), canonical(y.clone().into()))
+                    else {
+                        unreachable!("canonical keeps literals literals")
+                    };
+                    (x.value(), x.datatype(), x.language()).cmp(&(
+                        y.value(),
+                        y.datatype(),
+                        y.language(),
+                    ))
+                }
             }
         }
         _ => rank(a).cmp(&rank(b)),
@@ -211,7 +220,8 @@ pub(crate) fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
 }
 
 /// The term an evaluator returns for a computed value (MIN, MAX, SAMPLE): literals of the
-/// core XSD types in canonical form, as spareval's value-based aggregates produce them;
+/// core XSD types in canonical form (derived integer types as xsd:integer), as spareval's
+/// value-based aggregates produce them;
 /// other terms unchanged. Stored terms that are bound directly keep their lexical form.
 pub(crate) fn canonical(term: Term) -> Term {
     let Term::Literal(literal) = &term else {
@@ -221,7 +231,8 @@ pub(crate) fn canonical(term: Term) -> Term {
     let canonical =
         |lexical: String| Literal::new_typed_literal(lexical, datatype.into_owned()).into();
     match Value::of_literal(literal) {
-        Value::Integer(i) if datatype == xsd::INTEGER => canonical(i.to_string()),
+        // Every integer type becomes xsd:integer, as spareval's integer values do.
+        Value::Integer(i) => Literal::new_typed_literal(i.to_string(), xsd::INTEGER).into(),
         Value::Decimal(d) => canonical(d.to_string()),
         Value::Double(d) => canonical(d.to_string()),
         Value::Float(f) => canonical(f.to_string()),
