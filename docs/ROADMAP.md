@@ -298,7 +298,7 @@ Benchmarks run on one documented machine profile. Numbers go into `docs/spec/06-
 | The scope is large relative to team size | Milestones are independently useful. M1 alone makes NRESE a correct, fast-writing SPARQL store; M2 alone covers DMW/ResearchSpace needs. Re-plan at each gate. |
 | Semantic drift from GraphDB rulesets | Compare inferred-triple counts on LUBM and on our own data against a real GraphDB instance (a Free edition is enough for testing). |
 | The spareval evaluator is slow on complex queries until Pf3 | Acceptable for M1–M3 (it's Oxigraph-class). Pf3 targets the hot operators first, guided by profiles. |
-| Memory before compression (192 B/quad) | Fine up to ~50 M quads on a 16 GB machine. Pf1/Pf2 are needed before RG-scale-plus-provenance growth exceeds that; the trigger is monitored. |
+| Memory before compression (224 B/quad with seven permutations) | Fine up to ~50 M quads on a 16 GB machine. Pf1/Pf2 are needed before RG-scale-plus-provenance growth exceeds that; the trigger is monitored. |
 | Oxigraph crate API churn | Versions pinned; upgrades are explicit work items. |
 
 ## 8. Decisions

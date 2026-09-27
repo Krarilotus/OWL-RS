@@ -179,7 +179,11 @@ impl Dictionary {
             | TermKind::Date
             | TermKind::DateTime => inline_to_literal(id).map(Term::from),
             TermKind::DefaultGraph => None,
-            TermKind::Iri | TermKind::BlankNode | TermKind::Literal => {
+            TermKind::Iri
+            | TermKind::BlankNode
+            | TermKind::String
+            | TermKind::LangString
+            | TermKind::TypedLiteral => {
                 let inner = self.inner.read();
                 if id.payload() >= inner.ends.len() as u64 {
                     return None;
@@ -410,19 +414,22 @@ fn encode_key(term: TermRef<'_>, out: &mut Vec<u8>) -> TermKind {
             TermKind::BlankNode
         }
         TermRef::Literal(literal) => {
-            if let Some(language) = literal.language() {
+            let kind = if let Some(language) = literal.language() {
                 out.push(TAG_LANG);
                 out.extend_from_slice(language.as_bytes());
                 out.push(SEP);
+                TermKind::LangString
             } else if literal.datatype() == oxrdf::vocab::xsd::STRING {
                 out.push(TAG_STRING);
+                TermKind::String
             } else {
                 out.push(TAG_TYPED);
                 out.extend_from_slice(literal.datatype().as_str().as_bytes());
                 out.push(SEP);
-            }
+                TermKind::TypedLiteral
+            };
             out.extend_from_slice(literal.value().as_bytes());
-            TermKind::Literal
+            kind
         }
     }
 }
