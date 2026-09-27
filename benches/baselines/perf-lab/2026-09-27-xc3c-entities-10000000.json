@@ -1,0 +1,72 @@
+{
+  "label": "xc3c",
+  "open_s": 0.000,
+  "load_s": 2.045,
+  "peak_mib": 3656,
+  "sum_p50_ms": 254.783,
+  "queries": [
+    {
+      "name": "q01-point-lookup",
+      "rows": 4,
+      "p50_ms": 0.010,
+      "min_ms": 0.008,
+      "max_ms": 0.010
+    },
+    {
+      "name": "q02-two-hop",
+      "rows": 1,
+      "p50_ms": 0.013,
+      "min_ms": 0.012,
+      "max_ms": 0.013
+    },
+    {
+      "name": "q03-count-type",
+      "rows": 1,
+      "p50_ms": 0.003,
+      "min_ms": 0.002,
+      "max_ms": 0.007
+    },
+    {
+      "name": "q04-date-range",
+      "rows": 1,
+      "p50_ms": 111.503,
+      "min_ms": 110.746,
+      "max_ms": 112.108
+    },
+    {
+      "name": "q05-group-born",
+      "rows": 10,
+      "p50_ms": 0.046,
+      "min_ms": 0.040,
+      "max_ms": 0.063
+    },
+    {
+      "name": "q06-label-prefix",
+      "rows": 11,
+      "p50_ms": 129.206,
+      "min_ms": 127.713,
+      "max_ms": 147.098
+    },
+    {
+      "name": "q07-inbound",
+      "rows": 1,
+      "p50_ms": 0.010,
+      "min_ms": 0.003,
+      "max_ms": 0.012
+    },
+    {
+      "name": "q08-count-all",
+      "rows": 1,
+      "p50_ms": 0.006,
+      "min_ms": 0.004,
+      "max_ms": 0.008
+    },
+    {
+      "name": "q09-labels-limit",
+      "rows": 100000,
+      "p50_ms": 13.986,
+      "min_ms": 13.958,
+      "max_ms": 14.080
+    }
+  ]
+}
