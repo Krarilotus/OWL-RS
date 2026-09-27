@@ -977,6 +977,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-exec"
+version = "0.1.0"
+dependencies = [
+ "foldhash 0.2.0",
+ "hashbrown 0.16.1",
+ "rayon",
+]
+
+[[package]]
 name = "nrese-reasoner"
 version = "0.1.0"
 dependencies = [
@@ -994,6 +1003,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "jsonwebtoken",
+ "mimalloc",
  "nrese-core",
  "nrese-reasoner",
  "nrese-store",
@@ -1016,9 +1026,12 @@ name = "nrese-sparql"
 version = "0.1.0"
 dependencies = [
  "nrese-engine",
+ "nrese-exec",
  "oxigraph",
  "oxrdf",
  "oxrdfio",
+ "oxsdatatypes",
+ "regex",
  "sparesults",
  "spareval",
  "spargebra",
