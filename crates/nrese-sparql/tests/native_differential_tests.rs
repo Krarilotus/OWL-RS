@@ -46,7 +46,7 @@ fn random_object(rng: &mut Rng) -> Term {
         0..=2 => ex(&format!("e{}", rng.below(6))).into(),
         3 => Literal::new_typed_literal(rng.below(8).to_string(), xsd::INTEGER).into(),
         4 => Literal::new_typed_literal(format!("{}.5", rng.below(5)), xsd::DECIMAL).into(),
-        5 => Literal::new_typed_literal(format!("{}.0E0", rng.below(8)), xsd::DOUBLE).into(),
+        5 => Literal::new_typed_literal(format!("{}.25E0", rng.below(8)), xsd::DOUBLE).into(),
         6 => Literal::new_language_tagged_literal_unchecked(
             format!("s{}", rng.below(4)),
             *rng.pick(&["en", "de"]),
@@ -109,7 +109,15 @@ fn bgp(rng: &mut Rng) -> String {
 fn filter(rng: &mut Rng) -> String {
     let v = rng.pick(&VARS);
     let w = rng.pick(&VARS);
-    match rng.below(10) {
+    match rng.below(17) {
+        // The compiled (id-level) shapes, alone and combined:
+        10 => format!("FILTER(CONTAINS({v}, \"1\") || STRSTARTS(STR({w}), \"http\"))"),
+        11 => format!("FILTER(LANGMATCHES(LANG({v}), \"EN\") && !isBlank({w}))"),
+        12 => format!("FILTER({v} = <{EX}e1> || {w} != <{EX}e9>)"),
+        13 => format!("FILTER(3 < {v} && {v} <= 6)"),
+        14 => format!("FILTER(STRENDS({v}, \"2\") || \"de\" = LANG({v}))"),
+        15 => format!("FILTER(REGEX({v}, \"S\", \"i\"))"),
+        16 => format!("FILTER({v} = 2 || sameTerm({w}, <{EX}e3>))"),
         0 => format!("FILTER({v} > 3)"),
         1 => format!("FILTER({v} <= 2.5 || {w} = <{EX}e1>)"),
         2 => format!("FILTER(isIRI({v}))"),
@@ -149,6 +157,13 @@ fn group_pattern(rng: &mut Rng, depth: u32) -> String {
 
 fn random_query(rng: &mut Rng) -> (String, bool) {
     let pattern = group_pattern(rng, 0);
+    if rng.below(8) == 0 {
+        // LIMIT over one filtered pattern (the streamed scan); see `limited` below.
+        return (
+            format!("SELECT * WHERE {{ {} {} }} LIMIT {}", triple(rng), filter(rng), 1 + rng.below(4)),
+            false,
+        );
+    }
     match rng.below(4) {
         0 => {
             let key = rng.pick(&VARS);
@@ -215,6 +230,13 @@ fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
     out
 }
 
+/// The LIMIT of a generated `SELECT * … LIMIT n` query without ORDER BY.
+fn limited(text: &str) -> Option<usize> {
+    (!text.contains("ORDER BY"))
+        .then(|| text.rsplit_once(" LIMIT ")?.1.parse().ok())
+        .flatten()
+}
+
 #[test]
 fn native_results_equal_spareval_on_random_queries() {
     let mut rng = Rng(20_260_927);
@@ -244,6 +266,21 @@ fn native_results_equal_spareval_on_random_queries() {
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 ordered,
             );
+            if let Some(limit) = limited(&text) {
+                // LIMIT without ORDER BY may return any `limit` solutions: the native rows
+                // must be that many, and all of them solutions of the unlimited query.
+                let unlimited = text[..text.rfind(" LIMIT ").unwrap()].to_owned();
+                let query = SparqlParser::new().parse_query(&unlimited).unwrap();
+                let mut all = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+                assert_eq!(native.len(), all.len().min(limit), "{text}");
+                for row in &native {
+                    let position = all.iter().position(|r| r == row);
+                    assert!(position.is_some(), "{row} is not a solution: {text}");
+                    all.remove(position.unwrap());
+                }
+                checked += 1;
+                continue;
+            }
             let expected = rows(
                 evaluate_query(&snapshot, &query, &spareval).unwrap(),
                 ordered,

@@ -193,6 +193,20 @@ impl Dictionary {
         }
     }
 
+    /// Calls `f` with a borrowed view of the dictionary term `id`, without allocating: the
+    /// view points into the arena under the read lock, so `f` must be short. `None` for
+    /// inline ids (which carry their value, see [`TermId`]) and unknown ids.
+    pub fn with_view<R>(&self, id: TermId, f: impl FnOnce(TermView<'_>) -> R) -> Option<R> {
+        if !id.kind().is_dictionary() {
+            return None;
+        }
+        let inner = self.inner.read();
+        if id.payload() >= inner.ends.len() as u64 {
+            return None;
+        }
+        Some(f(view_key(inner.key(id.payload()))))
+    }
+
     /// Interns all four components of `quad`. Only the engine's writer calls this.
     pub(crate) fn intern_quad(&self, quad: QuadRef<'_>) -> EncodedQuad {
         let mut inner = self.inner.write();
@@ -443,6 +457,54 @@ fn split_sep(rest: &[u8]) -> (&str, &str) {
 
 /// Keys are only produced by [`encode_key`] or checked by [`validate_key`], so the
 /// unchecked constructors are sound here.
+/// A dictionary term's text, borrowed from the arena (see [`Dictionary::with_view`]).
+/// Executors read strings, language tags and datatypes through it without building terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermView<'a> {
+    Iri(&'a str),
+    BlankNode(&'a str),
+    /// A simple literal (`xsd:string`).
+    String(&'a str),
+    LangString {
+        value: &'a str,
+        language: &'a str,
+    },
+    Typed {
+        value: &'a str,
+        datatype: &'a str,
+    },
+}
+
+impl<'a> TermView<'a> {
+    /// The lexical form of a literal, or the IRI string: what SPARQL `STR` returns (`None`
+    /// for blank nodes).
+    pub fn str(self) -> Option<&'a str> {
+        match self {
+            Self::Iri(s) | Self::String(s) => Some(s),
+            Self::LangString { value, .. } | Self::Typed { value, .. } => Some(value),
+            Self::BlankNode(_) => None,
+        }
+    }
+}
+
+fn view_key(key: &[u8]) -> TermView<'_> {
+    let rest = &key[1..];
+    let text = || std::str::from_utf8(rest).unwrap_or_default();
+    match key[0] {
+        TAG_IRI => TermView::Iri(text()),
+        TAG_BNODE => TermView::BlankNode(text()),
+        TAG_STRING => TermView::String(text()),
+        TAG_LANG => {
+            let (language, value) = split_sep(rest);
+            TermView::LangString { value, language }
+        }
+        _ => {
+            let (datatype, value) = split_sep(rest);
+            TermView::Typed { value, datatype }
+        }
+    }
+}
+
 fn decode_key(key: &[u8]) -> Term {
     let rest = &key[1..];
     let text = || std::str::from_utf8(rest).unwrap_or_default().to_owned();
@@ -501,6 +563,48 @@ mod tests {
         roundtrip(LiteralRef::new_typed_literal("1450-01-01", xsd::DATE).into());
         roundtrip(LiteralRef::new_typed_literal("01", xsd::INTEGER).into());
         roundtrip(LiteralRef::new_typed_literal("7", xsd::INTEGER).into());
+    }
+
+    #[test]
+    fn views_expose_text_kind_language_and_datatype() {
+        let dict = Dictionary::default();
+        let view = |term: TermRef<'_>| {
+            let id = dict.intern(term);
+            dict.with_view(id, |v| format!("{v:?}"))
+        };
+        assert_eq!(
+            view(NamedNodeRef::new_unchecked("http://e/a").into()).unwrap(),
+            "Iri(\"http://e/a\")"
+        );
+        assert_eq!(
+            view(BlankNodeRef::new_unchecked("b0").into()).unwrap(),
+            "BlankNode(\"b0\")"
+        );
+        assert_eq!(
+            view(LiteralRef::new_simple_literal("plain").into()).unwrap(),
+            "String(\"plain\")"
+        );
+        assert_eq!(
+            view(LiteralRef::new_language_tagged_literal_unchecked("Haus", "de").into()).unwrap(),
+            "LangString { value: \"Haus\", language: \"de\" }"
+        );
+        assert_eq!(
+            view(LiteralRef::new_typed_literal("01", xsd::INTEGER).into()).unwrap(),
+            "Typed { value: \"01\", datatype: \"http://www.w3.org/2001/XMLSchema#integer\" }"
+        );
+        // Inline ids carry their value; there is no dictionary text to view.
+        assert_eq!(
+            view(LiteralRef::new_typed_literal("7", xsd::INTEGER).into()),
+            None
+        );
+        let id =
+            dict.intern(LiteralRef::new_language_tagged_literal_unchecked("Haus", "de").into());
+        assert_eq!(
+            dict.with_view(id, |v| v.str().map(str::to_owned))
+                .flatten()
+                .as_deref(),
+            Some("Haus")
+        );
     }
 
     #[test]

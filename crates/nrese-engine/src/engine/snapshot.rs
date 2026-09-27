@@ -252,6 +252,16 @@ impl Snapshot {
         self.dictionary.decode(id)
     }
 
+    /// Calls `f` with a borrowed view of the dictionary term `id` (see
+    /// [`Dictionary::with_view`](crate::Dictionary::with_view)); `None` for inline ids and
+    /// ids this snapshot doesn't know.
+    pub fn with_view<R>(&self, id: TermId, f: impl FnOnce(crate::TermView<'_>) -> R) -> Option<R> {
+        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
+            return None;
+        }
+        self.dictionary.with_view(id, f)
+    }
+
     pub fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
         self.dictionary.decode_quad(quad)
     }

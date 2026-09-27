@@ -263,7 +263,7 @@ impl Evaluator {
 }
 
 /// SPARQL `REGEX` flags (XPath): i, s, m, x, and q (the pattern is a literal string).
-fn compile_regex(pattern: &str, flags: &str) -> Option<Regex> {
+pub(crate) fn compile_regex(pattern: &str, flags: &str) -> Option<Regex> {
     let mut builder_pattern = String::new();
     let mut literal = false;
     for flag in flags.chars() {

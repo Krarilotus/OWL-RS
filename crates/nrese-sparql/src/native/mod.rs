@@ -14,6 +14,7 @@
 //! `COUNT(*)` over a single pattern reads the count from the index.
 
 mod expr;
+mod fast;
 mod value;
 
 use std::cell::RefCell;
@@ -43,6 +44,9 @@ use value::Value;
 /// A right side at least this many times larger than the running result is joined by
 /// probing the index once per result row instead of scanning it.
 const PROBE_FACTOR: u64 = 32;
+
+/// Decoded terms kept per query for repeated ids (ORDER BY, aggregates, expressions).
+const DECODE_CACHE_ENTRIES: usize = 1 << 18;
 
 pub(crate) enum NativeError {
     /// Not handled natively after all: run the query on spareval.
@@ -372,11 +376,16 @@ impl<'a> Context<'a> {
         if let Some(index) = computed_index(id) {
             return self.computed.borrow().get(index as usize).cloned();
         }
-        self.decoded
-            .borrow_mut()
-            .entry(id)
-            .or_insert_with(|| self.snapshot.decode(TermId::from_raw(id)))
-            .clone()
+        let mut decoded = self.decoded.borrow_mut();
+        if let Some(term) = decoded.get(&id) {
+            return term.clone();
+        }
+        let term = self.snapshot.decode(TermId::from_raw(id));
+        // Bounded: a scan over millions of distinct labels must not keep them all.
+        if decoded.len() < DECODE_CACHE_ENTRIES {
+            decoded.insert(id, term.clone());
+        }
+        term
     }
 
     /// The id of `term`: its stored id if the snapshot knows it, else a computed id, the same
@@ -526,6 +535,14 @@ impl<'a> Context<'a> {
                 start,
                 length,
             } => {
+                // LIMIT over one (filtered, projected) pattern: stream the scan, stop early.
+                if let Some(length) = length
+                    && let Some(solutions) = self.limited_scan(inner, start + length)?
+                {
+                    let mut solutions = solutions;
+                    solutions.table.slice(*start, Some(*length));
+                    return Ok(solutions);
+                }
                 // ORDER BY + LIMIT: only the first start + length rows need a full order.
                 if let GraphPattern::OrderBy {
                     inner: sorted,
@@ -890,6 +907,142 @@ impl<'a> Context<'a> {
 
     // --- filters -------------------------------------------------------------------------
 
+    /// `pattern` if it is one triple pattern, optionally filtered and projected, evaluated
+    /// until `limit` rows pass: the scan streams in chunks and stops early. `None` for other
+    /// shapes.
+    fn limited_scan(
+        &self,
+        pattern: &GraphPattern,
+        limit: usize,
+    ) -> NativeResult<Option<Solutions>> {
+        let (projection, rest) = match pattern {
+            GraphPattern::Project { inner, variables } => (Some(variables), &**inner),
+            other => (None, other),
+        };
+        let (filter, bgp) = match rest {
+            GraphPattern::Filter { expr, inner } if !contains_exists(expr) => {
+                (Some(expr), &**inner)
+            }
+            other => (None, other),
+        };
+        let GraphPattern::Bgp { patterns } = bgp else {
+            return Ok(None);
+        };
+        let [triple] = patterns.as_slice() else {
+            return Ok(None);
+        };
+        let vars = triple_variables(triple);
+        let mut vars_unique: Vec<Variable> = Vec::new();
+        for v in vars {
+            if !vars_unique.contains(&v) {
+                vars_unique.push(v);
+            }
+        }
+        let width = vars_unique.len();
+        let Some(scan) = self.scan_pattern(triple) else {
+            let solutions = Solutions {
+                vars: vars_unique,
+                table: IdTable::new(width),
+                ordered: false,
+            };
+            return Ok(Some(match projection {
+                Some(variables) => self.project(solutions, variables),
+                None => solutions,
+            }));
+        };
+        let places: Vec<Vec<usize>> = vars_unique
+            .iter()
+            .map(|v| (0..3).filter(|&i| scan.slots[i].is_var(v)).collect())
+            .collect();
+        let mut out = IdTable::new(width);
+        let mut chunk = IdTable::new(width);
+        let mut row = vec![0u64; width];
+        let mut quads = self
+            .snapshot
+            .quads_for_pattern_in(ReadModel::Materialised, &scan.quad_pattern());
+        loop {
+            let more = quads.next();
+            if let Some(quad) = more {
+                let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
+                let consistent = places.iter().zip(row.iter_mut()).all(|(p, slot)| {
+                    *slot = components[p[0]];
+                    p[1..].iter().all(|&i| components[i] == *slot)
+                });
+                if consistent {
+                    chunk.push_row(&row);
+                }
+            }
+            if chunk.len() >= 4096 || (more.is_none() && !chunk.is_empty()) {
+                self.check()?;
+                let mut part = Solutions {
+                    vars: vars_unique.clone(),
+                    table: std::mem::replace(&mut chunk, IdTable::new(width)),
+                    ordered: false,
+                };
+                if let Some(expression) = filter {
+                    let mask = self.filter_mask(&part, expression)?;
+                    part.table.retain_mask(&mask);
+                }
+                out.append(&part.table);
+                if out.len() >= limit {
+                    out.slice(0, Some(limit));
+                    break;
+                }
+            }
+            if more.is_none() {
+                break;
+            }
+        }
+        let solutions = Solutions {
+            vars: vars_unique,
+            table: out,
+            ordered: false,
+        };
+        Ok(Some(match projection {
+            Some(variables) => self.project(solutions, variables),
+            None => solutions,
+        }))
+    }
+
+    /// Which rows pass `expression`: the compiled id-level predicate where it decides
+    /// ([`fast`]), the generic term evaluator for every other row.
+    fn filter_mask(
+        &self,
+        solutions: &Solutions,
+        expression: &Expression,
+    ) -> NativeResult<Vec<bool>> {
+        let compiled = fast::compile(expression, self.snapshot);
+        let columns: Vec<(Variable, usize)> = solutions
+            .vars
+            .iter()
+            .enumerate()
+            .map(|(c, v)| (v.clone(), c))
+            .collect();
+        let mut mask = Vec::with_capacity(solutions.table.len());
+        for row in 0..solutions.table.len() {
+            if row % (1 << 16) == 0 {
+                self.check()?;
+            }
+            let decided = compiled.as_ref().map(|fast| {
+                let value = |v: &Variable| {
+                    columns
+                        .iter()
+                        .find(|(x, _)| x == v)
+                        .map_or(UNDEF, |&(_, c)| solutions.table.get(row, c))
+                };
+                fast.eval(&value, self.snapshot)
+            });
+            mask.push(match decided {
+                Some(fast::Tri::True) => true,
+                Some(fast::Tri::False | fast::Tri::Error) => false,
+                Some(fast::Tri::Unknown) | None => self
+                    .evaluator
+                    .filter(expression, &self.binding(solutions, row)),
+            });
+        }
+        Ok(mask)
+    }
+
     fn filter(&self, mut solutions: Solutions, expression: &Expression) -> NativeResult<Solutions> {
         match expression {
             Expression::And(a, b) if contains_exists(expression) => {
@@ -904,12 +1057,7 @@ impl<'a> Context<'a> {
                 self.exists(solutions, pattern, false)
             }
             _ => {
-                let mask: Vec<bool> = (0..solutions.table.len())
-                    .map(|row| {
-                        self.evaluator
-                            .filter(expression, &self.binding(&solutions, row))
-                    })
-                    .collect();
+                let mask = self.filter_mask(&solutions, expression)?;
                 solutions.table.retain_mask(&mask);
                 Ok(solutions)
             }
