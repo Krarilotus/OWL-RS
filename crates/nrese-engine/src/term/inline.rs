@@ -23,7 +23,6 @@ use super::{PAYLOAD_BITS, TermId, TermKind};
 
 const INT_MIN: i64 = -(1 << (PAYLOAD_BITS - 1));
 const INT_MAX: i64 = (1 << (PAYLOAD_BITS - 1)) - 1;
-const PAYLOAD_MASK: u64 = (1 << PAYLOAD_BITS) - 1;
 
 const DECIMAL_MANTISSA_BITS: u32 = 56;
 const DECIMAL_MANTISSA_MASK: u64 = (1 << DECIMAL_MANTISSA_BITS) - 1;
@@ -69,7 +68,12 @@ pub(crate) fn inline_to_literal(id: TermId) -> Option<Literal> {
         TermKind::Decimal => (decode_decimal(payload), xsd::DECIMAL),
         TermKind::Date => (decode_date(payload), xsd::DATE),
         TermKind::DateTime => (decode_date_time(payload), xsd::DATE_TIME),
-        TermKind::DefaultGraph | TermKind::Iri | TermKind::BlankNode | TermKind::Literal => {
+        TermKind::DefaultGraph
+        | TermKind::Iri
+        | TermKind::BlankNode
+        | TermKind::String
+        | TermKind::LangString
+        | TermKind::TypedLiteral => {
             return None;
         }
     };
@@ -78,10 +82,20 @@ pub(crate) fn inline_to_literal(id: TermId) -> Option<Literal> {
 
 // --- xsd:integer ------------------------------------------------------------------------
 
+/// Offset binary (`value - INT_MIN`), so payload order is numeric order and a FILTER range
+/// over integers is an id range.
 fn encode_integer(lexical: &str) -> Option<u64> {
     let value: i64 = lexical.parse().ok()?;
     ((INT_MIN..=INT_MAX).contains(&value) && is_canonical_integer(lexical))
-        .then_some((value as u64) & PAYLOAD_MASK)
+        .then(|| value.wrapping_sub(INT_MIN) as u64)
+}
+
+/// The id of an inline integer, if `value` is in the inline range. Executors use it to turn
+/// numeric bounds into id bounds.
+pub(crate) fn integer_id(value: i64) -> Option<TermId> {
+    (INT_MIN..=INT_MAX)
+        .contains(&value)
+        .then(|| TermId::new(TermKind::Integer, value.wrapping_sub(INT_MIN) as u64))
 }
 
 /// Canonical integer digits: optional '-', no '+', no leading zeros, no "-0".
@@ -94,7 +108,7 @@ fn is_canonical_integer(lexical: &str) -> bool {
 }
 
 pub(crate) fn decode_integer(payload: u64) -> i64 {
-    sign_extend(payload, PAYLOAD_BITS)
+    (payload as i64).wrapping_add(INT_MIN)
 }
 
 fn sign_extend(value: u64, bits: u32) -> i64 {
@@ -355,6 +369,48 @@ mod tests {
             xsd::INTEGER,
             &["01", "+1", "-0", "00", " 1", "", "-", &too_big, "abc"],
         );
+    }
+
+    /// Id order is numeric order, which lets executors turn a numeric FILTER into an id
+    /// range; `integer_id` agrees with the lexical path.
+    #[test]
+    fn integer_ids_sort_by_value() {
+        let mut values = vec![
+            INT_MIN,
+            INT_MIN + 1,
+            -1_000_000,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            7,
+            1 << 40,
+            INT_MAX,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..10_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            values.push((state as i64) >> 4); // uniform over the 60-bit range
+        }
+        let mut ids: Vec<(i64, TermId)> = values
+            .iter()
+            .map(|&v| {
+                let id = inline(&v.to_string(), xsd::INTEGER).expect("in range");
+                assert_eq!(integer_id(v), Some(id));
+                assert_eq!(id.as_inline_integer(), Some(v));
+                (v, id)
+            })
+            .collect();
+        ids.sort_by_key(|&(_, id)| id);
+        assert!(
+            ids.windows(2).all(|w| w[0].0 <= w[1].0),
+            "id order must be value order"
+        );
+        assert_eq!(integer_id(INT_MAX + 1), None);
+        assert_eq!(integer_id(INT_MIN - 1), None);
     }
 
     #[test]

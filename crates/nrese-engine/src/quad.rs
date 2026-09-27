@@ -128,8 +128,12 @@ impl QuadPattern {
 
 pub(crate) type Key = [u64; 4];
 
-/// The six sort orders the index maintains. Every [`QuadPattern`] is answered by a
-/// contiguous key range in exactly one of them (see [`AccessPlan::for_pattern`]).
+/// The sort orders the index maintains. Every [`QuadPattern`] is answered by a contiguous
+/// key range in one of the first six (see [`AccessPlan::for_pattern`]).
+///
+/// The last two exist for executors that need `(?s p ?o)` sorted by subject (star joins):
+/// [`Gpso`](Self::Gpso) in the asserted stack, and [`Psog`](Self::Psog) in the inferred
+/// stack, whose single graph makes it sort like GPSO (see `index::Layout`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Permutation {
@@ -139,20 +143,27 @@ pub enum Permutation {
     Gspo = 3,
     Gpos = 4,
     Gosp = 5,
+    Gpso = 6,
+    Psog = 7,
 }
 
 impl Permutation {
-    pub const ALL: [Self; 6] = [
+    /// Number of permutations; sizes the per-run permutation array.
+    pub const COUNT: usize = 8;
+
+    pub const ALL: [Self; Self::COUNT] = [
         Self::Spog,
         Self::Posg,
         Self::Ospg,
         Self::Gspo,
         Self::Gpos,
         Self::Gosp,
+        Self::Gpso,
+        Self::Psog,
     ];
 
     /// `order()[i]` is the canonical component (0=s,1=p,2=o,3=g) stored at key position `i`.
-    const fn order(self) -> [usize; 4] {
+    pub const fn order(self) -> [usize; 4] {
         match self {
             Self::Spog => [0, 1, 2, 3],
             Self::Posg => [1, 2, 0, 3],
@@ -160,6 +171,8 @@ impl Permutation {
             Self::Gspo => [3, 0, 1, 2],
             Self::Gpos => [3, 1, 2, 0],
             Self::Gosp => [3, 2, 0, 1],
+            Self::Gpso => [3, 1, 0, 2],
+            Self::Psog => [1, 0, 2, 3],
         }
     }
 
@@ -171,7 +184,8 @@ impl Permutation {
             Self::Gspo => Some(Self::Spog),
             Self::Gpos => Some(Self::Posg),
             Self::Gosp => Some(Self::Ospg),
-            Self::Spog | Self::Posg | Self::Ospg => None,
+            Self::Gpso => Some(Self::Psog),
+            Self::Spog | Self::Posg | Self::Ospg | Self::Psog => None,
         }
     }
 
@@ -244,6 +258,45 @@ impl AccessPlan {
                 Self::from_prefix(permutation, bound, exclude)
             }
         }
+    }
+
+    /// The plan that answers `pattern` in `permutation`, if the pattern's bound components
+    /// form a prefix of the permutation's order. Executors use it to get a scan in a chosen
+    /// sort order; [`for_pattern`](Self::for_pattern) picks one of these per pattern.
+    pub(crate) fn in_permutation(pattern: &QuadPattern, permutation: Permutation) -> Option<Self> {
+        let graph_first = permutation.order()[0] == 3;
+        let (graph, exclude) = match pattern.graph {
+            GraphSelector::Exact(g) => (Some(g.raw()), false),
+            GraphSelector::Any => (None, false),
+            GraphSelector::AnyNamed => {
+                if graph_first {
+                    // Named graphs are the keys with graph >= 1; nothing after the graph can
+                    // be bound, since the graph itself is a range.
+                    let unbound = pattern.subject.is_none()
+                        && pattern.predicate.is_none()
+                        && pattern.object.is_none();
+                    return unbound.then_some(Self {
+                        permutation,
+                        low: [1, 0, 0, 0],
+                        high: [u64::MAX; 4],
+                        exclude_default_graph: false,
+                    });
+                }
+                (None, true)
+            }
+        };
+        let canonical = [
+            pattern.subject.map(TermId::raw),
+            pattern.predicate.map(TermId::raw),
+            pattern.object.map(TermId::raw),
+            graph,
+        ];
+        let bound = permutation.order().map(|component| canonical[component]);
+        let prefix = bound.iter().take_while(|b| b.is_some()).count();
+        bound[prefix..]
+            .iter()
+            .all(Option::is_none)
+            .then(|| Self::from_prefix(permutation, bound, exclude))
     }
 
     /// `bound` lists key positions in permutation order; a bound prefix is followed only by

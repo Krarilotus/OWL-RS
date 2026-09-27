@@ -8,8 +8,11 @@
 //!   them, which is the whole MVCC mechanism.
 //! - **Compaction** replaces a window of runs by their merge
 //!   ([`IndexVersion::with_compacted`]); the window choice is in [`compaction`].
-//! - **Layouts** ([`Layout`]): the asserted stack holds arbitrary quads in six permutations;
-//!   the inferred stack holds default-graph quads only and needs three.
+//! - **Layouts** ([`Layout`]): the asserted stack holds arbitrary quads in the six pattern
+//!   permutations plus GPSO (subject-sorted scans per predicate, for star joins); the
+//!   inferred stack holds default-graph quads only and needs four.
+//! - **Counts** ([`IndexVersion::count_plan`]) are exact without scanning when the runs hold
+//!   no tombstones in range.
 //!
 //! Ownership: this module owns the physical layout and visibility rule. It knows nothing
 //! about terms, transactions or durability.
@@ -32,10 +35,10 @@ pub use compaction::CompactionPolicy;
 /// Which quads a stack of runs may hold, and therefore which permutations it maintains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Layout {
-    /// Any quads, in all six permutations.
+    /// Any quads, in the six pattern permutations plus GPSO.
     #[default]
     Quads,
-    /// Default-graph quads only (the inferred stack), in SPOG, POSG and OSPG. A graph-first
+    /// Default-graph quads only (the inferred stack), in SPOG, POSG, OSPG and PSOG. A graph-first
     /// order over one constant graph sorts exactly like the matching graph-last order, so
     /// the graph-first permutations would be redundant copies.
     DefaultGraph,
@@ -44,13 +47,34 @@ pub(crate) enum Layout {
 impl Layout {
     pub(crate) const fn permutations(self) -> &'static [Permutation] {
         match self {
-            Self::Quads => &Permutation::ALL,
-            Self::DefaultGraph => &[Permutation::Spog, Permutation::Posg, Permutation::Ospg],
+            Self::Quads => &[
+                Permutation::Spog,
+                Permutation::Posg,
+                Permutation::Ospg,
+                Permutation::Gspo,
+                Permutation::Gpos,
+                Permutation::Gosp,
+                Permutation::Gpso,
+            ],
+            Self::DefaultGraph => &[
+                Permutation::Spog,
+                Permutation::Posg,
+                Permutation::Ospg,
+                Permutation::Psog,
+            ],
         }
     }
 
+    /// True if scans in `permutation` can be answered: the layout maintains it, or (for the
+    /// single-graph layout) its graph-last equivalent.
+    pub(crate) fn supports(self, permutation: Permutation) -> bool {
+        let maintained = |p: Permutation| self.permutations().contains(&p);
+        maintained(permutation)
+            || (self == Self::DefaultGraph && permutation.graph_last().is_some_and(maintained))
+    }
+
     /// The plan that answers `plan` over this layout, or `None` if no quad the layout can
-    /// hold matches it.
+    /// hold matches it. The plan's permutation must be [`supported`](Self::supports).
     fn adapt(self, plan: &AccessPlan) -> Option<AccessPlan> {
         if self == Self::Quads {
             return Some(*plan);
@@ -62,12 +86,25 @@ impl Layout {
             return Some(*plan); // graph-last plans never bind the graph
         };
         let default = TermId::DEFAULT_GRAPH.raw();
-        // Graph-first plans come from an exact graph (or "all named graphs"); only the
-        // default graph can match. Rotate the graph from the front to the back.
-        (plan.low[0] == default && plan.high[0] == default).then_some(AccessPlan {
+        // Only the default graph can match, so the graph range must include it. Rotate the
+        // graph from the front to the back.
+        if !(plan.low[0] <= default && default <= plan.high[0]) {
+            return None; // an exact named graph, or "all named graphs"
+        }
+        if plan.low[0] == plan.high[0] {
+            return Some(AccessPlan {
+                permutation,
+                low: [plan.low[1], plan.low[2], plan.low[3], default],
+                high: [plan.high[1], plan.high[2], plan.high[3], default],
+                exclude_default_graph: false,
+            });
+        }
+        // An unbound graph (executors' sorted scans): the prefix stops at the graph, so
+        // nothing after it is bound, and every quad of this layout matches.
+        Some(AccessPlan {
             permutation,
-            low: [plan.low[1], plan.low[2], plan.low[3], default],
-            high: [plan.high[1], plan.high[2], plan.high[3], default],
+            low: [0, 0, 0, default],
+            high: [u64::MAX, u64::MAX, u64::MAX, default],
             exclude_default_graph: false,
         })
     }
@@ -129,7 +166,72 @@ impl IndexVersion {
         self.scan_plan(&plan).next().map(|quad| quad.graph)
     }
 
-    fn scan_plan(&self, plan: &AccessPlan) -> QuadScan<'_> {
+    /// Exact number of visible quads matching `plan`. By the exact-delta invariant each
+    /// tombstone cancels exactly one insert of the same key in an older run, and both lie in
+    /// any key range that holds either, so the count is the sum over runs of (entries in range
+    /// − 2 × tombstones in range): O(r log n) for tombstone-free runs, plus a popcount over
+    /// the range otherwise. Plans with a default-graph post-filter count by scanning.
+    pub(crate) fn count_plan(&self, plan: &AccessPlan) -> u64 {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return 0;
+        };
+        if adapted.exclude_default_graph {
+            return self.scan_plan(plan).count() as u64;
+        }
+        let signed: i64 = self
+            .runs
+            .iter()
+            .map(|run| {
+                let perm = run.permutation(adapted.permutation);
+                let (start, end) = perm.range(&adapted.low, &adapted.high);
+                (end - start) as i64 - 2 * perm.tombstones_in(start, end) as i64
+            })
+            .sum();
+        u64::try_from(signed).expect("exact deltas never make a range count negative")
+    }
+
+    /// For each distinct value at key `position` of `plan`'s permutation (the first component
+    /// after the plan's bound prefix), the signed number of visible quads with that value,
+    /// accumulated into `totals`. Each run is walked group by group with a binary search for
+    /// each group's end, so the cost is O(r · d · log n) for d distinct values, not O(k).
+    pub(crate) fn group_counts(
+        &self,
+        plan: &AccessPlan,
+        position: usize,
+        totals: &mut std::collections::BTreeMap<u64, i64>,
+    ) {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return;
+        };
+        debug_assert!(
+            !adapted.exclude_default_graph,
+            "group counts need an exact range"
+        );
+        // Adapting a graph-first plan to the single-graph layout moves the graph to the end.
+        // Grouping by that graph puts every quad of this layout in the default graph's group.
+        let position = if adapted.permutation == plan.permutation {
+            position
+        } else if position == 0 {
+            *totals.entry(TermId::DEFAULT_GRAPH.raw()).or_default() += self.count_plan(plan) as i64;
+            return;
+        } else {
+            position - 1
+        };
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            let mut i = start;
+            while i < end {
+                let value = perm.keys[i][position];
+                let j = i + perm.keys[i..end].partition_point(|key| key[position] <= value);
+                let signed = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
+                *totals.entry(value).or_default() += signed;
+                i = j;
+            }
+        }
+    }
+
+    pub(crate) fn scan_plan(&self, plan: &AccessPlan) -> QuadScan<'_> {
         let Some(plan) = self.layout.adapt(plan) else {
             return QuadScan {
                 merge: SignedMerge::new(std::iter::empty()),

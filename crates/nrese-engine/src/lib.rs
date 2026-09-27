@@ -3,7 +3,7 @@
 //! Owns the physical representation of an RDF dataset:
 //! - [`term`]: RDF terms ⇄ 64-bit [`TermId`]s (dictionary plus inline canonical values)
 //! - [`quad`]: encoded quads, patterns, and which permutation answers which pattern
-//! - `index`: immutable sorted runs over six permutations (three for the inferred stack),
+//! - `index`: immutable sorted runs over seven permutations (four for the inferred stack),
 //!   merged with sign-sum visibility, and size-tiered compaction
 //! - [`engine`]: the public façade: [`Engine`], MVCC [`Snapshot`]s over an asserted and an
 //!   inferred stack ([`ReadModel`]), single-writer [`Transaction`]s with exact deltas, and
