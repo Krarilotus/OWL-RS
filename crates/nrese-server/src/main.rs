@@ -7,6 +7,11 @@ use tracing_subscriber::EnvFilter;
 use nrese_server::ai::AiSuggestionService;
 use nrese_server::{AppState, CliCommand, CliConfig, LoadCommand, ServerConfig, build_app};
 
+/// mimalloc (Pf7a): 7-20% faster query sets and 30% faster bulk loads than the system
+/// allocator in the perf lab (benches/baselines/perf-lab/2026-09-27-r198-*).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
