@@ -189,6 +189,45 @@ fn digits(s: &str, range: std::ops::Range<usize>) -> Option<u32> {
 }
 
 /// `YYYY-MM-DD` with a year 0000–9999 and a real calendar day; returns the date bits.
+/// A `Date` id bound one local day before (`later == false`) or after `id`, for FILTER range
+/// scans: a date with a timezone and one without compare indeterminately when their local
+/// dates are less than a day (±14 h) apart, so a range over dates is widened by a day and
+/// its edges are checked by the full comparison. The bound needn't be a real date; it only
+/// has to order correctly (fields are compared as year, month, day, timezone).
+pub(crate) fn date_widened(id: TermId, later: bool) -> Option<TermId> {
+    if id.kind() != TermKind::Date {
+        return None;
+    }
+    let date = id.payload() >> TIMEZONE_BITS;
+    let (year, month, day) = (date >> 9, (date >> 5) & 0xf, date & 0x1f);
+    let last_day = |y: u64, m: u64| u64::from(days_in_month(y as u32, m as u32));
+    let (year, month, day, timezone) = if later {
+        let (y, m, d) = if day < last_day(year, month) {
+            (year, month, day + 1)
+        } else if month < 12 {
+            (year, month + 1, 1)
+        } else {
+            (year + 1, 1, 1)
+        };
+        (y, m, d, (1 << TIMEZONE_BITS) - 1)
+    } else {
+        let (y, m, d) = if day > 1 {
+            (year, month, day - 1)
+        } else if month > 1 {
+            (year, month - 1, last_day(year, month - 1))
+        } else if year > 0 {
+            (year - 1, 12, 31)
+        } else {
+            (0, 0, 0)
+        };
+        (y, m, d, 0)
+    };
+    Some(TermId::new(
+        TermKind::Date,
+        (((year << 9) | (month << 5) | day) << TIMEZONE_BITS) | timezone,
+    ))
+}
+
 fn parse_date_part(s: &str) -> Option<u64> {
     if s.len() != 10 || s.as_bytes()[4] != b'-' || s.as_bytes()[7] != b'-' {
         return None;
@@ -460,6 +499,33 @@ mod tests {
                 "",
             ],
         );
+    }
+
+    /// The widened bounds enclose every date of the neighbouring local days, whatever its
+    /// timezone, across month and year boundaries.
+    #[test]
+    fn widened_date_bounds_enclose_neighbouring_days() {
+        let id = |s: &str| inline(s, xsd::DATE).unwrap();
+        for (date, previous, next) in [
+            ("2000-03-01", "2000-02-29", "2000-03-02"),
+            ("2000-01-01", "1999-12-31", "2000-01-02"),
+            ("1999-12-31", "1999-12-30", "2000-01-01"),
+            ("2001-04-30", "2001-04-29", "2001-05-01"),
+        ] {
+            let low = date_widened(id(date), false).unwrap();
+            let high = date_widened(id(date), true).unwrap();
+            for zone in ["", "Z", "+14:00", "-14:00", "+05:30"] {
+                let p = id(&format!("{previous}{zone}"));
+                let n = id(&format!("{next}{zone}"));
+                let d = id(&format!("{date}{zone}"));
+                assert!(
+                    low <= p && p <= high && low <= d && d <= high && low <= n && n <= high,
+                    "{date}{zone}"
+                );
+            }
+            assert!(date_widened(id("2000-01-05"), false).unwrap() > id("2000-01-03Z"));
+            assert!(date_widened(id("2000-01-05"), true).unwrap() < id("2000-01-07"));
+        }
     }
 
     #[test]

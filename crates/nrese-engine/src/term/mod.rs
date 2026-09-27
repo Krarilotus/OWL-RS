@@ -135,6 +135,13 @@ impl TermId {
         inline::integer_id(value)
     }
 
+    /// For an inline date, an id one local day earlier (`later == false`) or later, with the
+    /// smallest or largest timezone code: widened FILTER range bounds (see
+    /// `inline::date_widened`). `None` for other ids.
+    pub fn date_widened(self, later: bool) -> Option<Self> {
+        inline::date_widened(self, later)
+    }
+
     /// The smallest and largest ids of `kind`: the id range a scan restricted to one kind
     /// covers (for example all language-tagged strings of a predicate).
     pub const fn kind_range(kind: TermKind) -> (Self, Self) {

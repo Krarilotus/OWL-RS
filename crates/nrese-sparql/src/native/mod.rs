@@ -15,6 +15,7 @@
 
 mod expr;
 mod fast;
+mod ranges;
 mod value;
 
 use std::cell::RefCell;
@@ -419,7 +420,7 @@ impl<'a> Context<'a> {
     fn eval(&self, pattern: &GraphPattern) -> NativeResult<Solutions> {
         self.check()?;
         match pattern {
-            GraphPattern::Bgp { patterns } => self.bgp(patterns),
+            GraphPattern::Bgp { patterns } => self.bgp(patterns, &[]),
             GraphPattern::Join { left, right } => {
                 let (left, right) = (self.eval(left)?, self.eval(right)?);
                 self.join(left, right)
@@ -432,7 +433,17 @@ impl<'a> Context<'a> {
                 let (left, right) = (self.eval(left)?, self.eval(right)?);
                 self.left_join(left, right, expression.as_ref())
             }
-            GraphPattern::Filter { expr, inner } => self.filter(self.eval(inner)?, expr),
+            GraphPattern::Filter { expr, inner } => {
+                // Range conjuncts on a variable narrow the scan that binds it; the full
+                // FILTER still runs on every row, so the ranges only prune.
+                let solutions = match &**inner {
+                    GraphPattern::Bgp { patterns } => {
+                        self.bgp(patterns, &ranges::hints(expr, self.snapshot))?
+                    }
+                    other => self.eval(other)?,
+                };
+                self.filter(solutions, expr)
+            }
             GraphPattern::Union { left, right } => {
                 let (left, right) = (self.eval(left)?, self.eval(right)?);
                 self.union(left, right)
@@ -586,7 +597,7 @@ impl<'a> Context<'a> {
 
     // --- basic graph patterns ------------------------------------------------------------
 
-    fn bgp(&self, triples: &[TriplePattern]) -> NativeResult<Solutions> {
+    fn bgp(&self, triples: &[TriplePattern], hints: &[ranges::Hint]) -> NativeResult<Solutions> {
         let mut scans = Vec::with_capacity(triples.len());
         for triple in triples {
             match self.scan_pattern(triple) {
@@ -613,9 +624,38 @@ impl<'a> Context<'a> {
         if scans.is_empty() {
             return Ok(Solutions::unit());
         }
+        // Each pattern's id ranges, if a hint narrows its object and the object comes first
+        // after the bound prefix in the permutation that sorts on it.
+        let ranged: Vec<Option<RangedScan<'_>>> = scans
+            .iter()
+            .map(|s| {
+                let Slot::Var(object) = &s.slots[2] else {
+                    return None;
+                };
+                let hint = hints.iter().find(|h| &h.variable == object)?;
+                let permutation = s.permutation_for(Some(object));
+                (s.first_free(permutation) == Some(2) && !s.repeats_variable())
+                    .then_some((permutation, hint.ranges.as_slice()))
+            })
+            .collect();
         let counts: Vec<u64> = scans
             .iter()
-            .map(|s| self.snapshot.count(&s.quad_pattern()))
+            .zip(&ranged)
+            .map(|(s, ranged)| match ranged {
+                Some((permutation, ranges)) => ranges
+                    .iter()
+                    .filter_map(|&(low, high)| {
+                        self.snapshot.count_range_in(
+                            ReadModel::Materialised,
+                            &s.quad_pattern(),
+                            *permutation,
+                            low,
+                            high,
+                        )
+                    })
+                    .sum(),
+                None => self.snapshot.count(&s.quad_pattern()),
+            })
             .collect();
         let mut remaining: Vec<usize> = (0..scans.len()).collect();
         // Start with the smallest pattern (ties: the one sharing most variables).
@@ -627,7 +667,10 @@ impl<'a> Context<'a> {
                 .into_iter()
                 .find(|v| scans[i].vars().contains(v))
         });
-        let mut result = self.scan(&scans[first], join_var.as_ref())?;
+        let mut result = match ranged[first] {
+            Some((permutation, ranges)) => self.scan_ranges(&scans[first], permutation, ranges)?,
+            None => self.scan(&scans[first], join_var.as_ref())?,
+        };
         while !remaining.is_empty() {
             // The smallest pattern connected to the result, or the smallest overall.
             let position = remaining
@@ -645,7 +688,12 @@ impl<'a> Context<'a> {
             result = if probe {
                 self.probe_join(result, &scans[next], &shared)?
             } else {
-                let scanned = self.scan(&scans[next], shared.first())?;
+                let scanned = match ranged[next] {
+                    Some((permutation, ranges)) => {
+                        self.scan_ranges(&scans[next], permutation, ranges)?
+                    }
+                    None => self.scan(&scans[next], shared.first())?,
+                };
                 self.join(result, scanned)?
             };
         }
@@ -721,6 +769,59 @@ impl<'a> Context<'a> {
             }
         }
         let table = table.assume_sorted_by(sorted);
+        self.produced(Solutions {
+            vars,
+            table,
+            ordered: false,
+        })
+    }
+
+    /// Scans `scan` over `ranges` of its object (the first free component of
+    /// `permutation`), in increasing order, so the output is sorted like a full scan.
+    fn scan_ranges(
+        &self,
+        scan: &ScanPattern,
+        permutation: Permutation,
+        ranges: &[(TermId, TermId)],
+    ) -> NativeResult<Solutions> {
+        let pattern = scan.quad_pattern();
+        let vars = scan.vars();
+        let columns: Vec<usize> = vars
+            .iter()
+            .map(|v| {
+                (0..3)
+                    .find(|&i| scan.slots[i].is_var(v))
+                    .expect("variable of the pattern")
+            })
+            .collect();
+        let mut table = IdTable::new(vars.len());
+        let mut row = vec![0u64; vars.len()];
+        for &(low, high) in ranges {
+            let Some(quads) = self.snapshot.scan_range_in(
+                ReadModel::Materialised,
+                &pattern,
+                permutation,
+                low,
+                high,
+            ) else {
+                return self.scan(scan, None);
+            };
+            for (n, quad) in quads.enumerate() {
+                if n % (1 << 16) == 0 {
+                    self.check()?;
+                }
+                let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
+                for (slot, &c) in row.iter_mut().zip(&columns) {
+                    *slot = components[c];
+                }
+                table.push_row(&row);
+            }
+        }
+        let object = vars
+            .iter()
+            .position(|v| scan.slots[2].is_var(v))
+            .expect("ranged object");
+        let table = table.assume_sorted_by(vec![object]);
         self.produced(Solutions {
             vars,
             table,
@@ -1497,6 +1598,10 @@ impl<'a> Context<'a> {
         }
     }
 }
+
+/// A pattern's ranged scan: the permutation that sorts on its object, and the object's
+/// id ranges from a range hint.
+type RangedScan<'a> = (Permutation, &'a [(TermId, TermId)]);
 
 /// One ORDER BY key's values per row: ids where id order is value order, else terms.
 enum SortKey {
