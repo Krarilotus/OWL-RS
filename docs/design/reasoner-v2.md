@@ -231,6 +231,17 @@ Generic semi-naive evaluation of transitive or equality rules makes O(n·closure
 | Transitive property | `prp-trp` per transitive property | SCC condensation plus per-component reachability; the closure is materialised (GraphDB semantics) but computed without redundant joins. Deletes: the affected components only. |
 | Equality | `eq-sym`, `eq-trans`, `eq-rep-*`, and `prp-fp`, `prp-ifp` and `prp-key` as producers | Union-find over `TermId`s with **rewriting** (Motik et al., AAAI 2015). Facts are stored over class representatives (the smallest id), and the read view expands members at scan time. The equivalence classes are persisted with the inferred stack. Deletes follow Motik et al., IJCAI 2015 (rewriting combined with maintenance). |
 | Symmetric / inverse | `prp-symp`, `prp-inv1/2` | Pairwise mirroring; no recursion beyond depth 2 |
+| Equivalence property | `prp-trp` + `prp-symp` on the same property (plus reflexivity if declared): an equivalence relation | Union-find over the property's edges gives the components in O(n + m). The closure is every pair within a component. It's either materialised in one pass without joins, or stored as components and expanded at read time like sameAs. That choice is a profile setting (D7): `materialise` by default for GraphDB parity, `compact` for large components. |
+
+**Evidence (reasoning benchmark, 2026-09-27).** In OWL2Bench RL(1) and DL(1), 55 k asserted triples, `hasSameHomeTownWith` is symmetric and transitive. Its closure is 1.31 M triples: hometown groups of about a thousand people, each closed into a clique. With generic rule evaluation, which is O(k³) per group, every baseline takes 15 to 31 minutes:
+
+| System | Time | Peak memory |
+|---|---|---|
+| NRESE v1 | 900 s | 0.9 GB |
+| Jena OWL-micro | 1,439 s | 5.7 GB |
+| Nemo | 1,859 s | 25 GB |
+
+The owlrl oracle doesn't finish within an hour. The equivalence and transitive modules should do this in well under a second: union-find, then writing out the pairs. That makes it the clearest demonstration of what modules are for.
 
 **Equality semantics.** Queries under the `Materialised` model see the fully expanded sameAs semantics, exactly as if every rewritten fact were materialised for every member. This matches GraphDB with sameAs enabled, without the O(k²) blow-up for cliques of size k. There is a per-repository switch to disable sameAs, like GraphDB's `disable-sameAs`.
 
@@ -330,7 +341,7 @@ Generic semi-naive evaluation of transitive or equality rules makes O(n·closure
 | **R0 Engine: inferred stack** | Second index stack in `Version` (three permutations), atomic dual-stack commits, WAL and checkpoint format carrying both stacks, separate inferred-write API on the transaction, bulk run install. **Pulled forward into M1 as E6**, while the v2 on-disk format has no deployments to migrate. | M | Engine model tests cover both stacks; crash tests recover both; the stack disjointness invariant is enforced in debug builds |
 | **R1 Rule IR, analysis, rulesets, profile** | IR (atoms with a graph term), analysis (SCCs, strata, schema atoms), built-in rulesets as data, `.pie` import/export, **naive reference evaluator**; the reasoning-profile schema of §2.2, validated at startup | M | `.pie` round-trip on GraphDB's published rulesets; the reference evaluator passes hand-written RDFS/RL fixtures |
 | **R2 Schema compiler + batch executor** | TBox closure, specialisation, list-axiom compilation, the vertically partitioned working set, semi-naive evaluation, sort-merge and LFTJ joins, morsel parallelism, bulk install of the inferred stack | L | Batch equals naive (proptest); LUBM-1/10/100 counts equal GraphDB for all rulesets (T1); T3 and T4 recorded |
-| **R3 Modules** | Hierarchy, transitive, equality (rewriting plus read-time expansion), symmetric/inverse | M | Each module equals its generic rules; sameAs semantics tests; UOBM parity |
+| **R3 Modules** | Hierarchy, transitive, equality (rewriting plus read-time expansion), symmetric/inverse, equivalence property | M | Each module equals its generic rules; sameAs semantics tests; UOBM parity; OWL2Bench RL(1) materialised in under 1 s (baselines: 15–31 min) |
 | **R4 Read models + commit-path reasoning** | Per-request read model over HTTP (`infer`, `onto:explicit`/`onto:implicit`); delta executor in the mutation pipeline with insert maintenance (`timing = commit`); single-graph layout for any `graph:<IRI>` placement; `ruleset = none` as a zero-cost path; bulk load `--reason`; stats and diagnostics for the active profile | M | Query tests for all three models (audit F4 closed); T5 for inserts; `none` adds no measurable write cost |
 | **R5 Truth maintenance + timings** | DRed, then B/F / FBF (`maintenance` setting); TBox deltas; sameAs maintenance; stack moves; reasoning jobs for large TBox changes; `deferred` and `on-demand` timings with inference-freshness tracking; the counting evaluation | L | T6 in CI for every timing; T5 for deletes; T7 recorded; `deferred` reaches the same state as `commit` |
 | **R6 Consistency + explanations** | Consistency rules with the `consistency` setting (`reject`/`report`/`off`), proof search, proof-carrying rejects, proof API; the v1 fixture suite on v2; **v1 `rules-mvp` deleted** | M | T2 and T9; v1 fixtures green on v2; `rules_mvp*` modules gone |
