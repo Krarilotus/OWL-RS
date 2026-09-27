@@ -162,7 +162,28 @@ fn filter(rng: &mut Rng) -> String {
 fn group_pattern(rng: &mut Rng, depth: u32) -> String {
     let mut parts = vec![bgp(rng)];
     for _ in 0..rng.below(3) {
-        let part = match rng.below(if depth > 1 { 3 } else { 8 }) {
+        let part = match rng.below(if depth > 1 { 3 } else { 10 }) {
+            8 | 9 => {
+                // A property path, ends variables or constants (e6 is unknown to the store).
+                let path = rng.pick(&[
+                    "<P0>*",
+                    "<P1>+",
+                    "(<P0>|<P1>)+",
+                    "^<P2>/<P0>",
+                    "!(<P0>|<P1>)",
+                    "<P3>?",
+                    "(<P0>/<P1>)*",
+                    "<P2>/<P2>",
+                    "(^<P1>)*",
+                    "<P0>|<P3>",
+                ]);
+                let end = |rng: &mut Rng| match rng.below(3) {
+                    0 => format!("<{EX}e{}>", rng.below(7)),
+                    _ => rng.pick(&VARS).to_string(),
+                };
+                let path = path.replace("<P", &format!("<{EX}p"));
+                format!("{} {path} {} .", end(rng), end(rng))
+            }
             7 => {
                 let v = rng.pick(&VARS);
                 let expression = rng.pick(&[
