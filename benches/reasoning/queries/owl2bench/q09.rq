@@ -1,0 +1,6 @@
+# OWL2Bench Q9. Find all the colleges having Non-Science discipline. NonScience is something which is not Science
+# Construct: ObjectComplementOf
+# Profiles: QL, RL, DL
+PREFIX : <https://kracr.iiitd.edu.in/OWL2Bench#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?x WHERE { ?x :hasCollegeDiscipline :NonScience }

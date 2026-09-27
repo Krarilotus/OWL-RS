@@ -13,7 +13,8 @@ import time
 from pathlib import Path
 
 import owlrl
-from rdflib import Graph
+import pyoxigraph
+from rdflib import Graph, Literal
 
 
 def main() -> None:
@@ -42,8 +43,17 @@ def main() -> None:
     Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     if args.queries:
+        # The closure is owlrl's; only query evaluation is delegated, to Oxigraph (W3C
+        # conformant). rdflib's SPARQL engine takes hours on LUBM's multi-way joins.
+        # Literal subjects (generalised RDF) aren't valid N-Triples.
+        closure = Graph()
+        for triple in graph:
+            if not isinstance(triple[0], Literal):
+                closure.add(triple)
+        store = pyoxigraph.Store()
+        store.bulk_load(closure.serialize(format="nt", encoding="utf-8"), pyoxigraph.RdfFormat.N_TRIPLES)
         for query in sorted(Path(args.queries).glob("*.rq")):
-            rows = len(list(graph.query(query.read_text(encoding="utf-8"))))
+            rows = len(list(store.query(query.read_text(encoding="utf-8"))))
             print(f"{query.stem}\t{rows}")
 
 

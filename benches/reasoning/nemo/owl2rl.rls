@@ -1,0 +1,132 @@
+%! OWL 2 RL/RDF rules (W3C OWL 2 Profiles, 2nd ed., §4.3, Tables 4-9) for Nemo, as the
+%! reasoning benchmark's datalog baseline (RT1).
+%!
+%! Input:  input.nt in the import directory (asserted triples, TBox and ABox together).
+%! Output: inferred.nt (derived triples that aren't in the input) and violations.csv
+%!         (consistency rules that fired: rule name, then the offending terms).
+%!
+%! Coverage: every rule of Tables 4-9 that derives triples, including the list-based ones
+%! (prp-spo2, prp-key, cls-int1/2, cls-uni, cls-oo, scm-int, scm-uni), plus the pairwise
+%! consistency rules. Left out, as in owlrl's default mode and the benchmark normalisation:
+%! eq-ref (x sameAs x for every term), the datatype rules (Table 8) and the axiomatic triples.
+%! cls-maxc2/cls-maxqc3/4 need the cardinality literal "1" or "0"; Nemo reads
+%! xsd:nonNegativeInteger literals as integers, so they're matched as numbers.
+
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+@import INPUT :- ntriples { resource = "input.nt" } .
+T(?s, ?p, ?o) :- INPUT(?s, ?p, ?o) .
+
+%% Lists
+member(?l, ?x) :- T(?l, rdf:first, ?x) .
+member(?l, ?x) :- T(?l, rdf:rest, ?r), member(?r, ?x) .
+
+%% Table 4: equality
+T(?y, owl:sameAs, ?x) :- T(?x, owl:sameAs, ?y) .                                   % eq-sym
+T(?x, owl:sameAs, ?z) :- T(?x, owl:sameAs, ?y), T(?y, owl:sameAs, ?z) .              % eq-trans
+T(?s2, ?p, ?o) :- T(?s, owl:sameAs, ?s2), T(?s, ?p, ?o) .                            % eq-rep-s
+T(?s, ?p2, ?o) :- T(?p, owl:sameAs, ?p2), T(?s, ?p, ?o) .                            % eq-rep-p
+T(?s, ?p, ?o2) :- T(?o, owl:sameAs, ?o2), T(?s, ?p, ?o) .                            % eq-rep-o
+violation("eq-diff1", ?x, ?y) :- T(?x, owl:sameAs, ?y), T(?x, owl:differentFrom, ?y) .
+
+%% Table 5: properties
+T(?x, rdf:type, ?c) :- T(?p, rdfs:domain, ?c), T(?x, ?p, ?y) .                       % prp-dom
+T(?y, rdf:type, ?c) :- T(?p, rdfs:range, ?c), T(?x, ?p, ?y) .                        % prp-rng
+T(?y1, owl:sameAs, ?y2) :- T(?p, rdf:type, owl:FunctionalProperty), T(?x, ?p, ?y1), T(?x, ?p, ?y2), ?y1 != ?y2 .           % prp-fp
+T(?x1, owl:sameAs, ?x2) :- T(?p, rdf:type, owl:InverseFunctionalProperty), T(?x1, ?p, ?y), T(?x2, ?p, ?y), ?x1 != ?x2 .    % prp-ifp
+violation("prp-irp", ?x, ?p) :- T(?p, rdf:type, owl:IrreflexiveProperty), T(?x, ?p, ?x) .
+T(?y, ?p, ?x) :- T(?p, rdf:type, owl:SymmetricProperty), T(?x, ?p, ?y) .             % prp-symp
+violation("prp-asyp", ?x, ?y) :- T(?p, rdf:type, owl:AsymmetricProperty), T(?x, ?p, ?y), T(?y, ?p, ?x) .
+T(?x, ?p, ?z) :- T(?p, rdf:type, owl:TransitiveProperty), T(?x, ?p, ?y), T(?y, ?p, ?z) .   % prp-trp
+T(?x, ?p2, ?y) :- T(?p1, rdfs:subPropertyOf, ?p2), T(?x, ?p1, ?y) .                  % prp-spo1
+T(?x, ?p2, ?y) :- T(?p1, owl:equivalentProperty, ?p2), T(?x, ?p1, ?y) .              % prp-eqp1
+T(?x, ?p1, ?y) :- T(?p1, owl:equivalentProperty, ?p2), T(?x, ?p2, ?y) .              % prp-eqp2
+violation("prp-pdw", ?x, ?y) :- T(?p1, owl:propertyDisjointWith, ?p2), T(?x, ?p1, ?y), T(?x, ?p2, ?y) .
+T(?y, ?p2, ?x) :- T(?p1, owl:inverseOf, ?p2), T(?x, ?p1, ?y) .                       % prp-inv1
+T(?y, ?p1, ?x) :- T(?p1, owl:inverseOf, ?p2), T(?x, ?p2, ?y) .                       % prp-inv2
+violation("prp-npa1", ?i1, ?i2) :- T(?x, owl:sourceIndividual, ?i1), T(?x, owl:assertionProperty, ?p), T(?x, owl:targetIndividual, ?i2), T(?i1, ?p, ?i2) .
+violation("prp-npa2", ?i, ?lt) :- T(?x, owl:sourceIndividual, ?i), T(?x, owl:assertionProperty, ?p), T(?x, owl:targetValue, ?lt), T(?i, ?p, ?lt) .
+
+% prp-spo2: property chains, walked along the chain list
+chainList(?l) :- T(?p, owl:propertyChainAxiom, ?l) .
+chainList(?r) :- chainList(?l), T(?l, rdf:rest, ?r), ?r != rdf:nil .
+chain(?x, ?l, ?y) :- chainList(?l), T(?l, rdf:first, ?p), T(?l, rdf:rest, rdf:nil), T(?x, ?p, ?y) .
+chain(?x, ?l, ?z) :- chainList(?l), T(?l, rdf:first, ?p), T(?l, rdf:rest, ?r), chain(?y, ?r, ?z), T(?x, ?p, ?y) .
+T(?x, ?p, ?y) :- T(?p, owl:propertyChainAxiom, ?l), chain(?x, ?l, ?y) .
+
+% prp-key: two instances of ?c agreeing on every key property are the same
+keyList(?c, ?l) :- T(?c, owl:hasKey, ?l) .
+keyList(?c, ?r) :- keyList(?c, ?l), T(?l, rdf:rest, ?r), ?r != rdf:nil .
+keyEq(?x, ?y, ?l) :- keyList(?c, ?l), T(?l, rdf:first, ?p), T(?l, rdf:rest, rdf:nil), T(?x, rdf:type, ?c), T(?y, rdf:type, ?c), T(?x, ?p, ?z), T(?y, ?p, ?z), ?x != ?y .
+keyEq(?x, ?y, ?l) :- keyList(?c, ?l), T(?l, rdf:first, ?p), T(?l, rdf:rest, ?r), keyEq(?x, ?y, ?r), T(?x, ?p, ?z), T(?y, ?p, ?z) .
+T(?x, owl:sameAs, ?y) :- T(?c, owl:hasKey, ?l), keyEq(?x, ?y, ?l) .
+
+%% Table 6: classes
+violation("cls-nothing2", ?x, owl:Nothing) :- T(?x, rdf:type, owl:Nothing) .
+% cls-int1: member of every class in the intersection list
+intList(?l) :- T(?c, owl:intersectionOf, ?l) .
+intList(?r) :- intList(?l), T(?l, rdf:rest, ?r), ?r != rdf:nil .
+inAll(?y, ?l) :- intList(?l), T(?l, rdf:first, ?c), T(?l, rdf:rest, rdf:nil), T(?y, rdf:type, ?c) .
+inAll(?y, ?l) :- intList(?l), T(?l, rdf:first, ?c), T(?l, rdf:rest, ?r), inAll(?y, ?r), T(?y, rdf:type, ?c) .
+T(?y, rdf:type, ?c) :- T(?c, owl:intersectionOf, ?l), inAll(?y, ?l) .
+T(?y, rdf:type, ?ci) :- T(?c, owl:intersectionOf, ?l), member(?l, ?ci), T(?y, rdf:type, ?c) .   % cls-int2
+T(?y, rdf:type, ?c) :- T(?c, owl:unionOf, ?l), member(?l, ?ci), T(?y, rdf:type, ?ci) .          % cls-uni
+violation("cls-com", ?x, ?c1) :- T(?c1, owl:complementOf, ?c2), T(?x, rdf:type, ?c1), T(?x, rdf:type, ?c2) .
+T(?u, rdf:type, ?x) :- T(?x, owl:someValuesFrom, ?y), T(?x, owl:onProperty, ?p), T(?u, ?p, ?v), T(?v, rdf:type, ?y) .   % cls-svf1
+T(?u, rdf:type, ?x) :- T(?x, owl:someValuesFrom, owl:Thing), T(?x, owl:onProperty, ?p), T(?u, ?p, ?v) .                  % cls-svf2
+T(?v, rdf:type, ?y) :- T(?x, owl:allValuesFrom, ?y), T(?x, owl:onProperty, ?p), T(?u, rdf:type, ?x), T(?u, ?p, ?v) .     % cls-avf
+T(?u, ?p, ?y) :- T(?x, owl:hasValue, ?y), T(?x, owl:onProperty, ?p), T(?u, rdf:type, ?x) .                                % cls-hv1
+T(?u, rdf:type, ?x) :- T(?x, owl:hasValue, ?y), T(?x, owl:onProperty, ?p), T(?u, ?p, ?y) .                                % cls-hv2
+violation("cls-maxc1", ?u, ?x) :- T(?x, owl:maxCardinality, 0), T(?x, owl:onProperty, ?p), T(?u, rdf:type, ?x), T(?u, ?p, ?y) .
+T(?y1, owl:sameAs, ?y2) :- T(?x, owl:maxCardinality, 1), T(?x, owl:onProperty, ?p), T(?u, rdf:type, ?x), T(?u, ?p, ?y1), T(?u, ?p, ?y2), ?y1 != ?y2 .   % cls-maxc2
+violation("cls-maxqc1", ?u, ?x) :- T(?x, owl:maxQualifiedCardinality, 0), T(?x, owl:onProperty, ?p), T(?x, owl:onClass, ?c), T(?u, rdf:type, ?x), T(?u, ?p, ?y), T(?y, rdf:type, ?c) .
+violation("cls-maxqc2", ?u, ?x) :- T(?x, owl:maxQualifiedCardinality, 0), T(?x, owl:onProperty, ?p), T(?x, owl:onClass, owl:Thing), T(?u, rdf:type, ?x), T(?u, ?p, ?y) .
+T(?y1, owl:sameAs, ?y2) :- T(?x, owl:maxQualifiedCardinality, 1), T(?x, owl:onProperty, ?p), T(?x, owl:onClass, ?c), T(?u, rdf:type, ?x), T(?u, ?p, ?y1), T(?y1, rdf:type, ?c), T(?u, ?p, ?y2), T(?y2, rdf:type, ?c), ?y1 != ?y2 .   % cls-maxqc3
+T(?y1, owl:sameAs, ?y2) :- T(?x, owl:maxQualifiedCardinality, 1), T(?x, owl:onProperty, ?p), T(?x, owl:onClass, owl:Thing), T(?u, rdf:type, ?x), T(?u, ?p, ?y1), T(?u, ?p, ?y2), ?y1 != ?y2 .   % cls-maxqc4
+T(?y, rdf:type, ?c) :- T(?c, owl:oneOf, ?l), member(?l, ?y) .                                                             % cls-oo
+
+%% Table 7: class axioms
+T(?x, rdf:type, ?c2) :- T(?c1, rdfs:subClassOf, ?c2), T(?x, rdf:type, ?c1) .         % cax-sco
+T(?x, rdf:type, ?c2) :- T(?c1, owl:equivalentClass, ?c2), T(?x, rdf:type, ?c1) .     % cax-eqc1
+T(?x, rdf:type, ?c1) :- T(?c1, owl:equivalentClass, ?c2), T(?x, rdf:type, ?c2) .     % cax-eqc2
+violation("cax-dw", ?x, ?c1) :- T(?c1, owl:disjointWith, ?c2), T(?x, rdf:type, ?c1), T(?x, rdf:type, ?c2) .
+violation("cax-adc", ?x, ?c1) :- T(?y, rdf:type, owl:AllDisjointClasses), T(?y, owl:members, ?l), member(?l, ?c1), member(?l, ?c2), ?c1 != ?c2, T(?x, rdf:type, ?c1), T(?x, rdf:type, ?c2) .
+violation("eq-diff2", ?y1, ?y2) :- T(?x, rdf:type, owl:AllDifferent), T(?x, owl:members, ?l), member(?l, ?y1), member(?l, ?y2), ?y1 != ?y2, T(?y1, owl:sameAs, ?y2) .
+violation("eq-diff3", ?y1, ?y2) :- T(?x, rdf:type, owl:AllDifferent), T(?x, owl:distinctMembers, ?l), member(?l, ?y1), member(?l, ?y2), ?y1 != ?y2, T(?y1, owl:sameAs, ?y2) .
+violation("prp-adp", ?u, ?v) :- T(?x, rdf:type, owl:AllDisjointProperties), T(?x, owl:members, ?l), member(?l, ?p1), member(?l, ?p2), ?p1 != ?p2, T(?u, ?p1, ?v), T(?u, ?p2, ?v) .
+
+%% Table 9: schema vocabulary
+T(?c, rdfs:subClassOf, ?c), T(?c, owl:equivalentClass, ?c), T(?c, rdfs:subClassOf, owl:Thing), T(owl:Nothing, rdfs:subClassOf, ?c) :- T(?c, rdf:type, owl:Class) .   % scm-cls
+T(?c1, rdfs:subClassOf, ?c3) :- T(?c1, rdfs:subClassOf, ?c2), T(?c2, rdfs:subClassOf, ?c3) .   % scm-sco
+T(?c1, rdfs:subClassOf, ?c2), T(?c2, rdfs:subClassOf, ?c1) :- T(?c1, owl:equivalentClass, ?c2) .   % scm-eqc1
+T(?c1, owl:equivalentClass, ?c2) :- T(?c1, rdfs:subClassOf, ?c2), T(?c2, rdfs:subClassOf, ?c1) .   % scm-eqc2
+T(?p, rdfs:subPropertyOf, ?p), T(?p, owl:equivalentProperty, ?p) :- T(?p, rdf:type, owl:ObjectProperty) .     % scm-op
+T(?p, rdfs:subPropertyOf, ?p), T(?p, owl:equivalentProperty, ?p) :- T(?p, rdf:type, owl:DatatypeProperty) .   % scm-dp
+T(?p1, rdfs:subPropertyOf, ?p3) :- T(?p1, rdfs:subPropertyOf, ?p2), T(?p2, rdfs:subPropertyOf, ?p3) .   % scm-spo
+T(?p1, rdfs:subPropertyOf, ?p2), T(?p2, rdfs:subPropertyOf, ?p1) :- T(?p1, owl:equivalentProperty, ?p2) .   % scm-eqp1
+T(?p1, owl:equivalentProperty, ?p2) :- T(?p1, rdfs:subPropertyOf, ?p2), T(?p2, rdfs:subPropertyOf, ?p1) .   % scm-eqp2
+T(?p, rdfs:domain, ?c2) :- T(?p, rdfs:domain, ?c1), T(?c1, rdfs:subClassOf, ?c2) .       % scm-dom1
+T(?p1, rdfs:domain, ?c) :- T(?p2, rdfs:domain, ?c), T(?p1, rdfs:subPropertyOf, ?p2) .     % scm-dom2
+T(?p, rdfs:range, ?c2) :- T(?p, rdfs:range, ?c1), T(?c1, rdfs:subClassOf, ?c2) .          % scm-rng1
+T(?p1, rdfs:range, ?c) :- T(?p2, rdfs:range, ?c), T(?p1, rdfs:subPropertyOf, ?p2) .       % scm-rng2
+% Restrictions as small relations: Nemo plans joins per predicate, and five-way self-joins
+% on the one triple table T are slow.
+svf(?x, ?p, ?y) :- T(?x, owl:someValuesFrom, ?y), T(?x, owl:onProperty, ?p) .
+avf(?x, ?p, ?y) :- T(?x, owl:allValuesFrom, ?y), T(?x, owl:onProperty, ?p) .
+hv(?x, ?p, ?y) :- T(?x, owl:hasValue, ?y), T(?x, owl:onProperty, ?p) .
+sco(?a, ?b) :- T(?a, rdfs:subClassOf, ?b) .
+spo(?a, ?b) :- T(?a, rdfs:subPropertyOf, ?b) .
+T(?c1, rdfs:subClassOf, ?c2) :- hv(?c1, ?p1, ?i), hv(?c2, ?p2, ?i), spo(?p1, ?p2) .     % scm-hv
+T(?c1, rdfs:subClassOf, ?c2) :- svf(?c1, ?p, ?y1), svf(?c2, ?p, ?y2), sco(?y1, ?y2) .   % scm-svf1
+T(?c1, rdfs:subClassOf, ?c2) :- svf(?c1, ?p1, ?y), svf(?c2, ?p2, ?y), spo(?p1, ?p2) .   % scm-svf2
+T(?c1, rdfs:subClassOf, ?c2) :- avf(?c1, ?p, ?y1), avf(?c2, ?p, ?y2), sco(?y1, ?y2) .   % scm-avf1
+T(?c2, rdfs:subClassOf, ?c1) :- avf(?c1, ?p1, ?y), avf(?c2, ?p2, ?y), spo(?p1, ?p2) .   % scm-avf2
+T(?c, rdfs:subClassOf, ?ci) :- T(?c, owl:intersectionOf, ?l), member(?l, ?ci) .          % scm-int
+T(?ci, rdfs:subClassOf, ?c) :- T(?c, owl:unionOf, ?l), member(?l, ?ci) .                  % scm-uni
+
+%% Output: the derived triples that weren't asserted
+INFERRED(?s, ?p, ?o) :- T(?s, ?p, ?o), ~INPUT(?s, ?p, ?o) .
+@export INFERRED :- ntriples { resource = "inferred.nt" } .
+@export violation :- csv { resource = "violations.csv" } .
