@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use nrese_engine::{
     EncodedQuad, EncodedTriple, Engine, EngineConfig, GraphSelector, QuadPattern, ReadModel,
-    Snapshot, TermId, Transaction,
+    Snapshot, TermId, Transaction, quad::Permutation,
 };
 use oxrdf::NamedNode;
 
@@ -370,6 +370,41 @@ fn assert_snapshot(snapshot: &Snapshot, model: &Model, context: &str) {
         |m, p| snapshot.quads_for_pattern_in(m, p).collect(),
         context,
     );
+    // XC1: exact counts, and sorted scans merging both stacks, in every permutation the
+    // pattern binds a prefix of and every included stack supports.
+    for read_model in MODELS {
+        let visible = model.visible(read_model);
+        for pattern in patterns() {
+            let expected: Vec<_> = visible
+                .iter()
+                .filter(|q| pattern.matches(q))
+                .copied()
+                .collect();
+            assert_eq!(
+                snapshot.count_in(read_model, &pattern),
+                expected.len() as u64,
+                "{context}: count {read_model:?} {pattern:?}"
+            );
+            for permutation in Permutation::ALL {
+                let Some(scan) = snapshot.scan_sorted_in(read_model, &pattern, permutation) else {
+                    continue;
+                };
+                let got: Vec<_> = scan.collect();
+                let mut sorted = expected.clone();
+                sorted.sort_by_key(|q| key(permutation, q));
+                assert_eq!(
+                    got, sorted,
+                    "{context}: {read_model:?} {pattern:?} {permutation:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A quad's components in `permutation`'s key order, as the public order describes it.
+fn key(permutation: Permutation, quad: &EncodedQuad) -> [TermId; 4] {
+    let canonical = [quad.subject, quad.predicate, quad.object, quad.graph];
+    permutation.order().map(|component| canonical[component])
 }
 
 fn assert_transaction(tx: &Transaction<'_>, model: &Model, context: &str) {

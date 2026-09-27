@@ -101,7 +101,7 @@ What reasoning is needed, when it runs and what a reader sees depend on the use 
 | `ruleset` | `none`, `rdfs`, `rdfs-plus`, `owl-horst`, `owl2-rl`, `owl2-ql`, or a custom `.pie`/IR program | `none` costs nothing: no reasoning stage and an empty inferred stack |
 | `timing` | **`commit`**, `deferred`, `on-demand` | `deferred`: writes don't wait, and a background reasoner commits inferred-only revisions. Readers can require the inferences to have caught up with a given revision. `on-demand`: materialisation only when triggered (API or operator), for batch pipelines. Changing the timing of a populated repository runs a reasoning job. |
 | `consistency` | **`reject`**, `report`, `off` | `reject` requires `timing = commit`. Under `deferred`, violations are reported against the revision that caused them. |
-| `placement` | **`default-graph`**, `graph:<IRI>`, `source-graph` | Where inferences live and which graphs rules range over. The first two put inferences in one graph and read rules over the union of graphs (GraphDB); the inferred stack keeps three permutations. `source-graph` evaluates rules per named graph and keeps inferences there (RDFox/Stardog style); the inferred stack then needs six permutations, doubling its memory. Fixed at repository creation, because it sets the stack layout. |
+| `placement` | **`default-graph`**, `graph:<IRI>`, `source-graph` | Where inferences live and which graphs rules range over. The first two put inferences in one graph and read rules over the union of graphs (GraphDB); the inferred stack keeps four permutations (three pattern orders plus PSO for joins). `source-graph` evaluates rules per named graph and keeps inferences there (RDFox/Stardog style); the inferred stack then needs six permutations, doubling its memory. Fixed at repository creation, because it sets the stack layout. |
 | `same_as` | **`rewrite`**, `off` | `rewrite` stores representatives and expands them at read time (§4.4) |
 | `maintenance` | **`auto`**, `dred`, `bf`, `counting` | For experts and benchmarks; `auto` chooses per stratum (§5) |
 | `axioms` | **`partial`**, `full` | GraphDB's `partialRDFS` distinction (§6.3) |
@@ -178,7 +178,7 @@ Used for initial loads, restores, ruleset changes and deltas above a size thresh
 
 - **Working set: vertical partitioning.** It is built from one snapshot scan as per-predicate binary relations of `(u64, u64)` pairs, in both **SO and OS order**. `rdf:type` is further split per class as unary sets.
   - This is Inferray's layout, and it is also what QLever's permutations amount to per predicate.
-  - It costs 32 B per fact for two orders, versus 192 B in the engine's six-permutation runs.
+  - It costs 32 B per fact for two orders, versus 128 B in the inferred stack's four-permutation runs (224 B in the asserted stack's seven).
   - Building it means a parallel radix sort of u64 pairs.
 - **Semi-naive evaluation per stratum.** Each relation has `old | Δ | new` segments. A rule with n atoms runs n delta variants (atom i on Δ, atoms before i on old, atoms after i on old ∪ Δ), so no derivation is repeated across rounds.
 - **Joins:**

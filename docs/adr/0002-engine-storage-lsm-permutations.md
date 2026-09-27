@@ -21,7 +21,7 @@ State of the art considered:
 - **Term IDs.** `TermId(u64)` has a 4-bit kind tag and a 60-bit payload.
   - Dictionary terms (IRI, blank node, literal) index an append-only arena with a SwissTable lookup.
   - Canonical `xsd:integer` (fits in 60 bits signed), `xsd:boolean`, `xsd:decimal` (56-bit mantissa, ≤ 15 fraction digits), `xsd:date` and `xsd:dateTime` (years 0000–9999, millisecond precision, timezones in 15-minute steps) values are inlined. Non-canonical lexical forms stay dictionary terms, so RDF term identity is preserved.
-- **Permutations.** Quads are stored in six permutations: `SPOG POSG OSPG` for an unbound graph, and `GSPO GPOS GOSP` for a bound graph. The default graph has the reserved id `0`.
+- **Permutations.** Quads are stored in six permutations: `SPOG POSG OSPG` for an unbound graph, and `GSPO GPOS GOSP` for a bound graph. The default graph has the reserved id `0`. (Amended 2026-09-27, XC1: a seventh, `GPSO`, gives subject-sorted scans per predicate for merge joins; see `docs/design/execution-core.md`.)
 - **Runs.** The index is a list of immutable sorted runs.
   - A commit appends one run of inserts plus tombstones. The run is computed exactly against the snapshot, so counts stay exact.
   - Reads merge the runs, and the newest wins.

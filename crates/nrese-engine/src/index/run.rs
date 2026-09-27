@@ -14,7 +14,7 @@ use rayon::prelude::*;
 use super::Layout;
 use crate::quad::{EncodedQuad, Key, Permutation};
 
-/// Deltas at least this large are sorted with all six permutations in parallel.
+/// Deltas at least this large are sorted with all of the layout's permutations in parallel.
 const PARALLEL_BUILD_THRESHOLD: usize = 16 * 1024;
 
 #[derive(Debug, Default)]
@@ -35,6 +35,29 @@ impl PermutationRun {
             .iter()
             .map(|word| u64::from(word.count_ones()))
             .sum()
+    }
+
+    /// Tombstones among the positions `start..end`. O(1) without tombstones, else
+    /// O((end - start) / 64).
+    pub(crate) fn tombstones_in(&self, start: usize, end: usize) -> u64 {
+        if self.tombstones.is_empty() || start >= end {
+            return 0;
+        }
+        let (first, last) = (start / 64, (end - 1) / 64);
+        let mask_from = |bit: usize| u64::MAX << (bit % 64);
+        let mask_to = |bit: usize| u64::MAX >> (63 - bit % 64);
+        if first == last {
+            return u64::from(
+                (self.tombstones[first] & mask_from(start) & mask_to(end - 1)).count_ones(),
+            );
+        }
+        let head = u64::from((self.tombstones[first] & mask_from(start)).count_ones());
+        let tail = u64::from((self.tombstones[last] & mask_to(end - 1)).count_ones());
+        let middle: u64 = self.tombstones[first + 1..last]
+            .iter()
+            .map(|word| u64::from(word.count_ones()))
+            .sum();
+        head + middle + tail
     }
 
     /// Index range of keys in `[low, high]`. O(log n).
@@ -74,7 +97,7 @@ impl PermutationRun {
 #[derive(Debug, Default)]
 pub(crate) struct Run {
     layout: Layout,
-    perms: [PermutationRun; 6],
+    perms: [PermutationRun; Permutation::COUNT],
     inserts: u64,
     deletes: u64,
 }
@@ -120,7 +143,10 @@ impl Run {
     /// Assembles a run from the permutation runs of `layout`, which hold the same entries.
     /// The counts are derived from SPOG (part of every layout), so they can't disagree with
     /// the data.
-    pub(crate) fn from_permutations(layout: Layout, perms: [PermutationRun; 6]) -> Self {
+    pub(crate) fn from_permutations(
+        layout: Layout,
+        perms: [PermutationRun; Permutation::COUNT],
+    ) -> Self {
         let spog = &perms[Permutation::Spog as usize];
         let deletes = spog.tombstone_count();
         let inserts = spog.keys.len() as u64 - deletes;
@@ -186,9 +212,9 @@ pub(crate) fn build_all(
     layout: Layout,
     size: usize,
     build: impl Fn(Permutation) -> PermutationRun + Sync,
-) -> [PermutationRun; 6] {
+) -> [PermutationRun; Permutation::COUNT] {
     let wanted = layout.permutations();
-    let mut perms: [PermutationRun; 6] = Default::default();
+    let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
     if size >= PARALLEL_BUILD_THRESHOLD {
         let built: Vec<PermutationRun> = wanted.par_iter().map(|&p| build(p)).collect();
         for (&permutation, run) in wanted.iter().zip(built) {

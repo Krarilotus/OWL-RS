@@ -12,7 +12,7 @@ use std::sync::Arc;
 use super::compaction::{CompactionPolicy, merge_runs};
 use super::run::Run;
 use super::{IndexVersion, Layout};
-use crate::quad::{EncodedQuad, GraphSelector, QuadPattern};
+use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
 
 /// SplitMix64: tiny, deterministic, good enough for test-case generation.
@@ -132,6 +132,53 @@ fn assert_matches_model(version: &IndexVersion, model: &BTreeSet<EncodedQuad>, c
             .copied()
             .collect();
         assert_eq!(got, expected, "{context}: pattern {pattern:?}");
+        let plan = AccessPlan::for_pattern(&pattern);
+        assert_eq!(
+            version.count_plan(&plan),
+            expected.len() as u64,
+            "{context}: exact count for {pattern:?}"
+        );
+        // Every supported permutation whose order the pattern binds a prefix of yields the
+        // same quads, sorted by that permutation's key.
+        for permutation in Permutation::ALL {
+            let Some(plan) = AccessPlan::in_permutation(&pattern, permutation) else {
+                continue;
+            };
+            if !version.layout.supports(permutation) {
+                continue;
+            }
+            let got: Vec<_> = version.scan_plan(&plan).collect();
+            let mut sorted = expected.clone();
+            sorted.sort_by_key(|q| permutation.to_key(q));
+            assert_eq!(got, sorted, "{context}: {pattern:?} in {permutation:?}");
+            assert_eq!(
+                version.count_plan(&plan),
+                expected.len() as u64,
+                "{context}: count of {pattern:?} in {permutation:?}"
+            );
+            // Group counts by the first free key position equal grouping the model.
+            let bound = plan
+                .low
+                .iter()
+                .zip(&plan.high)
+                .take_while(|(l, h)| l == h)
+                .count();
+            if bound < 4 && !plan.exclude_default_graph {
+                let mut totals = std::collections::BTreeMap::new();
+                version.group_counts(&plan, bound, &mut totals);
+                totals.retain(|_, count| *count != 0);
+                let mut grouped = std::collections::BTreeMap::new();
+                for quad in &expected {
+                    *grouped
+                        .entry(permutation.to_key(quad)[bound])
+                        .or_insert(0i64) += 1;
+                }
+                assert_eq!(
+                    totals, grouped,
+                    "{context}: group counts of {pattern:?} in {permutation:?}"
+                );
+            }
+        }
     }
     let graphs: Vec<_> = std::iter::successors(version.next_named_graph(None), |&g| {
         version.next_named_graph(Some(g))
@@ -231,12 +278,12 @@ fn base_run_from_quads_deduplicates() {
 }
 
 #[test]
-fn default_graph_layout_stores_three_permutations() {
+fn default_graph_layout_stores_four_of_seven_permutations() {
     let quads: Vec<_> = (0..4)
         .map(|n| EncodedQuad::new(term(n), term(1), term(2), graph(0)))
         .collect();
     let quads_bytes =
         IndexVersion::from_quads(Layout::Quads, quads.clone()).runs()[0].memory_bytes();
     let triples = IndexVersion::from_quads(Layout::DefaultGraph, quads);
-    assert_eq!(triples.runs()[0].memory_bytes() * 2, quads_bytes);
+    assert_eq!(triples.runs()[0].memory_bytes() * 7, quads_bytes * 4);
 }

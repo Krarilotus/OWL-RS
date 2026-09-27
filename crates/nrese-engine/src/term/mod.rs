@@ -18,6 +18,11 @@ pub const PAYLOAD_BITS: u32 = 60;
 const PAYLOAD_MASK: u64 = (1 << PAYLOAD_BITS) - 1;
 
 /// Kind tag stored in the top 4 bits of a [`TermId`].
+///
+/// Dictionary literals are split by datatype class, so the id alone tells an executor
+/// whether a term can be numeric: a numeric FILTER over a predicate reads its inline
+/// numeric ranges and its [`TypedLiteral`](Self::TypedLiteral) range, and skips strings and
+/// language-tagged strings without decoding them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum TermKind {
@@ -25,8 +30,9 @@ pub enum TermKind {
     DefaultGraph = 0,
     Iri = 1,
     BlankNode = 2,
-    Literal = 3,
-    /// Inline canonical `xsd:integer` (60-bit two's complement).
+    /// A simple literal (`xsd:string`).
+    String = 3,
+    /// Inline canonical `xsd:integer` (60-bit, offset binary, so ids sort by value).
     Integer = 4,
     /// Inline canonical `xsd:boolean`.
     Boolean = 5,
@@ -36,6 +42,10 @@ pub enum TermKind {
     Date = 7,
     /// Inline canonical `xsd:dateTime`.
     DateTime = 8,
+    /// A language-tagged string (`rdf:langString`).
+    LangString = 9,
+    /// A literal of any other datatype, including non-canonical forms of the inline ones.
+    TypedLiteral = 10,
 }
 
 impl TermKind {
@@ -44,19 +54,29 @@ impl TermKind {
             0 => Self::DefaultGraph,
             1 => Self::Iri,
             2 => Self::BlankNode,
-            3 => Self::Literal,
+            3 => Self::String,
             4 => Self::Integer,
             5 => Self::Boolean,
             6 => Self::Decimal,
             7 => Self::Date,
             8 => Self::DateTime,
+            9 => Self::LangString,
+            10 => Self::TypedLiteral,
             _ => return None,
         })
     }
 
     /// True for kinds whose payload is a dictionary index.
     pub const fn is_dictionary(self) -> bool {
-        matches!(self, Self::Iri | Self::BlankNode | Self::Literal)
+        matches!(
+            self,
+            Self::Iri | Self::BlankNode | Self::String | Self::LangString | Self::TypedLiteral
+        )
+    }
+
+    /// True for dictionary-backed literal kinds.
+    pub const fn is_dictionary_literal(self) -> bool {
+        matches!(self, Self::String | Self::LangString | Self::TypedLiteral)
     }
 
     /// True for kinds whose payload is the value itself.
@@ -109,6 +129,18 @@ impl TermId {
         (self.kind() == TermKind::Integer).then(|| inline::decode_integer(self.payload()))
     }
 
+    /// The inline id of the canonical integer `value`, if it is in the inline range. Inline
+    /// integer ids sort by value, so numeric bounds become id bounds.
+    pub fn inline_integer(value: i64) -> Option<Self> {
+        inline::integer_id(value)
+    }
+
+    /// The smallest and largest ids of `kind`: the id range a scan restricted to one kind
+    /// covers (for example all language-tagged strings of a predicate).
+    pub const fn kind_range(kind: TermKind) -> (Self, Self) {
+        (Self::new(kind, 0), Self::new(kind, PAYLOAD_MASK))
+    }
+
     /// Value of an inline boolean term, if this is one.
     pub fn as_inline_boolean(self) -> Option<bool> {
         (self.kind() == TermKind::Boolean).then(|| self.payload() != 0)
@@ -123,8 +155,8 @@ mod tests {
 
     #[test]
     fn kind_and_payload_roundtrip() {
-        let id = TermId::new(TermKind::Literal, 42);
-        assert_eq!(id.kind(), TermKind::Literal);
+        let id = TermId::new(TermKind::TypedLiteral, 42);
+        assert_eq!(id.kind(), TermKind::TypedLiteral);
         assert_eq!(id.payload(), 42);
         assert_eq!(TermId::from_raw(id.raw()), id);
     }
