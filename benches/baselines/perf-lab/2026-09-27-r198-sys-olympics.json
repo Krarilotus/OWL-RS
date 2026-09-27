@@ -1,0 +1,97 @@
+{
+  "label": "r198-sys",
+  "open_s": 0.000,
+  "load_s": 0.519,
+  "peak_mib": 898,
+  "sum_p50_ms": 1603.890,
+  "queries": [
+    {
+      "name": "q01-point-lookup",
+      "rows": 5,
+      "p50_ms": 0.015,
+      "min_ms": 0.014,
+      "max_ms": 0.024
+    },
+    {
+      "name": "q02-star-team",
+      "rows": 7155,
+      "p50_ms": 200.508,
+      "min_ms": 187.303,
+      "max_ms": 222.196
+    },
+    {
+      "name": "q03-gold-by-team",
+      "rows": 20,
+      "p50_ms": 69.156,
+      "min_ms": 66.713,
+      "max_ms": 74.523
+    },
+    {
+      "name": "q04-top-medallists",
+      "rows": 10,
+      "p50_ms": 291.894,
+      "min_ms": 279.635,
+      "max_ms": 297.295
+    },
+    {
+      "name": "q05-numeric-range",
+      "rows": 1527,
+      "p50_ms": 20.909,
+      "min_ms": 20.804,
+      "max_ms": 21.244
+    },
+    {
+      "name": "q06-text-filter",
+      "rows": 1033,
+      "p50_ms": 90.348,
+      "min_ms": 84.342,
+      "max_ms": 90.841
+    },
+    {
+      "name": "q07-games-by-year",
+      "rows": 51,
+      "p50_ms": 119.241,
+      "min_ms": 117.177,
+      "max_ms": 128.877
+    },
+    {
+      "name": "q08-event-hierarchy",
+      "rows": 765,
+      "p50_ms": 0.501,
+      "min_ms": 0.466,
+      "max_ms": 0.555
+    },
+    {
+      "name": "q09-no-medal",
+      "error": "timeout after 120 s"
+    },
+    {
+      "name": "q10-ask",
+      "rows": 1,
+      "p50_ms": 42.686,
+      "min_ms": 41.823,
+      "max_ms": 49.085
+    },
+    {
+      "name": "q11-count-all",
+      "rows": 1,
+      "p50_ms": 254.031,
+      "min_ms": 242.434,
+      "max_ms": 259.814
+    },
+    {
+      "name": "q12-all-labels",
+      "rows": 137026,
+      "p50_ms": 67.009,
+      "min_ms": 63.676,
+      "max_ms": 77.385
+    },
+    {
+      "name": "q13-avg-age-by-games",
+      "rows": 51,
+      "p50_ms": 447.592,
+      "min_ms": 436.371,
+      "max_ms": 478.423
+    }
+  ]
+}
