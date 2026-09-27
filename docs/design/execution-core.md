@@ -54,9 +54,11 @@ nrese-engine   permutations, cursors with seek, exact range counts, statistics, 
    - `TypedLiteral` (everything else, including `xsd:double`)
 
    A numeric FILTER then scans the integer id range plus the decimal and typed-literal ranges of the predicate, and skips its labels entirely. Per-predicate kind histograms (Pf4) usually prove the typed range empty.
-3. **The PSO order.** Star joins on subjects (`?s p1 ?a . ?s p2 ?b`) need each `(?s p ?o)` scan sorted by subject. The asserted stack gets **PSOG** as a seventh permutation, and the inferred stack gets **PSO** as a fourth. The +1/6 index memory is recovered by Pf1 compression.
-
-   Pf6's index-set setting may drop the graph-first permutations for default-graph-only repositories, leaving SPO, POS, OSP and PSO.
+3. **The PSO order.** Star joins on subjects (`?s p1 ?a . ?s p2 ?b`) need each `(?s p ?o)` scan sorted by subject.
+   - Patterns in one graph, including every default-graph query, are answered by the graph-first permutations (GSPO, GPOS, GOSP). None of them yields `(?s p ?o)` sorted by subject.
+   - So the asserted stack gets **GPSO** as a seventh permutation. The inferred stack, where a constant graph makes graph-first and graph-last orders identical, gets **PSOG** as a fourth.
+   - Union-graph patterns (SPOG, POSG, OSPG) stay without a PSO order. They're rarer, and a radix sort of the scan output covers them.
+   - The +1/6 index memory is recovered by Pf1 compression. Pf6's index-set setting may later drop permutations a repository never uses.
 4. **Cursor API.** Scans become cursors over (permutation, key range) with `seek(prefix)`, block-wise `next_block(&mut buf)`, and `count()`.
    - `count()` is **exact**: the sum of range sizes per run minus tombstones in range. That's O(r log n) with a per-block tombstone count (Pf1), and a scan until then.
    - Exact scan cardinalities at plan time are the planner's biggest advantage over estimate-only systems.
