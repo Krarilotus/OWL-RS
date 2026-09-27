@@ -45,6 +45,30 @@ M0 Foundation & cleanup ──► M1 Engine core ──► M2 Governance ──�
 
 M3 and M4 are independent after M2 and can run in parallel with two people. The order M2 → M3 is a proposal (decision D1 in section 8).
 
+### 3.1 Execution order from 2026-09-27 (supersedes the diagram's order; D1 revised, D11)
+
+The user's direction: make NRESE as strong as possible as a package of its own. That means efficient basics, maximum performance across the board, and industry-leading reasoning, query and operations performance. So **M4 and M3 come before M2**, in five phases:
+
+| Phase | Work packages | Why this order | Gate (all measured, recorded in `benches/baselines/`) |
+|---|---|---|---|
+| **1. Speed foundation** (S) | **Pf7a** toolchain and codegen (Rust 1.98.1, release profile, mimalloc); **PL** perf lab (in-process runner for the scorecard and reasoning query sets, p50/p99, profiling recipe) | It lifts every later number, and every later WP needs a fast, in-process measurement loop instead of the Docker scorecard | Baseline per query recorded; no regressions |
+| **2. Execution core and native queries** (XL) | **XC** shared execution core (D11); **Pf4** statistics; **Pf3** native executor for BGPs, joins, filters, aggregates, ORDER/LIMIT and OPTIONAL, with spareval kept for the rest | Queries are the largest gap: QLever is 10–2000× faster. The reasoner's batch executor (§4.1 of the design) needs the same operators | Each scorecard query within 2× of QLever, or faster; no result differences against spareval or the W3C suite |
+| **3. Reasoner v2** (XL) | **R1–R4**, then **R5**, **R6**, as designed, on the execution core | Reasoning is the headline (D9) | Inferred sets identical to the reference on LUBM and OWL2Bench; ≥ 10× Nemo/Jena on RT1; OWL2Bench RL(1) < 1 s; commit-path p50 ≤ 1 ms |
+| **4. Storage efficiency** (L) | **Pf2** memory-mapped runs with instant restart, **Pf1** compressed blocks, **Pf5** dictionary at scale, **E7** loader v2 | Serving memory (24 GiB at 67 M against 0.3 GiB), restart (21 s against 1 s) and bytes/triple (42–57 against 17–42) | Restart < 1 s at 100 M; bytes/triple ≤ QLever; load stays fastest |
+| **5. Operations** (M) | **Pf6** group commit, sync policies, write-path isolation, presets; **O2** online backup; **O3** metrics for the new components | Write p99 under read load is 0.2–2 s now | Write p99 < 20 ms under 8 readers with group commit |
+
+Phase 4 moves earlier if memory blocks the reasoning benchmarks at LUBM(1000). **M2 (governance) follows**, unless DMW or ResearchSpace need a piece of it sooner.
+
+**Execution core (XC), decision D11.** A new crate, `nrese-exec`, holds the ID-level execution machinery shared by SPARQL and reasoning:
+- **ID tables:** columnar `u64`, sorted on a key prefix
+- **Sorting:** radix sort
+- **Joins:** merge join, galloping join, Leapfrog Triejoin for cyclic patterns, hash join as the fallback
+- **Aggregation:** COUNT/GROUP BY over ids
+- **Parallelism:** rayon morsels with deterministic output
+- **Memory:** a budget per query or per reasoning job
+
+Scans reach storage through a seekable, block-wise cursor. That keeps Pf1 and Pf2 (compression, mmap) behind the interface: they change storage without touching an executor.
+
 ---
 
 ## 4. Milestones and work packages
@@ -186,7 +210,7 @@ Reasoning behaviour is **configured per repository and per request** (decision D
   5. Pf1 and Pf5: 42–57 bytes per triple against QLever's 17–42.
   6. E7: load is already the fastest of the group, 1.7–12× ahead at 67 M.
   7. Pf6: profiles, refined as the knobs appear.
-- **Open question for decision D1:** should Pf7 and Pf3/Pf4 run before, or in parallel with, M2 (governance)?
+- **D1 is resolved** (2026-09-27): §3.1 sets the phase order.
 
 | WP | Scope | Layer | Done when |
 |---|---|---|---|
@@ -281,7 +305,7 @@ Benchmarks run on one documented machine profile. Numbers go into `docs/spec/06-
 
 | # | Question | Decision |
 |---|---|---|
-| D1 | After M1, what comes first: governance (SHACL, FTS, RDF4J, ResearchSpace) or reasoning? | **Governance first** (decided 2026-09-25). DMW (D18) and ResearchSpace need it; reasoning builds on the same engine afterwards. The reasoning plan pulls only its storage part (E6) into M1, and M3 can start right after M1 if priorities change ([design/reasoner-v2.md](design/reasoner-v2.md) §9). |
+| D1 | After M1, what comes first: governance (SHACL, FTS, RDF4J, ResearchSpace) or reasoning? | **Revised 2026-09-27: performance (M4) and reasoning (M3) first, in the phases of §3.1.** The user: make NRESE as strong as possible as its own package, with efficient basics, maximum performance and industry-leading reasoning, query and operations performance. M2 follows. Originally: **governance first** (decided 2026-09-25). DMW (D18) and ResearchSpace need it; reasoning builds on the same engine afterwards. The reasoning plan pulls only its storage part (E6) into M1, and M3 can start right after M1 if priorities change ([design/reasoner-v2.md](design/reasoner-v2.md) §9). |
 | D2 | How to mark inferred data: separate asserted/inferred index stacks, or per-entry flags? | **Separate stacks** (decided 2026-09-25; see 1.1 above). |
 | D3 | Full-text engine: tantivy, or our own inverted index? | **tantivy** (decided 2026-09-25). |
 | D4 | RDF-star / RDF 1.2 triple terms: early (M2) or with reasoning (M3)? | **M3** (decided 2026-09-25), unless a concrete DMW/RS need appears earlier. |
@@ -289,5 +313,6 @@ Benchmarks run on one documented machine profile. Numbers go into `docs/spec/06-
 | D7 | Are reasoning behaviours fixed or configurable? | **Configurable** (decided 2026-09-26). Tuned defaults, other modes exposed per repository (ruleset, timing, consistency, placement, sameAs, maintenance) and per request (read model, explanations, freshness). Only the stack invariants are fixed. See [design/reasoner-v2.md](design/reasoner-v2.md) §2.2. |
 | D9 | What do the benchmarks lead with? | **Ontology reasoning** (user, 2026-09-26): "the real measurements for benchmarking should be all about reasoning capabilities for ontologies, as that's the main target for our triplestore to shine in, the other things are the basics". The reasoning benchmark (Pf0-R) is the headline evidence, and the load/query scorecard guards the basics. Open follow-up for D1: does M3 (reasoning) now move ahead of M2 (governance)? |
 | D10 | How good must the basics be? | **At least state of the art on every metric, ideally faster** (user, 2026-09-26). Reasoning is the headline (D9), but load, storage, query and write speed must match or beat the best system on each scorecard column: QLever for queries, the fastest loader for load, and so on. The means are machine-code-level optimisation (the latest Rust, codegen tuning, assembly inspection; Pf7), algorithm engineering and data structures (Pf1–Pf5, E7), and caches. "Good enough" isn't a target. |
+| D11 | Do SPARQL and the reasoner get separate executors? | **No: one shared execution core, `nrese-exec`** (2026-09-27; §3.1). The native SPARQL executor (Pf3) and the reasoner's batch and delta executors (R2, R4) use the same ID tables, sorts, joins (merge, galloping, Leapfrog Triejoin, hash) and memory budgets. Every optimisation then speeds up both, and there's one join implementation to test. |
 | D8 | How is performance judged, and which trade-offs are fixed? | **A multi-metric scorecard (Pf0); tuned defaults with configurable presets (Pf6)** (decided 2026-09-26). The benchmark suite is finished before further implementation. Competitor results follow the vendors' licences: GraphDB, RDFox and AnzoGraph results are never published without written permission. |
 | D6 | May the stray build directories in the working copy be deleted (F5)? | **Yes** (decided 2026-09-25): 23 untracked `target-*` directories (about 50 GB) were removed. |
