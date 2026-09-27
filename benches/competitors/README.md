@@ -41,7 +41,7 @@ Results: [SCORECARD.md](SCORECARD.md) (free-to-publish systems only).
 
 | System | Image | Bulk path |
 |---|---|---|
-| NRESE | built in `rust:1.91-bookworm` | `nrese-server load` |
+| NRESE | built in `rust:<rust-toolchain.toml version>-bookworm` | `nrese-server load` |
 | QLever | `adfreiburg/qlever:latest` | `qlever-index -p true` |
 | GraphDB 11.5.1 Free | `ontotext/graphdb:11.5.1` | `importrdf preload`, ruleset `empty`; queries need `GRAPHDB_LICENSE` |
 | Jena 6.2.0 TDB2 (Fuseki) | `nrese-bench/jena:6.2.0` (`jena/Dockerfile`) | `tdb2.tdbloader --loader=parallel`. `tdb2.xloader` fails on real data in 6.2.0 (Thrift "unknown type 15" while sorting terms; the synthetic data loads) |
