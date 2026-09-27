@@ -123,7 +123,17 @@ fn bgp(rng: &mut Rng) -> String {
 fn filter(rng: &mut Rng) -> String {
     let v = rng.pick(&VARS);
     let w = rng.pick(&VARS);
-    match rng.below(19) {
+    match rng.below(25) {
+        19 => format!("FILTER(YEAR({v}) = 2001 || MONTH({w}) = 1)"),
+        20 => format!("FILTER(ABS({v} - 3) < 2 || ROUND({w}) = 3)"),
+        21 => format!("FILTER({v} * 2 > 5 && {v} / 2 != 1)"),
+        22 => format!(
+            "FILTER(CONCAT(STR({v}), \"x\") = \"s1x\" || STRAFTER(STR({w}), \"e\") = \"2\")"
+        ),
+        23 => format!("FILTER(-{v} <= -2 && CEIL({v}) >= FLOOR({v}))"),
+        24 => format!(
+            "FILTER(STRBEFORE({v}, \"1\") = \"s\" || STRLANG(STR({w}), \"en\") = \"s1\"@en)"
+        ),
         17 => format!(
             "FILTER({v} >= \"2000-01-02\"^^<http://www.w3.org/2001/XMLSchema#date> && {v} < \"2001-01-02\"^^<http://www.w3.org/2001/XMLSchema#date>)"
         ),
@@ -152,7 +162,24 @@ fn filter(rng: &mut Rng) -> String {
 fn group_pattern(rng: &mut Rng, depth: u32) -> String {
     let mut parts = vec![bgp(rng)];
     for _ in 0..rng.below(3) {
-        let part = match rng.below(if depth > 1 { 3 } else { 7 }) {
+        let part = match rng.below(if depth > 1 { 3 } else { 8 }) {
+            7 => {
+                let v = rng.pick(&VARS);
+                let expression = rng.pick(&[
+                    "VAR + 1",
+                    "VAR * 1.5",
+                    "VAR / 4",
+                    "YEAR(VAR)",
+                    "CONCAT(STR(VAR), \"-\")",
+                    "STRDT(STR(VAR), <http://www.w3.org/2001/XMLSchema#integer>)",
+                    "FLOOR(VAR)",
+                ]);
+                format!(
+                    "BIND({} AS ?e{})",
+                    expression.replace("VAR", v),
+                    rng.below(1_000_000)
+                )
+            }
             0 | 1 => filter(rng),
             2 => bgp(rng),
             3 => format!("OPTIONAL {{ {} }}", group_pattern(rng, depth + 1)),

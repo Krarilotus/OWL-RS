@@ -13,6 +13,8 @@ use oxrdf::{Literal, NamedNode, Term, Variable};
 use regex::Regex;
 use spargebra::algebra::{Expression, Function};
 
+use oxsdatatypes::{Decimal, Double, Float, Integer};
+
 use super::value::{Value, boolean_term, compare, effective_boolean, equals, is_lang_string};
 
 /// True if the native evaluator implements every node of `expr`.
@@ -27,7 +29,12 @@ pub(crate) fn supported(expr: &Expression) -> bool {
         | Expression::Greater(a, b)
         | Expression::GreaterOrEqual(a, b)
         | Expression::Less(a, b)
-        | Expression::LessOrEqual(a, b) => supported(a) && supported(b),
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => supported(a) && supported(b),
+        Expression::UnaryPlus(a) | Expression::UnaryMinus(a) => supported(a),
         Expression::In(a, list) => supported(a) && list.iter().all(supported),
         Expression::Not(a) => supported(a),
         Expression::If(a, b, c) => supported(a) && supported(b) && supported(c),
@@ -51,6 +58,21 @@ pub(crate) fn supported(expr: &Expression) -> bool {
                         | Function::IsBlank
                         | Function::IsLiteral
                         | Function::IsNumeric
+                        | Function::Abs
+                        | Function::Ceil
+                        | Function::Floor
+                        | Function::Round
+                        | Function::Year
+                        | Function::Month
+                        | Function::Day
+                        | Function::Hours
+                        | Function::Minutes
+                        | Function::Seconds
+                        | Function::Concat
+                        | Function::StrBefore
+                        | Function::StrAfter
+                        | Function::StrDt
+                        | Function::StrLang
                 )
         }
         _ => false,
@@ -151,6 +173,15 @@ impl Evaluator {
                 }
             }
             Expression::Coalesce(list) => list.iter().find_map(|e| self.eval(e, binding)),
+            Expression::Add(a, b) => arithmetic(Operator::Add, values(a, b)?),
+            Expression::Subtract(a, b) => arithmetic(Operator::Subtract, values(a, b)?),
+            Expression::Multiply(a, b) => arithmetic(Operator::Multiply, values(a, b)?),
+            Expression::Divide(a, b) => arithmetic(Operator::Divide, values(a, b)?),
+            Expression::UnaryPlus(a) => {
+                let term = self.eval(a, binding)?;
+                Numeric::of(&Value::of(&term)).map(|_| term)
+            }
+            Expression::UnaryMinus(a) => Numeric::of(&Value::of(&self.eval(a, binding)?))?.negate(),
             Expression::FunctionCall(function, args) => self.call(function, args, binding),
             _ => None,
         }
@@ -251,6 +282,87 @@ impl Evaluator {
             Function::IsIri => arg(0).map(|t| boolean_term(t.is_named_node())),
             Function::IsBlank => arg(0).map(|t| boolean_term(t.is_blank_node())),
             Function::IsLiteral => arg(0).map(|t| boolean_term(t.is_literal())),
+            Function::Abs | Function::Ceil | Function::Floor | Function::Round => {
+                Numeric::of(&Value::of(&arg(0)?))?.rounding(function)
+            }
+            Function::Year | Function::Month | Function::Day => {
+                let (year, month, day) = match Value::of(&arg(0)?) {
+                    Value::Date(d) => (d.year(), d.month(), d.day()),
+                    Value::DateTime(d) => (d.year(), d.month(), d.day()),
+                    _ => return None,
+                };
+                let part = match function {
+                    Function::Year => year,
+                    Function::Month => i64::from(month),
+                    _ => i64::from(day),
+                };
+                Some(Literal::from(Integer::from(part)).into())
+            }
+            Function::Hours | Function::Minutes | Function::Seconds => {
+                let Value::DateTime(d) = Value::of(&arg(0)?) else {
+                    return None;
+                };
+                Some(match function {
+                    Function::Hours => Literal::from(Integer::from(i64::from(d.hour()))).into(),
+                    Function::Minutes => Literal::from(Integer::from(i64::from(d.minute()))).into(),
+                    _ => Literal::from(d.second()).into(),
+                })
+            }
+            Function::Concat => {
+                // The common language tag if every argument has it, else a simple literal.
+                let mut text = String::new();
+                let mut language: Option<Option<String>> = None;
+                for i in 0..args.len() {
+                    let (value, lang) = string(&arg(i)?)?;
+                    text.push_str(&value);
+                    language = Some(match language {
+                        None => lang,
+                        Some(previous) if previous == lang => previous,
+                        Some(_) => None,
+                    });
+                }
+                Some(plain(text, language.flatten()))
+            }
+            Function::StrBefore | Function::StrAfter => {
+                let (text, needle, language) = pair()?;
+                Some(match text.find(&needle) {
+                    // An empty match keeps the argument's language; no match is "".
+                    Some(at) => {
+                        let part = if matches!(function, Function::StrBefore) {
+                            text[..at].to_owned()
+                        } else {
+                            text[at + needle.len()..].to_owned()
+                        };
+                        plain(part, language)
+                    }
+                    None => Literal::new_simple_literal("").into(),
+                })
+            }
+            Function::StrDt => {
+                let Term::Literal(value) = arg(0)? else {
+                    return None;
+                };
+                let Term::NamedNode(datatype) = arg(1)? else {
+                    return None;
+                };
+                (value.language().is_none() && value.datatype() == xsd::STRING)
+                    .then(|| Literal::new_typed_literal(value.value(), datatype).into())
+            }
+            Function::StrLang => {
+                let Term::Literal(value) = arg(0)? else {
+                    return None;
+                };
+                let (language, _) = string(&arg(1)?)?;
+                (value.language().is_none()
+                    && value.datatype() == xsd::STRING
+                    && !language.is_empty())
+                .then(|| {
+                    Literal::new_language_tagged_literal(value.value(), language)
+                        .ok()
+                        .map(Term::from)
+                })
+                .flatten()
+            }
             Function::IsNumeric => arg(0).map(|t| {
                 boolean_term(matches!(
                     Value::of(&t),
@@ -286,4 +398,137 @@ pub(crate) fn compile_regex(pattern: &str, flags: &str) -> Option<Regex> {
         .size_limit(1 << 20)
         .build()
         .ok()
+}
+
+#[derive(Clone, Copy)]
+enum Operator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+/// A numeric value, for arithmetic with SPARQL's type promotion
+/// (integer → decimal → float → double); results print as spareval's do.
+#[derive(Clone, Copy)]
+enum Numeric {
+    Integer(Integer),
+    Decimal(Decimal),
+    Float(Float),
+    Double(Double),
+}
+
+impl Numeric {
+    fn of(value: &Value) -> Option<Self> {
+        Some(match value {
+            Value::Integer(i) => Self::Integer(*i),
+            Value::Decimal(d) => Self::Decimal(*d),
+            Value::Float(f) => Self::Float(*f),
+            Value::Double(d) => Self::Double(*d),
+            _ => return None,
+        })
+    }
+
+    fn term(self) -> Term {
+        match self {
+            Self::Integer(i) => Literal::from(i),
+            Self::Decimal(d) => Literal::from(d),
+            Self::Float(f) => Literal::from(f),
+            Self::Double(d) => Literal::from(d),
+        }
+        .into()
+    }
+
+    fn negate(self) -> Option<Term> {
+        Some(
+            match self {
+                Self::Integer(i) => Self::Integer(i.checked_neg()?),
+                Self::Decimal(d) => Self::Decimal(d.checked_neg()?),
+                Self::Float(f) => Self::Float(-f),
+                Self::Double(d) => Self::Double(-d),
+            }
+            .term(),
+        )
+    }
+
+    fn rounding(self, function: &Function) -> Option<Term> {
+        Some(
+            match (self, function) {
+                (Self::Integer(i), Function::Abs) => Self::Integer(i.checked_abs()?),
+                (Self::Integer(i), _) => Self::Integer(i),
+                (Self::Decimal(d), Function::Abs) => Self::Decimal(d.checked_abs()?),
+                (Self::Decimal(d), Function::Ceil) => Self::Decimal(d.checked_ceil()?),
+                (Self::Decimal(d), Function::Floor) => Self::Decimal(d.checked_floor()?),
+                (Self::Decimal(d), _) => Self::Decimal(d.checked_round()?),
+                (Self::Float(f), Function::Abs) => Self::Float(f.abs()),
+                (Self::Float(f), Function::Ceil) => Self::Float(f.ceil()),
+                (Self::Float(f), Function::Floor) => Self::Float(f.floor()),
+                (Self::Float(f), _) => Self::Float(f.round()),
+                (Self::Double(d), Function::Abs) => Self::Double(d.abs()),
+                (Self::Double(d), Function::Ceil) => Self::Double(d.ceil()),
+                (Self::Double(d), Function::Floor) => Self::Double(d.floor()),
+                (Self::Double(d), _) => Self::Double(d.round()),
+            }
+            .term(),
+        )
+    }
+}
+
+fn arithmetic(operator: Operator, (a, b): (Value, Value)) -> Option<Term> {
+    use Numeric::{Decimal as D, Double as Db, Float as F, Integer as I};
+    let (a, b) = (Numeric::of(&a)?, Numeric::of(&b)?);
+    let decimal = |n: Numeric| match n {
+        I(i) => Some(Decimal::from(i)),
+        D(d) => Some(d),
+        _ => None,
+    };
+    let float = |n: Numeric| match n {
+        I(i) => Some(Float::from(i)),
+        D(d) => Some(Float::from(d)),
+        F(f) => Some(f),
+        Db(_) => None,
+    };
+    let double = |n: Numeric| match n {
+        I(i) => Double::from(i),
+        D(d) => Double::from(d),
+        F(f) => Double::from(f),
+        Db(d) => d,
+    };
+    let result = match (a, b) {
+        (I(x), I(y)) => match operator {
+            Operator::Add => I(x.checked_add(y)?),
+            Operator::Subtract => I(x.checked_sub(y)?),
+            Operator::Multiply => I(x.checked_mul(y)?),
+            // Integer division is decimal division in SPARQL.
+            Operator::Divide => D(Decimal::from(x).checked_div(Decimal::from(y))?),
+        },
+        (I(_) | D(_), I(_) | D(_)) => {
+            let (x, y) = (decimal(a)?, decimal(b)?);
+            D(match operator {
+                Operator::Add => x.checked_add(y)?,
+                Operator::Subtract => x.checked_sub(y)?,
+                Operator::Multiply => x.checked_mul(y)?,
+                Operator::Divide => x.checked_div(y)?,
+            })
+        }
+        (I(_) | D(_) | F(_), I(_) | D(_) | F(_)) => {
+            let (x, y) = (float(a)?, float(b)?);
+            F(match operator {
+                Operator::Add => x + y,
+                Operator::Subtract => x - y,
+                Operator::Multiply => x * y,
+                Operator::Divide => x / y,
+            })
+        }
+        _ => {
+            let (x, y) = (double(a), double(b));
+            Db(match operator {
+                Operator::Add => x + y,
+                Operator::Subtract => x - y,
+                Operator::Multiply => x * y,
+                Operator::Divide => x / y,
+            })
+        }
+    };
+    Some(result.term())
 }
