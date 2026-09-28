@@ -18,12 +18,12 @@ use oxrdf::Quad;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
 
-use super::{CommitSummary, Inner, Snapshot, Stack, Version};
+use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version};
 use crate::durability::checkpoint;
 use crate::error::EngineResult;
 use crate::index::IndexVersion;
 use crate::index::run::Run;
-use crate::quad::EncodedQuad;
+use crate::quad::{EncodedQuad, EncodedTriple, QuadPattern};
 
 /// What a bulk load does with the existing data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,24 +138,7 @@ impl<'e> BulkLoad<'e> {
         }
 
         let built = started.elapsed();
-        let next = Arc::new(next);
-        match &shared.durable {
-            Some(durable) => {
-                let revision = next.revision;
-                let _checkpoint = durable.checkpoint_slot.lock();
-                let image = Snapshot::new(Arc::clone(&next), Arc::clone(&shared.dictionary));
-                checkpoint::write(durable.root(), &image)?;
-                // The checkpoint covers every logged revision: later commits start a new
-                // segment, and all older segments can go.
-                let mut wal = durable.wal.lock();
-                wal.rotate(revision + 1)?;
-                shared.versions.install(next);
-                wal.release_through(revision)?;
-                drop(wal);
-                checkpoint::remove_older_than(durable.root(), revision)?;
-            }
-            None => shared.versions.install(next),
-        }
+        publish(engine, next)?;
         drop(_compaction);
         tracing::info!(
             revision = summary.revision,
@@ -163,6 +146,133 @@ impl<'e> BulkLoad<'e> {
             index_build_ms = built.as_millis() as u64,
             checkpoint_ms = (started.elapsed() - built).as_millis() as u64,
             "bulk load published"
+        );
+        engine.after_commit(0);
+        Ok(summary)
+    }
+}
+
+/// Installs `next` as the latest version, the bulk way: in durable mode a checkpoint of it
+/// is written first, so no WAL record is needed. The caller holds the writer and compaction
+/// slots.
+fn publish(engine: &Inner, next: Version) -> EngineResult<()> {
+    let shared = &engine.shared;
+    let next = Arc::new(next);
+    match &shared.durable {
+        Some(durable) => {
+            let revision = next.revision;
+            let _checkpoint = durable.checkpoint_slot.lock();
+            let image = Snapshot::new(Arc::clone(&next), Arc::clone(&shared.dictionary));
+            checkpoint::write(durable.root(), &image)?;
+            // The checkpoint covers every logged revision: later commits start a new
+            // segment, and all older segments can go.
+            let mut wal = durable.wal.lock();
+            wal.rotate(revision + 1)?;
+            shared.versions.install(next);
+            wal.release_through(revision)?;
+            drop(wal);
+            checkpoint::remove_older_than(durable.root(), revision)?;
+        }
+        None => shared.versions.install(next),
+    }
+    Ok(())
+}
+
+/// A rematerialisation in progress: the reasoner reads [`base`](Self::base), computes the
+/// complete inferred set, and [`finish`](Self::finish) replaces the inferred stack with it
+/// as one revision. The batch counterpart of [`Transaction::insert_inferred`]
+/// (crate::Transaction::insert_inferred), for initial reasoning after a bulk load and for
+/// ruleset changes; durable the way bulk loads are.
+///
+/// It holds the writer slot for its lifetime, so the base can't change underneath. Dropping
+/// it without `finish` aborts it.
+pub struct Rematerialisation<'e> {
+    engine: &'e Inner,
+    _slot: MutexGuard<'e, ()>,
+    base: Snapshot,
+}
+
+impl<'e> Rematerialisation<'e> {
+    pub(super) fn new(engine: &'e Inner, slot: MutexGuard<'e, ()>) -> Self {
+        let base = engine.shared.snapshot();
+        Self {
+            engine,
+            _slot: slot,
+            base,
+        }
+    }
+
+    /// The state the inferences are derived from.
+    pub fn base(&self) -> &Snapshot {
+        &self.base
+    }
+
+    /// The id of `term`, interning it: rules mention constants the data may not contain.
+    pub fn intern(&self, term: oxrdf::TermRef<'_>) -> crate::TermId {
+        self.engine.shared.dictionary.intern(term)
+    }
+
+    /// Replaces the inferred stack with `inferred` (in the default graph). Statements that
+    /// are asserted in the default graph are dropped: the stacks stay disjoint. Returns the
+    /// revision and the inferred statements added and removed.
+    pub fn finish(self, inferred: Vec<EncodedTriple>) -> EngineResult<CommitSummary> {
+        let Self {
+            engine,
+            _slot,
+            base,
+        } = self;
+        let shared = &engine.shared;
+        let _compaction = shared.versions.compaction_slot.lock();
+        let started = Instant::now();
+        let mut quads: Vec<EncodedQuad> = inferred
+            .into_par_iter()
+            .map(EncodedTriple::in_default_graph)
+            .filter(|quad| !base.stack_contains(Stack::Asserted, quad))
+            .collect();
+        quads.par_sort_unstable();
+        quads.dedup();
+        let mut old: Vec<EncodedQuad> = base
+            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+            .collect();
+        old.par_sort_unstable();
+        let inserted = quads
+            .par_iter()
+            .filter(|q| old.binary_search(q).is_err())
+            .count();
+        let deleted = old
+            .par_iter()
+            .filter(|q| quads.binary_search(q).is_err())
+            .count();
+        // Compaction may have replaced runs since `base` was taken, with the same content.
+        let current = shared.snapshot();
+        let current = current.version();
+        let summary = CommitSummary {
+            revision: current.revision + 1,
+            inserted: 0,
+            deleted: 0,
+            inferred_inserted: inserted as u64,
+            inferred_deleted: deleted as u64,
+        };
+        if inserted + deleted == 0 {
+            return Ok(CommitSummary {
+                revision: current.revision,
+                ..summary
+            });
+        }
+        let next = Version {
+            asserted: current.asserted.clone(),
+            inferred: IndexVersion::from_quads(Stack::Inferred.layout(), quads),
+            revision: summary.revision,
+            dictionary_len: shared.dictionary.len(),
+        };
+        publish(engine, next)?;
+        drop(_compaction);
+        tracing::info!(
+            revision = summary.revision,
+            inferred_inserted = summary.inferred_inserted,
+            inferred_deleted = summary.inferred_deleted,
+            ms = started.elapsed().as_millis() as u64,
+            "inferred stack replaced"
         );
         engine.after_commit(0);
         Ok(summary)

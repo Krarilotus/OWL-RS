@@ -38,7 +38,7 @@ use crate::index::{CompactionPolicy, IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple};
 use crate::term::{Dictionary, DictionaryStats};
 
-pub use bulk::{BulkLoad, BulkMode};
+pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use snapshot::Snapshot;
 pub use transaction::{CommitSummary, Transaction};
 
@@ -485,6 +485,13 @@ impl Engine {
     pub fn bulk_load(&self, mode: BulkMode) -> BulkLoad<'_> {
         let slot = self.inner.writer.lock();
         BulkLoad::new(&self.inner, slot, mode)
+    }
+
+    /// Starts replacing the inferred stack, waiting for the writer slot. See
+    /// [`Rematerialisation`].
+    pub fn rematerialisation(&self) -> Rematerialisation<'_> {
+        let slot = self.inner.writer.lock();
+        Rematerialisation::new(&self.inner, slot)
     }
 
     /// Compacts until the policy is satisfied, waiting for any background merge.

@@ -1,10 +1,16 @@
 use crate::rules_mvp_policy::RulesMvpFeaturePolicy;
 use crate::rules_mvp_preset::RulesMvpPreset;
+use crate::v2::rulesets::Ruleset;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningMode {
     Disabled,
+    /// The v1 reasoner: a validation gate over the whole dataset, inferences not stored.
     RulesMvp,
+    /// Reasoner v2, RDFS: inferences materialised into the inferred stack.
+    Rdfs,
+    /// Reasoner v2, the OWL 2 RL/RDF rules: inferences materialised into the inferred stack.
+    Owl2Rl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -35,6 +41,8 @@ impl ReasonerConfig {
                 ReasoningMode::RulesMvp => {
                     ReasonerProfileConfig::RulesMvp(RulesMvpConfig::default())
                 }
+                ReasoningMode::Rdfs => ReasonerProfileConfig::Materialise(Ruleset::Rdfs),
+                ReasoningMode::Owl2Rl => ReasonerProfileConfig::Materialise(Ruleset::Owl2Rl),
             },
             read_model: ReasoningReadModel::AssertedOnly,
         }
@@ -56,6 +64,16 @@ impl ReasonerConfig {
         match self.profile {
             ReasonerProfileConfig::Disabled => ReasoningMode::Disabled,
             ReasonerProfileConfig::RulesMvp(_) => ReasoningMode::RulesMvp,
+            ReasonerProfileConfig::Materialise(Ruleset::Rdfs) => ReasoningMode::Rdfs,
+            ReasonerProfileConfig::Materialise(Ruleset::Owl2Rl) => ReasoningMode::Owl2Rl,
+        }
+    }
+
+    /// The v2 ruleset whose inferences the store materialises, if any.
+    pub const fn materialised_ruleset(&self) -> Option<Ruleset> {
+        match self.profile {
+            ReasonerProfileConfig::Materialise(ruleset) => Some(ruleset),
+            _ => None,
         }
     }
 
@@ -92,6 +110,9 @@ impl ReasonerConfig {
 pub enum ReasonerProfileConfig {
     Disabled,
     RulesMvp(RulesMvpConfig),
+    /// Reasoner v2: the store materialises the ruleset's closure into the inferred stack,
+    /// after bulk loads and on every commit (see `nrese_store::reasoning`).
+    Materialise(Ruleset),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

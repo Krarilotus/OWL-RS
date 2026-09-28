@@ -82,6 +82,39 @@ impl MutationPipeline {
             .apply(&mut tx, ticket.evaluation_token())
             .map_err(store_error)?;
 
+        if let Some(ruleset) = self.reasoner.config().materialised_ruleset() {
+            // Reasoner v2: the closure goes into the inferred stack, in this transaction.
+            let (closure, materialisation) =
+                crate::reasoning::apply_to_transaction(ruleset, &mut tx);
+            tracing::debug!(?materialisation, "commit-path materialisation");
+            if let Some(violation) = closure.violations.first() {
+                let decode = |id: u64| {
+                    tx.decode(nrese_engine::TermId::from_raw(id))
+                        .map_or_else(|| format!("#{id}"), |term| term.to_string())
+                };
+                let bindings: Vec<String> =
+                    violation.bindings.iter().map(|&id| decode(id)).collect();
+                return Err(MutationError::Rejected(Box::new(MutationReject {
+                    detail: format!(
+                        "mutation violates {} consistency check(s); first: {} with {}",
+                        closure.violations.len(),
+                        violation.rule,
+                        bindings.join(", ")
+                    ),
+                    explanation: None,
+                    attribution: None,
+                })));
+            }
+            if !ticket.begin_commit() {
+                return Err(MutationError::Cancelled);
+            }
+            let summary = tx.commit().map_err(|error| MutationError::Store {
+                kind,
+                source: StoreError::Engine(error),
+            })?;
+            return Ok(report.committed(summary.revision));
+        }
+
         let reads_triples = self.reasoner.config().mode() != ReasoningMode::Disabled;
         let snapshot =
             gate_snapshot(&tx, tx.base().revision() + 1, reads_triples).map_err(store_error)?;
