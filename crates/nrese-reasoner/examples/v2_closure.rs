@@ -71,6 +71,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Count each asserted triple once, as the other systems do.
+    facts.sort_unstable();
+    facts.dedup();
     let load = started.elapsed();
     let started = Instant::now();
     let (derived, violations, diagnostics, rounds) = if naive {
@@ -85,7 +88,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     } else {
         let result = batch::materialise(&facts, &rules, lists.as_ref(), &schema);
-        eprintln!("ground rules: {}", result.ground_rules);
+        eprintln!(
+            "ground rules {} | transitive {} | {:?}",
+            result.ground_rules, result.transitive, result.phases
+        );
         (
             result.derived,
             result.violations.len(),
