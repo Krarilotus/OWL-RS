@@ -66,6 +66,30 @@ impl ListVocabulary {
         }
     }
 
+    /// The predicates of list structure and list axioms, and the classes of the list
+    /// axioms typed by `rdf:type`: `(predicates, rdf:type, classes)`.
+    pub fn vocabulary(&self) -> (Vec<u64>, u64, Vec<u64>) {
+        (
+            vec![
+                self.first,
+                self.rest,
+                self.property_chain_axiom,
+                self.has_key,
+                self.intersection_of,
+                self.union_of,
+                self.one_of,
+                self.members,
+                self.distinct_members,
+            ],
+            self.rdf_type,
+            vec![
+                self.all_disjoint_classes,
+                self.all_disjoint_properties,
+                self.all_different,
+            ],
+        )
+    }
+
     /// Whether `fact` is list structure or a list axiom: the facts [`instantiate`] reads.
     pub fn is_list_fact(&self, [_, p, o]: [u64; 3]) -> bool {
         [
