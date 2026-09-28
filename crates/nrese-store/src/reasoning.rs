@@ -26,6 +26,7 @@ use nrese_engine::{
 };
 use nrese_reasoner::v2::batch::{self, Phases, Schema};
 use nrese_reasoner::v2::delta::{self, Base, MemoryBase};
+use nrese_reasoner::v2::eval::GroundProgram;
 use nrese_reasoner::v2::ir::{Rule, Vocabulary};
 use nrese_reasoner::v2::lists::ListVocabulary;
 use nrese_reasoner::v2::naive::{Triple, Violation};
@@ -52,6 +53,15 @@ impl std::fmt::Debug for Program {
 }
 
 impl Program {
+    /// The rules as the delta executor takes them.
+    pub fn rules(&self) -> delta::Rules<'_> {
+        delta::Rules {
+            rules: &self.rules,
+            lists: self.lists.as_ref(),
+            schema: &self.schema,
+        }
+    }
+
     /// Compiles `ruleset`; `intern` gives ids to the constants.
     pub fn new(ruleset: Ruleset, intern: &dyn Fn(TermRef<'_>) -> TermId) -> Self {
         let mut constants = Constants { intern };
@@ -185,6 +195,18 @@ impl<'a> EngineBase<'a> {
         }
     }
 
+    /// Whether `fact` was in the state before the transaction (any graph, either stack).
+    fn known_before(&self, fact: Triple) -> bool {
+        let [s, p, o] = fact.map(Some);
+        self.snapshot
+            .quads_for_pattern_in(
+                ReadModel::Materialised,
+                &pattern([s, p, o], GraphSelector::Any),
+            )
+            .next()
+            .is_some()
+    }
+
     fn committed(&self, model: ReadModel, fact: Triple) -> bool {
         let [s, p, o] = fact.map(Some);
         self.snapshot
@@ -227,12 +249,18 @@ impl Base for EngineBase<'_> {
 /// its result. Returns the violations the change introduced and the counts.
 pub fn apply_delta(
     program: &Program,
+    ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
-) -> (Vec<Violation>, MaterialisationReport) {
+) -> (Vec<Violation>, MaterialisationReport, Option<GroundProgram>) {
     let started = Instant::now();
     let update = {
         let base = EngineBase::new(tx);
-        let mut inserted: Vec<Triple> = tx.inserted().map(triple).collect();
+        // Facts new to the state: in no graph and not inferred before the transaction.
+        let mut inserted: Vec<Triple> = tx
+            .inserted()
+            .map(triple)
+            .filter(|&t| !base.known_before(t))
+            .collect();
         inserted.sort_unstable();
         inserted.dedup();
         // A triple deleted from one graph but still asserted in another stays a fact.
@@ -246,14 +274,7 @@ pub fn apply_delta(
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else {
-            delta::update(
-                &base,
-                &inserted,
-                &deleted,
-                &program.rules,
-                program.lists.as_ref(),
-                &program.schema,
-            )
+            delta::update(&base, &inserted, &deleted, program.rules(), ground)
         }
     };
     let (mut inserted, mut removed) = (0, 0);
@@ -281,5 +302,5 @@ pub fn apply_delta(
         rounds: update.rounds,
         elapsed: started.elapsed(),
     };
-    (update.violations, report)
+    (update.violations, report, update.program)
 }

@@ -322,6 +322,7 @@ fn substitute_atom(atom: &Atom, substitution: &[Option<u64>]) -> Atom {
 }
 
 /// A rule after grounding its schema atoms.
+#[derive(Clone)]
 pub struct Grounded {
     pub rule: Rule,
     /// The schema variables' values; the rest is `None`.
@@ -664,4 +665,294 @@ pub type RuleKey = (Vec<Atom>, Vec<Guard>, Head);
 
 pub fn rule_key(rule: &Rule) -> RuleKey {
     (rule.body.clone(), rule.guards.clone(), rule.head.clone())
+}
+
+/// A (rule, atom) reference into a [`GroundProgram`].
+type AtomRef = (u32, u8);
+
+/// Ground rules' atoms indexed by what they can match, so a round only visits the rules
+/// with an atom that can match a fact of the delta (the "dispatch tables" of design §3.2):
+/// `(?x type C)` atoms by `(type, C)`, other constant-predicate atoms by predicate.
+#[derive(Default, Clone)]
+pub struct Dispatch {
+    /// Constant predicate and object, by predicate then object.
+    by_object: hashbrown::HashMap<u64, hashbrown::HashMap<u64, Vec<AtomRef>>>,
+    /// Constant predicate, variable object.
+    by_predicate: hashbrown::HashMap<u64, Vec<AtomRef>>,
+    /// Variable predicate.
+    any: Vec<AtomRef>,
+}
+
+impl Dispatch {
+    fn push(&mut self, index: usize, rule: &Rule) {
+        self.push_atoms(index, &rule.body);
+    }
+
+    fn push_atoms(&mut self, index: usize, atoms: &[Atom]) {
+        let index = u32::try_from(index).expect("fewer than 2^32 ground rules");
+        for (i, atom) in atoms.iter().enumerate() {
+            let entry = (index, u8::try_from(i).expect("fewer than 256 atoms"));
+            match atom.0 {
+                [_, Term::Const(p), Term::Const(o)] => {
+                    self.by_object
+                        .entry(p)
+                        .or_default()
+                        .entry(o)
+                        .or_default()
+                        .push(entry);
+                }
+                [_, Term::Const(p), _] => self.by_predicate.entry(p).or_default().push(entry),
+                _ => self.any.push(entry),
+            }
+        }
+    }
+
+    /// The (rule, atom) pairs whose atom can match `fact`.
+    fn matching_fact(&self, [_, p, o]: Triple, out: &mut Vec<(usize, usize)>) {
+        let entries = self
+            .by_object
+            .get(&p)
+            .and_then(|objects| objects.get(&o))
+            .into_iter()
+            .flatten()
+            .chain(self.by_predicate.get(&p).into_iter().flatten())
+            .chain(&self.any);
+        out.extend(entries.map(|&(r, a)| (r as usize, usize::from(a))));
+    }
+
+    /// The (rule, atom) pairs whose atom can match a fact of `delta`'s delta, sorted.
+    pub(crate) fn matching(&self, delta: &super::batch::Store) -> Vec<(usize, usize)> {
+        let mut out: Vec<AtomRef> = Vec::new();
+        let mut any_delta = false;
+        for (p, relation) in delta.delta_relations() {
+            any_delta = true;
+            if let Some(entries) = self.by_predicate.get(&p) {
+                out.extend_from_slice(entries);
+            }
+            let Some(objects) = self.by_object.get(&p) else {
+                continue;
+            };
+            // Probe whichever side is smaller: the indexed objects or the delta's.
+            if objects.len() <= relation.delta_len() {
+                for (&o, entries) in objects {
+                    if relation.delta_has_object(o) {
+                        out.extend_from_slice(entries);
+                    }
+                }
+            } else {
+                relation.delta_objects(&mut |o| {
+                    if let Some(entries) = objects.get(&o) {
+                        out.extend_from_slice(entries);
+                    }
+                });
+            }
+        }
+        if any_delta {
+            out.extend_from_slice(&self.any);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out.into_iter()
+            .map(|(r, a)| (r as usize, usize::from(a)))
+            .collect()
+    }
+}
+
+/// A ground program: the rule instances with a body (indexed by [`Dispatch`]), the
+/// transitive predicates (closed by a module instead of joins), the facts of bodiless
+/// instances, and the ground consistency rules.
+#[derive(Default, Clone)]
+pub struct GroundProgram {
+    pub rules: Vec<Rule>,
+    known: HashSet<RuleKey>,
+    dispatch: Dispatch,
+    pub transitive: std::collections::BTreeSet<u64>,
+    /// Facts of bodiless instances, not yet handed out ([`Self::take_facts`]).
+    facts: Vec<Triple>,
+    /// Facts of all bodiless instances.
+    pub bodiless: HashSet<Triple>,
+    /// Rules by head atom, for backward derivation checks.
+    heads: Dispatch,
+    /// Ground consistency rules, each with the rule it came from.
+    pub consistency: Vec<(Rule, Grounded)>,
+    consistency_known: HashSet<(String, Vec<Option<u64>>, RuleKey)>,
+    consistency_dispatch: Dispatch,
+}
+
+impl std::fmt::Debug for GroundProgram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GroundProgram")
+            .field("rules", &self.rules.len())
+            .field("transitive", &self.transitive.len())
+            .field("bodiless", &self.bodiless.len())
+            .field("consistency", &self.consistency.len())
+            .finish()
+    }
+}
+
+impl GroundProgram {
+    /// Files one ground fact rule; returns its index if it is new and has a body.
+    pub fn add(&mut self, rule: Rule) -> Option<usize> {
+        if let Some(p) = transitive_predicate(&rule) {
+            self.transitive.insert(p);
+            None
+        } else if rule.body.is_empty() {
+            if let Head::Facts(heads) = &rule.head {
+                for head in heads {
+                    let fact = instantiate_head(head, &[]);
+                    if self.bodiless.insert(fact) {
+                        self.facts.push(fact);
+                    }
+                }
+            }
+            None
+        } else if self.known.insert(rule_key(&rule)) {
+            self.dispatch.push(self.rules.len(), &rule);
+            if let Head::Facts(heads) = &rule.head {
+                self.heads.push_atoms(self.rules.len(), heads);
+            }
+            self.rules.push(rule);
+            Some(self.rules.len() - 1)
+        } else {
+            None
+        }
+    }
+
+    /// Files one ground consistency rule (from `source`); returns its index if new.
+    fn add_consistency(&mut self, source: &Rule, grounded: Grounded) -> Option<usize> {
+        let key = (
+            source.name.clone(),
+            grounded.substitution.clone(),
+            rule_key(&grounded.rule),
+        );
+        if !self.consistency_known.insert(key) {
+            return None;
+        }
+        self.consistency_dispatch
+            .push(self.consistency.len(), &grounded.rule);
+        self.consistency.push((source.clone(), grounded));
+        Some(self.consistency.len() - 1)
+    }
+
+    /// Grounds `rules` (fact and consistency rules) over all of `source`.
+    pub fn ground<S: Source + ?Sized>(&mut self, source: &S, schema: &Schema, rules: &[Rule]) {
+        for rule in rules {
+            self.ground_one(source, schema, rule, false);
+        }
+    }
+
+    /// Grounds `rules` through the delta of `source` only (rules without schema atoms, list
+    /// rules among them, in full); returns the indices of the new fact rules and
+    /// consistency rules.
+    pub fn ground_delta<S: Source + ?Sized>(
+        &mut self,
+        source: &S,
+        schema: &Schema,
+        rules: &[Rule],
+    ) -> (Vec<usize>, Vec<usize>) {
+        let (mut facts, mut checks) = (Vec::new(), Vec::new());
+        for rule in rules {
+            let (f, c) = self.ground_one(source, schema, rule, true);
+            facts.extend(f);
+            checks.extend(c);
+        }
+        (facts, checks)
+    }
+
+    fn ground_one<S: Source + ?Sized>(
+        &mut self,
+        source: &S,
+        schema: &Schema,
+        rule: &Rule,
+        delta: bool,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let (mut facts, mut checks) = (Vec::new(), Vec::new());
+        if let Some(p) = transitive_predicate(rule) {
+            self.transitive.insert(p);
+            return (facts, checks);
+        }
+        let mut grounded = Vec::new();
+        let has_schema_atoms = rule.body.iter().any(|a| schema.is_schema_atom(a));
+        if delta && has_schema_atoms {
+            ground_delta(source, schema, rule, &mut |g| grounded.push(g));
+        } else {
+            ground(source, schema, rule, &mut |g| grounded.push(g));
+        }
+        for g in grounded {
+            if rule.head == Head::Inconsistent {
+                checks.extend(self.add_consistency(rule, g));
+            } else {
+                facts.extend(self.add(g.rule));
+            }
+        }
+        (facts, checks)
+    }
+
+    /// Whether bodiless instances filed facts since the last [`Self::take_facts`].
+    pub fn has_pending_facts(&self) -> bool {
+        !self.facts.is_empty()
+    }
+
+    /// The facts of bodiless instances filed since the last call.
+    pub fn take_facts(&mut self) -> Vec<Triple> {
+        std::mem::take(&mut self.facts)
+    }
+
+    /// The (rule, atom) variants that can match the delta of `delta`.
+    pub(crate) fn variants(&self, delta: &super::batch::Store) -> Vec<(usize, usize)> {
+        self.dispatch.matching(delta)
+    }
+
+    /// The (consistency rule, atom) variants that can match the delta of `delta`.
+    pub(crate) fn consistency_variants(&self, delta: &super::batch::Store) -> Vec<(usize, usize)> {
+        self.consistency_dispatch.matching(delta)
+    }
+
+    /// Every fact rule, with the transitive predicates as transitivity rules.
+    pub fn with_transitivity(&self) -> Vec<Rule> {
+        let mut rules = self.rules.clone();
+        rules.extend(self.transitive.iter().map(|&p| transitivity(p)));
+        rules
+    }
+
+    /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`):
+    /// a bodiless instance, a rule whose head matches it, or transitivity.
+    pub fn derivable<S: Source + ?Sized>(&self, source: &S, fact: Triple) -> bool {
+        if self.bodiless.contains(&fact) {
+            return true;
+        }
+        let mut producers = Vec::new();
+        self.heads.matching_fact(fact, &mut producers);
+        producers.sort_unstable();
+        producers.dedup_by_key(|(r, _)| *r);
+        let mut found = false;
+        for (r, _) in producers {
+            derivations(source, &self.rules[r], fact, Seg::All, &mut |_| {
+                found = true;
+                true
+            });
+            if found {
+                return true;
+            }
+        }
+        if self.transitive.contains(&fact[1]) {
+            derivations(source, &transitivity(fact[1]), fact, Seg::All, &mut |_| {
+                found = true;
+                true
+            });
+        }
+        found
+    }
+}
+
+/// The transitivity rule over `p`, for evaluation where the module doesn't apply
+/// (overdeletion, rederivation).
+pub fn transitivity(p: u64) -> Rule {
+    let (x, y, z) = (Term::Var(0), Term::Var(1), Term::Var(2));
+    Rule {
+        name: "prp-trp".to_owned(),
+        body: vec![Atom([x, Term::Const(p), y]), Atom([y, Term::Const(p), z])],
+        guards: Vec::new(),
+        head: Head::Facts(vec![Atom([x, Term::Const(p), z])]),
+    }
 }
