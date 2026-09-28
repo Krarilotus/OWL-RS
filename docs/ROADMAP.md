@@ -111,11 +111,31 @@ RT1 closure times (laptop, 16 threads):
 
 End to end on LUBM(100) (`reason_query`): load 4.7 s, reasoning with install 4.6 s, and all 14 queries in 1.2 s.
 
+**Status (2026-09-28, second batch):**
+- **R4b, the delta executor:** commits maintain the inferred stack incrementally.
+  - DRed: overdelete, rederive, then semi-naive insert. Transitive properties are closed per new edge. Only schema facts in the delta ground new rule instances.
+  - A dispatch index visits only rule instances that can match the delta.
+  - The ground program is cached per committed revision.
+  - It is exact against rematerialisation on 48,000 random changes and on 3,000 random commits through the engine, including named graphs.
+- **Read models per request:** GraphDB's `infer=false`, `FROM onto:explicit` and `FROM onto:implicit`, on both executors (differential-tested).
+- **Batch executor:**
+  - Two-level relations: a round no longer copies whole relations.
+  - Rounds after the first re-ground through new schema facts only.
+
+Commit latency through the store pipeline under `owl2-rl`, one ABox statement per commit (`reason_query --commits`):
+
+| Dataset | Delete p50 / p99 | Insert p50 |
+|---|---|---|
+| LUBM(10) | 0.20 / 0.42 ms | 0.06 ms |
+| LUBM(100) | 0.61 / 1.47 ms | 0.15 ms |
+
+That meets the Phase 3 commit-path gate (p50 ≤ 1 ms). Batch and end-to-end numbers are unchanged within noise (`benches/reasoning/local-bulk.sh`).
+
 Next in Phase 3:
-- R4b: the delta executor for the commit path. Commits currently recompute the closure, which is O(dataset).
-- R3: the equality (sameAs rewriting), equivalence-property and hierarchy modules.
+- R3: the equality module (sameAs by union-find, without the O(k²) re-derivation per fact) and the equivalence-property module.
+- R5: B/F deletion, instead of DRed's overdeletion inside transitive components.
+- Startup: skip rematerialisation when the inferred stack is already current for the configured ruleset.
 - The Docker scorecard with `nrese-v2` on the reference machine.
-- Tuning the LUBM(100) phases: joins 1.7 s, merge 1.1 s.
 
 **Execution core (XC), decision D11.** A new crate, `nrese-exec`, holds the ID-level execution machinery shared by SPARQL and reasoning:
 - **ID tables:** columnar `u64`, sorted on a key prefix
