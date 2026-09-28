@@ -30,11 +30,13 @@ fn split(line: &str) -> Option<[&str; 3]> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut changes, mut check, mut inputs) = (20usize, false, Vec::new());
+    let mut predicate: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--changes" => changes = args.next().and_then(|n| n.parse().ok()).unwrap_or(20),
             "--check" => check = true,
+            "--predicate" => predicate = args.next(),
             _ => inputs.push(arg),
         }
     }
@@ -43,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lists = ListVocabulary::new(&mut vocabulary);
     let schema = Schema::owl(&mut vocabulary);
     let rdf_type = vocabulary.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let target_predicate = predicate.map_or(rdf_type, |iri| vocabulary.iri(&iri));
     let mut asserted: Vec<Triple> = Vec::new();
     for path in &inputs {
         for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
@@ -65,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .copied()
         .filter(|t| {
-            t[1] == rdf_type
+            t[1] == target_predicate
                 && vocabulary.text(t[0]).starts_with('<')
                 && !vocabulary.text(t[2]).starts_with("<http://www.w3.org/")
         })
@@ -81,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|i| {
             [
                 vocabulary.term(&format!("<urn:nrese:bench:{i}>")),
-                rdf_type,
+                target_predicate,
                 targets[i][2],
             ]
         })

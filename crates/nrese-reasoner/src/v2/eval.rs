@@ -797,6 +797,12 @@ pub struct GroundProgram {
     facts: Vec<Triple>,
     /// Facts of all bodiless instances.
     pub bodiless: HashSet<Triple>,
+    /// The schema facts each rule instance was grounded on (parallel to `rules`), each
+    /// bodiless fact's, and each transitive predicate's: a backward proof that uses an
+    /// instance must prove them too.
+    premises: Vec<Vec<Triple>>,
+    bodiless_premises: hashbrown::HashMap<Triple, Vec<Triple>>,
+    transitive_premises: hashbrown::HashMap<u64, Vec<Triple>>,
     /// Rules by head atom, for backward derivation checks.
     heads: Dispatch,
     /// Ground consistency rules, each with the rule it came from.
@@ -819,8 +825,14 @@ impl std::fmt::Debug for GroundProgram {
 impl GroundProgram {
     /// Files one ground fact rule; returns its index if it is new and has a body.
     pub fn add(&mut self, rule: Rule) -> Option<usize> {
+        self.add_with(rule, Vec::new())
+    }
+
+    /// [`Self::add`], with the schema facts the instance was grounded on.
+    fn add_with(&mut self, rule: Rule, premises: Vec<Triple>) -> Option<usize> {
         if let Some(p) = transitive_predicate(&rule) {
             self.transitive.insert(p);
+            self.transitive_premises.entry(p).or_insert(premises);
             None
         } else if rule.body.is_empty() {
             if let Head::Facts(heads) = &rule.head {
@@ -828,6 +840,7 @@ impl GroundProgram {
                     let fact = instantiate_head(head, &[]);
                     if self.bodiless.insert(fact) {
                         self.facts.push(fact);
+                        self.bodiless_premises.insert(fact, premises.clone());
                     }
                 }
             }
@@ -838,10 +851,16 @@ impl GroundProgram {
                 self.heads.push_atoms(self.rules.len(), heads);
             }
             self.rules.push(rule);
+            self.premises.push(premises);
             Some(self.rules.len() - 1)
         } else {
             None
         }
+    }
+
+    /// The schema facts a bodiless fact was grounded on (empty if none, or not bodiless).
+    pub fn bodiless_premises(&self, fact: Triple) -> &[Triple] {
+        self.bodiless_premises.get(&fact).map_or(&[], Vec::as_slice)
     }
 
     /// Files one ground consistency rule (from `source`); returns its index if new.
@@ -912,7 +931,13 @@ impl GroundProgram {
             if rule.head == Head::Inconsistent {
                 checks.extend(self.add_consistency(rule, g));
             } else {
-                facts.extend(self.add(g.rule));
+                let premises = rule
+                    .body
+                    .iter()
+                    .filter(|a| schema.is_schema_atom(a))
+                    .map(|a| instantiate_head(a, &g.substitution))
+                    .collect();
+                facts.extend(self.add_with(g.rule, premises));
             }
         }
         (facts, checks)
@@ -945,9 +970,65 @@ impl GroundProgram {
         rules
     }
 
+    /// The bodies (instantiated premises, plus the schema facts the instance was grounded
+    /// on) of up to `limit` one-step derivations of `fact` over `source`, by rules whose
+    /// head matches it and transitivity. Bodiless instances are in [`Self::bodiless`].
+    pub fn derivation_bodies<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        limit: usize,
+    ) -> Vec<Vec<Triple>> {
+        let mut producers = Vec::new();
+        self.heads.matching_fact(fact, &mut producers);
+        producers.sort_unstable();
+        producers.dedup_by_key(|(r, _)| *r);
+        let transitive = self
+            .transitive
+            .contains(&fact[1])
+            .then(|| transitivity(fact[1]));
+        let none: &[Triple] = &[];
+        let transitive_premises = self
+            .transitive_premises
+            .get(&fact[1])
+            .map_or(none, Vec::as_slice);
+        let rules = producers
+            .into_iter()
+            .map(|(r, _)| (&self.rules[r], self.premises[r].as_slice()))
+            .chain(transitive.as_ref().map(|rule| (rule, transitive_premises)));
+        let mut bodies = Vec::new();
+        for (rule, premises) in rules {
+            derivations(source, rule, fact, Seg::All, &mut |bindings| {
+                let mut body: Vec<Triple> = rule
+                    .body
+                    .iter()
+                    .map(|atom| instantiate_head(atom, bindings))
+                    .collect();
+                body.extend_from_slice(premises);
+                bodies.push(body);
+                bodies.len() >= limit
+            });
+            if bodies.len() >= limit {
+                break;
+            }
+        }
+        bodies
+    }
+
     /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`):
     /// a bodiless instance, a rule whose head matches it, or transitivity.
     pub fn derivable<S: Source + ?Sized>(&self, source: &S, fact: Triple) -> bool {
+        self.derivable_with(source, fact, true)
+    }
+
+    /// [`Self::derivable`], optionally without transitivity (whose closure the caller
+    /// recomputes).
+    pub fn derivable_with<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        transitivity_too: bool,
+    ) -> bool {
         if self.bodiless.contains(&fact) {
             return true;
         }
@@ -965,7 +1046,7 @@ impl GroundProgram {
                 return true;
             }
         }
-        if self.transitive.contains(&fact[1]) {
+        if transitivity_too && self.transitive.contains(&fact[1]) {
             derivations(source, &transitivity(fact[1]), fact, Seg::All, &mut |_| {
                 found = true;
                 true
