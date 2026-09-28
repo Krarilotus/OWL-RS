@@ -41,7 +41,7 @@ use rayon::prelude::*;
 use super::batch::{Store, check, consistency_rules, fact_rules, sorted};
 use super::eval::{
     AllFacts, GroundProgram, Job, RuleKey, Schema, Seg, Source, instantiate_head, rule_key,
-    run_jobs, run_jobs_acyclic, transitive_predicate, transitivity,
+    run_jobs, run_jobs_acyclic, transitive_predicate,
 };
 use super::ir::{Head, Rule};
 use super::lists::{ListVocabulary, instantiate};
@@ -222,9 +222,39 @@ pub fn update<B: Base + ?Sized>(
     let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
 
     lap(0, &mut result);
-    // 1. Overdelete, over the old state.
+    // 1. Overdelete, over the old state. With B/F, a candidate with a proof that avoids
+    // the deleted facts is kept and doesn't propagate. B/F needs the old ground program to
+    // stay valid: if a schema or list fact is affected by the change, overdeletion
+    // restarts as plain DRed.
     let mut overdeleted: HashSet<Triple> = HashSet::new();
-    if !deleted.is_empty() {
+    // Transitive properties whose closure lost pairs: re-closed in phase 3.
+    let mut recloses: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    // List-rule instances don't record the list facts they come from, so B/F also needs
+    // every list fact to be asserted (inferred ones need sameAs on list nodes).
+    let lists_asserted = rules.lists.is_none_or(|lists| {
+        let (predicates, rdf_type, classes) = lists.vocabulary();
+        let mut asserted = true;
+        let mut check = |t: Triple| asserted &= base.is_asserted(t);
+        for p in predicates {
+            base.scan([None, Some(p), None], &mut check);
+        }
+        for c in classes {
+            base.scan([None, Some(rdf_type), Some(c)], &mut check);
+        }
+        asserted
+    });
+    let mut backward = lists_asserted && !deleted.iter().any(|&f| rules.is_program_fact(f));
+    'overdelete: while !deleted.is_empty() {
+        overdeleted.clear();
+        recloses.clear();
+        let mut prover = Prover {
+            base,
+            program: old_program,
+            proved: HashSet::new(),
+            failed: HashSet::new(),
+            active: HashSet::new(),
+            budget: 10_000,
+        };
         let mut extra = Store::new(deleted.to_vec());
         let (fact_schema_rules, old_lists) = {
             let old = Overlay {
@@ -244,11 +274,6 @@ pub fn update<B: Base + ?Sized>(
                 .collect();
             (schema_rules, lists)
         };
-        let transitivity_rules: Vec<Rule> = old_program
-            .transitive
-            .iter()
-            .map(|&p| transitivity(p))
-            .collect();
         let mut vanished_done: HashSet<RuleKey> = HashSet::new();
         loop {
             result.rounds += 1;
@@ -261,7 +286,12 @@ pub fn update<B: Base + ?Sized>(
             let mut scratch = GroundProgram::default();
             scratch.ground_delta(&old, schema, &fact_schema_rules);
             let mut fresh: Vec<Rule> = scratch.rules.clone();
-            fresh.extend(scratch.transitive.iter().map(|&p| transitivity(p)));
+            // Transitivity whose declaration is deleted: every inferred pair may lose its
+            // support.
+            let mut component: Vec<Triple> = Vec::new();
+            for &p in &scratch.transitive {
+                old.scan([None, Some(p), None], Seg::All, &mut |t| component.push(t));
+            }
             let mut bodiless = scratch.take_facts();
             // List rules whose list lost a fact: in full as well.
             let mut delta_facts = Vec::new();
@@ -284,7 +314,9 @@ pub fn update<B: Base + ?Sized>(
                         continue;
                     }
                     match transitive_predicate(rule) {
-                        Some(p) => fresh.push(transitivity(p)),
+                        Some(p) => {
+                            old.scan([None, Some(p), None], Seg::All, &mut |t| component.push(t));
+                        }
                         None if rule.body.is_empty() => {
                             if let Head::Facts(heads) = &rule.head {
                                 bodiless.extend(heads.iter().map(|h| instantiate_head(h, &[])));
@@ -298,9 +330,37 @@ pub fn update<B: Base + ?Sized>(
             for (r, i) in old_program.variants(&extra) {
                 jobs.extend(Job::variant(&old, &old_program.rules[r], i));
             }
-            for rule in &transitivity_rules {
-                for i in 0..2 {
-                    jobs.extend(Job::variant(&old, rule, i));
+            // Transitive properties, by component: a lost edge (a, b) may support every pair
+            // from a predecessor of a (or a) to a successor of b (or b). The relation is
+            // closed, so one hop finds them; the pairs are re-closed in phase 3.
+            for &p in &old_program.transitive {
+                let (mut sources, mut targets) = (Vec::new(), Vec::new());
+                extra.scan([None, Some(p), None], Seg::Delta, &mut |t| {
+                    sources.push(t[0]);
+                    targets.push(t[2]);
+                });
+                if sources.is_empty() {
+                    continue;
+                }
+                recloses.insert(p);
+                let mut before: HashSet<u64> = sources.iter().copied().collect();
+                for &a in &sources {
+                    old.scan([None, Some(p), Some(a)], Seg::All, &mut |t| {
+                        before.insert(t[0]);
+                    });
+                }
+                let mut after: HashSet<u64> = targets.iter().copied().collect();
+                for &b in &targets {
+                    old.scan([Some(b), Some(p), None], Seg::All, &mut |t| {
+                        after.insert(t[2]);
+                    });
+                }
+                for &x in &before {
+                    old.scan([Some(x), Some(p), None], Seg::All, &mut |t| {
+                        if after.contains(&t[2]) {
+                            component.push(t);
+                        }
+                    });
                 }
             }
             for rule in &fresh {
@@ -315,13 +375,26 @@ pub fn update<B: Base + ?Sized>(
             };
             let mut candidates = run_jobs_acyclic(&old, &jobs, &overdeletable);
             candidates.extend(bodiless.into_iter().filter(|&f| overdeletable(f)));
+            candidates.extend(component.into_iter().filter(|&f| overdeletable(f)));
             drop(jobs);
+            if backward {
+                // Proofs use ground instances whose schema facts are baked in: they are
+                // sound only while no schema or list fact is affected by the change.
+                if candidates.iter().any(|&f| rules.is_program_fact(f)) {
+                    backward = false;
+                    continue 'overdelete;
+                }
+                candidates.sort_unstable();
+                candidates.dedup();
+                candidates.retain(|&f| !prover.prove(&old, &extra, f, 0).0);
+            }
             let delta = extra.advance(candidates);
             if delta.is_empty() {
                 break;
             }
             overdeleted.extend(delta);
         }
+        break;
     }
 
     lap(1, &mut result);
@@ -351,7 +424,10 @@ pub fn update<B: Base + ?Sized>(
     let rederived: Vec<Triple> = candidates
         .par_iter()
         .copied()
-        .filter(|&fact| !base.is_asserted(fact) && settled.derivable(&remaining, fact))
+        .filter(|&fact| {
+            !base.is_asserted(fact)
+                && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]))
+        })
         .collect();
     let settled_consistency = program.consistency.len();
 
@@ -362,6 +438,7 @@ pub fn update<B: Base + ?Sized>(
     seeds.extend_from_slice(inserted);
     let mut extra = Store::new(seeds);
     let mut module_output: HashSet<Triple> = HashSet::new();
+    let mut reclose = recloses;
     loop {
         result.rounds += 1;
         let state = Overlay {
@@ -404,7 +481,7 @@ pub fn update<B: Base + ?Sized>(
         // next round skips them; edges from other rules are closed then.
         let mut produced: Vec<Triple> = Vec::new();
         for &p in &program.transitive {
-            if !transitive_before.contains(&p) {
+            if !transitive_before.contains(&p) || reclose.remove(&p) {
                 let mut all = Vec::new();
                 state.scan([None, Some(p), None], Seg::All, &mut |t| {
                     all.push((t[0], t[2]))
@@ -488,6 +565,88 @@ pub fn update<B: Base + ?Sized>(
     }
     .or(computed);
     result
+}
+
+/// Backward proofs for B/F deletion (Motik et al., AAAI 2015): a fact is kept if it has a
+/// derivation tree down to asserted facts (or bodiless program facts) that avoids the
+/// deleted ones. Proofs are memoised; facts on the current path don't count (no circular
+/// support), and a failure is memoised only if no cycle was cut beneath it. The search
+/// has a node budget: when it runs out the fact counts as unproved, which only costs
+/// overdeletion that the rederive phase repairs.
+struct Prover<'a, B: Base + ?Sized> {
+    base: &'a B,
+    program: &'a GroundProgram,
+    proved: HashSet<Triple>,
+    failed: HashSet<Triple>,
+    active: HashSet<Triple>,
+    budget: usize,
+}
+
+/// Derivations tried per fact, and the proof depth.
+const PROOF_BRANCHES: usize = 32;
+const PROOF_DEPTH: usize = 64;
+
+impl<B: Base + ?Sized> Prover<'_, B> {
+    /// Whether `fact` is provable over `state` without the facts in `gone`; the second
+    /// value says whether a cycle (or the budget) cut the search.
+    fn prove<S: Source + ?Sized>(
+        &mut self,
+        state: &S,
+        gone: &Store,
+        fact: Triple,
+        depth: usize,
+    ) -> (bool, bool) {
+        if self.proved.contains(&fact) {
+            return (true, false);
+        }
+        if self.failed.contains(&fact) || gone.contains(fact) {
+            return (false, false);
+        }
+        if self.base.is_asserted(fact) {
+            self.proved.insert(fact);
+            return (true, false);
+        }
+        // Transitive properties go through the component path of overdeletion instead (a
+        // proof search through a k-clique is O(k^3)): never proved here, so it's a failure
+        // that can be memoised.
+        if self.program.transitive.contains(&fact[1]) {
+            return (false, false);
+        }
+        if self.active.contains(&fact) || self.budget == 0 || depth > PROOF_DEPTH {
+            return (false, true);
+        }
+        self.budget -= 1;
+        self.active.insert(fact);
+        let mut cut = false;
+        let mut bodies = self.program.derivation_bodies(state, fact, PROOF_BRANCHES);
+        if self.program.bodiless.contains(&fact) {
+            bodies.insert(0, self.program.bodiless_premises(fact).to_vec());
+        }
+        for body in bodies {
+            if body.iter().any(|&g| gone.contains(g)) {
+                continue;
+            }
+            let mut holds = true;
+            for g in body {
+                let (proved, cycle) = self.prove(state, gone, g, depth + 1);
+                cut |= cycle;
+                if !proved {
+                    holds = false;
+                    break;
+                }
+            }
+            if holds {
+                self.active.remove(&fact);
+                self.proved.insert(fact);
+                return (true, false);
+            }
+        }
+        self.active.remove(&fact);
+        if !cut {
+            self.failed.insert(fact);
+        }
+        (false, cut)
+    }
 }
 
 /// Closes `p` after adding `edges` to a relation that is transitively closed apart from
