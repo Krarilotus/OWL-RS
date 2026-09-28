@@ -113,9 +113,15 @@ fn owl2_rl_inferences_follow_commits() {
     }
     // Deleting the support retracts the inference.
     pipeline
-        .apply(delete(&format!("<{EX}y> <{EX}ancestor> <{EX}z>")), &ticket())
+        .apply(
+            delete(&format!("<{EX}y> <{EX}ancestor> <{EX}z>")),
+            &ticket(),
+        )
         .expect("delete");
-    assert!(!contains(&pipeline, &format!("<{EX}x> <{EX}ancestor> <{EX}z>")));
+    assert!(!contains(
+        &pipeline,
+        &format!("<{EX}x> <{EX}ancestor> <{EX}z>")
+    ));
     assert!(contains(&pipeline, &format!("<{EX}tom> a <{EX}Animal>")));
     // An asserted statement that is also derivable counts as asserted only.
     pipeline
@@ -158,7 +164,9 @@ fn rematerialise_installs_the_closure_of_existing_data() {
         "<{EX}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{EX}Animal> .
          <{EX}tom> a <{EX}Cat> ."
     );
-    plain.apply(insert(&data), &MutationTicket::new()).expect("data");
+    plain
+        .apply(insert(&data), &MutationTicket::new())
+        .expect("data");
     let inferred = format!("<{EX}tom> a <{EX}Animal>");
     assert!(!contains(&plain, &inferred));
     let report = plain
