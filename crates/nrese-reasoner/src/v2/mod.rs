@@ -429,7 +429,7 @@ mod tests {
     /// violations it reports are exactly the new ones.
     #[test]
     fn delta_equals_rematerialisation_under_random_changes() {
-        use super::delta::{MemoryBase, update};
+        use super::delta::{MemoryBase, Rules, update};
 
         // NRESE_FUZZ_CASES and NRESE_FUZZ_SEED widen the sweep locally.
         let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
@@ -450,6 +450,13 @@ mod tests {
             asserted.dedup();
             let mut before = closure(&asserted);
             let mut inferred = before.derived.clone();
+            // Odd cases carry the ground program from change to change, even ones rebuild it.
+            let mut cache: Option<super::eval::GroundProgram> = None;
+            let compiled = Rules {
+                rules: &rules,
+                lists: Some(&lists),
+                schema: &schema,
+            };
             for step in 0..4 {
                 // Insert some facts of the pool, delete some asserted ones.
                 let insert: Vec<Triple> = pool
@@ -467,8 +474,11 @@ mod tests {
                     .collect();
                 after.sort_unstable();
                 after.dedup();
-                let insert: Vec<Triple> =
-                    insert.into_iter().filter(|f| !delete.contains(f)).collect();
+                // Facts new to the state: neither asserted nor inferred before.
+                let insert: Vec<Triple> = insert
+                    .into_iter()
+                    .filter(|f| !delete.contains(f) && inferred.binary_search(f).is_err())
+                    .collect();
                 // The engine drops inferred statements that become asserted.
                 let stack: Vec<Triple> = inferred
                     .iter()
@@ -477,7 +487,7 @@ mod tests {
                     .collect();
                 let base = MemoryBase::new(&after, &stack);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    update(&base, &insert, &delete, &rules, Some(&lists), &schema)
+                    update(&base, &insert, &delete, compiled, cache.as_ref())
                 }));
                 let context = || {
                     let text = |t: &Triple| {
@@ -496,6 +506,13 @@ mod tests {
                 };
                 changes += 1;
                 let expected = closure(&after);
+                if case % 2 == 1 {
+                    if let Some(program) = &result.program {
+                        cache = Some(program.clone());
+                    }
+                } else {
+                    cache = None;
+                }
                 {
                     let removal: HashSet<Triple> = result.remove.iter().copied().collect();
                     let mut maintained: Vec<Triple> = stack

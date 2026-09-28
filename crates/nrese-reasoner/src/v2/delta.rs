@@ -3,43 +3,47 @@
 //! dataset. It reads the state through [`Base`] (the store's indexes) and returns the
 //! changes to the inferred facts.
 //!
-//! One [`update`] runs three phases over the same compiled program as the batch executor
-//! ([`super::eval`]):
+//! One [`update`] runs three phases over the ground program of the batch executor
+//! ([`GroundProgram`]):
 //!
 //! 1. **Overdelete** (DRed; Gupta, Mumick and Subrahmanian, SIGMOD 1993). Every inferred
 //!    fact with a derivation that uses a deleted fact is removed, transitively: semi-naive
 //!    evaluation over the old state with the deleted facts as the delta. Rule instances
 //!    that exist because of a deleted schema fact are found by grounding through it
-//!    ([`super::eval::ground_delta`]) and evaluated in full.
+//!    ([`super::eval::ground_delta`]) and evaluated in full, as are list rules whose list
+//!    lost a fact.
 //! 2. **Rederive.** Each overdeleted fact (and each deleted asserted fact) that still has a
 //!    one-step derivation from the remaining facts is put back
-//!    ([`super::eval::derivations`]).
+//!    ([`GroundProgram::derivable`], which finds the candidate rules by head).
 //! 3. **Insert.** Semi-naive evaluation seeded with the rederived and the inserted facts.
-//!    Rule instances created by new schema facts are evaluated once over all facts.
-//!    Transitive properties are closed per new edge `(a, b)` as predecessors(a) ×
+//!    Rule instances created by new schema or list facts are evaluated once over all
+//!    facts. Transitive properties are closed per new edge `(a, b)` as predecessors(a) ×
 //!    successors(b) over the already closed relation, edge by edge, so a batch of edges
 //!    costs the pairs it adds rather than a recomputation.
 //!
 //! Consistency rules are then evaluated through the facts the change added: deletes can't
 //! create violations, and the state before the change passed the same check.
 //!
-//! List axioms are instantiated from the facts ([`super::lists`]), so a list rule appears
-//! or vanishes with its list: when overdeletion reaches list structure, every list rule of
-//! the old state that no longer exists is evaluated in full and its consequences are
-//! overdeleted; new list rules in phase 3 are evaluated in full.
+//! **The ground program is the expensive part to build** (grounding every rule against
+//! the TBox, instantiating the list axioms). [`update`] takes the program of the state
+//! before the change (see [`program`]) and returns the new one only if the change altered
+//! it, so commits that don't touch the schema cost what their delta costs. The dispatch
+//! index means a round only visits rule instances that can match its delta.
 //!
 //! DRed overdeletes whole transitive components on deletes inside them; B/F (R5) replaces
 //! it.
 
+use std::borrow::Cow;
+
 use hashbrown::HashSet;
 use rayon::prelude::*;
 
-use super::batch::{Store, consistency_rules, violations_of};
+use super::batch::{Store, check, consistency_rules, fact_rules, sorted};
 use super::eval::{
-    AllFacts, Job, RuleKey, Schema, Seg, Source, derivations, ground, ground_delta,
-    instantiate_head, rule_key, run_jobs, transitive_predicate,
+    AllFacts, GroundProgram, Job, RuleKey, Schema, Seg, Source, instantiate_head, rule_key,
+    run_jobs, transitive_predicate, transitivity,
 };
-use super::ir::{Atom, Head, Rule, Term};
+use super::ir::{Head, Rule};
 use super::lists::{ListVocabulary, instantiate};
 use super::naive::{Triple, Violation};
 
@@ -55,8 +59,59 @@ pub trait Base: Sync {
     fn is_asserted(&self, fact: Triple) -> bool;
 }
 
+/// The rules an update runs, compiled against the vocabulary.
+#[derive(Clone, Copy)]
+pub struct Rules<'a> {
+    pub rules: &'a [Rule],
+    pub lists: Option<&'a ListVocabulary>,
+    pub schema: &'a Schema,
+}
+
+impl Rules<'_> {
+    /// Fact and consistency rules, with the list rules instantiated over `source`.
+    fn source<S: Source + ?Sized>(&self, source: &S) -> Vec<Rule> {
+        let mut diagnostics = Vec::new();
+        let mut rules = fact_rules(source, self.rules, self.lists, &mut diagnostics);
+        rules.extend(consistency_rules(source, self.rules, self.lists));
+        rules
+    }
+
+    /// The ground program over `source`; its bodiless facts count as handed out.
+    fn program<S: Source + ?Sized>(&self, source: &S) -> GroundProgram {
+        let mut program = GroundProgram::default();
+        program.ground(source, self.schema, &self.source(source));
+        program.take_facts();
+        program
+    }
+
+    /// The list rules (both kinds) instantiated over `source`.
+    fn list_rules<S: Source + ?Sized>(&self, source: &S) -> Vec<Rule> {
+        self.lists
+            .map(|vocabulary| instantiate(vocabulary, &AllFacts(source)).0)
+            .unwrap_or_default()
+    }
+
+    fn is_list_fact(&self, fact: Triple) -> bool {
+        self.lists.is_some_and(|l| l.is_list_fact(fact))
+    }
+
+    /// Whether `fact` feeds the ground program: a schema or list fact.
+    fn is_program_fact(&self, fact: Triple) -> bool {
+        self.schema.is_schema_fact(fact) || self.is_list_fact(fact)
+    }
+
+    /// The rules with schema atoms (the ones grounding through a delta can extend).
+    fn schema_rules(&self) -> Vec<Rule> {
+        self.rules
+            .iter()
+            .filter(|r| r.body.iter().any(|a| self.schema.is_schema_atom(a)))
+            .cloned()
+            .collect()
+    }
+}
+
 /// What [`update`] computed.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Update {
     /// Facts to add to the inferred stack.
     pub insert: Vec<Triple>,
@@ -65,6 +120,21 @@ pub struct Update {
     /// Consistency violations that involve a fact the change added.
     pub violations: Vec<Violation>,
     pub rounds: usize,
+    /// The ground program of the state after the change, if it differs from the one given
+    /// (or none was given); `None` means the given program still applies.
+    pub program: Option<GroundProgram>,
+}
+
+impl std::fmt::Debug for Update {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Update")
+            .field("insert", &self.insert.len())
+            .field("remove", &self.remove.len())
+            .field("violations", &self.violations)
+            .field("rounds", &self.rounds)
+            .field("program_changed", &self.program.is_some())
+            .finish()
+    }
 }
 
 /// The state seen through a [`Base`], minus `hidden`, plus `extra` (whose delta is the
@@ -106,190 +176,99 @@ impl<B: Base + ?Sized> Source for Overlay<'_, B> {
     }
 }
 
-/// The transitivity rule over `p`, for evaluation where the module doesn't apply
-/// (overdeletion, rederivation).
-fn transitivity(p: u64) -> Rule {
-    let (x, y, z) = (Term::Var(0), Term::Var(1), Term::Var(2));
-    Rule {
-        name: "prp-trp".to_owned(),
-        body: vec![Atom([x, Term::Const(p), y]), Atom([y, Term::Const(p), z])],
-        guards: Vec::new(),
-        head: Head::Facts(vec![Atom([x, Term::Const(p), z])]),
-    }
+/// The ground program of the materialised state `base`: the cache [`update`] takes.
+pub fn program<B: Base + ?Sized>(base: &B, rules: Rules<'_>) -> GroundProgram {
+    let (hidden, extra) = (HashSet::new(), Store::default());
+    rules.program(&Overlay {
+        base,
+        hidden: &hidden,
+        extra: &extra,
+    })
 }
 
-/// The ground program over a state: rules, transitive predicates and bodiless facts.
-#[derive(Default)]
-struct Program {
-    rules: Vec<Rule>,
-    known: HashSet<RuleKey>,
-    transitive: std::collections::BTreeSet<u64>,
-    facts: Vec<Triple>,
-}
-
-impl Program {
-    /// Files `rule`; returns it if it is new and has a body.
-    fn add(&mut self, rule: Rule) -> Option<Rule> {
-        if let Some(p) = transitive_predicate(&rule) {
-            self.transitive.insert(p);
-            None
-        } else if rule.body.is_empty() {
-            if let Head::Facts(heads) = &rule.head {
-                self.facts
-                    .extend(heads.iter().map(|h| instantiate_head(h, &[])));
-            }
-            None
-        } else if self.known.insert(rule_key(&rule)) {
-            self.rules.push(rule.clone());
-            Some(rule)
-        } else {
-            None
-        }
-    }
-
-    /// Grounds `rules` over all of `source`.
-    fn full<S: Source + ?Sized>(source: &S, schema: &Schema, rules: &[Rule]) -> Self {
-        let mut program = Self::default();
-        for rule in rules {
-            if let Some(p) = transitive_predicate(rule) {
-                program.transitive.insert(p);
-                continue;
-            }
-            let mut grounded = Vec::new();
-            ground(source, schema, rule, &mut |g| grounded.push(g.rule));
-            for rule in grounded {
-                program.add(rule);
-            }
-        }
-        program
-    }
-
-    /// Grounds `rules` through the delta of `source`; returns the new rules.
-    fn extend_delta<S: Source + ?Sized>(
-        &mut self,
-        source: &S,
-        schema: &Schema,
-        rules: &[Rule],
-    ) -> Vec<Rule> {
-        let mut grounded = Vec::new();
-        for rule in rules {
-            if transitive_predicate(rule).is_some() {
-                continue;
-            }
-            ground_delta(source, schema, rule, &mut |g| grounded.push(g.rule));
-        }
-        grounded
-            .into_iter()
-            .filter_map(|rule| self.add(rule))
-            .collect()
-    }
-
-    /// Every rule, with the transitive predicates as rules.
-    fn with_transitivity(&self) -> Vec<Rule> {
-        let mut rules = self.rules.clone();
-        rules.extend(self.transitive.iter().map(|&p| transitivity(p)));
-        rules
-    }
-}
-
-/// The source rules: the fact rules, plus the list rules instantiated over `source`.
-fn source_rules<S: Source + ?Sized>(
-    source: &S,
-    rules: &[Rule],
-    lists: Option<&ListVocabulary>,
-) -> Vec<Rule> {
-    let mut out: Vec<Rule> = rules
-        .iter()
-        .filter(|r| r.head != Head::Inconsistent)
-        .cloned()
-        .collect();
-    if let Some(vocabulary) = lists {
-        let (list_rules, _) = instantiate(vocabulary, &AllFacts(source));
-        out.extend(
-            list_rules
-                .into_iter()
-                .filter(|r| r.head != Head::Inconsistent),
-        );
-    }
-    out
-}
-
-/// The fact rules [`super::lists`] instantiates over `source`.
-fn list_rules<S: Source + ?Sized>(source: &S, lists: Option<&ListVocabulary>) -> Vec<Rule> {
-    let Some(vocabulary) = lists else {
-        return Vec::new();
-    };
-    let (rules, _) = instantiate(vocabulary, &AllFacts(source));
-    rules
-        .into_iter()
-        .filter(|r| r.head != Head::Inconsistent)
-        .collect()
-}
-
-/// Whether `fact` is part of a list (structure or axiom), whose rules [`super::lists`]
-/// instantiates from the facts.
-fn is_list_fact(lists: Option<&ListVocabulary>, fact: Triple) -> bool {
-    lists.is_some_and(|l| l.is_list_fact(fact))
-}
-
-/// Maintains the materialisation of `base` under `rules` for the asserted facts
-/// `inserted` and `deleted`, which `base` already reflects.
+/// Maintains the materialisation of `base` under `rules` for a change of the asserted
+/// facts, which `base` already reflects: `inserted` are facts new to the state (neither
+/// asserted nor inferred before), `deleted` facts no longer asserted. `cache` is the
+/// ground program of the state before the change ([`program`]); without it, it is built.
 pub fn update<B: Base + ?Sized>(
     base: &B,
     inserted: &[Triple],
     deleted: &[Triple],
-    rules: &[Rule],
-    lists: Option<&ListVocabulary>,
-    schema: &Schema,
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
 ) -> Update {
     let mut result = Update::default();
-    let no_hidden = HashSet::new();
+    let schema = rules.schema;
+    let empty = Store::default();
+    let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
+    // The ground program of the old state: `base` without the inserted facts, plus the
+    // deleted ones.
+    let computed: Option<GroundProgram> = cache.is_none().then(|| {
+        let extra = Store::new(deleted.to_vec());
+        rules.program(&Overlay {
+            base,
+            hidden: &inserted_set,
+            extra: &extra,
+        })
+    });
+    let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
 
-    // 1. Overdelete, over the old state: `base` plus the deleted facts.
+    // 1. Overdelete, over the old state.
     let mut overdeleted: HashSet<Triple> = HashSet::new();
     if !deleted.is_empty() {
         let mut extra = Store::new(deleted.to_vec());
-        let (program, source, old_lists) = {
+        let (fact_schema_rules, old_lists) = {
             let old = Overlay {
                 base,
-                hidden: &no_hidden,
+                hidden: &inserted_set,
                 extra: &extra,
             };
-            let source = source_rules(&old, rules, lists);
-            (
-                Program::full(&old, schema, &source),
-                source,
-                list_rules(&old, lists),
-            )
+            let lists: Vec<Rule> = rules
+                .list_rules(&old)
+                .into_iter()
+                .filter(|r| r.head != Head::Inconsistent)
+                .collect();
+            let schema_rules: Vec<Rule> = rules
+                .schema_rules()
+                .into_iter()
+                .filter(|r| r.head != Head::Inconsistent)
+                .collect();
+            (schema_rules, lists)
         };
-        let program_rules = program.with_transitivity();
+        let transitivity_rules: Vec<Rule> = old_program
+            .transitive
+            .iter()
+            .map(|&p| transitivity(p))
+            .collect();
         let mut vanished_done: HashSet<RuleKey> = HashSet::new();
         loop {
             result.rounds += 1;
             let old = Overlay {
                 base,
-                hidden: &no_hidden,
+                hidden: &inserted_set,
                 extra: &extra,
             };
-            // Instances through a deleted schema fact, known or not, are evaluated in full.
-            let mut scratch = Program::default();
-            let mut fresh = scratch.extend_delta(&old, schema, &source);
+            // Instances through a deleted schema fact, known or not, in full.
+            let mut scratch = GroundProgram::default();
+            scratch.ground_delta(&old, schema, &fact_schema_rules);
+            let mut fresh: Vec<Rule> = scratch.rules.clone();
             fresh.extend(scratch.transitive.iter().map(|&p| transitivity(p)));
+            let mut bodiless = scratch.take_facts();
             // List rules whose list lost a fact: in full as well.
             let mut delta_facts = Vec::new();
             extra.scan([None, None, None], Seg::Delta, &mut |f| delta_facts.push(f));
-            if delta_facts.iter().any(|&f| is_list_fact(lists, f)) {
+            if delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
                 let mut gone: HashSet<Triple> = overdeleted.clone();
                 gone.extend(delta_facts.iter().copied());
                 gone.extend(deleted.iter().copied());
-                let empty = Store::default();
+                gone.extend(inserted.iter().copied());
                 let now = Overlay {
                     base,
                     hidden: &gone,
                     extra: &empty,
                 };
                 let current: HashSet<RuleKey> =
-                    list_rules(&now, lists).iter().map(rule_key).collect();
+                    rules.list_rules(&now).iter().map(rule_key).collect();
                 for rule in &old_lists {
                     let key = rule_key(rule);
                     if current.contains(&key) || !vanished_done.insert(key) {
@@ -299,9 +278,7 @@ pub fn update<B: Base + ?Sized>(
                         Some(p) => fresh.push(transitivity(p)),
                         None if rule.body.is_empty() => {
                             if let Head::Facts(heads) = &rule.head {
-                                scratch
-                                    .facts
-                                    .extend(heads.iter().map(|h| instantiate_head(h, &[])));
+                                bodiless.extend(heads.iter().map(|h| instantiate_head(h, &[])));
                             }
                         }
                         None => fresh.push(rule.clone()),
@@ -309,19 +286,26 @@ pub fn update<B: Base + ?Sized>(
                 }
             }
             let mut jobs = Vec::new();
-            for rule in &program_rules {
-                for i in 0..rule.body.len() {
+            for (r, i) in old_program.variants(&extra) {
+                jobs.extend(Job::variant(&old, &old_program.rules[r], i));
+            }
+            for rule in &transitivity_rules {
+                for i in 0..2 {
                     jobs.extend(Job::variant(&old, rule, i));
                 }
             }
             for rule in &fresh {
                 jobs.extend(Job::full(&old, rule));
             }
-            // Only inferred facts are overdeleted; asserted ones stay.
-            let overdeletable =
-                |f: Triple| base.contains(f) && !base.is_asserted(f) && !extra.contains(f);
+            // Only inferred facts of the old state are overdeleted; asserted ones stay.
+            let overdeletable = |f: Triple| {
+                base.contains(f)
+                    && !base.is_asserted(f)
+                    && !extra.contains(f)
+                    && !inserted_set.contains(&f)
+            };
             let mut candidates = run_jobs(&old, &jobs, &overdeletable);
-            candidates.extend(scratch.facts.iter().copied().filter(|&f| overdeletable(f)));
+            candidates.extend(bodiless.into_iter().filter(|&f| overdeletable(f)));
             drop(jobs);
             let delta = extra.advance(candidates);
             if delta.is_empty() {
@@ -332,41 +316,37 @@ pub fn update<B: Base + ?Sized>(
     }
 
     // 2. Rederive: overdeleted and deleted facts with a derivation from what remains. The
-    // program is grounded over the settled state, without the inserted facts: rule
-    // instances that exist because of them are then new in phase 3 and evaluated in full.
+    // program is that of the settled state, without the inserted facts: rule instances
+    // that exist because of them are then new in phase 3 and evaluated in full.
     let mut hidden: HashSet<Triple> = overdeleted.clone();
     hidden.extend(deleted.iter().copied());
     let mut unsettled = hidden.clone();
     unsettled.extend(inserted.iter().copied());
-    let empty = Store::default();
     let remaining = Overlay {
         base,
         hidden: &unsettled,
         extra: &empty,
     };
-    let source = source_rules(&remaining, rules, lists);
-    let mut program = Program::full(&remaining, schema, &source);
-    let checks = program.with_transitivity();
-    let bodiless: HashSet<Triple> = program.facts.drain(..).collect();
+    let program_changed = deleted
+        .iter()
+        .chain(&overdeleted)
+        .any(|&f| rules.is_program_fact(f));
+    let mut program: Cow<'_, GroundProgram> = if program_changed {
+        Cow::Owned(rules.program(&remaining))
+    } else {
+        Cow::Borrowed(old_program)
+    };
     let candidates: Vec<Triple> = overdeleted.iter().chain(deleted).copied().collect();
+    let settled: &GroundProgram = &program;
     let rederived: Vec<Triple> = candidates
         .par_iter()
         .copied()
-        .filter(|&fact| !base.is_asserted(fact))
-        .filter(|&fact| {
-            bodiless.contains(&fact)
-                || checks.iter().any(|rule| {
-                    let mut found = false;
-                    derivations(&remaining, rule, fact, Seg::All, &mut |_| {
-                        found = true;
-                        true
-                    });
-                    found
-                })
-        })
+        .filter(|&fact| !base.is_asserted(fact) && settled.derivable(&remaining, fact))
         .collect();
+    let settled_consistency = program.consistency.len();
 
     // 3. Insert: semi-naive from the rederived and inserted facts.
+    let schema_rules = rules.schema_rules();
     let mut seeds = rederived;
     seeds.extend_from_slice(inserted);
     let mut extra = Store::new(seeds);
@@ -378,39 +358,34 @@ pub fn update<B: Base + ?Sized>(
             hidden: &hidden,
             extra: &extra,
         };
-        // Rule instances through new schema facts, and list rules from new list facts.
+        // Instances through new schema facts, and list rules from new list facts. They
+        // are appended, so the new ones are `evaluated..`.
+        let evaluated = program.rules.len();
         let transitive_before = program.transitive.clone();
-        let mut fresh = program.extend_delta(&state, schema, &source);
-        {
-            let mut delta_facts = Vec::new();
-            extra.scan([None, None, None], Seg::Delta, &mut |f| delta_facts.push(f));
-            if delta_facts.iter().any(|&f| is_list_fact(lists, f))
-                && let Some(vocabulary) = lists
-            {
-                let (list_rules, _) = instantiate(vocabulary, &AllFacts(&state));
-                for rule in list_rules
-                    .into_iter()
-                    .filter(|r| r.head != Head::Inconsistent)
-                {
-                    fresh.extend(program.add(rule));
-                }
-            }
+        let mut delta_facts = Vec::new();
+        extra.scan([None, None, None], Seg::Delta, &mut |f| delta_facts.push(f));
+        if delta_facts.iter().any(|&f| schema.is_schema_fact(f)) {
+            program.to_mut().ground_delta(&state, schema, &schema_rules);
         }
-        let fresh_keys: HashSet<RuleKey> = fresh.iter().map(rule_key).collect();
+        if delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
+            let list_rules = rules.list_rules(&state);
+            program.to_mut().ground(&state, schema, &list_rules);
+        }
+        let mut candidates = if program.has_pending_facts() {
+            program.to_mut().take_facts()
+        } else {
+            Vec::new()
+        };
+        candidates.retain(|&f| !state.contains(f));
         let mut jobs = Vec::new();
-        for rule in &program.rules {
-            if fresh_keys.contains(&rule_key(rule)) {
-                continue;
-            }
-            for i in 0..rule.body.len() {
-                jobs.extend(Job::variant(&state, rule, i));
+        for (r, i) in program.variants(&extra) {
+            if r < evaluated {
+                jobs.extend(Job::variant(&state, &program.rules[r], i));
             }
         }
-        for rule in &fresh {
+        for rule in &program.rules[evaluated..] {
             jobs.extend(Job::full(&state, rule));
         }
-        let mut candidates = std::mem::take(&mut program.facts);
-        candidates.retain(|&f| !state.contains(f));
         candidates.extend(run_jobs(&state, &jobs, &|fact| !state.contains(fact)));
         drop(jobs);
         // Transitive properties: newly declared ones closed in full (SCC condensation), the
@@ -452,7 +427,8 @@ pub fn update<B: Base + ?Sized>(
     extra.scan([None, None, None], Seg::All, &mut |f| added.push(f));
     added.sort_unstable();
     added.dedup();
-    let visible_before = |f: Triple| base.contains(f) && !hidden.contains(&f);
+    let visible_before =
+        |f: Triple| base.contains(f) && !hidden.contains(&f) && !inserted_set.contains(&f);
     result.insert = added
         .iter()
         .copied()
@@ -467,8 +443,8 @@ pub fn update<B: Base + ?Sized>(
     result.remove.sort_unstable();
 
     // Consistency through the facts the change added. The overlay holds every fact of
-    // phase 3 (rederived ones are hidden in `base`), with the new ones as its delta.
-    let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
+    // phase 3 (rederived ones are hidden in `base`), with the new ones as its delta:
+    // existing instances through them, new instances in full.
     let (new_facts, restored): (Vec<Triple>, Vec<Triple>) = added.iter().copied().partition(|&f| {
         inserted_set.contains(&f) || (!visible_before(f) && !overdeleted.contains(&f))
     });
@@ -479,14 +455,25 @@ pub fn update<B: Base + ?Sized>(
         hidden: &hidden,
         extra: &fresh,
     };
+    let variants: Vec<(usize, usize)> = program
+        .consistency_variants(&fresh)
+        .into_iter()
+        .filter(|&(c, _)| c < settled_consistency)
+        .collect();
     let mut found = HashSet::new();
-    for rule in consistency_rules(&state, rules, lists) {
-        violations_of(&state, schema, &rule, true, &mut found);
+    check(
+        &state,
+        &program,
+        settled_consistency..program.consistency.len(),
+        &variants,
+        &mut found,
+    );
+    result.violations = sorted(found);
+    result.program = match program {
+        Cow::Owned(program) => Some(program),
+        Cow::Borrowed(_) => None,
     }
-    result.violations = found.into_iter().collect();
-    result
-        .violations
-        .sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
+    .or(computed);
     result
 }
 
