@@ -430,6 +430,92 @@ mod tests {
         assert!(derived.len() > 1000, "{}", derived.len());
     }
 
+    /// The delta executor's equality module under random deletes and re-inserts of an
+    /// equality-heavy ontology: equal to rematerialisation after every change.
+    #[test]
+    fn delta_equality_equals_rematerialisation() {
+        use super::delta::{MemoryBase, Rules, update};
+
+        let mut lines = Vec::new();
+        for i in 0..7 {
+            lines.push(format!("ex:a{i} owl:sameAs ex:a{}", i + 1));
+        }
+        for i in 0..3 {
+            lines.push(format!("ex:b{i} owl:sameAs ex:b{}", i + 1));
+        }
+        lines.extend(
+            [
+                "ex:a3 ex:knows ex:b2",
+                "ex:b0 ex:p ex:a7",
+                "ex:p owl:sameAs ex:q",
+                "ex:q rdfs:domain ex:C",
+                "ex:a7 rdf:type ex:D",
+                "ex:D rdfs:subClassOf ex:E",
+                "ex:b3 owl:sameAs ex:a0",
+                "ex:knows rdf:type owl:SymmetricProperty",
+            ]
+            .map(str::to_owned),
+        );
+        let mut vocabulary = LocalVocabulary::default();
+        let pool = load(
+            &mut vocabulary,
+            &lines.join(
+                "
+",
+            ),
+        );
+        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let compiled = Rules {
+            rules: &rules,
+            lists: Some(&lists),
+            schema: &schema,
+        };
+        let closure = |asserted: &[Triple]| {
+            batch::materialise(asserted, &rules, Some(&lists), &schema).derived
+        };
+        let mut next = rng(7);
+        let mut asserted: Vec<Triple> = pool.clone();
+        asserted.sort_unstable();
+        let mut inferred = closure(&asserted);
+        for step in 0..60 {
+            let fact = pool[next(pool.len())];
+            let deleting = asserted.binary_search(&fact).is_ok();
+            let mut after: Vec<Triple> = asserted.iter().copied().filter(|&t| t != fact).collect();
+            if !deleting {
+                after.push(fact);
+                after.sort_unstable();
+            }
+            let stack: Vec<Triple> = inferred
+                .iter()
+                .copied()
+                .filter(|t| after.binary_search(t).is_err())
+                .collect();
+            let base = MemoryBase::new(&after, &stack);
+            let new = !deleting && inferred.binary_search(&fact).is_err();
+            let (ins, del): (&[Triple], &[Triple]) = if deleting {
+                (&[], std::slice::from_ref(&fact))
+            } else if new {
+                (std::slice::from_ref(&fact), &[])
+            } else {
+                (&[], &[])
+            };
+            let result = update(&base, ins, del, compiled, None);
+            let removal: HashSet<Triple> = result.remove.iter().copied().collect();
+            let mut maintained: Vec<Triple> = stack
+                .into_iter()
+                .filter(|t| !removal.contains(t))
+                .chain(result.insert)
+                .collect();
+            maintained.sort_unstable();
+            maintained.dedup();
+            assert_eq!(maintained, closure(&after), "step {step}");
+            inferred = maintained;
+            asserted = after;
+        }
+    }
+
     /// Random small ontologies: the batch executor equals the naive one.
     #[test]
     fn batch_equals_naive_on_random_ontologies() {
