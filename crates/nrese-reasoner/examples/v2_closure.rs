@@ -90,7 +90,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         closure.violations.len()
     );
     for diagnostic in closure.diagnostics.iter().take(5) {
-        println!("  diagnostic: {diagnostic}");
+        // Diagnostics name terms by id; show their text.
+        let words: Vec<String> = diagnostic
+            .split(' ')
+            .map(|word| {
+                let digits = word.trim_matches(|c: char| !c.is_ascii_digit());
+                match digits.parse::<u64>() {
+                    Ok(id) if !digits.is_empty() && word.len() - digits.len() <= 2 => {
+                        word.replace(digits, vocabulary.text(id))
+                    }
+                    _ => word.to_owned(),
+                }
+            })
+            .collect();
+        println!("  diagnostic: {}", words.join(" "));
     }
     Ok(())
 }
