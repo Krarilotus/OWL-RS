@@ -22,6 +22,7 @@ mod symbols;
 mod taxonomy;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod v2;
 mod vocabulary;
 
 pub use config::{
