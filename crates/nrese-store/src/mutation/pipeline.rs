@@ -144,6 +144,8 @@ impl MutationPipeline {
             return Ok(report.committed(summary.revision));
         }
 
+        // Without reasoner v2, commits don't maintain the inferred stack.
+        self.store.invalidate_reasoning().map_err(store_error)?;
         let reads_triples = self.reasoner.config().mode() != ReasoningMode::Disabled;
         let snapshot =
             gate_snapshot(&tx, tx.base().revision() + 1, reads_triples).map_err(store_error)?;
