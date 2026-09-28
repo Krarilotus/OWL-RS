@@ -74,8 +74,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let mut cache = Some(program(&MemoryBase::new(&asserted, &inferred), compiled));
     let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
-    for target in targets {
-        for deleting in [true, false] {
+    let mut phases = [[std::time::Duration::ZERO; 5]; 2];
+    // Per target: delete it (timed), put it back, insert a statement about a new entity
+    // (timed: a fact new to the state), remove it again.
+    let fresh: Vec<Triple> = (0..targets.len())
+        .map(|i| {
+            [
+                vocabulary.term(&format!("<urn:nrese:bench:{i}>")),
+                rdf_type,
+                targets[i][2],
+            ]
+        })
+        .collect();
+    for (i, &existing) in targets.iter().enumerate() {
+        for (target, deleting, timed) in [
+            (existing, true, Some(0)),
+            (existing, false, None),
+            (fresh[i], false, Some(1)),
+            (fresh[i], true, None),
+        ] {
             let after: Vec<Triple> = if deleting {
                 asserted.iter().copied().filter(|&t| t != target).collect()
             } else {
@@ -101,6 +118,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let started = Instant::now();
             let result = update(&base, ins, del, compiled, cache.as_ref());
             let ms = started.elapsed().as_secs_f64() * 1000.0;
+            if let Some(k) = timed {
+                for (total, phase) in phases[k].iter_mut().zip(result.phases) {
+                    *total += phase;
+                }
+            }
             if std::env::var_os("NRESE_DELTA_DEBUG").is_some() {
                 let text = |t: &Triple| t.map(|id| vocabulary.text(id).to_owned()).join(" ");
                 eprintln!(
@@ -129,7 +151,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             inferred = next;
             asserted = after;
-            if deleting { &mut deletes } else { &mut inserts }.push(ms);
+            match timed {
+                Some(0) => deletes.push(ms),
+                Some(_) => inserts.push(ms),
+                None => {}
+            }
         }
     }
     let stats = |times: &mut Vec<f64>| {
@@ -139,6 +165,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let (d50, d99) = stats(&mut deletes);
     let (i50, i99) = stats(&mut inserts);
+    eprintln!(
+        "phases (program, overdelete, rederive, insert, consistency): deletes {:?} inserts {:?}",
+        phases[0], phases[1]
+    );
     println!(
         "{} changes: deletes p50 {d50:.3} ms p99 {d99:.3} ms | inserts p50 {i50:.3} ms p99 {i99:.3} ms",
         deletes.len()

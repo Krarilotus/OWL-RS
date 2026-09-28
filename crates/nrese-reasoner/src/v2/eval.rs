@@ -631,13 +631,12 @@ pub fn derivations<S: Source + ?Sized>(
         } else {
             let bound: Vec<bool> = bindings.iter().map(Option::is_some).collect();
             let atoms: Vec<usize> = (0..rule.body.len()).collect();
-            // Start from the atom with the most bound positions.
+            // Start from the atom with the most bound positions, then the fewest matches.
             let first = (0..rule.body.len())
                 .max_by_key(|&i| {
-                    pattern(&rule.body[i], &bindings)
-                        .iter()
-                        .filter(|p| p.is_some())
-                        .count()
+                    let bound = pattern(&rule.body[i], &bindings);
+                    let known = bound.iter().filter(|p| p.is_some()).count();
+                    (known, std::cmp::Reverse(source.estimate(bound, seg)))
                 })
                 .expect("a body");
             let order = plan_bound(source, rule, &atoms, first, &bound, |_| seg);
