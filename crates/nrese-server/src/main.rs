@@ -20,8 +20,22 @@ async fn main() -> Result<()> {
     let cli = CliConfig::from_args(std::env::args_os())?;
     let config = ServerConfig::load(cli.config_path.as_deref())?;
     let store = StoreService::new(config.store.clone())?;
+    let ruleset = config.reasoner.materialised_ruleset();
     if let CliCommand::Load(load) = cli.command {
-        return bulk_load(&store, load);
+        bulk_load(&store, load)?;
+        if let Some(ruleset) = ruleset {
+            store
+                .rematerialise(ruleset)
+                .context("reasoning after the bulk load failed")?;
+        }
+        return Ok(());
+    }
+    // Reasoner v2: bring the inferred stack in line with the configured ruleset (a no-op
+    // revision-wise when it already is), so reads see the closure from the first request.
+    if let Some(ruleset) = ruleset {
+        store
+            .rematerialise(ruleset)
+            .context("startup reasoning failed")?;
     }
     let reasoner = ReasonerService::new(config.reasoner.clone());
     let ai = AiSuggestionService::new(config.ai.clone())?;

@@ -16,6 +16,7 @@ pub(super) fn parse_reasoner_config(source: &dyn ConfigSource) -> Result<Reasone
             source.get(names::REASONER_RULES_MVP_PRESET).as_deref(),
             source.get(names::REASONER_RULES_MVP_FEATURES).as_deref(),
         )?),
+        ReasoningMode::Rdfs | ReasoningMode::Owl2Rl => ReasonerConfig::for_mode(mode).profile,
     };
     let config = ReasonerConfig {
         profile,
@@ -125,8 +126,11 @@ fn parse_reasoning_mode(input: Option<&str>) -> Result<ReasoningMode> {
     match input.unwrap_or("disabled").to_ascii_lowercase().as_str() {
         "disabled" | "none" | "off" => Ok(ReasoningMode::Disabled),
         "rulesmvp" | "rules_mvp" | "rules-mvp" => Ok(ReasoningMode::RulesMvp),
+        "rdfs" => Ok(ReasoningMode::Rdfs),
+        "owl2-rl" | "owl2rl" | "owl2_rl" => Ok(ReasoningMode::Owl2Rl),
         unknown => bail!(
-            "unsupported value '{unknown}' in {} (expected 'disabled' or 'rules-mvp')",
+            "unsupported value '{unknown}' in {} (expected 'disabled', 'rdfs', 'owl2-rl' or \
+             'rules-mvp')",
             names::REASONING_MODE
         ),
     }
@@ -148,6 +152,14 @@ mod tests {
         assert_eq!(
             parse_reasoning_mode(None).expect("default"),
             nrese_reasoner::ReasoningMode::Disabled
+        );
+        assert_eq!(
+            parse_reasoning_mode(Some("OWL2-RL")).expect("owl2-rl"),
+            nrese_reasoner::ReasoningMode::Owl2Rl
+        );
+        assert_eq!(
+            parse_reasoning_mode(Some("rdfs")).expect("rdfs"),
+            nrese_reasoner::ReasoningMode::Rdfs
         );
     }
 

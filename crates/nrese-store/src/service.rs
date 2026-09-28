@@ -174,6 +174,53 @@ impl StoreService {
         bulk_load(&self.engine, request)
     }
 
+    /// Replaces the inferred stack with `ruleset`'s closure over the asserted data, as one
+    /// revision (see [`crate::reasoning`]). For after bulk loads, at startup and after a
+    /// ruleset change; commits keep it current afterwards.
+    pub fn rematerialise(
+        &self,
+        ruleset: nrese_reasoner::v2::rulesets::Ruleset,
+    ) -> StoreResult<crate::reasoning::MaterialisationReport> {
+        let started = std::time::Instant::now();
+        let rematerialisation = self.engine.rematerialisation();
+        let asserted = rematerialisation
+            .base()
+            .len_in(nrese_engine::ReadModel::Asserted);
+        let closure = crate::reasoning::materialise(
+            ruleset,
+            rematerialisation.base().quads_for_pattern_in(
+                nrese_engine::ReadModel::Asserted,
+                &nrese_engine::QuadPattern::all(),
+            ),
+            &|term| rematerialisation.intern(term),
+        );
+        let inferred = closure.inferred.len() as u64;
+        let summary = rematerialisation.finish(closure.inferred)?;
+        tracing::info!(
+            ruleset = ruleset.name(),
+            revision = summary.revision,
+            asserted,
+            inferred,
+            inferred_inserted = summary.inferred_inserted,
+            inferred_deleted = summary.inferred_deleted,
+            violations = closure.violations.len(),
+            rounds = closure.rounds,
+            ms = started.elapsed().as_millis() as u64,
+            "inferred stack rematerialised"
+        );
+        Ok(crate::reasoning::MaterialisationReport {
+            ruleset: ruleset.name(),
+            revision: summary.revision,
+            asserted,
+            inferred,
+            inferred_inserted: summary.inferred_inserted,
+            inferred_deleted: summary.inferred_deleted,
+            violations: closure.violations.len(),
+            rounds: closure.rounds,
+            elapsed: started.elapsed(),
+        })
+    }
+
     pub fn restore_dataset(
         &self,
         request: &DatasetRestoreRequest,

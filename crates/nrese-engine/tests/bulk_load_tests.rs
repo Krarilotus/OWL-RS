@@ -221,3 +221,73 @@ fn durable_bulk_loads_are_checkpointed_and_survive_reopening() {
         quads(7_000..7_100).into_iter().collect()
     );
 }
+
+/// A default-graph triple over the `quad` shapes.
+fn triple(n: u64) -> Quad {
+    Quad {
+        graph_name: GraphName::DefaultGraph,
+        ..quad(n)
+    }
+}
+
+fn encode_with(
+    rematerialisation: &nrese_engine::Rematerialisation<'_>,
+    quad: &Quad,
+) -> EncodedTriple {
+    EncodedTriple::new(
+        rematerialisation.intern(quad.subject.as_ref().into()),
+        rematerialisation.intern(quad.predicate.as_ref().into()),
+        rematerialisation.intern(quad.object.as_ref()),
+    )
+}
+
+#[test]
+fn rematerialisation_replaces_the_inferred_stack_durably() {
+    let dir = tempfile::tempdir().unwrap();
+    let asserted: Vec<Quad> = (0..40).map(triple).collect();
+    let (inferred, expected) = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        load_by_transaction(&engine, &asserted);
+        // A first set, then a replacement overlapping it; both include asserted statements,
+        // which stay asserted only.
+        let first = engine.rematerialisation();
+        let set: Vec<EncodedTriple> = (20..100).map(|n| encode_with(&first, &triple(n))).collect();
+        let summary = first.finish(set).expect("finish");
+        assert_eq!((summary.revision, summary.inferred_inserted), (2, 60));
+        let second = engine.rematerialisation();
+        assert_eq!(second.base().len_in(ReadModel::Inferred), 60);
+        let set: Vec<EncodedTriple> = (80..150)
+            .map(|n| encode_with(&second, &triple(n)))
+            .collect();
+        let summary = second.finish(set).expect("finish");
+        assert_eq!(
+            (
+                summary.revision,
+                summary.inferred_inserted,
+                summary.inferred_deleted
+            ),
+            (3, 50, 40)
+        );
+        // An identical set changes nothing.
+        let third = engine.rematerialisation();
+        let set: Vec<EncodedTriple> = (80..150).map(|n| encode_with(&third, &triple(n))).collect();
+        assert_eq!(third.finish(set).expect("finish").revision, 3);
+        let snapshot = engine.snapshot();
+        (
+            contents(&snapshot, ReadModel::Inferred),
+            contents(&snapshot, ReadModel::Materialised),
+        )
+    };
+    let wanted: HashSet<Quad> = (80..150)
+        .map(triple)
+        .filter(|q| !asserted.contains(q))
+        .collect();
+    assert_eq!(inferred, wanted);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(engine.snapshot().revision(), 3);
+    assert_eq!(
+        contents(&engine.snapshot(), ReadModel::Materialised),
+        expected
+    );
+    assert_eq!(contents(&engine.snapshot(), ReadModel::Inferred), inferred);
+}
