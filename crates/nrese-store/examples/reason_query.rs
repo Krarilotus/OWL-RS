@@ -15,7 +15,11 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use nrese_reasoner::v2::rulesets::Ruleset;
-use nrese_store::{BulkLoadRequest, GraphTarget, StoreConfig, StoreService};
+use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_store::{
+    BulkLoadRequest, GraphTarget, MutationCommand, MutationPipeline, MutationTicket,
+    SparqlUpdateRequest, StoreConfig, StoreService,
+};
 
 /// `SELECT (COUNT(*) AS ?n) WHERE { <query> }` with the query's prologue kept in front.
 fn counting(query: &str) -> String {
@@ -54,6 +58,7 @@ fn first_integer(json: &str) -> Option<u64> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let (mut ruleset, mut queries, mut files) = (Ruleset::Owl2Rl, None, Vec::new());
+    let mut commits = 0usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--ruleset" => {
@@ -64,6 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--queries" => queries = args.next().map(PathBuf::from),
+            "--commits" => commits = args.next().and_then(|n| n.parse().ok()).unwrap_or(0),
             _ => files.push(PathBuf::from(arg)),
         }
     }
@@ -73,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let store = StoreService::new(StoreConfig::in_memory())?;
+    let store = std::sync::Arc::new(StoreService::new(StoreConfig::in_memory())?);
     let started = Instant::now();
     let load = store.bulk_load(&BulkLoadRequest {
         files,
@@ -93,6 +99,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.violations
     );
 
+    if commits > 0 {
+        commit_latency(&store, ruleset, commits)?;
+    }
     let Some(dir) = queries else {
         return Ok(());
     };
@@ -129,6 +138,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "queries: {:.2} ms in total (best of 4 each)",
         total * 1000.0
+    );
+    Ok(())
+}
+
+/// Commit-path latency (RT2): deletes and re-inserts `n` asserted `rdf:type` statements one
+/// at a time through the mutation pipeline, which maintains the inferred stack with the
+/// delta executor. Prints p50/p99 per operation.
+fn commit_latency(
+    store: &std::sync::Arc<StoreService>,
+    ruleset: Ruleset,
+    n: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mode = match ruleset {
+        Ruleset::Rdfs => ReasoningMode::Rdfs,
+        Ruleset::Owl2Rl => ReasoningMode::Owl2Rl,
+    };
+    let pipeline = MutationPipeline::new(
+        std::sync::Arc::clone(store),
+        std::sync::Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
+    );
+    // Asserted ABox type statements (IRIs, classes outside the W3C vocabularies), spread
+    // over the dataset.
+    let mut request = nrese_store::SparqlQueryRequest::new(format!(
+        "SELECT ?s ?c WHERE {{ ?s a ?c FILTER(isIRI(?s) && !STRSTARTS(STR(?c), \"http://www.w3.org/\")) }} LIMIT {}",
+        n * 50
+    ));
+    request.read_model = Some(nrese_store::ReadModel::Asserted);
+    request.solutions_format = nrese_store::SolutionsResultFormat::Tsv;
+    let tsv = String::from_utf8(store.execute_query(&request)?.payload)?;
+    let pairs: Vec<(String, String)> = tsv
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (s, c) = line.split_once('\t')?;
+            Some((s.to_owned(), c.to_owned()))
+        })
+        .step_by(50)
+        .take(n)
+        .collect();
+    let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
+    for (s, c) in &pairs {
+        let triple = format!("{s} a {c}");
+        for (update, times) in [("DELETE DATA", &mut deletes), ("INSERT DATA", &mut inserts)] {
+            let command = MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "{update} {{ {triple} }}"
+            )));
+            let started = Instant::now();
+            pipeline.apply(command, &MutationTicket::new())?;
+            times.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    let stats = |times: &mut Vec<f64>| {
+        times.sort_by(f64::total_cmp);
+        let at = |q: f64| times[((times.len() - 1) as f64 * q) as usize];
+        (at(0.5), at(0.99))
+    };
+    let (d50, d99) = stats(&mut deletes);
+    let (i50, i99) = stats(&mut inserts);
+    println!(
+        "commits: {} deletes p50 {d50:.2} ms p99 {d99:.2} ms | inserts p50 {i50:.2} ms p99 {i99:.2} ms",
+        pairs.len()
     );
     Ok(())
 }
