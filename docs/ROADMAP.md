@@ -131,11 +131,32 @@ Commit latency through the store pipeline under `owl2-rl`, one ABox statement pe
 
 That meets the Phase 3 commit-path gate (p50 ≤ 1 ms). Batch and end-to-end numbers are unchanged within noise (`benches/reasoning/local-bulk.sh`).
 
-Next in Phase 3:
-- R3: the equality module (sameAs by union-find, without the O(k²) re-derivation per fact) and the equivalence-property module.
-- R5: B/F deletion, instead of DRed's overdeletion inside transitive components.
-- Startup: skip rematerialisation when the inferred stack is already current for the configured ruleset.
-- The Docker scorecard with `nrese-v2` on the reference machine.
+**Status (2026-09-29, third batch):**
+- **R3 equality module:** in the batch executor, `eq-rep-s/p/o` are replaced by one expansion per fact over its terms' `sameAs` classes, O(k) instead of O(k²) per fact.
+- **R5 B/F deletion:**
+  - A deletion candidate with a backward proof down to still-asserted facts is kept and doesn't propagate.
+  - Ground instances, bodiless facts and list rules carry the schema and list facts they were grounded on (premises). A proof must prove those too, so no dependency stays hidden.
+- **Transitive deletes by component:** a lost edge affects only pairs from its source's predecessors to its target's successors. Pairs still connected by base edges keep a proof. The rest is re-closed by SCC condensation.
+- **Startup:** a marker file (`reasoning.state`) records the ruleset the inferred stack is exact for. With a matching marker, the server skips rematerialisation. With reasoning off, a leftover inferred stack is cleared.
+
+Evidence:
+- 84,000+ random insert/delete changes are exact against rematerialisation.
+- OWL2Bench RL(1), deleting one edge inside a clique of about 1,000 people (1.4 M inferred facts): 294 s became 0.65 s, or 1.25 s when the node really leaves the clique.
+
+End-of-batch numbers (`local-bulk.sh`):
+
+| | Result |
+|---|---|
+| LUBM(100) batch closure | 2.58 s |
+| LUBM(100) commits, store pipeline | delete p50 0.42 ms, p99 0.58 ms; insert p50 0.15 ms, p99 0.28 ms |
+| LUBM(100) 14 queries | 0.87 s |
+| OWL2Bench RL(1) closure | 0.53 s |
+
+Next:
+- The delta executor's own equality module; it uses the generic rules today.
+- The Docker scorecard with `nrese-v2` on the reference machine (office PC).
+- R6: consistency explanations and reject reports for v2.
+- The v1 fixture suite on v2, then removing `rules-mvp`.
 
 **Execution core (XC), decision D11.** A new crate, `nrese-exec`, holds the ID-level execution machinery shared by SPARQL and reasoning:
 - **ID tables:** columnar `u64`, sorted on a key prefix
