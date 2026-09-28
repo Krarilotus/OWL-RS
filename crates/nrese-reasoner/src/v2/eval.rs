@@ -549,6 +549,27 @@ pub fn run_jobs<S: Source + ?Sized>(
     jobs: &[Job<'_>],
     keep: &(dyn Fn(Triple) -> bool + Sync),
 ) -> Vec<Triple> {
+    run_jobs_with(source, jobs, keep, false)
+}
+
+/// [`run_jobs`] without circular derivations: those whose head is one of their own
+/// premises, such as `(?x type C) -> (?x type C)` from `C subClassOf C`. A well-founded
+/// proof never uses such a step, so overdeletion can skip them; it would otherwise
+/// cascade through every reflexive instance.
+pub fn run_jobs_acyclic<S: Source + ?Sized>(
+    source: &S,
+    jobs: &[Job<'_>],
+    keep: &(dyn Fn(Triple) -> bool + Sync),
+) -> Vec<Triple> {
+    run_jobs_with(source, jobs, keep, true)
+}
+
+fn run_jobs_with<S: Source + ?Sized>(
+    source: &S,
+    jobs: &[Job<'_>],
+    keep: &(dyn Fn(Triple) -> bool + Sync),
+    acyclic: bool,
+) -> Vec<Triple> {
     let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
         .iter()
         .enumerate()
@@ -569,7 +590,13 @@ pub fn run_jobs<S: Source + ?Sized>(
             job.run(source, range.clone(), &mut |bindings| {
                 for head in heads {
                     let fact = instantiate_head(head, bindings);
-                    if keep(fact) {
+                    let circular = acyclic
+                        && job
+                            .rule
+                            .body
+                            .iter()
+                            .any(|atom| instantiate_head(atom, bindings) == fact);
+                    if !circular && keep(fact) {
                         out.push(fact);
                     }
                 }
@@ -867,8 +894,12 @@ impl GroundProgram {
         delta: bool,
     ) -> (Vec<usize>, Vec<usize>) {
         let (mut facts, mut checks) = (Vec::new(), Vec::new());
+        // Source-level transitivity rules (`scm-sco`, `scm-spo`) don't depend on the
+        // delta: full grounding registers them, delta grounding leaves them alone.
         if let Some(p) = transitive_predicate(rule) {
-            self.transitive.insert(p);
+            if !delta {
+                self.transitive.insert(p);
+            }
             return (facts, checks);
         }
         let mut grounded = Vec::new();
