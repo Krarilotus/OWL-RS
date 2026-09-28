@@ -118,6 +118,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 (&[], &[])
             };
+            if std::env::var_os("NRESE_DELTA_DEBUG").is_some() {
+                eprintln!("prepared {:?}", Instant::now());
+            }
             let started = Instant::now();
             let result = update(&base, ins, del, compiled, cache.as_ref());
             let ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -135,6 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     result.insert.len(),
                     result.remove.len()
                 );
+                eprintln!("  phases {:?}", result.phases);
             }
             if let Some(program) = result.program {
                 cache = Some(program);
