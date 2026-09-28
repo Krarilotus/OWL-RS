@@ -30,12 +30,26 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-    // Reasoner v2: bring the inferred stack in line with the configured ruleset (a no-op
-    // revision-wise when it already is), so reads see the closure from the first request.
-    if let Some(ruleset) = ruleset {
-        store
-            .rematerialise(ruleset)
-            .context("startup reasoning failed")?;
+    // Reasoner v2: bring the inferred stack in line with the configured ruleset, unless
+    // the marker says it already is. Without v2 reasoning, a leftover stack is cleared so
+    // reads never see stale inferences.
+    match ruleset {
+        Some(ruleset) if store.materialised_for().as_deref() == Some(ruleset.name()) => {
+            tracing::info!(ruleset = ruleset.name(), "inferred stack is current");
+        }
+        Some(ruleset) => {
+            store
+                .rematerialise(ruleset)
+                .context("startup reasoning failed")?;
+        }
+        None => {
+            let cleared = store
+                .clear_inferred()
+                .context("clearing inferences failed")?;
+            if cleared > 0 {
+                tracing::info!(cleared, "reasoning is off: inferred stack cleared");
+            }
+        }
     }
     let reasoner = ReasonerService::new(config.reasoner.clone());
     let ai = AiSuggestionService::new(config.ai.clone())?;

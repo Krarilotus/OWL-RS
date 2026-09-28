@@ -34,7 +34,13 @@ pub struct StoreService {
     config: StoreConfig,
     engine: Engine,
     preloaded_ontology: Option<PathBuf>,
+    /// Whether the reasoning marker file may exist (see [`Self::materialised_for`]); saves
+    /// a file-system call per write once it is gone.
+    marker: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// The file recording which ruleset the inferred stack is exact for.
+const REASONING_MARKER: &str = "reasoning.state";
 
 impl fmt::Debug for StoreService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -52,12 +58,72 @@ impl StoreService {
             StoreMode::InMemory => Engine::new(EngineConfig::default())?,
             StoreMode::OnDisk => Engine::open(&config.data_dir, EngineConfig::default())?,
         };
+        let before = engine.snapshot().revision();
         let preloaded_ontology = preload_ontology(&engine, &config)?;
-        Ok(Self {
+        let service = Self {
             config,
             engine,
             preloaded_ontology,
-        })
+            marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        if service.engine.snapshot().revision() != before {
+            service.invalidate_reasoning()?;
+        }
+        Ok(service)
+    }
+
+    fn marker_path(&self) -> Option<PathBuf> {
+        (self.config.mode == StoreMode::OnDisk).then(|| self.config.data_dir.join(REASONING_MARKER))
+    }
+
+    /// The ruleset whose closure the inferred stack holds exactly, as recorded by the last
+    /// [`Self::rematerialise`] and kept by reasoner-v2 commits since; `None` if unknown
+    /// (in-memory stores, or a write that didn't maintain the inferences).
+    pub fn materialised_for(&self) -> Option<String> {
+        let path = self.marker_path()?;
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|text| text.trim().to_owned())
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Forgets the reasoning marker: called before any write that doesn't maintain the
+    /// inferred stack, so a crash can leave it missing but never stale.
+    pub fn invalidate_reasoning(&self) -> StoreResult<()> {
+        use std::sync::atomic::Ordering;
+        if !self.marker.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if let Some(path) = self.marker_path() {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(crate::error::StoreError::Io(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn record_reasoning(&self, ruleset: &str) -> StoreResult<()> {
+        let Some(path) = self.marker_path() else {
+            return Ok(());
+        };
+        let temporary = path.with_extension("tmp");
+        std::fs::write(&temporary, ruleset).map_err(crate::error::StoreError::Io)?;
+        std::fs::rename(&temporary, &path).map_err(crate::error::StoreError::Io)?;
+        self.marker
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Empties the inferred stack (reasoning switched off), forgetting the marker.
+    pub fn clear_inferred(&self) -> StoreResult<u64> {
+        self.invalidate_reasoning()?;
+        let rematerialisation = self.engine.rematerialisation();
+        if rematerialisation.base().len_in(ReadModel::Inferred) == 0 {
+            return Ok(0);
+        }
+        Ok(rematerialisation.finish(Vec::new())?.inferred_deleted)
     }
 
     pub(crate) fn engine(&self) -> &Engine {
@@ -127,6 +193,7 @@ impl StoreService {
 
     /// Applies and commits `command` without validation gates.
     pub fn apply(&self, command: &MutationCommand) -> StoreResult<MutationCommitReport> {
+        self.invalidate_reasoning()?;
         let mut tx = self.engine.transaction();
         let report = command.apply(&mut tx, &CancellationToken::new())?;
         let summary = tx.commit()?;
@@ -171,6 +238,7 @@ impl StoreService {
     /// sort, one revision, no validation gates. For initial loads and full restores; use
     /// the mutation pipeline for regular writes.
     pub fn bulk_load(&self, request: &BulkLoadRequest) -> StoreResult<BulkLoadReport> {
+        self.invalidate_reasoning()?;
         bulk_load(&self.engine, request)
     }
 
@@ -197,6 +265,7 @@ impl StoreService {
         );
         let inferred = closure.inferred.len() as u64;
         let summary = rematerialisation.finish(closure.inferred)?;
+        self.record_reasoning(ruleset.name())?;
         tracing::info!(
             ruleset = ruleset.name(),
             revision = summary.revision,
