@@ -129,6 +129,19 @@ pub struct Materialisation {
     pub ground_rules: usize,
     /// Predicates closed by the transitive module.
     pub transitive: usize,
+    /// Time per phase: grounding, rule joins, modules, merging, consistency.
+    pub phases: Phases,
+}
+
+/// Time spent per phase of [`materialise`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Phases {
+    pub load: std::time::Duration,
+    pub grounding: std::time::Duration,
+    pub joins: std::time::Duration,
+    pub modules: std::time::Duration,
+    pub merge: std::time::Duration,
+    pub consistency: std::time::Duration,
 }
 
 /// Which facts an atom reads in a semi-naive variant.
@@ -748,7 +761,10 @@ pub fn materialise(
     lists: Option<&ListVocabulary>,
     schema: &Schema,
 ) -> Materialisation {
+    let clock = std::time::Instant::now();
+    let mut phases = Phases::default();
     let mut store = Store::new(input);
+    phases.load = clock.elapsed();
     let mut result = Materialisation::default();
     let mut derived: Vec<Triple> = Vec::new();
     let mut program: Vec<Rule> = Vec::new();
@@ -759,6 +775,7 @@ pub fn materialise(
         result.rounds += 1;
         let mut candidates = Vec::new();
         let mut fresh = Vec::new();
+        let clock = std::time::Instant::now();
         if regrounding {
             let mut source: Vec<Rule> = rules
                 .iter()
@@ -798,6 +815,8 @@ pub fn materialise(
                 });
             }
         }
+        phases.grounding += clock.elapsed();
+        let clock = std::time::Instant::now();
         // Semi-naive variants of the rules already evaluated, full evaluation of new ones.
         let mut jobs = Vec::new();
         for rule in &program {
@@ -821,9 +840,14 @@ pub fn materialise(
         }
         candidates.extend(run_jobs(&store, &jobs));
         drop(jobs);
+        phases.joins += clock.elapsed();
+        let clock = std::time::Instant::now();
         candidates.extend(transitive.run(&store));
+        phases.modules += clock.elapsed();
+        let clock = std::time::Instant::now();
         program.extend(fresh);
         let delta = store.advance(candidates);
+        phases.merge += clock.elapsed();
         if delta.is_empty() {
             break;
         }
@@ -833,7 +857,10 @@ pub fn materialise(
     }
     result.ground_rules = program.len();
     result.transitive = transitive.predicates.len();
+    let clock = std::time::Instant::now();
     result.violations = violations(&store, rules, lists, schema);
+    phases.consistency = clock.elapsed();
+    result.phases = phases;
     derived.par_sort_unstable();
     result.derived = derived;
     result

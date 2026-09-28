@@ -13,6 +13,9 @@
 # Systems, each in Docker on the same host:
 #   nrese-v1        the v1 reasoner (`rules-mvp`, crates/nrese-store/examples/reason_bench.rs).
 #                   Its inferences aren't queryable, so it has no query results.
+#   nrese-v2        reasoner v2's batch executor (crates/nrese-reasoner/examples/v2_closure.rs).
+#                   Until its inferences are installed in the store (R4), Oxigraph answers
+#                   the queries over its closure, as for Nemo.
 #   jena-<profile>  Jena's rule reasoner, profile rdfs | owl-micro | owl-mini | owl
 #   nemo            Nemo, a Rust datalog engine, running nemo/owl2rl.rls (the OWL 2 RL/RDF rules)
 #   oracle          owlrl OWL 2 RL, the correctness reference. It runs only up to
@@ -44,7 +47,7 @@ HERE=$(native "$(cd "$(dirname "$0")" && pwd)")
 ROOT=$(native "$(cd "$HERE/../.." && pwd)")
 RESULTS=$(native "${RESULTS:-$HERE/results/$(date +%Y-%m-%d)}")
 ORACLE_CACHE=$(native "${ORACLE_CACHE:-$HERE/results/oracle}")
-SYSTEMS=${SYSTEMS:-oracle nrese-v1 jena-owl-micro nemo}
+SYSTEMS=${SYSTEMS:-oracle nrese-v2 nrese-v1 jena-owl-micro nemo}
 ORACLE_MAX_TRIPLES=${ORACLE_MAX_TRIPLES:-200000}
 ORACLE_TIMEOUT_S=${ORACLE_TIMEOUT_S:-900}  # owlrl is pure Python; past this, Nemo is the reference
 TIMEOUT_S=${TIMEOUT_S:-3600}
@@ -139,6 +142,18 @@ run_nrese() { # <dataset> <log>
   echo "$(field 'asserted ([0-9]+)' "$2"),$(awk "BEGIN { print $snapshot + $rules }"),$(field 'derived ([0-9]+)' "$2"),$(peak_mib "$2")"
 }
 
+run_nrese_v2() { # <dataset> <log>
+  measured "$2" "$RUST_IMAGE" /target/release/examples/v2_closure \
+    --out "/out/nrese-v2-$1.inferred.nt" $(inputs "$1") || return 1
+  if [ -d "$HERE/queries/${1%%-*}" ]; then
+    # shellcheck disable=SC2046
+    docker run --rm -v nrese-bench-data:/data:ro -v "$RESULTS:/out:ro" -v "$HERE/queries:/queries:ro" \
+      --entrypoint python nrese-bench/owlrl-oracle /oracle/answer_queries.py --queries "/queries/${1%%-*}" \
+      $(inputs "$1") "/out/nrese-v2-$1.inferred.nt" >>"$2" 2>&1 || true
+  fi
+  echo "$(field 'asserted ([0-9]+)' "$2"),$(field 'closure ([0-9.]+) s' "$2"),$(field 'derived ([0-9]+)' "$2"),$(peak_mib "$2")"
+}
+
 run_nemo() { # <dataset> <log>
   # Nemo reads one import file, so the inputs are concatenated first (outside the timing).
   # shellcheck disable=SC2046
@@ -170,11 +185,11 @@ run_jena() { # <dataset> <log> <profile>
 docker build -q -t nrese-bench/owlrl-oracle "$HERE/oracle" >/dev/null
 docker build -q -t nrese-bench/jena-reasoner "$HERE/jena" >/dev/null
 docker build -q -t nrese-bench/nemo "$HERE/nemo" >/dev/null
-if [[ " $SYSTEMS " == *" nrese-v1 "* ]] && [ -z "${SKIP_BUILD:-}" ]; then
+if [[ " $SYSTEMS " == *" nrese-v"* ]] && [ -z "${SKIP_BUILD:-}" ]; then
   docker volume create nrese-target >/dev/null
   docker run --rm -v "$ROOT:/src:ro" -v nrese-target:/target -v nrese-cargo:/usr/local/cargo/registry \
     -w /src "$RUST_IMAGE" cargo build --release --locked -p nrese-store --example reason_bench \
-    --target-dir /target >"$RESULTS/nrese-build.log" 2>&1
+    -p nrese-reasoner --example v2_closure --target-dir /target >"$RESULTS/nrese-build.log" 2>&1
 fi
 
 CSV=$RESULTS/reasoning-scorecard.csv
@@ -190,6 +205,7 @@ for dataset in $DATASETS; do
     case $system in
       oracle) result=$(run_oracle "$dataset" "$log") || { echo "$dataset,$system: $(tail -1 "$log")" >&2; continue; } ;;
       nrese-v1) result=$(run_nrese "$dataset" "$log") || { echo "$dataset,$system failed, see $log" >&2; continue; } ;;
+      nrese-v2) result=$(run_nrese_v2 "$dataset" "$log") || { echo "$dataset,$system failed, see $log" >&2; continue; } ;;
       nemo) result=$(run_nemo "$dataset" "$log") || { echo "$dataset,$system failed, see $log" >&2; continue; } ;;
       jena-*) result=$(run_jena "$dataset" "$log" "${system#jena-}") || { echo "$dataset,$system failed, see $log" >&2; continue; } ;;
       *) echo "unknown system $system" >&2; continue ;;
