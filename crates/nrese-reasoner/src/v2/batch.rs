@@ -357,6 +357,95 @@ impl Source for Store {
     }
 }
 
+/// The equality module, batch form (design §4.4): replaces `eq-rep-s/p/o`. The generic
+/// rules copy a fact to each `sameAs` partner of its subject, predicate or object, and
+/// every copy is copied again in the next round: O(k²) derivations per fact for a class
+/// of k members. Here each new fact is expanded once to every combination of its terms'
+/// classes (a term's class is the term plus its `sameAs` partners; the relation is kept
+/// closed by `eq-sym` and the transitive module). A new `sameAs` pair re-expands the facts
+/// that mention either side, so classes that grow later are covered.
+struct Equality {
+    same_as: u64,
+    /// The module's output of the last round: already expanded, so skipped once.
+    produced: HashSet<Triple>,
+}
+
+/// The rules the equality module replaces.
+fn is_replacement_rule(rule: &Rule) -> bool {
+    matches!(rule.name.as_str(), "eq-rep-s" | "eq-rep-p" | "eq-rep-o")
+}
+
+impl Equality {
+    /// The class of `x`: itself and its `sameAs` partners, sorted.
+    fn members(&self, store: &Store, x: u64) -> Vec<u64> {
+        let mut members = vec![x];
+        store.scan([Some(x), Some(self.same_as), None], Seg::All, &mut |t| {
+            members.push(t[2]);
+        });
+        members.sort_unstable();
+        members.dedup();
+        members
+    }
+
+    fn run(&mut self, store: &Store) -> Vec<Triple> {
+        if store.estimate([None, Some(self.same_as), None], Seg::All) == 0 {
+            self.produced.clear();
+            return Vec::new();
+        }
+        let same_as = self.same_as;
+        let mut seeds: Vec<Triple> = Vec::new();
+        let mut merged: Vec<u64> = Vec::new();
+        store.scan([None, None, None], Seg::Delta, &mut |t| {
+            if t[1] == same_as {
+                if t[0] != t[2] {
+                    merged.push(t[0]);
+                }
+            } else if !self.produced.contains(&t) {
+                seeds.push(t);
+            }
+        });
+        // Facts mentioning a term whose class grew.
+        merged.sort_unstable();
+        merged.dedup();
+        for &a in &merged {
+            let mut push = |t: Triple| {
+                if t[1] != same_as {
+                    seeds.push(t);
+                }
+            };
+            store.scan([Some(a), None, None], Seg::All, &mut push);
+            store.scan([None, None, Some(a)], Seg::All, &mut push);
+            store.scan([None, Some(a), None], Seg::All, &mut push);
+        }
+        seeds.par_sort_unstable();
+        seeds.dedup();
+        let out: Vec<Triple> = seeds
+            .par_iter()
+            .flat_map_iter(|&[s, p, o]| {
+                let (ms, mp, mo) = (
+                    self.members(store, s),
+                    self.members(store, p),
+                    self.members(store, o),
+                );
+                let mut facts = Vec::new();
+                for &s in &ms {
+                    for &p in &mp {
+                        for &o in &mo {
+                            let fact = [s, p, o];
+                            if !store.contains(fact) {
+                                facts.push(fact);
+                            }
+                        }
+                    }
+                }
+                facts
+            })
+            .collect();
+        self.produced = out.iter().copied().collect();
+        out
+    }
+}
+
 /// The transitive module, batch form: for each transitive predicate, its closure by SCC
 /// condensation, recomputed in any round after other rules added facts over it.
 #[derive(Default)]
@@ -465,6 +554,18 @@ pub fn materialise(
     let mut derived: Vec<Triple> = Vec::new();
     let mut program = GroundProgram::default();
     let mut transitive = Transitive::default();
+    // The equality module, if the rules include eq-rep-s (whose first atom names sameAs).
+    let mut equality =
+        rules
+            .iter()
+            .find(|r| r.name == "eq-rep-s")
+            .and_then(|r| match r.body.first()?.0[1] {
+                super::ir::Term::Const(same_as) => Some(Equality {
+                    same_as,
+                    produced: HashSet::new(),
+                }),
+                super::ir::Term::Var(_) => None,
+            });
     let mut regrounding = true;
     loop {
         result.rounds += 1;
@@ -472,7 +573,10 @@ pub fn materialise(
         // Rules from `evaluated` on were added this round: evaluated once in full.
         let evaluated = program.rules.len();
         if regrounding {
-            let source = fact_rules(&store, rules, lists, &mut result.diagnostics);
+            let mut source = fact_rules(&store, rules, lists, &mut result.diagnostics);
+            if equality.is_some() {
+                source.retain(|r| !is_replacement_rule(r));
+            }
             // The first round grounds everything; later ones through new schema facts
             // only (list rules in full, deduplicated).
             if result.rounds == 1 {
@@ -504,6 +608,9 @@ pub fn materialise(
         phases.joins += clock.elapsed();
         let clock = std::time::Instant::now();
         candidates.extend(transitive.run(&store));
+        if let Some(equality) = &mut equality {
+            candidates.extend(equality.run(&store));
+        }
         phases.modules += clock.elapsed();
         let clock = std::time::Instant::now();
         // Every candidate was checked against the store, which a round doesn't change.
