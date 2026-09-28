@@ -319,3 +319,46 @@ fn queries_choose_asserted_inferred_or_both() {
     // The protocol's default-graph-uri works the same way.
     assert!(!ask(format!("ASK {{ {tom_animal} }}"), None, &[explicit]));
 }
+
+/// The reasoning marker: set by rematerialisation, kept by v2 commits, dropped by writes
+/// that don't maintain inferences, and persistent across restarts.
+#[test]
+fn reasoning_marker_tracks_whether_inferences_are_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = nrese_store::StoreConfig {
+        mode: nrese_store::StoreMode::OnDisk,
+        data_dir: dir.path().to_path_buf(),
+        ontology_path: None,
+    };
+    let ruleset = nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl;
+    let data = format!("<{EX}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{EX}Animal>");
+    {
+        let store = Arc::new(StoreService::new(config.clone()).expect("store"));
+        assert_eq!(store.materialised_for(), None);
+        store.rematerialise(ruleset).expect("rematerialise");
+        assert_eq!(store.materialised_for().as_deref(), Some("owl2-rl"));
+        // A v2 commit keeps it.
+        let pipeline = MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Rl,
+            ))),
+        );
+        pipeline
+            .apply(insert(&data), &MutationTicket::new())
+            .expect("commit");
+        assert_eq!(store.materialised_for().as_deref(), Some("owl2-rl"));
+        // An ungated write drops it; rematerialisation restores it.
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ <{EX}tom> a <{EX}Cat> }}"
+            )))
+            .expect("update");
+        assert_eq!(store.materialised_for(), None);
+        store.rematerialise(ruleset).expect("rematerialise");
+    }
+    let store = StoreService::new(config).expect("reopen");
+    assert_eq!(store.materialised_for().as_deref(), Some("owl2-rl"));
+    assert_eq!(store.clear_inferred().expect("clear"), 1);
+    assert_eq!(store.materialised_for(), None);
+}
