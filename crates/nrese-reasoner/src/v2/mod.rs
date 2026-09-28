@@ -399,6 +399,37 @@ mod tests {
         lines
     }
 
+    /// Equality-heavy data: the batch executor's equality module equals the generic
+    /// `eq-rep-*` rules of the naive evaluator (chains of `sameAs` that merge classes over
+    /// several rounds, equal predicates, equal objects).
+    #[test]
+    fn equality_module_equals_the_generic_rules() {
+        let mut lines = Vec::new();
+        for i in 0..11 {
+            lines.push(format!("ex:a{i} owl:sameAs ex:a{}", i + 1));
+        }
+        for i in 0..4 {
+            lines.push(format!("ex:b{i} owl:sameAs ex:b{}", i + 1));
+        }
+        lines.extend(
+            [
+                "ex:a3 ex:knows ex:b2",
+                "ex:b0 ex:p ex:a7",
+                "ex:p owl:sameAs ex:q",
+                "ex:q rdfs:domain ex:C",
+                "ex:a11 rdf:type ex:D",
+                "ex:D rdfs:subClassOf ex:E",
+                "ex:b4 owl:sameAs ex:a0",
+            ]
+            .map(str::to_owned),
+        );
+        let (_, derived, _) = closure(&lines.join(
+            "
+",
+        ));
+        assert!(derived.len() > 1000, "{}", derived.len());
+    }
+
     /// Random small ontologies: the batch executor equals the naive one.
     #[test]
     fn batch_equals_naive_on_random_ontologies() {
