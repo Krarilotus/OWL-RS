@@ -1,42 +1,40 @@
+mod support;
+
 use std::path::PathBuf;
 
-use nrese_core::ReasonerEngine;
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::v2::rulesets::Ruleset;
 use nrese_store::{StoreConfig, StoreService};
+use support::{assert_inferred_triple, inferred_statements};
 
 fn minimal_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/ontologies/minimal_services.ttl")
 }
 
+/// Reasoner v2 over a store preloaded from Turtle: the inferred stack holds the closure.
 #[test]
-fn rules_mvp_runs_against_ttl_preloaded_store_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+fn owl2_rl_materialises_a_ttl_preloaded_store() -> Result<(), Box<dyn std::error::Error>> {
     let store = StoreService::new(StoreConfig::in_memory().with_ontology(minimal_fixture_path()))?;
-    let snapshot = store.dataset_snapshot()?;
-    let reasoner = ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::RulesMvp));
+    let report = store.rematerialise(Ruleset::Owl2Rl)?;
+    assert_eq!(report.violations, 0);
 
-    let plan = reasoner.plan(&snapshot)?;
-    let output = reasoner.run(&snapshot, &plan)?;
-    let derived = output.inferred.derived_triples;
-
-    assert_eq!(
-        output.report.status,
-        nrese_core::ReasonerRunStatus::Completed
+    let inferred = inferred_statements(&store)?;
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/alice",
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+        "http://example.com/Parent",
     );
-    assert!(derived.iter().any(|(s, p, o)| {
-        s == "http://example.com/alice"
-            && p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-            && o == "http://example.com/Parent"
-    }));
-    assert!(derived.iter().any(|(s, p, o)| {
-        s == "http://example.com/bob"
-            && p == "http://example.com/friendOf"
-            && o == "http://example.com/alice"
-    }));
-    assert!(derived.iter().any(|(s, p, o)| {
-        s == "http://example.com/spec"
-            && p == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-            && o == "http://example.com/Document"
-    }));
-
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/bob",
+        "http://example.com/friendOf",
+        "http://example.com/alice",
+    );
+    assert_inferred_triple(
+        &inferred,
+        "http://example.com/spec",
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+        "http://example.com/Document",
+    );
     Ok(())
 }

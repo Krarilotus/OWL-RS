@@ -19,6 +19,8 @@ pub mod lists;
 pub mod naive;
 pub mod rulesets;
 pub mod testing;
+#[cfg(test)]
+mod v1_scenarios;
 
 #[cfg(test)]
 mod tests {
@@ -265,6 +267,52 @@ mod tests {
         assert!(has(&mut v, &d, "ex:Mother rdfs:subClassOf ex:Female"));
         assert!(has(&mut v, &d, "ex:Mother rdfs:subClassOf ex:Woman"));
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// Runs a v1 scenario (full IRIs, `_:` blank nodes) on both executors: the expected
+    /// inferences must be derived, and a violation reported iff `violation` says so.
+    pub(super) fn scenario(
+        data: &[(&str, &str, &str)],
+        expected: &[(&str, &str, &str)],
+        violation: Option<bool>,
+    ) {
+        let mut vocabulary = LocalVocabulary::default();
+        let term = |v: &mut LocalVocabulary, t: &str| {
+            if t.starts_with("_:") {
+                v.term(t)
+            } else {
+                v.iri(t)
+            }
+        };
+        let input: Vec<Triple> = data
+            .iter()
+            .map(|&(s, p, o)| {
+                [
+                    term(&mut vocabulary, s),
+                    term(&mut vocabulary, p),
+                    term(&mut vocabulary, o),
+                ]
+            })
+            .collect();
+        let (derived, violations) = both(&mut vocabulary, &input);
+        for &(s, p, o) in expected {
+            let fact = [
+                term(&mut vocabulary, s),
+                term(&mut vocabulary, p),
+                term(&mut vocabulary, o),
+            ];
+            assert!(
+                derived.contains(&fact) || input.contains(&fact),
+                "missing ({s}, {p}, {o})"
+            );
+        }
+        if let Some(expected) = violation {
+            assert_eq!(
+                !violations.is_empty(),
+                expected,
+                "violations: {violations:?}"
+            );
+        }
     }
 
     /// A xorshift generator: `next(n)` is in `0..n`.

@@ -1,11 +1,11 @@
 mod support;
 
-use support::{assert_inferred_triple, run_rules_mvp_catalog_fixture};
+use support::{assert_inferred_triple, run_owl2_rl_catalog_fixture};
 
 #[test]
-fn rules_mvp_infers_foaf_agent_from_official_foaf_fixture() -> Result<(), Box<dyn std::error::Error>>
+fn owl2_rl_infers_foaf_agent_from_official_foaf_fixture() -> Result<(), Box<dyn std::error::Error>>
 {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "foaf.rdf",
         "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
          INSERT DATA { <http://example.com/alice> a foaf:Person . }",
@@ -21,9 +21,9 @@ fn rules_mvp_infers_foaf_agent_from_official_foaf_fixture() -> Result<(), Box<dy
 }
 
 #[test]
-fn rules_mvp_infers_time_inverse_and_transitive_property_closure_from_official_fixture()
+fn owl2_rl_infers_time_inverse_and_transitive_property_closure_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "time.ttl",
         "PREFIX time: <http://www.w3.org/2006/time#>
          INSERT DATA {
@@ -54,9 +54,9 @@ fn rules_mvp_infers_time_inverse_and_transitive_property_closure_from_official_f
 }
 
 #[test]
-fn rules_mvp_infers_org_inverse_and_domain_range_types_from_official_fixture()
+fn owl2_rl_infers_org_inverse_and_domain_range_types_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "org.ttl",
         "PREFIX org: <http://www.w3.org/ns/org#>
          INSERT DATA {
@@ -86,9 +86,9 @@ fn rules_mvp_infers_org_inverse_and_domain_range_types_from_official_fixture()
 }
 
 #[test]
-fn rules_mvp_infers_skos_transitive_superproperty_and_inverse_closure_from_official_fixture()
+fn owl2_rl_infers_skos_transitive_superproperty_and_inverse_closure_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "skos.rdf",
         "PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
          INSERT DATA {
@@ -131,9 +131,9 @@ fn rules_mvp_infers_skos_transitive_superproperty_and_inverse_closure_from_offic
 }
 
 #[test]
-fn rules_mvp_infers_prov_subclass_inverse_and_domain_range_from_official_fixture()
+fn owl2_rl_infers_prov_subclass_inverse_and_domain_range_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "prov.ttl",
         "PREFIX prov: <http://www.w3.org/ns/prov#>
          INSERT DATA {
@@ -170,9 +170,9 @@ fn rules_mvp_infers_prov_subclass_inverse_and_domain_range_from_official_fixture
 }
 
 #[test]
-fn rules_mvp_infers_dcat_domain_and_range_types_from_official_fixture()
+fn owl2_rl_infers_dcat_domain_and_range_types_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "dcat.ttl",
         "PREFIX dcat: <http://www.w3.org/ns/dcat#>
          INSERT DATA {
@@ -196,9 +196,9 @@ fn rules_mvp_infers_dcat_domain_and_range_types_from_official_fixture()
 }
 
 #[test]
-fn rules_mvp_infers_vcard_range_and_subproperty_closure_from_official_fixture()
+fn owl2_rl_infers_vcard_range_and_subproperty_closure_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "vcard.ttl",
         "PREFIX vcard: <http://www.w3.org/2006/vcard/ns#>
          INSERT DATA {
@@ -222,9 +222,9 @@ fn rules_mvp_infers_vcard_range_and_subproperty_closure_from_official_fixture()
 }
 
 #[test]
-fn rules_mvp_infers_dcterms_subproperty_and_equivalent_property_from_official_fixture()
+fn owl2_rl_infers_dcterms_subproperty_and_equivalent_property_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "dcterms.ttl",
         "PREFIX dcterms: <http://purl.org/dc/terms/>
          INSERT DATA {
@@ -252,9 +252,9 @@ fn rules_mvp_infers_dcterms_subproperty_and_equivalent_property_from_official_fi
 /// `ssn:forProperty` super-property lives in SSN (covered by the SSN test below). Until
 /// 2026-09-25 the catalog URL for SOSA actually returned SSN, so this test asserted an SSN
 /// axiom; it now pins the SOSA document's own semantics.
-fn rules_mvp_infers_sosa_inverse_property_from_official_fixture()
+fn owl2_rl_infers_sosa_inverse_property_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "sosa.ttl",
         "PREFIX sosa: <http://www.w3.org/ns/sosa/>
          INSERT DATA {
@@ -272,9 +272,9 @@ fn rules_mvp_infers_sosa_inverse_property_from_official_fixture()
 }
 
 #[test]
-fn rules_mvp_infers_ssn_inverse_and_subproperty_closure_from_official_fixture()
+fn owl2_rl_infers_ssn_inverse_and_subproperty_closure_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "ssn.ttl",
         "PREFIX sosa: <http://www.w3.org/ns/sosa/>
          PREFIX ssn: <http://www.w3.org/ns/ssn/>
@@ -300,9 +300,9 @@ fn rules_mvp_infers_ssn_inverse_and_subproperty_closure_from_official_fixture()
 }
 
 #[test]
-fn rules_mvp_infers_odrl_domain_range_and_subproperty_from_official_fixture()
+fn owl2_rl_infers_odrl_domain_range_and_subproperty_from_official_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
-    let inferred = run_rules_mvp_catalog_fixture(
+    let inferred = run_owl2_rl_catalog_fixture(
         "odrl.ttl",
         "PREFIX odrl: <http://www.w3.org/ns/odrl/2/>
          INSERT DATA {
