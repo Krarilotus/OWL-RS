@@ -337,6 +337,8 @@ impl Solutions {
 
 struct Context<'a> {
     snapshot: &'a Snapshot,
+    /// Which statements the query reads (asserted, inferred or both).
+    model: ReadModel,
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
@@ -349,6 +351,7 @@ impl<'a> Context<'a> {
     fn new(snapshot: &'a Snapshot, options: &QueryOptions) -> Self {
         Self {
             snapshot,
+            model: options.read_model,
             evaluator: Evaluator::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
@@ -625,6 +628,7 @@ impl<'a> Context<'a> {
         let resolved = paths::Path::resolve(path, self.snapshot);
         let evaluator = paths::PathEvaluator {
             snapshot: self.snapshot,
+            model: self.model,
         };
         // A variable (blank nodes are variables here), or a constant's id (computed if the
         // store doesn't know it; such an id has no edges).
@@ -724,7 +728,7 @@ impl<'a> Context<'a> {
                     .iter()
                     .filter_map(|&(low, high)| {
                         self.snapshot.count_range_in(
-                            ReadModel::Materialised,
+                            self.model,
                             &s.quad_pattern(),
                             *permutation,
                             low,
@@ -813,7 +817,7 @@ impl<'a> Context<'a> {
         let mut row = vec![0u64; vars.len()];
         let quads = self
             .snapshot
-            .scan_sorted_in(ReadModel::Materialised, &pattern, permutation)
+            .scan_sorted_in(self.model, &pattern, permutation)
             .expect("permutation_for returns a usable permutation");
         'quads: for (n, quad) in quads.enumerate() {
             if n % (1 << 16) == 0 {
@@ -875,13 +879,10 @@ impl<'a> Context<'a> {
         let mut table = IdTable::new(vars.len());
         let mut row = vec![0u64; vars.len()];
         for &(low, high) in ranges {
-            let Some(quads) = self.snapshot.scan_range_in(
-                ReadModel::Materialised,
-                &pattern,
-                permutation,
-                low,
-                high,
-            ) else {
+            let Some(quads) =
+                self.snapshot
+                    .scan_range_in(self.model, &pattern, permutation, low, high)
+            else {
                 return self.scan(scan, None);
             };
             for (n, quad) in quads.enumerate() {
@@ -964,7 +965,7 @@ impl<'a> Context<'a> {
                 }
                 'quads: for quad in self
                     .snapshot
-                    .quads_for_pattern_in(ReadModel::Materialised, &bound.quad_pattern())
+                    .quads_for_pattern_in(self.model, &bound.quad_pattern())
                 {
                     let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
                     let mut values = Vec::with_capacity(new_vars.len());
@@ -1138,7 +1139,7 @@ impl<'a> Context<'a> {
         let mut row = vec![0u64; width];
         let mut quads = self
             .snapshot
-            .quads_for_pattern_in(ReadModel::Materialised, &scan.quad_pattern());
+            .quads_for_pattern_in(self.model, &scan.quad_pattern());
         loop {
             let more = quads.next();
             if let Some(quad) = more {
@@ -1430,11 +1431,9 @@ impl<'a> Context<'a> {
         {
             let permutation = scan.permutation_for(Some(key));
             if scan.first_free(permutation) == Some(component)
-                && let Some(groups) = self.snapshot.group_counts_in(
-                    ReadModel::Materialised,
-                    &scan.quad_pattern(),
-                    permutation,
-                )
+                && let Some(groups) =
+                    self.snapshot
+                        .group_counts_in(self.model, &scan.quad_pattern(), permutation)
             {
                 let mut columns = vec![
                     groups

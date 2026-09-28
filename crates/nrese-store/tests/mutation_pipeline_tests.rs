@@ -265,3 +265,57 @@ asserted: {asserted:#?}",
         "{commits} commits, {changed} with inferences"
     );
 }
+
+/// Read models (reasoner-v2 design §4.3): asserted, inferred or both, per request, by
+/// parameter or GraphDB's pseudo-graphs `onto:explicit` / `onto:implicit`.
+#[test]
+fn queries_choose_asserted_inferred_or_both() {
+    let pipeline = pipeline(ReasoningMode::Owl2Rl);
+    let data = format!(
+        "<{EX}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{EX}Animal> .
+         <{EX}tom> a <{EX}Cat> ."
+    );
+    pipeline
+        .apply(insert(&data), &MutationTicket::new())
+        .expect("data");
+    let ask = |query: String, model: Option<nrese_store::ReadModel>, default_graphs: &[&str]| {
+        let mut request = nrese_store::SparqlQueryRequest::new(query);
+        request.read_model = model;
+        request.default_graphs = default_graphs.iter().map(|g| (*g).to_owned()).collect();
+        let result = pipeline.store().execute_query(&request).expect("ask");
+        String::from_utf8(result.payload)
+            .expect("utf8")
+            .contains("true")
+    };
+    let inferred = format!("ASK {{ <{EX}tom> a <{EX}Animal> }}");
+    let asserted = format!("ASK {{ <{EX}tom> a <{EX}Cat> }}");
+    use nrese_store::ReadModel::{Asserted, Inferred, Materialised};
+    for (model, sees_inferred, sees_asserted) in [
+        (None, true, true),
+        (Some(Materialised), true, true),
+        (Some(Asserted), false, true),
+        (Some(Inferred), true, false),
+    ] {
+        assert_eq!(
+            ask(inferred.clone(), model, &[]),
+            sees_inferred,
+            "{model:?}"
+        );
+        assert_eq!(
+            ask(asserted.clone(), model, &[]),
+            sees_asserted,
+            "{model:?}"
+        );
+    }
+    let explicit = "http://www.ontotext.com/explicit";
+    let implicit = "http://www.ontotext.com/implicit";
+    let from = |graph: &str, body: &str| format!("ASK FROM <{graph}> {{ {body} }}");
+    let tom_animal = format!("<{EX}tom> a <{EX}Animal>");
+    let tom_cat = format!("<{EX}tom> a <{EX}Cat>");
+    assert!(!ask(from(explicit, &tom_animal), None, &[]));
+    assert!(ask(from(explicit, &tom_cat), None, &[]));
+    assert!(ask(from(implicit, &tom_animal), None, &[]));
+    assert!(!ask(from(implicit, &tom_cat), None, &[]));
+    // The protocol's default-graph-uri works the same way.
+    assert!(!ask(format!("ASK {{ {tom_animal} }}"), None, &[explicit]));
+}

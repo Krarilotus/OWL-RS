@@ -6,9 +6,11 @@
 //! OPTIONAL (with filters), UNION, MINUS, (NOT) EXISTS, GROUP BY with every supported
 //! aggregate, DISTINCT, ORDER BY and LIMIT. Every query must run natively
 //! ([`runs_natively`]); results are compared as multisets, and as sequences where ORDER BY
-//! covers every projected variable (so ties are identical rows).
+//! covers every projected variable (so ties are identical rows). A third of the
+//! default-graph statements are inferred, and every query runs under a random read model
+//! (asserted, inferred or both).
 
-use nrese_engine::{Engine, EngineConfig};
+use nrese_engine::{EncodedTriple, Engine, EngineConfig, ReadModel};
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, runs_natively};
 use oxrdf::vocab::xsd;
 use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
@@ -331,20 +333,39 @@ fn limited(text: &str) -> Option<usize> {
 #[test]
 fn native_results_equal_spareval_on_random_queries() {
     let mut rng = Rng(20_260_927);
-    let spareval = QueryOptions {
-        force_spareval: true,
-        ..QueryOptions::default()
-    };
     let (mut checked, mut fallbacks) = (0, Vec::new());
     for dataset_case in 0..150 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
-            tx.insert(quad.as_ref());
+            if quad.graph_name.is_default_graph() && rng.below(3) == 0 {
+                let triple = EncodedTriple::new(
+                    tx.intern(quad.subject.as_ref().into()),
+                    tx.intern(quad.predicate.as_ref().into()),
+                    tx.intern(quad.object.as_ref()),
+                );
+                tx.insert_inferred(triple);
+            } else {
+                tx.insert(quad.as_ref());
+            }
         }
         tx.commit().unwrap();
         let snapshot = engine.snapshot();
         for query_case in 0..50 {
+            let model = *rng.pick(&[
+                ReadModel::Materialised,
+                ReadModel::Asserted,
+                ReadModel::Inferred,
+            ]);
+            let native_options = QueryOptions {
+                read_model: model,
+                ..QueryOptions::default()
+            };
+            let spareval = QueryOptions {
+                force_spareval: true,
+                read_model: model,
+                ..QueryOptions::default()
+            };
             let (text, ordered) = random_query(&mut rng);
             let query = SparqlParser::new()
                 .parse_query(&text)
@@ -354,7 +375,7 @@ fn native_results_equal_spareval_on_random_queries() {
                 continue;
             }
             let native = rows(
-                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                evaluate_query(&snapshot, &query, &native_options).unwrap(),
                 ordered,
             );
             if let Some(limit) = limited(&text) {
@@ -378,7 +399,7 @@ fn native_results_equal_spareval_on_random_queries() {
             );
             assert_eq!(
                 native, expected,
-                "dataset {dataset_case}, query {query_case}: {text}"
+                "dataset {dataset_case}, query {query_case}, {model:?}: {text}"
             );
             checked += 1;
         }

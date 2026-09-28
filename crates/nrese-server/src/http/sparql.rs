@@ -80,6 +80,10 @@ fn build_query_request(operation: QueryOperation, accept: Option<&str>) -> Sparq
     let mut request = SparqlQueryRequest::new(operation.query);
     request.default_graphs = operation.default_graphs;
     request.named_graphs = operation.named_graphs;
+    // GraphDB's `infer=false`: explicit statements only.
+    if operation.infer == Some(false) {
+        request.read_model = Some(nrese_store::ReadModel::Asserted);
+    }
 
     if media_type_matches(accept, "application/sparql-results+xml") {
         request.solutions_format = SolutionsResultFormat::Xml;

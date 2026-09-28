@@ -23,6 +23,9 @@ pub struct QueryOptions {
     /// Run on spareval even if the native executor supports the query (differential
     /// testing, and a production escape hatch).
     pub force_spareval: bool,
+    /// Which statements the query reads: asserted and inferred (the default), or one
+    /// stack (GraphDB's `infer=false`, `FROM onto:explicit` / `onto:implicit`).
+    pub read_model: nrese_engine::ReadModel,
 }
 
 /// Evaluates `query` against `view`. Queries the native executor supports run there
@@ -44,7 +47,7 @@ pub fn evaluate_query<'a, V: ReadView>(
     if let Some(dataset) = &options.dataset {
         *prepared.dataset_mut() = dataset.clone();
     }
-    prepared.execute(EngineDataset::new(view))
+    prepared.execute(EngineDataset::with_model(view, options.read_model))
 }
 
 pub(crate) fn evaluator(cancellation: Option<&CancellationToken>) -> QueryEvaluator {

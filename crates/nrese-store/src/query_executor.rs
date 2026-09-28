@@ -12,6 +12,8 @@
 
 use std::io::Write;
 
+use nrese_engine::ReadModel;
+
 use nrese_sparql::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryOptions, QueryResults,
     ReadView, evaluate_query,
@@ -19,6 +21,7 @@ use nrese_sparql::{
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode};
 use oxrdfio::RdfSerializer;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
+use spargebra::algebra::QueryDataset;
 use spargebra::{Query, SparqlParser};
 
 use crate::error::{StoreError, StoreResult};
@@ -45,18 +48,46 @@ impl SolutionsResultFormat {
 pub struct PreparedQuery {
     query: Query,
     dataset: Option<QueryDatasetSpecification>,
+    read_model: ReadModel,
     solutions_format: SolutionsResultFormat,
     graph_format: GraphResultFormat,
 }
 
 impl PreparedQuery {
     pub fn parse(request: &SparqlQueryRequest) -> StoreResult<Self> {
+        let mut query = SparqlParser::new().parse_query(&request.query)?;
+        let mut default_graphs = request.default_graphs.clone();
+        let from_protocol = pseudo_graph_strings(&mut default_graphs);
+        let from_query = query_dataset(&mut query)
+            .as_mut()
+            .and_then(pseudo_graph_iris);
+        // A query whose `FROM` held only pseudo-graphs reads the store's default dataset.
+        if let Some(dataset) = query_dataset(&mut query)
+            && dataset.default.is_empty()
+            && dataset.named.as_ref().is_none_or(Vec::is_empty)
+        {
+            *query_dataset(&mut query) = None;
+        }
+        let request = SparqlQueryRequest {
+            default_graphs,
+            ..request.clone()
+        };
         Ok(Self {
-            query: SparqlParser::new().parse_query(&request.query)?,
-            dataset: protocol_dataset(request)?,
+            query,
+            dataset: protocol_dataset(&request)?,
+            read_model: request
+                .read_model
+                .or(from_protocol)
+                .or(from_query)
+                .unwrap_or_default(),
             solutions_format: request.solutions_format,
             graph_format: request.graph_format,
         })
+    }
+
+    /// Which statements the query reads.
+    pub fn read_model(&self) -> ReadModel {
+        self.read_model
     }
 
     pub fn kind(&self) -> QueryResultKind {
@@ -74,6 +105,47 @@ impl PreparedQuery {
             }
             QueryResultKind::Graph => self.graph_format.media_type(),
         }
+    }
+}
+
+/// GraphDB's pseudo-graphs: `FROM onto:explicit` reads asserted statements only,
+/// `FROM onto:implicit` inferred ones, both together everything.
+const EXPLICIT: &str = "http://www.ontotext.com/explicit";
+const IMPLICIT: &str = "http://www.ontotext.com/implicit";
+
+fn pseudo_graph_model(explicit: bool, implicit: bool) -> Option<ReadModel> {
+    match (explicit, implicit) {
+        (true, false) => Some(ReadModel::Asserted),
+        (false, true) => Some(ReadModel::Inferred),
+        (true, true) => Some(ReadModel::Materialised),
+        (false, false) => None,
+    }
+}
+
+/// Removes the pseudo-graphs from `FROM`; returns the read model they select.
+fn pseudo_graph_iris(dataset: &mut QueryDataset) -> Option<ReadModel> {
+    let before = dataset.default.clone();
+    dataset
+        .default
+        .retain(|g| g.as_str() != EXPLICIT && g.as_str() != IMPLICIT);
+    let has = |iri: &str| before.iter().any(|g| g.as_str() == iri);
+    pseudo_graph_model(has(EXPLICIT), has(IMPLICIT))
+}
+
+/// Removes the pseudo-graphs from protocol `default-graph-uri` values.
+fn pseudo_graph_strings(graphs: &mut Vec<String>) -> Option<ReadModel> {
+    let has = |graphs: &[String], iri: &str| graphs.iter().any(|g| g == iri);
+    let model = pseudo_graph_model(has(graphs, EXPLICIT), has(graphs, IMPLICIT));
+    graphs.retain(|g| g != EXPLICIT && g != IMPLICIT);
+    model
+}
+
+fn query_dataset(query: &mut Query) -> &mut Option<QueryDataset> {
+    match query {
+        Query::Select { dataset, .. }
+        | Query::Construct { dataset, .. }
+        | Query::Describe { dataset, .. }
+        | Query::Ask { dataset, .. } => dataset,
     }
 }
 
@@ -117,6 +189,7 @@ pub(crate) fn run_query(
     let options = QueryOptions {
         dataset: prepared.dataset.clone(),
         cancellation: Some(cancellation.clone()),
+        read_model: prepared.read_model,
         ..QueryOptions::default()
     };
     let alive = || match cancellation.is_cancelled() {
