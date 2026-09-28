@@ -1,0 +1,667 @@
+//! Rule evaluation shared by the batch executor ([`super::batch`]) and the delta executor
+//! ([`super::delta`]). Everything here is generic over a [`Source`] of facts, which splits
+//! them into the segments semi-naive evaluation needs.
+//!
+//! - [`Schema`] and [`ground`]: the schema atoms of a rule are evaluated against the facts
+//!   and substituted into it (design §3.2). [`ground_delta`] grounds only through changed
+//!   schema facts, so an edit to the TBox yields exactly the rule instances it adds or
+//!   removes.
+//! - [`Job`] and [`run_jobs`]: one variant of one rule, driven by its first atom's matches,
+//!   run in parallel morsels; the other atoms are index lookups ordered by [`plan`].
+
+use hashbrown::HashSet;
+use rayon::prelude::*;
+
+use super::ir::{Atom, Guard, Head, OWL, RDF, RDFS, Rule, Term, Vocabulary};
+use super::lists::Facts;
+use super::naive::Triple;
+
+/// Driver matches per parallel work unit.
+const MORSEL: usize = 4096;
+
+/// Which facts an atom reads in a semi-naive variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seg {
+    /// Facts known before the last round.
+    Old,
+    /// Facts the last round added.
+    Delta,
+    /// Both.
+    All,
+}
+
+/// Facts, split into the last round's delta and the rest.
+pub trait Source: Sync {
+    /// Calls `f` with every fact of `seg` matching `pattern` (`None` = any term).
+    fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple));
+    /// An upper bound on the matches of `pattern` in `seg`, for planning. Zero must mean
+    /// that nothing matches.
+    fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize;
+    /// Whether `fact` is in [`Seg::All`].
+    fn contains(&self, fact: Triple) -> bool;
+}
+
+/// A [`Source`]'s facts (all segments) for list instantiation.
+pub struct AllFacts<'a, S: ?Sized>(pub &'a S);
+
+impl<S: Source + ?Sized> Facts for AllFacts<'_, S> {
+    fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        self.0
+            .scan([Some(subject), Some(predicate), None], Seg::All, &mut |t| {
+                out.push(t[2])
+            });
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        self.0
+            .scan([None, Some(predicate), None], Seg::All, &mut |t| {
+                out.push((t[0], t[2]))
+            });
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// The TBox vocabulary. Atoms over these predicates, and `rdf:type` atoms with these
+/// classes as object, are grounded before evaluation.
+pub struct Schema {
+    rdf_type: u64,
+    predicates: HashSet<u64>,
+    classes: HashSet<u64>,
+}
+
+impl Schema {
+    /// The RDFS and OWL 2 schema vocabulary. It includes the list vocabulary, so a change
+    /// to a list axiom re-instantiates the list rules.
+    pub fn owl(vocabulary: &mut impl Vocabulary) -> Self {
+        let rdf_type = vocabulary.iri(&format!("{RDF}type"));
+        let mut predicates = HashSet::new();
+        for local in ["subClassOf", "subPropertyOf", "domain", "range"] {
+            predicates.insert(vocabulary.iri(&format!("{RDFS}{local}")));
+        }
+        for local in ["first", "rest"] {
+            predicates.insert(vocabulary.iri(&format!("{RDF}{local}")));
+        }
+        for local in [
+            "equivalentClass",
+            "equivalentProperty",
+            "inverseOf",
+            "onProperty",
+            "onClass",
+            "someValuesFrom",
+            "allValuesFrom",
+            "hasValue",
+            "maxCardinality",
+            "maxQualifiedCardinality",
+            "disjointWith",
+            "complementOf",
+            "propertyDisjointWith",
+            "sourceIndividual",
+            "assertionProperty",
+            "targetIndividual",
+            "targetValue",
+            "intersectionOf",
+            "unionOf",
+            "oneOf",
+            "hasKey",
+            "propertyChainAxiom",
+            "members",
+            "distinctMembers",
+        ] {
+            predicates.insert(vocabulary.iri(&format!("{OWL}{local}")));
+        }
+        let classes = [
+            "Class",
+            "ObjectProperty",
+            "DatatypeProperty",
+            "TransitiveProperty",
+            "SymmetricProperty",
+            "AsymmetricProperty",
+            "FunctionalProperty",
+            "InverseFunctionalProperty",
+            "IrreflexiveProperty",
+            "AllDifferent",
+            "AllDisjointClasses",
+            "AllDisjointProperties",
+        ]
+        .iter()
+        .map(|local| vocabulary.iri(&format!("{OWL}{local}")))
+        .collect();
+        Self {
+            rdf_type,
+            predicates,
+            classes,
+        }
+    }
+
+    pub fn is_schema_atom(&self, atom: &Atom) -> bool {
+        match atom.0 {
+            [_, Term::Const(p), _] if self.predicates.contains(&p) => true,
+            [_, Term::Const(p), Term::Const(c)] => p == self.rdf_type && self.classes.contains(&c),
+            _ => false,
+        }
+    }
+
+    pub fn is_schema_fact(&self, [_, p, o]: Triple) -> bool {
+        self.predicates.contains(&p) || (p == self.rdf_type && self.classes.contains(&o))
+    }
+}
+
+pub fn value(term: Term, bindings: &[Option<u64>]) -> Option<u64> {
+    match term {
+        Term::Const(c) => Some(c),
+        Term::Var(v) => bindings[usize::from(v)],
+    }
+}
+
+/// The atom's pattern under `bindings` (`None` for free positions).
+pub fn pattern(atom: &Atom, bindings: &[Option<u64>]) -> [Option<u64>; 3] {
+    atom.0.map(|t| value(t, bindings))
+}
+
+/// The atom's constants (`None` for variables).
+pub fn constants(atom: &Atom) -> [Option<u64>; 3] {
+    atom.0.map(|t| match t {
+        Term::Const(c) => Some(c),
+        Term::Var(_) => None,
+    })
+}
+
+/// Binds the atom's free variables to `fact`; `None` if a repeated variable disagrees.
+/// Returns the variables it bound, as a bitmask over the atom's three positions.
+pub fn bind(atom: &Atom, fact: Triple, bindings: &mut [Option<u64>]) -> Option<u8> {
+    let mut newly = 0u8;
+    for (position, term) in atom.0.iter().enumerate() {
+        if let Term::Var(v) = *term {
+            match bindings[usize::from(v)] {
+                Some(existing) if existing != fact[position] => {
+                    unbind(atom, newly, bindings);
+                    return None;
+                }
+                Some(_) => {}
+                None => {
+                    bindings[usize::from(v)] = Some(fact[position]);
+                    newly |= 1 << position;
+                }
+            }
+        } else if let Term::Const(c) = *term
+            && c != fact[position]
+        {
+            unbind(atom, newly, bindings);
+            return None;
+        }
+    }
+    Some(newly)
+}
+
+pub fn unbind(atom: &Atom, newly: u8, bindings: &mut [Option<u64>]) {
+    for (position, term) in atom.0.iter().enumerate() {
+        if newly & (1 << position) != 0
+            && let Term::Var(v) = *term
+        {
+            bindings[usize::from(v)] = None;
+        }
+    }
+}
+
+/// Guards whose terms are both bound; unbound ones are decided later.
+pub fn guards_hold(guards: &[Guard], bindings: &[Option<u64>]) -> bool {
+    guards.iter().all(|guard| match guard {
+        Guard::NotEqual(a, b) => match (value(*a, bindings), value(*b, bindings)) {
+            (Some(a), Some(b)) => a != b,
+            _ => true,
+        },
+    })
+}
+
+/// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding.
+pub fn walk<S: Source + ?Sized>(
+    source: &S,
+    body: &[Atom],
+    guards: &[Guard],
+    order: &[(usize, Seg)],
+    depth: usize,
+    bindings: &mut [Option<u64>],
+    emit: &mut dyn FnMut(&[Option<u64>]),
+) {
+    let Some(&(index, seg)) = order.get(depth) else {
+        if guards_hold(guards, bindings) {
+            emit(bindings);
+        }
+        return;
+    };
+    let atom = &body[index];
+    source.scan(pattern(atom, bindings), seg, &mut |fact| {
+        if let Some(newly) = bind(atom, fact, bindings) {
+            walk(source, body, guards, order, depth + 1, bindings, emit);
+            unbind(atom, newly, bindings);
+        }
+    });
+}
+
+/// Orders `atoms` after `first`: most bound positions first, then fewest matches.
+pub fn plan<S: Source + ?Sized>(
+    source: &S,
+    rule: &Rule,
+    atoms: &[usize],
+    first: usize,
+    seg_of: impl Fn(usize) -> Seg,
+) -> Vec<(usize, Seg)> {
+    plan_bound(
+        source,
+        rule,
+        atoms,
+        first,
+        &vec![false; rule.variables()],
+        seg_of,
+    )
+}
+
+/// [`plan`], with the variables in `bound` bound beforehand.
+fn plan_bound<S: Source + ?Sized>(
+    source: &S,
+    rule: &Rule,
+    atoms: &[usize],
+    first: usize,
+    bound: &[bool],
+    seg_of: impl Fn(usize) -> Seg,
+) -> Vec<(usize, Seg)> {
+    fn mark(atom: &Atom, bound: &mut [bool]) {
+        for term in atom.0 {
+            if let Term::Var(v) = term {
+                bound[usize::from(v)] = true;
+            }
+        }
+    }
+    let mut bound = bound.to_vec();
+    let mut order = vec![(first, seg_of(first))];
+    mark(&rule.body[first], &mut bound);
+    let mut rest: Vec<usize> = atoms.iter().copied().filter(|&i| i != first).collect();
+    while !rest.is_empty() {
+        let (k, _) = rest
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, &i)| {
+                let atom = &rule.body[i];
+                let known = atom
+                    .0
+                    .iter()
+                    .filter(|t| match t {
+                        Term::Const(_) => true,
+                        Term::Var(v) => bound[usize::from(*v)],
+                    })
+                    .count();
+                (
+                    known,
+                    std::cmp::Reverse(source.estimate(constants(atom), seg_of(i))),
+                )
+            })
+            .expect("rest is not empty");
+        let i = rest.remove(k);
+        mark(&rule.body[i], &mut bound);
+        order.push((i, seg_of(i)));
+    }
+    order
+}
+
+fn substitute(term: Term, substitution: &[Option<u64>]) -> Term {
+    match term {
+        Term::Var(v) => substitution[usize::from(v)].map_or(term, Term::Const),
+        constant => constant,
+    }
+}
+
+fn substitute_atom(atom: &Atom, substitution: &[Option<u64>]) -> Atom {
+    Atom(atom.0.map(|t| substitute(t, substitution)))
+}
+
+/// A rule after grounding its schema atoms.
+pub struct Grounded {
+    pub rule: Rule,
+    /// The schema variables' values; the rest is `None`.
+    pub substitution: Vec<Option<u64>>,
+}
+
+/// The rule instance for one binding of the schema variables; `None` if a guard fails.
+fn instance(
+    rule: &Rule,
+    instance_atoms: &[usize],
+    substitution: &[Option<u64>],
+) -> Option<Grounded> {
+    let mut guards = Vec::new();
+    for guard in &rule.guards {
+        let Guard::NotEqual(a, b) = *guard;
+        match (substitute(a, substitution), substitute(b, substitution)) {
+            (Term::Const(a), Term::Const(b)) if a == b => return None,
+            (Term::Const(_), Term::Const(_)) => {}
+            (a, b) => guards.push(Guard::NotEqual(a, b)),
+        }
+    }
+    let head = match &rule.head {
+        Head::Facts(atoms) => Head::Facts(
+            atoms
+                .iter()
+                .map(|a| substitute_atom(a, substitution))
+                .collect(),
+        ),
+        Head::Inconsistent => Head::Inconsistent,
+    };
+    Some(Grounded {
+        rule: Rule {
+            name: rule.name.clone(),
+            body: instance_atoms
+                .iter()
+                .map(|&i| substitute_atom(&rule.body[i], substitution))
+                .collect(),
+            guards,
+            head,
+        },
+        substitution: substitution.to_vec(),
+    })
+}
+
+fn split_schema(schema: &Schema, rule: &Rule) -> (Vec<usize>, Vec<usize>) {
+    (0..rule.body.len()).partition(|&i| schema.is_schema_atom(&rule.body[i]))
+}
+
+/// Grounds `rule`'s schema atoms against all of `source`: calls `emit` with every
+/// instance rule. A rule without schema atoms is emitted as it is.
+pub fn ground<S: Source + ?Sized>(
+    source: &S,
+    schema: &Schema,
+    rule: &Rule,
+    emit: &mut dyn FnMut(Grounded),
+) {
+    let (schema_atoms, instance_atoms) = split_schema(schema, rule);
+    if schema_atoms.is_empty() {
+        emit(Grounded {
+            rule: rule.clone(),
+            substitution: vec![None; rule.variables()],
+        });
+        return;
+    }
+    let first = *schema_atoms
+        .iter()
+        .min_by_key(|&&i| source.estimate(constants(&rule.body[i]), Seg::All))
+        .expect("not empty");
+    let order = plan(source, rule, &schema_atoms, first, |_| Seg::All);
+    let mut bindings = vec![None; rule.variables()];
+    walk(
+        source,
+        &rule.body,
+        &rule.guards,
+        &order,
+        0,
+        &mut bindings,
+        &mut |substitution| {
+            if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
+                emit(grounded);
+            }
+        },
+    );
+}
+
+/// Grounds `rule` only through the delta: the instances whose schema binding uses at least
+/// one fact of [`Seg::Delta`] (the semi-naive variants of the schema atoms). Each such
+/// instance is emitted at least once. Rules without schema atoms emit nothing.
+pub fn ground_delta<S: Source + ?Sized>(
+    source: &S,
+    schema: &Schema,
+    rule: &Rule,
+    emit: &mut dyn FnMut(Grounded),
+) {
+    let (schema_atoms, instance_atoms) = split_schema(schema, rule);
+    for (k, &first) in schema_atoms.iter().enumerate() {
+        if source.estimate(constants(&rule.body[first]), Seg::Delta) == 0 {
+            continue;
+        }
+        let seg_of = |i: usize| {
+            let position = schema_atoms
+                .iter()
+                .position(|&a| a == i)
+                .expect("a schema atom");
+            match position.cmp(&k) {
+                std::cmp::Ordering::Less => Seg::Old,
+                std::cmp::Ordering::Equal => Seg::Delta,
+                std::cmp::Ordering::Greater => Seg::All,
+            }
+        };
+        let order = plan(source, rule, &schema_atoms, first, seg_of);
+        let mut bindings = vec![None; rule.variables()];
+        walk(
+            source,
+            &rule.body,
+            &rule.guards,
+            &order,
+            0,
+            &mut bindings,
+            &mut |substitution| {
+                if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
+                    emit(grounded);
+                }
+            },
+        );
+    }
+}
+
+/// The fact a head atom derives under `bindings`.
+pub fn instantiate_head(atom: &Atom, bindings: &[Option<u64>]) -> Triple {
+    atom.0
+        .map(|t| value(t, bindings).expect("safe rules bind head variables"))
+}
+
+/// One variant of one rule: the atom order (driver first) and the driver's matches.
+pub struct Job<'r> {
+    pub rule: &'r Rule,
+    order: Vec<(usize, Seg)>,
+    drivers: Vec<Triple>,
+}
+
+impl<'r> Job<'r> {
+    /// The variant driven by `first` (read from `seg_of(first)`), or `None` if it can't
+    /// match.
+    pub fn new<S: Source + ?Sized>(
+        source: &S,
+        rule: &'r Rule,
+        first: usize,
+        seg_of: impl Fn(usize) -> Seg,
+    ) -> Option<Self> {
+        // An atom over a predicate without facts can't match.
+        for (i, atom) in rule.body.iter().enumerate() {
+            if let Term::Const(p) = atom.0[1]
+                && source.estimate([None, Some(p), None], seg_of(i)) == 0
+            {
+                return None;
+            }
+        }
+        let atoms: Vec<usize> = (0..rule.body.len()).collect();
+        let order = plan(source, rule, &atoms, first, &seg_of);
+        let mut drivers = Vec::new();
+        source.scan(constants(&rule.body[first]), seg_of(first), &mut |fact| {
+            drivers.push(fact)
+        });
+        (!drivers.is_empty()).then_some(Self {
+            rule,
+            order,
+            drivers,
+        })
+    }
+
+    /// The semi-naive variant with atom `i` on the delta: atoms before it read the old
+    /// facts, atoms after it all facts.
+    pub fn variant<S: Source + ?Sized>(source: &S, rule: &'r Rule, i: usize) -> Option<Self> {
+        Self::new(source, rule, i, |j| match j.cmp(&i) {
+            std::cmp::Ordering::Less => Seg::Old,
+            std::cmp::Ordering::Equal => Seg::Delta,
+            std::cmp::Ordering::Greater => Seg::All,
+        })
+    }
+
+    /// The full evaluation over all facts, driven by the most selective atom.
+    pub fn full<S: Source + ?Sized>(source: &S, rule: &'r Rule) -> Option<Self> {
+        let first = (0..rule.body.len())
+            .min_by_key(|&i| source.estimate(constants(&rule.body[i]), Seg::All))
+            .expect("a rule with a body");
+        Self::new(source, rule, first, |_| Seg::All)
+    }
+
+    pub fn drivers(&self) -> usize {
+        self.drivers.len()
+    }
+
+    /// Runs the variant for `drivers[range]`, calling `emit` with each complete binding.
+    pub fn run<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        range: std::ops::Range<usize>,
+        emit: &mut dyn FnMut(&[Option<u64>]),
+    ) {
+        let mut bindings = vec![None; self.rule.variables()];
+        let driver = &self.rule.body[self.order[0].0];
+        for &fact in &self.drivers[range] {
+            if let Some(newly) = bind(driver, fact, &mut bindings) {
+                walk(
+                    source,
+                    &self.rule.body,
+                    &self.rule.guards,
+                    &self.order,
+                    1,
+                    &mut bindings,
+                    emit,
+                );
+                unbind(driver, newly, &mut bindings);
+            }
+        }
+    }
+}
+
+/// Runs `jobs` in parallel morsels; returns the facts their heads derive that `keep`
+/// accepts (typically: not yet in the source).
+pub fn run_jobs<S: Source + ?Sized>(
+    source: &S,
+    jobs: &[Job<'_>],
+    keep: &(dyn Fn(Triple) -> bool + Sync),
+) -> Vec<Triple> {
+    let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
+        .iter()
+        .enumerate()
+        .flat_map(|(j, job)| {
+            (0..job.drivers.len())
+                .step_by(MORSEL)
+                .map(move |start| (j, start..(start + MORSEL).min(job.drivers.len())))
+        })
+        .collect();
+    tasks
+        .par_iter()
+        .map(|(j, range)| {
+            let job = &jobs[*j];
+            let Head::Facts(heads) = &job.rule.head else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            job.run(source, range.clone(), &mut |bindings| {
+                for head in heads {
+                    let fact = instantiate_head(head, bindings);
+                    if keep(fact) {
+                        out.push(fact);
+                    }
+                }
+            });
+            out
+        })
+        .flatten()
+        .collect()
+}
+
+/// Calls `emit` with every binding of `rule`'s body under which its head derives `fact`,
+/// reading `seg` (a backward, one-step derivation check: DRed's rederivation, and
+/// explanations later).
+pub fn derivations<S: Source + ?Sized>(
+    source: &S,
+    rule: &Rule,
+    fact: Triple,
+    seg: Seg,
+    emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
+) {
+    let Head::Facts(heads) = &rule.head else {
+        return;
+    };
+    let mut bindings = vec![None; rule.variables()];
+    for head in heads {
+        let Some(newly) = bind(head, fact, &mut bindings) else {
+            continue;
+        };
+        let mut stop = false;
+        if rule.body.is_empty() {
+            stop = guards_hold(&rule.guards, &bindings) && emit(&bindings);
+        } else {
+            let bound: Vec<bool> = bindings.iter().map(Option::is_some).collect();
+            let atoms: Vec<usize> = (0..rule.body.len()).collect();
+            // Start from the atom with the most bound positions.
+            let first = (0..rule.body.len())
+                .max_by_key(|&i| {
+                    pattern(&rule.body[i], &bindings)
+                        .iter()
+                        .filter(|p| p.is_some())
+                        .count()
+                })
+                .expect("a body");
+            let order = plan_bound(source, rule, &atoms, first, &bound, |_| seg);
+            walk(
+                source,
+                &rule.body,
+                &rule.guards,
+                &order,
+                0,
+                &mut bindings,
+                &mut |b| {
+                    if !stop {
+                        stop = emit(b);
+                    }
+                },
+            );
+        }
+        unbind(head, newly, &mut bindings);
+        if stop {
+            return;
+        }
+    }
+}
+
+/// The predicate `p` of a transitivity rule `(?x p ?y), (?y p ?z) -> (?x p ?z)`: `prp-trp`
+/// after grounding, `scm-sco` and `scm-spo` before.
+pub fn transitive_predicate(rule: &Rule) -> Option<u64> {
+    let ([a, b], Head::Facts(head)) = (rule.body.as_slice(), &rule.head) else {
+        return None;
+    };
+    let [Atom([hx, Term::Const(p), hz])] = head.as_slice() else {
+        return None;
+    };
+    if !rule.guards.is_empty() {
+        return None;
+    }
+    for (first, second) in [(a, b), (b, a)] {
+        let (Atom([x, Term::Const(p1), y]), Atom([y2, Term::Const(p2), z])) = (first, second)
+        else {
+            continue;
+        };
+        let distinct = matches!((x, y, z), (Term::Var(x), Term::Var(y), Term::Var(z)) if x != y && y != z && x != z);
+        if distinct && p1 == p && p2 == p && y == y2 && x == hx && z == hz {
+            return Some(*p);
+        }
+    }
+    None
+}
+
+/// Identity of a ground rule, for deduplication (the name doesn't matter).
+pub type RuleKey = (Vec<Atom>, Vec<Guard>, Head);
+
+pub fn rule_key(rule: &Rule) -> RuleKey {
+    (rule.body.clone(), rule.guards.clone(), rule.head.clone())
+}
