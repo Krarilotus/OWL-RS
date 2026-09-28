@@ -277,7 +277,17 @@ impl Store {
     }
 
     /// Adds `candidates` and makes the new ones the delta; returns the new ones.
-    pub(crate) fn advance(&mut self, mut candidates: Vec<Triple>) -> Vec<Triple> {
+    pub(crate) fn advance(&mut self, candidates: Vec<Triple>) -> Vec<Triple> {
+        self.advance_checked(candidates, true)
+    }
+
+    /// [`Self::advance`] for candidates known to be absent from the store (filtered
+    /// against it when they were derived): skips the membership check.
+    pub(crate) fn advance_new(&mut self, candidates: Vec<Triple>) -> Vec<Triple> {
+        self.advance_checked(candidates, false)
+    }
+
+    fn advance_checked(&mut self, mut candidates: Vec<Triple>, check: bool) -> Vec<Triple> {
         candidates.par_sort_unstable_by_key(|&[s, p, o]| (p, s, o));
         candidates.dedup();
         let chunks: Vec<&[Triple]> = candidates.chunk_by(|a, b| a[1] == b[1]).collect();
@@ -298,7 +308,7 @@ impl Store {
                 let pairs = chunk
                     .iter()
                     .map(|&[s, _, o]| (s, o))
-                    .filter(|&(s, o)| !relation.contains(s, o))
+                    .filter(|&(s, o)| !check || !relation.contains(s, o))
                     .collect();
                 (index, pairs)
             })
@@ -479,6 +489,7 @@ pub fn materialise(
         // Semi-naive variants of the evaluated rules that can match the delta, full
         // evaluation of the new ones.
         let mut candidates = program.take_facts();
+        candidates.retain(|&f| !store.contains(f));
         let mut jobs = Vec::new();
         for (r, i) in program.variants(&store) {
             if r < evaluated {
@@ -495,7 +506,8 @@ pub fn materialise(
         candidates.extend(transitive.run(&store));
         phases.modules += clock.elapsed();
         let clock = std::time::Instant::now();
-        let delta = store.advance(candidates);
+        // Every candidate was checked against the store, which a round doesn't change.
+        let delta = store.advance_new(candidates);
         phases.merge += clock.elapsed();
         if delta.is_empty() {
             break;
