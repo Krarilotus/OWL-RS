@@ -66,30 +66,6 @@ impl ListVocabulary {
         }
     }
 
-    /// The predicates of list structure and list axioms, and the classes of the list
-    /// axioms typed by `rdf:type`: `(predicates, rdf:type, classes)`.
-    pub fn vocabulary(&self) -> (Vec<u64>, u64, Vec<u64>) {
-        (
-            vec![
-                self.first,
-                self.rest,
-                self.property_chain_axiom,
-                self.has_key,
-                self.intersection_of,
-                self.union_of,
-                self.one_of,
-                self.members,
-                self.distinct_members,
-            ],
-            self.rdf_type,
-            vec![
-                self.all_disjoint_classes,
-                self.all_disjoint_properties,
-                self.all_different,
-            ],
-        )
-    }
-
     /// Whether `fact` is list structure or a list axiom: the facts [`instantiate`] reads.
     pub fn is_list_fact(&self, [_, p, o]: [u64; 3]) -> bool {
         [
@@ -119,11 +95,13 @@ impl ListVocabulary {
     /// `(node rdf:first a)` to every `b` with `a owl:sameAs b`. The rules' `LIST[…]`
     /// pattern matches each resulting path, so every path is a variant, up to
     /// [`MAX_VARIANTS`]. A node without `rdf:first` or `rdf:rest`, or a cycle, is malformed.
-    fn list(&self, facts: &impl Facts, head: u64) -> Result<Vec<Vec<u64>>, &'static str> {
+    /// Each variant comes with the `rdf:first`/`rdf:rest` facts of its path.
+    fn list(&self, facts: &impl Facts, head: u64) -> Result<Vec<Variant>, &'static str> {
         let mut variants = Vec::new();
         let mut path = Vec::new();
         let mut nodes = Vec::new();
-        self.walk(facts, head, &mut nodes, &mut path, &mut variants)?;
+        let mut used = Vec::new();
+        self.walk(facts, head, &mut nodes, &mut path, &mut used, &mut variants)?;
         Ok(variants)
     }
 
@@ -133,13 +111,14 @@ impl ListVocabulary {
         node: u64,
         nodes: &mut Vec<u64>,
         path: &mut Vec<u64>,
-        variants: &mut Vec<Vec<u64>>,
+        used: &mut Vec<[u64; 3]>,
+        variants: &mut Vec<Variant>,
     ) -> Result<(), &'static str> {
         if node == self.nil {
             if variants.len() == MAX_VARIANTS {
                 return Err("too many variants under equality");
             }
-            variants.push(path.clone());
+            variants.push((path.clone(), used.clone()));
             return Ok(());
         }
         if nodes.contains(&node) {
@@ -155,15 +134,22 @@ impl ListVocabulary {
         nodes.push(node);
         for &first in &firsts {
             path.push(first);
+            used.push([node, self.first, first]);
             for &rest in &rests {
-                self.walk(facts, rest, nodes, path, variants)?;
+                used.push([node, self.rest, rest]);
+                self.walk(facts, rest, nodes, path, used, variants)?;
+                used.pop();
             }
+            used.pop();
             path.pop();
         }
         nodes.pop();
         Ok(())
     }
 }
+
+/// A member sequence of a list, with the facts its path uses.
+type Variant = (Vec<u64>, Vec<[u64; 3]>);
 
 /// The most member sequences one list axiom may have (see [`ListVocabulary::list`]).
 const MAX_VARIANTS: usize = 64;
@@ -193,16 +179,45 @@ type MakeRules<'a> = dyn FnMut(u64, &[u64], &mut Vec<Rule>) + 'a;
 
 /// The rules for every list axiom in `facts`, plus diagnostics for malformed lists.
 pub fn instantiate(vocabulary: &ListVocabulary, facts: &impl Facts) -> (Vec<Rule>, Vec<String>) {
+    let (rules, _, diagnostics) = instantiate_with_premises(vocabulary, facts);
+    (rules, diagnostics)
+}
+
+/// [`instantiate`], with the facts each rule comes from (its premises): the axiom, the
+/// list path's `rdf:first`/`rdf:rest` facts, and the axiom node's `rdf:type` facts for
+/// `owl:members` / `owl:distinctMembers` axioms.
+pub fn instantiate_with_premises(
+    vocabulary: &ListVocabulary,
+    facts: &impl Facts,
+) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<String>) {
     let voc = vocabulary;
     let mut rules = Vec::new();
+    let mut premises: Vec<Vec<[u64; 3]>> = Vec::new();
     let mut diagnostics = Vec::new();
     let mut lists = |predicate: u64, name: &str, rules: &mut Vec<Rule>, make: &mut MakeRules| {
         for (subject, head) in facts.pairs(predicate) {
             match voc.list(facts, head) {
                 Ok(variants) => {
-                    for members in variants {
+                    for (members, used) in variants {
                         if members.len() <= MAX_MEMBERS {
+                            let before = rules.len();
                             make(subject, &members, rules);
+                            let mut facts_used = used;
+                            facts_used.push([subject, predicate, head]);
+                            if predicate == voc.members || predicate == voc.distinct_members {
+                                for class in [
+                                    voc.all_disjoint_classes,
+                                    voc.all_disjoint_properties,
+                                    voc.all_different,
+                                ] {
+                                    if facts.objects(subject, voc.rdf_type).contains(&class) {
+                                        facts_used.push([subject, voc.rdf_type, class]);
+                                    }
+                                }
+                            }
+                            for _ in before..rules.len() {
+                                premises.push(facts_used.clone());
+                            }
                         } else {
                             diagnostics.push(format!(
                                 "{name}: list of {} members at node {head} skipped (limit {MAX_MEMBERS})",
@@ -387,5 +402,5 @@ pub fn instantiate(vocabulary: &ListVocabulary, facts: &impl Facts) -> (Vec<Rule
             }
         },
     );
-    (rules, diagnostics)
+    (rules, premises, diagnostics)
 }
