@@ -182,3 +182,86 @@ fn rematerialise_installs_the_closure_of_existing_data() {
         .expect("again");
     assert_eq!(again.revision, report.revision);
 }
+
+/// Reasoner v2's commit path (the delta executor over the engine) against rematerialisation:
+/// after every random commit, recomputing the closure changes nothing. Includes named
+/// graphs: a triple deleted from one graph but asserted in another stays a fact.
+#[test]
+fn owl2_rl_commits_keep_the_inferred_stack_exact() {
+    let pipeline = pipeline(ReasoningMode::Owl2Rl);
+    let mut state = 0x5DEE_CE66_D1CE_4E5Du64;
+    let mut next = move |n: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % n
+    };
+    let rdfs = "http://www.w3.org/2000/01/rdf-schema#";
+    let owl = "http://www.w3.org/2002/07/owl#";
+    let random_triple = |next: &mut dyn FnMut(u64) -> u64| -> String {
+        let c = |n: u64| format!("<{EX}C{n}>");
+        let p = |n: u64| format!("<{EX}p{n}>");
+        let i = |n: u64| format!("<{EX}i{n}>");
+        match next(9) {
+            0 => format!("{} <{rdfs}subClassOf> {}", c(next(4)), c(next(4))),
+            1 => format!("{} <{rdfs}subPropertyOf> {}", p(next(3)), p(next(3))),
+            2 => format!("{} <{rdfs}domain> {}", p(next(3)), c(next(4))),
+            3 => {
+                let kind = ["TransitiveProperty", "SymmetricProperty"][next(2) as usize];
+                format!("{} a <{owl}{kind}>", p(next(3)))
+            }
+            4 => format!("{} <{owl}inverseOf> {}", p(next(3)), p(next(3))),
+            5 | 6 => format!("{} a {}", i(next(6)), c(next(4))),
+            _ => format!("{} {} {}", i(next(6)), p(next(3)), i(next(6))),
+        }
+    };
+    let mut asserted: Vec<(String, Option<u64>)> = Vec::new();
+    let (mut commits, mut changed) = (0, 0);
+    // NRESE_FUZZ_CASES widens the sweep locally.
+    let rounds: u64 = std::env::var("NRESE_FUZZ_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150);
+    for _ in 0..rounds {
+        let deleting = !asserted.is_empty() && next(3) == 0;
+        let (triple, graph) = if deleting {
+            asserted.swap_remove(next(asserted.len() as u64) as usize)
+        } else {
+            let graph = (next(3) == 0).then(|| next(2));
+            (random_triple(&mut next), graph)
+        };
+        let data = match graph {
+            Some(g) => format!("GRAPH <{EX}g{g}> {{ {triple} }}"),
+            None => triple.clone(),
+        };
+        let command = if deleting {
+            delete(&data)
+        } else {
+            insert(&data)
+        };
+        if pipeline.apply(command, &MutationTicket::new()).is_ok() {
+            commits += 1;
+            if !deleting {
+                asserted.push((triple, graph));
+            }
+        } else if deleting {
+            asserted.push((triple, graph));
+        }
+        let check = pipeline
+            .store()
+            .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .expect("rematerialise");
+        assert_eq!(
+            (check.inferred_inserted, check.inferred_deleted),
+            (0, 0),
+            "after {commits} commits the inferred stack differs from the closure; last: {} {data}
+asserted: {asserted:#?}",
+            if deleting { "DELETE" } else { "INSERT" }
+        );
+        changed += usize::from(check.inferred > 0);
+    }
+    assert!(
+        commits > 100 && changed > 50,
+        "{commits} commits, {changed} with inferences"
+    );
+}

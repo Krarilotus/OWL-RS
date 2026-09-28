@@ -149,7 +149,10 @@ pub fn transitive_closure(edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     nodes.dedup();
     let n = nodes.len();
     let dense = |id: u64| nodes.binary_search(&id).expect("every endpoint is a node") as u32;
-    let mut pairs: Vec<(u32, u32)> = edges.par_iter().map(|&(a, b)| (dense(a), dense(b))).collect();
+    let mut pairs: Vec<(u32, u32)> = edges
+        .par_iter()
+        .map(|&(a, b)| (dense(a), dense(b)))
+        .collect();
     pairs.par_sort_unstable();
     pairs.dedup();
     let mut offsets = vec![0u32; n + 1];
@@ -160,7 +163,8 @@ pub fn transitive_closure(edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
         offsets[i + 1] += offsets[i];
     }
     let targets: Vec<u32> = pairs.iter().map(|&(_, b)| b).collect();
-    let successors = |v: u32| &targets[offsets[v as usize] as usize..offsets[v as usize + 1] as usize];
+    let successors =
+        |v: u32| &targets[offsets[v as usize] as usize..offsets[v as usize + 1] as usize];
 
     // Tarjan's algorithm, iterative. Components come out sinks first.
     const UNSEEN: u32 = u32::MAX;
@@ -267,13 +271,15 @@ pub fn transitive_closure(edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
         .into_par_iter()
         .flat_map_iter(|c| {
             let (members, starts, reach, nodes) = (&members, &starts, &reach, &nodes);
-            members[starts[c]..starts[c + 1]].iter().flat_map(move |&x| {
-                reach[c].iter().flat_map(move |&d| {
-                    members[starts[d as usize]..starts[d as usize + 1]]
-                        .iter()
-                        .map(move |&y| (nodes[x as usize], nodes[y as usize]))
+            members[starts[c]..starts[c + 1]]
+                .iter()
+                .flat_map(move |&x| {
+                    reach[c].iter().flat_map(move |&d| {
+                        members[starts[d as usize]..starts[d as usize + 1]]
+                            .iter()
+                            .map(move |&y| (nodes[x as usize], nodes[y as usize]))
+                    })
                 })
-            })
         })
         .collect()
 }
@@ -297,17 +303,20 @@ mod tests {
                 .map(|_| (100 + next(size), 100 + next(size)))
                 .collect();
             let adjacency = Adjacency::new(edges.clone());
-            let mut expected: Vec<(u64, u64)> = closure(&adjacency, adjacency.sources().to_vec(), false)
-                .rows()
-                .map(|r| (r[0], r[1]))
-                .collect();
+            let mut expected: Vec<(u64, u64)> =
+                closure(&adjacency, adjacency.sources().to_vec(), false)
+                    .rows()
+                    .map(|r| (r[0], r[1]))
+                    .collect();
             expected.sort_unstable();
             let mut got = transitive_closure(&edges);
             got.sort_unstable();
             assert_eq!(got, expected, "{edges:?}");
         }
         // A clique: every pair, including each node with itself.
-        let clique: Vec<(u64, u64)> = (0..50).flat_map(|a| [(a, (a + 1) % 50), ((a + 1) % 50, a)]).collect();
+        let clique: Vec<(u64, u64)> = (0..50)
+            .flat_map(|a| [(a, (a + 1) % 50), ((a + 1) % 50, a)])
+            .collect();
         assert_eq!(transitive_closure(&clique).len(), 50 * 50);
     }
 
