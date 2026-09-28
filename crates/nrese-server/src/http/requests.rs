@@ -16,11 +16,13 @@ pub struct QueryOperation {
     pub query: String,
     pub default_graphs: Vec<String>,
     pub named_graphs: Vec<String>,
+    /// GraphDB's `infer` parameter: `false` reads asserted statements only.
+    pub infer: Option<bool>,
 }
 
 impl QueryOperation {
-    /// Collects `query`, `default-graph-uri` and `named-graph-uri` from URL-encoded pairs.
-    /// The dataset parameters may repeat; other parameters are ignored.
+    /// Collects `query`, `default-graph-uri`, `named-graph-uri` and `infer` from
+    /// URL-encoded pairs. The dataset parameters may repeat; other parameters are ignored.
     fn parse_pairs(&mut self, encoded: &[u8]) -> Result<(), ApiError> {
         let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(encoded)
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -34,6 +36,17 @@ impl QueryOperation {
                 "query" => self.query = value,
                 "default-graph-uri" => self.default_graphs.push(value),
                 "named-graph-uri" => self.named_graphs.push(value),
+                "infer" => {
+                    self.infer = Some(match value.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        other => {
+                            return Err(ApiError::bad_request(format!(
+                                "infer must be true or false, not '{other}'"
+                            )));
+                        }
+                    });
+                }
                 _ => {}
             }
         }
@@ -139,6 +152,7 @@ mod tests {
                 query: "SELECT * WHERE { ?s ?p ?o }".to_owned(),
                 default_graphs: Vec::new(),
                 named_graphs: vec!["http://ex/a".to_owned(), "http://ex/b".to_owned()],
+                infer: None,
             }
         );
     }
@@ -155,6 +169,10 @@ mod tests {
             "query missing"
         );
         assert!(query_from_url(Some(&format!("query={SELECT}&query={SELECT}"))).is_err());
+        let operation =
+            query_from_url(Some(&format!("query={SELECT}&infer=false"))).expect("query");
+        assert_eq!(operation.infer, Some(false));
+        assert!(query_from_url(Some(&format!("query={SELECT}&infer=no"))).is_err());
     }
 
     #[test]

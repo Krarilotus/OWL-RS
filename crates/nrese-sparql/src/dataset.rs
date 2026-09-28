@@ -7,7 +7,7 @@
 //! matching no stored quad) stay [`EvalTerm::Value`]. Inline values (canonical integers,
 //! booleans) have ids without a dictionary entry, so computed values join with stored ones.
 
-use nrese_engine::{EncodedQuad, EngineError, GraphSelector, QuadPattern, TermId};
+use nrese_engine::{EncodedQuad, EngineError, GraphSelector, QuadPattern, ReadModel, TermId};
 use oxrdf::Term;
 use spareval::{InternalQuad, QueryableDataset};
 
@@ -20,14 +20,20 @@ pub enum EvalTerm {
     Value(Term),
 }
 
-/// Adapter handed to spareval. Cheap to copy: it is just a reference to the view.
+/// Adapter handed to spareval. Cheap to copy: a reference to the view and the read model.
 pub struct EngineDataset<'a, V> {
     view: &'a V,
+    model: ReadModel,
 }
 
 impl<'a, V> EngineDataset<'a, V> {
+    /// Reads asserted and inferred statements.
     pub fn new(view: &'a V) -> Self {
-        Self { view }
+        Self::with_model(view, ReadModel::Materialised)
+    }
+
+    pub fn with_model(view: &'a V, model: ReadModel) -> Self {
+        Self { view, model }
     }
 }
 
@@ -87,11 +93,11 @@ impl<'a, V: ReadView> QueryableDataset<'a> for EngineDataset<'a, V> {
                 graph: graph_selector(graph_name)?,
             })
         })();
-        let view: &'a V = self.view;
+        let (view, model): (&'a V, ReadModel) = (self.view, self.model);
         pattern
             .ok()
             .into_iter()
-            .flat_map(move |pattern| view.quads_for_pattern(&pattern))
+            .flat_map(move |pattern| view.quads_for_pattern_in(model, &pattern))
             .map(|quad| Ok(to_internal(quad)))
     }
 

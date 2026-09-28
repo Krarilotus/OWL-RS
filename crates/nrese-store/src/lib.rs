@@ -38,6 +38,7 @@ pub use mutation::{
     MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
     RejectAttributionCandidate,
 };
+pub use nrese_engine::ReadModel;
 pub use nrese_sparql::{CancellationToken, QueryEvaluationError};
 pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
