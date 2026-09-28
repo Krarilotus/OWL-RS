@@ -6,9 +6,10 @@
 //! n becomes one n-atom rule, and an intersection one rule per direction. That removes
 //! the `rdf:first`/`rdf:rest` helper rules that generic rulesets need.
 //!
-//! Lists are read from the facts: every node needs exactly one `rdf:first` and one
-//! `rdf:rest`, ending at `rdf:nil`, without cycles. Malformed lists produce a diagnostic
-//! and no rules; they're never silently truncated.
+//! Lists are read from the facts: every node needs an `rdf:first` and an `rdf:rest`, and
+//! the list must end at `rdf:nil` without cycles. Several `rdf:first`s (from equality)
+//! give several member sequences, each instantiated. Malformed or oversized lists produce
+//! a diagnostic and no rules; they're never silently truncated.
 
 use super::ir::{Atom, Guard, Head, OWL, RDF, Rule, Term, Vocabulary};
 
@@ -65,28 +66,63 @@ impl ListVocabulary {
         }
     }
 
-    /// The members of the list starting at `head`, or `None` if it is malformed.
-    fn list(&self, facts: &impl Facts, head: u64) -> Option<Vec<u64>> {
-        let mut members = Vec::new();
-        let mut node = head;
-        let mut seen = std::collections::HashSet::new();
-        while node != self.nil {
-            if !seen.insert(node) {
-                return None; // a cycle
+    /// Every member sequence of the list starting at `head`, or why it is malformed.
+    ///
+    /// Equality makes a node's `rdf:first` (or `rdf:rest`) ambiguous: `eq-rep-o` copies
+    /// `(node rdf:first a)` to every `b` with `a owl:sameAs b`. The rules' `LIST[…]`
+    /// pattern matches each resulting path, so every path is a variant, up to
+    /// [`MAX_VARIANTS`]. A node without `rdf:first` or `rdf:rest`, or a cycle, is malformed.
+    fn list(&self, facts: &impl Facts, head: u64) -> Result<Vec<Vec<u64>>, &'static str> {
+        let mut variants = Vec::new();
+        let mut path = Vec::new();
+        let mut nodes = Vec::new();
+        self.walk(facts, head, &mut nodes, &mut path, &mut variants)?;
+        Ok(variants)
+    }
+
+    fn walk(
+        &self,
+        facts: &impl Facts,
+        node: u64,
+        nodes: &mut Vec<u64>,
+        path: &mut Vec<u64>,
+        variants: &mut Vec<Vec<u64>>,
+    ) -> Result<(), &'static str> {
+        if node == self.nil {
+            if variants.len() == MAX_VARIANTS {
+                return Err("too many variants under equality");
             }
-            let (first, rest) = (
-                facts.objects(node, self.first),
-                facts.objects(node, self.rest),
-            );
-            let ([first], [rest]) = (first.as_slice(), rest.as_slice()) else {
-                return None;
-            };
-            members.push(*first);
-            node = *rest;
+            variants.push(path.clone());
+            return Ok(());
         }
-        Some(members)
+        if nodes.contains(&node) {
+            return Err("a cycle");
+        }
+        let (firsts, rests) = (
+            facts.objects(node, self.first),
+            facts.objects(node, self.rest),
+        );
+        if firsts.is_empty() || rests.is_empty() {
+            return Err("a node without rdf:first or rdf:rest");
+        }
+        nodes.push(node);
+        for &first in &firsts {
+            path.push(first);
+            for &rest in &rests {
+                self.walk(facts, rest, nodes, path, variants)?;
+            }
+            path.pop();
+        }
+        nodes.pop();
+        Ok(())
     }
 }
+
+/// The most member sequences one list axiom may have (see [`ListVocabulary::list`]).
+const MAX_VARIANTS: usize = 64;
+
+/// The longest list instantiated; longer ones are diagnosed.
+const MAX_MEMBERS: usize = 100;
 
 fn v(n: usize) -> Term {
     Term::Var(u8::try_from(n).expect("list rules stay below 256 variables"))
@@ -116,13 +152,20 @@ pub fn instantiate(vocabulary: &ListVocabulary, facts: &impl Facts) -> (Vec<Rule
     let mut lists = |predicate: u64, name: &str, rules: &mut Vec<Rule>, make: &mut MakeRules| {
         for (subject, head) in facts.pairs(predicate) {
             match voc.list(facts, head) {
-                Some(members) if members.len() <= 100 => make(subject, &members, rules),
-                Some(members) => diagnostics.push(format!(
-                    "{name}: list of {} members skipped (limit 100)",
-                    members.len()
-                )),
-                None => diagnostics.push(format!(
-                    "{name}: malformed list at node {head} (subject {subject})"
+                Ok(variants) => {
+                    for members in variants {
+                        if members.len() <= MAX_MEMBERS {
+                            make(subject, &members, rules);
+                        } else {
+                            diagnostics.push(format!(
+                                "{name}: list of {} members at node {head} skipped (limit {MAX_MEMBERS})",
+                                members.len()
+                            ));
+                        }
+                    }
+                }
+                Err(problem) => diagnostics.push(format!(
+                    "{name}: list at node {head} (subject {subject}) skipped: {problem}"
                 )),
             }
         }

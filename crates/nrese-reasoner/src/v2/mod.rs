@@ -180,10 +180,42 @@ mod tests {
             &mut vocabulary,
             "ex:C owl:intersectionOf _:a
              _:a rdf:first ex:A
-             _:a rdf:first ex:B
-             _:a rdf:rest rdf:nil",
+             _:a rdf:rest _:b
+             _:b rdf:first ex:B
+             ex:D owl:unionOf _:c
+             _:c rdf:first ex:A
+             _:c rdf:rest _:c",
         );
         let result = materialise(&input, &rules, Some(&lists));
-        assert_eq!(result.diagnostics.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(result.diagnostics.len(), 2, "{:?}", result.diagnostics);
+        assert!(
+            result
+                .derived
+                .iter()
+                .all(|t| t[1] != vocabulary.iri(&format!("{}subClassOf", super::ir::RDFS)))
+        );
+    }
+
+    #[test]
+    fn equality_gives_lists_several_member_sequences() {
+        // eq-rep-o copies `_:a rdf:first ex:Woman` to `ex:Female`; both paths are lists.
+        let (mut v, d, violations) = closure(
+            "ex:Woman owl:sameAs ex:Female
+             ex:Mother owl:intersectionOf _:a
+             _:a rdf:first ex:Woman
+             _:a rdf:rest _:b
+             _:b rdf:first ex:Parent
+             _:b rdf:rest rdf:nil
+             _:d rdf:type owl:AllDifferent
+             _:d owl:distinctMembers _:l
+             _:l rdf:first ex:ann
+             _:l rdf:rest _:m
+             _:m rdf:first ex:bob
+             _:m rdf:rest rdf:nil
+             ex:bob owl:sameAs ex:robert",
+        );
+        assert!(has(&mut v, &d, "ex:Mother rdfs:subClassOf ex:Female"));
+        assert!(has(&mut v, &d, "ex:Mother rdfs:subClassOf ex:Woman"));
+        assert!(violations.is_empty(), "{violations:?}");
     }
 }
