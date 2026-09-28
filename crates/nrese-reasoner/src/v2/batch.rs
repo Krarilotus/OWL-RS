@@ -60,14 +60,96 @@ pub struct Phases {
     pub consistency: std::time::Duration,
 }
 
-/// The pairs of one predicate.
+/// A sorted run of pairs, by subject and by object.
 #[derive(Default)]
-pub(crate) struct Relation {
-    pub(crate) so: Vec<Pair>,
+struct Run {
+    so: Vec<Pair>,
     /// `(object, subject)` pairs.
     os: Vec<Pair>,
-    pub(crate) delta_so: Vec<Pair>,
-    delta_os: Vec<Pair>,
+}
+
+impl Run {
+    /// A run of `so` (sorted, deduplicated).
+    fn new(so: Vec<Pair>) -> Self {
+        let mut os: Vec<Pair> = so.iter().map(|&(s, o)| (o, s)).collect();
+        os.par_sort_unstable();
+        Self { so, os }
+    }
+
+    fn len(&self) -> usize {
+        self.so.len()
+    }
+
+    fn contains(&self, s: u64, o: u64) -> bool {
+        self.so.binary_search(&(s, o)).is_ok()
+    }
+
+    /// Calls `f` with every `(s, o)` matching the bound positions that `keep` accepts.
+    fn scan(
+        &self,
+        s: Option<u64>,
+        o: Option<u64>,
+        keep: &dyn Fn(u64, u64) -> bool,
+        f: &mut dyn FnMut(u64, u64),
+    ) {
+        match (s, o) {
+            (Some(s), Some(o)) => {
+                if self.contains(s, o) && keep(s, o) {
+                    f(s, o);
+                }
+            }
+            (Some(s), None) => {
+                for &(_, o) in range(&self.so, s) {
+                    if keep(s, o) {
+                        f(s, o);
+                    }
+                }
+            }
+            (None, Some(o)) => {
+                for &(_, s) in range(&self.os, o) {
+                    if keep(s, o) {
+                        f(s, o);
+                    }
+                }
+            }
+            (None, None) => {
+                for &(s, o) in &self.so {
+                    if keep(s, o) {
+                        f(s, o);
+                    }
+                }
+            }
+        }
+    }
+
+    fn estimate(&self, s: Option<u64>, o: Option<u64>) -> usize {
+        match (s, o) {
+            (Some(s), Some(o)) => usize::from(self.contains(s, o)),
+            (Some(s), None) => range(&self.so, s).len(),
+            (None, Some(o)) => range(&self.os, o).len(),
+            (None, None) => self.so.len(),
+        }
+    }
+
+    /// The union with a disjoint run.
+    fn merge(&self, other: &Run) -> Run {
+        Run {
+            so: merge(&self.so, &other.so),
+            os: merge(&self.os, &other.os),
+        }
+    }
+}
+
+/// The pairs of one predicate, in two sorted runs: a large base and a small recent run
+/// that takes each round's delta. The recent run is folded into the base once it reaches
+/// a quarter of its size, so a round costs its delta plus the recent run, not the whole
+/// relation, and the total merge work stays O(n log n).
+#[derive(Default)]
+pub(crate) struct Relation {
+    base: Run,
+    recent: Run,
+    /// The last round's pairs (also in `recent`).
+    delta: Run,
 }
 
 /// The pairs whose first component is `key`.
@@ -97,88 +179,70 @@ fn merge(a: &[Pair], b: &[Pair]) -> Vec<Pair> {
 
 impl Relation {
     pub(crate) fn delta_len(&self) -> usize {
-        self.delta_so.len()
+        self.delta.len()
     }
 
     /// Whether the delta has a pair with object `o`.
     pub(crate) fn delta_has_object(&self, o: u64) -> bool {
-        !range(&self.delta_os, o).is_empty()
+        !range(&self.delta.os, o).is_empty()
     }
 
     /// Calls `f` with each distinct object of the delta.
     pub(crate) fn delta_objects(&self, f: &mut dyn FnMut(u64)) {
-        for chunk in self.delta_os.chunk_by(|a, b| a.0 == b.0) {
+        for chunk in self.delta.os.chunk_by(|a, b| a.0 == b.0) {
             f(chunk[0].0);
         }
     }
 
     pub(crate) fn contains(&self, s: u64, o: u64) -> bool {
-        self.so.binary_search(&(s, o)).is_ok()
+        self.base.contains(s, o) || self.recent.contains(s, o)
     }
 
-    fn segment(&self, seg: Seg) -> (&[Pair], &[Pair]) {
-        match seg {
-            Seg::Delta => (&self.delta_so, &self.delta_os),
-            Seg::Old | Seg::All => (&self.so, &self.os),
-        }
+    /// Every pair, in no particular order.
+    pub(crate) fn pairs(&self) -> Vec<Pair> {
+        let mut out = Vec::with_capacity(self.base.len() + self.recent.len());
+        out.extend_from_slice(&self.base.so);
+        out.extend_from_slice(&self.recent.so);
+        out
     }
 
     /// Calls `f` with every `(s, o)` matching the bound positions in `seg`.
     fn scan(&self, s: Option<u64>, o: Option<u64>, seg: Seg, f: &mut dyn FnMut(u64, u64)) {
-        let (so, os) = self.segment(seg);
-        let old = seg == Seg::Old && !self.delta_so.is_empty();
-        let keep = |s: u64, o: u64| !old || self.delta_so.binary_search(&(s, o)).is_err();
-        match (s, o) {
-            (Some(s), Some(o)) => {
-                if so.binary_search(&(s, o)).is_ok() && keep(s, o) {
-                    f(s, o);
-                }
+        let all = |_: u64, _: u64| true;
+        match seg {
+            Seg::Delta => self.delta.scan(s, o, &all, f),
+            Seg::All => {
+                self.base.scan(s, o, &all, f);
+                self.recent.scan(s, o, &all, f);
             }
-            (Some(s), None) => {
-                for &(_, o) in range(so, s) {
-                    if keep(s, o) {
-                        f(s, o);
-                    }
-                }
-            }
-            (None, Some(o)) => {
-                for &(_, s) in range(os, o) {
-                    if keep(s, o) {
-                        f(s, o);
-                    }
-                }
-            }
-            (None, None) => {
-                for &(s, o) in so {
-                    if keep(s, o) {
-                        f(s, o);
-                    }
-                }
+            // The delta is in `recent` only, so the base needs no filter.
+            Seg::Old => {
+                self.base.scan(s, o, &all, f);
+                let old = |s: u64, o: u64| !self.delta.contains(s, o);
+                self.recent.scan(s, o, &old, f);
             }
         }
     }
 
     /// An upper bound on the matches of the bound positions in `seg`.
     fn estimate(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> usize {
-        let (so, os) = self.segment(seg);
-        match (s, o) {
-            (Some(s), Some(o)) => usize::from(so.binary_search(&(s, o)).is_ok()),
-            (Some(s), None) => range(so, s).len(),
-            (None, Some(o)) => range(os, o).len(),
-            (None, None) => so.len(),
+        match seg {
+            Seg::Delta => self.delta.estimate(s, o),
+            Seg::Old | Seg::All => self.base.estimate(s, o) + self.recent.estimate(s, o),
         }
     }
 
     /// Makes `new` (sorted, deduplicated, disjoint from the relation) the delta.
     fn advance(&mut self, new: Vec<Pair>) {
-        let mut new_os: Vec<Pair> = new.iter().map(|&(s, o)| (o, s)).collect();
-        new_os.sort_unstable();
-        if !new.is_empty() {
-            self.so = merge(&self.so, &new);
-            self.os = merge(&self.os, &new_os);
+        // Fold the recent run into the base first, so the new delta stays in `recent`.
+        if self.recent.len() * 4 > self.base.len() {
+            self.base = self.base.merge(&self.recent);
+            self.recent = Run::default();
         }
-        self.delta_so = new;
-        self.delta_os = new_os;
+        self.delta = Run::new(new);
+        if self.delta.len() > 0 {
+            self.recent = self.recent.merge(&self.delta);
+        }
     }
 }
 
@@ -204,7 +268,7 @@ impl Store {
         self.predicates
             .iter()
             .zip(&self.relations)
-            .filter(|(_, r)| !r.delta_so.is_empty())
+            .filter(|(_, r)| r.delta_len() > 0)
             .map(|(&p, r)| (p, r))
     }
 
@@ -311,7 +375,7 @@ impl Transitive {
             };
             let before = out.len();
             out.extend(
-                nrese_exec::graph::transitive_closure(&relation.so)
+                nrese_exec::graph::transitive_closure(&relation.pairs())
                     .into_iter()
                     .filter(|&(s, o)| !relation.contains(s, o))
                     .map(|(s, o)| [s, p, o]),
@@ -324,7 +388,7 @@ impl Transitive {
     /// After a round: a predicate needs recomputing if other rules added facts over it.
     fn observe(&mut self, store: &Store) {
         for (p, dirty) in &mut self.predicates {
-            let added = store.relation(*p).map_or(0, |r| r.delta_so.len());
+            let added = store.relation(*p).map_or(0, Relation::delta_len);
             *dirty |= added > self.produced.get(p).copied().unwrap_or(0);
         }
     }
