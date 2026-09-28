@@ -41,7 +41,7 @@ use rayon::prelude::*;
 use super::batch::{Store, check, consistency_rules, fact_rules, sorted};
 use super::eval::{
     AllFacts, GroundProgram, Job, RuleKey, Schema, Seg, Source, instantiate_head, rule_key,
-    run_jobs, transitive_predicate, transitivity,
+    run_jobs, run_jobs_acyclic, transitive_predicate, transitivity,
 };
 use super::ir::{Head, Rule};
 use super::lists::{ListVocabulary, instantiate};
@@ -304,7 +304,7 @@ pub fn update<B: Base + ?Sized>(
                     && !extra.contains(f)
                     && !inserted_set.contains(&f)
             };
-            let mut candidates = run_jobs(&old, &jobs, &overdeletable);
+            let mut candidates = run_jobs_acyclic(&old, &jobs, &overdeletable);
             candidates.extend(bodiless.into_iter().filter(|&f| overdeletable(f)));
             drop(jobs);
             let delta = extra.advance(candidates);
