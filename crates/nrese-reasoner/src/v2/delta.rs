@@ -38,7 +38,7 @@ use std::borrow::Cow;
 use hashbrown::HashSet;
 use rayon::prelude::*;
 
-use super::batch::{Store, check, consistency_rules, fact_rules, sorted};
+use super::batch::{Store, check, sorted};
 use super::eval::{
     AllFacts, GroundProgram, Job, RuleKey, Schema, Seg, Source, instantiate_head, rule_key,
     run_jobs, run_jobs_acyclic, transitive_predicate,
@@ -68,18 +68,16 @@ pub struct Rules<'a> {
 }
 
 impl Rules<'_> {
-    /// Fact and consistency rules, with the list rules instantiated over `source`.
-    fn source<S: Source + ?Sized>(&self, source: &S) -> Vec<Rule> {
-        let mut diagnostics = Vec::new();
-        let mut rules = fact_rules(source, self.rules, self.lists, &mut diagnostics);
-        rules.extend(consistency_rules(source, self.rules, self.lists));
-        rules
-    }
-
-    /// The ground program over `source`; its bodiless facts count as handed out.
+    /// The ground program over `source`; its bodiless facts count as handed out. List
+    /// rules carry the list facts they come from as premises.
     fn program<S: Source + ?Sized>(&self, source: &S) -> GroundProgram {
         let mut program = GroundProgram::default();
-        program.ground(source, self.schema, &self.source(source));
+        program.ground(source, self.schema, self.rules);
+        if let Some(vocabulary) = self.lists {
+            let (rules, premises, _) =
+                super::lists::instantiate_with_premises(vocabulary, &AllFacts(source));
+            program.ground_with_premises(source, self.schema, &rules, &premises);
+        }
         program.take_facts();
         program
     }
@@ -229,21 +227,7 @@ pub fn update<B: Base + ?Sized>(
     let mut overdeleted: HashSet<Triple> = HashSet::new();
     // Transitive properties whose closure lost pairs: re-closed in phase 3.
     let mut recloses: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    // List-rule instances don't record the list facts they come from, so B/F also needs
-    // every list fact to be asserted (inferred ones need sameAs on list nodes).
-    let lists_asserted = rules.lists.is_none_or(|lists| {
-        let (predicates, rdf_type, classes) = lists.vocabulary();
-        let mut asserted = true;
-        let mut check = |t: Triple| asserted &= base.is_asserted(t);
-        for p in predicates {
-            base.scan([None, Some(p), None], &mut check);
-        }
-        for c in classes {
-            base.scan([None, Some(rdf_type), Some(c)], &mut check);
-        }
-        asserted
-    });
-    let mut backward = lists_asserted && !deleted.iter().any(|&f| rules.is_program_fact(f));
+    let mut backward = !deleted.iter().any(|&f| rules.is_program_fact(f));
     'overdelete: while !deleted.is_empty() {
         overdeleted.clear();
         recloses.clear();
@@ -342,7 +326,7 @@ pub fn update<B: Base + ?Sized>(
                 if sources.is_empty() {
                     continue;
                 }
-                recloses.insert(p);
+                let newly = recloses.insert(p);
                 let mut before: HashSet<u64> = sources.iter().copied().collect();
                 for &a in &sources {
                     old.scan([None, Some(p), Some(a)], Seg::All, &mut |t| {
@@ -355,12 +339,43 @@ pub fn update<B: Base + ?Sized>(
                         after.insert(t[2]);
                     });
                 }
+                // With B/F (instances valid), pairs still connected by base edges keep a
+                // proof: base edges are still-asserted facts and their one-atom images
+                // (symmetry, inverses, subproperties) around the component; their closure
+                // is computed by SCC condensation.
+                let connected: HashSet<(u64, u64)> = if backward {
+                    let mut edges = Vec::new();
+                    for &u in before.iter().chain(&after) {
+                        old.scan([Some(u), None, None], Seg::All, &mut |t| {
+                            if extra.contains(t) || !base.is_asserted(t) {
+                                return;
+                            }
+                            if t[1] == p {
+                                edges.push((t[0], t[2]));
+                            }
+                            for image in old_program.one_step_images(t) {
+                                if image[1] == p && !extra.contains(image) {
+                                    edges.push((image[0], image[2]));
+                                }
+                            }
+                        });
+                    }
+                    nrese_exec::graph::transitive_closure(&edges)
+                        .into_iter()
+                        .collect()
+                } else {
+                    HashSet::new()
+                };
+                let before_len = component.len();
                 for &x in &before {
                     old.scan([Some(x), Some(p), None], Seg::All, &mut |t| {
-                        if after.contains(&t[2]) {
+                        if after.contains(&t[2]) && !connected.contains(&(t[0], t[2])) {
                             component.push(t);
                         }
                     });
+                }
+                if newly && component.len() == before_len {
+                    recloses.remove(&p);
                 }
             }
             for rule in &fresh {
@@ -455,9 +470,14 @@ pub fn update<B: Base + ?Sized>(
         if delta_facts.iter().any(|&f| schema.is_schema_fact(f)) {
             program.to_mut().ground_delta(&state, schema, &schema_rules);
         }
-        if delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
-            let list_rules = rules.list_rules(&state);
-            program.to_mut().ground(&state, schema, &list_rules);
+        if delta_facts.iter().any(|&f| rules.is_list_fact(f))
+            && let Some(vocabulary) = rules.lists
+        {
+            let (list_rules, premises, _) =
+                super::lists::instantiate_with_premises(vocabulary, &AllFacts(&state));
+            program
+                .to_mut()
+                .ground_with_premises(&state, schema, &list_rules, &premises);
         }
         let mut candidates = if program.has_pending_facts() {
             program.to_mut().take_facts()

@@ -882,7 +882,21 @@ impl GroundProgram {
     /// Grounds `rules` (fact and consistency rules) over all of `source`.
     pub fn ground<S: Source + ?Sized>(&mut self, source: &S, schema: &Schema, rules: &[Rule]) {
         for rule in rules {
-            self.ground_one(source, schema, rule, false);
+            self.ground_one(source, schema, rule, false, &[]);
+        }
+    }
+
+    /// [`Self::ground`] for rules that come with premises of their own (list rules and the
+    /// list facts they were instantiated from).
+    pub fn ground_with_premises<S: Source + ?Sized>(
+        &mut self,
+        source: &S,
+        schema: &Schema,
+        rules: &[Rule],
+        premises: &[Vec<Triple>],
+    ) {
+        for (rule, extra) in rules.iter().zip(premises) {
+            self.ground_one(source, schema, rule, false, extra);
         }
     }
 
@@ -897,7 +911,7 @@ impl GroundProgram {
     ) -> (Vec<usize>, Vec<usize>) {
         let (mut facts, mut checks) = (Vec::new(), Vec::new());
         for rule in rules {
-            let (f, c) = self.ground_one(source, schema, rule, true);
+            let (f, c) = self.ground_one(source, schema, rule, true, &[]);
             facts.extend(f);
             checks.extend(c);
         }
@@ -910,6 +924,7 @@ impl GroundProgram {
         schema: &Schema,
         rule: &Rule,
         delta: bool,
+        extra: &[Triple],
     ) -> (Vec<usize>, Vec<usize>) {
         let (mut facts, mut checks) = (Vec::new(), Vec::new());
         // Source-level transitivity rules (`scm-sco`, `scm-spo`) don't depend on the
@@ -936,6 +951,7 @@ impl GroundProgram {
                     .iter()
                     .filter(|a| schema.is_schema_atom(a))
                     .map(|a| instantiate_head(a, &g.substitution))
+                    .chain(extra.iter().copied())
                     .collect();
                 facts.extend(self.add_with(g.rule, premises));
             }
@@ -968,6 +984,27 @@ impl GroundProgram {
         let mut rules = self.rules.clone();
         rules.extend(self.transitive.iter().map(|&p| transitivity(p)));
         rules
+    }
+
+    /// The facts that one-atom rule instances derive from `fact` (symmetry, inverses,
+    /// subproperties, class hierarchy steps, ...).
+    pub fn one_step_images(&self, fact: Triple) -> Vec<Triple> {
+        let mut refs = Vec::new();
+        self.dispatch.matching_fact(fact, &mut refs);
+        let mut out = Vec::new();
+        for (r, _) in refs {
+            let rule = &self.rules[r];
+            let (1, Head::Facts(heads)) = (rule.body.len(), &rule.head) else {
+                continue;
+            };
+            let mut bindings = vec![None; rule.variables()];
+            if bind(&rule.body[0], fact, &mut bindings).is_some()
+                && guards_hold(&rule.guards, &bindings)
+            {
+                out.extend(heads.iter().map(|h| instantiate_head(h, &bindings)));
+            }
+        }
+        out
     }
 
     /// The bodies (instantiated premises, plus the schema facts the instance was grounded
