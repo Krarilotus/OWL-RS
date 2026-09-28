@@ -127,6 +127,8 @@ pub struct Materialisation {
     pub rounds: usize,
     /// Rules after grounding, at the end.
     pub ground_rules: usize,
+    /// Predicates closed by the transitive module.
+    pub transitive: usize,
 }
 
 /// Which facts an atom reads in a semi-naive variant.
@@ -663,6 +665,79 @@ fn run_jobs(store: &Store, jobs: &[Job<'_>]) -> Vec<Triple> {
         .collect()
 }
 
+/// The predicate `p` of a transitivity rule `(?x p ?y), (?y p ?z) -> (?x p ?z)`: `prp-trp`
+/// after grounding, `scm-sco` and `scm-spo` before.
+fn transitive_predicate(rule: &Rule) -> Option<u64> {
+    let ([a, b], Head::Facts(head)) = (rule.body.as_slice(), &rule.head) else {
+        return None;
+    };
+    let [Atom([hx, Term::Const(p), hz])] = head.as_slice() else {
+        return None;
+    };
+    if !rule.guards.is_empty() {
+        return None;
+    }
+    for (first, second) in [(a, b), (b, a)] {
+        let (Atom([x, Term::Const(p1), y]), Atom([y2, Term::Const(p2), z])) = (first, second)
+        else {
+            continue;
+        };
+        let distinct = matches!((x, y, z), (Term::Var(x), Term::Var(y), Term::Var(z)) if x != y && y != z && x != z);
+        if distinct && p1 == p && p2 == p && y == y2 && x == hx && z == hz {
+            return Some(*p);
+        }
+    }
+    None
+}
+
+/// The transitive module (design §4.4): for each transitive predicate, its closure by SCC
+/// condensation instead of the transitivity rule's joins, which cost O(k³) on a k-clique.
+/// It is recomputed in any round after other rules added facts over the predicate.
+#[derive(Default)]
+struct Transitive {
+    /// Each predicate with whether it needs a recomputation.
+    predicates: std::collections::BTreeMap<u64, bool>,
+    /// New facts each predicate's last recomputation produced.
+    produced: HashMap<u64, usize>,
+}
+
+impl Transitive {
+    fn register(&mut self, p: u64) {
+        self.predicates.entry(p).or_insert(true);
+    }
+
+    /// The closure facts of every predicate that needs it, not yet in `store`.
+    fn run(&mut self, store: &Store) -> Vec<Triple> {
+        self.produced.clear();
+        let mut out = Vec::new();
+        for (&p, dirty) in &mut self.predicates {
+            if !std::mem::take(dirty) {
+                continue;
+            }
+            let Some(relation) = store.relation(p) else {
+                continue;
+            };
+            let before = out.len();
+            out.extend(
+                nrese_exec::graph::transitive_closure(&relation.so)
+                    .into_iter()
+                    .filter(|&(s, o)| !relation.contains(s, o))
+                    .map(|(s, o)| [s, p, o]),
+            );
+            self.produced.insert(p, out.len() - before);
+        }
+        out
+    }
+
+    /// After a round: a predicate needs recomputing if other rules added facts over it.
+    fn observe(&mut self, store: &Store) {
+        for (p, dirty) in &mut self.predicates {
+            let added = store.relation(*p).map_or(0, |r| r.delta_so.len());
+            *dirty |= added > self.produced.get(p).copied().unwrap_or(0);
+        }
+    }
+}
+
 /// Identity of a ground rule, for deduplication (the name doesn't matter).
 type RuleKey = (Vec<Atom>, Vec<Guard>, Head);
 
@@ -679,6 +754,7 @@ pub fn materialise(
     let mut program: Vec<Rule> = Vec::new();
     let mut known: HashSet<RuleKey> = HashSet::new();
     let mut regrounding = true;
+    let mut transitive = Transitive::default();
     loop {
         result.rounds += 1;
         let mut candidates = Vec::new();
@@ -699,9 +775,15 @@ pub fn materialise(
                 result.diagnostics = diagnostics;
             }
             for rule in &source {
+                if let Some(p) = transitive_predicate(rule) {
+                    transitive.register(p);
+                    continue;
+                }
                 ground(&store, schema, rule, &mut |grounded| {
                     let rule = grounded.rule;
-                    if rule.body.is_empty() {
+                    if let Some(p) = transitive_predicate(&rule) {
+                        transitive.register(p);
+                    } else if rule.body.is_empty() {
                         let Head::Facts(heads) = &rule.head else {
                             return;
                         };
@@ -739,15 +821,18 @@ pub fn materialise(
         }
         candidates.extend(run_jobs(&store, &jobs));
         drop(jobs);
+        candidates.extend(transitive.run(&store));
         program.extend(fresh);
         let delta = store.advance(candidates);
         if delta.is_empty() {
             break;
         }
+        transitive.observe(&store);
         regrounding = delta.iter().any(|&t| schema.is_schema_fact(t));
         derived.extend(delta);
     }
     result.ground_rules = program.len();
+    result.transitive = transitive.predicates.len();
     result.violations = violations(&store, rules, lists, schema);
     derived.par_sort_unstable();
     result.derived = derived;
