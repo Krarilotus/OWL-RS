@@ -5,9 +5,11 @@
 //! - [`rulesets`]: the built-in rulesets (`rdfs`, `owl2-rl`), with the W3C rule names
 //! - [`lists`]: list axioms (chains, keys, intersections, …) compiled to fixed-arity rules
 //! - [`naive`]: the naive reference evaluator, the oracle for the fast executors
+//! - [`batch`]: the batch executor: schema grounding and parallel semi-naive evaluation
 //!
 //! Everything works on ids through a [`ir::Vocabulary`] that interns the rules' constants.
 
+pub mod batch;
 pub mod ir;
 pub mod lists;
 pub mod naive;
@@ -18,19 +20,20 @@ pub mod testing;
 mod tests {
     use std::collections::HashSet;
 
+    use super::batch::{self, Schema};
     use super::ir::Vocabulary;
     use super::lists::ListVocabulary;
-    use super::naive::{Triple, materialise};
+    use super::naive::{Triple, Violation, materialise};
     use super::rulesets::Ruleset;
     use super::testing::LocalVocabulary;
 
     const EX: &str = "http://example.com/";
 
     /// Parses `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`); `_:x` are
-    /// blank nodes.
+    /// blank nodes and `"…"^^<…>` literals (without spaces) are taken as they are.
     fn load(vocabulary: &mut LocalVocabulary, text: &str) -> Vec<Triple> {
         let term = |v: &mut LocalVocabulary, t: &str| -> u64 {
-            if t.starts_with("_:") {
+            if t.starts_with("_:") || t.starts_with('"') {
                 return v.term(t);
             }
             let (prefix, local) = t.split_once(':').unwrap();
@@ -57,14 +60,55 @@ mod tests {
             .collect()
     }
 
+    /// The naive closure of `text`, after checking that the batch executor agrees.
     fn closure(text: &str) -> (LocalVocabulary, HashSet<Triple>, Vec<String>) {
         let mut vocabulary = LocalVocabulary::default();
-        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
-        let lists = ListVocabulary::new(&mut vocabulary);
         let input = load(&mut vocabulary, text);
-        let result = materialise(&input, &rules, Some(&lists));
-        let violations = result.violations.iter().map(|v| v.rule.clone()).collect();
-        (vocabulary, result.derived, violations)
+        let (derived, violations) = both(&mut vocabulary, &input);
+        (
+            vocabulary,
+            derived,
+            violations.into_iter().map(|v| v.rule).collect(),
+        )
+    }
+
+    /// Runs both executors on `input` and asserts that they agree.
+    fn both(
+        vocabulary: &mut LocalVocabulary,
+        input: &[Triple],
+    ) -> (HashSet<Triple>, Vec<Violation>) {
+        let rules = Ruleset::Owl2Rl.rules(vocabulary).unwrap();
+        let lists = ListVocabulary::new(vocabulary);
+        let schema = Schema::owl(vocabulary);
+        let naive = materialise(input, &rules, Some(&lists));
+        let batch = batch::materialise(input, &rules, Some(&lists), &schema);
+        let mut expected: Vec<Triple> = naive.derived.iter().copied().collect();
+        expected.sort_unstable();
+        if expected != batch.derived {
+            let text = |t: &Triple| {
+                let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+                format!("{s} {p} {o}")
+            };
+            let missing: Vec<String> = expected
+                .iter()
+                .filter(|t| batch.derived.binary_search(t).is_err())
+                .take(8)
+                .map(text)
+                .collect();
+            let extra: Vec<String> = batch
+                .derived
+                .iter()
+                .filter(|t| !naive.derived.contains(*t))
+                .take(8)
+                .map(text)
+                .collect();
+            let input: Vec<String> = input.iter().map(text).collect();
+            panic!("batch differs: missing {missing:#?}, extra {extra:#?}, input {input:#?}");
+        }
+        let mut violations = naive.violations;
+        violations.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
+        assert_eq!(violations, batch.violations, "violations differ");
+        (naive.derived, violations)
     }
 
     fn has(vocabulary: &mut LocalVocabulary, derived: &HashSet<Triple>, fact: &str) -> bool {
@@ -217,5 +261,154 @@ mod tests {
         assert!(has(&mut v, &d, "ex:Mother rdfs:subClassOf ex:Female"));
         assert!(has(&mut v, &d, "ex:Mother rdfs:subClassOf ex:Woman"));
         assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    /// Random small ontologies over a vocabulary that exercises every rule table: the
+    /// batch executor equals the naive one.
+    #[test]
+    fn batch_equals_naive_on_random_ontologies() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        const CLASS_AXIOMS: [&str; 5] = [
+            "rdfs:subClassOf",
+            "owl:equivalentClass",
+            "owl:disjointWith",
+            "owl:complementOf",
+            "rdfs:subClassOf",
+        ];
+        const PROPERTY_AXIOMS: [&str; 5] = [
+            "rdfs:subPropertyOf",
+            "owl:equivalentProperty",
+            "owl:inverseOf",
+            "owl:propertyDisjointWith",
+            "rdfs:subPropertyOf",
+        ];
+        const CHARACTERISTICS: [&str; 7] = [
+            "owl:TransitiveProperty",
+            "owl:SymmetricProperty",
+            "owl:FunctionalProperty",
+            "owl:InverseFunctionalProperty",
+            "owl:IrreflexiveProperty",
+            "owl:AsymmetricProperty",
+            "owl:ObjectProperty",
+        ];
+        let (mut derived, mut violations, mut rules) =
+            (0, 0, std::collections::BTreeSet::<String>::new());
+        const CARDINALITY: [&str; 2] = [
+            "\"1\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger>",
+            "\"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger>",
+        ];
+        for case in 0..400 {
+            let class = |n: usize| format!("ex:C{n}");
+            let property = |n: usize| format!("ex:p{n}");
+            let individual = |n: usize| format!("ex:i{n}");
+            let mut lines: Vec<String> = Vec::new();
+            let list = |lines: &mut Vec<String>, name: &str, members: [String; 2]| {
+                let [a, b] = members;
+                lines.push(format!("_:{name}a rdf:first {a}"));
+                lines.push(format!("_:{name}a rdf:rest _:{name}b"));
+                lines.push(format!("_:{name}b rdf:first {b}"));
+                lines.push(format!("_:{name}b rdf:rest rdf:nil"));
+                format!("_:{name}a")
+            };
+            for n in 0..(10 + next(30)) {
+                let line = match next(12) {
+                    0 | 1 => {
+                        format!(
+                            "{} {} {}",
+                            class(next(5)),
+                            CLASS_AXIOMS[next(5)],
+                            class(next(5))
+                        )
+                    }
+                    2 => format!(
+                        "{} {} {}",
+                        property(next(4)),
+                        PROPERTY_AXIOMS[next(5)],
+                        property(next(4))
+                    ),
+                    3 => {
+                        let axiom = ["rdfs:domain", "rdfs:range"][next(2)];
+                        format!("{} {axiom} {}", property(next(4)), class(next(5)))
+                    }
+                    4 => format!(
+                        "{} rdf:type {}",
+                        property(next(4)),
+                        CHARACTERISTICS[next(7)]
+                    ),
+                    5 | 6 => format!("{} rdf:type {}", individual(next(6)), class(next(5))),
+                    7 => {
+                        // A restriction: onProperty plus a filler.
+                        let c = class(next(5));
+                        lines.push(format!("{c} owl:onProperty {}", property(next(4))));
+                        match next(5) {
+                            0 => format!("{c} owl:someValuesFrom {}", class(next(5))),
+                            1 => format!("{c} owl:allValuesFrom {}", class(next(5))),
+                            2 => format!("{c} owl:hasValue {}", individual(next(6))),
+                            n => format!("{c} owl:maxCardinality {}", CARDINALITY[n - 3]),
+                        }
+                    }
+                    8 => {
+                        let relation = ["owl:sameAs", "owl:differentFrom", "rdf:type"][next(3)];
+                        if relation == "rdf:type" {
+                            format!("{} rdf:type owl:Nothing", class(next(5)))
+                        } else {
+                            format!("{} {relation} {}", individual(next(6)), individual(next(6)))
+                        }
+                    }
+                    9 => {
+                        let name = format!("l{n}");
+                        match next(4) {
+                            0 => {
+                                let head =
+                                    list(&mut lines, &name, [class(next(5)), class(next(5))]);
+                                format!("{} owl:intersectionOf {head}", class(next(5)))
+                            }
+                            1 => {
+                                let head =
+                                    list(&mut lines, &name, [class(next(5)), class(next(5))]);
+                                format!("{} owl:unionOf {head}", class(next(5)))
+                            }
+                            2 => {
+                                let members = [property(next(4)), property(next(4))];
+                                let head = list(&mut lines, &name, members);
+                                format!("{} owl:propertyChainAxiom {head}", property(next(4)))
+                            }
+                            _ => {
+                                let head =
+                                    list(&mut lines, &name, [property(next(4)), property(next(4))]);
+                                format!("{} owl:hasKey {head}", class(next(5)))
+                            }
+                        }
+                    }
+                    _ => format!(
+                        "{} {} {}",
+                        individual(next(6)),
+                        property(next(4)),
+                        individual(next(6))
+                    ),
+                };
+                lines.push(line);
+            }
+            let mut vocabulary = LocalVocabulary::default();
+            let input = load(&mut vocabulary, &lines.join("\n"));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                both(&mut vocabulary, &input)
+            }));
+            let Ok((d, v)) = result else {
+                panic!("case {case}:\n{}", lines.join("\n"));
+            };
+            derived += d.len();
+            violations += v.len();
+            rules.extend(v.into_iter().map(|v| v.rule));
+        }
+        // The cases exercise derivations and a spread of consistency rules.
+        assert!(derived > 20_000, "{derived}");
+        assert!(rules.len() >= 8, "{violations} violations of {rules:?}");
     }
 }
