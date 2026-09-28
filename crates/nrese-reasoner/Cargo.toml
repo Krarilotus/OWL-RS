@@ -6,5 +6,7 @@ license.workspace = true
 
 [dependencies]
 nrese-core = { path = "../nrese-core" }
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
+rayon = "1.10"
 tracing.workspace = true
 

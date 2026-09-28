@@ -47,7 +47,7 @@ pub enum Guard {
     NotEqual(Term, Term),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Head {
     /// Facts to derive.
     Facts(Vec<Atom>),
