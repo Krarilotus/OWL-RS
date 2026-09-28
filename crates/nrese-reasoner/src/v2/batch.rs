@@ -364,20 +364,33 @@ impl Source for Store {
 /// classes (a term's class is the term plus its `sameAs` partners; the relation is kept
 /// closed by `eq-sym` and the transitive module). A new `sameAs` pair re-expands the facts
 /// that mention either side, so classes that grow later are covered.
-struct Equality {
+pub(crate) struct Equality {
     same_as: u64,
     /// The module's output of the last round: already expanded, so skipped once.
     produced: HashSet<Triple>,
 }
 
 /// The rules the equality module replaces.
-fn is_replacement_rule(rule: &Rule) -> bool {
+pub(crate) fn is_replacement_rule(rule: &Rule) -> bool {
     matches!(rule.name.as_str(), "eq-rep-s" | "eq-rep-p" | "eq-rep-o")
 }
 
 impl Equality {
+    /// The module for `rules`, if they include `eq-rep-s` (whose first atom names
+    /// `owl:sameAs`).
+    pub(crate) fn for_rules(rules: &[Rule]) -> Option<Self> {
+        let rule = rules.iter().find(|r| r.name == "eq-rep-s")?;
+        match rule.body.first()?.0[1] {
+            super::ir::Term::Const(same_as) => Some(Self {
+                same_as,
+                produced: HashSet::new(),
+            }),
+            super::ir::Term::Var(_) => None,
+        }
+    }
+
     /// The class of `x`: itself and its `sameAs` partners, sorted.
-    fn members(&self, store: &Store, x: u64) -> Vec<u64> {
+    fn members<S: Source + ?Sized>(&self, store: &S, x: u64) -> Vec<u64> {
         let mut members = vec![x];
         store.scan([Some(x), Some(self.same_as), None], Seg::All, &mut |t| {
             members.push(t[2]);
@@ -387,7 +400,8 @@ impl Equality {
         members
     }
 
-    fn run(&mut self, store: &Store) -> Vec<Triple> {
+    /// The expansions of the delta of `store` (see the type's docs), not yet in it.
+    pub(crate) fn run<S: Source + ?Sized>(&mut self, store: &S) -> Vec<Triple> {
         if store.estimate([None, Some(self.same_as), None], Seg::All) == 0 {
             self.produced.clear();
             return Vec::new();
@@ -554,18 +568,7 @@ pub fn materialise(
     let mut derived: Vec<Triple> = Vec::new();
     let mut program = GroundProgram::default();
     let mut transitive = Transitive::default();
-    // The equality module, if the rules include eq-rep-s (whose first atom names sameAs).
-    let mut equality =
-        rules
-            .iter()
-            .find(|r| r.name == "eq-rep-s")
-            .and_then(|r| match r.body.first()?.0[1] {
-                super::ir::Term::Const(same_as) => Some(Equality {
-                    same_as,
-                    produced: HashSet::new(),
-                }),
-                super::ir::Term::Var(_) => None,
-            });
+    let mut equality = Equality::for_rules(rules);
     let mut regrounding = true;
     loop {
         result.rounds += 1;

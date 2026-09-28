@@ -38,7 +38,7 @@ use std::borrow::Cow;
 use hashbrown::HashSet;
 use rayon::prelude::*;
 
-use super::batch::{Store, check, sorted};
+use super::batch::{Equality, Store, check, is_replacement_rule, sorted};
 use super::eval::{
     AllFacts, GroundProgram, Job, RuleKey, Schema, Seg, Source, instantiate_head, rule_key,
     run_jobs, run_jobs_acyclic, transitive_predicate,
@@ -453,6 +453,10 @@ pub fn update<B: Base + ?Sized>(
     seeds.extend_from_slice(inserted);
     let mut extra = Store::new(seeds);
     let mut module_output: HashSet<Triple> = HashSet::new();
+    // The equality module replaces eq-rep-s/p/o here, as in the batch executor.
+    let mut equality = Equality::for_rules(rules.rules);
+    let module_equality = equality.is_some();
+    let replaced = |rule: &Rule| module_equality && is_replacement_rule(rule);
     let mut reclose = recloses;
     loop {
         result.rounds += 1;
@@ -487,14 +491,19 @@ pub fn update<B: Base + ?Sized>(
         candidates.retain(|&f| !state.contains(f));
         let mut jobs = Vec::new();
         for (r, i) in program.variants(&extra) {
-            if r < evaluated {
+            if r < evaluated && !replaced(&program.rules[r]) {
                 jobs.extend(Job::variant(&state, &program.rules[r], i));
             }
         }
         for rule in &program.rules[evaluated..] {
-            jobs.extend(Job::full(&state, rule));
+            if !replaced(rule) {
+                jobs.extend(Job::full(&state, rule));
+            }
         }
         candidates.extend(run_jobs(&state, &jobs, &|fact| !state.contains(fact)));
+        if let Some(equality) = &mut equality {
+            candidates.extend(equality.run(&state));
+        }
         drop(jobs);
         // Transitive properties: newly declared ones closed in full (SCC condensation), the
         // others per new edge. The module's own pairs keep the relation closed, so the
