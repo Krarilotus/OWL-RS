@@ -90,6 +90,33 @@ Next:
 - XC5: Leapfrog Triejoin and parallelism.
 - The Docker scorecard against QLever for the Phase 2 gate.
 
+**Status (2026-09-28): Phase 3 is under way.**
+- **R1:** the rule IR, the `rdfs` and `owl2-rl` rulesets (W3C rule names), list axioms compiled per axiom (every member sequence under equality), and the naive reference evaluator.
+- **R2:** the batch executor. It grounds schema atoms against the TBox, runs parallel semi-naive evaluation over per-predicate sorted relations, and deduplicates by sort and merge.
+- **R3 (transitive module):** SCC-condensation closure (`nrese-exec::graph::transitive_closure`) replaces transitivity rules.
+- **R4a:** modes `rdfs` and `owl2-rl` materialise into the inferred stack. This happens after bulk loads, at startup (`Engine::rematerialisation`), and on every commit, inside the transaction. Consistency violations reject the commit. Queries see inferences under the default read model.
+
+Evidence:
+- The batch executor equals the naive one on 400 random ontologies covering every rule table, lists and 8 consistency rules.
+- Inferred sets are identical to the owlrl oracle or Nemo on LUBM(1/10) and OWL2Bench QL/EL/RL/DL(1).
+- All 14 LUBM(1) queries give the published counts through the native engine. LUBM(10) and (100) agree with Nemo plus Oxigraph.
+
+RT1 closure times (laptop, 16 threads):
+
+| Dataset | NRESE v2 | NRESE v1 | Jena OWL-micro | Nemo |
+|---|---|---|---|---|
+| LUBM(10) | 0.26 s | 1.5 s (incomplete) | | 35 s |
+| LUBM(100) | 3.3 s | 24 s (incomplete) | | 398 s |
+| OWL2Bench RL(1) | 0.60 s | 900 s | 1,439 s | 1,859 s |
+
+End to end on LUBM(100) (`reason_query`): load 4.7 s, reasoning with install 4.6 s, and all 14 queries in 1.2 s.
+
+Next in Phase 3:
+- R4b: the delta executor for the commit path. Commits currently recompute the closure, which is O(dataset).
+- R3: the equality (sameAs rewriting), equivalence-property and hierarchy modules.
+- The Docker scorecard with `nrese-v2` on the reference machine.
+- Tuning the LUBM(100) phases: joins 1.7 s, merge 1.1 s.
+
 **Execution core (XC), decision D11.** A new crate, `nrese-exec`, holds the ID-level execution machinery shared by SPARQL and reasoning:
 - **ID tables:** columnar `u64`, sorted on a key prefix
 - **Sorting:** radix sort
