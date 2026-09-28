@@ -178,15 +178,25 @@ fn commit_latency(
         .take(n)
         .collect();
     let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
-    for (s, c) in &pairs {
-        let triple = format!("{s} a {c}");
-        for (update, times) in [("DELETE DATA", &mut deletes), ("INSERT DATA", &mut inserts)] {
+    // Per pair: delete an asserted statement (timed), put it back, insert a statement
+    // about a new entity (timed: a fact new to the state), remove it again.
+    for (i, (s, c)) in pairs.iter().enumerate() {
+        let existing = format!("{s} a {c}");
+        let fresh = format!("<urn:nrese:bench:{i}> a {c}");
+        for (update, triple, timed) in [
+            ("DELETE DATA", &existing, Some(&mut deletes)),
+            ("INSERT DATA", &existing, None),
+            ("INSERT DATA", &fresh, Some(&mut inserts)),
+            ("DELETE DATA", &fresh, None),
+        ] {
             let command = MutationCommand::Update(SparqlUpdateRequest::new(format!(
                 "{update} {{ {triple} }}"
             )));
             let started = Instant::now();
             pipeline.apply(command, &MutationTicket::new())?;
-            times.push(started.elapsed().as_secs_f64() * 1000.0);
+            if let Some(times) = timed {
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
         }
     }
     let stats = |times: &mut Vec<f64>| {

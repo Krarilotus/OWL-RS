@@ -120,6 +120,8 @@ pub struct Update {
     /// Consistency violations that involve a fact the change added.
     pub violations: Vec<Violation>,
     pub rounds: usize,
+    /// Time per phase: program, overdelete, rederive, insert, consistency.
+    pub phases: [std::time::Duration; 5],
     /// The ground program of the state after the change, if it differs from the one given
     /// (or none was given); `None` means the given program still applies.
     pub program: Option<GroundProgram>,
@@ -132,6 +134,7 @@ impl std::fmt::Debug for Update {
             .field("remove", &self.remove.len())
             .field("violations", &self.violations)
             .field("rounds", &self.rounds)
+            .field("phases", &self.phases)
             .field("program_changed", &self.program.is_some())
             .finish()
     }
@@ -198,6 +201,11 @@ pub fn update<B: Base + ?Sized>(
     cache: Option<&GroundProgram>,
 ) -> Update {
     let mut result = Update::default();
+    let mut clock = std::time::Instant::now();
+    let mut lap = |phase: usize, result: &mut Update| {
+        result.phases[phase] += clock.elapsed();
+        clock = std::time::Instant::now();
+    };
     let schema = rules.schema;
     let empty = Store::default();
     let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
@@ -213,6 +221,7 @@ pub fn update<B: Base + ?Sized>(
     });
     let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
 
+    lap(0, &mut result);
     // 1. Overdelete, over the old state.
     let mut overdeleted: HashSet<Triple> = HashSet::new();
     if !deleted.is_empty() {
@@ -315,6 +324,7 @@ pub fn update<B: Base + ?Sized>(
         }
     }
 
+    lap(1, &mut result);
     // 2. Rederive: overdeleted and deleted facts with a derivation from what remains. The
     // program is that of the settled state, without the inserted facts: rule instances
     // that exist because of them are then new in phase 3 and evaluated in full.
@@ -345,6 +355,7 @@ pub fn update<B: Base + ?Sized>(
         .collect();
     let settled_consistency = program.consistency.len();
 
+    lap(2, &mut result);
     // 3. Insert: semi-naive from the rederived and inserted facts.
     let schema_rules = rules.schema_rules();
     let mut seeds = rederived;
@@ -422,6 +433,7 @@ pub fn update<B: Base + ?Sized>(
         }
     }
 
+    lap(3, &mut result);
     // The changes to the inferred stack.
     let mut added: Vec<Triple> = Vec::new();
     extra.scan([None, None, None], Seg::All, &mut |f| added.push(f));
@@ -469,6 +481,7 @@ pub fn update<B: Base + ?Sized>(
         &mut found,
     );
     result.violations = sorted(found);
+    lap(4, &mut result);
     result.program = match program {
         Cow::Owned(program) => Some(program),
         Cow::Borrowed(_) => None,
