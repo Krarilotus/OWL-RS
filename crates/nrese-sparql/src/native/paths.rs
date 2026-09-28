@@ -66,6 +66,7 @@ fn dedup_pairs(mut pairs: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 
 pub(crate) struct PathEvaluator<'a> {
     pub(crate) snapshot: &'a Snapshot,
+    pub(crate) model: ReadModel,
 }
 
 impl PathEvaluator<'_> {
@@ -82,7 +83,7 @@ impl PathEvaluator<'_> {
             graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
         };
         self.snapshot
-            .quads_for_pattern_in(ReadModel::Materialised, &pattern)
+            .quads_for_pattern_in(self.model, &pattern)
             .map(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()))
     }
 
@@ -97,7 +98,7 @@ impl PathEvaluator<'_> {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
         let distinct = |permutation| {
             self.snapshot
-                .group_counts_in(ReadModel::Materialised, &pattern, permutation)
+                .group_counts_in(self.model, &pattern, permutation)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(id, _)| id.raw())

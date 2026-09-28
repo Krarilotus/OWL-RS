@@ -53,6 +53,9 @@ pub struct SparqlQueryRequest {
     pub default_graphs: Vec<String>,
     /// Protocol `named-graph-uri` values.
     pub named_graphs: Vec<String>,
+    /// Which statements the query reads; `None` = asserted and inferred, unless the query
+    /// names GraphDB's pseudo-graphs `onto:explicit` / `onto:implicit` in `FROM`.
+    pub read_model: Option<nrese_engine::ReadModel>,
 }
 
 impl SparqlQueryRequest {
@@ -63,6 +66,7 @@ impl SparqlQueryRequest {
             graph_format: GraphResultFormat::NTriples,
             default_graphs: Vec::new(),
             named_graphs: Vec::new(),
+            read_model: None,
         }
     }
 }
