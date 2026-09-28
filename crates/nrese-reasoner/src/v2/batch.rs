@@ -25,10 +25,7 @@ use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 
 pub use super::eval::Schema;
-use super::eval::{
-    AllFacts, Job, RuleKey, Seg, Source, ground, ground_delta, guards_hold, instantiate_head,
-    rule_key, run_jobs, transitive_predicate,
-};
+use super::eval::{AllFacts, GroundProgram, Job, Seg, Source, guards_hold, run_jobs};
 use super::ir::{Head, Rule};
 use super::lists::{ListVocabulary, instantiate};
 use super::naive::{Triple, Violation};
@@ -99,6 +96,22 @@ fn merge(a: &[Pair], b: &[Pair]) -> Vec<Pair> {
 }
 
 impl Relation {
+    pub(crate) fn delta_len(&self) -> usize {
+        self.delta_so.len()
+    }
+
+    /// Whether the delta has a pair with object `o`.
+    pub(crate) fn delta_has_object(&self, o: u64) -> bool {
+        !range(&self.delta_os, o).is_empty()
+    }
+
+    /// Calls `f` with each distinct object of the delta.
+    pub(crate) fn delta_objects(&self, f: &mut dyn FnMut(u64)) {
+        for chunk in self.delta_os.chunk_by(|a, b| a.0 == b.0) {
+            f(chunk[0].0);
+        }
+    }
+
     pub(crate) fn contains(&self, s: u64, o: u64) -> bool {
         self.so.binary_search(&(s, o)).is_ok()
     }
@@ -184,6 +197,15 @@ impl Store {
         let mut store = Self::default();
         store.advance(input);
         store
+    }
+
+    /// The relations with a non-empty delta, with their predicates.
+    pub(crate) fn delta_relations(&self) -> impl Iterator<Item = (u64, &Relation)> {
+        self.predicates
+            .iter()
+            .zip(&self.relations)
+            .filter(|(_, r)| !r.delta_so.is_empty())
+            .map(|(&p, r)| (p, r))
     }
 
     pub(crate) fn relation(&self, p: u64) -> Option<&Relation> {
@@ -309,7 +331,7 @@ impl Transitive {
 }
 
 /// The fact rules of `rules`, plus the list rules instantiated over `source`.
-fn fact_rules<S: Source + ?Sized>(
+pub(crate) fn fact_rules<S: Source + ?Sized>(
     source: &S,
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
@@ -332,127 +354,7 @@ fn fact_rules<S: Source + ?Sized>(
     out
 }
 
-/// The ground program: evaluated rules, new rules, facts from bodiless instances and the
-/// transitive predicates.
-#[derive(Default)]
-struct Program {
-    rules: Vec<Rule>,
-    known: HashSet<RuleKey>,
-    fresh: Vec<Rule>,
-    facts: Vec<Triple>,
-    transitive: Transitive,
-}
-
-impl Program {
-    /// Files one grounded rule.
-    fn add(&mut self, rule: Rule) {
-        if let Some(p) = transitive_predicate(&rule) {
-            self.transitive.register(p);
-        } else if rule.body.is_empty() {
-            if let Head::Facts(heads) = &rule.head {
-                self.facts
-                    .extend(heads.iter().map(|h| instantiate_head(h, &[])));
-            }
-        } else if self.known.insert(rule_key(&rule)) {
-            self.fresh.push(rule);
-        }
-    }
-
-    /// Grounds `rules` over all of `source` (`full`) or through its delta only.
-    fn ground<S: Source + ?Sized>(
-        &mut self,
-        source: &S,
-        schema: &Schema,
-        rules: &[Rule],
-        full: bool,
-    ) {
-        for rule in rules {
-            if let Some(p) = transitive_predicate(rule) {
-                self.transitive.register(p);
-                continue;
-            }
-            let mut grounded = Vec::new();
-            // Rules without schema atoms (list rules among them) have no delta grounding.
-            let has_schema_atoms = rule.body.iter().any(|a| schema.is_schema_atom(a));
-            if full || !has_schema_atoms {
-                ground(source, schema, rule, &mut |g| grounded.push(g.rule));
-            } else {
-                ground_delta(source, schema, rule, &mut |g| grounded.push(g.rule));
-            }
-            for rule in grounded {
-                self.add(rule);
-            }
-        }
-    }
-}
-
-/// The closure of `input` under `rules` (plus the list rules when `lists` is given).
-pub fn materialise(
-    input: &[Triple],
-    rules: &[Rule],
-    lists: Option<&ListVocabulary>,
-    schema: &Schema,
-) -> Materialisation {
-    let clock = std::time::Instant::now();
-    let mut phases = Phases::default();
-    let mut store = Store::new(input.to_vec());
-    phases.load = clock.elapsed();
-    let mut result = Materialisation::default();
-    let mut derived: Vec<Triple> = Vec::new();
-    let mut program = Program::default();
-    let mut regrounding = true;
-    loop {
-        result.rounds += 1;
-        let clock = std::time::Instant::now();
-        if regrounding {
-            let source_rules = fact_rules(&store, rules, lists, &mut result.diagnostics);
-            // The first round grounds everything; later ones through new schema facts
-            // only. List rules are re-instantiated in full (deduplicated by `known`).
-            program.ground(&store, schema, &source_rules, result.rounds == 1);
-        }
-        phases.grounding += clock.elapsed();
-        let clock = std::time::Instant::now();
-        // Semi-naive variants of the rules already evaluated, full evaluation of new ones.
-        let mut jobs = Vec::new();
-        for rule in &program.rules {
-            for i in 0..rule.body.len() {
-                jobs.extend(Job::variant(&store, rule, i));
-            }
-        }
-        for rule in &program.fresh {
-            jobs.extend(Job::full(&store, rule));
-        }
-        let mut candidates = std::mem::take(&mut program.facts);
-        candidates.extend(run_jobs(&store, &jobs, &|fact| !store.contains(fact)));
-        drop(jobs);
-        phases.joins += clock.elapsed();
-        let clock = std::time::Instant::now();
-        candidates.extend(program.transitive.run(&store));
-        phases.modules += clock.elapsed();
-        let clock = std::time::Instant::now();
-        let fresh = std::mem::take(&mut program.fresh);
-        program.rules.extend(fresh);
-        let delta = store.advance(candidates);
-        phases.merge += clock.elapsed();
-        if delta.is_empty() {
-            break;
-        }
-        program.transitive.observe(&store);
-        regrounding = delta.iter().any(|&t| schema.is_schema_fact(t));
-        derived.extend(delta);
-    }
-    result.ground_rules = program.rules.len();
-    result.transitive = program.transitive.predicates.len();
-    let clock = std::time::Instant::now();
-    result.violations = violations(&store, rules, lists, schema);
-    phases.consistency = clock.elapsed();
-    result.phases = phases;
-    derived.par_sort_unstable();
-    result.derived = derived;
-    result
-}
-
-/// The consistency rules (plus list ones) of `rules`.
+/// The consistency rules of `rules`, plus the list ones instantiated over `source`.
 pub(crate) fn consistency_rules<S: Source + ?Sized>(
     source: &S,
     rules: &[Rule],
@@ -474,81 +376,134 @@ pub(crate) fn consistency_rules<S: Source + ?Sized>(
     out
 }
 
-/// Adds the violations of consistency rule `rule` to `found`. With `delta_only`, only
-/// those that use a fact of the delta: the semi-naive variants of the existing instances,
-/// and new instances (grounded through delta schema facts) in full.
-pub(crate) fn violations_of<S: Source + ?Sized>(
-    source: &S,
-    schema: &Schema,
-    rule: &Rule,
-    delta_only: bool,
-    found: &mut HashSet<Violation>,
-) {
-    let variables = rule.variables();
-    let record =
-        |substitution: &[Option<u64>], bindings: &[Option<u64>], found: &mut HashSet<Violation>| {
-            let bindings = (0..variables)
-                .map(|v| substitution[v].or(bindings[v]).unwrap_or(0))
-                .collect();
-            found.insert(Violation {
-                rule: rule.name.clone(),
-                bindings,
-            });
-        };
-    let evaluate =
-        |grounded: super::eval::Grounded, variants: bool, found: &mut HashSet<Violation>| {
-            let ground_rule = &grounded.rule;
-            if ground_rule.body.is_empty() {
-                if guards_hold(&ground_rule.guards, &grounded.substitution) {
-                    record(&grounded.substitution, &vec![None; variables], found);
-                }
-                return;
-            }
-            let jobs: Vec<Job<'_>> = if variants {
-                (0..ground_rule.body.len())
-                    .filter_map(|i| Job::variant(source, ground_rule, i))
-                    .collect()
-            } else {
-                Job::full(source, ground_rule).into_iter().collect()
-            };
-            for job in jobs {
-                job.run(source, 0..job.drivers(), &mut |bindings| {
-                    record(&grounded.substitution, bindings, found)
-                });
-            }
-        };
-    let mut all = Vec::new();
-    ground(source, schema, rule, &mut |g| all.push(g));
-    if !delta_only {
-        for grounded in all {
-            evaluate(grounded, false, found);
-        }
-        return;
-    }
-    // Existing instances through the delta, new instances (through delta schema facts)
-    // in full.
-    for grounded in all {
-        evaluate(grounded, true, found);
-    }
-    let mut new = Vec::new();
-    ground_delta(source, schema, rule, &mut |g| new.push(g));
-    for grounded in new {
-        evaluate(grounded, false, found);
-    }
-}
-
-/// The consistency rules' violations on the closure in `store`.
-fn violations(
-    store: &Store,
+/// The closure of `input` under `rules` (plus the list rules when `lists` is given).
+pub fn materialise(
+    input: &[Triple],
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
     schema: &Schema,
-) -> Vec<Violation> {
-    let mut found = HashSet::new();
-    for rule in consistency_rules(store, rules, lists) {
-        violations_of(store, schema, &rule, false, &mut found);
+) -> Materialisation {
+    let clock = std::time::Instant::now();
+    let mut phases = Phases::default();
+    let mut store = Store::new(input.to_vec());
+    phases.load = clock.elapsed();
+    let mut result = Materialisation::default();
+    let mut derived: Vec<Triple> = Vec::new();
+    let mut program = GroundProgram::default();
+    let mut transitive = Transitive::default();
+    let mut regrounding = true;
+    loop {
+        result.rounds += 1;
+        let clock = std::time::Instant::now();
+        // Rules from `evaluated` on were added this round: evaluated once in full.
+        let evaluated = program.rules.len();
+        if regrounding {
+            let source = fact_rules(&store, rules, lists, &mut result.diagnostics);
+            // The first round grounds everything; later ones through new schema facts
+            // only (list rules in full, deduplicated).
+            if result.rounds == 1 {
+                program.ground(&store, schema, &source);
+            } else {
+                program.ground_delta(&store, schema, &source);
+            }
+            for &p in &program.transitive {
+                transitive.register(p);
+            }
+        }
+        phases.grounding += clock.elapsed();
+        let clock = std::time::Instant::now();
+        // Semi-naive variants of the evaluated rules that can match the delta, full
+        // evaluation of the new ones.
+        let mut candidates = program.take_facts();
+        let mut jobs = Vec::new();
+        for (r, i) in program.variants(&store) {
+            if r < evaluated {
+                jobs.extend(Job::variant(&store, &program.rules[r], i));
+            }
+        }
+        for rule in &program.rules[evaluated..] {
+            jobs.extend(Job::full(&store, rule));
+        }
+        candidates.extend(run_jobs(&store, &jobs, &|fact| !store.contains(fact)));
+        drop(jobs);
+        phases.joins += clock.elapsed();
+        let clock = std::time::Instant::now();
+        candidates.extend(transitive.run(&store));
+        phases.modules += clock.elapsed();
+        let clock = std::time::Instant::now();
+        let delta = store.advance(candidates);
+        phases.merge += clock.elapsed();
+        if delta.is_empty() {
+            break;
+        }
+        transitive.observe(&store);
+        regrounding = delta.iter().any(|&t| schema.is_schema_fact(t));
+        derived.extend(delta);
     }
+    result.ground_rules = program.rules.len();
+    result.transitive = transitive.predicates.len();
+    let clock = std::time::Instant::now();
+    program.ground(&store, schema, &consistency_rules(&store, rules, lists));
+    let mut found = HashSet::new();
+    check(
+        &store,
+        &program,
+        0..program.consistency.len(),
+        &[],
+        &mut found,
+    );
+    result.violations = sorted(found);
+    phases.consistency = clock.elapsed();
+    result.phases = phases;
+    derived.par_sort_unstable();
+    result.derived = derived;
+    result
+}
+
+/// Violations sorted by rule and bindings.
+pub(crate) fn sorted(found: HashSet<Violation>) -> Vec<Violation> {
     let mut violations: Vec<Violation> = found.into_iter().collect();
     violations.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
     violations
+}
+
+/// Evaluates consistency instances into `found`: those in `full` over all facts, and the
+/// `(instance, atom)` semi-naive variants in `variants` through the delta.
+pub(crate) fn check<S: Source + ?Sized>(
+    source: &S,
+    program: &GroundProgram,
+    full: impl IntoIterator<Item = usize>,
+    variants: &[(usize, usize)],
+    found: &mut HashSet<Violation>,
+) {
+    let record = |c: usize, bindings: &[Option<u64>], found: &mut HashSet<Violation>| {
+        let (rule, grounded) = &program.consistency[c];
+        let bindings = (0..rule.variables())
+            .map(|v| grounded.substitution[v].or(bindings[v]).unwrap_or(0))
+            .collect();
+        found.insert(Violation {
+            rule: rule.name.clone(),
+            bindings,
+        });
+    };
+    let mut jobs: Vec<(usize, Job<'_>)> = Vec::new();
+    for c in full {
+        let ground_rule = &program.consistency[c].1.rule;
+        if ground_rule.body.is_empty() {
+            if guards_hold(&ground_rule.guards, &program.consistency[c].1.substitution) {
+                record(c, &vec![None; program.consistency[c].0.variables()], found);
+            }
+        } else {
+            jobs.extend(Job::full(source, ground_rule).map(|job| (c, job)));
+        }
+    }
+    for &(c, i) in variants {
+        let ground_rule = &program.consistency[c].1.rule;
+        jobs.extend(Job::variant(source, ground_rule, i).map(|job| (c, job)));
+    }
+    for (c, job) in jobs {
+        job.run(source, 0..job.drivers(), &mut |bindings| {
+            record(c, bindings, found)
+        });
+    }
 }

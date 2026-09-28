@@ -31,6 +31,10 @@ pub struct MutationPipeline {
     last_reasoning_run: RwLock<Option<ReasoningRunRecord>>,
     /// Reasoner v2's ruleset compiled against the dictionary, on first use.
     program: std::sync::OnceLock<crate::reasoning::Program>,
+    /// Reasoner v2's ground program and the committed revision it describes. Writers
+    /// outside the pipeline (bulk loads, rematerialisation) change the revision, which
+    /// invalidates it.
+    ground: std::sync::Mutex<Option<(u64, nrese_reasoner::v2::eval::GroundProgram)>>,
 }
 
 impl MutationPipeline {
@@ -40,6 +44,7 @@ impl MutationPipeline {
             reasoner,
             last_reasoning_run: RwLock::new(None),
             program: std::sync::OnceLock::new(),
+            ground: std::sync::Mutex::new(None),
         }
     }
 
@@ -92,7 +97,15 @@ impl MutationPipeline {
                 let tx = &tx;
                 crate::reasoning::Program::new(ruleset, &|term| tx.intern(term))
             });
-            let (violations, materialisation) = crate::reasoning::apply_delta(program, &mut tx);
+            let revision = tx.base().revision();
+            // Writers are serialised by the transaction, so the cache can't change meanwhile.
+            let mut ground = self.ground.lock().unwrap_or_else(|p| p.into_inner());
+            let cached = ground
+                .as_ref()
+                .filter(|(at, _)| *at == revision)
+                .map(|(_, program)| program);
+            let (violations, materialisation, changed) =
+                crate::reasoning::apply_delta(program, cached, &mut tx);
             tracing::debug!(?materialisation, "commit-path materialisation");
             if let Some(violation) = violations.first() {
                 let decode = |id: u64| {
@@ -119,6 +132,15 @@ impl MutationPipeline {
                 kind,
                 source: StoreError::Engine(error),
             })?;
+            // The program now describes the committed state.
+            match changed {
+                Some(program) => *ground = Some((summary.revision, program)),
+                None => {
+                    if let Some((at, _)) = ground.as_mut() {
+                        *at = summary.revision;
+                    }
+                }
+            }
             return Ok(report.committed(summary.revision));
         }
 
