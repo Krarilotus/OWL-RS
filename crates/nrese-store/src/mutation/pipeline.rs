@@ -21,13 +21,16 @@ use crate::service::StoreService;
 /// 4. Claim the commit through the [`MutationTicket`]; abort if the caller cancelled.
 /// 5. Commit: WAL append (durable mode), then publish.
 ///
-/// Cost: O(delta) with reasoning disabled. The v1 reasoner reads the whole dataset as
-/// strings, so enabling it costs O(dataset) per write until the M3 reasoner replaces it.
+/// Cost: O(delta) with reasoning disabled. With reasoner v2 (`rdfs`, `owl2-rl`) the delta
+/// executor maintains the inferred stack at a cost that follows the change (plus grounding
+/// against the TBox). The v1 reasoner reads the whole dataset as strings, O(dataset).
 #[derive(Debug)]
 pub struct MutationPipeline {
     store: Arc<StoreService>,
     reasoner: Arc<ReasonerService>,
     last_reasoning_run: RwLock<Option<ReasoningRunRecord>>,
+    /// Reasoner v2's ruleset compiled against the dictionary, on first use.
+    program: std::sync::OnceLock<crate::reasoning::Program>,
 }
 
 impl MutationPipeline {
@@ -36,6 +39,7 @@ impl MutationPipeline {
             store,
             reasoner,
             last_reasoning_run: RwLock::new(None),
+            program: std::sync::OnceLock::new(),
         }
     }
 
@@ -84,10 +88,13 @@ impl MutationPipeline {
 
         if let Some(ruleset) = self.reasoner.config().materialised_ruleset() {
             // Reasoner v2: the closure goes into the inferred stack, in this transaction.
-            let (closure, materialisation) =
-                crate::reasoning::apply_to_transaction(ruleset, &mut tx);
+            let program = self.program.get_or_init(|| {
+                let tx = &tx;
+                crate::reasoning::Program::new(ruleset, &|term| tx.intern(term))
+            });
+            let (violations, materialisation) = crate::reasoning::apply_delta(program, &mut tx);
             tracing::debug!(?materialisation, "commit-path materialisation");
-            if let Some(violation) = closure.violations.first() {
+            if let Some(violation) = violations.first() {
                 let decode = |id: u64| {
                     tx.decode(nrese_engine::TermId::from_raw(id))
                         .map_or_else(|| format!("#{id}"), |term| term.to_string())
@@ -97,7 +104,7 @@ impl MutationPipeline {
                 return Err(MutationError::Rejected(Box::new(MutationReject {
                     detail: format!(
                         "mutation violates {} consistency check(s); first: {} with {}",
-                        closure.violations.len(),
+                        violations.len(),
                         violation.rule,
                         bindings.join(", ")
                     ),
