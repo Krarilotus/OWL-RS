@@ -5,11 +5,15 @@
 //! - [`rulesets`]: the built-in rulesets (`rdfs`, `owl2-rl`), with the W3C rule names
 //! - [`lists`]: list axioms (chains, keys, intersections, …) compiled to fixed-arity rules
 //! - [`naive`]: the naive reference evaluator, the oracle for the fast executors
+//! - [`eval`]: rule evaluation over any [`eval::Source`]: grounding, planning, joins
 //! - [`batch`]: the batch executor: schema grounding and parallel semi-naive evaluation
+//! - [`delta`]: the delta executor: maintenance under inserts and deletes (DRed)
 //!
 //! Everything works on ids through a [`ir::Vocabulary`] that interns the rules' constants.
 
 pub mod batch;
+pub mod delta;
+pub mod eval;
 pub mod ir;
 pub mod lists;
 pub mod naive;
@@ -263,17 +267,21 @@ mod tests {
         assert!(violations.is_empty(), "{violations:?}");
     }
 
-    /// Random small ontologies over a vocabulary that exercises every rule table: the
-    /// batch executor equals the naive one.
-    #[test]
-    fn batch_equals_naive_on_random_ontologies() {
-        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-        let mut next = move |n: usize| {
+    /// A xorshift generator: `next(n)` is in `0..n`.
+    fn rng(seed: u64) -> impl FnMut(usize) -> usize {
+        let mut state = seed;
+        move |n: usize| {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             (state % n as u64) as usize
-        };
+        }
+    }
+
+    /// A random small ontology (lines for [`load`]) over a vocabulary that exercises every
+    /// rule table: hierarchies, property axioms and characteristics, restrictions,
+    /// cardinalities, equality, lists and the consistency rules.
+    fn random_ontology(next: &mut dyn FnMut(usize) -> usize) -> Vec<String> {
         const CLASS_AXIOMS: [&str; 5] = [
             "rdfs:subClassOf",
             "owl:equivalentClass",
@@ -297,104 +305,108 @@ mod tests {
             "owl:AsymmetricProperty",
             "owl:ObjectProperty",
         ];
-        let (mut derived, mut violations, mut rules) =
-            (0, 0, std::collections::BTreeSet::<String>::new());
         const CARDINALITY: [&str; 2] = [
             "\"1\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger>",
             "\"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger>",
         ];
-        for case in 0..400 {
-            let class = |n: usize| format!("ex:C{n}");
-            let property = |n: usize| format!("ex:p{n}");
-            let individual = |n: usize| format!("ex:i{n}");
-            let mut lines: Vec<String> = Vec::new();
-            let list = |lines: &mut Vec<String>, name: &str, members: [String; 2]| {
-                let [a, b] = members;
-                lines.push(format!("_:{name}a rdf:first {a}"));
-                lines.push(format!("_:{name}a rdf:rest _:{name}b"));
-                lines.push(format!("_:{name}b rdf:first {b}"));
-                lines.push(format!("_:{name}b rdf:rest rdf:nil"));
-                format!("_:{name}a")
+        let class = |n: usize| format!("ex:C{n}");
+        let property = |n: usize| format!("ex:p{n}");
+        let individual = |n: usize| format!("ex:i{n}");
+        let mut lines: Vec<String> = Vec::new();
+        let list = |lines: &mut Vec<String>, name: &str, members: [String; 2]| {
+            let [a, b] = members;
+            lines.push(format!("_:{name}a rdf:first {a}"));
+            lines.push(format!("_:{name}a rdf:rest _:{name}b"));
+            lines.push(format!("_:{name}b rdf:first {b}"));
+            lines.push(format!("_:{name}b rdf:rest rdf:nil"));
+            format!("_:{name}a")
+        };
+        for n in 0..(10 + next(30)) {
+            let line = match next(12) {
+                0 | 1 => format!(
+                    "{} {} {}",
+                    class(next(5)),
+                    CLASS_AXIOMS[next(5)],
+                    class(next(5))
+                ),
+                2 => format!(
+                    "{} {} {}",
+                    property(next(4)),
+                    PROPERTY_AXIOMS[next(5)],
+                    property(next(4))
+                ),
+                3 => {
+                    let axiom = ["rdfs:domain", "rdfs:range"][next(2)];
+                    format!("{} {axiom} {}", property(next(4)), class(next(5)))
+                }
+                4 => format!(
+                    "{} rdf:type {}",
+                    property(next(4)),
+                    CHARACTERISTICS[next(7)]
+                ),
+                5 | 6 => format!("{} rdf:type {}", individual(next(6)), class(next(5))),
+                7 => {
+                    // A restriction: onProperty plus a filler.
+                    let c = class(next(5));
+                    lines.push(format!("{c} owl:onProperty {}", property(next(4))));
+                    match next(5) {
+                        0 => format!("{c} owl:someValuesFrom {}", class(next(5))),
+                        1 => format!("{c} owl:allValuesFrom {}", class(next(5))),
+                        2 => format!("{c} owl:hasValue {}", individual(next(6))),
+                        n => format!("{c} owl:maxCardinality {}", CARDINALITY[n - 3]),
+                    }
+                }
+                8 => {
+                    let relation = ["owl:sameAs", "owl:differentFrom", "rdf:type"][next(3)];
+                    if relation == "rdf:type" {
+                        format!("{} rdf:type owl:Nothing", class(next(5)))
+                    } else {
+                        format!("{} {relation} {}", individual(next(6)), individual(next(6)))
+                    }
+                }
+                9 => {
+                    let name = format!("l{n}");
+                    match next(4) {
+                        0 => {
+                            let head = list(&mut lines, &name, [class(next(5)), class(next(5))]);
+                            format!("{} owl:intersectionOf {head}", class(next(5)))
+                        }
+                        1 => {
+                            let head = list(&mut lines, &name, [class(next(5)), class(next(5))]);
+                            format!("{} owl:unionOf {head}", class(next(5)))
+                        }
+                        2 => {
+                            let members = [property(next(4)), property(next(4))];
+                            let head = list(&mut lines, &name, members);
+                            format!("{} owl:propertyChainAxiom {head}", property(next(4)))
+                        }
+                        _ => {
+                            let head =
+                                list(&mut lines, &name, [property(next(4)), property(next(4))]);
+                            format!("{} owl:hasKey {head}", class(next(5)))
+                        }
+                    }
+                }
+                _ => format!(
+                    "{} {} {}",
+                    individual(next(6)),
+                    property(next(4)),
+                    individual(next(6))
+                ),
             };
-            for n in 0..(10 + next(30)) {
-                let line = match next(12) {
-                    0 | 1 => {
-                        format!(
-                            "{} {} {}",
-                            class(next(5)),
-                            CLASS_AXIOMS[next(5)],
-                            class(next(5))
-                        )
-                    }
-                    2 => format!(
-                        "{} {} {}",
-                        property(next(4)),
-                        PROPERTY_AXIOMS[next(5)],
-                        property(next(4))
-                    ),
-                    3 => {
-                        let axiom = ["rdfs:domain", "rdfs:range"][next(2)];
-                        format!("{} {axiom} {}", property(next(4)), class(next(5)))
-                    }
-                    4 => format!(
-                        "{} rdf:type {}",
-                        property(next(4)),
-                        CHARACTERISTICS[next(7)]
-                    ),
-                    5 | 6 => format!("{} rdf:type {}", individual(next(6)), class(next(5))),
-                    7 => {
-                        // A restriction: onProperty plus a filler.
-                        let c = class(next(5));
-                        lines.push(format!("{c} owl:onProperty {}", property(next(4))));
-                        match next(5) {
-                            0 => format!("{c} owl:someValuesFrom {}", class(next(5))),
-                            1 => format!("{c} owl:allValuesFrom {}", class(next(5))),
-                            2 => format!("{c} owl:hasValue {}", individual(next(6))),
-                            n => format!("{c} owl:maxCardinality {}", CARDINALITY[n - 3]),
-                        }
-                    }
-                    8 => {
-                        let relation = ["owl:sameAs", "owl:differentFrom", "rdf:type"][next(3)];
-                        if relation == "rdf:type" {
-                            format!("{} rdf:type owl:Nothing", class(next(5)))
-                        } else {
-                            format!("{} {relation} {}", individual(next(6)), individual(next(6)))
-                        }
-                    }
-                    9 => {
-                        let name = format!("l{n}");
-                        match next(4) {
-                            0 => {
-                                let head =
-                                    list(&mut lines, &name, [class(next(5)), class(next(5))]);
-                                format!("{} owl:intersectionOf {head}", class(next(5)))
-                            }
-                            1 => {
-                                let head =
-                                    list(&mut lines, &name, [class(next(5)), class(next(5))]);
-                                format!("{} owl:unionOf {head}", class(next(5)))
-                            }
-                            2 => {
-                                let members = [property(next(4)), property(next(4))];
-                                let head = list(&mut lines, &name, members);
-                                format!("{} owl:propertyChainAxiom {head}", property(next(4)))
-                            }
-                            _ => {
-                                let head =
-                                    list(&mut lines, &name, [property(next(4)), property(next(4))]);
-                                format!("{} owl:hasKey {head}", class(next(5)))
-                            }
-                        }
-                    }
-                    _ => format!(
-                        "{} {} {}",
-                        individual(next(6)),
-                        property(next(4)),
-                        individual(next(6))
-                    ),
-                };
-                lines.push(line);
-            }
+            lines.push(line);
+        }
+        lines
+    }
+
+    /// Random small ontologies: the batch executor equals the naive one.
+    #[test]
+    fn batch_equals_naive_on_random_ontologies() {
+        let mut next = rng(0x9E37_79B9_7F4A_7C15);
+        let (mut derived, mut violations, mut rules) =
+            (0, 0, std::collections::BTreeSet::<String>::new());
+        for case in 0..400 {
+            let lines = random_ontology(&mut next);
             let mut vocabulary = LocalVocabulary::default();
             let input = load(&mut vocabulary, &lines.join("\n"));
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -410,5 +422,143 @@ mod tests {
         // The cases exercise derivations and a spread of consistency rules.
         assert!(derived > 20_000, "{derived}");
         assert!(rules.len() >= 8, "{violations} violations of {rules:?}");
+    }
+
+    /// Random ontologies under random insert/delete sequences: after every change, the
+    /// inferred facts the delta executor maintains equal a rematerialisation, and the
+    /// violations it reports are exactly the new ones.
+    #[test]
+    fn delta_equals_rematerialisation_under_random_changes() {
+        use super::delta::{MemoryBase, update};
+
+        // NRESE_FUZZ_CASES and NRESE_FUZZ_SEED widen the sweep locally.
+        let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+        let cases = env("NRESE_FUZZ_CASES").unwrap_or(300);
+        let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x2545_F491_4F6C_DD1D));
+        let (mut changes, mut inserted, mut removed) = (0, 0, 0);
+        for case in 0..cases {
+            let lines = random_ontology(&mut next);
+            let mut vocabulary = LocalVocabulary::default();
+            let pool = load(&mut vocabulary, &lines.join("\n"));
+            let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+            let lists = ListVocabulary::new(&mut vocabulary);
+            let schema = Schema::owl(&mut vocabulary);
+            let closure =
+                |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema);
+            let mut asserted: Vec<Triple> = pool.iter().copied().filter(|_| next(10) < 7).collect();
+            asserted.sort_unstable();
+            asserted.dedup();
+            let mut before = closure(&asserted);
+            let mut inferred = before.derived.clone();
+            for step in 0..4 {
+                // Insert some facts of the pool, delete some asserted ones.
+                let insert: Vec<Triple> = pool
+                    .iter()
+                    .copied()
+                    .filter(|f| asserted.binary_search(f).is_err() && next(4) == 0)
+                    .collect();
+                let delete: Vec<Triple> =
+                    asserted.iter().copied().filter(|_| next(6) == 0).collect();
+                let mut after: Vec<Triple> = asserted
+                    .iter()
+                    .copied()
+                    .filter(|f| !delete.contains(f))
+                    .chain(insert.iter().copied())
+                    .collect();
+                after.sort_unstable();
+                after.dedup();
+                let insert: Vec<Triple> =
+                    insert.into_iter().filter(|f| !delete.contains(f)).collect();
+                // The engine drops inferred statements that become asserted.
+                let stack: Vec<Triple> = inferred
+                    .iter()
+                    .copied()
+                    .filter(|f| after.binary_search(f).is_err())
+                    .collect();
+                let base = MemoryBase::new(&after, &stack);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    update(&base, &insert, &delete, &rules, Some(&lists), &schema)
+                }));
+                let context = || {
+                    let text = |t: &Triple| {
+                        let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+                        format!("{s} {p} {o}")
+                    };
+                    format!(
+                        "case {case} step {step}\ninsert {:#?}\ndelete {:#?}\nasserted before {:#?}",
+                        insert.iter().map(text).collect::<Vec<_>>(),
+                        delete.iter().map(text).collect::<Vec<_>>(),
+                        asserted.iter().map(text).collect::<Vec<_>>()
+                    )
+                };
+                let Ok(result) = result else {
+                    panic!("{}", context());
+                };
+                changes += 1;
+                let expected = closure(&after);
+                {
+                    let removal: HashSet<Triple> = result.remove.iter().copied().collect();
+                    let mut maintained: Vec<Triple> = stack
+                        .iter()
+                        .copied()
+                        .filter(|f| !removal.contains(f))
+                        .chain(result.insert.iter().copied())
+                        .collect();
+                    maintained.sort_unstable();
+                    maintained.dedup();
+                    if maintained != expected.derived {
+                        let text = |t: &Triple| {
+                            let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+                            format!("{s} {p} {o}")
+                        };
+                        let missing: Vec<String> = expected
+                            .derived
+                            .iter()
+                            .filter(|f| maintained.binary_search(f).is_err())
+                            .map(text)
+                            .collect();
+                        let extra: Vec<String> = maintained
+                            .iter()
+                            .filter(|f| expected.derived.binary_search(f).is_err())
+                            .map(text)
+                            .collect();
+                        panic!("{}\nmissing {missing:#?}\nextra {extra:#?}", context());
+                    }
+                    inserted += result.insert.len();
+                    removed += result.remove.len();
+                    // Reported violations: all of them are violations of the new state,
+                    // and every violation the old state didn't have is reported.
+                    let new_state: HashSet<&Violation> = expected.violations.iter().collect();
+                    let old_state: HashSet<&Violation> = before.violations.iter().collect();
+                    let reported: HashSet<&Violation> = result.violations.iter().collect();
+                    assert!(
+                        reported.is_subset(&new_state),
+                        "{}\n{reported:?}",
+                        context()
+                    );
+                    for violation in new_state.difference(&old_state) {
+                        let terms: Vec<&str> = violation
+                            .bindings
+                            .iter()
+                            .map(|&id| vocabulary.text(id))
+                            .collect();
+                        assert!(
+                            reported.contains(violation),
+                            "{}\nunreported {} {terms:?}",
+                            context(),
+                            violation.rule
+                        );
+                    }
+                    inferred = maintained;
+                }
+                asserted = after;
+                before = expected;
+            }
+        }
+        assert_eq!(changes, cases * 4);
+        assert!(
+            inserted > 1000 && removed > 1000,
+            "{inserted} inserted, {removed} removed"
+        );
     }
 }

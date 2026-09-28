@@ -66,6 +66,29 @@ impl ListVocabulary {
         }
     }
 
+    /// Whether `fact` is list structure or a list axiom: the facts [`instantiate`] reads.
+    pub fn is_list_fact(&self, [_, p, o]: [u64; 3]) -> bool {
+        [
+            self.first,
+            self.rest,
+            self.property_chain_axiom,
+            self.has_key,
+            self.intersection_of,
+            self.union_of,
+            self.one_of,
+            self.members,
+            self.distinct_members,
+        ]
+        .contains(&p)
+            || (p == self.rdf_type
+                && [
+                    self.all_disjoint_classes,
+                    self.all_disjoint_properties,
+                    self.all_different,
+                ]
+                .contains(&o))
+    }
+
     /// Every member sequence of the list starting at `head`, or why it is malformed.
     ///
     /// Equality makes a node's `rdf:first` (or `rdf:rest`) ambiguous: `eq-rep-o` copies
