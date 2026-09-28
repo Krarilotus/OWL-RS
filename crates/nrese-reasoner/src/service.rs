@@ -101,7 +101,9 @@ where
         let revision = snapshot.revision();
         let plan = match self.config.mode() {
             ReasoningMode::Disabled => ReasonerExecutionPlan::validation_only(revision),
-            ReasoningMode::RulesMvp => ReasonerExecutionPlan::full_materialization(revision),
+            ReasoningMode::RulesMvp | ReasoningMode::Rdfs | ReasoningMode::Owl2Rl => {
+                ReasonerExecutionPlan::full_materialization(revision)
+            }
         };
 
         Ok(plan)
@@ -119,6 +121,11 @@ where
             ReasonerProfileConfig::Disabled => (
                 ReasonerRunStatus::Skipped,
                 vec!["reasoner mode disabled"],
+                InferenceDelta::default(),
+            ),
+            ReasonerProfileConfig::Materialise(_) => (
+                ReasonerRunStatus::Skipped,
+                vec!["reasoner v2 materialises in the store's commit path, not in this gate"],
                 InferenceDelta::default(),
             ),
             ReasonerProfileConfig::RulesMvp(rules_mvp) => {

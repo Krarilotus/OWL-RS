@@ -14,6 +14,7 @@ pub mod mutation;
 pub mod query;
 mod query_executor;
 mod rdf_io;
+pub mod reasoning;
 pub mod service;
 mod snapshot;
 mod stats;

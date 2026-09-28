@@ -1,6 +1,7 @@
 use nrese_core::{CapabilityMaturity, ReasonerCapability, ReasonerFeature};
 
 use crate::config::{ReasonerConfig, ReasonerProfileConfig, ReasoningMode, RulesMvpConfig};
+use crate::v2::rulesets::Ruleset;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReasonerProfile {
@@ -30,7 +31,31 @@ pub fn profile_for_config(config: &ReasonerConfig) -> ReasonerProfile {
             semantic_tier: rules_mvp.preset.semantic_tier(),
             capabilities: rules_mvp_capabilities(rules_mvp),
         },
+        ReasonerProfileConfig::Materialise(ruleset) => ReasonerProfile {
+            name: "nrese-v2",
+            mode: mode_name(config.mode()),
+            semantic_tier: ruleset.name(),
+            capabilities: v2_capabilities(*ruleset),
+        },
     }
+}
+
+fn v2_capabilities(ruleset: Ruleset) -> Vec<ReasonerCapability> {
+    let owl = ruleset == Ruleset::Owl2Rl;
+    let capability = |feature, enabled_by_default| ReasonerCapability {
+        feature,
+        maturity: CapabilityMaturity::Mvp,
+        enabled_by_default,
+    };
+    vec![
+        capability(ReasonerFeature::RdfsSubclassClosure, true),
+        capability(ReasonerFeature::RdfsSubpropertyClosure, true),
+        capability(ReasonerFeature::RdfsTypePropagation, true),
+        capability(ReasonerFeature::RdfsDomainRangeTyping, true),
+        capability(ReasonerFeature::OwlEqualityReasoning, owl),
+        capability(ReasonerFeature::OwlPropertyChainAxioms, owl),
+        capability(ReasonerFeature::OwlConsistencyCheck, owl),
+    ]
 }
 
 fn rules_mvp_capabilities(config: &RulesMvpConfig) -> Vec<ReasonerCapability> {
@@ -79,6 +104,8 @@ pub const fn mode_name(mode: ReasoningMode) -> &'static str {
     match mode {
         ReasoningMode::Disabled => "disabled",
         ReasoningMode::RulesMvp => "rules-mvp",
+        ReasoningMode::Rdfs => "rdfs",
+        ReasoningMode::Owl2Rl => "owl2-rl",
     }
 }
 
