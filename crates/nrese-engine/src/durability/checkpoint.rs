@@ -1,9 +1,13 @@
 //! Checkpoints: a full image of one revision (dictionary plus both index stacks).
 //!
-//! Format (little-endian): `magic | revision u64 | dictionary_len u64 | (key_len u32, key)* |
-//! quad_count u64 | (s p o g)* | inferred_count u64 | (s p o)* | crc32 u32`, where the quads
-//! are the asserted stack, the triples the inferred stack (default graph), and the CRC
-//! covers everything before it.
+//! Format 5 (little-endian): `magic | revision u64 | dictionary_len u64 | (key_len u32,
+//! key)* | stack* | crc32 u32`, where each stack (asserted, then inferred) is `count u32 |
+//! (permutation u8, packed keys)*`: every permutation of the stack's layout, compressed as
+//! in memory ([`PackedKeys::write`]). Restart reads the permutations back instead of
+//! sorting them again (Pf2). The CRC covers everything before it.
+//!
+//! Format 4 stored the stacks as quad lists (`quad_count u64 | (s p o g)* | inferred_count
+//! u64 | (s p o)*`); it is still read, and the indexes are then rebuilt.
 //!
 //! A checkpoint is written from a [`Snapshot`], so writers keep committing while it is being
 //! written. It is streamed to `checkpoint-<revision>.tmp`, synced, and atomically renamed
@@ -14,15 +18,19 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use super::codec::{Reader, put_quad, put_triple, put_u32, put_u64};
-use crate::engine::{ReadModel, Snapshot};
+use super::codec::{Reader, put_u32, put_u64};
+use crate::engine::{Snapshot, Stack};
 use crate::error::{EngineError, EngineResult};
-use crate::quad::{EncodedQuad, EncodedTriple, QuadPattern};
+use crate::index::keys::PackedKeys;
+use crate::quad::{EncodedQuad, EncodedTriple, Permutation};
 use crate::term::Dictionary;
 
 /// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
-/// version 4 made integer ids order-preserving and split literal kinds (XC1).
-const MAGIC: &[u8; 8] = b"NRESECK4";
+/// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
+/// stores the packed permutations (Pf2).
+const MAGIC: &[u8; 8] = b"NRESECK5";
+/// The previous format, still read (same terms; stacks as quad lists).
+const MAGIC_V4: &[u8; 8] = b"NRESECK4";
 /// Magic prefix shared by every checkpoint format version.
 const FAMILY: &[u8; 7] = b"NRESECK";
 const EXTENSION: &str = "nck";
@@ -77,6 +85,13 @@ impl<W: Write> Checksummed<W> {
         self.buffer.clear();
         Ok(())
     }
+
+    /// Writes and checksums `bytes` after the scratch buffer.
+    fn write_bytes(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.flush_buffer()?;
+        self.crc.update(bytes);
+        self.inner.write_all(bytes)
+    }
 }
 
 /// Writes a checkpoint of `snapshot` and returns its path.
@@ -103,18 +118,14 @@ pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
         out.flush_buffer()?;
         from = to;
     }
-    put_u64(&mut out.buffer, snapshot.len_in(ReadModel::Asserted));
-    for quad in snapshot.quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all()) {
-        put_quad(&mut out.buffer, &quad);
-        if out.buffer.len() >= 1 << 16 {
-            out.flush_buffer()?;
-        }
-    }
-    put_u64(&mut out.buffer, snapshot.len_in(ReadModel::Inferred));
-    for quad in snapshot.quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all()) {
-        put_triple(&mut out.buffer, &quad.into());
-        if out.buffer.len() >= 1 << 16 {
-            out.flush_buffer()?;
+    for stack in Stack::ALL {
+        let index = snapshot.version().stack(stack);
+        let permutations = stack.layout().permutations();
+        put_u32(&mut out.buffer, permutations.len() as u32);
+        for &permutation in permutations {
+            out.buffer.push(permutation as u8);
+            let keys = index.packed(permutation);
+            keys.write(&mut |piece| out.write_bytes(piece))?;
         }
     }
     out.flush_buffer()?;
@@ -133,8 +144,18 @@ pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
 /// A loaded checkpoint: its revision and both stacks; the dictionary is restored in place.
 pub(crate) struct Loaded {
     pub revision: u64,
-    pub quads: Vec<EncodedQuad>,
-    pub inferred: Vec<EncodedTriple>,
+    pub stacks: Stacks,
+}
+
+/// The index stacks of a checkpoint.
+pub(crate) enum Stacks {
+    /// Format 5: the packed permutations of each stack (asserted, inferred).
+    Packed([Vec<(Permutation, PackedKeys)>; 2]),
+    /// Format 4: quad lists, to be indexed again.
+    Quads {
+        quads: Vec<EncodedQuad>,
+        inferred: Vec<EncodedTriple>,
+    },
 }
 
 /// Loads the newest checkpoint into `dictionary`, if there is one.
@@ -154,13 +175,14 @@ pub(crate) fn load_latest(dir: &Path, dictionary: &Dictionary) -> EngineResult<O
         return Err(corrupt("checksum mismatch"));
     }
     let mut reader = Reader::new(body);
-    match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC => {}
+    let packed = match reader.bytes(MAGIC.len()) {
+        Some(magic) if magic == MAGIC => true,
+        Some(magic) if magic == MAGIC_V4 => false,
         Some(magic) if magic.starts_with(FAMILY) => {
             return Err(EngineError::UnsupportedFormat(path));
         }
         _ => return Err(corrupt("bad magic")),
-    }
+    };
     let revision = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
     let dictionary_len = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
     for index in 0..dictionary_len {
@@ -171,6 +193,29 @@ pub(crate) fn load_latest(dir: &Path, dictionary: &Dictionary) -> EngineResult<O
             .bytes(len as usize)
             .ok_or_else(|| corrupt("truncated dictionary"))?;
         dictionary.restore_key(index, key)?;
+    }
+    if packed {
+        let mut stacks: [Vec<(Permutation, PackedKeys)>; 2] = Default::default();
+        for stack in &mut stacks {
+            let count = reader.u32().ok_or_else(|| corrupt("truncated stack"))?;
+            for _ in 0..count {
+                let id = reader.bytes(1).ok_or_else(|| corrupt("truncated stack"))?[0];
+                let permutation = *Permutation::ALL
+                    .get(id as usize)
+                    .ok_or_else(|| corrupt("unknown permutation"))?;
+                let rest = reader.bytes(reader.remaining()).expect("remaining bytes");
+                let (keys, used) = PackedKeys::read(rest).map_err(|error| corrupt(&error))?;
+                reader = Reader::new(&rest[used..]);
+                stack.push((permutation, keys));
+            }
+        }
+        if !reader.is_done() {
+            return Err(corrupt("trailing bytes"));
+        }
+        return Ok(Some(Loaded {
+            revision,
+            stacks: Stacks::Packed(stacks),
+        }));
     }
     let count = reader.u64().ok_or_else(|| corrupt("truncated quads"))?;
     if count.saturating_mul(32) > reader.remaining() as u64 {
@@ -190,8 +235,7 @@ pub(crate) fn load_latest(dir: &Path, dictionary: &Dictionary) -> EngineResult<O
         .ok_or_else(|| corrupt("truncated inferred"))?;
     Ok(Some(Loaded {
         revision,
-        quads,
-        inferred,
+        stacks: Stacks::Quads { quads, inferred },
     }))
 }
 

@@ -18,15 +18,18 @@
 //! about terms, transactions or durability.
 
 pub(crate) mod compaction;
-mod keys;
+pub(crate) mod keys;
 mod merge;
 pub(crate) mod run;
 
 use std::ops::Range;
 use std::sync::Arc;
 
+use std::borrow::Cow;
+
+use keys::PackedKeys;
 use merge::SignedMerge;
-use run::Run;
+use run::{PermutationRun, Run};
 
 use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
 use crate::term::TermId;
@@ -124,6 +127,54 @@ impl IndexVersion {
             layout,
             ..Self::default()
         }
+    }
+
+    /// A version holding one base run built from packed permutations (a checkpoint): every
+    /// permutation of the layout exactly once, all with the same number of keys.
+    pub(crate) fn from_packed(
+        layout: Layout,
+        packed: Vec<(Permutation, PackedKeys)>,
+    ) -> Result<Self, String> {
+        let wanted = layout.permutations();
+        let complete = packed.len() == wanted.len()
+            && wanted
+                .iter()
+                .all(|p| packed.iter().filter(|(q, _)| q == p).count() == 1);
+        if !complete {
+            return Err("the checkpoint doesn't hold every permutation once".into());
+        }
+        let len = packed[0].1.len();
+        if packed.iter().any(|(_, keys)| keys.len() != len) {
+            return Err("checkpoint permutations differ in size".into());
+        }
+        let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
+        for (permutation, keys) in packed {
+            perms[permutation as usize] = PermutationRun {
+                keys,
+                tombstones: Box::default(),
+            };
+        }
+        Ok(Self::empty(layout).with_run(Run::from_permutations(layout, perms)))
+    }
+
+    /// The visible keys of `permutation` as one packed array: the run's own array when the
+    /// version is a single run without tombstones, else packed from the merged scan.
+    pub(crate) fn packed(&self, permutation: Permutation) -> Cow<'_, PackedKeys> {
+        if let [run] = &*self.runs {
+            let perm = run.permutation(permutation);
+            if perm.tombstones.is_empty() {
+                return Cow::Borrowed(&perm.keys);
+            }
+        }
+        let parts = self.runs.iter().map(|run| {
+            let perm = run.permutation(permutation);
+            (perm, 0, perm.keys.len())
+        });
+        Cow::Owned(PackedKeys::from_sorted_iter(
+            SignedMerge::new(parts)
+                .filter(|&(_, sign)| sign > 0)
+                .map(|(key, _)| key),
+        ))
     }
 
     /// A version holding exactly the (deduplicated) `quads` in one base run.
