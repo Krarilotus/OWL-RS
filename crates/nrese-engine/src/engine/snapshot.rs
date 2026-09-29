@@ -6,7 +6,7 @@ use oxrdf::{Quad, QuadRef, Term, TermRef};
 
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
-use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
+use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{Dictionary, TermId};
 
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
@@ -130,6 +130,18 @@ impl Snapshot {
     /// per stack when the matching runs hold no tombstones in range (see
     /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up.
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+        if pattern.graph == GraphSelector::AnyNamed {
+            // Every graph minus the default graph: two range counts instead of a scan.
+            let every = QuadPattern {
+                graph: GraphSelector::Any,
+                ..*pattern
+            };
+            let default = QuadPattern {
+                graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
+                ..*pattern
+            };
+            return self.count_in(model, &every) - self.count_in(model, &default);
+        }
         let plan = AccessPlan::for_pattern(pattern);
         Stack::ALL
             .into_iter()
@@ -141,6 +153,9 @@ impl Snapshot {
     /// True if some quad matches `pattern` in `model`; cheaper than
     /// [`count_in`](Self::count_in)` > 0`.
     pub fn exists_in(&self, model: ReadModel, pattern: &QuadPattern) -> bool {
+        if pattern.graph == GraphSelector::AnyNamed {
+            return self.count_in(model, pattern) > 0;
+        }
         let plan = AccessPlan::for_pattern(pattern);
         Stack::ALL
             .into_iter()
