@@ -66,6 +66,32 @@ mod tests {
             .collect()
     }
 
+    /// The schema is closed before the instance data (batch), and that pre-closure derives
+    /// `ex:a rdf:type ex:C` from the enumeration alone, which the data also asserts: it
+    /// must not be reported as derived (`both` checks that, and batch = naive).
+    #[test]
+    fn schema_pre_closure_does_not_report_asserted_facts() {
+        let (mut vocabulary, derived, _) = closure(
+            "ex:C owl:equivalentClass _:e
+             _:e owl:oneOf _:l1
+             _:l1 rdf:first ex:a
+             _:l1 rdf:rest _:l2
+             _:l2 rdf:first ex:b
+             _:l2 rdf:rest rdf:nil
+             ex:a rdf:type ex:C",
+        );
+        let mut fact = |s: &str, o: &str| {
+            use super::ir::Vocabulary;
+            [
+                vocabulary.iri(&format!("{EX}{s}")),
+                vocabulary.iri(&format!("{}type", super::ir::RDF)),
+                vocabulary.iri(&format!("{EX}{o}")),
+            ]
+        };
+        assert!(derived.contains(&fact("b", "C")));
+        assert!(!derived.contains(&fact("a", "C")), "asserted");
+    }
+
     /// The naive closure of `text`, after checking that the batch executor agrees.
     fn closure(text: &str) -> (LocalVocabulary, HashSet<Triple>, Vec<String>) {
         let mut vocabulary = LocalVocabulary::default();
@@ -100,6 +126,12 @@ mod tests {
             }
         }
         let grouped = batch::materialise_grouped(groups, &rules, Some(&lists), &schema);
+        // Derived facts never include asserted ones (the schema pre-closure must filter).
+        let asserted: HashSet<Triple> = input.iter().copied().collect();
+        assert!(
+            batch.derived.iter().all(|t| !asserted.contains(t)),
+            "asserted fact reported as derived"
+        );
         assert_eq!(grouped.derived, batch.derived, "grouped input");
         assert_eq!(grouped.violations, batch.violations, "grouped input");
         let mut expected: Vec<Triple> = naive.derived.iter().copied().collect();
