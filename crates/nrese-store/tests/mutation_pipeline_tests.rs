@@ -334,10 +334,10 @@ fn queries_choose_asserted_inferred_or_both() {
     assert!(!ask(format!("ASK {{ {tom_animal} }}"), None, &[explicit]));
 }
 
-/// The reasoning marker: set by rematerialisation, kept by v2 commits, dropped by writes
+/// The reasoning state: set by rematerialisation, kept by v2 commits, dropped by writes
 /// that don't maintain inferences, and persistent across restarts.
 #[test]
-fn reasoning_marker_tracks_whether_inferences_are_current() {
+fn reasoning_state_tracks_whether_inferences_are_current() {
     let dir = tempfile::tempdir().unwrap();
     let config = nrese_store::StoreConfig {
         mode: nrese_store::StoreMode::OnDisk,
@@ -346,12 +346,17 @@ fn reasoning_marker_tracks_whether_inferences_are_current() {
         query_cache_bytes: 0,
     };
     let ruleset = nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl;
+    let current = |store: &StoreService| {
+        store
+            .reasoning_state()
+            .is_some_and(|state| state.is_current_for(ruleset))
+    };
     let data = format!("<{EX}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{EX}Animal>");
     {
         let store = Arc::new(StoreService::new(config.clone()).expect("store"));
-        assert_eq!(store.materialised_for(), None);
+        assert!(!current(&store));
         store.rematerialise(ruleset).expect("rematerialise");
-        assert_eq!(store.materialised_for().as_deref(), Some("owl2-rl"));
+        assert!(current(&store));
         // A v2 commit keeps it.
         let pipeline = MutationPipeline::new(
             Arc::clone(&store),
@@ -362,18 +367,94 @@ fn reasoning_marker_tracks_whether_inferences_are_current() {
         pipeline
             .apply(insert(&data), &MutationTicket::new())
             .expect("commit");
-        assert_eq!(store.materialised_for().as_deref(), Some("owl2-rl"));
+        assert!(current(&store));
         // An ungated write drops it; rematerialisation restores it.
         store
             .execute_update(&SparqlUpdateRequest::new(format!(
                 "INSERT DATA {{ <{EX}tom> a <{EX}Cat> }}"
             )))
             .expect("update");
-        assert_eq!(store.materialised_for(), None);
+        assert!(!current(&store));
         store.rematerialise(ruleset).expect("rematerialise");
     }
-    let store = StoreService::new(config).expect("reopen");
-    assert_eq!(store.materialised_for().as_deref(), Some("owl2-rl"));
+    let store = StoreService::new(config.clone()).expect("reopen");
+    assert!(current(&store));
+    assert_eq!(
+        store.consistency(),
+        nrese_store::ConsistencyStatus::Consistent
+    );
     assert_eq!(store.clear_inferred().expect("clear"), 1);
-    assert_eq!(store.materialised_for(), None);
+    assert!(!current(&store));
+    drop(store);
+    // A state file from a build with other semantics (another fingerprint) isn't current.
+    let path = dir.path().join("reasoning.state");
+    std::fs::write(
+        &path,
+        "ruleset owl2-rl\nfingerprint 0000000000000001\nviolations 0\n",
+    )
+    .expect("write state");
+    let store = StoreService::new(config).expect("reopen");
+    assert!(store.reasoning_state().is_some());
+    assert!(!current(&store), "semantics changed: not current");
+}
+
+/// Inconsistent data imported without reasoning puts the store in quarantine once it is
+/// materialised: unrelated consistent commits are accepted (and revalidate), new
+/// violations are still rejected, and a repair ends the quarantine.
+#[test]
+fn inconsistent_baselines_are_quarantined_until_repaired() {
+    let store = Arc::new(StoreService::new(nrese_store::StoreConfig::in_memory()).expect("store"));
+    // Imported with reasoning off: x is in two disjoint classes.
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "INSERT DATA {{ <{EX}A> <http://www.w3.org/2002/07/owl#disjointWith> <{EX}B> .
+                           <{EX}x> a <{EX}A> , <{EX}B> }}"
+        )))
+        .expect("import");
+    let ruleset = nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl;
+    let report = store.rematerialise(ruleset).expect("rematerialise");
+    assert_eq!(report.violations, 1);
+    assert_eq!(
+        store.consistency(),
+        nrese_store::ConsistencyStatus::Inconsistent { violations: 1 }
+    );
+    let pipeline = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    // An unrelated consistent write is accepted; the store stays in quarantine.
+    pipeline
+        .apply(
+            insert(&format!("<{EX}y> a <{EX}A>")),
+            &MutationTicket::new(),
+        )
+        .expect("unrelated commit");
+    assert!(matches!(
+        store.consistency(),
+        nrese_store::ConsistencyStatus::Inconsistent { .. }
+    ));
+    // A new violation is still rejected.
+    assert!(
+        pipeline
+            .apply(
+                insert(&format!("<{EX}y> a <{EX}B>")),
+                &MutationTicket::new()
+            )
+            .is_err()
+    );
+    // The repair: x leaves B.
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "DELETE DATA {{ <{EX}x> a <{EX}B> }}"
+            ))),
+            &MutationTicket::new(),
+        )
+        .expect("repair");
+    assert_eq!(
+        store.consistency(),
+        nrese_store::ConsistencyStatus::Consistent
+    );
 }

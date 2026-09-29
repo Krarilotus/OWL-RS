@@ -32,15 +32,16 @@ pub struct StoreService {
     config: StoreConfig,
     engine: Engine,
     preloaded_ontology: Option<PathBuf>,
-    /// Whether the reasoning marker file may exist (see [`Self::materialised_for`]); saves
-    /// a file-system call per write once it is gone.
+    /// Whether the reasoning state file may exist (see [`Self::reasoning_state`]); saves a
+    /// file-system call per write once it is gone.
     marker: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// The ruleset recorded this process (also for in-memory stores, which have no file).
-    materialised: std::sync::Arc<std::sync::Mutex<Option<&'static str>>>,
+    /// The reasoning state recorded this process (also for in-memory stores, which have no
+    /// file).
+    materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
     query_cache: std::sync::Arc<crate::query_cache::QueryCache>,
 }
 
-/// The file recording which ruleset the inferred stack is exact for.
+/// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
 const REASONING_MARKER: &str = "reasoning.state";
 
 impl fmt::Debug for StoreService {
@@ -82,22 +83,27 @@ impl StoreService {
         (self.config.mode == StoreMode::OnDisk).then(|| self.config.data_dir.join(REASONING_MARKER))
     }
 
-    /// The ruleset whose closure the inferred stack holds exactly, as recorded by the last
+    /// What the inferred stack is exact for, as recorded by the last
     /// [`Self::rematerialise`] and kept by reasoner-v2 commits since; `None` if unknown
-    /// (in-memory stores, or a write that didn't maintain the inferences).
-    pub fn materialised_for(&self) -> Option<String> {
-        if let Some(ruleset) = *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) {
-            return Some(ruleset.to_owned());
+    /// (never materialised, or a write that didn't maintain the inferences).
+    pub fn reasoning_state(&self) -> Option<crate::ReasoningState> {
+        if let Some(state) = &*self.materialised.lock().unwrap_or_else(|p| p.into_inner()) {
+            return Some(state.clone());
         }
         let path = self.marker_path()?;
-        std::fs::read_to_string(path)
-            .ok()
-            .map(|text| text.trim().to_owned())
-            .filter(|name| !name.is_empty())
+        let text = std::fs::read_to_string(path).ok()?;
+        crate::ReasoningState::from_text(&text)
     }
 
-    /// Forgets the reasoning marker: called before any write that doesn't maintain the
-    /// inferred stack, so a crash can leave it missing but never stale.
+    /// Whether the data is consistent under the recorded reasoning (see
+    /// [`crate::reasoning_state`] for the quarantine this reports).
+    pub fn consistency(&self) -> crate::ConsistencyStatus {
+        self.reasoning_state()
+            .map_or(crate::ConsistencyStatus::Unknown, |state| {
+                state.consistency()
+            })
+    }
+
     pub fn invalidate_reasoning(&self) -> StoreResult<()> {
         use std::sync::atomic::Ordering;
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -114,13 +120,14 @@ impl StoreService {
         Ok(())
     }
 
-    fn record_reasoning(&self, ruleset: &'static str) -> StoreResult<()> {
-        *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(ruleset);
+    fn record_reasoning(&self, state: crate::ReasoningState) -> StoreResult<()> {
+        let text = state.to_text();
+        *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
         let Some(path) = self.marker_path() else {
             return Ok(());
         };
         let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, ruleset).map_err(crate::error::StoreError::Io)?;
+        std::fs::write(&temporary, text).map_err(crate::error::StoreError::Io)?;
         std::fs::rename(&temporary, &path).map_err(crate::error::StoreError::Io)?;
         self.marker
             .store(true, std::sync::atomic::Ordering::Release);
@@ -305,7 +312,14 @@ impl StoreService {
         let closure = crate::reasoning::materialise(&program, rematerialisation.base());
         let inferred = closure.inferred.len() as u64;
         let summary = rematerialisation.finish(closure.inferred)?;
-        self.record_reasoning(ruleset.name())?;
+        self.record_reasoning(crate::ReasoningState::of(ruleset, closure.violations.len()))?;
+        if !closure.violations.is_empty() {
+            tracing::error!(
+                ruleset = ruleset.name(),
+                violations = closure.violations.len(),
+                "the data is inconsistent: the store is in quarantine until it is repaired"
+            );
+        }
         tracing::info!(
             ruleset = ruleset.name(),
             revision = summary.revision,

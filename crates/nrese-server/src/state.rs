@@ -53,8 +53,24 @@ impl AppState {
         self.ready.store(true, Ordering::Release);
     }
 
+    /// Started and serving strictly: not in reasoning quarantine (see
+    /// `nrese_store::reasoning_state`).
     pub fn is_ready(&self) -> bool {
+        self.is_started() && !self.is_quarantined()
+    }
+
+    /// Startup has finished (the server accepts requests).
+    pub fn is_started(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+    }
+
+    /// The data is inconsistent under the configured reasoning: readable and repairable,
+    /// but not ready.
+    pub fn is_quarantined(&self) -> bool {
+        matches!(
+            self.store().consistency(),
+            nrese_store::ConsistencyStatus::Inconsistent { .. }
+        )
     }
 
     pub fn reasoner_profile_name(&self) -> &'static str {
