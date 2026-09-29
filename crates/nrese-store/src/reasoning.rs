@@ -29,6 +29,7 @@ use nrese_reasoner::v2::batch::{self, Phases, Schema};
 use nrese_reasoner::v2::delta::{self, Base, MemoryBase};
 use nrese_reasoner::v2::eval::GroundProgram;
 use nrese_reasoner::v2::ir::{Rule, Vocabulary};
+use nrese_reasoner::v2::lists::ListDiagnostic;
 use nrese_reasoner::v2::lists::ListVocabulary;
 use nrese_reasoner::v2::naive::{Triple, Violation};
 use nrese_reasoner::v2::rulesets::Ruleset;
@@ -88,9 +89,65 @@ pub struct Closure {
     /// The storable inferred statements (in the default graph).
     pub inferred: Vec<EncodedTriple>,
     pub violations: Vec<Violation>,
-    pub diagnostics: Vec<String>,
+    /// List axioms that weren't instantiated.
+    pub diagnostics: Vec<ListDiagnostic>,
     pub rounds: usize,
     pub phases: Phases,
+}
+
+/// The most diagnostics a report lists; `diagnostics_total` counts them all.
+pub const MAX_REPORTED_DIAGNOSTICS: usize = 100;
+
+/// A part of the ontology the reasoner couldn't use, with its terms decoded. Today these
+/// are list axioms (property chains, keys, intersections, unions, enumerations,
+/// AllDisjoint/AllDifferent members) whose list is malformed, cyclic or too large: their
+/// rules are missing from the closure, and nothing else is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OntologyDiagnostic {
+    /// `malformed-list`, `cyclic-list`, `too-many-list-variants` or `list-too-long`.
+    pub kind: &'static str,
+    /// The OWL 2 RL rules the axiom feeds.
+    pub rules: &'static str,
+    /// The axiom: its subject, its predicate and the list's first node.
+    pub subject: String,
+    pub predicate: String,
+    pub list: String,
+    /// The node the problem is at, for malformed and cyclic lists.
+    pub node: Option<String>,
+    pub message: String,
+}
+
+/// `found`, decoded for reports (at most [`MAX_REPORTED_DIAGNOSTICS`]).
+fn decode_diagnostics(
+    found: &[ListDiagnostic],
+    decode: &dyn Fn(u64) -> String,
+) -> Vec<OntologyDiagnostic> {
+    found
+        .iter()
+        .take(MAX_REPORTED_DIAGNOSTICS)
+        .map(|d| OntologyDiagnostic {
+            kind: d.problem.kind(),
+            rules: d.rules,
+            subject: decode(d.subject),
+            predicate: decode(d.predicate),
+            list: decode(d.head),
+            node: d.problem.node().map(decode),
+            message: d.describe(decode),
+        })
+        .collect()
+}
+
+/// Logs `diagnostics` as warnings: they mean the closure lacks those axioms' rules.
+pub(crate) fn log_diagnostics(diagnostics: &[OntologyDiagnostic], total: usize, context: &str) {
+    for diagnostic in diagnostics {
+        tracing::warn!(kind = diagnostic.kind, "{context}: {}", diagnostic.message);
+    }
+    if total > diagnostics.len() {
+        tracing::warn!(
+            omitted = total - diagnostics.len(),
+            "{context}: further ontology diagnostics omitted"
+        );
+    }
 }
 
 /// What a rematerialisation or a commit-path run did.
@@ -104,8 +161,30 @@ pub struct MaterialisationReport {
     pub inferred_inserted: u64,
     pub inferred_deleted: u64,
     pub violations: usize,
+    /// Ontology parts the reasoner couldn't use: after a rematerialisation all of them,
+    /// after a commit those the commit introduced. At most [`MAX_REPORTED_DIAGNOSTICS`].
+    pub diagnostics: Vec<OntologyDiagnostic>,
+    pub diagnostics_total: usize,
     pub rounds: usize,
     pub elapsed: Duration,
+}
+
+impl MaterialisationReport {
+    /// The report's diagnostics, decoding ids with `decode`.
+    pub(crate) fn with_diagnostics(
+        mut self,
+        found: &[ListDiagnostic],
+        decode: &dyn Fn(u64) -> String,
+    ) -> Self {
+        self.diagnostics = decode_diagnostics(found, decode);
+        self.diagnostics_total = found.len();
+        self
+    }
+}
+
+/// An id decoded for reports ([`term_text`]); `#id` if the dictionary lacks it.
+pub(crate) fn decoded(term: Option<oxrdf::Term>, id: u64) -> String {
+    term.map_or_else(|| format!("#{id}"), |term| term_text(&term))
 }
 
 /// Interns the rules' constants into the engine dictionary.
@@ -326,7 +405,11 @@ pub fn apply_delta(
         violations: update.violations.len(),
         rounds: update.rounds,
         elapsed: started.elapsed(),
-    };
+        ..MaterialisationReport::default()
+    }
+    .with_diagnostics(&update.diagnostics, &|id| {
+        decoded(tx.decode(TermId::from_raw(id)), id)
+    });
     (update.violations, report, update.program)
 }
 
@@ -364,10 +447,7 @@ pub fn explain(
     tx: &Transaction<'_>,
 ) -> nrese_reasoner::RejectExplanation {
     use nrese_reasoner::v2::ir::{Head, Term};
-    let decode = |id: u64| {
-        tx.decode(TermId::from_raw(id))
-            .map_or_else(|| format!("#{id}"), |term| term_text(&term))
-    };
+    let decode = |id: u64| decoded(tx.decode(TermId::from_raw(id)), id);
     let value = |term: Term| match term {
         Term::Const(c) => Some(c),
         Term::Var(v) => violation.bindings.get(usize::from(v)).copied(),

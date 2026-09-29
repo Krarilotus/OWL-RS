@@ -83,7 +83,7 @@ Sizes: S ≤ 1 week, M 1–3 weeks, L 3–6 weeks (one developer).
 | A4 ✅ | Configuration: unknown keys rejected (with path); `config check` command; redacted effective config | Misspelt keys fail at startup; aliases and env overrides still work; committed `2213722` |
 | A5 ✅ | CI: the harness lockfile; the exact locked CI commands pass | `cargo test --locked` for the workspace and the harness; committed `97a6a78` |
 | A6 ✅ | Honest docs: capability matrix, README, a **supported-semantics contract** (rules supported/omitted, datatype map, graph scope, read models) | Matrix, README, config reference and `/version` capabilities agree: [reasoning-semantics.md](../spec/reasoning-semantics.md); `/version` `reasoning_semantics`; profiles list only what their mode computes |
-| A7 | Ontology diagnostics through the public boundary (malformed/cyclic/oversized lists) | Materialisation and commit reports carry typed diagnostics |
+| A7 ✅ | Ontology diagnostics through the public boundary (malformed/cyclic/oversized lists) | Materialisation and commit reports carry typed diagnostics: `OntologyDiagnostic` in `MaterialisationReport` and the run record; a commit reports only what it introduced |
 | A8 | Cancellation and work budgets inside commit-path reasoning | A cancelled large reasoning update releases the writer promptly and leaves both stacks unchanged |
 
 ### Phase B: reasoning profiles, GraphDB semantic parity (2.1, 2.2), M–L

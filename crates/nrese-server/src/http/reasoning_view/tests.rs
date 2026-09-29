@@ -27,4 +27,5 @@ async fn reasoning_diagnostics_includes_reject_diagnostics_baseline() {
     assert!(text.contains("reject_diagnostics"));
     assert!(text.contains("rule-premises-plus-commit-delta-attribution"));
     assert!(text.contains("owl-equality-reasoning"));
+    assert!(text.contains("\"last_materialisation\":null"), "{text}");
 }

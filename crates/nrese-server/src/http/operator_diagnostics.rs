@@ -76,6 +76,11 @@ pub fn reasoning(state: AppState) -> Response {
             read_model: state.reasoner_read_model_name(),
             capabilities,
             last_run: last_run.as_ref().map(reasoning_view::last_run_view),
+            last_materialisation: state
+                .store()
+                .last_materialisation()
+                .as_ref()
+                .map(reasoning_view::materialisation_view),
             reject_diagnostics: reasoning_view::reject_diagnostics_baseline(last_run.as_ref()),
         }),
     )

@@ -1,7 +1,12 @@
 use crate::reject_view::reject_view;
 use nrese_store::ReasoningRunRecord;
 
-use super::types::{LastReasoningRunView, ReasoningCapabilityView, RejectDiagnosticsBaseline};
+use nrese_store::{MaterialisationReport, OntologyDiagnostic};
+
+use super::types::{
+    LastReasoningRunView, MaterialisationView, OntologyDiagnosticView, ReasoningCapabilityView,
+    RejectDiagnosticsBaseline,
+};
 
 pub fn capability_view(capability: &nrese_core::ReasonerCapability) -> ReasoningCapabilityView {
     ReasoningCapabilityView {
@@ -27,6 +32,34 @@ pub fn last_run_view(run: &ReasoningRunRecord) -> LastReasoningRunView {
             .as_ref()
             .map(|reject| reject_view(reject, run.commit_attribution.as_ref())),
         likely_commit_trigger: run.likely_commit_trigger(),
+        ontology_diagnostics: run.diagnostics.iter().map(diagnostic_view).collect(),
+        ontology_diagnostics_total: run.diagnostics_total,
+    }
+}
+
+pub fn materialisation_view(report: &MaterialisationReport) -> MaterialisationView {
+    MaterialisationView {
+        revision: report.revision,
+        ruleset: report.ruleset,
+        asserted: report.asserted,
+        inferred: report.inferred,
+        consistency_violations: report.violations,
+        rounds: report.rounds,
+        elapsed_millis: u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
+        ontology_diagnostics: report.diagnostics.iter().map(diagnostic_view).collect(),
+        ontology_diagnostics_total: report.diagnostics_total,
+    }
+}
+
+fn diagnostic_view(diagnostic: &OntologyDiagnostic) -> OntologyDiagnosticView {
+    OntologyDiagnosticView {
+        kind: diagnostic.kind,
+        rules: diagnostic.rules,
+        subject: diagnostic.subject.clone(),
+        predicate: diagnostic.predicate.clone(),
+        list: diagnostic.list.clone(),
+        node: diagnostic.node.clone(),
+        message: diagnostic.message.clone(),
     }
 }
 

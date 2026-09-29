@@ -2,7 +2,7 @@ use nrese_core::ReasonerRunStatus;
 use nrese_reasoner::RejectExplanation;
 
 use super::attribution::RejectAttribution;
-use crate::reasoning::MaterialisationReport;
+use crate::reasoning::{MaterialisationReport, OntologyDiagnostic};
 
 /// One commit-path reasoning run (reasoner v2), kept for operator diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +19,10 @@ pub struct ReasoningRunRecord {
     pub elapsed_micros: u64,
     pub primary_reject: Option<RejectExplanation>,
     pub commit_attribution: Option<RejectAttribution>,
+    /// Ontology axioms the commit made unusable (at most
+    /// [`crate::reasoning::MAX_REPORTED_DIAGNOSTICS`]), and how many there are.
+    pub diagnostics: Vec<OntologyDiagnostic>,
+    pub diagnostics_total: usize,
 }
 
 impl ReasoningRunRecord {
@@ -43,6 +47,8 @@ impl ReasoningRunRecord {
             elapsed_micros: u64::try_from(report.elapsed.as_micros()).unwrap_or(u64::MAX),
             primary_reject,
             commit_attribution,
+            diagnostics: report.diagnostics.clone(),
+            diagnostics_total: report.diagnostics_total,
         }
     }
 

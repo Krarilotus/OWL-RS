@@ -809,6 +809,8 @@ pub struct GroundProgram {
     pub consistency: Vec<(Rule, Grounded)>,
     consistency_known: HashSet<(String, Vec<Option<u64>>, RuleKey)>,
     consistency_dispatch: Dispatch,
+    /// The list axioms of the program's state that weren't instantiated.
+    pub list_diagnostics: Vec<super::lists::ListDiagnostic>,
 }
 
 impl std::fmt::Debug for GroundProgram {
