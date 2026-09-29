@@ -15,6 +15,7 @@
 
 mod expr;
 mod fast;
+mod output;
 mod paths;
 mod plan;
 mod ranges;
@@ -138,6 +139,61 @@ pub(crate) fn explain(
         Err(NativeError::Fallback) => None,
         Err(NativeError::Evaluation(error)) => Some(Err(error)),
     }
+}
+
+pub use output::ResultsFormat;
+
+/// Writes the results of a native SELECT (or, in JSON, ASK) straight from the id table
+/// ([`output`]); `None` if the query doesn't run natively (use the general path).
+pub(crate) fn write_results(
+    snapshot: &Snapshot,
+    query: &Query,
+    options: &QueryOptions,
+    format: ResultsFormat,
+    out: &mut dyn std::io::Write,
+) -> Option<Result<(), crate::query::WriteResultsError>> {
+    let (pattern, form) = native_pattern(query, options)?;
+    match form {
+        Form::Construct(_) => return None,
+        Form::Ask if format != ResultsFormat::Json => return None,
+        _ => {}
+    }
+    let ctx = Context::new(snapshot, options);
+    let solutions = match ctx.eval(pattern) {
+        Ok(solutions) => solutions,
+        Err(NativeError::Fallback) => return None,
+        Err(NativeError::Evaluation(error)) => return Some(Err(error.into())),
+    };
+    if matches!(form, Form::Ask) {
+        let bytes = output::boolean(!solutions.table.is_empty());
+        return Some(out.write_all(bytes).map_err(Into::into));
+    }
+    let computed = ctx.computed.into_inner();
+    let token = options.cancellation.clone();
+    let cancelled = || token.as_ref().is_some_and(CancellationToken::is_cancelled);
+    let alive = || {
+        if cancelled() {
+            Err(std::io::Error::other("query cancelled"))
+        } else {
+            Ok(())
+        }
+    };
+    let writer = output::DirectResults {
+        snapshot,
+        computed: &computed,
+        format,
+    };
+    Some(
+        writer
+            .write(&solutions.vars, &solutions.table, out, &alive)
+            .map_err(|error| {
+                if cancelled() {
+                    QueryEvaluationError::Cancelled.into()
+                } else {
+                    error.into()
+                }
+            }),
+    )
 }
 
 /// The quads an update removes and adds, in that order.
