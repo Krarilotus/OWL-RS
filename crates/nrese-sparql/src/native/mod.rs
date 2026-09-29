@@ -22,7 +22,7 @@ mod value;
 mod wcoj;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -40,7 +40,9 @@ use oxrdf::vocab::xsd;
 use oxrdf::{Literal, Term, Variable};
 use oxsdatatypes::{Decimal, Double, Float, Integer};
 use rayon::prelude::*;
-use spareval::{CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter};
+use spareval::{
+    CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIter,
+};
 use spargebra::Query;
 use spargebra::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
@@ -82,15 +84,25 @@ pub(crate) fn evaluate<'a>(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<Result<QueryResults<'a>, QueryEvaluationError>> {
-    let (pattern, ask) = native_pattern(query, options)?;
+    let (pattern, form) = native_pattern(query, options)?;
     let ctx = Context::new(snapshot, options);
     let solutions = match ctx.eval(pattern) {
         Ok(solutions) => solutions,
         Err(NativeError::Fallback) => return None,
         Err(NativeError::Evaluation(error)) => return Some(Err(error)),
     };
-    if ask {
-        return Some(Ok(QueryResults::Boolean(!solutions.table.is_empty())));
+    match form {
+        Form::Select => {}
+        Form::Ask => return Some(Ok(QueryResults::Boolean(!solutions.table.is_empty()))),
+        Form::Construct(template) => {
+            let Context {
+                snapshot, computed, ..
+            } = ctx;
+            let triples = construct(snapshot, computed.into_inner(), solutions, template);
+            return Some(Ok(QueryResults::Graph(QueryTripleIter::new(
+                triples.map(Ok),
+            ))));
+        }
     }
     let variables: Arc<[Variable]> = solutions.vars.clone().into();
     let Context {
@@ -128,28 +140,133 @@ pub(crate) fn explain(
     }
 }
 
-/// The pattern of a query the native executor runs, and whether it is an ASK.
+/// What a query returns.
+enum Form<'q> {
+    Select,
+    Ask,
+    /// The triples of the template, per solution.
+    Construct(&'q [TriplePattern]),
+}
+
+/// The pattern of a query the native executor runs, and the query form.
 fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
-) -> Option<(&'q GraphPattern, bool)> {
-    if options.dataset.is_some() {
+) -> Option<(&'q GraphPattern, Form<'q>)> {
+    if options.dataset.is_some() || !query_supported(query) {
         return None;
     }
-    let (pattern, ask) = match query {
-        Query::Select {
-            dataset: None,
-            pattern,
-            ..
-        } => (pattern, false),
-        Query::Ask {
-            dataset: None,
-            pattern,
-            ..
-        } => (pattern, true),
-        _ => return None,
+    match query {
+        Query::Select { pattern, .. } => Some((pattern, Form::Select)),
+        Query::Ask { pattern, .. } => Some((pattern, Form::Ask)),
+        Query::Construct {
+            template, pattern, ..
+        } => Some((pattern, Form::Construct(template))),
+        Query::Describe { .. } => None,
+    }
+}
+
+/// A position of a CONSTRUCT template, resolved against the solution columns.
+enum TemplateTerm {
+    Constant(Term),
+    Column(usize),
+    /// A variable the solutions don't bind: the template triple never applies.
+    Unbound,
+    /// The template's n-th blank node label: a fresh blank node per solution.
+    Fresh(usize),
+}
+
+/// The triples of `template` instantiated with every solution, as spareval produces them:
+/// template blank nodes are fresh per solution, triples with an unbound or ill-placed term
+/// (a literal subject, a non-IRI predicate) are skipped, and repeated triples without blank
+/// nodes are emitted once (the memory of emitted triples is bounded, as in spareval).
+fn construct<'a>(
+    snapshot: &'a Snapshot,
+    computed: Vec<Term>,
+    solutions: Solutions,
+    template: &[TriplePattern],
+) -> impl Iterator<Item = oxrdf::Triple> + 'a {
+    let mut labels: Vec<String> = Vec::new();
+    let mut resolve = |term: &TermPattern| match term {
+        TermPattern::NamedNode(n) => TemplateTerm::Constant(n.clone().into()),
+        TermPattern::Literal(l) => TemplateTerm::Constant(l.clone().into()),
+        TermPattern::BlankNode(b) => {
+            let label = b.as_str().to_owned();
+            let index = labels.iter().position(|l| *l == label).unwrap_or_else(|| {
+                labels.push(label);
+                labels.len() - 1
+            });
+            TemplateTerm::Fresh(index)
+        }
+        TermPattern::Variable(v) => solutions
+            .column(v)
+            .map_or(TemplateTerm::Unbound, TemplateTerm::Column),
+        #[allow(unreachable_patterns)]
+        _ => TemplateTerm::Unbound,
     };
-    supported(pattern).then_some((pattern, ask))
+    let resolved: Vec<[TemplateTerm; 3]> = template
+        .iter()
+        .map(|t| {
+            let predicate = match &t.predicate {
+                NamedNodePattern::NamedNode(n) => TemplateTerm::Constant(n.clone().into()),
+                NamedNodePattern::Variable(v) => solutions
+                    .column(v)
+                    .map_or(TemplateTerm::Unbound, TemplateTerm::Column),
+            };
+            [resolve(&t.subject), predicate, resolve(&t.object)]
+        })
+        .collect();
+    let fresh_count = labels.len();
+    let table = solutions.table;
+    let mut emitted: HashSet<oxrdf::Triple> = HashSet::new();
+    let mut buffer: Vec<oxrdf::Triple> = Vec::new();
+    let mut row = 0;
+    std::iter::from_fn(move || {
+        loop {
+            if let Some(triple) = buffer.pop() {
+                return Some(triple);
+            }
+            if row >= table.len() {
+                return None;
+            }
+            let fresh: Vec<oxrdf::BlankNode> = (0..fresh_count)
+                .map(|_| oxrdf::BlankNode::default())
+                .collect();
+            let value = |term: &TemplateTerm| -> Option<Term> {
+                match term {
+                    TemplateTerm::Constant(term) => Some(term.clone()),
+                    TemplateTerm::Column(c) => decode(snapshot, &computed, table.get(row, *c)),
+                    TemplateTerm::Unbound => None,
+                    TemplateTerm::Fresh(i) => Some(fresh[*i].clone().into()),
+                }
+            };
+            for [s, p, o] in &resolved {
+                let subject = match value(s) {
+                    Some(Term::NamedNode(n)) => oxrdf::NamedOrBlankNode::from(n),
+                    Some(Term::BlankNode(b)) => oxrdf::NamedOrBlankNode::from(b),
+                    _ => continue,
+                };
+                let Some(Term::NamedNode(predicate)) = value(p) else {
+                    continue;
+                };
+                let Some(object) = value(o) else {
+                    continue;
+                };
+                let triple = oxrdf::Triple::new(subject, predicate, object);
+                let new = triple.subject.is_blank_node()
+                    || triple.object.is_blank_node()
+                    || emitted.insert(triple.clone());
+                if new {
+                    buffer.push(triple);
+                    if emitted.len() > 1024 * 1024 {
+                        emitted.clear();
+                    }
+                }
+            }
+            buffer.reverse();
+            row += 1;
+        }
+    })
 }
 
 fn decode(snapshot: &Snapshot, computed: &[Term], id: u64) -> Option<Term> {
@@ -175,6 +292,12 @@ pub(crate) fn query_supported(query: &Query) -> bool {
             pattern,
             ..
         } => supported(pattern),
+        Query::Construct {
+            dataset: None,
+            template,
+            pattern,
+            ..
+        } => supported(pattern) && template.iter().all(supported_triple),
         _ => false,
     }
 }
@@ -183,6 +306,7 @@ pub(crate) fn query_supported(query: &Query) -> bool {
 pub(crate) fn supported(pattern: &GraphPattern) -> bool {
     match pattern {
         GraphPattern::Bgp { patterns } => patterns.iter().all(supported_triple),
+        GraphPattern::Graph { inner, .. } => supported(inner) && scans_everywhere(inner),
         GraphPattern::Path {
             subject, object, ..
         } => supported_term(subject) && supported_term(object),
@@ -233,6 +357,29 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
                     }
                 })
         }
+        _ => false,
+    }
+}
+
+/// True if every solution of `pattern` comes from triple patterns in every branch, so inside
+/// `GRAPH ?g` each row binds `?g` from a scan (and inside `GRAPH <g>` each row needs a
+/// match in `<g>`). Patterns that can produce rows without a scan (VALUES, empty groups,
+/// aggregates, BIND alone, nested GRAPH, property paths) stay on spareval there.
+fn scans_everywhere(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Bgp { patterns } => !patterns.is_empty(),
+        GraphPattern::Join { left, right } => scans_everywhere(left) || scans_everywhere(right),
+        GraphPattern::Union { left, right } => scans_everywhere(left) && scans_everywhere(right),
+        GraphPattern::LeftJoin { left, .. } | GraphPattern::Minus { left, .. } => {
+            scans_everywhere(left)
+        }
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Extend { inner, .. }
+        | GraphPattern::Project { inner, .. }
+        | GraphPattern::Distinct { inner }
+        | GraphPattern::Reduced { inner }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Slice { inner, .. } => scans_everywhere(inner),
         _ => false,
     }
 }
@@ -387,6 +534,19 @@ struct Context<'a> {
     trace: Option<RefCell<Vec<PlanStep>>>,
     /// Nesting depth of the operator being evaluated (for the trace).
     depth: Cell<usize>,
+    /// The graph that triple patterns match in (`GRAPH`).
+    graph: RefCell<GraphScope>,
+}
+
+/// The active graph of triple patterns.
+#[derive(Clone, Debug)]
+enum GraphScope {
+    Default,
+    Named(TermId),
+    /// `GRAPH ?g`: any named graph, bound to the variable.
+    Variable(Variable),
+    /// `GRAPH <g>` for a graph the store doesn't know: nothing matches.
+    Missing,
 }
 
 impl<'a> Context<'a> {
@@ -404,6 +564,7 @@ impl<'a> Context<'a> {
                 .map_or_else(Budget::unlimited, Budget::new),
             trace: None,
             depth: Cell::new(0),
+            graph: RefCell::new(GraphScope::Default),
         }
     }
 
@@ -549,6 +710,22 @@ impl<'a> Context<'a> {
         self.check()?;
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns, &[]),
+            GraphPattern::Graph { name, inner } => {
+                let scope = match name {
+                    NamedNodePattern::NamedNode(n) => self
+                        .snapshot
+                        .lookup(n.as_ref().into())
+                        .map_or(GraphScope::Missing, GraphScope::Named),
+                    NamedNodePattern::Variable(v) => GraphScope::Variable(v.clone()),
+                };
+                let outer = self.graph.replace(scope);
+                let result = self.eval(inner);
+                *self.graph.borrow_mut() = outer;
+                result
+            }
+            GraphPattern::Path { .. } if !matches!(*self.graph.borrow(), GraphScope::Default) => {
+                Err(NativeError::Fallback)
+            }
             GraphPattern::Path {
                 subject,
                 path,
@@ -825,6 +1002,9 @@ impl<'a> Context<'a> {
                 let Slot::Var(object) = &s.slots[2] else {
                     return None;
                 };
+                if !s.in_default_graph() {
+                    return None;
+                }
                 let hint = hints.iter().find(|h| &h.variable == object)?;
                 let permutation = s.permutation_for(Some(object));
                 (s.first_free(permutation) == Some(2) && !s.repeats_variable())
@@ -853,6 +1033,7 @@ impl<'a> Context<'a> {
         let start = Instant::now();
         if scans.len() >= 3
             && ranged.iter().all(Option::is_none)
+            && scans.iter().all(ScanPattern::in_default_graph)
             && let Some(solutions) = self.cyclic_bgp(&scans, &counts)?
         {
             if self.trace.is_some() {
@@ -963,7 +1144,10 @@ impl<'a> Context<'a> {
             Permutation::Gosp,
             Permutation::Gpso,
         ];
-        let positions: Vec<usize> = (0..3).filter(|&c| scan.slots[c].is_var(var)).collect();
+        if !scan.in_default_graph() {
+            return count;
+        }
+        let positions: Vec<usize> = (0..4).filter(|&c| scan.slots[c].is_var(var)).collect();
         let [position] = positions[..] else {
             return count;
         };
@@ -998,10 +1182,11 @@ impl<'a> Context<'a> {
         let patterns: Vec<[wcoj::Pos; 3]> = scans
             .iter()
             .map(|scan| {
-                scan.slots.clone().map(|slot| match slot {
+                // Default-graph patterns only (checked by the caller): the graph is constant.
+                [0, 1, 2].map(|c| match &scan.slots[c] {
                     Slot::Const(id) => wcoj::Pos::Const(id.raw()),
                     Slot::Var(v) => {
-                        wcoj::Pos::Var(vars.iter().position(|x| *x == v).expect("collected above"))
+                        wcoj::Pos::Var(vars.iter().position(|x| x == v).expect("collected above"))
                     }
                 })
             })
@@ -1093,8 +1278,19 @@ impl<'a> Context<'a> {
             NamedNodePattern::Variable(v) => Slot::Var(v.clone()),
             NamedNodePattern::NamedNode(n) => Slot::Const(self.snapshot.lookup(n.as_ref().into())?),
         };
+        let graph = match &*self.graph.borrow() {
+            GraphScope::Default => Slot::Const(TermId::DEFAULT_GRAPH),
+            GraphScope::Named(id) => Slot::Const(*id),
+            GraphScope::Variable(v) => Slot::Var(v.clone()),
+            GraphScope::Missing => return None,
+        };
         Some(ScanPattern {
-            slots: [slot(&triple.subject)?, predicate, slot(&triple.object)?],
+            slots: [
+                slot(&triple.subject)?,
+                predicate,
+                slot(&triple.object)?,
+                graph,
+            ],
         })
     }
 
@@ -1105,7 +1301,7 @@ impl<'a> Context<'a> {
         let vars = scan.vars();
         let columns_of: Vec<Vec<usize>> = vars
             .iter()
-            .map(|v| (0..3).filter(|&i| scan.slots[i].is_var(v)).collect())
+            .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
         let mut table = IdTable::new(vars.len());
         let mut row = vec![0u64; vars.len()];
@@ -1117,7 +1313,7 @@ impl<'a> Context<'a> {
             if n % (1 << 16) == 0 {
                 self.check()?;
             }
-            let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
+            let components = quad.components();
             for (slot, positions) in row.iter_mut().zip(&columns_of) {
                 let value = components[positions[0]];
                 // A variable used twice in one pattern must bind the same term.
@@ -1132,7 +1328,6 @@ impl<'a> Context<'a> {
         let order: Vec<usize> = permutation
             .order()
             .iter()
-            .filter(|&&component| component < 3)
             .filter_map(|&component| match &scan.slots[component] {
                 Slot::Var(v) => vars.iter().position(|x| x == v),
                 Slot::Const(_) => None,
@@ -1165,7 +1360,7 @@ impl<'a> Context<'a> {
         let columns: Vec<usize> = vars
             .iter()
             .map(|v| {
-                (0..3)
+                (0..4)
                     .find(|&i| scan.slots[i].is_var(v))
                     .expect("variable of the pattern")
             })
@@ -1183,7 +1378,7 @@ impl<'a> Context<'a> {
                 if n % (1 << 16) == 0 {
                     self.check()?;
                 }
-                let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
+                let components = quad.components();
                 for (slot, &c) in row.iter_mut().zip(&columns) {
                     *slot = components[c];
                 }
@@ -1230,11 +1425,11 @@ impl<'a> Context<'a> {
         // Where each new variable sits in a matching quad (the shared ones become constants).
         let positions: Vec<Vec<usize>> = new_vars
             .iter()
-            .map(|v| (0..3).filter(|&i| scan.slots[i].is_var(v)).collect())
+            .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
         let shared_positions: Vec<Vec<usize>> = shared
             .iter()
-            .map(|v| (0..3).filter(|&i| scan.slots[i].is_var(v)).collect())
+            .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
         let probe = Probe {
             snapshot: self.snapshot,
@@ -1424,7 +1619,7 @@ impl<'a> Context<'a> {
         };
         let places: Vec<Vec<usize>> = vars_unique
             .iter()
-            .map(|v| (0..3).filter(|&i| scan.slots[i].is_var(v)).collect())
+            .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
         let mut out = IdTable::new(width);
         let mut chunk = IdTable::new(width);
@@ -1435,7 +1630,7 @@ impl<'a> Context<'a> {
         loop {
             let more = quads.next();
             if let Some(quad) = more {
-                let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
+                let components = quad.components();
                 let consistent = places.iter().zip(row.iter_mut()).all(|(p, slot)| {
                     *slot = components[p[0]];
                     p[1..].iter().all(|&i| components[i] == *slot)
@@ -1782,7 +1977,9 @@ impl<'a> Context<'a> {
             && let [triple] = patterns.as_slice()
         {
             let count = match self.scan_pattern(triple) {
-                Some(scan) if !scan.repeats_variable() => self.snapshot.count(&scan.quad_pattern()),
+                Some(scan) if !scan.repeats_variable() => {
+                    self.snapshot.count_in(self.model, &scan.quad_pattern())
+                }
                 Some(scan) => self.scan(&scan, None)?.table.len() as u64,
                 None => 0,
             };
@@ -1804,7 +2001,7 @@ impl<'a> Context<'a> {
             && aggregates
                 .iter()
                 .all(|(_, aggregate)| counts_rows(aggregate, &scan))
-            && let Some(component) = (0..3).find(|&c| scan.slots[c].is_var(key))
+            && let Some(component) = (0..4).find(|&c| scan.slots[c].is_var(key))
         {
             let permutation = scan.permutation_for(Some(key));
             if scan.first_free(permutation) == Some(component)
@@ -2093,7 +2290,7 @@ impl Probe<'_> {
                     .snapshot
                     .quads_for_pattern_in(self.model, &bound.quad_pattern())
                 {
-                    let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
+                    let components = quad.components();
                     let mut values = Vec::with_capacity(self.positions.len());
                     for places in self.positions {
                         let value = components[places[0]];
@@ -2486,10 +2683,11 @@ impl Slot {
     }
 }
 
-/// A triple pattern over the default graph, with constants resolved to ids.
+/// A triple pattern with constants resolved to ids, in a graph: `slots[3]` is the default
+/// graph, a named graph, or a graph variable (any named graph, inside `GRAPH ?g`).
 #[derive(Clone, Debug)]
 struct ScanPattern {
-    slots: [Slot; 3],
+    slots: [Slot; 4],
 }
 
 impl ScanPattern {
@@ -2502,11 +2700,20 @@ impl ScanPattern {
             subject: constant(&self.slots[0]),
             predicate: constant(&self.slots[1]),
             object: constant(&self.slots[2]),
-            graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
+            graph: match &self.slots[3] {
+                Slot::Const(id) => GraphSelector::Exact(*id),
+                Slot::Var(_) => GraphSelector::AnyNamed,
+            },
         }
     }
 
-    /// Distinct variables in subject, predicate, object order.
+    /// True if the pattern is in the default graph (statistics, ranges and the
+    /// worst-case-optimal join assume it).
+    fn in_default_graph(&self) -> bool {
+        matches!(self.slots[3], Slot::Const(id) if id == TermId::DEFAULT_GRAPH)
+    }
+
+    /// Distinct variables in subject, predicate, object, graph order.
     fn vars(&self) -> Vec<Variable> {
         let mut vars: Vec<Variable> = Vec::new();
         for slot in &self.slots {
@@ -2519,13 +2726,12 @@ impl ScanPattern {
         vars
     }
 
-    /// The first component of `permutation`'s order that this pattern leaves unbound (the
-    /// graph is always bound: patterns are in the default graph).
+    /// The first component of `permutation`'s order that this pattern leaves unbound.
     fn first_free(&self, permutation: Permutation) -> Option<usize> {
         permutation
             .order()
             .into_iter()
-            .find(|&c| c < 3 && matches!(self.slots[c], Slot::Var(_)))
+            .find(|&c| matches!(self.slots[c], Slot::Var(_)))
     }
 
     fn repeats_variable(&self) -> bool {
@@ -2543,34 +2749,36 @@ impl ScanPattern {
         names.len() != before
     }
 
-    /// A graph-first permutation (the pattern is in the default graph) whose free part starts
-    /// with `sort_var`, if one exists; any usable one otherwise.
+    /// A permutation whose free part starts with `sort_var`, if one exists; any usable one
+    /// otherwise. A constant graph takes a graph-first order, a graph variable a graph-last
+    /// one (its graph range is not a prefix).
     fn permutation_for(&self, sort_var: Option<&Variable>) -> Permutation {
-        const CANDIDATES: [Permutation; 4] = [
+        const GRAPH_FIRST: [Permutation; 4] = [
             Permutation::Gspo,
             Permutation::Gpos,
             Permutation::Gosp,
             Permutation::Gpso,
         ];
-        let pattern = self.quad_pattern();
-        let bound =
-            |component: usize| component == 3 || matches!(self.slots[component], Slot::Const(_));
+        const GRAPH_LAST: [Permutation; 3] =
+            [Permutation::Spog, Permutation::Posg, Permutation::Ospg];
+        let candidates: &[Permutation] = match self.slots[3] {
+            Slot::Const(_) => &GRAPH_FIRST,
+            Slot::Var(_) => &GRAPH_LAST,
+        };
+        let bound = |component: usize| matches!(self.slots[component], Slot::Const(_));
         let usable = |p: &Permutation| {
             let order = p.order();
             let prefix = order.iter().take_while(|&&c| bound(c)).count();
             order[prefix..].iter().all(|&c| !bound(c))
         };
         let first_free = |p: &Permutation| p.order().into_iter().find(|&c| !bound(c));
-        let wanted = sort_var.and_then(|v| (0..3).find(|&c| self.slots[c].is_var(v)));
-        CANDIDATES
+        let wanted = sort_var.and_then(|v| (0..4).find(|&c| self.slots[c].is_var(v)));
+        candidates
             .iter()
             .copied()
             .filter(usable)
             .find(|p| wanted.is_none() || first_free(p) == wanted)
-            .or_else(|| CANDIDATES.iter().copied().find(usable))
-            .inspect(|_| {
-                debug_assert_eq!(pattern.graph, GraphSelector::Exact(TermId::DEFAULT_GRAPH))
-            })
-            .expect("GSPO answers every default-graph pattern with a bound prefix")
+            .or_else(|| candidates.iter().copied().find(usable))
+            .expect("GSPO or SPOG/POSG/OSPG answer every pattern with a bound prefix")
     }
 }

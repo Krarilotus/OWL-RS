@@ -21,7 +21,7 @@ impl EncodedQuad {
         }
     }
 
-    pub(crate) const fn components(self) -> [u64; 4] {
+    pub const fn components(self) -> [u64; 4] {
         [
             self.subject.raw(),
             self.predicate.raw(),
