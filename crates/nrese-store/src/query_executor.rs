@@ -16,7 +16,8 @@ use nrese_engine::ReadModel;
 
 use nrese_sparql::{
     CancellationToken, Explanation, QueryDatasetSpecification, QueryEvaluationError, QueryOptions,
-    QueryResults, ReadView, evaluate_query, explain_query,
+    QueryResults, ReadView, ResultsFormat, WriteResultsError, evaluate_query, explain_query,
+    write_results,
 };
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode};
 use oxrdfio::RdfSerializer;
@@ -216,6 +217,22 @@ pub(crate) fn run_query(
         )),
         false => Ok(()),
     };
+    let mut out = out;
+    let format = match prepared.solutions_format {
+        SolutionsResultFormat::Json => Some(ResultsFormat::Json),
+        SolutionsResultFormat::Tsv => Some(ResultsFormat::Tsv),
+        SolutionsResultFormat::Csv => Some(ResultsFormat::Csv),
+        SolutionsResultFormat::Xml => None,
+    };
+    if let Some(format) = format
+        && matches!(prepared.query, Query::Select { .. } | Query::Ask { .. })
+        && let Some(written) = write_results(view, &prepared.query, &options, format, &mut out)
+    {
+        return written.map_err(|error| match error {
+            WriteResultsError::Evaluation(error) => StoreError::SparqlEvaluation(error),
+            WriteResultsError::Io(error) => StoreError::Io(error),
+        });
+    }
     match evaluate_query(view, &prepared.query, &options)? {
         QueryResults::Boolean(value) => {
             QueryResultsSerializer::from_format(prepared.solutions_format.results_format())

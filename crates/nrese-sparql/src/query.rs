@@ -50,6 +50,34 @@ pub fn evaluate_query<'a, V: ReadView>(
     prepared.execute(EngineDataset::with_model(view, options.read_model))
 }
 
+/// A failure while writing results directly ([`write_results`]).
+#[derive(Debug, thiserror::Error)]
+pub enum WriteResultsError {
+    #[error(transparent)]
+    Evaluation(#[from] QueryEvaluationError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// Writes the results of `query` as SPARQL 1.1 Query Results JSON, TSV or CSV to `out`,
+/// directly from the native executor's id table: byte for byte what serialising
+/// [`evaluate_query`]'s results gives, without building terms and solutions per row.
+/// `None` if the query doesn't run natively here (a transaction view, CONSTRUCT, ASK in
+/// TSV/CSV, `force_spareval`, an unsupported operator): then serialise
+/// [`evaluate_query`]'s results. On error the output is partial.
+pub fn write_results<V: ReadView>(
+    view: &V,
+    query: &Query,
+    options: &QueryOptions,
+    format: crate::ResultsFormat,
+    out: &mut dyn std::io::Write,
+) -> Option<Result<(), WriteResultsError>> {
+    if options.force_spareval {
+        return None;
+    }
+    crate::native::write_results(view.snapshot()?, query, options, format, out)
+}
+
 /// One operator of a query run, as [`explain_query`] reports it (EXPLAIN ANALYZE).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanStep {

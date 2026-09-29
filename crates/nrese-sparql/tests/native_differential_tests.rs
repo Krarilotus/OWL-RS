@@ -1174,3 +1174,114 @@ fn deletions_precede_insertions() {
         assert_eq!(contents(&engine).len(), 1, "spareval: {force_spareval}");
     }
 }
+
+/// SPARQL JSON, TSV and CSV written straight from the id table are byte for byte what the
+/// results serialiser writes from the decoded solutions, over random queries and data with
+/// every term kind, number forms and every character the formats escape.
+#[test]
+fn direct_results_equal_the_results_serialiser() {
+    use nrese_sparql::{ResultsFormat, write_results};
+    use sparesults::{QueryResultsFormat, QueryResultsSerializer};
+
+    let serialised = |results: QueryResults<'_>, format: QueryResultsFormat| -> Vec<u8> {
+        let serializer = QueryResultsSerializer::from_format(format);
+        let mut out = Vec::new();
+        match results {
+            QueryResults::Solutions(solutions) => {
+                let mut writer = serializer
+                    .serialize_solutions_to_writer(&mut out, solutions.variables().to_vec())
+                    .unwrap();
+                for solution in solutions {
+                    writer.serialize(&solution.unwrap()).unwrap();
+                }
+                writer.finish().unwrap();
+            }
+            QueryResults::Boolean(value) => {
+                serializer
+                    .serialize_boolean_to_writer(&mut out, value)
+                    .unwrap();
+            }
+            QueryResults::Graph(_) => unreachable!(),
+        }
+        out
+    };
+    let tricky: Vec<Term> = vec![
+        Literal::new_simple_literal("quote \" backslash \\ newline \n tab \t").into(),
+        Literal::new_simple_literal("control \u{1} \u{1f} \u{8} \u{c} \r and unicode é ü 漢字 😀")
+            .into(),
+        Literal::new_language_tagged_literal_unchecked("hello", "en-GB").into(),
+        Literal::new_typed_literal("custom", NamedNode::new_unchecked("http://example.com/dt"))
+            .into(),
+        Literal::new_typed_literal("typed string", xsd::STRING).into(),
+        oxrdf::BlankNode::new_unchecked("b1").into(),
+        NamedNode::new_unchecked("http://example.com/a\"b").into(),
+        Literal::new_simple_literal("comma, and \"quotes\"").into(),
+        Literal::new_typed_literal("+007", xsd::INTEGER).into(),
+        Literal::new_typed_literal("1.", xsd::DECIMAL).into(),
+        Literal::new_typed_literal(".5e3", xsd::DOUBLE).into(),
+        Literal::new_typed_literal("NaN", xsd::DOUBLE).into(),
+        Literal::new_typed_literal("1", xsd::BOOLEAN).into(),
+    ];
+    let mut rng = Rng(20_260_933);
+    let mut checked = 0;
+    for _ in 0..60 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        for (i, object) in tricky.iter().enumerate() {
+            let quad = Quad::new(
+                ex(&format!("e{}", i % 6)),
+                ex("p0"),
+                object.clone(),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..25 {
+            let (text, _) = random_query(&mut rng);
+            let text = match rng.below(4) {
+                // A computed value (not in the dictionary) with characters JSON escapes.
+                0 if !text.starts_with("SELECT *") => {
+                    text.replacen("SELECT", "SELECT (CONCAT(\"\\\"x\\n\", STR(?a)) AS ?z)", 1)
+                }
+                1 => format!("ASK {{ {} }}", triple(&mut rng)),
+                _ => text,
+            };
+            let Ok(query) = SparqlParser::new().parse_query(&text) else {
+                continue;
+            };
+            for (format, reference) in [
+                (ResultsFormat::Json, QueryResultsFormat::Json),
+                (ResultsFormat::Tsv, QueryResultsFormat::Tsv),
+                (ResultsFormat::Csv, QueryResultsFormat::Csv),
+            ] {
+                let mut direct = Vec::new();
+                let Some(written) = write_results(
+                    &snapshot,
+                    &query,
+                    &QueryOptions::default(),
+                    format,
+                    &mut direct,
+                ) else {
+                    continue;
+                };
+                written.unwrap();
+                let expected = serialised(
+                    evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                    reference,
+                );
+                assert_eq!(
+                    String::from_utf8(direct).unwrap(),
+                    String::from_utf8(expected).unwrap(),
+                    "{format:?}: {text}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 3000, "{checked}");
+}
