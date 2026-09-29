@@ -3,7 +3,8 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::policy::{
-    PolicyConfig, RateLimitConfig, RequestLimits, RequestTimeouts, SparqlParseErrorProfile,
+    DEFAULT_QUERY_MEMORY_BYTES, PolicyConfig, RateLimitConfig, RequestLimits, RequestTimeouts,
+    SparqlParseErrorProfile,
 };
 
 use super::auth_env::parse_auth_config;
@@ -16,6 +17,11 @@ pub(super) fn parse_policy_config(source: &dyn ConfigSource) -> Result<PolicyCon
         auth: parse_auth_config(source)?,
         limits: RequestLimits {
             max_query_bytes: parse_usize(source, names::MAX_QUERY_BYTES, 1_048_576)?,
+            max_query_memory_bytes: parse_usize(
+                source,
+                names::MAX_QUERY_MEMORY_BYTES,
+                DEFAULT_QUERY_MEMORY_BYTES,
+            )?,
             max_update_bytes: parse_usize(source, names::MAX_UPDATE_BYTES, 1_048_576)?,
             max_rdf_upload_bytes: parse_usize(source, names::MAX_RDF_UPLOAD_BYTES, 10_485_760)?,
         },

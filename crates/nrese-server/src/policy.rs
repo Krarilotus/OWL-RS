@@ -70,14 +70,20 @@ pub enum SparqlParseErrorProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestLimits {
     pub max_query_bytes: usize,
+    /// Bytes of intermediate results one query may hold; 0 is unlimited.
+    pub max_query_memory_bytes: usize,
     pub max_update_bytes: usize,
     pub max_rdf_upload_bytes: usize,
 }
+
+/// Default per-query memory: 4 GiB.
+pub const DEFAULT_QUERY_MEMORY_BYTES: usize = 4 << 30;
 
 impl Default for RequestLimits {
     fn default() -> Self {
         Self {
             max_query_bytes: 1_048_576,
+            max_query_memory_bytes: DEFAULT_QUERY_MEMORY_BYTES,
             max_update_bytes: 1_048_576,
             max_rdf_upload_bytes: 10_485_760,
         }

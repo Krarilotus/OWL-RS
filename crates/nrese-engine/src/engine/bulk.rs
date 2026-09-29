@@ -162,7 +162,11 @@ fn publish(engine: &Inner, next: Version) -> EngineResult<()> {
         Some(durable) => {
             let revision = next.revision;
             let _checkpoint = durable.checkpoint_slot.lock();
-            let image = Snapshot::new(Arc::clone(&next), Arc::clone(&shared.dictionary));
+            let image = Snapshot::new(
+                Arc::clone(&next),
+                Arc::clone(&shared.dictionary),
+                Arc::clone(&shared.statistics),
+            );
             checkpoint::write(durable.root(), &image)?;
             // The checkpoint covers every logged revision: later commits start a new
             // segment, and all older segments can go.

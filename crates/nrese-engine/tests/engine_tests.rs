@@ -255,3 +255,77 @@ fn random_transactions_match_a_model() {
         assert_eq!(all_quads(&engine), model);
     }
 }
+
+/// Distinct counts (planner statistics) equal the distinct values among the matches, and
+/// the cached estimate follows the data once it drifts.
+#[test]
+fn distinct_counts_match_the_data() {
+    use nrese_engine::ReadModel;
+    use nrese_engine::quad::Permutation;
+
+    let engine = inline_engine();
+    let mut state = 7u64;
+    let mut next = |n: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (state >> 33) % n
+    };
+    for round in 0..6 {
+        let mut tx = engine.transaction();
+        for _ in 0..300 {
+            tx.insert(quad(next(200), 1000 + next(3), next(50)).as_ref());
+        }
+        if round % 2 == 1 {
+            for _ in 0..100 {
+                tx.remove(quad(next(200), 1000 + next(3), next(50)).as_ref());
+            }
+        }
+        tx.commit().expect("commit");
+    }
+    let snapshot = engine.snapshot();
+    let default = GraphSelector::Exact(nrese_engine::TermId::DEFAULT_GRAPH);
+    for p in 1000..1003 {
+        let predicate = snapshot.lookup(iri(p).as_ref().into());
+        let pattern = QuadPattern {
+            subject: None,
+            predicate,
+            object: None,
+            graph: default,
+        };
+        let matches: Vec<_> = snapshot.quads_for_pattern(&pattern).collect();
+        let subjects: HashSet<_> = matches.iter().map(|q| q.subject).collect();
+        let objects: HashSet<_> = matches.iter().map(|q| q.object).collect();
+        for (permutation, expected) in [
+            (Permutation::Gpso, subjects.len()),
+            (Permutation::Gpos, objects.len()),
+        ] {
+            let model = ReadModel::Materialised;
+            assert_eq!(
+                snapshot.distinct_in(model, &pattern, permutation),
+                Some(expected as u64)
+            );
+            assert_eq!(
+                snapshot.distinct_estimate_in(model, &pattern, permutation),
+                Some(expected as u64)
+            );
+        }
+    }
+    let all = QuadPattern {
+        subject: None,
+        predicate: None,
+        object: None,
+        graph: default,
+    };
+    let predicates = |snapshot: &nrese_engine::Snapshot| {
+        snapshot.distinct_estimate_in(ReadModel::Materialised, &all, Permutation::Gpso)
+    };
+    assert_eq!(predicates(&snapshot), Some(3));
+    // More than a quarter more matches: the estimate is recomputed.
+    let mut tx = engine.transaction();
+    for s in 0..2000 {
+        tx.insert(quad(s, 2000 + s % 4, 0).as_ref());
+    }
+    tx.commit().expect("commit");
+    assert_eq!(predicates(&engine.snapshot()), Some(7));
+}

@@ -231,6 +231,34 @@ impl IndexVersion {
         }
     }
 
+    /// Appends the distinct values at key `position` of each run's range for `plan` (sorted
+    /// per run; values may repeat across runs). Tombstones are ignored: for estimates.
+    pub(crate) fn distinct_values(&self, plan: &AccessPlan, position: usize, out: &mut Vec<u64>) {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return;
+        };
+        let position = if adapted.permutation == plan.permutation {
+            position
+        } else if position == 0 {
+            if self.count_plan(plan) > 0 {
+                out.push(TermId::DEFAULT_GRAPH.raw());
+            }
+            return;
+        } else {
+            position - 1
+        };
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            let mut i = start;
+            while i < end {
+                let value = perm.keys[i][position];
+                out.push(value);
+                i += perm.keys[i..end].partition_point(|key| key[position] <= value);
+            }
+        }
+    }
+
     pub(crate) fn scan_plan(&self, plan: &AccessPlan) -> QuadScan<'_> {
         let Some(plan) = self.layout.adapt(plan) else {
             return QuadScan {

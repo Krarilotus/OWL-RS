@@ -39,6 +39,16 @@ impl StoreError {
     /// True if the request is at fault (syntax, invalid IRIs or payloads, unsupported query
     /// features) rather than the store. Transports map these to client errors. A cancelled
     /// evaluation is neither: the transport decides what cancelled it.
+    /// The query needed more memory than its limit
+    /// ([`SparqlQueryRequest::memory_limit`](crate::SparqlQueryRequest::memory_limit)).
+    pub fn is_memory_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::SparqlEvaluation(QueryEvaluationError::Dataset(error))
+                if error.downcast_ref::<nrese_sparql::BudgetExceeded>().is_some()
+        )
+    }
+
     pub fn is_request_error(&self) -> bool {
         match self {
             Self::SparqlSyntax(_)

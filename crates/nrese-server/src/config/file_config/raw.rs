@@ -59,6 +59,8 @@ pub(super) struct RawLimitsConfig {
     #[serde(default)]
     pub max_query_bytes: Option<usize>,
     #[serde(default)]
+    pub max_query_memory_bytes: Option<usize>,
+    #[serde(default)]
     pub max_update_bytes: Option<usize>,
     #[serde(default)]
     pub max_rdf_upload_bytes: Option<usize>,

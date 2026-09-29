@@ -12,7 +12,7 @@
 //! The first variable's candidates are split across threads (rayon); each thread extends
 //! its share depth-first and collects rows. The output is unordered.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use rayon::prelude::*;
@@ -30,11 +30,24 @@ pub(super) struct Query<'a> {
     pub model: ReadModel,
     pub patterns: Vec<[Pos; 3]>,
     pub variables: usize,
+    /// Solutions allowed (the query's memory budget).
+    pub max_rows: usize,
 }
 
 /// Why a join stopped early.
 pub(super) enum Stop {
     Cancelled,
+    TooManyRows,
+}
+
+/// Solutions a thread produces between two checks of the shared row count.
+const ROW_STEP: usize = 4096;
+
+/// State shared by the threads of one join.
+struct Shared<'t> {
+    cancelled: AtomicBool,
+    rows: AtomicUsize,
+    token: &'t (dyn Fn() -> bool + Sync),
 }
 
 /// Whether the variable graph of `patterns` has a cycle: patterns connect the variables
@@ -180,24 +193,29 @@ impl Query<'_> {
         depth: usize,
         bindings: &mut Vec<Option<u64>>,
         rows: &mut Vec<u64>,
-        cancelled: &AtomicBool,
-        token: &dyn Fn() -> bool,
+        shared: &Shared<'_>,
     ) -> Result<(), Stop> {
         let Some(&var) = order.get(depth) else {
             rows.extend(bindings.iter().map(|b| b.expect("every variable is bound")));
+            if (rows.len() / self.variables.max(1)).is_multiple_of(ROW_STEP) {
+                let total = shared.rows.fetch_add(ROW_STEP, Ordering::Relaxed) + ROW_STEP;
+                if total > self.max_rows {
+                    return Err(Stop::TooManyRows);
+                }
+            }
             return Ok(());
         };
         let Some(values) = self.candidates(var, bindings) else {
             return Ok(());
         };
         for (n, value) in values.into_iter().enumerate() {
-            if n % 1024 == 0 && (cancelled.load(Ordering::Relaxed) || token()) {
-                cancelled.store(true, Ordering::Relaxed);
+            if n % 1024 == 0 && (shared.cancelled.load(Ordering::Relaxed) || (shared.token)()) {
+                shared.cancelled.store(true, Ordering::Relaxed);
                 return Err(Stop::Cancelled);
             }
             bindings[var] = Some(value);
             if self.consistent(var, bindings) {
-                self.extend(order, depth + 1, bindings, rows, cancelled, token)?;
+                self.extend(order, depth + 1, bindings, rows, shared)?;
             }
         }
         bindings[var] = None;
@@ -211,7 +229,11 @@ impl Query<'_> {
         let Some(first) = self.candidates(order[0], &bindings) else {
             return Ok(Vec::new());
         };
-        let cancelled = AtomicBool::new(false);
+        let shared = Shared {
+            cancelled: AtomicBool::new(false),
+            rows: AtomicUsize::new(0),
+            token,
+        };
         let chunks: Vec<Result<Vec<u64>, Stop>> = first
             .par_chunks(256)
             .map(|chunk| {
@@ -220,7 +242,7 @@ impl Query<'_> {
                 for &value in chunk {
                     bindings[order[0]] = Some(value);
                     if self.consistent(order[0], &bindings) {
-                        self.extend(&order, 1, &mut bindings, &mut rows, &cancelled, token)?;
+                        self.extend(&order, 1, &mut bindings, &mut rows, &shared)?;
                     }
                 }
                 Ok(rows)
@@ -229,6 +251,9 @@ impl Query<'_> {
         let mut rows = Vec::new();
         for chunk in chunks {
             rows.extend(chunk?);
+        }
+        if rows.len() / self.variables.max(1) > self.max_rows {
+            return Err(Stop::TooManyRows);
         }
         Ok(rows)
     }

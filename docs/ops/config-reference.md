@@ -145,6 +145,7 @@ api_key = "replace-me"
 ## Policy Limits
 
 - `policy.limits.max_query_bytes` -> `NRESE_MAX_QUERY_BYTES`
+- `policy.limits.max_query_memory_bytes` -> `NRESE_MAX_QUERY_MEMORY_BYTES`: bytes of intermediate results one query may hold (default 4 GiB, `0` = unlimited). A query that needs more is rejected with `413` instead of growing the server's memory.
 - `policy.limits.max_update_bytes` -> `NRESE_MAX_UPDATE_BYTES`
 - `policy.limits.max_rdf_upload_bytes` -> `NRESE_MAX_RDF_UPLOAD_BYTES`
 
