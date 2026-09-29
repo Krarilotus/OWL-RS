@@ -30,6 +30,9 @@ pub struct UpdateOptions {
     /// `DELETE`/`INSERT ... WHERE` operation, replacing its own `USING` clauses.
     pub using: Option<QueryDatasetSpecification>,
     pub cancellation: Option<CancellationToken>,
+    /// Evaluate `WHERE` clauses on spareval even where the native executor could
+    /// (differential testing).
+    pub force_spareval: bool,
 }
 
 #[derive(Debug, Error)]
@@ -91,26 +94,55 @@ fn apply_operation(
             using,
             pattern,
         } => {
-            let evaluator = evaluator(options.cancellation.as_ref());
-            let mut prepared = evaluator.prepare_delete_insert(
-                delete.clone(),
-                insert.clone(),
-                update.base_iri.clone(),
-                using.clone(),
-                pattern,
-            );
-            if let Some(dataset) = &options.using {
-                *prepared.dataset_mut() = dataset.clone();
-            }
+            // Natively when the WHERE reads only committed data: the first operation of a
+            // request, or after operations that changed nothing.
+            let native = (!options.force_spareval
+                && options.using.is_none()
+                && using.is_none()
+                && update.base_iri.is_none()
+                && tx.pending() == (0, 0)
+                && tx.inferred_pending() == (0, 0))
+                .then(|| {
+                    let query_options = crate::query::QueryOptions {
+                        cancellation: options.cancellation.clone(),
+                        ..crate::query::QueryOptions::default()
+                    };
+                    crate::native::delete_insert(tx.base(), pattern, delete, insert, &query_options)
+                })
+                .flatten();
             // The whole WHERE result is computed against the state before this operation.
-            let changes = prepared
-                .execute(EngineDataset::new(&*tx))?
-                .collect::<Result<Vec<_>, _>>()?;
-            for change in changes {
-                match change {
-                    DeleteInsertQuad::Delete(quad) => tx.remove(quad.as_ref()),
-                    DeleteInsertQuad::Insert(quad) => tx.insert(quad.as_ref()),
-                };
+            let (deletes, inserts) = match native {
+                Some(changes) => changes?,
+                None => {
+                    let evaluator = evaluator(options.cancellation.as_ref());
+                    let mut prepared = evaluator.prepare_delete_insert(
+                        delete.clone(),
+                        insert.clone(),
+                        update.base_iri.clone(),
+                        using.clone(),
+                        pattern,
+                    );
+                    if let Some(dataset) = &options.using {
+                        *prepared.dataset_mut() = dataset.clone();
+                    }
+                    let mut deletes = Vec::new();
+                    let mut inserts = Vec::new();
+                    for change in prepared.execute(EngineDataset::new(&*tx))? {
+                        match change? {
+                            DeleteInsertQuad::Delete(quad) => deletes.push(quad),
+                            DeleteInsertQuad::Insert(quad) => inserts.push(quad),
+                        }
+                    }
+                    (deletes, inserts)
+                }
+            };
+            // Every deletion before any insertion (SPARQL 1.1 Update 3.1.3): a quad one
+            // solution deletes and another inserts is present afterwards.
+            for quad in &deletes {
+                tx.remove(quad.as_ref());
+            }
+            for quad in &inserts {
+                tx.insert(quad.as_ref());
             }
         }
         GraphUpdateOperation::Load { silent, source, .. } => {
