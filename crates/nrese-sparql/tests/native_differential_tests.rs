@@ -457,3 +457,106 @@ fn count_star_of_one_pattern_reads_the_index() {
         );
     }
 }
+
+/// Cyclic BGPs (triangles, 4-cycles, with types, constants, repeated variables and a
+/// variable predicate) over dense graphs: the worst-case-optimal join equals spareval.
+#[test]
+fn cyclic_bgps_equal_spareval() {
+    let mut rng = Rng(20_260_929);
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..QueryOptions::default()
+    };
+    let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    let mut checked = 0;
+    for _ in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for _ in 0..40 + rng.below(120) {
+            let quad = Quad::new(
+                ex(&format!("e{}", rng.below(8))),
+                ex(&format!("p{}", rng.below(3))),
+                ex(&format!("e{}", rng.below(8))),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+        for e in 0..8 {
+            if rng.below(2) == 0 {
+                let quad = Quad::new(
+                    ex(&format!("e{e}")),
+                    NamedNode::new_unchecked(rdf_type),
+                    ex(&format!("T{}", rng.below(2))),
+                    GraphName::DefaultGraph,
+                );
+                tx.insert(quad.as_ref());
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..25 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(3));
+            let edge = |rng: &mut Rng, a: &str, b: &str| {
+                let predicate = p(rng);
+                if rng.below(2) == 0 {
+                    format!("{a} {predicate} {b} .")
+                } else {
+                    format!("{b} {predicate} {a} .")
+                }
+            };
+            let mut body = match rng.below(6) {
+                0 | 1 => format!(
+                    "{} {} {}",
+                    edge(&mut rng, "?a", "?b"),
+                    edge(&mut rng, "?b", "?c"),
+                    edge(&mut rng, "?c", "?a")
+                ),
+                2 => format!(
+                    "{} {} {} {}",
+                    edge(&mut rng, "?a", "?b"),
+                    edge(&mut rng, "?b", "?c"),
+                    edge(&mut rng, "?c", "?d"),
+                    edge(&mut rng, "?d", "?a")
+                ),
+                3 => format!(
+                    "?a ?q ?b . {} {}",
+                    edge(&mut rng, "?b", "?c"),
+                    edge(&mut rng, "?c", "?a")
+                ),
+                4 => format!(
+                    "?a <{EX}p0> ?a . {} {}",
+                    edge(&mut rng, "?a", "?b"),
+                    edge(&mut rng, "?b", "?a")
+                ),
+                _ => {
+                    let (x, y) = (
+                        format!("<{EX}e{}>", rng.below(8)),
+                        format!("<{EX}e{}>", rng.below(8)),
+                    );
+                    format!(
+                        "{} {} {}",
+                        edge(&mut rng, "?a", "?b"),
+                        edge(&mut rng, "?b", &x),
+                        edge(&mut rng, &y, "?a")
+                    )
+                }
+            };
+            if rng.below(2) == 0 {
+                body.push_str(&format!(" ?a a <{EX}T{}> .", rng.below(2)));
+            }
+            let text = format!("SELECT * WHERE {{ {body} }}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "{text}");
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            assert_eq!(native, expected, "{text}");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 1000);
+}

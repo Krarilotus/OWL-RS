@@ -18,6 +18,7 @@ mod fast;
 mod paths;
 mod ranges;
 mod value;
+mod wcoj;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -739,6 +740,12 @@ impl<'a> Context<'a> {
                 None => self.snapshot.count(&s.quad_pattern()),
             })
             .collect();
+        if scans.len() >= 3
+            && ranged.iter().all(Option::is_none)
+            && let Some(solutions) = self.cyclic_bgp(&scans, &counts)?
+        {
+            return Ok(solutions);
+        }
         let mut remaining: Vec<usize> = (0..scans.len()).collect();
         // Start with the smallest pattern (ties: the one sharing most variables).
         remaining.sort_by_key(|&i| counts[i]);
@@ -780,6 +787,65 @@ impl<'a> Context<'a> {
             };
         }
         Ok(result)
+    }
+
+    /// A cyclic BGP by a worst-case-optimal join ([`wcoj`]); `None` if it isn't cyclic.
+    fn cyclic_bgp(&self, scans: &[ScanPattern], counts: &[u64]) -> NativeResult<Option<Solutions>> {
+        let mut vars: Vec<Variable> = Vec::new();
+        for scan in scans {
+            for v in scan.vars() {
+                if !vars.contains(&v) {
+                    vars.push(v);
+                }
+            }
+        }
+        let patterns: Vec<[wcoj::Pos; 3]> = scans
+            .iter()
+            .map(|scan| {
+                scan.slots.clone().map(|slot| match slot {
+                    Slot::Const(id) => wcoj::Pos::Const(id.raw()),
+                    Slot::Var(v) => {
+                        wcoj::Pos::Var(vars.iter().position(|x| *x == v).expect("collected above"))
+                    }
+                })
+            })
+            .collect();
+        if !wcoj::cyclic(&patterns, vars.len()) {
+            return Ok(None);
+        }
+        let width = vars.len();
+        // A pattern without matches (constants-only ones included) empties the BGP.
+        if counts.contains(&0) {
+            return Ok(Some(Solutions {
+                vars,
+                table: IdTable::new(width),
+                ordered: false,
+            }));
+        }
+        let patterns: Vec<[wcoj::Pos; 3]> = patterns
+            .into_iter()
+            .filter(|p| p.iter().any(|x| matches!(x, wcoj::Pos::Var(_))))
+            .collect();
+        let query = wcoj::Query {
+            snapshot: self.snapshot,
+            model: self.model,
+            patterns,
+            variables: width,
+        };
+        let token = self.cancellation.clone();
+        let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
+        let rows = query
+            .run(&cancelled)
+            .map_err(|wcoj::Stop::Cancelled| QueryEvaluationError::Cancelled)?;
+        let mut table = IdTable::new(width);
+        for row in rows.chunks_exact(width) {
+            table.push_row(row);
+        }
+        Ok(Some(self.produced(Solutions {
+            vars,
+            table,
+            ordered: false,
+        })?))
     }
 
     fn scan_pattern(&self, triple: &TriplePattern) -> Option<ScanPattern> {
