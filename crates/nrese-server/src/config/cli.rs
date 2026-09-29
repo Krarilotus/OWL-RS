@@ -18,6 +18,9 @@ pub enum CliCommand {
     #[default]
     Serve,
     Load(LoadCommand),
+    /// `check-config`: load and validate the configuration, print the effective settings
+    /// (secrets redacted) and exit.
+    CheckConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -38,6 +41,12 @@ impl CliConfig {
         if args.peek().is_some_and(|argument| argument == "load") {
             args.next();
             config.command = CliCommand::Load(LoadCommand::default());
+        } else if args
+            .peek()
+            .is_some_and(|argument| argument == "check-config")
+        {
+            args.next();
+            config.command = CliCommand::CheckConfig;
         }
 
         while let Some(argument) = args.next() {
@@ -96,6 +105,14 @@ mod tests {
                 .chain(args.iter().copied())
                 .map(OsString::from),
         )
+    }
+
+    #[test]
+    fn check_config_takes_a_config_path() {
+        let config = parse(&["check-config", "--config", "a.toml"]).expect("cli config");
+        assert_eq!(config.command, CliCommand::CheckConfig);
+        assert_eq!(config.config_path, Some(PathBuf::from("a.toml")));
+        assert!(parse(&["check-config", "--replace"]).is_err());
     }
 
     #[test]

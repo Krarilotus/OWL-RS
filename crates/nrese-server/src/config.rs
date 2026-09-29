@@ -43,6 +43,91 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    /// The effective settings, one `key = value` per line, for `check-config`. Credentials
+    /// are never printed: authentication and AI show their mode and provider only.
+    pub fn summary(&self) -> String {
+        let limits = &self.policy.limits;
+        let timeouts = &self.policy.timeouts;
+        let rates = &self.policy.rate_limits;
+        let store = &self.store;
+        let lines = [
+            ("server.bind_address", self.bind_address.to_string()),
+            (
+                "server.deployment_posture",
+                self.deployment_posture.as_str().to_owned(),
+            ),
+            ("store.mode", format!("{:?}", store.mode)),
+            ("store.data_dir", store.data_dir.display().to_string()),
+            (
+                "store.ontology_path",
+                store
+                    .ontology_path
+                    .as_ref()
+                    .map_or("(none)".to_owned(), |p| p.display().to_string()),
+            ),
+            (
+                "store.query_cache_bytes",
+                store.query_cache_bytes.to_string(),
+            ),
+            ("reasoner.mode", self.reasoner.mode().as_str().to_owned()),
+            (
+                "reasoner.semantics",
+                self.reasoner
+                    .materialised_ruleset()
+                    .map_or("(none)".to_owned(), |r| {
+                        format!("{} {:016x}", r.name(), r.fingerprint())
+                    }),
+            ),
+            ("policy.auth.mode", self.policy.auth.mode_name().to_owned()),
+            (
+                "policy.limits.max_query_bytes",
+                limits.max_query_bytes.to_string(),
+            ),
+            (
+                "policy.limits.max_query_memory_bytes",
+                limits.max_query_memory_bytes.to_string(),
+            ),
+            (
+                "policy.limits.max_update_bytes",
+                limits.max_update_bytes.to_string(),
+            ),
+            (
+                "policy.limits.max_rdf_upload_bytes",
+                limits.max_rdf_upload_bytes.to_string(),
+            ),
+            ("policy.timeouts.query", format!("{:?}", timeouts.query)),
+            ("policy.timeouts.update", format!("{:?}", timeouts.update)),
+            (
+                "policy.timeouts.graph_read",
+                format!("{:?}", timeouts.graph_read),
+            ),
+            (
+                "policy.timeouts.graph_write",
+                format!("{:?}", timeouts.graph_write),
+            ),
+            ("policy.rate_limits.window", format!("{:?}", rates.window)),
+            (
+                "policy.rate_limits.read_requests_per_window",
+                rates.read_requests_per_window.to_string(),
+            ),
+            (
+                "policy.rate_limits.write_requests_per_window",
+                rates.write_requests_per_window.to_string(),
+            ),
+            (
+                "policy.rate_limits.admin_requests_per_window",
+                rates.admin_requests_per_window.to_string(),
+            ),
+            ("ai.enabled", self.ai.enabled.to_string()),
+            ("ai.provider", self.ai.provider.provider_name().to_owned()),
+            ("ai.model", self.ai.model.clone()),
+        ];
+        lines
+            .iter()
+            .map(|(key, value)| format!("{key} = {value}\n"))
+            .collect()
+    }
+
     pub fn from_env() -> Result<Self> {
         Self::load(None)
     }
