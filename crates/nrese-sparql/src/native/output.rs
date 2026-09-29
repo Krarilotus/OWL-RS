@@ -416,6 +416,8 @@ impl DirectResults<'_> {
             if buffer.len() >= CHUNK {
                 out.write_all(&buffer)?;
                 buffer.clear();
+                // A cancelled query stops within one chunk of output.
+                alive()?;
             }
         }
         if json {
