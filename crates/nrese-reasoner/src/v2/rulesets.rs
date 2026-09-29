@@ -21,7 +21,28 @@ pub enum Ruleset {
     Owl2Rl,
 }
 
+/// Version of the evaluation semantics beyond the rule text: list compilation, equality
+/// handling, modules. Bump it with any change that alters what a ruleset derives or rejects,
+/// so stores materialised by an older build rebuild instead of trusting their state.
+pub const SEMANTICS_VERSION: u32 = 1;
+
 impl Ruleset {
+    /// Identifies what this ruleset derives: FNV-1a over [`SEMANTICS_VERSION`], the name and
+    /// the rule text. Stable across builds and platforms (no std hasher, which may change).
+    pub fn fingerprint(self) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |bytes: &[u8]| {
+            for &byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        feed(&SEMANTICS_VERSION.to_le_bytes());
+        feed(self.name().as_bytes());
+        feed(self.text().as_bytes());
+        hash
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Rdfs => "rdfs",

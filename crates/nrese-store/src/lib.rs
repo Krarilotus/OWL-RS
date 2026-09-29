@@ -16,6 +16,7 @@ mod query_cache;
 mod query_executor;
 mod rdf_io;
 pub mod reasoning;
+pub mod reasoning_state;
 pub mod service;
 mod stats;
 mod tell;
@@ -46,6 +47,7 @@ pub use query::{
 };
 pub use query_cache::QueryCacheStats;
 pub use query_executor::PreparedQuery;
+pub use reasoning_state::{ConsistencyStatus, ReasoningState};
 pub use service::StoreService;
 pub use stats::StoreStats;
 pub use tell::TellRequest;

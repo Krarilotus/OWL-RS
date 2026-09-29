@@ -16,7 +16,13 @@ pub struct StatusResponse {
 
 #[derive(Debug, Serialize)]
 pub struct ReadyResponse {
+    /// `ready`, `starting`, or `quarantined` (inconsistent data under the configured
+    /// reasoning).
     pub status: &'static str,
+    /// `consistent`, `inconsistent` or `unknown` (no current reasoning state).
+    pub consistency: &'static str,
+    /// Consistency violations in the materialised data, when inconsistent.
+    pub violations: Option<usize>,
     pub revision: u64,
     pub quad_count: u64,
     pub named_graph_count: usize,
@@ -127,11 +133,19 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let posture = state.runtime_posture();
 
+    let consistency = state.store().consistency();
     Ok(ReadyResponse {
-        status: if state.is_ready() {
-            "ready"
-        } else {
+        status: if !state.is_started() {
             "starting"
+        } else if state.is_quarantined() {
+            "quarantined"
+        } else {
+            "ready"
+        },
+        consistency: consistency.as_str(),
+        violations: match consistency {
+            nrese_store::ConsistencyStatus::Inconsistent { violations } => Some(violations),
+            _ => None,
         },
         revision: state.store().current_revision(),
         quad_count: stats.quad_count as u64,

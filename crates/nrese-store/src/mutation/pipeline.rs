@@ -86,7 +86,10 @@ impl MutationPipeline {
         // Reasoner v2 maintains the inferred stack from a correct one: materialise it first
         // if nothing records that it is current (a fresh or preloaded store).
         if let Some(ruleset) = self.reasoner.config().materialised_ruleset()
-            && self.store.materialised_for().as_deref() != Some(ruleset.name())
+            && !self
+                .store
+                .reasoning_state()
+                .is_some_and(|state| state.is_current_for(ruleset))
         {
             self.store.rematerialise(ruleset).map_err(store_error)?;
         }
@@ -160,6 +163,16 @@ impl MutationPipeline {
                         *at = summary.revision;
                     }
                 }
+            }
+            drop(ground);
+            // In quarantine the commit checked only its own facts: revalidate everything, so
+            // the store leaves quarantine once the data is repaired. The commit itself stands.
+            if matches!(
+                self.store.consistency(),
+                crate::ConsistencyStatus::Inconsistent { .. }
+            ) && let Err(error) = self.store.rematerialise(ruleset)
+            {
+                tracing::error!(%error, "revalidation after a commit in quarantine failed");
             }
             return Ok(report.committed(summary.revision));
         }
