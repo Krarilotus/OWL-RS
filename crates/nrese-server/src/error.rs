@@ -94,6 +94,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Server faults are logged once, here; the request span carries the request id,
+        // which the response returns in `x-request-id`.
+        if let Self::Internal(detail) = &self {
+            tracing::error!(%detail, "request failed on the server side");
+        }
         let (status, problem_type, title, detail, reasoner_reject) = match self {
             Self::BadRequest(detail) => (
                 StatusCode::BAD_REQUEST,
