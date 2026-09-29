@@ -12,6 +12,7 @@ mod graph_store_executor;
 mod loader;
 pub mod mutation;
 pub mod query;
+mod query_cache;
 mod query_executor;
 mod rdf_io;
 pub mod reasoning;
@@ -25,7 +26,7 @@ pub use backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
 };
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest};
-pub use config::{StoreConfig, StoreMode};
+pub use config::{DEFAULT_QUERY_CACHE_BYTES, StoreConfig, StoreMode};
 pub use delta::MutationDeltaPreview;
 pub use error::{StoreError, StoreResult};
 pub use graph_store::{
@@ -43,6 +44,7 @@ pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
     SparqlQueryRequest,
 };
+pub use query_cache::QueryCacheStats;
 pub use query_executor::PreparedQuery;
 pub use service::StoreService;
 pub use stats::StoreStats;

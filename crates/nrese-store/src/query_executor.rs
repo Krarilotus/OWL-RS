@@ -25,10 +25,7 @@ use spargebra::algebra::QueryDataset;
 use spargebra::{Query, SparqlParser};
 
 use crate::error::{StoreError, StoreResult};
-use crate::query::{
-    GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
-    SparqlQueryRequest,
-};
+use crate::query::{GraphResultFormat, QueryResultKind, SolutionsResultFormat, SparqlQueryRequest};
 
 impl SolutionsResultFormat {
     fn results_format(self) -> QueryResultsFormat {
@@ -90,6 +87,21 @@ impl PreparedQuery {
     /// Which statements the query reads.
     pub fn read_model(&self) -> ReadModel {
         self.read_model
+    }
+
+    /// Everything the serialised result depends on besides the data: the query (in its
+    /// canonical form, so formatting differences share an entry), the dataset parameters,
+    /// the read model and the output formats.
+    pub(crate) fn cache_request(&self) -> String {
+        format!(
+            "{}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
+            self.query, self.dataset, self.read_model, self.solutions_format, self.graph_format
+        )
+    }
+
+    /// Whether repeating the query may give another answer (see `query_cache::volatile`).
+    pub(crate) fn volatile(&self) -> bool {
+        crate::query_cache::volatile(&self.query.to_string())
     }
 
     pub fn kind(&self) -> QueryResultKind {
@@ -244,20 +256,4 @@ pub(crate) fn explain_prepared(
         ..QueryOptions::default()
     };
     Ok(explain_query(view, &prepared.query, &options)?)
-}
-
-/// Runs a query to completion into memory. For tools, tests and small results; the HTTP
-/// endpoint streams through `StoreService::run_query`.
-pub fn execute_query(
-    view: &impl ReadView,
-    request: &SparqlQueryRequest,
-) -> StoreResult<SerializedQueryResult> {
-    let prepared = PreparedQuery::parse(request)?;
-    let mut payload = Vec::new();
-    run_query(view, &prepared, &CancellationToken::new(), &mut payload)?;
-    Ok(SerializedQueryResult {
-        kind: prepared.kind(),
-        media_type: prepared.media_type(),
-        payload,
-    })
 }
