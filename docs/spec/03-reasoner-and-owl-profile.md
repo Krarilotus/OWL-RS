@@ -1,5 +1,7 @@
 # Reasoner and OWL Profile
 
+> **Historical.** The v1 reasoner is gone; the current contract is [reasoning-semantics.md](reasoning-semantics.md).
+>
 > **Scope:** describes the **v1** `rules-mvp` reasoner. The v2 reasoner (materialised, incremental, queryable) is [ADR-0003](../adr/0003-materialised-reasoning.md), designed and planned in [design/reasoner-v2.md](../design/reasoner-v2.md) (roadmap Milestone 3).
 
 ## Objective

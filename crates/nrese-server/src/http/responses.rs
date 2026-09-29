@@ -49,6 +49,9 @@ pub struct VersionResponse {
     pub reasoning_profile: &'static str,
     pub reasoning_read_model: &'static str,
     pub reasoning_semantic_tier: &'static str,
+    /// Ruleset, semantics version and fingerprint; changes exactly when this build's
+    /// closure differs. The contract: `docs/spec/reasoning-semantics.md`.
+    pub reasoning_semantics: Option<String>,
     pub graph_store_enabled: bool,
     pub graph_write_enabled: bool,
     pub sparql_update_enabled: bool,
@@ -178,6 +181,7 @@ pub fn build_version_response(state: &AppState) -> VersionResponse {
         reasoning_profile: posture.reasoning_profile,
         reasoning_read_model: posture.reasoning_read_model,
         reasoning_semantic_tier: posture.reasoning_semantic_tier,
+        reasoning_semantics: state.reasoner().semantics(),
         graph_store_enabled: posture.graph_store_enabled,
         graph_write_enabled: posture.graph_write_enabled,
         sparql_update_enabled: posture.sparql_update_enabled,
