@@ -343,6 +343,7 @@ fn reasoning_marker_tracks_whether_inferences_are_current() {
         mode: nrese_store::StoreMode::OnDisk,
         data_dir: dir.path().to_path_buf(),
         ontology_path: None,
+        query_cache_bytes: 0,
     };
     let ruleset = nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl;
     let data = format!("<{EX}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{EX}Animal>");

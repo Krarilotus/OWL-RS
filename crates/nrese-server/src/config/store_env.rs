@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use nrese_store::{StoreConfig, StoreMode};
 
 use super::env_names as names;
+use super::env_values::parse_usize;
 use super::source::ConfigSource;
 
 pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfig> {
@@ -15,6 +16,11 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             .map(PathBuf::from)
             .unwrap_or(defaults.data_dir),
         ontology_path: source.get(names::ONTOLOGY_PATH).map(PathBuf::from),
+        query_cache_bytes: parse_usize(
+            source,
+            names::QUERY_CACHE_BYTES,
+            nrese_store::DEFAULT_QUERY_CACHE_BYTES,
+        )?,
     })
 }
 

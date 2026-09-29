@@ -18,6 +18,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> KeyValueSource {
         names::ONTOLOGY_PATH,
         config.store.ontology_path,
     );
+    insert_numeric(
+        &mut source,
+        names::QUERY_CACHE_BYTES,
+        config.store.query_cache_bytes,
+    );
 
     insert_option(&mut source, names::REASONING_MODE, config.reasoner.mode);
 

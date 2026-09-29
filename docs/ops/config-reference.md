@@ -122,6 +122,11 @@ api_key = "replace-me"
 - env override: `NRESE_DATA_DIR`
 - default: `./data`
 
+- file key: `store.query_cache_bytes`
+- env override: `NRESE_QUERY_CACHE_BYTES`
+- default: `67108864` (64 MiB); `0` disables the cache
+- serialised results of repeated queries on an unchanged store are answered from memory. Every commit starts a new revision, so a cached result is never stale; queries using `NOW()`, `RAND()`, `UUID()`, `STRUUID()` or `BNODE()` are not cached, and no single result takes more than an eighth of the budget
+
 - file key: `store.ontology_path`
 - env override: `NRESE_ONTOLOGY_PATH`
 - optional; when set, the file is loaded at startup and a missing file is a startup error
