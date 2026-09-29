@@ -88,6 +88,20 @@ mod tests {
         let schema = Schema::owl(vocabulary);
         let naive = materialise(input, &rules, Some(&lists));
         let batch = batch::materialise(input, &rules, Some(&lists), &schema);
+        // The grouped entry point (what the store uses) derives the same.
+        let mut sorted: Vec<Triple> = input.to_vec();
+        sorted.sort_unstable_by_key(|&[s, p, o]| (p, o, s));
+        sorted.dedup();
+        let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+        for [s, p, o] in sorted {
+            match groups.last_mut() {
+                Some((last, pairs)) if *last == p => pairs.push((o, s)),
+                _ => groups.push((p, vec![(o, s)])),
+            }
+        }
+        let grouped = batch::materialise_grouped(groups, &rules, Some(&lists), &schema);
+        assert_eq!(grouped.derived, batch.derived, "grouped input");
+        assert_eq!(grouped.violations, batch.violations, "grouped input");
         let mut expected: Vec<Triple> = naive.derived.iter().copied().collect();
         expected.sort_unstable();
         if expected != batch.derived {
