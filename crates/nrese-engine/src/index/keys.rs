@@ -396,8 +396,19 @@ impl PackedKeys {
                 keys.iter_mut().for_each(|key| key[c] = constant);
                 continue;
             }
-            for (i, key) in keys.iter_mut().enumerate() {
-                key[c] = header.component(data, c, j0 + i);
+            // Tags first (usually constant), then payloads: sequential unpacking with a
+            // running bit position, the payload loop a shift and mask per key.
+            let tag_min = u64::from(header.tag_min[c]);
+            let mut bit = header.starts[2 * c] as usize + j0 * tw as usize;
+            for key in keys.iter_mut() {
+                key[c] = (tag_min + read(data, bit, tw)) << TAG_SHIFT;
+                bit += tw as usize;
+            }
+            let payload_min = header.payload_min[c];
+            let mut bit = header.starts[2 * c + 1] as usize + j0 * pw as usize;
+            for key in keys.iter_mut() {
+                key[c] |= payload_min + read(data, bit, pw);
+                bit += pw as usize;
             }
         }
     }
