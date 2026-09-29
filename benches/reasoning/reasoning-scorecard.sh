@@ -50,6 +50,9 @@ ORACLE_MAX_TRIPLES=${ORACLE_MAX_TRIPLES:-200000}
 ORACLE_TIMEOUT_S=${ORACLE_TIMEOUT_S:-900}  # owlrl is pure Python; past this, Nemo is the reference
 TIMEOUT_S=${TIMEOUT_S:-3600}
 JAVA_HEAP=${JAVA_HEAP:-16g}
+# Optional hard memory cap per container (e.g. 18g on a shared machine): a system that needs
+# more is killed inside its container (exit 137) instead of pressuring the host.
+DOCKER_MEMORY=${DOCKER_MEMORY:-}
 # The Rust image follows rust-toolchain.toml, so benchmarks build with the pinned compiler.
 RUST_IMAGE=${RUST_IMAGE:-rust:$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")-bookworm}
 DATASETS=${*:-lubm-1 lubm-10}
@@ -60,7 +63,9 @@ mkdir -p "$RESULTS" "$ORACLE_CACHE"
 measured() {
   local log=$1 image=$2 name=rsc-$$-$RANDOM rc=0
   shift 2
-  timeout "$TIMEOUT_S" docker run --name "$name" -v nrese-bench-data:/data:ro \
+  timeout "$TIMEOUT_S" docker run --name "$name" \
+    ${DOCKER_MEMORY:+--memory "$DOCKER_MEMORY" --memory-swap "$DOCKER_MEMORY"} \
+    -v nrese-bench-data:/data:ro \
     -v "$RESULTS:/out" -v "$ORACLE_CACHE:/cache" -v "$HERE/queries:/queries:ro" \
     -v nrese-target:/target:ro -e JAVA_TOOL_OPTIONS="-Xmx$JAVA_HEAP" --entrypoint sh "$image" \
     -c '"$@"; rc=$?; echo "peak_bytes $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0)"; exit $rc' \
