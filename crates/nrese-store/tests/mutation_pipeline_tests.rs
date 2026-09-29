@@ -64,7 +64,7 @@ fn committed_mutation_cannot_be_cancelled_afterwards() {
 
 #[test]
 fn gate_rejection_is_recorded_and_not_committed() {
-    let pipeline = pipeline(ReasoningMode::RulesMvp);
+    let pipeline = pipeline(ReasoningMode::Owl2Rl);
     let setup = "<http://example.com/A> <http://www.w3.org/2002/07/owl#disjointWith> <http://example.com/B> .
                  <http://example.com/x> a <http://example.com/A> .";
     pipeline
@@ -74,9 +74,23 @@ fn gate_rejection_is_recorded_and_not_committed() {
     let conflicting = "<http://example.com/x> a <http://example.com/B>";
     let result = pipeline.apply(insert(conflicting), &MutationTicket::new());
 
-    assert!(matches!(result, Err(MutationError::Rejected(_))));
+    let Err(MutationError::Rejected(reject)) = result else {
+        panic!("expected a rejection, got {result:?}");
+    };
     assert!(!contains(&pipeline, conflicting));
-    assert!(pipeline.last_reasoning_run().is_some());
+    // The explanation names the rule and its premises, and the commit's own statement.
+    let explanation = reject.explanation.as_ref().expect("explanation");
+    assert_eq!(explanation.violated_constraint, "cax-dw");
+    assert_eq!(explanation.focus_resource, "http://example.com/x");
+    assert_eq!(explanation.evidence.len(), 3);
+    let trigger = reject
+        .attribution
+        .as_ref()
+        .and_then(|a| a.likely_commit_trigger())
+        .expect("trigger");
+    assert_eq!(trigger.2, "http://example.com/B");
+    let run = pipeline.last_reasoning_run().expect("recorded");
+    assert_eq!(run.status, nrese_core::ReasonerRunStatus::Rejected);
 }
 
 fn delete(triple: &str) -> MutationCommand {

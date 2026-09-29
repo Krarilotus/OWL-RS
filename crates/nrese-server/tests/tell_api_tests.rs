@@ -15,7 +15,7 @@ use support::{
 async fn tell_endpoint_accepts_default_graph_turtle() -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
 
     let tell_response = app
@@ -46,7 +46,7 @@ async fn tell_endpoint_accepts_default_graph_turtle() -> Result<(), Box<dyn std:
 async fn tell_endpoint_supports_named_graph_ingest() -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
 
     let tell_response = app
@@ -79,7 +79,7 @@ async fn tell_endpoint_uses_reasoner_gate_and_rejects_without_publish()
     let app = test_app_with_store_config(
         StoreConfig::in_memory().with_ontology(minimal_fixture_path()),
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
 
     let tell_response = app
@@ -103,7 +103,7 @@ async fn tell_endpoint_uses_reasoner_gate_and_rejects_without_publish()
     assert_eq!(tell_response.status(), StatusCode::BAD_REQUEST);
     let tell_text = body_text(tell_response).await?;
     assert!(tell_text.contains("reasoner_reject"));
-    assert!(tell_text.contains("owl:disjointWith"));
+    assert!(tell_text.contains("cax-dw"));
 
     let ask_text = query_text(
         app,

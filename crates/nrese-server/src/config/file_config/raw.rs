@@ -38,18 +38,6 @@ pub(super) struct RawStoreConfig {
 pub(super) struct RawReasonerConfig {
     #[serde(default)]
     pub mode: Option<String>,
-    #[serde(default)]
-    pub read_model: Option<String>,
-    #[serde(default)]
-    pub rules_mvp: RawRulesMvpConfig,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub(super) struct RawRulesMvpConfig {
-    #[serde(default, alias = "tier")]
-    pub preset: Option<String>,
-    #[serde(default)]
-    pub features: Option<StringOrMany>,
 }
 
 #[derive(Debug, Default, Deserialize)]

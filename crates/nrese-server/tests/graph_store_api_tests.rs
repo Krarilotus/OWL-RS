@@ -183,7 +183,7 @@ async fn graph_put_uses_reasoner_gate_and_rejects_without_publish()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
 
     let response = app
@@ -207,7 +207,7 @@ async fn graph_put_uses_reasoner_gate_and_rejects_without_publish()
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let text = body_text(response).await?;
     assert!(text.contains("reasoner_reject"));
-    assert!(text.contains("owl:disjointWith"));
+    assert!(text.contains("cax-dw"));
 
     assert!(
         query_text(

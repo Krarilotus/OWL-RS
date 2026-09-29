@@ -10,7 +10,7 @@ use crate::state::AppState;
 #[tokio::test]
 async fn reasoning_diagnostics_includes_reject_diagnostics_baseline() {
     let store = StoreService::new(StoreConfig::default()).expect("store should initialize");
-    let reasoner = ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::RulesMvp));
+    let reasoner = ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Rl));
     let state = AppState::new(
         store,
         reasoner,
@@ -25,6 +25,6 @@ async fn reasoning_diagnostics_includes_reject_diagnostics_baseline() {
     let text = String::from_utf8(body.to_vec()).expect("body should be utf-8");
 
     assert!(text.contains("reject_diagnostics"));
-    assert!(text.contains("hybrid-heuristic-plus-deep-justification"));
+    assert!(text.contains("rule-premises-plus-commit-delta-attribution"));
     assert!(text.contains("owl-equality-reasoning"));
 }

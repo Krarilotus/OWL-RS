@@ -1,41 +1,48 @@
-use super::attribution::RejectAttribution;
-use nrese_core::{ReasonerRunReport, ReasonerRunStatus};
-use nrese_reasoner::{InferenceDelta, ReasoningCacheStats, ReasoningStats, RejectExplanation};
+use nrese_core::ReasonerRunStatus;
+use nrese_reasoner::RejectExplanation;
 
-/// Snapshot of one reasoning gate run, kept for operator diagnostics.
+use super::attribution::RejectAttribution;
+use crate::reasoning::MaterialisationReport;
+
+/// One commit-path reasoning run (reasoner v2), kept for operator diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReasoningRunRecord {
     pub revision: u64,
     pub status: ReasonerRunStatus,
+    pub ruleset: &'static str,
+    /// Inferred statements after the run, and those it added and removed.
     pub inferred_triples: u64,
+    pub inferred_inserted: u64,
+    pub inferred_deleted: u64,
     pub consistency_violations: u64,
-    pub stats: ReasoningStats,
-    pub cache: ReasoningCacheStats,
-    pub notes: Vec<String>,
-    pub diagnostics: Vec<String>,
+    pub rounds: usize,
+    pub elapsed_micros: u64,
     pub primary_reject: Option<RejectExplanation>,
     pub commit_attribution: Option<RejectAttribution>,
-    pub derived_triples_sample: Vec<(String, String, String)>,
 }
 
 impl ReasoningRunRecord {
     pub fn from_report(
-        report: &ReasonerRunReport,
-        inferred: &InferenceDelta,
+        report: &MaterialisationReport,
+        primary_reject: Option<RejectExplanation>,
         commit_attribution: Option<RejectAttribution>,
     ) -> Self {
         Self {
             revision: report.revision,
-            status: report.status,
-            inferred_triples: inferred.inferred_triples,
-            consistency_violations: inferred.consistency_violations,
-            stats: inferred.stats.clone(),
-            cache: inferred.cache.clone(),
-            notes: report.notes.iter().map(|note| (*note).to_owned()).collect(),
-            diagnostics: inferred.diagnostics.clone(),
-            primary_reject: inferred.primary_reject.clone(),
+            status: if report.violations > 0 {
+                ReasonerRunStatus::Rejected
+            } else {
+                ReasonerRunStatus::Completed
+            },
+            ruleset: report.ruleset,
+            inferred_triples: report.inferred,
+            inferred_inserted: report.inferred_inserted,
+            inferred_deleted: report.inferred_deleted,
+            consistency_violations: report.violations as u64,
+            rounds: report.rounds,
+            elapsed_micros: u64::try_from(report.elapsed.as_micros()).unwrap_or(u64::MAX),
+            primary_reject,
             commit_attribution,
-            derived_triples_sample: inferred.derived_triples.iter().take(5).cloned().collect(),
         }
     }
 
@@ -49,7 +56,5 @@ impl ReasoningRunRecord {
         self.primary_reject
             .as_ref()
             .map(|reject| reject.summary.clone())
-            .or_else(|| self.diagnostics.first().cloned())
-            .or_else(|| self.notes.first().cloned())
     }
 }

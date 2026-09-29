@@ -16,7 +16,6 @@ mod query_executor;
 mod rdf_io;
 pub mod reasoning;
 pub mod service;
-mod snapshot;
 mod stats;
 mod tell;
 pub mod update;
@@ -27,7 +26,7 @@ pub use backup::{
 };
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest};
 pub use config::{StoreConfig, StoreMode};
-pub use delta::{MutationDeltaPreview, StagedMutationPreview};
+pub use delta::MutationDeltaPreview;
 pub use error::{StoreError, StoreResult};
 pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
@@ -46,7 +45,6 @@ pub use query::{
 };
 pub use query_executor::PreparedQuery;
 pub use service::StoreService;
-pub use snapshot::StoreDatasetSnapshot;
 pub use stats::StoreStats;
 pub use tell::TellRequest;
 pub use update::{SparqlUpdateRequest, UpdateExecutionReport};

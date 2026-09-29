@@ -957,9 +957,6 @@ dependencies = [
 [[package]]
 name = "nrese-core"
 version = "0.1.0"
-dependencies = [
- "thiserror",
-]
 
 [[package]]
 name = "nrese-engine"
@@ -993,7 +990,6 @@ dependencies = [
  "nrese-core",
  "nrese-exec",
  "rayon",
- "tracing",
 ]
 
 [[package]]
