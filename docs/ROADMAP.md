@@ -86,7 +86,10 @@ Perf lab against the same build without the native executor (sum of p50):
 Single queries are up to 10³–10⁶× faster (counts, grouped counts, star joins, date ranges).
 
 **XC5 (2026-09-29):**
-- Cyclic BGPs (triangles, 4-cycles; LUBM q2/q9) run through a worst-case-optimal Generic Join (`native/wcoj.rs`). It binds one variable at a time from the pattern with the fewest exact matches and runs parallel over the first variable.
+- Cyclic BGPs (triangles, 4-cycles; LUBM q2/q9) run through a worst-case-optimal Generic Join (`native/wcoj.rs`).
+  - It binds one variable at a time and runs parallel over the first variable.
+  - The pattern with the fewest exact matches supplies the candidates. Patterns up to 32× larger are intersected as sorted index ranges (leapfrog style); the rest are checked by lookup.
+- LUBM(100), laptop: q2 went from 301 ms to 21 ms and q9 from 839 ms to 60 ms (14× each). All 14 queries take 143 ms instead of 870 ms, with counts equal to Nemo.
 - Hash, merge, left, anti and semi joins run in parallel row chunks, and so does the index nested-loop join. Output order is the sequential one.
 - Still sequential: filters and aggregates. They need a thread-safe decode path (evaluator and per-query caches).
 

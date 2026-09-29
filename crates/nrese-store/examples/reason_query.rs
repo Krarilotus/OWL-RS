@@ -4,8 +4,11 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-store --example reason_query -- \
-//!     [--ruleset owl2-rl|rdfs] [--queries dir] input.nt...
+//!     [--ruleset owl2-rl|rdfs] [--queries dir] [--explain] input.nt...
 //! ```
+//!
+//! `--explain` prints each query's plan (operators with estimated and actual rows, and
+//! times) after its timing line.
 //!
 //! Prints load, reasoning and per-query times, and one `qNN<TAB>count` line per query
 //! (the scorecard's answer format). Counting wraps each query as
@@ -17,8 +20,9 @@ use std::time::Instant;
 use nrese_reasoner::v2::rulesets::Ruleset;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
-    BulkLoadRequest, GraphTarget, MutationCommand, MutationPipeline, MutationTicket,
-    SparqlUpdateRequest, StoreConfig, StoreService,
+    BulkLoadRequest, CancellationToken, GraphTarget, MutationCommand, MutationPipeline,
+    MutationTicket, PreparedQuery, SparqlQueryRequest, SparqlUpdateRequest, StoreConfig,
+    StoreService,
 };
 
 /// `SELECT (COUNT(*) AS ?n) WHERE { <query> }` with the query's prologue kept in front.
@@ -59,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let (mut ruleset, mut queries, mut files) = (Ruleset::Owl2Rl, None, Vec::new());
     let mut commits = 0usize;
+    let mut explain = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--ruleset" => {
@@ -70,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--queries" => queries = args.next().map(PathBuf::from),
             "--commits" => commits = args.next().and_then(|n| n.parse().ok()).unwrap_or(0),
+            "--explain" => explain = true,
             _ => files.push(PathBuf::from(arg)),
         }
     }
@@ -130,6 +136,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         total += best;
         eprintln!("{name}: {:.2} ms", best * 1000.0);
+        if explain {
+            let prepared = PreparedQuery::parse(&SparqlQueryRequest::new(query.clone()))?;
+            let plan = store.explain_query(&prepared, &CancellationToken::new())?;
+            eprintln!("  executor {} | {} rows", plan.executor, plan.rows);
+            for step in &plan.steps {
+                let estimate = step
+                    .estimated_rows
+                    .map_or_else(String::new, |e| format!(" est {e}"));
+                eprintln!(
+                    "  {}{} {} |{} rows {} | {:.2} ms",
+                    "  ".repeat(step.depth),
+                    step.operator,
+                    step.detail,
+                    estimate,
+                    step.rows,
+                    step.micros as f64 / 1000.0
+                );
+            }
+        }
         println!(
             "{name}\t{}",
             count.map_or_else(|| "error".to_owned(), |c| c.to_string())

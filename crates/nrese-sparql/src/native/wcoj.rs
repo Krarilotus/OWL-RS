@@ -14,6 +14,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use rayon::prelude::*;
 
@@ -40,6 +41,10 @@ pub(super) enum Stop {
     TooManyRows,
 }
 
+/// A pattern at most this many times larger than the smallest one is intersected as a
+/// sorted list rather than checked by one lookup per candidate.
+const LIST_FACTOR: u64 = 32;
+
 /// Solutions a thread produces between two checks of the shared row count.
 const ROW_STEP: usize = 4096;
 
@@ -48,6 +53,17 @@ struct Shared<'t> {
     cancelled: AtomicBool,
     rows: AtomicUsize,
     token: &'t (dyn Fn() -> bool + Sync),
+}
+
+/// What a join did, for EXPLAIN.
+#[derive(Debug, Default)]
+pub(super) struct Stats {
+    /// The variable order.
+    pub order: Vec<usize>,
+    /// Candidate values produced, per depth.
+    pub candidates: Vec<AtomicUsize>,
+    /// Index lookups (counts) made to check candidates.
+    pub lookups: AtomicUsize,
 }
 
 /// Whether the variable graph of `patterns` has a cycle: patterns connect the variables
@@ -140,49 +156,129 @@ impl Query<'_> {
         order
     }
 
-    /// The candidate values of `var` under `bindings`, from the pattern with the fewest
-    /// matches, sorted and distinct; `None` if some pattern with `var` can't match.
-    fn candidates(&self, var: usize, bindings: &[Option<u64>]) -> Option<Vec<u64>> {
-        let mut best: Option<(u64, &[Pos; 3])> = None;
-        for pattern in self.patterns.iter().filter(|p| p.contains(&Pos::Var(var))) {
+    /// The candidate values of `var` under `bindings`, sorted and distinct, and which
+    /// patterns they already satisfy; `None` if some pattern with `var` can't match.
+    ///
+    /// The pattern with the fewest matches supplies the values. Every other pattern in
+    /// which `var` is the last unbound position and that is at most [`LIST_FACTOR`] times
+    /// larger is intersected as a sorted index range (leapfrog style): a sequential scan
+    /// costs a few nanoseconds per value, a lookup per candidate far more. The remaining
+    /// patterns are checked per candidate ([`consistent`](Self::consistent)).
+    fn candidates(&self, var: usize, bindings: &[Option<u64>]) -> Option<(Vec<u64>, Vec<bool>)> {
+        let mut counts: Vec<Option<u64>> = vec![None; self.patterns.len()];
+        let mut best: Option<(u64, usize)> = None;
+        for (i, pattern) in self.patterns.iter().enumerate() {
+            if !pattern.contains(&Pos::Var(var)) {
+                continue;
+            }
             let count = self.count(pattern, bindings);
             if count == 0 {
                 return None;
             }
+            counts[i] = Some(count);
             if best.is_none_or(|(c, _)| count < c) {
-                best = Some((count, pattern));
+                best = Some((count, i));
             }
         }
-        let (_, pattern) = best?;
-        let positions: Vec<usize> = (0..3).filter(|&i| pattern[i] == Pos::Var(var)).collect();
-        let mut values: Vec<u64> = Vec::new();
-        for quad in self
-            .snapshot
-            .quads_for_pattern_in(self.model, &self.quad_pattern(pattern, bindings))
-        {
-            let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
-            let value = components[positions[0]];
-            // A variable used twice in the pattern must bind one term.
-            if positions[1..].iter().all(|&p| components[p] == value) {
-                values.push(value);
+        let (smallest, driver) = best?;
+        let mut enforced = vec![false; self.patterns.len()];
+        enforced[driver] = true;
+        let mut values = match self.sorted_values(driver, var, bindings) {
+            Some(values) => values,
+            None => {
+                let pattern = &self.patterns[driver];
+                let positions: Vec<usize> =
+                    (0..3).filter(|&i| pattern[i] == Pos::Var(var)).collect();
+                let mut values: Vec<u64> = Vec::new();
+                for quad in self
+                    .snapshot
+                    .quads_for_pattern_in(self.model, &self.quad_pattern(pattern, bindings))
+                {
+                    let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
+                    let value = components[positions[0]];
+                    // A variable used twice in the pattern must bind one term.
+                    if positions[1..].iter().all(|&p| components[p] == value) {
+                        values.push(value);
+                    }
+                }
+                values.sort_unstable();
+                values.dedup();
+                values
+            }
+        };
+        let mut others: Vec<(u64, usize)> = counts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.map(|c| (c, i)))
+            .filter(|&(c, i)| i != driver && c <= smallest.saturating_mul(LIST_FACTOR))
+            .collect();
+        others.sort_unstable();
+        for (_, i) in others {
+            if values.is_empty() {
+                break;
+            }
+            if let Some(list) = self.sorted_values(i, var, bindings) {
+                values = intersect(&values, &list);
+                enforced[i] = true;
             }
         }
-        values.sort_unstable();
-        values.dedup();
-        Some(values)
+        Some((values, enforced))
     }
 
-    /// Whether every pattern with `var` still matches once `var` is bound (exact for the
-    /// patterns this binding completes).
-    fn consistent(&self, var: usize, bindings: &[Option<u64>]) -> bool {
+    /// The values of `var` in pattern `index`'s matches, in id order, if `var` is its only
+    /// unbound position (then an index range lists them sorted and distinct).
+    fn sorted_values(
+        &self,
+        index: usize,
+        var: usize,
+        bindings: &[Option<u64>],
+    ) -> Option<Vec<u64>> {
+        let pattern = &self.patterns[index];
+        let mut free = (0..3).filter(|&c| match pattern[c] {
+            Pos::Var(v) => bindings[v].is_none(),
+            Pos::Const(_) => false,
+        });
+        let position = free.next()?;
+        if free.next().is_some() || pattern[position] != Pos::Var(var) {
+            return None;
+        }
+        // A graph-first order with the free component last.
+        let permutation = match position {
+            0 => Permutation::Gpos,
+            1 => Permutation::Gosp,
+            _ => Permutation::Gspo,
+        };
+        let quads = self.snapshot.scan_sorted_in(
+            self.model,
+            &self.quad_pattern(pattern, bindings),
+            permutation,
+        )?;
+        Some(
+            quads
+                .map(|quad| [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()][position])
+                .collect(),
+        )
+    }
+
+    /// Whether every pattern with `var` not in `enforced` still matches once `var` is
+    /// bound (exact for the patterns this binding completes).
+    fn consistent(
+        &self,
+        var: usize,
+        bindings: &[Option<u64>],
+        enforced: &[bool],
+        stats: &Stats,
+    ) -> bool {
         self.patterns
             .iter()
-            .filter(|p| p.contains(&Pos::Var(var)))
-            .all(|p| {
+            .zip(enforced)
+            .filter(|(p, done)| !**done && p.contains(&Pos::Var(var)))
+            .all(|(p, _)| {
                 if repeats_unbound(p, bindings) {
                     // Checked exactly once its last variable is bound.
                     return true;
                 }
+                stats.lookups.fetch_add(1, Ordering::Relaxed);
                 self.count(p, bindings) > 0
             })
     }
@@ -194,6 +290,7 @@ impl Query<'_> {
         bindings: &mut Vec<Option<u64>>,
         rows: &mut Vec<u64>,
         shared: &Shared<'_>,
+        stats: &Stats,
     ) -> Result<(), Stop> {
         let Some(&var) = order.get(depth) else {
             rows.extend(bindings.iter().map(|b| b.expect("every variable is bound")));
@@ -205,17 +302,18 @@ impl Query<'_> {
             }
             return Ok(());
         };
-        let Some(values) = self.candidates(var, bindings) else {
+        let Some((values, enforced)) = self.candidates(var, bindings) else {
             return Ok(());
         };
+        stats.candidates[depth].fetch_add(values.len(), Ordering::Relaxed);
         for (n, value) in values.into_iter().enumerate() {
             if n % 1024 == 0 && (shared.cancelled.load(Ordering::Relaxed) || (shared.token)()) {
                 shared.cancelled.store(true, Ordering::Relaxed);
                 return Err(Stop::Cancelled);
             }
             bindings[var] = Some(value);
-            if self.consistent(var, bindings) {
-                self.extend(order, depth + 1, bindings, rows, shared)?;
+            if self.consistent(var, bindings, &enforced, stats) {
+                self.extend(order, depth + 1, bindings, rows, shared, stats)?;
             }
         }
         bindings[var] = None;
@@ -223,12 +321,20 @@ impl Query<'_> {
     }
 
     /// Every solution, as rows of `variables` ids (row-major).
-    pub(super) fn run(&self, token: &(dyn Fn() -> bool + Sync)) -> Result<Vec<u64>, Stop> {
+    pub(super) fn run(
+        &self,
+        token: &(dyn Fn() -> bool + Sync),
+        stats: &mut Stats,
+    ) -> Result<Vec<u64>, Stop> {
         let order = self.order();
+        stats.order.clone_from(&order);
+        stats.candidates = (0..order.len()).map(|_| AtomicUsize::new(0)).collect();
+        let stats = &*stats;
         let bindings = vec![None; self.variables];
-        let Some(first) = self.candidates(order[0], &bindings) else {
+        let Some((first, enforced)) = self.candidates(order[0], &bindings) else {
             return Ok(Vec::new());
         };
+        stats.candidates[0].fetch_add(first.len(), Ordering::Relaxed);
         let shared = Shared {
             cancelled: AtomicBool::new(false),
             rows: AtomicUsize::new(0),
@@ -241,8 +347,8 @@ impl Query<'_> {
                 let mut rows = Vec::new();
                 for &value in chunk {
                     bindings[order[0]] = Some(value);
-                    if self.consistent(order[0], &bindings) {
-                        self.extend(&order, 1, &mut bindings, &mut rows, &shared)?;
+                    if self.consistent(order[0], &bindings, &enforced, stats) {
+                        self.extend(&order, 1, &mut bindings, &mut rows, &shared, stats)?;
                     }
                 }
                 Ok(rows)
@@ -273,4 +379,57 @@ fn repeats_unbound(pattern: &[Pos; 3], bindings: &[Option<u64>]) -> bool {
         .iter()
         .enumerate()
         .any(|(i, v)| unbound[i + 1..].contains(v))
+}
+
+/// The values in both sorted, distinct lists: a merge that gallops over the longer one.
+fn intersect(small: &[u64], large: &[u64]) -> Vec<u64> {
+    let (small, large) = if small.len() <= large.len() {
+        (small, large)
+    } else {
+        (large, small)
+    };
+    let mut out = Vec::with_capacity(small.len());
+    let mut rest = large;
+    for &value in small {
+        // Exponential then binary search for the first element >= value.
+        let mut step = 1;
+        while step < rest.len() && rest[step - 1] < value {
+            step *= 2;
+        }
+        let skip = rest[..step.min(rest.len())].partition_point(|&x| x < value);
+        rest = &rest[skip..];
+        match rest.first() {
+            Some(&x) if x == value => out.push(value),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::intersect;
+
+    #[test]
+    fn intersect_matches_a_set_intersection() {
+        let mut state = 9u64;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (state >> 33) % n
+        };
+        for _ in 0..500 {
+            let mut a: Vec<u64> = (0..next(40)).map(|_| next(100)).collect();
+            let mut b: Vec<u64> = (0..next(400)).map(|_| next(100)).collect();
+            for v in [&mut a, &mut b] {
+                v.sort_unstable();
+                v.dedup();
+            }
+            let expected: Vec<u64> = a.iter().copied().filter(|x| b.contains(x)).collect();
+            assert_eq!(intersect(&a, &b), expected);
+            assert_eq!(intersect(&b, &a), expected);
+        }
+    }
 }
