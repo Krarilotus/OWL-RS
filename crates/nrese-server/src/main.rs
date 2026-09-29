@@ -24,17 +24,30 @@ async fn main() -> Result<()> {
     if let CliCommand::Load(load) = cli.command {
         bulk_load(&store, load)?;
         if let Some(ruleset) = ruleset {
-            store
+            let report = store
                 .rematerialise(ruleset)
                 .context("reasoning after the bulk load failed")?;
+            if report.violations > 0 {
+                // The data stays loaded (for diagnosis and repair); the server will start
+                // in quarantine.
+                anyhow::bail!(
+                    "the loaded data is inconsistent under {}: {} violation(s)",
+                    ruleset.name(),
+                    report.violations
+                );
+            }
         }
         return Ok(());
     }
     // Reasoner v2: bring the inferred stack in line with the configured ruleset, unless
-    // the marker says it already is. Without v2 reasoning, a leftover stack is cleared so
-    // reads never see stale inferences.
+    // the recorded state says it already is (same ruleset and semantics). Without v2
+    // reasoning, a leftover stack is cleared so reads never see stale inferences.
     match ruleset {
-        Some(ruleset) if store.materialised_for().as_deref() == Some(ruleset.name()) => {
+        Some(ruleset)
+            if store
+                .reasoning_state()
+                .is_some_and(|state| state.is_current_for(ruleset)) =>
+        {
             tracing::info!(ruleset = ruleset.name(), "inferred stack is current");
         }
         Some(ruleset) => {
