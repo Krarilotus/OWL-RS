@@ -22,9 +22,7 @@ pub async fn execute_query(
     operation: QueryOperation,
     accept: Option<&str>,
 ) -> Result<Response, ApiError> {
-    if !state.is_ready() {
-        return Err(ApiError::unavailable("server is not ready yet"));
-    }
+    state.ensure_serving()?;
     let policy = state.policy().clone();
     policy.enforce_query_bytes(operation.query.len())?;
     let deadline = tokio::time::Instant::now() + policy.timeouts.query;

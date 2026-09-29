@@ -4,15 +4,6 @@ use axum::http::{HeaderMap, header};
 use nrese_store::{GraphResultFormat, GraphTarget};
 
 use crate::error::ApiError;
-use crate::state::AppState;
-
-pub fn ensure_ready(state: &AppState) -> Result<(), ApiError> {
-    if state.is_ready() {
-        Ok(())
-    } else {
-        Err(ApiError::unavailable("server is not ready yet"))
-    }
-}
 
 pub fn parse_graph_target(raw_query: &RawQuery) -> Result<GraphTarget, ApiError> {
     let Some(raw) = raw_query.0.as_deref() else {

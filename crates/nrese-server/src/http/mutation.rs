@@ -20,9 +20,7 @@ pub async fn run(
     timeout: Duration,
     timeout_message: &'static str,
 ) -> Result<MutationCommitReport, ApiError> {
-    if !state.is_ready() {
-        return Err(ApiError::unavailable("server is not ready yet"));
-    }
+    state.ensure_serving()?;
     let pipeline = state.pipeline();
     let policy = state.policy();
     let ticket = MutationTicket::new();
