@@ -64,9 +64,7 @@ impl PermutationRun {
     /// Index range of keys in `[low, high]`. O(log n).
     #[inline]
     pub(crate) fn range(&self, low: &Key, high: &Key) -> (usize, usize) {
-        let start = self.keys.bound_in(0, self.keys.len(), low, false);
-        let end = self.keys.bound_in(start, self.keys.len(), high, true);
-        (start, end)
+        self.keys.range(low, high)
     }
 
     /// Builds a run from entries sorted by key, each flagged as tombstone or not.
