@@ -20,7 +20,10 @@ pub mod update;
 pub mod view;
 
 pub use dataset::{EngineDataset, EvalTerm};
-pub use query::{QueryOptions, evaluate_query, runs_natively};
+pub use nrese_exec::BudgetExceeded;
+pub use query::{
+    Explanation, PlanStep, QueryOptions, evaluate_query, explain_query, runs_natively,
+};
 pub use spareval::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,
 };

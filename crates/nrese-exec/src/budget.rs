@@ -78,6 +78,11 @@ impl Budget {
             .fetch_sub(bytes.min(self.used()), Ordering::Relaxed);
     }
 
+    /// Bytes that may still be charged.
+    pub fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.used())
+    }
+
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Relaxed)
     }

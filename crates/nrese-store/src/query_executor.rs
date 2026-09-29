@@ -15,8 +15,8 @@ use std::io::Write;
 use nrese_engine::ReadModel;
 
 use nrese_sparql::{
-    CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryOptions, QueryResults,
-    ReadView, evaluate_query,
+    CancellationToken, Explanation, QueryDatasetSpecification, QueryEvaluationError, QueryOptions,
+    QueryResults, ReadView, evaluate_query, explain_query,
 };
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode};
 use oxrdfio::RdfSerializer;
@@ -49,6 +49,7 @@ pub struct PreparedQuery {
     query: Query,
     dataset: Option<QueryDatasetSpecification>,
     read_model: ReadModel,
+    memory_limit: Option<usize>,
     solutions_format: SolutionsResultFormat,
     graph_format: GraphResultFormat,
 }
@@ -80,6 +81,7 @@ impl PreparedQuery {
                 .or(from_protocol)
                 .or(from_query)
                 .unwrap_or_default(),
+            memory_limit: request.memory_limit,
             solutions_format: request.solutions_format,
             graph_format: request.graph_format,
         })
@@ -190,6 +192,7 @@ pub(crate) fn run_query(
         dataset: prepared.dataset.clone(),
         cancellation: Some(cancellation.clone()),
         read_model: prepared.read_model,
+        memory_limit: prepared.memory_limit,
         ..QueryOptions::default()
     };
     let alive = || match cancellation.is_cancelled() {
@@ -224,6 +227,23 @@ pub(crate) fn run_query(
         }
     }
     Ok(())
+}
+
+/// Runs `prepared` on `view` as [`run_query`] would, consuming the results instead of
+/// serialising them, and reports how it ran (EXPLAIN ANALYZE).
+pub(crate) fn explain_prepared(
+    view: &impl ReadView,
+    prepared: &PreparedQuery,
+    cancellation: &CancellationToken,
+) -> StoreResult<Explanation> {
+    let options = QueryOptions {
+        dataset: prepared.dataset.clone(),
+        cancellation: Some(cancellation.clone()),
+        read_model: prepared.read_model,
+        memory_limit: prepared.memory_limit,
+        ..QueryOptions::default()
+    };
+    Ok(explain_query(view, &prepared.query, &options)?)
 }
 
 /// Runs a query to completion into memory. For tools, tests and small results; the HTTP

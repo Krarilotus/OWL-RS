@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use oxrdf::{Quad, QuadRef, Term, TermRef};
 
+use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
 use crate::term::{Dictionary, TermId};
@@ -21,6 +22,7 @@ use crate::term::{Dictionary, TermId};
 pub struct Snapshot {
     version: Arc<Version>,
     dictionary: Arc<Dictionary>,
+    statistics: Arc<Statistics>,
 }
 
 impl std::fmt::Debug for Snapshot {
@@ -34,10 +36,15 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
-    pub(super) fn new(version: Arc<Version>, dictionary: Arc<Dictionary>) -> Self {
+    pub(super) fn new(
+        version: Arc<Version>,
+        dictionary: Arc<Dictionary>,
+        statistics: Arc<Statistics>,
+    ) -> Self {
         Self {
             version,
             dictionary,
+            statistics,
         }
     }
 
@@ -280,6 +287,65 @@ impl Snapshot {
                 .map(|(value, count)| (TermId::from_raw(value), count as u64))
                 .collect(),
         )
+    }
+
+    /// The number of distinct values of the first unbound component of `pattern` in
+    /// `permutation`'s order, among its matches in `model`. O(r · d · log n) for d values,
+    /// with d values of memory. Exact unless deleted quads still shadow values in unmerged
+    /// runs (then an upper bound). `None` if the pattern's bound components aren't a prefix
+    /// of that order, or an included stack can't answer it. Planners should call the cached
+    /// [`distinct_estimate_in`](Self::distinct_estimate_in) instead.
+    pub fn distinct_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> Option<u64> {
+        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        if plan.exclude_default_graph {
+            return None;
+        }
+        let bound = plan
+            .low
+            .iter()
+            .zip(&plan.high)
+            .take_while(|(l, h)| l == h)
+            .count();
+        let supported = Stack::ALL
+            .into_iter()
+            .all(|stack| !model.includes(stack) || stack.layout().supports(permutation));
+        if bound >= 4 || !supported {
+            return None;
+        }
+        let mut values = Vec::new();
+        let mut sources = 0;
+        for stack in Stack::ALL {
+            if model.includes(stack) {
+                let before = values.len();
+                self.version
+                    .stack(stack)
+                    .distinct_values(&plan, bound, &mut values);
+                sources += usize::from(values.len() > before);
+            }
+        }
+        // One run of one stack yields sorted distinct values already.
+        if sources > 1 || !values.is_sorted() {
+            values.sort_unstable();
+            values.dedup();
+        }
+        Some(values.len() as u64)
+    }
+
+    /// [`distinct_in`](Self::distinct_in), cached by the engine across revisions until the
+    /// pattern's match count drifts by more than a quarter. For cost estimates only: the
+    /// value may be slightly stale.
+    pub fn distinct_estimate_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> Option<u64> {
+        self.statistics.distinct(self, model, pattern, permutation)
     }
 
     pub(crate) fn stack_quads<'a>(

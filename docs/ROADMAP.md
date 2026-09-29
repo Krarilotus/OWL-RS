@@ -90,9 +90,18 @@ Single queries are up to 10³–10⁶× faster (counts, grouped counts, star joi
 - Hash, merge, left, anti and semi joins run in parallel row chunks, and so does the index nested-loop join. Output order is the sequential one.
 - Still sequential: filters and aggregates. They need a thread-safe decode path (evaluator and per-query caches).
 
+**XC4 (2026-09-29):**
+- **Statistics:** `Snapshot::distinct_estimate_in` gives distinct values per pattern position. The engine computes them exactly from the index and caches them across revisions until the pattern's count drifts by a quarter.
+- **Optimiser:** BGPs with 3 or more patterns are ordered by dynamic programming over left-deep orders (greedy beyond 12 patterns). The cost is C_out plus access (scan vs. index probe), from exact counts and distinct estimates.
+- **EXPLAIN:** `explain_query`, and `explain=true` on `/dataset/query`. It runs the query and returns each operator with estimated and actual rows and time.
+
+**Robustness:**
+- Joins stop at a row limit derived from the per-query memory budget, before allocating. Before, a three-way cross product could abort the process with a 64 GB allocation.
+- The server sets the budget: `NRESE_MAX_QUERY_MEMORY_BYTES`, default 4 GiB. A query over the limit gets `413`.
+
 Next:
-- XC4: statistics, the optimiser and EXPLAIN.
 - XC5 rest: parallel filters and aggregates.
+- XC4 rest: characteristic sets for star estimates; report estimation error in the perf lab.
 - The Docker scorecard against QLever for the Phase 2 gate.
 
 **Status (2026-09-28): Phase 3 is under way.**

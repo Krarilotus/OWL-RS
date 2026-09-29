@@ -18,6 +18,8 @@ pub struct QueryOperation {
     pub named_graphs: Vec<String>,
     /// GraphDB's `infer` parameter: `false` reads asserted statements only.
     pub infer: Option<bool>,
+    /// `explain=true`: run the query and return how it ran (JSON) instead of its results.
+    pub explain: bool,
 }
 
 impl QueryOperation {
@@ -36,21 +38,22 @@ impl QueryOperation {
                 "query" => self.query = value,
                 "default-graph-uri" => self.default_graphs.push(value),
                 "named-graph-uri" => self.named_graphs.push(value),
-                "infer" => {
-                    self.infer = Some(match value.as_str() {
-                        "true" => true,
-                        "false" => false,
-                        other => {
-                            return Err(ApiError::bad_request(format!(
-                                "infer must be true or false, not '{other}'"
-                            )));
-                        }
-                    });
-                }
+                "infer" => self.infer = Some(boolean("infer", &value)?),
+                "explain" => self.explain = boolean("explain", &value)?,
                 _ => {}
             }
         }
         Ok(())
+    }
+}
+
+fn boolean(name: &str, value: &str) -> Result<bool, ApiError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(ApiError::bad_request(format!(
+            "{name} must be true or false, not '{other}'"
+        ))),
     }
 }
 
@@ -153,6 +156,7 @@ mod tests {
                 default_graphs: Vec::new(),
                 named_graphs: vec!["http://ex/a".to_owned(), "http://ex/b".to_owned()],
                 infer: None,
+                explain: false,
             }
         );
     }
@@ -173,6 +177,9 @@ mod tests {
             query_from_url(Some(&format!("query={SELECT}&infer=false"))).expect("query");
         assert_eq!(operation.infer, Some(false));
         assert!(query_from_url(Some(&format!("query={SELECT}&infer=no"))).is_err());
+        let operation =
+            query_from_url(Some(&format!("query={SELECT}&explain=true"))).expect("query");
+        assert!(operation.explain);
     }
 
     #[test]

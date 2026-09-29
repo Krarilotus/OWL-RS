@@ -11,7 +11,7 @@
 //! (asserted, inferred or both).
 
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, ReadModel};
-use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, runs_natively};
+use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query, runs_natively};
 use oxrdf::vocab::xsd;
 use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
 use spargebra::SparqlParser;
@@ -615,4 +615,72 @@ fn parallel_probe_join_equals_spareval() {
         assert!(native.len() >= 12_000, "{text}");
         assert_eq!(native, expected, "{text}");
     }
+}
+
+/// EXPLAIN runs the query and reports every operator: the BGP's join order with estimated
+/// and actual rows, and the operators above it.
+#[test]
+fn explain_reports_the_plan() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    for i in 0..500 {
+        let x = ex(&format!("x{i}"));
+        let class = if i % 10 == 0 { "Grad" } else { "Student" };
+        let quads = [
+            Quad::new(
+                x.clone(),
+                rdf_type.clone(),
+                ex(class),
+                GraphName::DefaultGraph,
+            ),
+            Quad::new(
+                x.clone(),
+                ex("memberOf"),
+                ex(&format!("d{}", i % 25)),
+                GraphName::DefaultGraph,
+            ),
+            Quad::new(
+                x,
+                ex("takes"),
+                ex(&format!("c{}", i % 40)),
+                GraphName::DefaultGraph,
+            ),
+        ];
+        for quad in &quads {
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let text = format!(
+        "SELECT ?x ?c WHERE {{ ?x a <{EX}Grad> . ?x <{EX}memberOf> <{EX}d0> . ?x <{EX}takes> ?c FILTER(?c != <{EX}c1>) }}"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let explanation = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    let solutions = rows(
+        evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    assert_eq!(explanation.executor, "native");
+    assert_eq!(explanation.rows, solutions.len() as u64);
+    let operators: Vec<(usize, &str)> = explanation
+        .steps
+        .iter()
+        .map(|s| (s.depth, s.operator.as_str()))
+        .collect();
+    assert_eq!(operators[0], (0, "project"));
+    assert_eq!(operators[1], (1, "filter"));
+    let bgp: Vec<_> = explanation.steps.iter().filter(|s| s.depth == 2).collect();
+    assert_eq!(bgp.len(), 3, "{:#?}", explanation.steps);
+    // memberOf d0 (20 rows) is the most selective start; every join step has an estimate.
+    assert!(bgp[0].detail.contains("memberOf"), "{:#?}", bgp);
+    assert!(bgp.iter().all(|s| s.estimated_rows.is_some()), "{:#?}", bgp);
+    assert_eq!(bgp[0].rows, 20);
+
+    let describe = SparqlParser::new()
+        .parse_query("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")
+        .unwrap();
+    let fallback = explain_query(&snapshot, &describe, &QueryOptions::default()).unwrap();
+    assert_eq!((fallback.executor, fallback.rows), ("spareval", 1500));
 }

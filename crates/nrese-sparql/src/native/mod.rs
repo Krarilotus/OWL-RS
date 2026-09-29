@@ -16,21 +16,26 @@
 mod expr;
 mod fast;
 mod paths;
+mod plan;
 mod ranges;
 mod value;
 mod wcoj;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::time::Instant;
 
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
     anti_join, join, join_keeping_left_order, join_with_undef, left_join, semi_join,
 };
-use nrese_exec::{Budget, IdTable, UNDEF, computed_id, computed_index, group::group_rows};
+use nrese_exec::{
+    Budget, BudgetExceeded, IdTable, UNDEF, computed_id, computed_index, group::group_rows,
+};
 use oxrdf::vocab::xsd;
 use oxrdf::{Literal, Term, Variable};
 use oxsdatatypes::{Decimal, Double, Float, Integer};
@@ -42,7 +47,7 @@ use spargebra::algebra::{
 };
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
-use crate::query::QueryOptions;
+use crate::query::{PlanStep, QueryOptions};
 use expr::Evaluator;
 use value::Value;
 
@@ -77,25 +82,7 @@ pub(crate) fn evaluate<'a>(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<Result<QueryResults<'a>, QueryEvaluationError>> {
-    if options.dataset.is_some() {
-        return None;
-    }
-    let (pattern, ask) = match query {
-        Query::Select {
-            dataset: None,
-            pattern,
-            ..
-        } => (pattern, false),
-        Query::Ask {
-            dataset: None,
-            pattern,
-            ..
-        } => (pattern, true),
-        _ => return None,
-    };
-    if !supported(pattern) {
-        return None;
-    }
+    let (pattern, ask) = native_pattern(query, options)?;
     let ctx = Context::new(snapshot, options);
     let solutions = match ctx.eval(pattern) {
         Ok(solutions) => solutions,
@@ -119,6 +106,50 @@ pub(crate) fn evaluate<'a>(
     Some(Ok(QueryResults::Solutions(QuerySolutionIter::from_tuples(
         variables, rows,
     ))))
+}
+
+/// Runs `query` natively, recording each operator ([`PlanStep`]); returns the steps and
+/// the number of solutions. `None` means "use spareval", as for [`evaluate`].
+pub(crate) fn explain(
+    snapshot: &Snapshot,
+    query: &Query,
+    options: &QueryOptions,
+) -> Option<Result<(Vec<PlanStep>, u64), QueryEvaluationError>> {
+    let (pattern, _) = native_pattern(query, options)?;
+    let mut ctx = Context::new(snapshot, options);
+    ctx.trace = Some(RefCell::default());
+    match ctx.eval(pattern) {
+        Ok(solutions) => Some(Ok((
+            ctx.trace.take().unwrap_or_default().into_inner(),
+            solutions.table.len() as u64,
+        ))),
+        Err(NativeError::Fallback) => None,
+        Err(NativeError::Evaluation(error)) => Some(Err(error)),
+    }
+}
+
+/// The pattern of a query the native executor runs, and whether it is an ASK.
+fn native_pattern<'q>(
+    query: &'q Query,
+    options: &QueryOptions,
+) -> Option<(&'q GraphPattern, bool)> {
+    if options.dataset.is_some() {
+        return None;
+    }
+    let (pattern, ask) = match query {
+        Query::Select {
+            dataset: None,
+            pattern,
+            ..
+        } => (pattern, false),
+        Query::Ask {
+            dataset: None,
+            pattern,
+            ..
+        } => (pattern, true),
+        _ => return None,
+    };
+    supported(pattern).then_some((pattern, ask))
 }
 
 fn decode(snapshot: &Snapshot, computed: &[Term], id: u64) -> Option<Term> {
@@ -352,6 +383,10 @@ struct Context<'a> {
     decoded: RefCell<HashMap<u64, Option<Term>>>,
     cancellation: Option<CancellationToken>,
     budget: Budget,
+    /// The operators run so far, for EXPLAIN; `None` when not explaining.
+    trace: Option<RefCell<Vec<PlanStep>>>,
+    /// Nesting depth of the operator being evaluated (for the trace).
+    depth: Cell<usize>,
 }
 
 impl<'a> Context<'a> {
@@ -367,6 +402,29 @@ impl<'a> Context<'a> {
             budget: options
                 .memory_limit
                 .map_or_else(Budget::unlimited, Budget::new),
+            trace: None,
+            depth: Cell::new(0),
+        }
+    }
+
+    /// Records an operator that ran below the current one (EXPLAIN only).
+    fn note(
+        &self,
+        operator: &str,
+        detail: String,
+        estimated_rows: Option<u64>,
+        rows: usize,
+        start: Instant,
+    ) {
+        if let Some(trace) = &self.trace {
+            trace.borrow_mut().push(PlanStep {
+                depth: self.depth.get(),
+                operator: operator.to_owned(),
+                detail,
+                estimated_rows,
+                rows: rows as u64,
+                micros: start.elapsed().as_micros() as u64,
+            });
         }
     }
 
@@ -388,6 +446,22 @@ impl<'a> Context<'a> {
             .charge(solutions.table.memory_bytes())
             .map_err(|e| QueryEvaluationError::Dataset(Box::new(e)))?;
         Ok(solutions)
+    }
+
+    /// The most rows a table `width` columns wide may have within the remaining budget.
+    fn max_rows(&self, width: usize) -> usize {
+        self.budget.remaining() / (width.max(1) * 8)
+    }
+
+    /// The error for an operator that would outgrow the budget.
+    fn too_large(&self, rows: usize, width: usize) -> NativeError {
+        let requested = rows.saturating_mul(width.max(1) * 8);
+        QueryEvaluationError::Dataset(Box::new(BudgetExceeded {
+            limit: self.budget.used().saturating_add(self.budget.remaining()),
+            requested,
+            used: self.budget.used(),
+        }))
+        .into()
     }
 
     fn consumed(&self, solutions: &Solutions) {
@@ -442,6 +516,36 @@ impl<'a> Context<'a> {
     }
 
     fn eval(&self, pattern: &GraphPattern) -> NativeResult<Solutions> {
+        let Some(trace) = &self.trace else {
+            return self.eval_operator(pattern);
+        };
+        let depth = self.depth.get();
+        let index = {
+            let mut trace = trace.borrow_mut();
+            let (operator, detail) = describe(pattern);
+            trace.push(PlanStep {
+                depth,
+                operator: operator.to_owned(),
+                detail,
+                estimated_rows: None,
+                rows: 0,
+                micros: 0,
+            });
+            trace.len() - 1
+        };
+        self.depth.set(depth + 1);
+        let start = Instant::now();
+        let result = self.eval_operator(pattern);
+        self.depth.set(depth);
+        if let Ok(solutions) = &result {
+            let step = &mut trace.borrow_mut()[index];
+            step.rows = solutions.table.len() as u64;
+            step.micros = start.elapsed().as_micros() as u64;
+        }
+        result
+    }
+
+    fn eval_operator(&self, pattern: &GraphPattern) -> NativeResult<Solutions> {
         self.check()?;
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns, &[]),
@@ -743,20 +847,29 @@ impl<'a> Context<'a> {
                         )
                     })
                     .sum(),
-                None => self.snapshot.count(&s.quad_pattern()),
+                None => self.snapshot.count_in(self.model, &s.quad_pattern()),
             })
             .collect();
+        let start = Instant::now();
         if scans.len() >= 3
             && ranged.iter().all(Option::is_none)
             && let Some(solutions) = self.cyclic_bgp(&scans, &counts)?
         {
+            if self.trace.is_some() {
+                let detail = triples.iter().map(ToString::to_string).collect::<Vec<_>>();
+                let rows = solutions.table.len();
+                self.note("wcoj", detail.join(" . "), None, rows, start);
+            }
             return Ok(solutions);
         }
-        let mut remaining: Vec<usize> = (0..scans.len()).collect();
-        // Start with the smallest pattern (ties: the one sharing most variables).
-        remaining.sort_by_key(|&i| counts[i]);
-        let first = remaining.remove(0);
-        let join_var = remaining.iter().find_map(|&i| {
+        let plan = self.join_order(&scans, &counts);
+        let estimate = |step: usize| {
+            let rows = plan.rows[step];
+            rows.is_finite().then(|| rows.round() as u64)
+        };
+        let order = &plan.order;
+        let first = order[0];
+        let join_var = order.get(1).and_then(|&i| {
             scans[first]
                 .vars()
                 .into_iter()
@@ -766,13 +879,17 @@ impl<'a> Context<'a> {
             Some((permutation, ranges)) => self.scan_ranges(&scans[first], permutation, ranges)?,
             None => self.scan(&scans[first], join_var.as_ref())?,
         };
-        while !remaining.is_empty() {
-            // The smallest pattern connected to the result, or the smallest overall.
-            let position = remaining
-                .iter()
-                .position(|&i| scans[i].vars().iter().any(|v| result.column(v).is_some()))
-                .unwrap_or(0);
-            let next = remaining.remove(position);
+        if self.trace.is_some() {
+            let operator = if ranged[first].is_some() {
+                "range scan"
+            } else {
+                "scan"
+            };
+            let detail = triples[first].to_string();
+            self.note(operator, detail, estimate(0), result.table.len(), start);
+        }
+        for (step, &next) in order.iter().enumerate().skip(1) {
+            let start = Instant::now();
             let shared: Vec<Variable> = scans[next]
                 .vars()
                 .into_iter()
@@ -791,8 +908,81 @@ impl<'a> Context<'a> {
                 };
                 self.join(result, scanned)?
             };
+            if self.trace.is_some() {
+                let operator = match (probe, shared.is_empty()) {
+                    (true, _) => "index join",
+                    (false, true) => "cross product",
+                    (false, false) => "join",
+                };
+                let detail = triples[next].to_string();
+                self.note(operator, detail, estimate(step), result.table.len(), start);
+            }
         }
         Ok(result)
+    }
+
+    /// The order in which to join a BGP's patterns ([`plan`]; `counts` are exact). Two
+    /// patterns start with the smaller one; larger BGPs are planned with distinct counts.
+    fn join_order(&self, scans: &[ScanPattern], counts: &[u64]) -> plan::Plan {
+        if scans.len() <= 2 {
+            let mut order: Vec<usize> = (0..scans.len()).collect();
+            order.sort_by_key(|&i| counts[i]);
+            let mut rows = vec![f64::NAN; order.len()];
+            rows[0] = counts[order[0]] as f64;
+            return plan::Plan { order, rows };
+        }
+        let mut vars: Vec<Variable> = Vec::new();
+        let inputs: Vec<plan::Input> = scans
+            .iter()
+            .zip(counts)
+            .map(|(scan, &count)| plan::Input {
+                count,
+                vars: scan
+                    .vars()
+                    .into_iter()
+                    .map(|v| {
+                        let d = self.distinct(scan, &v, count);
+                        let index = vars.iter().position(|x| *x == v).unwrap_or_else(|| {
+                            vars.push(v);
+                            vars.len() - 1
+                        });
+                        (index, d)
+                    })
+                    .collect(),
+            })
+            .collect();
+        plan::order(&inputs, vars.len(), PROBE_FACTOR)
+    }
+
+    /// Distinct values of `var` among `scan`'s `count` matches: the engine's statistics
+    /// where an index order puts `var` right after the constants, else `count`.
+    fn distinct(&self, scan: &ScanPattern, var: &Variable, count: u64) -> u64 {
+        const CANDIDATES: [Permutation; 4] = [
+            Permutation::Gspo,
+            Permutation::Gpos,
+            Permutation::Gosp,
+            Permutation::Gpso,
+        ];
+        let positions: Vec<usize> = (0..3).filter(|&c| scan.slots[c].is_var(var)).collect();
+        let [position] = positions[..] else {
+            return count;
+        };
+        if scan.vars().len() == 1 {
+            return count;
+        }
+        let bound = |c: usize| c == 3 || matches!(scan.slots[c], Slot::Const(_));
+        CANDIDATES
+            .iter()
+            .find(|p| {
+                let order = p.order();
+                let prefix = order.iter().take_while(|&&c| bound(c)).count();
+                order[prefix] == position && order[prefix + 1..].iter().all(|&c| !bound(c))
+            })
+            .and_then(|&p| {
+                self.snapshot
+                    .distinct_estimate_in(self.model, &scan.quad_pattern(), p)
+            })
+            .map_or(count, |d| d.min(count))
     }
 
     /// A cyclic BGP by a worst-case-optimal join ([`wcoj`]); `None` if it isn't cyclic.
@@ -837,12 +1027,17 @@ impl<'a> Context<'a> {
             model: self.model,
             patterns,
             variables: width,
+            max_rows: self.max_rows(width),
         };
         let token = self.cancellation.clone();
         let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
-        let rows = query
-            .run(&cancelled)
-            .map_err(|wcoj::Stop::Cancelled| QueryEvaluationError::Cancelled)?;
+        let rows = match query.run(&cancelled) {
+            Ok(rows) => rows,
+            Err(wcoj::Stop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
+            Err(wcoj::Stop::TooManyRows) => {
+                return Err(self.too_large(query.max_rows.saturating_add(1), width));
+            }
+        };
         let mut table = IdTable::new(width);
         for row in rows.chunks_exact(width) {
             table.push_row(row);
@@ -1023,6 +1218,8 @@ impl<'a> Context<'a> {
             shared_positions: &shared_positions,
             positions: &positions,
             width: vars.len(),
+            max_rows: self.max_rows(vars.len()),
+            produced: AtomicUsize::new(0),
         };
         let token = self.cancellation.clone();
         let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
@@ -1030,7 +1227,7 @@ impl<'a> Context<'a> {
         let out = if rows < 2 * PROBE_CHUNK {
             probe.rows(0..rows, &cancelled)
         } else {
-            let parts: Vec<Option<IdTable>> = (0..rows.div_ceil(PROBE_CHUNK))
+            let parts: Vec<Result<IdTable, ProbeStop>> = (0..rows.div_ceil(PROBE_CHUNK))
                 .into_par_iter()
                 .map(|i| {
                     probe.rows(
@@ -1041,11 +1238,15 @@ impl<'a> Context<'a> {
                 .collect();
             parts
                 .into_iter()
-                .collect::<Option<Vec<IdTable>>>()
+                .collect::<Result<Vec<IdTable>, ProbeStop>>()
                 .map(|parts| IdTable::concat(vars.len(), parts))
         };
-        let Some(out) = out else {
-            return Err(QueryEvaluationError::Cancelled.into());
+        let out = match out {
+            Ok(out) => out,
+            Err(ProbeStop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
+            Err(ProbeStop::TooManyRows) => {
+                return Err(self.too_large(probe.max_rows.saturating_add(1), vars.len()));
+            }
         };
         let out = if result.ordered {
             out
@@ -1065,16 +1266,18 @@ impl<'a> Context<'a> {
     fn join(&self, left: Solutions, right: Solutions) -> NativeResult<Solutions> {
         let (lk, rk) = shared_columns(&left, &right);
         let vars = joined_vars(&left, &right, &rk);
+        let max_rows = self.max_rows(vars.len());
         let table = if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
             if left.ordered {
                 return Err(NativeError::Fallback);
             }
-            join_with_undef(&left.table, &right.table, &lk, &rk)
+            join_with_undef(&left.table, &right.table, &lk, &rk, max_rows)
         } else if left.ordered {
-            join_keeping_left_order(&left.table, &right.table, &lk, &rk)
+            join_keeping_left_order(&left.table, &right.table, &lk, &rk, max_rows)
         } else {
-            join(&left.table, &right.table, &lk, &rk)
-        };
+            join(&left.table, &right.table, &lk, &rk, max_rows)
+        }
+        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
         self.consumed(&left);
         self.consumed(&right);
         self.produced(Solutions {
@@ -1095,8 +1298,9 @@ impl<'a> Context<'a> {
             return Err(NativeError::Fallback);
         }
         let vars = joined_vars(&left, &right, &rk);
+        let max_rows = self.max_rows(vars.len());
         let table = match expression {
-            None => left_join(&left.table, &right.table, &lk, &rk, None),
+            None => left_join(&left.table, &right.table, &lk, &rk, None, max_rows),
             Some(expression) => {
                 let accept = |row: &[u64]| {
                     let binding = |v: &Variable| {
@@ -1105,9 +1309,10 @@ impl<'a> Context<'a> {
                     };
                     self.evaluator.filter(expression, &binding)
                 };
-                left_join(&left.table, &right.table, &lk, &rk, Some(&accept))
+                left_join(&left.table, &right.table, &lk, &rk, Some(&accept), max_rows)
             }
-        };
+        }
+        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
         self.consumed(&left);
         self.consumed(&right);
         self.produced(Solutions {
@@ -1748,6 +1953,61 @@ enum SortKey {
 
 /// True if `aggregate` counts the rows of a pattern: `COUNT(*)`, or `COUNT(?v)` for a
 /// variable the pattern always binds.
+/// An operator's name and details for EXPLAIN.
+fn describe(pattern: &GraphPattern) -> (&'static str, String) {
+    let list = |vars: &[Variable]| {
+        vars.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    match pattern {
+        GraphPattern::Bgp { patterns } => ("bgp", format!("{} patterns", patterns.len())),
+        GraphPattern::Path {
+            subject,
+            path,
+            object,
+        } => ("path", format!("{subject} {path} {object}")),
+        GraphPattern::Join { .. } => ("join", String::new()),
+        GraphPattern::LeftJoin { expression, .. } => (
+            "optional",
+            expression
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        ),
+        GraphPattern::Filter { expr, .. } => ("filter", expr.to_string()),
+        GraphPattern::Union { .. } => ("union", String::new()),
+        GraphPattern::Extend {
+            variable,
+            expression,
+            ..
+        } => ("bind", format!("{expression} AS {variable}")),
+        GraphPattern::Minus { .. } => ("minus", String::new()),
+        GraphPattern::Values { variables, .. } => ("values", list(variables)),
+        GraphPattern::OrderBy { expression, .. } => (
+            "order by",
+            expression
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        GraphPattern::Project { variables, .. } => ("project", list(variables)),
+        GraphPattern::Distinct { .. } => ("distinct", String::new()),
+        GraphPattern::Reduced { .. } => ("reduced", String::new()),
+        GraphPattern::Slice { start, length, .. } => (
+            "slice",
+            match length {
+                Some(length) => format!("offset {start} limit {length}"),
+                None => format!("offset {start}"),
+            },
+        ),
+        GraphPattern::Group { variables, .. } => ("group", list(variables)),
+        _ => ("operator", String::new()),
+    }
+}
+
 /// An index nested-loop join of a key-sorted `table` with `scan`: the index is probed once
 /// per distinct key. Holds only thread-safe state, so chunks of rows run in parallel.
 struct Probe<'a> {
@@ -1761,11 +2021,24 @@ struct Probe<'a> {
     /// The scan positions of each new variable.
     positions: &'a [Vec<usize>],
     width: usize,
+    /// Output rows allowed in total (the query's memory budget), and produced so far.
+    max_rows: usize,
+    produced: AtomicUsize,
+}
+
+/// Why an index nested-loop join stopped early.
+enum ProbeStop {
+    Cancelled,
+    TooManyRows,
 }
 
 impl Probe<'_> {
-    /// The joined rows for `table` rows `rows`, in order; `None` if cancelled.
-    fn rows(&self, rows: Range<usize>, cancelled: &(dyn Fn() -> bool + Sync)) -> Option<IdTable> {
+    /// The joined rows for `table` rows `rows`, in order.
+    fn rows(
+        &self,
+        rows: Range<usize>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<IdTable, ProbeStop> {
         let table = self.table;
         let width = table.width();
         let mut out = IdTable::new(self.width);
@@ -1773,9 +2046,14 @@ impl Probe<'_> {
         let mut row = vec![0u64; self.width];
         let mut bound = self.scan.clone();
         let first = rows.start;
+        let mut counted = 0;
         for r in rows {
-            if (r - first).is_multiple_of(4096) && cancelled() {
-                return None;
+            if (r - first).is_multiple_of(4096) {
+                if cancelled() {
+                    return Err(ProbeStop::Cancelled);
+                }
+                self.grow(out.len() - counted)?;
+                counted = out.len();
             }
             let same_key = r > first
                 && self
@@ -1813,8 +2091,22 @@ impl Probe<'_> {
                 row[width..].copy_from_slice(values);
                 out.push_row(&row);
             }
+            // One key can match a whole index range: check within large fan-outs too.
+            if out.len() - counted > 1 << 16 {
+                self.grow(out.len() - counted)?;
+                counted = out.len();
+            }
         }
-        Some(out)
+        self.grow(out.len() - counted)?;
+        Ok(out)
+    }
+
+    fn grow(&self, rows: usize) -> Result<(), ProbeStop> {
+        let total = self.produced.fetch_add(rows, AtomicOrdering::Relaxed) + rows;
+        if total > self.max_rows {
+            return Err(ProbeStop::TooManyRows);
+        }
+        Ok(())
     }
 }
 

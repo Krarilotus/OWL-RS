@@ -67,7 +67,8 @@ fn encode(value: &str) -> String {
 #[tokio::test]
 async fn a_query_past_its_deadline_times_out() -> Result<(), Box<dyn std::error::Error>> {
     let (app, _dir) = app_with_triples(2_000, Duration::from_millis(300))?;
-    let query = "SELECT (COUNT(*) AS ?n) WHERE { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i }";
+    // 4 million rows, each through a regular expression: seconds of work, little memory.
+    let query = "SELECT (COUNT(*) AS ?n) WHERE { ?a ?b ?c . ?d ?e ?f FILTER(REGEX(CONCAT(STR(?c), STR(?f)), \"^(a|b)*x$\")) }";
     let started = Instant::now();
     let response = app
         .oneshot(get(&format!("/dataset/query?query={}", encode(query)))?)
@@ -168,5 +169,46 @@ async fn dataset_parameters_select_the_graphs() -> Result<(), Box<dyn std::error
         ))?)
         .await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_reports_how_the_query_ran() -> Result<(), Box<dyn std::error::Error>> {
+    let (app, _dir) = app_with_triples(1_000, Duration::from_secs(30))?;
+    let query = "SELECT ?s ?v WHERE { ?s <http://example.com/p1> ?v . ?s ?p ?v }";
+    let response = app
+        .oneshot(get(&format!(
+            "/dataset/query?query={}&explain=true",
+            encode(query)
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let explanation: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    assert_eq!(explanation["executor"], "native");
+    assert_eq!(explanation["rows"], 200);
+    let steps = explanation["steps"].as_array().expect("steps");
+    assert_eq!(steps[0]["operator"], "project");
+    assert!(
+        steps
+            .iter()
+            .any(|s| s["operator"] == "scan" && s["estimated_rows"] == 200),
+        "{steps:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_query_beyond_its_memory_limit_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let (app, _dir) = app_with_triples(2_000, Duration::from_secs(30))?;
+    // 8·10⁹ rows: refused before any memory is taken.
+    let query = "SELECT (COUNT(*) AS ?n) WHERE { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i }";
+    let started = Instant::now();
+    let response = app
+        .oneshot(get(&format!("/dataset/query?query={}", encode(query)))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(body_text(response).await?.contains("memory budget"));
+    assert!(started.elapsed() < Duration::from_secs(10));
     Ok(())
 }
