@@ -152,8 +152,18 @@ End-of-batch numbers (`local-bulk.sh`):
 | LUBM(100) 14 queries | 0.87 s |
 | OWL2Bench RL(1) closure | 0.53 s |
 
+**Status (2026-09-29, fourth batch):**
+- **Equality module in the commit path:** the delta executor expands facts over `sameAs` classes like the batch executor.
+- **v1 removed (R6 in part):**
+  - The v1 fixture suite runs on v2. That covers the 11 catalog ontology tests, the Turtle preload test, and the 48 v1 unit-test scenarios in `v2/v1_scenarios.rs`.
+  - One deliberate difference is pinned by a test: `owl:ReflexiveProperty` is outside OWL 2 RL.
+  - `rules-mvp` is gone (about 9,500 lines).
+  - Reasoning modes are `disabled`, `rdfs` and `owl2-rl`.
+  - Rejects carry the violated W3C rule, its premises (each marked asserted or inferred) and the commit's likely trigger.
+
 Next:
-- The delta executor's own equality module; it uses the generic rules today.
+- R6 rest: proof trees for inferred facts (explanations API).
+- The Docker scorecard with `nrese-v2` on the reference machine (office PC).
 - The Docker scorecard with `nrese-v2` on the reference machine (office PC).
 - R6: consistency explanations and reject reports for v2.
 - The v1 fixture suite on v2, then removing `rules-mvp`.
