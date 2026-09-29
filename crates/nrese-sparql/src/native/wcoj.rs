@@ -279,7 +279,8 @@ impl Query<'_> {
                     return true;
                 }
                 stats.lookups.fetch_add(1, Ordering::Relaxed);
-                self.count(p, bindings) > 0
+                self.snapshot
+                    .exists_in(self.model, &self.quad_pattern(p, bindings))
             })
     }
 
