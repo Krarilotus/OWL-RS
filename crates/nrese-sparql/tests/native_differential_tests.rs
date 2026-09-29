@@ -1049,3 +1049,128 @@ fn string_functions_casts_and_group_concat_equal_spareval() {
     }
     assert_eq!(checked, 40 * (24 * 2 + 4));
 }
+
+/// Every quad of `engine`, blank nodes written as `_:b`, sorted.
+fn contents(engine: &Engine) -> Vec<String> {
+    let snapshot = engine.snapshot();
+    let blank = |t: String| {
+        if t.starts_with("_:") {
+            "_:b".to_owned()
+        } else {
+            t
+        }
+    };
+    let mut out: Vec<String> = snapshot
+        .quads_for_pattern(&nrese_engine::QuadPattern::all())
+        .map(|q| {
+            let q = snapshot.decode_quad(q).unwrap();
+            format!(
+                "{} {} {} {}",
+                blank(q.subject.to_string()),
+                q.predicate,
+                blank(q.object.to_string()),
+                blank(q.graph_name.to_string())
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// DELETE/INSERT … WHERE with the WHERE evaluated natively (over random patterns, with
+/// blank nodes, graph variables and named graphs in the templates) changes the store
+/// exactly as with the WHERE on spareval.
+#[test]
+fn native_updates_equal_spareval_updates() {
+    use nrese_sparql::{UpdateOptions, apply_update};
+    let mut rng = Rng(20_260_932);
+    let templates = [
+        (
+            "DELETE { ?a ?p ?b }",
+            "INSERT { ?b <http://example.com/q> ?a }",
+        ),
+        (
+            "DELETE { ?a <http://example.com/p1> ?b }",
+            "INSERT { _:x <http://example.com/r> ?a . _:x <http://example.com/r> ?b }",
+        ),
+        ("", "INSERT { GRAPH <http://example.com/g> { ?a ?p ?b } }"),
+        (
+            "DELETE { ?b ?p ?a }",
+            "INSERT { GRAPH ?a { ?a <http://example.com/s> ?c } }",
+        ),
+        ("DELETE { ?a ?p ?b }", ""),
+    ];
+    let mut checked = 0;
+    for _ in 0..60 {
+        let data = random_dataset(&mut rng);
+        let engines = [
+            Engine::new(EngineConfig::default()).unwrap(),
+            Engine::new(EngineConfig::default()).unwrap(),
+        ];
+        for engine in &engines {
+            let mut tx = engine.transaction();
+            for quad in &data {
+                tx.insert(quad.as_ref());
+            }
+            tx.commit().unwrap();
+        }
+        for _ in 0..10 {
+            let pattern = group_pattern(&mut rng, 0);
+            let (delete, insert) = *rng.pick(&templates);
+            let text = format!("{delete} {insert} WHERE {{ ?a ?p ?b . {pattern} }}");
+            let update = SparqlParser::new()
+                .parse_update(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            for (engine, force_spareval) in engines.iter().zip([false, true]) {
+                let options = UpdateOptions {
+                    force_spareval,
+                    ..UpdateOptions::default()
+                };
+                let mut tx = engine.transaction();
+                apply_update(&mut tx, &update, &options).unwrap();
+                tx.commit().unwrap();
+            }
+            let (native, spareval) = (contents(&engines[0]), contents(&engines[1]));
+            if native != spareval {
+                let only = |a: &[String], b: &[String]| -> Vec<String> {
+                    a.iter().filter(|x| !b.contains(x)).cloned().collect()
+                };
+                panic!(
+                    "{text}
+only native: {:?}
+only spareval: {:?}",
+                    only(&native, &spareval),
+                    only(&spareval, &native)
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 600);
+}
+
+/// A quad one solution deletes and another inserts is present afterwards: every deletion
+/// comes before any insertion (SPARQL 1.1 Update 3.1.3), on both paths.
+#[test]
+fn deletions_precede_insertions() {
+    use nrese_sparql::{UpdateOptions, apply_update};
+    let text = format!(
+        "DELETE {{ ?d <{EX}q> <{EX}y> }} INSERT {{ ?i <{EX}q> <{EX}y> }} WHERE {{ {{ BIND(<{EX}x> AS ?i) }} UNION {{ BIND(<{EX}x> AS ?d) }} }}"
+    );
+    let update = SparqlParser::new().parse_update(&text).unwrap();
+    for force_spareval in [false, true] {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let quad = Quad::new(ex("x"), ex("q"), ex("y"), GraphName::DefaultGraph);
+        let mut tx = engine.transaction();
+        tx.insert(quad.as_ref());
+        tx.commit().unwrap();
+        let options = UpdateOptions {
+            force_spareval,
+            ..UpdateOptions::default()
+        };
+        let mut tx = engine.transaction();
+        apply_update(&mut tx, &update, &options).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(contents(&engine).len(), 1, "spareval: {force_spareval}");
+    }
+}
