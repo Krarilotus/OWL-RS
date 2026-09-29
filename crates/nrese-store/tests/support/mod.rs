@@ -41,7 +41,11 @@ pub fn inferred_statements(store: &StoreService) -> Result<Inferred, Box<dyn std
         .skip(1)
         .filter_map(|line| {
             let mut parts = line.split('\t');
-            Some((term(parts.next()?), term(parts.next()?), term(parts.next()?)))
+            Some((
+                term(parts.next()?),
+                term(parts.next()?),
+                term(parts.next()?),
+            ))
         })
         .collect())
 }

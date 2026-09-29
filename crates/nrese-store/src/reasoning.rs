@@ -304,3 +304,107 @@ pub fn apply_delta(
     };
     (update.violations, report, update.program)
 }
+
+/// What an OWL 2 RL consistency rule's violation means, for reject reports.
+fn describe(rule: &str) -> &'static str {
+    match rule {
+        "cax-dw" => "an instance of two disjoint classes",
+        "cax-adc" => "an instance of two classes of an owl:AllDisjointClasses axiom",
+        "cls-com" => "an instance of a class and of its complement",
+        "cls-nothing2" => "an instance of owl:Nothing",
+        "cls-maxc1" | "cls-maxqc1" | "cls-maxqc2" => "a maximum cardinality of 0 is exceeded",
+        "prp-irp" => "an irreflexive property relates a resource to itself",
+        "prp-asyp" => "an asymmetric property holds in both directions",
+        "prp-pdw" => "two disjoint properties relate the same pair",
+        "prp-adp" => "two properties of an owl:AllDisjointProperties axiom relate the same pair",
+        "prp-npa1" | "prp-npa2" => "a negative property assertion is contradicted",
+        "eq-diff1" | "eq-diff2" | "eq-diff3" => "resources declared different are the same",
+        _ => "a consistency rule is violated",
+    }
+}
+
+/// A term as reject reports show it: an IRI plainly, anything else in N-Triples form.
+fn term_text(term: &oxrdf::Term) -> String {
+    match term {
+        oxrdf::Term::NamedNode(node) => node.as_str().to_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// A violation decoded for a reject report: the violated rule's premises under its
+/// bindings (the facts that clash), each marked asserted or inferred.
+pub fn explain(
+    program: &Program,
+    violation: &Violation,
+    tx: &Transaction<'_>,
+) -> nrese_reasoner::RejectExplanation {
+    use nrese_reasoner::v2::ir::{Head, Term};
+    let decode = |id: u64| {
+        tx.decode(TermId::from_raw(id))
+            .map_or_else(|| format!("#{id}"), |term| term_text(&term))
+    };
+    let value = |term: Term| match term {
+        Term::Const(c) => Some(c),
+        Term::Var(v) => violation.bindings.get(usize::from(v)).copied(),
+    };
+    let evidence: Vec<nrese_reasoner::RejectEvidence> = program
+        .rules
+        .iter()
+        .find(|r| r.name == violation.rule && r.head == Head::Inconsistent)
+        .map(|rule| {
+            rule.body
+                .iter()
+                .filter_map(|atom| {
+                    let [s, p, o] = [value(atom.0[0])?, value(atom.0[1])?, value(atom.0[2])?];
+                    let asserted = tx
+                        .quads_for_pattern_in(
+                            ReadModel::Asserted,
+                            &pattern([Some(s), Some(p), Some(o)], GraphSelector::Any),
+                        )
+                        .next()
+                        .is_some();
+                    Some(nrese_reasoner::RejectEvidence {
+                        role: "premise",
+                        subject: decode(s),
+                        predicate: decode(p),
+                        object: decode(o),
+                        origin: if asserted { "asserted" } else { "inferred" }.to_owned(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // The instance the violation is about: the subject of the last premise (OWL 2 RL
+    // rules list schema premises first), else the first binding.
+    let focus = evidence
+        .last()
+        .map(|e| e.subject.clone())
+        .or_else(|| violation.bindings.first().map(|&id| decode(id)))
+        .unwrap_or_default();
+    let premises: Vec<String> = evidence
+        .iter()
+        .map(|e| format!("{} {} {} ({})", e.subject, e.predicate, e.object, e.origin))
+        .collect();
+    let summary = if premises.is_empty() {
+        let bindings: Vec<String> = violation.bindings.iter().map(|&id| decode(id)).collect();
+        format!(
+            "{} ({}): {}",
+            violation.rule,
+            describe(&violation.rule),
+            bindings.join(", ")
+        )
+    } else {
+        format!(
+            "{} ({}): {}",
+            violation.rule,
+            describe(&violation.rule),
+            premises.join("; ")
+        )
+    };
+    nrese_reasoner::RejectExplanation {
+        summary,
+        violated_constraint: violation.rule.clone(),
+        focus_resource: focus,
+        evidence,
+    }
+}

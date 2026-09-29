@@ -20,22 +20,6 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> KeyValueSource {
     );
 
     insert_option(&mut source, names::REASONING_MODE, config.reasoner.mode);
-    insert_option(
-        &mut source,
-        names::REASONER_READ_MODEL,
-        config.reasoner.read_model,
-    );
-    insert_option(
-        &mut source,
-        names::REASONER_RULES_MVP_PRESET,
-        config.reasoner.rules_mvp.preset,
-    );
-    insert_joined(
-        &mut source,
-        names::REASONER_RULES_MVP_FEATURES,
-        config.reasoner.rules_mvp.features,
-        ",",
-    );
 
     insert_numeric(
         &mut source,

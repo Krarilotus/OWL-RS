@@ -17,7 +17,7 @@ async fn tell_endpoint_accepts_official_foaf_rdf_xml_and_surfaces_reasoning_runt
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
     let foaf_bytes = fs::read(catalog_fixture_path("foaf.rdf"))?;
 
@@ -65,11 +65,7 @@ async fn tell_endpoint_accepts_official_foaf_rdf_xml_and_surfaces_reasoning_runt
             .as_u64()
             .is_some_and(|count| count > 0)
     );
-    assert!(
-        payload["last_run"]["stats"]["supported_asserted_triples"]
-            .as_u64()
-            .is_some_and(|count| count > 0)
-    );
+    assert_eq!(payload["last_run"]["ruleset"], "owl2-rl");
     Ok(())
 }
 
@@ -78,7 +74,7 @@ async fn graph_store_roundtrip_accepts_official_org_turtle_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
     let org_bytes = fs::read(catalog_fixture_path("org.ttl"))?;
 
@@ -140,7 +136,7 @@ async fn graph_store_roundtrip_accepts_official_prov_turtle_with_content_locatio
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
     let prov_bytes = fs::read(catalog_fixture_path("prov.ttl"))?;
 
@@ -177,7 +173,7 @@ async fn graph_store_roundtrip_accepts_official_skos_rdf_xml_fixture()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
     let skos_bytes = fs::read(catalog_fixture_path("skos.rdf"))?;
 

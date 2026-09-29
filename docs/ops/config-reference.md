@@ -43,21 +43,7 @@ data_dir = "./data"
 ontology_path = "C:/data/rg_ontology.ttl"
 
 [reasoner]
-mode = "rules-mvp"
-read_model = "asserted-only"
-
-[reasoner.rules_mvp]
-tier = "bounded-owl"
-features = [
-  "rdfs-subclass-closure",
-  "rdfs-subproperty-closure",
-  "rdfs-type-propagation",
-  "rdfs-domain-range-typing",
-  "owl-property-assertion-closure",
-  "owl-equality-reasoning",
-  "owl-consistency-check",
-  "unsupported-diagnostics",
-]
+mode = "owl2-rl"
 
 [policy.limits]
 max_query_bytes = 1048576
@@ -145,51 +131,16 @@ api_key = "replace-me"
 
 - file key: `reasoner.mode`
 - env override: `NRESE_REASONING_MODE`
-- values: `disabled` (aliases `none`, `off`), `rules-mvp`
-- unknown values are a startup error (a typo must not silently disable consistency checking)
-
-- file key: `reasoner.read_model`
-- env override: `NRESE_REASONER_READ_MODEL`
 - values:
-  - `asserted-only`
-- current semantics:
-  - query and graph-read surfaces expose the latest committed asserted dataset state
-  - reasoning currently affects mutation acceptance and diagnostics, not the default query result set
-
-- file key: `reasoner.rules_mvp.features`
-- env override: `NRESE_REASONER_RULES_MVP_FEATURES`
-- accepted values:
-  - `default`
-  - `all`
-  - `none`
-  - `rdfs-subclass-closure`
-  - `rdfs-subproperty-closure`
-  - `rdfs-type-propagation`
-  - `rdfs-domain-range-typing`
-  - `owl-property-assertion-closure`
-  - `owl-equality-reasoning`
-  - `owl-property-chain-axioms`
-  - `owl-consistency-check`
-  - `unsupported-diagnostics`
-- file format:
-  - string: `features = "default"`
-  - list: `features = ["rdfs-subclass-closure", "owl-consistency-check"]`
-
-- file key: `reasoner.rules_mvp.preset`
-- file key alias: `reasoner.rules_mvp.tier`
-- env override: `NRESE_REASONER_RULES_MVP_PRESET`
-- values:
-  - `rdfs-core`
-  - `bounded-owl`
-- precedence:
-  - explicit `features` override `preset`
-  - `preset` overrides the built-in default
-- runtime resolution:
-  - parsed `mode`, `preset`, and optional feature overrides collapse into one resolved runtime reasoner profile and semantic tier
-  - general runtime/capability payloads expose that resolved profile/tier, while per-feature detail stays on the dedicated reasoning-diagnostics surface
-- semantic tiers:
-  - `rdfs-core`: bounded RDFS closure/type propagation only
-  - `bounded-owl`: bounded OWL rule slice on top of the RDFS core
+  - `disabled` (aliases `none`, `off`): no reasoning; reads see asserted statements only
+  - `rdfs`: the RDFS closure is materialised into the inferred stack
+  - `owl2-rl`: the OWL 2 RL/RDF closure is materialised, and commits that violate a consistency rule are rejected with the rule and the facts it matched
+- unknown values are a startup error (a typo must not silently disable consistency checking); `rules-mvp`, the removed v1 reasoner, is an error that names its replacement
+- with `rdfs` or `owl2-rl`:
+  - `nrese-server load` and startup materialise the closure (startup skips it when `reasoning.state` in the data directory records that the inferred stack is current)
+  - every commit maintains it incrementally, inside the same transaction
+  - queries see asserted and inferred statements by default; `infer=false` or `FROM <http://www.ontotext.com/explicit>` reads asserted statements only, `FROM <http://www.ontotext.com/implicit>` inferred ones
+- switching reasoning off clears the inferred stack at the next startup
 
 ## Policy Limits
 

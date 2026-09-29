@@ -8,11 +8,11 @@ NRESE is a Rust RDF database under active redesign. The goal is a store that **r
 - **Decisions:** [docs/adr/](docs/adr/)
 - **Document index (German):** [Spezifikation.md](Spezifikation.md)
 
-## Current state (engine v2 storage, v1 reasoner)
+## Current state (engine v2 storage, reasoner v2)
 
 The server runs on **NRESE's own storage engine** (`nrese-engine`, [ADR-0002](docs/adr/0002-engine-storage-lsm-permutations.md)) with SPARQL 1.1 from `nrese-sparql` (spareval over engine snapshots). It offers:
 - SPARQL query and update, the Graph Store Protocol, and `TELL` ingest
-- a bounded rule reasoner used as a write gate (`rules-mvp`)
+- materialised reasoning (`rdfs`, `owl2-rl`): inferences are queryable and maintained on every commit, and consistency violations reject the commit
 - auth modes and deployment postures
 - an operator UI (`/ops`) and a user console (`/console`)
 - a comparison harness
@@ -27,7 +27,6 @@ Measured over HTTP at 10 M triples (details in [benches/baselines/](benches/base
 Durable storage needs no native toolchain. The revision is persistent, and recovery after a crash restores the last acknowledged commit.
 
 Known limits, addressed by later milestones:
-- **v1 reasoner:** it only sees triples between IRIs, its inferences can't be queried, and when enabled (`rules-mvp`) it reads the whole dataset on every write. Milestone 3 replaces it.
 - **Memory:** indexes are held in memory at about 190 bytes per quad; compression and on-disk runs are Pf1/Pf2.
 - **Behaviour changes from v1:** literal lexical forms are kept exactly as written, and a named graph exists only while it holds quads. See ADR-0002.
 
@@ -41,7 +40,7 @@ Already fixed on the way (Milestone 0):
 | Path | Layer | Owns |
 |---|---|---|
 | `crates/nrese-core` | L0 | shared report and capability contracts |
-| `crates/nrese-reasoner` | L2 | reasoning profiles, `rules-mvp`, consistency and explanations |
+| `crates/nrese-reasoner` | L2 | reasoner v2: rule IR, rulesets, batch and delta executors, modules; reasoning profiles |
 | `crates/nrese-store` | L3 | operations (query, update, graph store, tell, backup) and the mutation pipeline |
 | `crates/nrese-server` | L4 | HTTP transport, auth, policy, posture, UI hosting |
 | `crates/nrese-engine` | L1 | engine v2 storage (in progress, not yet part of the workspace build) |
@@ -165,13 +164,7 @@ Optional environment variables:
 - `NRESE_ONTOLOGY_PATH`
   Path to an ontology file to preload.
 - `NRESE_REASONING_MODE`
-  Example: `rules-mvp`
-- `NRESE_REASONER_READ_MODEL`
-  Example: `asserted-only`
-- `NRESE_REASONER_RULES_MVP_FEATURES`
-  Example: `rdfs-subclass-closure,rdfs-subproperty-closure,rdfs-type-propagation,rdfs-domain-range-typing,owl-property-assertion-closure,owl-equality-reasoning,owl-consistency-check,unsupported-diagnostics`
-- `NRESE_REASONER_RULES_MVP_PRESET`
-  Example: `bounded-owl`
+  `disabled`, `rdfs` or `owl2-rl`
 - `NRESE_DEPLOYMENT_POSTURE`
   Example: `read-only-demo`, `internal-authenticated`, or `replacement-grade`
 - `NRESE_SPARQL_PARSE_ERROR_PROFILE`
@@ -233,16 +226,11 @@ If you want to work on storage, dataset state, or SPARQL execution:
 
 If you want to work on reasoning:
 
-- start in [crates/nrese-reasoner/src/service.rs](crates/nrese-reasoner/src/service.rs)
-- profile declarations are in [crates/nrese-reasoner/src/profile.rs](crates/nrese-reasoner/src/profile.rs)
-- bounded rules are orchestrated from [crates/nrese-reasoner/src/rules.rs](crates/nrese-reasoner/src/rules.rs)
-- typed reasoner runtime configuration is owned in [crates/nrese-reasoner/src/config.rs](crates/nrese-reasoner/src/config.rs), while external parsing and precedence live in the grouped `crates/nrese-server/src/config/` modules
-- `rules-mvp` memoization and prepared-artifact reuse are implemented in the grouped [crates/nrese-reasoner/src/rules_mvp_cache/mod.rs](crates/nrese-reasoner/src/rules_mvp_cache/mod.rs) module with separate schema and prepared-run files
-- dataset indexing is grouped under [crates/nrese-reasoner/src/dataset_index/mod.rs](crates/nrese-reasoner/src/dataset_index/mod.rs) with builder, vocabulary-id, stats, and test files kept in the same topic folder
-- identity/equality handling is grouped under [crates/nrese-reasoner/src/identity/mod.rs](crates/nrese-reasoner/src/identity/mod.rs) with separate equality, entailment, and consistency files
-- effective type derivation is grouped under [crates/nrese-reasoner/src/effective_types/mod.rs](crates/nrese-reasoner/src/effective_types/mod.rs) with separate builder, origin, and test files
-- property closure is grouped under [crates/nrese-reasoner/src/property_closure/mod.rs](crates/nrese-reasoner/src/property_closure/mod.rs) with separate builder, equality-expansion, and test files
-- class-side consistency checks are grouped under [crates/nrese-reasoner/src/class_consistency/mod.rs](crates/nrese-reasoner/src/class_consistency/mod.rs), and property-side consistency checks are grouped under [crates/nrese-reasoner/src/property_consistency/mod.rs](crates/nrese-reasoner/src/property_consistency/mod.rs)
+- start in [docs/design/reasoner-v2.md](docs/design/reasoner-v2.md) and [crates/nrese-reasoner/src/v2/mod.rs](crates/nrese-reasoner/src/v2/mod.rs)
+- rules are data ([ir.rs](crates/nrese-reasoner/src/v2/ir.rs), [rulesets.rs](crates/nrese-reasoner/src/v2/rulesets.rs)); list axioms are compiled per axiom ([lists.rs](crates/nrese-reasoner/src/v2/lists.rs))
+- [naive.rs](crates/nrese-reasoner/src/v2/naive.rs) is the reference evaluator every executor is tested against
+- [batch.rs](crates/nrese-reasoner/src/v2/batch.rs) materialises (grounding, parallel semi-naive evaluation, transitive and equality modules); [delta.rs](crates/nrese-reasoner/src/v2/delta.rs) maintains the closure per commit (DRed with B/F proofs)
+- the store side (materialisation, commit path, reject explanations) is [crates/nrese-store/src/reasoning.rs](crates/nrese-store/src/reasoning.rs)
 
 If you want to work on HTTP, auth, or operator surfaces:
 

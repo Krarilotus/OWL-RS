@@ -1,28 +1,18 @@
-//! The pending delta of a mutation, in the shape the v1 reasoner gate and reject attribution
-//! read: IRI-only triples as strings, flattened across graphs.
+//! The pending delta of a mutation, in the shape reject attribution reads: IRI-only
+//! triples as strings, flattened across graphs.
 //!
 //! Cost is O(delta): it decodes only the transaction's pending changes. (Engine v1 cloned the
 //! store and diffed two full snapshots instead.)
 
 use std::collections::BTreeSet;
 
-use nrese_engine::{EncodedQuad, QuadPattern, ReadModel, Transaction};
+use nrese_engine::{EncodedQuad, Transaction};
 use oxrdf::{NamedOrBlankNode, Quad, Term};
-
-use crate::error::StoreResult;
-use crate::snapshot::StoreDatasetSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MutationDeltaPreview {
     pub inserted_triples: Vec<(String, String, String)>,
     pub removed_triples: Vec<(String, String, String)>,
-}
-
-/// What a mutation would do, as seen by the validation gates.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedMutationPreview {
-    pub snapshot: StoreDatasetSnapshot,
-    pub delta: MutationDeltaPreview,
 }
 
 impl MutationDeltaPreview {
@@ -57,23 +47,4 @@ fn iri_triple(quad: Quad) -> Option<(String, String, String)> {
         quad.predicate.into_string(),
         object.into_string(),
     ))
-}
-
-/// The post-mutation dataset for the v1 reasoner: O(dataset) when reasoning is enabled,
-/// O(1) otherwise.
-pub(crate) fn gate_snapshot(
-    tx: &Transaction<'_>,
-    revision: u64,
-    reasoning_reads_triples: bool,
-) -> StoreResult<StoreDatasetSnapshot> {
-    if !reasoning_reads_triples {
-        return Ok(StoreDatasetSnapshot::summary(
-            revision,
-            tx.len_in(ReadModel::Asserted),
-        ));
-    }
-    StoreDatasetSnapshot::capture(
-        crate::view::decoded_quads(tx, ReadModel::Asserted, &QuadPattern::all()),
-        revision,
-    )
 }

@@ -21,11 +21,7 @@ mode = "on-disk"
 data_dir = "/var/lib/nrese/data"
 
 [reasoner]
-mode = "rules-mvp"
-
-[reasoner.rules_mvp]
-preset = "bounded-owl"
-features = ["rdfs-subclass-closure", "owl-consistency-check"]
+mode = "owl2-rl"
 
 [ai]
 enabled = true
@@ -59,14 +55,6 @@ admin_subjects = ["CN=admin,O=Test"]
         Some("0.0.0.0:9191")
     );
     assert_eq!(source.get(names::STORE_MODE).as_deref(), Some("on-disk"));
-    assert_eq!(
-        source.get(names::REASONER_RULES_MVP_FEATURES).as_deref(),
-        Some("rdfs-subclass-closure,owl-consistency-check")
-    );
-    assert_eq!(
-        source.get(names::REASONER_RULES_MVP_PRESET).as_deref(),
-        Some("bounded-owl")
-    );
     assert_eq!(
         source.get(names::AI_PROVIDER).as_deref(),
         Some("openrouter")

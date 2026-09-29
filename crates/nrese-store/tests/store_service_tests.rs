@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-use nrese_core::DatasetSnapshot;
 use nrese_store::{
     GraphReadRequest, GraphTarget, GraphWriteRequest, QueryResultKind, SparqlQueryRequest,
     SparqlUpdateRequest, StoreConfig, StoreError, StoreService,
@@ -347,64 +346,6 @@ fn graph_delete_only_affects_target_named_graph() -> Result<(), Box<dyn std::err
     })?;
     assert!(String::from_utf8(one_after.payload)?.trim().is_empty());
     assert!(String::from_utf8(two_after.payload)?.contains("http://example.com/g2"));
-
-    Ok(())
-}
-
-#[test]
-fn dataset_snapshot_captures_revision_and_supported_triples()
--> Result<(), Box<dyn std::error::Error>> {
-    let config = StoreConfig::in_memory();
-    let service = StoreService::new(config)?;
-    service.execute_update(&SparqlUpdateRequest::new(
-        "INSERT DATA {
-            <http://example.com/s> <http://example.com/p> <http://example.com/o> .
-            <http://example.com/s> <http://example.com/p2> \"literal\" .
-        }",
-    ))?;
-
-    let snapshot = service.dataset_snapshot()?;
-    let triples: Vec<_> = nrese_core::TripleSource::triples(&snapshot).collect();
-    let coverage = snapshot.coverage_stats();
-
-    assert_eq!(snapshot.revision(), 1);
-    assert_eq!(snapshot.asserted_triple_count(), 2);
-    assert_eq!(snapshot.unsupported_triple_count(), 1);
-    assert_eq!(coverage.supported_triples, 1);
-    assert_eq!(coverage.unsupported_literal_objects, 1);
-    assert_eq!(triples.len(), 1);
-
-    Ok(())
-}
-
-#[test]
-fn dataset_snapshot_preserves_count_invariants_for_supported_and_unsupported_terms()
--> Result<(), Box<dyn std::error::Error>> {
-    let service = new_in_memory_service()?;
-    service.execute_update(&SparqlUpdateRequest::new(
-        "INSERT DATA {
-            <http://example.com/s1> <http://example.com/p1> <http://example.com/o1> .
-            <http://example.com/s1> <http://example.com/p2> \"literal\" .
-            _:b0 <http://example.com/p3> <http://example.com/o3> .
-            <http://example.com/s1> <http://example.com/p4> _:b1 .
-        }",
-    ))?;
-
-    let snapshot = service.dataset_snapshot()?;
-    let triples: Vec<_> = nrese_core::TripleSource::triples(&snapshot).collect();
-    let coverage = snapshot.coverage_stats();
-
-    assert_eq!(snapshot.revision(), service.current_revision());
-    assert_eq!(snapshot.asserted_triple_count(), 4);
-    assert_eq!(snapshot.unsupported_triple_count(), 3);
-    assert_eq!(coverage.supported_triples, 1);
-    assert_eq!(coverage.unsupported_literal_objects, 1);
-    assert_eq!(coverage.unsupported_blank_node_subjects, 1);
-    assert_eq!(coverage.unsupported_blank_node_objects, 1);
-    assert_eq!(triples.len(), 1);
-    assert_eq!(triples[0].subject.as_str(), "http://example.com/s1");
-    assert_eq!(triples[0].predicate.as_str(), "http://example.com/p1");
-    assert_eq!(triples[0].object.as_str(), "http://example.com/o1");
 
     Ok(())
 }

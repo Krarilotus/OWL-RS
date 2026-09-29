@@ -1,38 +1,14 @@
-mod class_consistency;
-mod closure_index;
+//! NRESE's reasoner: reasoner v2 ([`v2`]), with the configuration and profile the server
+//! exposes. The store runs it: the batch executor materialises after loads and at
+//! startup, the delta executor maintains the inferred stack on every commit.
+
 pub mod config;
-mod dataset_index;
-mod effective_types;
-mod explanation;
-mod identity;
-mod materialization;
 pub mod output;
 pub mod profile;
-mod property_chain;
-mod property_closure;
-mod property_consistency;
-mod property_taxonomy;
-mod rules;
-mod rules_mvp_cache;
-mod rules_mvp_policy;
-mod rules_mvp_preset;
 pub mod service;
-mod support;
-mod symbols;
-mod taxonomy;
-#[cfg(test)]
-pub(crate) mod test_support;
 pub mod v2;
-mod vocabulary;
 
-pub use config::{
-    ReasonerConfig, ReasonerProfileConfig, ReasoningMode, ReasoningReadModel, RulesMvpConfig,
-};
-pub use output::{
-    InferenceDelta, ReasoningCacheStats, ReasoningStats, RejectBlame, RejectEvidence,
-    RejectExplanation,
-};
+pub use config::{ReasonerConfig, ReasoningMode};
+pub use output::{RejectEvidence, RejectExplanation};
 pub use profile::{ReasonerProfile, mode_name, profile_for_config, profile_for_mode};
-pub use rules_mvp_policy::{FeatureMode, RulesMvpFeaturePolicy, UnsupportedConstructBehavior};
-pub use rules_mvp_preset::{RulesMvpPreset, RulesMvpPresetDescriptor};
 pub use service::ReasonerService;
