@@ -2,7 +2,7 @@ mod support;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use nrese_reasoner::ReasonerConfig;
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_store::StoreConfig;
 use tower::util::ServiceExt;
 
@@ -22,6 +22,34 @@ async fn version_endpoint_exposes_capabilities() -> Result<(), Box<dyn std::erro
 
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().contains_key("x-request-id"));
+    Ok(())
+}
+
+/// `/version` names the semantics the closure has, so a client can tell when an upgrade
+/// changes what is inferred.
+#[tokio::test]
+async fn version_endpoint_names_the_reasoning_semantics() -> Result<(), Box<dyn std::error::Error>>
+{
+    for (mode, expected) in [
+        (ReasoningMode::Owl2Rl, Some("owl2-rl v")),
+        (ReasoningMode::Rdfs, Some("rdfs v")),
+        (ReasoningMode::Disabled, None),
+    ] {
+        let app = test_app_with_settings(PolicyConfig::default(), ReasonerConfig::for_mode(mode))?;
+        let response = app
+            .oneshot(Request::builder().uri("/version").body(Body::empty())?)
+            .await?;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+        match expected {
+            Some(prefix) => {
+                let semantics = json["reasoning_semantics"].as_str().expect("semantics");
+                assert!(semantics.starts_with(prefix), "{semantics}");
+                assert_eq!(semantics.rsplit(' ').next().map(str::len), Some(16));
+            }
+            None => assert!(json["reasoning_semantics"].is_null()),
+        }
+    }
     Ok(())
 }
 

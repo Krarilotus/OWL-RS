@@ -10,9 +10,11 @@ NRESE is a Rust RDF database under active redesign. The goal is a store that **r
 
 ## Current state (engine v2 storage, reasoner v2)
 
-The server runs on **NRESE's own storage engine** (`nrese-engine`, [ADR-0002](docs/adr/0002-engine-storage-lsm-permutations.md)) with SPARQL 1.1 from `nrese-sparql` (spareval over engine snapshots). It offers:
+The server runs on **NRESE's own storage engine** (`nrese-engine`, [ADR-0002](docs/adr/0002-engine-storage-lsm-permutations.md)) with SPARQL 1.1 from `nrese-sparql`: a native executor (merge, hash and worst-case-optimal joins, cost-based join order, `explain=true`) for the queries it covers, spareval for the rest. It offers:
 - SPARQL query and update, the Graph Store Protocol, and `TELL` ingest
-- materialised reasoning (`rdfs`, `owl2-rl`): inferences are queryable and maintained on every commit, and consistency violations reject the commit
+- materialised reasoning (`rdfs`, `owl2-rl`): inferences are queryable and maintained on every commit, and consistency violations reject the commit. What each mode computes, and what it omits, is in [docs/spec/reasoning-semantics.md](docs/spec/reasoning-semantics.md)
+- per-request read models: asserted only (`infer=false`), inferred only, or both
+- a result cache keyed on the query and the revision
 - auth modes and deployment postures
 - an operator UI (`/ops`) and a user console (`/console`)
 - a comparison harness
@@ -27,12 +29,14 @@ Measured over HTTP at 10 M triples (details in [benches/baselines/](benches/base
 Durable storage needs no native toolchain. The revision is persistent, and recovery after a crash restores the last acknowledged commit.
 
 Known limits, addressed by later milestones:
-- **Memory:** indexes are held in memory at about 190 bytes per quad; compression and on-disk runs are Pf1/Pf2.
+- **Memory:** indexes are bit-packed but held in memory (LUBM(100), 13.4 M asserted and 8.7 M inferred facts: 2.5 GB peak); memory-mapped runs for data larger than RAM are Pf2 step 2.
+- **Reasoning:** the `rdfs` mode is a 6-rule subset; OWL 2 RL omits `eq-ref` and the datatype rules; named graphs aren't reasoning boundaries. See [reasoning-semantics.md](docs/spec/reasoning-semantics.md).
+- **Not yet available:** SHACL, full-text and geospatial search, the RDF4J protocol, clustering. Order and status: [docs/plan/2026-09-30-graphdb-parity-plan.md](docs/plan/2026-09-30-graphdb-parity-plan.md).
 - **Behaviour changes from v1:** literal lexical forms are kept exactly as written, and a named graph exists only while it holds quads. See ADR-0002.
 
 Already fixed on the way (Milestone 0):
 - A write that reports a timeout is guaranteed not to be committed.
-- Unknown config values fail at startup instead of silently changing behaviour.
+- Unknown config values and unknown config-file keys fail at startup instead of silently changing behaviour; `nrese-server check-config` validates a configuration and prints the effective settings.
 - Ontology preload happens only when `NRESE_ONTOLOGY_PATH` is set.
 
 ## Repository layout
@@ -40,10 +44,12 @@ Already fixed on the way (Milestone 0):
 | Path | Layer | Owns |
 |---|---|---|
 | `crates/nrese-core` | L0 | shared report and capability contracts |
+| `crates/nrese-engine` | L1 | storage engine: dictionary, packed permutation indexes, MVCC snapshots, WAL and checkpoints, statistics |
+| `crates/nrese-exec` | L1 | execution core: id tables, joins, grouping, closures, memory budgets; shared by SPARQL and reasoning |
+| `crates/nrese-sparql` | L2 | SPARQL 1.1: native executor and planner, spareval fallback, updates, result writers |
 | `crates/nrese-reasoner` | L2 | reasoner v2: rule IR, rulesets, batch and delta executors, modules; reasoning profiles |
 | `crates/nrese-store` | L3 | operations (query, update, graph store, tell, backup) and the mutation pipeline |
 | `crates/nrese-server` | L4 | HTTP transport, auth, policy, posture, UI hosting |
-| `crates/nrese-engine` | L1 | engine v2 storage (in progress, not yet part of the workspace build) |
 | `apps/nrese-console` | L5 | React/TypeScript console and CLI |
 | `benches/nrese-bench-harness` | tooling | black-box comparison and benchmark harness |
 | `docs/` | — | architecture, ADRs, roadmap, specs, ops runbooks |
@@ -55,7 +61,6 @@ Already fixed on the way (Milestone 0):
 - Rust toolchain
 - Cargo
 - optional: Docker, if you want to run a local Fuseki comparison stack
-- optional on Windows: LLVM / `libclang` if you want to build durable storage dependencies
 
 ### Build
 
