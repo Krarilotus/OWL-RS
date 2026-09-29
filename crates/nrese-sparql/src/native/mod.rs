@@ -140,6 +140,110 @@ pub(crate) fn explain(
     }
 }
 
+/// The quads an update removes and adds, in that order.
+pub(crate) type QuadChanges = (Vec<oxrdf::Quad>, Vec<oxrdf::Quad>);
+
+/// The quads a `DELETE`/`INSERT … WHERE` removes and adds, with its `WHERE` evaluated
+/// natively on `snapshot`; `None` if the pattern isn't supported (use spareval). Templates
+/// are filled as spareval fills them: a quad with an unbound or ill-placed term (a literal
+/// subject or graph, a non-IRI predicate) is skipped, and inserted blank nodes are fresh per
+/// solution.
+pub(crate) fn delete_insert(
+    snapshot: &Snapshot,
+    pattern: &GraphPattern,
+    delete: &[spargebra::term::GroundQuadPattern],
+    insert: &[spargebra::term::QuadPattern],
+    options: &QueryOptions,
+) -> Option<Result<QuadChanges, QueryEvaluationError>> {
+    use spargebra::term::{GraphNamePattern, GroundTermPattern};
+    if options.dataset.is_some() || !supported(pattern) {
+        return None;
+    }
+    let ctx = Context::new(snapshot, options);
+    let solutions = match ctx.eval(pattern) {
+        Ok(solutions) => solutions,
+        Err(NativeError::Fallback) => return None,
+        Err(NativeError::Evaluation(error)) => return Some(Err(error)),
+    };
+    let computed = ctx.computed.into_inner();
+    let table = &solutions.table;
+    let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
+    for row in 0..table.len() {
+        let value = |v: &Variable| -> Option<Term> {
+            decode(snapshot, &computed, table.get(row, solutions.column(v)?))
+        };
+        let subject = |term: Term| match term {
+            Term::NamedNode(n) => Some(oxrdf::NamedOrBlankNode::from(n)),
+            Term::BlankNode(b) => Some(oxrdf::NamedOrBlankNode::from(b)),
+            Term::Literal(_) => None,
+        };
+        let predicate = |p: &NamedNodePattern| match p {
+            NamedNodePattern::NamedNode(n) => Some(n.clone()),
+            NamedNodePattern::Variable(v) => match value(v)? {
+                Term::NamedNode(n) => Some(n),
+                _ => None,
+            },
+        };
+        let graph = |g: &GraphNamePattern| match g {
+            GraphNamePattern::NamedNode(n) => Some(oxrdf::GraphName::from(n.clone())),
+            GraphNamePattern::DefaultGraph => Some(oxrdf::GraphName::DefaultGraph),
+            GraphNamePattern::Variable(v) => match value(v)? {
+                Term::NamedNode(n) => Some(n.into()),
+                Term::BlankNode(b) => Some(b.into()),
+                Term::Literal(_) => None,
+            },
+        };
+        let ground = |t: &GroundTermPattern| match t {
+            GroundTermPattern::NamedNode(n) => Some(Term::from(n.clone())),
+            GroundTermPattern::Literal(l) => Some(Term::from(l.clone())),
+            GroundTermPattern::Variable(v) => value(v),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        };
+        for quad in delete {
+            let filled = (|| {
+                Some(oxrdf::Quad::new(
+                    subject(ground(&quad.subject)?)?,
+                    predicate(&quad.predicate)?,
+                    ground(&quad.object)?,
+                    graph(&quad.graph_name)?,
+                ))
+            })();
+            deletes.extend(filled);
+        }
+        let mut fresh: HashMap<String, oxrdf::BlankNode> = HashMap::new();
+        let mut term = |t: &TermPattern| -> Option<Term> {
+            match t {
+                TermPattern::NamedNode(n) => Some(n.clone().into()),
+                TermPattern::Literal(l) => Some(l.clone().into()),
+                TermPattern::BlankNode(b) => Some(
+                    fresh
+                        .entry(b.as_str().to_owned())
+                        .or_default()
+                        .clone()
+                        .into(),
+                ),
+                TermPattern::Variable(v) => value(v),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            }
+        };
+        for quad in insert {
+            let Some(s) = term(&quad.subject).and_then(subject) else {
+                continue;
+            };
+            let Some(o) = term(&quad.object) else {
+                continue;
+            };
+            let (Some(p), Some(g)) = (predicate(&quad.predicate), graph(&quad.graph_name)) else {
+                continue;
+            };
+            inserts.push(oxrdf::Quad::new(s, p, o, g));
+        }
+    }
+    Some(Ok((deletes, inserts)))
+}
+
 /// What a query returns.
 enum Form<'q> {
     Select,
