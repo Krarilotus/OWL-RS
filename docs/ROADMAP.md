@@ -85,9 +85,14 @@ Perf lab against the same build without the native executor (sum of p50):
 
 Single queries are up to 10³–10⁶× faster (counts, grouped counts, star joins, date ranges).
 
+**XC5 (2026-09-29):**
+- Cyclic BGPs (triangles, 4-cycles; LUBM q2/q9) run through a worst-case-optimal Generic Join (`native/wcoj.rs`). It binds one variable at a time from the pattern with the fewest exact matches and runs parallel over the first variable.
+- Hash, merge, left, anti and semi joins run in parallel row chunks, and so does the index nested-loop join. Output order is the sequential one.
+- Still sequential: filters and aggregates. They need a thread-safe decode path (evaluator and per-query caches).
+
 Next:
 - XC4: statistics, the optimiser and EXPLAIN.
-- XC5: Leapfrog Triejoin and parallelism.
+- XC5 rest: parallel filters and aggregates.
 - The Docker scorecard against QLever for the Phase 2 gate.
 
 **Status (2026-09-28): Phase 3 is under way.**
