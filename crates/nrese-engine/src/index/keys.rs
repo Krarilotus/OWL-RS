@@ -415,6 +415,27 @@ impl PackedKeys {
         }
     }
 
+    /// The index range of keys in `[low, high]`: a lower bound, then the upper bound found
+    /// by galloping over the block first keys from the lower bound's block (short ranges end
+    /// in the same or a nearby block).
+    pub(crate) fn range(&self, low: &Key, high: &Key) -> (usize, usize) {
+        let start = self.bound_in(0, self.len, low, false);
+        if start == self.len {
+            return (start, start);
+        }
+        let blocks = self.firsts.len();
+        let (mut from, mut step) = (start / BLOCK + 1, 1);
+        // Blocks before `from` start at or below `high` (or hold `start`).
+        while from + step - 1 < blocks && self.firsts[from + step - 1] <= *high {
+            from += step;
+            step *= 2;
+        }
+        let until = (from + step - 1).min(blocks);
+        let failing = from + self.firsts[from..until].partition_point(|k| k <= high);
+        let end = self.bound_in(start, (failing * BLOCK).min(self.len), high, true);
+        (start, end)
+    }
+
     /// The first index in `start..end` whose key is not below `key` (`inclusive`: not at or
     /// below it): a lower (upper) bound. Like [`partition_point_in`](Self::partition_point_in)
     /// with a lexicographic comparison, but inside the block each probe decodes components
@@ -555,6 +576,10 @@ mod tests {
                     expected
                 );
                 assert_eq!(packed.bound_in(start, end, &probe, false), expected);
+                let high = [probe[0], u64::MAX, u64::MAX, u64::MAX];
+                let from = keys.partition_point(|k| k < &probe);
+                let to = keys.partition_point(|k| k <= &high);
+                assert_eq!(packed.range(&probe, &high), (from, to));
                 let upper = start + keys[start..end].partition_point(|k| k <= &probe);
                 assert_eq!(packed.bound_in(start, end, &probe, true), upper);
                 // A probe between stored keys, too.
@@ -692,6 +717,17 @@ mod tests {
                 sum = sum.wrapping_add(packed.bound_in(0, packed.len(), probe, false) as u64);
             }
             let bound = start.elapsed().as_secs_f64() * 1e9 / probes.len() as f64;
+            // A pattern range: subject and predicate bound (as counts ask for it).
+            let start = std::time::Instant::now();
+            for probe in &probes {
+                let (low, high) = (
+                    [probe[0], probe[1], 0, 0],
+                    [probe[0], probe[1], u64::MAX, u64::MAX],
+                );
+                let (from, to) = packed.range(&low, &high);
+                sum = sum.wrapping_add((to - from) as u64);
+            }
+            let range = start.elapsed().as_secs_f64() * 1e9 / probes.len() as f64;
             let start = std::time::Instant::now();
             let mut out = Vec::with_capacity(BLOCK);
             for round in 0..10 {
@@ -703,7 +739,7 @@ mod tests {
             }
             let decode = start.elapsed().as_secs_f64() * 1e9 / (10 * packed.len()) as f64;
             eprintln!(
-                "get {get:.1} ns | bound_in {bound:.1} ns | decode {decode:.2} ns/key | {sum}"
+                "get {get:.1} ns | bound_in {bound:.1} ns | range {range:.1} ns | decode {decode:.2} ns/key | {sum}"
             );
         }
     }
