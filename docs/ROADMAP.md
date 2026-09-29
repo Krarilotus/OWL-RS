@@ -116,6 +116,8 @@ Single queries are up to 10³–10⁶× faster (counts, grouped counts, star joi
 - LUBM(100) restart: 1.7 s → 0.27 s, with a smaller checkpoint (611 → 514 MiB). The dictionary is restored in bulk: keys are validated and hashed in parallel, the arena is appended at once, and the table is sized up front. Memory-mapping the runs is step 2.
 - The batch reasoner reads its input per predicate from the POSG order and takes it by value: closure 10% faster. LUBM(100) peak memory is 2.5 GB, down from 5.5 GB before Pf1.
 
+**Reasoning, measured opportunity (2026-09-30):** LUBM(100) takes 71M derivations for 8.7M derived facts. About 27M re-derive known facts when rule instances grounded from derived schema facts (transitive subproperties, inherited domains and ranges) are evaluated in full. Closing the schema first moves the redundancy into round 1 (30% slower; not kept). The fix is to prune rule instances the rest of the hierarchy implies: a transitive reduction over the condensed class and property hierarchies, exact under equivalences and incremental grounding.
+
 Next:
 - Pf2 step 2 (mmap) and Pf5 (on-disk dictionary) for data larger than RAM.
 - XC4 rest: characteristic sets for star estimates; report estimation error in the perf lab.

@@ -240,6 +240,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(dir) => StoreConfig::on_disk(dir),
         None => StoreConfig::in_memory(),
     };
+    // No result cache: repeated runs measure evaluation.
+    let config = StoreConfig {
+        query_cache_bytes: 0,
+        ..config
+    };
     let started = Instant::now();
     let store = StoreService::new(config)?;
     let open_s = started.elapsed().as_secs_f64();

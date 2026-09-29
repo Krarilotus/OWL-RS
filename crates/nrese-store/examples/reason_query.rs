@@ -85,7 +85,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let store = std::sync::Arc::new(StoreService::new(StoreConfig::in_memory())?);
+    // No result cache: repeated runs measure evaluation.
+    let config = StoreConfig {
+        query_cache_bytes: 0,
+        ..StoreConfig::in_memory()
+    };
+    let store = std::sync::Arc::new(StoreService::new(config)?);
     let started = Instant::now();
     let load = store.bulk_load(&BulkLoadRequest {
         files,
