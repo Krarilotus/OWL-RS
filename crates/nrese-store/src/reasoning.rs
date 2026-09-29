@@ -20,6 +20,7 @@
 
 use std::time::{Duration, Instant};
 
+use nrese_engine::quad::Permutation;
 use nrese_engine::{
     EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TermKind,
     Transaction,
@@ -144,10 +145,9 @@ fn triple(quad: EncodedQuad) -> Triple {
 }
 
 /// The closure of `asserted` (any graphs) under `program`.
-pub fn materialise(program: &Program, asserted: impl Iterator<Item = EncodedQuad>) -> Closure {
-    let facts: Vec<Triple> = asserted.map(triple).collect();
-    let result = batch::materialise_owned(
-        facts,
+pub fn materialise(program: &Program, snapshot: &Snapshot) -> Closure {
+    let result = batch::materialise_grouped(
+        asserted_by_predicate(snapshot),
         &program.rules,
         program.lists.as_ref(),
         &program.schema,
@@ -164,6 +164,31 @@ pub fn materialise(program: &Program, asserted: impl Iterator<Item = EncodedQuad
         rounds: result.rounds,
         phases: result.phases,
     }
+}
+
+/// The asserted facts (any graph) of `snapshot` per predicate, as sorted, distinct
+/// `(object, subject)` pairs: one POSG scan, where a fact asserted in several graphs comes
+/// out adjacently.
+fn asserted_by_predicate(snapshot: &Snapshot) -> Vec<(u64, Vec<(u64, u64)>)> {
+    let scan = snapshot
+        .scan_sorted_in(ReadModel::Asserted, &QuadPattern::all(), Permutation::Posg)
+        .expect("the asserted stack keeps POSG");
+    let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+    for quad in scan {
+        let (p, pair) = (
+            quad.predicate.raw(),
+            (quad.object.raw(), quad.subject.raw()),
+        );
+        match groups.last_mut() {
+            Some((last, pairs)) if *last == p => {
+                if pairs.last() != Some(&pair) {
+                    pairs.push(pair);
+                }
+            }
+            _ => groups.push((p, vec![pair])),
+        }
+    }
+    groups
 }
 
 fn pattern([s, p, o]: [Option<u64>; 3], graph: GraphSelector) -> QuadPattern {

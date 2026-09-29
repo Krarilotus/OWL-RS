@@ -137,6 +137,16 @@ impl Run {
         }
     }
 
+    /// A run of `os` (`(object, subject)` pairs, sorted, deduplicated).
+    fn from_os(os: Vec<Pair>) -> Self {
+        let mut so: Vec<Pair> = os.iter().map(|&(o, s)| (s, o)).collect();
+        so.par_sort_unstable();
+        Self {
+            so: Arc::new(so),
+            os: Arc::new(os),
+        }
+    }
+
     /// The union with a disjoint run.
     fn merge(&self, other: &Run) -> Run {
         if self.len() == 0 {
@@ -270,6 +280,27 @@ impl Store {
     pub(crate) fn new(input: Vec<Triple>) -> Self {
         let mut store = Self::default();
         store.advance(input);
+        store
+    }
+
+    /// A store holding `groups` (see [`materialise_grouped`]), all of it as the delta.
+    pub(crate) fn from_groups(groups: Vec<(u64, Vec<Pair>)>) -> Self {
+        let mut store = Self::default();
+        for (p, _) in &groups {
+            store.index.insert(*p, store.predicates.len());
+            store.predicates.push(*p);
+        }
+        store.relations = groups
+            .into_par_iter()
+            .map(|(_, os)| {
+                let delta = Run::from_os(os);
+                Relation {
+                    base: Run::default(),
+                    recent: delta.clone(),
+                    delta,
+                }
+            })
+            .collect();
         store
     }
 
@@ -581,9 +612,37 @@ pub fn materialise_owned(
     schema: &Schema,
 ) -> Materialisation {
     let clock = std::time::Instant::now();
-    let mut phases = Phases::default();
-    let mut store = Store::new(input);
-    phases.load = clock.elapsed();
+    let store = Store::new(input);
+    run(store, clock.elapsed(), rules, lists, schema)
+}
+
+/// [`materialise`] over input already grouped the way the working set stores it: per
+/// predicate (each once), its `(object, subject)` pairs, sorted and distinct. A store can
+/// stream this from a predicate-object-subject index without an intermediate triple list or
+/// sort, holding about 32 bytes per input fact instead of about 72.
+pub fn materialise_grouped(
+    input: Vec<(u64, Vec<(u64, u64)>)>,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+) -> Materialisation {
+    let clock = std::time::Instant::now();
+    let store = Store::from_groups(input);
+    run(store, clock.elapsed(), rules, lists, schema)
+}
+
+/// Semi-naive evaluation to the fixpoint, from a store holding the input as its delta.
+fn run(
+    mut store: Store,
+    load: std::time::Duration,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+) -> Materialisation {
+    let mut phases = Phases {
+        load,
+        ..Phases::default()
+    };
     let mut result = Materialisation::default();
     let mut derived: Vec<Triple> = Vec::new();
     let mut program = GroundProgram::default();

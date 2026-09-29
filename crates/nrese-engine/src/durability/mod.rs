@@ -92,7 +92,17 @@ impl Durable {
             return Err(EngineError::Locked(root.to_path_buf()));
         }
         checkpoint::remove_temporaries(root)?;
-        let mut version = match checkpoint::load_latest(root, dictionary)? {
+        let timing = std::env::var_os("NRESE_RECOVERY_TIMING").is_some();
+        let clock = std::time::Instant::now();
+        let loaded = checkpoint::load_latest(root, dictionary)?;
+        if timing {
+            eprintln!(
+                "recovery: checkpoint read {:.3} s",
+                clock.elapsed().as_secs_f64()
+            );
+        }
+        let clock = std::time::Instant::now();
+        let mut version = match loaded {
             Some(loaded) => Version {
                 asserted: IndexVersion::from_quads(Stack::Asserted.layout(), loaded.quads),
                 inferred: IndexVersion::from_quads(
@@ -108,6 +118,12 @@ impl Durable {
             },
             None => Version::empty(),
         };
+        if timing {
+            eprintln!(
+                "recovery: indexes built {:.3} s",
+                clock.elapsed().as_secs_f64()
+            );
+        }
 
         let wal_dir = wal::wal_dir(root);
         fs::create_dir_all(&wal_dir)?;

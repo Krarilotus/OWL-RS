@@ -263,13 +263,7 @@ impl StoreService {
             .len_in(nrese_engine::ReadModel::Asserted);
         let program =
             crate::reasoning::Program::new(ruleset, &|term| rematerialisation.intern(term));
-        let closure = crate::reasoning::materialise(
-            &program,
-            rematerialisation.base().quads_for_pattern_in(
-                nrese_engine::ReadModel::Asserted,
-                &nrese_engine::QuadPattern::all(),
-            ),
-        );
+        let closure = crate::reasoning::materialise(&program, rematerialisation.base());
         let inferred = closure.inferred.len() as u64;
         let summary = rematerialisation.finish(closure.inferred)?;
         self.record_reasoning(ruleset.name())?;
