@@ -18,6 +18,7 @@
 //! about terms, transactions or durability.
 
 pub(crate) mod compaction;
+mod keys;
 mod merge;
 pub(crate) mod run;
 
@@ -190,6 +191,26 @@ impl IndexVersion {
         u64::try_from(signed).expect("exact deltas never make a range count negative")
     }
 
+    /// True if some visible quad matches `plan`: one bound search per run, where no run has
+    /// tombstones (otherwise the exact count decides).
+    pub(crate) fn any_plan(&self, plan: &AccessPlan) -> bool {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return false;
+        };
+        let has_tombstones = self
+            .runs
+            .iter()
+            .any(|run| !run.permutation(adapted.permutation).tombstones.is_empty());
+        if adapted.exclude_default_graph || has_tombstones {
+            return self.count_plan(plan) > 0;
+        }
+        self.runs.iter().any(|run| {
+            let keys = &run.permutation(adapted.permutation).keys;
+            let start = keys.bound_in(0, keys.len(), &adapted.low, false);
+            start < keys.len() && keys.get(start) <= adapted.high
+        })
+    }
+
     /// For each distinct value at key `position` of `plan`'s permutation (the first component
     /// after the plan's bound prefix), the signed number of visible quads with that value,
     /// accumulated into `totals`. Each run is walked group by group with a binary search for
@@ -222,8 +243,10 @@ impl IndexVersion {
             let (start, end) = perm.range(&adapted.low, &adapted.high);
             let mut i = start;
             while i < end {
-                let value = perm.keys[i][position];
-                let j = i + perm.keys[i..end].partition_point(|key| key[position] <= value);
+                let value = perm.keys.get(i)[position];
+                let j = perm
+                    .keys
+                    .partition_point_in(i, end, |key| key[position] <= value);
                 let signed = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
                 *totals.entry(value).or_default() += signed;
                 i = j;
@@ -252,9 +275,11 @@ impl IndexVersion {
             let (start, end) = perm.range(&adapted.low, &adapted.high);
             let mut i = start;
             while i < end {
-                let value = perm.keys[i][position];
+                let value = perm.keys.get(i)[position];
                 out.push(value);
-                i += perm.keys[i..end].partition_point(|key| key[position] <= value);
+                i = perm
+                    .keys
+                    .partition_point_in(i, end, |key| key[position] <= value);
             }
         }
     }

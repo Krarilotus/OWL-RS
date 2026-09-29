@@ -102,8 +102,16 @@ Single queries are up to 10³–10⁶× faster (counts, grouped counts, star joi
 - Joins stop at a row limit derived from the per-query memory budget, before allocating. Before, a three-way cross product could abort the process with a 64 GB allocation.
 - The server sets the budget: `NRESE_MAX_QUERY_MEMORY_BYTES`, default 4 GiB. A query over the limit gets `413`.
 
+**XC5 rest (2026-09-29):**
+- Filters and aggregates run in parallel chunks. The evaluator is thread-safe, and each task decodes with its own cache.
+- A new differential test found that `STR` of a typed literal returned its stored lexical form where spareval canonicalises. Fixed.
+
+**Pf1, compressed runs (2026-09-29):**
+- Every permutation of a run is stored in blocks of 128 keys, frame-of-reference bit-packed per key position with the kind tag and payload split (`index/keys.rs`).
+- Keys stay randomly accessible. Binary searches run on the compressed data; merge cursors decode block-wise; runs are packed in parallel, one permutation at a time.
+- LUBM(100) end to end (laptop): peak memory went from 5.5 GB to 2.9 GB, and the 14 queries from 143 ms to 177 ms. Load and closure are about 12% slower.
+
 Next:
-- XC5 rest: parallel filters and aggregates.
 - XC4 rest: characteristic sets for star estimates; report estimation error in the perf lab.
 - The Docker scorecard against QLever for the Phase 2 gate.
 

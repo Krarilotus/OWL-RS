@@ -1,7 +1,7 @@
 //! Immutable sorted runs.
 //!
-//! A run stores one sorted key array per [`Permutation`] plus a tombstone bitset (empty for
-//! runs without deletes). Runs are built once and never mutated; versions share them via
+//! A run stores one sorted key array per [`Permutation`], compressed ([`PackedKeys`]), plus
+//! a tombstone bitset (empty for runs without deletes). Runs are built once and never mutated; versions share them via
 //! `Arc`, which is what makes snapshots free.
 //!
 //! Invariant (exact deltas): an insert entry never shadows a visible quad and a tombstone
@@ -12,6 +12,7 @@
 use rayon::prelude::*;
 
 use super::Layout;
+use super::keys::PackedKeys;
 use crate::quad::{EncodedQuad, Key, Permutation};
 
 /// Deltas at least this large are sorted with all of the layout's permutations in parallel.
@@ -19,7 +20,7 @@ const PARALLEL_BUILD_THRESHOLD: usize = 16 * 1024;
 
 #[derive(Debug, Default)]
 pub(crate) struct PermutationRun {
-    pub(crate) keys: Box<[Key]>,
+    pub(crate) keys: PackedKeys,
     /// Bitset over `keys` positions; empty when the run has no tombstones.
     pub(crate) tombstones: Box<[u64]>,
 }
@@ -63,8 +64,8 @@ impl PermutationRun {
     /// Index range of keys in `[low, high]`. O(log n).
     #[inline]
     pub(crate) fn range(&self, low: &Key, high: &Key) -> (usize, usize) {
-        let start = self.keys.partition_point(|k| k < low);
-        let end = start + self.keys[start..].partition_point(|k| k <= high);
+        let start = self.keys.bound_in(0, self.keys.len(), low, false);
+        let end = self.keys.bound_in(start, self.keys.len(), high, true);
         (start, end)
     }
 
@@ -76,7 +77,7 @@ impl PermutationRun {
         } else {
             Vec::new()
         };
-        let keys = entries
+        let keys: Vec<Key> = entries
             .into_iter()
             .enumerate()
             .map(|(i, (key, tomb))| {
@@ -87,7 +88,7 @@ impl PermutationRun {
             })
             .collect();
         Self {
-            keys,
+            keys: PackedKeys::from_sorted(&keys),
             tombstones: tombstones.into_boxed_slice(),
         }
     }
@@ -133,11 +134,17 @@ impl Run {
             let mut keys: Vec<Key> = quads.par_iter().map(|q| permutation.to_key(q)).collect();
             keys.par_sort_unstable();
             PermutationRun {
-                keys: keys.into_boxed_slice(),
+                keys: PackedKeys::from_sorted(&keys),
                 tombstones: Box::default(),
             }
         };
-        Self::from_permutations(layout, build_all(layout, quads.len(), build))
+        // One permutation at a time (each sort is parallel): building them all at once would
+        // hold every uncompressed key array together, 32 bytes per quad each.
+        let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
+        for &permutation in layout.permutations() {
+            perms[permutation as usize] = build(permutation);
+        }
+        Self::from_permutations(layout, perms)
     }
 
     /// Assembles a run from the permutation runs of `layout`, which hold the same entries.
@@ -190,7 +197,7 @@ impl Run {
     pub(crate) fn memory_bytes(&self) -> u64 {
         self.perms
             .iter()
-            .map(|p| (p.keys.len() * size_of::<Key>() + p.tombstones.len() * 8) as u64)
+            .map(|p| (p.keys.memory_bytes() + p.tombstones.len() * 8) as u64)
             .sum()
     }
 
@@ -198,10 +205,10 @@ impl Run {
     pub(crate) fn sign_of(&self, quad: &EncodedQuad) -> i64 {
         let perm = self.permutation(Permutation::Spog);
         let key = Permutation::Spog.to_key(quad);
-        match perm.keys.binary_search(&key) {
-            Ok(index) if perm.is_tombstone(index) => -1,
-            Ok(_) => 1,
-            Err(_) => 0,
+        match perm.range(&key, &key) {
+            (start, end) if start == end => 0,
+            (start, _) if perm.is_tombstone(start) => -1,
+            _ => 1,
         }
     }
 }
