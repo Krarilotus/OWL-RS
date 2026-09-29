@@ -11,10 +11,10 @@ type Props = {
 };
 
 export function ReasoningRuntimeInspector({ strings, reasoning }: Props) {
-  const policy = reasoning?.configured_policy;
   const lastRun = reasoning?.last_run;
   const configSnippet = buildReasoningConfigSnippet(reasoning);
   const capabilities = sortReasoningCapabilities(reasoning?.capabilities);
+  const unavailable = strings.reasoningPolicyUnavailable;
 
   return (
     <div className="preset-panel">
@@ -26,129 +26,57 @@ export function ReasoningRuntimeInspector({ strings, reasoning }: Props) {
       <div className="fact-grid">
         <div className="fact-card">
           <div className="fact-label">{strings.reasoningPresetActiveLabel}</div>
-          <div className="fact-value mono">
-            {policy?.preset ?? strings.reasoningPolicyUnavailable}
-          </div>
+          <div className="fact-value mono">{reasoning?.mode ?? unavailable}</div>
         </div>
         <div className="fact-card">
           <div className="fact-label">{strings.reasoningPresetTierLabel}</div>
-          <div className="fact-value mono">
-            {policy?.semantic_tier ?? strings.reasoningPolicyUnavailable}
-          </div>
-        </div>
-        <div className="fact-card">
-          <div className="fact-label">{strings.reasoningPresetAvailableLabel}</div>
-          <div className="fact-value mono">
-            {(policy?.available_presets ?? []).join(", ") || strings.reasoningPolicyUnavailable}
-          </div>
-        </div>
-        <div className="fact-card">
-          <div className="fact-label">{strings.reasoningUnsupportedLabel}</div>
-          <div className="fact-value mono">
-            {policy?.unsupported_constructs ?? strings.reasoningPolicyUnavailable}
-          </div>
+          <div className="fact-value mono">{reasoning?.profile ?? unavailable}</div>
         </div>
         <div className="fact-card">
           <div className="fact-label">{strings.reasoningLastRunLabel}</div>
           <div className="fact-value mono">
-            {lastRun
-              ? `${lastRun.status} @ r${lastRun.revision}`
-              : strings.reasoningPolicyUnavailable}
-          </div>
-        </div>
-      </div>
-
-      <div className="fact-grid">
-        <div className="fact-card">
-          <div className="fact-label">{strings.reasoningCacheExecutionLabel}</div>
-          <div className="fact-value mono">
-            {lastRun
-              ? `${lastRun.cache.execution_cache_entries}/${lastRun.cache.execution_cache_capacity} (${lastRun.cache.execution_cache_hit ? strings.yesLabel : strings.noLabel})`
-              : strings.reasoningPolicyUnavailable}
-          </div>
-        </div>
-        <div className="fact-card">
-          <div className="fact-label">{strings.reasoningCacheSchemaLabel}</div>
-          <div className="fact-value mono">
-            {lastRun
-              ? `${lastRun.cache.schema_cache_entries}/${lastRun.cache.schema_cache_capacity} (${lastRun.cache.schema_cache_hit ? strings.yesLabel : strings.noLabel})`
-              : strings.reasoningPolicyUnavailable}
-          </div>
-        </div>
-        <div className="fact-card">
-          <div className="fact-label">{strings.reasoningCacheExecutionTotalsLabel}</div>
-          <div className="fact-value mono">
-            {lastRun
-              ? `${lastRun.cache.execution_cache_hits_total} / ${lastRun.cache.execution_cache_misses_total}`
-              : strings.reasoningPolicyUnavailable}
-          </div>
-        </div>
-        <div className="fact-card">
-          <div className="fact-label">{strings.reasoningCacheSchemaTotalsLabel}</div>
-          <div className="fact-value mono">
-            {lastRun
-              ? `${lastRun.cache.schema_cache_hits_total} / ${lastRun.cache.schema_cache_misses_total}`
-              : strings.reasoningPolicyUnavailable}
+            {lastRun ? `${lastRun.status} @ r${lastRun.revision}` : unavailable}
           </div>
         </div>
       </div>
 
       <div className="field">
-        <label>{strings.reasoningCoverageTitle}</label>
+        <label>{strings.reasoningRunTitle}</label>
         <div className="fact-grid">
           <div className="fact-card">
-            <div className="fact-label">{strings.reasoningCoverageSupportedLabel}</div>
+            <div className="fact-label">{strings.reasoningRunRulesetLabel}</div>
+            <div className="fact-value mono">{lastRun ? lastRun.ruleset : unavailable}</div>
+          </div>
+          <div className="fact-card">
+            <div className="fact-label">{strings.reasoningRunInferredLabel}</div>
             <div className="fact-value mono">
-              {lastRun ? lastRun.stats.supported_asserted_triples : strings.reasoningPolicyUnavailable}
+              {lastRun ? lastRun.inferred_triples : unavailable}
             </div>
           </div>
           <div className="fact-card">
-            <div className="fact-label">{strings.reasoningCoverageUnsupportedLabel}</div>
+            <div className="fact-label">{strings.reasoningRunChangesLabel}</div>
             <div className="fact-value mono">
-              {lastRun ? lastRun.stats.unsupported_asserted_triples : strings.reasoningPolicyUnavailable}
+              {lastRun
+                ? `+${lastRun.inferred_inserted} / -${lastRun.inferred_deleted}`
+                : unavailable}
             </div>
           </div>
           <div className="fact-card">
-            <div className="fact-label">{strings.reasoningCoverageBlankSubjectLabel}</div>
+            <div className="fact-label">{strings.reasoningRunViolationsLabel}</div>
             <div className="fact-value mono">
-              {lastRun ? lastRun.stats.unsupported_blank_node_subjects : strings.reasoningPolicyUnavailable}
+              {lastRun ? lastRun.consistency_violations : unavailable}
             </div>
           </div>
           <div className="fact-card">
-            <div className="fact-label">{strings.reasoningCoverageBlankObjectLabel}</div>
-            <div className="fact-value mono">
-              {lastRun ? lastRun.stats.unsupported_blank_node_objects : strings.reasoningPolicyUnavailable}
-            </div>
+            <div className="fact-label">{strings.reasoningRunRoundsLabel}</div>
+            <div className="fact-value mono">{lastRun ? lastRun.rounds : unavailable}</div>
           </div>
           <div className="fact-card">
-            <div className="fact-label">{strings.reasoningCoverageLiteralObjectLabel}</div>
+            <div className="fact-label">{strings.reasoningRunTimeLabel}</div>
             <div className="fact-value mono">
-              {lastRun ? lastRun.stats.unsupported_literal_objects : strings.reasoningPolicyUnavailable}
+              {lastRun ? `${(lastRun.elapsed_micros / 1000).toFixed(2)} ms` : unavailable}
             </div>
           </div>
-          <div className="fact-card">
-            <div className="fact-label">{strings.reasoningCoverageFlattenedQuadsLabel}</div>
-            <div className="fact-value mono">
-              {lastRun ? lastRun.stats.flattened_named_graph_quads : strings.reasoningPolicyUnavailable}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div className="field">
-        <label>{strings.reasoningFeatureModesLabel}</label>
-        <div className="fact-grid">
-          {(policy?.feature_modes ?? []).map((feature) => (
-            <div className="fact-card" key={feature.feature}>
-              <div className="fact-label">{feature.feature}</div>
-              <div className="fact-value mono">{feature.mode}</div>
-            </div>
-          ))}
-          {(policy?.feature_modes ?? []).length === 0 ? (
-            <div className="fact-card">
-              <div className="fact-value mono">{strings.reasoningPolicyUnavailable}</div>
-            </div>
-          ) : null}
         </div>
       </div>
 
@@ -168,7 +96,7 @@ export function ReasoningRuntimeInspector({ strings, reasoning }: Props) {
           ))}
           {capabilities.length === 0 ? (
             <div className="fact-card">
-              <div className="fact-value mono">{strings.reasoningPolicyUnavailable}</div>
+              <div className="fact-value mono">{unavailable}</div>
             </div>
           ) : null}
         </div>

@@ -13,10 +13,10 @@ vi.mock("../lib/api", () => ({
     deployment_posture: "open-workbench",
     store_mode: "in-memory",
     durability: "ephemeral",
-    reasoning_mode: "rules-mvp",
-    reasoning_profile: "nrese-rules-mvp",
-    reasoning_read_model: "asserted-only",
-    reasoning_semantic_tier: "bounded-owl-rules",
+    reasoning_mode: "owl2-rl",
+    reasoning_profile: "nrese-v2",
+    reasoning_read_model: "materialised",
+    reasoning_semantic_tier: "owl2-rl",
     ontology_path: null,
     version: "0.1.0",
   }),
@@ -31,9 +31,9 @@ vi.mock("../lib/api", () => ({
     deployment_posture: "open-workbench",
     ai_status_endpoint: "/api/ai/status",
     ai_query_suggestions_endpoint: "/api/ai/query-suggestions",
-    reasoning_profile: "nrese-rules-mvp",
-    reasoning_read_model: "asserted-only",
-    reasoning_semantic_tier: "bounded-owl-rules",
+    reasoning_profile: "nrese-v2",
+    reasoning_read_model: "materialised",
+    reasoning_semantic_tier: "owl2-rl",
     tell_enabled: true,
     ai_query_suggestions_enabled: true,
     ai_provider: "gemini",
@@ -45,53 +45,26 @@ vi.mock("../lib/api", () => ({
   }),
   getReasoningDiagnostics: async () => ({
     revision: 2,
-    mode: "rules-mvp",
-    profile: "rules-mvp",
-    read_model: "asserted-only",
+    mode: "owl2-rl",
+    profile: "nrese-v2",
+    read_model: "materialised",
     capabilities: [
       {
         feature: "owl-property-chain-axioms",
-        maturity: "bounded",
-        enabled_by_default: false,
+        maturity: "mvp",
+        enabled_by_default: true,
       },
     ],
-    configured_policy: {
-      preset: "bounded-owl",
-      semantic_tier: "bounded-owl-rules",
-      available_presets: ["rdfs-core", "bounded-owl"],
-      feature_modes: [
-        {
-          feature: "owl-property-chain-axioms",
-          mode: "enabled",
-        },
-      ],
-      unsupported_constructs: "diagnose",
-    },
     last_run: {
       revision: 2,
       status: "completed",
+      ruleset: "owl2-rl",
       inferred_triples: 3,
+      inferred_inserted: 3,
+      inferred_deleted: 0,
       consistency_violations: 0,
-      stats: {
-        supported_asserted_triples: 4,
-        unsupported_asserted_triples: 2,
-        unsupported_blank_node_subjects: 1,
-        unsupported_blank_node_objects: 0,
-        unsupported_literal_objects: 1,
-        flattened_named_graph_quads: 2,
-      },
-      cache: {
-        execution_cache_hit: false,
-        schema_cache_hit: true,
-        execution_cache_entries: 1,
-        schema_cache_entries: 1,
-        execution_cache_capacity: 8,
-        schema_cache_capacity: 8,
-        execution_cache_hits_total: 0,
-        execution_cache_misses_total: 1,
-        schema_cache_hits_total: 1,
-        schema_cache_misses_total: 1,
-      },
+      rounds: 2,
+      elapsed_micros: 120,
     },
   }),
   getQuerySuggestions: async () => ({
@@ -122,6 +95,6 @@ test("renders console sections", async () => {
   expect(screen.getByRole("heading", { name: /Knowledge workbench/i })).toBeInTheDocument();
   expect(await screen.findByText(/Reasoning capabilities/i)).toBeInTheDocument();
   expect((await screen.findAllByText(/owl-property-chain-axioms/i)).length).toBeGreaterThan(0);
-  expect(await screen.findByText(/Snapshot coverage/i)).toBeInTheDocument();
-  expect(screen.getByText(/Flattened named-graph quads/i)).toBeInTheDocument();
+  expect(await screen.findByText(/Last commit-path run/i)).toBeInTheDocument();
+  expect(screen.getByText(/Inferred statements/i)).toBeInTheDocument();
 });
