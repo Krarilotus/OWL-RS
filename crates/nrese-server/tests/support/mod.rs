@@ -50,7 +50,15 @@ pub fn test_app_with_store_config(
     policy: PolicyConfig,
     reasoner_config: ReasonerConfig,
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
-    let store = StoreService::new(store_config)?;
+    test_app_with_store(StoreService::new(store_config)?, policy, reasoner_config)
+}
+
+/// An app serving `store` as it is (already loaded or materialised).
+pub fn test_app_with_store(
+    store: StoreService,
+    policy: PolicyConfig,
+    reasoner_config: ReasonerConfig,
+) -> Result<axum::Router, Box<dyn std::error::Error>> {
     let reasoner = ReasonerService::new(reasoner_config);
     let state = AppState::new(
         store,

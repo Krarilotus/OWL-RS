@@ -8,9 +8,7 @@ use nrese_store::{MutationCommand, TellRequest};
 use crate::error::ApiError;
 use crate::http::media::header_value_str;
 use crate::http::mutation;
-use crate::http::rdf_payload::{
-    ensure_ready, parse_graph_target, parse_rdf_base_iri, parse_tell_content_format,
-};
+use crate::http::rdf_payload::{parse_graph_target, parse_rdf_base_iri, parse_tell_content_format};
 use crate::state::AppState;
 
 pub async fn execute_tell(
@@ -19,7 +17,7 @@ pub async fn execute_tell(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    ensure_ready(&state)?;
+    state.ensure_serving()?;
     state.policy().enforce_rdf_upload_bytes(body.len())?;
 
     let request = TellRequest {

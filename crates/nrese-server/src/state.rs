@@ -64,6 +64,17 @@ impl AppState {
         self.ready.load(Ordering::Acquire)
     }
 
+    /// Requests are served once startup has finished, also in quarantine: reads there
+    /// serve diagnosis, and writes the repair. Only `/readyz` and health report strict
+    /// readiness ([`Self::is_ready`]).
+    pub fn ensure_serving(&self) -> Result<(), ApiError> {
+        if self.is_started() {
+            Ok(())
+        } else {
+            Err(ApiError::unavailable("server is not ready yet"))
+        }
+    }
+
     /// The data is inconsistent under the configured reasoning: readable and repairable,
     /// but not ready.
     pub fn is_quarantined(&self) -> bool {
