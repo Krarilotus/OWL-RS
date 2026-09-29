@@ -812,9 +812,6 @@ dependencies = [
 [[package]]
 name = "nrese-core"
 version = "0.1.0"
-dependencies = [
- "thiserror",
-]
 
 [[package]]
 name = "nrese-engine"
@@ -831,11 +828,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-exec"
+version = "0.1.0"
+dependencies = [
+ "foldhash 0.2.0",
+ "hashbrown 0.16.1",
+ "rayon",
+]
+
+[[package]]
 name = "nrese-reasoner"
 version = "0.1.0"
 dependencies = [
+ "hashbrown 0.16.1",
  "nrese-core",
- "tracing",
+ "nrese-exec",
+ "rayon",
 ]
 
 [[package]]
@@ -843,7 +851,11 @@ name = "nrese-sparql"
 version = "0.1.0"
 dependencies = [
  "nrese-engine",
+ "nrese-exec",
  "oxrdf",
+ "oxsdatatypes",
+ "rayon",
+ "regex",
  "spareval",
  "spargebra",
  "thiserror",
