@@ -281,6 +281,14 @@ fn decode(snapshot: &Snapshot, computed: &[Term], id: u64) -> Option<Term> {
 
 /// True if [`evaluate`] handles `query` (barring runtime fallbacks), with no protocol dataset.
 pub(crate) fn query_supported(query: &Query) -> bool {
+    // A BASE resolves relative IRIs in IRI(): only spareval knows it at evaluation time.
+    let (Query::Select { base_iri, .. }
+    | Query::Ask { base_iri, .. }
+    | Query::Construct { base_iri, .. }
+    | Query::Describe { base_iri, .. }) = query;
+    if base_iri.is_some() {
+        return false;
+    }
     match query {
         Query::Select {
             dataset: None,
@@ -353,6 +361,7 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
                                     | AggregateFunction::Min
                                     | AggregateFunction::Max
                                     | AggregateFunction::Sample
+                                    | AggregateFunction::GroupConcat { .. }
                             )
                     }
                 })
@@ -2508,6 +2517,9 @@ impl Aggregator<'_> {
                         .map(value::canonical),
                     AggregateFunction::Sum => sum(&values),
                     AggregateFunction::Avg => average(&values),
+                    AggregateFunction::GroupConcat { separator } => {
+                        group_concat(&values, separator.as_deref().unwrap_or(" "))
+                    }
                     _ => None,
                 };
                 result.map_or(Agg::Id(UNDEF), Agg::Term)
@@ -2597,6 +2609,35 @@ impl Numeric {
         };
         Literal::new_typed_literal(lexical, datatype).into()
     }
+}
+
+/// GROUP_CONCAT as spareval computes it: string literals only (anything else makes the
+/// result unbound), joined in row order; the common language tag if all values share it.
+fn group_concat(values: &[Term], separator: &str) -> Option<Term> {
+    let mut concat = String::new();
+    let mut language: Option<Option<&str>> = None;
+    for (i, value) in values.iter().enumerate() {
+        let Term::Literal(literal) = value else {
+            return None;
+        };
+        let tag = literal.language();
+        if tag.is_none() && literal.datatype() != xsd::STRING {
+            return None;
+        }
+        match language {
+            Some(common) if common != tag => language = Some(None),
+            Some(_) => {}
+            None => language = Some(tag),
+        }
+        if i > 0 {
+            concat.push_str(separator);
+        }
+        concat.push_str(literal.value());
+    }
+    Some(match language.flatten() {
+        Some(tag) => Literal::new_language_tagged_literal_unchecked(concat, tag).into(),
+        None => Literal::new_simple_literal(concat).into(),
+    })
 }
 
 fn sum(values: &[Term]) -> Option<Term> {

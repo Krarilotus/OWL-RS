@@ -75,7 +75,12 @@ pub(crate) fn supported(expr: &Expression) -> bool {
                         | Function::StrAfter
                         | Function::StrDt
                         | Function::StrLang
+                        | Function::SubStr
+                        | Function::Replace
+                        | Function::EncodeForUri
+                        | Function::Iri
                 )
+                || matches!(function, Function::Custom(name) if args.len() == 1 && is_cast(name.as_str()))
         }
         _ => false,
     }
@@ -89,6 +94,17 @@ pub(crate) struct Evaluator {
 }
 
 impl Evaluator {
+    /// The compiled `pattern` with `flags`, cached per query; `None` if it doesn't compile.
+    /// A clone shares the compiled program, so matching runs outside the lock.
+    fn regex(&self, pattern: &str, flags: &str) -> Option<Regex> {
+        self.regexes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((pattern.to_owned(), flags.to_owned()))
+            .or_insert_with(|| compile_regex(pattern, flags))
+            .clone()
+    }
+
     /// Effective boolean value of `expr` for FILTER: errors and unbound values are false.
     pub(crate) fn filter(
         &self,
@@ -227,6 +243,73 @@ impl Evaluator {
             }
         };
         match function {
+            Function::SubStr => {
+                let (source, language) = string(&arg(0)?)?;
+                let position = |i: usize| -> Option<usize> {
+                    match Value::of(&arg(i)?) {
+                        Value::Integer(v) => usize::try_from(i64::from(v)).ok(),
+                        _ => None,
+                    }
+                };
+                let start = position(1)?;
+                let length = if args.len() > 2 {
+                    Some(position(2)?)
+                } else {
+                    None
+                };
+                // Character positions, 1-based, as spareval slices them.
+                let mut chars = source.char_indices().skip(start.checked_sub(1)?).peekable();
+                let result = match chars.peek().copied() {
+                    Some((from, _)) => match length {
+                        Some(length) => match chars.nth(length) {
+                            Some((to, _)) => &source[from..to],
+                            None => &source[from..],
+                        },
+                        None => &source[from..],
+                    },
+                    None => "",
+                };
+                Some(plain(result.to_owned(), language))
+            }
+            Function::Replace => {
+                let (text, language) = string(&arg(0)?)?;
+                let simple = |term: Term| match string(&term)? {
+                    (value, None) => Some(value),
+                    _ => None,
+                };
+                let pattern = simple(arg(1)?)?;
+                let replacement = simple(arg(2)?)?;
+                let flags = if args.len() > 3 {
+                    simple(arg(3)?)?
+                } else {
+                    String::new()
+                };
+                let regex = self.regex(&pattern, &flags)?;
+                let replaced = regex.replace_all(&text, replacement.as_str()).into_owned();
+                Some(plain(replaced, language))
+            }
+            Function::EncodeForUri => {
+                let (value, _) = string(&arg(0)?)?;
+                let mut encoded = String::with_capacity(value.len());
+                for byte in value.bytes() {
+                    match byte {
+                        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                            encoded.push(byte as char)
+                        }
+                        _ => encoded.push_str(&format!("%{byte:02X}")),
+                    }
+                }
+                Some(Literal::new_simple_literal(encoded).into())
+            }
+            Function::Iri => match arg(0)? {
+                iri @ Term::NamedNode(_) => Some(iri),
+                // Absolute IRIs only: queries with a BASE run on spareval.
+                term => match string(&term)? {
+                    (value, None) => NamedNode::new(value).ok().map(Term::from),
+                    _ => None,
+                },
+            },
+            Function::Custom(name) => cast(name.as_str(), arg(0)?),
             Function::Str => match arg(0)? {
                 Term::NamedNode(node) => Some(Literal::new_simple_literal(node.as_str()).into()),
                 // spareval reads typed literals as values: STR gives the canonical form.
@@ -282,15 +365,8 @@ impl Evaluator {
                     Some(_) => string(&arg(2)?)?.0,
                     None => String::new(),
                 };
-                // A clone shares the compiled program; matching runs outside the lock.
-                let regex = self
-                    .regexes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .entry((pattern.clone(), flags.clone()))
-                    .or_insert_with(|| compile_regex(&pattern, &flags))
-                    .clone();
-                regex.map(|r| boolean_term(r.is_match(&text)))
+                let regex = self.regex(&pattern, &flags)?;
+                Some(boolean_term(regex.is_match(&text)))
             }
             Function::IsIri => arg(0).map(|t| boolean_term(t.is_named_node())),
             Function::IsBlank => arg(0).map(|t| boolean_term(t.is_blank_node())),
@@ -544,4 +620,119 @@ fn arithmetic(operator: Operator, (a, b): (Value, Value)) -> Option<Term> {
         }
     };
     Some(result.term())
+}
+
+/// The XSD casts evaluated natively (SPARQL §17.5), as spareval implements them.
+fn is_cast(name: &str) -> bool {
+    [
+        xsd::STRING,
+        xsd::BOOLEAN,
+        xsd::DOUBLE,
+        xsd::FLOAT,
+        xsd::INTEGER,
+        xsd::DECIMAL,
+        xsd::DATE,
+        xsd::DATE_TIME,
+    ]
+    .iter()
+    .any(|t| t.as_str() == name)
+}
+
+/// `name(term)` for a cast of [`is_cast`]: the value read as spareval reads it, converted
+/// with the same `oxsdatatypes` conversions, in canonical form.
+fn cast(name: &str, term: Term) -> Option<Term> {
+    use oxsdatatypes::{Boolean, Date, DateTime};
+    let typed = |value: String, datatype: oxrdf::NamedNodeRef<'_>| -> Option<Term> {
+        Some(Literal::new_typed_literal(value, datatype).into())
+    };
+    if name == xsd::STRING.as_str() {
+        return match term {
+            Term::NamedNode(node) => Some(Literal::new_simple_literal(node.into_string()).into()),
+            Term::BlankNode(_) => None,
+            literal @ Term::Literal(_) => match canonical(literal) {
+                Term::Literal(literal) => Some(Literal::new_simple_literal(literal.value()).into()),
+                _ => None,
+            },
+        };
+    }
+    let value = Value::of(&term);
+    if name == xsd::BOOLEAN.as_str() {
+        let b: bool = match value {
+            Value::Boolean(b) => b,
+            Value::Float(v) => Boolean::from(v).into(),
+            Value::Double(v) => Boolean::from(v).into(),
+            Value::Integer(v) => Boolean::from(v).into(),
+            Value::Decimal(v) => Boolean::from(v).into(),
+            Value::String(s) => s.parse::<Boolean>().ok()?.into(),
+            _ => return None,
+        };
+        return Some(boolean_term(b));
+    }
+    if name == xsd::DOUBLE.as_str() {
+        let v: Double = match value {
+            Value::Float(v) => v.into(),
+            Value::Double(v) => v,
+            Value::Integer(v) => v.into(),
+            Value::Decimal(v) => v.into(),
+            Value::Boolean(b) => Boolean::from(b).into(),
+            Value::String(s) => s.parse().ok()?,
+            _ => return None,
+        };
+        return typed(v.to_string(), xsd::DOUBLE);
+    }
+    if name == xsd::FLOAT.as_str() {
+        let v: Float = match value {
+            Value::Float(v) => v,
+            Value::Double(v) => v.into(),
+            Value::Integer(v) => v.into(),
+            Value::Decimal(v) => v.into(),
+            Value::Boolean(b) => Boolean::from(b).into(),
+            Value::String(s) => s.parse().ok()?,
+            _ => return None,
+        };
+        return typed(v.to_string(), xsd::FLOAT);
+    }
+    if name == xsd::INTEGER.as_str() {
+        let v: Integer = match value {
+            Value::Float(v) => v.try_into().ok()?,
+            Value::Double(v) => v.try_into().ok()?,
+            Value::Integer(v) => v,
+            Value::Decimal(v) => v.try_into().ok()?,
+            Value::Boolean(b) => Boolean::from(b).into(),
+            Value::String(s) => s.parse().ok()?,
+            _ => return None,
+        };
+        return typed(v.to_string(), xsd::INTEGER);
+    }
+    if name == xsd::DECIMAL.as_str() {
+        let v: Decimal = match value {
+            Value::Float(v) => v.try_into().ok()?,
+            Value::Double(v) => v.try_into().ok()?,
+            Value::Integer(v) => v.into(),
+            Value::Decimal(v) => v,
+            Value::Boolean(b) => Boolean::from(b).into(),
+            Value::String(s) => s.parse().ok()?,
+            _ => return None,
+        };
+        return typed(v.to_string(), xsd::DECIMAL);
+    }
+    if name == xsd::DATE.as_str() {
+        let v: Date = match value {
+            Value::Date(v) => v,
+            Value::DateTime(v) => v.try_into().ok()?,
+            Value::String(s) => s.parse().ok()?,
+            _ => return None,
+        };
+        return typed(v.to_string(), xsd::DATE);
+    }
+    if name == xsd::DATE_TIME.as_str() {
+        let v: DateTime = match value {
+            Value::DateTime(v) => v,
+            Value::Date(v) => v.try_into().ok()?,
+            Value::String(s) => s.parse().ok()?,
+            _ => return None,
+        };
+        return typed(v.to_string(), xsd::DATE_TIME);
+    }
+    None
 }

@@ -12,7 +12,7 @@ nrese-exec = { path = "../nrese-exec" }
 oxsdatatypes = "=0.2.2"
 regex = "1.12"
 oxrdf = "=0.3.3"
-spareval = "=0.2.6"
+spareval = { version = "=0.2.6", features = ["sep-0002", "calendar-ext"] }
 spargebra = "=0.4.6"
 thiserror.workspace = true
 

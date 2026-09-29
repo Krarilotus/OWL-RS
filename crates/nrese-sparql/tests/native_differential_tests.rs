@@ -939,3 +939,113 @@ fn graph_patterns_equal_spareval() {
         "{checked} checked, {fallbacks} fallbacks"
     );
 }
+
+/// SUBSTR, REPLACE, ENCODE_FOR_URI, IRI, the XSD casts and GROUP_CONCAT over random data
+/// (dates with timezones, non-canonical integers, language strings) equal spareval.
+/// GROUP_CONCAT joins in row order, which SPARQL leaves open: its parts are compared sorted.
+#[test]
+fn string_functions_casts_and_group_concat_equal_spareval() {
+    let expressions = [
+        "SUBSTR(STR(?b), 2)",
+        "SUBSTR(STR(?b), 2, 3)",
+        "SUBSTR(?b, 1, 2)",
+        "SUBSTR(STR(?b), 0, 2)",
+        "REPLACE(STR(?b), \"[0-9]\", \"#\")",
+        "REPLACE(?b, \"(s)([0-9])\", \"$2$1\")",
+        "REPLACE(STR(?b), \"S\", \"x\", \"i\")",
+        "REPLACE(STR(?b), \"(\", \"x\")",
+        "ENCODE_FOR_URI(STR(?a))",
+        "ENCODE_FOR_URI(?b)",
+        "IRI(CONCAT(\"http://example.com/n/\", ENCODE_FOR_URI(STR(?b))))",
+        "IRI(\"relative\")",
+        "IRI(?a)",
+        "<http://www.w3.org/2001/XMLSchema#integer>(?b)",
+        "<http://www.w3.org/2001/XMLSchema#decimal>(?b)",
+        "<http://www.w3.org/2001/XMLSchema#double>(?b)",
+        "<http://www.w3.org/2001/XMLSchema#float>(?b)",
+        "<http://www.w3.org/2001/XMLSchema#boolean>(?b)",
+        "<http://www.w3.org/2001/XMLSchema#string>(?b)",
+        "<http://www.w3.org/2001/XMLSchema#string>(?a)",
+        "<http://www.w3.org/2001/XMLSchema#date>(?b)",
+        "<http://www.w3.org/2001/XMLSchema#dateTime>(?b)",
+        "<http://www.w3.org/2001/XMLSchema#dateTime>(\"2020-01-01T10:00:00Z\")",
+        "<http://www.w3.org/2001/XMLSchema#integer>(STR(?b))",
+    ];
+    let mut rng = Rng(20_260_931);
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..QueryOptions::default()
+    };
+    // GROUP_CONCAT values in a canonical order: the parts of each literal sorted.
+    let sorted_parts = |row: &str| -> String {
+        row.split(' ')
+            .map(
+                |term| match term.strip_prefix('"').and_then(|t| t.split_once('"')) {
+                    Some((value, rest)) => {
+                        let mut parts: Vec<&str> = value.split(',').collect();
+                        parts.sort_unstable();
+                        format!("\"{}\"{rest}", parts.join(","))
+                    }
+                    None => term.to_owned(),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut checked = 0;
+    for _ in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for expression in expressions {
+            for text in [
+                format!("SELECT ?a ?b ({expression} AS ?x) WHERE {{ ?a ?p ?b }}"),
+                format!(
+                    "SELECT ?a ?b (COALESCE({expression}, \"none\") AS ?x) WHERE {{ ?a ?p ?b FILTER(isLiteral({expression}) || isIRI({expression}) || ?p = <{EX}p0>) }}"
+                ),
+            ] {
+                let query = SparqlParser::new()
+                    .parse_query(&text)
+                    .unwrap_or_else(|e| panic!("{e}: {text}"));
+                assert!(runs_natively(&query), "{text}");
+                let native = rows(
+                    evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                    false,
+                );
+                let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+                assert_eq!(native, expected, "{text}");
+                checked += 1;
+            }
+        }
+        for concat in [
+            "GROUP_CONCAT(?b; separator=\",\")",
+            "GROUP_CONCAT(DISTINCT ?b; separator=\",\")",
+            "GROUP_CONCAT(STR(?b); separator=\",\")",
+            "GROUP_CONCAT(DISTINCT STR(?p); separator=\",\")",
+        ] {
+            let text = format!("SELECT ?a ({concat} AS ?x) WHERE {{ ?a ?p ?b }} GROUP BY ?a");
+            let query = SparqlParser::new().parse_query(&text).unwrap();
+            assert!(runs_natively(&query), "{text}");
+            let normalise = |rows: Vec<String>| {
+                let mut rows: Vec<String> = rows.iter().map(|r| sorted_parts(r)).collect();
+                rows.sort();
+                rows
+            };
+            let native = normalise(rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            ));
+            let expected = normalise(rows(
+                evaluate_query(&snapshot, &query, &spareval).unwrap(),
+                false,
+            ));
+            assert_eq!(native, expected, "{text}");
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 40 * (24 * 2 + 4));
+}
