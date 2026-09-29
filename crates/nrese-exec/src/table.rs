@@ -119,6 +119,25 @@ impl IdTable {
         self.sorted_by.clear();
     }
 
+    /// The rows of `parts` in order, in one table `width` wide (for parallel operators that
+    /// produce one part per chunk of their input).
+    pub fn concat(width: usize, parts: Vec<IdTable>) -> IdTable {
+        let mut parts = parts.into_iter();
+        let Some(mut out) = parts.next() else {
+            return IdTable::new(width);
+        };
+        let rest: Vec<IdTable> = parts.collect();
+        let extra: usize = rest.iter().map(IdTable::len).sum();
+        for column in &mut out.columns {
+            column.reserve_exact(extra);
+        }
+        for part in &rest {
+            out.append(part);
+        }
+        out.sorted_by.clear();
+        out
+    }
+
     /// Bytes held by the column buffers (by capacity), for memory budgets.
     pub fn memory_bytes(&self) -> usize {
         self.columns.iter().map(|c| c.capacity() * 8).sum()
@@ -225,11 +244,30 @@ impl IdTable {
     }
 
     /// Keeps the rows whose `mask` entry is true, preserving order and sortedness.
+    /// [`retain`](Self::retain) with a thread-safe predicate, evaluated in parallel for
+    /// large tables.
+    pub fn par_retain(&mut self, keep: impl Fn(&IdTable, usize) -> bool + Sync) {
+        let mask: Vec<bool> = if self.len < PARALLEL_SORT_ROWS {
+            (0..self.len).map(|row| keep(self, row)).collect()
+        } else {
+            (0..self.len)
+                .into_par_iter()
+                .map(|row| keep(self, row))
+                .collect()
+        };
+        self.retain_mask(&mask);
+    }
+
     pub fn retain_mask(&mut self, mask: &[bool]) {
         assert_eq!(mask.len(), self.len, "mask length");
-        for column in &mut self.columns {
+        let filter = |column: &mut Vec<u64>| {
             let mut keep = mask.iter();
             column.retain(|_| *keep.next().unwrap());
+        };
+        if self.len < PARALLEL_SORT_ROWS {
+            self.columns.iter_mut().for_each(filter);
+        } else {
+            self.columns.par_iter_mut().for_each(filter);
         }
         self.len = mask.iter().filter(|&&k| k).count();
     }

@@ -14,13 +14,32 @@
 //! right side of [`left_join`]'s output.
 
 use std::cmp::Ordering;
+use std::ops::Range;
 
 use hashbrown::HashMap;
+use rayon::prelude::*;
 
 use crate::UNDEF;
 use crate::table::IdTable;
 
 type Hasher = foldhash::fast::FixedState;
+
+/// Probe rows per parallel task; smaller joins run on one thread.
+const PARALLEL_ROWS: usize = 1 << 14;
+
+/// Runs `part` over consecutive row ranges of a `len`-row input, in parallel for large
+/// inputs, and concatenates the parts in input order (so the output order is the
+/// sequential one).
+fn chunked(len: usize, width: usize, part: impl Fn(Range<usize>) -> IdTable + Sync) -> IdTable {
+    if len < 2 * PARALLEL_ROWS {
+        return part(0..len);
+    }
+    let parts: Vec<IdTable> = (0..len.div_ceil(PARALLEL_ROWS))
+        .into_par_iter()
+        .map(|i| part(i * PARALLEL_ROWS..((i + 1) * PARALLEL_ROWS).min(len)))
+        .collect();
+    IdTable::concat(width, parts)
+}
 
 /// A predicate over a combined output row (the filter of an OPTIONAL).
 pub type RowFilter<'a> = &'a dyn Fn(&[u64]) -> bool;
@@ -163,18 +182,41 @@ fn gallop(
 }
 
 fn merge_join(left: &IdTable, right: &IdTable, lk: &[usize], rk: &[usize]) -> IdTable {
+    let width = left.width() + right_payload(right.width(), rk).len();
+    // Each chunk of left rows starts at the first right row with its key.
+    let out = chunked(left.len(), width, |rows| {
+        let start = if rows.start == 0 {
+            0
+        } else {
+            gallop(right, rk, 0, left, rows.start, lk, false)
+        };
+        merge_rows(left, rows, right, start, lk, rk)
+    });
+    // The output follows the left input's order, so it is sorted on the left keys.
+    out.assume_sorted_by(lk.to_vec())
+}
+
+/// Merge join of the left rows `rows` with the right rows from `r`.
+fn merge_rows(
+    left: &IdTable,
+    rows: Range<usize>,
+    right: &IdTable,
+    mut r: usize,
+    lk: &[usize],
+    rk: &[usize],
+) -> IdTable {
     let payload = right_payload(right.width(), rk);
     let mut out = IdTable::new(left.width() + payload.len());
     let mut row = vec![0; out.width()];
-    let (mut l, mut r) = (0, 0);
-    while l < left.len() && r < right.len() {
+    let (mut l, end) = (rows.start, rows.end);
+    while l < end && r < right.len() {
         match compare_keys(left, l, lk, right, r, rk) {
-            Ordering::Less => l = gallop(left, lk, l, right, r, rk, true),
+            Ordering::Less => l = gallop(left, lk, l, right, r, rk, true).min(end),
             Ordering::Greater => r = gallop(right, rk, r, left, l, lk, false),
             Ordering::Equal => {
-                let l_end = (l + 1..left.len())
+                let l_end = (l + 1..end)
                     .find(|&x| !same_key(left, l, x, lk))
-                    .unwrap_or(left.len());
+                    .unwrap_or(end);
                 let r_end = (r + 1..right.len())
                     .find(|&x| !same_key(right, r, x, rk))
                     .unwrap_or(right.len());
@@ -194,8 +236,7 @@ fn merge_join(left: &IdTable, right: &IdTable, lk: &[usize], rk: &[usize]) -> Id
             }
         }
     }
-    // The output follows the left input's order, so it is sorted on the left keys.
-    out.assume_sorted_by(lk.to_vec())
+    out
 }
 
 /// Hash table from key to the chain of `build` rows with that key: `heads[key]` is the first
@@ -267,26 +308,30 @@ fn hash_join(
         (probe, build, build_keys)
     };
     let payload = right_payload(right.width(), rk);
-    let mut out = IdTable::new(left.width() + payload.len());
-    let mut row = vec![0; out.width()];
-    for p in 0..probe.len() {
-        let mut b = table.first(probe, p, probe_keys);
-        while b != END {
-            let (li, ri) = if build_is_left {
-                (b as usize, p)
-            } else {
-                (p, b as usize)
-            };
-            for (i, c) in left.columns().iter().enumerate() {
-                row[i] = c[li];
+    let width = left.width() + payload.len();
+    let out = chunked(probe.len(), width, |rows| {
+        let mut out = IdTable::new(width);
+        let mut row = vec![0; width];
+        for p in rows {
+            let mut b = table.first(probe, p, probe_keys);
+            while b != END {
+                let (li, ri) = if build_is_left {
+                    (b as usize, p)
+                } else {
+                    (p, b as usize)
+                };
+                for (i, c) in left.columns().iter().enumerate() {
+                    row[i] = c[li];
+                }
+                for (i, &c) in payload.iter().enumerate() {
+                    row[left.width() + i] = right.get(ri, c);
+                }
+                out.push_row(&row);
+                b = table.next[b as usize];
             }
-            for (i, &c) in payload.iter().enumerate() {
-                row[left.width() + i] = right.get(ri, c);
-            }
-            out.push_row(&row);
-            b = table.next[b as usize];
         }
-    }
+        out
+    });
     if !build_is_left && probe.is_sorted_on(probe_keys) {
         out.assume_sorted_by(probe_keys.to_vec())
     } else {
@@ -304,11 +349,52 @@ pub fn left_join(
     right_keys: &[usize],
     accept: Option<RowFilter<'_>>,
 ) -> IdTable {
+    let width = left.width() + right_payload(right.width(), right_keys).len();
+    let table = (!left_keys.is_empty()).then(|| BuildTable::new(right, right_keys));
+    let out = match accept {
+        // The filter may not be thread-safe (it decodes terms through a cache).
+        Some(accept) => left_join_rows(
+            left,
+            right,
+            left_keys,
+            right_keys,
+            table.as_ref(),
+            0..left.len(),
+            Some(accept),
+        ),
+        None => chunked(left.len(), width, |rows| {
+            left_join_rows(
+                left,
+                right,
+                left_keys,
+                right_keys,
+                table.as_ref(),
+                rows,
+                None,
+            )
+        }),
+    };
+    if left.is_sorted_on(left_keys) && !left_keys.is_empty() {
+        out.assume_sorted_by(left_keys.to_vec())
+    } else {
+        out
+    }
+}
+
+/// [`left_join`] of the left rows `rows`.
+fn left_join_rows(
+    left: &IdTable,
+    right: &IdTable,
+    left_keys: &[usize],
+    right_keys: &[usize],
+    table: Option<&BuildTable>,
+    rows: Range<usize>,
+    accept: Option<RowFilter<'_>>,
+) -> IdTable {
     let payload = right_payload(right.width(), right_keys);
     let mut out = IdTable::new(left.width() + payload.len());
     let mut row = vec![0; out.width()];
-    let table = (!left_keys.is_empty()).then(|| BuildTable::new(right, right_keys));
-    for l in 0..left.len() {
+    for l in rows {
         for (i, c) in left.columns().iter().enumerate() {
             row[i] = c[l];
         }
@@ -322,7 +408,7 @@ pub fn left_join(
                 matched = true;
             }
         };
-        match &table {
+        match table {
             Some(table) => {
                 let mut r = table.first(left, l, left_keys);
                 while r != END {
@@ -339,11 +425,7 @@ pub fn left_join(
             out.push_row(&row);
         }
     }
-    if left.is_sorted_on(left_keys) && !left_keys.is_empty() {
-        out.assume_sorted_by(left_keys.to_vec())
-    } else {
-        out
-    }
+    out
 }
 
 /// Left rows whose key doesn't occur in `right` (MINUS, FILTER NOT EXISTS). Order and
@@ -363,7 +445,7 @@ pub fn anti_join(
         return out;
     }
     let table = BuildTable::new(right, right_keys);
-    out.retain(|t, row| table.first(t, row, left_keys) == END);
+    out.par_retain(|t, row| table.first(t, row, left_keys) == END);
     out
 }
 
@@ -383,7 +465,7 @@ pub fn semi_join(
         return out;
     }
     let table = BuildTable::new(right, right_keys);
-    out.retain(|t, row| table.first(t, row, left_keys) != END);
+    out.par_retain(|t, row| table.first(t, row, left_keys) != END);
     out
 }
 
@@ -574,5 +656,41 @@ mod tests {
         );
         let anti = anti_join(&left, &right, &[0], &[0]);
         assert_eq!(sorted_rows(&anti), vec![vec![2, 20]]);
+    }
+
+    /// Inputs large enough to run in parallel chunks give the sequential output, in the
+    /// sequential order.
+    #[test]
+    fn parallel_joins_equal_sequential() {
+        let mut rng = Rng(11);
+        let rows = 5 * PARALLEL_ROWS;
+        let mut left = random_table(&mut rng, 2, rows, rows as u64, false);
+        let mut right = random_table(&mut rng, 2, rows / 2, rows as u64, false);
+        let (lk, rk) = ([0], [1]);
+
+        let hashed = join(&left, &right, &lk, &rk);
+        left.sort_by(&lk);
+        right.sort_by(&rk);
+        let merged = join(&left, &right, &lk, &rk);
+        assert_eq!(
+            merged,
+            merge_rows(&left, 0..rows, &right, 0, &lk, &rk).assume_sorted_by(lk.to_vec())
+        );
+        assert!(merged.len() > rows / 4, "the join must produce rows");
+        assert_eq!(sorted_rows(&hashed), sorted_rows(&merged));
+
+        let accept_all: &dyn Fn(&[u64]) -> bool = &|_| true;
+        assert_eq!(
+            left_join(&left, &right, &lk, &rk, None),
+            left_join(&left, &right, &lk, &rk, Some(accept_all))
+        );
+
+        let table = BuildTable::new(&right, &rk);
+        let mut anti = left.clone();
+        anti.retain(|t, row| table.first(t, row, &lk) == END);
+        assert_eq!(anti_join(&left, &right, &lk, &rk), anti);
+        let mut semi = left.clone();
+        semi.retain(|t, row| table.first(t, row, &lk) != END);
+        assert_eq!(semi_join(&left, &right, &lk, &rk), semi);
     }
 }

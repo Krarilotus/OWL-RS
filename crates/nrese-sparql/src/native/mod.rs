@@ -22,6 +22,7 @@ mod wcoj;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use nrese_engine::quad::Permutation;
@@ -33,6 +34,7 @@ use nrese_exec::{Budget, IdTable, UNDEF, computed_id, computed_index, group::gro
 use oxrdf::vocab::xsd;
 use oxrdf::{Literal, Term, Variable};
 use oxsdatatypes::{Decimal, Double, Float, Integer};
+use rayon::prelude::*;
 use spareval::{CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter};
 use spargebra::Query;
 use spargebra::algebra::{
@@ -47,6 +49,10 @@ use value::Value;
 /// A right side at least this many times larger than the running result is joined by
 /// probing the index once per result row instead of scanning it.
 const PROBE_FACTOR: u64 = 32;
+
+/// Result rows per parallel task of an index nested-loop join; smaller results probe on
+/// one thread.
+const PROBE_CHUNK: usize = 4096;
 
 /// Decoded terms kept per query for repeated ids (ORDER BY, aggregates, expressions).
 const DECODE_CACHE_ENTRIES: usize = 1 << 18;
@@ -999,10 +1005,6 @@ impl<'a> Context<'a> {
             .collect();
         let mut vars = result.vars.clone();
         vars.extend(new_vars.iter().cloned());
-        let mut out = IdTable::new(vars.len());
-        let mut matches: Vec<Vec<u64>> = Vec::new();
-        let mut row = vec![0u64; vars.len()];
-        let width = result.table.width();
         // Where each new variable sits in a matching quad (the shared ones become constants).
         let positions: Vec<Vec<usize>> = new_vars
             .iter()
@@ -1012,47 +1014,39 @@ impl<'a> Context<'a> {
             .iter()
             .map(|v| (0..3).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
-        let mut bound = scan.clone();
-        for r in 0..result.table.len() {
-            if r % 4096 == 0 {
-                self.check()?;
-            }
-            let same_key = r > 0
-                && key_columns
-                    .iter()
-                    .all(|&k| result.table.get(r, k) == result.table.get(r - 1, k));
-            if !same_key {
-                matches.clear();
-                for (slots, &k) in shared_positions.iter().zip(&key_columns) {
-                    let id = TermId::from_raw(result.table.get(r, k));
-                    for &i in slots {
-                        bound.slots[i] = Slot::Const(id);
-                    }
-                }
-                'quads: for quad in self
-                    .snapshot
-                    .quads_for_pattern_in(self.model, &bound.quad_pattern())
-                {
-                    let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
-                    let mut values = Vec::with_capacity(new_vars.len());
-                    for places in &positions {
-                        let value = components[places[0]];
-                        if places[1..].iter().any(|&p| components[p] != value) {
-                            continue 'quads;
-                        }
-                        values.push(value);
-                    }
-                    matches.push(values);
-                }
-            }
-            for values in &matches {
-                for (c, slot) in row.iter_mut().enumerate().take(width) {
-                    *slot = result.table.get(r, c);
-                }
-                row[width..].copy_from_slice(values);
-                out.push_row(&row);
-            }
-        }
+        let probe = Probe {
+            snapshot: self.snapshot,
+            model: self.model,
+            table: &result.table,
+            scan,
+            key_columns: &key_columns,
+            shared_positions: &shared_positions,
+            positions: &positions,
+            width: vars.len(),
+        };
+        let token = self.cancellation.clone();
+        let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
+        let rows = result.table.len();
+        let out = if rows < 2 * PROBE_CHUNK {
+            probe.rows(0..rows, &cancelled)
+        } else {
+            let parts: Vec<Option<IdTable>> = (0..rows.div_ceil(PROBE_CHUNK))
+                .into_par_iter()
+                .map(|i| {
+                    probe.rows(
+                        i * PROBE_CHUNK..((i + 1) * PROBE_CHUNK).min(rows),
+                        &cancelled,
+                    )
+                })
+                .collect();
+            parts
+                .into_iter()
+                .collect::<Option<Vec<IdTable>>>()
+                .map(|parts| IdTable::concat(vars.len(), parts))
+        };
+        let Some(out) = out else {
+            return Err(QueryEvaluationError::Cancelled.into());
+        };
         let out = if result.ordered {
             out
         } else {
@@ -1754,6 +1748,76 @@ enum SortKey {
 
 /// True if `aggregate` counts the rows of a pattern: `COUNT(*)`, or `COUNT(?v)` for a
 /// variable the pattern always binds.
+/// An index nested-loop join of a key-sorted `table` with `scan`: the index is probed once
+/// per distinct key. Holds only thread-safe state, so chunks of rows run in parallel.
+struct Probe<'a> {
+    snapshot: &'a Snapshot,
+    model: ReadModel,
+    table: &'a IdTable,
+    scan: &'a ScanPattern,
+    key_columns: &'a [usize],
+    /// The scan positions of each key column's variable.
+    shared_positions: &'a [Vec<usize>],
+    /// The scan positions of each new variable.
+    positions: &'a [Vec<usize>],
+    width: usize,
+}
+
+impl Probe<'_> {
+    /// The joined rows for `table` rows `rows`, in order; `None` if cancelled.
+    fn rows(&self, rows: Range<usize>, cancelled: &(dyn Fn() -> bool + Sync)) -> Option<IdTable> {
+        let table = self.table;
+        let width = table.width();
+        let mut out = IdTable::new(self.width);
+        let mut matches: Vec<Vec<u64>> = Vec::new();
+        let mut row = vec![0u64; self.width];
+        let mut bound = self.scan.clone();
+        let first = rows.start;
+        for r in rows {
+            if (r - first).is_multiple_of(4096) && cancelled() {
+                return None;
+            }
+            let same_key = r > first
+                && self
+                    .key_columns
+                    .iter()
+                    .all(|&k| table.get(r, k) == table.get(r - 1, k));
+            if !same_key {
+                matches.clear();
+                for (slots, &k) in self.shared_positions.iter().zip(self.key_columns) {
+                    let id = TermId::from_raw(table.get(r, k));
+                    for &i in slots {
+                        bound.slots[i] = Slot::Const(id);
+                    }
+                }
+                'quads: for quad in self
+                    .snapshot
+                    .quads_for_pattern_in(self.model, &bound.quad_pattern())
+                {
+                    let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
+                    let mut values = Vec::with_capacity(self.positions.len());
+                    for places in self.positions {
+                        let value = components[places[0]];
+                        if places[1..].iter().any(|&p| components[p] != value) {
+                            continue 'quads;
+                        }
+                        values.push(value);
+                    }
+                    matches.push(values);
+                }
+            }
+            for values in &matches {
+                for (c, slot) in row.iter_mut().enumerate().take(width) {
+                    *slot = table.get(r, c);
+                }
+                row[width..].copy_from_slice(values);
+                out.push_row(&row);
+            }
+        }
+        Some(out)
+    }
+}
+
 fn counts_rows(aggregate: &AggregateExpression, scan: &ScanPattern) -> bool {
     match aggregate {
         AggregateExpression::CountSolutions { distinct: false } => true,

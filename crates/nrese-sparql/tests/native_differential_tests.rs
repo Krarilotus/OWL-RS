@@ -560,3 +560,59 @@ fn cyclic_bgps_equal_spareval() {
     }
     assert_eq!(checked, 1000);
 }
+
+/// A selective pattern joined with a much larger one runs as a parallel index nested-loop
+/// join (enough rows for several chunks); it equals spareval.
+#[test]
+fn parallel_probe_join_equals_spareval() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    for i in 0..12_000 {
+        let quad = Quad::new(
+            ex(&format!("t{i}")),
+            rdf_type.clone(),
+            ex("T"),
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+        for j in 0..(i % 4) {
+            let quad = Quad::new(
+                ex(&format!("t{i}")),
+                ex("p"),
+                ex(&format!("o{}", (i * 7 + j) % 5000)),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+    }
+    for i in 0..400_000 {
+        let quad = Quad::new(
+            ex(&format!("u{}", i / 4)),
+            ex("p"),
+            ex(&format!("o{}", i % 5000)),
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..QueryOptions::default()
+    };
+    for text in [
+        format!("SELECT ?x ?y WHERE {{ ?x a <{EX}T> . ?x <{EX}p> ?y }}"),
+        format!("SELECT ?x ?y WHERE {{ ?x a <{EX}T> OPTIONAL {{ ?x <{EX}p> ?y }} }}"),
+    ] {
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        assert!(runs_natively(&query), "{text}");
+        let native = rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        );
+        let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+        assert!(native.len() >= 12_000, "{text}");
+        assert_eq!(native, expected, "{text}");
+    }
+}
