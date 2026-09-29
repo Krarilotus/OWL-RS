@@ -21,6 +21,8 @@
 //!
 //! The naive evaluator ([`super::naive`]) is the oracle: both compute the same closure.
 
+use std::sync::Arc;
+
 use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 
@@ -60,12 +62,13 @@ pub struct Phases {
     pub consistency: std::time::Duration,
 }
 
-/// A sorted run of pairs, by subject and by object.
-#[derive(Default)]
+/// A sorted run of pairs, by subject and by object. Cloning shares the pairs, so the
+/// recent run can be the delta itself instead of a copy.
+#[derive(Default, Clone)]
 struct Run {
-    so: Vec<Pair>,
+    so: Arc<Vec<Pair>>,
     /// `(object, subject)` pairs.
-    os: Vec<Pair>,
+    os: Arc<Vec<Pair>>,
 }
 
 impl Run {
@@ -73,7 +76,10 @@ impl Run {
     fn new(so: Vec<Pair>) -> Self {
         let mut os: Vec<Pair> = so.iter().map(|&(s, o)| (o, s)).collect();
         os.par_sort_unstable();
-        Self { so, os }
+        Self {
+            so: Arc::new(so),
+            os: Arc::new(os),
+        }
     }
 
     fn len(&self) -> usize {
@@ -113,7 +119,7 @@ impl Run {
                 }
             }
             (None, None) => {
-                for &(s, o) in &self.so {
+                for &(s, o) in self.so.iter() {
                     if keep(s, o) {
                         f(s, o);
                     }
@@ -133,9 +139,12 @@ impl Run {
 
     /// The union with a disjoint run.
     fn merge(&self, other: &Run) -> Run {
+        if self.len() == 0 {
+            return other.clone();
+        }
         Run {
-            so: merge(&self.so, &other.so),
-            os: merge(&self.os, &other.os),
+            so: Arc::new(merge(&self.so, &other.so)),
+            os: Arc::new(merge(&self.os, &other.os)),
         }
     }
 }
@@ -236,11 +245,12 @@ impl Relation {
     fn advance(&mut self, new: Vec<Pair>) {
         // Fold the recent run into the base first, so the new delta stays in `recent`.
         if self.recent.len() * 4 > self.base.len() {
-            self.base = self.base.merge(&self.recent);
-            self.recent = Run::default();
+            let recent = std::mem::take(&mut self.recent);
+            self.base = self.base.merge(&recent);
         }
         self.delta = Run::new(new);
         if self.delta.len() > 0 {
+            // An empty recent run becomes the delta itself (shared, not copied).
             self.recent = self.recent.merge(&self.delta);
         }
     }
@@ -560,9 +570,19 @@ pub fn materialise(
     lists: Option<&ListVocabulary>,
     schema: &Schema,
 ) -> Materialisation {
+    materialise_owned(input.to_vec(), rules, lists, schema)
+}
+
+/// [`materialise`] taking the input by value, so the working set is its only copy.
+pub fn materialise_owned(
+    input: Vec<Triple>,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+) -> Materialisation {
     let clock = std::time::Instant::now();
     let mut phases = Phases::default();
-    let mut store = Store::new(input.to_vec());
+    let mut store = Store::new(input);
     phases.load = clock.elapsed();
     let mut result = Materialisation::default();
     let mut derived: Vec<Triple> = Vec::new();

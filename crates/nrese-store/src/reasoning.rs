@@ -146,8 +146,8 @@ fn triple(quad: EncodedQuad) -> Triple {
 /// The closure of `asserted` (any graphs) under `program`.
 pub fn materialise(program: &Program, asserted: impl Iterator<Item = EncodedQuad>) -> Closure {
     let facts: Vec<Triple> = asserted.map(triple).collect();
-    let result = batch::materialise(
-        &facts,
+    let result = batch::materialise_owned(
+        facts,
         &program.rules,
         program.lists.as_ref(),
         &program.schema,
