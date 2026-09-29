@@ -1031,7 +1031,8 @@ impl<'a> Context<'a> {
         };
         let token = self.cancellation.clone();
         let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
-        let rows = match query.run(&cancelled) {
+        let mut stats = wcoj::Stats::default();
+        let rows = match query.run(&cancelled, &mut stats) {
             Ok(rows) => rows,
             Err(wcoj::Stop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
             Err(wcoj::Stop::TooManyRows) => {
@@ -1041,6 +1042,32 @@ impl<'a> Context<'a> {
         let mut table = IdTable::new(width);
         for row in rows.chunks_exact(width) {
             table.push_row(row);
+        }
+        if let Some(trace) = &self.trace {
+            let order: Vec<String> = stats
+                .order
+                .iter()
+                .zip(&stats.candidates)
+                .map(|(&v, n)| {
+                    format!(
+                        "{} ({} candidates)",
+                        vars[v],
+                        n.load(std::sync::atomic::Ordering::Relaxed)
+                    )
+                })
+                .collect();
+            trace.borrow_mut().push(PlanStep {
+                depth: self.depth.get() + 1,
+                operator: "wcoj order".to_owned(),
+                detail: format!(
+                    "{} | {} lookups",
+                    order.join(", "),
+                    stats.lookups.load(std::sync::atomic::Ordering::Relaxed)
+                ),
+                estimated_rows: None,
+                rows: table.len() as u64,
+                micros: 0,
+            });
         }
         Ok(Some(self.produced(Solutions {
             vars,
