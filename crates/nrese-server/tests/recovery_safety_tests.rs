@@ -40,7 +40,7 @@ async fn reasoner_reject_keeps_ready_revision_unchanged_and_data_unpublished()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
     )?;
 
     let response = app

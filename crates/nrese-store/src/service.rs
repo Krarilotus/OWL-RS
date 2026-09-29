@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use nrese_engine::{Engine, EngineConfig, QuadPattern, ReadModel};
+use nrese_engine::{Engine, EngineConfig, ReadModel};
 use nrese_sparql::CancellationToken;
 
 use crate::backup::{
@@ -20,10 +20,8 @@ use crate::loader::preload_ontology;
 use crate::mutation::{MutationCommand, MutationCommitReport};
 use crate::query::{SerializedQueryResult, SparqlQueryRequest};
 use crate::query_executor::{PreparedQuery, execute_query, run_query};
-use crate::snapshot::StoreDatasetSnapshot;
 use crate::stats::{StoreStats, collect_stats};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
-use crate::view::decoded_quads;
 
 /// The dataset and the operations on it. Reads run on an engine snapshot and never wait for
 /// writers. Production writes go through [`MutationPipeline`](crate::MutationPipeline),
@@ -37,6 +35,8 @@ pub struct StoreService {
     /// Whether the reasoning marker file may exist (see [`Self::materialised_for`]); saves
     /// a file-system call per write once it is gone.
     marker: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The ruleset recorded this process (also for in-memory stores, which have no file).
+    materialised: std::sync::Arc<std::sync::Mutex<Option<&'static str>>>,
 }
 
 /// The file recording which ruleset the inferred stack is exact for.
@@ -65,6 +65,7 @@ impl StoreService {
             engine,
             preloaded_ontology,
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            materialised: std::sync::Arc::default(),
         };
         if service.engine.snapshot().revision() != before {
             service.invalidate_reasoning()?;
@@ -80,6 +81,9 @@ impl StoreService {
     /// [`Self::rematerialise`] and kept by reasoner-v2 commits since; `None` if unknown
     /// (in-memory stores, or a write that didn't maintain the inferences).
     pub fn materialised_for(&self) -> Option<String> {
+        if let Some(ruleset) = *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) {
+            return Some(ruleset.to_owned());
+        }
         let path = self.marker_path()?;
         std::fs::read_to_string(path)
             .ok()
@@ -91,6 +95,7 @@ impl StoreService {
     /// inferred stack, so a crash can leave it missing but never stale.
     pub fn invalidate_reasoning(&self) -> StoreResult<()> {
         use std::sync::atomic::Ordering;
+        *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
         if !self.marker.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
@@ -104,7 +109,8 @@ impl StoreService {
         Ok(())
     }
 
-    fn record_reasoning(&self, ruleset: &str) -> StoreResult<()> {
+    fn record_reasoning(&self, ruleset: &'static str) -> StoreResult<()> {
+        *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(ruleset);
         let Some(path) = self.marker_path() else {
             return Ok(());
         };
@@ -153,15 +159,6 @@ impl StoreService {
         format: DatasetBackupFormat,
     ) -> StoreResult<DatasetBackupArtifact> {
         export_dataset(&self.engine.snapshot(), format)
-    }
-
-    /// The asserted dataset in the v1 reasoner's string form. O(dataset).
-    pub fn dataset_snapshot(&self) -> StoreResult<StoreDatasetSnapshot> {
-        let snapshot = self.engine.snapshot();
-        StoreDatasetSnapshot::capture(
-            decoded_quads(&snapshot, ReadModel::Asserted, &QuadPattern::all()),
-            snapshot.revision(),
-        )
     }
 
     pub fn execute_query(

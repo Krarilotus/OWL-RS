@@ -60,7 +60,7 @@ async fn reasoner_reject_does_not_publish_data_or_advance_revision()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
     )?;
 
     let rejected = app

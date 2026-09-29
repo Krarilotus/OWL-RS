@@ -9,5 +9,4 @@ nrese-core = { path = "../nrese-core" }
 nrese-exec = { path = "../nrese-exec" }
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
 rayon = "1.10"
-tracing.workspace = true
 

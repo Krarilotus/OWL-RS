@@ -75,7 +75,6 @@ pub fn reasoning(state: AppState) -> Response {
             profile: state.reasoner_profile_name(),
             read_model: state.reasoner_read_model_name(),
             capabilities,
-            configured_policy: reasoning_view::configured_reasoning_policy(&state.reasoner()),
             last_run: last_run.as_ref().map(reasoning_view::last_run_view),
             reject_diagnostics: reasoning_view::reject_diagnostics_baseline(last_run.as_ref()),
         }),

@@ -374,16 +374,16 @@ async fn operator_reasoning_diagnostics_endpoint_exposes_reject_baseline()
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     let text = String::from_utf8(body.to_vec())?;
     assert!(text.contains("reject_diagnostics"));
-    assert!(text.contains("hybrid-heuristic-plus-deep-justification"));
+    assert!(text.contains("rule-premises-plus-commit-delta-attribution"));
     Ok(())
 }
 
 #[tokio::test]
-async fn rules_mvp_update_surfaces_last_reasoning_run_in_operator_diagnostics()
+async fn owl2_rl_update_surfaces_last_reasoning_run_in_operator_diagnostics()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
     )?;
 
     let update_response = app
@@ -418,24 +418,19 @@ async fn rules_mvp_update_surfaces_last_reasoning_run_in_operator_diagnostics()
     let text = String::from_utf8(body.to_vec())?;
     assert!(text.contains("\"last_run\""));
     assert!(text.contains("\"completed\""));
-    assert!(text.contains("http://example.com/alice"));
-    assert!(text.contains("\"stats\""));
-    assert!(text.contains("\"cache\""));
-    assert!(text.contains("\"supported_asserted_triples\""));
-    assert!(text.contains("\"unsupported_blank_node_subjects\""));
-    assert!(text.contains("\"flattened_named_graph_quads\""));
-    assert!(text.contains("\"inferred_equality_link_count\""));
-    assert!(text.contains("\"subclass_edge_count\""));
-    assert!(text.contains("\"execution_cache_entries\""));
+    assert!(text.contains("\"ruleset\":\"owl2-rl\""));
+    assert!(text.contains("\"inferred_inserted\""));
+    assert!(text.contains("\"rounds\""));
+    assert!(text.contains("\"elapsed_micros\""));
     Ok(())
 }
 
 #[tokio::test]
-async fn rules_mvp_accepts_functional_property_multiplicity_and_reports_inferred_equality()
+async fn owl2_rl_accepts_functional_property_multiplicity_and_reports_inferred_equality()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
     )?;
 
     let update_response = app
@@ -470,18 +465,17 @@ async fn rules_mvp_accepts_functional_property_multiplicity_and_reports_inferred
     let body = axum::body::to_bytes(diagnostics_response.into_body(), usize::MAX).await?;
     let text = String::from_utf8(body.to_vec())?;
     assert!(text.contains("\"completed\""));
-    assert!(text.contains("\"inferred_equality_link_count\":1"));
-    assert!(text.contains("http://example.com/one"));
-    assert!(text.contains("http://example.com/two"));
+    // prp-fp derives one sameAs two (and its symmetric and reflexive consequences).
+    assert!(!text.contains("\"inferred_inserted\":0"));
     Ok(())
 }
 
 #[tokio::test]
-async fn rules_mvp_rejects_disjoint_type_conflicts_and_surfaces_reason()
+async fn owl2_rl_rejects_disjoint_type_conflicts_and_surfaces_reason()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
     )?;
 
     let update_response = app
@@ -512,13 +506,12 @@ async fn rules_mvp_rejects_disjoint_type_conflicts_and_surfaces_reason()
     );
     let update_body = axum::body::to_bytes(update_response.into_body(), usize::MAX).await?;
     let update_text = String::from_utf8(update_body.to_vec())?;
-    assert!(update_text.contains("owl:disjointWith"));
+    assert!(update_text.contains("cax-dw"));
     assert!(update_text.contains("reasoner_reject"));
     assert!(update_text.contains("likely_commit_trigger"));
     assert!(update_text.contains("commit_attribution"));
-    assert!(update_text.contains("principal_contributor"));
     assert!(update_text.contains("\"evidence\""));
-    assert!(update_text.contains("constraint-axiom"));
+    assert!(update_text.contains("\"premise\""));
     assert!(update_text.contains("matched_evidence_roles"));
     assert!(update_text.contains("http://example.com/alice"));
     assert!(update_text.contains("Likely commit-local trigger"));
@@ -554,21 +547,20 @@ async fn rules_mvp_rejects_disjoint_type_conflicts_and_surfaces_reason()
         axum::body::to_bytes(diagnostics_response.into_body(), usize::MAX).await?;
     let diagnostics_text = String::from_utf8(diagnostics_body.to_vec())?;
     assert!(diagnostics_text.contains("\"rejected\""));
-    assert!(diagnostics_text.contains("owl:disjointWith"));
+    assert!(diagnostics_text.contains("cax-dw"));
     assert!(diagnostics_text.contains("\"last_reject\""));
     assert!(diagnostics_text.contains("likely_commit_trigger"));
     assert!(diagnostics_text.contains("commit_attribution"));
-    assert!(diagnostics_text.contains("principal_contributor"));
     assert!(diagnostics_text.contains("\"evidence\""));
     assert!(diagnostics_text.contains("matched_evidence_roles"));
     Ok(())
 }
 
 #[tokio::test]
-async fn rules_mvp_rejects_owl_nothing_type_conflicts() -> Result<(), Box<dyn std::error::Error>> {
+async fn owl2_rl_rejects_owl_nothing_type_conflicts() -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
     )?;
 
     let update_response = app
@@ -624,7 +616,7 @@ async fn ttl_fixture_is_loaded_and_drives_reasoner_aware_update_flow()
     let app = test_app_with_store_config(
         StoreConfig::in_memory().with_ontology(minimal_fixture_path()),
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
     )?;
 
     let ready_response = app
@@ -671,7 +663,7 @@ async fn ttl_fixture_is_loaded_and_drives_reasoner_aware_update_flow()
     let diagnostics_text = String::from_utf8(diagnostics_body.to_vec())?;
     assert!(diagnostics_text.contains("\"last_run\""));
     assert!(diagnostics_text.contains("\"completed\""));
-    assert!(diagnostics_text.contains("\"stats\""));
+    assert!(diagnostics_text.contains("\"rounds\""));
     assert!(diagnostics_text.contains("\"inferred_triples\""));
 
     Ok(())

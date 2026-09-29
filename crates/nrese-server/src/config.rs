@@ -147,7 +147,7 @@ mode = "in-memory"
 data_dir = "./runtime-data"
 
 [reasoner]
-mode = "rules-mvp"
+mode = "owl2-rl"
 
 [ai]
 enabled = true
@@ -200,7 +200,7 @@ bind_address = "0.0.0.0:9191"
 deployment_posture = "open-workbench"
 
 [reasoner]
-mode = "rules-mvp"
+mode = "owl2-rl"
 
 [auth]
 mode = "none"
@@ -268,9 +268,6 @@ mode = "none"
             (names::STORE_MODE, None),
             (names::ONTOLOGY_PATH, None),
             (names::REASONING_MODE, None),
-            (names::REASONER_READ_MODEL, None),
-            (names::REASONER_RULES_MVP_PRESET, None),
-            (names::REASONER_RULES_MVP_FEATURES, None),
             (names::MAX_QUERY_BYTES, None),
             (names::MAX_UPDATE_BYTES, None),
             (names::MAX_RDF_UPLOAD_BYTES, None),

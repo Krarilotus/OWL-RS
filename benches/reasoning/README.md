@@ -25,9 +25,9 @@ Everything runs in Docker on the same host. The data lives in the volume `nrese-
 | `queries/lubm/` | The 14 LUBM queries, plus the published LUBM(1) answer counts (`expected-lubm-1.tsv`) |
 | `queries/owl2bench/` | The 22 OWL2Bench queries (Zenodo 10.5281/zenodo.3838735, CC-BY-4.0) and the profiles each one targets |
 | `oracle/` | owlrl (the reference OWL 2 RL implementation) computes the closure, and pyoxigraph answers the queries over it. Correctness only; never a performance number. |
+| NRESE v2 | `crates/nrese-reasoner/examples/v2_closure.rs`: reasoner v2's batch executor, built in Docker; `local-bulk.sh` adds end-to-end load, queries and commit latency through the store |
 | `jena/` | Jena's rule reasoners (RDFS, OWL micro/mini/full), in memory |
 | `nemo/` | Nemo (Rust datalog, TU Dresden) with `owl2rl.rls`, a translation of the W3C OWL 2 RL/RDF rule tables |
-| NRESE v1 | `crates/nrese-store/examples/reason_bench.rs`: the `rules-mvp` reasoner, built in Docker |
 
 ## Reading the results
 

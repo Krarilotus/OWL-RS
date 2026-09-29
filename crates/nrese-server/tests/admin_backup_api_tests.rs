@@ -177,7 +177,7 @@ async fn restore_endpoint_uses_reasoner_gate_and_rejects_without_publish()
     let app = test_app_with_store_config(
         StoreConfig::default(),
         admin_policy(),
-        ReasonerConfig::for_mode(ReasoningMode::RulesMvp),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
 
     let restore = app
@@ -199,7 +199,7 @@ async fn restore_endpoint_uses_reasoner_gate_and_rejects_without_publish()
     assert_eq!(restore.status(), StatusCode::BAD_REQUEST);
     let restore_text = body_text(restore).await?;
     assert!(restore_text.contains("reasoner_reject"));
-    assert!(restore_text.contains("owl:disjointWith"));
+    assert!(restore_text.contains("cax-dw"));
 
     let ask = app
         .clone()

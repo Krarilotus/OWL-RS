@@ -3,7 +3,7 @@
 # entailment) on LUBM. See docs/design/reasoning-benchmark.md.
 #
 #   benches/reasoning/reasoning-scorecard.sh [datasets...]        (default: lubm-1 lubm-10)
-#   SYSTEMS="nrese-v1 jena-owl-micro" benches/reasoning/reasoning-scorecard.sh lubm-100
+#   SYSTEMS="nrese-v2 jena-owl-micro" benches/reasoning/reasoning-scorecard.sh lubm-100
 #
 # Input, from the volume `nrese-bench-data`:
 #   lubm-<N>             /data/univ-bench.nt plus /data/lubm-<N>.nt (prepare-lubm.sh)
@@ -11,8 +11,6 @@
 # Queries: queries/<family>/*.rq, where the family is the name up to the first "-".
 #
 # Systems, each in Docker on the same host:
-#   nrese-v1        the v1 reasoner (`rules-mvp`, crates/nrese-store/examples/reason_bench.rs).
-#                   Its inferences aren't queryable, so it has no query results.
 #   nrese-v2        reasoner v2's batch executor (crates/nrese-reasoner/examples/v2_closure.rs).
 #                   Until its inferences are installed in the store (R4), Oxigraph answers
 #                   the queries over its closure, as for Nemo.
@@ -47,7 +45,7 @@ HERE=$(native "$(cd "$(dirname "$0")" && pwd)")
 ROOT=$(native "$(cd "$HERE/../.." && pwd)")
 RESULTS=$(native "${RESULTS:-$HERE/results/$(date +%Y-%m-%d)}")
 ORACLE_CACHE=$(native "${ORACLE_CACHE:-$HERE/results/oracle}")
-SYSTEMS=${SYSTEMS:-oracle nrese-v2 nrese-v1 jena-owl-micro nemo}
+SYSTEMS=${SYSTEMS:-oracle nrese-v2 jena-owl-micro nemo}
 ORACLE_MAX_TRIPLES=${ORACLE_MAX_TRIPLES:-200000}
 ORACLE_TIMEOUT_S=${ORACLE_TIMEOUT_S:-900}  # owlrl is pure Python; past this, Nemo is the reference
 TIMEOUT_S=${TIMEOUT_S:-3600}
@@ -133,15 +131,6 @@ run_oracle() { # <dataset> <log>
   echo "$(field 'asserted: ([0-9]+)' "$2"),$(field 'triples in ([0-9.]+) s' "$2"),$(field 'closure \(owl2-rl\): ([0-9]+)' "$2"),$(peak_mib "$2")"
 }
 
-run_nrese() { # <dataset> <log>
-  measured "$2" "$RUST_IMAGE" /target/release/examples/reason_bench \
-    --derived "/out/nrese-v1-$1.inferred.nt" $(inputs "$1") || return 1
-  local snapshot rules
-  snapshot=$(field 'snapshot ([0-9.]+)' "$2")
-  rules=$(field 'rules-mvp ([0-9.]+)' "$2")
-  echo "$(field 'asserted ([0-9]+)' "$2"),$(awk "BEGIN { print $snapshot + $rules }"),$(field 'derived ([0-9]+)' "$2"),$(peak_mib "$2")"
-}
-
 run_nrese_v2() { # <dataset> <log>
   measured "$2" "$RUST_IMAGE" /target/release/examples/v2_closure \
     --out "/out/nrese-v2-$1.inferred.nt" $(inputs "$1") || return 1
@@ -188,8 +177,8 @@ docker build -q -t nrese-bench/nemo "$HERE/nemo" >/dev/null
 if [[ " $SYSTEMS " == *" nrese-v"* ]] && [ -z "${SKIP_BUILD:-}" ]; then
   docker volume create nrese-target >/dev/null
   docker run --rm -v "$ROOT:/src:ro" -v nrese-target:/target -v nrese-cargo:/usr/local/cargo/registry \
-    -w /src "$RUST_IMAGE" cargo build --release --locked -p nrese-store --example reason_bench \
-    -p nrese-reasoner --example v2_closure --target-dir /target >"$RESULTS/nrese-build.log" 2>&1
+    -w /src "$RUST_IMAGE" cargo build --release --locked -p nrese-reasoner --example v2_closure \
+    --target-dir /target >"$RESULTS/nrese-build.log" 2>&1
 fi
 
 CSV=$RESULTS/reasoning-scorecard.csv
@@ -204,7 +193,6 @@ for dataset in $DATASETS; do
     rm -f "$RESULTS/$system-$dataset.inferred.nt" "$RESULTS/$system-$dataset.answers.tsv"
     case $system in
       oracle) result=$(run_oracle "$dataset" "$log") || { echo "$dataset,$system: $(tail -1 "$log")" >&2; continue; } ;;
-      nrese-v1) result=$(run_nrese "$dataset" "$log") || { echo "$dataset,$system failed, see $log" >&2; continue; } ;;
       nrese-v2) result=$(run_nrese_v2 "$dataset" "$log") || { echo "$dataset,$system failed, see $log" >&2; continue; } ;;
       nemo) result=$(run_nemo "$dataset" "$log") || { echo "$dataset,$system failed, see $log" >&2; continue; } ;;
       jena-*) result=$(run_jena "$dataset" "$log" "${system#jena-}") || { echo "$dataset,$system failed, see $log" >&2; continue; } ;;
