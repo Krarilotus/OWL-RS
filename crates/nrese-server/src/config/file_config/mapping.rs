@@ -28,6 +28,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> KeyValueSource {
     );
     insert_numeric(
         &mut source,
+        names::MAX_QUERY_MEMORY_BYTES,
+        config.policy.limits.max_query_memory_bytes,
+    );
+    insert_numeric(
+        &mut source,
         names::MAX_UPDATE_BYTES,
         config.policy.limits.max_update_bytes,
     );

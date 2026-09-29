@@ -29,13 +29,32 @@ pub async fn execute_query(
     policy.enforce_query_bytes(operation.query.len())?;
     let deadline = tokio::time::Instant::now() + policy.timeouts.query;
 
-    let request = build_query_request(operation, accept);
+    let explain = operation.explain;
+    let mut request = build_query_request(operation, accept);
+    let memory = policy.limits.max_query_memory_bytes;
+    request.memory_limit = (memory > 0).then_some(memory);
     let prepared =
         PreparedQuery::parse(&request).map_err(|error| map_query_error(&policy, error))?;
     let media_type = prepared.media_type();
     let store = state.store();
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
+    if explain {
+        return stream_blocking(
+            deadline,
+            cancellation,
+            "application/json",
+            QUERY_TIMEOUT_MESSAGE,
+            move |out| {
+                let explanation = store
+                    .explain_query(&prepared, &token)
+                    .map_err(|error| map_query_error(&policy, error))?;
+                serde_json::to_writer(out, &explanation_json(&explanation))
+                    .map_err(|error| ApiError::internal(error.to_string()))
+            },
+        )
+        .await;
+    }
     stream_blocking(
         deadline,
         cancellation,
@@ -50,6 +69,31 @@ pub async fn execute_query(
     .await
 }
 
+/// The JSON form of an EXPLAIN: the executor, totals, and one object per operator in
+/// evaluation order (`depth` gives the nesting).
+fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value {
+    let steps: Vec<serde_json::Value> = explanation
+        .steps
+        .iter()
+        .map(|step| {
+            serde_json::json!({
+                "depth": step.depth,
+                "operator": step.operator,
+                "detail": step.detail,
+                "estimated_rows": step.estimated_rows,
+                "rows": step.rows,
+                "micros": step.micros,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "executor": explanation.executor,
+        "rows": explanation.rows,
+        "micros": explanation.micros,
+        "steps": steps,
+    })
+}
+
 /// Query errors caused by the request are 400s; a cancelled evaluation is a timeout;
 /// anything else is the server's fault.
 fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
@@ -57,6 +101,10 @@ fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
         StoreError::SparqlEvaluation(nrese_store::QueryEvaluationError::Cancelled) => {
             ApiError::timeout(QUERY_TIMEOUT_MESSAGE)
         }
+        // The query needs more memory than the policy allows: the client's to change.
+        error if error.is_memory_limit() => ApiError::payload_too_large(format!(
+            "{error} (policy limit NRESE_MAX_QUERY_MEMORY_BYTES)"
+        )),
         error if error.is_request_error() => {
             policy.bad_request_for_sparql_parse_error(error.to_string())
         }

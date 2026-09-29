@@ -20,6 +20,7 @@
 
 mod bulk;
 mod snapshot;
+mod statistics;
 mod transaction;
 
 use std::path::Path;
@@ -279,6 +280,7 @@ impl Versions {
 /// `Arc<Shared>`, never the engine itself, so dropping the last [`Engine`] stops it.
 struct Shared {
     dictionary: Arc<Dictionary>,
+    statistics: Arc<statistics::Statistics>,
     versions: Versions,
     durable: Option<Durable>,
     wants_compaction: AtomicBool,
@@ -287,7 +289,11 @@ struct Shared {
 
 impl Shared {
     fn snapshot(&self) -> Snapshot {
-        Snapshot::new(self.versions.load(), Arc::clone(&self.dictionary))
+        Snapshot::new(
+            self.versions.load(),
+            Arc::clone(&self.dictionary),
+            Arc::clone(&self.statistics),
+        )
     }
 
     /// Writes a checkpoint of the latest revision and releases the WAL it covers. Writers
@@ -447,6 +453,7 @@ impl Engine {
         };
         let shared = Arc::new(Shared {
             dictionary,
+            statistics: Arc::default(),
             versions: Versions {
                 current: RwLock::new(Arc::new(version)),
                 compaction_slot: Mutex::new(()),

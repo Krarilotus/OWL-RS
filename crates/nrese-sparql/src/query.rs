@@ -50,6 +50,85 @@ pub fn evaluate_query<'a, V: ReadView>(
     prepared.execute(EngineDataset::with_model(view, options.read_model))
 }
 
+/// One operator of a query run, as [`explain_query`] reports it (EXPLAIN ANALYZE).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStep {
+    /// Nesting depth: a step's inputs follow it one level deeper.
+    pub depth: usize,
+    /// `bgp`, `scan`, `index join`, `join`, `wcoj`, `filter`, `optional`, `group`, ...
+    pub operator: String,
+    /// The triple pattern, expression or variables the operator works on.
+    pub detail: String,
+    /// The planner's estimate of the rows after this step (BGP joins only).
+    pub estimated_rows: Option<u64>,
+    /// Rows the operator produced.
+    pub rows: u64,
+    /// Wall time including the operator's inputs.
+    pub micros: u64,
+}
+
+/// How a query ran ([`explain_query`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explanation {
+    /// `native`, or `spareval` for queries the native executor doesn't support (no steps).
+    pub executor: &'static str,
+    pub steps: Vec<PlanStep>,
+    /// Solutions (1 or 0 for ASK); CONSTRUCT and DESCRIBE count triples.
+    pub rows: u64,
+    pub micros: u64,
+}
+
+/// Runs `query` like [`evaluate_query`], consuming its results, and reports how it ran:
+/// the executor, each operator with its (estimated and) actual rows, and times.
+pub fn explain_query<V: ReadView>(
+    view: &V,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<Explanation, QueryEvaluationError> {
+    let start = std::time::Instant::now();
+    if !options.force_spareval
+        && let Some(snapshot) = view.snapshot()
+        && let Some(explained) = crate::native::explain(snapshot, query, options)
+    {
+        let (steps, rows) = explained?;
+        return Ok(Explanation {
+            executor: "native",
+            steps,
+            rows,
+            micros: start.elapsed().as_micros() as u64,
+        });
+    }
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..options.clone()
+    };
+    let rows = match evaluate_query(view, query, &spareval)? {
+        QueryResults::Solutions(solutions) => {
+            let mut rows = 0;
+            for solution in solutions {
+                solution?;
+                rows += 1;
+            }
+            rows
+        }
+        QueryResults::Boolean(value) => u64::from(value),
+        QueryResults::Graph(triples) => {
+            let mut rows = 0;
+            for triple in triples {
+                triple?;
+                rows += 1;
+            }
+            rows
+        }
+    };
+    Ok(Explanation {
+        executor: "spareval",
+        steps: Vec::new(),
+        rows,
+        micros: start.elapsed().as_micros() as u64,
+    })
+}
+
 pub(crate) fn evaluator(cancellation: Option<&CancellationToken>) -> QueryEvaluator {
     let evaluator = QueryEvaluator::new();
     match cancellation {
