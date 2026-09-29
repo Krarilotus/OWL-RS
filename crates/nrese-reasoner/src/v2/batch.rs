@@ -256,7 +256,13 @@ impl Relation {
         // Fold the recent run into the base first, so the new delta stays in `recent`.
         if self.recent.len() * 4 > self.base.len() {
             let recent = std::mem::take(&mut self.recent);
-            self.base = self.base.merge(&recent);
+            if self.base.len() == 0 {
+                self.base = recent;
+            } else {
+                // One order at a time, so the old and new base never coexist in both.
+                self.base.so = Arc::new(merge(&self.base.so, &recent.so));
+                self.base.os = Arc::new(merge(&self.base.os, &recent.os));
+            }
         }
         self.delta = Run::new(new);
         if self.delta.len() > 0 {
