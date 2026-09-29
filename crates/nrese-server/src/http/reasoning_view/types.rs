@@ -10,7 +10,35 @@ pub struct ReasoningDiagnosticsResponse {
     pub read_model: &'static str,
     pub capabilities: Vec<ReasoningCapabilityView>,
     pub last_run: Option<LastReasoningRunView>,
+    /// The latest full materialisation (startup, load): its counts and every ontology
+    /// axiom it couldn't use.
+    pub last_materialisation: Option<MaterialisationView>,
     pub reject_diagnostics: RejectDiagnosticsBaseline,
+}
+
+/// An ontology axiom the reasoner couldn't use (`nrese_store::OntologyDiagnostic`).
+#[derive(Debug, Serialize)]
+pub struct OntologyDiagnosticView {
+    pub kind: &'static str,
+    pub rules: &'static str,
+    pub subject: String,
+    pub predicate: String,
+    pub list: String,
+    pub node: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MaterialisationView {
+    pub revision: u64,
+    pub ruleset: &'static str,
+    pub asserted: u64,
+    pub inferred: u64,
+    pub consistency_violations: usize,
+    pub rounds: usize,
+    pub elapsed_millis: u64,
+    pub ontology_diagnostics: Vec<OntologyDiagnosticView>,
+    pub ontology_diagnostics_total: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,4 +71,7 @@ pub struct LastReasoningRunView {
     pub elapsed_micros: u64,
     pub primary_reject: Option<RejectExplanationView>,
     pub likely_commit_trigger: Option<(String, String, String)>,
+    /// Ontology axioms this commit made unusable.
+    pub ontology_diagnostics: Vec<OntologyDiagnosticView>,
+    pub ontology_diagnostics_total: usize,
 }

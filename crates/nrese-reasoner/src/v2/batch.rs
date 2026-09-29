@@ -41,7 +41,7 @@ pub struct Materialisation {
     pub derived: Vec<Triple>,
     /// Consistency violations on the closure, sorted.
     pub violations: Vec<Violation>,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<super::lists::ListDiagnostic>,
     pub rounds: usize,
     /// Rules after grounding, at the end.
     pub ground_rules: usize,
@@ -559,7 +559,7 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
     source: &S,
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
-    diagnostics: &mut Vec<String>,
+    diagnostics: &mut Vec<super::lists::ListDiagnostic>,
 ) -> Vec<Rule> {
     let mut out: Vec<Rule> = rules
         .iter()

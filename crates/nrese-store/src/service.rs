@@ -38,6 +38,9 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
+    /// The latest full materialisation's report (startup, load, ruleset change).
+    last_materialisation:
+        std::sync::Arc<std::sync::Mutex<Option<crate::reasoning::MaterialisationReport>>>,
     query_cache: std::sync::Arc<crate::query_cache::QueryCache>,
 }
 
@@ -72,6 +75,7 @@ impl StoreService {
             preloaded_ontology,
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             materialised: std::sync::Arc::default(),
+            last_materialisation: std::sync::Arc::default(),
         };
         if service.engine.snapshot().revision() != before {
             service.invalidate_reasoning()?;
@@ -311,6 +315,16 @@ impl StoreService {
             crate::reasoning::Program::new(ruleset, &|term| rematerialisation.intern(term));
         let closure = crate::reasoning::materialise(&program, rematerialisation.base());
         let inferred = closure.inferred.len() as u64;
+        let base = rematerialisation.base();
+        let reported = crate::reasoning::MaterialisationReport::default()
+            .with_diagnostics(&closure.diagnostics, &|id| {
+                crate::reasoning::decoded(base.decode(nrese_engine::TermId::from_raw(id)), id)
+            });
+        crate::reasoning::log_diagnostics(
+            &reported.diagnostics,
+            reported.diagnostics_total,
+            "materialisation skipped an ontology axiom",
+        );
         let summary = rematerialisation.finish(closure.inferred)?;
         self.record_reasoning(crate::ReasoningState::of(ruleset, closure.violations.len()))?;
         if !closure.violations.is_empty() {
@@ -332,7 +346,7 @@ impl StoreService {
             ms = started.elapsed().as_millis() as u64,
             "inferred stack rematerialised"
         );
-        Ok(crate::reasoning::MaterialisationReport {
+        let report = crate::reasoning::MaterialisationReport {
             ruleset: ruleset.name(),
             revision: summary.revision,
             asserted,
@@ -342,7 +356,21 @@ impl StoreService {
             violations: closure.violations.len(),
             rounds: closure.rounds,
             elapsed: started.elapsed(),
-        })
+            ..reported
+        };
+        *self
+            .last_materialisation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(report.clone());
+        Ok(report)
+    }
+
+    /// The latest full materialisation's report, if one ran since the store opened.
+    pub fn last_materialisation(&self) -> Option<crate::reasoning::MaterialisationReport> {
+        self.last_materialisation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn restore_dataset(

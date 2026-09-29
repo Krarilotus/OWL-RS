@@ -479,3 +479,74 @@ fn self_difference_is_rejected_on_commit() {
     assert!(result.is_err(), "{result:?}");
     assert_eq!(store.stats().expect("stats").quad_count, 0);
 }
+
+/// Ontology axioms the reasoner can't use are reported, with decoded terms: a full
+/// materialisation reports all of them, a commit those it introduced.
+#[test]
+fn unusable_list_axioms_are_reported() {
+    const OWL: &str = "http://www.w3.org/2002/07/owl#";
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let store = Arc::new(StoreService::new(nrese_store::StoreConfig::in_memory()).expect("store"));
+    let plain = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Disabled,
+        ))),
+    );
+    let cyclic = format!(
+        "<{EX}D> <{OWL}unionOf> <{EX}c> . <{EX}c> <{RDF}first> <{EX}A> . <{EX}c> <{RDF}rest> <{EX}c> ."
+    );
+    plain
+        .apply(insert(&cyclic), &MutationTicket::new())
+        .expect("data");
+    let report = store
+        .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+        .expect("rematerialise");
+    assert_eq!(report.diagnostics_total, 1);
+    let diagnostic = &report.diagnostics[0];
+    assert_eq!(
+        (
+            diagnostic.kind,
+            diagnostic.rules,
+            diagnostic.subject.as_str()
+        ),
+        ("cyclic-list", "cls-uni", format!("{EX}D").as_str())
+    );
+    assert_eq!(diagnostic.node.as_deref(), Some(format!("{EX}c").as_str()));
+    assert!(
+        diagnostic.message.contains("returns to node"),
+        "{}",
+        diagnostic.message
+    );
+    assert_eq!(
+        store.last_materialisation().expect("recorded").diagnostics,
+        report.diagnostics
+    );
+
+    let owl = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    let run = |data: &str| {
+        owl.apply(insert(data), &MutationTicket::new())
+            .expect("commit");
+        owl.last_reasoning_run().expect("run")
+    };
+    let unrelated = run(&format!("<{EX}x> <{EX}p> <{EX}y> ."));
+    assert!(
+        unrelated.diagnostics.is_empty(),
+        "{:?}",
+        unrelated.diagnostics
+    );
+    let broken = run(&format!(
+        "<{EX}C> <{OWL}intersectionOf> <{EX}a> . <{EX}a> <{RDF}first> <{EX}A> ."
+    ));
+    assert_eq!(broken.diagnostics_total, 1, "{:?}", broken.diagnostics);
+    assert_eq!(broken.diagnostics[0].kind, "malformed-list");
+    assert_eq!(
+        broken.diagnostics[0].node.as_deref(),
+        Some(format!("{EX}a").as_str())
+    );
+}

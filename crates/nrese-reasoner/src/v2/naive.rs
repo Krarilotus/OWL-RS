@@ -26,7 +26,7 @@ pub struct Closure {
     /// Facts derived beyond the input (never an input fact).
     pub derived: HashSet<Triple>,
     pub violations: Vec<Violation>,
-    pub diagnostics: Vec<String>,
+    pub diagnostics: Vec<super::lists::ListDiagnostic>,
     pub rounds: usize,
 }
 

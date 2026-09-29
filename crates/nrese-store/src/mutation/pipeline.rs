@@ -117,6 +117,11 @@ impl MutationPipeline {
             let (violations, materialisation, changed) =
                 crate::reasoning::apply_delta(program, cached, &mut tx);
             tracing::debug!(?materialisation, "commit-path materialisation");
+            crate::reasoning::log_diagnostics(
+                &materialisation.diagnostics,
+                materialisation.diagnostics_total,
+                "the commit leaves an ontology axiom unusable",
+            );
             if let Some(violation) = violations.first() {
                 let explanation = crate::reasoning::explain(program, violation, &tx);
                 let attribution =
