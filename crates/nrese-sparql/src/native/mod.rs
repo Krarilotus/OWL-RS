@@ -364,7 +364,8 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
 /// True if every solution of `pattern` comes from triple patterns in every branch, so inside
 /// `GRAPH ?g` each row binds `?g` from a scan (and inside `GRAPH <g>` each row needs a
 /// match in `<g>`). Patterns that can produce rows without a scan (VALUES, empty groups,
-/// aggregates, BIND alone, nested GRAPH, property paths) stay on spareval there.
+/// aggregates, BIND alone, nested GRAPH, property paths) and subqueries stay on spareval
+/// there.
 fn scans_everywhere(pattern: &GraphPattern) -> bool {
     match pattern {
         GraphPattern::Bgp { patterns } => !patterns.is_empty(),
@@ -373,13 +374,11 @@ fn scans_everywhere(pattern: &GraphPattern) -> bool {
         GraphPattern::LeftJoin { left, .. } | GraphPattern::Minus { left, .. } => {
             scans_everywhere(left)
         }
-        GraphPattern::Filter { inner, .. }
-        | GraphPattern::Extend { inner, .. }
-        | GraphPattern::Project { inner, .. }
-        | GraphPattern::Distinct { inner }
-        | GraphPattern::Reduced { inner }
-        | GraphPattern::OrderBy { inner, .. }
-        | GraphPattern::Slice { inner, .. } => scans_everywhere(inner),
+        GraphPattern::Filter { inner, .. } | GraphPattern::Extend { inner, .. } => {
+            scans_everywhere(inner)
+        }
+        // A subquery (projection and its modifiers) scopes its variables: its own `?g` is
+        // not the graph variable.
         _ => false,
     }
 }

@@ -89,7 +89,7 @@ Single queries are up to 10³–10⁶× faster (counts, grouped counts, star joi
 - Cyclic BGPs (triangles, 4-cycles; LUBM q2/q9) run through a worst-case-optimal Generic Join (`native/wcoj.rs`).
   - It binds one variable at a time and runs parallel over the first variable.
   - The pattern with the fewest exact matches supplies the candidates. Patterns up to 32× larger are intersected as sorted index ranges (leapfrog style); the rest are checked by lookup.
-- LUBM(100), laptop: q2 went from 301 ms to 21 ms and q9 from 839 ms to 60 ms (14× each). All 14 queries take 143 ms instead of 870 ms, with counts equal to Nemo.
+- LUBM(100), desktop PC: q2 went from 301 ms to 21 ms and q9 from 839 ms to 60 ms (14× each). All 14 queries take 143 ms instead of 870 ms, with counts equal to Nemo.
 - Hash, merge, left, anti and semi joins run in parallel row chunks, and so does the index nested-loop join. Output order is the sequential one.
 - Still sequential: filters and aggregates. They need a thread-safe decode path (evaluator and per-query caches).
 
@@ -109,7 +109,7 @@ Single queries are up to 10³–10⁶× faster (counts, grouped counts, star joi
 **Pf1, compressed runs (2026-09-29):**
 - Every permutation of a run is stored in blocks of 128 keys, frame-of-reference bit-packed per key position with the kind tag and payload split (`index/keys.rs`).
 - Keys stay randomly accessible. Binary searches run on the compressed data; merge cursors decode block-wise; runs are packed in parallel, one permutation at a time.
-- LUBM(100) end to end (laptop): peak memory went from 5.5 GB to 2.9 GB, and the 14 queries from 143 ms to 177 ms. Load and closure are about 12% slower.
+- LUBM(100) end to end (desktop PC): peak memory went from 5.5 GB to 2.9 GB, and the 14 queries from 143 ms to 177 ms. Load and closure are about 12% slower.
 
 **Pf2, step 1 (2026-09-29):**
 - Checkpoint format 5 stores each stack's packed permutations as in memory; restart reads them back instead of sorting again. Format 4 is still read.
@@ -132,7 +132,7 @@ Evidence:
 - Inferred sets are identical to the owlrl oracle or Nemo on LUBM(1/10) and OWL2Bench QL/EL/RL/DL(1).
 - All 14 LUBM(1) queries give the published counts through the native engine. LUBM(10) and (100) agree with Nemo plus Oxigraph.
 
-RT1 closure times (laptop, 16 threads):
+RT1 closure times (desktop PC, 16 threads):
 
 | Dataset | NRESE v2 | NRESE v1 | Jena OWL-micro | Nemo |
 |---|---|---|---|---|
