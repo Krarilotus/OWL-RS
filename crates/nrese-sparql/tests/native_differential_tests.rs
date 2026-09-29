@@ -680,11 +680,16 @@ fn explain_reports_the_plan() {
     assert!(bgp.iter().all(|s| s.estimated_rows.is_some()), "{:#?}", bgp);
     assert_eq!(bgp[0].rows, 20);
 
-    let describe = SparqlParser::new()
+    let construct = SparqlParser::new()
         .parse_query("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")
         .unwrap();
+    let native = explain_query(&snapshot, &construct, &QueryOptions::default()).unwrap();
+    assert_eq!((native.executor, native.rows), ("native", 1500));
+    let describe = SparqlParser::new()
+        .parse_query(&format!("DESCRIBE <{EX}x1>"))
+        .unwrap();
     let fallback = explain_query(&snapshot, &describe, &QueryOptions::default()).unwrap();
-    assert_eq!((fallback.executor, fallback.rows), ("spareval", 1500));
+    assert_eq!((fallback.executor, fallback.rows), ("spareval", 3));
 }
 
 /// Filters and aggregates over tables large enough to run in parallel chunks (with terms
@@ -765,4 +770,172 @@ only spareval: {only_spareval:?}",
             );
         }
     }
+}
+
+/// A graph result as sorted triple strings, every blank node written as `_:b` (they are
+/// fresh per solution, so only their positions can be compared).
+fn graph(results: QueryResults<'_>) -> Vec<String> {
+    let QueryResults::Graph(triples) = results else {
+        panic!("not a graph result");
+    };
+    let blank = |term: String| {
+        if term.starts_with("_:") {
+            "_:b".to_owned()
+        } else {
+            term
+        }
+    };
+    let mut out: Vec<String> = triples
+        .map(|t| {
+            let t = t.unwrap();
+            format!(
+                "{} {} {}",
+                blank(t.subject.to_string()),
+                t.predicate,
+                blank(t.object.to_string())
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// CONSTRUCT over the random generator's patterns (with a template of variables, bound or
+/// not, constants, a blank node and a literal in subject position) equals spareval.
+#[test]
+fn construct_equals_spareval() {
+    use spargebra::term::{BlankNode, NamedNodePattern, TermPattern, TriplePattern};
+    use spargebra::{Query, algebra::GraphPattern};
+
+    let mut rng = Rng(20_260_929);
+    let var = |name: &str| TermPattern::Variable(oxrdf::Variable::new_unchecked(name));
+    let template = vec![
+        TriplePattern {
+            subject: var("a"),
+            predicate: NamedNodePattern::NamedNode(ex("q")),
+            object: var("b"),
+        },
+        TriplePattern {
+            subject: TermPattern::BlankNode(BlankNode::new_unchecked("x")),
+            predicate: NamedNodePattern::NamedNode(ex("r")),
+            object: var("a"),
+        },
+        TriplePattern {
+            subject: var("b"),
+            predicate: NamedNodePattern::Variable(oxrdf::Variable::new_unchecked("c")),
+            object: TermPattern::Literal(Literal::new_simple_literal("k")),
+        },
+        TriplePattern {
+            subject: var("d"),
+            predicate: NamedNodePattern::NamedNode(ex("s")),
+            object: TermPattern::BlankNode(BlankNode::new_unchecked("x")),
+        },
+    ];
+    let mut checked = 0;
+    for _ in 0..60 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..30 {
+            let (text, _) = random_query(&mut rng);
+            let Query::Select { pattern, .. } = SparqlParser::new().parse_query(&text).unwrap()
+            else {
+                unreachable!()
+            };
+            let pattern: GraphPattern = pattern;
+            let query = Query::Construct {
+                template: template.clone(),
+                dataset: None,
+                pattern,
+                base_iri: None,
+            };
+            if !runs_natively(&query) {
+                continue;
+            }
+            let native =
+                graph(evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap());
+            let spareval = QueryOptions {
+                force_spareval: true,
+                ..QueryOptions::default()
+            };
+            let expected = graph(evaluate_query(&snapshot, &query, &spareval).unwrap());
+            assert_eq!(native, expected, "{query}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 1000, "{checked}");
+}
+
+/// GRAPH patterns (a graph variable or constant, mixed with default-graph patterns, the
+/// graph variable shared across GRAPH blocks and grouped on) equal spareval.
+#[test]
+fn graph_patterns_equal_spareval() {
+    let mut rng = Rng(20_260_930);
+    let (mut checked, mut fallbacks) = (0, 0);
+    for _ in 0..80 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            // e1 is also a graph name, so ?g can join with entities.
+            let graph: GraphName = match rng.below(5) {
+                0 | 1 => GraphName::DefaultGraph,
+                2 => ex("g0").into(),
+                3 => ex("g1").into(),
+                _ => ex("e1").into(),
+            };
+            let quad = Quad::new(quad.subject, quad.predicate, quad.object, graph);
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..40 {
+            let inner = group_pattern(&mut rng, 0);
+            let other = triple(&mut rng);
+            let graph = rng
+                .pick(&[
+                    "?g",
+                    "<http://example.com/g0>",
+                    "<http://example.com/e1>",
+                    "<http://example.com/g9>",
+                ])
+                .to_string();
+            let text = match rng.below(5) {
+                0 => format!("SELECT * WHERE {{ GRAPH {graph} {{ {inner} }} }}"),
+                1 => format!("SELECT * WHERE {{ {other} GRAPH {graph} {{ {inner} }} }}"),
+                2 => format!("SELECT * WHERE {{ GRAPH ?g {{ {inner} }} GRAPH ?g {{ {other} }} }}"),
+                3 => format!(
+                    "SELECT ?g (COUNT(*) AS ?n) WHERE {{ GRAPH ?g {{ {inner} }} }} GROUP BY ?g"
+                ),
+                _ => format!(
+                    "SELECT * WHERE {{ GRAPH {graph} {{ {inner} OPTIONAL {{ {other} }} }} }}"
+                ),
+            };
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            if !runs_natively(&query) {
+                fallbacks += 1;
+                continue;
+            }
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let spareval = QueryOptions {
+                force_spareval: true,
+                ..QueryOptions::default()
+            };
+            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            assert_eq!(native, expected, "{text}");
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 1500 && fallbacks * 4 < checked,
+        "{checked} checked, {fallbacks} fallbacks"
+    );
 }
