@@ -111,7 +111,13 @@ Single queries are up to 10³–10⁶× faster (counts, grouped counts, star joi
 - Keys stay randomly accessible. Binary searches run on the compressed data; merge cursors decode block-wise; runs are packed in parallel, one permutation at a time.
 - LUBM(100) end to end (laptop): peak memory went from 5.5 GB to 2.9 GB, and the 14 queries from 143 ms to 177 ms. Load and closure are about 12% slower.
 
+**Pf2, step 1 (2026-09-29):**
+- Checkpoint format 5 stores each stack's packed permutations as in memory; restart reads them back instead of sorting again. Format 4 is still read.
+- LUBM(100) restart: 1.7 s → 0.6 s, with a smaller checkpoint (611 → 514 MiB). What remains is mostly the dictionary restore (Pf5). Memory-mapping the runs is step 2.
+- The batch reasoner reads its input per predicate from the POSG order and takes it by value: closure 10% faster. LUBM(100) peak memory is 2.5 GB, down from 5.5 GB before Pf1.
+
 Next:
+- Pf5: dictionary restore without rehashing; Pf2 step 2 (mmap).
 - XC4 rest: characteristic sets for star estimates; report estimation error in the perf lab.
 - The Docker scorecard against QLever for the Phase 2 gate.
 
