@@ -96,7 +96,7 @@ impl ListVocabulary {
     /// pattern matches each resulting path, so every path is a variant, up to
     /// [`MAX_VARIANTS`]. A node without `rdf:first` or `rdf:rest`, or a cycle, is malformed.
     /// Each variant comes with the `rdf:first`/`rdf:rest` facts of its path.
-    fn list(&self, facts: &impl Facts, head: u64) -> Result<Vec<Variant>, &'static str> {
+    fn list(&self, facts: &impl Facts, head: u64) -> Result<Vec<Variant>, ListProblem> {
         let mut variants = Vec::new();
         let mut path = Vec::new();
         let mut nodes = Vec::new();
@@ -113,23 +113,23 @@ impl ListVocabulary {
         path: &mut Vec<u64>,
         used: &mut Vec<[u64; 3]>,
         variants: &mut Vec<Variant>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), ListProblem> {
         if node == self.nil {
             if variants.len() == MAX_VARIANTS {
-                return Err("too many variants under equality");
+                return Err(ListProblem::TooManyVariants);
             }
             variants.push((path.clone(), used.clone()));
             return Ok(());
         }
         if nodes.contains(&node) {
-            return Err("a cycle");
+            return Err(ListProblem::Cycle { node });
         }
         let (firsts, rests) = (
             facts.objects(node, self.first),
             facts.objects(node, self.rest),
         );
         if firsts.is_empty() || rests.is_empty() {
-            return Err("a node without rdf:first or rdf:rest");
+            return Err(ListProblem::Malformed { node });
         }
         nodes.push(node);
         for &first in &firsts {
@@ -152,10 +152,82 @@ impl ListVocabulary {
 type Variant = (Vec<u64>, Vec<[u64; 3]>);
 
 /// The most member sequences one list axiom may have (see [`ListVocabulary::list`]).
-const MAX_VARIANTS: usize = 64;
+pub const MAX_VARIANTS: usize = 64;
 
 /// The longest list instantiated; longer ones are diagnosed.
-const MAX_MEMBERS: usize = 100;
+pub const MAX_MEMBERS: usize = 100;
+
+/// Why a list axiom wasn't instantiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListProblem {
+    /// `node` lacks `rdf:first` or `rdf:rest` (the list doesn't end at `rdf:nil`).
+    Malformed { node: u64 },
+    /// The list returns to `node`.
+    Cycle { node: u64 },
+    /// Equality gives the list more than [`MAX_VARIANTS`] member sequences.
+    TooManyVariants,
+    /// A member sequence longer than [`MAX_MEMBERS`].
+    TooLong { members: usize },
+}
+
+impl ListProblem {
+    /// A stable name for reports: `malformed-list`, `cyclic-list`,
+    /// `too-many-list-variants` or `list-too-long`.
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Malformed { .. } => "malformed-list",
+            Self::Cycle { .. } => "cyclic-list",
+            Self::TooManyVariants => "too-many-list-variants",
+            Self::TooLong { .. } => "list-too-long",
+        }
+    }
+
+    /// The node the problem is at, if one.
+    pub const fn node(self) -> Option<u64> {
+        match self {
+            Self::Malformed { node } | Self::Cycle { node } => Some(node),
+            Self::TooManyVariants | Self::TooLong { .. } => None,
+        }
+    }
+}
+
+/// A list axiom the reasoner skipped: its rules are missing from the closure. Lists are
+/// never truncated, so this is the whole effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ListDiagnostic {
+    /// The OWL 2 RL rules the axiom feeds (`prp-spo2`, `cls-int`, …).
+    pub rules: &'static str,
+    /// The axiom `(subject predicate head)`; `head` starts the list.
+    pub subject: u64,
+    pub predicate: u64,
+    pub head: u64,
+    pub problem: ListProblem,
+}
+
+impl ListDiagnostic {
+    /// A sentence for reports, with `term` rendering ids.
+    pub fn describe(&self, term: &dyn Fn(u64) -> String) -> String {
+        let problem = match self.problem {
+            ListProblem::Malformed { node } => {
+                format!("node {} has no rdf:first or no rdf:rest", term(node))
+            }
+            ListProblem::Cycle { node } => format!("the list returns to node {}", term(node)),
+            ListProblem::TooManyVariants => {
+                format!("owl:sameAs gives it more than {MAX_VARIANTS} member sequences")
+            }
+            ListProblem::TooLong { members } => {
+                format!("it has {members} members (limit {MAX_MEMBERS})")
+            }
+        };
+        format!(
+            "{} {} {} skipped ({}): {problem}",
+            term(self.subject),
+            term(self.predicate),
+            term(self.head),
+            self.rules
+        )
+    }
+}
 
 fn v(n: usize) -> Term {
     Term::Var(u8::try_from(n).expect("list rules stay below 256 variables"))
@@ -178,7 +250,10 @@ fn rule(name: &str, body: Vec<Atom>, guards: Vec<Guard>, head: Head) -> Rule {
 type MakeRules<'a> = dyn FnMut(u64, &[u64], &mut Vec<Rule>) + 'a;
 
 /// The rules for every list axiom in `facts`, plus diagnostics for malformed lists.
-pub fn instantiate(vocabulary: &ListVocabulary, facts: &impl Facts) -> (Vec<Rule>, Vec<String>) {
+pub fn instantiate(
+    vocabulary: &ListVocabulary,
+    facts: &impl Facts,
+) -> (Vec<Rule>, Vec<ListDiagnostic>) {
     let (rules, _, diagnostics) = instantiate_with_premises(vocabulary, facts);
     (rules, diagnostics)
 }
@@ -189,49 +264,59 @@ pub fn instantiate(vocabulary: &ListVocabulary, facts: &impl Facts) -> (Vec<Rule
 pub fn instantiate_with_premises(
     vocabulary: &ListVocabulary,
     facts: &impl Facts,
-) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<String>) {
+) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
     let voc = vocabulary;
     let mut rules = Vec::new();
     let mut premises: Vec<Vec<[u64; 3]>> = Vec::new();
-    let mut diagnostics = Vec::new();
-    let mut lists = |predicate: u64, name: &str, rules: &mut Vec<Rule>, make: &mut MakeRules| {
-        for (subject, head) in facts.pairs(predicate) {
-            match voc.list(facts, head) {
-                Ok(variants) => {
-                    for (members, used) in variants {
-                        if members.len() <= MAX_MEMBERS {
-                            let before = rules.len();
-                            make(subject, &members, rules);
-                            let mut facts_used = used;
-                            facts_used.push([subject, predicate, head]);
-                            if predicate == voc.members || predicate == voc.distinct_members {
-                                for class in [
-                                    voc.all_disjoint_classes,
-                                    voc.all_disjoint_properties,
-                                    voc.all_different,
-                                ] {
-                                    if facts.objects(subject, voc.rdf_type).contains(&class) {
-                                        facts_used.push([subject, voc.rdf_type, class]);
+    let mut diagnostics: Vec<ListDiagnostic> = Vec::new();
+    let mut lists =
+        |predicate: u64, name: &'static str, rules: &mut Vec<Rule>, make: &mut MakeRules| {
+            for (subject, head) in facts.pairs(predicate) {
+                let mut diagnose = |problem| {
+                    let diagnostic = ListDiagnostic {
+                        rules: name,
+                        subject,
+                        predicate,
+                        head,
+                        problem,
+                    };
+                    if !diagnostics.contains(&diagnostic) {
+                        diagnostics.push(diagnostic);
+                    }
+                };
+                match voc.list(facts, head) {
+                    Ok(variants) => {
+                        for (members, used) in variants {
+                            if members.len() <= MAX_MEMBERS {
+                                let before = rules.len();
+                                make(subject, &members, rules);
+                                let mut facts_used = used;
+                                facts_used.push([subject, predicate, head]);
+                                if predicate == voc.members || predicate == voc.distinct_members {
+                                    for class in [
+                                        voc.all_disjoint_classes,
+                                        voc.all_disjoint_properties,
+                                        voc.all_different,
+                                    ] {
+                                        if facts.objects(subject, voc.rdf_type).contains(&class) {
+                                            facts_used.push([subject, voc.rdf_type, class]);
+                                        }
                                     }
                                 }
+                                for _ in before..rules.len() {
+                                    premises.push(facts_used.clone());
+                                }
+                            } else {
+                                diagnose(ListProblem::TooLong {
+                                    members: members.len(),
+                                });
                             }
-                            for _ in before..rules.len() {
-                                premises.push(facts_used.clone());
-                            }
-                        } else {
-                            diagnostics.push(format!(
-                                "{name}: list of {} members at node {head} skipped (limit {MAX_MEMBERS})",
-                                members.len()
-                            ));
                         }
                     }
+                    Err(problem) => diagnose(problem),
                 }
-                Err(problem) => diagnostics.push(format!(
-                    "{name}: list at node {head} (subject {subject}) skipped: {problem}"
-                )),
             }
-        }
-    };
+        };
     let ty = voc.rdf_type;
     // prp-spo2: (x0 p1 x1) … (x(n-1) pn xn) -> (x0 p xn)
     lists(
@@ -359,7 +444,7 @@ pub fn instantiate_with_premises(
     };
     lists(
         voc.members,
-        "members",
+        "cax-adc, prp-adp, eq-diff2",
         &mut rules,
         &mut |node, members, rules| {
             for (i, &a) in members.iter().enumerate() {

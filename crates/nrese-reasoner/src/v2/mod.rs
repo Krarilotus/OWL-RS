@@ -318,12 +318,83 @@ mod tests {
              _:c rdf:rest _:c",
         );
         let result = materialise(&input, &rules, Some(&lists));
-        assert_eq!(result.diagnostics.len(), 2, "{:?}", result.diagnostics);
+        let problems: Vec<(&str, &str)> = result
+            .diagnostics
+            .iter()
+            .map(|d| (d.rules, d.problem.kind()))
+            .collect();
+        assert_eq!(
+            problems,
+            [("cls-int", "malformed-list"), ("cls-uni", "cyclic-list")]
+        );
+        let b = vocabulary.term("_:b");
+        assert_eq!(result.diagnostics[0].problem.node(), Some(b));
         assert!(
             result
                 .derived
                 .iter()
                 .all(|t| t[1] != vocabulary.iri(&format!("{}subClassOf", super::ir::RDFS)))
+        );
+        let batch = batch::materialise(&input, &rules, Some(&lists), &Schema::owl(&mut vocabulary));
+        assert_eq!(batch.diagnostics, result.diagnostics);
+    }
+
+    /// A commit reports the list axioms it made uninstantiable, and only those: a broken
+    /// list already in the state isn't reported again.
+    #[test]
+    fn commits_report_the_list_problems_they_introduce() {
+        use super::delta::{MemoryBase, Rules, program, update};
+        use super::lists::ListProblem;
+        let mut vocabulary = LocalVocabulary::default();
+        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let compiled = Rules {
+            rules: &rules,
+            lists: Some(&lists),
+            schema: &schema,
+        };
+        let mut asserted = load(
+            &mut vocabulary,
+            "ex:D owl:unionOf ex:c
+             ex:c rdf:first ex:A
+             ex:c rdf:rest ex:c
+             ex:x ex:p ex:y",
+        );
+        asserted.sort_unstable();
+        let inferred = batch::materialise(&asserted, &rules, Some(&lists), &schema).derived;
+        let old = program(&MemoryBase::new(&asserted, &inferred), compiled);
+        assert_eq!(old.list_diagnostics.len(), 1, "the cyclic list");
+        let ex_a = vocabulary.iri(&format!("{EX}a"));
+
+        let mut commit = |asserted: &mut Vec<Triple>, text: &str, cache| {
+            let added = load(&mut vocabulary, text);
+            asserted.extend(&added);
+            asserted.sort_unstable();
+            let base = MemoryBase::new(asserted, &inferred);
+            update(&base, &added, &[], compiled, Some(cache))
+        };
+        let broken = commit(
+            &mut asserted,
+            "ex:C owl:intersectionOf ex:a
+             ex:a rdf:first ex:A",
+            &old,
+        );
+        assert_eq!(
+            broken
+                .diagnostics
+                .iter()
+                .map(|d| (d.rules, d.problem))
+                .collect::<Vec<_>>(),
+            [("cls-int", ListProblem::Malformed { node: ex_a })]
+        );
+        let after = broken.program.expect("list facts changed the program");
+        assert_eq!(after.list_diagnostics.len(), 2);
+        let unrelated = commit(&mut asserted, "ex:y ex:p ex:z", &after);
+        assert!(
+            unrelated.diagnostics.is_empty(),
+            "{:?}",
+            unrelated.diagnostics
         );
     }
 

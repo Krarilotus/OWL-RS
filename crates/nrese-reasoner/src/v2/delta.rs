@@ -74,9 +74,10 @@ impl Rules<'_> {
         let mut program = GroundProgram::default();
         program.ground(source, self.schema, self.rules);
         if let Some(vocabulary) = self.lists {
-            let (rules, premises, _) =
+            let (rules, premises, diagnostics) =
                 super::lists::instantiate_with_premises(vocabulary, &AllFacts(source));
             program.ground_with_premises(source, self.schema, &rules, &premises);
+            program.list_diagnostics = diagnostics;
         }
         program.take_facts();
         program
@@ -117,6 +118,9 @@ pub struct Update {
     pub remove: Vec<Triple>,
     /// Consistency violations that involve a fact the change added.
     pub violations: Vec<Violation>,
+    /// List axioms the change left uninstantiable (malformed, cyclic, oversized) that
+    /// weren't before.
+    pub diagnostics: Vec<super::lists::ListDiagnostic>,
     pub rounds: usize,
     /// Time per phase: program, overdelete, rederive, insert, consistency.
     pub phases: [std::time::Duration; 5],
@@ -131,6 +135,7 @@ impl std::fmt::Debug for Update {
             .field("insert", &self.insert.len())
             .field("remove", &self.remove.len())
             .field("violations", &self.violations)
+            .field("diagnostics", &self.diagnostics)
             .field("rounds", &self.rounds)
             .field("phases", &self.phases)
             .field("program_changed", &self.program.is_some())
@@ -477,11 +482,11 @@ pub fn update<B: Base + ?Sized>(
         if delta_facts.iter().any(|&f| rules.is_list_fact(f))
             && let Some(vocabulary) = rules.lists
         {
-            let (list_rules, premises, _) =
+            let (list_rules, premises, diagnostics) =
                 super::lists::instantiate_with_premises(vocabulary, &AllFacts(&state));
-            program
-                .to_mut()
-                .ground_with_premises(&state, schema, &list_rules, &premises);
+            let program = program.to_mut();
+            program.ground_with_premises(&state, schema, &list_rules, &premises);
+            program.list_diagnostics = diagnostics;
         }
         let mut candidates = if program.has_pending_facts() {
             program.to_mut().take_facts()
@@ -588,6 +593,12 @@ pub fn update<B: Base + ?Sized>(
     );
     result.violations = sorted(found);
     lap(4, &mut result);
+    result.diagnostics = program
+        .list_diagnostics
+        .iter()
+        .filter(|d| !old_program.list_diagnostics.contains(d))
+        .copied()
+        .collect();
     result.program = match program {
         Cow::Owned(program) => Some(program),
         Cow::Borrowed(_) => None,

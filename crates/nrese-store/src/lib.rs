@@ -47,6 +47,7 @@ pub use query::{
 };
 pub use query_cache::QueryCacheStats;
 pub use query_executor::PreparedQuery;
+pub use reasoning::{MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
 pub use service::StoreService;
 pub use stats::StoreStats;

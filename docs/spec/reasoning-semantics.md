@@ -38,7 +38,9 @@ This matches GraphDB's `rdfs` with *partialRDFS*, not full RDFS entailment. Full
 **List limits:**
 - A list axiom is instantiated for at most 64 member sequences (when `sameAs` makes several nodes one list).
 - Lists of at most 100 members are instantiated.
-- Longer, malformed (a node without `rdf:first`/`rdf:rest`) or cyclic lists are diagnosed and not instantiated.
+- Longer, malformed (a node without `rdf:first`/`rdf:rest`) or cyclic lists are not instantiated, never truncated. Each one is reported as a typed diagnostic (`malformed-list`, `cyclic-list`, `list-too-long`, `too-many-list-variants`) with the axiom and node decoded:
+  - full materialisations (load, startup) report all of them: in the log, and under `last_materialisation` in `/ops/api/diagnostics/reasoning`;
+  - a commit reports those it introduced: in the log, and under `last_run`.
 
 **Generalised triples:**
 - Full materialisation may derive intermediate triples RDF can't store: a literal subject, or a non-IRI predicate.
