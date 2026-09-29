@@ -1484,35 +1484,48 @@ impl<'a> Context<'a> {
         expression: &Expression,
     ) -> NativeResult<Vec<bool>> {
         let compiled = fast::compile(expression, self.snapshot);
-        let columns: Vec<(Variable, usize)> = solutions
-            .vars
-            .iter()
-            .enumerate()
-            .map(|(c, v)| (v.clone(), c))
-            .collect();
-        let mut mask = Vec::with_capacity(solutions.table.len());
-        for row in 0..solutions.table.len() {
-            if row % (1 << 16) == 0 {
+        let rows = solutions.table.len();
+        let mask = FilterMask {
+            snapshot: self.snapshot,
+            evaluator: &self.evaluator,
+            compiled: compiled.as_ref(),
+            expression,
+            solutions,
+        };
+        if rows < 2 * PARALLEL_EXPRESSION_ROWS {
+            let term = |id: u64| self.term(id);
+            let mut out = Vec::with_capacity(rows);
+            for start in (0..rows).step_by(1 << 16) {
                 self.check()?;
+                out.extend(mask.rows(start..(start + (1 << 16)).min(rows), &term));
             }
-            let decided = compiled.as_ref().map(|fast| {
-                let value = |v: &Variable| {
-                    columns
-                        .iter()
-                        .find(|(x, _)| x == v)
-                        .map_or(UNDEF, |&(_, c)| solutions.table.get(row, c))
-                };
-                fast.eval(&value, self.snapshot)
-            });
-            mask.push(match decided {
-                Some(fast::Tri::True) => true,
-                Some(fast::Tri::False | fast::Tri::Error) => false,
-                Some(fast::Tri::Unknown) | None => self
-                    .evaluator
-                    .filter(expression, &self.binding(solutions, row)),
-            });
+            return Ok(out);
         }
-        Ok(mask)
+        // Parallel: each task decodes through the snapshot with its own cache; the query's
+        // computed terms are only read while the filter runs.
+        let computed = self.computed.borrow();
+        let computed: &[Term] = &computed;
+        let token = self.cancellation.as_ref();
+        let parts: Vec<Option<Vec<bool>>> = (0..rows.div_ceil(PARALLEL_EXPRESSION_ROWS))
+            .into_par_iter()
+            .map(|i| {
+                if token.is_some_and(CancellationToken::is_cancelled) {
+                    return None;
+                }
+                let decoder = Decoder::new(self.snapshot, computed);
+                let range =
+                    i * PARALLEL_EXPRESSION_ROWS..((i + 1) * PARALLEL_EXPRESSION_ROWS).min(rows);
+                Some(mask.rows(range, &|id| decoder.term(id)))
+            })
+            .collect();
+        let mut out = Vec::with_capacity(rows);
+        for part in parts {
+            let Some(part) = part else {
+                return Err(QueryEvaluationError::Cancelled.into());
+            };
+            out.extend(part);
+        }
+        Ok(out)
     }
 
     fn filter(&self, mut solutions: Solutions, expression: &Expression) -> NativeResult<Solutions> {
@@ -1587,6 +1600,78 @@ impl<'a> Context<'a> {
     /// bound terms. Inline integers (and UNDEF) sort by id already (offset binary). Otherwise
     /// each distinct id is decoded once, the distinct terms are sorted, and every row gets its
     /// term's rank: equal-ordering terms (1 and 1.0) share a rank.
+    /// Every aggregate of every group (`members` lists each group's rows), in parallel
+    /// chunks of groups for large inputs.
+    fn aggregate_groups(
+        &self,
+        solutions: &Solutions,
+        members: &[Vec<usize>],
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Vec<Vec<Agg>>> {
+        let per_group = |aggregator: &Aggregator<'_>, rows: &[usize]| -> Vec<Agg> {
+            aggregates
+                .iter()
+                .map(|(_, aggregate)| aggregator.aggregate(solutions, rows, aggregate))
+                .collect()
+        };
+        if solutions.table.len() < 2 * PARALLEL_EXPRESSION_ROWS || members.len() < 2 {
+            let term = |id: u64| self.term(id);
+            let aggregator = Aggregator {
+                evaluator: &self.evaluator,
+                term: &term,
+            };
+            return Ok(members
+                .iter()
+                .map(|rows| per_group(&aggregator, rows))
+                .collect());
+        }
+        // Chunks of groups holding about PARALLEL_EXPRESSION_ROWS rows each.
+        let mut bounds = vec![0];
+        let mut rows = 0;
+        for (i, group) in members.iter().enumerate() {
+            rows += group.len();
+            if rows >= PARALLEL_EXPRESSION_ROWS {
+                bounds.push(i + 1);
+                rows = 0;
+            }
+        }
+        if *bounds.last().expect("starts with 0") != members.len() {
+            bounds.push(members.len());
+        }
+        let computed = self.computed.borrow();
+        let computed: &[Term] = &computed;
+        let token = self.cancellation.as_ref();
+        let (snapshot, evaluator) = (self.snapshot, &self.evaluator);
+        let parts: Vec<Option<Vec<Vec<Agg>>>> = bounds
+            .par_windows(2)
+            .map(|window| {
+                if token.is_some_and(CancellationToken::is_cancelled) {
+                    return None;
+                }
+                let decoder = Decoder::new(snapshot, computed);
+                let term = |id: u64| decoder.term(id);
+                let aggregator = Aggregator {
+                    evaluator,
+                    term: &term,
+                };
+                Some(
+                    members[window[0]..window[1]]
+                        .iter()
+                        .map(|rows| per_group(&aggregator, rows))
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut out = Vec::with_capacity(members.len());
+        for part in parts {
+            let Some(part) = part else {
+                return Err(QueryEvaluationError::Cancelled.into());
+            };
+            out.extend(part);
+        }
+        Ok(out)
+    }
+
     fn order_ranks(&self, column: &[u64]) -> Vec<u64> {
         let integer = |id: u64| TermId::from_raw(id).kind() == nrese_engine::TermKind::Integer;
         if column.iter().all(|&id| id == UNDEF || integer(id)) {
@@ -1779,10 +1864,14 @@ impl<'a> Context<'a> {
         }
         let mut columns: Vec<Vec<u64>> = groups.keys.clone().into_columns();
         let mut vars: Vec<Variable> = variables.to_vec();
-        for (target, aggregate) in aggregates {
-            let column: Vec<u64> = members
+        let values = self.aggregate_groups(&solutions, &members, aggregates)?;
+        for (index, (target, _)) in aggregates.iter().enumerate() {
+            let column: Vec<u64> = values
                 .iter()
-                .map(|rows| self.aggregate(&solutions, rows, aggregate))
+                .map(|group| match &group[index] {
+                    Agg::Id(id) => *id,
+                    Agg::Term(term) => self.id(term),
+                })
                 .collect();
             columns.push(column);
             vars.push(target.clone());
@@ -1798,173 +1887,6 @@ impl<'a> Context<'a> {
             table,
             ordered: false,
         })
-    }
-
-    /// An aggregate over one variable's ids without decoding terms, where that is exact:
-    /// COUNT always, and SUM/AVG/MIN/MAX when every value is an inline integer (whose id
-    /// order is value order). `None` means "evaluate on terms". Error semantics are
-    /// spareval's: an unbound value makes SUM/AVG/MIN/MAX unbound, and an i64 overflow
-    /// makes SUM/AVG unbound.
-    fn aggregate_ids(
-        &self,
-        name: &AggregateFunction,
-        mut ids: Vec<u64>,
-        distinct: bool,
-    ) -> Option<u64> {
-        let dedup = |ids: &mut Vec<u64>| {
-            let mut seen = std::collections::HashSet::with_capacity(ids.len());
-            ids.retain(|id| seen.insert(*id));
-        };
-        match name {
-            AggregateFunction::Count => {
-                ids.retain(|&id| id != UNDEF);
-                if distinct {
-                    dedup(&mut ids);
-                }
-                Some(self.id(&integer(ids.len() as u64)))
-            }
-            AggregateFunction::Sum
-            | AggregateFunction::Avg
-            | AggregateFunction::Min
-            | AggregateFunction::Max => {
-                if ids.contains(&UNDEF) {
-                    return Some(UNDEF);
-                }
-                let values: Option<Vec<i64>> = ids
-                    .iter()
-                    .map(|&id| TermId::from_raw(id).as_inline_integer())
-                    .collect();
-                let values = values?;
-                if distinct {
-                    dedup(&mut ids);
-                }
-                let values: Vec<i64> = if distinct {
-                    ids.iter()
-                        .filter_map(|&id| TermId::from_raw(id).as_inline_integer())
-                        .collect()
-                } else {
-                    values
-                };
-                Some(match name {
-                    AggregateFunction::Min => ids.iter().copied().min().unwrap_or(UNDEF),
-                    AggregateFunction::Max => ids.iter().copied().max().unwrap_or(UNDEF),
-                    _ => {
-                        let Some(sum) = values.iter().try_fold(0i64, |acc, &v| acc.checked_add(v))
-                        else {
-                            return Some(UNDEF);
-                        };
-                        if *name == AggregateFunction::Sum {
-                            self.id(
-                                &Literal::new_typed_literal(sum.to_string(), xsd::INTEGER).into()
-                            )
-                        } else if values.is_empty() {
-                            self.id(&integer(0))
-                        } else {
-                            match Decimal::from(sum).checked_div(Decimal::from(values.len() as i64))
-                            {
-                                Some(avg) => self.id(&Literal::new_typed_literal(
-                                    avg.to_string(),
-                                    xsd::DECIMAL,
-                                )
-                                .into()),
-                                None => UNDEF,
-                            }
-                        }
-                    }
-                })
-            }
-            _ => None,
-        }
-    }
-
-    fn aggregate(
-        &self,
-        solutions: &Solutions,
-        rows: &[usize],
-        aggregate: &AggregateExpression,
-    ) -> u64 {
-        match aggregate {
-            AggregateExpression::CountSolutions { distinct } => {
-                let count = if *distinct {
-                    let mut seen: Vec<Vec<u64>> =
-                        rows.iter().map(|&r| solutions.table.row(r)).collect();
-                    seen.sort_unstable();
-                    seen.dedup();
-                    seen.len()
-                } else {
-                    rows.len()
-                };
-                self.id(&integer(count as u64))
-            }
-            AggregateExpression::FunctionCall {
-                name,
-                expr,
-                distinct,
-            } => {
-                if let Expression::Variable(variable) = expr {
-                    let ids: Vec<u64> = match solutions.column(variable) {
-                        Some(column) => rows
-                            .iter()
-                            .map(|&r| solutions.table.get(r, column))
-                            .collect(),
-                        None => vec![UNDEF; rows.len()],
-                    };
-                    if let Some(result) = self.aggregate_ids(name, ids, *distinct) {
-                        return result;
-                    }
-                }
-                let evaluated: Vec<Option<Term>> = rows
-                    .iter()
-                    .map(|&row| self.evaluator.eval(expr, &self.binding(solutions, row)))
-                    .collect();
-                // As spareval: COUNT skips errors and SAMPLE takes the first value, but one
-                // error makes SUM, AVG, MIN and MAX unbound.
-                let fails_on_error =
-                    !matches!(name, AggregateFunction::Count | AggregateFunction::Sample);
-                if fails_on_error && evaluated.iter().any(Option::is_none) {
-                    return UNDEF;
-                }
-                let mut values: Vec<Term> = evaluated.into_iter().flatten().collect();
-                if *distinct {
-                    let mut unique = Vec::with_capacity(values.len());
-                    for value in values {
-                        if !unique.contains(&value) {
-                            unique.push(value);
-                        }
-                    }
-                    values = unique;
-                }
-                let result = match name {
-                    AggregateFunction::Count => Some(integer(values.len() as u64)),
-                    AggregateFunction::Sample => values.into_iter().next().map(value::canonical),
-                    // The first of equal extremes, as spareval keeps it.
-                    AggregateFunction::Min => values
-                        .into_iter()
-                        .reduce(|best, v| {
-                            if value::order(Some(&v), Some(&best)).is_lt() {
-                                v
-                            } else {
-                                best
-                            }
-                        })
-                        .map(value::canonical),
-                    AggregateFunction::Max => values
-                        .into_iter()
-                        .reduce(|best, v| {
-                            if value::order(Some(&v), Some(&best)).is_gt() {
-                                v
-                            } else {
-                                best
-                            }
-                        })
-                        .map(value::canonical),
-                    AggregateFunction::Sum => sum(&values),
-                    AggregateFunction::Avg => average(&values),
-                    _ => None,
-                };
-                result.map_or(UNDEF, |term| self.id(&term))
-            }
-        }
     }
 }
 
@@ -2032,6 +1954,78 @@ fn describe(pattern: &GraphPattern) -> (&'static str, String) {
         ),
         GraphPattern::Group { variables, .. } => ("group", list(variables)),
         _ => ("operator", String::new()),
+    }
+}
+
+/// Rows per parallel task of a filter or aggregation; smaller inputs run on one thread.
+const PARALLEL_EXPRESSION_ROWS: usize = 1 << 13;
+
+/// Decoded terms a [`Decoder`] keeps.
+const DECODER_CACHE_ENTRIES: usize = 1 << 12;
+
+/// Term decoding for one task of a parallel operator: the snapshot, the query's computed
+/// terms (read-only meanwhile), and a small cache of its own.
+struct Decoder<'a> {
+    snapshot: &'a Snapshot,
+    computed: &'a [Term],
+    cache: RefCell<HashMap<u64, Option<Term>>>,
+}
+
+impl<'a> Decoder<'a> {
+    fn new(snapshot: &'a Snapshot, computed: &'a [Term]) -> Self {
+        Self {
+            snapshot,
+            computed,
+            cache: RefCell::default(),
+        }
+    }
+
+    fn term(&self, id: u64) -> Option<Term> {
+        if let Some(term) = self.cache.borrow().get(&id) {
+            return term.clone();
+        }
+        let term = decode(self.snapshot, self.computed, id);
+        let mut cache = self.cache.borrow_mut();
+        if cache.len() < DECODER_CACHE_ENTRIES {
+            cache.insert(id, term.clone());
+        }
+        term
+    }
+}
+
+/// A FILTER over a table: the id-level fast path where it decides, the evaluator otherwise.
+/// Thread-safe; the caller supplies term decoding.
+struct FilterMask<'a> {
+    snapshot: &'a Snapshot,
+    evaluator: &'a Evaluator,
+    compiled: Option<&'a fast::Fast>,
+    expression: &'a Expression,
+    solutions: &'a Solutions,
+}
+
+impl FilterMask<'_> {
+    /// Whether each row of `rows` passes.
+    fn rows(&self, rows: Range<usize>, term: &dyn Fn(u64) -> Option<Term>) -> Vec<bool> {
+        let table = &self.solutions.table;
+        rows.map(|row| {
+            let decided = self.compiled.map(|fast| {
+                let value = |v: &Variable| {
+                    self.solutions
+                        .column(v)
+                        .map_or(UNDEF, |c| table.get(row, c))
+                };
+                fast.eval(&value, self.snapshot)
+            });
+            match decided {
+                Some(fast::Tri::True) => true,
+                Some(fast::Tri::False | fast::Tri::Error) => false,
+                Some(fast::Tri::Unknown) | None => {
+                    let binding = |v: &Variable| term(table.get(row, self.solutions.column(v)?));
+                    self.evaluator.filter(self.expression, &binding)
+                }
+            }
+        })
+        .collect()
     }
 }
 
@@ -2134,6 +2128,195 @@ impl Probe<'_> {
             return Err(ProbeStop::TooManyRows);
         }
         Ok(())
+    }
+}
+
+/// An aggregate's value: a stored or computed id, or a new term the query interns.
+enum Agg {
+    Id(u64),
+    Term(Term),
+}
+
+/// Computes aggregates over groups of rows. Thread-safe given a thread-safe `term`, so
+/// groups can be aggregated in parallel; the caller interns the results.
+struct Aggregator<'a> {
+    evaluator: &'a Evaluator,
+    term: &'a dyn Fn(u64) -> Option<Term>,
+}
+
+impl Aggregator<'_> {
+    fn binding<'s>(
+        &'s self,
+        solutions: &'s Solutions,
+        row: usize,
+    ) -> impl Fn(&Variable) -> Option<Term> + 's {
+        move |variable| (self.term)(solutions.table.get(row, solutions.column(variable)?))
+    }
+
+    /// An aggregate over one variable's ids without decoding terms, where that is exact:
+    /// COUNT always, and SUM/AVG/MIN/MAX when every value is an inline integer (whose id
+    /// order is value order). `None` means "evaluate on terms". Error semantics are
+    /// spareval's: an unbound value makes SUM/AVG/MIN/MAX unbound, and an i64 overflow
+    /// makes SUM/AVG unbound.
+    fn aggregate_ids(
+        &self,
+        name: &AggregateFunction,
+        mut ids: Vec<u64>,
+        distinct: bool,
+    ) -> Option<Agg> {
+        let dedup = |ids: &mut Vec<u64>| {
+            let mut seen = std::collections::HashSet::with_capacity(ids.len());
+            ids.retain(|id| seen.insert(*id));
+        };
+        match name {
+            AggregateFunction::Count => {
+                ids.retain(|&id| id != UNDEF);
+                if distinct {
+                    dedup(&mut ids);
+                }
+                Some(Agg::Term(integer(ids.len() as u64)))
+            }
+            AggregateFunction::Sum
+            | AggregateFunction::Avg
+            | AggregateFunction::Min
+            | AggregateFunction::Max => {
+                if ids.contains(&UNDEF) {
+                    return Some(Agg::Id(UNDEF));
+                }
+                let values: Option<Vec<i64>> = ids
+                    .iter()
+                    .map(|&id| TermId::from_raw(id).as_inline_integer())
+                    .collect();
+                let values = values?;
+                if distinct {
+                    dedup(&mut ids);
+                }
+                let values: Vec<i64> = if distinct {
+                    ids.iter()
+                        .filter_map(|&id| TermId::from_raw(id).as_inline_integer())
+                        .collect()
+                } else {
+                    values
+                };
+                Some(match name {
+                    AggregateFunction::Min => Agg::Id(ids.iter().copied().min().unwrap_or(UNDEF)),
+                    AggregateFunction::Max => Agg::Id(ids.iter().copied().max().unwrap_or(UNDEF)),
+                    _ => {
+                        let Some(sum) = values.iter().try_fold(0i64, |acc, &v| acc.checked_add(v))
+                        else {
+                            return Some(Agg::Id(UNDEF));
+                        };
+                        if *name == AggregateFunction::Sum {
+                            Agg::Term(
+                                Literal::new_typed_literal(sum.to_string(), xsd::INTEGER).into(),
+                            )
+                        } else if values.is_empty() {
+                            Agg::Term(integer(0))
+                        } else {
+                            match Decimal::from(sum).checked_div(Decimal::from(values.len() as i64))
+                            {
+                                Some(avg) => Agg::Term(
+                                    Literal::new_typed_literal(avg.to_string(), xsd::DECIMAL)
+                                        .into(),
+                                ),
+                                None => Agg::Id(UNDEF),
+                            }
+                        }
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn aggregate(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        aggregate: &AggregateExpression,
+    ) -> Agg {
+        match aggregate {
+            AggregateExpression::CountSolutions { distinct } => {
+                let count = if *distinct {
+                    let mut seen: Vec<Vec<u64>> =
+                        rows.iter().map(|&r| solutions.table.row(r)).collect();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    seen.len()
+                } else {
+                    rows.len()
+                };
+                Agg::Term(integer(count as u64))
+            }
+            AggregateExpression::FunctionCall {
+                name,
+                expr,
+                distinct,
+            } => {
+                if let Expression::Variable(variable) = expr {
+                    let ids: Vec<u64> = match solutions.column(variable) {
+                        Some(column) => rows
+                            .iter()
+                            .map(|&r| solutions.table.get(r, column))
+                            .collect(),
+                        None => vec![UNDEF; rows.len()],
+                    };
+                    if let Some(result) = self.aggregate_ids(name, ids, *distinct) {
+                        return result;
+                    }
+                }
+                let evaluated: Vec<Option<Term>> = rows
+                    .iter()
+                    .map(|&row| self.evaluator.eval(expr, &self.binding(solutions, row)))
+                    .collect();
+                // As spareval: COUNT skips errors and SAMPLE takes the first value, but one
+                // error makes SUM, AVG, MIN and MAX unbound.
+                let fails_on_error =
+                    !matches!(name, AggregateFunction::Count | AggregateFunction::Sample);
+                if fails_on_error && evaluated.iter().any(Option::is_none) {
+                    return Agg::Id(UNDEF);
+                }
+                let mut values: Vec<Term> = evaluated.into_iter().flatten().collect();
+                if *distinct {
+                    let mut unique = Vec::with_capacity(values.len());
+                    for value in values {
+                        if !unique.contains(&value) {
+                            unique.push(value);
+                        }
+                    }
+                    values = unique;
+                }
+                let result = match name {
+                    AggregateFunction::Count => Some(integer(values.len() as u64)),
+                    AggregateFunction::Sample => values.into_iter().next().map(value::canonical),
+                    // The first of equal extremes, as spareval keeps it.
+                    AggregateFunction::Min => values
+                        .into_iter()
+                        .reduce(|best, v| {
+                            if value::order(Some(&v), Some(&best)).is_lt() {
+                                v
+                            } else {
+                                best
+                            }
+                        })
+                        .map(value::canonical),
+                    AggregateFunction::Max => values
+                        .into_iter()
+                        .reduce(|best, v| {
+                            if value::order(Some(&v), Some(&best)).is_gt() {
+                                v
+                            } else {
+                                best
+                            }
+                        })
+                        .map(value::canonical),
+                    AggregateFunction::Sum => sum(&values),
+                    AggregateFunction::Avg => average(&values),
+                    _ => None,
+                };
+                result.map_or(Agg::Id(UNDEF), Agg::Term)
+            }
+        }
     }
 }
 

@@ -10,6 +10,8 @@
 //! default-graph statements are inferred, and every query runs under a random read model
 //! (asserted, inferred or both).
 
+use std::collections::HashSet;
+
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, ReadModel};
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query, runs_natively};
 use oxrdf::vocab::xsd;
@@ -683,4 +685,84 @@ fn explain_reports_the_plan() {
         .unwrap();
     let fallback = explain_query(&snapshot, &describe, &QueryOptions::default()).unwrap();
     assert_eq!((fallback.executor, fallback.rows), ("spareval", 1500));
+}
+
+/// Filters and aggregates over tables large enough to run in parallel chunks (with terms
+/// computed by BIND, regular expressions, strings, decimals) equal spareval.
+#[test]
+fn parallel_filters_and_aggregates_equal_spareval() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..40_000u32 {
+        let s = ex(&format!("s{i}"));
+        let values: [Term; 3] = [
+            Literal::new_typed_literal((i % 997).to_string(), xsd::INTEGER).into(),
+            Literal::new_typed_literal(format!("{}.{}", i % 89, i % 7), xsd::DECIMAL).into(),
+            if i % 3 == 0 {
+                Literal::new_language_tagged_literal_unchecked(format!("name {}", i % 311), "en")
+                    .into()
+            } else {
+                Literal::new_simple_literal(format!("label-{}-{}", i % 53, i % 5)).into()
+            },
+        ];
+        for (p, value) in ["n", "d", "l"].iter().zip(values) {
+            let quad = Quad::new(s.clone(), ex(p), value, GraphName::DefaultGraph);
+            tx.insert(quad.as_ref());
+        }
+        let group = Quad::new(
+            s,
+            ex("g"),
+            ex(&format!("g{}", i % 1500)),
+            GraphName::DefaultGraph,
+        );
+        tx.insert(group.as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..QueryOptions::default()
+    };
+    let queries = [
+        format!("SELECT ?s ?l WHERE {{ ?s <{EX}l> ?l FILTER(REGEX(STR(?l), \"-1[0-9]-\")) }}"),
+        format!("SELECT ?s WHERE {{ ?s <{EX}l> ?l FILTER(CONTAINS(UCASE(STR(?l)), \"NAME 3\")) }}"),
+        format!(
+            "SELECT ?s ?x WHERE {{ ?s <{EX}n> ?n . ?s <{EX}d> ?d BIND(CONCAT(STR(?n), \"/\", STR(?d)) AS ?x) FILTER(STRLEN(?x) > 7 && ?d > 40) }}"
+        ),
+        format!(
+            "SELECT ?g (COUNT(*) AS ?c) (SUM(?n) AS ?sn) (AVG(?d) AS ?ad) (MIN(?l) AS ?ml) (MAX(?d) AS ?xd) (COUNT(DISTINCT ?l) AS ?cl) WHERE {{ ?s <{EX}g> ?g . ?s <{EX}n> ?n . ?s <{EX}d> ?d . ?s <{EX}l> ?l }} GROUP BY ?g"
+        ),
+        format!(
+            "SELECT ?g (SUM(?n * 2) AS ?s2) (MAX(STRLEN(STR(?l))) AS ?ml) (SAMPLE(?n) AS ?one) WHERE {{ ?s <{EX}g> ?g . ?s <{EX}n> ?n . ?s <{EX}l> ?l }} GROUP BY ?g"
+        ),
+        format!(
+            "SELECT ?k (COUNT(*) AS ?c) WHERE {{ ?s <{EX}n> ?n BIND(CONCAT(\"k\", STR(?n / 100)) AS ?k) }} GROUP BY ?k"
+        ),
+    ];
+    for text in queries {
+        let query = SparqlParser::new()
+            .parse_query(&text)
+            .unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert!(runs_natively(&query), "{text}");
+        let native = rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        );
+        let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+        assert!(!expected.is_empty(), "{text}");
+        if native != expected {
+            let (a, b): (HashSet<_>, HashSet<_>) =
+                (native.iter().collect(), expected.iter().collect());
+            let only_native: Vec<_> = a.difference(&b).take(5).collect();
+            let only_spareval: Vec<_> = b.difference(&a).take(5).collect();
+            panic!(
+                "{text}
+{} native vs {} spareval rows
+only native: {only_native:?}
+only spareval: {only_spareval:?}",
+                native.len(),
+                expected.len()
+            );
+        }
+    }
 }
