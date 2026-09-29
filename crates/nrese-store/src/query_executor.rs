@@ -44,6 +44,9 @@ impl SolutionsResultFormat {
 #[derive(Debug, Clone)]
 pub struct PreparedQuery {
     query: Query,
+    /// The request's query text, as sent (the cache key: parsing names aggregate variables
+    /// randomly, so the parsed form differs between parses of the same text).
+    text: String,
     dataset: Option<QueryDatasetSpecification>,
     read_model: ReadModel,
     memory_limit: Option<usize>,
@@ -72,6 +75,7 @@ impl PreparedQuery {
         };
         Ok(Self {
             query,
+            text: request.query.clone(),
             dataset: protocol_dataset(&request)?,
             read_model: request
                 .read_model
@@ -89,19 +93,18 @@ impl PreparedQuery {
         self.read_model
     }
 
-    /// Everything the serialised result depends on besides the data: the query (in its
-    /// canonical form, so formatting differences share an entry), the dataset parameters,
-    /// the read model and the output formats.
+    /// Everything the serialised result depends on besides the data: the query text, the
+    /// dataset parameters, the read model and the output formats.
     pub(crate) fn cache_request(&self) -> String {
         format!(
             "{}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
-            self.query, self.dataset, self.read_model, self.solutions_format, self.graph_format
+            self.text, self.dataset, self.read_model, self.solutions_format, self.graph_format
         )
     }
 
     /// Whether repeating the query may give another answer (see `query_cache::volatile`).
     pub(crate) fn volatile(&self) -> bool {
-        crate::query_cache::volatile(&self.query.to_string())
+        crate::query_cache::volatile(&self.text)
     }
 
     pub fn kind(&self) -> QueryResultKind {

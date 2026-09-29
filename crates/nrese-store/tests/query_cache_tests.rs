@@ -26,11 +26,13 @@ fn repeated_queries_hit_until_the_next_commit() {
     let store = store(1 << 20);
     let first = answer(&store, QUERY);
     assert_eq!(answer(&store, QUERY), first);
-    // Formatting differences share the entry (the key is the parsed query).
-    let reformatted = QUERY.replace(' ', "  ");
-    assert_eq!(answer(&store, &reformatted), first);
+    // Aggregates too: parsing names their internal variables randomly, so the key is the
+    // query text, not the parsed form.
+    let count = "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }";
+    let counted = answer(&store, count);
+    assert_eq!(answer(&store, count), counted);
     let stats = store.query_cache_stats();
-    assert_eq!((stats.hits, stats.misses, stats.entries), (2, 1, 1));
+    assert_eq!((stats.hits, stats.misses, stats.entries), (2, 2, 2));
 
     store
         .execute_update_str("INSERT DATA { <http://example.com/s> <http://example.com/p> 2 }")
@@ -38,7 +40,7 @@ fn repeated_queries_hit_until_the_next_commit() {
     let after = answer(&store, QUERY);
     assert_ne!(after, first, "a commit starts a new revision");
     assert!(after.contains('2'));
-    assert_eq!(store.query_cache_stats().misses, 2);
+    assert_eq!(store.query_cache_stats().misses, 3);
 }
 
 #[test]
