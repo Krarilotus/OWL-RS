@@ -163,7 +163,18 @@ pub(crate) fn load_latest(dir: &Path, dictionary: &Dictionary) -> EngineResult<O
     let Some((_, path)) = list(dir)?.pop() else {
         return Ok(None);
     };
+    let timing = std::env::var_os("NRESE_RECOVERY_TIMING").is_some();
+    let clock = std::time::Instant::now();
+    let lap = |what: &str| {
+        if timing {
+            eprintln!(
+                "  checkpoint {what}: {:.3} s",
+                clock.elapsed().as_secs_f64()
+            );
+        }
+    };
     let bytes = fs::read(&path)?;
+    lap("file read");
     let corrupt =
         |what: &str| EngineError::Corruption(format!("checkpoint {}: {what}", path.display()));
     let (body, crc) = bytes
@@ -174,6 +185,7 @@ pub(crate) fn load_latest(dir: &Path, dictionary: &Dictionary) -> EngineResult<O
     {
         return Err(corrupt("checksum mismatch"));
     }
+    lap("crc");
     let mut reader = Reader::new(body);
     let packed = match reader.bytes(MAGIC.len()) {
         Some(magic) if magic == MAGIC => true,
@@ -185,15 +197,22 @@ pub(crate) fn load_latest(dir: &Path, dictionary: &Dictionary) -> EngineResult<O
     };
     let revision = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
     let dictionary_len = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
-    for index in 0..dictionary_len {
+    let count = usize::try_from(dictionary_len).map_err(|_| corrupt("dictionary too large"))?;
+    if count > reader.remaining() / 4 {
+        return Err(corrupt("dictionary length exceeds file size"));
+    }
+    let mut keys: Vec<&[u8]> = Vec::with_capacity(count);
+    for _ in 0..count {
         let len = reader
             .u32()
             .ok_or_else(|| corrupt("truncated dictionary"))?;
         let key = reader
             .bytes(len as usize)
             .ok_or_else(|| corrupt("truncated dictionary"))?;
-        dictionary.restore_key(index, key)?;
+        keys.push(key);
     }
+    dictionary.restore_keys(&keys)?;
+    lap("dictionary");
     if packed {
         let mut stacks: [Vec<(Permutation, PackedKeys)>; 2] = Default::default();
         for stack in &mut stacks {
@@ -212,6 +231,7 @@ pub(crate) fn load_latest(dir: &Path, dictionary: &Dictionary) -> EngineResult<O
         if !reader.is_done() {
             return Err(corrupt("trailing bytes"));
         }
+        lap("packed permutations");
         return Ok(Some(Loaded {
             revision,
             stacks: Stacks::Packed(stacks),

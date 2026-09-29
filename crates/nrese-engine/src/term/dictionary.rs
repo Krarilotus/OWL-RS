@@ -310,6 +310,49 @@ impl Dictionary {
             .collect()
     }
 
+    /// Restores a checkpoint's dictionary into this empty one: `keys` in id order. Keys are
+    /// validated and hashed in parallel, appended to the arena at once and indexed in a
+    /// table sized up front; a duplicate key is corruption.
+    pub(crate) fn restore_keys(&self, keys: &[&[u8]]) -> EngineResult<()> {
+        use rayon::prelude::*;
+        let hashes: Vec<u64> = keys
+            .par_iter()
+            .map(|key| validate_key(key).map(|()| self.hasher.hash_one(key)))
+            .collect::<EngineResult<_>>()?;
+        let mut inner = self.inner.write();
+        if !inner.ends.is_empty() {
+            return Err(EngineError::Corruption(
+                "checkpoint dictionary restored into a non-empty dictionary".to_owned(),
+            ));
+        }
+        let Inner { table, bytes, ends } = &mut *inner;
+        bytes.reserve_exact(keys.iter().map(|key| key.len()).sum());
+        ends.reserve_exact(keys.len());
+        for key in keys {
+            bytes.extend_from_slice(key);
+            ends.push(bytes.len() as u64);
+        }
+        let key = |i: u64| {
+            let i = i as usize;
+            let start = if i == 0 { 0 } else { ends[i - 1] as usize };
+            &bytes[start..ends[i] as usize]
+        };
+        *table = HashTable::with_capacity(keys.len());
+        for (index, &hash) in hashes.iter().enumerate() {
+            let index = index as u64;
+            if table
+                .find(hash, |&other| key(other) == key(index))
+                .is_some()
+            {
+                return Err(EngineError::Corruption(format!(
+                    "duplicate dictionary key at {index}"
+                )));
+            }
+            table.insert_unique(hash, index, |&i| self.hasher.hash_one(key(i)));
+        }
+        Ok(())
+    }
+
     /// Re-adds a raw key during recovery. The key must land exactly at `expected_index`.
     pub(crate) fn restore_key(&self, expected_index: u64, key: &[u8]) -> EngineResult<()> {
         validate_key(key)?;
@@ -545,6 +588,33 @@ mod tests {
     use oxrdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
 
     use super::*;
+
+    #[test]
+    fn bulk_restore_matches_interning() {
+        let source = Dictionary::default();
+        let terms: Vec<NamedNode> = (0..5000)
+            .map(|i| NamedNode::new_unchecked(format!("http://example.com/{i}")))
+            .collect();
+        let ids: Vec<TermId> = terms
+            .iter()
+            .map(|t| source.intern(t.as_ref().into()))
+            .collect();
+        let keys = source.export_keys(0, source.len());
+        let slices: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let restored = Dictionary::default();
+        restored.restore_keys(&slices).unwrap();
+        for (term, id) in terms.iter().zip(&ids) {
+            assert_eq!(restored.lookup(term.as_ref().into()), Some(*id));
+            assert_eq!(restored.decode(*id), Some(term.clone().into()));
+        }
+        let mut duplicated = slices.clone();
+        duplicated.push(slices[42]);
+        assert!(Dictionary::default().restore_keys(&duplicated).is_err());
+        assert!(
+            restored.restore_keys(&slices).is_err(),
+            "only into an empty dictionary"
+        );
+    }
 
     fn roundtrip(term: TermRef<'_>) {
         let dict = Dictionary::default();
