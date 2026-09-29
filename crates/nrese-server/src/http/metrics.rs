@@ -10,7 +10,8 @@ pub fn render(state: &AppState) -> Result<Response, ApiError> {
         .store()
         .stats()
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    let body = format!(
+    let cache = state.store().query_cache_stats();
+    let mut body = format!(
         "# HELP nrese_ready Whether the server is ready.\n\
 # TYPE nrese_ready gauge\n\
 nrese_ready {ready}\n\
@@ -41,6 +42,19 @@ nrese_store_mode_info{{mode=\"{}\",durability=\"{}\"}} 1\n",
         state.store_mode_name(),
         state.durability_name(),
     );
+    body.push_str(&format!(
+        "# HELP nrese_query_cache_hits_total Queries answered from the result cache.
+# TYPE nrese_query_cache_hits_total counter
+nrese_query_cache_hits_total {}
+# HELP nrese_query_cache_misses_total Cacheable queries evaluated.
+# TYPE nrese_query_cache_misses_total counter
+nrese_query_cache_misses_total {}
+# HELP nrese_query_cache_bytes Bytes held by the query result cache.
+# TYPE nrese_query_cache_bytes gauge
+nrese_query_cache_bytes {}
+",
+        cache.hits, cache.misses, cache.bytes,
+    ));
 
     let mut response = (StatusCode::OK, body).into_response();
     response.headers_mut().insert(
@@ -87,5 +101,6 @@ mod tests {
         assert!(text.contains("nrese_store_inferred"));
         assert!(text.contains("nrese_store_mode_info"));
         assert!(text.contains("nrese_reasoner_mode_info"));
+        assert!(text.contains("nrese_query_cache_hits_total"));
     }
 }

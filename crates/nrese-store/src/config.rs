@@ -17,7 +17,13 @@ pub struct StoreConfig {
     /// Ontology file loaded at startup. `None` means no preload; there are no implicit
     /// fallback locations.
     pub ontology_path: Option<PathBuf>,
+    /// Bytes of serialised query results kept for repeated queries on an unchanged store
+    /// (see `query_cache`); 0 disables the cache.
+    pub query_cache_bytes: usize,
 }
+
+/// Default query result cache: 64 MiB.
+pub const DEFAULT_QUERY_CACHE_BYTES: usize = 64 << 20;
 
 impl Default for StoreConfig {
     fn default() -> Self {
@@ -31,6 +37,7 @@ impl StoreConfig {
             mode: StoreMode::InMemory,
             data_dir: PathBuf::from("./data"),
             ontology_path: None,
+            query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
         }
     }
 
@@ -39,6 +46,7 @@ impl StoreConfig {
             mode: StoreMode::OnDisk,
             data_dir: data_dir.into(),
             ontology_path: None,
+            query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
         }
     }
 

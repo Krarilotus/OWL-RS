@@ -19,7 +19,7 @@ use crate::graph_store_executor::execute_graph_read;
 use crate::loader::preload_ontology;
 use crate::mutation::{MutationCommand, MutationCommitReport};
 use crate::query::{SerializedQueryResult, SparqlQueryRequest};
-use crate::query_executor::{PreparedQuery, execute_query, explain_prepared, run_query};
+use crate::query_executor::{PreparedQuery, explain_prepared, run_query};
 use crate::stats::{StoreStats, collect_stats};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 
@@ -37,6 +37,7 @@ pub struct StoreService {
     marker: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The ruleset recorded this process (also for in-memory stores, which have no file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<&'static str>>>,
+    query_cache: std::sync::Arc<crate::query_cache::QueryCache>,
 }
 
 /// The file recording which ruleset the inferred stack is exact for.
@@ -60,7 +61,11 @@ impl StoreService {
         };
         let before = engine.snapshot().revision();
         let preloaded_ontology = preload_ontology(&engine, &config)?;
+        let query_cache = std::sync::Arc::new(crate::query_cache::QueryCache::new(
+            config.query_cache_bytes,
+        ));
         let service = Self {
+            query_cache,
             config,
             engine,
             preloaded_ontology,
@@ -165,7 +170,19 @@ impl StoreService {
         &self,
         request: &SparqlQueryRequest,
     ) -> StoreResult<SerializedQueryResult> {
-        execute_query(&self.engine.snapshot(), request)
+        let prepared = PreparedQuery::parse(request)?;
+        let mut payload = Vec::new();
+        self.run_query(&prepared, &CancellationToken::new(), &mut payload)?;
+        Ok(SerializedQueryResult {
+            kind: prepared.kind(),
+            media_type: prepared.media_type(),
+            payload,
+        })
+    }
+
+    /// Hits, misses and size of the query result cache.
+    pub fn query_cache_stats(&self) -> crate::query_cache::QueryCacheStats {
+        self.query_cache.stats()
     }
 
     /// Evaluates a prepared query on the latest snapshot, writing results to `out` as they
@@ -177,7 +194,29 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
-        run_query(&self.engine.snapshot(), prepared, cancellation, out)
+        let snapshot = self.engine.snapshot();
+        if !self.query_cache.enabled() || prepared.volatile() {
+            return run_query(&snapshot, prepared, cancellation, out);
+        }
+        let key = crate::query_cache::CacheKey {
+            request: prepared.cache_request(),
+            revision: snapshot.revision(),
+        };
+        let mut out = out;
+        if let Some(bytes) = self.query_cache.get(&key) {
+            out.write_all(&bytes)?;
+            return Ok(());
+        }
+        let mut tee = crate::query_cache::Tee {
+            inner: out,
+            copy: Some(Vec::new()),
+            limit: self.query_cache.max_entry(),
+        };
+        run_query(&snapshot, prepared, cancellation, &mut tee)?;
+        if let Some(copy) = tee.copy {
+            self.query_cache.insert(key, copy);
+        }
+        Ok(())
     }
 
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
