@@ -458,3 +458,24 @@ fn inconsistent_baselines_are_quarantined_until_repaired() {
         nrese_store::ConsistencyStatus::Consistent
     );
 }
+
+/// A write asserting that an individual differs from itself is rejected (eq-ref's
+/// consequence, checked without materialising `x sameAs x`).
+#[test]
+fn self_difference_is_rejected_on_commit() {
+    let store = Arc::new(StoreService::new(nrese_store::StoreConfig::in_memory()).expect("store"));
+    let pipeline = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    let result = pipeline.apply(
+        insert(&format!(
+            "<{EX}x> <http://www.w3.org/2002/07/owl#differentFrom> <{EX}x>"
+        )),
+        &MutationTicket::new(),
+    );
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(store.stats().expect("stats").quad_count, 0);
+}

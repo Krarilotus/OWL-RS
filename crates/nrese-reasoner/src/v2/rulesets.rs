@@ -5,7 +5,10 @@
 //! `cls-oo`, `scm-int`, `scm-uni`, `cax-adc`, `eq-diff2/3`, `prp-adp`) aren't in the
 //! text: they're instantiated per list axiom by [`super::lists`]. Left out, as in owlrl's
 //! default mode and the reasoning benchmark's normalisation: `eq-ref` (`x sameAs x` for
-//! every term), the datatype rules (table 8) and the axiomatic triples.
+//! every term), the datatype rules (table 8) and the axiomatic triples. What `eq-ref`
+//! contributes to consistency is kept without materialising it: `x differentFrom x` is a
+//! second `eq-diff1` rule, and `AllDifferent` lists naming one individual twice are
+//! inconsistent (`eq-diff2/3` in [`super::lists`]).
 //!
 //! Every ruleset is validated by the tests: it parses, every rule is safe, and the
 //! evaluator's closure equals the owlrl oracle's on the benchmark data.
@@ -24,7 +27,7 @@ pub enum Ruleset {
 /// Version of the evaluation semantics beyond the rule text: list compilation, equality
 /// handling, modules. Bump it with any change that alters what a ruleset derives or rejects,
 /// so stores materialised by an older build rebuild instead of trusting their state.
-pub const SEMANTICS_VERSION: u32 = 1;
+pub const SEMANTICS_VERSION: u32 = 2;
 
 impl Ruleset {
     /// Identifies what this ruleset derives: FNV-1a over [`SEMANTICS_VERSION`], the name and
@@ -87,6 +90,7 @@ eq-rep-s: (?s owl:sameAs ?t), (?s ?p ?o) -> (?t ?p ?o)
 eq-rep-p: (?p owl:sameAs ?q), (?s ?p ?o) -> (?s ?q ?o)
 eq-rep-o: (?o owl:sameAs ?t), (?s ?p ?o) -> (?s ?p ?t)
 eq-diff1: (?x owl:sameAs ?y), (?x owl:differentFrom ?y) -> false
+eq-diff1: (?x owl:differentFrom ?x) -> false
 
 # Table 5: properties
 prp-dom:  (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)

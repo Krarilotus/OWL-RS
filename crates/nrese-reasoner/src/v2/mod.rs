@@ -66,6 +66,40 @@ mod tests {
             .collect()
     }
 
+    /// `eq-ref`'s consequences for consistency without materialising `x sameAs x`: an
+    /// individual different from itself, and an AllDifferent list naming one individual
+    /// twice, are inconsistent.
+    #[test]
+    fn reflexive_equality_is_checked_without_materialising_it() {
+        let (_, derived, violations) = closure("ex:x owl:differentFrom ex:x");
+        assert_eq!(violations, vec!["eq-diff1".to_owned()]);
+        assert!(derived.is_empty(), "no reflexive sameAs is materialised");
+        for property in ["members", "distinctMembers"] {
+            let (_, _, violations) = closure(&format!(
+                "_:d rdf:type owl:AllDifferent
+                 _:d owl:{property} _:l1
+                 _:l1 rdf:first ex:a
+                 _:l1 rdf:rest _:l2
+                 _:l2 rdf:first ex:a
+                 _:l2 rdf:rest rdf:nil"
+            ));
+            assert!(
+                violations.iter().any(|v| v.starts_with("eq-diff")),
+                "{property}: {violations:?}"
+            );
+        }
+        // Different individuals in an AllDifferent list are fine.
+        let (_, _, violations) = closure(
+            "_:d rdf:type owl:AllDifferent
+             _:d owl:members _:l1
+             _:l1 rdf:first ex:a
+             _:l1 rdf:rest _:l2
+             _:l2 rdf:first ex:b
+             _:l2 rdf:rest rdf:nil",
+        );
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
     /// The schema is closed before the instance data (batch), and that pre-closure derives
     /// `ex:a rdf:type ex:C` from the enumeration alone, which the data also asserts: it
     /// must not be reported as derived (`both` checks that, and batch = naive).
@@ -173,7 +207,8 @@ mod tests {
         let mut vocabulary = LocalVocabulary::default();
         let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
         // Tables 4 (6 rules), 5 (16), 6 (13), 7 (4) and 9 (18); list rules come from `lists`.
-        assert_eq!(rules.len(), 57);
+        // Plus the reflexive eq-diff1 (x differentFrom x), eq-ref's consistency part.
+        assert_eq!(rules.len(), 58);
         assert!(rules.iter().any(|r| r.name == "cls-maxqc4"));
         Ruleset::Rdfs.rules(&mut vocabulary).unwrap();
     }
