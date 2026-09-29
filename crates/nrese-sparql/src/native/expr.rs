@@ -5,8 +5,8 @@
 //! error or an unbound variable, which SPARQL treats alike in FILTERs. The supported set
 //! grows with coverage (execution-core design, XC5).
 
-use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use oxrdf::vocab::xsd;
 use oxrdf::{Literal, NamedNode, Term, Variable};
@@ -15,7 +15,9 @@ use spargebra::algebra::{Expression, Function};
 
 use oxsdatatypes::{Decimal, Double, Float, Integer};
 
-use super::value::{Value, boolean_term, compare, effective_boolean, equals, is_lang_string};
+use super::value::{
+    Value, boolean_term, canonical, compare, effective_boolean, equals, is_lang_string,
+};
 
 /// True if the native evaluator implements every node of `expr`.
 pub(crate) fn supported(expr: &Expression) -> bool {
@@ -79,10 +81,11 @@ pub(crate) fn supported(expr: &Expression) -> bool {
     }
 }
 
-/// Evaluates expressions; caches compiled regular expressions per query.
+/// Evaluates expressions; caches compiled regular expressions per query. Thread-safe, so
+/// parallel filters and aggregates share one.
 #[derive(Default)]
 pub(crate) struct Evaluator {
-    regexes: RefCell<HashMap<(String, String), Option<Regex>>>,
+    regexes: Mutex<HashMap<(String, String), Option<Regex>>>,
 }
 
 impl Evaluator {
@@ -226,7 +229,13 @@ impl Evaluator {
         match function {
             Function::Str => match arg(0)? {
                 Term::NamedNode(node) => Some(Literal::new_simple_literal(node.as_str()).into()),
-                Term::Literal(literal) => Some(Literal::new_simple_literal(literal.value()).into()),
+                // spareval reads typed literals as values: STR gives the canonical form.
+                literal @ Term::Literal(_) => match canonical(literal) {
+                    Term::Literal(literal) => {
+                        Some(Literal::new_simple_literal(literal.value()).into())
+                    }
+                    _ => None,
+                },
                 Term::BlankNode(_) => None,
             },
             Function::Lang => match arg(0)? {
@@ -273,11 +282,15 @@ impl Evaluator {
                     Some(_) => string(&arg(2)?)?.0,
                     None => String::new(),
                 };
-                let mut cache = self.regexes.borrow_mut();
-                let regex = cache
+                // A clone shares the compiled program; matching runs outside the lock.
+                let regex = self
+                    .regexes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .entry((pattern.clone(), flags.clone()))
-                    .or_insert_with(|| compile_regex(&pattern, &flags));
-                regex.as_ref().map(|r| boolean_term(r.is_match(&text)))
+                    .or_insert_with(|| compile_regex(&pattern, &flags))
+                    .clone();
+                regex.map(|r| boolean_term(r.is_match(&text)))
             }
             Function::IsIri => arg(0).map(|t| boolean_term(t.is_named_node())),
             Function::IsBlank => arg(0).map(|t| boolean_term(t.is_blank_node())),

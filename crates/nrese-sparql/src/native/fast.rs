@@ -313,7 +313,7 @@ impl Fast {
         }
         let id = TermId::from_raw(id);
         if id.kind().is_inline() {
-            // STR of an inline literal is its lexical form; not string-typed without STR.
+            // STR of an inline literal needs its canonical form; not string-typed without STR.
             return if str { Tri::Unknown } else { Tri::Error };
         }
         snapshot
@@ -321,9 +321,9 @@ impl Fast {
                 (TermView::String(text) | TermView::LangString { value: text, .. }, _) => {
                     Tri::of(test(text))
                 }
-                (TermView::Iri(text) | TermView::Typed { value: text, .. }, true) => {
-                    Tri::of(test(text))
-                }
+                (TermView::Iri(text), true) => Tri::of(test(text)),
+                // STR of a typed literal is its canonical form (see `value::canonical`).
+                (TermView::Typed { .. }, true) => Tri::Unknown,
                 (TermView::BlankNode(_), _) | (_, false) => Tri::Error,
             })
             .unwrap_or(Tri::Unknown)
