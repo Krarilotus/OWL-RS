@@ -23,7 +23,8 @@ L4  nrese-server                  HTTP transport, auth, policy, posture, UI host
 L3  nrese-store                   application service: operations, mutation pipeline, validation gates, backup
 L2  nrese-sparql  nrese-reasoner  nrese-shacl
                                   query/update evaluation · materialisation & consistency · shape validation
-L1  nrese-engine                  term dictionary, quad indexes, MVCC snapshots, transactions, durability
+L1  nrese-engine  nrese-exec      term dictionary, quad indexes, MVCC snapshots, transactions, durability
+                                  · id tables, joins, grouping, closures, memory budgets
 L0  nrese-core                    shared vocabulary: capability/report contracts, error kinds
 ```
 
@@ -35,7 +36,8 @@ Tooling outside the layer model: `benches/nrese-bench-harness` (black-box HTTP c
 |---|---|---|
 | `nrese-core` | Report and capability contracts shared by several L2+ crates (reasoning run reports, validation report shapes). | Anything with an algorithm or I/O. |
 | `nrese-engine` | Term model and dictionary encoding (`TermId`), quad indexes in all needed permutations, LSM runs and compaction, MVCC snapshots, the commit protocol, the write-ahead log and checkpoints, bulk load, cardinality statistics. | SPARQL semantics, RDF syntax parsing, validation or reasoning rules, HTTP. |
-| `nrese-sparql` | SPARQL 1.1 query and update evaluation over an engine snapshot: the spareval adapter, query cancellation, dataset specification (`FROM`, protocol `default-graph-uri`), update-to-delta planning, result serialisation, and (later) the native join executor. | Commit decisions, validation, persistence, HTTP. |
+| `nrese-exec` | Id-level execution shared by SPARQL and reasoning: column-major id tables, merge/hash/left/anti joins, worst-case-optimal intersection, grouping and aggregation, graph closures, per-query memory budgets. It never decodes a term and depends on no NRESE crate. | Term values, storage, SPARQL or rule semantics. |
+| `nrese-sparql` | SPARQL 1.1 query and update evaluation over an engine snapshot: the native executor and its planner (EXPLAIN), the spareval fallback, query cancellation, dataset specification (`FROM`, protocol `default-graph-uri`), update-to-delta planning, result serialisation. | Commit decisions, validation, persistence, HTTP. |
 | `nrese-reasoner` | Reasoning profiles, rule sets, materialisation, incremental maintenance, consistency checks, explanations. | Storage layout, HTTP, SHACL. |
 | `nrese-shacl` | Shapes-graph compilation, SHACL Core (later SHACL-SPARQL) validation, incremental validation scoped to a delta, validation reports. | Storage layout, reasoning, HTTP. |
 | `nrese-store` | The operations the product offers (query, update, graph store, tell, backup/restore, stats), the **mutation pipeline** (plan → validate → commit), gate ordering, revision reporting, preload. | HTTP status codes, auth, request parsing. |

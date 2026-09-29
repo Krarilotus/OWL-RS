@@ -78,11 +78,11 @@ Sizes: S ≤ 1 week, M 1–3 weeks, L 3–6 weeks (one developer).
 | Slice | Scope | Done when |
 |---|---|---|
 | A1 ✅ | Reasoning state: semantic fingerprint, quarantine for inconsistent baselines | Lifecycle test (import, quarantine, repair); committed `ceb8c8e` |
-| A2 | Self-difference and other reflexive-equality consistency cases (`eq-ref` gap) | `x owl:differentFrom x` rejected on commit and in full materialisation |
-| A3 | Typed failure meaning at HTTP: request errors 4xx, server faults 5xx with request id | Per mutation kind: syntax, parse, cancel, reject and injected engine error |
-| A4 | Configuration: unknown keys rejected (with path); `config check` command; redacted effective config | Misspelt keys fail at startup; aliases and env overrides still work |
-| A5 | CI: the harness lockfile; the exact locked CI commands pass | `cargo test --locked` for the workspace and the harness |
-| A6 | Honest docs: capability matrix, README, a **supported-semantics contract** (rules supported/omitted, datatype map, graph scope, read models) | Matrix, README, config reference and `/version` capabilities agree |
+| A2 ✅ | Self-difference and other reflexive-equality consistency cases (`eq-ref` gap) | `x owl:differentFrom x` rejected on commit and in full materialisation; committed `b349d11` |
+| A3 ✅ | Typed failure meaning at HTTP: request errors 4xx, server faults 5xx with request id | Per mutation kind: syntax, parse, cancel, reject and injected engine error; committed `f0d5e77` |
+| A4 ✅ | Configuration: unknown keys rejected (with path); `config check` command; redacted effective config | Misspelt keys fail at startup; aliases and env overrides still work; committed `2213722` |
+| A5 ✅ | CI: the harness lockfile; the exact locked CI commands pass | `cargo test --locked` for the workspace and the harness; committed `97a6a78` |
+| A6 ✅ | Honest docs: capability matrix, README, a **supported-semantics contract** (rules supported/omitted, datatype map, graph scope, read models) | Matrix, README, config reference and `/version` capabilities agree: [reasoning-semantics.md](../spec/reasoning-semantics.md); `/version` `reasoning_semantics`; profiles list only what their mode computes |
 | A7 | Ontology diagnostics through the public boundary (malformed/cyclic/oversized lists) | Materialisation and commit reports carry typed diagnostics |
 | A8 | Cancellation and work budgets inside commit-path reasoning | A cancelled large reasoning update releases the writer promptly and leaves both stacks unchanged |
 

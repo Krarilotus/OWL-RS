@@ -14,7 +14,8 @@ NRESE wird eine RDF-Datenbank, die **wie QLever liest und Daten wie GraphDB verw
 | Warum wurde etwas so entschieden? | [docs/adr/](docs/adr/) |
 | Was wird in welcher Reihenfolge gebaut? | [docs/ROADMAP.md](docs/ROADMAP.md) |
 | Wie weit sind wir gegenüber QLever und GraphDB? | [docs/spec/06-target-capability-matrix.md](docs/spec/06-target-capability-matrix.md) |
-| Verhalten der aktuellen v1-Implementierung | [docs/spec/02](docs/spec/02-storage-and-transactions.md), [03](docs/spec/03-reasoner-and-owl-profile.md), [04](docs/spec/04-api-and-protocols.md) |
+| Was das Reasoning berechnet (Regeln, Auslassungen, Graph-Scope, Konsistenz) | [docs/spec/reasoning-semantics.md](docs/spec/reasoning-semantics.md) |
+| Verhalten der v1-Implementierung (historisch) | [docs/spec/02](docs/spec/02-storage-and-transactions.md), [03](docs/spec/03-reasoner-and-owl-profile.md), [04](docs/spec/04-api-and-protocols.md) |
 | Betrieb und Konfiguration | [docs/ops/](docs/ops/), vor allem [config-reference.md](docs/ops/config-reference.md) |
 | Code-Regeln | [docs/dev/code-structure-guidelines.md](docs/dev/code-structure-guidelines.md) |
 

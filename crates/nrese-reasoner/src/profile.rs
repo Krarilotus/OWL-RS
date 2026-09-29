@@ -21,20 +21,30 @@ pub fn profile_for_config(config: &ReasonerConfig) -> ReasonerProfile {
         maturity: CapabilityMaturity::Mvp,
         enabled_by_default,
     };
-    let owl = mode == ReasoningMode::Owl2Rl;
-    let capabilities = match mode {
-        ReasoningMode::Disabled => Vec::new(),
-        ReasoningMode::Rdfs | ReasoningMode::Owl2Rl => vec![
-            capability(ReasonerFeature::RdfsSubclassClosure, true),
-            capability(ReasonerFeature::RdfsSubpropertyClosure, true),
-            capability(ReasonerFeature::RdfsTypePropagation, true),
-            capability(ReasonerFeature::RdfsDomainRangeTyping, true),
-            capability(ReasonerFeature::OwlEqualityReasoning, owl),
-            capability(ReasonerFeature::OwlPropertyChainAxioms, owl),
-            capability(ReasonerFeature::OwlConsistencyCheck, owl),
-            capability(ReasonerFeature::IncrementalRefresh, true),
-        ],
+    // What the mode computes, and nothing it can't: a feature another mode offers isn't
+    // listed as "disabled" here. The precise contract is `docs/spec/reasoning-semantics.md`.
+    let rdfs = [
+        ReasonerFeature::RdfsSubclassClosure,
+        ReasonerFeature::RdfsSubpropertyClosure,
+        ReasonerFeature::RdfsTypePropagation,
+        ReasonerFeature::RdfsDomainRangeTyping,
+        ReasonerFeature::IncrementalRefresh,
+    ];
+    let owl = [
+        ReasonerFeature::OwlEqualityReasoning,
+        ReasonerFeature::OwlPropertyChainAxioms,
+        ReasonerFeature::OwlConsistencyCheck,
+        ReasonerFeature::ExplanationTrace,
+    ];
+    let features: &[ReasonerFeature] = match mode {
+        ReasoningMode::Disabled => &[],
+        ReasoningMode::Rdfs => &rdfs,
+        ReasoningMode::Owl2Rl => &[rdfs.as_slice(), owl.as_slice()].concat(),
     };
+    let capabilities = features
+        .iter()
+        .map(|&feature| capability(feature, true))
+        .collect();
     ReasonerProfile {
         name: match mode {
             ReasoningMode::Disabled => "nrese-disabled",
@@ -48,4 +58,41 @@ pub fn profile_for_config(config: &ReasonerConfig) -> ReasonerProfile {
 
 pub const fn mode_name(mode: ReasoningMode) -> &'static str {
     mode.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_core::ReasonerFeature;
+
+    use super::profile_for_mode;
+    use crate::config::ReasoningMode;
+
+    #[test]
+    fn profiles_list_only_what_their_mode_computes() {
+        let features = |mode| -> Vec<ReasonerFeature> {
+            profile_for_mode(mode)
+                .capabilities
+                .iter()
+                .map(|capability| capability.feature)
+                .collect()
+        };
+        assert!(features(ReasoningMode::Disabled).is_empty());
+        let rdfs = features(ReasoningMode::Rdfs);
+        assert!(rdfs.contains(&ReasonerFeature::RdfsSubclassClosure));
+        assert!(!rdfs.contains(&ReasonerFeature::OwlEqualityReasoning));
+        assert!(!rdfs.contains(&ReasonerFeature::OwlConsistencyCheck));
+        let owl = features(ReasoningMode::Owl2Rl);
+        assert!(rdfs.iter().all(|feature| owl.contains(feature)));
+        assert!(owl.contains(&ReasonerFeature::OwlConsistencyCheck));
+        assert!(owl.contains(&ReasonerFeature::ExplanationTrace));
+        assert!(!owl.contains(&ReasonerFeature::OwlClassSatisfiability));
+        for mode in [ReasoningMode::Rdfs, ReasoningMode::Owl2Rl] {
+            assert!(
+                profile_for_mode(mode)
+                    .capabilities
+                    .iter()
+                    .all(|c| c.enabled_by_default)
+            );
+        }
+    }
 }

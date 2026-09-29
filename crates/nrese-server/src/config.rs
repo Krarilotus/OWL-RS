@@ -72,11 +72,9 @@ impl ServerConfig {
             ("reasoner.mode", self.reasoner.mode().as_str().to_owned()),
             (
                 "reasoner.semantics",
-                self.reasoner
-                    .materialised_ruleset()
-                    .map_or("(none)".to_owned(), |r| {
-                        format!("{} {:016x}", r.name(), r.fingerprint())
-                    }),
+                nrese_reasoner::ReasonerService::new(self.reasoner.clone())
+                    .semantics()
+                    .unwrap_or_else(|| "(none)".to_owned()),
             ),
             ("policy.auth.mode", self.policy.auth.mode_name().to_owned()),
             (

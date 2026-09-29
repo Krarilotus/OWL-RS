@@ -1,0 +1,86 @@
+# Reasoning: supported semantics
+
+This is the contract for what NRESE's reasoning computes, as implemented on 30 September 2026 (`SEMANTICS_VERSION` 2). A mode name alone doesn't state it; this page does. The source of truth is `crates/nrese-reasoner/src/v2/rulesets.rs` (the rule text) and `lists.rs` (list axioms).
+
+## Modes
+
+`reasoner.mode` / `NRESE_REASONING_MODE`: `disabled`, `rdfs` or `owl2-rl`.
+
+### `rdfs`: a 6-rule RDFS subset
+
+| Rule | Derives |
+|---|---|
+| rdfs2, rdfs3 | domain and range typing |
+| rdfs5, rdfs11 | transitive `subPropertyOf`, `subClassOf` |
+| rdfs7, rdfs9 | subproperty and subclass propagation |
+
+**Not included:**
+- the remaining RDFS entailment rules (rdfs1, rdfs4a/b, rdfs6, rdfs8, rdfs10, rdfs12, rdfs13 and the `rdf:` rules);
+- axiomatic triples.
+
+This matches GraphDB's `rdfs` with *partialRDFS*, not full RDFS entailment. Full RDFS is planned (parity plan B1).
+
+### `owl2-rl`: OWL 2 RL/RDF rules
+
+**Included:**
+- **Fixed rules (58):** W3C OWL 2 Profiles §4.3 tables 4 (equality), 5 (properties), 6 (classes), 7 (class axioms) and 9 (schema vocabulary), with the W3C rule names.
+- **One extra `eq-diff1`:** `x owl:differentFrom x` is inconsistent (see `eq-ref` below).
+- **List axioms, instantiated per axiom:** `prp-spo2` (property chains), `prp-key`, `cls-int1/2`, `cls-uni`, `cls-oo`, `scm-int`, `scm-uni`, `cax-adc`, `eq-diff2/3`, `prp-adp`.
+
+**Omitted, and what that means:**
+
+| Omitted | Consequence |
+|---|---|
+| `eq-ref` (`x sameAs x` for every term) | Not materialised (it would double the store). Its consistency consequences are kept: `x differentFrom x`, and AllDifferent lists naming one individual twice, are inconsistent. Queries for `?x owl:sameAs ?x` don't return reflexive pairs. |
+| Datatype rules, table 8 (`dt-type1/2`, `dt-eq`, `dt-diff`, `dt-not-type`) | Literals aren't typed by their datatype, and `"1"^^xsd:integer` and `"01"^^xsd:integer` aren't equated. Ill-typed literals aren't inconsistencies. Planned (parity plan B3), without folding lexical forms. |
+| Axiomatic triples | Not materialised (as W3C allows for the RL/RDF rules). |
+
+**List limits:**
+- A list axiom is instantiated for at most 64 member sequences (when `sameAs` makes several nodes one list).
+- Lists of at most 100 members are instantiated.
+- Longer, malformed (a node without `rdf:first`/`rdf:rest`) or cyclic lists are diagnosed and not instantiated.
+
+**Generalised triples:**
+- Full materialisation may derive intermediate triples RDF can't store: a literal subject, or a non-IRI predicate.
+- Only storable facts are persisted. Commit-path reasoning reads persisted facts, so it doesn't see the dropped ones.
+- This only affects rules that would turn such triples back into storable facts, for example `owl:inverseOf` on a datatype property, which OWL 2 doesn't allow.
+
+**Completeness:** W3C states the conditions under which the RL/RDF rules are complete for OWL 2 RL ontologies. Datasets labelled EL, QL or DL are reasoned with these RL rules, and results are RL entailments, not EL/QL/DL reasoning.
+
+## Graph scope
+
+- Rules match over the **union of all graphs** (default and named).
+- Inferred statements go to the **default graph**.
+- An inferred statement is suppressed while it is asserted in any graph.
+- A named graph is **not** a reasoning boundary: there's no per-graph isolation or inferred provenance yet (planned: R9, per-graph placement).
+
+## Reads
+
+- **Default:** asserted plus inferred (`Materialised`).
+- **Per request:**
+  - `infer=false`, or `FROM <http://www.ontotext.com/explicit>`: asserted only;
+  - `FROM <http://www.ontotext.com/implicit>`: inferred only.
+- Graph Store reads use the default.
+
+## Consistency
+
+- A commit whose closure violates a consistency rule is **rejected**. The response carries an explanation: the rule, its premises (asserted or inferred) and the likely commit-local trigger.
+- Commit-path checking examines what the commit adds, so it relies on a consistent baseline. When a full materialisation finds violations (data imported without reasoning, or a ruleset switched on later), the store is **quarantined**:
+  - `/readyz` answers 503 with status `quarantined` and the violation count;
+  - reads work;
+  - consistent commits are accepted and each one revalidates the whole store, until the data is repaired.
+- `nrese-server load` fails when the loaded data is inconsistent (the data stays loaded).
+
+## Freshness
+
+The reasoning state (`reasoning.state` in the data directory) records:
+- the ruleset;
+- its **semantic fingerprint** (the rule text and `SEMANTICS_VERSION`);
+- the violation count.
+
+Startup skips rematerialisation only if the ruleset and the fingerprint match. A new build that changes what a ruleset derives rebuilds once. `nrese-server check-config` prints the fingerprint. Writes that don't maintain the inferred stack (bulk load, ungated tools, commits with reasoning off, a store changed while opening) drop the state, and the next reasoning write or startup rematerialises.
+
+## Maintenance
+
+- Commits maintain the inferred stack incrementally: DRed with backward/forward proofs, transitive and equality modules.
+- It's equal to full rematerialisation on 84,000 random changes and 3,000 random engine commits (differential tests).
