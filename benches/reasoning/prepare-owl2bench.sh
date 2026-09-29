@@ -11,6 +11,9 @@ export MSYS_NO_PATHCONV=1
 native() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 HERE=$(native "$(cd "$(dirname "$0")" && pwd)")
 JENA_IMAGE=${JENA_IMAGE:-nrese-bench/jena:6.2.0}
+# The pinned Jena image (benches/competitors/jena), built here if missing.
+docker image inspect "$JENA_IMAGE" >/dev/null 2>&1 ||
+  docker build -q -t "$JENA_IMAGE" "$HERE/../competitors/jena" >/dev/null
 
 docker build -q -t nrese-bench/owl2bench "$HERE/owl2bench" >/dev/null
 for spec in ${*:-RL:1 RL:10 EL:1 QL:1 DL:1}; do

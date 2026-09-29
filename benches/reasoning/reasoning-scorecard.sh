@@ -177,6 +177,8 @@ run_jena() { # <dataset> <log> <profile>
 
 # Images and the NRESE build
 docker build -q -t nrese-bench/owlrl-oracle "$HERE/oracle" >/dev/null
+docker image inspect nrese-bench/jena:6.2.0 >/dev/null 2>&1 ||
+  docker build -q -t nrese-bench/jena:6.2.0 "$HERE/../competitors/jena" >/dev/null
 docker build -q -t nrese-bench/jena-reasoner "$HERE/jena" >/dev/null
 docker build -q -t nrese-bench/nemo "$HERE/nemo" >/dev/null
 if [[ " $SYSTEMS " == *" nrese-v"* ]] && [ -z "${SKIP_BUILD:-}" ]; then

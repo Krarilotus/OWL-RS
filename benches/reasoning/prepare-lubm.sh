@@ -20,6 +20,9 @@ export MSYS_NO_PATHCONV=1
 native() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 HERE=$(native "$(cd "$(dirname "$0")" && pwd)")
 JENA_IMAGE=${JENA_IMAGE:-nrese-bench/jena:6.2.0}
+# The pinned Jena image (benches/competitors/jena), built here if missing.
+docker image inspect "$JENA_IMAGE" >/dev/null 2>&1 ||
+  docker build -q -t "$JENA_IMAGE" "$HERE/../competitors/jena" >/dev/null
 ONTOLOGY_URL=http://swat.cse.lehigh.edu/onto/univ-bench.owl
 
 docker build -q -t nrese-bench/lubm-uba "$HERE/lubm" >/dev/null
