@@ -63,7 +63,9 @@ mkdir -p "$RESULTS" "$ORACLE_CACHE"
 measured() {
   local log=$1 image=$2 name=rsc-$$-$RANDOM rc=0
   shift 2
-  timeout "$TIMEOUT_S" docker run --name "$name" \
+  # --init: tini as PID 1 passes the timeout's SIGTERM on (a shell as PID 1 ignores it, and
+  # the container then ran past its limit); -k: KILL if it still hasn't stopped.
+  timeout -k 30 "$TIMEOUT_S" docker run --init --name "$name" \
     ${DOCKER_MEMORY:+--memory "$DOCKER_MEMORY" --memory-swap "$DOCKER_MEMORY"} \
     -v nrese-bench-data:/data:ro \
     -v "$RESULTS:/out" -v "$ORACLE_CACHE:/cache" -v "$HERE/queries:/queries:ro" \
