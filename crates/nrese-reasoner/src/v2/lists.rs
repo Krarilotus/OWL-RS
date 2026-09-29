@@ -347,6 +347,16 @@ pub fn instantiate_with_premises(
     );
     // cax-adc, eq-diff2, prp-adp: pairwise over `members`, by the type of the axiom node.
     let typed = |node: u64, class: u64| facts.objects(node, ty).contains(&class);
+    // The premise that makes two members of an AllDifferent axiom inconsistent: `a sameAs b`,
+    // or, when the list names one individual twice, the axiom itself (`a sameAs a` holds by
+    // eq-ref, which isn't materialised).
+    let different_members = |a: u64, b: u64, node: u64| {
+        if a == b {
+            Atom([c(node), c(ty), c(voc.all_different)])
+        } else {
+            Atom([c(a), c(voc.same_as), c(b)])
+        }
+    };
     lists(
         voc.members,
         "members",
@@ -365,7 +375,7 @@ pub fn instantiate_with_premises(
                     if typed(node, voc.all_different) {
                         rules.push(rule(
                             "eq-diff2",
-                            vec![Atom([c(a), c(voc.same_as), c(b)])],
+                            vec![different_members(a, b, node)],
                             vec![],
                             Head::Inconsistent,
                         ));
@@ -394,7 +404,7 @@ pub fn instantiate_with_premises(
                 for &b in &members[i + 1..] {
                     rules.push(rule(
                         "eq-diff3",
-                        vec![Atom([c(a), c(voc.same_as), c(b)])],
+                        vec![different_members(a, b, node)],
                         vec![],
                         Head::Inconsistent,
                     ));
