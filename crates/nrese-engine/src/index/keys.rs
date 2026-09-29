@@ -98,7 +98,7 @@ impl Header {
 }
 
 /// A sorted array of keys, compressed per block.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PackedKeys {
     len: usize,
     headers: Box<[Header]>,
@@ -107,6 +107,9 @@ pub(crate) struct PackedKeys {
     /// Packed bits; one spare word at the end, so reads never cross the slice end.
     data: Box<[u64]>,
 }
+
+/// Serialised size of a [`Header`].
+const HEADER_BYTES: usize = 8 + 32 + 4 + 8 + 16;
 
 /// Arrays at least this long are packed in parallel.
 const PARALLEL_PACK: usize = 1 << 16;
@@ -182,6 +185,177 @@ impl PackedKeys {
             firsts: keys.chunks(BLOCK).map(|block| block[0]).collect(),
             data: data.into_boxed_slice(),
         }
+    }
+
+    /// Packs keys arriving in sorted order (a merged scan), without holding them all.
+    pub(crate) fn from_sorted_iter(keys: impl Iterator<Item = Key>) -> Self {
+        let mut packed = Self::default();
+        let mut data: Vec<u64> = Vec::new();
+        let (mut headers, mut firsts) = (Vec::new(), Vec::new());
+        let mut block: Vec<Key> = Vec::with_capacity(BLOCK);
+        let mut flush = |block: &mut Vec<Key>, data: &mut Vec<u64>| {
+            let mut header = Header::of(block);
+            header.offset = data.len() as u64;
+            let start = data.len();
+            data.resize(start + header.words(block.len()), 0);
+            header.pack(block, &mut data[start..]);
+            headers.push(header);
+            firsts.push(block[0]);
+            block.clear();
+        };
+        for key in keys {
+            debug_assert!(
+                block.last().is_none_or(|last| *last < key),
+                "keys must be sorted"
+            );
+            block.push(key);
+            packed.len += 1;
+            if block.len() == BLOCK {
+                flush(&mut block, &mut data);
+            }
+        }
+        if !block.is_empty() {
+            flush(&mut block, &mut data);
+        }
+        data.push(0);
+        packed.headers = headers.into_boxed_slice();
+        packed.firsts = firsts.into_boxed_slice();
+        packed.data = data.into_boxed_slice();
+        packed
+    }
+
+    /// Serialises the array: `len | blocks | words | headers | firsts | data`, little-endian;
+    /// `emit` receives consecutive pieces (large arrays in chunks).
+    pub(crate) fn write(
+        &self,
+        emit: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut buffer: Vec<u8> = Vec::with_capacity(1 << 16);
+        for value in [
+            self.len as u64,
+            self.headers.len() as u64,
+            self.data.len() as u64,
+        ] {
+            buffer.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut drain = |buffer: &mut Vec<u8>, force: bool| -> std::io::Result<()> {
+            if force || buffer.len() >= 1 << 16 {
+                emit(buffer)?;
+                buffer.clear();
+            }
+            Ok(())
+        };
+        for header in &self.headers {
+            buffer.extend_from_slice(&header.offset.to_le_bytes());
+            for min in header.payload_min {
+                buffer.extend_from_slice(&min.to_le_bytes());
+            }
+            buffer.extend_from_slice(&header.tag_min);
+            buffer.extend_from_slice(&header.widths);
+            for start in header.starts {
+                buffer.extend_from_slice(&start.to_le_bytes());
+            }
+            drain(&mut buffer, false)?;
+        }
+        for key in &self.firsts {
+            for component in key {
+                buffer.extend_from_slice(&component.to_le_bytes());
+            }
+            drain(&mut buffer, false)?;
+        }
+        for word in &self.data {
+            buffer.extend_from_slice(&word.to_le_bytes());
+            drain(&mut buffer, false)?;
+        }
+        drain(&mut buffer, true)
+    }
+
+    /// Reads what [`write`](Self::write) wrote from `bytes`, returning the array and the
+    /// bytes consumed. The structure is checked (block counts, widths, offsets), so a
+    /// damaged file fails here instead of in a later lookup.
+    pub(crate) fn read(bytes: &[u8]) -> Result<(Self, usize), String> {
+        let mut at = 0;
+        let mut take = |n: usize| -> Result<&[u8], String> {
+            let piece = bytes.get(at..at + n).ok_or("truncated packed keys")?;
+            at += n;
+            Ok(piece)
+        };
+        let u64_at = |piece: &[u8], i: usize| {
+            u64::from_le_bytes(piece[8 * i..8 * i + 8].try_into().expect("8 bytes"))
+        };
+        let counts = take(24)?;
+        let (len, blocks, words) = (u64_at(counts, 0), u64_at(counts, 1), u64_at(counts, 2));
+        let len = usize::try_from(len).map_err(|_| "key count overflows")?;
+        let blocks = usize::try_from(blocks).map_err(|_| "block count overflows")?;
+        let words = usize::try_from(words).map_err(|_| "word count overflows")?;
+        if blocks != len.div_ceil(BLOCK) || words == 0 {
+            return Err("inconsistent packed key counts".into());
+        }
+        let raw = take(
+            blocks
+                .checked_mul(HEADER_BYTES)
+                .ok_or("header size overflows")?,
+        )?;
+        let mut headers = Vec::with_capacity(blocks);
+        let mut expected_offset = 0u64;
+        for (b, piece) in raw.as_chunks::<HEADER_BYTES>().0.iter().enumerate() {
+            let mut header = Header {
+                offset: u64_at(piece, 0),
+                ..Header::default()
+            };
+            for c in 0..4 {
+                header.payload_min[c] = u64_at(piece, 1 + c);
+            }
+            header.tag_min.copy_from_slice(&piece[40..44]);
+            header.widths.copy_from_slice(&piece[44..52]);
+            for (i, start) in header.starts.iter_mut().enumerate() {
+                *start = u16::from_le_bytes([piece[52 + 2 * i], piece[53 + 2 * i]]);
+            }
+            let n = BLOCK.min(len - b * BLOCK);
+            let valid_widths = header.widths.chunks(2).all(|w| w[0] <= 4 && w[1] <= 60);
+            let mut bit = 0;
+            let valid_starts = header
+                .starts
+                .iter()
+                .zip(&header.widths)
+                .all(|(&start, &w)| {
+                    let ok = start as usize == bit;
+                    bit += n * w as usize;
+                    ok
+                });
+            if header.offset != expected_offset || !valid_widths || !valid_starts {
+                return Err(format!("damaged header of block {b}"));
+            }
+            expected_offset += header.words(n) as u64;
+            headers.push(header);
+        }
+        if expected_offset + 1 != words as u64 {
+            return Err("packed data length does not match its blocks".into());
+        }
+        let raw = take(blocks.checked_mul(32).ok_or("first keys overflow")?)?;
+        let firsts: Vec<Key> = raw
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|piece| std::array::from_fn(|c| u64_at(piece, c)))
+            .collect();
+        let raw = take(words.checked_mul(8).ok_or("data size overflows")?)?;
+        let data: Vec<u64> = raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| u64::from_le_bytes(*b))
+            .collect();
+        let keys = Self {
+            len,
+            headers: headers.into_boxed_slice(),
+            firsts: firsts.into_boxed_slice(),
+            data: data.into_boxed_slice(),
+        };
+        if (0..blocks).any(|b| keys.get(b * BLOCK) != keys.firsts[b]) {
+            return Err("packed first keys do not match their blocks".into());
+        }
+        Ok((keys, at))
     }
 
     #[inline]
@@ -383,6 +557,44 @@ mod tests {
                         && k[position] < u64::MAX),
                     expected
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn serialised_keys_read_back() {
+        let mut state = 17;
+        for n in [0, 1, 128, 1000, 70_000] {
+            let keys = random_keys(&mut state, n);
+            let packed = PackedKeys::from_sorted(&keys);
+            let streamed = PackedKeys::from_sorted_iter(keys.iter().copied());
+            let mut bytes = Vec::new();
+            packed
+                .write(&mut |piece| {
+                    bytes.extend_from_slice(piece);
+                    Ok(())
+                })
+                .unwrap();
+            let mut streamed_bytes = Vec::new();
+            streamed
+                .write(&mut |piece| {
+                    streamed_bytes.extend_from_slice(piece);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(bytes, streamed_bytes, "streaming packs identically, n {n}");
+            bytes.extend_from_slice(b"trailing");
+            let (read, used) = PackedKeys::read(&bytes).unwrap();
+            assert_eq!(used, bytes.len() - 8);
+            assert_eq!(
+                (0..read.len()).map(|i| read.get(i)).collect::<Vec<_>>(),
+                keys
+            );
+            if n > 0 {
+                let mut damaged = bytes.clone();
+                damaged[24 + 44] = 61; // a tag width no header can have
+                assert!(PackedKeys::read(&damaged).is_err());
+                assert!(PackedKeys::read(&bytes[..bytes.len() - 16]).is_err());
             }
         }
     }

@@ -103,19 +103,37 @@ impl Durable {
         }
         let clock = std::time::Instant::now();
         let mut version = match loaded {
-            Some(loaded) => Version {
-                asserted: IndexVersion::from_quads(Stack::Asserted.layout(), loaded.quads),
-                inferred: IndexVersion::from_quads(
-                    Stack::Inferred.layout(),
-                    loaded
-                        .inferred
-                        .into_iter()
-                        .map(|triple| triple.in_default_graph())
-                        .collect(),
-                ),
-                revision: loaded.revision,
-                dictionary_len: 0,
-            },
+            Some(loaded) => {
+                let (asserted, inferred) = match loaded.stacks {
+                    checkpoint::Stacks::Packed([asserted, inferred]) => {
+                        let index = |stack: Stack, packed| {
+                            IndexVersion::from_packed(stack.layout(), packed).map_err(|error| {
+                                EngineError::Corruption(format!("checkpoint: {error}"))
+                            })
+                        };
+                        (
+                            index(Stack::Asserted, asserted)?,
+                            index(Stack::Inferred, inferred)?,
+                        )
+                    }
+                    checkpoint::Stacks::Quads { quads, inferred } => (
+                        IndexVersion::from_quads(Stack::Asserted.layout(), quads),
+                        IndexVersion::from_quads(
+                            Stack::Inferred.layout(),
+                            inferred
+                                .into_iter()
+                                .map(|triple| triple.in_default_graph())
+                                .collect(),
+                        ),
+                    ),
+                };
+                Version {
+                    asserted,
+                    inferred,
+                    revision: loaded.revision,
+                    dictionary_len: 0,
+                }
+            }
             None => Version::empty(),
         };
         if timing {

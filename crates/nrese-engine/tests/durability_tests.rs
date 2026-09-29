@@ -378,3 +378,74 @@ fn copy_dir(from: &Path, to: &Path) {
         }
     }
 }
+
+/// A checkpoint of a stack with several runs and tombstones (no compaction) stores the
+/// merged, visible state; restart reads it back as one run (format 5).
+#[test]
+fn checkpoint_of_many_runs_with_tombstones_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        compaction: nrese_engine::CompactionPolicy {
+            fanout: 0,
+            ..nrese_engine::CompactionPolicy::default()
+        },
+        ..config()
+    };
+    let engine = Engine::open(dir.path(), config).unwrap();
+    let mut batches = batches(0..400);
+    // Delete quads inserted by earlier commits: tombstones in later runs.
+    for (i, (_, deletes)) in batches.iter_mut().enumerate().skip(1) {
+        deletes.extend((0..(i as u64 * 3)).step_by(7).map(quad));
+    }
+    let states = commit_all(&engine, &batches);
+    assert!(engine.stats().runs > 4, "runs: {}", engine.stats().runs);
+    engine.checkpoint().unwrap();
+    let expected = states.last().unwrap().clone();
+    assert_eq!(contents(&engine), expected);
+    drop(engine);
+    let reopened = Engine::open(dir.path(), config).unwrap();
+    assert_eq!(contents(&reopened), expected);
+    assert_eq!(reopened.stats().runs, 1, "one run per stack after restart");
+}
+
+/// Checkpoints in format 4 (stacks as quad lists) are still read.
+#[test]
+fn format_4_checkpoints_are_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let iri = |index: u64| (1u64 << 60) | index;
+    let integer = {
+        let engine = Engine::new(config()).unwrap();
+        let mut tx = engine.transaction();
+        tx.insert(quad(0).as_ref());
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        snapshot
+            .lookup(
+                Literal::new_typed_literal("0", xsd::INTEGER)
+                    .as_ref()
+                    .into(),
+            )
+            .unwrap()
+            .raw()
+    };
+    let mut file = b"NRESECK4".to_vec();
+    file.extend_from_slice(&7u64.to_le_bytes()); // revision
+    let keys: [&[u8]; 2] = [b"Ihttp://example.com/s0", b"Ihttp://example.com/p0"];
+    file.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+    for key in keys {
+        file.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        file.extend_from_slice(key);
+    }
+    file.extend_from_slice(&1u64.to_le_bytes()); // one asserted quad
+    for component in [iri(0), iri(1), integer, 0] {
+        file.extend_from_slice(&component.to_le_bytes());
+    }
+    file.extend_from_slice(&0u64.to_le_bytes()); // no inferred triples
+    let crc = crc32(&file);
+    file.extend_from_slice(&crc.to_le_bytes());
+    fs::write(dir.path().join("checkpoint-00000000000000000007.nck"), file).unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let expected: HashSet<Quad> = [quad(0)].into_iter().collect();
+    assert_eq!(contents(&engine), expected);
+    assert_eq!(engine.stats().revision, 7);
+}
