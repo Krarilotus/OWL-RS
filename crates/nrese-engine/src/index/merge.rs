@@ -10,6 +10,7 @@
 //! Cost: O(k) per distinct key for k inputs. The engine keeps k at O(log_F n) runs via
 //! compaction; a loser tree only pays off for larger k and is left to the Pf work packages.
 
+use super::keys::BLOCK;
 use super::run::PermutationRun;
 use crate::quad::Key;
 
@@ -17,12 +18,47 @@ struct Cursor<'a> {
     run: &'a PermutationRun,
     pos: usize,
     end: usize,
+    /// The key at `pos`, decoded once.
+    key: Key,
+    /// Keys decoded ahead, starting at index `buffered`; filled on long ranges only, so
+    /// point probes decode just the keys they read.
+    buffer: Vec<Key>,
+    buffered: usize,
 }
+
+/// A range at least this long left in the current block is decoded block-wise.
+const BUFFER_FROM: usize = 16;
 
 impl Cursor<'_> {
     #[inline]
     fn key(&self) -> &Key {
-        &self.run.keys[self.pos]
+        &self.key
+    }
+
+    /// Moves to the next entry; false at the end.
+    #[inline]
+    fn advance(&mut self) -> bool {
+        self.pos += 1;
+        if self.pos == self.end {
+            return false;
+        }
+        let offset = self.pos - self.buffered;
+        if offset < self.buffer.len() {
+            self.key = self.buffer[offset];
+            return true;
+        }
+        let block_end = self.end.min((self.pos / BLOCK + 1) * BLOCK);
+        if block_end - self.pos >= BUFFER_FROM {
+            self.buffer.clear();
+            self.run
+                .keys
+                .decode_range(self.pos, block_end, &mut self.buffer);
+            self.buffered = self.pos;
+            self.key = self.buffer[0];
+        } else {
+            self.key = self.run.keys.get(self.pos);
+        }
+        true
     }
 
     #[inline]
@@ -45,7 +81,14 @@ impl<'a> SignedMerge<'a> {
         let cursors = parts
             .into_iter()
             .filter(|&(_, start, end)| start < end)
-            .map(|(run, pos, end)| Cursor { run, pos, end })
+            .map(|(run, pos, end)| Cursor {
+                run,
+                pos,
+                end,
+                key: run.keys.get(pos),
+                buffer: Vec::new(),
+                buffered: pos + 1,
+            })
             .collect();
         Self { cursors }
     }
@@ -65,8 +108,7 @@ impl Iterator for SignedMerge<'_> {
         if let [cursor] = self.cursors.as_mut_slice() {
             // Single input: no comparisons needed.
             let item = (*cursor.key(), cursor.sign());
-            cursor.pos += 1;
-            if cursor.pos == cursor.end {
+            if !cursor.advance() {
                 self.cursors.clear();
             }
             return Some(item);
@@ -78,8 +120,7 @@ impl Iterator for SignedMerge<'_> {
             let cursor = &mut self.cursors[i];
             if *cursor.key() == key {
                 sign += cursor.sign();
-                cursor.pos += 1;
-                if cursor.pos == cursor.end {
+                if !cursor.advance() {
                     self.cursors.swap_remove(i);
                     continue;
                 }

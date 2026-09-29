@@ -329,3 +329,50 @@ fn distinct_counts_match_the_data() {
     tx.commit().expect("commit");
     assert_eq!(predicates(&engine.snapshot()), Some(7));
 }
+
+/// `exists_in` agrees with `count_in > 0` on random patterns, with and without deletes.
+#[test]
+fn exists_agrees_with_count() {
+    use nrese_engine::ReadModel;
+
+    let engine = inline_engine();
+    let mut state = 3u64;
+    let mut next = |n: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (state >> 33) % n
+    };
+    for round in 0..8 {
+        let mut tx = engine.transaction();
+        for _ in 0..200 {
+            tx.insert(quad(next(60), 1000 + next(4), next(60)).as_ref());
+        }
+        if round % 3 == 2 {
+            for _ in 0..150 {
+                tx.remove(quad(next(60), 1000 + next(4), next(60)).as_ref());
+            }
+        }
+        tx.commit().expect("commit");
+        let snapshot = engine.snapshot();
+        for _ in 0..300 {
+            let term = |n: u64, next: &mut dyn FnMut(u64) -> u64| {
+                (next(3) > 0)
+                    .then(|| snapshot.lookup(iri(n).as_ref().into()))
+                    .flatten()
+            };
+            let pattern = QuadPattern {
+                subject: term(next(60), &mut next),
+                predicate: term(1000 + next(4), &mut next),
+                object: term(next(60), &mut next),
+                graph: GraphSelector::Exact(nrese_engine::TermId::DEFAULT_GRAPH),
+            };
+            let model = ReadModel::Materialised;
+            assert_eq!(
+                snapshot.exists_in(model, &pattern),
+                snapshot.count_in(model, &pattern) > 0,
+                "{pattern:?}"
+            );
+        }
+    }
+}

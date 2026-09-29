@@ -138,6 +138,15 @@ impl Snapshot {
             .sum()
     }
 
+    /// True if some quad matches `pattern` in `model`; cheaper than
+    /// [`count_in`](Self::count_in)` > 0`.
+    pub fn exists_in(&self, model: ReadModel, pattern: &QuadPattern) -> bool {
+        let plan = AccessPlan::for_pattern(pattern);
+        Stack::ALL
+            .into_iter()
+            .any(|stack| model.includes(stack) && self.version.stack(stack).any_plan(&plan))
+    }
+
     /// Quads matching `pattern` in `model`, sorted by `permutation`'s key order, or `None` if
     /// the pattern's bound components aren't a prefix of that order (see
     /// [`Permutation::order`]). Executors use this to get scans in the order a merge join
