@@ -398,6 +398,8 @@ Benchmarks run on one documented machine profile. Numbers go into `docs/spec/06-
 
 ## 6. Friend's GraphDB parity list: disposition
 
+The current status of every item and the order of work (phases A–F) are in [plan/2026-09-30-graphdb-parity-plan.md](plan/2026-09-30-graphdb-parity-plan.md).
+
 **A** = adopt as written, **Ad** = adopt with a design change, **D** = defer (with target), **R** = reject.
 
 | Item | Disposition | Where | Note |
