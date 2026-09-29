@@ -27,6 +27,17 @@ pub enum AuthConfig {
 }
 
 impl AuthConfig {
+    /// The authentication mode, without its credentials.
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::BearerStatic(_) => "bearer-static",
+            Self::BearerJwt(_) => "bearer-jwt",
+            Self::Mtls(_) => "mtls",
+            Self::OidcIntrospection(_) => "oidc-introspection",
+        }
+    }
+
     pub async fn authorize(
         &self,
         action: PolicyAction,

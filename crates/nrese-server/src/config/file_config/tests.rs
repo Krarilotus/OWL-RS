@@ -72,3 +72,27 @@ admin_subjects = ["CN=admin,O=Test"]
         Some("plain-text")
     );
 }
+
+/// A misspelt or unsupported key is a startup error naming the key, not a silently ignored
+/// setting; aliases still work.
+#[test]
+fn unknown_keys_are_rejected_and_aliases_accepted() {
+    let temp_dir = tempdir().expect("temp dir");
+    let path = temp_dir.path().join("config.toml");
+    for (text, key) in [
+        ("unknown_table = 1\n", "unknown_table"),
+        ("[store]\nmdoe = \"on-disk\"\n", "mdoe"),
+        ("[reasoner]\nconsistency = \"report\"\n", "consistency"),
+        ("[policy.limits]\nmax_query_byte = 1\n", "max_query_byte"),
+    ] {
+        fs::write(&path, text).expect("write config");
+        let error = format!("{:#}", load_file_source(&path).expect_err(text));
+        assert!(error.contains(key), "{key}: {error}");
+    }
+    fs::write(&path, "[server]\nbind_addr = \"127.0.0.1:9000\"\n").expect("write config");
+    let source = load_file_source(&path).expect("alias accepted");
+    assert_eq!(
+        source.get(names::BIND_ADDR).as_deref(),
+        Some("127.0.0.1:9000")
+    );
+}

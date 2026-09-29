@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawFileConfig {
     #[serde(default)]
     pub server: RawServerConfig,
@@ -17,6 +18,7 @@ pub(super) struct RawFileConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawServerConfig {
     #[serde(default, alias = "bind_addr")]
     pub bind_address: Option<String>,
@@ -25,6 +27,7 @@ pub(super) struct RawServerConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawStoreConfig {
     #[serde(default)]
     pub mode: Option<String>,
@@ -37,12 +40,14 @@ pub(super) struct RawStoreConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawReasonerConfig {
     #[serde(default)]
     pub mode: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawPolicyConfig {
     #[serde(default)]
     pub limits: RawLimitsConfig,
@@ -57,6 +62,7 @@ pub(super) struct RawPolicyConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawLimitsConfig {
     #[serde(default)]
     pub max_query_bytes: Option<usize>,
@@ -69,6 +75,7 @@ pub(super) struct RawLimitsConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawRateLimitConfig {
     #[serde(default)]
     pub window_secs: Option<u64>,
@@ -81,6 +88,7 @@ pub(super) struct RawRateLimitConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawTimeoutConfig {
     #[serde(default)]
     pub query_ms: Option<u64>,
@@ -93,6 +101,7 @@ pub(super) struct RawTimeoutConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawExposureConfig {
     #[serde(default)]
     pub operator_ui: Option<bool>,
@@ -101,6 +110,7 @@ pub(super) struct RawExposureConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawAuthConfig {
     #[serde(default)]
     pub mode: Option<String>,
@@ -115,6 +125,7 @@ pub(super) struct RawAuthConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawAiConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -135,6 +146,7 @@ pub(super) struct RawAiConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawAiGeminiConfig {
     #[serde(default)]
     pub api_key: Option<String>,
@@ -143,6 +155,7 @@ pub(super) struct RawAiGeminiConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawAiOpenRouterConfig {
     #[serde(default)]
     pub api_key: Option<String>,
@@ -155,6 +168,7 @@ pub(super) struct RawAiOpenRouterConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawBearerStaticConfig {
     #[serde(default)]
     pub read_token: Option<String>,
@@ -163,6 +177,7 @@ pub(super) struct RawBearerStaticConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawBearerJwtConfig {
     #[serde(default)]
     pub shared_secret: Option<String>,
@@ -179,6 +194,7 @@ pub(super) struct RawBearerJwtConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawMtlsConfig {
     #[serde(default)]
     pub subject_header: Option<String>,
@@ -189,6 +205,7 @@ pub(super) struct RawMtlsConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RawOidcIntrospectionConfig {
     #[serde(default)]
     pub introspection_url: Option<String>,
