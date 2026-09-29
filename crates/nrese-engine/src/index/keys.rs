@@ -119,6 +119,8 @@ fn width(max: u64) -> u8 {
     (64 - max.leading_zeros()) as u8
 }
 
+/// The `width`-bit value at `bit`. Two predictable branches beat a branch-free `u128`
+/// double-word shift here (measured with `keys_bench`: 13 against 32 ns per random key).
 #[inline]
 fn read(data: &[u64], bit: usize, width: u8) -> u64 {
     if width == 0 {
@@ -646,5 +648,63 @@ mod tests {
         let packed = PackedKeys::from_sorted(&keys);
         let per_key = packed.memory_bytes() as f64 / keys.len() as f64;
         assert!(per_key < 8.0, "{per_key} bytes per key");
+    }
+
+    /// Micro-benchmark of the hot paths (random access, bound search, block decode) over a
+    /// million realistic keys: `cargo test --release -p nrese-engine --lib keys_bench --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn keys_bench() {
+        let mut state = 23;
+        let mut keys: Vec<Key> = (0..1_000_000u64)
+            .map(|i| {
+                let object = if i % 3 == 0 {
+                    (3 << TAG_SHIFT) | (rng(&mut state) % 3_000_000)
+                } else {
+                    (1 << TAG_SHIFT) | (rng(&mut state) % 3_000_000)
+                };
+                [
+                    (1 << TAG_SHIFT) | (i / 7),
+                    (1 << TAG_SHIFT) | (i % 20),
+                    object,
+                    0,
+                ]
+            })
+            .collect();
+        keys.sort_unstable();
+        let packed = PackedKeys::from_sorted(&keys);
+        let probes: Vec<Key> = (0..1_000_000)
+            .map(|_| keys[(rng(&mut state) % 1_000_000) as usize])
+            .collect();
+        let positions: Vec<usize> = (0..10_000_000)
+            .map(|_| (rng(&mut state) % 1_000_000) as usize)
+            .collect();
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let mut sum = 0u64;
+            for &i in &positions {
+                sum = sum.wrapping_add(packed.get(i)[2]);
+            }
+            let get = start.elapsed().as_secs_f64() * 1e9 / positions.len() as f64;
+            let start = std::time::Instant::now();
+            for probe in &probes {
+                sum = sum.wrapping_add(packed.bound_in(0, packed.len(), probe, false) as u64);
+            }
+            let bound = start.elapsed().as_secs_f64() * 1e9 / probes.len() as f64;
+            let start = std::time::Instant::now();
+            let mut out = Vec::with_capacity(BLOCK);
+            for round in 0..10 {
+                for block in 0..packed.len() / BLOCK {
+                    out.clear();
+                    packed.decode_range(block * BLOCK, block * BLOCK + BLOCK, &mut out);
+                    sum = sum.wrapping_add(out[round % BLOCK][2]);
+                }
+            }
+            let decode = start.elapsed().as_secs_f64() * 1e9 / (10 * packed.len()) as f64;
+            eprintln!(
+                "get {get:.1} ns | bound_in {bound:.1} ns | decode {decode:.2} ns/key | {sum}"
+            );
+        }
     }
 }
