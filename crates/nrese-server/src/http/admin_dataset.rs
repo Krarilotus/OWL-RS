@@ -18,7 +18,7 @@ const QUAD_COUNT_HEADER: &str = "x-nrese-quad-count";
 const CHECKSUM_HEADER: &str = "x-nrese-checksum-sha256";
 
 pub async fn backup(state: AppState) -> Result<Response, ApiError> {
-    ensure_ready(&state)?;
+    state.ensure_serving()?;
 
     let store = state.store();
     let artifact =
@@ -57,7 +57,7 @@ pub async fn restore(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    ensure_ready(&state)?;
+    state.ensure_serving()?;
     let format = parse_restore_format(headers.get(header::CONTENT_TYPE))?;
     let request = DatasetRestoreRequest {
         format,
@@ -81,14 +81,6 @@ pub async fn restore(
     };
 
     Ok((StatusCode::OK, Json(build_admin_restore_response(&report))).into_response())
-}
-
-fn ensure_ready(state: &AppState) -> Result<(), ApiError> {
-    if state.is_ready() {
-        Ok(())
-    } else {
-        Err(ApiError::unavailable("server is not ready yet"))
-    }
 }
 
 fn parse_restore_format(

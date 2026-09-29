@@ -9,7 +9,7 @@ use crate::http::guard;
 use crate::http::media::{header_value_str, media_type_matches};
 use crate::http::mutation;
 use crate::http::rdf_payload::{
-    ensure_ready, parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
+    parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
 };
 use crate::state::AppState;
 
@@ -53,7 +53,7 @@ async fn read_graph(
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<nrese_store::GraphReadResult, ApiError> {
-    ensure_ready(&state)?;
+    state.ensure_serving()?;
 
     let target = parse_graph_target(&raw_query)?;
     let format = parse_graph_accept_format(header_value_str(headers.get(header::ACCEPT)));
@@ -92,7 +92,7 @@ pub async fn delete_graph(
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    ensure_ready(&state)?;
+    state.ensure_serving()?;
     guard::enforce_graph_write(&state, &headers).await?;
     let target = parse_graph_target(&raw_query)?;
     mutation::run(
@@ -113,7 +113,7 @@ async fn write_graph(
     body: Bytes,
     replace: bool,
 ) -> Result<StatusCode, ApiError> {
-    ensure_ready(&state)?;
+    state.ensure_serving()?;
     guard::enforce_graph_write(&state, &headers).await?;
     state.policy().enforce_rdf_upload_bytes(body.len())?;
     let target = parse_graph_target(&raw_query)?;
