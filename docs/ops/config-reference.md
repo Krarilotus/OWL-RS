@@ -30,6 +30,11 @@ Notes:
 - If no config file path is provided by CLI or `NRESE_CONFIG_PATH`, the server runs from env/defaults only.
 - External reasoner input may still be expressed as `mode`, `preset`, and optional feature overrides, but the server resolves those inputs into one runtime profile/tier contract before diagnostics, capabilities, and frontend surfaces see them.
 
+## Validation
+
+- Unknown keys in the TOML file are a startup error that names the key (for example a misspelt `mdoe`). Known aliases such as `server.bind_addr` still work.
+- `nrese-server check-config [--config FILE]` loads and validates the configuration (file, then environment overrides), prints the effective settings and exits. Credentials are never printed: authentication and AI show their mode and provider only. `reasoner.semantics` shows the ruleset and its semantic fingerprint (the stored inferences are rebuilt when it changes).
+
 ## Minimal Example
 
 ```toml

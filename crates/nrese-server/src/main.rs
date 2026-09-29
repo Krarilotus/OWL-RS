@@ -19,6 +19,12 @@ async fn main() -> Result<()> {
 
     let cli = CliConfig::from_args(std::env::args_os())?;
     let config = ServerConfig::load(cli.config_path.as_deref())?;
+    if cli.command == CliCommand::CheckConfig {
+        // Loading validated everything; show what takes effect.
+        print!("{}", config.summary());
+        println!("configuration is valid");
+        return Ok(());
+    }
     let store = StoreService::new(config.store.clone())?;
     let ruleset = config.reasoner.materialised_ruleset();
     if let CliCommand::Load(load) = cli.command {
