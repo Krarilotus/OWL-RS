@@ -56,13 +56,13 @@ pub fn evaluate_query<'a, V: ReadView>(
     }
     let evaluator = evaluator(options.cancellation.as_ref());
     let mut prepared = evaluator.prepare(query);
-    if let Some(dataset) = &options.dataset {
-        *prepared.dataset_mut() = dataset.clone();
-    }
-    prepared.execute(
-        EngineDataset::with_model(view, options.read_model)
-            .union_default_graph(options.union_default_graph),
-    )
+    // The adapter presents the query's dataset as an ordinary store.
+    *prepared.dataset_mut() = QueryDatasetSpecification::new();
+    prepared.execute(EngineDataset::with_model(view, options.read_model).reading(
+        options.union_default_graph,
+        options.dataset.as_ref(),
+        query.dataset(),
+    ))
 }
 
 /// A failure while writing results directly ([`write_results`]).

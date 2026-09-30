@@ -329,9 +329,12 @@ fn by_value(term: &Term) -> Term {
     }
 }
 
+/// The rows of a SELECT, as strings; an ASK is one row, `true` or `false`.
 fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
-    let QueryResults::Solutions(solutions) = results else {
-        panic!("SELECT gives solutions")
+    let solutions = match results {
+        QueryResults::Solutions(solutions) => solutions,
+        QueryResults::Boolean(answer) => return vec![answer.to_string()],
+        QueryResults::Graph(_) => panic!("SELECT and ASK give no graph"),
     };
     let variables: Vec<_> = solutions.variables().to_vec();
     let mut out: Vec<String> = solutions
@@ -2506,4 +2509,608 @@ fn updates_over_the_merged_default_graph_equal_spareval() {
         }
     }
     assert!(changed > 100, "only {changed} updates changed anything");
+}
+
+/// A `WHERE` body for the dataset tests: what the default graph of the dataset holds,
+/// `GRAPH` with a name or a variable over every kind of pattern (triple patterns, paths,
+/// subqueries, `VALUES` and `BIND` without a triple pattern, `MINUS`, (NOT) EXISTS, nested
+/// `GRAPH`, the graph variable as a subject or object), and joins of the two. Patterns
+/// are connected, so that they have solutions.
+///
+/// Where spareval departs from SPARQL 1.1 §18.6, the generator stays out and
+/// [`a_dataset_is_what_the_query_names`] checks the native executor by example: a pattern
+/// that gives rows without reading a statement is only put under `GRAPH ?g`, and isn't
+/// `VALUES` (under the name of a graph outside the dataset spareval gives its rows, where
+/// the standard gives none; under `GRAPH ?g` it leaves `?g` unbound in the rows of
+/// `VALUES`), and a subquery or a `MINUS` without a variable in common is only put under
+/// a graph's name (under `GRAPH ?g` spareval evaluates the subquery once over all graphs,
+/// with `?g` unbound, and takes `?g` for a variable the two sides of `MINUS` share).
+fn dataset_body(rng: &mut Rng) -> String {
+    let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+    let graph = |rng: &mut Rng| {
+        rng.pick(&[
+            "?g",
+            "?g",
+            "<http://example.com/g0>",
+            "<http://example.com/g1>",
+            "<http://example.com/e1>",
+            "<http://example.com/g9>",
+        ])
+        .to_string()
+    };
+    let path = |rng: &mut Rng| {
+        rng.pick(&[
+            "<P0>+",
+            "(<P0>|<P1>)+",
+            "<P1>/<P2>",
+            "^<P2>/<P0>",
+            "!(<P0>|<P1>)",
+            "<P0>|<P3>",
+        ])
+        .replace("<P", &format!("<{EX}p"))
+    };
+    match rng.below(16) {
+        0 => group_pattern(rng, 0),
+        1 => format!(
+            "{} GRAPH {} {{ {} }}",
+            triple(rng),
+            graph(rng),
+            group_pattern(rng, 0)
+        ),
+        // Paths in a named graph, from a free and from a bound start.
+        2 => format!("GRAPH {} {{ ?a {} ?c }}", graph(rng), path(rng)),
+        3 => format!(
+            "GRAPH {} {{ ?a {} ?b . ?b {} ?c }}",
+            graph(rng),
+            p(rng),
+            path(rng)
+        ),
+        4 => format!(
+            "?a {} ?b . GRAPH {} {{ ?b {} ?c }}",
+            p(rng),
+            graph(rng),
+            path(rng)
+        ),
+        // Zero-length paths from a constant: a term is a node of a graph that names it.
+        5 => format!(
+            "GRAPH ?g {{ <{EX}e{}> ({}|{})* ?c }}",
+            rng.below(7),
+            p(rng),
+            p(rng)
+        ),
+        // A subquery.
+        6 => format!(
+            "GRAPH {} {{ {{ SELECT ?a (COUNT(?b) AS ?n) (MAX(?b) AS ?m) WHERE {{ ?a {} ?b }} GROUP BY ?a }} }}",
+            rng.pick(&[
+                "<http://example.com/g0>",
+                "<http://example.com/e1>",
+                "<http://example.com/g9>"
+            ]),
+            p(rng)
+        ),
+        // MINUS: no variable in common removes nothing.
+        7 => {
+            let graph = graph(rng);
+            let shared: &[&str] = if graph == "?g" {
+                &["?a", "?b"]
+            } else {
+                &["?a", "?b", "?c"]
+            };
+            format!(
+                "GRAPH {graph} {{ ?a {} ?b MINUS {{ {} {} ?d }} }}",
+                p(rng),
+                rng.pick(shared),
+                p(rng)
+            )
+        }
+        // Rows that no triple pattern gives.
+        8 | 9 => format!(
+            "GRAPH ?g {{ {} }}",
+            *rng.pick(&["", "BIND(1 AS ?x)", "{ BIND(1 AS ?x) } { BIND(2 AS ?y) }"])
+        ),
+        10 => format!(
+            "GRAPH {} {{ ?a {} ?b GRAPH ?h {{ ?b {} ?c }} }}",
+            graph(rng),
+            p(rng),
+            p(rng)
+        ),
+        // The default graph of the dataset, read by paths.
+        11 => format!("?a {} ?c . OPTIONAL {{ ?c {} ?d }}", path(rng), p(rng)),
+        12 => format!(
+            "GRAPH {} {{ ?a {} ?b FILTER {}EXISTS {{ ?b {} ?c }} }}",
+            graph(rng),
+            p(rng),
+            if rng.below(2) == 0 { "NOT " } else { "" },
+            p(rng)
+        ),
+        // The graph's name among its own terms (e1 names a graph and an entity).
+        13 => {
+            let path = path(rng);
+            format!(
+                "GRAPH ?g {{ {} }}",
+                rng.pick(&[
+                    "?g ?p ?b".to_owned(),
+                    "?a ?p ?g".to_owned(),
+                    "?a ?p ?b BIND(?g AS ?x)".to_owned(),
+                    format!("?g {path} ?b"),
+                    format!("?a {path} ?g"),
+                ])
+            )
+        }
+        14 => format!(
+            "GRAPH ?g {{ ?a {} ?b }} GRAPH ?h {{ ?a {} ?c }} FILTER(?g != ?h)",
+            p(rng),
+            p(rng)
+        ),
+        _ => format!(
+            "{{ ?a {} ?b }} UNION {{ GRAPH {} {{ ?a {} ?b OPTIONAL {{ ?b {} ?c }} }} }}",
+            p(rng),
+            graph(rng),
+            p(rng),
+            path(rng)
+        ),
+    }
+}
+
+/// `FROM` and `FROM NAMED` clauses: none, one graph, several (their merge), a graph the
+/// store doesn't hold, named graphs only, and both kinds.
+fn dataset_clause(rng: &mut Rng) -> String {
+    let from: &[&str] = match rng.below(7) {
+        0 | 1 => &[],
+        2 => &["g0"],
+        3 => &["g0", "g1"],
+        4 => &["g0", "g1", "e1"],
+        5 => &["g9"],
+        _ => &["g1", "g9"],
+    };
+    let named: &[&str] = match rng.below(5) {
+        0 | 1 => &[],
+        2 => &["g0"],
+        3 => &["g1", "e1"],
+        _ => &["g0", "g1", "e1", "g9"],
+    };
+    from.iter()
+        .map(|g| format!("FROM <{EX}{g}> "))
+        .chain(named.iter().map(|g| format!("FROM NAMED <{EX}{g}> ")))
+        .collect()
+}
+
+/// The protocol's dataset (`default-graph-uri`, `named-graph-uri`), which replaces the
+/// query's: the store's default graph may be one of its default graphs.
+fn protocol_dataset(rng: &mut Rng) -> Option<nrese_sparql::QueryDatasetSpecification> {
+    let default: Vec<GraphName> = match rng.below(7) {
+        0..=2 => return None,
+        3 => vec![ex("g0").into()],
+        4 => vec![GraphName::DefaultGraph, ex("g1").into()],
+        5 => vec![GraphName::DefaultGraph],
+        _ => vec![ex("g0").into(), ex("e1").into(), ex("g9").into()],
+    };
+    let only_the_store_default = default == [GraphName::DefaultGraph];
+    let mut dataset = nrese_sparql::QueryDatasetSpecification::new();
+    dataset.set_default_graph(default);
+    if only_the_store_default || rng.below(2) == 0 {
+        dataset.set_available_named_graphs(vec![ex("g1").into(), ex("e1").into()]);
+    }
+    Some(dataset)
+}
+
+/// Datasets (`FROM`, `FROM NAMED`, the protocol's parameters) and `GRAPH` over any
+/// pattern run on the native executor and equal spareval, under every read model and
+/// with the store's default graph plain or merged.
+#[test]
+fn datasets_and_graph_patterns_equal_spareval() {
+    let mut rng = Rng(20_260_935);
+    let (mut checked, mut with_solutions, mut with_dataset, mut fallbacks) = (0, 0, 0, 0);
+    for dataset_case in 0..100 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        load_spread_over_graphs(&engine, &mut rng);
+        let snapshot = engine.snapshot();
+        for query_case in 0..40 {
+            let clause = dataset_clause(&mut rng);
+            let body = dataset_body(&mut rng);
+            let text = match rng.below(4) {
+                0 => format!("SELECT DISTINCT * {clause}WHERE {{ {body} }}"),
+                1 => format!("ASK {clause}WHERE {{ {body} }}"),
+                _ => format!("SELECT * {clause}WHERE {{ {body} }}"),
+            };
+            let options = QueryOptions {
+                read_model: *rng.pick(&[
+                    ReadModel::Materialised,
+                    ReadModel::Asserted,
+                    ReadModel::Inferred,
+                ]),
+                union_default_graph: rng.below(3) == 0,
+                dataset: protocol_dataset(&mut rng),
+                ..QueryOptions::default()
+            };
+            let context = format!(
+                "dataset {dataset_case}, query {query_case}, {:?}, merged {}, protocol {:?}: {text}",
+                options.read_model, options.union_default_graph, options.dataset
+            );
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            // The random patterns of the main test hold operators that don't run natively
+            // yet (EXISTS in an OPTIONAL's condition).
+            if !runs_natively(&query) {
+                fallbacks += 1;
+                continue;
+            }
+            // A silent fallback would compare spareval with itself.
+            assert_eq!(
+                explain_query(&snapshot, &query, &options).unwrap().executor,
+                "native",
+                "{context}"
+            );
+            let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            let spareval = QueryOptions {
+                force_spareval: true,
+                ..options.clone()
+            };
+            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            assert_same_rows(&native, &expected, &context);
+            checked += 1;
+            with_solutions += usize::from(!native.is_empty() && native != ["false"]);
+            with_dataset += usize::from(!clause.is_empty() || options.dataset.is_some());
+        }
+    }
+    assert!(
+        fallbacks * 50 < checked && with_solutions * 3 > checked && with_dataset * 2 > checked,
+        "{checked} checked, {fallbacks} not native by shape, {with_solutions} with solutions, \
+         {with_dataset} with a dataset"
+    );
+}
+
+/// What a dataset is (SPARQL 1.1 §13.2), by example and not by comparison: `FROM` alone
+/// leaves no named graphs, `FROM NAMED` alone leaves an empty default graph, several
+/// `FROM` merge (a statement two of them hold counts once), the protocol's dataset
+/// replaces the query's, and `GRAPH` naming a graph outside the dataset has no solutions
+/// (§18.6), even for a pattern that reads no statement.
+#[test]
+fn a_dataset_is_what_the_query_names() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let quad = |s: &str, o: &str, g: GraphName| Quad::new(ex(s), ex("p"), ex(o), g);
+    for q in [
+        quad("d", "d1", GraphName::DefaultGraph),
+        quad("a", "b", ex("g0").into()),
+        quad("b", "c", ex("g0").into()),
+        quad("a", "b", ex("g1").into()),
+        quad("c", "d", ex("g1").into()),
+        quad("x", "y", ex("g2").into()),
+    ] {
+        tx.insert(q.as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let count = |text: &str, options: &QueryOptions| -> usize {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        assert_eq!(
+            explain_query(&snapshot, &query, options).unwrap().executor,
+            "native",
+            "{text}"
+        );
+        let native = rows(evaluate_query(&snapshot, &query, options).unwrap(), false);
+        let spareval = QueryOptions {
+            force_spareval: true,
+            ..options.clone()
+        };
+        let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+        assert_eq!(native, expected, "{text}");
+        native.len()
+    };
+    let plain = QueryOptions::default();
+    let g = |name: &str| format!("<{EX}{name}>");
+    let (g0, g1, g2, g9) = (g("g0"), g("g1"), g("g2"), g("g9"));
+    for (text, solutions) in [
+        ("SELECT * WHERE { ?s ?p ?o }".to_owned(), 1),
+        (format!("SELECT * FROM {g0} WHERE {{ ?s ?p ?o }}"), 2),
+        // a-b is in both graphs: once in their merge.
+        (
+            format!("SELECT * FROM {g0} FROM {g1} WHERE {{ ?s ?p ?o }}"),
+            3,
+        ),
+        (
+            format!("SELECT * FROM {g0} FROM {g1} WHERE {{ ?s <{EX}p>+ ?o }}"),
+            6,
+        ),
+        (format!("SELECT * FROM {g0} WHERE {{ ?s <{EX}p>+ ?o }}"), 3),
+        (format!("SELECT * FROM {g9} WHERE {{ ?s ?p ?o }}"), 0),
+        // FROM alone: no named graphs.
+        (
+            format!("SELECT * FROM {g0} WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }}"),
+            0,
+        ),
+        (
+            format!("SELECT * FROM {g0} WHERE {{ GRAPH {g1} {{ ?s ?p ?o }} }}"),
+            0,
+        ),
+        (format!("SELECT * FROM {g0} WHERE {{ GRAPH ?g {{ }} }}"), 0),
+        // FROM NAMED alone: an empty default graph.
+        (format!("SELECT * FROM NAMED {g0} WHERE {{ ?s ?p ?o }}"), 0),
+        (
+            format!("SELECT * FROM NAMED {g0} WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }}"),
+            2,
+        ),
+        (
+            format!("SELECT * FROM NAMED {g0} WHERE {{ GRAPH {g1} {{ ?s ?p ?o }} }}"),
+            0,
+        ),
+        (
+            format!(
+                "SELECT * FROM NAMED {g0} FROM NAMED {g2} WHERE {{ GRAPH ?g {{ ?s <{EX}p>+ ?o }} }}"
+            ),
+            4,
+        ),
+        (
+            format!(
+                "SELECT * FROM NAMED {g0} FROM NAMED {g2} FROM NAMED {g9} WHERE {{ GRAPH ?g {{ }} }}"
+            ),
+            2,
+        ),
+        // Without a dataset: every named graph, and not the default graph.
+        ("SELECT * WHERE { GRAPH ?g { } }".to_owned(), 3),
+        (
+            format!("SELECT * WHERE {{ GRAPH ?g {{ ?s <{EX}p>+ ?o }} }}"),
+            6,
+        ),
+        (
+            format!(
+                "SELECT * FROM {g2} FROM NAMED {g0} WHERE {{ ?x ?q ?y GRAPH ?g {{ ?s ?p ?o }} }}"
+            ),
+            2,
+        ),
+        // a-b is in g0 as well, which the merge doesn't hold: it counts, once.
+        (
+            format!("SELECT * FROM {g1} FROM {g2} WHERE {{ ?s ?p ?o }}"),
+            3,
+        ),
+    ] {
+        assert_eq!(count(&text, &plain), solutions, "{text}");
+    }
+    // The store's default graph named in the protocol's dataset.
+    for (default, named, text, solutions) in [
+        (
+            vec![GraphName::DefaultGraph],
+            Some(vec![ex("g2").into()]),
+            "SELECT * WHERE { ?s ?p ?o }",
+            1,
+        ),
+        (
+            vec![GraphName::DefaultGraph],
+            Some(vec![ex("g2").into()]),
+            "SELECT * WHERE { GRAPH ?g { ?s ?p ?o } }",
+            1,
+        ),
+        (
+            vec![GraphName::DefaultGraph, ex("g1").into()],
+            None,
+            "SELECT * WHERE { ?s ?p ?o }",
+            3,
+        ),
+    ] {
+        let mut dataset = nrese_sparql::QueryDatasetSpecification::new();
+        dataset.set_default_graph(default);
+        if let Some(named) = named {
+            dataset.set_available_named_graphs(named);
+        }
+        let options = QueryOptions {
+            dataset: Some(dataset),
+            union_default_graph: true,
+            ..QueryOptions::default()
+        };
+        assert_eq!(
+            count(text, &options),
+            solutions,
+            "{text} over {:?}",
+            options.dataset
+        );
+    }
+    // spareval evaluates the pattern in a graph that isn't there: only the native executor
+    // is checked.
+    let native_count = |text: &str| {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        rows(evaluate_query(&snapshot, &query, &plain).unwrap(), false).len()
+    };
+    let subquery = "SELECT ?g ?n WHERE { GRAPH ?g { SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o } } }";
+    let query = SparqlParser::new().parse_query(subquery).unwrap();
+    let integer = "^^<http://www.w3.org/2001/XMLSchema#integer>";
+    assert_eq!(
+        rows(evaluate_query(&snapshot, &query, &plain).unwrap(), false),
+        [
+            format!("{g0} \"2\"{integer}"),
+            format!("{g1} \"2\"{integer}"),
+            format!("{g2} \"1\"{integer}"),
+        ],
+        "a subquery under GRAPH ?g runs in each graph"
+    );
+    for (text, solutions) in [
+        (
+            "SELECT * WHERE { GRAPH ?g { ?s ?p ?o MINUS { ?x ?y ?z } } }".to_owned(),
+            5,
+        ),
+        (
+            format!("SELECT * WHERE {{ GRAPH {g9} {{ VALUES ?x {{ 1 2 }} }} }}"),
+            0,
+        ),
+        (
+            format!("SELECT * WHERE {{ GRAPH {g0} {{ VALUES ?x {{ 1 2 }} }} }}"),
+            2,
+        ),
+        (
+            format!("SELECT * FROM NAMED {g1} WHERE {{ GRAPH {g0} {{ BIND(1 AS ?x) }} }}"),
+            0,
+        ),
+        (
+            format!(
+                "SELECT * FROM NAMED {g0} FROM NAMED {g2} WHERE {{ GRAPH ?g {{ VALUES ?x {{ 1 2 }} }} }}"
+            ),
+            4,
+        ),
+        (
+            format!("SELECT * WHERE {{ GRAPH {g9} {{ <{EX}x> <{EX}p>* ?o }} }}"),
+            0,
+        ),
+        // A BIND to the graph variable keeps the rows of the graph it names.
+        (
+            format!("SELECT * WHERE {{ GRAPH ?g {{ ?s ?p ?o BIND({g0} AS ?g) }} }}"),
+            2,
+        ),
+        (
+            format!("SELECT * WHERE {{ GRAPH {g2} {{ <{EX}x> <{EX}p>* ?o }} }}"),
+            2,
+        ),
+    ] {
+        assert_eq!(native_count(&text), solutions, "{text}");
+    }
+    // The protocol's dataset replaces the query's.
+    let mut dataset = nrese_sparql::QueryDatasetSpecification::new();
+    dataset.set_default_graph(vec![ex("g2").into()]);
+    dataset.set_available_named_graphs(vec![ex("g1").into()]);
+    let protocol = QueryOptions {
+        dataset: Some(dataset),
+        ..QueryOptions::default()
+    };
+    for (text, solutions) in [
+        (format!("SELECT * FROM {g0} WHERE {{ ?s ?p ?o }}"), 1),
+        (
+            format!("SELECT * FROM NAMED {g0} WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }}"),
+            2,
+        ),
+        (format!("SELECT * WHERE {{ GRAPH {g0} {{ ?s ?p ?o }} }}"), 0),
+    ] {
+        assert_eq!(count(&text, &protocol), solutions, "{text}");
+    }
+    // The merged default graph is the store's default only: a dataset names its own.
+    let merged = QueryOptions {
+        union_default_graph: true,
+        ..QueryOptions::default()
+    };
+    assert_eq!(count("SELECT * WHERE { ?s ?p ?o }", &merged), 5);
+    assert_eq!(
+        count(&format!("SELECT * FROM {g0} WHERE {{ ?s ?p ?o }}"), &merged),
+        2
+    );
+}
+
+/// Updates with a dataset of their own (`WITH`, `USING`, `USING NAMED`, the protocol's
+/// parameters) change the store the same way on both executors.
+#[test]
+fn updates_with_a_dataset_equal_spareval() {
+    use nrese_sparql::{UpdateOptions, apply_update};
+    let mut rng = Rng(20_260_936);
+    let (mut checked, mut changed) = (0, 0);
+    for _ in 0..60 {
+        let engines = [
+            Engine::new(EngineConfig::default()).unwrap(),
+            Engine::new(EngineConfig::default()).unwrap(),
+        ];
+        let seed = rng.0;
+        for engine in &engines {
+            rng.0 = seed;
+            load_spread_over_graphs(engine, &mut rng);
+        }
+        for _ in 0..8 {
+            let p = format!("<{EX}p{}>", rng.below(4));
+            let pattern = match rng.below(4) {
+                0 => format!("?a {p} ?b"),
+                1 => format!("?a {p} ?b . GRAPH ?g {{ ?b ?q ?c }}"),
+                2 => format!("?a {p}+ ?b"),
+                _ => format!("?a {p} ?b OPTIONAL {{ GRAPH <{EX}g1> {{ ?b ?q ?c }} }}"),
+            };
+            let template = *rng.pick(&[
+                "DELETE { ?a ?p ?b } INSERT { ?b <http://example.com/q> ?a }",
+                "INSERT { GRAPH <http://example.com/new> { ?a <http://example.com/q> ?b } }",
+                "DELETE { ?a <http://example.com/p0> ?b }",
+                "INSERT { ?b <http://example.com/q> ?c }",
+            ]);
+            let text = match rng.below(5) {
+                0 => format!("WITH <{EX}g0> {template} WHERE {{ {pattern} }}"),
+                1 => format!("{template} USING <{EX}g0> WHERE {{ {pattern} }}"),
+                2 => format!("{template} USING <{EX}g0> USING <{EX}g1> WHERE {{ {pattern} }}"),
+                3 => format!(
+                    "{template} USING <{EX}e1> USING NAMED <{EX}g0> USING NAMED <{EX}g1> WHERE {{ {pattern} }}"
+                ),
+                _ => format!("{template} WHERE {{ {pattern} }}"),
+            };
+            let using = (rng.below(4) == 0).then(|| {
+                let mut dataset = nrese_sparql::QueryDatasetSpecification::new();
+                dataset.set_default_graph(vec![ex("g1").into(), ex("g0").into()]);
+                dataset.set_available_named_graphs(vec![ex("e1").into()]);
+                dataset
+            });
+            let update = SparqlParser::new()
+                .parse_update(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let before = contents(&engines[0]);
+            for (engine, force_spareval) in engines.iter().zip([false, true]) {
+                let options = UpdateOptions {
+                    force_spareval,
+                    using: using.clone(),
+                    ..UpdateOptions::default()
+                };
+                let mut tx = engine.transaction();
+                apply_update(&mut tx, &update, &options).unwrap();
+                tx.commit().unwrap();
+            }
+            let (native, spareval) = (contents(&engines[0]), contents(&engines[1]));
+            assert_eq!(native, spareval, "{text} (protocol {using:?})");
+            checked += 1;
+            changed += usize::from(native != before);
+        }
+    }
+    assert!(
+        checked == 480 && changed * 3 > checked,
+        "{changed} of {checked} updates changed something"
+    );
+}
+
+/// The default graph merged from listed graphs (`FROM <g0> FROM <g1>`) through the
+/// shortcuts that read the index directly (an index nested-loop join, a streamed `LIMIT`,
+/// `COUNT(*)` of one pattern): each statement once, and none from another graph.
+#[test]
+fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let quad = |s: &str, o: String, g: &str| Quad::new(ex(s), ex("p"), ex(&o), ex(g));
+    tx.insert(quad("a", "b".to_owned(), "g0").as_ref());
+    for i in 0..40 {
+        for g in ["g0", "g1"] {
+            tx.insert(quad("b", format!("x{i}"), g).as_ref());
+        }
+        tx.insert(quad("b", format!("y{i}"), "g2").as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let from = format!("FROM <{EX}g0> FROM <{EX}g1>");
+    for (text, solutions) in [
+        (
+            format!("SELECT * {from} WHERE {{ <{EX}a> <{EX}p> ?b . ?b <{EX}p> ?c }}"),
+            40,
+        ),
+        (
+            format!("SELECT * {from} WHERE {{ ?b <{EX}p> ?c }} LIMIT 100"),
+            41,
+        ),
+        (
+            format!("SELECT (COUNT(*) AS ?n) {from} WHERE {{ ?b <{EX}p> ?c }}"),
+            1,
+        ),
+    ] {
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let options = QueryOptions::default();
+        assert_eq!(
+            explain_query(&snapshot, &query, &options).unwrap().executor,
+            "native"
+        );
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        assert_eq!(native.len(), solutions, "{text}");
+        assert!(
+            native.iter().all(|row| !row.contains("/y")),
+            "{text}: {native:?}"
+        );
+        if text.contains("COUNT") {
+            assert!(native[0].starts_with("\"41\""), "{text}: {native:?}");
+        }
+    }
 }

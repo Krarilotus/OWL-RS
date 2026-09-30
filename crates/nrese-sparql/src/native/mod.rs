@@ -89,7 +89,7 @@ pub(crate) fn evaluate<'a>(
     options: &QueryOptions,
 ) -> Option<Result<QueryResults<'a>, QueryEvaluationError>> {
     let (pattern, form) = native_pattern(query, options)?;
-    let ctx = Context::new(snapshot, options);
+    let ctx = Context::new(snapshot, options, query_dataset(query));
     let solutions = match ctx.eval(&pattern) {
         Ok(solutions) => solutions,
         Err(NativeError::Fallback) => return None,
@@ -132,7 +132,7 @@ pub(crate) fn explain(
     options: &QueryOptions,
 ) -> Option<Result<(Vec<PlanStep>, u64), QueryEvaluationError>> {
     let (pattern, _) = native_pattern(query, options)?;
-    let mut ctx = Context::new(snapshot, options);
+    let mut ctx = Context::new(snapshot, options, query_dataset(query));
     ctx.trace = Some(RefCell::default());
     match ctx.eval(&pattern) {
         Ok(solutions) => Some(Ok((
@@ -161,7 +161,7 @@ pub(crate) fn write_results(
         Form::Ask if format != ResultsFormat::Json => return None,
         _ => {}
     }
-    let ctx = Context::new(snapshot, options);
+    let ctx = Context::new(snapshot, options, query_dataset(query));
     let solutions = match ctx.eval(&pattern) {
         Ok(solutions) => solutions,
         Err(NativeError::Fallback) => return None,
@@ -203,7 +203,9 @@ pub(crate) fn write_results(
 pub(crate) type QuadChanges = (Vec<oxrdf::Quad>, Vec<oxrdf::Quad>);
 
 /// The quads a `DELETE`/`INSERT … WHERE` removes and adds, with its `WHERE` evaluated
-/// natively on `snapshot`; `None` if the pattern isn't supported (use spareval). Templates
+/// natively on `snapshot`; `None` if the pattern isn't supported (use spareval). `using`
+/// is the operation's dataset (`USING`, `WITH`); the protocol's, in `options.dataset`,
+/// replaces it. Templates
 /// are filled as spareval fills them: a quad with an unbound or ill-placed term (a literal
 /// subject or graph, a non-IRI predicate) is skipped, and inserted blank nodes are fresh per
 /// solution.
@@ -212,14 +214,15 @@ pub(crate) fn delete_insert(
     pattern: &GraphPattern,
     delete: &[spargebra::term::GroundQuadPattern],
     insert: &[spargebra::term::QuadPattern],
+    using: Option<&spargebra::algebra::QueryDataset>,
     options: &QueryOptions,
 ) -> Option<Result<QuadChanges, QueryEvaluationError>> {
     use spargebra::term::{GraphNamePattern, GroundTermPattern};
-    if options.dataset.is_some() || !supported(pattern) {
+    if !supported(pattern) {
         return None;
     }
     let pattern = pushdown::push_filters(pattern.clone());
-    let ctx = Context::new(snapshot, options);
+    let ctx = Context::new(snapshot, options, using);
     let solutions = match ctx.eval(&pattern) {
         Ok(solutions) => solutions,
         Err(NativeError::Fallback) => return None,
@@ -318,7 +321,7 @@ fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
 ) -> Option<(GraphPattern, Form<'q>)> {
-    if options.dataset.is_some() || !query_supported(query) {
+    if !query_supported(query) {
         return None;
     }
     let (pattern, form) = match query {
@@ -450,7 +453,16 @@ fn decode(snapshot: &Snapshot, computed: &[Term], id: u64) -> Option<Term> {
     }
 }
 
-/// True if [`evaluate`] handles `query` (barring runtime fallbacks), with no protocol dataset.
+/// The query's own dataset (`FROM`, `FROM NAMED`), if it names one.
+fn query_dataset(query: &Query) -> Option<&spargebra::algebra::QueryDataset> {
+    let (Query::Select { dataset, .. }
+    | Query::Ask { dataset, .. }
+    | Query::Construct { dataset, .. }
+    | Query::Describe { dataset, .. }) = query;
+    dataset.as_ref()
+}
+
+/// True if [`evaluate`] handles `query` (barring runtime fallbacks).
 pub(crate) fn query_supported(query: &Query) -> bool {
     // A BASE resolves relative IRIs in IRI(): only spareval knows it at evaluation time.
     let (Query::Select { base_iri, .. }
@@ -461,21 +473,9 @@ pub(crate) fn query_supported(query: &Query) -> bool {
         return false;
     }
     match query {
-        Query::Select {
-            dataset: None,
-            pattern,
-            ..
-        }
-        | Query::Ask {
-            dataset: None,
-            pattern,
-            ..
-        } => supported(pattern),
+        Query::Select { pattern, .. } | Query::Ask { pattern, .. } => supported(pattern),
         Query::Construct {
-            dataset: None,
-            template,
-            pattern,
-            ..
+            template, pattern, ..
         } => supported(pattern) && template.iter().all(supported_triple),
         _ => false,
     }
@@ -485,7 +485,7 @@ pub(crate) fn query_supported(query: &Query) -> bool {
 pub(crate) fn supported(pattern: &GraphPattern) -> bool {
     match pattern {
         GraphPattern::Bgp { patterns } => patterns.iter().all(supported_triple),
-        GraphPattern::Graph { inner, .. } => supported(inner) && scans_everywhere(inner),
+        GraphPattern::Graph { inner, .. } => supported(inner),
         GraphPattern::Path {
             subject, object, ..
         } => supported_term(subject) && supported_term(object),
@@ -541,25 +541,99 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
     }
 }
 
-/// True if every solution of `pattern` comes from triple patterns in every branch, so inside
-/// `GRAPH ?g` each row binds `?g` from a scan (and inside `GRAPH <g>` each row needs a
-/// match in `<g>`). Patterns that can produce rows without a scan (VALUES, empty groups,
-/// aggregates, BIND alone, nested GRAPH, property paths) and subqueries stay on spareval
-/// there.
-fn scans_everywhere(pattern: &GraphPattern) -> bool {
-    match pattern {
-        GraphPattern::Bgp { patterns } => !patterns.is_empty(),
-        GraphPattern::Join { left, right } => scans_everywhere(left) || scans_everywhere(right),
-        GraphPattern::Union { left, right } => scans_everywhere(left) && scans_everywhere(right),
-        GraphPattern::LeftJoin { left, .. } | GraphPattern::Minus { left, .. } => {
-            scans_everywhere(left)
+/// True if `GRAPH ?graph { pattern }` can be evaluated once for all graphs, every triple
+/// pattern binding `?graph` from its scan: every solution then comes from triple patterns
+/// in every branch, and the pattern holds nothing but triple patterns and the operators
+/// that join them on `?graph` like on any variable.
+///
+/// Anything else is evaluated graph by graph: a row without a scan (VALUES, an empty
+/// group, BIND alone), a property path (followed within one graph), a subquery or a nested
+/// GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make rows
+/// with no other common variable remove each other) and a BIND to `?graph` itself.
+fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
+    fn only_scans(pattern: &GraphPattern, graph: &Variable) -> bool {
+        match pattern {
+            GraphPattern::Bgp { .. } => true,
+            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
+                only_scans(left, graph) && only_scans(right, graph)
+            }
+            GraphPattern::LeftJoin {
+                left,
+                right,
+                expression,
+            } => {
+                only_scans(left, graph)
+                    && only_scans(right, graph)
+                    && expression.as_ref().is_none_or(|e| filter(e, graph))
+            }
+            GraphPattern::Filter { inner, expr } => only_scans(inner, graph) && filter(expr, graph),
+            GraphPattern::Extend {
+                inner,
+                variable,
+                expression,
+            } => variable != graph && only_scans(inner, graph) && filter(expression, graph),
+            _ => false,
         }
-        GraphPattern::Filter { inner, .. } | GraphPattern::Extend { inner, .. } => {
-            scans_everywhere(inner)
+    }
+    // `EXISTS` is a join on the shared variables, `?graph` among them.
+    fn filter(expression: &Expression, graph: &Variable) -> bool {
+        match expression {
+            Expression::And(a, b) => filter(a, graph) && filter(b, graph),
+            Expression::Exists(pattern) => only_scans(pattern, graph),
+            Expression::Not(inner) if matches!(**inner, Expression::Exists(_)) => {
+                filter(inner, graph)
+            }
+            // An `EXISTS` anywhere else is not a join.
+            other => !pushdown::per_solution(other) || !contains_any_exists(other),
         }
-        // A subquery (projection and its modifiers) scopes its variables: its own `?g` is
-        // not the graph variable.
-        _ => false,
+    }
+    fn rows_from_scans(pattern: &GraphPattern) -> bool {
+        match pattern {
+            GraphPattern::Bgp { patterns } => !patterns.is_empty(),
+            GraphPattern::Join { left, right } => rows_from_scans(left) || rows_from_scans(right),
+            GraphPattern::Union { left, right } => rows_from_scans(left) && rows_from_scans(right),
+            GraphPattern::LeftJoin { left, .. } | GraphPattern::Minus { left, .. } => {
+                rows_from_scans(left)
+            }
+            GraphPattern::Filter { inner, .. } | GraphPattern::Extend { inner, .. } => {
+                rows_from_scans(inner)
+            }
+            _ => false,
+        }
+    }
+    only_scans(pattern, graph) && rows_from_scans(pattern)
+}
+
+/// True if `expression` holds an `EXISTS` at any depth.
+fn contains_any_exists(expression: &Expression) -> bool {
+    match expression {
+        Expression::Exists(_) => true,
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => false,
+        Expression::Or(a, b)
+        | Expression::And(a, b)
+        | Expression::Equal(a, b)
+        | Expression::SameTerm(a, b)
+        | Expression::Greater(a, b)
+        | Expression::GreaterOrEqual(a, b)
+        | Expression::Less(a, b)
+        | Expression::LessOrEqual(a, b)
+        | Expression::Add(a, b)
+        | Expression::Subtract(a, b)
+        | Expression::Multiply(a, b)
+        | Expression::Divide(a, b) => contains_any_exists(a) || contains_any_exists(b),
+        Expression::In(a, list) => contains_any_exists(a) || list.iter().any(contains_any_exists),
+        Expression::UnaryPlus(a) | Expression::UnaryMinus(a) | Expression::Not(a) => {
+            contains_any_exists(a)
+        }
+        Expression::If(a, b, c) => {
+            contains_any_exists(a) || contains_any_exists(b) || contains_any_exists(c)
+        }
+        Expression::Coalesce(list) | Expression::FunctionCall(_, list) => {
+            list.iter().any(contains_any_exists)
+        }
     }
 }
 
@@ -746,6 +820,11 @@ struct Context<'a> {
     graph: RefCell<GraphScope>,
     /// [`QueryOptions::as_written`].
     as_written: bool,
+    /// With a dataset of several default graphs (`FROM <a> FROM <b>`), the graphs whose
+    /// merge the default graph is; the scope is then [`GraphScope::Union`].
+    merge_set: Option<Vec<TermId>>,
+    /// The graphs `GRAPH` may name, if the dataset lists them (`FROM NAMED`).
+    named: Option<Vec<TermId>>,
 }
 
 /// The active graph of triple patterns.
@@ -763,8 +842,28 @@ enum GraphScope {
 }
 
 impl<'a> Context<'a> {
-    fn new(snapshot: &'a Snapshot, options: &QueryOptions) -> Self {
+    /// `dataset` is the query's own (`FROM`); the protocol's, in `options`, replaces it.
+    fn new(
+        snapshot: &'a Snapshot,
+        options: &QueryOptions,
+        dataset: Option<&spargebra::algebra::QueryDataset>,
+    ) -> Self {
+        use crate::dataset::{DefaultGraph, ResolvedDataset};
+        let resolved = ResolvedDataset::resolve(
+            snapshot,
+            options.union_default_graph,
+            options.dataset.as_ref(),
+            dataset,
+        );
+        let (scope, merge_set) = match resolved.default {
+            DefaultGraph::Store => (GraphScope::Default, None),
+            DefaultGraph::Graph(graph) => (GraphScope::Named(graph), None),
+            DefaultGraph::Merge(graphs) => (GraphScope::Union, graphs),
+            DefaultGraph::Empty => (GraphScope::Missing, None),
+        };
         Self {
+            merge_set,
+            named: resolved.named,
             as_written: options.as_written,
             snapshot,
             model: options.read_model,
@@ -779,11 +878,7 @@ impl<'a> Context<'a> {
                 .within(options.shared_memory.clone()),
             trace: None,
             depth: Cell::new(0),
-            graph: RefCell::new(if options.union_default_graph {
-                GraphScope::Union
-            } else {
-                GraphScope::Default
-            }),
+            graph: RefCell::new(scope),
         }
     }
 
@@ -965,27 +1060,7 @@ impl<'a> Context<'a> {
         self.check()?;
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns, &[], &mut Vec::new()),
-            GraphPattern::Graph { name, inner } => {
-                let scope = match name {
-                    NamedNodePattern::NamedNode(n) => self
-                        .snapshot
-                        .lookup(n.as_ref().into())
-                        .map_or(GraphScope::Missing, GraphScope::Named),
-                    NamedNodePattern::Variable(v) => GraphScope::Variable(v.clone()),
-                };
-                let outer = self.graph.replace(scope);
-                let result = self.eval(inner);
-                *self.graph.borrow_mut() = outer;
-                result
-            }
-            GraphPattern::Path { .. }
-                if !matches!(
-                    *self.graph.borrow(),
-                    GraphScope::Default | GraphScope::Union
-                ) =>
-            {
-                Err(NativeError::Fallback)
-            }
+            GraphPattern::Graph { name, inner } => self.graph(name, inner),
             GraphPattern::Path {
                 subject,
                 path,
@@ -1222,6 +1297,118 @@ impl<'a> Context<'a> {
         }
     }
 
+    // --- GRAPH ---------------------------------------------------------------------------
+
+    /// Evaluates `pattern` with `scope` as the active graph.
+    fn in_graph(&self, scope: GraphScope, pattern: &GraphPattern) -> NativeResult<Solutions> {
+        let outer = self.graph.replace(scope);
+        let result = self.eval(pattern);
+        *self.graph.borrow_mut() = outer;
+        result
+    }
+
+    /// Whether the dataset has the named graph `id`.
+    fn is_named_graph(&self, id: TermId) -> bool {
+        match &self.named {
+            Some(named) => named.contains(&id),
+            None => self.snapshot.contains_named_graph(id),
+        }
+    }
+
+    fn graph(&self, name: &NamedNodePattern, inner: &GraphPattern) -> NativeResult<Solutions> {
+        let variable = match name {
+            NamedNodePattern::NamedNode(n) => {
+                let id = self
+                    .snapshot
+                    .lookup(n.as_ref().into())
+                    .filter(|&id| self.is_named_graph(id));
+                return match id {
+                    Some(id) => self.in_graph(GraphScope::Named(id), inner),
+                    // No such graph in the dataset: no solutions, whatever the pattern
+                    // would give without reading statements (VALUES, BIND).
+                    None => {
+                        let mut vars = Vec::new();
+                        bound_variables(inner, &mut vars);
+                        let table = IdTable::new(vars.len());
+                        Ok(Solutions {
+                            vars,
+                            table,
+                            ordered: false,
+                        })
+                    }
+                };
+            }
+            NamedNodePattern::Variable(v) => v,
+        };
+        if scans_everywhere(inner, variable) {
+            // Every row comes from scans, which bind the variable: one evaluation for
+            // all graphs.
+            let mut solutions = self.in_graph(GraphScope::Variable(variable.clone()), inner)?;
+            if let (Some(named), Some(column)) = (&self.named, solutions.column(variable)) {
+                let mask: Vec<bool> = solutions
+                    .table
+                    .column(column)
+                    .iter()
+                    .map(|&id| named.contains(&TermId::from_raw(id)))
+                    .collect();
+                solutions.table.retain_mask(&mask);
+            }
+            return Ok(solutions);
+        }
+        // Graph by graph: the pattern in each named graph, with the variable bound to it.
+        let graphs: Vec<TermId> = match &self.named {
+            Some(named) => named.clone(),
+            None => self.snapshot.named_graphs().collect(),
+        };
+        let mut all: Option<Solutions> = None;
+        for graph in graphs {
+            self.check()?;
+            let mut solutions = self.in_graph(GraphScope::Named(graph), inner)?;
+            match solutions.column(variable) {
+                // The pattern binds the variable itself: it must be this graph.
+                Some(column) => {
+                    let mask: Vec<bool> = solutions
+                        .table
+                        .column(column)
+                        .iter()
+                        .map(|&id| id == graph.raw() || id == UNDEF)
+                        .collect();
+                    solutions.table.retain_mask(&mask);
+                    let mut columns = std::mem::take(&mut solutions.table).into_columns();
+                    columns[column].fill(graph.raw());
+                    solutions.table = IdTable::from_columns(columns);
+                }
+                None => {
+                    let rows = solutions.table.len();
+                    let mut columns = std::mem::take(&mut solutions.table).into_columns();
+                    columns.push(vec![graph.raw(); rows]);
+                    solutions.vars.push(variable.clone());
+                    solutions.table = IdTable::from_columns(columns);
+                }
+            }
+            all = Some(match all {
+                Some(all) => self.union(all, solutions)?,
+                None => solutions,
+            });
+        }
+        match all {
+            Some(all) => Ok(all),
+            None => {
+                let mut vars = Vec::new();
+                bound_variables(inner, &mut vars);
+                if !vars.contains(variable) {
+                    vars.push(variable.clone());
+                }
+                let table = IdTable::new(vars.len());
+                Ok(Solutions {
+                    vars,
+                    table,
+                    ordered: false,
+                })
+            }
+        }
+    }
+
     // --- property paths ------------------------------------------------------------------
 
     /// An end of a path: a variable (blank nodes are variables here), or a constant's id
@@ -1239,24 +1426,28 @@ impl<'a> Context<'a> {
         }
     }
 
-    fn path_evaluator(&self) -> paths::PathEvaluator<'a> {
-        paths::PathEvaluator {
+    /// The path evaluator for the active graph. There is none while `GRAPH ?g` is evaluated
+    /// for all graphs at once; [`scans_everywhere`] sends patterns with paths graph by graph.
+    fn path_evaluator(&self) -> NativeResult<paths::PathEvaluator<'_>> {
+        let graph = match &*self.graph.borrow() {
+            GraphScope::Default => paths::PathGraph::Default,
+            GraphScope::Union => paths::PathGraph::Merged(self.merge_set.as_deref()),
+            GraphScope::Named(id) => paths::PathGraph::Named(*id),
+            // A graph the store doesn't hold: the merge of no graphs.
+            GraphScope::Missing => paths::PathGraph::Merged(Some(&[])),
+            GraphScope::Variable(_) => return Err(NativeError::Fallback),
+        };
+        Ok(paths::PathEvaluator {
             snapshot: self.snapshot,
             model: self.model,
-            merged: matches!(*self.graph.borrow(), GraphScope::Union),
-        }
+            graph,
+        })
     }
 
     /// The solutions of `path` that can join `bound`: if `bound` binds one of the path's
     /// variable ends in every row, the path is followed from those values (the subject's,
     /// if both are bound). Otherwise all of the path's solutions.
     fn path_from(&self, bound: &Solutions, path: &PathPattern<'_>) -> NativeResult<Solutions> {
-        if !matches!(
-            *self.graph.borrow(),
-            GraphScope::Default | GraphScope::Union
-        ) {
-            return Err(NativeError::Fallback);
-        }
         let start = Instant::now();
         // The distinct values of a variable, if every row of `bound` has one.
         let values = |variable: &Variable| -> Option<Vec<u64>> {
@@ -1273,7 +1464,7 @@ impl<'a> Context<'a> {
             return self.filtered_path(path, None, start);
         };
         let resolved = paths::Path::resolve(path.path, self.snapshot);
-        let evaluator = self.path_evaluator();
+        let evaluator = self.path_evaluator()?;
         let (pairs, from) = if let Some(starts) = values(&s) {
             (evaluator.reached_from(&resolved, &starts), starts.len())
         } else if let Some(ends) = values(&o) {
@@ -1334,7 +1525,7 @@ impl<'a> Context<'a> {
         object: &TermPattern,
     ) -> NativeResult<Solutions> {
         let resolved = paths::Path::resolve(path, self.snapshot);
-        let evaluator = self.path_evaluator();
+        let evaluator = self.path_evaluator()?;
         let end = |term: &TermPattern| self.path_end(term);
         let column = |values: Vec<u64>| IdTable::from_columns(vec![values]);
         let (vars, table) = match (end(subject), end(object)) {
@@ -1489,7 +1680,9 @@ impl<'a> Context<'a> {
                 .into_iter()
                 .filter(|v| result.column(v).is_some())
                 .collect();
+            // (A default graph merged from listed graphs is read by scans, which filter.)
             let probe = !shared.is_empty()
+                && self.merge_set.is_none()
                 && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
             result = if probe {
                 self.probe_join(result, &scans[next], &shared)?
@@ -1760,6 +1953,11 @@ impl<'a> Context<'a> {
             }
             let components = quad.components();
             if merged {
+                if let Some(graphs) = &self.merge_set
+                    && !graphs.contains(&quad.graph)
+                {
+                    continue;
+                }
                 // Graph-last order: the copies of a statement follow each other.
                 let statement = [components[0], components[1], components[2]];
                 if previous == Some(statement) {
@@ -1985,7 +2183,9 @@ impl<'a> Context<'a> {
             };
             expression.is_none_or(|expression| self.evaluator.filter(expression, &binding))
         };
-        let accept: Option<&dyn Fn(&[u64]) -> bool> = expression.is_some().then_some(&accept);
+        let accept = expression
+            .is_some()
+            .then_some(&accept as &dyn Fn(&[u64]) -> bool);
         let table = if unbound_keys {
             outer_join_with_undef(&left.table, &right.table, &lk, &rk, accept, true, max_rows)
         } else {
@@ -2056,6 +2256,9 @@ impl<'a> Context<'a> {
         let [triple] = patterns.as_slice() else {
             return Ok(None);
         };
+        if self.merge_set.is_some() {
+            return Ok(None);
+        }
         let vars = triple_variables(triple);
         let mut vars_unique: Vec<Variable> = Vec::new();
         for v in vars {
