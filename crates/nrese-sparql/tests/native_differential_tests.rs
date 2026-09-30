@@ -1005,6 +1005,156 @@ fn computed_values_equal_spareval() {
     );
 }
 
+/// A query whose consumer ignores duplicate rows (`SELECT DISTINCT`, or a group of
+/// `DISTINCT`, `MIN`, `MAX` and `SAMPLE` aggregates) over `?a <p> ?b` and OPTIONALs that
+/// are independent of each other, depend on each other, carry conditions, paths and
+/// BINDs. Some queries mix in an aggregate that does count duplicates, which switches the
+/// set evaluation off. Returns the query and whether its results depend on the order of
+/// the rows (`GROUP_CONCAT`, `SAMPLE`).
+fn set_query(rng: &mut Rng) -> (String, bool) {
+    let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+    let mut pattern = format!("?a {} ?b .", p(rng));
+    for _ in 0..1 + rng.below(3) {
+        let (p1, p2) = (p(rng), p(rng));
+        pattern.push_str(&match rng.below(9) {
+            0 | 1 => format!(" OPTIONAL {{ ?a {p1} ?c }}"),
+            2 => format!(" OPTIONAL {{ ?a {p1} ?d }}"),
+            3 => format!(" OPTIONAL {{ ?a {p1} ?d FILTER(?d != ?b) }}"),
+            4 => format!(" OPTIONAL {{ ?b {p1} ?e }}"),
+            // Depends on an earlier OPTIONAL's variable, if there is one.
+            5 => format!(" OPTIONAL {{ ?a {p1} ?c . ?a {p2} ?g }}"),
+            6 => format!(" OPTIONAL {{ ?a ({p1}|{p2})+ ?e }}"),
+            7 => format!(" OPTIONAL {{ ?a {p1} ?d BIND(STR(?d) AS ?h) }}"),
+            _ => format!(" ?a {p1} ?g ."),
+        });
+    }
+    // A filter that must stay above the OPTIONALs, on variables nothing else may need.
+    match rng.below(6) {
+        0 => pattern.push_str(" FILTER(!BOUND(?c) || ?c != ?b)"),
+        1 => pattern.push_str(" FILTER(!BOUND(?d) || isLiteral(?d))"),
+        _ => {}
+    }
+    if rng.below(4) == 0 {
+        pattern.push_str(" BIND(STRLEN(STR(?b)) AS ?len)");
+    }
+    if rng.below(4) == 0 {
+        return (
+            format!(
+                "SELECT DISTINCT {} WHERE {{ {pattern} }}",
+                rng.pick(&["?a ?c", "?a ?d ?e", "?b", "?a ?len", "?c ?d", "?a ?h ?g"])
+            ),
+            false,
+        );
+    }
+    let keys = *rng.pick(&["?a", "?a ?b", "?b", "?a ?c", "?len ?a"]);
+    let mut ordered = false;
+    let aggregates: Vec<String> = (0..1 + rng.below(3))
+        .map(|i| {
+            let aggregate = match rng.below(16) {
+                0 | 1 => "COUNT(DISTINCT ?c)",
+                2 | 3 => "COUNT(DISTINCT ?d)",
+                4 => "COUNT(DISTINCT ?e)",
+                5 => "MIN(?c)",
+                6 => "MAX(?d)",
+                7 => "MAX(STR(?e))",
+                8 => "COUNT(DISTINCT ?g)",
+                // Compared with the as-written evaluation only: SPARQL's DISTINCT is over
+                // terms ("03" and "3" are two), spareval's SUM(DISTINCT) over values.
+                9 => {
+                    ordered = true;
+                    "SUM(DISTINCT ?d)"
+                }
+                // Over two OPTIONALs at once. COALESCE keeps the argument free of errors:
+                // for a COUNT(DISTINCT ...) whose argument fails in every row, spareval
+                // answers unbound, where SPARQL drops the errors and counts 0.
+                10 => {
+                    "COUNT(DISTINCT CONCAT(COALESCE(STR(?c), \"-\"), \"/\", COALESCE(STR(?d), \"-\")))"
+                }
+                11 => "MIN(?h)",
+                12 => {
+                    ordered = true;
+                    "GROUP_CONCAT(DISTINCT STR(?c); separator=\"|\")"
+                }
+                13 => {
+                    ordered = true;
+                    "SAMPLE(?d)"
+                }
+                // These count duplicates: the whole group is evaluated as written.
+                14 => "COUNT(?c)",
+                _ => "COUNT(*)",
+            };
+            format!("({aggregate} AS ?x{i})")
+        })
+        .collect();
+    let having = match rng.below(5) {
+        0 => " HAVING (COUNT(DISTINCT ?c) > 1)",
+        1 => " HAVING (MIN(?c) != MAX(?c) || COUNT(DISTINCT ?d) = 0)",
+        _ => "",
+    };
+    (
+        format!(
+            "SELECT {keys} {} WHERE {{ {pattern} }} GROUP BY {keys}{having}",
+            aggregates.join(" ")
+        ),
+        ordered,
+    )
+}
+
+/// Set evaluation (`native/sets.rs`): queries whose consumers ignore duplicates give the
+/// results of the same queries evaluated as written, and spareval's. Order-dependent
+/// results (`GROUP_CONCAT`, `SAMPLE`) are compared with the as-written evaluation only,
+/// where they must be identical: the set evaluation keeps first occurrences in order.
+/// Mutation-checked.
+#[test]
+fn duplicate_insensitive_queries_equal_both_evaluations() {
+    let mut rng = Rng(20_261_003);
+    let (mut checked, mut with_solutions) = (0, 0);
+    let as_written = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..QueryOptions::default()
+    };
+    for dataset_case in 0..60 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..60 {
+            let (text, order_dependent) = set_query(&mut rng);
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "{text}");
+            let context = format!("dataset {dataset_case}, query {query_case}: {text}");
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let plain = rows(
+                evaluate_query(&snapshot, &query, &as_written).unwrap(),
+                false,
+            );
+            assert_same_rows(&native, &plain, &format!("against as written: {context}"));
+            if !order_dependent {
+                let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+                assert_same_rows(&native, &expected, &context);
+            }
+            checked += 1;
+            with_solutions += usize::from(!native.is_empty());
+        }
+    }
+    assert!(
+        with_solutions * 4 > checked * 3,
+        "only {with_solutions} of {checked} queries have solutions"
+    );
+}
+
 /// A filter on a variable that a subquery binds but doesn't project sees it unbound: the
 /// filter is an error and the row is dropped. Checked against the answer the specification
 /// gives, not against spareval, whose optimiser moves such a filter into the subquery

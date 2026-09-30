@@ -3,6 +3,7 @@
 #
 #   scripts/bench-cleanup.sh             remove everything listed below
 #   scripts/bench-cleanup.sh --dry-run   only say what would be removed
+#   scripts/bench-cleanup.sh --tools     also remove the installed tools (below)
 #
 # The scorecard scripts call this when they exit, so a run cleans up after itself, also
 # when it fails or is interrupted. Between the runs of one batch, set NRESE_BENCH_KEEP=1
@@ -25,6 +26,10 @@
 #
 #   NRESE_BENCH_KEEP=1          keep the dataset volume, the local datasets and the images
 #   NRESE_BENCH_KEEP_IMAGES=1   keep only the images
+#
+# Installed tools: where benches/suite/install-tools.sh has run, the images are this
+# machine's tools and stay; a run's containers, volumes, datasets and dumps still go.
+# `--tools` removes what that script installed (its images and .cache/tools).
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -32,9 +37,19 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/scripts/lib/disk.sh"
 
 DRY=
-[ "${1:-}" = "--dry-run" ] && DRY=1
+TOOLS=
+for argument in "$@"; do
+  case $argument in
+    --dry-run) DRY=1 ;;
+    --tools) TOOLS=1 ;;
+    *) echo "unknown argument $argument" >&2; exit 2 ;;
+  esac
+done
+TOOLBOX="$ROOT/.cache/bench-toolbox"
 KEEP=${NRESE_BENCH_KEEP:-}
 KEEP_IMAGES=${NRESE_BENCH_KEEP_IMAGES:-$KEEP}
+# Installed tools stay unless they are what is to be removed.
+[ -f "$TOOLBOX" ] && [ -z "$TOOLS" ] && KEEP_IMAGES=1
 LOCAL=${NRESE_BENCH_LOCAL:-$HOME/nrese-bench}
 
 # The images the runs pulled themselves (remember_pulls in lib/disk.sh).
@@ -67,6 +82,13 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
       docker image inspect "$image" >/dev/null 2>&1 && run docker rmi "$image"
     done
     [ -n "$DRY" ] || rm -f "$PULLED_LIST"
+  fi
+  if [ -n "$TOOLS" ] && [ -f "$TOOLBOX" ]; then
+    for image in $(sort -u "$TOOLBOX"); do
+      docker image inspect "$image" >/dev/null 2>&1 && run docker rmi "$image"
+    done
+    run rm -rf "$ROOT/.cache/tools"
+    [ -n "$DRY" ] || rm -f "$TOOLBOX"
   fi
 fi
 

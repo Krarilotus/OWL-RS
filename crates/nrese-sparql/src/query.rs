@@ -30,6 +30,11 @@ pub struct QueryOptions {
     /// graphs (as in GraphDB, RDF4J stores and Blazegraph), not only the default graph. A
     /// statement counts once, however many graphs hold it.
     pub union_default_graph: bool,
+    /// Evaluate the operators where the query puts them: no filter pushdown, no set
+    /// evaluation for DISTINCT and duplicate-insensitive aggregates, paths computed in
+    /// full before they are joined. The results are the same; the differential tests
+    /// compare the two, and it is an escape hatch if a rewrite is ever suspected.
+    pub as_written: bool,
 }
 
 /// Evaluates `query` against `view`. Queries the native executor supports run there

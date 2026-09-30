@@ -21,8 +21,8 @@
 #   QUERY_TIMEOUT_S  per query run (default 300, the project's QLever setting)
 #   RUNS             measured runs per query after one warm-up run (default 3)
 #   QUERY_MEMORY_MIB NRESE's memory budget per query (default 4096; 0 = unlimited)
-#   FUSEKI_HOME      a directory with fuseki-server.jar (default: what `just fuseki-fetch`
-#                    put into the project's fuseki/ directory)
+#   FUSEKI_HOME      a directory with fuseki-server.jar (default: what
+#                    benches/suite/install-tools.sh installed, else the project's fuseki/)
 #   FUSEKI_HEAP      JVM heap (default 64g, the project's setting)
 #   JAVA             the java command (default java); on a cluster without Java:
 #                    JAVA="apptainer exec temurin-21.sif java"
@@ -171,9 +171,9 @@ case $SYSTEM in
     ;;
   fuseki-owl)
     JAVA=${JAVA:-java}
-    FUSEKI_HOME=${FUSEKI_HOME:-$(ls -d "$REPO"/fuseki/apache-jena-fuseki-* 2>/dev/null | tail -1)}
+    FUSEKI_HOME=${FUSEKI_HOME:-$(ls -d "$ROOT"/.cache/tools/apache-jena-fuseki-* "$REPO"/fuseki/apache-jena-fuseki-* 2>/dev/null | head -1)}
     [ -f "${FUSEKI_HOME:-/nonexistent}/fuseki-server.jar" ] || {
-      echo "no fuseki-server.jar: set FUSEKI_HOME, or run \`just fuseki-fetch\` in $REPO" >&2
+      echo "no fuseki-server.jar: run benches/suite/install-tools.sh, or set FUSEKI_HOME" >&2
       exit 2
     }
     VERSION=$(basename "$FUSEKI_HOME")

@@ -293,7 +293,8 @@ pub(super) fn movable(conjunct: &Expression) -> bool {
     !expression_variables(conjunct).is_empty() && !per_solution(conjunct)
 }
 
-fn per_solution(expression: &Expression) -> bool {
+/// Whether the expression reads the whole solution (`EXISTS`) or draws a value per row.
+pub(super) fn per_solution(expression: &Expression) -> bool {
     match expression {
         Expression::Exists(_) => true,
         Expression::NamedNode(_)
@@ -334,7 +335,7 @@ fn covers(pattern: &GraphPattern, variables: &[Variable]) -> bool {
 }
 
 /// The variables bound in every solution of `pattern`.
-fn certain(pattern: &GraphPattern) -> Vec<Variable> {
+pub(super) fn certain(pattern: &GraphPattern) -> Vec<Variable> {
     let mut out = Vec::new();
     let mut add = |variable: &Variable| {
         if !out.contains(variable) {
