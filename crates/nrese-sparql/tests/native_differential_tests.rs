@@ -571,6 +571,202 @@ only spareval: {:#?}",
     );
 }
 
+/// The rows of two evaluations, or a panic that shows the rows only one of them has.
+fn assert_same_rows(native: &[String], expected: &[String], context: &str) {
+    if native == expected {
+        return;
+    }
+    let only = |rows: &[String], other: &[String]| -> Vec<String> {
+        let mut other = other.to_vec();
+        rows.iter()
+            .filter(|row| match other.iter().position(|r| r == *row) {
+                Some(at) => {
+                    other.swap_remove(at);
+                    false
+                }
+                None => true,
+            })
+            .take(5)
+            .cloned()
+            .collect()
+    };
+    panic!(
+        "{context}
+{} native and {} spareval rows
+only native: {:#?}
+only spareval: {:#?}",
+        native.len(),
+        expected.len(),
+        only(native, expected),
+        only(expected, native)
+    );
+}
+
+/// A property path joined to a pattern that binds one of its ends is followed from those
+/// values only (`Context::path_from`): the same rows, with their multiplicities, as the
+/// open path joined afterwards. Every path form, from either end, both ends, the same
+/// variable at both ends, under OPTIONAL, with a filter of its own, from values the store
+/// doesn't know, and over the merge of all graphs. Mutation-checked.
+#[test]
+fn paths_from_bound_values_equal_spareval() {
+    const PATHS: [&str; 14] = [
+        "<P0>*",
+        "<P1>+",
+        "(<P0>|<P1>)+",
+        "^<P2>/<P0>",
+        "!(<P0>|<P1>)",
+        "<P3>?",
+        "(<P0>/<P1>)*",
+        "<P2>/<P2>",
+        "(^<P1>)*",
+        "<P0>|<P3>",
+        "(<P0>|^<P0>)*",
+        "^<P1>",
+        "<P0>/<P1>/^<P0>",
+        "(<P2>|<P2>)/<P0>?",
+    ];
+    let mut rng = Rng(20_261_001);
+    let (mut checked, mut with_solutions) = (0, 0);
+    for dataset_case in 0..50 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let quads = random_dataset(&mut rng);
+        // Half of the cases spread the statements over graphs and read their merge.
+        let merged = dataset_case % 2 == 1;
+        for (i, quad) in quads.iter().enumerate() {
+            let graph: GraphName = match (merged, i % 3) {
+                (true, 1) => ex("g1").into(),
+                (true, 2) => ex("g2").into(),
+                _ => GraphName::DefaultGraph,
+            };
+            let quad = Quad::new(
+                quad.subject.clone(),
+                quad.predicate.clone(),
+                quad.object.clone(),
+                graph,
+            );
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let native_options = QueryOptions {
+            union_default_graph: merged,
+            ..QueryOptions::default()
+        };
+        let spareval = QueryOptions {
+            force_spareval: true,
+            union_default_graph: merged,
+            ..QueryOptions::default()
+        };
+        for query_case in 0..60 {
+            let path = |rng: &mut Rng| rng.pick(&PATHS).replace("<P", &format!("<{EX}p"));
+            let (p, q) = (path(&mut rng), path(&mut rng));
+            // A closure: each pair once.
+            let closure = rng
+                .pick(&[PATHS[0], PATHS[1], PATHS[2], PATHS[6], PATHS[8], PATHS[10]])
+                .replace("<P", &format!("<{EX}p"));
+            let first = format!("?a <{EX}p{}> ?b .", rng.below(4));
+            let group = match rng.below(12) {
+                0 => format!("{first} ?b {p} ?c"),
+                1 => format!("{first} ?c {p} ?b"),
+                // Both ends bound. Only closures: where a path has a pair twice (two
+                // statements behind `!(…)`, two ways through a sequence), spareval tests
+                // for the path per row and returns the row once; SPARQL counts both.
+                2 => format!("{first} ?a {closure} ?b"),
+                3 => format!("{first} ?b {p} ?b"),
+                4 => format!("{first} OPTIONAL {{ ?b {p} ?c }}"),
+                5 => format!("{first} OPTIONAL {{ ?c {p} ?a FILTER(isIRI(?c) && ?c != ?a) }}"),
+                6 => format!("?c {p} ?b . {first}"),
+                7 => format!("{first} ?b {p} ?c FILTER(isIRI(?c))"),
+                8 => format!("{first} ?b {p} ?c . ?c {q} ?d"),
+                // Values the store may not know (e6 never occurs), and a literal.
+                9 => format!("VALUES ?b {{ <{EX}e1> <{EX}e6> 3 \"s1\" }} ?b {p} ?c"),
+                10 => format!("{first} BIND(IRI(CONCAT(STR(?a), \"\")) AS ?f) ?f {p} ?c"),
+                _ => format!("{first} {{ ?b {p} ?c }} UNION {{ ?c {q} ?a }}"),
+            };
+            let text = format!("SELECT * WHERE {{ {group} }}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "{text}");
+            let native = rows(
+                evaluate_query(&snapshot, &query, &native_options).unwrap(),
+                false,
+            );
+            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            assert_same_rows(
+                &native,
+                &expected,
+                &format!("dataset {dataset_case} (merged: {merged}), query {query_case}: {text}"),
+            );
+            checked += 1;
+            with_solutions += usize::from(!expected.is_empty());
+        }
+    }
+    assert!(
+        with_solutions * 2 > checked,
+        "only {with_solutions} of {checked} queries have solutions"
+    );
+}
+
+/// With many bound values a closure walks an adjacency built from one scan of its step,
+/// from those values, forwards or backwards.
+#[test]
+fn closures_from_many_bound_values_equal_spareval() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    // 6,000 members of 1,500 chains of four, some of them closed into a cycle.
+    for i in 0..6_000u32 {
+        let node = ex(&format!("n{i}"));
+        let member = Quad::new(node.clone(), ex("in"), ex("set"), GraphName::DefaultGraph);
+        tx.insert(member.as_ref());
+        let next = match (i % 4, i % 28) {
+            (3, 27) => Some(i - 3),
+            (3, _) => None,
+            _ => Some(i + 1),
+        };
+        if let Some(next) = next {
+            let quad = Quad::new(
+                node,
+                ex("next"),
+                ex(&format!("n{next}")),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..QueryOptions::default()
+    };
+    for group in [
+        format!("?a <{EX}in> ?s . ?a <{EX}next>+ ?b"),
+        format!("?a <{EX}in> ?s . ?b <{EX}next>+ ?a"),
+        format!("?a <{EX}in> ?s . ?a <{EX}next>* ?b"),
+        format!("?a <{EX}in> ?s . ?b <{EX}next>* ?a"),
+        format!("?a <{EX}in> ?s . ?a <{EX}next>+ ?a"),
+        // Literals and the class are bound too: not nodes of any `next` edge.
+        format!("?x ?p ?a . ?a <{EX}next>* ?b"),
+        // The predicates are bound as well, and they are no nodes: a zero-length path
+        // doesn't start from them.
+        format!("{{ ?a <{EX}in> ?s }} UNION {{ ?x ?a ?y }} ?a <{EX}next>* ?b"),
+        format!("{{ ?a <{EX}in> ?s }} UNION {{ ?x ?a ?y }} ?b <{EX}next>* ?a"),
+    ] {
+        let text = format!("SELECT ?a ?b WHERE {{ {group} }}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        assert!(runs_natively(&query), "{text}");
+        let native = rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        );
+        let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+        assert!(expected.len() > 100, "{text}");
+        assert_same_rows(&native, &expected, &text);
+    }
+}
+
 /// A filter on a variable that a subquery binds but doesn't project sees it unbound: the
 /// filter is an error and the row is dropped. Checked against the answer the specification
 /// gives, not against spareval, whose optimiser moves such a filter into the subquery
@@ -873,12 +1069,56 @@ fn explain_reports_the_plan() {
         .collect();
     assert_eq!(operators[0], (0, "project"));
     assert_eq!(operators[1], (1, "filter"));
-    let bgp: Vec<_> = explanation.steps.iter().filter(|s| s.depth == 2).collect();
+    let below: Vec<_> = explanation.steps.iter().filter(|s| s.depth == 2).collect();
+    let bgp: Vec<_> = below.iter().filter(|s| s.operator != "filter").collect();
     assert_eq!(bgp.len(), 3, "{:#?}", explanation.steps);
     // memberOf d0 (20 rows) is the most selective start; every join step has an estimate.
     assert!(bgp[0].detail.contains("memberOf"), "{:#?}", bgp);
     assert!(bgp.iter().all(|s| s.estimated_rows.is_some()), "{:#?}", bgp);
     assert_eq!(bgp[0].rows, 20);
+    // The filter runs right after the pattern that binds ?c.
+    let takes = below.iter().position(|s| s.detail.contains("takes"));
+    assert_eq!(
+        below[takes.unwrap() + 1].operator,
+        "filter",
+        "{:#?}",
+        explanation.steps
+    );
+
+    // A filter on a variable of the first pattern runs before the joins, so they read
+    // fewer rows; a conjunct on a later variable waits for it.
+    let text = format!(
+        "SELECT ?x ?c ?d WHERE {{ ?x a <{EX}Student> . ?x <{EX}memberOf> ?d . ?x <{EX}takes> ?c
+           FILTER(STRENDS(STR(?x), \"7\") && ?c != <{EX}c7>) }}"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let explanation = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..QueryOptions::default()
+    };
+    assert_eq!(
+        rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false
+        ),
+        rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false)
+    );
+    let below: Vec<_> = explanation.steps.iter().filter(|s| s.depth == 2).collect();
+    assert_eq!(
+        (below[0].operator.as_str(), below[1].operator.as_str()),
+        ("scan", "filter"),
+        "{:#?}",
+        explanation.steps
+    );
+    assert!(below[1].detail.contains("STRENDS") && below[1].rows < below[0].rows / 5);
+    // Every step after it works on the filtered rows.
+    assert!(
+        below[2..].iter().all(|s| s.rows <= below[1].rows),
+        "{:#?}",
+        explanation.steps
+    );
+    assert_eq!(below.iter().filter(|s| s.operator == "filter").count(), 2);
 
     let construct = SparqlParser::new()
         .parse_query("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")
