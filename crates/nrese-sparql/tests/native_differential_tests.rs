@@ -3607,3 +3607,133 @@ fn multi_operation_updates_equal_spareval() {
     }
     assert!(changed > 150, "only {changed} requests changed anything");
 }
+
+/// Data closed under `owl:sameAs` (every fact replicated over identity classes, the
+/// `sameAs` relation complete): with `equality_closed`, grouped queries whose OPTIONALs
+/// feed `COUNT(DISTINCT …)`, MIN, MAX or SAMPLE join on one representative per class;
+/// the answers equal spareval's, and the OPTIONAL's join is smaller.
+#[test]
+fn identity_classes_shrink_detached_optionals() {
+    let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    let mut rng = Rng(20_260_942);
+    let (mut checked, mut shrunk) = (0, 0);
+    for _ in 0..12 {
+        // Classes of 1 to 5 identities; facts between classes, replicated.
+        let mut classes: Vec<Vec<NamedNode>> = Vec::new();
+        for c in 0..12 {
+            classes.push(
+                (0..1 + rng.below(5))
+                    .map(|m| ex(&format!("c{c}m{m}")))
+                    .collect(),
+            );
+        }
+        let mut quads = Vec::new();
+        for class in &classes {
+            for a in class {
+                for b in class {
+                    if class.len() > 1 {
+                        quads.push(Quad::new(
+                            a.clone(),
+                            same_as.clone(),
+                            b.clone(),
+                            GraphName::DefaultGraph,
+                        ));
+                    }
+                }
+            }
+        }
+        for _ in 0..40 {
+            let (s, o) = (rng.below(12) as usize, rng.below(12) as usize);
+            let p = ex(&format!("p{}", rng.below(3)));
+            let literal = rng.below(4) == 0;
+            for a in &classes[s] {
+                if literal {
+                    quads.push(Quad::new(
+                        a.clone(),
+                        p.clone(),
+                        Literal::new_simple_literal(format!("v{o}")),
+                        GraphName::DefaultGraph,
+                    ));
+                } else {
+                    for b in &classes[o] {
+                        quads.push(Quad::new(
+                            a.clone(),
+                            p.clone(),
+                            b.clone(),
+                            GraphName::DefaultGraph,
+                        ));
+                    }
+                }
+            }
+        }
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in &quads {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..15 {
+            let (p, q) = (rng.below(3), rng.below(3));
+            let aggregate = *rng.pick(&[
+                "COUNT(DISTINCT ?x)",
+                "MIN(?x)",
+                "MAX(?x)",
+                "SAMPLE(?x)",
+                "COUNT(DISTINCT ?x) AS ?m) (MIN(?x)",
+            ]);
+            let text = format!(
+                "SELECT ?k ({aggregate} AS ?n) WHERE {{ ?k <{EX}p{p}> ?y . OPTIONAL {{ ?y <{EX}p{q}> ?x }} }} GROUP BY ?k"
+            );
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let closed = QueryOptions {
+                equality_closed: true,
+                ..QueryOptions::default()
+            };
+            // SAMPLE may pick another value; compare it as "bound or not".
+            let normalise = |rows: Vec<String>| -> Vec<String> {
+                if aggregate.starts_with("SAMPLE") {
+                    rows.into_iter()
+                        .map(|r| {
+                            let bound = !r.ends_with("UNDEF");
+                            format!("{} {bound}", r.split(' ').next().unwrap())
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    rows
+                }
+            };
+            let native = normalise(rows(
+                evaluate_query(&snapshot, &query, &closed).unwrap(),
+                false,
+            ));
+            let spareval = QueryOptions {
+                force_spareval: true,
+                ..QueryOptions::default()
+            };
+            let mut expected = normalise(rows(
+                evaluate_query(&snapshot, &query, &spareval).unwrap(),
+                false,
+            ));
+            expected.sort();
+            let mut native_sorted = native.clone();
+            native_sorted.sort();
+            assert_eq!(native_sorted, expected, "{text}");
+            let rows_of = |options: &QueryOptions| -> u64 {
+                explain_query(&snapshot, &query, options)
+                    .unwrap()
+                    .steps
+                    .iter()
+                    .filter(|s| s.operator == "optional")
+                    .map(|s| s.rows)
+                    .sum()
+            };
+            let open = QueryOptions::default();
+            shrunk += usize::from(rows_of(&closed) < rows_of(&open));
+            checked += 1;
+        }
+    }
+    assert!(shrunk * 3 > checked, "{shrunk} of {checked} joins shrank");
+}

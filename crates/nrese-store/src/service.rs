@@ -76,6 +76,7 @@ impl StoreService {
             query_memory: (config.total_query_memory_bytes > 0)
                 .then(|| nrese_sparql::SharedBudget::new(config.total_query_memory_bytes)),
             services: std::sync::Arc::default(),
+            equality_closed: std::sync::Arc::default(),
         };
         let service = Self {
             query_cache,
@@ -90,7 +91,26 @@ impl StoreService {
         if service.engine.snapshot().revision() != before {
             service.invalidate_reasoning()?;
         }
+        if let Some(state) = service.reasoning_state() {
+            service.note_equality(&state);
+        }
         Ok(service)
+    }
+
+    /// Whether the recorded reasoning closes the data under `owl:sameAs` (a ruleset with
+    /// the equality rules): queries may then rely on it.
+    fn note_equality(&self, state: &crate::ReasoningState) {
+        let closed = nrese_reasoner::v2::rulesets::Ruleset::from_name(&state.ruleset).is_some_and(
+            |ruleset| {
+                ruleset.owl_rules().map_or(
+                    ruleset == nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl,
+                    |rules| rules.contains(&"eq-rep-s"),
+                )
+            },
+        );
+        self.settings
+            .equality_closed
+            .store(closed, std::sync::atomic::Ordering::Release);
     }
 
     fn marker_path(&self) -> Option<PathBuf> {
@@ -120,6 +140,9 @@ impl StoreService {
 
     pub fn invalidate_reasoning(&self) -> StoreResult<()> {
         use std::sync::atomic::Ordering;
+        self.settings
+            .equality_closed
+            .store(false, Ordering::Release);
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
         if !self.marker.swap(false, Ordering::AcqRel) {
             return Ok(());
@@ -135,6 +158,7 @@ impl StoreService {
     }
 
     fn record_reasoning(&self, state: crate::ReasoningState) -> StoreResult<()> {
+        self.note_equality(&state);
         let text = state.to_text();
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
         let Some(path) = self.marker_path() else {
