@@ -121,7 +121,7 @@ P0 = wrong answers or lost data; P1 = a production deployment would hit it; P2 =
 | 5 | P1 | **The store serves from memory.** Data larger than RAM can't be served; last measured, 67 M statements took 16 GiB to serve (QLever: 0.2 GiB) | Roadmap, Pf2 | Pf2 step 2 (memory-mapped runs), Pf5 |
 | 6 | P1 | **Join order stopped at pattern boundaries** (fixed in `96c2ab9`: a part joined to rows already computed is evaluated from them, the smaller side first; what remains is filter selectivity in the order). A path, subquery or OPTIONAL splits a group; the parts are joined as written. Only paths take bound values from their partner, and filters don't inform the order | Plans of the integration questions | W3b |
 | 7 | P1 | **Equality reasoning replicates.** Every statement is copied to every identity of its terms; answers repeat per identity | 883 `owl:sameAs` statements for 65 resources | W4 |
-| 9 | P1 | **A full materialisation can't be cancelled**, nor the closure of a newly declared transitive property | Capability matrix | A8 remainder |
+| 9 | P1 | ~~A full materialisation can't be cancelled~~ (fixed: the batch executor and the transitive closure poll a stop signal; a mutation's rematerialisation stops with the request) | Capability matrix | A8 remainder |
 | 10 | P1 | **No repository isolation and no graph-level access control.** One dataset per server; authentication exists, authorisation by graph doesn't | Capability matrix | D1, E1 |
 | 11 | P1 | **Backups have no versioned manifest and no point-in-time restore;** no upgrade test for the on-disk format | Capability matrix | E3 |
 | 12 | P1 | **Operations can't be observed:** no request outcomes or latencies, no WAL, checkpoint or backup metrics | Capability matrix | E2 |

@@ -757,3 +757,27 @@ fn unnamed_union_memberships_are_left_out_on_request() {
         format!("{ex}Place")
     )));
 }
+
+/// A stopped rematerialisation changes nothing and says so.
+#[test]
+fn a_stopped_rematerialisation_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.ttl");
+    std::fs::write(
+        &path,
+        "@prefix ex: <http://example.com/> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:A rdfs:subClassOf ex:B . ex:x a ex:A .",
+    )
+    .unwrap();
+    let store = StoreService::new(in_memory_store_config().with_ontology(path)).unwrap();
+    let ruleset = nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl;
+    let error = store.rematerialise_until(ruleset, &|| true).unwrap_err();
+    assert!(matches!(
+        error,
+        nrese_store::StoreError::MaterialisationCancelled
+    ));
+    assert!(store.reasoning_state().is_none());
+    assert!(support::inferred_statements(&store).unwrap().is_empty());
+    store.rematerialise(ruleset).unwrap();
+    assert!(!support::inferred_statements(&store).unwrap().is_empty());
+}

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 
+use super::delta::Interrupted;
 pub use super::eval::Schema;
 use super::eval::{AllFacts, GroundProgram, Job, NEVER, Seg, Source, guards_hold, run_jobs};
 use super::ir::{Head, Rule};
@@ -522,8 +523,9 @@ impl Transitive {
         self.predicates.entry(p).or_insert(true);
     }
 
-    /// The closure facts of every predicate that needs it, not yet in `store`.
-    fn run(&mut self, store: &Store) -> Vec<Triple> {
+    /// The closure facts of every predicate that needs it, not yet in `store`; `None` if
+    /// `stop` fired.
+    fn run(&mut self, store: &Store, stop: super::eval::Stop<'_>) -> Option<Vec<Triple>> {
         self.produced.clear();
         let mut out = Vec::new();
         for (&p, dirty) in &mut self.predicates {
@@ -535,14 +537,14 @@ impl Transitive {
             };
             let before = out.len();
             out.extend(
-                nrese_exec::graph::transitive_closure(&relation.pairs())
+                nrese_exec::graph::transitive_closure_until(&relation.pairs(), stop)?
                     .into_iter()
                     .filter(|&(s, o)| !relation.contains(s, o))
                     .map(|(s, o)| [s, p, o]),
             );
             self.produced.insert(p, out.len() - before);
         }
-        out
+        Some(out)
     }
 
     /// After a round: a predicate needs recomputing if other rules added facts over it.
@@ -619,7 +621,7 @@ pub fn materialise_owned(
 ) -> Materialisation {
     let clock = std::time::Instant::now();
     let store = Store::new(input);
-    run(store, clock.elapsed(), rules, lists, schema)
+    run(store, clock.elapsed(), rules, lists, schema, NEVER).expect("never stopped")
 }
 
 /// [`materialise`] over input already grouped the way the working set stores it: per
@@ -632,9 +634,21 @@ pub fn materialise_grouped(
     lists: Option<&ListVocabulary>,
     schema: &Schema,
 ) -> Materialisation {
+    materialise_grouped_until(input, rules, lists, schema, NEVER).expect("never stopped")
+}
+
+/// [`materialise_grouped`], polling `stop` in every round, rule job and module; a fired
+/// `stop` ends it with [`Interrupted`] and nothing of the partial closure.
+pub fn materialise_grouped_until(
+    input: Vec<(u64, Vec<(u64, u64)>)>,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    stop: super::eval::Stop<'_>,
+) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = Store::from_groups(input);
-    run(store, clock.elapsed(), rules, lists, schema)
+    run(store, clock.elapsed(), rules, lists, schema, stop)
 }
 
 /// Semi-naive evaluation to the fixpoint, from a store holding the input as its delta.
@@ -644,7 +658,9 @@ fn run(
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
     schema: &Schema,
-) -> Materialisation {
+    stop: super::eval::Stop<'_>,
+) -> Result<Materialisation, Interrupted> {
+    let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut phases = Phases {
         load,
         ..Phases::default()
@@ -656,6 +672,7 @@ fn run(
     let mut equality = Equality::for_rules(rules);
     let mut regrounding = true;
     loop {
+        check_stop()?;
         result.rounds += 1;
         let clock = std::time::Instant::now();
         // Rules from `evaluated` on were added this round: evaluated once in full.
@@ -691,19 +708,16 @@ fn run(
         for rule in &program.rules[evaluated..] {
             jobs.extend(Job::full(&store, rule));
         }
-        candidates.extend(run_jobs(
-            &store,
-            &jobs,
-            &|fact| !store.contains(fact),
-            NEVER,
-        ));
+        candidates.extend(run_jobs(&store, &jobs, &|fact| !store.contains(fact), stop));
         drop(jobs);
+        check_stop()?;
         phases.joins += clock.elapsed();
         let clock = std::time::Instant::now();
-        candidates.extend(transitive.run(&store));
+        candidates.extend(transitive.run(&store, stop).ok_or(Interrupted)?);
         if let Some(equality) = &mut equality {
             candidates.extend(equality.run(&store));
         }
+        check_stop()?;
         phases.modules += clock.elapsed();
         let clock = std::time::Instant::now();
         // Every candidate was checked against the store, which a round doesn't change.
@@ -733,7 +747,7 @@ fn run(
     result.phases = phases;
     derived.par_sort_unstable();
     result.derived = derived;
-    result
+    Ok(result)
 }
 
 /// Violations sorted by rule and bindings.
