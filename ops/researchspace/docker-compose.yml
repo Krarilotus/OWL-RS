@@ -1,0 +1,57 @@
+# ResearchSpace on NRESE: the ResearchSpace platform with NRESE as its triple store, in
+# place of the Blazegraph of ResearchSpace's own setup
+# (https://github.com/researchspace/researchspace-docker-compose, `basic`).
+#
+#   docker compose -f ops/researchspace/docker-compose.yml up --build
+#
+#   ResearchSpace   http://localhost:10214   (its default login: admin / admin)
+#   NRESE           http://localhost:10215   (console, SPARQL at /dataset/sparql)
+#
+# See docs/integration/researchspace.md for what works and what doesn't yet.
+
+services:
+  nrese:
+    build:
+      context: ../..
+    image: nrese:local
+    restart: unless-stopped
+    ports:
+      - "10215:8080"
+    environment:
+      # ResearchSpace writes into named graphs and queries without naming them.
+      NRESE_DEFAULT_GRAPH: union
+      NRESE_REASONING_MODE: ${NRESE_REASONING_MODE:-disabled}
+      # ResearchSpace's forms and containers send larger updates than the default allows.
+      NRESE_MAX_UPDATE_BYTES: ${NRESE_MAX_UPDATE_BYTES:-16777216}
+    volumes:
+      - nrese-data:/var/lib/nrese/data
+
+  researchspace:
+    image: ${RESEARCHSPACE_IMAGE:-researchspace/platform-ci:latest}
+    restart: unless-stopped
+    depends_on:
+      - nrese
+    ports:
+      - "10214:8080"
+    environment:
+      # One URL for queries and updates: NRESE's combined SPARQL endpoint.
+      PLATFORM_OPTS: >-
+        -Dconfig.environment.sparqlEndpoint=http://nrese:8080/dataset/sparql
+        -Dlog4j.configurationFile=classpath:org/researchspace/logging/log4j2.xml
+        -Dconfig.storage.images.type=nonVersionedFile
+        -Dconfig.storage.images.mutable=true
+        -Dconfig.storage.images.root=/images
+        -Dconfig.storage.tmp.type=nonVersionedFile
+        -Dconfig.storage.tmp.mutable=true
+        -Dconfig.storage.tmp.root=/tmp-data
+        -Dorg.eclipse.jetty.server.Request.maxFormContentSize=1000000
+    volumes:
+      - researchspace-images:/images
+      - researchspace-tmp:/tmp-data
+      - researchspace-runtime:/runtime-data
+
+volumes:
+  nrese-data:
+  researchspace-images:
+  researchspace-tmp:
+  researchspace-runtime:

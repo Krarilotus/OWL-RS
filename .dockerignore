@@ -1,0 +1,10 @@
+# The image build needs the manifests, .cargo, crates and the console's sources only.
+*
+!Cargo.toml
+!Cargo.lock
+!.cargo
+!crates
+!apps/nrese-console
+apps/nrese-console/node_modules
+apps/nrese-console/dist
+**/target

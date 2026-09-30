@@ -41,6 +41,12 @@ pub async fn console_ui(
     console::index()
 }
 
+/// The console's scripts, styles and runtime configuration: static files, served without
+/// the access check of the page that loads them.
+pub async fn console_file(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    console::file(&path)
+}
+
 pub async fn operator_ui(
     State(state): State<AppState>,
     headers: HeaderMap,

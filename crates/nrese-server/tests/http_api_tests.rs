@@ -696,3 +696,77 @@ async fn ttl_fixture_is_loaded_and_drives_reasoner_aware_update_flow()
 
     Ok(())
 }
+
+/// The user console comes out of the binary: the page, its hashed assets (cacheable) and
+/// its runtime configuration. A binary built without the console says so instead.
+#[tokio::test]
+async fn the_console_is_served_from_the_binary() -> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app()?;
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+        }
+    };
+    let version: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(get("/version").await?.into_body(), usize::MAX).await?,
+    )?;
+    let page = get("/console").await?;
+    if version["user_console_embedded"] != true {
+        // No console build beside this checkout (the Rust CI job): the page explains it.
+        assert_eq!(page.status(), StatusCode::SERVICE_UNAVAILABLE);
+        return Ok(());
+    }
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        axum::body::to_bytes(page.into_body(), usize::MAX)
+            .await?
+            .to_vec(),
+    )?;
+    // Every script and stylesheet the page names is served, with its type.
+    let mut assets = 0;
+    for reference in html
+        .split('"')
+        .filter(|part| part.starts_with("/console/assets/"))
+    {
+        let uri: &'static str = Box::leak(reference.to_owned().into_boxed_str());
+        let response = get(uri).await?;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(
+            header("content-type").starts_with("text/javascript")
+                || header("content-type").starts_with("text/css"),
+            "{uri}: {}",
+            header("content-type")
+        );
+        assert!(header("cache-control").contains("immutable"), "{uri}");
+        assets += 1;
+    }
+    assert!(assets >= 1, "{html}");
+    let config = get("/console/console-config.js").await?;
+    assert_eq!(config.status(), StatusCode::OK);
+    assert_eq!(
+        config
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache")
+    );
+    assert_eq!(
+        get("/console/assets/missing.js").await?.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get("/console/../Cargo.toml").await?.status(),
+        StatusCode::NOT_FOUND
+    );
+    Ok(())
+}

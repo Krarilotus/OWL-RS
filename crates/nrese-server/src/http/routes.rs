@@ -1,8 +1,6 @@
 use axum::Router;
-use axum::routing::{get, get_service, post};
-use tower_http::services::ServeDir;
+use axum::routing::{get, post};
 
-use crate::http::console;
 use crate::http::handlers;
 use crate::state::AppState;
 
@@ -81,9 +79,6 @@ pub fn router(state: AppState) -> Router {
             crate::runtime_posture::SHACL_ENDPOINT,
             get(handlers::shacl_get).post(handlers::shacl_post),
         )
-        .nest_service(
-            "/console/assets",
-            get_service(ServeDir::new(console::assets_dir())),
-        )
+        .route("/console/{*path}", get(handlers::console_file))
         .with_state(state)
 }
