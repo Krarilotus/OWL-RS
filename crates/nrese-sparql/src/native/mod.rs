@@ -26,6 +26,7 @@ mod ranges;
 mod search;
 mod sets;
 mod sideways;
+mod spatial;
 pub(crate) mod value;
 mod wcoj;
 
@@ -1650,6 +1651,26 @@ impl<'a> Context<'a> {
         hints: &[ranges::Hint],
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
     ) -> NativeResult<Solutions> {
+        // GeoSPARQL relations between features (`spatial`): those with a constant side
+        // start the joins, the others follow them.
+        if let Some((first, later, rest)) = spatial::split(triples) {
+            let mut result = Solutions::unit();
+            for triple in &first {
+                result = self.spatial_join(result, triple)?;
+            }
+            result = self.filter_bound(result, filters)?;
+            if !rest.is_empty() {
+                result = if first.is_empty() {
+                    self.bgp(&rest, hints, filters)?
+                } else {
+                    self.bgp_from(result, &rest, filters)?
+                };
+            }
+            for triple in &later {
+                result = self.spatial_join(result, triple)?;
+            }
+            return self.filter_bound(result, filters);
+        }
         // Full-text searches start the joins (`search`).
         if let Some((searches, rest)) = search::split(triples) {
             let mut result = Solutions::unit();
@@ -1811,6 +1832,25 @@ impl<'a> Context<'a> {
         triples: &[TriplePattern],
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
     ) -> NativeResult<Solutions> {
+        // GeoSPARQL relations (`spatial`) join after the other patterns.
+        if let Some((first, later, rest)) = spatial::split(triples) {
+            let mut result = if rest.is_empty() {
+                result
+            } else {
+                self.bgp_from(result, &rest, filters)?
+            };
+            for triple in first.iter().chain(&later) {
+                result = self.spatial_join(result, triple)?;
+            }
+            let bound: Vec<Variable> = result
+                .vars
+                .iter()
+                .enumerate()
+                .filter(|&(c, _)| !result.table.column(c).contains(&UNDEF))
+                .map(|(_, v)| v.clone())
+                .collect();
+            return self.filter_among(result, filters, &bound);
+        }
         let mut scans = Vec::with_capacity(triples.len());
         for triple in triples {
             match self.scan_pattern(triple) {
@@ -2514,7 +2554,10 @@ impl<'a> Context<'a> {
         let [triple] = patterns.as_slice() else {
             return Ok(None);
         };
-        if self.merge_set.is_some() || search::is_search(triple, patterns) {
+        if self.merge_set.is_some()
+            || search::is_search(triple, patterns)
+            || spatial::is_spatial(triple)
+        {
             return Ok(None);
         }
         let vars = triple_variables(triple);
@@ -2899,6 +2942,7 @@ impl<'a> Context<'a> {
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
             && !search::is_search(triple, patterns)
+            && !spatial::is_spatial(triple)
         {
             let count = match self.scan_pattern(triple) {
                 // The index counts quads; in the merged default graph a statement in
@@ -2923,6 +2967,7 @@ impl<'a> Context<'a> {
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
             && !search::is_search(triple, patterns)
+            && !spatial::is_spatial(triple)
             && let Some(scan) = self.scan_pattern(triple)
             && !scan.repeats_variable()
             && !scan.merged()

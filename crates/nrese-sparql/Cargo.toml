@@ -15,6 +15,7 @@ oxrdf = "=0.3.3"
 # SPARQL functions (RAND, UUID, the hashes, IRI against BASE): the crates spareval uses.
 # GeoSPARQL: geometries and their relations; WKT literals.
 geo = "0.33"
+rstar = "0.12"
 wkt = "0.14"
 hex = "0.4"
 md-5 = "0.10"
