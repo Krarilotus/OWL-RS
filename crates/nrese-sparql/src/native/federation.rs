@@ -1,7 +1,8 @@
 //! `SERVICE` ([`crate::service`]): the block goes to the endpoint as `SELECT *`, with the
-//! values bound so far as `VALUES` when it is joined to them.
+//! values bound so far as `VALUES` when it is joined to them. `SERVICE ?endpoint` calls
+//! each endpoint the solutions it is joined to bind, with their rows.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use spargebra::Query;
 use spargebra::algebra::GraphPattern;
@@ -9,7 +10,8 @@ use spargebra::term::{GroundTerm, NamedNodePattern};
 
 use nrese_exec::{IdTable, UNDEF};
 use oxrdf::{Term, Variable};
-use spareval::QueryEvaluationError;
+
+use crate::results::QueryEvaluationError;
 
 use super::{Context, NativeError, NativeResult, Solutions, bound_variables};
 use crate::service::{BIND_CHUNK, BIND_LIMIT};
@@ -24,10 +26,95 @@ impl Context<'_> {
         silent: bool,
         bound: Option<&Solutions>,
     ) -> NativeResult<Solutions> {
-        let NamedNodePattern::NamedNode(endpoint) = name else {
-            return Err(NativeError::Fallback);
+        let variable = match name {
+            NamedNodePattern::NamedNode(endpoint) => {
+                return self.call_silently(endpoint.as_str(), inner, bound, silent);
+            }
+            NamedNodePattern::Variable(v) => v,
         };
-        match self.call_service(endpoint.as_str(), inner, bound) {
+        // The endpoints are the values the joined solutions have for the variable.
+        let unbound = || -> NativeResult<Solutions> {
+            if silent {
+                Ok(Solutions::unit())
+            } else {
+                Err(QueryEvaluationError::Service(
+                    format!("SERVICE {variable}: the variable has no value").into(),
+                )
+                .into())
+            }
+        };
+        let Some((bound, column)) = bound.and_then(|b| Some((b, b.column(variable)?))) else {
+            return unbound();
+        };
+        let mut rows_of: HashMap<u64, Vec<usize>> = HashMap::new();
+        for row in 0..bound.table.len() {
+            rows_of
+                .entry(bound.table.get(row, column))
+                .or_default()
+                .push(row);
+        }
+        let mut endpoints: Vec<(u64, Vec<usize>)> = rows_of.into_iter().collect();
+        endpoints.sort_unstable_by_key(|(id, _)| *id);
+        let mut all: Option<Solutions> = None;
+        for (id, rows) in endpoints {
+            let endpoint = match (id != UNDEF).then(|| self.term(id)).flatten() {
+                Some(Term::NamedNode(n)) => n,
+                _ if silent => continue,
+                _ => {
+                    return Err(QueryEvaluationError::Service(
+                        format!("SERVICE {variable}: an endpoint must be an IRI").into(),
+                    )
+                    .into());
+                }
+            };
+            let mut subset = IdTable::new(bound.table.width());
+            for &row in &rows {
+                subset.push_row(&bound.table.row(row));
+            }
+            let subset = Solutions {
+                vars: bound.vars.clone(),
+                table: subset,
+                ordered: false,
+            };
+            let found = self.call_silently(endpoint.as_str(), inner, Some(&subset), silent)?;
+            // The endpoint's rows carry the endpoint, so they join to the rows that named it.
+            let found = if found.vars.contains(variable) {
+                found
+            } else {
+                let mut vars = found.vars.clone();
+                vars.push(variable.clone());
+                let mut table = IdTable::new(vars.len());
+                let mut line = vec![id; vars.len()];
+                for row in 0..found.table.len() {
+                    line[..found.vars.len()].copy_from_slice(&found.table.row(row));
+                    table.push_row(&line);
+                }
+                Solutions {
+                    vars,
+                    table,
+                    ordered: false,
+                }
+            };
+            all = Some(match all {
+                Some(all) => self.union(all, found)?,
+                None => found,
+            });
+        }
+        match all {
+            Some(all) => Ok(all),
+            None => unbound(),
+        }
+    }
+
+    /// One endpoint's answer; with `silent`, a failure gives one solution without bindings.
+    fn call_silently(
+        &self,
+        endpoint: &str,
+        inner: &GraphPattern,
+        bound: Option<&Solutions>,
+        silent: bool,
+    ) -> NativeResult<Solutions> {
+        match self.call_service(endpoint, inner, bound) {
             Err(NativeError::Evaluation(error))
                 if silent && !matches!(error, QueryEvaluationError::Cancelled) =>
             {

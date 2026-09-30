@@ -12,8 +12,8 @@
 use std::error::Error;
 use std::sync::Arc;
 
+use crate::results::CancellationToken;
 use oxrdf::{Term, Variable};
-use spareval::CancellationToken;
 
 /// Rows of bound values per `SERVICE` request of a bind join.
 pub const BIND_CHUNK: usize = 200;

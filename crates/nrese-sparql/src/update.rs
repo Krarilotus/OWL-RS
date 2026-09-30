@@ -13,16 +13,12 @@ use std::collections::HashMap;
 
 use nrese_engine::{GraphSelector, QuadPattern, TermId, Transaction};
 use oxrdf::{BlankNode, GraphName as OxGraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use spareval::{
-    CancellationToken, DeleteInsertQuad, QueryDatasetSpecification, QueryEvaluationError,
-};
 use spargebra::algebra::GraphTarget;
 use spargebra::term::{GraphName, GroundQuad, GroundTerm, Quad as DataQuad};
 use spargebra::{GraphUpdateOperation, Update};
 use thiserror::Error;
 
-use crate::dataset::EngineDataset;
-use crate::query::evaluator;
+use crate::results::{CancellationToken, QueryDatasetSpecification, QueryEvaluationError};
 
 #[derive(Clone, Default)]
 pub struct UpdateOptions {
@@ -33,9 +29,6 @@ pub struct UpdateOptions {
     /// ([`QueryOptions::union_default_graph`](crate::QueryOptions)).
     pub union_default_graph: bool,
     pub cancellation: Option<CancellationToken>,
-    /// Evaluate `WHERE` clauses on spareval even where the native executor could
-    /// (differential testing).
-    pub force_spareval: bool,
     /// Who answers `SERVICE` calls in `WHERE` clauses ([`crate::service`]).
     pub services: Option<crate::Services>,
 }
@@ -97,60 +90,27 @@ fn apply_operation(
             using,
             pattern,
         } => {
-            // Natively, on the committed state, or after earlier operations of the request
-            // changed something, on a snapshot of the pending state.
-            let pending = (!options.force_spareval
-                && (tx.pending() != (0, 0) || tx.inferred_pending() != (0, 0)))
+            // On the committed state, or after earlier operations of the request changed
+            // something, on a snapshot of the pending state. The whole WHERE result is
+            // computed against the state before this operation.
+            let pending = (tx.pending() != (0, 0) || tx.inferred_pending() != (0, 0))
                 .then(|| tx.pending_snapshot());
-            let native = (!options.force_spareval)
-                .then(|| {
-                    let query_options = crate::query::QueryOptions {
-                        cancellation: options.cancellation.clone(),
-                        union_default_graph: options.union_default_graph,
-                        dataset: options.using.clone(),
-                        services: options.services.clone(),
-                        ..crate::query::QueryOptions::default()
-                    };
-                    crate::native::delete_insert(
-                        pending.as_ref().unwrap_or(tx.base()),
-                        pattern,
-                        delete,
-                        insert,
-                        using.as_ref(),
-                        update.base_iri.as_ref(),
-                        &query_options,
-                    )
-                })
-                .flatten();
-            // The whole WHERE result is computed against the state before this operation.
-            let (deletes, inserts) = match native {
-                Some(changes) => changes?,
-                None => {
-                    let evaluator = evaluator(options.cancellation.as_ref());
-                    let prepared = evaluator.prepare_delete_insert(
-                        delete.clone(),
-                        insert.clone(),
-                        update.base_iri.clone(),
-                        // The adapter presents the operation's dataset as the store.
-                        None,
-                        pattern,
-                    );
-                    let mut deletes = Vec::new();
-                    let mut inserts = Vec::new();
-                    let dataset = EngineDataset::new(&*tx).reading(
-                        options.union_default_graph,
-                        options.using.as_ref(),
-                        using.as_ref(),
-                    );
-                    for change in prepared.execute(dataset)? {
-                        match change? {
-                            DeleteInsertQuad::Delete(quad) => deletes.push(quad),
-                            DeleteInsertQuad::Insert(quad) => inserts.push(quad),
-                        }
-                    }
-                    (deletes, inserts)
-                }
+            let query_options = crate::query::QueryOptions {
+                cancellation: options.cancellation.clone(),
+                union_default_graph: options.union_default_graph,
+                dataset: options.using.clone(),
+                services: options.services.clone(),
+                ..crate::query::QueryOptions::default()
             };
+            let (deletes, inserts) = crate::native::delete_insert(
+                pending.as_ref().unwrap_or(tx.base()),
+                pattern,
+                delete,
+                insert,
+                using.as_ref(),
+                update.base_iri.as_ref(),
+                &query_options,
+            )?;
             // Every deletion before any insertion (SPARQL 1.1 Update 3.1.3): a quad one
             // solution deletes and another inserts is present afterwards.
             for quad in &deletes {

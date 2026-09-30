@@ -41,58 +41,6 @@ const CRS84: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
 const EPSG_4326: &str = "http://www.opengis.net/def/crs/EPSG/0/4326";
 const UOM: &str = "http://www.opengis.net/def/uom/OGC/1.0/";
 
-/// The functions and how many arguments each takes.
-const FUNCTIONS: &[(&str, usize)] = &[
-    ("sfEquals", 2),
-    ("sfDisjoint", 2),
-    ("sfIntersects", 2),
-    ("sfTouches", 2),
-    ("sfCrosses", 2),
-    ("sfWithin", 2),
-    ("sfContains", 2),
-    ("sfOverlaps", 2),
-    ("ehEquals", 2),
-    ("ehDisjoint", 2),
-    ("ehMeet", 2),
-    ("ehOverlap", 2),
-    ("ehCovers", 2),
-    ("ehCoveredBy", 2),
-    ("ehInside", 2),
-    ("ehContains", 2),
-    ("rcc8eq", 2),
-    ("rcc8dc", 2),
-    ("rcc8ec", 2),
-    ("rcc8po", 2),
-    ("rcc8tppi", 2),
-    ("rcc8tpp", 2),
-    ("rcc8ntpp", 2),
-    ("rcc8ntppi", 2),
-    ("relate", 3),
-    ("distance", 3),
-    ("area", 2),
-    ("length", 2),
-    ("buffer", 3),
-    ("convexHull", 1),
-    ("boundary", 1),
-    ("envelope", 1),
-    ("centroid", 1),
-    ("intersection", 2),
-    ("union", 2),
-    ("difference", 2),
-    ("symDifference", 2),
-    ("getSRID", 1),
-    ("isEmpty", 1),
-    ("dimension", 1),
-    ("asWKT", 1),
-    ("asGeoJSON", 1),
-];
-
-/// Whether `name` is a GeoSPARQL function the executor evaluates with `arity` arguments.
-pub(crate) fn supported(name: &str, arity: usize) -> bool {
-    name.strip_prefix(GEOF)
-        .is_some_and(|local| FUNCTIONS.contains(&(local, arity)))
-}
-
 /// How a geometry literal is written.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Serialisation {

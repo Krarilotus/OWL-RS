@@ -1,6 +1,6 @@
 [package]
 name = "nrese-sparql"
-description = "NRESE SPARQL layer: spareval over nrese-engine snapshots and transactions, update execution"
+description = "NRESE SPARQL layer: query and update execution over nrese-engine snapshots and transactions"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,8 +11,9 @@ nrese-engine = { path = "../nrese-engine" }
 nrese-exec = { path = "../nrese-exec" }
 oxsdatatypes = "=0.2.2"
 regex = "1.12"
-oxrdf = "=0.3.3"
-# SPARQL functions (RAND, UUID, the hashes, IRI against BASE): the crates spareval uses.
+# The conversions from XSD values to literals (until nrese-rdf replaces oxrdf).
+oxrdf = { version = "=0.3.3", features = ["oxsdatatypes"] }
+# SPARQL functions (RAND, UUID, the hashes, IRI against BASE).
 # GeoSPARQL: geometries and their relations; WKT, GeoJSON and GML literals.
 geo = "0.33"
 quick-xml = "0.37"
@@ -25,15 +26,14 @@ oxiri = "0.2"
 rand = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
-spareval = { version = "=0.2.6", features = ["sep-0002", "calendar-ext"] }
 spargebra = "=0.4.6"
 thiserror.workspace = true
 
 [dev-dependencies]
 # The GeoSPARQL compliance runner reasons over the benchmark's dataset (RDFS).
 nrese-reasoner = { path = "../nrese-reasoner" }
-# Differential oracle: the same spareval evaluator over Oxigraph's own storage.
-oxigraph = { version = "0.5.6", default-features = false }
+# The differential tests' reference: the specification's algebra, evaluated plainly.
+nrese-sparql-reference = { path = "../nrese-sparql-reference" }
 # W3C suite runner: manifests, data files and expected results.
 oxrdfio = "=0.2.4"
 sparesults = "=0.3.3"

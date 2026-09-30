@@ -1,18 +1,17 @@
-//! Q1 evidence: queries and updates give the same results on nrese-engine as on Oxigraph's
-//! own storage, which runs the same `spareval` evaluator. A difference therefore points at
-//! the adapter (term identity, graph handling, update semantics), not the evaluator.
+//! Q1 evidence: queries and update sequences give the same results through NRESE's query
+//! and update path over the engine as on the reference evaluator (`nrese-sparql-reference`)
+//! over the same quads: term identity, graph handling, dataset clauses, update semantics.
 //!
 //! Blank-node labels are normalised, since fresh labels legitimately differ between stores.
 //!
-//! The shared dataset uses canonical lexical forms only: Oxigraph canonicalises typed
-//! literals on storage (`"030"^^xsd:integer` becomes `"30"`), which violates RDF term
-//! identity. NRESE preserves lexical forms (ADR-0002); `non_canonical_literals_keep_their_identity`
-//! pins that behaviour separately.
+//! The shared dataset uses canonical lexical forms only; NRESE preserves lexical forms
+//! (ADR-0002), which `non_canonical_literals_keep_their_identity` pins separately.
 
 use nrese_engine::{Engine, EngineConfig};
 use nrese_sparql::{QueryOptions, QueryResults, UpdateOptions, apply_update, evaluate_query};
-use oxigraph::sparql::{QueryResults as OxResults, SparqlEvaluator};
-use oxigraph::store::Store;
+use std::cell::RefCell;
+
+use nrese_sparql_reference::Dataset;
 use oxrdf::vocab::xsd;
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Term};
 use spargebra::SparqlParser;
@@ -238,17 +237,17 @@ fn normalize(results: QueryResults<'_>, ordered: bool) -> Normalized {
     }
 }
 
-fn load_both() -> (Engine, Store) {
+fn load_both() -> (Engine, RefCell<Dataset>) {
     let engine = Engine::new(EngineConfig {
         background_maintenance: false,
         ..EngineConfig::default()
     })
     .unwrap();
-    let store = Store::new().unwrap();
+    let store = RefCell::new(Dataset::default());
     let mut tx = engine.transaction();
     for quad in dataset() {
         tx.insert(quad.as_ref());
-        store.insert(&quad).unwrap();
+        store.borrow_mut().insert(quad);
     }
     tx.commit().unwrap();
     (engine, store)
@@ -261,12 +260,11 @@ fn ours(engine: &Engine, query: &str) -> Normalized {
     normalize(results, query.contains("ORDER BY"))
 }
 
-fn oracle(store: &Store, query: &str) -> Normalized {
-    let results: OxResults<'_> = SparqlEvaluator::new()
-        .parse_query(query)
-        .unwrap()
-        .on_store(store)
-        .execute()
+fn oracle(store: &RefCell<Dataset>, query: &str) -> Normalized {
+    let parsed = SparqlParser::new().parse_query(query).unwrap();
+    let results = store
+        .borrow()
+        .query(&parsed, &QueryOptions::default())
         .unwrap();
     normalize(results, query.contains("ORDER BY"))
 }
@@ -293,11 +291,9 @@ fn update_sequences_match_the_oracle() {
         let mut tx = engine.transaction();
         apply_update(&mut tx, &parsed, &UpdateOptions::default()).unwrap();
         tx.commit().unwrap();
-        SparqlEvaluator::new()
-            .parse_update(update)
-            .unwrap()
-            .on_store(&store)
-            .execute()
+        store
+            .borrow_mut()
+            .update(&parsed, &QueryOptions::default())
             .unwrap();
         assert_eq!(
             ours(&engine, ALL_QUADS),

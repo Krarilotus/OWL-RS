@@ -5,10 +5,8 @@
 //! own needs (sorting, grouping), not by the result size. A transport that forwards the
 //! writer's output as it arrives streams end to end.
 //!
-//! Cancellation: the token is checked by the evaluator on every quad it reads and here on
-//! every result row. Between two quad reads, spareval's in-memory join and aggregation loops
-//! can't be interrupted (0.7 s measured on a 10¹⁰-row cross product); the native executor
-//! (Pf3) closes that gap.
+//! Cancellation: the token is checked by the executor before every operator, in scans and
+//! in its chunked join and grouping loops, and here on every result row.
 
 use std::io::Write;
 
@@ -243,7 +241,6 @@ pub(crate) fn run_query(
         equality_closed: store
             .equality_closed
             .load(std::sync::atomic::Ordering::Acquire),
-        ..QueryOptions::default()
     };
     let alive = || match cancellation.is_cancelled() {
         true => Err(StoreError::SparqlEvaluation(
@@ -315,7 +312,6 @@ pub(crate) fn explain_prepared(
         equality_closed: store
             .equality_closed
             .load(std::sync::atomic::Ordering::Acquire),
-        ..QueryOptions::default()
     };
     Ok(explain_query(view, &prepared.query, &options)?)
 }

@@ -331,7 +331,7 @@ impl Context<'_> {
     fn side(&self, term: &TermPattern, solutions: &Solutions) -> Side {
         match term {
             TermPattern::NamedNode(n) => {
-                Side::Constant(self.snapshot.lookup(n.as_ref().into()).map(TermId::raw))
+                Side::Constant(self.lookup_const(n.as_ref().into()).map(TermId::raw))
             }
             TermPattern::Variable(v) => match solutions.column(v) {
                 Some(c) => Side::Bound(c),

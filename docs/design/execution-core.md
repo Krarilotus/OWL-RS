@@ -1,6 +1,9 @@
 # Execution core and native query engine (XC, Pf3, Pf4)
 
 Status: **design**, 2026-09-27. Phase 2 of [ROADMAP §3.1](../ROADMAP.md); decision D11: one execution core for SPARQL and reasoning.
+Update 2026-10-01: the fallback below is gone; the native executor evaluates every query,
+and the differential tests compare it with `nrese-sparql-reference`
+([migration plan](../plan/2026-10-01-oxigraph-migration.md)).
 
 ## 1. Goal
 
