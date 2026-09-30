@@ -1,0 +1,43 @@
+# The Jena oracle (benches/oracle/README.md): the differential tests' queries answered by a
+# second engine. Fails when a difference is left unexplained; the report is kept.
+name: Nightly oracle
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  jena:
+    name: NRESE and Jena
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain version from rust-toolchain.toml
+        run: echo "RUST_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: oracle
+      - name: dump the differential tests' cases
+        run: |
+          NRESE_ORACLE_DUMP="$PWD/oracle-dump" cargo test --locked -p nrese-sparql \
+            --test native_differential_tests -- native_results_equal_spareval_on_random_queries \
+            pushed_filters_equal_spareval computed_values_equal_spareval
+      - name: Jena answers them
+        run: |
+          docker build -q -t nrese-bench/jena:6.2.0 benches/competitors/jena
+          docker build -q -t nrese-bench/jena-oracle benches/oracle/jena
+          docker run --rm -v "$PWD/oracle-dump:/cases" nrese-bench/jena-oracle /cases
+      - name: compare
+        run: python3 benches/oracle/compare.py oracle-dump --report oracle-report.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oracle-report
+          path: oracle-report.md

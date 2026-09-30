@@ -31,6 +31,7 @@ PULLED=(
   "eclipse/rdf4j-workbench:latest"
   "obolibrary/robot:v1.9.8" # ELK and HermiT: the classification oracle
   "eclipse-temurin:21-jre"
+  "eclipse-temurin:21-jdk" # compiles the Java runners (reasoning/jena, oracle/jena)
   "python:3.13-slim"
   "alpine:latest"
   "$RUST_IMAGE"
@@ -43,6 +44,7 @@ BUILT=(
   "nrese-bench/nemo=reasoning/nemo"
   "nrese-bench/lubm-uba=reasoning/lubm"
   "nrese-bench/owl2bench=reasoning/owl2bench"
+  "nrese-bench/jena-oracle=oracle/jena" # the second oracle (benches/oracle)
 )
 FUSEKI=$ROOT/.cache/tools/apache-jena-fuseki-$FUSEKI_VERSION
 
