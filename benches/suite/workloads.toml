@@ -6,6 +6,8 @@
 # needs:   capabilities from systems.toml; `any` lists alternatives (one is enough)
 # state:   ready (a kit in this repository runs it), partial, planned (to add),
 #          blocked (waits for an NRESE capability: `waits-for`)
+# The suite's driver (suite.py run) runs the workloads suitekit/workloads.py defines;
+# the others it lists as not run.
 # check:   how a result is verified before its time counts
 
 # --- reasoning ---------------------------------------------------------------------------
@@ -212,8 +214,7 @@ tasks = ["search"]
 needs = ["load", "query", "fulltext"]
 source = "ResearchSpace's templates; l3s.de/~minack/rdf-fulltext-benchmark"
 licence = "to check before use"
-state = "blocked"
-waits-for = "fulltext"
+state = "planned"
 check = "result sets across systems"
 
 [geosparql]
@@ -223,8 +224,7 @@ tasks = ["space"]
 needs = ["load", "query", "geosparql"]
 source = "github.com/OpenLinkSoftware/GeoSPARQLBenchmark; geographica.di.uoa.gr"
 licence = "to check before use"
-state = "blocked"
-waits-for = "geosparql"
+state = "planned"
 check = "the benchmark's expected answers"
 
 [federation]
@@ -234,8 +234,7 @@ tasks = ["federation"]
 needs = ["query", "federation"]
 source = "fedbench.fluidops.net; w3c/rdf-tests"
 licence = "to check before use"
-state = "blocked"
-waits-for = "federation"
+state = "planned"
 check = "answers against the single-store run"
 
 # --- the consumers ---------------------------------------------------------------------------
