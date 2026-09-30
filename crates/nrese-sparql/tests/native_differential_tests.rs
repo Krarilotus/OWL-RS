@@ -118,6 +118,22 @@ fn triple(rng: &mut Rng) -> String {
 }
 
 fn bgp(rng: &mut Rng) -> String {
+    // Half of the patterns are connected and start from `?a <p> ?b`: each further triple
+    // continues from a variable that is already bound, so the join has something to match
+    // and the operators above it get rows to work on. The other half is unconstrained
+    // (repeated variables, unknown constants, variable predicates) and mostly empty.
+    if rng.below(2) == 0 {
+        let mut triples = vec![format!("?a <{EX}p{}> ?b .", rng.below(4))];
+        for _ in 0..rng.below(3) {
+            let subject = *rng.pick(&["?a", "?b"]);
+            let object = match rng.below(4) {
+                0 => format!("<{EX}e{}>", rng.below(6)),
+                _ => rng.pick(&["?c", "?d"]).to_string(),
+            };
+            triples.push(format!("{subject} <{EX}p{}> {object} .", rng.below(4)));
+        }
+        return triples.join(" ");
+    }
     (0..1 + rng.below(3))
         .map(|_| triple(rng))
         .collect::<Vec<_>>()
@@ -185,8 +201,21 @@ fn group_pattern(rng: &mut Rng, depth: u32) -> String {
                     0 => format!("<{EX}e{}>", rng.below(7)),
                     _ => rng.pick(&VARS).to_string(),
                 };
+                // A path that matches with length zero starts from a constant or from
+                // `?z`, which no filter names. From a variable that a literal is bound to,
+                // spareval's optimiser takes the start for a node and decides `?v = 2`
+                // from that; SPARQL lets a zero-length path start at any term of the
+                // graph. `paths_from_bound_values_equal_spareval` covers bound starts.
+                let subject = if path.ends_with('*') || path.ends_with('?') {
+                    match rng.below(3) {
+                        0 => format!("<{EX}e{}>", rng.below(7)),
+                        _ => "?z".to_owned(),
+                    }
+                } else {
+                    end(rng)
+                };
                 let path = path.replace("<P", &format!("<{EX}p"));
-                format!("{} {path} {} .", end(rng), end(rng))
+                format!("{subject} {path} {} .", end(rng))
             }
             7 => {
                 let v = rng.pick(&VARS);
@@ -336,6 +365,7 @@ fn limited(text: &str) -> Option<usize> {
 fn native_results_equal_spareval_on_random_queries() {
     let mut rng = Rng(20_260_927);
     let (mut checked, mut fallbacks) = (0, Vec::new());
+    let mut with_solutions = 0;
     for dataset_case in 0..150 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
@@ -404,8 +434,16 @@ fn native_results_equal_spareval_on_random_queries() {
                 "dataset {dataset_case}, query {query_case}, {model:?}: {text}"
             );
             checked += 1;
+            with_solutions += usize::from(!expected.is_empty());
         }
     }
+    // Agreement on empty results proves little: a fair share of the queries must have
+    // solutions. It is a fifth (a tenth before the generator got its connected patterns);
+    // the tests with their own generators below reach a quarter to three quarters.
+    assert!(
+        with_solutions * 6 > checked,
+        "only {with_solutions} of {checked} queries have solutions"
+    );
     // Queries outside native coverage run on spareval, which is correct by construction;
     // the generator's shapes must still be almost all native.
     assert!(
@@ -765,6 +803,206 @@ fn closures_from_many_bound_values_equal_spareval() {
         assert!(expected.len() > 100, "{text}");
         assert_same_rows(&native, &expected, &text);
     }
+}
+
+/// A query over values the query computes itself: grouping, aggregating, ordering,
+/// deduplicating, joining and filtering on the results of `BIND` and `SELECT` expressions
+/// and of aggregates in subqueries. The patterns are single statements and joins on `?a`,
+/// so nearly every query has solutions. Returns the query and whether its rows are ordered.
+///
+/// Left out, because spareval differs from the specification there: `DATATYPE` of a
+/// literal of a derived integer type (spareval answers `xsd:integer` for an `xsd:int`).
+fn computed_query(rng: &mut Rng) -> (String, bool) {
+    let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+    let base = match rng.below(3) {
+        0 => format!("?a {} ?b", p(rng)),
+        1 => format!("?a {} ?b . ?a {} ?c", p(rng), p(rng)),
+        _ => format!("?a {} ?b OPTIONAL {{ ?a {} ?c }}", p(rng), p(rng)),
+    };
+    let expression = rng
+        .pick(&[
+            "STR(?b)",
+            "isIRI(?b)",
+            "?b + 1",
+            "?b * 1.5",
+            "LANG(?b)",
+            "YEAR(?b)",
+            "STRLEN(STR(?b))",
+            "UCASE(STR(?b))",
+            "IF(isLiteral(?b), \"lit\", \"iri\")",
+            "COALESCE(?b + 0, STRLEN(STR(?b)))",
+            "CONCAT(STR(?a), \"/\", STR(?b))",
+            "IRI(STR(?b))",
+            "SUBSTR(STR(?b), 2, 3)",
+            "?b = 3 || isIRI(?b)",
+            "ABS(?b - 4)",
+            "STRDT(STR(?b), <http://www.w3.org/2001/XMLSchema#integer>)",
+        ])
+        .to_string();
+    let bound = format!("{base} BIND({expression} AS ?k)");
+    match rng.below(14) {
+        0 => {
+            let aggregate = rng
+                .pick(&[
+                    "COUNT(?b)",
+                    "SUM(?b)",
+                    "AVG(?b)",
+                    "MIN(?b)",
+                    "MAX(?b)",
+                    "COUNT(DISTINCT ?b)",
+                    "COUNT(*)",
+                ])
+                .to_string();
+            (
+                format!("SELECT ?a (({aggregate}) AS ?x) WHERE {{ {base} }} GROUP BY ?a"),
+                false,
+            )
+        }
+        // Grouping by a computed key, and aggregates of computed values.
+        1 => (
+            format!(
+                "SELECT ?k (COUNT(*) AS ?n) (COUNT(DISTINCT ?a) AS ?d) WHERE {{ {bound} }} GROUP BY ?k"
+            ),
+            false,
+        ),
+        2 => (
+            format!(
+                "SELECT ?a (SUM(?k) AS ?s) (MIN(?k) AS ?lo) (MAX(?k) AS ?hi) (COUNT(?k) AS ?n) (COUNT(DISTINCT ?k) AS ?d) (AVG(?k) AS ?m) WHERE {{ {bound} }} GROUP BY ?a"
+            ),
+            false,
+        ),
+        3 => (
+            format!(
+                "SELECT ?a (COUNT(?b) AS ?n) WHERE {{ {base} }} GROUP BY ?a HAVING (COUNT(?b) > 1 && MAX(?b) != MIN(?b))"
+            ),
+            false,
+        ),
+        // A total order over computed values: every variable is a sort key.
+        4 => (
+            format!("SELECT ?k ?a ?b WHERE {{ {bound} }} ORDER BY ?k ?a ?b"),
+            true,
+        ),
+        5 => (
+            format!(
+                "SELECT ?k ?a ?b WHERE {{ {bound} }} ORDER BY DESC(?k) DESC(?b) ?a LIMIT {} OFFSET {}",
+                1 + rng.below(9),
+                rng.below(3)
+            ),
+            true,
+        ),
+        6 => (format!("SELECT DISTINCT ?k WHERE {{ {bound} }}"), false),
+        // Joining on a computed value, which may or may not be a term of the store.
+        7 => (
+            format!("SELECT * WHERE {{ {{ {bound} }} ?k {} ?d }}", p(rng)),
+            false,
+        ),
+        8 => (
+            format!("SELECT * WHERE {{ {{ {bound} }} {{ ?e {} ?k }} }}", p(rng)),
+            false,
+        ),
+        // Filters over computed values, beyond the compiled shapes.
+        9 => {
+            let filter = rng
+                .pick(&[
+                    "?k IN (1, 2, \"s1\", \"lit\", true)",
+                    "IF(BOUND(?k), ?k != ?b, true)",
+                    "COALESCE(?k, 0) != 1",
+                    "?k = ?b || !BOUND(?k)",
+                    "STR(?k) < \"m\"",
+                    "?k > 2 || isIRI(?k)",
+                    "sameTerm(?k, ?b)",
+                    "BOUND(?k) && DATATYPE(?k) = <http://www.w3.org/2001/XMLSchema#integer>",
+                ])
+                .to_string();
+            (
+                format!("SELECT * WHERE {{ {bound} FILTER({filter}) }}"),
+                false,
+            )
+        }
+        // An aggregate of a subquery, joined and filtered outside.
+        10 => (
+            format!(
+                "SELECT * WHERE {{ {{ SELECT ?a (COUNT(*) AS ?n) (MAX(?b) AS ?top) WHERE {{ {base} }} GROUP BY ?a }} ?a {} ?d FILTER(?n >= {}) }}",
+                p(rng),
+                1 + rng.below(3)
+            ),
+            false,
+        ),
+        11 => (
+            format!(
+                "SELECT ?a ?b (STRLEN(STR(?b)) AS ?l) (IF(isLiteral(?b), ?b, ?a) AS ?f) (?l + 1 AS ?m) WHERE {{ {base} }}"
+            ),
+            false,
+        ),
+        12 => (
+            format!(
+                "SELECT ?a ?k WHERE {{ {bound} VALUES ?a {{ <{EX}e0> <{EX}e1> <{EX}e2> <{EX}e6> }} MINUS {{ ?a {} ?k }} }}",
+                p(rng)
+            ),
+            false,
+        ),
+        _ => (
+            format!(
+                "SELECT ?k (COUNT(*) AS ?n) WHERE {{ {{ {base} BIND(\"left\" AS ?k) }} UNION {{ ?a {} ?b BIND(STR(?b) AS ?k) }} }} GROUP BY ?k",
+                p(rng)
+            ),
+            false,
+        ),
+    }
+}
+
+/// Queries over computed values give spareval's results: see [`computed_query`].
+#[test]
+fn computed_values_equal_spareval() {
+    let mut rng = Rng(20_261_002);
+    let (mut checked, mut with_solutions, mut fallbacks) = (0, 0, 0);
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..QueryOptions::default()
+    };
+    for dataset_case in 0..60 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..60 {
+            let (text, ordered) = computed_query(&mut rng);
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            if !runs_natively(&query) {
+                fallbacks += 1;
+                continue;
+            }
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                ordered,
+            );
+            let expected = rows(
+                evaluate_query(&snapshot, &query, &spareval).unwrap(),
+                ordered,
+            );
+            assert_same_rows(
+                &native,
+                &expected,
+                &format!("dataset {dataset_case}, query {query_case}: {text}"),
+            );
+            checked += 1;
+            with_solutions += usize::from(!expected.is_empty());
+        }
+    }
+    assert!(
+        fallbacks * 5 < checked,
+        "{fallbacks} of {} queries not native",
+        checked + fallbacks
+    );
+    assert!(
+        with_solutions * 4 > checked * 3,
+        "only {with_solutions} of {checked} queries have solutions"
+    );
 }
 
 /// A filter on a variable that a subquery binds but doesn't project sees it unbound: the
