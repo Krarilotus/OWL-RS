@@ -34,7 +34,7 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 | Explicit/implicit pseudo-graphs | no | yes | **done**: `infer=false`, `FROM onto:explicit` / `onto:implicit`, per request, on both executors (differential-tested) | E6, R4 | query tests |
 | SHACL Core + paths on commit | no | yes | delivered on request: every Core component, path and target kind (W3C Core suite 98 of 98); `/dataset/shacl` validates against the stored shapes graph or posted shapes and returns the report as RDF or JSON. Missing: the commit gate and incremental validation (C2) | S1, S2 | W3C SHACL suite; incremental = full |
 | SHACL-SPARQL | no | yes | missing | S3 | W3C SHACL-SPARQL tests |
-| Full-text search | yes (integrated) | yes (connectors/Lucene) | missing | T1 | ResearchSpace search; relevance tests |
+| Full-text search | yes (integrated) | yes (connectors/Lucene) | delivered: Blazegraph's `bds:search` with relevance, rank, all words, prefixes and limits; an in-memory index over string literals, built at the first search. Not yet: Jena's `text:query`, GraphDB's connectors, stemming, phrase search, a persisted index | T1 | ResearchSpace search; relevance tests |
 | Autocompletion | yes | partial | missing | T1 | latency benchmark |
 | GeoSPARQL | partial | yes | missing | G1 | GeoSPARQL compliance subset |
 | Vector similarity | no | yes (similarity/connectors) | missing | V1 | recall@k |

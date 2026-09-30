@@ -29,6 +29,27 @@ One extension to the query language, as Jena and QLever have it: `HAVING` may na
 
 Without dataset parameters and `FROM` clauses, a query reads the default graph, or the merge of all graphs if the server is configured with `store.default_graph = "union"` ([config-reference.md](config-reference.md)). `/version` says which.
 
+**Full-text search,** with Blazegraph's vocabulary (what ResearchSpace sends), in any basic graph pattern:
+
+```sparql
+PREFIX bds: <http://www.bigdata.com/rdf/search#>
+SELECT ?s ?o ?score WHERE {
+  ?o bds:search "tower bridge" ; bds:relevance ?score ; bds:matchAllTerms "true" .
+  ?s rdfs:label ?o .
+}
+```
+
+| Predicate | Object |
+|---|---|
+| `bds:search` | the words (a literal); a word ending in `*` matches as a prefix; case doesn't matter |
+| `bds:relevance` | a variable: an `xsd:double` in (0, 1], the best match 1 (BM25, normalised) |
+| `bds:rank` | a variable: the rank by relevance, from 1 |
+| `bds:matchAllTerms "true"` | every word must occur (else any) |
+| `bds:prefixMatch "true"` | every word matches as a prefix |
+| `bds:minRelevance`, `bds:minRank`, `bds:maxRank` | limits |
+
+The matched literal (the subject) is a simple or language-tagged string that is the object of a statement in the graph the pattern reads. Words are runs of letters and digits. The index is built in memory at the first search after startup and extended with new literals at later searches; searches start the pattern's joins.
+
 **Updates:**
 - `POST` with a form and an `update` field
 - `POST` with `Content-Type: application/sparql-update` and the update as the body
