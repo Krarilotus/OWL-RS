@@ -269,6 +269,52 @@ pub fn materialise(program: &Program, snapshot: &Snapshot) -> Closure {
     }
 }
 
+/// Equality by representatives against replication on the asserted data of `snapshot`
+/// (work package W4): facts and time of both closures, and the classes. A measurement,
+/// not a store operation.
+pub fn equality_report(program: &Program, snapshot: &Snapshot) -> String {
+    let input: Vec<Triple> = asserted_by_predicate(snapshot)
+        .into_iter()
+        .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
+        .collect();
+    let started = Instant::now();
+    let replicated = batch::materialise(
+        &input,
+        &program.rules,
+        program.lists.as_ref(),
+        &program.schema,
+    );
+    let replicated_time = started.elapsed();
+    let started = Instant::now();
+    let closure = nrese_reasoner::v2::representatives::materialise(
+        &input,
+        &program.rules,
+        program.lists.as_ref(),
+        &program.schema,
+    );
+    let representative_time = started.elapsed();
+    let classes = closure.classes.classes().count();
+    let members: usize = closure.classes.classes().map(|(_, m)| m.len()).sum();
+    let largest = closure
+        .classes
+        .classes()
+        .map(|(_, m)| m.len())
+        .max()
+        .unwrap_or(0);
+    format!(
+        "equality: asserted {} | replicated closure {} facts in {:.3} s | representatives {} facts in {:.3} s, {} merges | {} classes, {} members, largest {}",
+        input.len(),
+        input.len() + replicated.derived.len(),
+        replicated_time.as_secs_f64(),
+        closure.facts.len(),
+        representative_time.as_secs_f64(),
+        closure.merges,
+        classes,
+        members,
+        largest
+    )
+}
+
 /// The asserted facts (any graph) of `snapshot` per predicate, as sorted, distinct
 /// `(object, subject)` pairs: one POSG scan, where a fact asserted in several graphs comes
 /// out adjacently.
