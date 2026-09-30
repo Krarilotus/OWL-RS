@@ -292,3 +292,124 @@ fn constructions_and_properties() {
     // Not a WKT literal: an error, so the BIND leaves the variable unbound.
     assert!(number(&engine, "geof:area(\"POINT(1 2)\", uom:metre)").is_none());
 }
+
+/// Relations as triple patterns: between random geometries, `?a geo:R ?b` equals the
+/// filter `geof:R(wkt(?a), wkt(?b))` for every relation (the R-tree finds the candidates,
+/// or every object for disjointness), and features stand in for their default geometry.
+#[test]
+fn relations_as_triple_patterns() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let wkt = NamedNode::new_unchecked("http://www.opengis.net/ont/geosparql#wktLiteral");
+    let geo = |local: &str| {
+        NamedNode::new_unchecked(format!("http://www.opengis.net/ont/geosparql#{local}"))
+    };
+    let ex = |local: &str| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+    let mut state: u64 = 11;
+    let mut next = |n: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) % n
+    };
+    for i in 0..40 {
+        let (x, y) = (next(20), next(20));
+        let text = match next(3) {
+            0 => format!("POINT({x} {y})"),
+            1 => format!("LINESTRING({x} {y}, {} {})", x + next(6), y + next(6)),
+            _ => {
+                let (w, h) = (1 + next(8), 1 + next(8));
+                format!(
+                    "POLYGON(({x} {y}, {} {y}, {} {}, {x} {}, {x} {y}))",
+                    x + w,
+                    x + w,
+                    y + h,
+                    y + h
+                )
+            }
+        };
+        let g = ex(&format!("g{i}"));
+        tx.insert(
+            Quad::new(
+                g.clone(),
+                geo("asWKT"),
+                Literal::new_typed_literal(text, wkt.clone()),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        if i < 10 {
+            tx.insert(
+                Quad::new(
+                    ex(&format!("f{i}")),
+                    geo("hasDefaultGeometry"),
+                    g,
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+        }
+    }
+    tx.commit().unwrap();
+    let pairs = |query: &str| -> Vec<String> {
+        let mut rows: Vec<String> = select(&engine, query)
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .map(|t| t.as_ref().map_or("-".to_owned(), ToString::to_string))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let mut nonempty = 0;
+    for relation in [
+        "sfEquals",
+        "sfDisjoint",
+        "sfIntersects",
+        "sfTouches",
+        "sfCrosses",
+        "sfWithin",
+        "sfContains",
+        "sfOverlaps",
+        "ehCovers",
+        "ehCoveredBy",
+        "ehInside",
+        "rcc8ec",
+        "rcc8po",
+        "rcc8ntpp",
+        "rcc8dc",
+    ] {
+        let property = pairs(&format!(
+            "SELECT ?a ?b WHERE {{ ?a geo:{relation} ?b . ?a geo:asWKT ?x . ?b geo:asWKT ?y }}"
+        ));
+        let function = pairs(&format!(
+            "SELECT ?a ?b WHERE {{ ?a geo:asWKT ?x . ?b geo:asWKT ?y FILTER(geof:{relation}(?x, ?y)) }}"
+        ));
+        assert_eq!(property, function, "{relation}");
+        nonempty += usize::from(!property.is_empty());
+        // A feature relates as its default geometry does.
+        let features = pairs(&format!(
+            "SELECT ?b WHERE {{ ex:f3 geo:{relation} ?b . ?b geo:asWKT ?y }}"
+        ));
+        let geometry = pairs(&format!(
+            "SELECT ?b WHERE {{ ex:g3 geo:{relation} ?b . ?b geo:asWKT ?y }}"
+        ));
+        assert_eq!(features, geometry, "{relation}");
+        // From a constant side the candidates come from the R-tree.
+        let filtered = pairs(&format!(
+            "SELECT ?b WHERE {{ ex:g3 geo:asWKT ?x . ?b geo:asWKT ?y FILTER(geof:{relation}(?x, ?y)) }}"
+        ));
+        assert_eq!(geometry, filtered, "{relation} from a constant");
+    }
+    assert!(nonempty >= 10, "{nonempty}");
+    // Both sides free; a constant side starting the joins; one pattern with LIMIT.
+    let within = pairs("SELECT ?f WHERE { ?f geo:sfWithin ex:g0 . ?f geo:hasDefaultGeometry ?g }");
+    let check = pairs(
+        "SELECT ?f WHERE { ?f geo:hasDefaultGeometry ?g . ?g geo:asWKT ?x . ex:g0 geo:asWKT ?y FILTER(geof:sfWithin(?x, ?y)) }",
+    );
+    assert_eq!(within, check);
+    assert!(pairs("SELECT ?a ?b WHERE { ?a geo:sfIntersects ?b } LIMIT 3").len() <= 3);
+}

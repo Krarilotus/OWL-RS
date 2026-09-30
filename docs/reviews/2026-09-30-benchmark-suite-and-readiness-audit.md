@@ -81,7 +81,7 @@ The owner's rule: every capability implemented and tuned before the comparison r
 | SHACL Core | done on request | The commit gate, incremental validation, parallel evaluation | C2, C1c |
 | SHACL-SPARQL | **missing** | | C3 |
 | Full-text search | done: Blazegraph's `bds:search` with relevance, rank and options, an in-memory index over string literals (`63252ac`) | Jena's `text:query`, stemming, phrases, a persisted index | F1 |
-| GeoSPARQL | done for the functions over WKT: the three relation families, DE-9IM, geodesic measures, constructions (`fd47edf`) | Relation properties in triple patterns (query rewrite), GML and GeoJSON, a spatial index | F2 |
+| GeoSPARQL | done for the functions over WKT: the three relation families, DE-9IM, geodesic measures, constructions (`fd47edf`) | GML and GeoJSON; the R-tree for the filter functions (the triple patterns have it) | F2 |
 | Federation (`SERVICE`) | done: allow-listed endpoints, bind joins with `VALUES`, `SILENT` (`9c547e0`) | — | D4 |
 | Classification | done for OWL 2 EL: `GET /dataset/classification`; equal to ELK on 300 random EL ontologies | DL ontologies stay HermiT's and Konclude's | R8 |
 
