@@ -59,6 +59,8 @@ impl Inner {
 pub struct Dictionary {
     inner: RwLock<Inner>,
     hasher: foldhash::fast::FixedState,
+    /// Built at the first search, extended at later ones ([`super::text`]).
+    text: RwLock<super::text::TextIndex>,
 }
 
 impl Default for Dictionary {
@@ -66,6 +68,7 @@ impl Default for Dictionary {
         Self {
             inner: RwLock::default(),
             hasher: foldhash::fast::FixedState::with_seed(0x6e72_6573_655f_6474),
+            text: RwLock::default(),
         }
     }
 }
@@ -167,6 +170,29 @@ impl Dictionary {
             self.hasher.hash_one(&bytes[start..ends[i] as usize])
         });
         index
+    }
+
+    /// The string literals matching `query`, best first; the text index first takes in the
+    /// terms interned since the last search.
+    pub fn text_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+        if self.text.read().covered() < self.len() {
+            let mut text = self.text.write();
+            let inner = self.inner.read();
+            let end = inner.ends.len() as u64;
+            for index in text.covered()..end {
+                match view_key(inner.key(index)) {
+                    TermView::String(value) => {
+                        text.add(TermId::new(TermKind::String, index).raw(), value);
+                    }
+                    TermView::LangString { value, .. } => {
+                        text.add(TermId::new(TermKind::LangString, index).raw(), value);
+                    }
+                    _ => {}
+                }
+            }
+            text.cover(end);
+        }
+        self.text.read().search(query)
     }
 
     /// Decodes an id back into a term. Returns `None` for ids that do not belong to this

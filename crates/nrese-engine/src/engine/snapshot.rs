@@ -426,6 +426,15 @@ impl Snapshot {
     pub fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
         self.dictionary.decode_quad(quad)
     }
+
+    /// The string literals this snapshot's dictionary holds that match `query`, best first
+    /// (whether statements still use them is the caller's to check).
+    pub fn text_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
+        let known = self.version.dictionary_len;
+        let mut matches = self.dictionary.text_search(query);
+        matches.retain(|m| TermId::from_raw(m.id).payload() < known);
+        matches
+    }
 }
 
 /// Two quad streams sorted by one permutation, merged into one sorted stream. The inputs

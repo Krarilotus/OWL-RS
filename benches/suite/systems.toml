@@ -33,10 +33,10 @@ capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
   "reason-incremental", "consistency", "explain",
-  "shacl-core",
+  "shacl-core", "fulltext",
 ]
 # What the suite needs and NRESE lacks; each names its step in the parity plan.
-missing = { "reason-custom-rules" = "B2", "shacl-sparql" = "C3", "fulltext" = "F1", "geosparql" = "F2", "federation" = "D4", "classify" = "R8, not planned" }
+missing = { "reason-custom-rules" = "B2", "shacl-sparql" = "C3", "geosparql" = "F2", "federation" = "D4", "classify" = "R8, not planned" }
 
 [qlever]
 name = "QLever"
