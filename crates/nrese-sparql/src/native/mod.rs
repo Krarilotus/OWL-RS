@@ -1765,7 +1765,31 @@ impl<'a> Context<'a> {
             }
             return Ok(solutions);
         }
-        let plan = self.join_order(&scans, &counts);
+        // The order plans with what the filters leave of each pattern (W3b): a pattern
+        // whose variables a selective filter reads counts as smaller. Ranged patterns
+        // are already counted within their ranges; probing decisions keep exact counts.
+        let planned: Vec<u64> = scans
+            .iter()
+            .zip(&counts)
+            .zip(&ranged)
+            .map(|((scan, &count), ranged)| {
+                if ranged.is_some() || self.as_written {
+                    return count;
+                }
+                let vars = scan.vars();
+                let factor: f64 = filters
+                    .iter()
+                    .filter(|(_, read)| !read.is_empty() && read.iter().all(|v| vars.contains(v)))
+                    .map(|(conjunct, _)| pushdown::selectivity(conjunct))
+                    .product();
+                if count == 0 {
+                    0
+                } else {
+                    ((count as f64 * factor).ceil() as u64).max(1)
+                }
+            })
+            .collect();
+        let plan = self.join_order(&scans, &planned);
         let estimate = |step: usize| {
             let rows = plan.rows[step];
             rows.is_finite().then(|| rows.round() as u64)
@@ -1986,7 +2010,7 @@ impl<'a> Context<'a> {
                     .vars()
                     .into_iter()
                     .map(|v| {
-                        let d = self.distinct(scan, &v, count);
+                        let d = self.distinct(scan, &v, count).min(count);
                         let index = vars.iter().position(|x| *x == v).unwrap_or_else(|| {
                             vars.push(v);
                             vars.len() - 1
