@@ -1877,7 +1877,9 @@ fn string_functions_casts_and_group_concat_equal_spareval() {
         force_spareval: true,
         ..QueryOptions::default()
     };
-    // GROUP_CONCAT values in a canonical order: the parts of each literal sorted.
+    // GROUP_CONCAT values in a canonical order: the parts of each literal sorted, and no
+    // language tag (the result is a simple literal, SPARQL 1.1 §18.5.1.7; spareval keeps a
+    // tag all values share).
     let sorted_parts = |row: &str| -> String {
         row.split(' ')
             .map(
@@ -1885,6 +1887,7 @@ fn string_functions_casts_and_group_concat_equal_spareval() {
                     Some((value, rest)) => {
                         let mut parts: Vec<&str> = value.split(',').collect();
                         parts.sort_unstable();
+                        let rest = if rest.starts_with('@') { "" } else { rest };
                         format!("\"{}\"{rest}", parts.join(","))
                     }
                     None => term.to_owned(),

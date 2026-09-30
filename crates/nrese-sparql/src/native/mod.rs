@@ -3431,31 +3431,23 @@ impl Numeric {
 
 /// GROUP_CONCAT as spareval computes it: string literals only (anything else makes the
 /// result unbound), joined in row order; the common language tag if all values share it.
+/// GROUP_CONCAT (SPARQL 1.1 §18.5.1.7): CONCAT of the values and the separator, so a
+/// simple literal whatever language the values share (spareval keeps a common tag).
 fn group_concat(values: &[Term], separator: &str) -> Option<Term> {
     let mut concat = String::new();
-    let mut language: Option<Option<&str>> = None;
     for (i, value) in values.iter().enumerate() {
         let Term::Literal(literal) = value else {
             return None;
         };
-        let tag = literal.language();
-        if tag.is_none() && literal.datatype() != xsd::STRING {
+        if literal.language().is_none() && literal.datatype() != xsd::STRING {
             return None;
-        }
-        match language {
-            Some(common) if common != tag => language = Some(None),
-            Some(_) => {}
-            None => language = Some(tag),
         }
         if i > 0 {
             concat.push_str(separator);
         }
         concat.push_str(literal.value());
     }
-    Some(match language.flatten() {
-        Some(tag) => Literal::new_language_tagged_literal_unchecked(concat, tag).into(),
-        None => Literal::new_simple_literal(concat).into(),
-    })
+    Some(Literal::new_simple_literal(concat).into())
 }
 
 fn sum(values: &[Term]) -> Option<Term> {
