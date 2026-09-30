@@ -1583,8 +1583,14 @@ fn explain_reports_the_plan() {
     let describe = SparqlParser::new()
         .parse_query(&format!("DESCRIBE <{EX}x1>"))
         .unwrap();
-    let fallback = explain_query(&snapshot, &describe, &QueryOptions::default()).unwrap();
-    assert_eq!((fallback.executor, fallback.rows), ("spareval", 3));
+    let native = explain_query(&snapshot, &describe, &QueryOptions::default()).unwrap();
+    assert_eq!((native.executor, native.rows), ("native", 3));
+    // BNODE with a label is the general evaluator's.
+    let labelled = SparqlParser::new()
+        .parse_query("SELECT ?b WHERE { BIND(BNODE(\"x\") AS ?b) }")
+        .unwrap();
+    let fallback = explain_query(&snapshot, &labelled, &QueryOptions::default()).unwrap();
+    assert_eq!((fallback.executor, fallback.rows), ("spareval", 1));
 }
 
 /// Filters and aggregates over tables large enough to run in parallel chunks (with terms
@@ -3247,5 +3253,173 @@ fn exists_equal_spareval() {
         // takes.
         native_runs * 10 > checked * 7 && with_solutions * 2 > checked,
         "{checked} checked, {native_runs} native, {with_solutions} with solutions"
+    );
+}
+
+/// DESCRIBE over variables, IRIs and `*`, in the store's default graph, the merged one and
+/// a dataset's, with blank node objects (described in turn, chains and a cycle among them):
+/// the native executor answers it, as spareval does.
+#[test]
+fn describe_equals_spareval() {
+    use oxrdf::BlankNode;
+    let mut rng = Rng(20_260_938);
+    let mut checked = 0;
+    for _ in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        load_spread_over_graphs(&engine, &mut rng);
+        let mut tx = engine.transaction();
+        let (b0, b1) = (BlankNode::default(), BlankNode::default());
+        for (s, p, o) in [
+            (ex("e1").into(), ex("p1"), Term::from(b0.clone())),
+            (b0.clone().into(), ex("p2"), b1.clone().into()),
+            (b1.clone().into(), ex("p2"), b0.clone().into()),
+            (b1.clone().into(), ex("p3"), ex("e2").into()),
+        ] {
+            let s: oxrdf::NamedOrBlankNode = s;
+            tx.insert(Quad::new(s, p, o, GraphName::DefaultGraph).as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..25 {
+            let p = rng.below(4);
+            let text = match rng.below(6) {
+                0 => format!("DESCRIBE ?a WHERE {{ ?a <{EX}p{p}> ?b }}"),
+                1 => format!("DESCRIBE ?a ?b WHERE {{ ?a <{EX}p{p}> ?b }}"),
+                2 => format!("DESCRIBE <{EX}e{}>", rng.below(7)),
+                // Which rows a LIMIT keeps is open without an order that fixes them.
+                3 => format!("DESCRIBE * WHERE {{ ?a <{EX}p{p}> ?b }} ORDER BY ?a ?b LIMIT 3"),
+                4 => format!("DESCRIBE ?a FROM <{EX}g0> WHERE {{ ?a <{EX}p{p}> ?b }}"),
+                _ => format!("DESCRIBE <{EX}e1> ?b WHERE {{ <{EX}e1> ?p ?b }}"),
+            };
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let options = QueryOptions {
+                union_default_graph: rng.below(3) == 0,
+                ..QueryOptions::default()
+            };
+            assert!(runs_natively(&query), "{text}");
+            assert_eq!(
+                explain_query(&snapshot, &query, &options).unwrap().executor,
+                "native"
+            );
+            let native = graph(evaluate_query(&snapshot, &query, &options).unwrap());
+            let spareval = QueryOptions {
+                force_spareval: true,
+                ..options.clone()
+            };
+            let expected = graph(evaluate_query(&snapshot, &query, &spareval).unwrap());
+            assert_eq!(
+                native, expected,
+                "{text} (merged {})",
+                options.union_default_graph
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 1000);
+}
+
+/// TIMEZONE and TZ of dates and times of every kind, the hashes, and IRI() resolved against
+/// the query's BASE equal spareval; RAND, UUID, STRUUID, BNODE() and NOW() have the
+/// properties SPARQL gives them (fresh per call, or one value per query).
+#[test]
+fn the_remaining_functions_run_natively() {
+    let mut rng = Rng(20_260_939);
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    load_spread_over_graphs(&engine, &mut rng);
+    let snapshot = engine.snapshot();
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    let temporal = [
+        format!("\"2001-01-01T10:00:00Z\"^^<{xsd}dateTime>"),
+        format!("\"2001-01-01T10:00:00-05:30\"^^<{xsd}dateTime>"),
+        format!("\"2001-01-01T10:00:00\"^^<{xsd}dateTime>"),
+        format!("\"2001-01-01+14:00\"^^<{xsd}date>"),
+        format!("\"10:00:00+01:00\"^^<{xsd}time>"),
+        format!("\"2001-02Z\"^^<{xsd}gYearMonth>"),
+        format!("\"2001\"^^<{xsd}gYear>"),
+        format!("\"--02-03-01:00\"^^<{xsd}gMonthDay>"),
+        format!("\"---03Z\"^^<{xsd}gDay>"),
+        format!("\"--02\"^^<{xsd}gMonth>"),
+        format!("\"not a date\"^^<{xsd}dateTime>"),
+        "\"2001-01-01\"".to_owned(),
+    ];
+    let mut texts: Vec<String> = Vec::new();
+    for value in &temporal {
+        texts.push(format!(
+            "SELECT (TIMEZONE({value}) AS ?d) (TZ({value}) AS ?t) WHERE {{}}"
+        ));
+    }
+    // Over the stored dates (with and without timezones) and strings.
+    texts.push("SELECT ?o (TIMEZONE(?o) AS ?d) (TZ(?o) AS ?t) WHERE { ?s ?p ?o }".to_owned());
+    for hash in ["MD5", "SHA1", "SHA256", "SHA384", "SHA512"] {
+        texts.push(format!("SELECT ?o ({hash}(?o) AS ?h) WHERE {{ ?s ?p ?o }}"));
+        texts.push(format!(
+            "SELECT ({hash}(\"abc\") AS ?h) ({hash}(\"é\"^^<{xsd}string>) AS ?k) WHERE {{}}"
+        ));
+    }
+    for base in ["http://example.com/dir/", "http://example.com/dir/doc#frag"] {
+        texts.push(format!(
+            "BASE <{base}> SELECT ?o (IRI(?v) AS ?i) WHERE {{ ?s ?p ?o BIND(STR(?o) AS ?v) }}"
+        ));
+        texts.push(format!(
+            "BASE <{base}> SELECT (IRI(\"../up\") AS ?a) (IRI(\"x?q\") AS ?b) (IRI(\"\") AS ?c) (IRI(<rel>) AS ?d) WHERE {{}}"
+        ));
+    }
+    for text in &texts {
+        let query = SparqlParser::new()
+            .parse_query(text)
+            .unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert!(runs_natively(&query), "{text}");
+        let native = rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        );
+        let spareval = QueryOptions {
+            force_spareval: true,
+            ..QueryOptions::default()
+        };
+        let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+        assert_eq!(native, expected, "{text}");
+    }
+    let one = |text: &str| -> Vec<String> {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        assert!(runs_natively(&query), "{text}");
+        rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        )
+    };
+    let count = one("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")[0].clone();
+    // Fresh per call: as many distinct values as rows; RAND in [0, 1).
+    for fresh in ["UUID()", "STRUUID()", "BNODE()", "RAND()"] {
+        assert_eq!(
+            one(&format!(
+                "SELECT (COUNT(DISTINCT ?x) AS ?n) WHERE {{ ?s ?p ?o BIND({fresh} AS ?x) }}"
+            ))[0],
+            count,
+            "{fresh}"
+        );
+    }
+    assert_eq!(
+        one(
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o FILTER(RAND() >= 0 && RAND() < 1 && isNumeric(RAND())) }"
+        )[0],
+        count
+    );
+    let uuids = one(
+        "SELECT ?u ?s WHERE { BIND(UUID() AS ?u) BIND(STRUUID() AS ?s) FILTER(isIRI(?u) && STRSTARTS(STR(?u), \"urn:uuid:\") && STRLEN(?s) = 36 && REGEX(?s, \"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$\")) }",
+    );
+    assert_eq!(uuids.len(), 1, "{uuids:?}");
+    assert_eq!(
+        one("SELECT ?b WHERE { BIND(BNODE() AS ?b) FILTER(isBlank(?b)) }").len(),
+        1
+    );
+    // NOW: one instant for the whole query, a dateTime with a timezone.
+    assert_eq!(
+        one(
+            "SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE { ?s ?p ?o BIND(NOW() AS ?t) FILTER(DATATYPE(?t) = <http://www.w3.org/2001/XMLSchema#dateTime> && TZ(?t) != \"\") }"
+        )[0],
+        "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>"
     );
 }

@@ -6,9 +6,6 @@
 # fixed upstream in spareval or by our native executor (Pf3). No entry is ours alone.
 
 # Tests added to rdf-tests after SPARQL 1.1 was approved (errata / SPARQL 1.2 work):
-<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-empty-group-count-graph> # spareval: no row for an empty group inside GRAPH ?g
-<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/negation/manifest#graph-minus> # spareval: MINUS disjointness inside GRAPH ?g
-<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/bindings/manifest#graph> # spareval: VALUES binding the GRAPH variable
 <http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_more_set_start> # spareval: zero-length * path with a constant end on an empty dataset
 <http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_more_set_end> # spareval: zero-length * path with a constant start on an empty dataset
 <http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_one_set_start> # spareval: zero-length ? path with a constant end on an empty dataset

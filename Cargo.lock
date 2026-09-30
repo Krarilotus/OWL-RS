@@ -961,14 +961,20 @@ dependencies = [
 name = "nrese-sparql"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "md-5",
  "nrese-engine",
  "nrese-exec",
  "oxigraph",
+ "oxiri",
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",
+ "rand",
  "rayon",
  "regex",
+ "sha1",
+ "sha2",
  "sparesults",
  "spareval",
  "spargebra",

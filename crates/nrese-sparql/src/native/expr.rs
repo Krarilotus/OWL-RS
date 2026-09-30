@@ -6,14 +6,21 @@
 //! grows with coverage (execution-core design, XC5).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
+use md5::{Digest, Md5};
+use oxiri::Iri;
 use oxrdf::vocab::xsd;
-use oxrdf::{Literal, NamedNode, Term, Variable};
+use oxrdf::{BlankNode, Literal, NamedNode, Term, Variable};
 use regex::Regex;
+use sha1::Sha1;
+use sha2::{Sha256, Sha384, Sha512};
 use spargebra::algebra::{Expression, Function};
 
-use oxsdatatypes::{Decimal, Double, Float, Integer};
+use oxsdatatypes::{
+    Date, DateTime, DayTimeDuration, Decimal, Double, Float, GDay, GMonth, GMonthDay, GYear,
+    GYearMonth, Integer, Time, TimezoneOffset,
+};
 
 use super::value::{
     Value, boolean_term, canonical, compare, effective_boolean, equals, is_lang_string,
@@ -79,8 +86,22 @@ pub(crate) fn supported(expr: &Expression) -> bool {
                         | Function::Replace
                         | Function::EncodeForUri
                         | Function::Iri
+                        | Function::Timezone
+                        | Function::Tz
+                        | Function::Now
+                        | Function::Rand
+                        | Function::Uuid
+                        | Function::StrUuid
+                        | Function::Md5
+                        | Function::Sha1
+                        | Function::Sha256
+                        | Function::Sha384
+                        | Function::Sha512
                 )
                 || matches!(function, Function::Custom(name) if args.len() == 1 && is_cast(name.as_str()))
+                // BNODE(label) is the same blank node within one solution and a different
+                // one in the next: the evaluator doesn't know solutions apart.
+                || (matches!(function, Function::BNode) && args.is_empty())
         }
         _ => false,
     }
@@ -91,9 +112,20 @@ pub(crate) fn supported(expr: &Expression) -> bool {
 #[derive(Default)]
 pub(crate) struct Evaluator {
     regexes: Mutex<HashMap<(String, String), Option<Regex>>>,
+    /// The query's `BASE`, against which `IRI()` resolves a relative IRI.
+    base: Option<Iri<String>>,
+    /// `NOW()`: one instant for the whole query, taken when first asked for.
+    now: OnceLock<DateTime>,
 }
 
 impl Evaluator {
+    pub(crate) fn with_base(base: Option<Iri<String>>) -> Self {
+        Self {
+            base,
+            ..Self::default()
+        }
+    }
+
     /// The compiled `pattern` with `flags`, cached per query; `None` if it doesn't compile.
     /// A clone shares the compiled program, so matching runs outside the lock.
     fn regex(&self, pattern: &str, flags: &str) -> Option<Regex> {
@@ -303,12 +335,56 @@ impl Evaluator {
             }
             Function::Iri => match arg(0)? {
                 iri @ Term::NamedNode(_) => Some(iri),
-                // Absolute IRIs only: queries with a BASE run on spareval.
-                term => match string(&term)? {
-                    (value, None) => NamedNode::new(value).ok().map(Term::from),
+                term => match (string(&term)?, &self.base) {
+                    ((value, None), Some(base)) => base
+                        .resolve(&value)
+                        .ok()
+                        .map(|iri| NamedNode::new_unchecked(iri.into_inner()).into()),
+                    ((value, None), None) => NamedNode::new(value).ok().map(Term::from),
                     _ => None,
                 },
             },
+            Function::Timezone | Function::Tz => {
+                let Term::Literal(literal) = arg(0)? else {
+                    return None;
+                };
+                let (duration, offset) = zone(&literal)?;
+                match function {
+                    Function::Timezone => duration.map(|duration| {
+                        Literal::new_typed_literal(duration.to_string(), xsd::DAY_TIME_DURATION)
+                            .into()
+                    }),
+                    _ => Some(
+                        Literal::new_simple_literal(
+                            offset.map_or_else(String::new, |o| o.to_string()),
+                        )
+                        .into(),
+                    ),
+                }
+            }
+            Function::Now => Some(Literal::from(*self.now.get_or_init(DateTime::now)).into()),
+            Function::Rand => Some(Literal::from(rand::random::<f64>()).into()),
+            Function::Uuid => Some(NamedNode::new_unchecked(format!("urn:uuid:{}", uuid())).into()),
+            Function::StrUuid => Some(Literal::new_simple_literal(uuid()).into()),
+            Function::BNode if args.is_empty() => Some(BlankNode::default().into()),
+            Function::Md5
+            | Function::Sha1
+            | Function::Sha256
+            | Function::Sha384
+            | Function::Sha512 => {
+                let (value, None) = string(&arg(0)?)? else {
+                    return None;
+                };
+                let bytes = value.as_bytes();
+                let hash = match function {
+                    Function::Md5 => hex::encode(Md5::digest(bytes)),
+                    Function::Sha1 => hex::encode(Sha1::digest(bytes)),
+                    Function::Sha256 => hex::encode(Sha256::digest(bytes)),
+                    Function::Sha384 => hex::encode(Sha384::digest(bytes)),
+                    _ => hex::encode(Sha512::digest(bytes)),
+                };
+                Some(Literal::new_simple_literal(hash).into())
+            }
             Function::Custom(name) => cast(name.as_str(), arg(0)?),
             Function::Str => match arg(0)? {
                 Term::NamedNode(node) => Some(Literal::new_simple_literal(node.as_str()).into()),
@@ -454,6 +530,46 @@ impl Evaluator {
             _ => None,
         }
     }
+}
+
+/// The timezone of a date or time literal, as `TIMEZONE` (a duration) and `TZ` (an offset)
+/// read it; `None` if the literal is no well-formed date or time.
+fn zone(literal: &Literal) -> Option<(Option<DayTimeDuration>, Option<TimezoneOffset>)> {
+    let value = literal.value();
+    macro_rules! of {
+        ($type:ty) => {{
+            let parsed: $type = value.parse().ok()?;
+            (parsed.timezone(), parsed.timezone_offset())
+        }};
+    }
+    Some(match literal.datatype().as_str() {
+        "http://www.w3.org/2001/XMLSchema#dateTime"
+        | "http://www.w3.org/2001/XMLSchema#dateTimeStamp" => of!(DateTime),
+        "http://www.w3.org/2001/XMLSchema#date" => of!(Date),
+        "http://www.w3.org/2001/XMLSchema#time" => of!(Time),
+        "http://www.w3.org/2001/XMLSchema#gYearMonth" => of!(GYearMonth),
+        "http://www.w3.org/2001/XMLSchema#gYear" => of!(GYear),
+        "http://www.w3.org/2001/XMLSchema#gMonthDay" => of!(GMonthDay),
+        "http://www.w3.org/2001/XMLSchema#gDay" => of!(GDay),
+        "http://www.w3.org/2001/XMLSchema#gMonth" => of!(GMonth),
+        _ => return None,
+    })
+}
+
+/// A random (version 4) UUID, lower-case hex in groups of 8-4-4-4-12.
+fn uuid() -> String {
+    let mut bytes = rand::random::<u128>().to_le_bytes();
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    let hex = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// The regular expression of SPARQL's `REGEX(_, pattern, flags)`; `None` if the pattern
