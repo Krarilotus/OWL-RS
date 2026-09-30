@@ -20,6 +20,9 @@ pub struct QueryOptions {
     pub cancellation: Option<CancellationToken>,
     /// Bytes of intermediate results the native executor may hold; `None` is unlimited.
     pub memory_limit: Option<usize>,
+    /// The server's budget for all running queries together, which this query's memory
+    /// counts against as well.
+    pub shared_memory: Option<std::sync::Arc<nrese_exec::SharedBudget>>,
     /// Run on spareval even if the native executor supports the query (differential
     /// testing, and a production escape hatch).
     pub force_spareval: bool,

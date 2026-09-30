@@ -52,6 +52,19 @@ impl StoreError {
         )
     }
 
+    /// The query needed memory that other running queries hold: the server's budget for
+    /// all queries ([`StoreConfig::total_query_memory_bytes`](crate::StoreConfig)) is
+    /// used up. The same query may succeed later.
+    pub fn is_server_memory_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::SparqlEvaluation(QueryEvaluationError::Dataset(error))
+                if error
+                    .downcast_ref::<nrese_sparql::BudgetExceeded>()
+                    .is_some_and(|exceeded| exceeded.shared)
+        )
+    }
+
     pub fn is_request_error(&self) -> bool {
         match self {
             Self::SparqlSyntax(_)

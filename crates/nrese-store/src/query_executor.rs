@@ -39,6 +39,15 @@ impl SolutionsResultFormat {
     }
 }
 
+/// What the store adds to every query it runs.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StoreSettings {
+    /// [`StoreConfig::union_default_graph`](crate::StoreConfig).
+    pub union_default_graph: bool,
+    /// The budget for all running queries together, if the store has one.
+    pub query_memory: Option<std::sync::Arc<nrese_sparql::SharedBudget>>,
+}
+
 /// A parsed query with its protocol dataset and output format. Preparing is cheap and
 /// reports syntax errors before any result is produced, so a transport can still choose
 /// the response status.
@@ -210,7 +219,7 @@ pub(crate) fn protocol_dataset(
 pub(crate) fn run_query(
     view: &impl ReadView,
     prepared: &PreparedQuery,
-    union_default_graph: bool,
+    store: &StoreSettings,
     cancellation: &CancellationToken,
     out: impl Write,
 ) -> StoreResult<()> {
@@ -219,7 +228,8 @@ pub(crate) fn run_query(
         cancellation: Some(cancellation.clone()),
         read_model: prepared.read_model,
         memory_limit: prepared.memory_limit,
-        union_default_graph,
+        shared_memory: store.query_memory.clone(),
+        union_default_graph: store.union_default_graph,
         ..QueryOptions::default()
     };
     let alive = || match cancellation.is_cancelled() {
@@ -277,7 +287,7 @@ pub(crate) fn run_query(
 pub(crate) fn explain_prepared(
     view: &impl ReadView,
     prepared: &PreparedQuery,
-    union_default_graph: bool,
+    store: &StoreSettings,
     cancellation: &CancellationToken,
 ) -> StoreResult<Explanation> {
     let options = QueryOptions {
@@ -285,7 +295,8 @@ pub(crate) fn explain_prepared(
         cancellation: Some(cancellation.clone()),
         read_model: prepared.read_model,
         memory_limit: prepared.memory_limit,
-        union_default_graph,
+        shared_memory: store.query_memory.clone(),
+        union_default_graph: store.union_default_graph,
         ..QueryOptions::default()
     };
     Ok(explain_query(view, &prepared.query, &options)?)

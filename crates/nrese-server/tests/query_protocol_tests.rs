@@ -212,3 +212,44 @@ async fn a_query_beyond_its_memory_limit_is_rejected() -> Result<(), Box<dyn std
     assert!(started.elapsed() < Duration::from_secs(10));
     Ok(())
 }
+
+/// The server's budget for all running queries: a query that fits its own limit and asks
+/// for more than the server has left is told to come back, and the server's budget is
+/// free again afterwards.
+#[tokio::test]
+async fn a_query_beyond_the_servers_memory_budget_is_told_to_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("data.nt");
+    let triples: String = (0..2_000)
+        .map(|i| format!("<http://example.com/s{i}> <http://example.com/p> \"value {i}\" .\n"))
+        .collect();
+    std::fs::write(&path, triples)?;
+    let store = StoreConfig {
+        total_query_memory_bytes: 8 << 20,
+        ..StoreConfig::in_memory().with_ontology(path)
+    };
+    let app =
+        test_app_with_store_config(store, PolicyConfig::default(), ReasonerConfig::default())?;
+    // 4·10⁶ rows of six columns: within the query's own 4 GiB, beyond the server's 8 MiB.
+    let query = "SELECT * WHERE { ?a ?b ?c . ?d ?e ?f }";
+    let response = app
+        .clone()
+        .oneshot(get(&format!("/dataset/query?query={}", encode(query)))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_text(response).await?;
+    assert!(
+        body.contains("the server's query memory is in use") && body.contains("total_query_memory"),
+        "{body}"
+    );
+    // Nothing of the failed query is still charged: a query that fits runs.
+    let response = app
+        .oneshot(get(&format!(
+            "/dataset/query?query={}",
+            encode("SELECT * WHERE { ?a ?b ?c }")
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}

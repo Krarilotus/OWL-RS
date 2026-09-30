@@ -1,8 +1,10 @@
-use super::raw::{RawFileConfig, StringOrMany};
+use anyhow::{Result, bail};
+
+use super::raw::{Amount, RawFileConfig, StringOrMany};
 use crate::config::env_names as names;
 use crate::config::source::KeyValueSource;
 
-pub(super) fn into_key_value_source(config: RawFileConfig) -> KeyValueSource {
+pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSource> {
     let mut source = KeyValueSource::default();
 
     insert_option(&mut source, names::BIND_ADDR, config.server.bind_address);
@@ -247,7 +249,70 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> KeyValueSource {
         config.auth.oidc_introspection.timeout_ms,
     );
 
-    source
+    // [budgets]: the same settings under one table, with units.
+    let budgets = config.budgets;
+    for (key, value, older) in [
+        (
+            names::MAX_QUERY_MEMORY_BYTES,
+            budgets.query_memory,
+            "policy.limits.max_query_memory_bytes",
+        ),
+        (
+            names::MAX_TOTAL_QUERY_MEMORY_BYTES,
+            budgets.total_query_memory,
+            "",
+        ),
+        (
+            names::QUERY_TIMEOUT_MS,
+            budgets.query_timeout,
+            "policy.timeouts.query_ms",
+        ),
+        (
+            names::UPDATE_TIMEOUT_MS,
+            budgets.update_timeout,
+            "policy.timeouts.update_ms",
+        ),
+        (
+            names::GRAPH_READ_TIMEOUT_MS,
+            budgets.graph_read_timeout,
+            "policy.timeouts.graph_read_ms",
+        ),
+        (
+            names::GRAPH_WRITE_TIMEOUT_MS,
+            budgets.graph_write_timeout,
+            "policy.timeouts.graph_write_ms",
+        ),
+        (
+            names::MAX_QUERY_BYTES,
+            budgets.query_text,
+            "policy.limits.max_query_bytes",
+        ),
+        (
+            names::MAX_UPDATE_BYTES,
+            budgets.update_size,
+            "policy.limits.max_update_bytes",
+        ),
+        (
+            names::MAX_RDF_UPLOAD_BYTES,
+            budgets.upload_size,
+            "policy.limits.max_rdf_upload_bytes",
+        ),
+        (
+            names::QUERY_CACHE_BYTES,
+            budgets.result_cache,
+            "store.query_cache_bytes",
+        ),
+    ] {
+        let Some(value) = value.map(Amount::into_text) else {
+            continue;
+        };
+        if crate::config::source::ConfigSource::get(&source, key).is_some() {
+            bail!("a budget is set twice: in [budgets] and as {older}");
+        }
+        source.insert(key, value);
+    }
+
+    Ok(source)
 }
 
 fn insert_option(source: &mut KeyValueSource, key: &str, value: Option<String>) {

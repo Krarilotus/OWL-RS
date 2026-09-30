@@ -42,6 +42,9 @@ pub struct StoreService {
     last_materialisation:
         std::sync::Arc<std::sync::Mutex<Option<crate::reasoning::MaterialisationReport>>>,
     query_cache: std::sync::Arc<crate::query_cache::QueryCache>,
+    /// What every query gets from the store: the default graph's meaning and the budget
+    /// all running queries share.
+    settings: crate::query_executor::StoreSettings,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -68,8 +71,14 @@ impl StoreService {
         let query_cache = std::sync::Arc::new(crate::query_cache::QueryCache::new(
             config.query_cache_bytes,
         ));
+        let settings = crate::query_executor::StoreSettings {
+            union_default_graph: config.union_default_graph,
+            query_memory: (config.total_query_memory_bytes > 0)
+                .then(|| nrese_sparql::SharedBudget::new(config.total_query_memory_bytes)),
+        };
         let service = Self {
             query_cache,
+            settings,
             config,
             engine,
             preloaded_ontology,
@@ -206,9 +215,9 @@ impl StoreService {
         out: impl std::io::Write,
     ) -> StoreResult<()> {
         let snapshot = self.engine.snapshot();
-        let union = self.config.union_default_graph;
+        let settings = &self.settings;
         if !self.query_cache.enabled() || prepared.volatile() {
-            return run_query(&snapshot, prepared, union, cancellation, out);
+            return run_query(&snapshot, prepared, settings, cancellation, out);
         }
         let key = crate::query_cache::CacheKey {
             request: prepared.cache_request(),
@@ -224,7 +233,7 @@ impl StoreService {
             copy: Some(Vec::new()),
             limit: self.query_cache.max_entry(),
         };
-        run_query(&snapshot, prepared, union, cancellation, &mut tee)?;
+        run_query(&snapshot, prepared, settings, cancellation, &mut tee)?;
         if let Some(copy) = tee.copy {
             self.query_cache.insert(key, copy);
         }
@@ -241,9 +250,17 @@ impl StoreService {
         explain_prepared(
             &self.engine.snapshot(),
             prepared,
-            self.config.union_default_graph,
+            &self.settings,
             cancellation,
         )
+    }
+
+    /// Bytes of intermediate results the running queries hold now, the most they held at
+    /// once, and the limit; `None` without a limit
+    /// ([`StoreConfig::total_query_memory_bytes`]).
+    pub fn query_memory(&self) -> Option<(usize, usize, usize)> {
+        let budget = self.settings.query_memory.as_ref()?;
+        Some((budget.used(), budget.peak(), budget.limit()))
     }
 
     pub fn execute_query_str(&self, query: &str) -> StoreResult<SerializedQueryResult> {

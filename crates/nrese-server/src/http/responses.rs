@@ -68,6 +68,23 @@ pub struct VersionResponse {
     pub user_console_embedded: bool,
     pub ai_query_suggestions_enabled: bool,
     pub ai_provider: &'static str,
+    /// The resource budgets in effect (`[budgets]` in the configuration).
+    pub budgets: BudgetsResponse,
+}
+
+/// Memory and sizes in bytes (0 = unlimited), times in milliseconds.
+#[derive(Debug, Serialize)]
+pub struct BudgetsResponse {
+    pub query_memory: usize,
+    pub total_query_memory: usize,
+    pub query_timeout_ms: u64,
+    pub update_timeout_ms: u64,
+    pub graph_read_timeout_ms: u64,
+    pub graph_write_timeout_ms: u64,
+    pub query_text: usize,
+    pub update_size: usize,
+    pub upload_size: usize,
+    pub result_cache: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +221,23 @@ pub fn build_version_response(state: &AppState) -> VersionResponse {
         user_console_embedded: crate::http::console::is_embedded(),
         ai_query_suggestions_enabled: posture.ai_query_suggestions_enabled,
         ai_provider: posture.ai_provider,
+        budgets: {
+            let (limits, timeouts) = (&state.policy().limits, &state.policy().timeouts);
+            let store = state.store();
+            let store = store.config();
+            BudgetsResponse {
+                query_memory: limits.max_query_memory_bytes,
+                total_query_memory: store.total_query_memory_bytes,
+                query_timeout_ms: timeouts.query.as_millis() as u64,
+                update_timeout_ms: timeouts.update.as_millis() as u64,
+                graph_read_timeout_ms: timeouts.graph_read.as_millis() as u64,
+                graph_write_timeout_ms: timeouts.graph_write.as_millis() as u64,
+                query_text: limits.max_query_bytes,
+                update_size: limits.max_update_bytes,
+                upload_size: limits.max_rdf_upload_bytes,
+                result_cache: store.query_cache_bytes,
+            }
+        },
     }
 }
 
