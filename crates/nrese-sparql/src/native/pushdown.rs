@@ -287,6 +287,27 @@ pub(super) fn conjuncts_of<'e>(expression: &'e Expression, out: &mut Vec<&'e Exp
     }
 }
 
+/// A rough share of the rows a filter conjunct keeps, for ordering joins only:
+/// comparisons with a constant for equality keep few, ranges some, string tests a
+/// quarter, negations most.
+pub(super) fn selectivity(conjunct: &Expression) -> f64 {
+    let constant = |e: &Expression| matches!(e, Expression::NamedNode(_) | Expression::Literal(_));
+    match conjunct {
+        Expression::Equal(a, b) | Expression::SameTerm(a, b) if constant(a) || constant(b) => 0.01,
+        Expression::In(_, list) => (0.01 * list.len() as f64).min(1.0),
+        Expression::Greater(..)
+        | Expression::GreaterOrEqual(..)
+        | Expression::Less(..)
+        | Expression::LessOrEqual(..) => 0.3,
+        Expression::Equal(..) | Expression::SameTerm(..) => 0.1,
+        Expression::FunctionCall(..) => 0.25,
+        Expression::And(a, b) => selectivity(a) * selectivity(b),
+        Expression::Or(a, b) => (selectivity(a) + selectivity(b)).min(1.0),
+        Expression::Not(_) => 0.9,
+        _ => 1.0,
+    }
+}
+
 /// Whether a conjunct means the same wherever its variables are bound: it has variables,
 /// and neither reads the rest of the solution (`EXISTS`) nor draws a value per row.
 pub(super) fn movable(conjunct: &Expression) -> bool {

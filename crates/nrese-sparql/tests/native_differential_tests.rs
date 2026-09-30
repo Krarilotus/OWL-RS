@@ -3737,3 +3737,58 @@ fn identity_classes_shrink_detached_optionals() {
     }
     assert!(shrunk * 3 > checked, "{shrunk} of {checked} joins shrank");
 }
+
+/// A selective filter makes its pattern count as smaller when the join order is planned:
+/// the equality-filtered larger pattern starts, and the answers don't change.
+#[test]
+fn selective_filters_move_their_pattern_first() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..3000 {
+        tx.insert(
+            Quad::new(
+                ex(&format!("s{}", i % 1500)),
+                ex("label"),
+                Literal::new_simple_literal(format!("v{i}")),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    for i in 0..500 {
+        tx.insert(
+            Quad::new(
+                ex(&format!("s{i}")),
+                ex("kind"),
+                ex(&format!("k{}", i % 7)),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let text =
+        format!("SELECT * WHERE {{ ?s <{EX}label> ?l . ?s <{EX}kind> ?k FILTER(?l = \"v42\") }}");
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let plan = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    let first = plan
+        .steps
+        .iter()
+        .find(|s| s.operator == "scan" || s.operator == "range scan")
+        .unwrap();
+    assert!(first.detail.contains("label"), "{:#?}", plan.steps);
+    let optimised = rows(
+        evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    let written = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    assert_eq!(
+        optimised,
+        rows(evaluate_query(&snapshot, &query, &written).unwrap(), false)
+    );
+    assert_eq!(optimised.len(), 1);
+}
