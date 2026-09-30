@@ -48,6 +48,15 @@ impl Snapshot {
         }
     }
 
+    /// A snapshot of `version` over this one's dictionary and statistics.
+    pub(super) fn with_version(&self, version: Version) -> Snapshot {
+        Snapshot {
+            version: Arc::new(version),
+            dictionary: Arc::clone(&self.dictionary),
+            statistics: Arc::clone(&self.statistics),
+        }
+    }
+
     pub(crate) fn version(&self) -> &Version {
         &self.version
     }

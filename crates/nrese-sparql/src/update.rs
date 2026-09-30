@@ -97,11 +97,12 @@ fn apply_operation(
             using,
             pattern,
         } => {
-            // Natively when the WHERE reads only committed data: the first operation of a
-            // request, or after operations that changed nothing.
-            let native = (!options.force_spareval
-                && tx.pending() == (0, 0)
-                && tx.inferred_pending() == (0, 0))
+            // Natively, on the committed state, or after earlier operations of the request
+            // changed something, on a snapshot of the pending state.
+            let pending = (!options.force_spareval
+                && (tx.pending() != (0, 0) || tx.inferred_pending() != (0, 0)))
+                .then(|| tx.pending_snapshot());
+            let native = (!options.force_spareval)
                 .then(|| {
                     let query_options = crate::query::QueryOptions {
                         cancellation: options.cancellation.clone(),
@@ -111,7 +112,7 @@ fn apply_operation(
                         ..crate::query::QueryOptions::default()
                     };
                     crate::native::delete_insert(
-                        tx.base(),
+                        pending.as_ref().unwrap_or(tx.base()),
                         pattern,
                         delete,
                         insert,
