@@ -20,6 +20,7 @@ mod paths;
 mod plan;
 mod pushdown;
 mod ranges;
+mod sets;
 pub(crate) mod value;
 mod wcoj;
 
@@ -327,7 +328,12 @@ fn native_pattern<'q>(
         } => (pattern, Form::Construct(template)),
         Query::Describe { .. } => return None,
     };
-    Some((pushdown::push_filters(pattern.clone()), form))
+    let pattern = if options.as_written {
+        pattern.clone()
+    } else {
+        pushdown::push_filters(pattern.clone())
+    };
+    Some((pattern, form))
 }
 
 /// A position of a CONSTRUCT template, resolved against the solution columns.
@@ -737,6 +743,8 @@ struct Context<'a> {
     depth: Cell<usize>,
     /// The graph that triple patterns match in (`GRAPH`).
     graph: RefCell<GraphScope>,
+    /// [`QueryOptions::as_written`].
+    as_written: bool,
 }
 
 /// The active graph of triple patterns.
@@ -756,6 +764,7 @@ enum GraphScope {
 impl<'a> Context<'a> {
     fn new(snapshot: &'a Snapshot, options: &QueryOptions) -> Self {
         Self {
+            as_written: options.as_written,
             snapshot,
             model: options.read_model,
             evaluator: Evaluator::default(),
@@ -914,6 +923,28 @@ impl<'a> Context<'a> {
         result
     }
 
+    /// `BIND(expression AS variable)`: a column with the expression's value per row, unbound
+    /// where it is an error.
+    fn extend(
+        &self,
+        mut solutions: Solutions,
+        variable: &Variable,
+        expression: &Expression,
+    ) -> NativeResult<Solutions> {
+        let values: Vec<u64> = (0..solutions.table.len())
+            .map(|row| {
+                self.evaluator
+                    .eval(expression, &self.binding(&solutions, row))
+                    .map_or(UNDEF, |term| self.id(&term))
+            })
+            .collect();
+        let mut columns = std::mem::take(&mut solutions.table).into_columns();
+        columns.push(values);
+        solutions.vars.push(variable.clone());
+        solutions.table = IdTable::from_columns(columns);
+        self.produced(solutions)
+    }
+
     fn eval_operator(&self, pattern: &GraphPattern) -> NativeResult<Solutions> {
         self.check()?;
         match pattern {
@@ -986,8 +1017,10 @@ impl<'a> Context<'a> {
                     let hints = ranges::hints(expr, self.snapshot);
                     let mut all = Vec::new();
                     pushdown::conjuncts_of(expr, &mut all);
-                    let (mut early, late): (Vec<_>, Vec<_>) =
-                        all.into_iter().partition(|c| pushdown::movable(c));
+                    let as_written = self.as_written;
+                    let (mut early, late): (Vec<_>, Vec<_>) = all
+                        .into_iter()
+                        .partition(|c| !as_written && pushdown::movable(c));
                     let mut early: Vec<(&Expression, Vec<Variable>)> = early
                         .drain(..)
                         .map(|c| (c, expression_variables(c)))
@@ -999,6 +1032,16 @@ impl<'a> Context<'a> {
                         solutions = self.filter(solutions, conjunct)?;
                     }
                     Ok(solutions)
+                }
+                // HAVING: the group may apply parts of it before it reads everything
+                // (`sets`); all of it is applied here.
+                GraphPattern::Group {
+                    inner,
+                    variables,
+                    aggregates,
+                } => {
+                    let solutions = self.group(inner, variables, aggregates, Some(expr))?;
+                    self.filter(solutions, expr)
                 }
                 other => {
                     let solutions = self.eval(other)?;
@@ -1014,19 +1057,8 @@ impl<'a> Context<'a> {
                 variable,
                 expression,
             } => {
-                let mut solutions = self.eval(inner)?;
-                let values: Vec<u64> = (0..solutions.table.len())
-                    .map(|row| {
-                        self.evaluator
-                            .eval(expression, &self.binding(&solutions, row))
-                            .map_or(UNDEF, |term| self.id(&term))
-                    })
-                    .collect();
-                let mut columns = std::mem::take(&mut solutions.table).into_columns();
-                columns.push(values);
-                solutions.vars.push(variable.clone());
-                solutions.table = IdTable::from_columns(columns);
-                self.produced(solutions)
+                let solutions = self.eval(inner)?;
+                self.extend(solutions, variable, expression)
             }
             GraphPattern::Minus { left, right } => {
                 let (left, right) = (self.eval(left)?, self.eval(right)?);
@@ -1097,6 +1129,19 @@ impl<'a> Context<'a> {
                     solutions.table.dedup_preserving_order();
                     return self.order_by(solutions, expression, None);
                 }
+                // DISTINCT over a projection of joins: the joins work on sets (`sets`).
+                if let GraphPattern::Project {
+                    inner: projected,
+                    variables,
+                } = &**inner
+                    && sets::joins(projected)
+                    && !self.as_written
+                {
+                    let solutions = self.eval_set(projected, variables)?;
+                    let mut solutions = self.project(solutions, variables);
+                    solutions.table.dedup_preserving_order();
+                    return Ok(solutions);
+                }
                 let mut solutions = self.eval(inner)?;
                 solutions.table.dedup_preserving_order();
                 Ok(solutions)
@@ -1151,7 +1196,7 @@ impl<'a> Context<'a> {
                 inner,
                 variables,
                 aggregates,
-            } => self.group(inner, variables, aggregates),
+            } => self.group(inner, variables, aggregates, None),
             _ => Err(NativeError::Fallback),
         }
     }
@@ -1199,6 +1244,9 @@ impl<'a> Context<'a> {
             values.dedup();
             (values.last() != Some(&UNDEF)).then_some(values)
         };
+        if self.as_written {
+            return self.filtered_path(path, None, start);
+        }
         let (Ok(s), Ok(o)) = (self.path_end(path.subject), self.path_end(path.object)) else {
             // A constant end already bounds the path.
             return self.filtered_path(path, None, start);
@@ -2216,6 +2264,7 @@ impl<'a> Context<'a> {
             let aggregator = Aggregator {
                 evaluator: &self.evaluator,
                 term: &term,
+                memo: RefCell::default(),
             };
             return Ok(members
                 .iter()
@@ -2250,6 +2299,7 @@ impl<'a> Context<'a> {
                 let aggregator = Aggregator {
                     evaluator,
                     term: &term,
+                    memo: RefCell::default(),
                 };
                 Some(
                     members[window[0]..window[1]]
@@ -2371,6 +2421,7 @@ impl<'a> Context<'a> {
         inner: &GraphPattern,
         variables: &[Variable],
         aggregates: &[(Variable, AggregateExpression)],
+        having: Option<&Expression>,
     ) -> NativeResult<Solutions> {
         // COUNT(*) of one triple pattern without GROUP BY: the index knows the answer.
         if variables.is_empty()
@@ -2434,7 +2485,26 @@ impl<'a> Context<'a> {
                 });
             }
         }
-        let solutions = self.eval(inner)?;
+        // Aggregates that ignore duplicates let the pattern be evaluated as a set, and
+        // OPTIONALs that only feed them be aggregated apart from the rest (`sets`).
+        let solutions = match sets::insensitive_arguments(aggregates) {
+            Some(arguments) if sets::joins(inner) && !self.as_written => {
+                if !variables.is_empty()
+                    && let Some(solutions) =
+                        self.group_detached(inner, variables, aggregates, &arguments, having)?
+                {
+                    return Ok(solutions);
+                }
+                let mut needed = variables.to_vec();
+                for variable in arguments.into_iter().flatten() {
+                    if !needed.contains(&variable) {
+                        needed.push(variable);
+                    }
+                }
+                self.eval_set(inner, &needed)?
+            }
+            _ => self.eval(inner)?,
+        };
         let key_table = if variables.is_empty() {
             IdTable::from_rows(0, std::iter::repeat_n(&[][..], solutions.table.len()))
         } else {
@@ -2750,6 +2820,9 @@ enum Agg {
 struct Aggregator<'a> {
     evaluator: &'a Evaluator,
     term: &'a dyn Fn(u64) -> Option<Term>,
+    /// The value of an expression over one variable, per (expression, id): groups share
+    /// most of their values, and `STR(?x)` of an id is the same in each of them.
+    memo: RefCell<HashMap<(usize, u64), Option<Term>>>,
 }
 
 impl Aggregator<'_> {
@@ -2837,6 +2910,53 @@ impl Aggregator<'_> {
         }
     }
 
+    /// The expression's value for each of `rows`. With `distinct`, only for the first row
+    /// of each combination of the expression's variables: the repeats can't add a value.
+    fn evaluated(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        expr: &Expression,
+        distinct: bool,
+    ) -> Vec<Option<Term>> {
+        let mut columns: Vec<usize> = expression_variables(expr)
+            .iter()
+            .filter_map(|v| solutions.column(v))
+            .collect();
+        columns.sort_unstable();
+        columns.dedup();
+        let table = &solutions.table;
+        let eval = |row: usize| self.evaluator.eval(expr, &self.binding(solutions, row));
+        // A value drawn per row (RAND, BNODE, ...) is drawn for every row.
+        if pushdown::per_solution(expr) {
+            return rows.iter().map(|&row| eval(row)).collect();
+        }
+        if let [column] = columns[..] {
+            // One variable: its ids stand for the rows, and the values are remembered
+            // across groups.
+            let key = expr as *const Expression as usize;
+            let mut seen = HashSet::new();
+            let mut memo = self.memo.borrow_mut();
+            return rows
+                .iter()
+                .filter(|&&row| !distinct || seen.insert(table.get(row, column)))
+                .map(|&row| {
+                    memo.entry((key, table.get(row, column)))
+                        .or_insert_with(|| eval(row))
+                        .clone()
+                })
+                .collect();
+        }
+        if !distinct || columns.is_empty() {
+            return rows.iter().map(|&row| eval(row)).collect();
+        }
+        let mut seen: HashSet<Vec<u64>> = HashSet::new();
+        rows.iter()
+            .filter(|&&row| seen.insert(columns.iter().map(|&c| table.get(row, c)).collect()))
+            .map(|&row| eval(row))
+            .collect()
+    }
+
     fn aggregate(
         &self,
         solutions: &Solutions,
@@ -2873,10 +2993,7 @@ impl Aggregator<'_> {
                         return result;
                     }
                 }
-                let evaluated: Vec<Option<Term>> = rows
-                    .iter()
-                    .map(|&row| self.evaluator.eval(expr, &self.binding(solutions, row)))
-                    .collect();
+                let evaluated = self.evaluated(solutions, rows, expr, *distinct);
                 // As spareval: COUNT skips errors and SAMPLE takes the first value, but one
                 // error makes SUM, AVG, MIN and MAX unbound.
                 let fails_on_error =
@@ -2886,13 +3003,11 @@ impl Aggregator<'_> {
                 }
                 let mut values: Vec<Term> = evaluated.into_iter().flatten().collect();
                 if *distinct {
-                    let mut unique = Vec::with_capacity(values.len());
-                    for value in values {
-                        if !unique.contains(&value) {
-                            unique.push(value);
-                        }
-                    }
-                    values = unique;
+                    // The first of each, in order.
+                    let mut seen: HashSet<&Term> = HashSet::with_capacity(values.len());
+                    let first: Vec<bool> = values.iter().map(|value| seen.insert(value)).collect();
+                    let mut first = first.into_iter();
+                    values.retain(|_| first.next().unwrap_or(false));
                 }
                 let result = match name {
                     AggregateFunction::Count => Some(integer(values.len() as u64)),

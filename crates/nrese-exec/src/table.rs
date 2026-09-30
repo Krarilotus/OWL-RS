@@ -291,12 +291,31 @@ impl IdTable {
             self.dedup();
             return;
         }
-        let mut seen = hashbrown::HashSet::with_capacity_and_hasher(
-            self.len,
-            foldhash::fast::FixedState::default(),
-        );
+        // A table of row numbers, hashed and compared through the columns: no row is
+        // copied.
+        use std::hash::{BuildHasher, Hasher};
+        let state = foldhash::fast::FixedState::default();
+        let columns = &self.columns;
+        let hash_of = |row: usize| {
+            let mut hasher = state.build_hasher();
+            for column in columns {
+                hasher.write_u64(column[row]);
+            }
+            hasher.finish()
+        };
+        let mut seen: hashbrown::HashTable<usize> = hashbrown::HashTable::with_capacity(self.len);
         let mask: Vec<bool> = (0..self.len)
-            .map(|row| seen.insert(self.row(row)))
+            .map(|row| {
+                let hash = hash_of(row);
+                let same = |&other: &usize| columns.iter().all(|c| c[other] == c[row]);
+                match seen.entry(hash, same, |&other| hash_of(other)) {
+                    hashbrown::hash_table::Entry::Occupied(_) => false,
+                    hashbrown::hash_table::Entry::Vacant(slot) => {
+                        slot.insert(row);
+                        true
+                    }
+                }
+            })
             .collect();
         self.retain_mask(&mask);
     }
