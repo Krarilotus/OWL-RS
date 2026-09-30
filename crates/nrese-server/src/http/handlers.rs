@@ -20,6 +20,7 @@ use crate::http::requests::{
 };
 use crate::http::responses::{StatusResponse, build_ready_response, build_version_response};
 use crate::http::service_description::build_service_description;
+use crate::http::shacl;
 use crate::http::sparql;
 use crate::http::tell;
 use crate::state::AppState;
@@ -246,6 +247,27 @@ pub async fn sparql_post(
                 .map(IntoResponse::into_response)
         }
     }
+}
+
+/// Validates the data against the repository's shapes graph.
+pub async fn shacl_get(
+    State(state): State<AppState>,
+    raw_query: RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_query_read(&state, &headers).await?;
+    shacl::validate(state, raw_query, headers, None).await
+}
+
+/// Validates the data against the shapes in the request body.
+pub async fn shacl_post(
+    State(state): State<AppState>,
+    raw_query: RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    guard::enforce_query_read(&state, &headers).await?;
+    shacl::validate(state, raw_query, headers, Some(body)).await
 }
 
 pub async fn tell_post(

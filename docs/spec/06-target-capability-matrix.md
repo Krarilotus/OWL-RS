@@ -32,7 +32,7 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 | Incremental retraction (TMS) | no | yes | **done**: DRed with backward/forward proofs; incremental = rematerialisation on 84 k random changes and 3 k engine commits | R5 | incremental = rematerialisation property tests |
 | Consistency checking with explanations | no | yes | delivered: rejecting commits with explanations (premises, rule, trigger); inconsistent baselines are quarantined. Missing: W3C RL consistency test run, datatype consistency (B3) | R6 | W3C RL consistency tests; v1 fixture suite; explanation ≤ 10 ms |
 | Explicit/implicit pseudo-graphs | no | yes | **done**: `infer=false`, `FROM onto:explicit` / `onto:implicit`, per request, on both executors (differential-tested) | E6, R4 | query tests |
-| SHACL Core + paths on commit | no | yes | delivered as a library (`nrese-shacl`): every Core component, path and target kind; the W3C Core suite passes 98 of 98. Missing: the store operation and endpoint (C1b), the commit gate and incremental validation (C2) | S1, S2 | W3C SHACL suite; incremental = full |
+| SHACL Core + paths on commit | no | yes | delivered on request: every Core component, path and target kind (W3C Core suite 98 of 98); `/dataset/shacl` validates against the stored shapes graph or posted shapes and returns the report as RDF or JSON. Missing: the commit gate and incremental validation (C2) | S1, S2 | W3C SHACL suite; incremental = full |
 | SHACL-SPARQL | no | yes | missing | S3 | W3C SHACL-SPARQL tests |
 | Full-text search | yes (integrated) | yes (connectors/Lucene) | missing | T1 | ResearchSpace search; relevance tests |
 | Autocompletion | yes | partial | missing | T1 | latency benchmark |

@@ -127,6 +127,11 @@ api_key = "replace-me"
 - env override: `NRESE_DATA_DIR`
 - default: `./data`
 
+- file key: `shacl.shapes_graph`
+- env override: `NRESE_SHACL_SHAPES_GRAPH`
+- default: `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph` (the graph RDF4J and GraphDB use)
+- the graph whose shapes `GET /dataset/shacl` validates against ([http-api.md](http-api.md)); it must be an IRI
+
 - file key: `store.query_cache_bytes`
 - env override: `NRESE_QUERY_CACHE_BYTES`
 - default: `67108864` (64 MiB); `0` disables the cache

@@ -10,11 +10,20 @@ pub(super) struct RawFileConfig {
     #[serde(default)]
     pub reasoner: RawReasonerConfig,
     #[serde(default)]
+    pub shacl: RawShaclConfig,
+    #[serde(default)]
     pub policy: RawPolicyConfig,
     #[serde(default)]
     pub auth: RawAuthConfig,
     #[serde(default)]
     pub ai: RawAiConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RawShaclConfig {
+    #[serde(default)]
+    pub shapes_graph: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

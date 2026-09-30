@@ -77,6 +77,10 @@ pub fn router(state: AppState) -> Router {
                 .post(handlers::graph_post)
                 .delete(handlers::graph_delete),
         )
+        .route(
+            crate::runtime_posture::SHACL_ENDPOINT,
+            get(handlers::shacl_get).post(handlers::shacl_post),
+        )
         .nest_service(
             "/console/assets",
             get_service(ServeDir::new(console::assets_dir())),
