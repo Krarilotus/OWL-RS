@@ -40,6 +40,10 @@ pub struct QueryOptions {
     pub as_written: bool,
     /// Who answers `SERVICE` calls ([`crate::service`]); `None`: federation is off.
     pub services: Option<crate::Services>,
+    /// The data is closed under `owl:sameAs` (materialised by a ruleset with the equality
+    /// rules): every fact about one identity holds for the others. Some operators then
+    /// work on one representative per identity class where the answer can't tell.
+    pub equality_closed: bool,
 }
 
 /// Evaluates `query` against `view`. Queries the native executor supports run there

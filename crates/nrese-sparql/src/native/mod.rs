@@ -13,6 +13,7 @@
 //! smaller than the next pattern, and otherwise by merge joins on sorted scans or hash joins.
 //! `COUNT(*)` over a single pattern reads the count from the index.
 
+mod equality;
 mod exists;
 pub(crate) mod expr;
 mod fast;
@@ -845,6 +846,8 @@ struct Context<'a> {
     synthetic: Cell<usize>,
     /// [`QueryOptions::services`].
     services: Option<crate::Services>,
+    /// [`QueryOptions::equality_closed`].
+    equality_closed: bool,
 }
 
 /// The active graph of triple patterns.
@@ -902,6 +905,7 @@ impl<'a> Context<'a> {
             graph: RefCell::new(scope),
             synthetic: Cell::new(0),
             services: options.services.clone(),
+            equality_closed: options.equality_closed,
         }
     }
 

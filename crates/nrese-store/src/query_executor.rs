@@ -49,6 +49,9 @@ pub(crate) struct StoreSettings {
     /// Who answers `SERVICE` calls, once the application installs a client
     /// ([`StoreService::set_service_client`](crate::StoreService::set_service_client)).
     pub services: std::sync::Arc<std::sync::OnceLock<nrese_sparql::Services>>,
+    /// The inferred stack is current under a ruleset with equality reasoning
+    /// ([`QueryOptions::equality_closed`](nrese_sparql::QueryOptions)).
+    pub equality_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A parsed query with its protocol dataset and output format. Preparing is cheap and
@@ -237,6 +240,9 @@ pub(crate) fn run_query(
         shared_memory: store.query_memory.clone(),
         union_default_graph: store.union_default_graph,
         services: store.services.get().cloned(),
+        equality_closed: store
+            .equality_closed
+            .load(std::sync::atomic::Ordering::Acquire),
         ..QueryOptions::default()
     };
     let alive = || match cancellation.is_cancelled() {
@@ -306,6 +312,9 @@ pub(crate) fn explain_prepared(
         shared_memory: store.query_memory.clone(),
         union_default_graph: store.union_default_graph,
         services: store.services.get().cloned(),
+        equality_closed: store
+            .equality_closed
+            .load(std::sync::atomic::Ordering::Acquire),
         ..QueryOptions::default()
     };
     Ok(explain_query(view, &prepared.query, &options)?)

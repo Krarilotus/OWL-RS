@@ -457,8 +457,35 @@ impl Context<'_> {
                     .column(core.column(variable).expect("filtered above"));
                 columns.push(rows.iter().map(|&row| column[row]).collect());
             }
+            // Data closed under sameAs: a plain pattern gives every identity of a key the
+            // same rows, so the join, which feeds duplicate-insensitive aggregates only,
+            // runs on one representative per identity class (`equality`).
+            let by_representative: Vec<Variable> = match self.representatives() {
+                Some(_) if expression.is_none() && matches!(right, GraphPattern::Bgp { .. }) => {
+                    from_core
+                        .iter()
+                        .filter(|v| reads[i].contains(v))
+                        .filter(|v| selected.iter().all(|&a| !arguments[a].contains(v)))
+                        .cloned()
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            let representatives = self.representatives();
+            let to_representatives = |vars: &[Variable], columns: &mut [Vec<u64>]| {
+                if let Some(representatives) = &representatives {
+                    for (variable, column) in vars.iter().zip(columns.iter_mut()) {
+                        if by_representative.contains(variable) {
+                            for id in column.iter_mut() {
+                                *id = super::equality::representative(representatives, *id);
+                            }
+                        }
+                    }
+                }
+            };
             let mut vars = vec![group.clone()];
             vars.extend(from_core.iter().cloned());
+            to_representatives(&vars, &mut columns);
             let mut table = IdTable::from_columns(columns);
             table.dedup_preserving_order();
             let left = self.produced(Solutions {
@@ -471,10 +498,16 @@ impl Context<'_> {
             for &a in &selected {
                 add(&mut right_needed, arguments[a].iter().cloned());
             }
-            let right = match as_path(right) {
+            let mut right = match as_path(right) {
                 Some(path) => self.path_from(&left, &path)?,
                 None => self.eval_set(right, &right_needed)?,
             };
+            if !by_representative.is_empty() {
+                let mut columns = std::mem::take(&mut right.table).into_columns();
+                to_representatives(&right.vars, &mut columns);
+                right.table = IdTable::from_columns(columns);
+                right.table.dedup_preserving_order();
+            }
             let start = std::time::Instant::now();
             let joined = self.left_join(left, right, *expression)?;
             let column = joined.column(&group).expect("the left side's first column");
