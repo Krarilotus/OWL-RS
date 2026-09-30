@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""The benchmark suite's run matrix: which workload runs on which system.
+"""The benchmark suite: which workload runs on which system, and the runs themselves.
 
     benches/suite/suite.py             the matrix, and what NRESE can't run yet
     benches/suite/suite.py --check     validate the two files (exit 1 on an error)
     benches/suite/suite.py nrese       one system's column, with the reasons
+    benches/suite/suite.py run ...     run the matrix (suite.py run --help)
+    benches/suite/suite.py report ...  results as tables (suite.py report --help)
+    benches/suite/suite.py images [systems]  the images the systems need (for build-sif.sh)
 
 A workload runs on a system if the system has every capability in the workload's `needs`
 and, if the workload lists alternatives (`any`), at least one of them. Everything else is
@@ -74,6 +77,15 @@ def main(argv):
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
+    if argv[1:2] == ["run"]:
+        from suitekit import driver
+        return driver.main(argv[2:], systems, workloads, HERE.parent.parent)
+    if argv[1:2] == ["images"]:
+        from suitekit import driver
+        return driver.images(argv[2:], systems, HERE.parent.parent)
+    if argv[1:2] == ["report"]:
+        from suitekit import report
+        return report.main(argv[2:])
     if argv[1:] == ["--check"]:
         print(f"{len(systems)} systems, {len(workloads)} workloads: ok")
         return 0

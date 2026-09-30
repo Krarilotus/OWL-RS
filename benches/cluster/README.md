@@ -40,12 +40,35 @@ sbatch --export=ALL,TIER_NAME=cohort,FUSEKI_HEAP=200g benches/cluster/integratio
 sbatch -p fat --export=ALL,TIER_NAME=full,FUSEKI_HEAP=2000g benches/cluster/integration.sbatch fuseki-owl current
 ```
 
+## The whole suite
+
+`suite.sbatch` runs the benchmark suite ([../suite](../suite/README.md)) in a job: the systems from SIF images, NRESE and the client as processes, the datasets from a directory.
+
+```sh
+# on a workstation with Docker: the datasets, and the images this repository builds
+benches/reasoning/prepare-lubm.sh 100 1000
+docker run --rm -v nrese-bench-data:/data:ro -v "$PWD/tmp/cluster-data":/out alpine sh -c 'cp /data/*.nt /out/'
+mkdir -p tmp/cluster-sif
+for image in nrese-bench/jena:6.2.0 nrese-bench/nemo nrese-bench/owlrl-oracle; do
+  docker save "$image" -o "tmp/cluster-sif/$(echo "$image" | tr '/:' '__').tar"
+done
+rsync -a tmp/cluster-data/ draco:/work/$USER/nrese/data/
+rsync -a tmp/cluster-sif/ draco:/work/$USER/nrese/sif/
+
+# on the cluster
+benches/cluster/build-sif.sh /work/$USER/nrese/sif        # the SIF files: from the archives, the rest from their registries
+sbatch benches/cluster/suite.sbatch --workloads lubm --tier lubm=100 --tier lubm=1000
+PYTHON=python3.11 sbatch ...                             # the suite needs Python 3.11 (module avail python)
+```
+
+The suite's Apptainer path was run in WSL (Ubuntu 24.04, Apptainer 1.5.4) with SIF images built from the local Docker images.
+
 ## How a run is set up
 
 - **A whole node per run** (`--exclusive --mem=0`): no other job shares its cores, memory or memory bandwidth. One system at a time; systems are compared across jobs on the same node type, which `environment.txt` records.
 - **One hardware thread per core** (`--hint=nomultithread`), as the cluster's documentation recommends for threaded programs.
 - **No containers for NRESE, Fuseki and the client:** they run as processes. Peak memory is read from the processes; SLURM's accounting (`sacct.txt`) is kept next to it.
-- **Containers for the other systems:** the cluster has Apptainer, not Docker. An image is converted once on a login node (`apptainer pull qlever.sif docker://adfreiburg/qlever`) and run with the data directory bound in. Java without a module: `JAVA="apptainer exec temurin-21.sif java"`. The adapters for QLever, Oxigraph, Virtuoso and the licensed systems are still to be written for this; on a workstation they run in Docker ([../competitors](../competitors/README.md)).
+- **Containers for the other systems:** the cluster has Apptainer, not Docker. The suite runs them from SIF images (below). Java without a module: `JAVA="apptainer exec temurin-21.sif java"`.
 - **Where things go:** results in `$NRESE_WORK/results/<date>-job<id>/` (they stay), the build in `$NRESE_WORK/target`, the store and temporary files in `$NRESE_WORK/scratch/<job id>/` (removed when the run ends). Nothing large in `/home`.
 - **What is recorded** (`environment.txt`): job, node, partition, CPU model and counts, memory, kernel, the commits of NRESE and of the workload, the toolchain, the arguments.
 
