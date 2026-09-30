@@ -13,6 +13,7 @@
 //!   operator is supported (`native`, the execution core of D11), else with spareval
 //! - [`update`] applies SPARQL Update requests ([`apply_update`])
 
+pub mod compat;
 pub mod dataset;
 mod native;
 pub mod query;

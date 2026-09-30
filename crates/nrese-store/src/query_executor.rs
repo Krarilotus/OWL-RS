@@ -22,8 +22,8 @@ use nrese_sparql::{
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode};
 use oxrdfio::RdfSerializer;
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
+use spargebra::Query;
 use spargebra::algebra::QueryDataset;
-use spargebra::{Query, SparqlParser};
 
 use crate::error::{StoreError, StoreResult};
 use crate::query::{GraphResultFormat, QueryResultKind, SolutionsResultFormat, SparqlQueryRequest};
@@ -57,7 +57,7 @@ pub struct PreparedQuery {
 
 impl PreparedQuery {
     pub fn parse(request: &SparqlQueryRequest) -> StoreResult<Self> {
-        let mut query = SparqlParser::new().parse_query(&request.query)?;
+        let mut query = nrese_sparql::compat::parse_query(&request.query)?;
         let mut default_graphs = request.default_graphs.clone();
         let from_protocol = pseudo_graph_strings(&mut default_graphs);
         let from_query = query_dataset(&mut query)
