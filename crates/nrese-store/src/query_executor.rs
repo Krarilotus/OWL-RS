@@ -60,6 +60,7 @@ pub struct PreparedQuery {
     dataset: Option<QueryDatasetSpecification>,
     read_model: ReadModel,
     memory_limit: Option<usize>,
+    as_written: bool,
     solutions_format: SolutionsResultFormat,
     graph_format: GraphResultFormat,
 }
@@ -93,6 +94,7 @@ impl PreparedQuery {
                 .or(from_query)
                 .unwrap_or_default(),
             memory_limit: request.memory_limit,
+            as_written: request.as_written,
             solutions_format: request.solutions_format,
             graph_format: request.graph_format,
         })
@@ -228,6 +230,7 @@ pub(crate) fn run_query(
         cancellation: Some(cancellation.clone()),
         read_model: prepared.read_model,
         memory_limit: prepared.memory_limit,
+        as_written: prepared.as_written,
         shared_memory: store.query_memory.clone(),
         union_default_graph: store.union_default_graph,
         ..QueryOptions::default()
@@ -295,6 +298,7 @@ pub(crate) fn explain_prepared(
         cancellation: Some(cancellation.clone()),
         read_model: prepared.read_model,
         memory_limit: prepared.memory_limit,
+        as_written: prepared.as_written,
         shared_memory: store.query_memory.clone(),
         union_default_graph: store.union_default_graph,
         ..QueryOptions::default()
