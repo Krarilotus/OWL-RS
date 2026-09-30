@@ -70,3 +70,5 @@ Draco. The scorecard is replaced by the suite's report.
 ## Status
 
 Updated as packages land (commit in brackets).
+
+- 1.1 done (`fb0128d`). Measured with `reason_query --equality-report` on the integration workload's example tier: with the project's ontology the replicated closure has 65,928 facts, the representative one 25,902 (9 classes, the largest of 24 identities), computed 4 times faster; with the GND ontology 253,599 against 187,531, most of the rest being memberships in unnamed classes. So W7 (1.5) goes next, then 1.2 and 1.3.

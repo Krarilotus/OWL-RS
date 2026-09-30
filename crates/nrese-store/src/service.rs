@@ -342,6 +342,14 @@ impl StoreService {
     /// Replaces the inferred stack with `ruleset`'s closure over the asserted data, as one
     /// revision (see [`crate::reasoning`]). For after bulk loads, at startup and after a
     /// ruleset change; commits keep it current afterwards.
+    /// The closure's size with equality replicated and over representatives, for
+    /// `ruleset` on the asserted data ([`crate::reasoning::equality_report`]).
+    pub fn equality_report(&self, ruleset: nrese_reasoner::v2::rulesets::Ruleset) -> String {
+        let tx = self.engine.transaction();
+        let program = crate::reasoning::Program::new(ruleset, &|term| tx.intern(term));
+        crate::reasoning::equality_report(&program, tx.base())
+    }
+
     pub fn rematerialise(
         &self,
         ruleset: nrese_reasoner::v2::rulesets::Ruleset,

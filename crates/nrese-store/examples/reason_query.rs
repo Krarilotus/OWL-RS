@@ -117,6 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut commits = 0usize;
     let mut explain = false;
     let mut as_written = false;
+    let mut equality_report = false;
     let (mut runs, mut timeout, mut memory_limit) = (3usize, None, None);
     let number = |value: Option<String>, option: &str| -> Result<u64, String> {
         value
@@ -137,6 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--commits" => commits = args.next().and_then(|n| n.parse().ok()).unwrap_or(0),
             "--explain" => explain = true,
             "--as-written" => as_written = true,
+            "--equality-report" => equality_report = true,
             "--runs" => runs = number(args.next(), "--runs")?.max(1) as usize,
             "--timeout-s" => {
                 timeout = Some(Duration::from_secs(number(args.next(), "--timeout-s")?));
@@ -168,6 +170,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         graph: GraphTarget::DefaultGraph,
     })?;
     let load_time = started.elapsed();
+    if equality_report {
+        println!("{}", store.equality_report(ruleset));
+    }
     let report = store.rematerialise(ruleset)?;
     println!(
         "{}: asserted {} | load {:.2} s | closure {:.2} s in {} rounds | derived {} | violations {}",
