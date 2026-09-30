@@ -246,11 +246,13 @@ mod tests {
                 .len(),
             50
         );
-        assert!(
+        // dt-type1: the 32 datatypes OWL 2 RL supports.
+        assert_eq!(
             Ruleset::Owl2Rl
                 .axiom_triples(&mut vocabulary)
                 .unwrap()
-                .is_empty()
+                .len(),
+            32
         );
 
         let data = "ex:Cat rdfs:subClassOf ex:Animal

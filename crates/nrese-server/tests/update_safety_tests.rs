@@ -6,7 +6,7 @@ use nrese_reasoner::ReasonerConfig;
 use nrese_server::policy::PolicyConfig;
 use tower::util::ServiceExt;
 
-use support::{query_text, readyz_text, test_app_with_settings};
+use support::{query_text, ready_revision, readyz_text, test_app_with_settings};
 
 #[tokio::test]
 async fn invalid_update_does_not_mutate_dataset_or_revision()
@@ -62,6 +62,7 @@ async fn reasoner_reject_does_not_publish_data_or_advance_revision()
         PolicyConfig::default(),
         ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
     )?;
+    let revision_before = ready_revision(app.clone()).await?;
 
     let rejected = app
         .clone()
@@ -91,7 +92,7 @@ async fn reasoner_reject_does_not_publish_data_or_advance_revision()
         .contains("false")
     );
 
-    assert!(readyz_text(app).await?.contains("\"revision\":0"));
+    assert_eq!(ready_revision(app).await?, revision_before);
 
     Ok(())
 }

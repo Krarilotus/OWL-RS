@@ -6,7 +6,7 @@ use nrese_reasoner::ReasonerConfig;
 use nrese_server::policy::PolicyConfig;
 use tower::util::ServiceExt;
 
-use support::{query_text, readyz_text, test_app, test_app_with_settings};
+use support::{query_text, ready_revision, readyz_text, test_app, test_app_with_settings};
 
 #[tokio::test]
 async fn malformed_update_keeps_ready_revision_unchanged() -> Result<(), Box<dyn std::error::Error>>
@@ -42,6 +42,7 @@ async fn reasoner_reject_keeps_ready_revision_unchanged_and_data_unpublished()
         PolicyConfig::default(),
         ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
     )?;
+    let revision_before = ready_revision(app.clone()).await?;
 
     let response = app
         .clone()
@@ -62,7 +63,7 @@ async fn reasoner_reject_keeps_ready_revision_unchanged_and_data_unpublished()
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let ready_text = readyz_text(app.clone()).await?;
-    assert!(ready_text.contains("\"revision\":0"));
+    assert!(ready_text.contains(&format!("\"revision\":{revision_before}")));
     assert!(ready_text.contains("\"status\":\"ready\""));
 
     assert!(

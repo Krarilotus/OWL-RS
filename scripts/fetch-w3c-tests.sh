@@ -28,3 +28,17 @@ fetch w3c/rdf-tests 369a90d1a60c021b746df2e411da0ff36258a758 \
   "${NRESE_W3C_TESTS:-$CACHE/rdf-tests}" sparql/sparql11
 fetch w3c/data-shapes d556a1fc90c5d5ffdf388124cbb687cf43c5a35e \
   "$CACHE/data-shapes" data-shapes-test-suite/tests
+
+# The OWL 2 test cases (approved by the OWL Working Group; one RDF/XML file, pinned by its
+# checksum): crates/nrese-store/tests/w3c_owl2_rl runs the OWL 2 RL ones.
+OWL_TESTS="$CACHE/owl-test/all.rdf"
+OWL_TESTS_SHA256=5383f1ddf4cf2f03703a2f886f41d4e5bc375633a1cfa94a03254fd89330f8bb
+if [ -f "$OWL_TESTS" ] && echo "$OWL_TESTS_SHA256  $OWL_TESTS" | sha256sum -c --quiet - 2>/dev/null; then
+  echo "OWL 2 test cases already in $OWL_TESTS"
+else
+  mkdir -p "$(dirname "$OWL_TESTS")"
+  curl -sSfL -o "$OWL_TESTS.partial" https://www.w3.org/2009/11/owl-test/all.rdf
+  echo "$OWL_TESTS_SHA256  $OWL_TESTS.partial" | sha256sum -c --quiet -
+  mv "$OWL_TESTS.partial" "$OWL_TESTS"
+  echo "OWL 2 test cases in $OWL_TESTS"
+fi

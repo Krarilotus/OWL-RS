@@ -768,8 +768,14 @@ pub(crate) fn check<S: Source + ?Sized>(
 ) {
     let record = |c: usize, bindings: &[Option<u64>], found: &mut HashSet<Violation>| {
         let (rule, grounded) = &program.consistency[c];
+        // The job's bindings are sized for the grounded instance, which lacks the schema
+        // variables when one of them has the highest index.
         let bindings = (0..rule.variables())
-            .map(|v| grounded.substitution[v].or(bindings[v]).unwrap_or(0))
+            .map(|v| {
+                grounded.substitution[v]
+                    .or_else(|| bindings.get(v).copied().flatten())
+                    .unwrap_or(0)
+            })
             .collect();
         found.insert(Violation {
             rule: rule.name.clone(),
