@@ -14,6 +14,10 @@
 #   wikidata-lexemes  Wikidata lexemes dump, latest (1.5 GB gz)
 # Full Wikidata truthy (72 GB gz, ~8 B triples) needs a large server and isn't included.
 set -euo pipefail
+
+# Datasets, store files and images take tens of GB: don't start on a nearly full disk.
+. "$(dirname "$0")/../../scripts/lib/disk.sh"
+require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
 export MSYS_NO_PATHCONV=1
 
 OXIGRAPH_IMAGE=${OXIGRAPH_IMAGE:-ghcr.io/oxigraph/oxigraph:0.5.11}

@@ -16,6 +16,10 @@
 #     so those lines are dropped.
 # The generator is pinned (lubm/Dockerfile), so the output is the same on every machine.
 set -euo pipefail
+
+# Datasets, store files and images take tens of GB: don't start on a nearly full disk.
+. "$(dirname "$0")/../../scripts/lib/disk.sh"
+require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
 export MSYS_NO_PATHCONV=1
 native() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 HERE=$(native "$(cd "$(dirname "$0")" && pwd)")
