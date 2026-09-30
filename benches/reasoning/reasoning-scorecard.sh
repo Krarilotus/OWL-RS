@@ -186,7 +186,9 @@ run_jena() { # <dataset> <log> <profile>
   echo "$(field 'asserted ([0-9]+)' "$2"),$(field 'closure ([0-9.]+)' "$2"),$(field 'inferred ([0-9]+)' "$2"),$(peak_mib "$2")"
 }
 
-# Images and the NRESE build
+# Images and the NRESE build. What this run is about to pull is its to remove afterwards
+# (scripts/bench-cleanup.sh).
+remember_pulls "$ROOT/tmp/bench-pulled-images" "$RUST_IMAGE"
 docker build -q -t nrese-bench/owlrl-oracle "$HERE/oracle" >/dev/null
 docker image inspect nrese-bench/jena:6.2.0 >/dev/null 2>&1 ||
   docker build -q -t nrese-bench/jena:6.2.0 "$HERE/../competitors/jena" >/dev/null
