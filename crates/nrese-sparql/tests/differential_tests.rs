@@ -343,13 +343,34 @@ fn a_failed_update_leaves_nothing_to_commit() {
     let (engine, _) = load_both();
     let before = ours(&engine, ALL_QUADS);
     let update = SparqlParser::new()
-        .parse_update("INSERT DATA { <http://example.com/new> <http://example.com/p> 1 } ; DROP GRAPH <http://example.com/missing>")
+        .parse_update("INSERT DATA { <http://example.com/new> <http://example.com/p> 1 } ; CREATE GRAPH <http://example.com/g1>")
         .unwrap();
     let mut tx = engine.transaction();
     let error = apply_update(&mut tx, &update, &UpdateOptions::default()).unwrap_err();
-    assert!(error.to_string().contains("does not exist"), "{error}");
+    assert!(error.to_string().contains("already exists"), "{error}");
     drop(tx); // the caller aborts on error
     assert_eq!(ours(&engine, ALL_QUADS), before);
+}
+
+/// The store doesn't record empty graphs, so clearing or dropping a graph that holds
+/// nothing succeeds and changes nothing, without `SILENT` too. RDF4J clients (and so
+/// ResearchSpace) clear a graph before they write it, whether it exists or not.
+#[test]
+fn clearing_a_graph_that_holds_nothing_succeeds() {
+    let (engine, _) = load_both();
+    let before = ours(&engine, ALL_QUADS);
+    for text in [
+        "CLEAR GRAPH <http://example.com/missing>",
+        "DROP GRAPH <http://example.com/missing>",
+        "DROP GRAPH <http://example.com/missing> ; INSERT DATA { GRAPH <http://example.com/missing> { <http://example.com/a> <http://example.com/p> 1 } } ; DROP GRAPH <http://example.com/missing>",
+    ] {
+        let update = SparqlParser::new().parse_update(text).unwrap();
+        let mut tx = engine.transaction();
+        apply_update(&mut tx, &update, &UpdateOptions::default())
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        tx.commit().unwrap();
+        assert_eq!(ours(&engine, ALL_QUADS), before, "{text}");
+    }
 }
 
 #[test]

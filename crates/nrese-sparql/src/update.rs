@@ -44,8 +44,6 @@ pub enum UpdateError {
     Evaluation(#[from] QueryEvaluationError),
     #[error("graph {0} already exists")]
     GraphAlreadyExists(NamedNode),
-    #[error("graph {0} does not exist")]
-    GraphDoesNotExist(NamedNode),
     #[error("LOAD <{0}> is not enabled on this server")]
     LoadNotAllowed(NamedNode),
     #[error("update cancelled")]
@@ -164,27 +162,24 @@ fn apply_operation(
                 return Err(UpdateError::GraphAlreadyExists(graph.clone()));
             }
         }
-        GraphUpdateOperation::Clear { graph, silent }
-        | GraphUpdateOperation::Drop { graph, silent } => {
-            clear(tx, graph, *silent)?;
+        GraphUpdateOperation::Clear { graph, .. } | GraphUpdateOperation::Drop { graph, .. } => {
+            clear(tx, graph);
         }
     }
     Ok(())
 }
 
-/// `CLEAR` and `DROP` are the same operation when graphs exist iff non-empty.
-fn clear(tx: &mut Transaction<'_>, target: &GraphTarget, silent: bool) -> Result<(), UpdateError> {
+/// `CLEAR` and `DROP` are the same operation here: the store doesn't record empty graphs,
+/// so a graph exists iff it holds statements. For the same reason, clearing or dropping a
+/// graph that holds nothing succeeds, with or without `SILENT` (SPARQL 1.1 Update §3.2
+/// leaves that to stores that don't record empty graphs; RDF4J clients, and so
+/// ResearchSpace, clear a graph before they write it, whether it exists or not).
+fn clear(tx: &mut Transaction<'_>, target: &GraphTarget) {
     let graph = match target {
-        GraphTarget::NamedNode(name) => {
-            let existing = tx
-                .lookup(name.as_ref().into())
-                .filter(|&id| tx.contains_named_graph(id));
-            match existing {
-                Some(id) => GraphSelector::Exact(id),
-                None if silent => return Ok(()),
-                None => return Err(UpdateError::GraphDoesNotExist(name.clone())),
-            }
-        }
+        GraphTarget::NamedNode(name) => match tx.lookup(name.as_ref().into()) {
+            Some(id) => GraphSelector::Exact(id),
+            None => return,
+        },
         GraphTarget::DefaultGraph => GraphSelector::Exact(TermId::DEFAULT_GRAPH),
         GraphTarget::NamedGraphs => GraphSelector::AnyNamed,
         GraphTarget::AllGraphs => GraphSelector::Any,
@@ -193,7 +188,6 @@ fn clear(tx: &mut Transaction<'_>, target: &GraphTarget, silent: bool) -> Result
         graph,
         ..QuadPattern::all()
     });
-    Ok(())
 }
 
 fn graph_name(graph: &GraphName) -> OxGraphName {
