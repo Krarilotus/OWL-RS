@@ -212,7 +212,7 @@ pub(crate) fn delete_insert(
     options: &QueryOptions,
 ) -> Option<Result<QuadChanges, QueryEvaluationError>> {
     use spargebra::term::{GraphNamePattern, GroundTermPattern};
-    if options.dataset.is_some() || options.union_default_graph || !supported(pattern) {
+    if options.dataset.is_some() || !supported(pattern) {
         return None;
     }
     let ctx = Context::new(snapshot, options);
@@ -313,9 +313,7 @@ fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
 ) -> Option<(&'q GraphPattern, Form<'q>)> {
-    // A protocol dataset, or a default graph that is the merge of all graphs, isn't
-    // what the scans here read.
-    if options.dataset.is_some() || options.union_default_graph || !query_supported(query) {
+    if options.dataset.is_some() || !query_supported(query) {
         return None;
     }
     match query {
@@ -712,6 +710,9 @@ struct Context<'a> {
 #[derive(Clone, Debug)]
 enum GraphScope {
     Default,
+    /// The default graph as the merge of all graphs
+    /// ([`QueryOptions::union_default_graph`]): every statement once.
+    Union,
     Named(TermId),
     /// `GRAPH ?g`: any named graph, bound to the variable.
     Variable(Variable),
@@ -734,7 +735,11 @@ impl<'a> Context<'a> {
                 .map_or_else(Budget::unlimited, Budget::new),
             trace: None,
             depth: Cell::new(0),
-            graph: RefCell::new(GraphScope::Default),
+            graph: RefCell::new(if options.union_default_graph {
+                GraphScope::Union
+            } else {
+                GraphScope::Default
+            }),
         }
     }
 
@@ -893,7 +898,12 @@ impl<'a> Context<'a> {
                 *self.graph.borrow_mut() = outer;
                 result
             }
-            GraphPattern::Path { .. } if !matches!(*self.graph.borrow(), GraphScope::Default) => {
+            GraphPattern::Path { .. }
+                if !matches!(
+                    *self.graph.borrow(),
+                    GraphScope::Default | GraphScope::Union
+                ) =>
+            {
                 Err(NativeError::Fallback)
             }
             GraphPattern::Path {
@@ -1087,6 +1097,7 @@ impl<'a> Context<'a> {
         let evaluator = paths::PathEvaluator {
             snapshot: self.snapshot,
             model: self.model,
+            merged: matches!(*self.graph.borrow(), GraphScope::Union),
         };
         // A variable (blank nodes are variables here), or a constant's id (computed if the
         // store doesn't know it; such an id has no edges).
@@ -1358,6 +1369,7 @@ impl<'a> Context<'a> {
                     Slot::Var(v) => {
                         wcoj::Pos::Var(vars.iter().position(|x| x == v).expect("collected above"))
                     }
+                    Slot::Merged => unreachable!("only the graph position is merged"),
                 })
             })
             .collect();
@@ -1450,6 +1462,7 @@ impl<'a> Context<'a> {
         };
         let graph = match &*self.graph.borrow() {
             GraphScope::Default => Slot::Const(TermId::DEFAULT_GRAPH),
+            GraphScope::Union => Slot::Merged,
             GraphScope::Named(id) => Slot::Const(*id),
             GraphScope::Variable(v) => Slot::Var(v.clone()),
             GraphScope::Missing => return None,
@@ -1479,11 +1492,21 @@ impl<'a> Context<'a> {
             .snapshot
             .scan_sorted_in(self.model, &pattern, permutation)
             .expect("permutation_for returns a usable permutation");
+        let merged = scan.merged();
+        let mut previous: Option<[u64; 3]> = None;
         'quads: for (n, quad) in quads.enumerate() {
             if n % (1 << 16) == 0 {
                 self.check()?;
             }
             let components = quad.components();
+            if merged {
+                // Graph-last order: the copies of a statement follow each other.
+                let statement = [components[0], components[1], components[2]];
+                if previous == Some(statement) {
+                    continue;
+                }
+                previous = Some(statement);
+            }
             for (slot, positions) in row.iter_mut().zip(&columns_of) {
                 let value = components[positions[0]];
                 // A variable used twice in one pattern must bind the same term.
@@ -1500,7 +1523,7 @@ impl<'a> Context<'a> {
             .iter()
             .filter_map(|&component| match &scan.slots[component] {
                 Slot::Var(v) => vars.iter().position(|x| x == v),
-                Slot::Const(_) => None,
+                Slot::Const(_) | Slot::Merged => None,
             })
             .collect();
         let mut sorted = Vec::new();
@@ -1794,9 +1817,27 @@ impl<'a> Context<'a> {
         let mut out = IdTable::new(width);
         let mut chunk = IdTable::new(width);
         let mut row = vec![0u64; width];
-        let mut quads = self
-            .snapshot
-            .quads_for_pattern_in(self.model, &scan.quad_pattern());
+        // The merged default graph is read in a graph-last order, where the copies of a
+        // statement are adjacent, and all but the first are skipped.
+        let mut quads: Box<dyn Iterator<Item = nrese_engine::EncodedQuad> + '_> = if scan.merged() {
+            let sorted = self
+                .snapshot
+                .scan_sorted_in(self.model, &scan.quad_pattern(), scan.permutation_for(None))
+                .expect("permutation_for returns a usable permutation");
+            let mut previous: Option<[u64; 3]> = None;
+            Box::new(sorted.filter(move |quad| {
+                let components = quad.components();
+                let statement = [components[0], components[1], components[2]];
+                let first = previous != Some(statement);
+                previous = Some(statement);
+                first
+            }))
+        } else {
+            Box::new(
+                self.snapshot
+                    .quads_for_pattern_in(self.model, &scan.quad_pattern()),
+            )
+        };
         loop {
             let more = quads.next();
             if let Some(quad) = more {
@@ -2147,7 +2188,9 @@ impl<'a> Context<'a> {
             && let [triple] = patterns.as_slice()
         {
             let count = match self.scan_pattern(triple) {
-                Some(scan) if !scan.repeats_variable() => {
+                // The index counts quads; in the merged default graph a statement in
+                // several graphs is several quads, so there the scan counts.
+                Some(scan) if !scan.repeats_variable() && !scan.merged() => {
                     self.snapshot.count_in(self.model, &scan.quad_pattern())
                 }
                 Some(scan) => self.scan(&scan, None)?.table.len() as u64,
@@ -2168,6 +2211,7 @@ impl<'a> Context<'a> {
             && let [triple] = patterns.as_slice()
             && let Some(scan) = self.scan_pattern(triple)
             && !scan.repeats_variable()
+            && !scan.merged()
             && aggregates
                 .iter()
                 .all(|(_, aggregate)| counts_rows(aggregate, &scan))
@@ -2470,6 +2514,12 @@ impl Probe<'_> {
                         values.push(value);
                     }
                     matches.push(values);
+                }
+                if self.scan.merged() {
+                    // A statement in several graphs matched once per graph; its values
+                    // are the same each time.
+                    matches.sort_unstable();
+                    matches.dedup();
                 }
             }
             for values in &matches {
@@ -2877,6 +2927,10 @@ fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {
 enum Slot {
     Var(Variable),
     Const(TermId),
+    /// The graph position of a pattern in the merged default graph: any graph, and a
+    /// statement that several graphs hold counts once. Reads in this scope use a
+    /// graph-last order, where the copies of a statement are adjacent, and drop them.
+    Merged,
 }
 
 impl Slot {
@@ -2886,7 +2940,8 @@ impl Slot {
 }
 
 /// A triple pattern with constants resolved to ids, in a graph: `slots[3]` is the default
-/// graph, a named graph, or a graph variable (any named graph, inside `GRAPH ?g`).
+/// graph, a named graph, a graph variable (any named graph, inside `GRAPH ?g`), or
+/// [`Slot::Merged`].
 #[derive(Clone, Debug)]
 struct ScanPattern {
     slots: [Slot; 4],
@@ -2896,7 +2951,7 @@ impl ScanPattern {
     fn quad_pattern(&self) -> QuadPattern {
         let constant = |slot: &Slot| match slot {
             Slot::Const(id) => Some(*id),
-            Slot::Var(_) => None,
+            Slot::Var(_) | Slot::Merged => None,
         };
         QuadPattern {
             subject: constant(&self.slots[0]),
@@ -2905,6 +2960,7 @@ impl ScanPattern {
             graph: match &self.slots[3] {
                 Slot::Const(id) => GraphSelector::Exact(*id),
                 Slot::Var(_) => GraphSelector::AnyNamed,
+                Slot::Merged => GraphSelector::Any,
             },
         }
     }
@@ -2913,6 +2969,12 @@ impl ScanPattern {
     /// worst-case-optimal join assume it).
     fn in_default_graph(&self) -> bool {
         matches!(self.slots[3], Slot::Const(id) if id == TermId::DEFAULT_GRAPH)
+    }
+
+    /// True if the pattern reads the merged default graph: index reads may then return a
+    /// statement once per graph that holds it, and the reader drops the copies.
+    fn merged(&self) -> bool {
+        matches!(self.slots[3], Slot::Merged)
     }
 
     /// Distinct variables in subject, predicate, object, graph order.
@@ -2942,7 +3004,7 @@ impl ScanPattern {
             .iter()
             .filter_map(|s| match s {
                 Slot::Var(v) => Some(v),
-                Slot::Const(_) => None,
+                Slot::Const(_) | Slot::Merged => None,
             })
             .collect();
         let before = names.len();
@@ -2952,8 +3014,9 @@ impl ScanPattern {
     }
 
     /// A permutation whose free part starts with `sort_var`, if one exists; any usable one
-    /// otherwise. A constant graph takes a graph-first order, a graph variable a graph-last
-    /// one (its graph range is not a prefix).
+    /// otherwise. A constant graph takes a graph-first order; a graph variable and the
+    /// merged default graph take a graph-last one (their graphs are not a prefix, and in a
+    /// graph-last order the copies of a statement are adjacent).
     fn permutation_for(&self, sort_var: Option<&Variable>) -> Permutation {
         const GRAPH_FIRST: [Permutation; 4] = [
             Permutation::Gspo,
@@ -2965,7 +3028,7 @@ impl ScanPattern {
             [Permutation::Spog, Permutation::Posg, Permutation::Ospg];
         let candidates: &[Permutation] = match self.slots[3] {
             Slot::Const(_) => &GRAPH_FIRST,
-            Slot::Var(_) => &GRAPH_LAST,
+            Slot::Var(_) | Slot::Merged => &GRAPH_LAST,
         };
         let bound = |component: usize| matches!(self.slots[component], Slot::Const(_));
         let usable = |p: &Permutation| {
