@@ -2,7 +2,7 @@
 //! `?building geo:sfWithin ex:Berlin` holds between two spatial objects, features or
 //! geometries, whose geometries stand in the relation.
 //!
-//! A geometry is a node with a `geo:asWKT` literal; a feature's geometries are its
+//! A geometry is a node with a `geo:asWKT`, `geo:asGeoJSON` or `geo:asGML` literal; a feature's geometries are its
 //! `geo:hasDefaultGeometry`, or else its `geo:hasGeometry` ones; the relation holds if it
 //! holds for some pair of their shapes (in one reference system). Relations are computed
 //! from the data, not read from statements.
@@ -18,9 +18,11 @@ use std::sync::{Arc, Mutex};
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::{IdTable, UNDEF};
+use oxrdf::Term;
 use oxrdf::{NamedNodeRef, Variable};
 use rstar::primitives::{GeomWithData, Rectangle};
 use rstar::{AABB, RTree};
+use spargebra::algebra::{Expression, Function};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use super::geo::{RELATIONS, Shape, holds_apart, parse, relation};
@@ -28,11 +30,16 @@ use super::{Context, NativeResult, Solutions};
 
 const GEO: &str = "http://www.opengis.net/ont/geosparql#";
 
+/// The properties from a geometry to its literals.
+const SERIALISATIONS: [&str; 3] = ["asWKT", "asGeoJSON", "asGML"];
+
 type Entry = GeomWithData<Rectangle<[f64; 2]>, u64>;
 
 pub(super) struct SpatialIndex {
     shapes: HashMap<u64, Vec<Arc<Shape>>>,
     tree: RTree<Entry>,
+    /// The geometry literals themselves, for filters over them.
+    literals: RTree<Entry>,
 }
 
 type Cached = (Snapshot, ReadModel, Arc<SpatialIndex>);
@@ -106,12 +113,19 @@ impl SpatialIndex {
                 .collect()
         };
         let mut shapes: HashMap<u64, Vec<Arc<Shape>>> = HashMap::new();
-        for (geometry, literal) in with(id("asWKT")) {
+        let mut literal_entries: HashMap<u64, Entry> = HashMap::new();
+        let serialisations = SERIALISATIONS.iter().flat_map(|local| with(id(local)));
+        for (geometry, literal) in serialisations {
             if let Some(shape) = snapshot
                 .decode(TermId::from_raw(literal))
                 .as_ref()
                 .and_then(parse)
             {
+                if let Some(b) = bbox(&shape) {
+                    literal_entries.entry(literal).or_insert_with(|| {
+                        GeomWithData::new(Rectangle::from_corners(b.lower(), b.upper()), literal)
+                    });
+                }
                 shapes.entry(geometry).or_default().push(Arc::new(shape));
             }
         }
@@ -154,6 +168,7 @@ impl SpatialIndex {
         Self {
             shapes,
             tree: RTree::bulk_load(entries),
+            literals: RTree::bulk_load(literal_entries.into_values().collect()),
         }
     }
 
@@ -200,7 +215,67 @@ enum Side {
     Free(Variable),
 }
 
+/// A filter conjunct `geof:relation(?v, constant)` (or the other way round) for a
+/// relation the index can find candidates for: the variable and the constant's shape.
+fn indexed_filter(conjunct: &Expression) -> Option<(Variable, Shape)> {
+    let Expression::FunctionCall(Function::Custom(name), args) = conjunct else {
+        return None;
+    };
+    let local = name.as_str().strip_prefix(super::geo::GEOF)?;
+    if !RELATIONS.contains(&local) || holds_apart(local) {
+        return None;
+    }
+    match args.as_slice() {
+        [Expression::Variable(v), Expression::Literal(l)]
+        | [Expression::Literal(l), Expression::Variable(v)] => {
+            Some((v.clone(), parse(&Term::from(l.clone()))?))
+        }
+        _ => None,
+    }
+}
+
 impl Context<'_> {
+    /// For a basic graph pattern under `conjuncts`: when one of them relates a variable
+    /// that is the object of a `geo:asWKT` (`asGeoJSON`, `asGML`) pattern to a constant
+    /// shape, the geometry literals whose bounding box meets the shape's, as rows to start the joins from (the
+    /// conjunct still decides).
+    pub(super) fn spatial_seed(
+        &self,
+        conjuncts: &[&Expression],
+        patterns: &[TriplePattern],
+    ) -> Option<Solutions> {
+        if self.as_written {
+            return None;
+        }
+        for conjunct in conjuncts {
+            let Some((variable, shape)) = indexed_filter(conjunct) else {
+                continue;
+            };
+            let bound_by_wkt = patterns.iter().any(|t| {
+                matches!(&t.predicate, NamedNodePattern::NamedNode(n)
+                    if n.as_str().strip_prefix(GEO).is_some_and(|l| SERIALISATIONS.contains(&l)))
+                    && matches!(&t.object, TermPattern::Variable(o) if *o == variable)
+            });
+            let Some(b) = bbox(&shape) else {
+                continue;
+            };
+            if !bound_by_wkt {
+                continue;
+            }
+            let index = self.spatial_index();
+            let mut table = IdTable::new(1);
+            for entry in index.literals.locate_in_envelope_intersecting(&b) {
+                table.push_row(&[entry.data]);
+            }
+            return Some(Solutions {
+                vars: vec![variable],
+                table,
+                ordered: false,
+            });
+        }
+        None
+    }
+
     fn spatial_index(&self) -> Arc<SpatialIndex> {
         let mut cache = CACHE
             .lock()

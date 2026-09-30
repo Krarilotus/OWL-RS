@@ -19,6 +19,7 @@ pub(crate) mod expr;
 mod fast;
 mod federation;
 mod geo;
+mod geo_formats;
 mod output;
 mod paths;
 mod plan;
@@ -1191,14 +1192,22 @@ impl<'a> Context<'a> {
                     let mut all = Vec::new();
                     pushdown::conjuncts_of(expr, &mut all);
                     let as_written = self.as_written;
-                    let (mut early, late): (Vec<_>, Vec<_>) = all
+                    let (early, late): (Vec<_>, Vec<_>) = all
                         .into_iter()
                         .partition(|c| !as_written && pushdown::movable(c));
+                    let spatial_seed = self.spatial_seed(&early, patterns);
                     let mut early: Vec<(&Expression, Vec<Variable>)> = early
-                        .drain(..)
+                        .into_iter()
                         .map(|c| (c, expression_variables(c)))
                         .collect();
-                    let mut solutions = self.bgp(patterns, &hints, &mut early)?;
+                    // A spatial filter's candidates from the R-tree start the joins.
+                    let mut solutions = match spatial_seed {
+                        Some(seed) => {
+                            let seed = self.produced(seed)?;
+                            self.bgp_from(seed, patterns, &mut early)?
+                        }
+                        None => self.bgp(patterns, &hints, &mut early)?,
+                    };
                     // What the pattern couldn't place: variables it doesn't bind (the
                     // conjunct is then an error or a BOUND test), EXISTS, draws per row.
                     for conjunct in early.into_iter().map(|(c, _)| c).chain(late) {
