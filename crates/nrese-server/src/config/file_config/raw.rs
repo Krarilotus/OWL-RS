@@ -115,6 +115,8 @@ pub(super) struct RawStoreConfig {
 pub(super) struct RawReasonerConfig {
     #[serde(default)]
     pub mode: Option<String>,
+    #[serde(default)]
+    pub unnamed_classes: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

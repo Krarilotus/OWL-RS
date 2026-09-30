@@ -91,6 +91,15 @@ impl ServerConfig {
             ("shacl.shapes_graph", store.shapes_graph.clone()),
             ("reasoner.mode", self.reasoner.mode().as_str().to_owned()),
             (
+                "reasoner.unnamed_classes",
+                if store.hide_unnamed_classes {
+                    "skip"
+                } else {
+                    "derive"
+                }
+                .to_owned(),
+            ),
+            (
                 "reasoner.semantics",
                 nrese_reasoner::ReasonerService::new(self.reasoner.clone())
                     .semantics()

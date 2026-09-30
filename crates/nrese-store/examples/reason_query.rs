@@ -118,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut explain = false;
     let mut as_written = false;
     let mut equality_report = false;
+    let mut skip_unnamed = false;
     let (mut runs, mut timeout, mut memory_limit) = (3usize, None, None);
     let number = |value: Option<String>, option: &str| -> Result<u64, String> {
         value
@@ -139,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--explain" => explain = true,
             "--as-written" => as_written = true,
             "--equality-report" => equality_report = true,
+            "--skip-unnamed-classes" => skip_unnamed = true,
             "--runs" => runs = number(args.next(), "--runs")?.max(1) as usize,
             "--timeout-s" => {
                 timeout = Some(Duration::from_secs(number(args.next(), "--timeout-s")?));
@@ -160,6 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // No result cache: repeated runs measure evaluation.
     let config = StoreConfig {
         query_cache_bytes: 0,
+        hide_unnamed_classes: skip_unnamed,
         ..StoreConfig::in_memory()
     };
     let store = std::sync::Arc::new(StoreService::new(config)?);

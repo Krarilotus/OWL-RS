@@ -663,3 +663,97 @@ fn full_rdfs_keeps_its_axioms() {
     after.sort();
     assert_eq!(before, after);
 }
+
+/// `reasoner.unnamed_classes = "skip"` (W7): memberships in an unnamed union range that
+/// nothing consumes stay out of the store, on rematerialisation and on commits, while
+/// everything else equals the full closure; a commit that makes the class consumed
+/// brings them back.
+#[test]
+fn unnamed_union_memberships_are_left_out_on_request() {
+    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let ex = "http://example.com/";
+    let ontology = format!(
+        "@prefix ex: <{ex}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:livesIn rdfs:range [ a owl:Class ; owl:unionOf ( ex:City ex:Village ) ] .
+         ex:livesIn rdfs:domain ex:Person .
+         ex:Person rdfs:subClassOf ex:Agent .
+         ex:ann ex:livesIn ex:jena ."
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("o.ttl");
+    std::fs::write(&path, ontology).unwrap();
+    let run = |hide: bool| -> (MutationPipeline, Vec<(String, String, String)>) {
+        let config = nrese_store::StoreConfig {
+            hide_unnamed_classes: hide,
+            ..in_memory_store_config().with_ontology(path.clone())
+        };
+        let store = std::sync::Arc::new(StoreService::new(config).unwrap());
+        store
+            .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .unwrap();
+        let pipeline = MutationPipeline::new(
+            std::sync::Arc::clone(&store),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Rl,
+            ))),
+        );
+        pipeline
+            .apply(
+                insert(&format!("<{ex}bob> <{ex}livesIn> <{ex}weimar>")),
+                &MutationTicket::new(),
+            )
+            .unwrap();
+        // Blank node labels differ between stores.
+        let label = |t: String| {
+            if t.starts_with("_:") {
+                "_:b".to_owned()
+            } else {
+                t
+            }
+        };
+        let mut inferred: Vec<_> = support::inferred_statements(pipeline.store())
+            .unwrap()
+            .into_iter()
+            .map(|(s, p, o)| (label(s), p, label(o)))
+            .collect();
+        inferred.sort();
+        (pipeline, inferred)
+    };
+    let (_, full) = run(false);
+    let (lean_pipeline, lean) = run(true);
+    let memberships = |statements: &[(String, String, String)]| -> usize {
+        statements
+            .iter()
+            .filter(|(_, p, o)| p == &format!("{rdf}type") && o.starts_with("_:"))
+            .count()
+    };
+    assert_eq!(
+        memberships(&full),
+        2,
+        "jena and weimar, in the full closure"
+    );
+    assert_eq!(memberships(&lean), 0);
+    let without: Vec<_> = full
+        .iter()
+        .filter(|(_, p, o)| !(p == &format!("{rdf}type") && o.starts_with("_:")))
+        .cloned()
+        .collect();
+    assert_eq!(lean, without, "everything else is the same");
+    // Making the class consumed brings its memberships back (and what they entail).
+    lean_pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "INSERT {{ ?u <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{ex}Place> }} WHERE {{ ?u <http://www.w3.org/2002/07/owl#unionOf> ?l }}"
+            ))),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+    let after = support::inferred_statements(lean_pipeline.store()).unwrap();
+    assert_eq!(memberships(&after), 2);
+    assert!(after.contains(&(
+        format!("{ex}weimar"),
+        format!("{rdf}type"),
+        format!("{ex}Place")
+    )));
+}

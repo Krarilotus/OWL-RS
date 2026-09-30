@@ -29,7 +29,23 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
         )?,
         federation: parse_federation(source)?,
+        hide_unnamed_classes: parse_unnamed_classes(
+            source.get(names::REASONING_UNNAMED_CLASSES).as_deref(),
+        )?,
     })
+}
+
+/// Memberships in unnamed union classes that nothing consumes: `derive` them (OWL 2 RL
+/// as written, the default) or `skip` them.
+fn parse_unnamed_classes(input: Option<&str>) -> Result<bool> {
+    match input.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("derive") => Ok(false),
+        Some("skip") => Ok(true),
+        Some(unknown) => bail!(
+            "unsupported value '{unknown}' in {} (expected 'derive' or 'skip')",
+            names::REASONING_UNNAMED_CLASSES
+        ),
+    }
 }
 
 /// `SERVICE` endpoints: comma-separated IRIs or prefixes, `*` for any; none by default.

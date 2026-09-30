@@ -31,6 +31,9 @@ pub struct StoreConfig {
     pub total_query_memory_bytes: usize,
     /// Which remote endpoints `SERVICE` may call.
     pub federation: FederationConfig,
+    /// Reasoning leaves out memberships in unnamed union classes that nothing consumes
+    /// (`reasoner.unnamed_classes = "skip"`; work package W7).
+    pub hide_unnamed_classes: bool,
 }
 
 /// SPARQL 1.1 Federated Query: the endpoints `SERVICE` may call, and how long and how much
@@ -93,6 +96,7 @@ impl StoreConfig {
             union_default_graph: false,
             total_query_memory_bytes: 0,
             federation: FederationConfig::default(),
+            hide_unnamed_classes: false,
         }
     }
 
@@ -106,6 +110,7 @@ impl StoreConfig {
             union_default_graph: false,
             total_query_memory_bytes: 0,
             federation: FederationConfig::default(),
+            hide_unnamed_classes: false,
         }
     }
 

@@ -33,6 +33,7 @@ use nrese_reasoner::v2::lists::ListDiagnostic;
 use nrese_reasoner::v2::lists::ListVocabulary;
 use nrese_reasoner::v2::naive::{Triple, Violation};
 use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::v2::unnamed::UnnamedVocabulary;
 use oxrdf::{LiteralRef, NamedNodeRef, TermRef};
 use std::collections::HashSet;
 
@@ -43,6 +44,11 @@ pub struct Program {
     rules: Vec<Rule>,
     lists: Option<ListVocabulary>,
     schema: Schema,
+    /// Leave out memberships in unnamed classes nothing consumes (W7).
+    hide_unnamed_classes: bool,
+    unnamed: UnnamedVocabulary,
+    /// The rules make a declared class a subclass of `owl:Thing` (scm-cls).
+    things: bool,
     /// The ruleset's axiomatic triples, sorted: they seed every closure, and a commit
     /// never retracts them.
     axioms: Vec<Triple>,
@@ -77,6 +83,8 @@ impl Program {
             .has_list_rules()
             .then(|| ListVocabulary::new(&mut constants));
         let schema = Schema::owl(&mut constants);
+        let unnamed = UnnamedVocabulary::new(&mut constants);
+        let things = rules.iter().any(|rule| rule.name == "scm-cls");
         let mut axioms = ruleset
             .axiom_triples(&mut constants)
             .expect("the built-in axioms parse (tested)");
@@ -86,8 +94,58 @@ impl Program {
             rules,
             lists,
             schema,
+            hide_unnamed_classes: false,
+            unnamed,
+            things,
             axioms,
         }
+    }
+
+    /// This program leaving out memberships in unnamed classes nothing consumes, or not.
+    #[must_use]
+    pub fn hiding_unnamed_classes(mut self, hide: bool) -> Self {
+        self.hide_unnamed_classes = hide;
+        self
+    }
+
+    /// The schema for a run over `snapshot`: with the unnamed classes to leave out, when
+    /// the program does.
+    fn schema_for(&self, snapshot: &Snapshot) -> Schema {
+        if !self.hide_unnamed_classes {
+            return self.schema.clone();
+        }
+        self.schema.clone().hiding(self.hidden_classes(snapshot))
+    }
+
+    /// The unnamed classes of `snapshot`'s asserted statements that can be left out.
+    fn hidden_classes(&self, snapshot: &Snapshot) -> std::collections::HashMap<u64, bool> {
+        let quads = |pattern: QuadPattern| -> Vec<Triple> {
+            snapshot
+                .quads_for_pattern_in(ReadModel::Asserted, &pattern)
+                .map(triple)
+                .collect()
+        };
+        let any =
+            |s: Option<u64>, p: Option<u64>, o: Option<u64>| pattern([s, p, o], GraphSelector::Any);
+        let union_of = self.unnamed.union_of();
+        let mut candidates: Vec<u64> = quads(any(None, Some(union_of), None))
+            .into_iter()
+            .map(|t| t[0])
+            .filter(|&s| TermId::from_raw(s).kind() == TermKind::BlankNode)
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        nrese_reasoner::v2::unnamed::hidden_classes(
+            candidates,
+            &|class| {
+                let mut out = quads(any(Some(class), None, None));
+                out.extend(quads(any(None, None, Some(class))));
+                out.extend(quads(any(None, Some(class), None)));
+                out
+            },
+            &self.unnamed,
+            self.things,
+        )
     }
 }
 
@@ -175,6 +233,9 @@ pub struct MaterialisationReport {
     pub diagnostics_total: usize,
     pub rounds: usize,
     pub elapsed: Duration,
+    /// A commit made an unnamed class that was left out consumable: its memberships are
+    /// missing until the store rematerialises.
+    pub needs_rematerialisation: bool,
 }
 
 impl MaterialisationReport {
@@ -248,12 +309,8 @@ pub fn materialise(program: &Program, snapshot: &Snapshot) -> Closure {
         }
         axioms.push(axiom);
     }
-    let result = batch::materialise_grouped(
-        input,
-        &program.rules,
-        program.lists.as_ref(),
-        &program.schema,
-    );
+    let schema = program.schema_for(snapshot);
+    let result = batch::materialise_grouped(input, &program.rules, program.lists.as_ref(), &schema);
     Closure {
         inferred: result
             .derived
@@ -438,6 +495,20 @@ pub fn apply_delta(
     let started = Instant::now();
     // Axioms the state lacks (a store that never rematerialised): added with this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
+    // Unnamed classes left out: as the commit leaves them; one it makes consumable
+    // needs a rematerialisation for the memberships left out so far.
+    let (schema, revived) = if program.hide_unnamed_classes {
+        let before = program.hidden_classes(tx.base());
+        let after = program.hidden_classes(&tx.pending_snapshot());
+        let revived = before.keys().any(|class| !after.contains_key(class));
+        (program.schema.clone().hiding(after), revived)
+    } else {
+        (program.schema.clone(), false)
+    };
+    let rules = delta::Rules {
+        schema: &schema,
+        ..program.rules()
+    };
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
         // Facts new to the state: in no graph and not inferred before the transaction.
@@ -468,7 +539,7 @@ pub fn apply_delta(
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else {
-            delta::update_until(&base, &inserted, &deleted, program.rules(), ground, stop)?
+            delta::update_until(&base, &inserted, &deleted, rules, ground, stop)?
         }
     };
     let (mut inserted, mut removed) = (0, 0);
@@ -500,6 +571,7 @@ pub fn apply_delta(
         violations: update.violations.len(),
         rounds: update.rounds,
         elapsed: started.elapsed(),
+        needs_rematerialisation: revived,
         ..MaterialisationReport::default()
     }
     .with_diagnostics(&update.diagnostics, &|id| {
