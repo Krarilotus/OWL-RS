@@ -342,6 +342,12 @@ impl StoreService {
     /// Replaces the inferred stack with `ruleset`'s closure over the asserted data, as one
     /// revision (see [`crate::reasoning`]). For after bulk loads, at startup and after a
     /// ruleset change; commits keep it current afterwards.
+    /// Whether the inferred stack is `ruleset`'s closure as this store computes it.
+    pub fn reasoning_is_current(&self, ruleset: nrese_reasoner::v2::rulesets::Ruleset) -> bool {
+        self.reasoning_state()
+            .is_some_and(|state| state.is_current_with(ruleset, self.config.hide_unnamed_classes))
+    }
+
     /// The closure's size with equality replicated and over representatives, for
     /// `ruleset` on the asserted data ([`crate::reasoning::equality_report`]).
     pub fn equality_report(&self, ruleset: nrese_reasoner::v2::rulesets::Ruleset) -> String {
@@ -360,7 +366,8 @@ impl StoreService {
             .base()
             .len_in(nrese_engine::ReadModel::Asserted);
         let program =
-            crate::reasoning::Program::new(ruleset, &|term| rematerialisation.intern(term));
+            crate::reasoning::Program::new(ruleset, &|term| rematerialisation.intern(term))
+                .hiding_unnamed_classes(self.config.hide_unnamed_classes);
         let closure = crate::reasoning::materialise(&program, rematerialisation.base());
         let inferred = closure.inferred.len() as u64;
         let base = rematerialisation.base();
@@ -374,7 +381,11 @@ impl StoreService {
             "materialisation skipped an ontology axiom",
         );
         let summary = rematerialisation.finish(closure.inferred)?;
-        self.record_reasoning(crate::ReasoningState::of(ruleset, closure.violations.len()))?;
+        self.record_reasoning(crate::ReasoningState::of_with(
+            ruleset,
+            self.config.hide_unnamed_classes,
+            closure.violations.len(),
+        ))?;
         if !closure.violations.is_empty() {
             tracing::error!(
                 ruleset = ruleset.name(),

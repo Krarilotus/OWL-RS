@@ -21,6 +21,7 @@ pub mod naive;
 pub mod representatives;
 pub mod rulesets;
 pub mod testing;
+pub mod unnamed;
 #[cfg(test)]
 mod v1_scenarios;
 
@@ -771,6 +772,120 @@ mod tests {
             lines.push(line);
         }
         lines
+    }
+
+    /// Unnamed union classes (W7): on random ontologies whose domains and ranges are
+    /// anonymous unions, some also used where memberships are consumed, the closure with
+    /// the hidden classes' memberships left out is the full closure without them, under
+    /// every ruleset; classes that are consumed are never hidden.
+    #[test]
+    fn hidden_unnamed_classes_leave_the_rest_of_the_closure() {
+        use super::unnamed::{UnnamedVocabulary, hidden_classes_in};
+        let mut next = rng(0x000D_DBA1_1C1A_55E5);
+        let (mut hidden_total, mut dropped_total) = (0, 0);
+        for ruleset in super::rulesets::ALL {
+            for case in 0..60 {
+                let mut lines = random_ontology(&mut next);
+                for u in 0..1 + next(4) {
+                    let head = format!("_:u{u}l0");
+                    lines.push(format!("_:u{u} owl:unionOf {head}"));
+                    for m in 0..2 {
+                        lines.push(format!("_:u{u}l{m} rdf:first ex:C{}", next(5)));
+                        let rest = if m == 1 {
+                            "rdf:nil".to_owned()
+                        } else {
+                            format!("_:u{u}l{}", m + 1)
+                        };
+                        lines.push(format!("_:u{u}l{m} rdf:rest {rest}"));
+                    }
+                    if next(2) == 0 {
+                        lines.push(format!("_:u{u} rdf:type owl:Class"));
+                    }
+                    let axiom = ["rdfs:domain", "rdfs:range"][next(2)];
+                    lines.push(format!("ex:p{} {axiom} _:u{u}", next(4)));
+                    // Now and then a use that consumes the memberships.
+                    match next(6) {
+                        0 => lines.push(format!("_:u{u} rdfs:subClassOf ex:C{}", next(5))),
+                        1 => lines.push(format!("ex:C{} owl:disjointWith _:u{u}", next(5))),
+                        _ => {}
+                    }
+                }
+                for _ in 0..next(8) {
+                    lines.push(format!("ex:i{} ex:p{} ex:i{}", next(6), next(4), next(6)));
+                }
+                let mut vocabulary = LocalVocabulary::default();
+                let input = load(
+                    &mut vocabulary,
+                    &lines.join(
+                        "
+",
+                    ),
+                );
+                let unnamed = UnnamedVocabulary::new(&mut vocabulary);
+                let names = vocabulary.clone();
+                let rules = ruleset.rules(&mut vocabulary).unwrap();
+                let things = rules.iter().any(|r| r.name == "scm-cls");
+                let hidden = hidden_classes_in(
+                    &input,
+                    &unnamed,
+                    &|id| names.text(id).starts_with("_:"),
+                    things,
+                );
+                let lists = ListVocabulary::new(&mut vocabulary);
+                let lists = ruleset.has_list_rules().then_some(&lists);
+                let schema = Schema::owl(&mut vocabulary);
+                let full = batch::materialise(&input, &rules, lists, &schema);
+                let rdf_type = vocabulary.iri(&format!("{}type", super::ir::RDF));
+                let expected: HashSet<Triple> = full
+                    .derived
+                    .iter()
+                    .copied()
+                    .filter(|t| !(t[1] == rdf_type && hidden.contains_key(&t[2])))
+                    .collect();
+                let dropped = full.derived.len() - expected.len();
+                let schema = Schema::owl(&mut vocabulary).hiding(hidden.clone());
+                let lean = batch::materialise(&input, &rules, lists, &schema);
+                let got: HashSet<Triple> = lean.derived.iter().copied().collect();
+                if got != expected {
+                    let text = |t: &Triple| {
+                        let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+                        format!("{s} {p} {o}")
+                    };
+                    let missing: Vec<String> =
+                        expected.difference(&got).take(6).map(text).collect();
+                    let extra: Vec<String> = got.difference(&expected).take(6).map(text).collect();
+                    panic!(
+                        "{} case {case}: missing {missing:#?} extra {extra:#?}
+{}",
+                        ruleset.name(),
+                        lines.join(
+                            "
+"
+                        )
+                    );
+                }
+                assert_eq!(
+                    lean.violations.iter().map(|v| &v.rule).collect::<Vec<_>>(),
+                    full.violations.iter().map(|v| &v.rule).collect::<Vec<_>>(),
+                    "{} case {case}",
+                    ruleset.name()
+                );
+                // A consumed class is never hidden.
+                for &class in hidden.keys() {
+                    let consumed = input.iter().any(|t| {
+                        (t[0] == class && t[1] != unnamed.union_of() && t[1] != rdf_type)
+                            || (t[2] == class && vocabulary.text(t[1]).contains("disjointWith"))
+                    });
+                    assert!(!consumed, "{}", vocabulary.text(class));
+                }
+                hidden_total += hidden.len();
+                dropped_total += dropped;
+            }
+        }
+        assert!(
+            hidden_total > 300 && dropped_total > 300,
+            "{hidden_total} {dropped_total}"
+        );
     }
 
     /// Equality by representatives: on random ontologies with extra `sameAs` and data,

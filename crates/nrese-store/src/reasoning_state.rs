@@ -48,18 +48,41 @@ impl ConsistencyStatus {
     }
 }
 
+/// The fingerprint of `ruleset` as the store runs it: leaving out unnamed classes' memberships
+/// is another closure.
+pub(crate) fn fingerprint(ruleset: Ruleset, hide_unnamed_classes: bool) -> u64 {
+    const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0007;
+    ruleset.fingerprint()
+        ^ if hide_unnamed_classes {
+            HIDDEN_UNNAMED_CLASSES
+        } else {
+            0
+        }
+}
+
 impl ReasoningState {
+    #[cfg(test)]
     pub(crate) fn of(ruleset: Ruleset, violations: usize) -> Self {
+        Self::of_with(ruleset, false, violations)
+    }
+
+    pub(crate) fn of_with(ruleset: Ruleset, hide_unnamed_classes: bool, violations: usize) -> Self {
         Self {
             ruleset: ruleset.name().to_owned(),
-            fingerprint: ruleset.fingerprint(),
+            fingerprint: fingerprint(ruleset, hide_unnamed_classes),
             violations,
         }
     }
 
     /// Whether the inferred stack is exactly `ruleset`'s closure of the asserted data.
     pub fn is_current_for(&self, ruleset: Ruleset) -> bool {
-        self.ruleset == ruleset.name() && self.fingerprint == ruleset.fingerprint()
+        self.is_current_with(ruleset, false)
+    }
+
+    /// [`Self::is_current_for`] with unnamed classes' memberships left out or not.
+    pub fn is_current_with(&self, ruleset: Ruleset, hide_unnamed_classes: bool) -> bool {
+        self.ruleset == ruleset.name()
+            && self.fingerprint == fingerprint(ruleset, hide_unnamed_classes)
     }
 
     pub fn consistency(&self) -> ConsistencyStatus {
