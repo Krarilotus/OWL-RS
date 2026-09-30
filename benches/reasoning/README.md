@@ -43,3 +43,15 @@ Everything runs in Docker on the same host. The data lives in the volume `nrese-
 
 - **LUBM:** the ontology is published under `swat.cse.lehigh.edu`, but UBA data and the queries use `www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#`. The ontology is rewritten to match. The `<> owl:imports` header lines aren't valid N-Triples and are dropped.
 - **OWL2Bench:** the generator (since commit 1539dad, 2022) writes `https://kracr.iiitd.edu.in/OWL2Bench#`, but the TBoxes at the repository root still use `http://benchmark/OWL2Bench#`. With those TBoxes, no axiom touches the ABox. The kit uses the matching TBoxes from `OWL2Bench/`, and the queries use the generator's namespace.
+
+## Cleaning up after a run
+
+A run leaves nothing behind but its results. The scorecard scripts call `scripts/bench-cleanup.sh` when they exit, also when they fail or are interrupted. It removes:
+- the run's containers and store volumes;
+- the dataset volume `nrese-bench-data` and local datasets under `~/nrese-bench`;
+- the images built here (`nrese-bench/*`) and the systems' images the scripts pulled;
+- inferred-set dumps (`*.inferred.nt`); the scorecard keeps their counts and comparisons.
+
+Scorecards (CSV), logs and reports stay.
+
+For several runs in a row, set `NRESE_BENCH_KEEP=1` so datasets and images survive between them, and run `scripts/bench-cleanup.sh` once at the end. `--dry-run` shows what it would remove. It only removes things by the names these scripts use, never "everything unused", so other projects' containers, volumes and images are safe.

@@ -11,6 +11,8 @@ set -euo pipefail
 # Datasets, store files and images take tens of GB: don't start on a nearly full disk.
 . "$(dirname "$0")/../../scripts/lib/disk.sh"
 require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
+# What this creates (the dataset volume, images) is removed by scripts/bench-cleanup.sh,
+# which the scorecards run when they exit.
 export MSYS_NO_PATHCONV=1
 native() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 HERE=$(native "$(cd "$(dirname "$0")" && pwd)")

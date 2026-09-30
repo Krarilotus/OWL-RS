@@ -34,6 +34,11 @@ set -euo pipefail
 # Datasets, store files and images take tens of GB: don't start on a nearly full disk.
 . "$(dirname "$0")/../../scripts/lib/disk.sh"
 require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
+# A run cleans up after itself, also when it fails or is interrupted: containers, store
+# volumes, datasets and images go, results stay. NRESE_BENCH_KEEP=1 keeps datasets and
+# images for the next run of a batch (see scripts/bench-cleanup.sh).
+CLEANUP="$(cd "$(dirname "$0")/../.." && pwd)/scripts/bench-cleanup.sh"
+trap '"$CLEANUP" >&2' EXIT
 export MSYS_NO_PATHCONV=1
 
 DATASET=${1:?usage: $0 <dataset> [systems...]}
@@ -96,7 +101,7 @@ mem_mib_lines() { while read -r v; do echo "$v" | mem_mib; echo; done; }
 measured() {
   local name=$1 log=$2 start rc
   shift 2
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker rm -f -v "$name" >/dev/null 2>&1 || true
   start=$(ms)
   docker run -d --name "$name" "$@" >/dev/null
   watch_memory "$name" "$log.mem"
@@ -107,7 +112,7 @@ measured() {
   peak=$(peak_mib "$log.mem")
   rc=$(docker inspect -f '{{.State.ExitCode}}' "$name")
   docker logs "$name" >"$log" 2>&1
-  docker rm "$name" >/dev/null
+  docker rm -v "$name" >/dev/null
   [ "$rc" = 0 ] || { echo "load failed ($rc), see $log" >&2; return 1; }
   echo "$wall ${peak:-0}"
 }
@@ -117,7 +122,7 @@ measured() {
 serve() {
   local name=$1 endpoint=$2 start
   shift 2
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker rm -f -v "$name" >/dev/null 2>&1 || true
   start=$(ms)
   docker run -d --name "$name" "$@" >/dev/null
   until [ "$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode 'query=ASK {}' "$endpoint")" = 200 ]; do
@@ -194,7 +199,7 @@ VIRTUOSO_ENV=(-e DBA_PASSWORD=bench
 load_virtuoso() {
   # Virtuoso loads through its running server: time ld_dir + 6 loaders + checkpoint.
   local name=virtuoso-sc-load start peak pid
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker rm -f -v "$name" >/dev/null 2>&1 || true
   docker run -d --name "$name" "${VIRTUOSO_ENV[@]}" -v nrese-bench-data:/data:ro -v "$1:/database" \
     "$VIRTUOSO_IMAGE" >/dev/null
   until docker logs "$name" 2>&1 | grep -q "Server online at 1111"; do sleep 0.2; done
@@ -212,7 +217,7 @@ load_virtuoso() {
   local wall=$(( $(ms) - start ))
   docker stop -t 60 "$name" >/dev/null
   wait "$WATCHER" 2>/dev/null || true # exits once the server has stopped
-  docker rm "$name" >/dev/null
+  docker rm -v "$name" >/dev/null
   peak=$(peak_mib "$2.mem")
   echo "$wall ${peak:-0}"
 }
@@ -233,7 +238,7 @@ serve_virtuoso() {
 ANZOGRAPH_IMAGE=${ANZOGRAPH_IMAGE:-cambridgesemantics/anzograph:3.5.0}
 load_anzograph() {
   local name=anzograph-sc start
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker rm -f -v "$name" >/dev/null 2>&1 || true
   # Its own files live in /data, so the benchmark data is mounted at /bench.
   docker run -d --name "$name" -p "$PORT:7070" -v nrese-bench-data:/bench:ro "$ANZOGRAPH_IMAGE" >/dev/null
   until [ "$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode 'query=ASK {}' \
@@ -290,7 +295,7 @@ head -1 "$CSV"
 for system in $SYSTEMS; do
   volume=sc-$system-$DATASET
   # Leftovers of an interrupted run would hold the volume (and its lock).
-  docker rm -f "$system-sc" "$system-sc-load" >/dev/null 2>&1 || true
+  docker rm -f -v "$system-sc" "$system-sc-load" >/dev/null 2>&1 || true
   docker volume rm -f "$volume" >/dev/null 2>&1 || true
   docker volume create "$volume" >/dev/null
   prefix=$RESULTS/$system-$DATASET
@@ -308,7 +313,7 @@ for system in $SYSTEMS; do
   else
     if ! "serve_$system" "$volume"; then
       echo "$line,FAILED" | tee -a "$CSV"
-      docker rm -f "$system-sc" >/dev/null 2>&1 || true
+      docker rm -f -v "$system-sc" >/dev/null 2>&1 || true
       docker volume rm -f "$volume" >/dev/null
       continue
     fi
@@ -328,7 +333,7 @@ ok = [q for q in r['queries'] if not q['error']]
 t = r.get('throughput') or {}
 w = t.get('writes') or {}
 print(f\"{len(ok)},{len(r['queries'])},{sum(q['p50_ms'] for q in ok):.1f},{t.get('queries_per_s', 0):.1f},{w.get('p50_ms') or ''},{w.get('p99_ms') or ''},{w.get('errors', '')}\")" "$prefix-queries.json")
-    docker rm -f "$system-sc" >/dev/null
+    docker rm -f -v "$system-sc" >/dev/null
     echo "$line,$restart,$rss,$summary" | tee -a "$CSV"
   fi
   docker volume rm -f "$volume" >/dev/null

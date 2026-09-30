@@ -10,6 +10,11 @@ set -euo pipefail
 # Datasets, store files and images take tens of GB: don't start on a nearly full disk.
 . "$(dirname "$0")/../../scripts/lib/disk.sh"
 require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
+# A run cleans up after itself, also when it fails or is interrupted: containers, store
+# volumes, datasets and images go, results stay. NRESE_BENCH_KEEP=1 keeps datasets and
+# images for the next run of a batch (see scripts/bench-cleanup.sh).
+CLEANUP="$(cd "$(dirname "$0")/../.." && pwd)/scripts/bench-cleanup.sh"
+trap '"$CLEANUP" >&2' EXIT
 DATA=${DATA:-$HOME/nrese-bench/reasoning}
 cd "$(dirname "$0")/../.."
 cargo build -q --release -p nrese-reasoner --example v2_closure --example v2_delta
