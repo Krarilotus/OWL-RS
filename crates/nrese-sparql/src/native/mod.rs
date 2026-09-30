@@ -13,13 +13,13 @@
 //! smaller than the next pattern, and otherwise by merge joins on sorted scans or hash joins.
 //! `COUNT(*)` over a single pattern reads the count from the index.
 
-mod expr;
+pub(crate) mod expr;
 mod fast;
 mod output;
 mod paths;
 mod plan;
 mod ranges;
-mod value;
+pub(crate) mod value;
 mod wcoj;
 
 use std::cell::{Cell, RefCell};

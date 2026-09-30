@@ -11,7 +11,7 @@ use oxsdatatypes::{Boolean, Date, DateTime, Decimal, Double, Float, Integer};
 
 /// A term's value, as far as operators distinguish them.
 #[derive(Debug, Clone)]
-pub(crate) enum Value {
+pub enum Value {
     Integer(Integer),
     Decimal(Decimal),
     Float(Float),
@@ -45,7 +45,7 @@ const INTEGER_TYPES: [&str; 12] = [
 ];
 
 impl Value {
-    pub(crate) fn of(term: &Term) -> Self {
+    pub fn of(term: &Term) -> Self {
         match term {
             Term::NamedNode(node) => Self::Iri(node.as_str().to_owned()),
             Term::BlankNode(node) => Self::Blank(node.as_str().to_owned()),
@@ -130,7 +130,7 @@ fn to_double(value: &Value) -> Option<Double> {
 }
 
 /// `<`, `>`, `<=`, `>=`: `None` is a type error (the FILTER is then false).
-pub(crate) fn compare(a: &Value, b: &Value) -> Option<Ordering> {
+pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     if a.is_numeric() && b.is_numeric() {
         return compare_numeric(a, b);
     }
@@ -145,7 +145,7 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Option<Ordering> {
 }
 
 /// `=` (RDFterm-equal extended by value equality): `None` is a type error.
-pub(crate) fn equals(a: &Value, b: &Value) -> Option<bool> {
+pub fn equals(a: &Value, b: &Value) -> Option<bool> {
     if a.is_numeric() && b.is_numeric() {
         return compare_numeric(a, b).map(|o| o == Ordering::Equal);
     }
@@ -165,6 +165,18 @@ pub(crate) fn equals(a: &Value, b: &Value) -> Option<bool> {
         (Value::Other(_), _) | (_, Value::Other(_)) => None,
         _ => Some(false),
     }
+}
+
+/// SPARQL's `langMatches` (RFC 4647 basic filtering): whether the language tag `tag`
+/// matches `range`; `*` matches every non-empty tag.
+pub fn lang_matches(tag: &str, range: &str) -> bool {
+    if range == "*" {
+        return !tag.is_empty();
+    }
+    tag.len() >= range.len()
+        && tag.is_char_boundary(range.len())
+        && tag[..range.len()].eq_ignore_ascii_case(range)
+        && (tag.len() == range.len() || tag.as_bytes()[range.len()] == b'-')
 }
 
 /// Effective boolean value (SPARQL §17.2.2); `None` is a type error.

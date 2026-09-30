@@ -1,0 +1,21 @@
+[package]
+name = "nrese-shacl"
+description = "NRESE SHACL: shapes compiled to an id-level program, validated over engine snapshots and transactions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nrese-engine = { path = "../nrese-engine" }
+nrese-sparql = { path = "../nrese-sparql" }
+oxrdf = "=0.3.3"
+oxsdatatypes = "=0.2.2"
+regex = "1.12"
+
+[dev-dependencies]
+# W3C suite runner: manifests, data and shapes files.
+oxrdfio = "=0.2.4"
+
+[[test]]
+name = "w3c_shacl"
+path = "tests/w3c_shacl/main.rs"
