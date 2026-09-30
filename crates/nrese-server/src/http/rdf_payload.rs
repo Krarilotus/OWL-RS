@@ -76,26 +76,20 @@ fn parse_labeled_rdf_content_format(
     content_type: Option<&str>,
     surface: &str,
 ) -> Result<GraphResultFormat, ApiError> {
-    if crate::http::media::media_type_matches(content_type, "application/n-triples") {
-        return Ok(GraphResultFormat::NTriples);
-    }
-    if crate::http::media::media_type_matches(content_type, "application/rdf+xml") {
-        return Ok(GraphResultFormat::RdfXml);
-    }
-    if crate::http::media::media_type_matches(content_type, "text/turtle")
-        || crate::http::media::media_type_matches(content_type, "application/x-turtle")
-    {
-        return Ok(GraphResultFormat::Turtle);
-    }
-
-    Err(ApiError::bad_request(format!(
-        "unsupported {surface} content type: {}",
-        if content_type.unwrap_or_default().is_empty() {
-            "<missing>"
-        } else {
-            content_type.unwrap_or_default()
-        }
-    )))
+    use crate::http::media::{GRAPHS, content_format};
+    // `text/plain` is an output alias only: as a payload type it says nothing about RDF.
+    content_format(content_type, GRAPHS)
+        .filter(|_| !crate::http::media::media_type_matches(content_type, "text/plain"))
+        .ok_or_else(|| {
+            ApiError::unsupported_media_type(format!(
+                "unsupported {surface} content type: {}",
+                if content_type.unwrap_or_default().is_empty() {
+                    "<missing>"
+                } else {
+                    content_type.unwrap_or_default()
+                }
+            ))
+        })
 }
 
 #[cfg(test)]

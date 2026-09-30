@@ -64,6 +64,10 @@ impl MutationCommand {
             Self::Update(request) => {
                 let update = SparqlParser::new().parse_update(&request.update)?;
                 let options = UpdateOptions {
+                    using: crate::query_executor::protocol_dataset(
+                        &request.using_graphs,
+                        &request.using_named_graphs,
+                    )?,
                     cancellation: Some(cancellation.clone()),
                     ..UpdateOptions::default()
                 };

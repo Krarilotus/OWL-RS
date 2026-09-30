@@ -22,7 +22,7 @@ async fn graph_put_rejects_unsupported_content_type_with_problem_json()
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(
         response
             .headers()

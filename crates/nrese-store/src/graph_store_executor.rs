@@ -15,7 +15,7 @@ pub fn execute_graph_read(
     view: &impl ReadView,
     request: &GraphReadRequest,
 ) -> StoreResult<GraphReadResult> {
-    let triples = match request.target.pattern_in(view)? {
+    let triples: Vec<oxrdf::Triple> = match request.target.pattern_in(view)? {
         Some(pattern) => decoded_quads(view, ReadModel::Materialised, &pattern)
             .map(|quad| quad.map(Into::into))
             .collect::<StoreResult<Vec<_>>>()?,
@@ -23,6 +23,7 @@ pub fn execute_graph_read(
     };
     Ok(GraphReadResult {
         media_type: request.format.media_type(),
+        exists: matches!(request.target, GraphTarget::DefaultGraph) || !triples.is_empty(),
         payload: serialize_triples(request.format, triples)?,
     })
 }

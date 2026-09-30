@@ -354,7 +354,7 @@ Seed and compare against a reference endpoint:
 
 ## Documentation
 
-The document index lives in one place: [Spezifikation.md](Spezifikation.md). Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+The HTTP interface is described in [docs/ops/http-api.md](docs/ops/http-api.md). The document index lives in one place: [Spezifikation.md](Spezifikation.md). Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Licence
 

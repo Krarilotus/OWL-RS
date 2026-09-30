@@ -1,6 +1,6 @@
 use crate::runtime_posture::{
     GRAPH_STORE_ENDPOINT, METRICS_ENDPOINT, OPERATOR_UI_PATH, QUERY_ENDPOINT,
-    SERVICE_DESCRIPTION_ENDPOINT, TELL_ENDPOINT, UPDATE_ENDPOINT,
+    SERVICE_DESCRIPTION_ENDPOINT, SPARQL_ENDPOINT, TELL_ENDPOINT, UPDATE_ENDPOINT,
 };
 use crate::state::AppState;
 
@@ -40,7 +40,9 @@ pub fn build_service_description(state: &AppState) -> String {
 [] a sd:Service ;\n\
    sd:endpoint <{QUERY_ENDPOINT}> ;\n\
    sd:supportedLanguage sd:SPARQL11Query ;\n\
-   sd:resultFormat format:SPARQL_Results_JSON , format:SPARQL_Results_XML , format:SPARQL_Results_CSV , format:SPARQL_Results_TSV ;\n\
+   sd:resultFormat format:SPARQL_Results_JSON , format:SPARQL_Results_XML , format:SPARQL_Results_CSV , format:SPARQL_Results_TSV , format:N-Triples , format:Turtle , format:RDF_XML , format:JSON-LD , format:N-Quads , format:TriG ;\n\
+   sd:inputFormat format:N-Triples , format:Turtle , format:RDF_XML , format:JSON-LD , format:N-Quads , format:TriG ;\n\
+   nrese:sparqlEndpoint <{SPARQL_ENDPOINT}> ;\n\
    nrese:serviceDescriptionEndpoint <{SERVICE_DESCRIPTION_ENDPOINT}> ;\n\
 {update_endpoint}\
 {tell_endpoint}\
@@ -87,6 +89,8 @@ mod tests {
         let ttl = build_service_description(&state);
 
         assert!(ttl.contains("/dataset/query"));
+        assert!(ttl.contains("nrese:sparqlEndpoint </dataset/sparql>"));
+        assert!(ttl.contains("format:JSON-LD"));
         assert!(ttl.contains("/dataset/update"));
         assert!(ttl.contains("/dataset/tell"));
         assert!(ttl.contains("/dataset/data"));

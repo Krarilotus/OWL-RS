@@ -22,6 +22,11 @@ impl GraphResultFormat {
             Self::NTriples => RdfFormat::NTriples,
             Self::Turtle => RdfFormat::Turtle,
             Self::RdfXml => RdfFormat::RdfXml,
+            Self::NQuads => RdfFormat::NQuads,
+            Self::TriG => RdfFormat::TriG,
+            Self::JsonLd => RdfFormat::JsonLd {
+                profile: oxrdfio::JsonLdProfileSet::empty(),
+            },
         }
     }
 }
@@ -50,8 +55,8 @@ fn parser(
     }
 }
 
-/// Parses a single-graph payload (Turtle, N-Triples, RDF/XML) into quads of `graph`.
-/// Named-graph content in the payload is an error.
+/// Parses a single-graph payload into quads of `graph`. Named-graph content in the payload
+/// (possible in N-Quads, TriG and JSON-LD) is an error.
 pub(crate) fn parse_graph(
     format: GraphResultFormat,
     base_iri: Option<&str>,

@@ -77,7 +77,7 @@ impl PreparedQuery {
         Ok(Self {
             query,
             text: request.query.clone(),
-            dataset: protocol_dataset(&request)?,
+            dataset: protocol_dataset(&request.default_graphs, &request.named_graphs)?,
             read_model: request
                 .read_model
                 .or(from_protocol)
@@ -87,6 +87,13 @@ impl PreparedQuery {
             solutions_format: request.solutions_format,
             graph_format: request.graph_format,
         })
+    }
+
+    /// Sets the output formats. A transport negotiates them once it knows the query form
+    /// ([`Self::kind`]), which parsing tells.
+    pub fn set_formats(&mut self, solutions: SolutionsResultFormat, graph: GraphResultFormat) {
+        self.solutions_format = solutions;
+        self.graph_format = graph;
     }
 
     /// Which statements the query reads.
@@ -169,10 +176,14 @@ fn query_dataset(query: &mut Query) -> &mut Option<QueryDataset> {
 
 /// SPARQL 1.1 Protocol: if `default-graph-uri` or `named-graph-uri` is given, together
 /// they replace the query's `FROM` / `FROM NAMED` clauses.
-fn protocol_dataset(
-    request: &SparqlQueryRequest,
+/// The dataset a request's protocol parameters describe (`default-graph-uri` and
+/// `named-graph-uri` for queries, `using-graph-uri` and `using-named-graph-uri` for
+/// updates); `None` if it gives none.
+pub(crate) fn protocol_dataset(
+    default_graphs: &[String],
+    named_graphs: &[String],
 ) -> StoreResult<Option<QueryDatasetSpecification>> {
-    if request.default_graphs.is_empty() && request.named_graphs.is_empty() {
+    if default_graphs.is_empty() && named_graphs.is_empty() {
         return Ok(None);
     }
     let iri = |value: &String| {
@@ -180,15 +191,13 @@ fn protocol_dataset(
     };
     let mut dataset = QueryDatasetSpecification::new();
     dataset.set_default_graph(
-        request
-            .default_graphs
+        default_graphs
             .iter()
             .map(|value| iri(value).map(GraphName::from))
             .collect::<StoreResult<_>>()?,
     );
     dataset.set_available_named_graphs(
-        request
-            .named_graphs
+        named_graphs
             .iter()
             .map(|value| iri(value).map(NamedOrBlankNode::from))
             .collect::<StoreResult<_>>()?,

@@ -22,6 +22,11 @@ pub enum GraphResultFormat {
     NTriples,
     Turtle,
     RdfXml,
+    /// One graph as N-Quads: its triples, without graph names.
+    NQuads,
+    /// One graph as TriG: its triples in the default graph block.
+    TriG,
+    JsonLd,
 }
 
 impl GraphResultFormat {
@@ -30,6 +35,9 @@ impl GraphResultFormat {
             Self::NTriples => "application/n-triples",
             Self::Turtle => "text/turtle",
             Self::RdfXml => "application/rdf+xml",
+            Self::NQuads => "application/n-quads",
+            Self::TriG => "application/trig",
+            Self::JsonLd => "application/ld+json",
         }
     }
 
@@ -38,6 +46,9 @@ impl GraphResultFormat {
             "ttl" => Some(Self::Turtle),
             "nt" => Some(Self::NTriples),
             "rdf" | "xml" => Some(Self::RdfXml),
+            "nq" => Some(Self::NQuads),
+            "trig" => Some(Self::TriG),
+            "jsonld" => Some(Self::JsonLd),
             _ => None,
         }
     }
