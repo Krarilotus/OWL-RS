@@ -26,6 +26,8 @@ COPY .cargo .cargo
 COPY crates crates
 # The server's build script embeds the console it finds here.
 COPY --from=console /src/apps/nrese-console/dist apps/nrese-console/dist
+# `--build-arg CARGO_BUILD_JOBS=8` keeps the build from taking every core.
+ARG CARGO_BUILD_JOBS=default
 RUN cargo build --release --locked -p nrese-server
 
 # --- the image -------------------------------------------------------------------------
