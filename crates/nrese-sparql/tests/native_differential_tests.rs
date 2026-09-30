@@ -3114,3 +3114,138 @@ fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
         }
     }
 }
+
+/// An `EXISTS` for [`exists_equal_spareval`]: over any pattern, correlated with the outer
+/// solution through the variables it binds, through filters at its top, or deeper (inside
+/// an OPTIONAL, MINUS or BIND, where the native executor hands the query back).
+fn exists_pattern(rng: &mut Rng) -> String {
+    let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+    let outer = |rng: &mut Rng| rng.pick(&["?a", "?b", "?c"]).to_string();
+    match rng.below(17) {
+        0 => format!("?b {} ?x", p(rng)),
+        1 => format!("?x {} {}", p(rng), outer(rng)),
+        // Correlated filters at the top.
+        2 => format!("?x {} ?y FILTER(?y > {})", p(rng), outer(rng)),
+        3 => format!("?a {} ?y FILTER(?y != ?b && ?y != {})", p(rng), outer(rng)),
+        4 => format!("?x {} ?y FILTER(sameTerm(?x, {}))", p(rng), outer(rng)),
+        5 => format!("{{ ?b {} ?x }} UNION {{ ?x {} ?b }}", p(rng), p(rng)),
+        6 => format!("?a {}+ ?x", p(rng)),
+        7 => format!("?a {} ?x OPTIONAL {{ ?x {} ?y }}", p(rng), p(rng)),
+        8 => format!("VALUES ?b {{ <{EX}e1> 3 \"s1\"@en }}"),
+        9 => format!(
+            "{{ SELECT ?a (COUNT(?x) AS ?n) WHERE {{ ?a {} ?x }} GROUP BY ?a }} FILTER(?n > 1)",
+            p(rng)
+        ),
+        10 => format!("?a {} ?x MINUS {{ ?x {} ?y }}", p(rng), p(rng)),
+        11 => format!(
+            "?a {} ?x FILTER NOT EXISTS {{ ?x {} {} }}",
+            p(rng),
+            p(rng),
+            outer(rng)
+        ),
+        // Deeper correlation: the general evaluator's.
+        12 => format!(
+            "?x {} ?y OPTIONAL {{ ?y {} {} }}",
+            p(rng),
+            p(rng),
+            outer(rng)
+        ),
+        13 => format!(
+            "?x {} ?y BIND({} AS ?z) FILTER(?z = ?y)",
+            p(rng),
+            outer(rng)
+        ),
+        14 => format!("?x {} ?y MINUS {{ ?y {} {} }}", p(rng), p(rng), outer(rng)),
+        // A subquery's own variable that shares a name with an outer one isn't the outer one.
+        15 => format!(
+            "{{ SELECT ?x WHERE {{ ?x {} ?y OPTIONAL {{ ?y {} {} }} }} }}",
+            p(rng),
+            p(rng),
+            outer(rng)
+        ),
+        _ => format!("{{ SELECT ?b WHERE {{ ?b {} ?y }} LIMIT 1 }}", p(rng)),
+    }
+}
+
+/// `EXISTS` over any pattern and anywhere an expression may stand (FILTER, inside `||`
+/// and `!`, BIND, an OPTIONAL's condition, under GRAPH), correlated with the outer
+/// solution in every way, on outer solutions with unbound variables: equal to spareval,
+/// and on the native executor wherever the correlation allows.
+#[test]
+fn exists_equal_spareval() {
+    let mut rng = Rng(20_260_937);
+    let (mut checked, mut native_runs, mut with_solutions) = (0, 0, 0);
+    for _ in 0..80 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        load_spread_over_graphs(&engine, &mut rng);
+        let snapshot = engine.snapshot();
+        for query_case in 0..50 {
+            let outer = format!(
+                "?a <{EX}p{}> ?b . {}",
+                rng.below(4),
+                if rng.below(2) == 0 {
+                    format!("OPTIONAL {{ ?b <{EX}p{}> ?c }}", rng.below(4))
+                } else {
+                    format!("?b <{EX}p{}> ?c", rng.below(4))
+                }
+            );
+            let exists = exists_pattern(&mut rng);
+            let not = if rng.below(3) == 0 { "NOT " } else { "" };
+            let text = match rng.below(7) {
+                0 | 1 => format!("SELECT * WHERE {{ {outer} FILTER {not}EXISTS {{ {exists} }} }}"),
+                2 => format!(
+                    "SELECT * WHERE {{ {outer} FILTER(BOUND(?c) || {not}EXISTS {{ {exists} }}) }}"
+                ),
+                3 => format!("SELECT * WHERE {{ {outer} BIND({not}EXISTS {{ {exists} }} AS ?e) }}"),
+                4 => format!(
+                    "SELECT * WHERE {{ ?a <{EX}p{}> ?b OPTIONAL {{ ?b <{EX}p{}> ?c FILTER {not}EXISTS {{ {exists} }} }} }}",
+                    rng.below(4),
+                    rng.below(4)
+                ),
+                // Under GRAPH ?g spareval evaluates a subquery once over all graphs
+                // (`dataset_body`).
+                5 if !exists.contains("SELECT") => format!(
+                    "SELECT * WHERE {{ GRAPH ?g {{ {outer} FILTER {not}EXISTS {{ {exists} }} }} }}"
+                ),
+                _ => format!(
+                    "SELECT ?a (COUNT(*) AS ?n) WHERE {{ {outer} FILTER {not}EXISTS {{ {exists} }} }} GROUP BY ?a"
+                ),
+            };
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let options = QueryOptions {
+                read_model: *rng.pick(&[ReadModel::Materialised, ReadModel::Asserted]),
+                union_default_graph: rng.below(2) == 0,
+                ..QueryOptions::default()
+            };
+            let context = format!(
+                "query {query_case}, merged {}: {text}",
+                options.union_default_graph
+            );
+            if runs_natively(&query) {
+                assert_eq!(
+                    explain_query(&snapshot, &query, &options).unwrap().executor,
+                    "native",
+                    "{context}"
+                );
+                native_runs += 1;
+            }
+            let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            let spareval = QueryOptions {
+                force_spareval: true,
+                ..options.clone()
+            };
+            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            assert_same_rows(&native, &expected, &context);
+            checked += 1;
+            with_solutions += usize::from(!native.is_empty());
+        }
+    }
+    assert!(
+        // A quarter of the EXISTS patterns are correlated deeper than the native executor
+        // takes.
+        native_runs * 10 > checked * 7 && with_solutions * 2 > checked,
+        "{checked} checked, {native_runs} native, {with_solutions} with solutions"
+    );
+}
