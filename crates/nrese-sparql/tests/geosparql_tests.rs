@@ -413,3 +413,165 @@ fn relations_as_triple_patterns() {
     assert_eq!(within, check);
     assert!(pairs("SELECT ?a ?b WHERE { ?a geo:sfIntersects ?b } LIMIT 3").len() <= 3);
 }
+
+/// `FILTER(geof:R(?wkt, constant))` over a `geo:asWKT` pattern starts from the R-tree's
+/// candidates: the answers equal the plain evaluation's for every relation, and a small
+/// search box reads few rows.
+#[test]
+fn filter_functions_use_the_index() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let wkt = NamedNode::new_unchecked("http://www.opengis.net/ont/geosparql#wktLiteral");
+    let as_wkt = NamedNode::new_unchecked("http://www.opengis.net/ont/geosparql#asWKT");
+    for i in 0..400u32 {
+        let (x, y) = (i % 20, i / 20);
+        tx.insert(
+            Quad::new(
+                NamedNode::new_unchecked(format!("http://example.com/g{i}")),
+                as_wkt.clone(),
+                Literal::new_typed_literal(format!("POINT({x} {y})"), wkt.clone()),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let boxed = "\"POLYGON((2.5 2.5, 5.5 2.5, 5.5 5.5, 2.5 5.5, 2.5 2.5))\"^^geo:wktLiteral";
+    for relation in [
+        "sfWithin",
+        "sfIntersects",
+        "sfDisjoint",
+        "ehInside",
+        "rcc8ntpp",
+    ] {
+        let text = format!(
+            "{PREFIXES}SELECT ?g WHERE {{ ?g geo:asWKT ?w FILTER(geof:{relation}(?w, {boxed})) }}"
+        );
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let answer = |options: &QueryOptions| -> Vec<String> {
+            let QueryResults::Solutions(solutions) =
+                evaluate_query(&snapshot, &query, options).unwrap()
+            else {
+                panic!()
+            };
+            let mut rows: Vec<String> = solutions.map(|s| s.unwrap()[0].to_string()).collect();
+            rows.sort();
+            rows
+        };
+        let plain = QueryOptions {
+            as_written: true,
+            ..QueryOptions::default()
+        };
+        assert_eq!(
+            answer(&QueryOptions::default()),
+            answer(&plain),
+            "{relation}"
+        );
+    }
+    let text = format!(
+        "{PREFIXES}SELECT ?g WHERE {{ ?g geo:asWKT ?w FILTER(geof:sfWithin(?w, {boxed})) }}"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let plan = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    assert_eq!(plan.rows, 9);
+    let largest = plan.steps.iter().map(|s| s.rows).max().unwrap();
+    assert!(largest < 50, "{:#?}", plan.steps);
+}
+
+/// GeoJSON and GML literals take part like WKT ones: in relations as triple patterns, in
+/// filters (index-seeded), with GML's EPSG:4326 read latitude first.
+#[test]
+fn geojson_and_gml_literals() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let geo = |local: &str| {
+        NamedNode::new_unchecked(format!("http://www.opengis.net/ont/geosparql#{local}"))
+    };
+    for (name, property, datatype, text) in [
+        (
+            "area",
+            "asGeoJSON",
+            "geoJSONLiteral",
+            r#"{"type":"Polygon","coordinates":[[[0,0],[10,0],[10,10],[0,10],[0,0]]]}"#,
+        ),
+        (
+            "inside",
+            "asGML",
+            "gmlLiteral",
+            r#"<gml:Point xmlns:gml="http://www.opengis.net/gml/3.2" srsName="EPSG:4326"><gml:pos>6 5</gml:pos></gml:Point>"#,
+        ),
+        (
+            "outside",
+            "asGML",
+            "gmlLiteral",
+            r#"<gml:Point xmlns:gml="http://www.opengis.net/gml/3.2" srsName="http://www.opengis.net/def/crs/EPSG/0/4326"><gml:pos>1 20</gml:pos></gml:Point>"#,
+        ),
+        ("same", "asWKT", "wktLiteral", "POINT(20 1)"),
+    ] {
+        tx.insert(
+            Quad::new(
+                NamedNode::new_unchecked(format!("http://example.com/{name}")),
+                geo(property),
+                Literal::new_typed_literal(text, geo(datatype)),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let names = |rows: Vec<Vec<Option<Term>>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|row| match &row[0] {
+                Some(Term::NamedNode(n)) => n
+                    .as_str()
+                    .trim_start_matches("http://example.com/")
+                    .to_owned(),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(
+        names(select(
+            &engine,
+            "SELECT ?x WHERE { ?x geo:sfWithin ex:area FILTER(?x != ex:area) }"
+        )),
+        ["inside"]
+    );
+    assert_eq!(
+        names(select(
+            &engine,
+            "SELECT ?x WHERE { ?x geo:sfEquals ex:same FILTER(?x != ex:same) }"
+        )),
+        ["outside"]
+    );
+    let within = r#""{\"type\":\"Polygon\",\"coordinates\":[[[4,4],[8,4],[8,8],[4,8],[4,4]]]}"^^geo:geoJSONLiteral"#;
+    assert_eq!(
+        names(select(
+            &engine,
+            &format!("SELECT ?x WHERE {{ ?x geo:asGML ?l FILTER(geof:sfWithin(?l, {within})) }}")
+        )),
+        ["inside"]
+    );
+    let rows = select(
+        &engine,
+        &format!(
+            "SELECT ?v WHERE {{ BIND(geof:asGeoJSON({}) AS ?v) }}",
+            wkt("POINT(1 2)")
+        ),
+    );
+    let Some(Term::Literal(l)) = &rows[0][0] else {
+        panic!("{rows:?}")
+    };
+    assert_eq!(l.value(), r#"{"coordinates":[1.0,2.0],"type":"Point"}"#);
+    assert_eq!(
+        l.datatype().as_str(),
+        "http://www.opengis.net/ont/geosparql#geoJSONLiteral"
+    );
+    let projected = wkt("<http://www.opengis.net/def/crs/EPSG/0/3857> POINT(1 2)");
+    let rows = select(
+        &engine,
+        &format!("SELECT ?v WHERE {{ BIND(geof:asGeoJSON({projected}) AS ?v) }}"),
+    );
+    assert_eq!(rows[0][0], None, "GeoJSON is CRS84 only");
+}
