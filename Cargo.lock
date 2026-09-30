@@ -1161,6 +1161,7 @@ dependencies = [
  "nrese-sparql",
  "oxrdf",
  "oxrdfio",
+ "oxsdatatypes",
  "oxttl",
  "rayon",
  "sha2",

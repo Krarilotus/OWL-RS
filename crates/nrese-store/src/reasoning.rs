@@ -49,6 +49,9 @@ pub struct Program {
     unnamed: UnnamedVocabulary,
     /// The rules make a declared class a subclass of `owl:Thing` (scm-cls).
     things: bool,
+    /// For the datatype checks ([`crate::datatypes`]).
+    rdf_type: u64,
+    same_as: Option<u64>,
     /// The ruleset's axiomatic triples, sorted: they seed every closure, and a commit
     /// never retracts them.
     axioms: Vec<Triple>,
@@ -85,6 +88,8 @@ impl Program {
         let schema = Schema::owl(&mut constants);
         let unnamed = UnnamedVocabulary::new(&mut constants);
         let things = rules.iter().any(|rule| rule.name == "scm-cls");
+        let rdf_type = constants.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+        let same_as = nrese_reasoner::v2::representatives::same_as(&rules);
         let mut axioms = ruleset
             .axiom_triples(&mut constants)
             .expect("the built-in axioms parse (tested)");
@@ -97,6 +102,8 @@ impl Program {
             hide_unnamed_classes: false,
             unnamed,
             things,
+            rdf_type,
+            same_as,
             axioms,
         }
     }
@@ -326,6 +333,13 @@ pub fn materialise_until(
         &schema,
         stop,
     )?;
+    let mut violations = result.violations;
+    violations.extend(crate::datatypes::violations(
+        &result.derived,
+        program.rdf_type,
+        program.same_as,
+        &|id| snapshot.decode(TermId::from_raw(id)),
+    ));
     Ok(Closure {
         inferred: result
             .derived
@@ -334,7 +348,7 @@ pub fn materialise_until(
             .filter(|&t| storable(t))
             .map(encode)
             .collect(),
-        violations: result.violations,
+        violations,
         diagnostics: result.diagnostics,
         rounds: result.rounds,
         phases: result.phases,
@@ -557,6 +571,13 @@ pub fn apply_delta(
             delta::update_until(&base, &inserted, &deleted, rules, ground, stop)?
         }
     };
+    let mut update = update;
+    update.violations.extend(crate::datatypes::violations(
+        &update.insert,
+        program.rdf_type,
+        program.same_as,
+        &|id| tx.decode(TermId::from_raw(id)),
+    ));
     let (mut inserted, mut removed) = (0, 0);
     // A statement asserted in any graph is explicit, never also inferred (the engine
     // enforces that for the default graph only).
@@ -609,6 +630,8 @@ fn describe(rule: &str) -> &'static str {
         "prp-adp" => "two properties of an owl:AllDisjointProperties axiom relate the same pair",
         "prp-npa1" | "prp-npa2" => "a negative property assertion is contradicted",
         "eq-diff1" | "eq-diff2" | "eq-diff3" => "resources declared different are the same",
+        "dt-not-type" => "a literal is typed with a datatype whose value space doesn't contain it",
+        "dt-diff" => "two different data values would be the same",
         _ => "a consistency rule is violated",
     }
 }

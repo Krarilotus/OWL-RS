@@ -781,3 +781,75 @@ fn a_stopped_rematerialisation_changes_nothing() {
     store.rematerialise(ruleset).unwrap();
     assert!(!support::inferred_statements(&store).unwrap().is_empty());
 }
+
+/// OWL 2 RL's datatype consistency (dt-not-type, dt-diff): a value outside a data
+/// property's range datatype, and a functional data property with two different values,
+/// are inconsistencies, on materialisation and on commits; equal values and values in
+/// range are not.
+#[test]
+fn datatype_consistency() {
+    let ex = "http://example.com/";
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    let schema = format!(
+        "@prefix ex: <{ex}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . @prefix xsd: <{xsd}> .
+         ex:age a owl:DatatypeProperty, owl:FunctionalProperty ; rdfs:range xsd:nonNegativeInteger .
+         ex:weight rdfs:range xsd:double .
+         ex:name rdfs:range xsd:string .
+         "
+    );
+    let violations = |data: &str| -> usize {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.ttl");
+        std::fs::write(&path, format!("{schema}{data}")).unwrap();
+        let store = StoreService::new(in_memory_store_config().with_ontology(path)).unwrap();
+        store
+            .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .unwrap()
+            .violations
+    };
+    assert_eq!(
+        violations("ex:a ex:age 42 ; ex:weight 1.5e0 ; ex:name \"Ann\" ."),
+        0
+    );
+    // Equal values under two lexical forms are one value.
+    assert_eq!(violations("ex:a ex:age 42, \"042\"^^xsd:integer ."), 0);
+    assert!(violations("ex:a ex:age 42, 43 .") > 0, "two ages");
+    assert!(violations("ex:a ex:age -1 .") > 0, "below the range");
+    assert!(violations("ex:a ex:age \"forty\" .") > 0, "a string");
+    assert!(
+        violations("ex:a ex:weight 70 .") > 0,
+        "an integer is no double"
+    );
+    assert!(
+        violations("ex:a ex:name \"Ann\"@en .") > 0,
+        "a language string is no xsd:string"
+    );
+
+    // On a commit: rejected, with the rule named.
+    let pipeline = pipeline(ReasoningMode::Owl2Rl);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.ttl");
+    std::fs::write(&path, &schema).unwrap();
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ <{ex}age> <http://www.w3.org/2000/01/rdf-schema#range> <{xsd}nonNegativeInteger> }}"
+            ))),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+    let error = pipeline
+        .apply(
+            insert(&format!("<{ex}b> <{ex}age> \"-5\"^^<{xsd}integer>")),
+            &MutationTicket::new(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("dt-not-type"), "{error}");
+    pipeline
+        .apply(
+            insert(&format!("<{ex}b> <{ex}age> \"5\"^^<{xsd}integer>")),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+}

@@ -45,7 +45,7 @@ This matches GraphDB's `rdfs` with *partialRDFS*. Full RDFS entailment is `rdfs-
 | Omitted | Consequence |
 |---|---|
 | `eq-ref` (`x sameAs x` for every term) | Not materialised (it would double the store). Its consistency consequences are kept: `x differentFrom x`, and AllDifferent lists naming one individual twice, are inconsistent. Queries for `?x owl:sameAs ?x` don't return reflexive pairs. |
-| Datatype rules, table 8 (`dt-type1/2`, `dt-eq`, `dt-diff`, `dt-not-type`) | Literals aren't typed by their datatype, and `"1"^^xsd:integer` and `"01"^^xsd:integer` aren't equated. Ill-typed literals aren't inconsistencies. Planned (parity plan B3), without folding lexical forms. |
+| Datatype rules, table 8, in part | `dt-not-type` and `dt-diff` are checked: a value outside a property's range datatype (a string where the range is `xsd:integer`, an integer where it is `xsd:double`, whose value spaces are disjoint in OWL 2, 300 for `xsd:byte`) and two different data values made the same (a functional data property with two values) are inconsistencies, on materialisation and on commits. Not done: `dt-type1/2` and `dt-eq` (literals aren't typed or equated by value, so `"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms in answers, though the checks treat them as one value); ill-typed literals and datatypes outside OWL 2's list aren't judged. |
 | Axiomatic triples | Not materialised (as W3C allows for the RL/RDF rules). |
 
 **List limits:**
