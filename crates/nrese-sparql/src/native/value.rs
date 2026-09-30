@@ -164,6 +164,10 @@ pub fn equals(a: &Value, b: &Value) -> Option<bool> {
         // Different kinds of term (IRI vs literal, …) are simply unequal; two literals of
         // types we can't compare are a type error unless identical.
         (Value::Iri(_) | Value::Blank(_), _) | (_, Value::Iri(_) | Value::Blank(_)) => Some(false),
+        // A language-tagged string equals no typed literal, whatever its datatype means.
+        (Value::LangString(..), Value::Other(_)) | (Value::Other(_), Value::LangString(..)) => {
+            Some(false)
+        }
         (Value::Other(_), _) | (_, Value::Other(_)) => None,
         _ => Some(false),
     }
