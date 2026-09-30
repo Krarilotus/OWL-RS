@@ -10,6 +10,10 @@
 //! the default graph; an open `?x p* ?y` pairs every such node with itself. Both ends bound
 //! is an existence test (one solution or none).
 //!
+//! The default graph is the store's, or the merge of all graphs
+//! ([`PathEvaluator::merged`]): then every read takes a graph-last index order, where the
+//! copies of a statement in several graphs are adjacent, and keeps one.
+//!
 //! A bound end is followed by index probes, so `ex:Cat rdfs:subClassOf* ?c` touches only the
 //! nodes it reaches. Open closures build an [`Adjacency`] from the step's pairs and walk it
 //! from every start.
@@ -67,6 +71,8 @@ fn dedup_pairs(mut pairs: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 pub(crate) struct PathEvaluator<'a> {
     pub(crate) snapshot: &'a Snapshot,
     pub(crate) model: ReadModel,
+    /// The default graph is the merge of all graphs.
+    pub(crate) merged: bool,
 }
 
 impl PathEvaluator<'_> {
@@ -80,10 +86,34 @@ impl PathEvaluator<'_> {
             subject: subject.map(TermId::from_raw),
             predicate: predicate.map(TermId::from_raw),
             object: object.map(TermId::from_raw),
-            graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
+            graph: if self.merged {
+                GraphSelector::Any
+            } else {
+                GraphSelector::Exact(TermId::DEFAULT_GRAPH)
+            },
         };
-        self.snapshot
-            .quads_for_pattern_in(self.model, &pattern)
+        let own = (!self.merged).then(|| self.snapshot.quads_for_pattern_in(self.model, &pattern));
+        // Merged: the graph-last order whose prefix the bound positions are.
+        let merged = self.merged.then(|| {
+            let permutation = match (subject.is_some(), predicate.is_some(), object.is_some()) {
+                (true, _, false) | (false, false, false) | (true, true, true) => Permutation::Spog,
+                (false, true, _) => Permutation::Posg,
+                (_, false, true) => Permutation::Ospg,
+            };
+            let mut previous = None;
+            self.snapshot
+                .scan_sorted_in(self.model, &pattern, permutation)
+                .expect("the bound positions are a prefix of the order")
+                .filter(move |quad| {
+                    let statement = (quad.subject, quad.predicate, quad.object);
+                    let first = previous != Some(statement);
+                    previous = Some(statement);
+                    first
+                })
+        });
+        own.into_iter()
+            .flatten()
+            .chain(merged.into_iter().flatten())
             .map(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()))
     }
 
@@ -95,7 +125,15 @@ impl PathEvaluator<'_> {
 
     /// Every subject and object of the default graph, each once, sorted.
     fn nodes(&self) -> Vec<u64> {
-        let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
+        let (pattern, by_subject, by_object) = if self.merged {
+            (QuadPattern::all(), Permutation::Spog, Permutation::Ospg)
+        } else {
+            (
+                QuadPattern::in_graph(TermId::DEFAULT_GRAPH),
+                Permutation::Gspo,
+                Permutation::Gosp,
+            )
+        };
         let distinct = |permutation| {
             self.snapshot
                 .group_counts_in(self.model, &pattern, permutation)
@@ -103,9 +141,7 @@ impl PathEvaluator<'_> {
                 .into_iter()
                 .map(|(id, _)| id.raw())
         };
-        let mut nodes: Vec<u64> = distinct(Permutation::Gspo)
-            .chain(distinct(Permutation::Gosp))
-            .collect();
+        let mut nodes: Vec<u64> = distinct(by_subject).chain(distinct(by_object)).collect();
         nodes.sort_unstable();
         nodes.dedup();
         nodes

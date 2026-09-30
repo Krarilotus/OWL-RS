@@ -136,7 +136,7 @@ api_key = "replace-me"
 - use `union` for clients that write into named graphs and query without naming them (ResearchSpace, the Datamodel Workflow's exports)
 - `GRAPH` patterns, `FROM` clauses and the protocol's dataset parameters mean the same in both modes
 - an update without `GRAPH` still writes to, and deletes from, the default graph only
-- cost today: in `union` mode queries run on the general evaluator, not the native executor, so they are slower; native support is the next step for this setting
+- cost: `union` runs on the native executor like `default`, but reads graph-last index orders and drops repeated statements, and the shortcuts that answer from index counts alone (`COUNT(*)` of one pattern, range filters, the worst-case-optimal join) don't apply. How much slower that is hasn't been measured yet
 - `/version` reports the mode as `default_graph`
 
 - file key: `shacl.shapes_graph`
