@@ -220,6 +220,24 @@ On-disk mode is always available. It writes a WAL plus checkpoints under `NRESE_
 
 ## Development
 
+### Building without filling the disk
+
+Cargo never removes build output it no longer uses, so an unattended `target/` grows without bound (it reached 145 GB here). Two things keep it small:
+
+- `.cargo/config.toml`: no debug information for dependencies, line tables only for our crates, no incremental cache, and one build directory for the workspace and the benchmark harness. A full build with all tests is about 6 GB.
+- `scripts/cargo-guarded.sh`, used in place of `cargo`:
+  - over the build directory's budget (25 GB, `NRESE_TARGET_BUDGET_GB`) it removes the build output before building;
+  - below the free-space floor (20 GB, `NRESE_MIN_FREE_GB`) it doesn't build;
+  - it uses half the cores and low priority, so the machine stays usable.
+
+```bash
+scripts/cargo-guarded.sh test --locked --workspace
+scripts/cargo-guarded.sh --status   # sizes and limits
+scripts/cargo-guarded.sh --clean    # empty the build directory
+```
+
+The benchmark scripts check free space the same way before they create datasets or containers.
+
 ### Where To Start
 
 If you want to work on shared contracts:

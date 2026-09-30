@@ -38,7 +38,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target.name }}
-          workspaces: ${{ matrix.target.name == 'workspace' && '.' || 'benches/nrese-bench-harness' }}
+          # Both workspaces build into the repository's `target` (.cargo/config.toml).
+          workspaces: ${{ matrix.target.name == 'workspace' && '.' || 'benches/nrese-bench-harness -> ../../target' }}
       - name: fmt
         run: cargo fmt --manifest-path ${{ matrix.target.manifest }} --all --check
       - name: clippy
