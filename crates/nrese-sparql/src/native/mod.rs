@@ -17,6 +17,7 @@ mod exists;
 pub(crate) mod expr;
 mod fast;
 mod federation;
+mod geo;
 mod output;
 mod paths;
 mod plan;
