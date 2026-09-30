@@ -39,3 +39,6 @@ pnpm-debug.log*
 
 # Perf lab build logs (benches/perf-lab.sh); the JSON reports are committed.
 /benches/baselines/perf-lab/.build-*
+
+# Integration workload results (licensed systems may write there too)
+/benches/integration/results/

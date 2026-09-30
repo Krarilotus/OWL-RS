@@ -50,7 +50,8 @@ QUERY_TIMEOUT_S=${QUERY_TIMEOUT_S:-120}
 CLIENTS=${CLIENTS:-8}          # throughput phase: concurrent clients (0 = skip)
 DURATION_S=${DURATION_S:-60}   # throughput phase: seconds
 QUERIES=$ROOT/benches/competitors/queries/${DATASET%%-[0-9]*}
-HARNESS=$ROOT/benches/nrese-bench-harness/target/release/nrese-bench-harness
+# Both workspaces build into one directory (.cargo/config.toml).
+HARNESS=${HARNESS:-$ROOT/target/release/nrese-bench-harness}
 FILE=/data/$DATASET.nt
 GRAPHDB_IMAGE=${GRAPHDB_IMAGE:-ontotext/graphdb:11.5.1}
 QLEVER_IMAGE=${QLEVER_IMAGE:-adfreiburg/qlever:latest}
@@ -289,7 +290,7 @@ if [ -z "${SKIP_BUILD:-}" ]; then
   docker run --rm -v "$ROOT:/src:ro" -v nrese-target:/target -w /src "$RUST_IMAGE" \
     cargo build --release --locked -p nrese-server --target-dir /target >"$RESULTS/nrese-build.log" 2>&1
   docker build -q -t "$JENA_IMAGE" "$ROOT/benches/competitors/jena" >/dev/null
-  cargo build --release --quiet --manifest-path "$ROOT/benches/nrese-bench-harness/Cargo.toml"
+  (cd "$ROOT" && scripts/cargo-guarded.sh build --release --locked --quiet --manifest-path benches/nrese-bench-harness/Cargo.toml)
 fi
 
 CSV=$RESULTS/scorecard-$DATASET.csv
