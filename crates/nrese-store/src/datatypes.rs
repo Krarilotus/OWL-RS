@@ -23,8 +23,9 @@ use std::str::FromStr;
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 
-/// A literal's data value, as far as the checks tell values apart.
-#[derive(Debug, Clone, PartialEq)]
+/// A literal's data value, as far as the checks tell values apart. Values are compared by
+/// identity, as OWL 2 does: `+0.0` and `-0.0` are two floating-point values, NaN is one.
+#[derive(Debug, Clone)]
 enum Data {
     /// owl:real / xsd:decimal and its subtypes.
     Decimal(Decimal),
@@ -35,6 +36,27 @@ enum Data {
     LangString(String, String),
     DateTime(DateTime),
     AnyUri(String),
+}
+
+impl PartialEq for Data {
+    fn eq(&self, other: &Self) -> bool {
+        fn identical_f64(a: f64, b: f64) -> bool {
+            (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+        }
+        match (self, other) {
+            (Data::Double(a), Data::Double(b)) => identical_f64(f64::from(*a), f64::from(*b)),
+            (Data::Float(a), Data::Float(b)) => {
+                identical_f64(f64::from(f32::from(*a)), f64::from(f32::from(*b)))
+            }
+            (Data::Decimal(a), Data::Decimal(b)) => a == b,
+            (Data::Boolean(a), Data::Boolean(b)) => a == b,
+            (Data::String(a), Data::String(b)) => a == b,
+            (Data::LangString(a, x), Data::LangString(b, y)) => a == b && x == y,
+            (Data::DateTime(a), Data::DateTime(b)) => a == b,
+            (Data::AnyUri(a), Data::AnyUri(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 fn is_literal(id: u64) -> bool {
@@ -252,5 +274,10 @@ mod tests {
         assert_ne!(data(&typed("1", "integer")), data(&typed("2", "int")));
         assert_eq!(data(&typed("01", "integer")), data(&typed("1", "int")));
         assert_ne!(data(&typed("1", "integer")), data(&typed("1", "double")));
+        // Identity, not IEEE equality (the W3C test "Plus and Minus Zero are Distinct").
+        assert_ne!(data(&typed("+0.0", "float")), data(&typed("-0.0", "float")));
+        assert_ne!(data(&typed("0", "double")), data(&typed("-0", "double")));
+        assert_eq!(data(&typed("NaN", "double")), data(&typed("NaN", "double")));
+        assert_eq!(data(&typed("1.0", "double")), data(&typed("1", "double")));
     }
 }

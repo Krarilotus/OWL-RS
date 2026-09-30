@@ -121,6 +121,7 @@ impl Ruleset {
     pub fn axioms(self) -> &'static str {
         match self {
             Self::RdfsFull => RDFS_AXIOMS,
+            Self::Owl2Rl => OWL2_RL_DATATYPE_AXIOMS,
             _ => "",
         }
     }
@@ -200,6 +201,43 @@ rdfs13: (?d rdf:type rdfs:Datatype) -> (?d rdfs:subClassOf rdfs:Literal)
 /// The RDF and RDFS axiomatic triples (RDF 1.1 Semantics §8.1.1, §9.1), without the
 /// infinitely many about `rdf:_1`, `rdf:_2`, …, and rdfs1 for the datatypes every
 /// system recognises (`rdf:langString`, `xsd:string`).
+/// OWL 2 RL's rule `dt-type1`: every datatype the profile supports (all of OWL 2's but
+/// `owl:real` and `owl:rational`) is an `rdfs:Datatype`.
+pub const OWL2_RL_DATATYPE_AXIOMS: &str = r#"
+rdf:PlainLiteral rdf:type rdfs:Datatype
+rdf:XMLLiteral rdf:type rdfs:Datatype
+rdfs:Literal rdf:type rdfs:Datatype
+xsd:decimal rdf:type rdfs:Datatype
+xsd:integer rdf:type rdfs:Datatype
+xsd:nonNegativeInteger rdf:type rdfs:Datatype
+xsd:nonPositiveInteger rdf:type rdfs:Datatype
+xsd:positiveInteger rdf:type rdfs:Datatype
+xsd:negativeInteger rdf:type rdfs:Datatype
+xsd:long rdf:type rdfs:Datatype
+xsd:int rdf:type rdfs:Datatype
+xsd:short rdf:type rdfs:Datatype
+xsd:byte rdf:type rdfs:Datatype
+xsd:unsignedLong rdf:type rdfs:Datatype
+xsd:unsignedInt rdf:type rdfs:Datatype
+xsd:unsignedShort rdf:type rdfs:Datatype
+xsd:unsignedByte rdf:type rdfs:Datatype
+xsd:double rdf:type rdfs:Datatype
+xsd:float rdf:type rdfs:Datatype
+xsd:string rdf:type rdfs:Datatype
+xsd:normalizedString rdf:type rdfs:Datatype
+xsd:token rdf:type rdfs:Datatype
+xsd:language rdf:type rdfs:Datatype
+xsd:Name rdf:type rdfs:Datatype
+xsd:NCName rdf:type rdfs:Datatype
+xsd:NMTOKEN rdf:type rdfs:Datatype
+xsd:boolean rdf:type rdfs:Datatype
+xsd:hexBinary rdf:type rdfs:Datatype
+xsd:base64Binary rdf:type rdfs:Datatype
+xsd:anyURI rdf:type rdfs:Datatype
+xsd:dateTime rdf:type rdfs:Datatype
+xsd:dateTimeStamp rdf:type rdfs:Datatype
+"#;
+
 pub const RDFS_AXIOMS: &str = r#"
 rdf:type rdf:type rdf:Property
 rdf:subject rdf:type rdf:Property

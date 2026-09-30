@@ -8,7 +8,9 @@ use nrese_server::policy::{PolicyConfig, RateLimitConfig};
 use nrese_store::StoreConfig;
 use tower::util::ServiceExt;
 
-use support::{body_text, readyz_text, test_app_with_policy, test_app_with_store_config};
+use support::{
+    body_text, ready_revision, readyz_text, test_app_with_policy, test_app_with_store_config,
+};
 
 fn admin_policy() -> PolicyConfig {
     PolicyConfig {
@@ -179,6 +181,7 @@ async fn restore_endpoint_uses_reasoner_gate_and_rejects_without_publish()
         admin_policy(),
         ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
+    let revision_before = ready_revision(app.clone()).await?;
 
     let restore = app
         .clone()
@@ -212,7 +215,7 @@ async fn restore_endpoint_uses_reasoner_gate_and_rejects_without_publish()
         )
         .await?;
     assert!(body_text(ask).await?.contains("false"));
-    assert!(readyz_text(app).await?.contains("\"revision\":0"));
+    assert_eq!(ready_revision(app).await?, revision_before);
 
     Ok(())
 }
