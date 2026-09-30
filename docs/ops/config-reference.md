@@ -163,6 +163,7 @@ api_key = "replace-me"
   - `owl2-ql`: OWL 2 QL materialised; commits that violate its disjointness axioms are rejected
   - `owl2-rl`: the OWL 2 RL/RDF closure is materialised, and commits that violate a consistency rule are rejected with the rule and the facts it matched
 - unknown values are a startup error (a typo must not silently disable consistency checking); `rules-mvp`, the removed v1 reasoner, is an error that names its replacement
+- file key `reasoner.unnamed_classes`, env `NRESE_REASONING_UNNAMED_CLASSES`: `derive` (the default, OWL 2 RL as written) or `skip`: memberships in unnamed union classes that nothing consumes (an anonymous union used only as a domain or range, as the GND ontology does) are not derived. Everything else stays; members of such a class declared `owl:Class` are still `owl:Thing`s. With the GND ontology on the integration workload's example tier: 219,840 inferred statements become 99,213, with the same answers to its questions. A commit that makes such a class used (a subclass axiom on it) triggers a rematerialisation
 - with any mode but `disabled`:
   - `nrese-server load` and startup materialise the closure (startup skips it when `reasoning.state` in the data directory records that the inferred stack is current for this build's semantics; `/version` reports them as `reasoning_semantics`, e.g. `owl2-rl v2 <fingerprint>`)
   - what each mode derives and omits: [reasoning-semantics.md](../spec/reasoning-semantics.md)

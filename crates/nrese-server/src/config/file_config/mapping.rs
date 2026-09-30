@@ -38,6 +38,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
     );
 
     insert_option(&mut source, names::REASONING_MODE, config.reasoner.mode);
+    insert_option(
+        &mut source,
+        names::REASONING_UNNAMED_CLASSES,
+        config.reasoner.unnamed_classes,
+    );
 
     insert_joined(
         &mut source,

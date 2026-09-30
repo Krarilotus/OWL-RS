@@ -15,6 +15,10 @@ This is the contract for what NRESE's reasoning computes, as implemented on 30 S
 | `owl2-ql` | prp-dom, prp-rng, prp-spo1, prp-eqp1/2, prp-inv1/2, prp-symp, cax-sco, cax-eqc1/2, cls-svf2, the schema rules scm-cls, sco, eqc1/2, op, dp, spo, eqp1/2, dom1/2, rng1/2, and the checks prp-asyp, prp-irp, prp-pdw, cls-nothing2, cax-dw. Existentials on the right of `SubClassOf` are not materialised (they would invent individuals); a query rewriter would answer them |
 | `owl2-rl` | below |
 
+### Unnamed union classes
+
+With `reasoner.unnamed_classes = "skip"`, an unnamed class that has an `owl:unionOf` and occurs only as the object of `rdfs:domain`, `rdfs:range`, `rdf:type`, `rdfs:subClassOf` or `owl:allValuesFrom`, or in its own definition, gets no inferred members: no rule consumes them and no query can name the class. A membership of such a class declared `owl:Class` becomes an `owl:Thing` membership where the ruleset has scm-cls. The closure is otherwise the full one (property test over every ruleset).
+
 ### `rdfs`: a 6-rule RDFS subset
 
 | Rule | Derives |

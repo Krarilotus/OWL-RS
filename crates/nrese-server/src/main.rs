@@ -50,11 +50,7 @@ async fn main() -> Result<()> {
     // the recorded state says it already is (same ruleset and semantics). Without v2
     // reasoning, a leftover stack is cleared so reads never see stale inferences.
     match ruleset {
-        Some(ruleset)
-            if store
-                .reasoning_state()
-                .is_some_and(|state| state.is_current_for(ruleset)) =>
-        {
+        Some(ruleset) if store.reasoning_is_current(ruleset) => {
             tracing::info!(ruleset = ruleset.name(), "inferred stack is current");
         }
         Some(ruleset) => {

@@ -9,6 +9,8 @@
 //! - [`Job`] and [`run_jobs`]: one variant of one rule, driven by its first atom's matches,
 //!   run in parallel morsels; the other atoms are index lookups ordered by [`plan`].
 
+use std::collections::HashMap;
+
 use hashbrown::HashSet;
 use rayon::prelude::*;
 
@@ -70,8 +72,13 @@ impl<S: Source + ?Sized> Facts for AllFacts<'_, S> {
 
 /// The TBox vocabulary. Atoms over these predicates, and `rdf:type` atoms with these
 /// classes as object, are grounded before evaluation.
+#[derive(Clone)]
 pub struct Schema {
     rdf_type: u64,
+    thing: u64,
+    /// Unnamed classes whose memberships aren't derived (work package W7,
+    /// [`super::unnamed`]): each with whether a membership stands for `owl:Thing`.
+    hidden: HashMap<u64, bool>,
     predicates: HashSet<u64>,
     classes: HashSet<u64>,
 }
@@ -135,9 +142,51 @@ impl Schema {
         .collect();
         Self {
             rdf_type,
+            thing: vocabulary.iri(&format!("{OWL}Thing")),
+            hidden: HashMap::new(),
             predicates,
             classes,
         }
+    }
+
+    /// This schema, with memberships in `hidden` classes not derived: a ground rule that
+    /// would derive one derives `owl:Thing` instead where the value is `true`, else
+    /// nothing ([`super::unnamed`]).
+    #[must_use]
+    pub fn hiding(mut self, hidden: HashMap<u64, bool>) -> Self {
+        self.hidden = hidden;
+        self
+    }
+
+    pub fn hidden(&self) -> &HashMap<u64, bool> {
+        &self.hidden
+    }
+
+    /// `rule` with its heads' memberships in hidden classes rewritten; `None` if nothing
+    /// is left to derive.
+    fn rewrite_heads(&self, mut rule: Rule) -> Option<Rule> {
+        if self.hidden.is_empty() {
+            return Some(rule);
+        }
+        if let Head::Facts(atoms) = &mut rule.head {
+            atoms.retain_mut(|atom| match atom.0 {
+                [_, Term::Const(p), Term::Const(c)] if p == self.rdf_type => {
+                    match self.hidden.get(&c) {
+                        Some(true) => {
+                            atom.0[2] = Term::Const(self.thing);
+                            true
+                        }
+                        Some(false) => false,
+                        None => true,
+                    }
+                }
+                _ => true,
+            });
+            if atoms.is_empty() {
+                return None;
+            }
+        }
+        Some(rule)
     }
 
     pub fn is_schema_atom(&self, atom: &Atom) -> bool {
@@ -974,7 +1023,9 @@ impl GroundProgram {
                     .map(|a| instantiate_head(a, &g.substitution))
                     .chain(extra.iter().copied())
                     .collect();
-                facts.extend(self.add_with(g.rule, premises));
+                if let Some(rule) = schema.rewrite_heads(g.rule) {
+                    facts.extend(self.add_with(rule, premises));
+                }
             }
         }
         (facts, checks)

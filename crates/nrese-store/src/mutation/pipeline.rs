@@ -86,10 +86,7 @@ impl MutationPipeline {
         // Reasoner v2 maintains the inferred stack from a correct one: materialise it first
         // if nothing records that it is current (a fresh or preloaded store).
         if let Some(ruleset) = self.reasoner.config().materialised_ruleset()
-            && !self
-                .store
-                .reasoning_state()
-                .is_some_and(|state| state.is_current_for(ruleset))
+            && !self.store.reasoning_is_current(ruleset)
         {
             self.store.rematerialise(ruleset).map_err(store_error)?;
         }
@@ -111,6 +108,7 @@ impl MutationPipeline {
             let program = self.program.get_or_init(|| {
                 let tx = &tx;
                 crate::reasoning::Program::new(ruleset, &|term| tx.intern(term))
+                    .hiding_unnamed_classes(self.store.config().hide_unnamed_classes)
             });
             let revision = tx.base().revision();
             // Writers are serialised by the transaction, so the cache can't change meanwhile.
@@ -179,6 +177,12 @@ impl MutationPipeline {
                 }
             }
             drop(ground);
+            // A class left out became consumable: its memberships are computed in full.
+            if materialisation.needs_rematerialisation
+                && let Err(error) = self.store.rematerialise(ruleset)
+            {
+                tracing::error!(%error, "rematerialisation for an unnamed class that became used failed");
+            }
             // In quarantine the commit checked only its own facts: revalidate everything, so
             // the store leaves quarantine once the data is repaired. The commit itself stands.
             if matches!(
