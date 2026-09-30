@@ -8,6 +8,10 @@
 //! evaluator decides that row. The semantics are spareval's; the randomized differential
 //! test covers every shape.
 //!
+//! The predicates read stored ids. A value the query computed itself (`BIND`, a `SELECT`
+//! expression, an aggregate) has an id of the query's own, which says nothing about the
+//! term: every predicate but `BOUND` leaves such a row to the generic evaluator.
+//!
 //! | Shape | Evaluation |
 //! |---|---|
 //! | `BOUND(?v)`, `isIRI/isBlank/isLiteral(?v)` | the id's kind |
@@ -20,7 +24,7 @@
 use std::cmp::Ordering;
 
 use nrese_engine::{Snapshot, TermId, TermKind, TermView};
-use nrese_exec::UNDEF;
+use nrese_exec::{UNDEF, computed_index};
 use oxrdf::Variable;
 use oxrdf::vocab::xsd;
 use regex::Regex;
@@ -205,15 +209,32 @@ pub(crate) fn compile(expr: &Expression, snapshot: &Snapshot) -> Option<Fast> {
 impl Fast {
     /// Evaluates for one row; `value(v)` is the row's id for `v` (UNDEF if unbound).
     pub(crate) fn eval(&self, value: &dyn Fn(&Variable) -> u64, snapshot: &Snapshot) -> Tri {
-        let kind = |v: &Variable| {
+        // The stored id of `v` in this row. `Err` is the answer without one: an error for
+        // an unbound variable, and "not decided here" for a term the query computed.
+        let stored = |v: &Variable| -> Result<TermId, Tri> {
             let id = value(v);
-            (id != UNDEF).then(|| TermId::from_raw(id).kind())
+            if id == UNDEF {
+                Err(Tri::Error)
+            } else if computed_index(id).is_some() {
+                Err(Tri::Unknown)
+            } else {
+                Ok(TermId::from_raw(id))
+            }
         };
-        let is_literal = |k: TermKind| {
-            !matches!(
-                k,
-                TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
-            )
+        let on_kind = |v: &Variable, test: &dyn Fn(TermKind) -> bool| match stored(v) {
+            Ok(id) => Tri::of(test(id.kind())),
+            Err(undecided) => undecided,
+        };
+        let language = |id: TermId, test: &dyn Fn(&str) -> bool| match id.kind() {
+            TermKind::Iri | TermKind::BlankNode => Tri::Error,
+            TermKind::LangString => snapshot
+                .with_view(id, |view| match view {
+                    TermView::LangString { language, .. } => Tri::of(test(language)),
+                    _ => Tri::Unknown,
+                })
+                .unwrap_or(Tri::Unknown),
+            // Any other literal has the empty language tag.
+            _ => Tri::of(test("")),
         };
         match self {
             Self::And(a, b) => match (a.eval(value, snapshot), b.eval(value, snapshot)) {
@@ -234,100 +255,66 @@ impl Fast {
                 other => other,
             },
             Self::Bound(v) => Tri::of(value(v) != UNDEF),
-            Self::IsIri(v) => kind(v).map_or(Tri::Error, |k| Tri::of(k == TermKind::Iri)),
-            Self::IsBlank(v) => kind(v).map_or(Tri::Error, |k| Tri::of(k == TermKind::BlankNode)),
-            Self::IsLiteral(v) => kind(v).map_or(Tri::Error, |k| Tri::of(is_literal(k))),
-            Self::SameIri(v, iri) => {
-                let id = value(v);
-                if id == UNDEF {
-                    Tri::Error
-                } else {
-                    Tri::of(Some(id) == *iri)
-                }
-            }
-            Self::LangEquals(v, tag) => match kind(v) {
-                None => Tri::Error,
-                Some(TermKind::Iri | TermKind::BlankNode) => Tri::Error,
-                Some(TermKind::LangString) => {
-                    let id = TermId::from_raw(value(v));
-                    snapshot
-                        .with_view(id, |view| match view {
-                            TermView::LangString { language, .. } => Tri::of(language == tag),
-                            _ => Tri::Unknown,
-                        })
-                        .unwrap_or(Tri::Unknown)
-                }
-                // Any other literal has the empty language tag.
-                Some(_) => Tri::of(tag.is_empty()),
+            Self::IsIri(v) => on_kind(v, &|k| k == TermKind::Iri),
+            Self::IsBlank(v) => on_kind(v, &|k| k == TermKind::BlankNode),
+            Self::IsLiteral(v) => on_kind(v, &|k| {
+                !matches!(
+                    k,
+                    TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
+                )
+            }),
+            Self::SameIri(v, iri) => match stored(v) {
+                Ok(id) => Tri::of(Some(id.raw()) == *iri),
+                Err(undecided) => undecided,
             },
-            Self::LangMatches(v, range) => match kind(v) {
-                None | Some(TermKind::Iri | TermKind::BlankNode) => Tri::Error,
-                Some(TermKind::LangString) => {
-                    let id = TermId::from_raw(value(v));
-                    snapshot
-                        .with_view(id, |view| match view {
-                            TermView::LangString { language, .. } => {
-                                Tri::of(lang_matches(language, range))
-                            }
-                            _ => Tri::Unknown,
-                        })
-                        .unwrap_or(Tri::Unknown)
-                }
-                Some(_) => Tri::of(lang_matches("", range)),
+            Self::LangEquals(v, tag) => match stored(v) {
+                Ok(id) => language(id, &|language| language == tag),
+                Err(undecided) => undecided,
             },
-            Self::Text(v, str, op, needle) => {
-                self.on_text(v, *str, value, snapshot, |text| match op {
+            Self::LangMatches(v, range) => match stored(v) {
+                Ok(id) => language(id, &|language| lang_matches(language, range)),
+                Err(undecided) => undecided,
+            },
+            Self::Text(v, str, op, needle) => match stored(v) {
+                Ok(id) => on_text(id, *str, snapshot, |text| match op {
                     TextOp::Contains => text.contains(needle.as_str()),
                     TextOp::StartsWith => text.starts_with(needle.as_str()),
                     TextOp::EndsWith => text.ends_with(needle.as_str()),
-                })
-            }
-            Self::Regex(v, str, regex) => {
-                self.on_text(v, *str, value, snapshot, |text| regex.is_match(text))
-            }
-            Self::IntCompare(v, orderings, constant) => {
-                let id = value(v);
-                if id == UNDEF {
-                    return Tri::Error;
-                }
-                match TermId::from_raw(id).as_inline_integer() {
+                }),
+                Err(undecided) => undecided,
+            },
+            Self::Regex(v, str, regex) => match stored(v) {
+                Ok(id) => on_text(id, *str, snapshot, |text| regex.is_match(text)),
+                Err(undecided) => undecided,
+            },
+            Self::IntCompare(v, orderings, constant) => match stored(v) {
+                Ok(id) => match id.as_inline_integer() {
                     Some(x) => Tri::of(orderings.contains(&x.cmp(constant))),
                     None => Tri::Unknown,
-                }
-            }
+                },
+                Err(undecided) => undecided,
+            },
         }
     }
+}
 
-    /// A string test on `?v` (a string literal) or `STR(?v)` (also IRIs and every literal).
-    fn on_text(
-        &self,
-        v: &Variable,
-        str: bool,
-        value: &dyn Fn(&Variable) -> u64,
-        snapshot: &Snapshot,
-        test: impl FnOnce(&str) -> bool,
-    ) -> Tri {
-        let id = value(v);
-        if id == UNDEF {
-            return Tri::Error;
-        }
-        let id = TermId::from_raw(id);
-        if id.kind().is_inline() {
-            // STR of an inline literal needs its canonical form; not string-typed without STR.
-            return if str { Tri::Unknown } else { Tri::Error };
-        }
-        snapshot
-            .with_view(id, |view| match (view, str) {
-                (TermView::String(text) | TermView::LangString { value: text, .. }, _) => {
-                    Tri::of(test(text))
-                }
-                (TermView::Iri(text), true) => Tri::of(test(text)),
-                // STR of a typed literal is its canonical form (see `value::canonical`).
-                (TermView::Typed { .. }, true) => Tri::Unknown,
-                (TermView::BlankNode(_), _) | (_, false) => Tri::Error,
-            })
-            .unwrap_or(Tri::Unknown)
+/// A string test on a term (a string literal) or on its `STR` (also IRIs and every literal).
+fn on_text(id: TermId, str: bool, snapshot: &Snapshot, test: impl FnOnce(&str) -> bool) -> Tri {
+    if id.kind().is_inline() {
+        // STR of an inline literal needs its canonical form; not string-typed without STR.
+        return if str { Tri::Unknown } else { Tri::Error };
     }
+    snapshot
+        .with_view(id, |view| match (view, str) {
+            (TermView::String(text) | TermView::LangString { value: text, .. }, _) => {
+                Tri::of(test(text))
+            }
+            (TermView::Iri(text), true) => Tri::of(test(text)),
+            // STR of a typed literal is its canonical form (see `value::canonical`).
+            (TermView::Typed { .. }, true) => Tri::Unknown,
+            (TermView::BlankNode(_), _) | (_, false) => Tri::Error,
+        })
+        .unwrap_or(Tri::Unknown)
 }
 
 /// SPARQL `LANGMATCHES` (RFC 4647 basic filtering).
