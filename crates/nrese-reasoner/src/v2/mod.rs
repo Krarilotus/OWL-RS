@@ -143,11 +143,21 @@ mod tests {
         vocabulary: &mut LocalVocabulary,
         input: &[Triple],
     ) -> (HashSet<Triple>, Vec<Violation>) {
-        let rules = Ruleset::Owl2Rl.rules(vocabulary).unwrap();
+        both_with(Ruleset::Owl2Rl, vocabulary, input)
+    }
+
+    /// [`both`] for any ruleset.
+    fn both_with(
+        ruleset: Ruleset,
+        vocabulary: &mut LocalVocabulary,
+        input: &[Triple],
+    ) -> (HashSet<Triple>, Vec<Violation>) {
+        let rules = ruleset.rules(vocabulary).unwrap();
         let lists = ListVocabulary::new(vocabulary);
+        let lists = ruleset.has_list_rules().then_some(&lists);
         let schema = Schema::owl(vocabulary);
-        let naive = materialise(input, &rules, Some(&lists));
-        let batch = batch::materialise(input, &rules, Some(&lists), &schema);
+        let naive = materialise(input, &rules, lists);
+        let batch = batch::materialise(input, &rules, lists, &schema);
         // The grouped entry point (what the store uses) derives the same.
         let mut sorted: Vec<Triple> = input.to_vec();
         sorted.sort_unstable_by_key(|&[s, p, o]| (p, o, s));
@@ -159,7 +169,7 @@ mod tests {
                 _ => groups.push((p, vec![(o, s)])),
             }
         }
-        let grouped = batch::materialise_grouped(groups, &rules, Some(&lists), &schema);
+        let grouped = batch::materialise_grouped(groups, &rules, lists, &schema);
         // Derived facts never include asserted ones (the schema pre-closure must filter).
         let asserted: HashSet<Triple> = input.iter().copied().collect();
         assert!(
@@ -200,6 +210,114 @@ mod tests {
     fn has(vocabulary: &mut LocalVocabulary, derived: &HashSet<Triple>, fact: &str) -> bool {
         let triple = load(vocabulary, fact)[0];
         derived.contains(&triple)
+    }
+
+    /// Every profile parses, adds only OWL 2 RL rules that exist, and derives what its
+    /// definition says and not what the next profile adds.
+    #[test]
+    fn profiles_derive_what_they_define() {
+        use super::rulesets::ALL;
+        let mut vocabulary = LocalVocabulary::default();
+        let owl: Vec<String> = Ruleset::Owl2Rl
+            .rules(&mut vocabulary)
+            .unwrap()
+            .into_iter()
+            .map(|rule| rule.name)
+            .collect();
+        for ruleset in ALL {
+            let rules = ruleset.rules(&mut vocabulary).unwrap();
+            assert!(!rules.is_empty(), "{}", ruleset.name());
+            for name in ruleset.owl_rules().unwrap_or_default() {
+                assert!(
+                    owl.contains(&name.to_string()),
+                    "{name} in {}",
+                    ruleset.name()
+                );
+            }
+            assert_eq!(Ruleset::from_name(ruleset.name()), Some(ruleset));
+        }
+        assert_eq!(
+            Ruleset::RdfsFull
+                .axiom_triples(&mut vocabulary)
+                .unwrap()
+                .len(),
+            50
+        );
+        assert!(
+            Ruleset::Owl2Rl
+                .axiom_triples(&mut vocabulary)
+                .unwrap()
+                .is_empty()
+        );
+
+        let data = "ex:Cat rdfs:subClassOf ex:Animal
+             ex:tom rdf:type ex:Cat
+             ex:owns rdfs:domain ex:Person
+             ex:alice ex:owns ex:tom
+             ex:ancestor rdf:type owl:TransitiveProperty
+             ex:a ex:ancestor ex:b
+             ex:b ex:ancestor ex:c
+             ex:tom owl:sameAs ex:thomas
+             ex:HasPet owl:someValuesFrom owl:Thing
+             ex:HasPet owl:onProperty ex:owns
+             ex:Owner owl:hasValue ex:tom
+             ex:Owner owl:onProperty ex:owns
+             ex:Cat owl:disjointWith ex:Person
+             ex:tom rdf:type ex:Person";
+        let run = |ruleset: Ruleset| {
+            let mut vocabulary = LocalVocabulary::default();
+            let input = load(&mut vocabulary, data);
+            let (derived, violations) = both_with(ruleset, &mut vocabulary, &input);
+            let has = |fact: &str| {
+                let triple = load(&mut vocabulary.clone(), fact)[0];
+                derived.contains(&triple)
+            };
+            let facts = [
+                "ex:tom rdf:type ex:Animal",
+                "ex:alice rdf:type ex:Person",
+                "ex:owns rdf:type rdf:Property",
+                "ex:tom rdf:type rdfs:Resource",
+                "ex:a ex:ancestor ex:c",
+                "ex:thomas rdf:type ex:Cat",
+                "ex:alice rdf:type ex:HasPet",
+                "ex:alice rdf:type ex:Owner",
+            ]
+            .map(has);
+            (facts, !violations.is_empty())
+        };
+        // subclass, domain, rdfD2, rdfs4a, transitivity, sameAs, someValuesFrom Thing,
+        // hasValue; and whether the disjointness is a violation.
+        let t = true;
+        let f = false;
+        assert_eq!(run(Ruleset::Rdfs), ([t, t, f, f, f, f, f, f], f));
+        assert_eq!(run(Ruleset::RdfsFull), ([t, t, t, t, f, f, f, f], f));
+        assert_eq!(run(Ruleset::RdfsPlus), ([t, t, f, f, t, t, f, f], f));
+        assert_eq!(run(Ruleset::OwlHorst), ([t, t, f, f, t, t, t, t], f));
+        assert_eq!(run(Ruleset::Owl2Ql), ([t, t, f, f, f, f, t, f], t));
+        assert_eq!(run(Ruleset::Owl2Rl), ([t, t, f, f, t, t, t, t], t));
+    }
+
+    /// Random small ontologies: the batch executor equals the naive one under every
+    /// profile.
+    #[test]
+    fn every_profile_batch_equals_naive() {
+        let mut next = rng(0x5851_F42D_4C95_7F2D);
+        for ruleset in super::rulesets::ALL {
+            let mut derived = 0;
+            for case in 0..60 {
+                let lines = random_ontology(&mut next);
+                let mut vocabulary = LocalVocabulary::default();
+                let input = load(&mut vocabulary, &lines.join("\n"));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    both_with(ruleset, &mut vocabulary, &input)
+                }));
+                let Ok((d, _)) = result else {
+                    panic!("{} case {case}:\n{}", ruleset.name(), lines.join("\n"));
+                };
+                derived += d.len();
+            }
+            assert!(derived > 200, "{}: {derived}", ruleset.name());
+        }
     }
 
     #[test]
@@ -811,11 +929,18 @@ mod tests {
             let lines = random_ontology(&mut next);
             let mut vocabulary = LocalVocabulary::default();
             let pool = load(&mut vocabulary, &lines.join("\n"));
-            let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+            // A third of the cases run the other rulesets in turn.
+            let ruleset = if case % 3 == 0 {
+                super::rulesets::ALL[(case as usize / 3) % 5]
+            } else {
+                Ruleset::Owl2Rl
+            };
+            let rules = ruleset.rules(&mut vocabulary).unwrap();
             let lists = ListVocabulary::new(&mut vocabulary);
+            let lists = ruleset.has_list_rules().then_some(&lists);
             let schema = Schema::owl(&mut vocabulary);
             let closure =
-                |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema);
+                |asserted: &[Triple]| batch::materialise(asserted, &rules, lists, &schema);
             let mut asserted: Vec<Triple> = pool.iter().copied().filter(|_| next(10) < 7).collect();
             asserted.sort_unstable();
             asserted.dedup();
@@ -825,7 +950,7 @@ mod tests {
             let mut cache: Option<super::eval::GroundProgram> = None;
             let compiled = Rules {
                 rules: &rules,
-                lists: Some(&lists),
+                lists,
                 schema: &schema,
             };
             for step in 0..4 {
@@ -866,7 +991,8 @@ mod tests {
                         format!("{s} {p} {o}")
                     };
                     format!(
-                        "case {case} step {step}\ninsert {:#?}\ndelete {:#?}\nasserted before {:#?}",
+                        "case {case} ({}) step {step}\ninsert {:#?}\ndelete {:#?}\nasserted before {:#?}",
+                        ruleset.name(),
                         insert.iter().map(text).collect::<Vec<_>>(),
                         delete.iter().map(text).collect::<Vec<_>>(),
                         asserted.iter().map(text).collect::<Vec<_>>()

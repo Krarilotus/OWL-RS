@@ -38,8 +38,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match arg.as_str() {
             "--ruleset" => {
                 ruleset = match args.next().as_deref() {
-                    Some("rdfs") => Ruleset::Rdfs,
-                    Some("owl2-rl") => Ruleset::Owl2Rl,
+                    Some(name) if Ruleset::from_name(name).is_some() => {
+                        Ruleset::from_name(name).expect("checked")
+                    }
                     other => return Err(format!("unknown ruleset {other:?}").into()),
                 }
             }
