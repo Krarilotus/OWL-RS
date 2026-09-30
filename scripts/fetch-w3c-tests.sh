@@ -42,3 +42,9 @@ else
   mv "$OWL_TESTS.partial" "$OWL_TESTS"
   echo "OWL 2 test cases in $OWL_TESTS"
 fi
+
+# The GeoSPARQL compliance benchmark's dataset, queries and answers (OpenLink Software,
+# GPL-2.0: fetched, never copied into this repository):
+# crates/nrese-sparql/tests/geosparql_compliance runs them.
+fetch OpenLinkSoftware/GeoSPARQLBenchmark 879e0746e74c1327f74e57366104bcf1a6d63fb1 \
+  "$CACHE/geosparql-benchmark" src/main/resources

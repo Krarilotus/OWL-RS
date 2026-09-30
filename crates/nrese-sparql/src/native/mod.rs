@@ -20,6 +20,12 @@ mod fast;
 mod federation;
 mod geo;
 mod geo_formats;
+
+/// The reference system (an IRI) and geometry of a GeoSPARQL literal: WKT, GeoJSON or
+/// GML; `None` for other terms. EPSG:4326 is read as CRS84 (longitude first).
+pub fn geometry_literal(term: &oxrdf::Term) -> Option<(String, ::geo::Geometry<f64>)> {
+    geo::parse(term).map(|shape| (shape.crs, shape.geometry))
+}
 mod output;
 mod paths;
 mod plan;

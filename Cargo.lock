@@ -1131,6 +1131,7 @@ dependencies = [
  "md-5",
  "nrese-engine",
  "nrese-exec",
+ "nrese-reasoner",
  "oxigraph",
  "oxiri",
  "oxrdf",
