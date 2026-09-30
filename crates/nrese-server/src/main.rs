@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use axum::serve::ListenerExt;
 use nrese_reasoner::ReasonerService;
 use nrese_store::{BulkLoadRequest, GraphTarget, StoreService};
 use tokio::net::TcpListener;
@@ -100,6 +101,14 @@ async fn main() -> Result<()> {
         "nrese-server bootstrap complete"
     );
 
+    // Without TCP_NODELAY a response written in several pieces (every streamed result)
+    // waits for the client's delayed acknowledgement: about 40 ms on Linux, whatever the
+    // query took.
+    let listener = listener.tap_io(|stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::debug!(%error, "could not set TCP_NODELAY on a connection");
+        }
+    });
     axum::serve(listener, app)
         .await
         .context("nrese-server terminated unexpectedly")
