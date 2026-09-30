@@ -139,9 +139,10 @@ Secondary indexes (F1–F3) follow the review's publication rule: an index names
 ## 4. Order and parallelism
 
 - **A before everything.** It's small, and it fixes the boundaries everything else crosses.
-- **B next.** Reasoning is the headline (D9), and tomorrow's licensed GraphDB/RDFox setup gives B1 its oracle.
-- **D1 (multi-repository) before C2, D2 and E1.** SHACL, RDF4J and security are all per repository. Retrofitting that later would touch every one of them.
-- **C and D2 order by consumer need:** DMW needs SHACL, ResearchSpace needs RDF4J and full-text search.
+- **C1 (the SHACL validator) next** (owner decision 3). It needs nothing from B or D.
+- **B alongside, once its oracle exists.** B1's gate compares against GraphDB and RDFox, which are set up at the office with the owner. B3 and B4 don't need them.
+- **D1 (multi-repository) before C2, D2 and E1.** The SHACL commit gate, RDF4J and security are all per repository. Retrofitting that later would touch every one of them.
+- **Then D2 and F1** (RDF4J, full-text), which ResearchSpace needs.
 - **Performance work continues alongside, profile-driven.** No benchmark rounds until asked.
 
 ## 5. Codebase health rules for every slice
@@ -158,17 +159,16 @@ Secondary indexes (F1–F3) follow the review's publication rule: an index names
 - Every slice removes what it replaces. No parallel old paths.
 - Evidence per slice: differential or conformance tests; mutation checks for new test oracles.
 
-## 6. Decisions needed from the owner
+## 6. Owner decisions (30 September 2026)
 
-1. **Dependencies for F1–F3:**
-   - Full-text: tantivy (large, well maintained, MIT) or our own inverted index.
-   - Geo: an R-tree crate or our own.
-   - Vectors: HNSW, own or crate.
+1. **Dependencies for the specialised indexes (F1–F3): use libraries, replace what underperforms.**
+   - A library is allowed if its licence permits commercial use without conditions on our code (MIT, Apache-2.0, BSD, and similar), and it is maintained.
+   - Each one sits behind our own trait, is measured in the perf lab, and is replaced by our own Rust implementation where it costs us: an architecture that doesn't fit the engine (its own storage, its own threading), or measured inefficiency.
+   - Starting points: tantivy (MIT) for full-text, an R-tree crate for geo, and our own HNSW unless a crate measures better.
+2. **Licence model: open.** The owner asked for an explanation of Apache-2.0 versus AGPL-3.0 first. Until a choice is made:
+   - no `LICENSE` file is added;
+   - the `license = "Apache-2.0"` line that the Cargo manifests have carried since March 2026 stays as it is, and is part of that decision.
+3. **Order: SHACL (phase C) before RDF4J and full-text (D2, F1).**
+4. **Implementation language:** protocols and formats still to come (RDF4J, Binary RDF, JSON-LD, federation) are implemented natively in Rust, in the server and its crates. No JVM sidecar, no wrapped reference implementation, no interpreted glue on a request path.
 
-   Owning them fits the open-core model and our performance goals, but costs weeks each.
-2. **Licence model** (open core, commercialisation later):
-   - Apache-2.0 core: maximum adoption, but others may also commercialise.
-   - AGPL-3.0 core plus a commercial licence (dual licensing): the common open-core route to selling. Needs a CLA for outside contributions.
-
-   Either way the owner keeps the copyright. Get legal advice before publishing a licence.
-3. **Order of C (SHACL) versus D2/F1 (RDF4J, full-text):** which consumer comes first, DMW or ResearchSpace?
+**Still to do with the owner, at the office:** set up the licensed systems (GraphDB, RDFox, Stardog, AnzoGraph) under evaluation agreements. Their results stay local and unpublished.
