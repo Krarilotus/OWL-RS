@@ -90,7 +90,7 @@ pub(crate) fn evaluate<'a>(
     options: &QueryOptions,
 ) -> Option<Result<QueryResults<'a>, QueryEvaluationError>> {
     let (pattern, form) = native_pattern(query, options)?;
-    let ctx = Context::new(snapshot, options, query_dataset(query));
+    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let solutions = match ctx.eval(&pattern) {
         Ok(solutions) => solutions,
         Err(NativeError::Fallback) => return None,
@@ -98,6 +98,16 @@ pub(crate) fn evaluate<'a>(
     };
     match form {
         Form::Select => {}
+        Form::Describe => {
+            let triples = match ctx.describe(&solutions) {
+                Ok(triples) => triples,
+                Err(NativeError::Fallback) => return None,
+                Err(NativeError::Evaluation(error)) => return Some(Err(error)),
+            };
+            return Some(Ok(QueryResults::Graph(QueryTripleIter::new(
+                triples.into_iter().map(Ok),
+            ))));
+        }
         Form::Ask => return Some(Ok(QueryResults::Boolean(!solutions.table.is_empty()))),
         Form::Construct(template) => {
             let Context {
@@ -132,17 +142,28 @@ pub(crate) fn explain(
     query: &Query,
     options: &QueryOptions,
 ) -> Option<Result<(Vec<PlanStep>, u64), QueryEvaluationError>> {
-    let (pattern, _) = native_pattern(query, options)?;
-    let mut ctx = Context::new(snapshot, options, query_dataset(query));
+    let (pattern, form) = native_pattern(query, options)?;
+    let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     ctx.trace = Some(RefCell::default());
-    match ctx.eval(&pattern) {
-        Ok(solutions) => Some(Ok((
-            ctx.trace.take().unwrap_or_default().into_inner(),
-            solutions.table.len() as u64,
-        ))),
-        Err(NativeError::Fallback) => None,
-        Err(NativeError::Evaluation(error)) => Some(Err(error)),
-    }
+    let solutions = match ctx.eval(&pattern) {
+        Ok(solutions) => solutions,
+        Err(NativeError::Fallback) => return None,
+        Err(NativeError::Evaluation(error)) => return Some(Err(error)),
+    };
+    let steps = ctx.trace.take().unwrap_or_default().into_inner();
+    // CONSTRUCT and DESCRIBE count triples.
+    let rows = match form {
+        Form::Select | Form::Ask => solutions.table.len(),
+        Form::Describe => match ctx.describe(&solutions) {
+            Ok(triples) => triples.len(),
+            Err(NativeError::Fallback) => return None,
+            Err(NativeError::Evaluation(error)) => return Some(Err(error)),
+        },
+        Form::Construct(template) => {
+            construct(snapshot, ctx.computed.into_inner(), solutions, template).count()
+        }
+    };
+    Some(Ok((steps, rows as u64)))
 }
 
 pub use output::ResultsFormat;
@@ -158,11 +179,11 @@ pub(crate) fn write_results(
 ) -> Option<Result<(), crate::query::WriteResultsError>> {
     let (pattern, form) = native_pattern(query, options)?;
     match form {
-        Form::Construct(_) => return None,
+        Form::Construct(_) | Form::Describe => return None,
         Form::Ask if format != ResultsFormat::Json => return None,
         _ => {}
     }
-    let ctx = Context::new(snapshot, options, query_dataset(query));
+    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let solutions = match ctx.eval(&pattern) {
         Ok(solutions) => solutions,
         Err(NativeError::Fallback) => return None,
@@ -216,6 +237,7 @@ pub(crate) fn delete_insert(
     delete: &[spargebra::term::GroundQuadPattern],
     insert: &[spargebra::term::QuadPattern],
     using: Option<&spargebra::algebra::QueryDataset>,
+    base: Option<&oxiri::Iri<String>>,
     options: &QueryOptions,
 ) -> Option<Result<QuadChanges, QueryEvaluationError>> {
     use spargebra::term::{GraphNamePattern, GroundTermPattern};
@@ -223,7 +245,7 @@ pub(crate) fn delete_insert(
         return None;
     }
     let pattern = pushdown::push_filters(pattern.clone());
-    let ctx = Context::new(snapshot, options, using);
+    let ctx = Context::new(snapshot, options, using, base);
     let solutions = match ctx.eval(&pattern) {
         Ok(solutions) => solutions,
         Err(NativeError::Fallback) => return None,
@@ -314,6 +336,8 @@ enum Form<'q> {
     Ask,
     /// The triples of the template, per solution.
     Construct(&'q [TriplePattern]),
+    /// The statements about each term the solutions bind ([`Context::describe`]).
+    Describe,
 }
 
 /// The pattern of a query the native executor runs, as it runs it (filters pushed down,
@@ -331,7 +355,7 @@ fn native_pattern<'q>(
         Query::Construct {
             template, pattern, ..
         } => (pattern, Form::Construct(template)),
-        Query::Describe { .. } => return None,
+        Query::Describe { pattern, .. } => (pattern, Form::Describe),
     };
     let pattern = if options.as_written {
         pattern.clone()
@@ -463,22 +487,24 @@ fn query_dataset(query: &Query) -> Option<&spargebra::algebra::QueryDataset> {
     dataset.as_ref()
 }
 
-/// True if [`evaluate`] handles `query` (barring runtime fallbacks).
-pub(crate) fn query_supported(query: &Query) -> bool {
-    // A BASE resolves relative IRIs in IRI(): only spareval knows it at evaluation time.
+/// The query's `BASE`, against which `IRI()` resolves relative IRIs.
+fn query_base(query: &Query) -> Option<&oxiri::Iri<String>> {
     let (Query::Select { base_iri, .. }
     | Query::Ask { base_iri, .. }
     | Query::Construct { base_iri, .. }
     | Query::Describe { base_iri, .. }) = query;
-    if base_iri.is_some() {
-        return false;
-    }
+    base_iri.as_ref()
+}
+
+/// True if [`evaluate`] handles `query` (barring runtime fallbacks).
+pub(crate) fn query_supported(query: &Query) -> bool {
     match query {
-        Query::Select { pattern, .. } | Query::Ask { pattern, .. } => supported(pattern),
+        Query::Select { pattern, .. }
+        | Query::Ask { pattern, .. }
+        | Query::Describe { pattern, .. } => supported(pattern),
         Query::Construct {
             template, pattern, ..
         } => supported(pattern) && template.iter().all(supported_triple),
-        _ => false,
     }
 }
 
@@ -829,6 +855,7 @@ impl<'a> Context<'a> {
         snapshot: &'a Snapshot,
         options: &QueryOptions,
         dataset: Option<&spargebra::algebra::QueryDataset>,
+        base: Option<&oxiri::Iri<String>>,
     ) -> Self {
         use crate::dataset::{DefaultGraph, ResolvedDataset};
         let resolved = ResolvedDataset::resolve(
@@ -849,7 +876,7 @@ impl<'a> Context<'a> {
             as_written: options.as_written,
             snapshot,
             model: options.read_model,
-            evaluator: Evaluator::default(),
+            evaluator: Evaluator::with_base(base.cloned()),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
             decoded: RefCell::default(),
@@ -1885,6 +1912,79 @@ impl<'a> Context<'a> {
         })?))
     }
 
+    /// `DESCRIBE`, as spareval answers it: each term the solutions bind, once, with the
+    /// statements of the default graph it is the subject of; a blank node such a statement
+    /// has as its object is described in turn.
+    fn describe(&self, solutions: &Solutions) -> NativeResult<Vec<oxrdf::Triple>> {
+        let (predicate, object) = (
+            Variable::new_unchecked("described predicate"),
+            Variable::new_unchecked("described object"),
+        );
+        let Some(graph) = self.graph_slot() else {
+            return Ok(Vec::new());
+        };
+        let table = &solutions.table;
+        let mut described: HashSet<u64> = HashSet::new();
+        let mut todo = Vec::new();
+        let mut out = Vec::new();
+        for row in 0..table.len() {
+            for column in 0..table.width() {
+                let id = table.get(row, column);
+                if id != UNDEF && computed_index(id).is_none() && described.insert(id) {
+                    todo.push(id);
+                }
+            }
+            while let Some(node) = todo.pop() {
+                let Some(subject) = self
+                    .term(node)
+                    .and_then(|t| oxrdf::NamedOrBlankNode::try_from(t).ok())
+                else {
+                    continue;
+                };
+                let scan = ScanPattern {
+                    slots: [
+                        Slot::Const(TermId::from_raw(node)),
+                        Slot::Var(predicate.clone()),
+                        Slot::Var(object.clone()),
+                        graph.clone(),
+                    ],
+                };
+                let statements = self.scan(&scan, None)?;
+                let (p_column, o_column) = (
+                    statements.column(&predicate).expect("scanned"),
+                    statements.column(&object).expect("scanned"),
+                );
+                for r in 0..statements.table.len() {
+                    let o_id = statements.table.get(r, o_column);
+                    let (Some(Term::NamedNode(p)), Some(o)) = (
+                        self.term(statements.table.get(r, p_column)),
+                        self.term(o_id),
+                    ) else {
+                        continue;
+                    };
+                    if o.is_blank_node() && described.insert(o_id) {
+                        todo.push(o_id);
+                    }
+                    out.push(oxrdf::Triple::new(subject.clone(), p, o));
+                }
+                self.consumed(&statements);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The graph position of a triple pattern in the active graph; `None` if the graph
+    /// holds nothing.
+    fn graph_slot(&self) -> Option<Slot> {
+        Some(match &*self.graph.borrow() {
+            GraphScope::Default => Slot::Const(TermId::DEFAULT_GRAPH),
+            GraphScope::Union => Slot::Merged,
+            GraphScope::Named(id) => Slot::Const(*id),
+            GraphScope::Variable(v) => Slot::Var(v.clone()),
+            GraphScope::Missing => return None,
+        })
+    }
+
     fn scan_pattern(&self, triple: &TriplePattern) -> Option<ScanPattern> {
         let slot = |term: &TermPattern| -> Option<Slot> {
             Some(match term {
@@ -1902,13 +2002,7 @@ impl<'a> Context<'a> {
             NamedNodePattern::Variable(v) => Slot::Var(v.clone()),
             NamedNodePattern::NamedNode(n) => Slot::Const(self.snapshot.lookup(n.as_ref().into())?),
         };
-        let graph = match &*self.graph.borrow() {
-            GraphScope::Default => Slot::Const(TermId::DEFAULT_GRAPH),
-            GraphScope::Union => Slot::Merged,
-            GraphScope::Named(id) => Slot::Const(*id),
-            GraphScope::Variable(v) => Slot::Var(v.clone()),
-            GraphScope::Missing => return None,
-        };
+        let graph = self.graph_slot()?;
         Some(ScanPattern {
             slots: [
                 slot(&triple.subject)?,
