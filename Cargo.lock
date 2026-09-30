@@ -1021,6 +1021,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-shacl"
+version = "0.1.0"
+dependencies = [
+ "nrese-engine",
+ "nrese-sparql",
+ "oxrdf",
+ "oxrdfio",
+ "oxsdatatypes",
+ "regex",
+]
+
+[[package]]
 name = "nrese-sparql"
 version = "0.1.0"
 dependencies = [

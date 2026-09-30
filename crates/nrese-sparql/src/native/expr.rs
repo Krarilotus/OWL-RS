@@ -330,14 +330,7 @@ impl Evaluator {
             Function::LangMatches => {
                 let (tag, _) = string(&arg(0)?)?;
                 let (range, _) = string(&arg(1)?)?;
-                let matches = if range == "*" {
-                    !tag.is_empty()
-                } else {
-                    tag.len() >= range.len()
-                        && tag[..range.len()].eq_ignore_ascii_case(&range)
-                        && (tag.len() == range.len() || tag.as_bytes()[range.len()] == b'-')
-                };
-                Some(boolean_term(matches))
+                Some(boolean_term(super::value::lang_matches(&tag, &range)))
             }
             Function::Datatype => match arg(0)? {
                 Term::Literal(literal) if is_lang_string(&literal) => {
@@ -463,8 +456,9 @@ impl Evaluator {
     }
 }
 
-/// SPARQL `REGEX` flags (XPath): i, s, m, x, and q (the pattern is a literal string).
-pub(crate) fn compile_regex(pattern: &str, flags: &str) -> Option<Regex> {
+/// The regular expression of SPARQL's `REGEX(_, pattern, flags)`; `None` if the pattern
+/// or a flag is invalid. Flags (XPath): i, s, m, x, and q (the pattern is a literal string).
+pub fn compile_regex(pattern: &str, flags: &str) -> Option<Regex> {
     let mut builder_pattern = String::new();
     let mut literal = false;
     for flag in flags.chars() {

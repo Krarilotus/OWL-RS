@@ -19,6 +19,14 @@ pub mod query;
 pub mod update;
 pub mod view;
 
+/// SPARQL's value semantics for terms (§17): what `<`, `=` and friends compare. Public for
+/// the layers that are defined through them (SHACL's value-range and property-pair
+/// constraints).
+pub mod value {
+    pub use crate::native::expr::compile_regex;
+    pub use crate::native::value::{Value, compare, equals, lang_matches};
+}
+
 pub use dataset::{EngineDataset, EvalTerm};
 pub use native::ResultsFormat;
 pub use nrese_exec::BudgetExceeded;

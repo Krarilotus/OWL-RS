@@ -598,10 +598,7 @@ fn cancelled_reasoning_commits_stop_promptly_and_change_nothing() {
             std::time::Instant::now()
         })
     };
-    let result = owl.apply(
-        insert(&format!("<{EX}D> <{RDFS_SUB}> <{EX}C0> .")),
-        &ticket,
-    );
+    let result = owl.apply(insert(&format!("<{EX}D> <{RDFS_SUB}> <{EX}C0> .")), &ticket);
     let returned = std::time::Instant::now();
     let cancelled = canceller.join().expect("canceller");
     assert!(
@@ -614,7 +611,10 @@ fn cancelled_reasoning_commits_stop_promptly_and_change_nothing() {
     assert_eq!(count(), before);
     assert!(!contains(&owl, &format!("<{EX}x0> a <{EX}C0>")));
 
-    owl.apply(insert(&format!("<{EX}y> a <{EX}C0> .")), &MutationTicket::new())
-        .expect("the writer is free");
+    owl.apply(
+        insert(&format!("<{EX}y> a <{EX}C0> .")),
+        &MutationTicket::new(),
+    )
+    .expect("the writer is free");
     assert!(contains(&owl, &format!("<{EX}y> a <{EX}C100>")));
 }

@@ -31,7 +31,8 @@ Durable storage needs no native toolchain. The revision is persistent, and recov
 Known limits, addressed by later milestones:
 - **Memory:** indexes are bit-packed but held in memory (LUBM(100), 13.4 M asserted and 8.7 M inferred facts: 2.5 GB peak); memory-mapped runs for data larger than RAM are Pf2 step 2.
 - **Reasoning:** the `rdfs` mode is a 6-rule subset; OWL 2 RL omits `eq-ref` and the datatype rules; named graphs aren't reasoning boundaries. See [reasoning-semantics.md](docs/spec/reasoning-semantics.md).
-- **Not yet available:** SHACL, full-text and geospatial search, the RDF4J protocol, clustering. Order and status: [docs/plan/2026-09-30-graphdb-parity-plan.md](docs/plan/2026-09-30-graphdb-parity-plan.md).
+- **SHACL:** the validator exists as a library and passes the W3C Core suite; the endpoint and the commit gate are the next slices ([docs/design/shacl.md](docs/design/shacl.md)).
+- **Not yet available:** full-text and geospatial search, the RDF4J protocol, clustering. Order and status: [docs/plan/2026-09-30-graphdb-parity-plan.md](docs/plan/2026-09-30-graphdb-parity-plan.md).
 - **Behaviour changes from v1:** literal lexical forms are kept exactly as written, and a named graph exists only while it holds quads. See ADR-0002.
 
 Already fixed on the way (Milestone 0):
@@ -48,6 +49,7 @@ Already fixed on the way (Milestone 0):
 | `crates/nrese-exec` | L1 | execution core: id tables, joins, grouping, closures, memory budgets; shared by SPARQL and reasoning |
 | `crates/nrese-sparql` | L2 | SPARQL 1.1: native executor and planner, spareval fallback, updates, result writers |
 | `crates/nrese-reasoner` | L2 | reasoner v2: rule IR, rulesets, batch and delta executors, modules; reasoning profiles |
+| `crates/nrese-shacl` | L2 | SHACL Core: shapes compiler, validator, validation report (not yet wired into the server) |
 | `crates/nrese-store` | L3 | operations (query, update, graph store, tell, backup) and the mutation pipeline |
 | `crates/nrese-server` | L4 | HTTP transport, auth, policy, posture, UI hosting |
 | `apps/nrese-console` | L5 | React/TypeScript console and CLI |

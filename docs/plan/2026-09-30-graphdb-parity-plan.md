@@ -33,7 +33,7 @@ Legend: ✅ done · 🟡 partial · ❌ missing · ➖ deliberately different.
 | 2.1 | Rules compiled to id-level code | ✅ | Schema-grounded rule instances, dispatch index, parallel joins |
 | 2.2 | Semi-naive fixpoint, consistency rules | ✅ | Batch = naive on 400 random ontologies |
 | 2.3 | TMS, retraction, atomic rollback | ✅ | DRed + B/F; incremental = rematerialisation on 84 k random changes |
-| 3.1–3.2 | SHACL Core, SHACL-SPARQL, commit gate, incremental validation | ❌ | S1–S3; nothing built yet |
+| 3.1–3.2 | SHACL Core, SHACL-SPARQL, commit gate, incremental validation | 🟡 | The Core validator is built (`nrese-shacl`, W3C Core 98 of 98). Not yet: endpoint, commit gate, incremental validation, SHACL-SPARQL. Design: [shacl.md](../design/shacl.md) |
 | 4.1 | SPARQL 1.1 Query, Update | ✅ | W3C suite 485/495; native executor covers almost all queries |
 | 4.1 | Federated `SERVICE` | ❌ | X2 (with SSRF guards) |
 | 4.1 | Graph Store Protocol | 🟡 | Works; status codes for missing graphs differ from the spec (review) |
@@ -101,7 +101,9 @@ GraphDB's value is its rulesets. Ours are data (rule text), so breadth is mostly
 
 | Slice | Scope | Done when |
 |---|---|---|
-| C1 | `nrese-shacl` crate: shapes compiled to an id-level program; SHACL Core components, all property paths, severities; report as graph and JSON | W3C SHACL Core suite |
+| C1a ✅ | `nrese-shacl` crate: shapes compiled to an id-level program; SHACL Core components, all property paths, severities; the report as a graph | W3C SHACL Core suite: 98 of 98 |
+| C1b | Store operation and server endpoint: validate the repository, or a posted shapes graph; the report as RDF and JSON; configuration | HTTP tests; the report round-trips as RDF |
+| C1c | Parallel and set-at-a-time evaluation | Same reports as C1a; perf-lab numbers recorded |
 | C2 | Commit gate after reasoning, in store orchestration; a target index; incremental validation from Δ⁺/Δ⁻ | Incremental = full revalidation on random deltas; cost proportional to affected focus nodes |
 | C3 | SHACL-SPARQL constraints and targets through `nrese-sparql` | W3C SHACL-SPARQL tests |
 
