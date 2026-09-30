@@ -1,0 +1,23 @@
+[package]
+name = "oxigraph-comparison"
+description = "NRESE's RDF bundle side by side with the Oxigraph crates it replaces: differential tests and throughput benchmarks"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# A workspace of its own: the NRESE workspace stays free of Oxigraph crates.
+[workspace]
+
+[dependencies]
+nrese-rdf = { path = "../../crates/rdf/nrese-rdf" }
+nrese-xsd = { path = "../../crates/rdf/nrese-xsd" }
+# The released crates, unpatched: the comparison is with Oxigraph as it ships.
+oxiri = "=0.2.11"
+oxrdf = "=0.3.3"
+oxsdatatypes = "=0.2.2"
+rand = "0.9"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -29,7 +29,7 @@ use nrese_exec::join::{anti_join, compatible_mask, outer_join_with_undef, semi_j
 use nrese_exec::{IdTable, UNDEF};
 
 use super::{
-    Context, NativeError, NativeResult, Solutions, bound_variables, expr, has_undef, pushdown,
+    Context, GraphScope, NativeResult, Solutions, bound_variables, expr, has_undef, pushdown,
     shared_columns, supported,
 };
 
@@ -40,16 +40,8 @@ pub(super) fn supported_expression(expression: &Expression, outer: &[Variable]) 
     let plain = split(expression, &mut patterns, &mut |n| {
         Variable::new_unchecked(format!("exists {n}"))
     });
-    expr::supported(&plain)
-        && patterns
-            .iter()
-            .all(|(_, pattern)| supported(pattern) && exists_supported(pattern, outer))
-}
-
-/// Whether `EXISTS { pattern }` runs natively on solutions of `outer`.
-fn exists_supported(pattern: &GraphPattern, outer: &[Variable]) -> bool {
-    let (_, inner) = top_filters(pattern);
-    correlation_safe(inner, outer)
+    let _ = outer;
+    expr::supported(&plain) && patterns.iter().all(|(_, pattern)| supported(pattern))
 }
 
 /// The conjuncts of the filters at the top of `pattern`, and what they filter.
@@ -393,7 +385,11 @@ impl Context<'_> {
             self.exists_mask(&solutions, pattern)?
         } else {
             if !correlation_safe(inner, &solutions.vars) {
-                return Err(NativeError::Fallback);
+                let mask = self.exists_substituted(&solutions, pattern)?;
+                solutions
+                    .table
+                    .retain_mask(&mask.iter().map(|m| *m == keep_matching).collect::<Vec<_>>());
+                return Ok(solutions);
             }
             // One evaluation, one semi- or anti-join.
             let found = self.eval(pattern)?;
@@ -432,6 +428,72 @@ impl Context<'_> {
             .any(|v| solutions.column(v).is_some())
     }
 
+    /// Per row of `solutions`, whether `EXISTS { pattern }` holds, by substitution
+    /// ([`super::substitute`]): the pattern with the row's values put in, evaluated once
+    /// per distinct value of the outer variables it mentions.
+    fn exists_substituted(
+        &self,
+        solutions: &Solutions,
+        pattern: &GraphPattern,
+    ) -> NativeResult<Vec<bool>> {
+        let visible = mentioned(pattern);
+        let columns: Vec<(usize, Variable)> = solutions
+            .vars
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| visible.contains(v))
+            .map(|(i, v)| (i, v.clone()))
+            .collect();
+        // Under `GRAPH ?g` evaluated for all graphs at once, each row's graph is its `?g`:
+        // the pattern holds or not in that graph, not in any.
+        let graph_column = match &*self.graph.borrow() {
+            GraphScope::Variable(v) => solutions.column(v),
+            _ => None,
+        };
+        let mut answers: HashMap<Vec<u64>, bool> = HashMap::new();
+        let mut mask = Vec::with_capacity(solutions.table.len());
+        for row in 0..solutions.table.len() {
+            self.check()?;
+            let mut key: Vec<u64> = columns
+                .iter()
+                .map(|(c, _)| solutions.table.get(row, *c))
+                .collect();
+            let graph = graph_column
+                .map(|c| solutions.table.get(row, c))
+                .filter(|&id| id != UNDEF);
+            key.push(graph.unwrap_or(UNDEF));
+            if let Some(&holds) = answers.get(&key) {
+                mask.push(holds);
+                continue;
+            }
+            let mut terms = HashMap::new();
+            for ((_, variable), &id) in columns.iter().zip(&key) {
+                if id == UNDEF {
+                    continue;
+                }
+                if let Some(term) = self.term(id) {
+                    if let Term::BlankNode(b) = &term {
+                        self.register_alias(super::substitute::alias(b.as_str()).as_str(), id);
+                    }
+                    terms.insert(variable.clone(), term);
+                }
+            }
+            let substituted = super::substitute::Values { terms: &terms }.pattern(pattern);
+            let found = match graph {
+                Some(id) => self.in_graph(
+                    GraphScope::Named(nrese_engine::TermId::from_raw(id)),
+                    &substituted,
+                )?,
+                None => self.eval(&substituted)?,
+            };
+            let holds = !found.table.is_empty();
+            self.consumed(&found);
+            answers.insert(key, holds);
+            mask.push(holds);
+        }
+        Ok(mask)
+    }
+
     /// Per row of `solutions`, whether `EXISTS { pattern }` holds.
     pub(super) fn exists_mask(
         &self,
@@ -443,7 +505,7 @@ impl Context<'_> {
         }
         let (conjuncts, inner) = top_filters(pattern);
         if !correlation_safe(inner, &solutions.vars) {
-            return Err(NativeError::Fallback);
+            return self.exists_substituted(solutions, pattern);
         }
         let (local, correlated): (Vec<&Expression>, Vec<&Expression>) = conjuncts
             .into_iter()

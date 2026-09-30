@@ -1,4 +1,5 @@
-//! SPARQL property paths over ids, with spareval's semantics (the differential oracle).
+//! SPARQL property paths over ids (SPARQL 1.1 §18.4; the deviations the reference
+//! evaluator's `Deviations` names aside).
 //!
 //! | Path | Result |
 //! |---|---|
@@ -185,7 +186,7 @@ impl PathEvaluator<'_> {
         nodes
     }
 
-    /// Ends reachable from `start` (a bag, as spareval's `eval_from`).
+    /// Ends reachable from `start` (a bag).
     pub(crate) fn from(&self, path: &Path, start: u64) -> Vec<u64> {
         match path {
             Path::Link(None) => Vec::new(),
@@ -227,7 +228,7 @@ impl PathEvaluator<'_> {
         }
     }
 
-    /// Starts that reach `end` (a bag, as spareval's `eval_to`).
+    /// Starts that reach `end` (a bag).
     pub(crate) fn to(&self, path: &Path, end: u64) -> Vec<u64> {
         match path {
             Path::Link(None) => Vec::new(),
@@ -269,7 +270,7 @@ impl PathEvaluator<'_> {
         }
     }
 
-    /// True if `path` connects `start` to `end` (spareval's `eval_closed`).
+    /// True if `path` connects `start` to `end`.
     pub(crate) fn connects(&self, path: &Path, start: u64, end: u64) -> bool {
         match path {
             Path::Link(None) => false,
@@ -358,7 +359,7 @@ impl PathEvaluator<'_> {
         }
     }
 
-    /// Every `(start, end)` pair (spareval's `eval_open`).
+    /// Every `(start, end)` pair.
     pub(crate) fn open(&self, path: &Path) -> Vec<(u64, u64)> {
         match path {
             Path::Link(None) => Vec::new(),

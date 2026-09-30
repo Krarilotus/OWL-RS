@@ -10,7 +10,7 @@ NRESE is a Rust RDF database under active redesign. The goal is a store that **r
 
 ## Current state (engine v2 storage, reasoner v2)
 
-The server runs on **NRESE's own storage engine** (`nrese-engine`, [ADR-0002](docs/adr/0002-engine-storage-lsm-permutations.md)) with SPARQL 1.1 from `nrese-sparql`: a native executor (merge, hash and worst-case-optimal joins, cost-based join order, `explain=true`) for the queries it covers, spareval for the rest. It offers:
+The server runs on **NRESE's own storage engine** (`nrese-engine`, [ADR-0002](docs/adr/0002-engine-storage-lsm-permutations.md)) with SPARQL 1.1 from `nrese-sparql`: a native executor (merge, hash and worst-case-optimal joins, cost-based join order, `explain=true`) that evaluates every query and update. It offers:
 - SPARQL query and update, the Graph Store Protocol, and `TELL` ingest
 - materialised reasoning (`rdfs`, `owl2-rl`): inferences are queryable and maintained on every commit, and consistency violations reject the commit. What each mode computes, and what it omits, is in [docs/spec/reasoning-semantics.md](docs/spec/reasoning-semantics.md)
 - per-request read models: asserted only (`infer=false`), inferred only, or both
@@ -49,7 +49,7 @@ Already fixed on the way (Milestone 0):
 | `crates/nrese-core` | L0 | shared report and capability contracts |
 | `crates/nrese-engine` | L1 | storage engine: dictionary, packed permutation indexes, MVCC snapshots, WAL and checkpoints, statistics |
 | `crates/nrese-exec` | L1 | execution core: id tables, joins, grouping, closures, memory budgets; shared by SPARQL and reasoning |
-| `crates/nrese-sparql` | L2 | SPARQL 1.1: native executor and planner, spareval fallback, updates, result writers |
+| `crates/nrese-sparql` | L2 | SPARQL 1.1: native executor and planner, updates, result writers |
 | `crates/nrese-reasoner` | L2 | reasoner v2: rule IR, rulesets, batch and delta executors, modules; reasoning profiles |
 | `crates/nrese-shacl` | L2 | SHACL Core: shapes compiler, validator, validation report |
 | `crates/nrese-store` | L3 | operations (query, update, graph store, tell, backup) and the mutation pipeline |

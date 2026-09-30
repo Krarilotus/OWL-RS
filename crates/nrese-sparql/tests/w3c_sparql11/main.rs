@@ -4,9 +4,10 @@
 //! - **Source.** The suite is the pinned `w3c/rdf-tests` checkout fetched by
 //!   `scripts/fetch-w3c-tests.sh` into `.cache/rdf-tests`, or wherever `NRESE_W3C_TESTS`
 //!   points. Without it the test is skipped, unless `NRESE_W3C_REQUIRED` is set (as in CI).
-//! - **Oracle.** Every test also runs on Oxigraph's store, with the same spareval evaluator.
-//!   A failure on both is the evaluator's or the test format's. A failure only on ours is our
-//!   bug, or one of our documented semantic differences. The gate is spareval's pass rate.
+//! - **Reference.** Every test also runs on the reference evaluator
+//!   (`nrese-sparql-reference`: the specification's algebra, evaluated plainly), which
+//!   shares the executor's function semantics. A failure on both is a function's or the
+//!   test format's; a failure only on ours is the executor's.
 //! - **Not covered here.** Protocol, Graph Store Protocol, service description and
 //!   federation tests are HTTP-level and belong to the server's suites.
 //! - **Expected failures.** Every known failure of ours is listed with its reason in
@@ -24,13 +25,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use manifest::{GraphFile, Kind, Suite, Test};
 use nrese_engine::{Engine, EngineConfig, QuadPattern};
 use nrese_sparql::{QueryOptions, QueryResults, UpdateOptions, apply_update, evaluate_query};
-use oxigraph::sparql::SparqlEvaluator;
-use oxigraph::store::Store;
 use oxrdf::graph::CanonicalizationAlgorithm;
 use oxrdf::{BlankNode, Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Variable};
 use results::{Results, canonical, parse_expected};
 use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use spargebra::{Query, SparqlParser, Update};
+use std::cell::RefCell;
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
 
@@ -138,7 +138,7 @@ fn report(rows: &BTreeMap<String, Row>) -> String {
         oracle_passed += usize::from(matches!(row.oracle, Outcome::Passed));
     }
     let mut out = String::from(
-        "W3C SPARQL 1.1 on engine v2: passed / failed / skipped (failures shared with the oracle)\n",
+        "W3C SPARQL 1.1 on engine v2: passed / failed / skipped (failures shared with the reference)\n",
     );
     let mut total = [0; 4];
     for (kind, counts) in &by_kind {
@@ -153,14 +153,14 @@ fn report(rows: &BTreeMap<String, Row>) -> String {
     }
     let _ = writeln!(
         out,
-        "  total: {} / {} / {} ({})\n  oracle (spareval on Oxigraph's store) passed: {oracle_passed}\n",
+        "  total: {} / {} / {} ({})\n  reference evaluator passed: {oracle_passed}\n",
         total[0], total[1], total[2], total[3]
     );
     for (id, row) in rows {
         match &row.ours {
             Outcome::Failed(message) => {
                 let scope = match row.oracle.failed() {
-                    true => "shared with the oracle",
+                    true => "shared with the reference",
                     false => "ours only",
                 };
                 let message: String = message.chars().take(3_000).collect();
@@ -170,7 +170,7 @@ fn report(rows: &BTreeMap<String, Row>) -> String {
                 let _ = writeln!(out, "SKIP {id}: {reason}");
             }
             Outcome::Passed if row.oracle.failed() => {
-                let _ = writeln!(out, "PASS (oracle fails) {id}");
+                let _ = writeln!(out, "PASS (reference fails) {id}");
             }
             Outcome::Passed => {}
         }
@@ -181,7 +181,7 @@ fn report(rows: &BTreeMap<String, Row>) -> String {
 /// Where a test runs.
 enum Backend {
     Ours(Engine),
-    Oracle(Store),
+    Oracle(RefCell<nrese_sparql_reference::Dataset>),
 }
 
 impl Backend {
@@ -196,7 +196,7 @@ impl Backend {
     }
 
     fn oracle() -> Self {
-        Self::Oracle(Store::new().expect("store"))
+        Self::Oracle(RefCell::default())
     }
 
     fn insert(&self, quads: &[Quad]) -> Result<(), String> {
@@ -208,9 +208,13 @@ impl Backend {
                 }
                 tx.commit().map(drop).map_err(|error| error.to_string())
             }
-            Self::Oracle(store) => store
-                .extend(quads.iter().cloned())
-                .map_err(|error| error.to_string()),
+            Self::Oracle(dataset) => {
+                let mut dataset = dataset.borrow_mut();
+                for quad in quads {
+                    dataset.insert(quad.clone());
+                }
+                Ok(())
+            }
         }
     }
 
@@ -227,11 +231,10 @@ impl Backend {
                 let snapshot = engine.snapshot();
                 consume(evaluate_query(&snapshot, query, &QueryOptions::default()).map_err(failed)?)
             }
-            Self::Oracle(store) => consume(
-                SparqlEvaluator::new()
-                    .for_query(query.clone())
-                    .on_store(store)
-                    .execute()
+            Self::Oracle(dataset) => consume(
+                dataset
+                    .borrow()
+                    .query(query, &QueryOptions::default())
                     .map_err(failed)?,
             ),
         }
@@ -245,10 +248,9 @@ impl Backend {
                     .map_err(|error| format!("update failed: {error}"))?;
                 tx.commit().map(drop).map_err(|error| error.to_string())
             }
-            Self::Oracle(store) => SparqlEvaluator::new()
-                .for_update(update.clone())
-                .on_store(store)
-                .execute()
+            Self::Oracle(dataset) => dataset
+                .borrow_mut()
+                .update(update, &QueryOptions::default())
                 .map_err(|error| format!("update failed: {error}")),
         }
     }
@@ -262,7 +264,7 @@ impl Backend {
                     .map(|quad| snapshot.decode_quad(quad).expect("decodable"))
                     .collect()
             }
-            Self::Oracle(store) => store.iter().map(|quad| quad.expect("quad")).collect(),
+            Self::Oracle(dataset) => dataset.borrow().quads().cloned().collect(),
         };
         dataset.canonicalize(CanonicalizationAlgorithm::Unstable);
         dataset

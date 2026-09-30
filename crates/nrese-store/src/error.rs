@@ -81,7 +81,6 @@ impl StoreError {
                 QueryEvaluationError::Dataset(_)
                     | QueryEvaluationError::Unexpected(_)
                     | QueryEvaluationError::Cancelled
-                    | QueryEvaluationError::UnexpectedDefaultGraph
             ),
             Self::Configuration(_)
             | Self::Io(_)

@@ -1,11 +1,9 @@
 //! The native query executor (execution-core design, XC3): SPARQL algebra evaluated over id
 //! tables with the shared execution core (`nrese-exec`, decision D11).
 //!
-//! **Whole-query switch.** [`evaluate`] returns `None` unless every operator of the query is
-//! supported ([`supported`]); the caller then runs spareval exactly as before. A few rare
-//! semantic corners are only detectable at runtime (UNDEF in MINUS or NOT EXISTS keys); they
-//! also hand the query back to spareval ([`NativeError::Fallback`]). So native coverage can
-//! grow without ever changing results.
+//! **The only executor.** Every query and update runs here. What it doesn't implement is
+//! an error ([`NativeError::Unsupported`], `QueryEvaluationError::Unsupported`), found
+//! before evaluation where the algebra shows it ([`supported`]).
 //!
 //! **Execution.** Intermediate results are [`IdTable`]s of term ids; terms are decoded only
 //! for expressions and for the output. BGPs are ordered greedily by *exact* pattern counts
@@ -35,6 +33,7 @@ mod search;
 mod sets;
 mod sideways;
 mod spatial;
+mod substitute;
 pub(crate) mod value;
 mod wcoj;
 
@@ -45,6 +44,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
+use crate::results::{
+    CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIter,
+};
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
@@ -58,14 +60,12 @@ use oxrdf::vocab::xsd;
 use oxrdf::{Literal, Term, Variable};
 use oxsdatatypes::{Decimal, Double, Float, Integer};
 use rayon::prelude::*;
-use spareval::{
-    CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIter,
-};
 use spargebra::Query;
 use spargebra::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
 };
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
+use std::borrow::Cow;
 
 use crate::query::{PlanStep, QueryOptions};
 use expr::Evaluator;
@@ -83,8 +83,8 @@ const PROBE_CHUNK: usize = 4096;
 const DECODE_CACHE_ENTRIES: usize = 1 << 18;
 
 pub(crate) enum NativeError {
-    /// Not handled natively after all: run the query on spareval.
-    Fallback,
+    /// Something the executor doesn't implement.
+    Unsupported(String),
     Evaluation(QueryEvaluationError),
 }
 
@@ -94,95 +94,89 @@ impl From<QueryEvaluationError> for NativeError {
     }
 }
 
+impl From<NativeError> for QueryEvaluationError {
+    fn from(error: NativeError) -> Self {
+        match error {
+            NativeError::Unsupported(what) => QueryEvaluationError::Unsupported(what),
+            NativeError::Evaluation(error) => error,
+        }
+    }
+}
+
+fn unsupported<T>(what: impl Into<String>) -> NativeResult<T> {
+    Err(NativeError::Unsupported(what.into()))
+}
+
 type NativeResult<T> = Result<T, NativeError>;
 
-/// Runs `query` natively if it is fully supported; `None` means "use spareval".
+/// Runs `query` on `snapshot` (borrowed from the view, or owned: a transaction's pending
+/// state). The solutions are computed here and decoded as they are read.
 pub(crate) fn evaluate<'a>(
-    snapshot: &'a Snapshot,
+    snapshot: Cow<'a, Snapshot>,
     query: &Query,
     options: &QueryOptions,
-) -> Option<Result<QueryResults<'a>, QueryEvaluationError>> {
+) -> Result<QueryResults<'a>, QueryEvaluationError> {
     let (pattern, form) = native_pattern(query, options)?;
-    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let solutions = match ctx.eval(&pattern) {
-        Ok(solutions) => solutions,
-        Err(NativeError::Fallback) => return None,
-        Err(NativeError::Evaluation(error)) => return Some(Err(error)),
-    };
+    let ctx = Context::new(&snapshot, options, query_dataset(query), query_base(query));
+    let solutions = ctx.eval(&pattern)?;
     match form {
         Form::Select => {}
         Form::Describe => {
-            let triples = match ctx.describe(&solutions) {
-                Ok(triples) => triples,
-                Err(NativeError::Fallback) => return None,
-                Err(NativeError::Evaluation(error)) => return Some(Err(error)),
-            };
-            return Some(Ok(QueryResults::Graph(QueryTripleIter::new(
+            let triples = ctx.describe(&solutions)?;
+            return Ok(QueryResults::Graph(QueryTripleIter::new(
                 triples.into_iter().map(Ok),
-            ))));
+            )));
         }
-        Form::Ask => return Some(Ok(QueryResults::Boolean(!solutions.table.is_empty()))),
+        Form::Ask => return Ok(QueryResults::Boolean(!solutions.table.is_empty())),
         Form::Construct(template) => {
-            let Context {
-                snapshot, computed, ..
-            } = ctx;
-            let triples = construct(snapshot, computed.into_inner(), solutions, template);
-            return Some(Ok(QueryResults::Graph(QueryTripleIter::new(
-                triples.map(Ok),
-            ))));
+            let computed = ctx.computed.into_inner();
+            let triples: Vec<_> = construct(&snapshot, computed, solutions, template).collect();
+            return Ok(QueryResults::Graph(QueryTripleIter::new(
+                triples.into_iter().map(Ok),
+            )));
         }
     }
     let variables: Arc<[Variable]> = solutions.vars.clone().into();
-    let Context {
-        snapshot, computed, ..
-    } = ctx;
-    let computed = computed.into_inner();
+    let computed = ctx.computed.into_inner();
     let table = solutions.table;
     let rows = (0..table.len()).map(move |row| {
         Ok((0..table.width())
-            .map(|column| decode(snapshot, &computed, table.get(row, column)))
+            .map(|column| decode(&snapshot, &computed, table.get(row, column)))
             .collect::<Vec<_>>())
     });
-    Some(Ok(QueryResults::Solutions(QuerySolutionIter::from_tuples(
+    Ok(QueryResults::Solutions(QuerySolutionIter::new(
         variables, rows,
-    ))))
+    )))
 }
 
-/// Runs `query` natively, recording each operator ([`PlanStep`]); returns the steps and
-/// the number of solutions. `None` means "use spareval", as for [`evaluate`].
+/// Runs `query`, recording each operator ([`PlanStep`]); returns the steps and the number
+/// of solutions (triples for CONSTRUCT and DESCRIBE).
 pub(crate) fn explain(
     snapshot: &Snapshot,
     query: &Query,
     options: &QueryOptions,
-) -> Option<Result<(Vec<PlanStep>, u64), QueryEvaluationError>> {
+) -> Result<(Vec<PlanStep>, u64), QueryEvaluationError> {
     let (pattern, form) = native_pattern(query, options)?;
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     ctx.trace = Some(RefCell::default());
-    let solutions = match ctx.eval(&pattern) {
-        Ok(solutions) => solutions,
-        Err(NativeError::Fallback) => return None,
-        Err(NativeError::Evaluation(error)) => return Some(Err(error)),
-    };
+    let solutions = ctx.eval(&pattern)?;
     let steps = ctx.trace.take().unwrap_or_default().into_inner();
     // CONSTRUCT and DESCRIBE count triples.
     let rows = match form {
         Form::Select | Form::Ask => solutions.table.len(),
-        Form::Describe => match ctx.describe(&solutions) {
-            Ok(triples) => triples.len(),
-            Err(NativeError::Fallback) => return None,
-            Err(NativeError::Evaluation(error)) => return Some(Err(error)),
-        },
+        Form::Describe => ctx.describe(&solutions)?.len(),
         Form::Construct(template) => {
             construct(snapshot, ctx.computed.into_inner(), solutions, template).count()
         }
     };
-    Some(Ok((steps, rows as u64)))
+    Ok((steps, rows as u64))
 }
 
 pub use output::ResultsFormat;
 
-/// Writes the results of a native SELECT (or, in JSON, ASK) straight from the id table
-/// ([`output`]); `None` if the query doesn't run natively (use the general path).
+/// Writes the results of a SELECT (or, in JSON, ASK) straight from the id table
+/// ([`output`]); `None` for CONSTRUCT, DESCRIBE and ASK in TSV or CSV (use the general
+/// path).
 pub(crate) fn write_results(
     snapshot: &Snapshot,
     query: &Query,
@@ -190,7 +184,10 @@ pub(crate) fn write_results(
     format: ResultsFormat,
     out: &mut dyn std::io::Write,
 ) -> Option<Result<(), crate::query::WriteResultsError>> {
-    let (pattern, form) = native_pattern(query, options)?;
+    let (pattern, form) = match native_pattern(query, options) {
+        Ok(native) => native,
+        Err(error) => return Some(Err(error.into())),
+    };
     match form {
         Form::Construct(_) | Form::Describe => return None,
         Form::Ask if format != ResultsFormat::Json => return None,
@@ -199,8 +196,7 @@ pub(crate) fn write_results(
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let solutions = match ctx.eval(&pattern) {
         Ok(solutions) => solutions,
-        Err(NativeError::Fallback) => return None,
-        Err(NativeError::Evaluation(error)) => return Some(Err(error.into())),
+        Err(error) => return Some(Err(QueryEvaluationError::from(error).into())),
     };
     if matches!(form, Form::Ask) {
         let bytes = output::boolean(!solutions.table.is_empty());
@@ -237,11 +233,11 @@ pub(crate) fn write_results(
 /// The quads an update removes and adds, in that order.
 pub(crate) type QuadChanges = (Vec<oxrdf::Quad>, Vec<oxrdf::Quad>);
 
-/// The quads a `DELETE`/`INSERT … WHERE` removes and adds, with its `WHERE` evaluated
-/// natively on `snapshot`; `None` if the pattern isn't supported (use spareval). `using`
+/// The quads a `DELETE`/`INSERT … WHERE` removes and adds, with its `WHERE` evaluated on
+/// `snapshot`. `using`
 /// is the operation's dataset (`USING`, `WITH`); the protocol's, in `options.dataset`,
 /// replaces it. Templates
-/// are filled as spareval fills them: a quad with an unbound or ill-placed term (a literal
+/// are filled as SPARQL 1.1 Update §3.1.3 says: a quad with an unbound or ill-placed term (a literal
 /// subject or graph, a non-IRI predicate) is skipped, and inserted blank nodes are fresh per
 /// solution.
 pub(crate) fn delete_insert(
@@ -252,18 +248,14 @@ pub(crate) fn delete_insert(
     using: Option<&spargebra::algebra::QueryDataset>,
     base: Option<&oxiri::Iri<String>>,
     options: &QueryOptions,
-) -> Option<Result<QuadChanges, QueryEvaluationError>> {
+) -> Result<QuadChanges, QueryEvaluationError> {
     use spargebra::term::{GraphNamePattern, GroundTermPattern};
-    if !supported(pattern) {
-        return None;
+    if let Some(what) = unsupported_part(pattern) {
+        return Err(QueryEvaluationError::Unsupported(what));
     }
     let pattern = pushdown::push_filters(pattern.clone());
     let ctx = Context::new(snapshot, options, using, base);
-    let solutions = match ctx.eval(&pattern) {
-        Ok(solutions) => solutions,
-        Err(NativeError::Fallback) => return None,
-        Err(NativeError::Evaluation(error)) => return Some(Err(error)),
-    };
+    let solutions = ctx.eval(&pattern)?;
     let computed = ctx.computed.into_inner();
     let table = &solutions.table;
     let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
@@ -340,7 +332,7 @@ pub(crate) fn delete_insert(
             inserts.push(oxrdf::Quad::new(s, p, o, g));
         }
     }
-    Some(Ok((deletes, inserts)))
+    Ok((deletes, inserts))
 }
 
 /// What a query returns.
@@ -358,9 +350,17 @@ enum Form<'q> {
 fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
-) -> Option<(GraphPattern, Form<'q>)> {
+) -> Result<(GraphPattern, Form<'q>), QueryEvaluationError> {
     if !query_supported(query) {
-        return None;
+        let pattern = match query {
+            Query::Select { pattern, .. }
+            | Query::Ask { pattern, .. }
+            | Query::Construct { pattern, .. }
+            | Query::Describe { pattern, .. } => pattern,
+        };
+        return Err(QueryEvaluationError::Unsupported(
+            unsupported_part(pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
+        ));
     }
     let (pattern, form) = match query {
         Query::Select { pattern, .. } => (pattern, Form::Select),
@@ -375,7 +375,19 @@ fn native_pattern<'q>(
     } else {
         pushdown::push_filters(pattern.clone())
     };
-    Some((pattern, form))
+    Ok((pattern, form))
+}
+
+/// A description of the first part of `pattern` the executor doesn't implement.
+fn unsupported_part(pattern: &GraphPattern) -> Option<String> {
+    if supported(pattern) {
+        return None;
+    }
+    let text = pattern.to_string();
+    Some(format!(
+        "the pattern {}",
+        text.chars().take(200).collect::<String>()
+    ))
 }
 
 /// A position of a CONSTRUCT template, resolved against the solution columns.
@@ -388,10 +400,10 @@ enum TemplateTerm {
     Fresh(usize),
 }
 
-/// The triples of `template` instantiated with every solution, as spareval produces them:
-/// template blank nodes are fresh per solution, triples with an unbound or ill-placed term
-/// (a literal subject, a non-IRI predicate) are skipped, and repeated triples without blank
-/// nodes are emitted once (the memory of emitted triples is bounded, as in spareval).
+/// The triples of `template` instantiated with every solution (SPARQL 1.1 §16.2): template
+/// blank nodes are fresh per solution, triples with an unbound or ill-placed term (a
+/// literal subject, a non-IRI predicate) are skipped, and repeated triples without blank
+/// nodes are emitted once (the memory of emitted triples is bounded).
 fn construct<'a>(
     snapshot: &'a Snapshot,
     computed: Vec<Term>,
@@ -527,10 +539,7 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
         GraphPattern::Bgp { patterns } => patterns.iter().all(supported_triple),
         GraphPattern::Graph { inner, .. } => supported(inner),
         // The block runs at the endpoint.
-        GraphPattern::Service {
-            name: NamedNodePattern::NamedNode(_),
-            ..
-        } => true,
+        GraphPattern::Service { .. } => true,
         GraphPattern::Path {
             subject, object, ..
         } => supported_term(subject) && supported_term(object),
@@ -599,6 +608,7 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
                     }
                 })
         }
+        #[allow(unreachable_patterns)]
         _ => false,
     }
 }
@@ -662,6 +672,54 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
             }
             _ => false,
         }
+    }
+    // Inside `GRAPH ?g { P }`, `?g` is bound only where P binds it (SPARQL 1.1 §18.6: P
+    // is evaluated in each graph, then joined with `?g`). An expression reading `?g`
+    // sees it unbound, which only the graph-by-graph evaluation gives.
+    fn read_by_expressions(pattern: &GraphPattern, graph: &Variable) -> bool {
+        match pattern {
+            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
+                read_by_expressions(left, graph) || read_by_expressions(right, graph)
+            }
+            GraphPattern::LeftJoin {
+                left,
+                right,
+                expression,
+            } => {
+                read_by_expressions(left, graph)
+                    || read_by_expressions(right, graph)
+                    || expression
+                        .as_ref()
+                        .is_some_and(|e| exists::deep_variables(e).contains(graph))
+            }
+            GraphPattern::Filter { inner, expr: e }
+            | GraphPattern::Extend {
+                inner,
+                expression: e,
+                ..
+            } => read_by_expressions(inner, graph) || exists::deep_variables(e).contains(graph),
+            _ => false,
+        }
+    }
+    fn bound_by_scans(pattern: &GraphPattern, graph: &Variable) -> bool {
+        match pattern {
+            GraphPattern::Bgp { patterns } => patterns.iter().any(|t| {
+                [&t.subject, &t.object]
+                    .into_iter()
+                    .any(|term| matches!(term, TermPattern::Variable(v) if v == graph))
+                    || matches!(&t.predicate, NamedNodePattern::Variable(v) if v == graph)
+            }),
+            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
+                bound_by_scans(left, graph) || bound_by_scans(right, graph)
+            }
+            GraphPattern::LeftJoin { left, .. }
+            | GraphPattern::Filter { inner: left, .. }
+            | GraphPattern::Extend { inner: left, .. } => bound_by_scans(left, graph),
+            _ => false,
+        }
+    }
+    if read_by_expressions(pattern, graph) && !bound_by_scans(pattern, graph) {
+        return false;
     }
     only_scans(pattern, graph) && rows_from_scans(pattern)
 }
@@ -804,7 +862,7 @@ fn expression_variables(expression: &Expression) -> Vec<Variable> {
 }
 
 /// Solutions: a table whose column `i` binds variable `vars[i]`. `ordered` marks a row
-/// order that matters (from ORDER BY): operators then keep it, as spareval does, so a
+/// order that matters (from ORDER BY): operators then keep it, so a
 /// sorted subquery stays sorted through the joins above it.
 struct Solutions {
     vars: Vec<Variable>,
@@ -830,6 +888,8 @@ struct Context<'a> {
     snapshot: &'a Snapshot,
     /// Which statements the query reads (asserted, inferred or both).
     model: ReadModel,
+    /// Alias IRIs that stand for blank nodes put into a pattern ([`substitute`]).
+    aliases: RefCell<HashMap<String, u64>>,
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
@@ -899,6 +959,7 @@ impl<'a> Context<'a> {
             snapshot,
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
+            aliases: RefCell::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
             decoded: RefCell::default(),
@@ -913,6 +974,29 @@ impl<'a> Context<'a> {
             synthetic: Cell::new(0),
             services: options.services.clone(),
             equality_closed: options.equality_closed,
+        }
+    }
+
+    /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
+    /// blank node.
+    fn lookup_const(&self, term: oxrdf::TermRef<'_>) -> Option<TermId> {
+        if let oxrdf::TermRef::NamedNode(n) = term
+            && n.as_str().starts_with(substitute::ALIAS)
+        {
+            return self
+                .aliases
+                .borrow()
+                .get(n.as_str())
+                .map(|&id| TermId::from_raw(id));
+        }
+        self.snapshot.lookup(term)
+    }
+
+    /// Makes `alias` stand for the blank node `id` in patterns and expressions.
+    fn register_alias(&self, alias: &str, id: u64) {
+        self.aliases.borrow_mut().insert(alias.to_owned(), id);
+        if let Some(term) = self.term(id) {
+            self.evaluator.register_alias(alias, term);
         }
     }
 
@@ -1013,7 +1097,7 @@ impl<'a> Context<'a> {
     /// The id of `term`: its stored id if the snapshot knows it, else a computed id, the same
     /// one for equal terms.
     fn id(&self, term: &Term) -> u64 {
-        if let Some(id) = self.snapshot.lookup(term.as_ref()) {
+        if let Some(id) = self.lookup_const(term.as_ref()) {
             return id.raw();
         }
         let mut ids = self.computed_ids.borrow_mut();
@@ -1084,7 +1168,9 @@ impl<'a> Context<'a> {
         let values: Vec<u64> = (0..solutions.table.len())
             .map(|row| {
                 self.evaluator
-                    .eval(&plain, &self.binding(&solutions, row))
+                    .in_solution(row as u64, || {
+                        self.evaluator.eval(&plain, &self.binding(&solutions, row))
+                    })
                     .map_or(UNDEF, |term| self.id(&term))
             })
             .collect();
@@ -1392,7 +1478,7 @@ impl<'a> Context<'a> {
             } => self.group(inner, variables, aggregates, None),
             // LATERAL, where a feature of spargebra enables it.
             #[allow(unreachable_patterns)]
-            _ => Err(NativeError::Fallback),
+            _ => unsupported("LATERAL"),
         }
     }
 
@@ -1418,8 +1504,7 @@ impl<'a> Context<'a> {
         let variable = match name {
             NamedNodePattern::NamedNode(n) => {
                 let id = self
-                    .snapshot
-                    .lookup(n.as_ref().into())
+                    .lookup_const(n.as_ref().into())
                     .filter(|&id| self.is_named_graph(id));
                 return match id {
                     Some(id) => self.in_graph(GraphScope::Named(id), inner),
@@ -1534,7 +1619,8 @@ impl<'a> Context<'a> {
             GraphScope::Named(id) => paths::PathGraph::Named(*id),
             // A graph the store doesn't hold: the merge of no graphs.
             GraphScope::Missing => paths::PathGraph::Merged(Some(&[])),
-            GraphScope::Variable(_) => return Err(NativeError::Fallback),
+            // `GRAPH ?g` sends patterns with paths graph by graph (`scans_everywhere`).
+            GraphScope::Variable(_) => return unsupported("a path read in all graphs at once"),
         };
         Ok(paths::PathEvaluator {
             snapshot: self.snapshot,
@@ -2165,7 +2251,7 @@ impl<'a> Context<'a> {
         })?))
     }
 
-    /// `DESCRIBE`, as spareval answers it: each term the solutions bind, once, with the
+    /// `DESCRIBE` (its answer is implementation-defined, §16.4): each term the solutions bind, once, with the
     /// statements of the default graph it is the subject of; a blank node such a statement
     /// has as its object is described in turn.
     fn describe(&self, solutions: &Solutions) -> NativeResult<Vec<oxrdf::Triple>> {
@@ -2245,15 +2331,15 @@ impl<'a> Context<'a> {
                 TermPattern::BlankNode(b) => {
                     Slot::Var(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
                 }
-                TermPattern::NamedNode(n) => Slot::Const(self.snapshot.lookup(n.as_ref().into())?),
-                TermPattern::Literal(l) => Slot::Const(self.snapshot.lookup(l.as_ref().into())?),
+                TermPattern::NamedNode(n) => Slot::Const(self.lookup_const(n.as_ref().into())?),
+                TermPattern::Literal(l) => Slot::Const(self.lookup_const(l.as_ref().into())?),
                 #[allow(unreachable_patterns)]
                 _ => return None,
             })
         };
         let predicate = match &triple.predicate {
             NamedNodePattern::Variable(v) => Slot::Var(v.clone()),
-            NamedNodePattern::NamedNode(n) => Slot::Const(self.snapshot.lookup(n.as_ref().into())?),
+            NamedNodePattern::NamedNode(n) => Slot::Const(self.lookup_const(n.as_ref().into())?),
         };
         let graph = self.graph_slot()?;
         Some(ScanPattern {
@@ -3396,9 +3482,9 @@ impl Aggregator<'_> {
 
     /// An aggregate over one variable's ids without decoding terms, where that is exact:
     /// COUNT always, and SUM/AVG/MIN/MAX when every value is an inline integer (whose id
-    /// order is value order). `None` means "evaluate on terms". Error semantics are
-    /// spareval's: an unbound value makes SUM/AVG/MIN/MAX unbound, and an i64 overflow
-    /// makes SUM/AVG unbound.
+    /// order is value order). `None` means "evaluate on terms". Errors as in §18.5.1: an
+    /// unbound value makes SUM/AVG/MIN/MAX unbound, and an i64 overflow makes SUM/AVG
+    /// unbound.
     fn aggregate_ids(
         &self,
         name: &AggregateFunction,
@@ -3554,8 +3640,8 @@ impl Aggregator<'_> {
                     }
                 }
                 let evaluated = self.evaluated(solutions, rows, expr, *distinct);
-                // As spareval: COUNT skips errors and SAMPLE takes the first value, but one
-                // error makes SUM, AVG, MIN and MAX unbound.
+                // COUNT skips errors and SAMPLE takes the first value, but one error makes
+                // SUM, AVG, MIN and MAX unbound.
                 let fails_on_error =
                     !matches!(name, AggregateFunction::Count | AggregateFunction::Sample);
                 if fails_on_error && evaluated.iter().any(Option::is_none) {
@@ -3572,7 +3658,7 @@ impl Aggregator<'_> {
                 let result = match name {
                     AggregateFunction::Count => Some(integer(values.len() as u64)),
                     AggregateFunction::Sample => values.into_iter().next().map(value::canonical),
-                    // The first of equal extremes, as spareval keeps it.
+                    // The first of equal extremes.
                     AggregateFunction::Min => values
                         .into_iter()
                         .reduce(|best, v| {
@@ -3689,11 +3775,10 @@ impl Numeric {
     }
 }
 
-/// GROUP_CONCAT as spareval computes it: string literals only (anything else makes the
-/// result unbound), joined in row order; the common language tag if all values share it.
-/// GROUP_CONCAT (SPARQL 1.1 §18.5.1.7): CONCAT of the values and the separator, so a
-/// simple literal whatever language the values share (spareval keeps a common tag).
-fn group_concat(values: &[Term], separator: &str) -> Option<Term> {
+/// GROUP_CONCAT (SPARQL 1.1 §18.5.1.7): string literals only (anything else makes the
+/// result unbound), joined in row order with the separator, as CONCAT of the values: a
+/// simple literal whatever language the values share.
+pub fn group_concat(values: &[Term], separator: &str) -> Option<Term> {
     let mut concat = String::new();
     for (i, value) in values.iter().enumerate() {
         let Term::Literal(literal) = value else {
@@ -3710,7 +3795,7 @@ fn group_concat(values: &[Term], separator: &str) -> Option<Term> {
     Some(Literal::new_simple_literal(concat).into())
 }
 
-fn sum(values: &[Term]) -> Option<Term> {
+pub fn sum(values: &[Term]) -> Option<Term> {
     let mut total = Numeric::Integer(Integer::from(0));
     for value in values {
         total = total.add(Numeric::of(value)?)?;
@@ -3718,7 +3803,7 @@ fn sum(values: &[Term]) -> Option<Term> {
     Some(total.term())
 }
 
-fn average(values: &[Term]) -> Option<Term> {
+pub fn average(values: &[Term]) -> Option<Term> {
     if values.is_empty() {
         return Some(integer(0));
     }
