@@ -35,6 +35,8 @@ Without dataset parameters and `FROM` clauses, a query reads the default graph, 
 |---|---|
 | `using-graph-uri`, `using-named-graph-uri` (repeatable) | The dataset of every `WHERE` clause; replaces `USING` |
 
+`CLEAR GRAPH` and `DROP GRAPH` of a graph that holds nothing succeed: the store doesn't record empty graphs, so there is nothing to miss.
+
 On the combined URL a form is a query or an update by its field, and a body by its media type. A `GET` without `query` returns the service description.
 
 **Result formats,** chosen from the `Accept` header by weight (`q`), with wildcards; the first of each list is the default:

@@ -18,6 +18,7 @@ NRESE wird eine RDF-Datenbank, die **wie QLever liest und Daten wie GraphDB verw
 | Verhalten der v1-Implementierung (historisch) | [docs/spec/02](docs/spec/02-storage-and-transactions.md), [03](docs/spec/03-reasoner-and-owl-profile.md), [04](docs/spec/04-api-and-protocols.md) |
 | Betrieb und Konfiguration | [docs/ops/](docs/ops/), vor allem [config-reference.md](docs/ops/config-reference.md) |
 | HTTP-Schnittstelle (Endpunkte, Formate, Statuscodes) | [docs/ops/http-api.md](docs/ops/http-api.md) |
+| Anbindung von ResearchSpace und Datamodel Workflow | [docs/integration/](docs/integration/) |
 | Code-Regeln | [docs/dev/code-structure-guidelines.md](docs/dev/code-structure-guidelines.md) |
 
 Überholte Dokumente (Fuseki-Gap-Matrix, alter Umsetzungsplan) liegen in [docs/archive/](docs/archive/).

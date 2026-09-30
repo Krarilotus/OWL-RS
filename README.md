@@ -33,6 +33,7 @@ Known limits, addressed by later milestones:
 - **Default graph:** a query without `GRAPH` reads only the default graph unless `store.default_graph = "union"` is set ([config-reference](docs/ops/config-reference.md)); the speed of that mode hasn't been measured yet.
 - **Reasoning:** the `rdfs` mode is a 6-rule subset; OWL 2 RL omits `eq-ref` and the datatype rules; named graphs aren't reasoning boundaries. See [reasoning-semantics.md](docs/spec/reasoning-semantics.md).
 - **SHACL:** Core validation on request (`/dataset/shacl`, W3C Core suite 98 of 98); validation on commit is a later slice ([docs/design/shacl.md](docs/design/shacl.md)).
+- **ResearchSpace and the Datamodel Workflow** run against it through the standard protocols ([docs/integration/](docs/integration/)); ResearchSpace's keyword search waits for full-text search.
 - **Not yet available:** full-text and geospatial search, the RDF4J protocol, clustering. Order and status: [docs/plan/2026-09-30-graphdb-parity-plan.md](docs/plan/2026-09-30-graphdb-parity-plan.md).
 - **Behaviour changes from v1:** literal lexical forms are kept exactly as written, and a named graph exists only while it holds quads. See ADR-0002.
 
