@@ -18,6 +18,7 @@ pub mod eval;
 pub mod ir;
 pub mod lists;
 pub mod naive;
+pub mod representatives;
 pub mod rulesets;
 pub mod testing;
 #[cfg(test)]
@@ -770,6 +771,96 @@ mod tests {
             lines.push(line);
         }
         lines
+    }
+
+    /// Equality by representatives: on random ontologies with extra `sameAs` and data,
+    /// under every ruleset with equality, the representative closure expanded is exactly
+    /// the replicated closure, and the same consistency rules fire.
+    #[test]
+    fn representatives_expand_to_the_replicated_closure() {
+        use super::representatives;
+        let mut next = rng(0x1234_5678_9ABC_DEF1);
+        let (mut classes_seen, mut merges) = (0, 0);
+        for ruleset in [Ruleset::Owl2Rl, Ruleset::RdfsPlus, Ruleset::OwlHorst] {
+            for case in 0..120 {
+                let mut lines = random_ontology(&mut next);
+                for _ in 0..next(6) {
+                    lines.push(format!("ex:i{} owl:sameAs ex:i{}", next(6), next(6)));
+                }
+                for _ in 0..next(10) {
+                    lines.push(format!("ex:i{} ex:p{} ex:i{}", next(6), next(4), next(6)));
+                }
+                // Equal properties and classes (punning), now and then.
+                if next(3) == 0 {
+                    lines.push(format!("ex:p{} owl:sameAs ex:p{}", next(4), next(4)));
+                }
+                if next(4) == 0 {
+                    lines.push(format!("ex:C{} owl:sameAs ex:C{}", next(5), next(5)));
+                }
+                let mut vocabulary = LocalVocabulary::default();
+                let input = load(
+                    &mut vocabulary,
+                    &lines.join(
+                        "
+",
+                    ),
+                );
+                let rules = ruleset.rules(&mut vocabulary).unwrap();
+                let lists = ListVocabulary::new(&mut vocabulary);
+                let lists = ruleset.has_list_rules().then_some(&lists);
+                let schema = Schema::owl(&mut vocabulary);
+                let replicated = batch::materialise(&input, &rules, lists, &schema);
+                let mut expected: HashSet<Triple> = input.iter().copied().collect();
+                expected.extend(replicated.derived.iter().copied());
+                let closure = representatives::materialise(&input, &rules, lists, &schema);
+                let expanded: HashSet<Triple> = closure
+                    .facts
+                    .iter()
+                    .flat_map(|&f| closure.classes.expand(f))
+                    .collect();
+                if expanded != expected {
+                    let text = |t: &Triple| {
+                        let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+                        format!("{s} {p} {o}")
+                    };
+                    let missing: Vec<String> =
+                        expected.difference(&expanded).take(6).map(text).collect();
+                    let extra: Vec<String> =
+                        expanded.difference(&expected).take(6).map(text).collect();
+                    panic!(
+                        "{} case {case}: missing {missing:#?} extra {extra:#?}
+{}",
+                        ruleset.name(),
+                        lines.join(
+                            "
+"
+                        )
+                    );
+                }
+                let rules_fired = |v: &[Violation]| -> std::collections::BTreeSet<String> {
+                    v.iter().map(|v| v.rule.clone()).collect()
+                };
+                assert_eq!(
+                    rules_fired(&closure.violations),
+                    rules_fired(&replicated.violations),
+                    "{} case {case}
+{}",
+                    ruleset.name(),
+                    lines.join(
+                        "
+"
+                    )
+                );
+                classes_seen += usize::from(!closure.classes.is_empty());
+                merges += closure.merges;
+                // The representative closure is never larger.
+                assert!(closure.facts.len() <= expected.len());
+            }
+        }
+        assert!(
+            classes_seen > 150 && merges > 150,
+            "{classes_seen} {merges}"
+        );
     }
 
     /// Equality-heavy data: the batch executor's equality module equals the generic
