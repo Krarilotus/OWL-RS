@@ -13,6 +13,7 @@
 //! smaller than the next pattern, and otherwise by merge joins on sorted scans or hash joins.
 //! `COUNT(*)` over a single pattern reads the count from the index.
 
+mod exists;
 pub(crate) mod expr;
 mod fast;
 mod output;
@@ -35,7 +36,7 @@ use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
     anti_join, compatible_mask, join, join_keeping_left_order, join_with_undef, left_join,
-    outer_join_with_undef, semi_join,
+    outer_join_with_undef,
 };
 use nrese_exec::{
     Budget, BudgetExceeded, IdTable, UNDEF, computed_id, computed_index, group::group_rows,
@@ -496,11 +497,28 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
             left,
             right,
             expression,
-        } => supported(left) && supported(right) && expression.as_ref().is_none_or(expr::supported),
-        GraphPattern::Filter { expr, inner } => supported(inner) && supported_filter(expr),
+        } => {
+            let mut outer = Vec::new();
+            bound_variables(left, &mut outer);
+            bound_variables(right, &mut outer);
+            supported(left)
+                && supported(right)
+                && expression
+                    .as_ref()
+                    .is_none_or(|e| exists::supported_expression(e, &outer))
+        }
+        GraphPattern::Filter { expr, inner } => {
+            let mut outer = Vec::new();
+            bound_variables(inner, &mut outer);
+            supported(inner) && exists::supported_expression(expr, &outer)
+        }
         GraphPattern::Extend {
             inner, expression, ..
-        } => supported(inner) && expr::supported(expression),
+        } => {
+            let mut outer = Vec::new();
+            bound_variables(inner, &mut outer);
+            supported(inner) && exists::supported_expression(expression, &outer)
+        }
         GraphPattern::Values { bindings, .. } => bindings
             .iter()
             .flatten()
@@ -660,31 +678,6 @@ fn supported_triple(triple: &TriplePattern) -> bool {
     term(&triple.subject) && term(&triple.object)
 }
 
-/// FILTER expressions: the supported expression language, plus (NOT) EXISTS over a supported
-/// pattern that reads no variable from outside except through the shared ones (an
-/// uncorrelated sub-pattern, which is a semi- or anti-join).
-fn supported_filter(expression: &Expression) -> bool {
-    match expression {
-        // FILTER(A && B) is FILTER(A) then FILTER(B): an error in either drops the row.
-        Expression::And(a, b) => supported_filter(a) && supported_filter(b),
-        Expression::Exists(pattern) => uncorrelated(pattern),
-        Expression::Not(inner) if matches!(**inner, Expression::Exists(_)) => {
-            supported_filter(inner)
-        }
-        other => expr::supported(other),
-    }
-}
-
-/// True if a conjunct of `expression` is an (NOT) EXISTS, which needs a join.
-fn contains_exists(expression: &Expression) -> bool {
-    match expression {
-        Expression::And(a, b) => contains_exists(a) || contains_exists(b),
-        Expression::Exists(_) => true,
-        Expression::Not(inner) => matches!(**inner, Expression::Exists(_)),
-        _ => false,
-    }
-}
-
 /// A property path pattern, with the filter directly on it, if any.
 struct PathPattern<'q> {
     subject: &'q TermPattern,
@@ -696,7 +689,9 @@ struct PathPattern<'q> {
 /// `pattern` as a path, alone or under a filter that needs no join (no `EXISTS`).
 fn as_path(pattern: &GraphPattern) -> Option<PathPattern<'_>> {
     let (pattern, filter) = match pattern {
-        GraphPattern::Filter { expr, inner } if !contains_exists(expr) => (&**inner, Some(expr)),
+        GraphPattern::Filter { expr, inner } if !contains_any_exists(expr) => {
+            (&**inner, Some(expr))
+        }
         other => (other, None),
     };
     match pattern {
@@ -711,21 +706,6 @@ fn as_path(pattern: &GraphPattern) -> Option<PathPattern<'_>> {
             filter,
         }),
         _ => None,
-    }
-}
-
-fn uncorrelated(pattern: &GraphPattern) -> bool {
-    match pattern {
-        GraphPattern::Bgp { patterns } => patterns.iter().all(supported_triple),
-        GraphPattern::Join { left, right } => uncorrelated(left) && uncorrelated(right),
-        GraphPattern::Filter { expr, inner } => {
-            let mut bound = Vec::new();
-            bound_variables(inner, &mut bound);
-            expr::supported(expr)
-                && uncorrelated(inner)
-                && expression_variables(expr).iter().all(|v| bound.contains(v))
-        }
-        _ => false,
     }
 }
 
@@ -825,6 +805,8 @@ struct Context<'a> {
     merge_set: Option<Vec<TermId>>,
     /// The graphs `GRAPH` may name, if the dataset lists them (`FROM NAMED`).
     named: Option<Vec<TermId>>,
+    /// Numbers the columns the executor adds for itself ([`exists`]).
+    synthetic: Cell<usize>,
 }
 
 /// The active graph of triple patterns.
@@ -879,6 +861,7 @@ impl<'a> Context<'a> {
             trace: None,
             depth: Cell::new(0),
             graph: RefCell::new(scope),
+            synthetic: Cell::new(0),
         }
     }
 
@@ -1038,17 +1021,23 @@ impl<'a> Context<'a> {
     /// where it is an error.
     fn extend(
         &self,
-        mut solutions: Solutions,
+        solutions: Solutions,
         variable: &Variable,
         expression: &Expression,
     ) -> NativeResult<Solutions> {
+        let (solutions, plain, added) = if contains_any_exists(expression) {
+            self.with_exists(solutions, expression)?
+        } else {
+            (solutions, expression.clone(), 0)
+        };
         let values: Vec<u64> = (0..solutions.table.len())
             .map(|row| {
                 self.evaluator
-                    .eval(expression, &self.binding(&solutions, row))
+                    .eval(&plain, &self.binding(&solutions, row))
                     .map_or(UNDEF, |term| self.id(&term))
             })
             .collect();
+        let mut solutions = drop_last_columns(solutions, added);
         let mut columns = std::mem::take(&mut solutions.table).into_columns();
         columns.push(values);
         solutions.vars.push(variable.clone());
@@ -2169,6 +2158,11 @@ impl<'a> Context<'a> {
         right: Solutions,
         expression: Option<&Expression>,
     ) -> NativeResult<Solutions> {
+        if let Some(expression) = expression
+            && contains_any_exists(expression)
+        {
+            return self.left_join_with_exists(left, right, expression);
+        }
         let (lk, rk) = shared_columns(&left, &right);
         // A variable that may be unbound on either side (from an earlier OPTIONAL) is
         // compatible with any value and takes it.
@@ -2245,7 +2239,7 @@ impl<'a> Context<'a> {
             other => (None, other),
         };
         let (filter, bgp) = match rest {
-            GraphPattern::Filter { expr, inner } if !contains_exists(expr) => {
+            GraphPattern::Filter { expr, inner } if !contains_any_exists(expr) => {
                 (Some(expr), &**inner)
             }
             other => (None, other),
@@ -2404,7 +2398,7 @@ impl<'a> Context<'a> {
 
     fn filter(&self, mut solutions: Solutions, expression: &Expression) -> NativeResult<Solutions> {
         match expression {
-            Expression::And(a, b) if contains_exists(expression) => {
+            Expression::And(a, b) if contains_any_exists(expression) => {
                 let solutions = self.filter(solutions, a)?;
                 self.filter(solutions, b)
             }
@@ -2415,44 +2409,19 @@ impl<'a> Context<'a> {
                 };
                 self.exists(solutions, pattern, false)
             }
+            // EXISTS inside the expression: a column per EXISTS, which it reads.
+            _ if contains_any_exists(expression) => {
+                let (mut solutions, plain, added) = self.with_exists(solutions, expression)?;
+                let mask = self.filter_mask(&solutions, &plain)?;
+                solutions.table.retain_mask(&mask);
+                Ok(drop_last_columns(solutions, added))
+            }
             _ => {
                 let mask = self.filter_mask(&solutions, expression)?;
                 solutions.table.retain_mask(&mask);
                 Ok(solutions)
             }
         }
-    }
-
-    fn exists(
-        &self,
-        solutions: Solutions,
-        pattern: &GraphPattern,
-        keep_matching: bool,
-    ) -> NativeResult<Solutions> {
-        let inner = self.eval(pattern)?;
-        let (lk, rk) = shared_columns(&solutions, &inner);
-        let table = if has_undef(&solutions.table, &lk) || has_undef(&inner.table, &rk) {
-            // An unbound variable isn't substituted into the pattern: any value matches.
-            let found = compatible_mask(&solutions.table, &inner.table, &lk, &rk, false);
-            let mut table = solutions.table.clone();
-            table.retain_mask(
-                &found
-                    .iter()
-                    .map(|f| *f == keep_matching)
-                    .collect::<Vec<_>>(),
-            );
-            table
-        } else if keep_matching {
-            semi_join(&solutions.table, &inner.table, &lk, &rk)
-        } else {
-            anti_join(&solutions.table, &inner.table, &lk, &rk)
-        };
-        self.consumed(&inner);
-        Ok(Solutions {
-            vars: solutions.vars,
-            table,
-            ordered: solutions.ordered,
-        })
     }
 
     // --- modifiers -----------------------------------------------------------------------
@@ -3442,6 +3411,23 @@ fn joined_vars(left: &Solutions, right: &Solutions, right_keys: &[usize]) -> Vec
             .map(|(_, v)| v.clone()),
     );
     vars
+}
+
+/// `solutions` without its last `count` columns.
+fn drop_last_columns(mut solutions: Solutions, count: usize) -> Solutions {
+    if count == 0 {
+        return solutions;
+    }
+    let rows = solutions.table.len();
+    let mut columns = std::mem::take(&mut solutions.table).into_columns();
+    columns.truncate(columns.len() - count);
+    solutions.vars.truncate(solutions.vars.len() - count);
+    solutions.table = if columns.is_empty() {
+        IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
+    } else {
+        IdTable::from_columns(columns)
+    };
+    solutions
 }
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {
