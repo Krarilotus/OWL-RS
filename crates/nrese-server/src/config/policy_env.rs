@@ -16,14 +16,26 @@ pub(super) fn parse_policy_config(source: &dyn ConfigSource) -> Result<PolicyCon
     Ok(PolicyConfig {
         auth: parse_auth_config(source)?,
         limits: RequestLimits {
-            max_query_bytes: parse_usize(source, names::MAX_QUERY_BYTES, 1_048_576)?,
+            max_query_bytes: parse_usize(
+                source,
+                names::MAX_QUERY_BYTES,
+                crate::policy::DEFAULT_MAX_QUERY_BYTES,
+            )?,
             max_query_memory_bytes: parse_usize(
                 source,
                 names::MAX_QUERY_MEMORY_BYTES,
                 DEFAULT_QUERY_MEMORY_BYTES,
             )?,
-            max_update_bytes: parse_usize(source, names::MAX_UPDATE_BYTES, 1_048_576)?,
-            max_rdf_upload_bytes: parse_usize(source, names::MAX_RDF_UPLOAD_BYTES, 10_485_760)?,
+            max_update_bytes: parse_usize(
+                source,
+                names::MAX_UPDATE_BYTES,
+                crate::policy::DEFAULT_MAX_UPDATE_BYTES,
+            )?,
+            max_rdf_upload_bytes: parse_usize(
+                source,
+                names::MAX_RDF_UPLOAD_BYTES,
+                crate::policy::DEFAULT_MAX_RDF_UPLOAD_BYTES,
+            )?,
         },
         rate_limits: RateLimitConfig {
             window: Duration::from_secs(parse_u64(source, names::RATE_LIMIT_WINDOW_SECS, 60)?),

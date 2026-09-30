@@ -52,8 +52,8 @@ mode = "owl2-rl"
 
 [policy.limits]
 max_query_bytes = 1048576
-max_update_bytes = 1048576
-max_rdf_upload_bytes = 10485760
+max_update_bytes = 16777216
+max_rdf_upload_bytes = 134217728
 
 [policy.rate_limits]
 window_secs = 60
@@ -172,10 +172,12 @@ api_key = "replace-me"
 
 ## Policy Limits
 
-- `policy.limits.max_query_bytes` -> `NRESE_MAX_QUERY_BYTES`
+- `policy.limits.max_query_bytes` -> `NRESE_MAX_QUERY_BYTES`: the longest query text (default 1 MiB)
 - `policy.limits.max_query_memory_bytes` -> `NRESE_MAX_QUERY_MEMORY_BYTES`: bytes of intermediate results one query may hold (default 4 GiB, `0` = unlimited). A query that needs more is rejected with `413` instead of growing the server's memory.
-- `policy.limits.max_update_bytes` -> `NRESE_MAX_UPDATE_BYTES`
-- `policy.limits.max_rdf_upload_bytes` -> `NRESE_MAX_RDF_UPLOAD_BYTES`
+- `policy.limits.max_update_bytes` -> `NRESE_MAX_UPDATE_BYTES`: the largest SPARQL update (default 16 MiB)
+- `policy.limits.max_rdf_upload_bytes` -> `NRESE_MAX_RDF_UPLOAD_BYTES`: the largest RDF payload of a Graph Store, TELL or SHACL request (default 128 MiB); larger data goes through `nrese-server load`
+
+These limits are the ones that apply: a request over its limit gets `413` as a problem document. Requests are held in memory while they are handled, so a limit is also memory a request may take.
 
 ## Policy Rate Limits
 
