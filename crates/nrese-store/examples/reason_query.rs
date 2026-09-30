@@ -5,12 +5,14 @@
 //! ```text
 //! cargo run --release -p nrese-store --example reason_query -- \
 //!     [--ruleset owl2-rl|rdfs] [--queries dir] [--runs n] [--timeout-s n]
-//!     [--memory-mib n] [--explain] input.{nt,ttl,...}...
+//!     [--memory-mib n] [--explain] [--as-written] input.{nt,ttl,...}...
 //! ```
 //!
 //! - `--runs`: measured runs per query after one warm-up run (default 3); the best counts.
 //! - `--timeout-s`, `--memory-mib`: limits per query run (default: none). A query that
 //!   exceeds one is reported as `timeout` or `memory`, and the run goes on.
+//! - `--as-written` evaluates the operators where the query puts them (no filter
+//!   pushdown, no set evaluation, paths in full), to compare with.
 //! - `--explain` prints each query's plan (operators with estimated and actual rows, and
 //!   times) after its timing line.
 //!
@@ -114,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut ruleset, mut queries, mut files) = (Ruleset::Owl2Rl, None, Vec::new());
     let mut commits = 0usize;
     let mut explain = false;
+    let mut as_written = false;
     let (mut runs, mut timeout, mut memory_limit) = (3usize, None, None);
     let number = |value: Option<String>, option: &str| -> Result<u64, String> {
         value
@@ -132,6 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--queries" => queries = args.next().map(PathBuf::from),
             "--commits" => commits = args.next().and_then(|n| n.parse().ok()).unwrap_or(0),
             "--explain" => explain = true,
+            "--as-written" => as_written = true,
             "--runs" => runs = number(args.next(), "--runs")?.max(1) as usize,
             "--timeout-s" => {
                 timeout = Some(Duration::from_secs(number(args.next(), "--timeout-s")?));
@@ -203,6 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let query = counting(&text);
         let mut request = SparqlQueryRequest::new(query.clone());
         request.memory_limit = memory_limit;
+        request.as_written = as_written;
         let prepared = match PreparedQuery::parse(&request) {
             Ok(prepared) => prepared,
             Err(error) => {
