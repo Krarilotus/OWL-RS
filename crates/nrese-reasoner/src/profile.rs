@@ -36,9 +36,18 @@ pub fn profile_for_config(config: &ReasonerConfig) -> ReasonerProfile {
         ReasonerFeature::OwlConsistencyCheck,
         ReasonerFeature::ExplanationTrace,
     ];
+    let equality = [ReasonerFeature::OwlEqualityReasoning];
+    let consistency = [
+        ReasonerFeature::OwlConsistencyCheck,
+        ReasonerFeature::ExplanationTrace,
+    ];
     let features: &[ReasonerFeature] = match mode {
         ReasoningMode::Disabled => &[],
-        ReasoningMode::Rdfs => &rdfs,
+        ReasoningMode::Rdfs | ReasoningMode::RdfsFull => &rdfs,
+        ReasoningMode::RdfsPlus | ReasoningMode::OwlHorst => {
+            &[rdfs.as_slice(), equality.as_slice()].concat()
+        }
+        ReasoningMode::Owl2Ql => &[rdfs.as_slice(), consistency.as_slice()].concat(),
         ReasoningMode::Owl2Rl => &[rdfs.as_slice(), owl.as_slice()].concat(),
     };
     let capabilities = features
@@ -48,7 +57,7 @@ pub fn profile_for_config(config: &ReasonerConfig) -> ReasonerProfile {
     ReasonerProfile {
         name: match mode {
             ReasoningMode::Disabled => "nrese-disabled",
-            ReasoningMode::Rdfs | ReasoningMode::Owl2Rl => "nrese-v2",
+            _ => "nrese-v2",
         },
         mode: mode_name(mode),
         semantic_tier: mode.as_str(),
@@ -86,7 +95,7 @@ mod tests {
         assert!(owl.contains(&ReasonerFeature::OwlConsistencyCheck));
         assert!(owl.contains(&ReasonerFeature::ExplanationTrace));
         assert!(!owl.contains(&ReasonerFeature::OwlClassSatisfiability));
-        for mode in [ReasoningMode::Rdfs, ReasoningMode::Owl2Rl] {
+        for mode in ReasoningMode::REASONING {
             assert!(
                 profile_for_mode(mode)
                     .capabilities

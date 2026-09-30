@@ -127,8 +127,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match arg.as_str() {
             "--ruleset" => {
                 ruleset = match args.next().as_deref() {
-                    Some("rdfs") => Ruleset::Rdfs,
-                    Some("owl2-rl") => Ruleset::Owl2Rl,
+                    Some(name) if Ruleset::from_name(name).is_some() => {
+                        Ruleset::from_name(name).expect("checked")
+                    }
                     other => return Err(format!("unknown ruleset {other:?}").into()),
                 }
             }
@@ -294,10 +295,7 @@ fn commit_latency(
     ruleset: Ruleset,
     n: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mode = match ruleset {
-        Ruleset::Rdfs => ReasoningMode::Rdfs,
-        Ruleset::Owl2Rl => ReasoningMode::Owl2Rl,
-    };
+    let mode = ReasoningMode::for_ruleset(ruleset);
     let pipeline = MutationPipeline::new(
         std::sync::Arc::clone(store),
         std::sync::Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),

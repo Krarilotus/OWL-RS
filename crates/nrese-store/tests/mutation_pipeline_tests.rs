@@ -618,3 +618,48 @@ fn cancelled_reasoning_commits_stop_promptly_and_change_nothing() {
     .expect("the writer is free");
     assert!(contains(&owl, &format!("<{EX}y> a <{EX}C100>")));
 }
+
+/// `rdfs-full`: the axiomatic triples hold from the first commit on, their consequences
+/// are drawn, and deleting the data a rule derived an axiom from again doesn't retract it.
+#[test]
+fn full_rdfs_keeps_its_axioms() {
+    let pipeline = pipeline(ReasoningMode::RdfsFull);
+    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let rdfs = "http://www.w3.org/2000/01/rdf-schema#";
+    let axiom = format!("<{rdf}type> <{rdf}type> <{rdf}Property>");
+    let fact = format!("<http://example.com/tom> <{rdf}type> <http://example.com/Cat>");
+    pipeline
+        .apply(insert(&fact), &MutationTicket::new())
+        .expect("commit");
+    assert!(contains(&pipeline, &axiom));
+    // rdfs4a, rdf:type's axiomatic domain, and rdfs1 for xsd:string.
+    assert!(contains(
+        &pipeline,
+        &format!("<http://example.com/tom> <{rdf}type> <{rdfs}Resource>")
+    ));
+    assert!(contains(
+        &pipeline,
+        &format!("<http://www.w3.org/2001/XMLSchema#string> <{rdfs}subClassOf> <{rdfs}Literal>")
+    ));
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "DELETE DATA {{ {fact} }}"
+            ))),
+            &MutationTicket::new(),
+        )
+        .expect("delete");
+    assert!(!contains(&pipeline, &fact));
+    assert!(contains(&pipeline, &axiom), "an axiom is never retracted");
+    // A rematerialisation computes the same.
+    let before = support::inferred_statements(pipeline.store()).unwrap();
+    pipeline
+        .store()
+        .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::RdfsFull)
+        .unwrap();
+    let mut after = support::inferred_statements(pipeline.store()).unwrap();
+    let mut before = before;
+    before.sort();
+    after.sort();
+    assert_eq!(before, after);
+}

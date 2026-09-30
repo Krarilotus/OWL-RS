@@ -10,6 +10,18 @@
 //! second `eq-diff1` rule, and `AllDifferent` lists naming one individual twice are
 //! inconsistent (`eq-diff2/3` in [`super::lists`]).
 //!
+//! The other profiles are the RDFS rules plus a named part of the OWL 2 RL table
+//! ([`Ruleset::owl_rules`]), as GraphDB's rulesets of the same names are:
+//!
+//! | Ruleset | Rules |
+//! |---|---|
+//! | `rdfs` | rdfs2, 3, 5, 7, 9, 11: what queries over data use (GraphDB's partial RDFS) |
+//! | `rdfs-full` | every RDFS entailment rule (RDF 1.1 Semantics §9.2) and the finite RDF and RDFS axiomatic triples |
+//! | `rdfs-plus` | `rdfs` with equality, inverse, symmetric, transitive, functional and inverse functional properties, equivalent classes and properties |
+//! | `owl-horst` | `rdfs-plus` with `hasValue`, `someValuesFrom` and `allValuesFrom` (ter Horst's pD*) |
+//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains, ranges, inverses, `someValuesFrom owl:Thing`, and the disjointness checks |
+//! | `owl2-rl` | the OWL 2 RL/RDF rules |
+//!
 //! Every ruleset is validated by the tests: it parses, every rule is safe, and the
 //! evaluator's closure equals the owlrl oracle's on the benchmark data.
 
@@ -20,9 +32,27 @@ use super::ir::{ParseError, Rule, Vocabulary, parse_rules};
 pub enum Ruleset {
     /// RDFS entailment rules without axiomatic triples (GraphDB's `rdfs` with partialRDFS).
     Rdfs,
+    /// All RDFS entailment rules and the axiomatic triples (RDF 1.1 Semantics §9.2).
+    RdfsFull,
+    /// RDFS with the property characteristics and equivalences of RDFS-Plus.
+    RdfsPlus,
+    /// ter Horst's pD* (OWL-Horst).
+    OwlHorst,
+    /// OWL 2 QL, materialised.
+    Owl2Ql,
     /// The OWL 2 RL/RDF rules.
     Owl2Rl,
 }
+
+/// Every ruleset, in order of what it derives.
+pub const ALL: [Ruleset; 6] = [
+    Ruleset::Rdfs,
+    Ruleset::RdfsFull,
+    Ruleset::RdfsPlus,
+    Ruleset::OwlHorst,
+    Ruleset::Owl2Ql,
+    Ruleset::Owl2Rl,
+];
 
 /// Version of the evaluation semantics beyond the rule text: list compilation, equality
 /// handling, modules. Bump it with any change that alters what a ruleset derives or rejects,
@@ -43,20 +73,55 @@ impl Ruleset {
         feed(&SEMANTICS_VERSION.to_le_bytes());
         feed(self.name().as_bytes());
         feed(self.text().as_bytes());
+        for name in self.owl_rules().unwrap_or_default() {
+            feed(name.as_bytes());
+        }
+        feed(self.axioms().as_bytes());
         hash
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Rdfs => "rdfs",
+            Self::RdfsFull => "rdfs-full",
+            Self::RdfsPlus => "rdfs-plus",
+            Self::OwlHorst => "owl-horst",
+            Self::Owl2Ql => "owl2-ql",
             Self::Owl2Rl => "owl2-rl",
         }
     }
 
+    /// The ruleset named `name` (as [`Ruleset::name`] gives it).
+    pub fn from_name(name: &str) -> Option<Self> {
+        ALL.into_iter().find(|ruleset| ruleset.name() == name)
+    }
+
+    /// The ruleset's own rule text; the OWL 2 RL rules it adds are [`Ruleset::owl_rules`].
     pub fn text(self) -> &'static str {
         match self {
-            Self::Rdfs => RDFS,
+            Self::Rdfs | Self::RdfsPlus | Self::OwlHorst => RDFS,
+            Self::RdfsFull => RDFS_FULL,
+            Self::Owl2Ql => "",
             Self::Owl2Rl => OWL2_RL,
+        }
+    }
+
+    /// The OWL 2 RL rules (by their W3C names) the ruleset adds to its own text.
+    pub fn owl_rules(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::Rdfs | Self::RdfsFull | Self::Owl2Rl => None,
+            Self::RdfsPlus => Some(RDFS_PLUS),
+            Self::OwlHorst => Some(OWL_HORST),
+            Self::Owl2Ql => Some(OWL2_QL),
+        }
+    }
+
+    /// Statements that hold in every graph the ruleset reasons over, as `s p o` lines of
+    /// prefixed names: they seed the closure and are never retracted.
+    pub fn axioms(self) -> &'static str {
+        match self {
+            Self::RdfsFull => RDFS_AXIOMS,
+            _ => "",
         }
     }
 
@@ -66,7 +131,37 @@ impl Ruleset {
     }
 
     pub fn rules(self, vocabulary: &mut impl Vocabulary) -> Result<Vec<Rule>, ParseError> {
-        parse_rules(self.text(), vocabulary)
+        let mut rules = parse_rules(self.text(), vocabulary)?;
+        if let Some(names) = self.owl_rules() {
+            rules.extend(
+                parse_rules(OWL2_RL, vocabulary)?
+                    .into_iter()
+                    .filter(|rule| names.contains(&rule.name.as_str())),
+            );
+        }
+        Ok(rules)
+    }
+
+    /// The axiomatic triples ([`Ruleset::axioms`]) as ids.
+    pub fn axiom_triples(
+        self,
+        vocabulary: &mut impl Vocabulary,
+    ) -> Result<Vec<[u64; 3]>, ParseError> {
+        let mut out = Vec::new();
+        for line in self
+            .axioms()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        {
+            out.push(
+                super::ir::parse_triple(line, vocabulary).map_err(|message| ParseError {
+                    rule: line.to_owned(),
+                    message,
+                })?,
+            );
+        }
+        Ok(out)
     }
 }
 
@@ -80,6 +175,133 @@ rdfs7:  (?p rdfs:subPropertyOf ?q), (?x ?p ?y) -> (?x ?q ?y)
 rdfs9:  (?c rdfs:subClassOf ?d), (?x rdf:type ?c) -> (?x rdf:type ?d)
 rdfs11: (?c rdfs:subClassOf ?d), (?d rdfs:subClassOf ?e) -> (?c rdfs:subClassOf ?e)
 "#;
+
+/// RDFS entailment (RDF 1.1 Semantics §9.2.1), every rule: rdfD2 (a predicate is a
+/// property), rdfs2 to rdfs13. rdfs1 (every recognised datatype is an `rdfs:Datatype`) is
+/// in the axioms; rdfD1, which invents a blank node for every literal, is left out as
+/// every system leaves it out.
+pub const RDFS_FULL: &str = r#"
+rdfD2:  (?x ?p ?y) -> (?p rdf:type rdf:Property)
+rdfs2:  (?p rdfs:domain ?c), (?x ?p ?y) -> (?x rdf:type ?c)
+rdfs3:  (?p rdfs:range ?c), (?x ?p ?y) -> (?y rdf:type ?c)
+rdfs4a: (?x ?p ?y) -> (?x rdf:type rdfs:Resource)
+rdfs4b: (?x ?p ?y) -> (?y rdf:type rdfs:Resource)
+rdfs5:  (?p rdfs:subPropertyOf ?q), (?q rdfs:subPropertyOf ?r) -> (?p rdfs:subPropertyOf ?r)
+rdfs6:  (?p rdf:type rdf:Property) -> (?p rdfs:subPropertyOf ?p)
+rdfs7:  (?p rdfs:subPropertyOf ?q), (?x ?p ?y) -> (?x ?q ?y)
+rdfs8:  (?c rdf:type rdfs:Class) -> (?c rdfs:subClassOf rdfs:Resource)
+rdfs9:  (?c rdfs:subClassOf ?d), (?x rdf:type ?c) -> (?x rdf:type ?d)
+rdfs10: (?c rdf:type rdfs:Class) -> (?c rdfs:subClassOf ?c)
+rdfs11: (?c rdfs:subClassOf ?d), (?d rdfs:subClassOf ?e) -> (?c rdfs:subClassOf ?e)
+rdfs12: (?p rdf:type rdfs:ContainerMembershipProperty) -> (?p rdfs:subPropertyOf rdfs:member)
+rdfs13: (?d rdf:type rdfs:Datatype) -> (?d rdfs:subClassOf rdfs:Literal)
+"#;
+
+/// The RDF and RDFS axiomatic triples (RDF 1.1 Semantics §8.1.1, §9.1), without the
+/// infinitely many about `rdf:_1`, `rdf:_2`, …, and rdfs1 for the datatypes every
+/// system recognises (`rdf:langString`, `xsd:string`).
+pub const RDFS_AXIOMS: &str = r#"
+rdf:type rdf:type rdf:Property
+rdf:subject rdf:type rdf:Property
+rdf:predicate rdf:type rdf:Property
+rdf:object rdf:type rdf:Property
+rdf:first rdf:type rdf:Property
+rdf:rest rdf:type rdf:Property
+rdf:value rdf:type rdf:Property
+rdf:nil rdf:type rdf:List
+rdf:type rdfs:domain rdfs:Resource
+rdfs:domain rdfs:domain rdf:Property
+rdfs:range rdfs:domain rdf:Property
+rdfs:subPropertyOf rdfs:domain rdf:Property
+rdfs:subClassOf rdfs:domain rdfs:Class
+rdf:subject rdfs:domain rdf:Statement
+rdf:predicate rdfs:domain rdf:Statement
+rdf:object rdfs:domain rdf:Statement
+rdfs:member rdfs:domain rdfs:Resource
+rdf:first rdfs:domain rdf:List
+rdf:rest rdfs:domain rdf:List
+rdfs:seeAlso rdfs:domain rdfs:Resource
+rdfs:isDefinedBy rdfs:domain rdfs:Resource
+rdfs:comment rdfs:domain rdfs:Resource
+rdfs:label rdfs:domain rdfs:Resource
+rdf:value rdfs:domain rdfs:Resource
+rdf:type rdfs:range rdfs:Class
+rdfs:domain rdfs:range rdfs:Class
+rdfs:range rdfs:range rdfs:Class
+rdfs:subPropertyOf rdfs:range rdf:Property
+rdfs:subClassOf rdfs:range rdfs:Class
+rdf:subject rdfs:range rdfs:Resource
+rdf:predicate rdfs:range rdfs:Resource
+rdf:object rdfs:range rdfs:Resource
+rdfs:member rdfs:range rdfs:Resource
+rdf:first rdfs:range rdfs:Resource
+rdf:rest rdfs:range rdf:List
+rdfs:seeAlso rdfs:range rdfs:Resource
+rdfs:isDefinedBy rdfs:range rdfs:Resource
+rdfs:comment rdfs:range rdfs:Literal
+rdfs:label rdfs:range rdfs:Literal
+rdf:value rdfs:range rdfs:Resource
+rdf:Alt rdfs:subClassOf rdfs:Container
+rdf:Bag rdfs:subClassOf rdfs:Container
+rdf:Seq rdfs:subClassOf rdfs:Container
+rdfs:ContainerMembershipProperty rdfs:subClassOf rdf:Property
+rdfs:isDefinedBy rdfs:subPropertyOf rdfs:seeAlso
+rdfs:Datatype rdfs:subClassOf rdfs:Class
+rdf:langString rdf:type rdfs:Datatype
+rdf:HTML rdf:type rdfs:Datatype
+rdf:XMLLiteral rdf:type rdfs:Datatype
+xsd:string rdf:type rdfs:Datatype
+"#;
+
+/// RDFS-Plus: RDFS with the OWL 2 RL rules for equality, inverse, symmetric, transitive,
+/// functional and inverse functional properties, equivalent classes and properties.
+pub const RDFS_PLUS: &[&str] = &[
+    "eq-sym", "eq-trans", "eq-rep-s", "eq-rep-p", "eq-rep-o", "prp-fp", "prp-ifp", "prp-symp",
+    "prp-trp", "prp-eqp1", "prp-eqp2", "prp-inv1", "prp-inv2", "cax-eqc1", "cax-eqc2", "scm-eqc1",
+    "scm-eqc2", "scm-eqp1", "scm-eqp2",
+];
+
+/// OWL-Horst (pD*): RDFS-Plus with `hasValue`, `someValuesFrom` and `allValuesFrom`.
+pub const OWL_HORST: &[&str] = &[
+    "eq-sym", "eq-trans", "eq-rep-s", "eq-rep-p", "eq-rep-o", "prp-fp", "prp-ifp", "prp-symp",
+    "prp-trp", "prp-eqp1", "prp-eqp2", "prp-inv1", "prp-inv2", "cax-eqc1", "cax-eqc2", "scm-eqc1",
+    "scm-eqc2", "scm-eqp1", "scm-eqp2", "cls-hv1", "cls-hv2", "cls-svf1", "cls-svf2", "cls-avf",
+];
+
+/// OWL 2 QL, materialised: its axioms without the existentials on the right of
+/// `SubClassOf` (they would invent individuals), and its consistency checks.
+pub const OWL2_QL: &[&str] = &[
+    "prp-dom",
+    "prp-rng",
+    "prp-spo1",
+    "prp-eqp1",
+    "prp-eqp2",
+    "prp-inv1",
+    "prp-inv2",
+    "prp-symp",
+    "prp-asyp",
+    "prp-irp",
+    "prp-pdw",
+    "cls-nothing2",
+    "cls-svf2",
+    "cax-sco",
+    "cax-eqc1",
+    "cax-eqc2",
+    "cax-dw",
+    "scm-cls",
+    "scm-sco",
+    "scm-eqc1",
+    "scm-eqc2",
+    "scm-op",
+    "scm-dp",
+    "scm-spo",
+    "scm-eqp1",
+    "scm-eqp2",
+    "scm-dom1",
+    "scm-dom2",
+    "scm-rng1",
+    "scm-rng2",
+];
 
 /// OWL 2 RL/RDF, tables 4-7 and 9 (list rules in `lists`).
 pub const OWL2_RL: &str = r#"
