@@ -50,6 +50,8 @@ SELECT ?s ?o ?score WHERE {
 
 The matched literal (the subject) is a simple or language-tagged string that is the object of a statement in the graph the pattern reads. Words are runs of letters and digits. The index is built in memory at the first search after startup and extended with new literals at later searches; searches start the pattern's joins.
 
+**GeoSPARQL functions** over `geo:wktLiteral` values, in any expression: the Simple Features, Egenhofer and RCC8 relations (`geof:sfWithin`, `geof:ehCovers`, `geof:rcc8ntpp`, …), `geof:relate` (DE-9IM), `geof:distance`, `geof:area`, `geof:length` (with an OGC unit such as `uom:metre`), `geof:buffer`, `convexHull`, `envelope`, `centroid`, `intersection`, `union`, `difference`, `symDifference`, `getSRID`, `isEmpty`, `dimension`, `asWKT`. Coordinates are CRS84 (longitude, latitude) unless the literal names another system; EPSG:4326 is read latitude first. In CRS84, metres are geodesic (WGS84), degrees planar. Not yet: the relation properties in triple patterns (`?a geo:sfWithin ?b`, GeoSPARQL's query rewrite), GML and GeoJSON literals, a spatial index.
+
 **Updates:**
 - `POST` with a form and an `update` field
 - `POST` with `Content-Type: application/sparql-update` and the update as the body

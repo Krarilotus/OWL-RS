@@ -37,7 +37,7 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 | Federated query (`SERVICE`) | yes | yes | delivered: SPARQL 1.1 Federated Query to allow-listed endpoints (off by default), bind joins with `VALUES`, `SILENT`; JSON, XML, TSV and CSV results | D4 | FedBench |
 | Full-text search | yes (integrated) | yes (connectors/Lucene) | delivered: Blazegraph's `bds:search` with relevance, rank, all words, prefixes and limits; an in-memory index over string literals, built at the first search. Not yet: Jena's `text:query`, GraphDB's connectors, stemming, phrase search, a persisted index | T1 | ResearchSpace search; relevance tests |
 | Autocompletion | yes | partial | missing | T1 | latency benchmark |
-| GeoSPARQL | partial | yes | missing | G1 | GeoSPARQL compliance subset |
+| GeoSPARQL | partial | yes | delivered: the filter functions over WKT (relations of all three families, DE-9IM, geodesic measures, constructions); not yet: relation properties in triple patterns (query rewrite), GML and GeoJSON, a spatial index | G1 | GeoSPARQL compliance subset |
 | Vector similarity | no | yes (similarity/connectors) | missing | V1 | recall@k |
 | RDF-star / RDF 1.2 triple terms | partial | yes | missing | R7 | RDF 1.2 tests |
 | Graph-level access control | no | yes (Enterprise) | missing | O1 | security matrix |
