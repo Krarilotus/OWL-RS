@@ -55,6 +55,20 @@ nrese_query_cache_bytes {}
 ",
         cache.hits, cache.misses, cache.bytes,
     ));
+    if let Some((used, peak, limit)) = state.store().query_memory() {
+        body.push_str(&format!(
+            "# HELP nrese_query_memory_bytes Intermediate results the running queries hold.
+# TYPE nrese_query_memory_bytes gauge
+nrese_query_memory_bytes {used}
+# HELP nrese_query_memory_peak_bytes The most the running queries held at once.
+# TYPE nrese_query_memory_peak_bytes gauge
+nrese_query_memory_peak_bytes {peak}
+# HELP nrese_query_memory_limit_bytes The budget for all running queries together.
+# TYPE nrese_query_memory_limit_bytes gauge
+nrese_query_memory_limit_bytes {limit}
+",
+        ));
+    }
 
     let mut response = (StatusCode::OK, body).into_response();
     response.headers_mut().insert(

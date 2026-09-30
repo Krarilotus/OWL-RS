@@ -131,8 +131,10 @@ impl IdTable {
         for column in &mut out.columns {
             column.reserve_exact(extra);
         }
-        for part in &rest {
-            out.append(part);
+        // Each part is freed as soon as it is copied: together with the output they
+        // would hold the rows twice.
+        for part in rest {
+            out.append(&part);
         }
         out.sorted_by.clear();
         out

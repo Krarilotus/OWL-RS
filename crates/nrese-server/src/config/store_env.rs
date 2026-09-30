@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use nrese_store::{StoreConfig, StoreMode};
 
 use super::env_names as names;
-use super::env_values::parse_usize;
+use super::env_values::parse_bytes;
 use super::source::ConfigSource;
 
 pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfig> {
@@ -16,7 +16,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             .map(PathBuf::from)
             .unwrap_or(defaults.data_dir),
         ontology_path: source.get(names::ONTOLOGY_PATH).map(PathBuf::from),
-        query_cache_bytes: parse_usize(
+        query_cache_bytes: parse_bytes(
             source,
             names::QUERY_CACHE_BYTES,
             nrese_store::DEFAULT_QUERY_CACHE_BYTES,
@@ -25,7 +25,22 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             .get(names::SHACL_SHAPES_GRAPH)
             .unwrap_or(defaults.shapes_graph),
         union_default_graph: parse_default_graph(source.get(names::DEFAULT_GRAPH).as_deref())?,
+        total_query_memory_bytes: parse_total_query_memory(
+            source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
+        )?,
     })
+}
+
+/// The share of the machine's memory that all running queries may hold by default.
+pub const DEFAULT_TOTAL_QUERY_MEMORY: &str = "50%";
+
+/// Bytes or a share of the machine's memory; `0` is unlimited, and so is a share where
+/// the machine's memory isn't known.
+fn parse_total_query_memory(input: Option<&str>) -> Result<usize> {
+    let text = input.unwrap_or(DEFAULT_TOTAL_QUERY_MEMORY);
+    let bytes = super::units::parse_memory(text)
+        .with_context(|| format!("failed to parse {}", names::MAX_TOTAL_QUERY_MEMORY_BYTES))?;
+    Ok(bytes.unwrap_or(0) as usize)
 }
 
 /// What a query without a dataset reads as its default graph: `default` (only the

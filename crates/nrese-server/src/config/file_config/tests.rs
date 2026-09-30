@@ -89,10 +89,80 @@ fn unknown_keys_are_rejected_and_aliases_accepted() {
         let error = format!("{:#}", load_file_source(&path).expect_err(text));
         assert!(error.contains(key), "{key}: {error}");
     }
+    // A budget under both its names is ambiguous.
+    fs::write(
+        &path,
+        "[budgets]\nquery_timeout = \"10s\"\n[policy.timeouts]\nquery_ms = 5000\n",
+    )
+    .expect("write config");
+    let error = format!("{:#}", load_file_source(&path).expect_err("set twice"));
+    assert!(
+        error.contains("set twice") && error.contains("policy.timeouts.query_ms"),
+        "{error}"
+    );
     fs::write(&path, "[server]\nbind_addr = \"127.0.0.1:9000\"\n").expect("write config");
     let source = load_file_source(&path).expect("alias accepted");
     assert_eq!(
         source.get(names::BIND_ADDR).as_deref(),
         Some("127.0.0.1:9000")
+    );
+}
+
+/// `[budgets]` holds every resource budget, with units; the values reach the same runtime
+/// keys as the older, separate settings.
+#[test]
+fn budgets_are_one_table_with_units() {
+    let temp_dir = tempdir().expect("temp dir");
+    let path = temp_dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"
+[budgets]
+query_memory = "8GiB"
+total_query_memory = "24 GiB"
+query_timeout = "2min"
+update_timeout = 90000
+upload_size = "1GiB"
+result_cache = "256MiB"
+"#,
+    )
+    .expect("config file");
+    let source = load_file_source(&path).expect("file source");
+    for (key, value) in [
+        (names::MAX_QUERY_MEMORY_BYTES, "8GiB"),
+        (names::MAX_TOTAL_QUERY_MEMORY_BYTES, "24 GiB"),
+        (names::QUERY_TIMEOUT_MS, "2min"),
+        (names::UPDATE_TIMEOUT_MS, "90000"),
+        (names::MAX_RDF_UPLOAD_BYTES, "1GiB"),
+        (names::QUERY_CACHE_BYTES, "256MiB"),
+    ] {
+        assert_eq!(source.get(key).as_deref(), Some(value), "{key}");
+    }
+
+    let config = crate::config::ServerConfig::load(Some(&path)).expect("config");
+    assert_eq!(config.policy.limits.max_query_memory_bytes, 8 << 30);
+    assert_eq!(config.store.total_query_memory_bytes, 24 << 30);
+    assert_eq!(config.policy.timeouts.query.as_secs(), 120);
+    assert_eq!(config.policy.timeouts.update.as_secs(), 90);
+    assert_eq!(config.policy.limits.max_rdf_upload_bytes, 1 << 30);
+    assert_eq!(config.store.query_cache_bytes, 256 << 20);
+    let summary = config.summary();
+    for line in [
+        "budgets.query_memory = 8 GiB",
+        "budgets.total_query_memory = 24 GiB",
+        "budgets.query_timeout = 120s",
+        "budgets.upload_size = 1 GiB",
+    ] {
+        assert!(summary.contains(line), "{line}: {summary}");
+    }
+
+    fs::write(&path, "[budgets]\nquery_memory = \"4 parsecs\"\n").expect("write config");
+    let error = format!(
+        "{:#}",
+        crate::config::ServerConfig::load(Some(&path)).expect_err("unknown unit")
+    );
+    assert!(
+        error.contains("NRESE_MAX_QUERY_MEMORY_BYTES") && error.contains("parsecs"),
+        "{error}"
     );
 }

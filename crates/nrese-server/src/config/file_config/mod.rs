@@ -19,5 +19,5 @@ pub(super) fn load_file_source(path: &Path) -> Result<KeyValueSource> {
     let config: RawFileConfig = toml::from_str(&raw)
         .with_context(|| format!("failed to parse config file {}", path.display()))?;
 
-    Ok(into_key_value_source(config))
+    into_key_value_source(config).with_context(|| format!("invalid config file {}", path.display()))
 }

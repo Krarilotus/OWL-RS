@@ -21,6 +21,7 @@ mod source;
 mod store_env;
 #[cfg(test)]
 mod test_support;
+pub mod units;
 
 pub use cli::{CliCommand, CliConfig, LoadCommand};
 
@@ -50,6 +51,11 @@ impl ServerConfig {
         let timeouts = &self.policy.timeouts;
         let rates = &self.policy.rate_limits;
         let store = &self.store;
+        // 0 switches a memory budget off.
+        let size = |bytes: usize| match bytes {
+            0 => "unlimited".to_owned(),
+            bytes => units::format_size(bytes as u64),
+        };
         let lines = [
             ("server.bind_address", self.bind_address.to_string()),
             (
@@ -64,10 +70,6 @@ impl ServerConfig {
                     .ontology_path
                     .as_ref()
                     .map_or("(none)".to_owned(), |p| p.display().to_string()),
-            ),
-            (
-                "store.query_cache_bytes",
-                store.query_cache_bytes.to_string(),
             ),
             (
                 "store.default_graph",
@@ -87,32 +89,25 @@ impl ServerConfig {
                     .unwrap_or_else(|| "(none)".to_owned()),
             ),
             ("policy.auth.mode", self.policy.auth.mode_name().to_owned()),
+            ("budgets.query_memory", size(limits.max_query_memory_bytes)),
             (
-                "policy.limits.max_query_bytes",
-                limits.max_query_bytes.to_string(),
+                "budgets.total_query_memory",
+                size(store.total_query_memory_bytes),
             ),
+            ("budgets.query_timeout", format!("{:?}", timeouts.query)),
+            ("budgets.update_timeout", format!("{:?}", timeouts.update)),
             (
-                "policy.limits.max_query_memory_bytes",
-                limits.max_query_memory_bytes.to_string(),
-            ),
-            (
-                "policy.limits.max_update_bytes",
-                limits.max_update_bytes.to_string(),
-            ),
-            (
-                "policy.limits.max_rdf_upload_bytes",
-                limits.max_rdf_upload_bytes.to_string(),
-            ),
-            ("policy.timeouts.query", format!("{:?}", timeouts.query)),
-            ("policy.timeouts.update", format!("{:?}", timeouts.update)),
-            (
-                "policy.timeouts.graph_read",
+                "budgets.graph_read_timeout",
                 format!("{:?}", timeouts.graph_read),
             ),
             (
-                "policy.timeouts.graph_write",
+                "budgets.graph_write_timeout",
                 format!("{:?}", timeouts.graph_write),
             ),
+            ("budgets.query_text", size(limits.max_query_bytes)),
+            ("budgets.update_size", size(limits.max_update_bytes)),
+            ("budgets.upload_size", size(limits.max_rdf_upload_bytes)),
+            ("budgets.result_cache", size(store.query_cache_bytes)),
             ("policy.rate_limits.window", format!("{:?}", rates.window)),
             (
                 "policy.rate_limits.read_requests_per_window",
