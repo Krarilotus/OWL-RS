@@ -276,6 +276,9 @@ serve_graphdb() {
 
 # --- run -----------------------------------------------------------------------------------
 
+# What this run is about to pull is its to remove afterwards (scripts/bench-cleanup.sh).
+remember_pulls "$ROOT/tmp/bench-pulled-images" "$GRAPHDB_IMAGE" "$QLEVER_IMAGE" "$OXIGRAPH_IMAGE" \
+  "$VIRTUOSO_IMAGE" "$ANZOGRAPH_IMAGE" "$RUST_IMAGE"
 docker run --rm -v nrese-bench-data:/data alpine test -s "$FILE" || {
   echo "missing $FILE: run prepare-datasets.sh or the harness generate command" >&2
   exit 1
