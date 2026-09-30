@@ -26,6 +26,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> KeyValueSource {
 
     insert_option(
         &mut source,
+        names::DEFAULT_GRAPH,
+        config.store.default_graph,
+    );
+    insert_option(
+        &mut source,
         names::SHACL_SHAPES_GRAPH,
         config.shacl.shapes_graph,
     );

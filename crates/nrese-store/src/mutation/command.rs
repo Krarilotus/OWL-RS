@@ -59,6 +59,7 @@ impl MutationCommand {
         &self,
         tx: &mut Transaction<'_>,
         cancellation: &CancellationToken,
+        union_default_graph: bool,
     ) -> Result<MutationCommitReport, StoreError> {
         match self {
             Self::Update(request) => {
@@ -69,6 +70,7 @@ impl MutationCommand {
                         &request.using_named_graphs,
                     )?,
                     cancellation: Some(cancellation.clone()),
+                    union_default_graph,
                     ..UpdateOptions::default()
                 };
                 apply_update(tx, &update, &options)?;

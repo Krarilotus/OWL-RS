@@ -52,6 +52,9 @@ pub struct VersionResponse {
     /// Ruleset, semantics version and fingerprint; changes exactly when this build's
     /// closure differs. The contract: `docs/spec/reasoning-semantics.md`.
     pub reasoning_semantics: Option<String>,
+    /// What a query without a dataset reads: `default` (the default graph) or `union`
+    /// (the merge of all graphs).
+    pub default_graph: &'static str,
     pub graph_store_enabled: bool,
     pub graph_write_enabled: bool,
     pub sparql_update_enabled: bool,
@@ -182,6 +185,11 @@ pub fn build_version_response(state: &AppState) -> VersionResponse {
         reasoning_read_model: posture.reasoning_read_model,
         reasoning_semantic_tier: posture.reasoning_semantic_tier,
         reasoning_semantics: state.reasoner().semantics(),
+        default_graph: if state.store().config().union_default_graph {
+            "union"
+        } else {
+            "default"
+        },
         graph_store_enabled: posture.graph_store_enabled,
         graph_write_enabled: posture.graph_write_enabled,
         sparql_update_enabled: posture.sparql_update_enabled,

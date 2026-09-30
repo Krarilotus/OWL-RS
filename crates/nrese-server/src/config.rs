@@ -69,6 +69,15 @@ impl ServerConfig {
                 "store.query_cache_bytes",
                 store.query_cache_bytes.to_string(),
             ),
+            (
+                "store.default_graph",
+                if store.union_default_graph {
+                    "union"
+                } else {
+                    "default"
+                }
+                .to_owned(),
+            ),
             ("shacl.shapes_graph", store.shapes_graph.clone()),
             ("reasoner.mode", self.reasoner.mode().as_str().to_owned()),
             (

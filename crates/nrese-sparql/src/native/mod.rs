@@ -212,7 +212,7 @@ pub(crate) fn delete_insert(
     options: &QueryOptions,
 ) -> Option<Result<QuadChanges, QueryEvaluationError>> {
     use spargebra::term::{GraphNamePattern, GroundTermPattern};
-    if options.dataset.is_some() || !supported(pattern) {
+    if options.dataset.is_some() || options.union_default_graph || !supported(pattern) {
         return None;
     }
     let ctx = Context::new(snapshot, options);
@@ -313,7 +313,9 @@ fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
 ) -> Option<(&'q GraphPattern, Form<'q>)> {
-    if options.dataset.is_some() || !query_supported(query) {
+    // A protocol dataset, or a default graph that is the merge of all graphs, isn't
+    // what the scans here read.
+    if options.dataset.is_some() || options.union_default_graph || !query_supported(query) {
         return None;
     }
     match query {

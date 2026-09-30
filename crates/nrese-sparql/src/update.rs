@@ -29,6 +29,9 @@ pub struct UpdateOptions {
     /// Protocol `using-graph-uri` / `using-named-graph-uri`. Applies to every
     /// `DELETE`/`INSERT ... WHERE` operation, replacing its own `USING` clauses.
     pub using: Option<QueryDatasetSpecification>,
+    /// The default graph of `WHERE` clauses without a dataset is the merge of all graphs
+    /// ([`QueryOptions::union_default_graph`](crate::QueryOptions)).
+    pub union_default_graph: bool,
     pub cancellation: Option<CancellationToken>,
     /// Evaluate `WHERE` clauses on spareval even where the native executor could
     /// (differential testing).
@@ -105,6 +108,7 @@ fn apply_operation(
                 .then(|| {
                     let query_options = crate::query::QueryOptions {
                         cancellation: options.cancellation.clone(),
+                        union_default_graph: options.union_default_graph,
                         ..crate::query::QueryOptions::default()
                     };
                     crate::native::delete_insert(tx.base(), pattern, delete, insert, &query_options)
@@ -127,7 +131,9 @@ fn apply_operation(
                     }
                     let mut deletes = Vec::new();
                     let mut inserts = Vec::new();
-                    for change in prepared.execute(EngineDataset::new(&*tx))? {
+                    let dataset =
+                        EngineDataset::new(&*tx).union_default_graph(options.union_default_graph);
+                    for change in prepared.execute(dataset)? {
                         match change? {
                             DeleteInsertQuad::Delete(quad) => deletes.push(quad),
                             DeleteInsertQuad::Insert(quad) => inserts.push(quad),

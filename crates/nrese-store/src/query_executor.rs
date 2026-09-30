@@ -210,6 +210,7 @@ pub(crate) fn protocol_dataset(
 pub(crate) fn run_query(
     view: &impl ReadView,
     prepared: &PreparedQuery,
+    union_default_graph: bool,
     cancellation: &CancellationToken,
     out: impl Write,
 ) -> StoreResult<()> {
@@ -218,6 +219,7 @@ pub(crate) fn run_query(
         cancellation: Some(cancellation.clone()),
         read_model: prepared.read_model,
         memory_limit: prepared.memory_limit,
+        union_default_graph,
         ..QueryOptions::default()
     };
     let alive = || match cancellation.is_cancelled() {
@@ -275,6 +277,7 @@ pub(crate) fn run_query(
 pub(crate) fn explain_prepared(
     view: &impl ReadView,
     prepared: &PreparedQuery,
+    union_default_graph: bool,
     cancellation: &CancellationToken,
 ) -> StoreResult<Explanation> {
     let options = QueryOptions {
@@ -282,6 +285,7 @@ pub(crate) fn explain_prepared(
         cancellation: Some(cancellation.clone()),
         read_model: prepared.read_model,
         memory_limit: prepared.memory_limit,
+        union_default_graph,
         ..QueryOptions::default()
     };
     Ok(explain_query(view, &prepared.query, &options)?)
