@@ -15,7 +15,9 @@
 #   containers  <system>-sc, <system>-sc-load, rsc-*      (with their anonymous volumes)
 #   volumes     sc-*, qlever-index-*, nrese-target, nrese-cargo, jena-dist,
 #               and the dataset volume nrese-bench-data
-#   images      nrese-bench/* (built here), and the systems' images the scripts pull
+#   images      nrese-bench/* (built here), and the images a run pulled itself (it notes
+#               them in tmp/bench-pulled-images; an image that was already on the
+#               machine is someone else's and stays)
 #   files       inferred-set dumps (*.inferred.nt) under benches/reasoning/results,
 #               tmp/bench-run-* in the repository (scratch of a run),
 #               datasets (*.nt) and store directories (store-*) under the local
@@ -35,15 +37,9 @@ KEEP=${NRESE_BENCH_KEEP:-}
 KEEP_IMAGES=${NRESE_BENCH_KEEP_IMAGES:-$KEEP}
 LOCAL=${NRESE_BENCH_LOCAL:-$HOME/nrese-bench}
 
-# The images the scripts pull (their defaults); an image another container uses stays.
-PULLED_IMAGES="
-ontotext/graphdb:11.5.1
-adfreiburg/qlever:latest
-ghcr.io/oxigraph/oxigraph:0.5.11
-openlink/virtuoso-opensource-7:7.2.17
-cambridgesemantics/anzograph:3.5.0
-rust:$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")-bookworm
-"
+# The images the runs pulled themselves (remember_pulls in lib/disk.sh).
+PULLED_LIST="$ROOT/tmp/bench-pulled-images"
+PULLED_IMAGES=$(sort -u "$PULLED_LIST" 2>/dev/null || true)
 
 run() {
   if [ -n "$DRY" ]; then
@@ -62,12 +58,15 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   for volume in $(docker volume ls -q | grep -E '^(sc-.*|qlever-index-.*|nrese-target|nrese-cargo|jena-dist)$' || true); do
     run docker volume rm -f "$volume"
   done
-  [ -n "$KEEP" ] || run docker volume rm -f nrese-bench-data
+  if [ -z "$KEEP" ] && docker volume inspect nrese-bench-data >/dev/null 2>&1; then
+    run docker volume rm -f nrese-bench-data
+  fi
   if [ -z "$KEEP_IMAGES" ]; then
     for image in $(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^nrese-bench/' || true) $PULLED_IMAGES; do
-      # No -f: an image a container still uses is somebody's, and stays.
+      # No -f: an image a container still uses stays.
       docker image inspect "$image" >/dev/null 2>&1 && run docker rmi "$image"
     done
+    [ -n "$DRY" ] || rm -f "$PULLED_LIST"
   fi
 fi
 

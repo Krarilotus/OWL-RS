@@ -1,4 +1,4 @@
-# Disk checks shared by the build guard and the benchmark scripts. Source it.
+# Disk and clean-up helpers shared by the build guard and the benchmark scripts. Source it.
 #
 # A script that writes a lot (builds, datasets, container volumes) calls
 # `require_free_gb <n> <what>` before it starts, so it stops with a clear message
@@ -16,6 +16,18 @@ dir_gb() {
   else
     printf 0
   fi
+}
+
+# remember_pulls <list file> <image>...: notes the images that aren't on this machine
+# yet. The run is about to pull them, so they are its to remove afterwards
+# (scripts/bench-cleanup.sh); an image that was already here belongs to someone else.
+remember_pulls() {
+  local list=$1 image
+  shift
+  mkdir -p "$(dirname "$list")"
+  for image in "$@"; do
+    docker image inspect "$image" >/dev/null 2>&1 || echo "$image" >>"$list"
+  done
 }
 
 # require_free_gb <GB> <what is about to run> [directory]: exits 1 if less is free.

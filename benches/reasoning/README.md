@@ -49,7 +49,7 @@ Everything runs in Docker on the same host. The data lives in the volume `nrese-
 A run leaves nothing behind but its results. The scorecard scripts call `scripts/bench-cleanup.sh` when they exit, also when they fail or are interrupted. It removes:
 - the run's containers and store volumes;
 - the dataset volume `nrese-bench-data` and local datasets under `~/nrese-bench`;
-- the images built here (`nrese-bench/*`) and the systems' images the scripts pulled;
+- the images built here (`nrese-bench/*`) and the images the run pulled itself (an image that was already on the machine stays);
 - inferred-set dumps (`*.inferred.nt`); the scorecard keeps their counts and comparisons.
 
 Scorecards (CSV), logs and reports stay.
