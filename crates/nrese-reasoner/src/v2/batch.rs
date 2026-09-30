@@ -27,7 +27,7 @@ use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 
 pub use super::eval::Schema;
-use super::eval::{AllFacts, GroundProgram, Job, Seg, Source, guards_hold, run_jobs};
+use super::eval::{AllFacts, GroundProgram, Job, NEVER, Seg, Source, guards_hold, run_jobs};
 use super::ir::{Head, Rule};
 use super::lists::{ListVocabulary, instantiate};
 use super::naive::{Triple, Violation};
@@ -691,7 +691,12 @@ fn run(
         for rule in &program.rules[evaluated..] {
             jobs.extend(Job::full(&store, rule));
         }
-        candidates.extend(run_jobs(&store, &jobs, &|fact| !store.contains(fact)));
+        candidates.extend(run_jobs(
+            &store,
+            &jobs,
+            &|fact| !store.contains(fact),
+            NEVER,
+        ));
         drop(jobs);
         phases.joins += clock.elapsed();
         let clock = std::time::Instant::now();

@@ -550,3 +550,71 @@ fn unusable_list_axioms_are_reported() {
         Some(format!("{EX}a").as_str())
     );
 }
+
+/// A write cancelled while its reasoning runs (a request timeout) stops promptly: nothing
+/// of it is committed, neither asserted nor inferred, and the writer is free again.
+#[test]
+fn cancelled_reasoning_commits_stop_promptly_and_change_nothing() {
+    const RDFS_SUB: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
+    let store = Arc::new(StoreService::new(nrese_store::StoreConfig::in_memory()).expect("store"));
+    let plain = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Disabled,
+        ))),
+    );
+    // A class chain C0 ⊑ … ⊑ C100 and 10,000 instances of D: linking D into the chain
+    // derives a million types.
+    let mut data: Vec<String> = (0..100)
+        .map(|i| format!("<{EX}C{i}> <{RDFS_SUB}> <{EX}C{}> .", i + 1))
+        .collect();
+    data.extend((0..10_000).map(|j| format!("<{EX}x{j}> a <{EX}D> .")));
+    plain
+        .apply(insert(&data.join("\n")), &MutationTicket::new())
+        .expect("data");
+    store
+        .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+        .expect("rematerialise");
+    let owl = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    let count = || {
+        let result = store
+            .execute_query_str("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")
+            .expect("count");
+        String::from_utf8(result.payload).expect("utf8")
+    };
+    let (revision, before) = (store.current_revision(), count());
+
+    let ticket = MutationTicket::new();
+    let canceller = {
+        let ticket = ticket.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(ticket.cancel(), "the commit must not have started");
+            std::time::Instant::now()
+        })
+    };
+    let result = owl.apply(
+        insert(&format!("<{EX}D> <{RDFS_SUB}> <{EX}C0> .")),
+        &ticket,
+    );
+    let returned = std::time::Instant::now();
+    let cancelled = canceller.join().expect("canceller");
+    assert!(
+        matches!(result, Err(MutationError::Cancelled)),
+        "{result:?}"
+    );
+    let latency = returned.saturating_duration_since(cancelled);
+    assert!(latency < std::time::Duration::from_secs(2), "{latency:?}");
+    assert_eq!(store.current_revision(), revision);
+    assert_eq!(count(), before);
+    assert!(!contains(&owl, &format!("<{EX}x0> a <{EX}C0>")));
+
+    owl.apply(insert(&format!("<{EX}y> a <{EX}C0> .")), &MutationTicket::new())
+        .expect("the writer is free");
+    assert!(contains(&owl, &format!("<{EX}y> a <{EX}C100>")));
+}

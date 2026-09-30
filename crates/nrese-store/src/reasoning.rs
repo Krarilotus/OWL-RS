@@ -351,11 +351,15 @@ impl Base for EngineBase<'_> {
 /// Keeps the transaction's inferred stack equal to the closure of its asserted state,
 /// given that it was before the transaction's changes: runs the delta executor and applies
 /// its result. Returns the violations the change introduced and the counts.
+///
+/// `stop` is polled throughout the reasoning; when it fires, nothing has been applied to
+/// `tx`'s inferred stack and [`delta::Interrupted`] is returned.
 pub fn apply_delta(
     program: &Program,
     ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
-) -> (Vec<Violation>, MaterialisationReport, Option<GroundProgram>) {
+    stop: nrese_reasoner::v2::eval::Stop<'_>,
+) -> Result<(Vec<Violation>, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
     let started = Instant::now();
     let update = {
         let base = EngineBase::new(tx);
@@ -378,7 +382,7 @@ pub fn apply_delta(
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else {
-            delta::update(&base, &inserted, &deleted, program.rules(), ground)
+            delta::update_until(&base, &inserted, &deleted, program.rules(), ground, stop)?
         }
     };
     let (mut inserted, mut removed) = (0, 0);
@@ -410,7 +414,7 @@ pub fn apply_delta(
     .with_diagnostics(&update.diagnostics, &|id| {
         decoded(tx.decode(TermId::from_raw(id)), id)
     });
-    (update.violations, report, update.program)
+    Ok((update.violations, report, update.program))
 }
 
 /// What an OWL 2 RL consistency rule's violation means, for reject reports.

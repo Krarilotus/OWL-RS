@@ -174,6 +174,14 @@ api_key = "replace-me"
 - `policy.timeouts.graph_read_ms` -> `NRESE_GRAPH_READ_TIMEOUT_MS`
 - `policy.timeouts.graph_write_ms` -> `NRESE_GRAPH_WRITE_TIMEOUT_MS`
 
+A write that times out before its commit starts is never committed, and the request gets 408. The deadline reaches every phase of the write:
+- the `WHERE` evaluation of an update;
+- commit-path reasoning, polled between rounds and per work unit.
+
+A cancelled reasoning run discards the asserted and the inferred changes and frees the writer at once. Two steps don't poll the deadline:
+- the one-off full materialisation that runs when no current reasoning state is recorded;
+- closing a newly declared transitive property.
+
 ## SPARQL Parse Error Profile
 
 - `policy.sparql_parse_error_profile` -> `NRESE_SPARQL_PARSE_ERROR_PROFILE`

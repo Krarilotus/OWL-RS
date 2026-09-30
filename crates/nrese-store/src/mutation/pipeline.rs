@@ -114,8 +114,12 @@ impl MutationPipeline {
                 .as_ref()
                 .filter(|(at, _)| *at == revision)
                 .map(|(_, program)| program);
+            // A cancelled request stops the reasoning; dropping `tx` then discards both
+            // the asserted and the inferred changes, and releases the writer.
+            let stop = || ticket.is_cancelled();
             let (violations, materialisation, changed) =
-                crate::reasoning::apply_delta(program, cached, &mut tx);
+                crate::reasoning::apply_delta(program, cached, &mut tx, &stop)
+                    .map_err(|_| MutationError::Cancelled)?;
             tracing::debug!(?materialisation, "commit-path materialisation");
             crate::reasoning::log_diagnostics(
                 &materialisation.diagnostics,
