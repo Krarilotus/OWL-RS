@@ -241,7 +241,7 @@ fn the_default_graph_can_be_the_merge_of_all_graphs() {
     assert_eq!(subjects(&own, seen), ["a"]);
 }
 
-/// `HAVING` may name a `SELECT` alias, as Jena, RDF4J and QLever allow: the alias means
+/// `HAVING` may name a `SELECT` alias, as Jena and QLever allow: the alias means
 /// its expression. Read by the standard, the alias is unbound there and no group passes.
 #[test]
 fn having_may_name_a_select_alias() {
