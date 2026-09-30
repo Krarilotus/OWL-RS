@@ -98,7 +98,6 @@ fn apply_operation(
             // Natively when the WHERE reads only committed data: the first operation of a
             // request, or after operations that changed nothing.
             let native = (!options.force_spareval
-                && update.base_iri.is_none()
                 && tx.pending() == (0, 0)
                 && tx.inferred_pending() == (0, 0))
                 .then(|| {
@@ -114,6 +113,7 @@ fn apply_operation(
                         delete,
                         insert,
                         using.as_ref(),
+                        update.base_iri.as_ref(),
                         &query_options,
                     )
                 })
