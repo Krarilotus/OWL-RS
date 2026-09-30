@@ -21,6 +21,7 @@ mod paths;
 mod plan;
 mod pushdown;
 mod ranges;
+mod search;
 mod sets;
 pub(crate) mod value;
 mod wcoj;
@@ -1587,6 +1588,21 @@ impl<'a> Context<'a> {
         hints: &[ranges::Hint],
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
     ) -> NativeResult<Solutions> {
+        // Full-text searches start the joins (`search`).
+        if let Some((searches, rest)) = search::split(triples) {
+            let mut result = Solutions::unit();
+            for search in &searches {
+                let start = Instant::now();
+                let found = self.search(search)?;
+                if self.trace.is_some() {
+                    let rows = found.table.len();
+                    self.note("text search", format!("{search:?}"), None, rows, start);
+                }
+                result = self.join(result, found)?;
+            }
+            result = self.filter_bound(result, filters)?;
+            return self.bgp_from(result, &rest, filters);
+        }
         let mut scans = Vec::with_capacity(triples.len());
         for triple in triples {
             match self.scan_pattern(triple) {
@@ -1719,6 +1735,76 @@ impl<'a> Context<'a> {
                 };
                 let detail = triples[next].to_string();
                 self.note(operator, detail, estimate(step), result.table.len(), start);
+            }
+            result = self.filter_bound(result, filters)?;
+        }
+        Ok(result)
+    }
+
+    /// Joins `triples` to `result`, a pattern connected to what is bound first, each by
+    /// probing the index where the running result is small.
+    fn bgp_from(
+        &self,
+        mut result: Solutions,
+        triples: &[TriplePattern],
+        filters: &mut Vec<(&Expression, Vec<Variable>)>,
+    ) -> NativeResult<Solutions> {
+        let mut scans = Vec::with_capacity(triples.len());
+        for triple in triples {
+            match self.scan_pattern(triple) {
+                Some(scan) => scans.push(scan),
+                None => {
+                    let mut vars = result.vars.clone();
+                    for triple in triples {
+                        for v in triple_variables(triple) {
+                            if !vars.contains(&v) {
+                                vars.push(v);
+                            }
+                        }
+                    }
+                    let width = vars.len();
+                    self.consumed(&result);
+                    return Ok(Solutions {
+                        vars,
+                        table: IdTable::new(width),
+                        ordered: false,
+                    });
+                }
+            }
+        }
+        let counts: Vec<u64> = scans
+            .iter()
+            .map(|s| self.snapshot.count_in(self.model, &s.quad_pattern()))
+            .collect();
+        let mut left: Vec<usize> = (0..scans.len()).collect();
+        while !left.is_empty() {
+            let connected = |i: &usize| scans[*i].vars().iter().any(|v| result.column(v).is_some());
+            let at = left
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, i)| (!connected(i), counts[**i]))
+                .map(|(at, _)| at)
+                .expect("not empty");
+            let next = left.remove(at);
+            let start = Instant::now();
+            let shared: Vec<Variable> = scans[next]
+                .vars()
+                .into_iter()
+                .filter(|v| result.column(v).is_some())
+                .collect();
+            let probe = !shared.is_empty()
+                && self.merge_set.is_none()
+                && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
+            result = if probe {
+                self.probe_join(result, &scans[next], &shared)?
+            } else {
+                let scanned = self.scan(&scans[next], shared.first())?;
+                self.join(result, scanned)?
+            };
+            if self.trace.is_some() {
+                let operator = if probe { "index join" } else { "join" };
+                let rows = result.table.len();
+                self.note(operator, triples[next].to_string(), None, rows, start);
             }
             result = self.filter_bound(result, filters)?;
         }
@@ -2344,7 +2430,7 @@ impl<'a> Context<'a> {
         let [triple] = patterns.as_slice() else {
             return Ok(None);
         };
-        if self.merge_set.is_some() {
+        if self.merge_set.is_some() || search::is_search(triple, patterns) {
             return Ok(None);
         }
         let vars = triple_variables(triple);
@@ -2728,6 +2814,7 @@ impl<'a> Context<'a> {
             && let [(target, AggregateExpression::CountSolutions { distinct: false })] = aggregates
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
+            && !search::is_search(triple, patterns)
         {
             let count = match self.scan_pattern(triple) {
                 // The index counts quads; in the merged default graph a statement in
@@ -2751,6 +2838,7 @@ impl<'a> Context<'a> {
         if let [key] = variables
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
+            && !search::is_search(triple, patterns)
             && let Some(scan) = self.scan_pattern(triple)
             && !scan.repeats_variable()
             && !scan.merged()

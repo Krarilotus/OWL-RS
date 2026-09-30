@@ -29,4 +29,4 @@ pub use engine::{
 pub use error::{EngineError, EngineResult};
 pub use index::CompactionPolicy;
 pub use quad::{EncodedQuad, EncodedTriple, GraphSelector, QuadPattern};
-pub use term::{Dictionary, DictionaryStats, TermId, TermKind, TermView};
+pub use term::{Dictionary, DictionaryStats, TermId, TermKind, TermView, TextMatch, TextQuery};
