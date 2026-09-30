@@ -1,11 +1,13 @@
-//! GeoSPARQL 1.1 filter functions over WKT literals (`geo:wktLiteral`).
+//! GeoSPARQL 1.1 filter functions over geometry literals: WKT (`geo:wktLiteral`), GeoJSON
+//! (`geo:geoJSONLiteral`) and GML (`geo:gmlLiteral`, the simple features; see
+//! [`super::geo_formats`]).
 //!
 //! | Functions | |
 //! |---|---|
 //! | Simple Features, Egenhofer, RCC8 relations | `geof:sfWithin`, `ehCovers`, `rcc8ntpp`, … and `geof:relate(a, b, "T*F**F***")` (DE-9IM) |
 //! | Measures | `geof:distance(a, b, unit)`, `geof:area(a, unit)`, `geof:length(a, unit)` |
 //! | Constructions | `buffer`, `convexHull`, `envelope`, `centroid`, `intersection`, `union`, `difference`, `symDifference` |
-//! | Properties | `getSRID`, `isEmpty`, `dimension`, `asWKT` |
+//! | Properties | `getSRID`, `isEmpty`, `dimension`, `asWKT`, `asGeoJSON` |
 //!
 //! Coordinates are in the literal's reference system: CRS84 (longitude, latitude) unless
 //! the literal starts with another system's IRI; EPSG:4326 (latitude, longitude) is read
@@ -13,7 +15,8 @@
 //! metres are geodesic (distances between the nearest points, areas and lengths on the
 //! WGS84 ellipsoid); degrees and radians are planar. In other systems a measure is in the
 //! system's own unit. `buffer` in metres needs a projected system. The boolean operations
-//! (`intersection`, `union`, …) take polygons.
+//! (`intersection`, `union`, …) take polygons. Constructions return WKT; `asGeoJSON`
+//! takes CRS84 geometries.
 
 use geo::{
     Area, BooleanOps, BoundingRect, Buffer, Centroid, Closest, ClosestPoint, ConvexHull,
@@ -24,11 +27,14 @@ use geo::{Geometry, MultiPolygon, Point};
 use oxrdf::{Literal, NamedNode, Term};
 use wkt::{ToWkt, TryFromWkt};
 
+use super::geo_formats;
 use super::value::boolean_term;
 
 /// The GeoSPARQL function namespace.
 pub(crate) const GEOF: &str = "http://www.opengis.net/def/function/geosparql/";
 const WKT_LITERAL: &str = "http://www.opengis.net/ont/geosparql#wktLiteral";
+const GEOJSON_LITERAL: &str = "http://www.opengis.net/ont/geosparql#geoJSONLiteral";
+const GML_LITERAL: &str = "http://www.opengis.net/ont/geosparql#gmlLiteral";
 const CRS84: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
 const EPSG_4326: &str = "http://www.opengis.net/def/crs/EPSG/0/4326";
 const UOM: &str = "http://www.opengis.net/def/uom/OGC/1.0/";
@@ -75,6 +81,7 @@ const FUNCTIONS: &[(&str, usize)] = &[
     ("isEmpty", 1),
     ("dimension", 1),
     ("asWKT", 1),
+    ("asGeoJSON", 1),
 ];
 
 /// Whether `name` is a GeoSPARQL function the executor evaluates with `arity` arguments.
@@ -95,23 +102,48 @@ impl Shape {
     }
 }
 
-/// The shape of a `geo:wktLiteral`; `None` for anything else.
+/// The reference system a GML `srsName` names, in GeoSPARQL's IRI form.
+fn srs_iri(name: &str) -> String {
+    let code = name
+        .strip_prefix("EPSG:")
+        .or_else(|| name.strip_prefix("urn:ogc:def:crs:EPSG::"))
+        .or_else(|| name.strip_prefix("http://www.opengis.net/def/crs/EPSG/0/"));
+    match code {
+        Some(code) => format!("http://www.opengis.net/def/crs/EPSG/0/{code}"),
+        None if name == "urn:ogc:def:crs:OGC:1.3:CRS84" || name == "urn:ogc:def:crs:OGC::CRS84" => {
+            CRS84.to_owned()
+        }
+        None => name.to_owned(),
+    }
+}
+
+/// The shape of a geometry literal (WKT, GeoJSON or GML); `None` for anything else.
 pub(super) fn parse(term: &Term) -> Option<Shape> {
     let Term::Literal(literal) = term else {
         return None;
     };
-    if literal.datatype().as_str() != WKT_LITERAL {
-        return None;
-    }
     let text = literal.value().trim();
-    let (crs, text) = match text.strip_prefix('<') {
-        Some(rest) => {
-            let (iri, rest) = rest.split_once('>')?;
-            (iri.to_owned(), rest.trim())
+    let (crs, geometry) = match literal.datatype().as_str() {
+        WKT_LITERAL => {
+            let (crs, text) = match text.strip_prefix('<') {
+                Some(rest) => {
+                    let (iri, rest) = rest.split_once('>')?;
+                    (iri.to_owned(), rest.trim())
+                }
+                None => (CRS84.to_owned(), text),
+            };
+            (crs, Geometry::<f64>::try_from_wkt_str(text).ok()?)
         }
-        None => (CRS84.to_owned(), text),
+        GEOJSON_LITERAL => (CRS84.to_owned(), geo_formats::from_geojson(text)?),
+        GML_LITERAL => {
+            let (srs, geometry) = geo_formats::from_gml(text)?;
+            (
+                srs.map_or_else(|| CRS84.to_owned(), |s| srs_iri(&s)),
+                geometry,
+            )
+        }
+        _ => return None,
     };
-    let geometry = Geometry::<f64>::try_from_wkt_str(text).ok()?;
     Some(if crs == EPSG_4326 {
         Shape {
             geometry: geometry.map_coords(|c| geo::coord! { x: c.y, y: c.x }),
@@ -396,6 +428,16 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
         "asWKT" => {
             let a = shape(0)?;
             Some(literal(&a.geometry, &a.crs))
+        }
+        "asGeoJSON" => {
+            let a = shape(0)?;
+            a.geographic().then(|| {
+                Literal::new_typed_literal(
+                    geo_formats::to_geojson(&a.geometry),
+                    NamedNode::new_unchecked(GEOJSON_LITERAL),
+                )
+                .into()
+            })
         }
         _ => None,
     }
