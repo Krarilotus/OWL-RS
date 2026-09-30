@@ -38,6 +38,8 @@ pub struct QueryOptions {
     /// full before they are joined. The results are the same; the differential tests
     /// compare the two, and it is an escape hatch if a rewrite is ever suspected.
     pub as_written: bool,
+    /// Who answers `SERVICE` calls ([`crate::service`]); `None`: federation is off.
+    pub services: Option<crate::Services>,
 }
 
 /// Evaluates `query` against `view`. Queries the native executor supports run there

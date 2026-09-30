@@ -75,6 +75,7 @@ impl StoreService {
             union_default_graph: config.union_default_graph,
             query_memory: (config.total_query_memory_bytes > 0)
                 .then(|| nrese_sparql::SharedBudget::new(config.total_query_memory_bytes)),
+            services: std::sync::Arc::default(),
         };
         let service = Self {
             query_cache,
@@ -271,6 +272,17 @@ impl StoreService {
         execute_graph_read(&self.engine.snapshot(), request)
     }
 
+    /// Installs who answers `SERVICE` calls (for every clone of this store); the first
+    /// client installed stays. Without one, `SERVICE` is an error.
+    pub fn set_service_client(&self, client: std::sync::Arc<dyn nrese_sparql::ServiceClient>) {
+        let _ = self.settings.services.set(nrese_sparql::Services(client));
+    }
+
+    /// Who answers `SERVICE` calls, if a client is installed.
+    pub fn services(&self) -> Option<nrese_sparql::Services> {
+        self.settings.services.get().cloned()
+    }
+
     /// Applies and commits `command` without validation gates.
     pub fn apply(&self, command: &MutationCommand) -> StoreResult<MutationCommitReport> {
         self.invalidate_reasoning()?;
@@ -279,6 +291,7 @@ impl StoreService {
             &mut tx,
             &CancellationToken::new(),
             self.config.union_default_graph,
+            self.services(),
         )?;
         let summary = tx.commit()?;
         Ok(report.committed(summary.revision))

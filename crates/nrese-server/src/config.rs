@@ -80,6 +80,14 @@ impl ServerConfig {
                 }
                 .to_owned(),
             ),
+            (
+                "federation.allow",
+                if store.federation.enabled() {
+                    store.federation.allow.join(", ")
+                } else {
+                    "(none: SERVICE is off)".to_owned()
+                },
+            ),
             ("shacl.shapes_graph", store.shapes_graph.clone()),
             ("reasoner.mode", self.reasoner.mode().as_str().to_owned()),
             (

@@ -28,6 +28,45 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         total_query_memory_bytes: parse_total_query_memory(
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
         )?,
+        federation: parse_federation(source)?,
+    })
+}
+
+/// `SERVICE` endpoints: comma-separated IRIs or prefixes, `*` for any; none by default.
+fn parse_federation(source: &dyn ConfigSource) -> Result<nrese_store::FederationConfig> {
+    let defaults = nrese_store::FederationConfig::default();
+    let allow: Vec<String> = source
+        .get(names::FEDERATION_ALLOW)
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    for entry in &allow {
+        if entry != "*" && !(entry.starts_with("http://") || entry.starts_with("https://")) {
+            bail!(
+                "{}: '{entry}' is neither an http(s) endpoint (or prefix) nor '*'",
+                names::FEDERATION_ALLOW
+            );
+        }
+    }
+    Ok(nrese_store::FederationConfig {
+        allow,
+        timeout_ms: match source.get(names::FEDERATION_TIMEOUT_MS) {
+            Some(text) => super::units::parse_duration_ms(&text)
+                .with_context(|| format!("failed to parse {}", names::FEDERATION_TIMEOUT_MS))?,
+            None => defaults.timeout_ms,
+        },
+        max_rows: match source.get(names::FEDERATION_MAX_ROWS) {
+            Some(text) => text
+                .trim()
+                .parse()
+                .with_context(|| format!("failed to parse {}", names::FEDERATION_MAX_ROWS))?,
+            None => defaults.max_rows,
+        },
     })
 }
 

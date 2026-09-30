@@ -60,6 +60,7 @@ impl MutationCommand {
         tx: &mut Transaction<'_>,
         cancellation: &CancellationToken,
         union_default_graph: bool,
+        services: Option<nrese_sparql::Services>,
     ) -> Result<MutationCommitReport, StoreError> {
         match self {
             Self::Update(request) => {
@@ -71,6 +72,7 @@ impl MutationCommand {
                     )?,
                     cancellation: Some(cancellation.clone()),
                     union_default_graph,
+                    services,
                     ..UpdateOptions::default()
                 };
                 apply_update(tx, &update, &options)?;

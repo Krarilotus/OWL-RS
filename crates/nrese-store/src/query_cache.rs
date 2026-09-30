@@ -128,7 +128,8 @@ impl QueryCache {
 /// True if `query` may give another answer when repeated on the same data.
 pub(crate) fn volatile(query: &str) -> bool {
     let upper = query.to_ascii_uppercase();
-    ["NOW(", "RAND(", "UUID(", "BNODE("]
+    // SERVICE: the endpoint's data may change without this store's revision.
+    ["NOW(", "RAND(", "UUID(", "BNODE(", "SERVICE"]
         .iter()
         .any(|function| upper.contains(function))
 }
