@@ -7,7 +7,7 @@
 //! | `p+`, `p*` | sets (each end once per start), via breadth-first reachability |
 //!
 //! Zero-length paths (`*`, `?`) only start from terms that occur as a subject or object in
-//! the default graph; an open `?x p* ?y` pairs every such node with itself. Both ends bound
+//! the graph the path is followed in ([`PathGraph`]); an open `?x p* ?y` pairs every such node with itself. Both ends bound
 //! is an existence test (one solution or none).
 //!
 //! The default graph is the store's, or the merge of all graphs
@@ -77,11 +77,22 @@ fn dedup_pairs(mut pairs: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     pairs
 }
 
+/// The graph a path is followed in.
+#[derive(Clone, Copy)]
+pub(crate) enum PathGraph<'a> {
+    /// The store's default graph.
+    Default,
+    /// One named graph (`GRAPH <g>`, or a dataset whose default graph is one graph).
+    Named(TermId),
+    /// The merge of all graphs, or of the listed ones (a dataset with several `FROM`):
+    /// every statement once.
+    Merged(Option<&'a [TermId]>),
+}
+
 pub(crate) struct PathEvaluator<'a> {
     pub(crate) snapshot: &'a Snapshot,
     pub(crate) model: ReadModel,
-    /// The default graph is the merge of all graphs.
-    pub(crate) merged: bool,
+    pub(crate) graph: PathGraph<'a>,
 }
 
 impl PathEvaluator<'_> {
@@ -91,19 +102,22 @@ impl PathEvaluator<'_> {
         predicate: Option<u64>,
         object: Option<u64>,
     ) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
+        let (selector, merged) = match self.graph {
+            PathGraph::Default => (GraphSelector::Exact(TermId::DEFAULT_GRAPH), None),
+            PathGraph::Named(graph) => (GraphSelector::Exact(graph), None),
+            PathGraph::Merged(graphs) => (GraphSelector::Any, Some(graphs)),
+        };
         let pattern = QuadPattern {
             subject: subject.map(TermId::from_raw),
             predicate: predicate.map(TermId::from_raw),
             object: object.map(TermId::from_raw),
-            graph: if self.merged {
-                GraphSelector::Any
-            } else {
-                GraphSelector::Exact(TermId::DEFAULT_GRAPH)
-            },
+            graph: selector,
         };
-        let own = (!self.merged).then(|| self.snapshot.quads_for_pattern_in(self.model, &pattern));
+        let own = merged
+            .is_none()
+            .then(|| self.snapshot.quads_for_pattern_in(self.model, &pattern));
         // Merged: the graph-last order whose prefix the bound positions are.
-        let merged = self.merged.then(|| {
+        let merged = merged.map(|graphs| {
             let permutation = match (subject.is_some(), predicate.is_some(), object.is_some()) {
                 (true, _, false) | (false, false, false) | (true, true, true) => Permutation::Spog,
                 (false, true, _) => Permutation::Posg,
@@ -113,6 +127,7 @@ impl PathEvaluator<'_> {
             self.snapshot
                 .scan_sorted_in(self.model, &pattern, permutation)
                 .expect("the bound positions are a prefix of the order")
+                .filter(move |quad| graphs.is_none_or(|graphs| graphs.contains(&quad.graph)))
                 .filter(move |quad| {
                     let statement = (quad.subject, quad.predicate, quad.object);
                     let first = previous != Some(statement);
@@ -132,16 +147,30 @@ impl PathEvaluator<'_> {
             || self.quads(None, None, Some(node)).next().is_some()
     }
 
-    /// Every subject and object of the default graph, each once, sorted.
+    /// Every subject and object of the graph, each once, sorted.
     fn nodes(&self) -> Vec<u64> {
-        let (pattern, by_subject, by_object) = if self.merged {
-            (QuadPattern::all(), Permutation::Spog, Permutation::Ospg)
-        } else {
-            (
+        let (pattern, by_subject, by_object) = match self.graph {
+            PathGraph::Merged(None) => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
+            // The statistics know no set of graphs: read its statements.
+            PathGraph::Merged(Some(_)) => {
+                let mut nodes: Vec<u64> = self
+                    .quads(None, None, None)
+                    .flat_map(|(s, _, o)| [s, o])
+                    .collect();
+                nodes.sort_unstable();
+                nodes.dedup();
+                return nodes;
+            }
+            PathGraph::Default => (
                 QuadPattern::in_graph(TermId::DEFAULT_GRAPH),
                 Permutation::Gspo,
                 Permutation::Gosp,
-            )
+            ),
+            PathGraph::Named(graph) => (
+                QuadPattern::in_graph(graph),
+                Permutation::Gspo,
+                Permutation::Gosp,
+            ),
         };
         let distinct = |permutation| {
             self.snapshot

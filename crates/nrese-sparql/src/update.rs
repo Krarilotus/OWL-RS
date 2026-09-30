@@ -98,8 +98,6 @@ fn apply_operation(
             // Natively when the WHERE reads only committed data: the first operation of a
             // request, or after operations that changed nothing.
             let native = (!options.force_spareval
-                && options.using.is_none()
-                && using.is_none()
                 && update.base_iri.is_none()
                 && tx.pending() == (0, 0)
                 && tx.inferred_pending() == (0, 0))
@@ -107,9 +105,17 @@ fn apply_operation(
                     let query_options = crate::query::QueryOptions {
                         cancellation: options.cancellation.clone(),
                         union_default_graph: options.union_default_graph,
+                        dataset: options.using.clone(),
                         ..crate::query::QueryOptions::default()
                     };
-                    crate::native::delete_insert(tx.base(), pattern, delete, insert, &query_options)
+                    crate::native::delete_insert(
+                        tx.base(),
+                        pattern,
+                        delete,
+                        insert,
+                        using.as_ref(),
+                        &query_options,
+                    )
                 })
                 .flatten();
             // The whole WHERE result is computed against the state before this operation.
@@ -117,20 +123,21 @@ fn apply_operation(
                 Some(changes) => changes?,
                 None => {
                     let evaluator = evaluator(options.cancellation.as_ref());
-                    let mut prepared = evaluator.prepare_delete_insert(
+                    let prepared = evaluator.prepare_delete_insert(
                         delete.clone(),
                         insert.clone(),
                         update.base_iri.clone(),
-                        using.clone(),
+                        // The adapter presents the operation's dataset as the store.
+                        None,
                         pattern,
                     );
-                    if let Some(dataset) = &options.using {
-                        *prepared.dataset_mut() = dataset.clone();
-                    }
                     let mut deletes = Vec::new();
                     let mut inserts = Vec::new();
-                    let dataset =
-                        EngineDataset::new(&*tx).union_default_graph(options.union_default_graph);
+                    let dataset = EngineDataset::new(&*tx).reading(
+                        options.union_default_graph,
+                        options.using.as_ref(),
+                        using.as_ref(),
+                    );
                     for change in prepared.execute(dataset)? {
                         match change? {
                             DeleteInsertQuad::Delete(quad) => deletes.push(quad),
