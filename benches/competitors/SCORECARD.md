@@ -1,4 +1,6 @@
-# Scorecard results (Pf0)
+# Scorecard results (Pf0): historical
+
+> **Out of date since 27 September 2026. Don't quote these numbers.** They were measured on 26 September, on the borrowed query evaluator, in single runs on a workstation. NRESE has had its own executor since (Pf3), and everything this page says about its query speed describes code that no longer runs. The page stays as the record of where the work started; the rerun, on a machine that runs nothing else and with repetitions, comes after the capability work ([audit](../../docs/reviews/2026-09-30-benchmark-suite-and-readiness-audit.md), §6).
 
 Run of 2026-09-26: `scorecard.sh` over five datasets. Only systems whose licences allow publishing results are listed (QLever, Virtuoso Open Source, Oxigraph, Jena/Fuseki). GraphDB, RDFox and AnzoGraph results are kept local (see [README.md](README.md)).
 
