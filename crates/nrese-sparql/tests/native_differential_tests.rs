@@ -1155,6 +1155,70 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
     );
 }
 
+/// Joins on variables that may be unbound (SPARQL compatibility: an unbound variable is
+/// compatible with any value and takes it): inner joins, OPTIONAL, MINUS, (NOT) EXISTS and
+/// joins that keep the order of a sorted subquery, all after an OPTIONAL that binds the
+/// shared variable in some rows only. They run natively (they used to go to the general
+/// evaluator while running) and give spareval's results. Wiring mutation-checked; the
+/// kernels have their own test against the definitions.
+#[test]
+fn joins_on_unbound_variables_equal_spareval() {
+    let mut rng = Rng(20_261_004);
+    let (mut checked, mut with_solutions) = (0, 0);
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..QueryOptions::default()
+    };
+    for dataset_case in 0..60 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..50 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+            // ?c is bound where the OPTIONAL matches.
+            let base = format!("?a {} ?b OPTIONAL {{ ?a {} ?c }}", p(&mut rng), p(&mut rng));
+            let (p1, p2) = (p(&mut rng), p(&mut rng));
+            let group = match rng.below(10) {
+                0 => format!("{base} OPTIONAL {{ ?c {p1} ?d }}"),
+                1 => format!("{base} OPTIONAL {{ ?a {p1} ?c }}"),
+                2 => format!("{base} OPTIONAL {{ ?b {p1} ?c FILTER(?c != ?a) }}"),
+                3 => format!("{base} ?c {p1} ?d ."),
+                4 => format!("{base} MINUS {{ ?c {p1} ?e }}"),
+                5 => format!("{base} MINUS {{ ?a {p1} ?c }}"),
+                6 => format!("{base} FILTER EXISTS {{ ?c {p1} ?e }}"),
+                7 => format!("{base} FILTER NOT EXISTS {{ ?b {p1} ?c }}"),
+                // The sorted subquery's order is kept through the join on ?c.
+                8 => format!("{{ SELECT ?a ?c WHERE {{ {base} }} ORDER BY ?a ?c }} ?c {p1} ?d"),
+                _ => format!("{base} OPTIONAL {{ ?c {p1} ?d }} OPTIONAL {{ ?d {p2} ?e }}"),
+            };
+            let text = format!("SELECT * WHERE {{ {group} }}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let context = format!("dataset {dataset_case}, query {query_case}: {text}");
+            assert!(runs_natively(&query), "{context}");
+            let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+            assert_eq!(explained.executor, "native", "{context}");
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            assert_same_rows(&native, &expected, &context);
+            checked += 1;
+            with_solutions += usize::from(!expected.is_empty());
+        }
+    }
+    assert!(
+        with_solutions * 4 > checked * 3,
+        "only {with_solutions} of {checked} queries have solutions"
+    );
+}
+
 /// A filter on a variable that a subquery binds but doesn't project sees it unbound: the
 /// filter is an error and the row is dropped. Checked against the answer the specification
 /// gives, not against spareval, whose optimiser moves such a filter into the subquery

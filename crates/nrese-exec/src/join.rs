@@ -9,9 +9,11 @@
 //! | [`left_join`] | hash join, probing with every left row | OPTIONAL; a filter over the combined row decides which matches count |
 //! | [`anti_join`] | hash set of right keys | MINUS and FILTER NOT EXISTS with shared variables |
 //! | [`join_with_undef`] | the fast join for rows with bound keys, nested loops for rows with UNDEF | inner joins where a key may be unbound (after OPTIONAL) |
+//! | [`outer_join_with_undef`] | a hash table for rows with bound keys, scans for rows with UNDEF; left order kept | OPTIONAL, and joins that keep the left order, where a key may be unbound |
+//! | [`compatible_mask`] | the same | MINUS and (NOT) EXISTS where a key may be unbound |
 //!
-//! Key values must not be [`UNDEF`](crate::UNDEF) except in [`join_with_undef`] and on the
-//! right side of [`left_join`]'s output.
+//! Key values must not be [`UNDEF`](crate::UNDEF) except in the `*_with_undef` functions,
+//! in [`compatible_mask`], and on the right side of [`left_join`]'s output.
 //!
 //! Joins that can multiply rows take `max_rows` and stop with [`TooManyRows`] once their
 //! output would exceed it, before the memory is taken: a cross product of three 2,000-row
@@ -656,6 +658,157 @@ pub fn join_with_undef(
     out.finish()
 }
 
+/// `right` for joins whose keys may be UNDEF: its rows with every key bound by key, and
+/// the rows with an unbound key, which can match any left row.
+struct Compatible<'a> {
+    right: &'a IdTable,
+    left_keys: &'a [usize],
+    right_keys: &'a [usize],
+    bound: HashMap<Vec<u64>, Vec<u32>, Hasher>,
+    open: Vec<u32>,
+}
+
+impl<'a> Compatible<'a> {
+    fn new(right: &'a IdTable, left_keys: &'a [usize], right_keys: &'a [usize]) -> Self {
+        let mut bound: HashMap<Vec<u64>, Vec<u32>, Hasher> = HashMap::default();
+        let mut open = Vec::new();
+        for r in 0..right.len() {
+            let key: Vec<u64> = right_keys.iter().map(|&k| right.get(r, k)).collect();
+            if key.contains(&UNDEF) {
+                open.push(r as u32);
+            } else {
+                bound.entry(key).or_default().push(r as u32);
+            }
+        }
+        Self {
+            right,
+            left_keys,
+            right_keys,
+            bound,
+            open,
+        }
+    }
+
+    /// Whether left row `l` and right row `r` agree wherever both bind a key.
+    fn agree(&self, left: &IdTable, l: usize, r: usize) -> bool {
+        self.left_keys.iter().zip(self.right_keys).all(|(&a, &b)| {
+            let (x, y) = (left.get(l, a), self.right.get(r, b));
+            x == y || x == UNDEF || y == UNDEF
+        })
+    }
+
+    /// Calls `found` with each right row compatible with left row `l`, in right order for
+    /// a left row with an unbound key; stops when `found` returns `false`.
+    fn each(
+        &self,
+        left: &IdTable,
+        l: usize,
+        mut found: impl FnMut(usize) -> Result<bool, TooManyRows>,
+    ) -> Result<(), TooManyRows> {
+        let key: Vec<u64> = self.left_keys.iter().map(|&k| left.get(l, k)).collect();
+        if key.contains(&UNDEF) {
+            for r in 0..self.right.len() {
+                if self.agree(left, l, r) && !found(r)? {
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+        for &r in self.bound.get(&key).into_iter().flatten() {
+            if !found(r as usize)? {
+                return Ok(());
+            }
+        }
+        for &r in &self.open {
+            if self.agree(left, l, r as usize) && !found(r as usize)? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A join in `left`'s row order where key columns may hold UNDEF (SPARQL compatibility:
+/// UNDEF matches any value, and the output takes the bound one). With `keep_unmatched`
+/// it is the left outer join (OPTIONAL): a left row without an accepted match appears
+/// once, its right payload UNDEF. `accept` sees the combined output row.
+pub fn outer_join_with_undef(
+    left: &IdTable,
+    right: &IdTable,
+    left_keys: &[usize],
+    right_keys: &[usize],
+    accept: Option<RowFilter<'_>>,
+    keep_unmatched: bool,
+    max_rows: usize,
+) -> Result<IdTable, TooManyRows> {
+    let payload = right_payload(right.width(), right_keys);
+    let width = left.width() + payload.len();
+    let limit = Limit::new(max_rows);
+    let mut out = Sink::new(width, &limit);
+    let compatible = Compatible::new(right, left_keys, right_keys);
+    let mut row = vec![0; width];
+    for l in 0..left.len() {
+        let mut matched = false;
+        compatible.each(left, l, |r| {
+            for (i, c) in left.columns().iter().enumerate() {
+                row[i] = c[l];
+            }
+            for (&a, &b) in left_keys.iter().zip(right_keys) {
+                if row[a] == UNDEF {
+                    row[a] = right.get(r, b);
+                }
+            }
+            for (i, &c) in payload.iter().enumerate() {
+                row[left.width() + i] = right.get(r, c);
+            }
+            if accept.is_none_or(|f| f(&row)) {
+                out.push(&row)?;
+                matched = true;
+            }
+            Ok(true)
+        })?;
+        if !matched && keep_unmatched {
+            for (i, c) in left.columns().iter().enumerate() {
+                row[i] = c[l];
+            }
+            for value in &mut row[left.width()..] {
+                *value = UNDEF;
+            }
+            out.push(&row)?;
+        }
+    }
+    out.finish()
+}
+
+/// Per left row, whether some right row is compatible with it on the keys, which may hold
+/// UNDEF on either side. With `bound_in_both`, the two rows must also share a key that
+/// both bind: SPARQL's MINUS removes a row only for a solution it has a variable in
+/// common with. Without it, this is (NOT) EXISTS.
+pub fn compatible_mask(
+    left: &IdTable,
+    right: &IdTable,
+    left_keys: &[usize],
+    right_keys: &[usize],
+    bound_in_both: bool,
+) -> Vec<bool> {
+    let compatible = Compatible::new(right, left_keys, right_keys);
+    (0..left.len())
+        .map(|l| {
+            let mut any = false;
+            let _ = compatible.each(left, l, |r| {
+                let shares = !bound_in_both
+                    || left_keys
+                        .iter()
+                        .zip(right_keys)
+                        .any(|(&a, &b)| left.get(l, a) != UNDEF && right.get(r, b) != UNDEF);
+                any |= shares;
+                Ok(!any)
+            });
+            any
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,6 +914,103 @@ mod tests {
                 "case {case}"
             );
         }
+    }
+
+    /// The joins over keys that may be unbound, against their definitions: every compatible
+    /// pair (UNDEF matches anything, the bound value is kept), left rows without a match
+    /// once for the outer join, and for MINUS a compatible row that shares a bound key.
+    #[test]
+    fn outer_joins_and_masks_with_undef_match_the_definitions() {
+        let mut rng = Rng(11);
+        for case in 0..400 {
+            let (left_rows, right_rows) = (rng.below(16) as usize, rng.below(16) as usize);
+            let left = random_table(&mut rng, 3, left_rows, 3, true);
+            let right = random_table(&mut rng, 3, right_rows, 3, true);
+            let (lk, rk) = ([0usize, 1], [1usize, 0]);
+            let compatible = |l: &[u64], r: &[u64]| {
+                lk.iter()
+                    .zip(&rk)
+                    .all(|(&a, &b)| l[a] == r[b] || l[a] == UNDEF || r[b] == UNDEF)
+            };
+            // The condition of an OPTIONAL, on the combined row.
+            let accept = |row: &[u64]| row[2] != row[3];
+            let filter: Option<RowFilter<'_>> = (case % 2 == 0).then_some(&accept);
+            let mut inner = Vec::new();
+            let mut outer = Vec::new();
+            for l in left.rows() {
+                let mut matched = false;
+                for r in right.rows().filter(|r| compatible(&l, r)) {
+                    let mut row = l.clone();
+                    for (&a, &b) in lk.iter().zip(&rk) {
+                        if row[a] == UNDEF {
+                            row[a] = r[b];
+                        }
+                    }
+                    row.push(r[2]);
+                    if filter.is_none_or(|f| f(&row)) {
+                        inner.push(row.clone());
+                        outer.push(row);
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    let mut row = l.clone();
+                    row.push(UNDEF);
+                    outer.push(row);
+                }
+            }
+            let sorted = |mut rows: Vec<Vec<u64>>| {
+                rows.sort();
+                rows
+            };
+            let got = outer_join_with_undef(&left, &right, &lk, &rk, filter, true, usize::MAX);
+            assert_eq!(
+                sorted_rows(&got.unwrap()),
+                sorted(outer),
+                "outer, case {case}"
+            );
+            let got = outer_join_with_undef(&left, &right, &lk, &rk, filter, false, usize::MAX);
+            let got = got.unwrap();
+            assert_eq!(sorted_rows(&got), sorted(inner), "inner, case {case}");
+            // The left order is kept: the left columns of the output follow the input.
+            if filter.is_none() {
+                let mut position = 0;
+                for row in got.rows() {
+                    while !left
+                        .row(position)
+                        .iter()
+                        .zip(&row)
+                        .all(|(l, o)| l == o || *l == UNDEF)
+                    {
+                        position += 1;
+                    }
+                }
+            }
+
+            for bound_in_both in [false, true] {
+                let expected: Vec<bool> = left
+                    .rows()
+                    .map(|l| {
+                        right.rows().any(|r| {
+                            compatible(&l, &r)
+                                && (!bound_in_both
+                                    || lk
+                                        .iter()
+                                        .zip(&rk)
+                                        .any(|(&a, &b)| l[a] != UNDEF && r[b] != UNDEF))
+                        })
+                    })
+                    .collect();
+                assert_eq!(
+                    compatible_mask(&left, &right, &lk, &rk, bound_in_both),
+                    expected,
+                    "mask (bound in both: {bound_in_both}), case {case}"
+                );
+            }
+        }
+        // The row limit applies.
+        let many = IdTable::from_rows(1, (0..100).map(|_| &[UNDEF][..]));
+        assert!(outer_join_with_undef(&many, &many, &[0], &[0], None, true, 99).is_err());
     }
 
     #[test]
