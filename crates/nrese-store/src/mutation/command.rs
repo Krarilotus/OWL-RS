@@ -73,7 +73,6 @@ impl MutationCommand {
                     cancellation: Some(cancellation.clone()),
                     union_default_graph,
                     services,
-                    ..UpdateOptions::default()
                 };
                 apply_update(tx, &update, &options)?;
                 Ok(MutationCommitReport::Applied { revision: 0 })

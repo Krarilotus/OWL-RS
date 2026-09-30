@@ -1,6 +1,6 @@
 //! Term values for the native executor: SPARQL comparison, effective boolean value, and the
-//! `ORDER BY` order, following SPARQL 1.1 §17 and matching spareval where the specification
-//! leaves room (differential tests pin that).
+//! `ORDER BY` order, following SPARQL 1.1 §17; where the specification leaves room, the
+//! reference evaluator shares these functions, and the choices are named where made.
 
 use std::cmp::Ordering;
 use std::str::FromStr;
@@ -157,7 +157,7 @@ pub fn equals(a: &Value, b: &Value) -> Option<bool> {
         }
         (Value::Boolean(x), Value::Boolean(y)) => Some(x == y),
         // With a timezone on one side only the order is undetermined (`<` is an error),
-        // but the two are not equal: `=` is false and `!=` true, as in spareval.
+        // but the two are not equal: `=` is false and `!=` true.
         (Value::Date(x), Value::Date(y)) => Some(x == y),
         (Value::DateTime(x), Value::DateTime(y)) => Some(x == y),
         (Value::Other(x), Value::Other(y)) if x == y => Some(true),
@@ -200,7 +200,7 @@ pub(crate) fn effective_boolean(value: &Value) -> Option<bool> {
 
 /// `ORDER BY` order (SPARQL §15.1): unbound < blank nodes < IRIs < literals; literals by
 /// value where comparable, then by lexical form and datatype so the order is total.
-pub(crate) fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
+pub fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
     fn rank(term: Option<&Term>) -> u8 {
         match term {
             None => 0,
@@ -213,12 +213,12 @@ pub(crate) fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
         (Some(Term::BlankNode(x)), Some(Term::BlankNode(y))) => x.as_str().cmp(y.as_str()),
         (Some(Term::NamedNode(x)), Some(Term::NamedNode(y))) => x.as_str().cmp(y.as_str()),
         (Some(Term::Literal(x)), Some(Term::Literal(y))) => {
-            // As spareval: by value where comparable (equal values tie, e.g. 1 and 1.0),
+            // By value where comparable (equal values tie, e.g. 1 and 1.0),
             // otherwise by (lexical form, datatype, language).
             match compare(&Value::of_literal(x), &Value::of_literal(y)) {
                 Some(order) => order,
-                // spareval compares the canonical forms of its values here ("03" as "3",
-                // an xsd:int as an xsd:integer).
+                // Otherwise the canonical forms of the values ("03" as "3", an xsd:int as
+                // an xsd:integer): §15.1 leaves this order to the implementation.
                 None => {
                     let (Term::Literal(x), Term::Literal(y)) =
                         (canonical(x.clone().into()), canonical(y.clone().into()))
@@ -238,10 +238,11 @@ pub(crate) fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
 }
 
 /// The term an evaluator returns for a computed value (MIN, MAX, SAMPLE): literals of the
-/// core XSD types in canonical form (derived integer types as xsd:integer), as spareval's
-/// value-based aggregates produce them;
+/// core XSD types in canonical form (derived integer types as xsd:integer). A deviation
+/// kept from the spareval era (the specification returns the term itself); see the
+/// migration plan's status;
 /// other terms unchanged. Stored terms that are bound directly keep their lexical form.
-pub(crate) fn canonical(term: Term) -> Term {
+pub fn canonical(term: Term) -> Term {
     let Term::Literal(literal) = &term else {
         return term;
     };
@@ -249,7 +250,7 @@ pub(crate) fn canonical(term: Term) -> Term {
     let canonical =
         |lexical: String| Literal::new_typed_literal(lexical, datatype.into_owned()).into();
     match Value::of_literal(literal) {
-        // Every integer type becomes xsd:integer, as spareval's integer values do.
+        // Every integer type becomes xsd:integer (the deviation above).
         Value::Integer(i) => Literal::new_typed_literal(i.to_string(), xsd::INTEGER).into(),
         Value::Decimal(d) => canonical(d.to_string()),
         Value::Double(d) => canonical(d.to_string()),

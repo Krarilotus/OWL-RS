@@ -1,4 +1,6 @@
-//! XC3 gate: the native executor gives the same results as spareval on the same snapshot.
+//! XC3 gate: the native executor gives the same results as the reference evaluator
+//! (`nrese-sparql-reference`, the specification's algebra evaluated without optimisations)
+//! on the same snapshot.
 //!
 //! Random datasets mix every term kind the operators distinguish: IRIs, inline and
 //! dictionary numbers, strings with and without language tags, dates, booleans. Random
@@ -24,6 +26,52 @@ use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
 use spargebra::SparqlParser;
 
 const EX: &str = "http://example.com/";
+
+/// The reference evaluator's answer on what `snapshot` holds in `options.read_model`.
+fn reference(
+    snapshot: &nrese_engine::Snapshot,
+    query: &spargebra::Query,
+    options: &QueryOptions,
+) -> Result<QueryResults<'static>, nrese_sparql::QueryEvaluationError> {
+    nrese_sparql_reference::evaluate_query(snapshot, query, options)
+}
+
+/// Applies `update` to `engine`: natively, or (`reference`) on the reference evaluator's
+/// copy of the engine's statements, written back as the engine's asserted statements.
+fn update_engine(
+    engine: &Engine,
+    update: &spargebra::Update,
+    options: &nrese_sparql::UpdateOptions,
+    reference: bool,
+) {
+    if !reference {
+        let mut tx = engine.transaction();
+        nrese_sparql::apply_update(&mut tx, update, options).unwrap();
+        tx.commit().unwrap();
+        return;
+    }
+    // The WHERE reads what a query reads, inferred statements included; the changes go
+    // to the engine as the removals and insertions a native update makes.
+    let before =
+        nrese_sparql_reference::Dataset::from_snapshot(&engine.snapshot(), ReadModel::Materialised);
+    let mut dataset = before.clone();
+    let query_options = QueryOptions {
+        dataset: options.using.clone(),
+        union_default_graph: options.union_default_graph,
+        ..QueryOptions::default()
+    };
+    dataset.update(update, &query_options).unwrap();
+    let old: HashSet<&Quad> = before.quads().collect();
+    let new: HashSet<&Quad> = dataset.quads().collect();
+    let mut tx = engine.transaction();
+    for quad in old.difference(&new) {
+        tx.remove(quad.as_ref());
+    }
+    for quad in new.difference(&old) {
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+}
 
 /// SplitMix64: deterministic test-case generation.
 struct Rng(u64);
@@ -280,7 +328,7 @@ fn group_pattern(rng: &mut Rng, depth: u32) -> String {
                 // `?z`, which no filter names. From a variable that a literal is bound to,
                 // spareval's optimiser takes the start for a node and decides `?v = 2`
                 // from that; SPARQL lets a zero-length path start at any term of the
-                // graph. `paths_from_bound_values_equal_spareval` covers bound starts.
+                // graph. `paths_from_bound_values_equal_the_reference` covers bound starts.
                 let subject = if path.ends_with('*') || path.ends_with('?') {
                     match rng.below(3) {
                         0 => format!("<{EX}e{}>", rng.below(7)),
@@ -476,7 +524,7 @@ fn limited(text: &str) -> Option<usize> {
 }
 
 #[test]
-fn native_results_equal_spareval_on_random_queries() {
+fn native_results_equal_the_reference_on_random_queries() {
     let mut rng = Rng(20_260_927);
     let (mut checked, mut fallbacks) = (0, Vec::new());
     let mut with_solutions = 0;
@@ -510,8 +558,7 @@ fn native_results_equal_spareval_on_random_queries() {
                 read_model: model,
                 ..QueryOptions::default()
             };
-            let spareval = QueryOptions {
-                force_spareval: true,
+            let oracle = QueryOptions {
                 read_model: model,
                 ..QueryOptions::default()
             };
@@ -532,7 +579,7 @@ fn native_results_equal_spareval_on_random_queries() {
                 // must be that many, and all of them solutions of the unlimited query.
                 let unlimited = text[..text.rfind(" LIMIT ").unwrap()].to_owned();
                 let query = SparqlParser::new().parse_query(&unlimited).unwrap();
-                let mut all = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+                let mut all = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
                 assert_eq!(native.len(), all.len().min(limit), "{text}");
                 for row in &native {
                     let position = all.iter().position(|r| r == row);
@@ -542,10 +589,7 @@ fn native_results_equal_spareval_on_random_queries() {
                 checked += 1;
                 continue;
             }
-            let expected = rows(
-                evaluate_query(&snapshot, &query, &spareval).unwrap(),
-                ordered,
-            );
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), ordered);
             assert_eq!(
                 native, expected,
                 "dataset {dataset_case}, query {query_case}, {model:?}: {text}"
@@ -660,11 +704,10 @@ fn filtered_group(rng: &mut Rng) -> String {
 /// MINUS and BINDs, and into subqueries. Each rule of the pushdown was mutation-checked
 /// against this test.
 #[test]
-fn pushed_filters_equal_spareval() {
+fn pushed_filters_equal_the_reference() {
     let mut rng = Rng(20_260_930);
     let (mut checked, mut with_solutions, mut fallbacks) = (0, 0, 0);
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     let dump = Dump::new("pushed-filters");
@@ -691,7 +734,7 @@ fn pushed_filters_equal_spareval() {
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
             );
-            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
             if native != expected {
                 let only = |rows: &[String], other: &[String]| -> Vec<String> {
                     let mut other = other.to_vec();
@@ -709,9 +752,9 @@ fn pushed_filters_equal_spareval() {
                 };
                 panic!(
                     "dataset {dataset_case}, query {query_case}: {text}
-{} native and {} spareval rows
+{} native and {} reference rows
 only native: {:#?}
-only spareval: {:#?}",
+only reference: {:#?}",
                     native.len(),
                     expected.len(),
                     only(&native, &expected),
@@ -758,9 +801,9 @@ fn assert_same_rows(native: &[String], expected: &[String], context: &str) {
     };
     panic!(
         "{context}
-{} native and {} spareval rows
+{} native and {} reference rows
 only native: {:#?}
-only spareval: {:#?}",
+only reference: {:#?}",
         native.len(),
         expected.len(),
         only(native, expected),
@@ -774,7 +817,7 @@ only spareval: {:#?}",
 /// variable at both ends, under OPTIONAL, with a filter of its own, from values the store
 /// doesn't know, and over the merge of all graphs. Mutation-checked.
 #[test]
-fn paths_from_bound_values_equal_spareval() {
+fn paths_from_bound_values_equal_the_reference() {
     const PATHS: [&str; 14] = [
         "<P0>*",
         "<P1>+",
@@ -819,8 +862,7 @@ fn paths_from_bound_values_equal_spareval() {
             union_default_graph: merged,
             ..QueryOptions::default()
         };
-        let spareval = QueryOptions {
-            force_spareval: true,
+        let oracle = QueryOptions {
             union_default_graph: merged,
             ..QueryOptions::default()
         };
@@ -859,7 +901,7 @@ fn paths_from_bound_values_equal_spareval() {
                 evaluate_query(&snapshot, &query, &native_options).unwrap(),
                 false,
             );
-            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
             assert_same_rows(
                 &native,
                 &expected,
@@ -878,7 +920,7 @@ fn paths_from_bound_values_equal_spareval() {
 /// With many bound values a closure walks an adjacency built from one scan of its step,
 /// from those values, forwards or backwards.
 #[test]
-fn closures_from_many_bound_values_equal_spareval() {
+fn closures_from_many_bound_values_equal_the_reference() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
     // 6,000 members of 1,500 chains of four, some of them closed into a cycle.
@@ -903,8 +945,7 @@ fn closures_from_many_bound_values_equal_spareval() {
     }
     tx.commit().unwrap();
     let snapshot = engine.snapshot();
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     for group in [
@@ -927,7 +968,7 @@ fn closures_from_many_bound_values_equal_spareval() {
             evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
             false,
         );
-        let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
         assert!(expected.len() > 100, "{text}");
         assert_same_rows(&native, &expected, &text);
     }
@@ -1079,13 +1120,12 @@ fn computed_query(rng: &mut Rng) -> (String, bool) {
     }
 }
 
-/// Queries over computed values give spareval's results: see [`computed_query`].
+/// Queries over computed values give the reference evaluator's results: see [`computed_query`].
 #[test]
-fn computed_values_equal_spareval() {
+fn computed_values_equal_the_reference() {
     let mut rng = Rng(20_261_002);
     let (mut checked, mut with_solutions, mut fallbacks) = (0, 0, 0);
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     let dump = Dump::new("computed-values");
@@ -1112,10 +1152,7 @@ fn computed_values_equal_spareval() {
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 ordered,
             );
-            let expected = rows(
-                evaluate_query(&snapshot, &query, &spareval).unwrap(),
-                ordered,
-            );
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), ordered);
             assert_same_rows(
                 &native,
                 &expected,
@@ -1235,7 +1272,7 @@ fn set_query(rng: &mut Rng) -> (String, bool) {
 }
 
 /// Set evaluation (`native/sets.rs`): queries whose consumers ignore duplicates give the
-/// results of the same queries evaluated as written, and spareval's. Order-dependent
+/// results of the same queries evaluated as written, and the reference evaluator's. Order-dependent
 /// results (`GROUP_CONCAT`, `SAMPLE`) are compared with the as-written evaluation only,
 /// where they must be identical: the set evaluation keeps first occurrences in order.
 /// Mutation-checked.
@@ -1247,8 +1284,7 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
         as_written: true,
         ..QueryOptions::default()
     };
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     for dataset_case in 0..60 {
@@ -1276,7 +1312,7 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
             );
             assert_same_rows(&native, &plain, &format!("against as written: {context}"));
             if !order_dependent {
-                let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+                let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
                 assert_same_rows(&native, &expected, &context);
             }
             checked += 1;
@@ -1293,14 +1329,13 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
 /// compatible with any value and takes it): inner joins, OPTIONAL, MINUS, (NOT) EXISTS and
 /// joins that keep the order of a sorted subquery, all after an OPTIONAL that binds the
 /// shared variable in some rows only. They run natively (they used to go to the general
-/// evaluator while running) and give spareval's results. Wiring mutation-checked; the
+/// evaluator while running) and give the reference evaluator's results. Wiring mutation-checked; the
 /// kernels have their own test against the definitions.
 #[test]
-fn joins_on_unbound_variables_equal_spareval() {
+fn joins_on_unbound_variables_equal_the_reference() {
     let mut rng = Rng(20_261_004);
     let (mut checked, mut with_solutions) = (0, 0);
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     for dataset_case in 0..60 {
@@ -1341,7 +1376,7 @@ fn joins_on_unbound_variables_equal_spareval() {
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
             );
-            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
             assert_same_rows(&native, &expected, &context);
             checked += 1;
             with_solutions += usize::from(!expected.is_empty());
@@ -1443,12 +1478,11 @@ fn count_star_of_one_pattern_reads_the_index() {
 }
 
 /// Cyclic BGPs (triangles, 4-cycles, with types, constants, repeated variables and a
-/// variable predicate) over dense graphs: the worst-case-optimal join equals spareval.
+/// variable predicate) over dense graphs: the worst-case-optimal join equals the reference evaluator.
 #[test]
-fn cyclic_bgps_equal_spareval() {
+fn cyclic_bgps_equal_the_reference() {
     let mut rng = Rng(20_260_929);
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     let rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -1537,7 +1571,7 @@ fn cyclic_bgps_equal_spareval() {
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
             );
-            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
             assert_eq!(native, expected, "{text}");
             checked += 1;
         }
@@ -1546,9 +1580,9 @@ fn cyclic_bgps_equal_spareval() {
 }
 
 /// A selective pattern joined with a much larger one runs as a parallel index nested-loop
-/// join (enough rows for several chunks); it equals spareval.
+/// join (enough rows for several chunks); it equals the reference evaluator.
 #[test]
-fn parallel_probe_join_equals_spareval() {
+fn parallel_probe_join_equals_the_reference() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
     let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
@@ -1581,8 +1615,7 @@ fn parallel_probe_join_equals_spareval() {
     }
     tx.commit().unwrap();
     let snapshot = engine.snapshot();
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     for text in [
@@ -1595,7 +1628,7 @@ fn parallel_probe_join_equals_spareval() {
             evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
             false,
         );
-        let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
         assert!(native.len() >= 12_000, "{text}");
         assert_eq!(native, expected, "{text}");
     }
@@ -1679,8 +1712,7 @@ fn explain_reports_the_plan() {
     );
     let query = SparqlParser::new().parse_query(&text).unwrap();
     let explanation = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     assert_eq!(
@@ -1688,7 +1720,7 @@ fn explain_reports_the_plan() {
             evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
             false
         ),
-        rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false)
+        rows(reference(&snapshot, &query, &oracle).unwrap(), false)
     );
     let below: Vec<_> = explanation.steps.iter().filter(|s| s.depth == 2).collect();
     assert_eq!(
@@ -1716,18 +1748,18 @@ fn explain_reports_the_plan() {
         .unwrap();
     let native = explain_query(&snapshot, &describe, &QueryOptions::default()).unwrap();
     assert_eq!((native.executor, native.rows), ("native", 3));
-    // BNODE with a label is the general evaluator's.
+    // BNODE with a label: the native executor too (there is no other).
     let labelled = SparqlParser::new()
         .parse_query("SELECT ?b WHERE { BIND(BNODE(\"x\") AS ?b) }")
         .unwrap();
-    let fallback = explain_query(&snapshot, &labelled, &QueryOptions::default()).unwrap();
-    assert_eq!((fallback.executor, fallback.rows), ("spareval", 1));
+    let native = explain_query(&snapshot, &labelled, &QueryOptions::default()).unwrap();
+    assert_eq!((native.executor, native.rows), ("native", 1));
 }
 
 /// Filters and aggregates over tables large enough to run in parallel chunks (with terms
-/// computed by BIND, regular expressions, strings, decimals) equal spareval.
+/// computed by BIND, regular expressions, strings, decimals) equal the reference evaluator.
 #[test]
-fn parallel_filters_and_aggregates_equal_spareval() {
+fn parallel_filters_and_aggregates_equal_the_reference() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = engine.transaction();
     for i in 0..40_000u32 {
@@ -1756,8 +1788,7 @@ fn parallel_filters_and_aggregates_equal_spareval() {
     }
     tx.commit().unwrap();
     let snapshot = engine.snapshot();
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     let queries = [
@@ -1785,18 +1816,53 @@ fn parallel_filters_and_aggregates_equal_spareval() {
             evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
             false,
         );
-        let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+        let mut expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
         assert!(!expected.is_empty(), "{text}");
+        let mut native = native;
+        if text.contains("SAMPLE(?n) AS ?one") {
+            // SAMPLE may pick any value of its group: the other columns must be equal,
+            // and each sample must be an ?n of its group.
+            let members = rows(
+                reference(
+                    &snapshot,
+                    &SparqlParser::new()
+                        .parse_query(&format!(
+                            "SELECT ?g ?n WHERE {{ ?s <{EX}g> ?g . ?s <{EX}n> ?n }}"
+                        ))
+                        .unwrap(),
+                    &oracle,
+                )
+                .unwrap(),
+                false,
+            );
+            let members: HashSet<&str> = members.iter().map(String::as_str).collect();
+            let split = |row: &str| -> (String, String) {
+                let (rest, sample) = row.rsplit_once('\t').unwrap();
+                (rest.to_owned(), sample.to_owned())
+            };
+            for row in &native {
+                let (rest, sample) = split(row);
+                let group = rest.split('\t').next().unwrap();
+                assert!(
+                    members.contains(format!("{group}\t{sample}").as_str()),
+                    "{row}: {text}"
+                );
+            }
+            native = native.iter().map(|r| split(r).0).collect();
+            expected = expected.iter().map(|r| split(r).0).collect();
+            native.sort();
+            expected.sort();
+        }
         if native != expected {
             let (a, b): (HashSet<_>, HashSet<_>) =
                 (native.iter().collect(), expected.iter().collect());
             let only_native: Vec<_> = a.difference(&b).take(5).collect();
-            let only_spareval: Vec<_> = b.difference(&a).take(5).collect();
+            let only_reference: Vec<_> = b.difference(&a).take(5).collect();
             panic!(
                 "{text}
-{} native vs {} spareval rows
+{} native vs {} reference rows
 only native: {only_native:?}
-only spareval: {only_spareval:?}",
+only reference: {only_reference:?}",
                 native.len(),
                 expected.len()
             );
@@ -1833,9 +1899,9 @@ fn graph(results: QueryResults<'_>) -> Vec<String> {
 }
 
 /// CONSTRUCT over the random generator's patterns (with a template of variables, bound or
-/// not, constants, a blank node and a literal in subject position) equals spareval.
+/// not, constants, a blank node and a literal in subject position) equals the reference evaluator.
 #[test]
-fn construct_equals_spareval() {
+fn construct_equals_the_reference() {
     use spargebra::term::{BlankNode, NamedNodePattern, TermPattern, TriplePattern};
     use spargebra::{Query, algebra::GraphPattern};
 
@@ -1874,6 +1940,11 @@ fn construct_equals_spareval() {
         let snapshot = engine.snapshot();
         for _ in 0..30 {
             let (text, _) = random_query(&mut rng);
+            // Which solutions a LIMIT without ORDER BY keeps is open, and the template
+            // doesn't show them all: no single right graph to compare.
+            if limited(&text).is_some() {
+                continue;
+            }
             let Query::Select { pattern, .. } = SparqlParser::new().parse_query(&text).unwrap()
             else {
                 unreachable!()
@@ -1890,11 +1961,10 @@ fn construct_equals_spareval() {
             }
             let native =
                 graph(evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap());
-            let spareval = QueryOptions {
-                force_spareval: true,
+            let oracle = QueryOptions {
                 ..QueryOptions::default()
             };
-            let expected = graph(evaluate_query(&snapshot, &query, &spareval).unwrap());
+            let expected = graph(reference(&snapshot, &query, &oracle).unwrap());
             assert_eq!(native, expected, "{query}");
             checked += 1;
         }
@@ -1903,9 +1973,9 @@ fn construct_equals_spareval() {
 }
 
 /// GRAPH patterns (a graph variable or constant, mixed with default-graph patterns, the
-/// graph variable shared across GRAPH blocks and grouped on) equal spareval.
+/// graph variable shared across GRAPH blocks and grouped on) equal the reference evaluator.
 #[test]
-fn graph_patterns_equal_spareval() {
+fn graph_patterns_equal_the_reference() {
     let mut rng = Rng(20_260_930);
     let (mut checked, mut fallbacks) = (0, 0);
     for _ in 0..80 {
@@ -1957,11 +2027,10 @@ fn graph_patterns_equal_spareval() {
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
             );
-            let spareval = QueryOptions {
-                force_spareval: true,
+            let oracle = QueryOptions {
                 ..QueryOptions::default()
             };
-            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
             assert_eq!(native, expected, "{text}");
             checked += 1;
         }
@@ -1973,10 +2042,10 @@ fn graph_patterns_equal_spareval() {
 }
 
 /// SUBSTR, REPLACE, ENCODE_FOR_URI, IRI, the XSD casts and GROUP_CONCAT over random data
-/// (dates with timezones, non-canonical integers, language strings) equal spareval.
+/// (dates with timezones, non-canonical integers, language strings) equal the reference evaluator.
 /// GROUP_CONCAT joins in row order, which SPARQL leaves open: its parts are compared sorted.
 #[test]
-fn string_functions_casts_and_group_concat_equal_spareval() {
+fn string_functions_casts_and_group_concat_equal_the_reference() {
     let expressions = [
         "SUBSTR(STR(?b), 2)",
         "SUBSTR(STR(?b), 2, 3)",
@@ -2004,8 +2073,7 @@ fn string_functions_casts_and_group_concat_equal_spareval() {
         "<http://www.w3.org/2001/XMLSchema#integer>(STR(?b))",
     ];
     let mut rng = Rng(20_260_931);
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..QueryOptions::default()
     };
     // GROUP_CONCAT values in a canonical order: the parts of each literal sorted, and no
@@ -2051,7 +2119,7 @@ fn string_functions_casts_and_group_concat_equal_spareval() {
                     evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                     false,
                 );
-                let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+                let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
                 assert_eq!(native, expected, "{text}");
                 checked += 1;
             }
@@ -2074,10 +2142,7 @@ fn string_functions_casts_and_group_concat_equal_spareval() {
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
             ));
-            let expected = normalise(rows(
-                evaluate_query(&snapshot, &query, &spareval).unwrap(),
-                false,
-            ));
+            let expected = normalise(rows(reference(&snapshot, &query, &oracle).unwrap(), false));
             assert_eq!(native, expected, "{text}");
             checked += 1;
         }
@@ -2114,10 +2179,10 @@ fn contents(engine: &Engine) -> Vec<String> {
 
 /// DELETE/INSERT … WHERE with the WHERE evaluated natively (over random patterns, with
 /// blank nodes, graph variables and named graphs in the templates) changes the store
-/// exactly as with the WHERE on spareval.
+/// exactly as with the WHERE on the reference evaluator.
 #[test]
-fn native_updates_equal_spareval_updates() {
-    use nrese_sparql::{UpdateOptions, apply_update};
+fn native_updates_equal_the_reference() {
+    use nrese_sparql::UpdateOptions;
     let mut rng = Rng(20_260_932);
     let templates = [
         (
@@ -2156,26 +2221,23 @@ fn native_updates_equal_spareval_updates() {
             let update = SparqlParser::new()
                 .parse_update(&text)
                 .unwrap_or_else(|e| panic!("{e}: {text}"));
-            for (engine, force_spareval) in engines.iter().zip([false, true]) {
+            for (engine, reference) in engines.iter().zip([false, true]) {
                 let options = UpdateOptions {
-                    force_spareval,
                     ..UpdateOptions::default()
                 };
-                let mut tx = engine.transaction();
-                apply_update(&mut tx, &update, &options).unwrap();
-                tx.commit().unwrap();
+                update_engine(engine, &update, &options, reference);
             }
-            let (native, spareval) = (contents(&engines[0]), contents(&engines[1]));
-            if native != spareval {
+            let (native, oracle) = (contents(&engines[0]), contents(&engines[1]));
+            if native != oracle {
                 let only = |a: &[String], b: &[String]| -> Vec<String> {
                     a.iter().filter(|x| !b.contains(x)).cloned().collect()
                 };
                 panic!(
                     "{text}
 only native: {:?}
-only spareval: {:?}",
-                    only(&native, &spareval),
-                    only(&spareval, &native)
+only the reference: {:?}",
+                    only(&native, &oracle),
+                    only(&oracle, &native)
                 );
             }
             checked += 1;
@@ -2188,25 +2250,19 @@ only spareval: {:?}",
 /// comes before any insertion (SPARQL 1.1 Update 3.1.3), on both paths.
 #[test]
 fn deletions_precede_insertions() {
-    use nrese_sparql::{UpdateOptions, apply_update};
+    use nrese_sparql::UpdateOptions;
     let text = format!(
         "DELETE {{ ?d <{EX}q> <{EX}y> }} INSERT {{ ?i <{EX}q> <{EX}y> }} WHERE {{ {{ BIND(<{EX}x> AS ?i) }} UNION {{ BIND(<{EX}x> AS ?d) }} }}"
     );
     let update = SparqlParser::new().parse_update(&text).unwrap();
-    for force_spareval in [false, true] {
+    for reference in [false, true] {
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let quad = Quad::new(ex("x"), ex("q"), ex("y"), GraphName::DefaultGraph);
         let mut tx = engine.transaction();
         tx.insert(quad.as_ref());
         tx.commit().unwrap();
-        let options = UpdateOptions {
-            force_spareval,
-            ..UpdateOptions::default()
-        };
-        let mut tx = engine.transaction();
-        apply_update(&mut tx, &update, &options).unwrap();
-        tx.commit().unwrap();
-        assert_eq!(contents(&engine).len(), 1, "spareval: {force_spareval}");
+        update_engine(&engine, &update, &UpdateOptions::default(), reference);
+        assert_eq!(contents(&engine).len(), 1, "reference: {reference}");
     }
 }
 
@@ -2361,12 +2417,12 @@ fn load_spread_over_graphs(engine: &Engine, rng: &mut Rng) {
     tx.commit().unwrap();
 }
 
-/// The merged default graph (`union_default_graph`): the native executor equals spareval
+/// The merged default graph (`union_default_graph`): the native executor equals the reference evaluator
 /// over the merging dataset adapter, on the random queries of the main test and on
 /// queries that mix `GRAPH` blocks with merged patterns, under every read model. A
 /// statement held by several graphs counts once in both.
 #[test]
-fn the_merged_default_graph_equals_spareval() {
+fn the_merged_default_graph_equals_the_reference() {
     let mut rng = Rng(20_260_933);
     let (mut checked, mut fallbacks, mut native_runs, mut native_runs_plain) = (0, 0, 0, 0);
     for dataset_case in 0..120 {
@@ -2384,8 +2440,7 @@ fn the_merged_default_graph_equals_spareval() {
                 union_default_graph: true,
                 ..QueryOptions::default()
             };
-            let spareval = QueryOptions {
-                force_spareval: true,
+            let oracle = QueryOptions {
                 ..native_options.clone()
             };
             let (text, ordered) = if rng.below(4) == 0 {
@@ -2429,7 +2484,7 @@ fn the_merged_default_graph_equals_spareval() {
             if let Some(limit) = limited(&text) {
                 let unlimited = text[..text.rfind(" LIMIT ").unwrap()].to_owned();
                 let query = SparqlParser::new().parse_query(&unlimited).unwrap();
-                let mut all = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+                let mut all = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
                 assert_eq!(native.len(), all.len().min(limit), "{context}");
                 for row in &native {
                     let position = all.iter().position(|r| r == row);
@@ -2437,10 +2492,7 @@ fn the_merged_default_graph_equals_spareval() {
                     all.remove(position.unwrap());
                 }
             } else {
-                let expected = rows(
-                    evaluate_query(&snapshot, &query, &spareval).unwrap(),
-                    ordered,
-                );
+                let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), ordered);
                 assert_eq!(native, expected, "{context}");
             }
             checked += 1;
@@ -2510,8 +2562,7 @@ fn merged_default_graph_shortcuts_count_statements_once() {
         union_default_graph: true,
         ..QueryOptions::default()
     };
-    let spareval = QueryOptions {
-        force_spareval: true,
+    let oracle = QueryOptions {
         ..native_options.clone()
     };
     // More quads than statements: the copies are there.
@@ -2521,6 +2572,10 @@ fn merged_default_graph_shortcuts_count_statements_once() {
         let query = SparqlParser::new().parse_query(text).unwrap();
         assert!(runs_natively(&query), "{text}");
         rows(evaluate_query(&snapshot, &query, options).unwrap(), false)
+    };
+    let run_reference = |text: &str| {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        rows(reference(&snapshot, &query, &oracle).unwrap(), false)
     };
     let integer = |n: usize| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
     assert_eq!(
@@ -2541,7 +2596,7 @@ fn merged_default_graph_shortcuts_count_statements_once() {
     ] {
         let native = run(&text, &native_options);
         assert!(!native.is_empty(), "{text}");
-        assert_eq!(native, run(&text, &spareval), "{text}");
+        assert_eq!(native, run_reference(&text), "{text}");
         let explained = explain_query(
             &snapshot,
             &SparqlParser::new().parse_query(&text).unwrap(),
@@ -2576,10 +2631,9 @@ fn merged_default_graph_shortcuts_count_statements_once() {
 
     // A streamed LIMIT: that many rows, each a distinct solution of the unlimited query.
     let limited = format!("SELECT * WHERE {{ <{EX}t7> ?p ?o FILTER(isIRI(?o)) }} LIMIT 3");
-    let all = run(
-        &format!("SELECT * WHERE {{ <{EX}t7> ?p ?o FILTER(isIRI(?o)) }}"),
-        &spareval,
-    );
+    let all = run_reference(&format!(
+        "SELECT * WHERE {{ <{EX}t7> ?p ?o FILTER(isIRI(?o)) }}"
+    ));
     let native = run(&limited, &native_options);
     assert_eq!(native.len(), all.len().min(3));
     let distinct: HashSet<&String> = native.iter().collect();
@@ -2594,8 +2648,8 @@ fn merged_default_graph_shortcuts_count_statements_once() {
 /// Updates whose `WHERE` reads the merged default graph change the store the same way on
 /// both executors. What an update writes or deletes without `GRAPH` is the default graph.
 #[test]
-fn updates_over_the_merged_default_graph_equal_spareval() {
-    use nrese_sparql::{UpdateOptions, apply_update};
+fn updates_over_the_merged_default_graph_equal_the_reference() {
+    use nrese_sparql::UpdateOptions;
     let mut rng = Rng(20_260_934);
     let templates = [
         (
@@ -2633,18 +2687,15 @@ fn updates_over_the_merged_default_graph_equal_spareval() {
                 .parse_update(&text)
                 .unwrap_or_else(|e| panic!("{e}: {text}"));
             let before = contents(&engines[0]);
-            for (engine, force_spareval) in engines.iter().zip([false, true]) {
+            for (engine, reference) in engines.iter().zip([false, true]) {
                 let options = UpdateOptions {
-                    force_spareval,
                     union_default_graph: true,
                     ..UpdateOptions::default()
                 };
-                let mut tx = engine.transaction();
-                apply_update(&mut tx, &update, &options).unwrap();
-                tx.commit().unwrap();
+                update_engine(engine, &update, &options, reference);
             }
-            let (native, spareval) = (contents(&engines[0]), contents(&engines[1]));
-            assert_eq!(native, spareval, "{text}");
+            let (native, oracle) = (contents(&engines[0]), contents(&engines[1]));
+            assert_eq!(native, oracle, "{text}");
             changed += usize::from(native != before);
         }
     }
@@ -2835,10 +2886,10 @@ fn protocol_dataset(rng: &mut Rng) -> Option<nrese_sparql::QueryDatasetSpecifica
 }
 
 /// Datasets (`FROM`, `FROM NAMED`, the protocol's parameters) and `GRAPH` over any
-/// pattern run on the native executor and equal spareval, under every read model and
+/// pattern run on the native executor and equal the reference evaluator, under every read model and
 /// with the store's default graph plain or merged.
 #[test]
-fn datasets_and_graph_patterns_equal_spareval() {
+fn datasets_and_graph_patterns_equal_the_reference() {
     let mut rng = Rng(20_260_935);
     let (mut checked, mut with_solutions, mut with_dataset, mut fallbacks) = (0, 0, 0, 0);
     for dataset_case in 0..100 {
@@ -2876,18 +2927,15 @@ fn datasets_and_graph_patterns_equal_spareval() {
                 fallbacks += 1;
                 continue;
             }
-            // A silent fallback would compare spareval with itself.
+            // A silent fallback would hide a query the executor can't take.
             assert_eq!(
                 explain_query(&snapshot, &query, &options).unwrap().executor,
                 "native",
                 "{context}"
             );
             let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
-            let spareval = QueryOptions {
-                force_spareval: true,
-                ..options.clone()
-            };
-            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            let oracle = QueryOptions { ..options.clone() };
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
             assert_same_rows(&native, &expected, &context);
             checked += 1;
             with_solutions += usize::from(!native.is_empty() && native != ["false"]);
@@ -2931,11 +2979,8 @@ fn a_dataset_is_what_the_query_names() {
             "{text}"
         );
         let native = rows(evaluate_query(&snapshot, &query, options).unwrap(), false);
-        let spareval = QueryOptions {
-            force_spareval: true,
-            ..options.clone()
-        };
-        let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+        let oracle = QueryOptions { ..options.clone() };
+        let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
         assert_eq!(native, expected, "{text}");
         native.len()
     };
@@ -3136,8 +3181,8 @@ fn a_dataset_is_what_the_query_names() {
 /// Updates with a dataset of their own (`WITH`, `USING`, `USING NAMED`, the protocol's
 /// parameters) change the store the same way on both executors.
 #[test]
-fn updates_with_a_dataset_equal_spareval() {
-    use nrese_sparql::{UpdateOptions, apply_update};
+fn updates_with_a_dataset_equal_the_reference() {
+    use nrese_sparql::UpdateOptions;
     let mut rng = Rng(20_260_936);
     let (mut checked, mut changed) = (0, 0);
     for _ in 0..60 {
@@ -3183,18 +3228,15 @@ fn updates_with_a_dataset_equal_spareval() {
                 .parse_update(&text)
                 .unwrap_or_else(|e| panic!("{e}: {text}"));
             let before = contents(&engines[0]);
-            for (engine, force_spareval) in engines.iter().zip([false, true]) {
+            for (engine, reference) in engines.iter().zip([false, true]) {
                 let options = UpdateOptions {
-                    force_spareval,
                     using: using.clone(),
                     ..UpdateOptions::default()
                 };
-                let mut tx = engine.transaction();
-                apply_update(&mut tx, &update, &options).unwrap();
-                tx.commit().unwrap();
+                update_engine(engine, &update, &options, reference);
             }
-            let (native, spareval) = (contents(&engines[0]), contents(&engines[1]));
-            assert_eq!(native, spareval, "{text} (protocol {using:?})");
+            let (native, oracle) = (contents(&engines[0]), contents(&engines[1]));
+            assert_eq!(native, oracle, "{text} (protocol {using:?})");
             checked += 1;
             changed += usize::from(native != before);
         }
@@ -3255,7 +3297,7 @@ fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
     }
 }
 
-/// An `EXISTS` for [`exists_equal_spareval`]: over any pattern, correlated with the outer
+/// An `EXISTS` for [`exists_equal_the_reference`]: over any pattern, correlated with the outer
 /// solution through the variables it binds, through filters at its top, or deeper (inside
 /// an OPTIONAL, MINUS or BIND, where the native executor hands the query back).
 fn exists_pattern(rng: &mut Rng) -> String {
@@ -3309,10 +3351,10 @@ fn exists_pattern(rng: &mut Rng) -> String {
 
 /// `EXISTS` over any pattern and anywhere an expression may stand (FILTER, inside `||`
 /// and `!`, BIND, an OPTIONAL's condition, under GRAPH), correlated with the outer
-/// solution in every way, on outer solutions with unbound variables: equal to spareval,
+/// solution in every way, on outer solutions with unbound variables: equal to the reference evaluator,
 /// and on the native executor wherever the correlation allows.
 #[test]
-fn exists_equal_spareval() {
+fn exists_equal_the_reference() {
     let mut rng = Rng(20_260_937);
     let (mut checked, mut native_runs, mut with_solutions) = (0, 0, 0);
     for _ in 0..80 {
@@ -3372,11 +3414,8 @@ fn exists_equal_spareval() {
                 native_runs += 1;
             }
             let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
-            let spareval = QueryOptions {
-                force_spareval: true,
-                ..options.clone()
-            };
-            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            let oracle = QueryOptions { ..options.clone() };
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
             assert_same_rows(&native, &expected, &context);
             checked += 1;
             with_solutions += usize::from(!native.is_empty());
@@ -3392,9 +3431,9 @@ fn exists_equal_spareval() {
 
 /// DESCRIBE over variables, IRIs and `*`, in the store's default graph, the merged one and
 /// a dataset's, with blank node objects (described in turn, chains and a cycle among them):
-/// the native executor answers it, as spareval does.
+/// the native executor answers it, as the reference evaluator does.
 #[test]
-fn describe_equals_spareval() {
+fn describe_equals_the_reference() {
     use oxrdf::BlankNode;
     let mut rng = Rng(20_260_938);
     let mut checked = 0;
@@ -3438,11 +3477,8 @@ fn describe_equals_spareval() {
                 "native"
             );
             let native = graph(evaluate_query(&snapshot, &query, &options).unwrap());
-            let spareval = QueryOptions {
-                force_spareval: true,
-                ..options.clone()
-            };
-            let expected = graph(evaluate_query(&snapshot, &query, &spareval).unwrap());
+            let oracle = QueryOptions { ..options.clone() };
+            let expected = graph(reference(&snapshot, &query, &oracle).unwrap());
             assert_eq!(
                 native, expected,
                 "{text} (merged {})",
@@ -3455,7 +3491,7 @@ fn describe_equals_spareval() {
 }
 
 /// TIMEZONE and TZ of dates and times of every kind, the hashes, and IRI() resolved against
-/// the query's BASE equal spareval; RAND, UUID, STRUUID, BNODE() and NOW() have the
+/// the query's BASE equal the reference evaluator; RAND, UUID, STRUUID, BNODE() and NOW() have the
 /// properties SPARQL gives them (fresh per call, or one value per query).
 #[test]
 fn the_remaining_functions_run_natively() {
@@ -3509,11 +3545,10 @@ fn the_remaining_functions_run_natively() {
             evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
             false,
         );
-        let spareval = QueryOptions {
-            force_spareval: true,
+        let oracle = QueryOptions {
             ..QueryOptions::default()
         };
-        let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
         assert_eq!(native, expected, "{text}");
     }
     let one = |text: &str| -> Vec<String> {
@@ -3593,10 +3628,10 @@ fn skewed_dataset(rng: &mut Rng) -> Vec<Quad> {
 
 /// Groups whose parts a join crosses (OPTIONAL, UNION, BIND, FILTER, paths, subqueries,
 /// MINUS), with a rare pattern in one part and common ones in the others, in both orders:
-/// evaluating one part from another's rows equals spareval, and the rare side does seed
+/// evaluating one part from another's rows equals the reference evaluator, and the rare side does seed
 /// index probes into the common patterns.
 #[test]
-fn sideways_joins_equal_spareval() {
+fn sideways_joins_equal_the_reference() {
     let mut rng = Rng(20_260_940);
     let (mut checked, mut probed) = (0, 0);
     for _ in 0..4 {
@@ -3655,11 +3690,10 @@ fn sideways_joins_equal_spareval() {
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
             );
-            let spareval = QueryOptions {
-                force_spareval: true,
+            let oracle = QueryOptions {
                 ..QueryOptions::default()
             };
-            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
             assert_same_rows(&native, &expected, &text);
             let plan = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
             probed += usize::from(plan.steps.iter().any(|s| s.operator == "index join"));
@@ -3673,10 +3707,10 @@ fn sideways_joins_equal_spareval() {
 }
 
 /// Requests of several operations, where later WHERE clauses read what earlier ones
-/// inserted and deleted (on the pending state's snapshot): the store ends as with spareval.
+/// inserted and deleted (on the pending state's snapshot): the store ends as with the reference evaluator.
 #[test]
-fn multi_operation_updates_equal_spareval() {
-    use nrese_sparql::{UpdateOptions, apply_update};
+fn multi_operation_updates_equal_the_reference() {
+    use nrese_sparql::UpdateOptions;
     let mut rng = Rng(20_260_941);
     let mut changed = 0;
     for _ in 0..40 {
@@ -3722,17 +3756,14 @@ fn multi_operation_updates_equal_spareval() {
                 .parse_update(&text)
                 .unwrap_or_else(|e| panic!("{e}: {text}"));
             let before = contents(&engines[0]);
-            for (engine, force_spareval) in engines.iter().zip([false, true]) {
+            for (engine, reference) in engines.iter().zip([false, true]) {
                 let options = UpdateOptions {
-                    force_spareval,
                     ..UpdateOptions::default()
                 };
-                let mut tx = engine.transaction();
-                apply_update(&mut tx, &update, &options).unwrap();
-                tx.commit().unwrap();
+                update_engine(engine, &update, &options, reference);
             }
-            let (native, spareval) = (contents(&engines[0]), contents(&engines[1]));
-            assert_eq!(native, spareval, "{text}");
+            let (native, oracle) = (contents(&engines[0]), contents(&engines[1]));
+            assert_eq!(native, oracle, "{text}");
             changed += usize::from(native != before);
         }
     }
@@ -3742,7 +3773,7 @@ fn multi_operation_updates_equal_spareval() {
 /// Data closed under `owl:sameAs` (every fact replicated over identity classes, the
 /// `sameAs` relation complete): with `equality_closed`, grouped queries whose OPTIONALs
 /// feed `COUNT(DISTINCT …)`, MIN, MAX or SAMPLE join on one representative per class;
-/// the answers equal spareval's, and the OPTIONAL's join is smaller.
+/// the answers equal the reference evaluator's, and the OPTIONAL's join is smaller.
 #[test]
 fn identity_classes_shrink_detached_optionals() {
     let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
@@ -3828,8 +3859,9 @@ fn identity_classes_shrink_detached_optionals() {
                 if aggregate.starts_with("SAMPLE") {
                     rows.into_iter()
                         .map(|r| {
+                            // Columns are tab-separated: the key, then the sample.
                             let bound = !r.ends_with("UNDEF");
-                            format!("{} {bound}", r.split(' ').next().unwrap())
+                            format!("{} {bound}", r.split('\t').next().unwrap())
                         })
                         .collect::<Vec<_>>()
                 } else {
@@ -3840,14 +3872,11 @@ fn identity_classes_shrink_detached_optionals() {
                 evaluate_query(&snapshot, &query, &closed).unwrap(),
                 false,
             ));
-            let spareval = QueryOptions {
-                force_spareval: true,
+            let oracle = QueryOptions {
                 ..QueryOptions::default()
             };
-            let mut expected = normalise(rows(
-                evaluate_query(&snapshot, &query, &spareval).unwrap(),
-                false,
-            ));
+            let mut expected =
+                normalise(rows(reference(&snapshot, &query, &oracle).unwrap(), false));
             expected.sort();
             let mut native_sorted = native.clone();
             native_sorted.sort();

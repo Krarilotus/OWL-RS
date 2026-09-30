@@ -1,6 +1,9 @@
 # ADR-0001: Own storage engine; reuse Oxigraph's parsers and SPARQL evaluator
 
-Status: accepted (2026-09-25)
+Status: accepted (2026-09-25); amended 2026-10-01: the Oxigraph libraries are being
+replaced altogether ([migration plan](../plan/2026-10-01-oxigraph-migration.md)).
+`spareval` has left the runtime (the native executor evaluates everything), and the
+differential tests' oracle is `nrese-sparql-reference`.
 
 ## Context
 

@@ -5,8 +5,8 @@
 //! shapes below; otherwise the generic evaluator runs. Per row, a predicate answers true,
 //! false, error (both drop the row) or [`Tri::Unknown`] for a value it doesn't handle (an
 //! inline literal under `STR`, a non-integer in a numeric comparison), and the generic
-//! evaluator decides that row. The semantics are spareval's; the randomized differential
-//! test covers every shape.
+//! evaluator decides that row. The semantics are the generic evaluator's; the randomized
+//! differential test covers every shape.
 //!
 //! The predicates read stored ids. A value the query computed itself (`BIND`, a `SELECT`
 //! expression, an aggregate) has an id of the query's own, which says nothing about the

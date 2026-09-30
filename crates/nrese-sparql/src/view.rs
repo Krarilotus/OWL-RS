@@ -9,6 +9,7 @@
 
 use nrese_engine::{EncodedQuad, QuadPattern, ReadModel, Snapshot, TermId, Transaction};
 use oxrdf::{Quad, Term, TermRef};
+use std::borrow::Cow;
 
 pub trait ReadView {
     /// Quads matching `pattern` in `model`. The iterator borrows the view, not the pattern.
@@ -40,11 +41,14 @@ pub trait ReadView {
     /// Decodes a quad read from this view; `None` only for ids the view doesn't know.
     fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad>;
 
-    /// The committed snapshot behind this view, if it is one. The native executor needs
-    /// its exact counts and sorted scans; other views run on spareval.
+    /// The committed snapshot behind this view, if it is one.
     fn snapshot(&self) -> Option<&Snapshot> {
         None
     }
+
+    /// A snapshot of what this view reads, for the executor: the view itself if it is a
+    /// snapshot, else one of its state (a transaction's pending changes over its base).
+    fn evaluation_snapshot(&self) -> Cow<'_, Snapshot>;
 }
 
 impl ReadView for Snapshot {
@@ -79,6 +83,10 @@ impl ReadView for Snapshot {
     fn snapshot(&self) -> Option<&Snapshot> {
         Some(self)
     }
+
+    fn evaluation_snapshot(&self) -> Cow<'_, Snapshot> {
+        Cow::Borrowed(self)
+    }
 }
 
 impl<'e> ReadView for Transaction<'e> {
@@ -108,5 +116,13 @@ impl<'e> ReadView for Transaction<'e> {
 
     fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
         Transaction::decode_quad(self, quad)
+    }
+
+    fn evaluation_snapshot(&self) -> Cow<'_, Snapshot> {
+        if self.pending() == (0, 0) && self.inferred_pending() == (0, 0) {
+            Cow::Borrowed(self.base())
+        } else {
+            Cow::Owned(self.pending_snapshot())
+        }
     }
 }

@@ -1,7 +1,7 @@
 //! Expression evaluation for the native executor.
 //!
 //! [`supported`] decides whether the native executor can evaluate an expression; if not,
-//! the whole query runs on spareval. Evaluation works on decoded terms: `None` means an
+//! the query is refused as unsupported. Evaluation works on decoded terms: `None` means an
 //! error or an unbound variable, which SPARQL treats alike in FILTERs. The supported set
 //! grows with coverage (execution-core design, XC5).
 
@@ -98,11 +98,9 @@ pub(crate) fn supported(expr: &Expression) -> bool {
                         | Function::Sha384
                         | Function::Sha512
                 )
-                || matches!(function, Function::Custom(name) if args.len() == 1 && is_cast(name.as_str()))
-                || matches!(function, Function::Custom(name) if super::geo::supported(name.as_str(), args.len()))
-                // BNODE(label) is the same blank node within one solution and a different
-                // one in the next: the evaluator doesn't know solutions apart.
-                || (matches!(function, Function::BNode) && args.is_empty())
+                // Casts, GeoSPARQL; any other IRI is an unknown function: an error.
+                || matches!(function, Function::Custom(_))
+                || (matches!(function, Function::BNode) && args.len() <= 1)
         }
         _ => false,
     }
@@ -111,20 +109,47 @@ pub(crate) fn supported(expr: &Expression) -> bool {
 /// Evaluates expressions; caches compiled regular expressions per query. Thread-safe, so
 /// parallel filters and aggregates share one.
 #[derive(Default)]
-pub(crate) struct Evaluator {
+pub struct Evaluator {
     regexes: Mutex<HashMap<(String, String), Option<Regex>>>,
     /// The query's `BASE`, against which `IRI()` resolves a relative IRI.
     base: Option<Iri<String>>,
     /// `NOW()`: one instant for the whole query, taken when first asked for.
     now: OnceLock<DateTime>,
+    /// Alias IRIs standing for blank nodes put into a pattern (`substitute`).
+    aliases: std::sync::RwLock<HashMap<String, Term>>,
+    /// This query run, in the blank nodes `BNODE(label)` makes.
+    run: u64,
+}
+
+thread_local! {
+    /// The solution an expression is evaluated for ([`Evaluator::in_solution`]).
+    static SOLUTION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Evaluator {
-    pub(crate) fn with_base(base: Option<Iri<String>>) -> Self {
+    /// An evaluator for one query; `base` resolves relative IRIs of `IRI()`.
+    pub fn with_base(base: Option<Iri<String>>) -> Self {
         Self {
             base,
+            run: rand::random(),
             ..Self::default()
         }
+    }
+
+    /// Runs `evaluate` for solution number `solution`: what `BNODE(label)` keeps apart.
+    pub fn in_solution<T>(&self, solution: u64, evaluate: impl FnOnce() -> T) -> T {
+        let previous = SOLUTION.with(|s| s.replace(solution));
+        let result = evaluate();
+        SOLUTION.with(|s| s.set(previous));
+        result
+    }
+
+    /// Makes `alias` evaluate to `term` (a blank node put into a pattern).
+    pub(crate) fn register_alias(&self, alias: &str, term: Term) {
+        self.aliases
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(alias.to_owned(), term);
     }
 
     /// The compiled `pattern` with `flags`, cached per query; `None` if it doesn't compile.
@@ -139,17 +164,15 @@ impl Evaluator {
     }
 
     /// Effective boolean value of `expr` for FILTER: errors and unbound values are false.
-    pub(crate) fn filter(
-        &self,
-        expr: &Expression,
-        binding: &dyn Fn(&Variable) -> Option<Term>,
-    ) -> bool {
+    pub fn filter(&self, expr: &Expression, binding: &dyn Fn(&Variable) -> Option<Term>) -> bool {
         self.eval(expr, binding)
             .and_then(|term| effective_boolean(&Value::of(&term)))
             .unwrap_or(false)
     }
 
-    pub(crate) fn eval(
+    /// The value of `expr` with the variables `binding` gives; `None` for an error or an
+    /// unbound value.
+    pub fn eval(
         &self,
         expr: &Expression,
         binding: &dyn Fn(&Variable) -> Option<Term>,
@@ -166,6 +189,13 @@ impl Evaluator {
             ))
         };
         match expr {
+            Expression::NamedNode(node) if node.as_str().starts_with(super::substitute::ALIAS) => {
+                self.aliases
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(node.as_str())
+                    .cloned()
+            }
             Expression::NamedNode(node) => Some(node.clone().into()),
             Expression::Literal(literal) => Some(literal.clone().into()),
             Expression::Variable(variable) => binding(variable),
@@ -290,7 +320,7 @@ impl Evaluator {
                 } else {
                     None
                 };
-                // Character positions, 1-based, as spareval slices them.
+                // Character positions, 1-based (XPath fn:substring).
                 let mut chars = source.char_indices().skip(start.checked_sub(1)?).peekable();
                 let result = match chars.peek().copied() {
                     Some((from, _)) => match length {
@@ -368,6 +398,32 @@ impl Evaluator {
             Function::Uuid => Some(NamedNode::new_unchecked(format!("urn:uuid:{}", uuid())).into()),
             Function::StrUuid => Some(Literal::new_simple_literal(uuid()).into()),
             Function::BNode if args.is_empty() => Some(BlankNode::default().into()),
+            // The same blank node for the same label within one solution, another in the
+            // next solution and in the next query run (SPARQL 1.1 §17.4.2.9).
+            Function::BNode => {
+                let label = match arg(0)? {
+                    Term::Literal(l)
+                        if l.language().is_none()
+                            && l.datatype().as_str()
+                                == "http://www.w3.org/2001/XMLSchema#string" =>
+                    {
+                        l.value().to_owned()
+                    }
+                    _ => return None,
+                };
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                label.hash(&mut hasher);
+                let solution = SOLUTION.with(std::cell::Cell::get);
+                Some(
+                    BlankNode::new_unchecked(format!(
+                        "b{:x}s{solution:x}l{:x}",
+                        self.run,
+                        hasher.finish()
+                    ))
+                    .into(),
+                )
+            }
             Function::Md5
             | Function::Sha1
             | Function::Sha256
@@ -393,7 +449,9 @@ impl Evaluator {
             Function::Custom(name) => cast(name.as_str(), arg(0)?),
             Function::Str => match arg(0)? {
                 Term::NamedNode(node) => Some(Literal::new_simple_literal(node.as_str()).into()),
-                // spareval reads typed literals as values: STR gives the canonical form.
+                // Typed literals are read as values: STR gives the canonical form. A
+                // deviation (SPARQL 1.1 §17.4.2.5 gives the lexical form), kept from the
+                // spareval era; see the migration plan's status.
                 literal @ Term::Literal(_) => match canonical(literal) {
                     Term::Literal(literal) => {
                         Some(Literal::new_simple_literal(literal.value()).into())
@@ -532,6 +590,7 @@ impl Evaluator {
                     Value::Integer(_) | Value::Decimal(_) | Value::Float(_) | Value::Double(_)
                 ))
             }),
+            #[allow(unreachable_patterns)]
             _ => None,
         }
     }
@@ -613,7 +672,7 @@ enum Operator {
 }
 
 /// A numeric value, for arithmetic with SPARQL's type promotion
-/// (integer → decimal → float → double); results print as spareval's do.
+/// (integer → decimal → float → double); results print in the XSD value's string form.
 #[derive(Clone, Copy)]
 enum Numeric {
     Integer(Integer),
@@ -737,24 +796,8 @@ fn arithmetic(operator: Operator, (a, b): (Value, Value)) -> Option<Term> {
     Some(result.term())
 }
 
-/// The XSD casts evaluated natively (SPARQL §17.5), as spareval implements them.
-fn is_cast(name: &str) -> bool {
-    [
-        xsd::STRING,
-        xsd::BOOLEAN,
-        xsd::DOUBLE,
-        xsd::FLOAT,
-        xsd::INTEGER,
-        xsd::DECIMAL,
-        xsd::DATE,
-        xsd::DATE_TIME,
-    ]
-    .iter()
-    .any(|t| t.as_str() == name)
-}
-
-/// `name(term)` for a cast of [`is_cast`]: the value read as spareval reads it, converted
-/// with the same `oxsdatatypes` conversions, in canonical form.
+/// `name(term)` for a cast (XPath §19): the value read from the literal, converted, in
+/// canonical form.
 fn cast(name: &str, term: Term) -> Option<Term> {
     use oxsdatatypes::{Boolean, Date, DateTime};
     let typed = |value: String, datatype: oxrdf::NamedNodeRef<'_>| -> Option<Term> {

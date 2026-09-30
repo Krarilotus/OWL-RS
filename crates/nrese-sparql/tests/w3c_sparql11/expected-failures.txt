@@ -1,15 +1,14 @@
 # Known failures of nrese-sparql on the W3C SPARQL 1.1 suite (rdf-tests pinned in
 # scripts/fetch-w3c-tests.sh). Format: <test IRI> # reason.
 #
-# Every entry below also fails on the oracle: the same spareval 0.2.6 evaluator over
-# Oxigraph's store. They are evaluator behaviours, not engine or adapter bugs. They are
-# fixed upstream in spareval or by our native executor (Pf3). No entry is ours alone.
+# The executor's known deviation (completion plan 4.3): a zero-length path from a term
+# the graph doesn't have gives nothing. The reference evaluator follows it on purpose
+# (nrese-sparql-reference, `Deviations`), so these fail there too.
 
 # Tests added to rdf-tests after SPARQL 1.1 was approved (errata / SPARQL 1.2 work):
-<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_more_set_start> # spareval: zero-length * path with a constant end on an empty dataset
-<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_more_set_end> # spareval: zero-length * path with a constant start on an empty dataset
-<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_one_set_start> # spareval: zero-length ? path with a constant end on an empty dataset
-<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_one_set_end> # spareval: zero-length ? path with a constant start on an empty dataset
+<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_more_set_start> # zero-length * path with a constant end on an empty dataset
+<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_more_set_end> # zero-length * path with a constant start on an empty dataset
+<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_one_set_start> # zero-length ? path with a constant end on an empty dataset
+<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_one_set_end> # zero-length ? path with a constant start on an empty dataset
 
 # Approved tests:
-<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#bnode01> # spareval: BNODE(str) scoping per solution
