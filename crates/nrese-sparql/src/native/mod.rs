@@ -604,6 +604,35 @@ fn contains_exists(expression: &Expression) -> bool {
     }
 }
 
+/// A property path pattern, with the filter directly on it, if any.
+struct PathPattern<'q> {
+    subject: &'q TermPattern,
+    path: &'q spargebra::algebra::PropertyPathExpression,
+    object: &'q TermPattern,
+    filter: Option<&'q Expression>,
+}
+
+/// `pattern` as a path, alone or under a filter that needs no join (no `EXISTS`).
+fn as_path(pattern: &GraphPattern) -> Option<PathPattern<'_>> {
+    let (pattern, filter) = match pattern {
+        GraphPattern::Filter { expr, inner } if !contains_exists(expr) => (&**inner, Some(expr)),
+        other => (other, None),
+    };
+    match pattern {
+        GraphPattern::Path {
+            subject,
+            path,
+            object,
+        } => Some(PathPattern {
+            subject,
+            path,
+            object,
+            filter,
+        }),
+        _ => None,
+    }
+}
+
 fn uncorrelated(pattern: &GraphPattern) -> bool {
     match pattern {
         GraphPattern::Bgp { patterns } => patterns.iter().all(supported_triple),
@@ -888,7 +917,7 @@ impl<'a> Context<'a> {
     fn eval_operator(&self, pattern: &GraphPattern) -> NativeResult<Solutions> {
         self.check()?;
         match pattern {
-            GraphPattern::Bgp { patterns } => self.bgp(patterns, &[]),
+            GraphPattern::Bgp { patterns } => self.bgp(patterns, &[], &mut Vec::new()),
             GraphPattern::Graph { name, inner } => {
                 let scope = match name {
                     NamedNodePattern::NamedNode(n) => self
@@ -916,28 +945,66 @@ impl<'a> Context<'a> {
                 object,
             } => self.path(subject, path, object),
             GraphPattern::Join { left, right } => {
-                let (left, right) = (self.eval(left)?, self.eval(right)?);
-                self.join(left, right)
+                // A path joined to a pattern is evaluated second, from the values the
+                // pattern binds to one of its ends.
+                match (as_path(left), as_path(right)) {
+                    (_, Some(path)) => {
+                        let bound = self.eval(left)?;
+                        let reached = self.path_from(&bound, &path)?;
+                        self.join(bound, reached)
+                    }
+                    (Some(path), None) => {
+                        let bound = self.eval(right)?;
+                        let reached = self.path_from(&bound, &path)?;
+                        self.join(reached, bound)
+                    }
+                    (None, None) => {
+                        let (left, right) = (self.eval(left)?, self.eval(right)?);
+                        self.join(left, right)
+                    }
+                }
             }
             GraphPattern::LeftJoin {
                 left,
                 right,
                 expression,
             } => {
-                let (left, right) = (self.eval(left)?, self.eval(right)?);
+                let left = self.eval(left)?;
+                // Only rows that agree with a left row on the shared variables can match.
+                let right = match as_path(right) {
+                    Some(path) => self.path_from(&left, &path)?,
+                    None => self.eval(right)?,
+                };
                 self.left_join(left, right, expression.as_ref())
             }
-            GraphPattern::Filter { expr, inner } => {
-                // Range conjuncts on a variable narrow the scan that binds it; the full
-                // FILTER still runs on every row, so the ranges only prune.
-                let solutions = match &**inner {
-                    GraphPattern::Bgp { patterns } => {
-                        self.bgp(patterns, &ranges::hints(expr, self.snapshot))?
+            GraphPattern::Filter { expr, inner } => match &**inner {
+                GraphPattern::Bgp { patterns } => {
+                    // Range conjuncts on a variable narrow the scan that binds it (the
+                    // conjunct still runs on every row, so the ranges only prune). Each
+                    // conjunct runs as soon as the join sequence has bound its variables,
+                    // so that a selective filter keeps the following joins small.
+                    let hints = ranges::hints(expr, self.snapshot);
+                    let mut all = Vec::new();
+                    pushdown::conjuncts_of(expr, &mut all);
+                    let (mut early, late): (Vec<_>, Vec<_>) =
+                        all.into_iter().partition(|c| pushdown::movable(c));
+                    let mut early: Vec<(&Expression, Vec<Variable>)> = early
+                        .drain(..)
+                        .map(|c| (c, expression_variables(c)))
+                        .collect();
+                    let mut solutions = self.bgp(patterns, &hints, &mut early)?;
+                    // What the pattern couldn't place: variables it doesn't bind (the
+                    // conjunct is then an error or a BOUND test), EXISTS, draws per row.
+                    for conjunct in early.into_iter().map(|(c, _)| c).chain(late) {
+                        solutions = self.filter(solutions, conjunct)?;
                     }
-                    other => self.eval(other)?,
-                };
-                self.filter(solutions, expr)
-            }
+                    Ok(solutions)
+                }
+                other => {
+                    let solutions = self.eval(other)?;
+                    self.filter(solutions, expr)
+                }
+            },
             GraphPattern::Union { left, right } => {
                 let (left, right) = (self.eval(left)?, self.eval(right)?);
                 self.union(left, right)
@@ -1091,6 +1158,106 @@ impl<'a> Context<'a> {
 
     // --- property paths ------------------------------------------------------------------
 
+    /// An end of a path: a variable (blank nodes are variables here), or a constant's id
+    /// (computed if the store doesn't know it; such an id has no edges).
+    fn path_end(&self, term: &TermPattern) -> Result<Variable, u64> {
+        match term {
+            TermPattern::Variable(v) => Ok(v.clone()),
+            TermPattern::BlankNode(b) => {
+                Ok(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
+            }
+            TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())),
+            TermPattern::Literal(l) => Err(self.id(&l.clone().into())),
+            #[allow(unreachable_patterns)]
+            _ => Err(UNDEF),
+        }
+    }
+
+    fn path_evaluator(&self) -> paths::PathEvaluator<'a> {
+        paths::PathEvaluator {
+            snapshot: self.snapshot,
+            model: self.model,
+            merged: matches!(*self.graph.borrow(), GraphScope::Union),
+        }
+    }
+
+    /// The solutions of `path` that can join `bound`: if `bound` binds one of the path's
+    /// variable ends in every row, the path is followed from those values (the subject's,
+    /// if both are bound). Otherwise all of the path's solutions.
+    fn path_from(&self, bound: &Solutions, path: &PathPattern<'_>) -> NativeResult<Solutions> {
+        if !matches!(
+            *self.graph.borrow(),
+            GraphScope::Default | GraphScope::Union
+        ) {
+            return Err(NativeError::Fallback);
+        }
+        let start = Instant::now();
+        // The distinct values of a variable, if every row of `bound` has one.
+        let values = |variable: &Variable| -> Option<Vec<u64>> {
+            let mut values = bound.table.column(bound.column(variable)?).to_vec();
+            values.sort_unstable();
+            values.dedup();
+            (values.last() != Some(&UNDEF)).then_some(values)
+        };
+        let (Ok(s), Ok(o)) = (self.path_end(path.subject), self.path_end(path.object)) else {
+            // A constant end already bounds the path.
+            return self.filtered_path(path, None, start);
+        };
+        let resolved = paths::Path::resolve(path.path, self.snapshot);
+        let evaluator = self.path_evaluator();
+        let (pairs, from) = if let Some(starts) = values(&s) {
+            (evaluator.reached_from(&resolved, &starts), starts.len())
+        } else if let Some(ends) = values(&o) {
+            (evaluator.reaching(&resolved, &ends), ends.len())
+        } else {
+            return self.filtered_path(path, None, start);
+        };
+        let (vars, table) = if s == o {
+            let same = pairs.into_iter().filter(|(a, b)| a == b).map(|(a, _)| a);
+            (vec![s], IdTable::from_columns(vec![same.collect()]))
+        } else {
+            let (starts, ends): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
+            (vec![s, o], IdTable::from_columns(vec![starts, ends]))
+        };
+        let reached = self.produced(Solutions {
+            vars,
+            table,
+            ordered: false,
+        })?;
+        self.filtered_path(path, Some((reached, from)), start)
+    }
+
+    /// The path's solutions (`reached`, from that many bound values, or all of them),
+    /// after the path's own filter.
+    fn filtered_path(
+        &self,
+        path: &PathPattern<'_>,
+        reached: Option<(Solutions, usize)>,
+        start: Instant,
+    ) -> NativeResult<Solutions> {
+        let (subject, object) = (path.subject, path.object);
+        let mut detail = format!("{subject} {} {object}", path.path);
+        let mut solutions = match reached {
+            Some((solutions, values)) => {
+                detail.push_str(&format!(" from {values} bound values"));
+                solutions
+            }
+            None => self.path(subject, path.path, object)?,
+        };
+        if self.trace.is_some() {
+            self.note("path", detail, None, solutions.table.len(), start);
+        }
+        if let Some(filter) = path.filter {
+            let start = Instant::now();
+            solutions = self.filter(solutions, filter)?;
+            if self.trace.is_some() {
+                let rows = solutions.table.len();
+                self.note("filter", filter.to_string(), None, rows, start);
+            }
+        }
+        Ok(solutions)
+    }
+
     fn path(
         &self,
         subject: &TermPattern,
@@ -1098,25 +1265,8 @@ impl<'a> Context<'a> {
         object: &TermPattern,
     ) -> NativeResult<Solutions> {
         let resolved = paths::Path::resolve(path, self.snapshot);
-        let evaluator = paths::PathEvaluator {
-            snapshot: self.snapshot,
-            model: self.model,
-            merged: matches!(*self.graph.borrow(), GraphScope::Union),
-        };
-        // A variable (blank nodes are variables here), or a constant's id (computed if the
-        // store doesn't know it; such an id has no edges).
-        let end = |term: &TermPattern| -> Result<Variable, u64> {
-            match term {
-                TermPattern::Variable(v) => Ok(v.clone()),
-                TermPattern::BlankNode(b) => {
-                    Ok(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-                }
-                TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())),
-                TermPattern::Literal(l) => Err(self.id(&l.clone().into())),
-                #[allow(unreachable_patterns)]
-                _ => Err(UNDEF),
-            }
-        };
+        let evaluator = self.path_evaluator();
+        let end = |term: &TermPattern| self.path_end(term);
         let column = |values: Vec<u64>| IdTable::from_columns(vec![values]);
         let (vars, table) = match (end(subject), end(object)) {
             (Err(start), Err(finish)) => {
@@ -1152,7 +1302,15 @@ impl<'a> Context<'a> {
 
     // --- basic graph patterns ------------------------------------------------------------
 
-    fn bgp(&self, triples: &[TriplePattern], hints: &[ranges::Hint]) -> NativeResult<Solutions> {
+    /// Joins the patterns in the planned order. `filters` are conjuncts with their
+    /// variables: each is applied, and removed from the list, after the first step that
+    /// binds all its variables.
+    fn bgp(
+        &self,
+        triples: &[TriplePattern],
+        hints: &[ranges::Hint],
+        filters: &mut Vec<(&Expression, Vec<Variable>)>,
+    ) -> NativeResult<Solutions> {
         let mut scans = Vec::with_capacity(triples.len());
         for triple in triples {
             match self.scan_pattern(triple) {
@@ -1254,6 +1412,7 @@ impl<'a> Context<'a> {
             let detail = triples[first].to_string();
             self.note(operator, detail, estimate(0), result.table.len(), start);
         }
+        result = self.filter_bound(result, filters)?;
         for (step, &next) in order.iter().enumerate().skip(1) {
             let start = Instant::now();
             let shared: Vec<Variable> = scans[next]
@@ -1283,8 +1442,36 @@ impl<'a> Context<'a> {
                 let detail = triples[next].to_string();
                 self.note(operator, detail, estimate(step), result.table.len(), start);
             }
+            result = self.filter_bound(result, filters)?;
         }
         Ok(result)
+    }
+
+    /// Applies, and removes from `filters`, the conjuncts whose variables `solutions` binds.
+    fn filter_bound(
+        &self,
+        mut solutions: Solutions,
+        filters: &mut Vec<(&Expression, Vec<Variable>)>,
+    ) -> NativeResult<Solutions> {
+        let mut index = 0;
+        while index < filters.len() {
+            if !filters[index]
+                .1
+                .iter()
+                .all(|v| solutions.column(v).is_some())
+            {
+                index += 1;
+                continue;
+            }
+            let (conjunct, _) = filters.remove(index);
+            let start = Instant::now();
+            solutions = self.filter(solutions, conjunct)?;
+            if self.trace.is_some() {
+                let rows = solutions.table.len();
+                self.note("filter", conjunct.to_string(), None, rows, start);
+            }
+        }
+        Ok(solutions)
     }
 
     /// The order in which to join a BGP's patterns ([`plan`]; `counts` are exact). Two
