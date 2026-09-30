@@ -17,6 +17,11 @@
 //! A bound end is followed by index probes, so `ex:Cat rdfs:subClassOf* ?c` touches only the
 //! nodes it reaches. Open closures build an [`Adjacency`] from the step's pairs and walk it
 //! from every start.
+//!
+//! A path joined to a pattern that binds one of its ends is evaluated from those values
+//! only ([`PathEvaluator::reached_from`], [`PathEvaluator::reaching`]): the rows an open
+//! evaluation would give for them, without the rest. `?p a :Person . ?x owl:sameAs* ?p`
+//! then costs what the persons' identity groups cost, not one row per node of the graph.
 
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
@@ -55,6 +60,10 @@ impl Path {
         }
     }
 }
+
+/// Up to this many bound values, a closure probes the index from each node it reaches.
+/// Beyond, it scans its step once into an [`Adjacency`] and walks that from the values.
+const PROBED_VALUES: usize = 4096;
 
 fn dedup_keep_order(mut values: Vec<u64>) -> Vec<u64> {
     let mut seen = std::collections::HashSet::with_capacity(values.len());
@@ -265,6 +274,58 @@ impl PathEvaluator<'_> {
             Path::Negated(excluded) => self
                 .quads(Some(start), None, Some(end))
                 .any(|(_, p, _)| !excluded.contains(&p)),
+        }
+    }
+
+    /// The `(start, end)` pairs of [`Self::open`] whose start is one of `starts` (distinct
+    /// values).
+    pub(crate) fn reached_from(&self, path: &Path, starts: &[u64]) -> Vec<(u64, u64)> {
+        match path {
+            Path::OneOrMore(step) | Path::ZeroOrMore(step) if starts.len() > PROBED_VALUES => {
+                let reflexive = matches!(path, Path::ZeroOrMore(_));
+                let adjacency = Adjacency::new(self.open(step));
+                let starts = starts
+                    .iter()
+                    .copied()
+                    .filter(|&node| !reflexive || self.is_node(node));
+                pairs_of(closure(&adjacency, starts, reflexive))
+            }
+            _ => starts
+                .iter()
+                .flat_map(|&start| {
+                    self.from(path, start)
+                        .into_iter()
+                        .map(move |end| (start, end))
+                })
+                .collect(),
+        }
+    }
+
+    /// The `(start, end)` pairs of [`Self::open`] whose end is one of `ends` (distinct
+    /// values).
+    pub(crate) fn reaching(&self, path: &Path, ends: &[u64]) -> Vec<(u64, u64)> {
+        match path {
+            Path::OneOrMore(step) | Path::ZeroOrMore(step) if ends.len() > PROBED_VALUES => {
+                let reflexive = matches!(path, Path::ZeroOrMore(_));
+                let backwards =
+                    Adjacency::new(self.open(step).into_iter().map(|(s, o)| (o, s)).collect());
+                let ends = ends
+                    .iter()
+                    .copied()
+                    .filter(|&node| !reflexive || self.is_node(node));
+                pairs_of(closure(&backwards, ends, reflexive))
+                    .into_iter()
+                    .map(|(end, start)| (start, end))
+                    .collect()
+            }
+            _ => ends
+                .iter()
+                .flat_map(|&end| {
+                    self.to(path, end)
+                        .into_iter()
+                        .map(move |start| (start, end))
+                })
+                .collect(),
         }
     }
 

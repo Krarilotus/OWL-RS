@@ -276,9 +276,20 @@ fn conjunction(conjuncts: Vec<Expression>) -> Option<Expression> {
         .reduce(|a, b| Expression::And(Box::new(a), Box::new(b)))
 }
 
+/// The conjuncts of `a && b && …`, by reference.
+pub(super) fn conjuncts_of<'e>(expression: &'e Expression, out: &mut Vec<&'e Expression>) {
+    match expression {
+        Expression::And(a, b) => {
+            conjuncts_of(a, out);
+            conjuncts_of(b, out);
+        }
+        other => out.push(other),
+    }
+}
+
 /// Whether a conjunct means the same wherever its variables are bound: it has variables,
 /// and neither reads the rest of the solution (`EXISTS`) nor draws a value per row.
-fn movable(conjunct: &Expression) -> bool {
+pub(super) fn movable(conjunct: &Expression) -> bool {
     !expression_variables(conjunct).is_empty() && !per_solution(conjunct)
 }
 
