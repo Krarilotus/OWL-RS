@@ -101,25 +101,33 @@ P0 = wrong answers or lost data; P1 = a production deployment would hit it; P2 =
 | Open property paths computed for every node | The same | The integration workload |
 | No `TCP_NODELAY` on the server's connections | A streamed result waited 40 ms for the client's delayed acknowledgement (CQ06: 44 ms for a 0.7 ms query) | The integration workload, rerun after the fixes above |
 
+### Fixed after the audit (same day)
+
+| Gap | What changed | Commit |
+|---|---|---|
+| 3: the memory budget was no bound | Operators charge hash tables and working memory, tables grow within what is left, a server-wide budget (`budgets.total_query_memory`, default half the machine's memory) caps all queries together. Measured on Linux: a 1 GiB budget peaks at 815 MiB (was 5.8 GB with 4 GiB) | `55dc842` |
+| 8: aggregates over independent OPTIONALs | `SELECT DISTINCT` and groups whose aggregates ignore duplicates work on sets; an OPTIONAL that only feeds aggregates is joined to the kept groups. CQ05 answers (9,009 rows, 0.4 s) | `ca89027` |
+| 1, in part: the general evaluator ran too much | Now native: joins on possibly unbound variables; datasets (`FROM`, `FROM NAMED`, `USING`, `WITH`, the protocol's parameters); `GRAPH` over any pattern; EXISTS over any pattern and anywhere in an expression, correlated through filters; `DESCRIBE`; `BASE`; NOW, RAND, UUID, STRUUID, BNODE(), the hashes, TIMEZONE, TZ | `1b86db5`, `7d59d4f`, `8c7d47e`, `52b7761` |
+| Native answers where spareval's are wrong | Several `FROM` graphs merge (a statement they share counts once); `GRAPH` naming a graph outside the dataset has no solutions; per graph under `GRAPH ?g`: `VALUES`, subqueries, `MINUS` without other shared variables; GROUP_CONCAT is a simple literal. Five W3C tests the oracle fails now pass (`agg-empty-group-count-graph`, `bindings#graph`, `graph-minus`, `agg-groupconcat-04`, `-06`) | `7d59d4f`, `637037d` |
+| 15, in part: weak generators | Generators with solutions for datasets and `GRAPH`, the merged default graph, EXISTS in every position, updates with datasets, DESCRIBE; each new rule mutation-checked | same |
+
 ### Open
 
 | # | Priority | Gap | Evidence | Step |
 |---|---|---|---|---|
-| 1 | P0 | **The general evaluator returns wrong answers in four known cases.** It runs every query the native executor doesn't: queries with protocol datasets, `DESCRIBE`, `BASE`, unsupported functions, reads inside a transaction. (a) A filter on a variable a subquery hides is moved into the subquery. (b) After a zero-length path from a variable bound to a literal, `=` compares terms. (c) `DATATYPE` of an `xsd:int` is `xsd:integer`. (d) With both ends of a path bound, a pair that exists twice counts once | Differential tests, each case pinned | Widen native coverage until the fallback is unreachable for standard queries; report upstream |
+| 1 | P0 | **The general evaluator returns wrong answers in known cases,** and still runs what the native executor doesn't: `BNODE` with a label, `ADJUST`, functions outside SPARQL 1.1 (other than the XSD casts), `SERVICE`, RDF 1.2 triple terms, EXISTS correlated inside an OPTIONAL, MINUS, BIND or limited subquery of its pattern, and an update's `WHERE` after an earlier operation of the same request changed something. Its known errors: (a) a filter on a variable a subquery hides is moved into the subquery; (b) after a zero-length path from a variable bound to a literal, `=` compares terms; (c) `DATATYPE` of an `xsd:int` is `xsd:integer`; (d) with both ends of a path bound, a pair that exists twice counts once; (e) the cases in the row above. The native executor itself departs from the standard in one case the oracle shares: a zero-length path from a constant that isn't a node of the graph gives nothing (four W3C tests added after SPARQL 1.1) | Differential tests, each case pinned; W3C suite | Native reads inside a transaction; the zero-length rule; report upstream |
 | 2 | P0 | **The tests' oracle is the evaluator of item 1.** Where both executors are wrong the same way, nothing notices | This audit | A second engine (Jena) answers the conformance and differential queries in a nightly job |
-| 3 | P1 | **The query memory budget is not a bound.** With the 4 GiB default, a failing query took the server to 5.8 GB: tables grow by doubling, and operators' working memory isn't counted. Budgets are per query, not summed | Measured on the integration workload | E4, W6 |
 | 4 | P1 | **Results of operators are built as whole tables.** A query whose intermediate result exceeds the budget fails, where a pipelined engine would stream it | CQ05 | W6 |
 | 5 | P1 | **The store serves from memory.** Data larger than RAM can't be served; last measured, 67 M statements took 16 GiB to serve (QLever: 0.2 GiB) | Roadmap, Pf2 | Pf2 step 2 (memory-mapped runs), Pf5 |
 | 6 | P1 | **Join order stops at pattern boundaries.** A path, subquery or OPTIONAL splits a group; the parts are joined as written. Only paths take bound values from their partner, and filters don't inform the order | Plans of the integration questions | W3b |
 | 7 | P1 | **Equality reasoning replicates.** Every statement is copied to every identity of its terms; answers repeat per identity | 883 `owl:sameAs` statements for 65 resources | W4 |
-| 8 | P1 | **Aggregates over independent OPTIONALs build their product** (10¹⁰ rows for CQ05) | CQ05 | W5 |
 | 9 | P1 | **A full materialisation can't be cancelled**, nor the closure of a newly declared transitive property | Capability matrix | A8 remainder |
 | 10 | P1 | **No repository isolation and no graph-level access control.** One dataset per server; authentication exists, authorisation by graph doesn't | Capability matrix | D1, E1 |
 | 11 | P1 | **Backups have no versioned manifest and no point-in-time restore;** no upgrade test for the on-disk format | Capability matrix | E3 |
 | 12 | P1 | **Operations can't be observed:** no request outcomes or latencies, no WAL, checkpoint or backup metrics | Capability matrix | E2 |
 | 13 | P1 | **What ResearchSpace needs is incomplete:** keyword search finds nothing; the RDF4J repository type doesn't connect | Smoke test | F1, D2 |
 | 14 | P1 | **SHACL doesn't gate commits.** Validation runs on request | Capability matrix | C2 |
-| 15 | P1 | **The main random test was weak.** A tenth of its queries had solutions; now a fifth, and three generators with a quarter to three quarters. Updates, `GRAPH` patterns and the merged default graph still use the weak generator | This audit | Give each area a generator that produces solutions |
+| 15 | P1 | **Plain updates still use the weak generator** (the main random test: a fifth of its queries have solutions) | This audit | A generator with solutions for updates without a dataset |
 | 16 | P1 | **No test under sustained concurrent load,** and no fuzzing of the HTTP surface or the parsers | Not found in the repository | A soak test in the perf lab; fuzz targets |
 | 17 | P1 | **No reference machine and no repeated runs** behind any published number | §2 | The cluster |
 | 18 | P2 | Reasoning profiles beyond OWL 2 RL, datatype reasoning, custom rules | §4 | B1 to B3 |
@@ -129,7 +137,7 @@ P0 = wrong answers or lost data; P1 = a production deployment would hit it; P2 =
 ## 6. Order of work
 
 1. **Correctness before speed:** items 1, 2 and 15. Every area gets a generator with solutions; a second oracle runs nightly.
-2. **The executor's resource behaviour:** items 3, 4, 6 and 8 (W3b, W5, W6). They decide whether the larger tiers of the integration workload answer at all.
+2. **The executor's resource behaviour:** items 4 and 6 (W3b, W6). They decide whether the larger tiers of the integration workload answer at all.
 3. **Reasoning as the suite needs it:** the profiles (B1, which also unlocks LDBC SPB), equality by representatives (W4), datatypes (B3).
 4. **The capabilities the consumers wait for:** full-text (F1), multi-repository and RDF4J (D1, D2), the SHACL commit gate (C2).
 5. **The suite's plumbing,** while 1 to 4 proceed: one adapter contract and result schema, the Apptainer path, then the missing workloads (LDBC SPB, Sparqloscope, BSBM, WatDiv, ERA-SHACL).
