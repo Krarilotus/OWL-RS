@@ -29,6 +29,7 @@ PULLED=(
   "oxfordsemantic/rdfox:7.6b"
   "stardog/stardog:latest"
   "eclipse/rdf4j-workbench:latest"
+  "obolibrary/robot:v1.9.8" # ELK and HermiT: the classification oracle
   "eclipse-temurin:21-jre"
   "python:3.13-slim"
   "alpine:latest"

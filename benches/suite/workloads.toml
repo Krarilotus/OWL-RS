@@ -104,8 +104,8 @@ tasks = ["RT6"]
 needs = ["classify"]
 source = "OWL Reasoner Evaluation 2015 corpus (Zenodo)"
 licence = "per ontology"
-state = "blocked"
-waits-for = "classify"
+state = "planned"
+note = "NRESE classifies the EL part (GET /dataset/classification, example `classify`); the DL ontologies of the corpus are HermiT's and Konclude's"
 check = "class hierarchy against HermiT or ELK"
 
 # --- queries and updates without reasoning (the basics) ------------------------------------

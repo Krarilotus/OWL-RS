@@ -1,5 +1,6 @@
 mod admin_dataset;
 mod ai;
+mod classification;
 mod console;
 mod graph_store;
 mod guard;
