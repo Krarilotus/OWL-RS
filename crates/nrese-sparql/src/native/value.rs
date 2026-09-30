@@ -156,8 +156,10 @@ pub fn equals(a: &Value, b: &Value) -> Option<bool> {
             Some(x == y && lx.eq_ignore_ascii_case(ly))
         }
         (Value::Boolean(x), Value::Boolean(y)) => Some(x == y),
-        (Value::Date(x), Value::Date(y)) => x.partial_cmp(y).map(|o| o == Ordering::Equal),
-        (Value::DateTime(x), Value::DateTime(y)) => x.partial_cmp(y).map(|o| o == Ordering::Equal),
+        // With a timezone on one side only the order is undetermined (`<` is an error),
+        // but the two are not equal: `=` is false and `!=` true, as in spareval.
+        (Value::Date(x), Value::Date(y)) => Some(x == y),
+        (Value::DateTime(x), Value::DateTime(y)) => Some(x == y),
         (Value::Other(x), Value::Other(y)) if x == y => Some(true),
         // Different kinds of term (IRI vs literal, …) are simply unequal; two literals of
         // types we can't compare are a type error unless identical.

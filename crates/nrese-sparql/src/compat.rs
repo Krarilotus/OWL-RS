@@ -4,8 +4,8 @@
 //!
 //! **`HAVING` on a `SELECT` alias.** `SELECT (SUM(?x) AS ?total) … HAVING (?total > 0)`:
 //! in the standard, `HAVING` is evaluated before the `SELECT` expressions, so `?total` is
-//! unbound there and no group passes. Jena, RDF4J, Virtuoso and QLever read the alias as
-//! its expression, and queries in the wild rely on it. [`parse_query`] replaces such a
+//! unbound there and no group passes. Jena and QLever read the alias as its expression,
+//! and queries in the wild rely on it. [`parse_query`] replaces such a
 //! variable in `HAVING` by the expression it names.
 
 use std::collections::HashMap;

@@ -417,6 +417,206 @@ fn native_results_equal_spareval_on_random_queries() {
     );
 }
 
+/// A group for the filter pushdown test: `?a <p0> ?b`, then parts that bind `?c` and `?d`
+/// in some solutions, in all, or not at all (OPTIONAL, a path, UNION, MINUS, BIND,
+/// subqueries), then filters over the four variables. Unlike [`group_pattern`], the parts
+/// share variables in ways that match, so most queries have solutions to filter. `?f` is
+/// what a BIND binds.
+fn filtered_group(rng: &mut Rng) -> String {
+    let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+    let mut parts = vec![format!("?a <{EX}p0> ?b .")];
+    let mut bind = false;
+    for _ in 0..1 + rng.below(3) {
+        let (from, to) = (*rng.pick(&["?a", "?b"]), *rng.pick(&["?c", "?d"]));
+        let (p1, p2) = (p(rng), p(rng));
+        // BIND needs a variable the group hasn't used: `?f`, once.
+        let choice = match rng.below(12) {
+            7 | 8 if bind => 0,
+            choice => choice,
+        };
+        bind |= matches!(choice, 7 | 8);
+        parts.push(match choice {
+            0 => format!("OPTIONAL {{ {from} {p1} {to} }}"),
+            1 => format!("OPTIONAL {{ {from} {p1} {to} FILTER(isIRI({to})) }}"),
+            // The zero-length path starts at `?a`, an IRI. From a variable bound to a
+            // literal, spareval's optimiser takes the path's start for a node and compares
+            // it as a term (`"04"^^xsd:integer != "4"^^xsd:int`), where SPARQL compares
+            // values.
+            2 => format!("OPTIONAL {{ {from} {p1} {to} . ?a {p2}* ?e FILTER({to} != ?b) }}"),
+            3 => format!("{from} {p1}+ {to} ."),
+            4 => format!("{from} ({p1}|{p2}) {to} ."),
+            5 => format!("{{ {from} {p1} ?c }} UNION {{ {from} {p2} ?d }}"),
+            6 => format!("MINUS {{ {from} {p1} {to} }}"),
+            7 => format!("BIND(STR({from}) AS ?f)"),
+            // Fails, and leaves its variable unbound, for everything but numbers.
+            8 => match rng.below(3) {
+                0 => "BIND(?b + 1 AS ?f)".to_owned(),
+                // An IRI the store knows or one it doesn't, or a tagged string.
+                1 => format!(
+                    "BIND(IRI(CONCAT(STR({from}), \"{}\")) AS ?f)",
+                    rng.pick(&["", "x"])
+                ),
+                _ => format!("BIND(STRLANG(STR({from}), \"en\") AS ?f)"),
+            },
+            9 => format!("{{ SELECT ?a {to} WHERE {{ ?a {p1} {to} . ?a {p2} ?b }} }}"),
+            10 => format!(
+                "{{ SELECT DISTINCT ?a {to} WHERE {{ ?a {p1} {to} }} ORDER BY DESC(?a) {to} LIMIT {} }}",
+                1 + rng.below(8)
+            ),
+            _ => format!("{{ SELECT ?a (COUNT(*) AS {to}) WHERE {{ ?a {p1} ?b }} GROUP BY ?a }}"),
+        });
+    }
+    for _ in 0..1 + rng.below(2) {
+        let variables = ["?a", "?b", "?c", "?d", "?f"];
+        let (v, w) = (*rng.pick(&variables), *rng.pick(&variables));
+        parts.push(match rng.below(18) {
+            // The compiled (id-level) shapes, which must leave computed values (`?f`) to
+            // the general evaluator:
+            10 => format!("FILTER(CONTAINS(STR({v}), \"e1\") || isBlank({w}))"),
+            11 => format!("FILTER(STRSTARTS({v}, \"http\") || STRENDS(STR({w}), \"2\"))"),
+            12 => format!("FILTER(REGEX(STR({v}), \"E[0-3]\", \"i\"))"),
+            13 => format!("FILTER(LANG({v}) = \"en\" || LANGMATCHES(LANG({w}), \"DE\"))"),
+            14 => format!("FILTER({v} = <{EX}e2> || {w} = <{EX}e2x>)"),
+            15 => format!("FILTER({v} >= 2 && {v} < 6)"),
+            16 => format!("FILTER(isLiteral({v}) && !isIRI({w}))"),
+            17 => format!("FILTER(LANG({v}) = \"\")"),
+            0 => format!("FILTER(isIRI({v}))"),
+            1 => format!("FILTER(!BOUND({v}))"),
+            2 => format!("FILTER(BOUND({v}) && {v} != {w})"),
+            3 => format!("FILTER({v} != <{EX}e1>)"),
+            4 => format!("FILTER(!BOUND({v}) || isLiteral({v}))"),
+            5 => format!("FILTER(STR({v}) > \"http://example.com/e1\" && isIRI({w}))"),
+            6 => format!("FILTER({v} > 2)"),
+            7 => format!("FILTER(COALESCE({v}, 0) != 1)"),
+            8 => format!("FILTER({v} = {w} || isLiteral({w}))"),
+            _ => format!("FILTER(sameTerm({v}, {w}) || {v} != {w})"),
+        });
+    }
+    parts.join(" ")
+}
+
+/// Filter pushdown (`native/pushdown.rs`): filters written at the end of a group give
+/// spareval's results wherever the executor moves them: below joins, OPTIONALs, UNIONs,
+/// MINUS and BINDs, and into subqueries. Each rule of the pushdown was mutation-checked
+/// against this test.
+#[test]
+fn pushed_filters_equal_spareval() {
+    let mut rng = Rng(20_260_930);
+    let (mut checked, mut with_solutions, mut fallbacks) = (0, 0, 0);
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..QueryOptions::default()
+    };
+    for dataset_case in 0..60 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..60 {
+            let text = format!("SELECT * WHERE {{ {} }}", filtered_group(&mut rng));
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            if !runs_natively(&query) {
+                fallbacks += 1;
+                continue;
+            }
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            if native != expected {
+                let only = |rows: &[String], other: &[String]| -> Vec<String> {
+                    let mut other = other.to_vec();
+                    rows.iter()
+                        .filter(|row| match other.iter().position(|r| r == *row) {
+                            Some(at) => {
+                                other.swap_remove(at);
+                                false
+                            }
+                            None => true,
+                        })
+                        .take(5)
+                        .cloned()
+                        .collect()
+                };
+                panic!(
+                    "dataset {dataset_case}, query {query_case}: {text}
+{} native and {} spareval rows
+only native: {:#?}
+only spareval: {:#?}",
+                    native.len(),
+                    expected.len(),
+                    only(&native, &expected),
+                    only(&expected, &native)
+                );
+            }
+            checked += 1;
+            with_solutions += usize::from(!expected.is_empty());
+        }
+    }
+    assert!(
+        fallbacks * 5 < checked,
+        "{fallbacks} of {} queries not native",
+        checked + fallbacks
+    );
+    // A filter that drops everything proves little: enough queries must keep solutions.
+    assert!(
+        with_solutions * 5 > checked,
+        "only {with_solutions} of {checked} queries have solutions"
+    );
+}
+
+/// A filter on a variable that a subquery binds but doesn't project sees it unbound: the
+/// filter is an error and the row is dropped. Checked against the answer the specification
+/// gives, not against spareval, whose optimiser moves such a filter into the subquery
+/// (where the variable is bound) and returns the rows.
+#[test]
+fn a_filter_sees_a_variable_a_subquery_hides_as_unbound() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (s, p, o) in [("e0", "p0", "e1"), ("e0", "p1", "e2"), ("e3", "p1", "e2")] {
+        let quad = Quad::new(ex(s), ex(p), ex(o), GraphName::DefaultGraph);
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let answers = |group: &str| {
+        let text = format!(
+            "SELECT * WHERE {{ {} }}",
+            group.replace('<', &format!("<{EX}"))
+        );
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        assert!(runs_natively(&query), "{text}");
+        rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        )
+        .len()
+    };
+    let subquery = "{ SELECT ?a WHERE { ?a <p0> ?c . ?a <p1> ?d } }";
+    // The subquery alone has the solution ?a = e0.
+    assert_eq!(answers(subquery), 1);
+    // ?c and ?d are not visible outside it.
+    assert_eq!(answers(&format!("{subquery} FILTER(isIRI(?c))")), 0);
+    assert_eq!(answers(&format!("{subquery} FILTER(?c != ?a)")), 0);
+    assert_eq!(answers(&format!("{subquery} FILTER(!BOUND(?c))")), 1);
+    // In a UNION: the branch without the variable has no solutions, the other keeps its own.
+    assert_eq!(
+        answers(&format!(
+            "{{ {subquery} UNION {{ ?a <p1> ?d }} FILTER(isIRI(?d)) }}"
+        )),
+        2
+    );
+    // A variable it projects is visible, and the filter may move inside.
+    assert_eq!(answers(&format!("{subquery} FILTER(isIRI(?a))")), 1);
+    assert_eq!(answers(&format!("{subquery} FILTER(?a = <e3>)")), 0);
+}
+
 #[test]
 fn count_star_of_one_pattern_reads_the_index() {
     let engine = Engine::new(EngineConfig::default()).unwrap();

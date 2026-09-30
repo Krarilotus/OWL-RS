@@ -25,7 +25,7 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 
 Other parameters are ignored, so clients that send their own (`queryLn`, `timeout`) work.
 
-One extension to the query language, as Jena, RDF4J, Virtuoso and QLever have it: `HAVING` may name a `SELECT` alias (`SELECT (COUNT(?x) AS ?n) … HAVING (?n > 1)`), which then means the alias's expression. Read by the standard, the alias is unbound in `HAVING` and no group passes.
+One extension to the query language, as Jena and QLever have it: `HAVING` may name a `SELECT` alias (`SELECT (COUNT(?x) AS ?n) … HAVING (?n > 1)`), which then means the alias's expression. Read by the standard, the alias is unbound in `HAVING` and no group passes.
 
 Without dataset parameters and `FROM` clauses, a query reads the default graph, or the merge of all graphs if the server is configured with `store.default_graph = "union"` ([config-reference.md](config-reference.md)). `/version` says which.
 

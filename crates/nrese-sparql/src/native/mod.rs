@@ -18,6 +18,7 @@ mod fast;
 mod output;
 mod paths;
 mod plan;
+mod pushdown;
 mod ranges;
 pub(crate) mod value;
 mod wcoj;
@@ -87,7 +88,7 @@ pub(crate) fn evaluate<'a>(
 ) -> Option<Result<QueryResults<'a>, QueryEvaluationError>> {
     let (pattern, form) = native_pattern(query, options)?;
     let ctx = Context::new(snapshot, options);
-    let solutions = match ctx.eval(pattern) {
+    let solutions = match ctx.eval(&pattern) {
         Ok(solutions) => solutions,
         Err(NativeError::Fallback) => return None,
         Err(NativeError::Evaluation(error)) => return Some(Err(error)),
@@ -131,7 +132,7 @@ pub(crate) fn explain(
     let (pattern, _) = native_pattern(query, options)?;
     let mut ctx = Context::new(snapshot, options);
     ctx.trace = Some(RefCell::default());
-    match ctx.eval(pattern) {
+    match ctx.eval(&pattern) {
         Ok(solutions) => Some(Ok((
             ctx.trace.take().unwrap_or_default().into_inner(),
             solutions.table.len() as u64,
@@ -159,7 +160,7 @@ pub(crate) fn write_results(
         _ => {}
     }
     let ctx = Context::new(snapshot, options);
-    let solutions = match ctx.eval(pattern) {
+    let solutions = match ctx.eval(&pattern) {
         Ok(solutions) => solutions,
         Err(NativeError::Fallback) => return None,
         Err(NativeError::Evaluation(error)) => return Some(Err(error.into())),
@@ -215,8 +216,9 @@ pub(crate) fn delete_insert(
     if options.dataset.is_some() || !supported(pattern) {
         return None;
     }
+    let pattern = pushdown::push_filters(pattern.clone());
     let ctx = Context::new(snapshot, options);
-    let solutions = match ctx.eval(pattern) {
+    let solutions = match ctx.eval(&pattern) {
         Ok(solutions) => solutions,
         Err(NativeError::Fallback) => return None,
         Err(NativeError::Evaluation(error)) => return Some(Err(error)),
@@ -308,22 +310,24 @@ enum Form<'q> {
     Construct(&'q [TriplePattern]),
 }
 
-/// The pattern of a query the native executor runs, and the query form.
+/// The pattern of a query the native executor runs, as it runs it (filters pushed down,
+/// [`pushdown`]), and the query form.
 fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
-) -> Option<(&'q GraphPattern, Form<'q>)> {
+) -> Option<(GraphPattern, Form<'q>)> {
     if options.dataset.is_some() || !query_supported(query) {
         return None;
     }
-    match query {
-        Query::Select { pattern, .. } => Some((pattern, Form::Select)),
-        Query::Ask { pattern, .. } => Some((pattern, Form::Ask)),
+    let (pattern, form) = match query {
+        Query::Select { pattern, .. } => (pattern, Form::Select),
+        Query::Ask { pattern, .. } => (pattern, Form::Ask),
         Query::Construct {
             template, pattern, ..
-        } => Some((pattern, Form::Construct(template))),
-        Query::Describe { .. } => None,
-    }
+        } => (pattern, Form::Construct(template)),
+        Query::Describe { .. } => return None,
+    };
+    Some((pushdown::push_filters(pattern.clone()), form))
 }
 
 /// A position of a CONSTRUCT template, resolved against the solution columns.

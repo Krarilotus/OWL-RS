@@ -4,25 +4,32 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-store --example reason_query -- \
-//!     [--ruleset owl2-rl|rdfs] [--queries dir] [--explain] input.nt...
+//!     [--ruleset owl2-rl|rdfs] [--queries dir] [--runs n] [--timeout-s n]
+//!     [--memory-mib n] [--explain] input.{nt,ttl,...}...
 //! ```
 //!
-//! `--explain` prints each query's plan (operators with estimated and actual rows, and
-//! times) after its timing line.
+//! - `--runs`: measured runs per query after one warm-up run (default 3); the best counts.
+//! - `--timeout-s`, `--memory-mib`: limits per query run (default: none). A query that
+//!   exceeds one is reported as `timeout` or `memory`, and the run goes on.
+//! - `--explain` prints each query's plan (operators with estimated and actual rows, and
+//!   times) after its timing line.
 //!
-//! Prints load, reasoning and per-query times, and one `qNN<TAB>count` line per query
-//! (the scorecard's answer format). Counting wraps each query as
-//! `SELECT (COUNT(*) AS ?n) WHERE { … }`, so result serialisation isn't timed.
+//! Prints load and reasoning times, the process's peak memory (Linux), and one
+//! `name<TAB>count<TAB>milliseconds` line per query (the scorecard's answer format; in
+//! place of the count `timeout`, `memory`, `error`, or `empty` for a file without a
+//! query). Counting wraps each query as `SELECT (COUNT(*) AS ?n) WHERE { … }`, so result
+//! serialisation isn't timed.
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use nrese_reasoner::v2::rulesets::Ruleset;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
     BulkLoadRequest, CancellationToken, GraphTarget, MutationCommand, MutationPipeline,
-    MutationTicket, PreparedQuery, SparqlQueryRequest, SparqlUpdateRequest, StoreConfig,
-    StoreService,
+    MutationTicket, PreparedQuery, QueryEvaluationError, SparqlQueryRequest, SparqlUpdateRequest,
+    StoreConfig, StoreError, StoreService,
 };
 
 /// `SELECT (COUNT(*) AS ?n) WHERE { <query> }` with the query's prologue kept in front.
@@ -47,6 +54,49 @@ fn counting(query: &str) -> String {
     format!("{prologue}SELECT (COUNT(*) AS ?n) WHERE {{ {body} }}")
 }
 
+/// Whether the text holds a query: something besides comments, `PREFIX` and `BASE`.
+fn has_query(text: &str) -> bool {
+    text.lines().map(str::trim_start).any(|line| {
+        let upper = line.to_ascii_uppercase();
+        !(line.is_empty()
+            || line.starts_with('#')
+            || upper.starts_with("PREFIX")
+            || upper.starts_with("BASE"))
+    })
+}
+
+/// Runs `work`, cancelling `token` if it takes longer than `timeout`.
+fn within<T>(timeout: Option<Duration>, token: &CancellationToken, work: impl FnOnce() -> T) -> T {
+    let Some(timeout) = timeout else {
+        return work();
+    };
+    let (done, finished) = mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            if finished.recv_timeout(timeout) == Err(RecvTimeoutError::Timeout) {
+                token.cancel();
+            }
+        });
+        let result = work();
+        let _ = done.send(());
+        result
+    })
+}
+
+/// The process's peak resident memory in MiB, where the system tells (Linux).
+fn peak_memory_mib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib / 1024)
+}
+
+fn print_peak_memory(after: &str) {
+    if let Some(mib) = peak_memory_mib() {
+        println!("memory: peak {mib} MiB after {after}");
+    }
+}
+
 /// The first integer value in a SPARQL JSON result.
 fn first_integer(json: &str) -> Option<u64> {
     let start = json.find("\"value\"")?;
@@ -64,6 +114,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut ruleset, mut queries, mut files) = (Ruleset::Owl2Rl, None, Vec::new());
     let mut commits = 0usize;
     let mut explain = false;
+    let (mut runs, mut timeout, mut memory_limit) = (3usize, None, None);
+    let number = |value: Option<String>, option: &str| -> Result<u64, String> {
+        value
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| format!("{option} takes a number"))
+    };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--ruleset" => {
@@ -76,12 +132,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--queries" => queries = args.next().map(PathBuf::from),
             "--commits" => commits = args.next().and_then(|n| n.parse().ok()).unwrap_or(0),
             "--explain" => explain = true,
+            "--runs" => runs = number(args.next(), "--runs")?.max(1) as usize,
+            "--timeout-s" => {
+                timeout = Some(Duration::from_secs(number(args.next(), "--timeout-s")?));
+            }
+            "--memory-mib" => {
+                memory_limit = Some(number(args.next(), "--memory-mib")? as usize * 1024 * 1024);
+            }
             _ => files.push(PathBuf::from(arg)),
         }
     }
     if files.is_empty() {
         return Err(
-            "usage: reason_query [--ruleset owl2-rl|rdfs] [--queries dir] input.nt...".into(),
+            "usage: reason_query [--ruleset owl2-rl|rdfs] [--queries dir] [--runs n] \
+             [--timeout-s n] [--memory-mib n] [--explain] input.nt..."
+                .into(),
         );
     }
 
@@ -110,6 +175,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report.violations
     );
 
+    print_peak_memory("load and closure");
+
     if commits > 0 {
         commit_latency(&store, ruleset, commits)?;
     }
@@ -128,20 +195,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|s| s.to_str())
             .unwrap_or("?")
             .to_owned();
-        let query = counting(&std::fs::read_to_string(&path)?);
-        // Best of three, after one warm-up run.
-        let mut best = f64::MAX;
-        let mut count = None;
-        for _ in 0..4 {
-            let started = Instant::now();
-            let result = store.execute_query_str(&query)?;
-            let elapsed = started.elapsed().as_secs_f64();
-            count = first_integer(&String::from_utf8_lossy(&result.payload));
-            best = best.min(elapsed);
+        let text = std::fs::read_to_string(&path)?;
+        if !has_query(&text) {
+            println!("{name}\tempty");
+            continue;
         }
-        total += best;
+        let query = counting(&text);
+        let mut request = SparqlQueryRequest::new(query.clone());
+        request.memory_limit = memory_limit;
+        let prepared = match PreparedQuery::parse(&request) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                eprintln!("{name}: {error}");
+                println!("{name}\terror");
+                continue;
+            }
+        };
+        // The best of the measured runs, after one warm-up run. A run that fails ends
+        // the query: it would fail again.
+        let mut best = f64::MAX;
+        let mut outcome = String::from("error");
+        for _ in 0..=runs {
+            let token = CancellationToken::new();
+            let mut payload = Vec::new();
+            let started = Instant::now();
+            let result = within(timeout, &token, || {
+                store.run_query(&prepared, &token, &mut payload)
+            });
+            let elapsed = started.elapsed().as_secs_f64();
+            match result {
+                Ok(()) => {
+                    best = best.min(elapsed);
+                    outcome = first_integer(&String::from_utf8_lossy(&payload))
+                        .map_or_else(|| "error".to_owned(), |count| count.to_string());
+                }
+                Err(error) => {
+                    best = elapsed;
+                    outcome = if error.is_memory_limit() {
+                        "memory"
+                    } else if matches!(
+                        error,
+                        StoreError::SparqlEvaluation(QueryEvaluationError::Cancelled)
+                    ) {
+                        "timeout"
+                    } else {
+                        "error"
+                    }
+                    .to_owned();
+                    eprintln!("{name}: {error}");
+                    break;
+                }
+            }
+        }
+        let failed = outcome.parse::<u64>().is_err();
+        if !failed {
+            total += best;
+        }
         eprintln!("{name}: {:.2} ms", best * 1000.0);
-        if explain {
+        if explain && !failed {
             let prepared = PreparedQuery::parse(&SparqlQueryRequest::new(query.clone()))?;
             let plan = store.explain_query(&prepared, &CancellationToken::new())?;
             eprintln!("  executor {} | {} rows", plan.executor, plan.rows);
@@ -160,15 +271,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        println!(
-            "{name}\t{}",
-            count.map_or_else(|| "error".to_owned(), |c| c.to_string())
-        );
+        println!("{name}\t{outcome}\t{:.2}", best * 1000.0);
     }
     eprintln!(
-        "queries: {:.2} ms in total (best of 4 each)",
+        "queries: {:.2} ms in total (best of {runs} each, failed ones not counted)",
         total * 1000.0
     );
+    print_peak_memory("the queries");
     Ok(())
 }
 
