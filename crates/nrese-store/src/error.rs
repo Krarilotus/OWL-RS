@@ -36,6 +36,9 @@ pub enum StoreError {
     },
     #[error("configured ontology file does not exist: {}", path.display())]
     OntologyFileNotFound { path: PathBuf },
+    /// A materialisation was stopped; the previous inferred stack stands.
+    #[error("materialisation cancelled")]
+    MaterialisationCancelled,
 }
 
 impl StoreError {
@@ -83,7 +86,8 @@ impl StoreError {
             Self::Configuration(_)
             | Self::Io(_)
             | Self::Engine(_)
-            | Self::OntologyFileNotFound { .. } => false,
+            | Self::OntologyFileNotFound { .. }
+            | Self::MaterialisationCancelled => false,
         }
     }
 }

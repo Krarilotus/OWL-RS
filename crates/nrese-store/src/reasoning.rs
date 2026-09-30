@@ -294,6 +294,15 @@ fn triple(quad: EncodedQuad) -> Triple {
 
 /// The closure of `asserted` (any graphs) under `program`, its axioms included.
 pub fn materialise(program: &Program, snapshot: &Snapshot) -> Closure {
+    materialise_until(program, snapshot, nrese_reasoner::v2::eval::NEVER).expect("never stopped")
+}
+
+/// [`materialise`], polling `stop` throughout; `Err` if it fired.
+pub fn materialise_until(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: nrese_reasoner::v2::eval::Stop<'_>,
+) -> Result<Closure, delta::Interrupted> {
     let mut input = asserted_by_predicate(snapshot);
     // Axioms nothing asserts are inferred statements, and premises of the rules.
     let mut axioms: Vec<Triple> = Vec::new();
@@ -310,8 +319,14 @@ pub fn materialise(program: &Program, snapshot: &Snapshot) -> Closure {
         axioms.push(axiom);
     }
     let schema = program.schema_for(snapshot);
-    let result = batch::materialise_grouped(input, &program.rules, program.lists.as_ref(), &schema);
-    Closure {
+    let result = batch::materialise_grouped_until(
+        input,
+        &program.rules,
+        program.lists.as_ref(),
+        &schema,
+        stop,
+    )?;
+    Ok(Closure {
         inferred: result
             .derived
             .into_iter()
@@ -323,7 +338,7 @@ pub fn materialise(program: &Program, snapshot: &Snapshot) -> Closure {
         diagnostics: result.diagnostics,
         rounds: result.rounds,
         phases: result.phases,
-    }
+    })
 }
 
 /// Equality by representatives against replication on the asserted data of `snapshot`

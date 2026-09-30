@@ -88,7 +88,13 @@ impl MutationPipeline {
         if let Some(ruleset) = self.reasoner.config().materialised_ruleset()
             && !self.store.reasoning_is_current(ruleset)
         {
-            self.store.rematerialise(ruleset).map_err(store_error)?;
+            // The request's cancellation stops it; the store stays as it was.
+            let stop = || ticket.is_cancelled();
+            match self.store.rematerialise_until(ruleset, &stop) {
+                Ok(_) => {}
+                Err(StoreError::MaterialisationCancelled) => return Err(MutationError::Cancelled),
+                Err(error) => return Err(store_error(error)),
+            }
         }
         let mut tx = self.store.engine().transaction();
         if ticket.is_cancelled() {
