@@ -103,7 +103,7 @@ Added on 30 September 2026. Kit and instructions: [benches/integration](../../be
 | CQ02 (2,430 rows) | 18 ms | 4,897 ms | 23 ms |
 | CQ03 (90) | 0.8 ms | 18.5 ms | 3.1 ms |
 | CQ04 (19) | 1.2 ms | 11.9 ms | 3.8 ms |
-| CQ05 | stopped at the 4 GiB query budget | no answer in 120 s | the same |
+| CQ05 (9,009) | 0.36 s in the process, after the fixes below (not yet over HTTP) | no answer in 120 s | stopped at the 4 GiB query budget |
 | CQ06 (648) | 2.9 ms | 148 ms | 11 s |
 | CQ07 (576) | 4.1 ms | 75 ms | 236 ms |
 | CQ08 (159,040) | 1,068 ms | 4,959 ms | out of memory |
@@ -118,9 +118,11 @@ The eight questions both answer have the same row counts. CQ01 is an empty file.
 - A property path with two variable ends was computed for every node of the graph before it was joined (CQ03, CQ04, CQ10).
 - The server didn't set `TCP_NODELAY`: a result sent in several pieces waited 40 ms for the client's delayed acknowledgement, whatever the query took.
 
+Fixed later that day:
+- CQ05 is a product of about 10¹⁰ rows under full equality, with several OPTIONALs that only feed `COUNT(DISTINCT …)` and `SAMPLE`. `SELECT DISTINCT` and groups whose aggregates ignore duplicates now work on sets, and such an OPTIONAL is joined to the groups after they are formed (W5): 9,009 rows in 0.36 s.
+- The query memory budget is a bound: operators charge their working memory, and a budget for all queries together caps the server (1 GiB budget, 815 MiB peak, measured on Linux).
+
 Open:
-- CQ05 is a product of about 10¹⁰ rows under full equality. Neither system answered it. It needs equality by representatives (W4) or aggregation per OPTIONAL branch (W5).
-- Serving memory is the executor's tables: the failing CQ05 took the server to 6.1 GB, past its 4 GiB query budget (W6).
 - CQ08's second is mostly its 159,040 rows written as JSON and read by the client; evaluating them takes 0.3 s.
 - With the GND ontology added, 55 % of the inferred statements are memberships in unnamed union classes (W7).
 
