@@ -12,6 +12,4 @@
 <http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#zero_or_one_set_end> # spareval: zero-length ? path with a constant start on an empty dataset
 
 # Approved tests:
-<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-groupconcat-04> # spareval: GROUP_CONCAT result checked by ASK differs
-<http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-groupconcat-06> # spareval: GROUP_CONCAT result checked by ASK differs
 <http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#bnode01> # spareval: BNODE(str) scoping per solution
