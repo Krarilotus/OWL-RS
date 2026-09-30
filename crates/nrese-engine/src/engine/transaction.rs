@@ -139,6 +139,50 @@ impl<'e> Transaction<'e> {
         &self.base
     }
 
+    /// The state the transaction would commit, as a snapshot: the base with the pending
+    /// changes of each stack as one more run, as a commit publishes them, but not
+    /// published. It sees the terms the transaction interned. Costs O(d log d) for d
+    /// pending changes.
+    pub fn pending_snapshot(&self) -> Snapshot {
+        let shadowed: HashSet<EncodedQuad> = self.shadowed_inferred().collect();
+        let asserted_inserts: Vec<EncodedQuad> = self.asserted.inserts.iter().copied().collect();
+        let asserted_deletes: Vec<EncodedQuad> = self.asserted.deletes.iter().copied().collect();
+        // A statement asserted now leaves the inferred stack (as `take_over_inferred`).
+        let inferred_inserts: Vec<EncodedQuad> = self
+            .inferred
+            .inserts
+            .iter()
+            .filter(|quad| !shadowed.contains(*quad))
+            .copied()
+            .collect();
+        let mut inferred_deletes: Vec<EncodedQuad> =
+            self.inferred.deletes.iter().copied().collect();
+        inferred_deletes.extend(shadowed.iter().filter(|quad| {
+            !self.inferred.inserts.contains(*quad)
+                && !self.inferred.deletes.contains(*quad)
+                && self.base.stack_contains(Stack::Inferred, quad)
+        }));
+        let base = self.base.version();
+        let run = |stack: Stack, inserts: &[EncodedQuad], deletes: &[EncodedQuad]| {
+            crate::index::run::Run::from_delta(stack.layout(), inserts, deletes)
+        };
+        let version = Version {
+            asserted: base.asserted.with_run(run(
+                Stack::Asserted,
+                &asserted_inserts,
+                &asserted_deletes,
+            )),
+            inferred: base.inferred.with_run(run(
+                Stack::Inferred,
+                &inferred_inserts,
+                &inferred_deletes,
+            )),
+            revision: base.revision,
+            dictionary_len: self.engine.shared.dictionary.len(),
+        };
+        self.base.with_version(version)
+    }
+
     /// Number of asserted and inferred quads, including pending changes.
     pub fn len(&self) -> u64 {
         self.len_in(ReadModel::Materialised)
