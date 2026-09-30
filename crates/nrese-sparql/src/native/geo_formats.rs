@@ -130,6 +130,89 @@ fn geojson_value(geometry: &Geometry<f64>) -> Value {
     }
 }
 
+/// The GML 3.2 text of a geometry in reference system `crs`.
+pub(super) fn to_gml(geometry: &Geometry<f64>, crs: &str) -> String {
+    const NS: &str = "http://www.opengis.net/ont/gml";
+    fn positions(coords: impl Iterator<Item = Coord<f64>>) -> String {
+        coords
+            .map(|c| format!("{} {}", c.x, c.y))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    fn ring(l: &LineString<f64>) -> String {
+        format!(
+            "<gml:LinearRing><gml:posList>{}</gml:posList></gml:LinearRing>",
+            positions(l.0.iter().copied())
+        )
+    }
+    fn polygon(p: &Polygon<f64>) -> String {
+        let mut out = format!(
+            "<gml:Polygon><gml:exterior>{}</gml:exterior>",
+            ring(p.exterior())
+        );
+        for interior in p.interiors() {
+            out.push_str(&format!("<gml:interior>{}</gml:interior>", ring(interior)));
+        }
+        out + "</gml:Polygon>"
+    }
+    fn body(geometry: &Geometry<f64>) -> String {
+        match geometry {
+            Geometry::Point(p) => format!(
+                "<gml:Point><gml:pos>{} {}</gml:pos></gml:Point>",
+                p.x(),
+                p.y()
+            ),
+            Geometry::Line(l) => format!(
+                "<gml:LineString><gml:posList>{}</gml:posList></gml:LineString>",
+                positions([l.start, l.end].into_iter())
+            ),
+            Geometry::LineString(l) => format!(
+                "<gml:LineString><gml:posList>{}</gml:posList></gml:LineString>",
+                positions(l.0.iter().copied())
+            ),
+            Geometry::Polygon(p) => polygon(p),
+            Geometry::MultiPoint(m) => format!(
+                "<gml:MultiPoint>{}</gml:MultiPoint>",
+                m.0.iter()
+                    .map(|p| format!(
+                        "<gml:pointMember>{}</gml:pointMember>",
+                        body(&Geometry::Point(*p))
+                    ))
+                    .collect::<String>()
+            ),
+            Geometry::MultiLineString(m) => format!(
+                "<gml:MultiCurve>{}</gml:MultiCurve>",
+                m.0.iter()
+                    .map(|l| format!(
+                        "<gml:curveMember>{}</gml:curveMember>",
+                        body(&Geometry::LineString(l.clone()))
+                    ))
+                    .collect::<String>()
+            ),
+            Geometry::MultiPolygon(m) => format!(
+                "<gml:MultiSurface>{}</gml:MultiSurface>",
+                m.0.iter()
+                    .map(|p| format!("<gml:surfaceMember>{}</gml:surfaceMember>", polygon(p)))
+                    .collect::<String>()
+            ),
+            Geometry::GeometryCollection(c) => format!(
+                "<gml:MultiGeometry>{}</gml:MultiGeometry>",
+                c.0.iter()
+                    .map(|g| format!("<gml:geometryMember>{}</gml:geometryMember>", body(g)))
+                    .collect::<String>()
+            ),
+            Geometry::Rect(r) => polygon(&r.to_polygon()),
+            Geometry::Triangle(t) => polygon(&t.to_polygon()),
+        }
+    }
+    // The namespace and reference system on the outermost element.
+    let text = body(geometry);
+    let end = text.find('>').unwrap_or(text.len());
+    let (open, rest) = text.split_at(end);
+    let srs = crs.replace('&', "&amp;").replace('"', "&quot;");
+    format!("{open} xmlns:gml=\"{NS}\" srsName=\"{srs}\"{rest}")
+}
+
 /// An element of a GML text: its local name, `srsName` and `srsDimension`, text and
 /// children.
 #[derive(Default)]
@@ -283,6 +366,8 @@ fn gml_geometry(element: &Element, dimension: usize) -> Option<Geometry<f64>> {
     Some(match element.name.as_str() {
         "Point" => match gml_coords(element, dimension)?.as_slice() {
             [c] => Geometry::Point(Point(*c)),
+            // The empty point (geo has no empty Point).
+            [] => Geometry::GeometryCollection(GeometryCollection::default()),
             _ => return None,
         },
         "LineString" | "LinearRing" => {
@@ -381,6 +466,15 @@ mod tests {
             r#"<Envelope><lowerCorner>0 0</lowerCorner><upperCorner>2 3</upperCorner></Envelope>"#;
         assert!(matches!(from_gml(envelope).unwrap().1, Geometry::Rect(_)));
         assert!(from_gml("<Point><pos>1 2 3</pos></Point>").is_none());
+        // Written and read back: the same geometry and system.
+        let (_, geometry) = from_gml(polygon).unwrap();
+        let written = to_gml(&geometry, "http://www.opengis.net/def/crs/EPSG/0/3857");
+        let (srs, again) = from_gml(&written).unwrap();
+        assert_eq!(
+            srs.as_deref(),
+            Some("http://www.opengis.net/def/crs/EPSG/0/3857")
+        );
+        assert_eq!(again, geometry);
         assert!(from_gml("<Curve/>").is_none());
         assert!(from_gml("<Point>").is_none());
     }

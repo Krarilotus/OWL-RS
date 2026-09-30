@@ -30,6 +30,8 @@ spargebra = "=0.4.6"
 thiserror.workspace = true
 
 [dev-dependencies]
+# The GeoSPARQL compliance runner reasons over the benchmark's dataset (RDFS).
+nrese-reasoner = { path = "../nrese-reasoner" }
 # Differential oracle: the same spareval evaluator over Oxigraph's own storage.
 oxigraph = { version = "0.5.6", default-features = false }
 # W3C suite runner: manifests, data files and expected results.

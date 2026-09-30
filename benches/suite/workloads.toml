@@ -224,10 +224,12 @@ title = "GeoSPARQL compliance benchmark (206 queries); Geographica 2 for perform
 kind = "conformance"
 tasks = ["space"]
 needs = ["load", "query", "geosparql"]
-source = "github.com/OpenLinkSoftware/GeoSPARQLBenchmark; geographica.di.uoa.gr"
-licence = "to check before use"
-state = "planned"
+source = "github.com/OpenLinkSoftware/GeoSPARQLBenchmark (scripts/fetch-w3c-tests.sh); geographica.di.uoa.gr"
+licence = "GPL-2.0 (fetched, never copied into this repository); Geographica: to check before use"
+state = "partial"
+kit = "crates/nrese-sparql/tests/geosparql_compliance"
 check = "the benchmark's expected answers"
+note = "The compliance part runs on NRESE in CI: 175 of 212; the 37 others are reference answers that contradict GeoSPARQL's definitions or each other (expected-failures.txt). Geographica 2 (performance) is to add"
 
 [federation]
 title = "FedBench / W3C federation tests"

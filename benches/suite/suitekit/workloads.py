@@ -125,6 +125,13 @@ def w3c_owl2_rl(root: Path, tier: str, settings: dict) -> Plan:
                 note="the test cases come from scripts/fetch-w3c-tests.sh")
 
 
+def geosparql(root: Path, tier: str, settings: dict) -> Plan:
+    return Plan("geosparql", tier, kind="kit", systems={"nrese"},
+                command=["bash", "scripts/cargo-guarded.sh", "test", "--locked", "-p", "nrese-sparql",
+                         "--test", "geosparql_compliance"],
+                note="the compliance benchmark; the data comes from scripts/fetch-w3c-tests.sh")
+
+
 def write_scaling(root: Path, tier: str, settings: dict) -> Plan:
     return Plan("write-scaling", tier, kind="writes", systems={"nrese"},
                 note="the harness drives NRESE's graph store API")
@@ -145,6 +152,7 @@ DEFINITIONS = {
     "w3c-sparql11": (w3c_sparql, ["-"]),
     "w3c-shacl": (w3c_shacl, ["-"]),
     "w3c-owl2-rl": (w3c_owl2_rl, ["-"]),
+    "geosparql": (geosparql, ["compliance"]),
     "write-scaling": (write_scaling, ["1m"]),
     "clients": (clients, ["-"]),
 }

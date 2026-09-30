@@ -5,7 +5,8 @@
 //! A geometry is a node with a `geo:asWKT`, `geo:asGeoJSON` or `geo:asGML` literal; a feature's geometries are its
 //! `geo:hasDefaultGeometry`, or else its `geo:hasGeometry` ones; the relation holds if it
 //! holds for some pair of their shapes (in one reference system). Relations are computed
-//! from the data, not read from statements.
+//! from the geometries, and read from the statements that assert them: a pattern matches
+//! both.
 //!
 //! An R-tree over the shapes' bounding boxes finds the candidates: only the disjointness
 //! relations (`sfDisjoint`, `ehDisjoint`, `rcc8dc`) look at every object. The index is
@@ -40,6 +41,9 @@ pub(super) struct SpatialIndex {
     tree: RTree<Entry>,
     /// The geometry literals themselves, for filters over them.
     literals: RTree<Entry>,
+    /// Relation statements in the data: per relation, subject to objects and back.
+    asserted: HashMap<(&'static str, u64), Vec<u64>>,
+    asserted_back: HashMap<(&'static str, u64), Vec<u64>>,
 }
 
 type Cached = (Snapshot, ReadModel, Arc<SpatialIndex>);
@@ -165,11 +169,44 @@ impl SpatialIndex {
                 })
             })
             .collect();
+        let (mut asserted, mut asserted_back): (HashMap<_, Vec<u64>>, HashMap<_, Vec<u64>>) =
+            (HashMap::new(), HashMap::new());
+        for &local in RELATIONS {
+            for (a, b) in with(id(local)) {
+                asserted.entry((local, a)).or_default().push(b);
+                asserted_back.entry((local, b)).or_default().push(a);
+            }
+        }
         Self {
             shapes,
             tree: RTree::bulk_load(entries),
             literals: RTree::bulk_load(literal_entries.into_values().collect()),
+            asserted,
+            asserted_back,
         }
+    }
+
+    fn local(local: &str) -> Option<&'static str> {
+        RELATIONS.iter().copied().find(|r| *r == local)
+    }
+
+    /// The objects a statement relates `a` to.
+    fn asserted_objects(&self, local: &str, a: u64) -> &[u64] {
+        Self::local(local)
+            .and_then(|l| self.asserted.get(&(l, a)))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The subjects a statement relates to `b`.
+    fn asserted_subjects(&self, local: &str, b: u64) -> &[u64] {
+        Self::local(local)
+            .and_then(|l| self.asserted_back.get(&(l, b)))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether the relation holds between `a` and `b`: stated, or computed.
+    fn related(&self, local: &str, a: u64, b: u64) -> bool {
+        self.asserted_objects(local, a).contains(&b) || self.holds(local, a, b)
     }
 
     /// Whether `relation` holds between the spatial objects `a` and `b`.
@@ -358,9 +395,9 @@ impl Context<'_> {
             if matches!(s, Side::Constant(None)) || matches!(o, Side::Constant(None)) {
                 continue;
             }
-            let pairs: Vec<(u64, u64)> = match (a, b) {
+            let mut pairs: Vec<(u64, u64)> = match (a, b) {
                 (Some(a), Some(b)) => {
-                    if index.holds(local, a, b) {
+                    if index.related(local, a, b) {
                         vec![(a, b)]
                     } else {
                         Vec::new()
@@ -370,12 +407,14 @@ impl Context<'_> {
                     .candidates(local, a)
                     .into_iter()
                     .filter(|&b| index.holds(local, a, b))
+                    .chain(index.asserted_objects(local, a).iter().copied())
                     .map(|b| (a, b))
                     .collect(),
                 (None, Some(b)) => index
                     .candidates(local, b)
                     .into_iter()
                     .filter(|&a| index.holds(local, a, b))
+                    .chain(index.asserted_subjects(local, b).iter().copied())
                     .map(|a| (a, b))
                     .collect(),
                 (None, None) => {
@@ -389,9 +428,19 @@ impl Context<'_> {
                             }
                         }
                     }
+                    if let Some(l) = SpatialIndex::local(local) {
+                        for ((relation, a), objects) in &index.asserted {
+                            if *relation == l {
+                                pairs.extend(objects.iter().map(|&b| (*a, b)));
+                            }
+                        }
+                    }
                     pairs
                 }
             };
+            // A pair both stated and computed counts once.
+            pairs.sort_unstable();
+            pairs.dedup();
             for (a, b) in pairs {
                 if same && a != b {
                     continue;
