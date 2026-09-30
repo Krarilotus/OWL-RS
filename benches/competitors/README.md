@@ -72,6 +72,18 @@ Results: [SCORECARD.md](SCORECARD.md) (free-to-publish systems only).
   - full Wikidata, which needs a large server
   - runs on a dedicated Linux reference machine instead of Docker Desktop
 
+## Cleaning up after a run
+
+A run leaves nothing behind but its results. The scorecard scripts call `scripts/bench-cleanup.sh` when they exit, also when they fail or are interrupted. It removes:
+- the run's containers and store volumes;
+- the dataset volume `nrese-bench-data` and local datasets under `~/nrese-bench`;
+- the images built here (`nrese-bench/*`) and the systems' images the scripts pulled;
+- inferred-set dumps (`*.inferred.nt`); the scorecard keeps their counts and comparisons.
+
+Scorecards (CSV), logs and reports stay.
+
+For several runs in a row, set `NRESE_BENCH_KEEP=1` so datasets and images survive between them, and run `scripts/bench-cleanup.sh` once at the end. `--dry-run` shows what it would remove. It only removes things by the names these scripts use, never "everything unused", so other projects' containers, volumes and images are safe.
+
 ## Getting licences
 
 - **RDFox:** <https://www.oxfordsemantic.tech/free-trial>. It requires an institutional email and acceptance of the [evaluation licence](https://www.oxfordsemantic.tech/rdfox-evaluation-license).

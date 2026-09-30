@@ -43,6 +43,11 @@ set -euo pipefail
 # Datasets, store files and images take tens of GB: don't start on a nearly full disk.
 . "$(dirname "$0")/../../scripts/lib/disk.sh"
 require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
+# A run cleans up after itself, also when it fails or is interrupted: containers, store
+# volumes, datasets and images go, results stay. NRESE_BENCH_KEEP=1 keeps datasets and
+# images for the next run of a batch (see scripts/bench-cleanup.sh).
+CLEANUP="$(cd "$(dirname "$0")/../.." && pwd)/scripts/bench-cleanup.sh"
+trap '"$CLEANUP" >&2' EXIT
 export MSYS_NO_PATHCONV=1
 native() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 HERE=$(native "$(cd "$(dirname "$0")" && pwd)")
@@ -76,7 +81,7 @@ measured() {
     -v nrese-target:/target:ro -e JAVA_TOOL_OPTIONS="-Xmx$JAVA_HEAP" --entrypoint sh "$image" \
     -c '"$@"; rc=$?; echo "peak_bytes $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0)"; exit $rc' \
     sh "$@" >"$log" 2>&1 || rc=$?
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker rm -f -v "$name" >/dev/null 2>&1 || true
   return $rc
 }
 field() { sed -nE "s/.*$1.*/\1/p" "$2" | head -1; } # <ERE with one capture group> <file>

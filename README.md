@@ -237,7 +237,7 @@ scripts/cargo-guarded.sh --status   # sizes and limits
 scripts/cargo-guarded.sh --clean    # empty the build directory
 ```
 
-The benchmark scripts check free space the same way before they create datasets or containers.
+The benchmark scripts check free space the same way before they create datasets or containers, and clean up after themselves when they exit (`scripts/bench-cleanup.sh`; see [benches/reasoning/README.md](benches/reasoning/README.md)).
 
 ### Where To Start
 
