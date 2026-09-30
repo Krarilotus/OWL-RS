@@ -141,6 +141,16 @@ pub fn closure(
 /// O(n + m) plus the total size of the components' reach sets. On a clique of k nodes
 /// that's O(k²), the size of the output, where a search per node ([`closure`]) is O(k³).
 pub fn transitive_closure(edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    transitive_closure_until(edges, &|| false).expect("never stopped")
+}
+
+/// [`transitive_closure`], polling `stop` while it works; `None` if it fired. The
+/// output of a large relation can be quadratic in its size, so this is what makes a
+/// newly declared transitive property's closure cancellable.
+pub fn transitive_closure_until(
+    edges: &[(u64, u64)],
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Option<Vec<(u64, u64)>> {
     use rayon::prelude::*;
 
     // Dense node numbering and CSR over it.
@@ -199,6 +209,9 @@ pub fn transitive_closure(edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     // `members[starts[c]..starts[c + 1]]` are component c's nodes.
     let (mut members, mut starts) = (Vec::with_capacity(n), vec![0usize]);
     for root in 0..n as u32 {
+        if root % 4096 == 0 && stop() {
+            return None;
+        }
         if t.order[root as usize] != UNSEEN {
             continue;
         }
@@ -239,6 +252,9 @@ pub fn transitive_closure(edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut reach: Vec<Vec<u32>> = Vec::with_capacity(components);
     let mut stamp = vec![u32::MAX; components];
     for c in 0..components {
+        if c % 1024 == 0 && stop() {
+            return None;
+        }
         let mut set = Vec::new();
         let nodes_of_c = &members[starts[c]..starts[c + 1]];
         let mut cyclic = nodes_of_c.len() > 1;
@@ -267,21 +283,28 @@ pub fn transitive_closure(edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
         reach.push(set);
     }
 
-    (0..components)
+    let out: Vec<(u64, u64)> = (0..components)
         .into_par_iter()
         .flat_map_iter(|c| {
             let (members, starts, reach, nodes) = (&members, &starts, &reach, &nodes);
-            members[starts[c]..starts[c + 1]]
-                .iter()
-                .flat_map(move |&x| {
-                    reach[c].iter().flat_map(move |&d| {
-                        members[starts[d as usize]..starts[d as usize + 1]]
-                            .iter()
-                            .map(move |&y| (nodes[x as usize], nodes[y as usize]))
-                    })
+            // A stopped run produces nothing more; the caller discards what it has.
+            let stopped = c % 256 == 0 && stop();
+            members[if stopped {
+                0..0
+            } else {
+                starts[c]..starts[c + 1]
+            }]
+            .iter()
+            .flat_map(move |&x| {
+                reach[c].iter().flat_map(move |&d| {
+                    members[starts[d as usize]..starts[d as usize + 1]]
+                        .iter()
+                        .map(move |&y| (nodes[x as usize], nodes[y as usize]))
                 })
+            })
         })
-        .collect()
+        .collect();
+    (!stop()).then_some(out)
 }
 
 #[cfg(test)]
@@ -318,6 +341,7 @@ mod tests {
             .flat_map(|a| [(a, (a + 1) % 50), ((a + 1) % 50, a)])
             .collect();
         assert_eq!(transitive_closure(&clique).len(), 50 * 50);
+        assert!(transitive_closure_until(&clique, &|| true).is_none());
     }
 
     /// Floyd–Warshall-style fixpoint over a tiny graph as the reference.

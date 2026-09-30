@@ -1095,6 +1095,63 @@ mod tests {
         }
     }
 
+    /// A materialisation stops when asked, at any poll, and a stop that never fires
+    /// changes nothing (completion plan 1.7).
+    #[test]
+    fn materialisation_stops_when_asked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut next = rng(77);
+        let lines = random_ontology(&mut next);
+        let mut vocabulary = LocalVocabulary::default();
+        let input = load(
+            &mut vocabulary,
+            &lines.join(
+                "
+",
+            ),
+        );
+        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+        let mut sorted = input.clone();
+        sorted.sort_unstable_by_key(|&[s, p, o]| (p, o, s));
+        sorted.dedup();
+        for [s, p, o] in sorted {
+            match groups.last_mut() {
+                Some((last, pairs)) if *last == p => pairs.push((o, s)),
+                _ => groups.push((p, vec![(o, s)])),
+            }
+        }
+        let full = batch::materialise(&input, &rules, Some(&lists), &schema);
+        let polls = AtomicUsize::new(0);
+        let count = || {
+            polls.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let again =
+            batch::materialise_grouped_until(groups.clone(), &rules, Some(&lists), &schema, &count)
+                .expect("never stopped");
+        assert_eq!(again.derived, full.derived);
+        let total = polls.load(Ordering::Relaxed);
+        assert!(total > 2, "{total} polls");
+        for at in [0, 1, total / 2] {
+            let seen = AtomicUsize::new(0);
+            let stop = || seen.fetch_add(1, Ordering::Relaxed) >= at;
+            assert!(
+                batch::materialise_grouped_until(
+                    groups.clone(),
+                    &rules,
+                    Some(&lists),
+                    &schema,
+                    &stop
+                )
+                .is_err(),
+                "stopped at poll {at}"
+            );
+        }
+    }
+
     /// Random small ontologies: the batch executor equals the naive one.
     #[test]
     fn batch_equals_naive_on_random_ontologies() {

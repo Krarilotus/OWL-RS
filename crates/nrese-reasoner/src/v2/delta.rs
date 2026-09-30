@@ -387,7 +387,8 @@ pub fn update_until<B: Base + ?Sized>(
                             }
                         });
                     }
-                    nrese_exec::graph::transitive_closure(&edges)
+                    nrese_exec::graph::transitive_closure_until(&edges, stop)
+                        .ok_or(Interrupted)?
                         .into_iter()
                         .collect()
                 } else {
@@ -549,7 +550,8 @@ pub fn update_until<B: Base + ?Sized>(
                     all.push((t[0], t[2]))
                 });
                 produced.extend(
-                    nrese_exec::graph::transitive_closure(&all)
+                    nrese_exec::graph::transitive_closure_until(&all, stop)
+                        .ok_or(Interrupted)?
                         .into_iter()
                         .map(|(s, o)| [s, p, o])
                         .filter(|&f| !state.contains(f)),

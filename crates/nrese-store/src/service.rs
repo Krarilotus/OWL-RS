@@ -384,6 +384,16 @@ impl StoreService {
         &self,
         ruleset: nrese_reasoner::v2::rulesets::Ruleset,
     ) -> StoreResult<crate::reasoning::MaterialisationReport> {
+        self.rematerialise_until(ruleset, nrese_reasoner::v2::eval::NEVER)
+    }
+
+    /// [`Self::rematerialise`], stopped when `stop` fires: then nothing changes and
+    /// [`StoreError::MaterialisationCancelled`](crate::StoreError) is returned.
+    pub fn rematerialise_until(
+        &self,
+        ruleset: nrese_reasoner::v2::rulesets::Ruleset,
+        stop: nrese_reasoner::v2::eval::Stop<'_>,
+    ) -> StoreResult<crate::reasoning::MaterialisationReport> {
         let started = std::time::Instant::now();
         let rematerialisation = self.engine.rematerialisation();
         let asserted = rematerialisation
@@ -392,7 +402,8 @@ impl StoreService {
         let program =
             crate::reasoning::Program::new(ruleset, &|term| rematerialisation.intern(term))
                 .hiding_unnamed_classes(self.config.hide_unnamed_classes);
-        let closure = crate::reasoning::materialise(&program, rematerialisation.base());
+        let closure = crate::reasoning::materialise_until(&program, rematerialisation.base(), stop)
+            .map_err(|_| crate::StoreError::MaterialisationCancelled)?;
         let inferred = closure.inferred.len() as u64;
         let base = rematerialisation.base();
         let reported = crate::reasoning::MaterialisationReport::default()
