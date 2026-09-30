@@ -13,6 +13,7 @@ pub const UPDATE_ENDPOINT: &str = "/dataset/update";
 pub const SPARQL_ENDPOINT: &str = "/dataset/sparql";
 pub const TELL_ENDPOINT: &str = "/dataset/tell";
 pub const GRAPH_STORE_ENDPOINT: &str = "/dataset/data";
+pub const SHACL_ENDPOINT: &str = "/dataset/shacl";
 pub const ADMIN_BACKUP_ENDPOINT: &str = "/ops/api/admin/dataset/backup";
 pub const ADMIN_RESTORE_ENDPOINT: &str = "/ops/api/admin/dataset/restore";
 pub const AI_STATUS_ENDPOINT: &str = "/api/ai/status";

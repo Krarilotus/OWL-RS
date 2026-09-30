@@ -61,6 +61,35 @@ On the combined URL a form is a query or an update by its field, and a body by i
 - `Content-Location` gives the base IRI for relative IRIs in the payload.
 - Writing the same content twice leaves the same graph: blank nodes are scoped to the payload, and a `PUT` replaces.
 
+## SHACL validation
+
+`/dataset/shacl`
+
+| Method | Validates against | Body |
+|---|---|---|
+| GET | The repository's shapes graph (`shacl.shapes_graph`, by default `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph`) | none |
+| POST | The shapes in the request body; they aren't stored | The shapes, in any graph format |
+
+Shapes are stored like any graph: `PUT /dataset/data?graph=<the shapes graph>`.
+
+| Parameter | Meaning |
+|---|---|
+| (none) | Validate every graph, except graphs that hold shapes |
+| `graph=<IRI>` or `default` | Validate one graph |
+| `shapes-graph=<IRI>` | `GET` only: shapes stored in another graph |
+| `infer=false` | Validate asserted statements only (the default includes inferred ones) |
+
+The answer is the validation report, with status 200 whether the data conforms or not:
+- `text/turtle` by default, or any other graph format: the `sh:ValidationReport` graph;
+- `application/json`: `conforms`, `revision`, `shapes` (how many were used; 0 means no shapes were found) and `results`, each with `focusNode`, `resultPath`, `value`, `sourceShape`, `sourceConstraintComponent`, `resultSeverity` and `resultMessage`.
+
+Ill-formed shapes are 400, naming the shape and the parameter.
+
+Limits today:
+- SHACL Core only; validation runs on request, not yet on commit.
+- A `POST` holds the writer while it validates (its shapes live in a transaction that is never committed), so other writes wait.
+- The shapes graph is an ordinary graph: queries see it, and reasoning reads it like any other.
+
 ## Status codes
 
 | Code | When |
@@ -84,7 +113,7 @@ Errors are `application/problem+json` documents. Every response carries `x-reque
 |---|---|
 | `/healthz`, `/readyz` | Liveness; readiness with revision, reasoning mode and consistency |
 | `/version` | Build, enabled surfaces, reasoning semantics |
-| `/dataset/service-description` | SPARQL service description (Turtle) |
+| `/dataset/service-description` | SPARQL service description (Turtle); it names every endpoint above |
 | `/dataset/info` | Statement and graph counts |
 | `/dataset/tell` | Adds an RDF payload to a graph (`POST`) |
 | `/metrics` | Prometheus metrics |

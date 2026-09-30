@@ -11,8 +11,8 @@ use oxrdf::{NamedNodeRef, Term};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub graphs: GraphSelector,
-    /// A graph left out of `graphs` (the shapes graph, when every graph is validated).
-    pub excluded: Option<TermId>,
+    /// Graphs left out of `graphs`: shapes graphs, when every graph is validated.
+    pub excluded: [Option<TermId>; 2],
     pub model: ReadModel,
 }
 
@@ -21,7 +21,7 @@ impl Selection {
     pub const fn of(graphs: GraphSelector) -> Self {
         Self {
             graphs,
-            excluded: None,
+            excluded: [None; 2],
             model: ReadModel::Materialised,
         }
     }
@@ -30,13 +30,16 @@ impl Selection {
     pub const fn asserted(graphs: GraphSelector) -> Self {
         Self {
             graphs,
-            excluded: None,
+            excluded: [None; 2],
             model: ReadModel::Asserted,
         }
     }
 
+    /// Leaves `graph` out. Two graphs can be left out (the stored shapes graph and the
+    /// shapes of the request); a third replaces the second.
     pub const fn excluding(mut self, graph: TermId) -> Self {
-        self.excluded = Some(graph);
+        let slot = if self.excluded[0].is_none() { 0 } else { 1 };
+        self.excluded[slot] = Some(graph);
         self
     }
 }
@@ -80,7 +83,7 @@ impl<'a, V: ReadView> GraphView<'a, V> {
         let excluded = self.selection.excluded;
         self.view
             .quads_for_pattern_in(self.selection.model, &pattern)
-            .filter(move |quad| Some(quad.graph) != excluded)
+            .filter(move |quad| !excluded.contains(&Some(quad.graph)))
     }
 
     /// The objects of `(subject predicate ?)`.

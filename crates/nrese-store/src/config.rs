@@ -20,10 +20,16 @@ pub struct StoreConfig {
     /// Bytes of serialised query results kept for repeated queries on an unchanged store
     /// (see `query_cache`); 0 disables the cache.
     pub query_cache_bytes: usize,
+    /// The graph that holds the repository's SHACL shapes.
+    pub shapes_graph: String,
 }
 
 /// Default query result cache: 64 MiB.
 pub const DEFAULT_QUERY_CACHE_BYTES: usize = 64 << 20;
+
+/// The default shapes graph: the one RDF4J and GraphDB use, so their clients and
+/// documentation apply unchanged.
+pub const DEFAULT_SHAPES_GRAPH: &str = "http://rdf4j.org/schema/rdf4j#SHACLShapeGraph";
 
 impl Default for StoreConfig {
     fn default() -> Self {
@@ -38,6 +44,7 @@ impl StoreConfig {
             data_dir: PathBuf::from("./data"),
             ontology_path: None,
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
+            shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
         }
     }
 
@@ -47,6 +54,7 @@ impl StoreConfig {
             data_dir: data_dir.into(),
             ontology_path: None,
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
+            shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
         }
     }
 
@@ -61,6 +69,12 @@ impl StoreConfig {
             return Err(StoreError::Configuration(
                 "data_dir must not be empty in on-disk mode".to_owned(),
             ));
+        }
+        if oxrdf::NamedNode::new(self.shapes_graph.as_str()).is_err() {
+            return Err(StoreError::Configuration(format!(
+                "shapes_graph must be an IRI, not '{}'",
+                self.shapes_graph
+            )));
         }
         if matches!(self.ontology_path.as_ref(), Some(path) if path.as_os_str().is_empty()) {
             return Err(StoreError::Configuration(

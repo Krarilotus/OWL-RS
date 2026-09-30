@@ -69,6 +69,7 @@ impl ServerConfig {
                 "store.query_cache_bytes",
                 store.query_cache_bytes.to_string(),
             ),
+            ("shacl.shapes_graph", store.shapes_graph.clone()),
             ("reasoner.mode", self.reasoner.mode().as_str().to_owned()),
             (
                 "reasoner.semantics",

@@ -342,8 +342,8 @@ fn reasoning_state_tracks_whether_inferences_are_current() {
     let config = nrese_store::StoreConfig {
         mode: nrese_store::StoreMode::OnDisk,
         data_dir: dir.path().to_path_buf(),
-        ontology_path: None,
         query_cache_bytes: 0,
+        ..nrese_store::StoreConfig::default()
     };
     let ruleset = nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl;
     let current = |store: &StoreService| {
