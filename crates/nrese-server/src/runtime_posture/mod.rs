@@ -9,6 +9,8 @@ pub const OPERATOR_UI_PATH: &str = "/ops";
 pub const REASONING_DIAGNOSTICS_PATH: &str = "/ops/api/diagnostics/reasoning";
 pub const QUERY_ENDPOINT: &str = "/dataset/query";
 pub const UPDATE_ENDPOINT: &str = "/dataset/update";
+/// Queries and updates on one URL (also served at `/dataset`).
+pub const SPARQL_ENDPOINT: &str = "/dataset/sparql";
 pub const TELL_ENDPOINT: &str = "/dataset/tell";
 pub const GRAPH_STORE_ENDPOINT: &str = "/dataset/data";
 pub const ADMIN_BACKUP_ENDPOINT: &str = "/ops/api/admin/dataset/backup";

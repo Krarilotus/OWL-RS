@@ -59,6 +59,15 @@ pub fn router(state: AppState) -> Router {
             get(handlers::query_get).post(handlers::query_post),
         )
         .route("/dataset/update", post(handlers::update_post))
+        // One URL for queries and updates, for clients configured with a single endpoint.
+        .route(
+            crate::runtime_posture::SPARQL_ENDPOINT,
+            get(handlers::sparql_get).post(handlers::sparql_post),
+        )
+        .route(
+            "/dataset",
+            get(handlers::sparql_get).post(handlers::sparql_post),
+        )
         .route("/dataset/tell", post(handlers::tell_post))
         .route(
             "/dataset/data",

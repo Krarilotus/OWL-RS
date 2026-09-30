@@ -6,7 +6,7 @@ use nrese_store::{GraphReadRequest, GraphWriteRequest, MutationCommand, Mutation
 
 use crate::error::ApiError;
 use crate::http::guard;
-use crate::http::media::{header_value_str, media_type_matches};
+use crate::http::media::{GRAPHS, header_value_str, negotiated};
 use crate::http::mutation;
 use crate::http::rdf_payload::{
     parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
@@ -56,17 +56,23 @@ async fn read_graph(
     state.ensure_serving()?;
 
     let target = parse_graph_target(&raw_query)?;
-    let format = parse_graph_accept_format(header_value_str(headers.get(header::ACCEPT)));
+    let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let request = GraphReadRequest { target, format };
     let store = state.store();
-    tokio::time::timeout(
+    let result = tokio::time::timeout(
         state.policy().timeouts.graph_read,
         tokio::task::spawn_blocking(move || store.execute_graph_read(&request)),
     )
     .await
     .map_err(|_| ApiError::timeout("graph read exceeded policy timeout"))?
     .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::bad_request(error.to_string()))
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    // Graph Store Protocol §5.2: a graph that doesn't exist is 404, not an empty document.
+    if result.exists {
+        Ok(result)
+    } else {
+        Err(ApiError::not_found("the graph does not exist"))
+    }
 }
 
 pub async fn put_graph(
@@ -95,15 +101,23 @@ pub async fn delete_graph(
     state.ensure_serving()?;
     guard::enforce_graph_write(&state, &headers).await?;
     let target = parse_graph_target(&raw_query)?;
-    mutation::run(
+    let report = mutation::run(
         &state,
         MutationCommand::GraphDelete(target),
         state.policy().timeouts.graph_write,
         "graph delete exceeded policy timeout",
     )
     .await?;
-
-    Ok(StatusCode::NO_CONTENT)
+    // Graph Store Protocol §5.4: deleting a named graph that doesn't exist is 404.
+    match report {
+        MutationCommitReport::GraphDelete(report)
+            if !report.modified
+                && matches!(report.target, nrese_store::GraphTarget::NamedGraph(_)) =>
+        {
+            Err(ApiError::not_found("the graph does not exist"))
+        }
+        _ => Ok(StatusCode::NO_CONTENT),
+    }
 }
 
 async fn write_graph(
@@ -153,28 +167,15 @@ fn write_graph_status(report: &nrese_store::GraphWriteReport) -> StatusCode {
     }
 }
 
-fn parse_graph_accept_format(accept: Option<&str>) -> nrese_store::GraphResultFormat {
-    if media_type_matches(accept, "application/rdf+xml") {
-        nrese_store::GraphResultFormat::RdfXml
-    } else if media_type_matches(accept, "text/turtle")
-        || media_type_matches(accept, "application/x-turtle")
-    {
-        nrese_store::GraphResultFormat::Turtle
-    } else {
-        nrese_store::GraphResultFormat::NTriples
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use axum::extract::RawQuery;
     use axum::http::StatusCode;
-    use nrese_store::GraphResultFormat;
     use nrese_store::GraphWriteReport;
 
     use crate::http::rdf_payload::parse_graph_target;
 
-    use super::{parse_graph_accept_format, write_graph_status};
+    use super::write_graph_status;
 
     #[test]
     fn graph_target_defaults_to_default_graph() {
@@ -200,19 +201,6 @@ mod tests {
             "default=&graph=http%3A%2F%2Fexample.com%2Fg".to_owned(),
         )));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn graph_accept_format_handles_parameterized_accept_values() {
-        let format = parse_graph_accept_format(Some("application/n-triples, text/turtle; q=0.9"));
-        assert_eq!(format, GraphResultFormat::Turtle);
-    }
-
-    #[test]
-    fn graph_accept_format_prefers_rdf_xml_when_present() {
-        let format =
-            parse_graph_accept_format(Some("application/n-triples, application/rdf+xml; q=0.9"));
-        assert_eq!(format, GraphResultFormat::RdfXml);
     }
 
     #[test]
