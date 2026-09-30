@@ -774,7 +774,8 @@ impl<'a> Context<'a> {
             cancellation: options.cancellation.clone(),
             budget: options
                 .memory_limit
-                .map_or_else(Budget::unlimited, Budget::new),
+                .map_or_else(Budget::unlimited, Budget::new)
+                .within(options.shared_memory.clone()),
             trace: None,
             depth: Cell::new(0),
             graph: RefCell::new(if options.union_default_graph {
@@ -826,9 +827,21 @@ impl<'a> Context<'a> {
         Ok(solutions)
     }
 
-    /// The most rows a table `width` columns wide may have within the remaining budget.
+    /// The most rows a table `width` columns wide may grow to within the remaining budget.
+    /// Half of what the bytes would hold: a table that grows reallocates, and a join's
+    /// parallel parts are copied into one table, so for a moment the rows exist twice.
     fn max_rows(&self, width: usize) -> usize {
-        self.budget.remaining() / (width.max(1) * 8)
+        self.budget.remaining() / (width.max(1) * 8 * 2)
+    }
+
+    /// Charges a join's hash table over `rows` build rows (a key, a row number and the
+    /// table's slack per row); the caller releases the returned bytes after the join.
+    fn charge_hash_table(&self, rows: usize) -> NativeResult<usize> {
+        let bytes = rows.saturating_mul(32);
+        self.budget
+            .charge(bytes)
+            .map_err(|e| QueryEvaluationError::Dataset(Box::new(e)))?;
+        Ok(bytes)
     }
 
     /// The error for an operator that would outgrow the budget.
@@ -836,8 +849,10 @@ impl<'a> Context<'a> {
         let requested = rows.saturating_mul(width.max(1) * 8);
         QueryEvaluationError::Dataset(Box::new(BudgetExceeded {
             limit: self.budget.used().saturating_add(self.budget.remaining()),
-            requested,
+            // A table may grow to half of what is left (`max_rows`).
+            requested: requested.saturating_mul(2),
             used: self.budget.used(),
+            shared: self.budget.bounded_by_shared(),
         }))
         .into()
     }
@@ -1920,6 +1935,7 @@ impl<'a> Context<'a> {
     fn join(&self, left: Solutions, right: Solutions) -> NativeResult<Solutions> {
         let (lk, rk) = shared_columns(&left, &right);
         let vars = joined_vars(&left, &right, &rk);
+        let hash_table = self.charge_hash_table(left.table.len().min(right.table.len()))?;
         let max_rows = self.max_rows(vars.len());
         let table = if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
             if left.ordered {
@@ -1932,6 +1948,7 @@ impl<'a> Context<'a> {
             join(&left.table, &right.table, &lk, &rk, max_rows)
         }
         .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
+        self.budget.release(hash_table);
         self.consumed(&left);
         self.consumed(&right);
         self.produced(Solutions {
@@ -1952,6 +1969,7 @@ impl<'a> Context<'a> {
             return Err(NativeError::Fallback);
         }
         let vars = joined_vars(&left, &right, &rk);
+        let hash_table = self.charge_hash_table(right.table.len())?;
         let max_rows = self.max_rows(vars.len());
         let table = match expression {
             None => left_join(&left.table, &right.table, &lk, &rk, None, max_rows),
@@ -1967,6 +1985,7 @@ impl<'a> Context<'a> {
             }
         }
         .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
+        self.budget.release(hash_table);
         self.consumed(&left);
         self.consumed(&right);
         self.produced(Solutions {

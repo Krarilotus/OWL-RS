@@ -50,22 +50,18 @@ ontology_path = "C:/data/rg_ontology.ttl"
 [reasoner]
 mode = "owl2-rl"
 
-[policy.limits]
-max_query_bytes = 1048576
-max_update_bytes = 16777216
-max_rdf_upload_bytes = 134217728
+[budgets]
+query_memory = "4GiB"
+total_query_memory = "50%"
+query_timeout = "30s"
+update_timeout = "60s"
+upload_size = "128MiB"
 
 [policy.rate_limits]
 window_secs = 60
 read_requests_per_window = 0
 write_requests_per_window = 0
 admin_requests_per_window = 0
-
-[policy.timeouts]
-query_ms = 30000
-update_ms = 60000
-graph_read_ms = 30000
-graph_write_ms = 60000
 
 [policy]
 sparql_parse_error_profile = "problem-json"
@@ -170,14 +166,30 @@ api_key = "replace-me"
   - queries see asserted and inferred statements by default; `infer=false` or `FROM <http://www.ontotext.com/explicit>` reads asserted statements only, `FROM <http://www.ontotext.com/implicit>` inferred ones
 - switching reasoning off clears the inferred stack at the next startup
 
-## Policy Limits
+## Budgets
 
-- `policy.limits.max_query_bytes` -> `NRESE_MAX_QUERY_BYTES`: the longest query text (default 1 MiB)
-- `policy.limits.max_query_memory_bytes` -> `NRESE_MAX_QUERY_MEMORY_BYTES`: bytes of intermediate results one query may hold (default 4 GiB, `0` = unlimited). A query that needs more is rejected with `413` instead of growing the server's memory.
-- `policy.limits.max_update_bytes` -> `NRESE_MAX_UPDATE_BYTES`: the largest SPARQL update (default 16 MiB)
-- `policy.limits.max_rdf_upload_bytes` -> `NRESE_MAX_RDF_UPLOAD_BYTES`: the largest RDF payload of a Graph Store, TELL or SHACL request (default 128 MiB); larger data goes through `nrese-server load`
+Every limit on memory, time and request size is in one table, `[budgets]`. Values are plain numbers (bytes, milliseconds) or numbers with a unit: `"4GiB"`, `"512MiB"`, `"2GB"`, `"30s"`, `"2min"`, and for memory a share of the machine, `"50%"`. `nrese-server check-config` prints the values in effect, and `/version` reports them under `budgets`.
 
-These limits are the ones that apply: a request over its limit gets `413` as a problem document. Requests are held in memory while they are handled, so a limit is also memory a request may take.
+| Key | Environment | Default | What it bounds |
+|---|---|---|---|
+| `budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | 4 GiB | Intermediate results of one query. A query that needs more is answered `413`. `0` = unlimited |
+| `budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | 50 % of the machine's memory | Intermediate results of all running queries together. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
+| `budgets.query_timeout` | `NRESE_QUERY_TIMEOUT_MS` | 30 s | A query, until its last result is sent (`408`) |
+| `budgets.update_timeout` | `NRESE_UPDATE_TIMEOUT_MS` | 60 s | A SPARQL update, reasoning included |
+| `budgets.graph_read_timeout` | `NRESE_GRAPH_READ_TIMEOUT_MS` | 30 s | A Graph Store read |
+| `budgets.graph_write_timeout` | `NRESE_GRAPH_WRITE_TIMEOUT_MS` | 60 s | A Graph Store write |
+| `budgets.query_text` | `NRESE_MAX_QUERY_BYTES` | 1 MiB | The text of a query |
+| `budgets.update_size` | `NRESE_MAX_UPDATE_BYTES` | 16 MiB | A SPARQL update request |
+| `budgets.upload_size` | `NRESE_MAX_RDF_UPLOAD_BYTES` | 128 MiB | An RDF payload (Graph Store, TELL, SHACL shapes); larger data goes through `nrese-server load` |
+| `budgets.result_cache` | `NRESE_QUERY_CACHE_BYTES` | 64 MiB | Serialised results kept for repeated queries. `0` switches the cache off |
+
+How the two memory budgets work:
+- They count what queries hold between their operators: the tables of joins, groups and sorts, and the hash tables of joins. A table that is being built may take half of what is left, because growing it, and merging the parts of a parallel join, holds its rows twice for a moment.
+- The machine's memory is the container's limit where there is one (cgroups), else the machine's. It is known on Linux; elsewhere a share such as `50%` means "no limit", so set a size.
+- The store's own memory (the data and its indexes) is not part of either budget.
+- A request over a size limit is answered `413`. Requests are held in memory while they are handled, so a size limit is also memory a request may take.
+
+The same settings have older names, which still work: `policy.limits.max_query_bytes`, `max_query_memory_bytes`, `max_update_bytes`, `max_rdf_upload_bytes`; `policy.timeouts.query_ms`, `update_ms`, `graph_read_ms`, `graph_write_ms`; `store.query_cache_bytes`. A setting under both names is a startup error.
 
 ## Policy Rate Limits
 
@@ -186,12 +198,7 @@ These limits are the ones that apply: a request over its limit gets `413` as a p
 - `policy.rate_limits.write_requests_per_window` -> `NRESE_WRITE_REQUESTS_PER_WINDOW`
 - `policy.rate_limits.admin_requests_per_window` -> `NRESE_ADMIN_REQUESTS_PER_WINDOW`
 
-## Policy Timeouts
-
-- `policy.timeouts.query_ms` -> `NRESE_QUERY_TIMEOUT_MS`
-- `policy.timeouts.update_ms` -> `NRESE_UPDATE_TIMEOUT_MS`
-- `policy.timeouts.graph_read_ms` -> `NRESE_GRAPH_READ_TIMEOUT_MS`
-- `policy.timeouts.graph_write_ms` -> `NRESE_GRAPH_WRITE_TIMEOUT_MS`
+## Timeouts and writes
 
 A write that times out before its commit starts is never committed, and the request gets 408. The deadline reaches every phase of the write:
 - the `WHERE` evaluation of an update;

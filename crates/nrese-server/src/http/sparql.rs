@@ -104,9 +104,13 @@ fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
         StoreError::SparqlEvaluation(nrese_store::QueryEvaluationError::Cancelled) => {
             ApiError::timeout(QUERY_TIMEOUT_MESSAGE)
         }
+        // Other queries hold the memory this one asked for: it may succeed later.
+        error if error.is_server_memory_limit() => ApiError::unavailable(format!(
+            "{error} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
+        )),
         // The query needs more memory than the policy allows: the client's to change.
         error if error.is_memory_limit() => ApiError::payload_too_large(format!(
-            "{error} (policy limit NRESE_MAX_QUERY_MEMORY_BYTES)"
+            "{error} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"
         )),
         error if error.is_request_error() => {
             policy.bad_request_for_sparql_parse_error(error.to_string())

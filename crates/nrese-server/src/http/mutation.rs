@@ -44,9 +44,13 @@ pub async fn run(
 fn map_error(policy: &PolicyConfig, error: MutationError, timeout_message: &str) -> ApiError {
     match error {
         MutationError::Store { kind, source } => {
-            if source.is_memory_limit() {
+            if source.is_server_memory_limit() {
+                ApiError::unavailable(format!(
+                    "{source} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
+                ))
+            } else if source.is_memory_limit() {
                 ApiError::payload_too_large(format!(
-                    "{source} (policy limit NRESE_MAX_QUERY_MEMORY_BYTES)"
+                    "{source} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"
                 ))
             } else if !source.is_request_error() {
                 ApiError::internal(format!("{} failed: {source}", kind_name(kind)))

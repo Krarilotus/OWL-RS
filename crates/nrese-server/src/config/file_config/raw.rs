@@ -14,9 +14,55 @@ pub(super) struct RawFileConfig {
     #[serde(default)]
     pub policy: RawPolicyConfig,
     #[serde(default)]
+    pub budgets: RawBudgetsConfig,
+    #[serde(default)]
     pub auth: RawAuthConfig,
     #[serde(default)]
     pub ai: RawAiConfig,
+}
+
+/// A number, or a number with a unit as text (`"4GiB"`, `"30s"`, `"50%"`).
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(super) enum Amount {
+    Number(u64),
+    Text(String),
+}
+
+impl Amount {
+    pub(super) fn into_text(self) -> String {
+        match self {
+            Self::Number(number) => number.to_string(),
+            Self::Text(text) => text,
+        }
+    }
+}
+
+/// Every resource budget in one place. Each key has an older name in `[policy.limits]`,
+/// `[policy.timeouts]` or `[store]`, which still works; setting both is an error.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RawBudgetsConfig {
+    #[serde(default)]
+    pub query_memory: Option<Amount>,
+    #[serde(default)]
+    pub total_query_memory: Option<Amount>,
+    #[serde(default)]
+    pub query_timeout: Option<Amount>,
+    #[serde(default)]
+    pub update_timeout: Option<Amount>,
+    #[serde(default)]
+    pub graph_read_timeout: Option<Amount>,
+    #[serde(default)]
+    pub graph_write_timeout: Option<Amount>,
+    #[serde(default)]
+    pub query_text: Option<Amount>,
+    #[serde(default)]
+    pub update_size: Option<Amount>,
+    #[serde(default)]
+    pub upload_size: Option<Amount>,
+    #[serde(default)]
+    pub result_cache: Option<Amount>,
 }
 
 #[derive(Debug, Default, Deserialize)]
