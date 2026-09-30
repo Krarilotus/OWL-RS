@@ -376,3 +376,100 @@ fn exists_agrees_with_count() {
         }
     }
 }
+
+/// A transaction's pending snapshot is exactly what its commit then publishes, in every
+/// read model: asserted and inferred inserts and deletes, a statement asserted that was
+/// inferred, terms interned by the transaction.
+#[test]
+fn a_pending_snapshot_is_what_the_commit_publishes() {
+    use nrese_engine::{EncodedTriple, ReadModel};
+    let mut state: u64 = 7;
+    let mut next = |n: u64| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (state >> 33) % n
+    };
+    for _ in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for _ in 0..30 {
+            tx.insert(quad(next(6), next(3), next(6)).as_ref());
+        }
+        for _ in 0..10 {
+            let q = quad(next(6), next(3), next(6));
+            let t = EncodedTriple::new(
+                tx.intern(q.subject.as_ref().into()),
+                tx.intern(q.predicate.as_ref().into()),
+                tx.intern(q.object.as_ref()),
+            );
+            tx.insert_inferred(t);
+        }
+        tx.commit().unwrap();
+        let mut tx = engine.transaction();
+        for _ in 0..15 {
+            let q = quad(next(8), next(3), next(8));
+            match next(4) {
+                0 => {
+                    tx.remove(q.as_ref());
+                }
+                1 => {
+                    let t = EncodedTriple::new(
+                        tx.intern(q.subject.as_ref().into()),
+                        tx.intern(q.predicate.as_ref().into()),
+                        tx.intern(q.object.as_ref()),
+                    );
+                    if next(2) == 0 {
+                        tx.insert_inferred(t);
+                    } else {
+                        tx.remove_inferred(t);
+                    }
+                }
+                _ => {
+                    tx.insert(q.as_ref());
+                }
+            }
+        }
+        let quads = |snapshot: &nrese_engine::Snapshot, model: ReadModel| -> Vec<String> {
+            let mut out: Vec<String> = snapshot
+                .quads_for_pattern_in(model, &QuadPattern::all())
+                .map(|q| format!("{:?}", snapshot.decode_quad(q)))
+                .collect();
+            out.sort();
+            out
+        };
+        let pending = tx.pending_snapshot();
+        let before: Vec<Vec<String>> = [
+            ReadModel::Asserted,
+            ReadModel::Inferred,
+            ReadModel::Materialised,
+        ]
+        .map(|m| quads(&pending, m))
+        .into();
+        let counts: Vec<u64> = [
+            ReadModel::Asserted,
+            ReadModel::Inferred,
+            ReadModel::Materialised,
+        ]
+        .map(|m| pending.len_in(m))
+        .into();
+        tx.commit().unwrap();
+        let committed = engine.snapshot();
+        let after: Vec<Vec<String>> = [
+            ReadModel::Asserted,
+            ReadModel::Inferred,
+            ReadModel::Materialised,
+        ]
+        .map(|m| quads(&committed, m))
+        .into();
+        assert_eq!(before, after);
+        let committed_counts: Vec<u64> = [
+            ReadModel::Asserted,
+            ReadModel::Inferred,
+            ReadModel::Materialised,
+        ]
+        .map(|m| committed.len_in(m))
+        .into();
+        assert_eq!(counts, committed_counts);
+    }
+}

@@ -3540,3 +3540,70 @@ fn sideways_joins_equal_spareval() {
         "{probed} of {checked} probed the index"
     );
 }
+
+/// Requests of several operations, where later WHERE clauses read what earlier ones
+/// inserted and deleted (on the pending state's snapshot): the store ends as with spareval.
+#[test]
+fn multi_operation_updates_equal_spareval() {
+    use nrese_sparql::{UpdateOptions, apply_update};
+    let mut rng = Rng(20_260_941);
+    let mut changed = 0;
+    for _ in 0..40 {
+        let data = random_dataset(&mut rng);
+        let engines = [
+            Engine::new(EngineConfig::default()).unwrap(),
+            Engine::new(EngineConfig::default()).unwrap(),
+        ];
+        for engine in &engines {
+            let mut tx = engine.transaction();
+            for quad in &data {
+                tx.insert(quad.as_ref());
+            }
+            tx.commit().unwrap();
+        }
+        for _ in 0..8 {
+            let mut operations = Vec::new();
+            for _ in 0..2 + rng.below(3) {
+                let p = rng.below(4);
+                let q = rng.below(4);
+                operations.push(match rng.below(5) {
+                    0 => format!(
+                        "INSERT DATA {{ <{EX}e{}> <{EX}p{p}> <{EX}e{}> . <{EX}new{}> <{EX}p{q}> \"s1\" }}",
+                        rng.below(6),
+                        rng.below(6),
+                        rng.below(3)
+                    ),
+                    1 => format!(
+                        "DELETE {{ ?a <{EX}p{p}> ?b }} INSERT {{ ?b <{EX}p{q}> ?a }} WHERE {{ ?a <{EX}p{p}> ?b . {} }}",
+                        group_pattern(&mut rng, 1)
+                    ),
+                    2 => format!("DELETE WHERE {{ ?a <{EX}p{p}> ?b . ?b <{EX}p{q}> ?c }}"),
+                    3 => format!(
+                        "INSERT {{ GRAPH <{EX}g> {{ ?a <{EX}copy> ?b }} }} WHERE {{ ?a <{EX}p{p}> ?b }}"
+                    ),
+                    _ => format!(
+                        "INSERT {{ ?a <{EX}seen> ?c }} WHERE {{ GRAPH <{EX}g> {{ ?a <{EX}copy> ?b }} ?b <{EX}p{q}> ?c }}"
+                    ),
+                });
+            }
+            let text = operations.join(" ;\n");
+            let update = SparqlParser::new()
+                .parse_update(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let before = contents(&engines[0]);
+            for (engine, force_spareval) in engines.iter().zip([false, true]) {
+                let options = UpdateOptions {
+                    force_spareval,
+                    ..UpdateOptions::default()
+                };
+                let mut tx = engine.transaction();
+                apply_update(&mut tx, &update, &options).unwrap();
+                tx.commit().unwrap();
+            }
+            let (native, spareval) = (contents(&engines[0]), contents(&engines[1]));
+            assert_eq!(native, spareval, "{text}");
+            changed += usize::from(native != before);
+        }
+    }
+    assert!(changed > 150, "only {changed} requests changed anything");
+}
