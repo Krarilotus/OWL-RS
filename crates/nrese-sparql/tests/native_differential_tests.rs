@@ -3426,3 +3426,117 @@ fn the_remaining_functions_run_natively() {
         "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>"
     );
 }
+
+/// Data where one predicate is rare and the others common, so that a join across group
+/// parts pays to evaluate from the rare side (native/sideways.rs).
+fn skewed_dataset(rng: &mut Rng) -> Vec<Quad> {
+    let mut quads = Vec::new();
+    for i in 0..600 {
+        for p in 0..3 {
+            if rng.below(3) > 0 {
+                quads.push(Quad::new(
+                    ex(&format!("e{i}")),
+                    ex(&format!("p{p}")),
+                    ex(&format!("e{}", rng.below(600))),
+                    GraphName::DefaultGraph,
+                ));
+            }
+        }
+        quads.push(Quad::new(
+            ex(&format!("e{i}")),
+            ex("name"),
+            Literal::new_simple_literal(format!("n{}", i % 97)),
+            GraphName::DefaultGraph,
+        ));
+    }
+    for _ in 0..6 {
+        quads.push(Quad::new(
+            ex(&format!("e{}", rng.below(600))),
+            ex("rare"),
+            ex(&format!("e{}", rng.below(600))),
+            GraphName::DefaultGraph,
+        ));
+    }
+    quads
+}
+
+/// Groups whose parts a join crosses (OPTIONAL, UNION, BIND, FILTER, paths, subqueries,
+/// MINUS), with a rare pattern in one part and common ones in the others, in both orders:
+/// evaluating one part from another's rows equals spareval, and the rare side does seed
+/// index probes into the common patterns.
+#[test]
+fn sideways_joins_equal_spareval() {
+    let mut rng = Rng(20_260_940);
+    let (mut checked, mut probed) = (0, 0);
+    for _ in 0..4 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in skewed_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..60 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(3));
+            let rare = format!("?a <{EX}rare> ?b .");
+            let common = |rng: &mut Rng| {
+                let v = *rng.pick(&["?a", "?b"]);
+                match rng.below(11) {
+                    // ?b is out of this group's scope: the seed must not show it.
+                    10 => format!(
+                        "?a <{EX}name> ?n . BIND(COALESCE(?b, \"none\") AS ?m{})",
+                        rng.below(1_000_000)
+                    ),
+                    0 => format!("{v} {} ?c . ?c {} ?d .", p(rng), p(rng)),
+                    1 => format!("OPTIONAL {{ {v} {} ?c . ?c <{EX}name> ?n }}", p(rng)),
+                    2 => format!("OPTIONAL {{ {v} {} ?c FILTER(?c != ?a) }}", p(rng)),
+                    3 => format!("{{ {v} {} ?c }} UNION {{ ?c {} {v} }}", p(rng), p(rng)),
+                    4 => format!(
+                        "{v} <{EX}name> ?n . BIND(CONCAT(?n, \"!\") AS ?m{})",
+                        rng.below(1_000_000)
+                    ),
+                    5 => format!("{v} {} ?c FILTER(?c != ?b)", p(rng)),
+                    6 => format!("{v} {}+ ?c .", p(rng)),
+                    7 => format!(
+                        "{{ SELECT {v} (COUNT(?c) AS ?k) WHERE {{ {v} {} ?c }} GROUP BY {v} }}",
+                        p(rng)
+                    ),
+                    8 => format!("{v} {} ?c MINUS {{ ?c {} ?a }}", p(rng), p(rng)),
+                    _ => format!(
+                        "OPTIONAL {{ {v} {} ?c }} OPTIONAL {{ ?c <{EX}name> ?n }}",
+                        p(rng)
+                    ),
+                }
+            };
+            let (x, y) = (common(&mut rng), common(&mut rng));
+            let body = match rng.below(4) {
+                0 => format!("{rare} {x}"),
+                1 => format!("{x} {rare}"),
+                2 => format!("{{ {x} }} {{ {rare} }} {y}"),
+                _ => format!("{x} {{ {rare} {y} }}"),
+            };
+            let text = format!("SELECT * WHERE {{ {body} }}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "{text}");
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let spareval = QueryOptions {
+                force_spareval: true,
+                ..QueryOptions::default()
+            };
+            let expected = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+            assert_same_rows(&native, &expected, &text);
+            let plan = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+            probed += usize::from(plan.steps.iter().any(|s| s.operator == "index join"));
+            checked += 1;
+        }
+    }
+    assert!(
+        probed * 3 > checked,
+        "{probed} of {checked} probed the index"
+    );
+}

@@ -25,6 +25,7 @@ mod pushdown;
 mod ranges;
 mod search;
 mod sets;
+mod sideways;
 pub(crate) mod value;
 mod wcoj;
 
@@ -1150,10 +1151,12 @@ impl<'a> Context<'a> {
                         let reached = self.path_from(&bound, &path)?;
                         self.join(reached, bound)
                     }
-                    (None, None) => {
+                    (None, None) if self.as_written => {
                         let (left, right) = (self.eval(left)?, self.eval(right)?);
                         self.join(left, right)
                     }
+                    // The smaller side first; the other from its rows (`sideways`).
+                    (None, None) => self.join_sideways(left, right),
                 }
             }
             GraphPattern::LeftJoin {
@@ -1162,7 +1165,11 @@ impl<'a> Context<'a> {
                 expression,
             } => {
                 let left = self.eval(left)?;
-                // Only rows that agree with a left row on the shared variables can match.
+                if !self.as_written {
+                    // Only rows that agree with a left row on the shared variables can
+                    // match: the right side is evaluated from the left side's values.
+                    return self.optional(left, right, expression.as_ref());
+                }
                 let right = match as_path(right) {
                     Some(path) => self.path_from(&left, &path)?,
                     None => self.eval(right)?,
@@ -1831,6 +1838,16 @@ impl<'a> Context<'a> {
             .iter()
             .map(|s| self.snapshot.count_in(self.model, &s.quad_pattern()))
             .collect();
+        // A conjunct runs once its variables are bound: by a scan, or by the seed where no
+        // row leaves them unbound (a column alone isn't enough: an OPTIONAL may have left
+        // it empty).
+        let mut bound: Vec<Variable> = result
+            .vars
+            .iter()
+            .enumerate()
+            .filter(|&(c, _)| !result.table.column(c).contains(&UNDEF))
+            .map(|(_, v)| v.clone())
+            .collect();
         let mut left: Vec<usize> = (0..scans.len()).collect();
         while !left.is_empty() {
             let connected = |i: &usize| scans[*i].vars().iter().any(|v| result.column(v).is_some());
@@ -1861,7 +1878,12 @@ impl<'a> Context<'a> {
                 let rows = result.table.len();
                 self.note(operator, triples[next].to_string(), None, rows, start);
             }
-            result = self.filter_bound(result, filters)?;
+            for v in scans[next].vars() {
+                if !bound.contains(&v) {
+                    bound.push(v);
+                }
+            }
+            result = self.filter_among(result, filters, &bound)?;
         }
         Ok(result)
     }
@@ -1869,16 +1891,23 @@ impl<'a> Context<'a> {
     /// Applies, and removes from `filters`, the conjuncts whose variables `solutions` binds.
     fn filter_bound(
         &self,
+        solutions: Solutions,
+        filters: &mut Vec<(&Expression, Vec<Variable>)>,
+    ) -> NativeResult<Solutions> {
+        let bound = solutions.vars.clone();
+        self.filter_among(solutions, filters, &bound)
+    }
+
+    /// Applies, and removes from `filters`, the conjuncts whose variables are all in `bound`.
+    fn filter_among(
+        &self,
         mut solutions: Solutions,
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
+        bound: &[Variable],
     ) -> NativeResult<Solutions> {
         let mut index = 0;
         while index < filters.len() {
-            if !filters[index]
-                .1
-                .iter()
-                .all(|v| solutions.column(v).is_some())
-            {
+            if !filters[index].1.iter().all(|v| bound.contains(v)) {
                 index += 1;
                 continue;
             }

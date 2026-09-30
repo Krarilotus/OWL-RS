@@ -138,7 +138,7 @@ pub(super) fn correlation_safe(pattern: &GraphPattern, outer: &[Variable]) -> bo
 
 /// Every variable `pattern` mentions where the outside can see it (a subquery's own
 /// variables only if it projects them).
-fn mentioned(pattern: &GraphPattern) -> Vec<Variable> {
+pub(super) fn mentioned(pattern: &GraphPattern) -> Vec<Variable> {
     let mut out = Vec::new();
     walk_pattern(pattern, &mut out);
     out
@@ -257,7 +257,7 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Vec<Variable>) {
 }
 
 /// The variables `expression` reads, those of its `EXISTS` patterns included.
-fn deep_variables(expression: &Expression) -> Vec<Variable> {
+pub(super) fn deep_variables(expression: &Expression) -> Vec<Variable> {
     let mut out = Vec::new();
     walk_expression(expression, &mut out);
     out
