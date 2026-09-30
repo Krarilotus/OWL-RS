@@ -25,8 +25,6 @@ services:
       # ResearchSpace writes into named graphs and queries without naming them.
       NRESE_DEFAULT_GRAPH: union
       NRESE_REASONING_MODE: ${NRESE_REASONING_MODE:-disabled}
-      # ResearchSpace's forms and containers send larger updates than the default allows.
-      NRESE_MAX_UPDATE_BYTES: ${NRESE_MAX_UPDATE_BYTES:-16777216}
     volumes:
       - nrese-data:/var/lib/nrese/data
 

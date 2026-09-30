@@ -525,3 +525,64 @@ async fn graphs_round_trip_in_every_format() -> TestResult {
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     Ok(())
 }
+
+/// The policy's size limits are the ones that apply: a request larger than the web
+/// framework's own default (2 MiB) but within the policy passes, and one over the policy
+/// is refused with a problem document. (ResearchSpace loads its larger system graphs in
+/// single updates.)
+#[tokio::test]
+async fn request_size_limits_are_the_policys() -> TestResult {
+    let mut policy = PolicyConfig::default();
+    policy.limits.max_update_bytes = 6 * 1024 * 1024;
+    policy.limits.max_rdf_upload_bytes = 6 * 1024 * 1024;
+    let app = support::test_app_with_policy(policy)?;
+
+    // About 3 MiB of statements, as a form-encoded update (larger still on the wire).
+    let statements: String = (0..30_000)
+        .map(|i| {
+            format!(
+                "<http://example.com/s{i}> <http://example.com/p> \"{}\" .\n",
+                "x".repeat(60)
+            )
+        })
+        .collect();
+    assert!(statements.len() > 3 * 1024 * 1024);
+    let body = format!(
+        "update={}",
+        encode(&format!("INSERT DATA {{ {statements} }}"))
+    );
+    let response = send(
+        &app,
+        Method::POST,
+        "/dataset/sparql",
+        &[("content-type", FORM)],
+        body,
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let graph = format!("/dataset/data?graph={}", encode("http://example.com/big"));
+    let response = send(
+        &app,
+        Method::PUT,
+        &graph,
+        &[("content-type", "application/n-triples")],
+        statements.clone(),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Over the policy: refused by the policy, as a problem document.
+    let too_large = statements.repeat(3);
+    let response = send(
+        &app,
+        Method::PUT,
+        &graph,
+        &[("content-type", "application/n-triples")],
+        too_large,
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(content_type(&response), "application/problem+json");
+    Ok(())
+}
