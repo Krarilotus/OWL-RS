@@ -6,6 +6,7 @@ mod backup;
 mod bulk_load;
 mod classification;
 pub mod config;
+mod datatypes;
 mod delta;
 pub mod error;
 pub mod graph_store;
