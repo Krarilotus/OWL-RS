@@ -42,3 +42,10 @@ pnpm-debug.log*
 
 # Integration workload results (licensed systems may write there too)
 /benches/integration/results/
+# Suite results (licensed systems write there too); the suite's Python caches
+/benches/suite/results/
+/benches/oracle/results/
+/benches/suite/suitekit/__pycache__/
+
+# Lockfiles of the vendored crates, made when their own tests run
+/vendor/*/Cargo.lock

@@ -9,6 +9,8 @@ members = [
     "crates/nrese-reasoner",
     "crates/nrese-server",
 ]
+# Patched copies of published crates, used through [patch.crates-io] below.
+exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]
@@ -35,3 +37,9 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
+
+# oxsdatatypes 0.2.2 with decimal multiplication and division fixed for zero operands and
+# products past 18 fractional digits (vendor/oxsdatatypes/NRESE-PATCH.md). The bench
+# harness, a workspace of its own, patches it the same way.
+[patch.crates-io]
+oxsdatatypes = { path = "vendor/oxsdatatypes" }
