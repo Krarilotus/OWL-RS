@@ -78,14 +78,22 @@ pub struct RequestLimits {
 
 /// Default per-query memory: 4 GiB.
 pub const DEFAULT_QUERY_MEMORY_BYTES: usize = 4 << 30;
+/// Default longest query text: 1 MiB.
+pub const DEFAULT_MAX_QUERY_BYTES: usize = 1 << 20;
+/// Default largest SPARQL update: 16 MiB. Clients that write a whole graph in one update
+/// (RDF4J's, and so ResearchSpace) send several megabytes.
+pub const DEFAULT_MAX_UPDATE_BYTES: usize = 16 << 20;
+/// Default largest RDF payload (Graph Store, TELL, SHACL shapes): 128 MiB, enough for an
+/// exported graph of about a million statements. Larger data goes through `load`.
+pub const DEFAULT_MAX_RDF_UPLOAD_BYTES: usize = 128 << 20;
 
 impl Default for RequestLimits {
     fn default() -> Self {
         Self {
-            max_query_bytes: 1_048_576,
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
             max_query_memory_bytes: DEFAULT_QUERY_MEMORY_BYTES,
-            max_update_bytes: 1_048_576,
-            max_rdf_upload_bytes: 10_485_760,
+            max_update_bytes: DEFAULT_MAX_UPDATE_BYTES,
+            max_rdf_upload_bytes: DEFAULT_MAX_RDF_UPLOAD_BYTES,
         }
     }
 }
