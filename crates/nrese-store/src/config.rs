@@ -29,6 +29,44 @@ pub struct StoreConfig {
     /// unlimited. A query that asks for more than is left fails with
     /// [`StoreError::is_server_memory_limit`](crate::StoreError::is_server_memory_limit).
     pub total_query_memory_bytes: usize,
+    /// Which remote endpoints `SERVICE` may call.
+    pub federation: FederationConfig,
+}
+
+/// SPARQL 1.1 Federated Query: the endpoints `SERVICE` may call, and how long and how much
+/// it may read from them. Off (no endpoint allowed) by default: a query could otherwise
+/// make the server fetch any URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationConfig {
+    /// Endpoint IRIs, or prefixes of them, `SERVICE` may call; `*` allows any.
+    pub allow: Vec<String>,
+    /// Per request to an endpoint.
+    pub timeout_ms: u64,
+    /// Rows one request may return.
+    pub max_rows: usize,
+}
+
+impl Default for FederationConfig {
+    fn default() -> Self {
+        Self {
+            allow: Vec::new(),
+            timeout_ms: 30_000,
+            max_rows: 1_000_000,
+        }
+    }
+}
+
+impl FederationConfig {
+    pub fn enabled(&self) -> bool {
+        !self.allow.is_empty()
+    }
+
+    /// Whether `endpoint` is allowed.
+    pub fn allows(&self, endpoint: &str) -> bool {
+        self.allow
+            .iter()
+            .any(|allowed| allowed == "*" || endpoint.starts_with(allowed.as_str()))
+    }
 }
 
 /// Default query result cache: 64 MiB.
@@ -54,6 +92,7 @@ impl StoreConfig {
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
             total_query_memory_bytes: 0,
+            federation: FederationConfig::default(),
         }
     }
 
@@ -66,6 +105,7 @@ impl StoreConfig {
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
             total_query_memory_bytes: 0,
+            federation: FederationConfig::default(),
         }
     }
 

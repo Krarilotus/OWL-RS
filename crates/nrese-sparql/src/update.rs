@@ -36,6 +36,8 @@ pub struct UpdateOptions {
     /// Evaluate `WHERE` clauses on spareval even where the native executor could
     /// (differential testing).
     pub force_spareval: bool,
+    /// Who answers `SERVICE` calls in `WHERE` clauses ([`crate::service`]).
+    pub services: Option<crate::Services>,
 }
 
 #[derive(Debug, Error)]
@@ -105,6 +107,7 @@ fn apply_operation(
                         cancellation: options.cancellation.clone(),
                         union_default_graph: options.union_default_graph,
                         dataset: options.using.clone(),
+                        services: options.services.clone(),
                         ..crate::query::QueryOptions::default()
                     };
                     crate::native::delete_insert(

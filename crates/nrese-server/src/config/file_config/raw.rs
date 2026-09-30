@@ -16,6 +16,8 @@ pub(super) struct RawFileConfig {
     #[serde(default)]
     pub budgets: RawBudgetsConfig,
     #[serde(default)]
+    pub federation: RawFederationConfig,
+    #[serde(default)]
     pub auth: RawAuthConfig,
     #[serde(default)]
     pub ai: RawAiConfig,
@@ -63,6 +65,18 @@ pub(super) struct RawBudgetsConfig {
     pub upload_size: Option<Amount>,
     #[serde(default)]
     pub result_cache: Option<Amount>,
+}
+
+/// `SERVICE`: the endpoints it may call, and per request how long and how many rows.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RawFederationConfig {
+    #[serde(default)]
+    pub allow: Option<StringOrMany>,
+    #[serde(default)]
+    pub timeout: Option<Amount>,
+    #[serde(default)]
+    pub max_rows: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
