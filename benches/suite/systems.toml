@@ -19,7 +19,9 @@
 #   fulltext, geosparql, federation
 #
 # `publish`: free = results may be published; permission = only with the vendor's written
-# consent (benches/competitors/README.md). `runs`: how the kits start it today.
+# consent (benches/competitors/README.md). `runs`: how the suite can start it
+# (suitekit/adapters.py): docker, apptainer (the same image as a SIF file), native (a
+# host process).
 #
 # The capabilities of the other systems are from their documentation. An adapter confirms
 # them when it first runs, and a capability that turns out not to work is removed here
@@ -28,7 +30,7 @@
 [nrese]
 name = "NRESE"
 publish = "free"
-runs = ["docker", "native"]
+runs = ["docker", "apptainer", "native"]
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
@@ -41,25 +43,25 @@ missing = { "reason-custom-rules" = "B2", "shacl-sparql" = "C3" }
 [qlever]
 name = "QLever"
 publish = "free"
-runs = ["docker"]
+runs = ["docker", "apptainer"]
 capabilities = ["load", "query", "update", "fulltext", "geosparql", "federation"]
 
 [oxigraph]
 name = "Oxigraph"
 publish = "free"
-runs = ["docker"]
+runs = ["docker", "apptainer"]
 capabilities = ["load", "query", "update", "federation"]
 
 [virtuoso]
 name = "Virtuoso Open Source 7"
 publish = "free"
-runs = ["docker"]
+runs = ["docker", "apptainer"]
 capabilities = ["load", "query", "update", "fulltext", "geosparql", "federation"]
 
 [jena]
 name = "Apache Jena (TDB2, Fuseki, rule reasoners)"
 publish = "free"
-runs = ["docker", "native"]
+runs = ["docker", "apptainer"]
 # The rule reasoners work on an in-memory model; TDB2 itself doesn't reason.
 capabilities = [
   "load", "query", "update",
@@ -76,14 +78,14 @@ capabilities = ["load", "query", "update", "reason-rdfs", "shacl-core", "shacl-s
 [nemo]
 name = "Nemo (datalog)"
 publish = "free"
-runs = ["docker"]
+runs = ["docker", "apptainer"]
 # No SPARQL: the kit answers queries over its materialisation with another engine.
 capabilities = ["load", "reason-owl2-rl", "reason-custom-rules"]
 
 [owlrl]
 name = "owlrl (reference OWL 2 RL closure; correctness only)"
 publish = "free"
-runs = ["docker"]
+runs = ["docker", "apptainer"]
 capabilities = ["load", "reason-rdfs", "reason-owl2-rl"]
 
 [dl-reasoners]
@@ -95,7 +97,7 @@ capabilities = ["classify", "consistency", "explain"]
 [graphdb]
 name = "GraphDB"
 publish = "permission"
-runs = ["docker"]
+runs = ["docker", "apptainer"]
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql", "reason-custom-rules",
@@ -106,7 +108,7 @@ capabilities = [
 [rdfox]
 name = "RDFox"
 publish = "permission"
-runs = ["docker"]
+runs = ["docker", "apptainer"]
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-custom-rules",
