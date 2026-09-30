@@ -57,6 +57,19 @@ Already fixed on the way (Milestone 0):
 | `benches/nrese-bench-harness` | tooling | black-box comparison and benchmark harness |
 | `docs/` | — | architecture, ADRs, roadmap, specs, ops runbooks |
 
+## Quick start with Docker
+
+```bash
+docker build -t nrese .
+docker run -p 8080:8080 -v nrese-data:/var/lib/nrese/data nrese
+```
+
+The server is then at `http://localhost:8080`: the console at `/console`, SPARQL at `/dataset/sparql`, the Graph Store at `/dataset/data` ([HTTP interface](docs/ops/http-api.md)). Data is kept in the `nrese-data` volume. Settings are environment variables, for example `-e NRESE_DEFAULT_GRAPH=union -e NRESE_REASONING_MODE=owl2-rl` ([configuration](docs/ops/config-reference.md)). The image has no authentication switched on; set `NRESE_AUTH_MODE` before exposing it.
+
+Using it with other systems:
+- [the Datamodel Workflow's exports](docs/integration/datamodel-workflow.md)
+- [ResearchSpace](docs/integration/researchspace.md), with a compose file that starts both
+
 ## Setup
 
 ### Prerequisites
@@ -72,6 +85,8 @@ cargo build
 ```
 
 ### Build The User Frontend
+
+The server embeds the console it finds in `apps/nrese-console/dist` when it is compiled, so build the console first if you want `/console` (the API works without it).
 
 ```powershell
 Set-Location .\apps\nrese-console

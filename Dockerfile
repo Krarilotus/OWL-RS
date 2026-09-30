@@ -32,7 +32,13 @@ RUN cargo build --release --locked -p nrese-server
 
 # --- the image -------------------------------------------------------------------------
 FROM debian:bookworm-slim
-RUN useradd --system --uid 10001 --home-dir /var/lib/nrese --shell /usr/sbin/nologin nrese \
+# The binary needs no system libraries. The CA store is for outgoing HTTPS (an identity
+# provider's token introspection); for an internal certificate authority, mount your CA
+# bundle and point SSL_CERT_FILE at it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /var/lib/nrese --shell /usr/sbin/nologin nrese \
     && mkdir -p /var/lib/nrese/data \
     && chown -R nrese:nrese /var/lib/nrese
 COPY --from=build /src/target/release/nrese-server /usr/local/bin/nrese-server
