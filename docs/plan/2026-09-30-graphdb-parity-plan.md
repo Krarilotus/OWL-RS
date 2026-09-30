@@ -115,7 +115,7 @@ GraphDB's value is its rulesets. Ours are data (rule text), so breadth is mostly
 | D2 | RDF4J protocol: `/repositories`, statements, transactions (begin/add/delete/commit/rollback, which map onto the mutation pipeline and its gates), contexts, size | RDF4J `HTTPRepository` client integration test; ResearchSpace connects |
 | D3 | Formats: JSON-LD, Binary RDF (RDF4J), TriX if needed | Round trips; RDF4J client uses Binary RDF |
 | D4 | Federation: `SERVICE` with an async client, allowlist, timeouts, SSRF guards | Federated W3C tests; blocked-target security tests |
-| D5 | Graph Store Protocol status codes | W3C GSP behaviour for missing graphs |
+| D5 ✅ | Graph Store Protocol status codes | W3C GSP behaviour for missing graphs (done with U1) |
 
 ### Phase E: governance and operations (6.1, 6.3), M–L
 
@@ -160,6 +160,31 @@ Secondary indexes (F1–F3) follow the review's publication rule: an index names
 - Configuration: typed and validated. Unknown keys fail. Tuned defaults, with use-case modes exposed (not every internal heuristic).
 - Every slice removes what it replaces. No parallel old paths.
 - Evidence per slice: differential or conformance tests; mutation checks for new test oracles.
+
+## 5a. The path to a package the Datamodel Workflow and ResearchSpace can use
+
+Owner request of 30 September 2026. The parity phases stay as they are; this is the order in which their slices make the two consumers work, with the small compatibility work they need first.
+
+**What each consumer does to a store:**
+
+| Consumer | How it talks to the store | What it needs beyond that |
+|---|---|---|
+| Datamodel Workflow (its plan, WP15 and D18) | SPARQL 1.1 Update and the Graph Store Protocol for export, one named graph per module and version; SPARQL queries (competency questions, provenance); re-exporting a version must give identical results | Optionally SHACL validation in the store (its shapes are the ABox contract); login through the installation's identity provider |
+| ResearchSpace | RDF4J's client: either a SPARQL repository (one endpoint URL for queries and updates, long weighted `Accept` lists) or an RDF4J HTTP repository; named graphs for its LDP containers, written with SPARQL Update | Keyword search (`bds:search` in its stock templates) |
+
+**Steps:**
+
+| Step | For | Scope | Done when |
+|---|---|---|---|
+| U1 ✅ | both | The HTTP surface as real clients use it: content negotiation with weights and wildcards; one SPARQL endpoint for queries and updates; `using-graph-uri`; Graph Store status codes (D5); N-Quads, TriG and JSON-LD for graph results | Protocol tests with RDF4J's and common HTTP clients' request shapes (`client_compat_tests.rs`); reference: [http-api.md](../ops/http-api.md) |
+| U2 | DMW | SHACL validation over HTTP (C1b): the repository's shapes graph, or shapes sent with the request | A report as RDF and JSON for DMW's shapes |
+| U3 | both | The package: a container image with the console, a compose file with ResearchSpace, a quickstart, one integration guide per consumer | A clean machine reaches a working setup from the guide |
+| U4 | both | Smoke tests against the real clients: the ResearchSpace platform in Docker on NRESE; DMW's export protocol replayed (export, re-export, provenance query, validation) | Both run from a script; what doesn't work yet is listed |
+| U5 | ResearchSpace | Full-text search and the `bds:search` shim (F1) | ResearchSpace's keyword search works on its stock templates |
+| U6 | ResearchSpace | Multi-repository (D1), then the RDF4J protocol (D2) | The RDF4J HTTP repository type connects |
+| U7 | DMW | SHACL on commit (C2) | A commit that breaks a shape is rejected with the report |
+
+U1 to U4 make a prototype both can run against. U5 to U7 remove the remaining workarounds (regex-based search templates in ResearchSpace; validation only on request for DMW).
 
 ## 6. Owner decisions (30 September 2026)
 

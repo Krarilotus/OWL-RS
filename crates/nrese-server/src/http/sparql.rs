@@ -1,14 +1,14 @@
 use axum::http::StatusCode;
 use axum::response::Response;
 use nrese_store::{
-    CancellationToken, GraphResultFormat, MutationCommand, PreparedQuery, SolutionsResultFormat,
-    SparqlQueryRequest, SparqlUpdateRequest, StoreError,
+    CancellationToken, GraphResultFormat, MutationCommand, PreparedQuery, QueryResultKind,
+    SolutionsResultFormat, SparqlQueryRequest, SparqlUpdateRequest, StoreError,
 };
 
 use crate::error::ApiError;
-use crate::http::media::media_type_matches;
+use crate::http::media::{BOOLEAN, GRAPHS, SOLUTIONS, negotiated};
 use crate::http::mutation;
-use crate::http::requests::QueryOperation;
+use crate::http::requests::{QueryOperation, UpdateOperation};
 use crate::http::result_stream::stream_blocking;
 use crate::policy::PolicyConfig;
 use crate::state::AppState;
@@ -28,11 +28,16 @@ pub async fn execute_query(
     let deadline = tokio::time::Instant::now() + policy.timeouts.query;
 
     let explain = operation.explain;
-    let mut request = build_query_request(operation, accept);
+    let mut request = build_query_request(operation);
     let memory = policy.limits.max_query_memory_bytes;
     request.memory_limit = (memory > 0).then_some(memory);
-    let prepared =
+    let mut prepared =
         PreparedQuery::parse(&request).map_err(|error| map_query_error(&policy, error))?;
+    // The query form decides which formats exist; an EXPLAIN is always JSON.
+    if !explain {
+        let (solutions, graph) = negotiate_formats(prepared.kind(), accept)?;
+        prepared.set_formats(solutions, graph);
+    }
     let media_type = prepared.media_type();
     let store = state.store();
     let cancellation = CancellationToken::new();
@@ -110,11 +115,19 @@ fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
     }
 }
 
-pub async fn execute_update(state: AppState, update: String) -> Result<StatusCode, ApiError> {
-    state.policy().enforce_update_bytes(update.len())?;
+pub async fn execute_update(
+    state: AppState,
+    operation: UpdateOperation,
+) -> Result<StatusCode, ApiError> {
+    state
+        .policy()
+        .enforce_update_bytes(operation.update.len())?;
+    let mut request = SparqlUpdateRequest::new(operation.update);
+    request.using_graphs = operation.using_graphs;
+    request.using_named_graphs = operation.using_named_graphs;
     mutation::run(
         &state,
-        MutationCommand::Update(SparqlUpdateRequest::new(update)),
+        MutationCommand::Update(request),
         state.policy().timeouts.update,
         "update execution exceeded policy timeout",
     )
@@ -122,7 +135,21 @@ pub async fn execute_update(state: AppState, update: String) -> Result<StatusCod
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn build_query_request(operation: QueryOperation, accept: Option<&str>) -> SparqlQueryRequest {
+/// The formats for a query of `kind`, as the client's `Accept` header weights them; 406 if
+/// it accepts none that the form has.
+fn negotiate_formats(
+    kind: QueryResultKind,
+    accept: Option<&str>,
+) -> Result<(SolutionsResultFormat, GraphResultFormat), ApiError> {
+    let (solutions, graph) = (SolutionsResultFormat::Json, GraphResultFormat::NTriples);
+    Ok(match kind {
+        QueryResultKind::Solutions => (negotiated(accept, SOLUTIONS)?, graph),
+        QueryResultKind::Boolean => (negotiated(accept, BOOLEAN)?, graph),
+        QueryResultKind::Graph => (solutions, negotiated(accept, GRAPHS)?),
+    })
+}
+
+fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
     let mut request = SparqlQueryRequest::new(operation.query);
     request.default_graphs = operation.default_graphs;
     request.named_graphs = operation.named_graphs;
@@ -130,66 +157,55 @@ fn build_query_request(operation: QueryOperation, accept: Option<&str>) -> Sparq
     if operation.infer == Some(false) {
         request.read_model = Some(nrese_store::ReadModel::Asserted);
     }
-
-    if media_type_matches(accept, "application/sparql-results+xml") {
-        request.solutions_format = SolutionsResultFormat::Xml;
-    } else if media_type_matches(accept, "text/csv") {
-        request.solutions_format = SolutionsResultFormat::Csv;
-    } else if media_type_matches(accept, "text/tab-separated-values") {
-        request.solutions_format = SolutionsResultFormat::Tsv;
-    } else {
-        request.solutions_format = SolutionsResultFormat::Json;
-    }
-
-    request.graph_format = if media_type_matches(accept, "application/rdf+xml") {
-        GraphResultFormat::RdfXml
-    } else if media_type_matches(accept, "text/turtle")
-        || media_type_matches(accept, "application/x-turtle")
-    {
-        GraphResultFormat::Turtle
-    } else {
-        GraphResultFormat::NTriples
-    };
-
     request
 }
 
 #[cfg(test)]
 mod tests {
-    use nrese_store::{GraphResultFormat, SolutionsResultFormat};
+    use nrese_store::{GraphResultFormat, QueryResultKind, SolutionsResultFormat};
 
-    use super::build_query_request;
-    use crate::http::requests::QueryOperation;
-
-    fn operation(query: &str) -> QueryOperation {
-        QueryOperation {
-            query: query.to_owned(),
-            ..QueryOperation::default()
-        }
-    }
+    use super::negotiate_formats;
 
     #[test]
-    fn query_accept_csv_selects_csv_format() {
-        let request = build_query_request(
-            operation("SELECT * WHERE { ?s ?p ?o }"),
-            Some("text/csv,application/sparql-results+json"),
+    fn the_query_form_decides_which_formats_are_negotiated() {
+        let formats = |kind, accept| negotiate_formats(kind, accept).ok();
+        assert_eq!(
+            formats(
+                QueryResultKind::Solutions,
+                Some("text/csv,application/sparql-results+json;q=0.5")
+            )
+            .map(|(solutions, _)| solutions),
+            Some(SolutionsResultFormat::Csv)
         );
-
-        assert_eq!(request.solutions_format, SolutionsResultFormat::Csv);
-    }
-
-    #[test]
-    fn query_accept_default_is_json() {
-        let request = build_query_request(operation("ASK WHERE { ?s ?p ?o }"), None);
-        assert_eq!(request.solutions_format, SolutionsResultFormat::Json);
-    }
-
-    #[test]
-    fn query_accept_prefers_rdf_xml_for_graph_results() {
-        let request = build_query_request(
-            operation("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }"),
-            Some("application/rdf+xml, application/n-triples"),
+        // An ASK has no CSV form: the next acceptable type is used, or none.
+        assert_eq!(
+            formats(
+                QueryResultKind::Boolean,
+                Some("text/csv,application/sparql-results+xml;q=0.5")
+            )
+            .map(|(solutions, _)| solutions),
+            Some(SolutionsResultFormat::Xml)
         );
-        assert_eq!(request.graph_format, GraphResultFormat::RdfXml);
+        assert_eq!(formats(QueryResultKind::Boolean, Some("text/csv")), None);
+        assert_eq!(
+            formats(
+                QueryResultKind::Graph,
+                Some("application/rdf+xml, application/n-triples;q=0.9")
+            )
+            .map(|(_, graph)| graph),
+            Some(GraphResultFormat::RdfXml)
+        );
+        // A client that only takes result tables can't receive a graph.
+        assert_eq!(
+            formats(
+                QueryResultKind::Graph,
+                Some("application/sparql-results+json")
+            ),
+            None
+        );
+        assert_eq!(
+            formats(QueryResultKind::Solutions, None),
+            Some((SolutionsResultFormat::Json, GraphResultFormat::NTriples))
+        );
     }
 }

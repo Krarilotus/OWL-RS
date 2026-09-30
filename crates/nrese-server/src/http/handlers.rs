@@ -14,7 +14,10 @@ use crate::http::metrics;
 use crate::http::operator_api;
 use crate::http::operator_diagnostics;
 use crate::http::operator_ui;
-use crate::http::requests::{accept_header_value, extract_update, query_from_post, query_from_url};
+use crate::http::requests::{
+    SparqlOperation, accept_header_value, operation_from_post, query_from_post, query_from_url,
+    update_from_post,
+};
 use crate::http::responses::{StatusResponse, build_ready_response, build_version_response};
 use crate::http::service_description::build_service_description;
 use crate::http::sparql;
@@ -186,12 +189,63 @@ pub async fn query_post(
 
 pub async fn update_post(
     State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
-    let update = extract_update(headers.get(header::CONTENT_TYPE), &body)?;
-    sparql::execute_update(state, update).await
+    let operation = update_from_post(
+        raw_query.as_deref(),
+        headers.get(header::CONTENT_TYPE),
+        &body,
+    )?;
+    sparql::execute_update(state, operation).await
+}
+
+/// `GET` on the combined SPARQL endpoint: a query, or without one the service description
+/// (SPARQL 1.1 Service Description §2).
+pub async fn sparql_get(
+    state: State<AppState>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let has_query = raw_query.as_deref().is_some_and(|raw| {
+        serde_urlencoded::from_str::<Vec<(String, String)>>(raw)
+            .is_ok_and(|pairs| pairs.iter().any(|(key, _)| key == "query"))
+    });
+    if has_query {
+        query_get(state, RawQuery(raw_query), headers).await
+    } else {
+        service_description(state, headers).await
+    }
+}
+
+/// `POST` on the combined SPARQL endpoint: a query or an update, each under its own
+/// access rule. Clients that are configured with one endpoint URL use this (RDF4J's
+/// SPARQL repository as ResearchSpace sets it up; Fuseki- and Blazegraph-style setups).
+pub async fn sparql_post(
+    State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let operation = operation_from_post(
+        raw_query.as_deref(),
+        headers.get(header::CONTENT_TYPE),
+        &body,
+    )?;
+    match operation {
+        SparqlOperation::Query(operation) => {
+            guard::enforce_query_read(&state, &headers).await?;
+            sparql::execute_query(state, operation, accept_header_value(&headers)).await
+        }
+        SparqlOperation::Update(operation) => {
+            guard::enforce_update_write(&state, &headers).await?;
+            sparql::execute_update(state, operation)
+                .await
+                .map(IntoResponse::into_response)
+        }
+    }
 }
 
 pub async fn tell_post(

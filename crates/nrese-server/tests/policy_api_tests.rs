@@ -264,7 +264,8 @@ async fn invalid_update_returns_problem_json() -> Result<(), Box<dyn std::error:
         )
         .await?;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // A body of a media type that isn't a SPARQL update: 415, as a problem document.
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(
         response
             .headers()
