@@ -94,32 +94,37 @@ Added on 30 September 2026. Kit and instructions: [benches/integration](../../be
 
 **First measurement.** Example tier: 21,261 statements with the project's alignment axioms. One run on a shared workstation with 16 cores and 32 GB, so these are development figures and not results to publish. Both systems through the same client, full results fetched as JSON, 1 warm-up and 3 measured runs, p50:
 
-| | NRESE, `owl2-rl` | Fuseki 6.0.0, Jena's OWL rule reasoner as the project configures it (8 GB heap) |
-|---|---|---|
-| Load | 0.09 s, reasoned and durable | 2.1 s, not yet reasoned |
-| Reasoning | 0.04 s (within the load) | 106 s (at the first query) |
-| Statements answered | 65,928 | 73,639 (Jena's rule set derives more than OWL 2 RL) |
-| Peak memory | 158 MiB loading; 5.8 GB serving, from CQ05's attempt | 1.7 GB |
-| CQ02 (2,430 rows) | 23 ms | 4,897 ms |
-| CQ03 (90) | 3.1 ms | 18.5 ms |
-| CQ04 (19) | 3.8 ms | 11.9 ms |
-| CQ05 | stopped at the 4 GiB query budget | no answer in 120 s |
-| CQ06 (648) | 6.7 ms | 148 ms |
-| CQ07 (576) | 15.8 ms | 75 ms |
-| CQ08 (159,040) | 1,083 ms | 4,959 ms |
-| CQ09 (13) | 84 ms | 22 ms |
-| CQ10 (4) | 3.2 ms | 18.6 ms |
+| | NRESE, `owl2-rl` | Fuseki 6.0.0, Jena's OWL rule reasoner as the project configures it (8 GB heap) | NRESE before the day's fixes |
+|---|---|---|---|
+| Load | 0.09 s, reasoned and durable | 2.1 s, not yet reasoned | |
+| Reasoning | 0.04 s (within the load) | 106 s (at the first query) | |
+| Statements answered | 65,928 | 73,639 (Jena's rule set derives more than OWL 2 RL) | |
+| Peak memory | 154 MiB loading; 6.1 GB serving, from CQ05's attempt | 1.7 GB | |
+| CQ02 (2,430 rows) | 18 ms | 4,897 ms | 23 ms |
+| CQ03 (90) | 0.8 ms | 18.5 ms | 3.1 ms |
+| CQ04 (19) | 1.2 ms | 11.9 ms | 3.8 ms |
+| CQ05 | stopped at the 4 GiB query budget | no answer in 120 s | the same |
+| CQ06 (648) | 2.9 ms | 148 ms | 11 s |
+| CQ07 (576) | 4.1 ms | 75 ms | 236 ms |
+| CQ08 (159,040) | 1,068 ms | 4,959 ms | out of memory |
+| CQ09 (13) | 1.3 ms | 22 ms | 280 ms |
+| CQ10 (4) | 0.5 ms | 18.6 ms | no rows (a wrong answer) |
 
-The eight questions both answer have the same row counts. CQ01 is an empty file. Fuseki kept working on the abandoned CQ05 while the later questions ran, so its later times are upper bounds.
+The eight questions both answer have the same row counts. CQ01 is an empty file. Fuseki kept working on the abandoned CQ05 while the later questions ran, so its later times are upper bounds. Without reasoning (`nrese-plain`) the nine questions take 6 ms together, and answer less. The last column is where NRESE started: CQ02 to CQ04 from the first run on this machine, the others measured in the process on the development PC.
 
-**What it showed about NRESE** (work packages X1 to X7 in the [plan](../plan/2026-09-30-graphdb-parity-plan.md), §5b):
-- Two defects are fixed: a `HAVING` on a `SELECT` alias returned nothing, and filters ran after the joins of their group (CQ06 took 11 s and CQ08 ran out of memory before the fix).
-- CQ09 is slower than on Fuseki: a property path with a bound end is still computed for all pairs.
-- CQ05 is a product of about 10¹⁰ rows under full equality. Neither system answered it. It needs equality by representatives or aggregation per OPTIONAL branch.
-- Serving memory is the executor's tables: a failing query took the server to 5.8 GB.
-- With the GND ontology added, 55 % of the inferred statements are memberships in unnamed union classes.
+**What it showed about NRESE** (work packages W1 to W7 in the [plan](../plan/2026-09-30-graphdb-parity-plan.md), §5b). Fixed the same day:
+- `HAVING` on a `SELECT` alias returned no rows (CQ10).
+- A group's filters ran after all its joins, also inside a basic graph pattern (CQ06, CQ07, CQ08, CQ09).
+- A property path with two variable ends was computed for every node of the graph before it was joined (CQ03, CQ04, CQ10).
+- The server didn't set `TCP_NODELAY`: a result sent in several pieces waited 40 ms for the client's delayed acknowledgement, whatever the query took.
 
-**Still to measure:** the cohort and full tiers (they need the project's pipeline output), the other systems, and the GND ontology variant on Fuseki.
+Open:
+- CQ05 is a product of about 10¹⁰ rows under full equality. Neither system answered it. It needs equality by representatives (W4) or aggregation per OPTIONAL branch (W5).
+- Serving memory is the executor's tables: the failing CQ05 took the server to 6.1 GB, past its 4 GiB query budget (W6).
+- CQ08's second is mostly its 159,040 rows written as JSON and read by the client; evaluating them takes 0.3 s.
+- With the GND ontology added, 55 % of the inferred statements are memberships in unnamed union classes (W7).
+
+**Still to measure:** the cohort tier (being built with the project's pipeline) and the full tier, the other systems, and the GND ontology variant on Fuseki.
 
 ## 8. Runs on a cluster
 
@@ -155,5 +160,5 @@ What the paper claims, and the experiment that supports each claim. Every experi
 1. A cluster account, and the adapters for the other systems under Apptainer.
 2. The cohort and full tiers of the integration workload, and its authors' agreement to be named.
 3. Licence files for GraphDB, RDFox, Stardog and AnzoGraph, and the vendors' answers on publishing.
-4. The engine work the first measurement asks for (X3 to X6), so that the larger tiers are answered and not only loaded.
+4. The engine work the first measurement asks for (W3 to W6), so that the larger tiers are answered and not only loaded.
 5. RT6 (classification) stays out of the paper unless R8 is built.
