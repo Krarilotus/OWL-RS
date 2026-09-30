@@ -21,3 +21,7 @@ toml = "0.9.12"
 
 [dev-dependencies]
 tempfile = "3.23.0"
+
+# The workspace's patched oxsdatatypes (vendor/oxsdatatypes/NRESE-PATCH.md).
+[patch.crates-io]
+oxsdatatypes = { path = "../../vendor/oxsdatatypes" }

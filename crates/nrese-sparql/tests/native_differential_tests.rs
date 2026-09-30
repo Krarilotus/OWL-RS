@@ -9,8 +9,13 @@
 //! covers every projected variable (so ties are identical rows). A third of the
 //! default-graph statements are inferred, and every query runs under a random read model
 //! (asserted, inferred or both).
+//!
+//! With `NRESE_ORACLE_DUMP=<dir>`, the random, pushed-filter and computed-value tests also
+//! write their datasets and compared queries with the native rows, for a second oracle to
+//! answer ([`Dump`]; benches/oracle).
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, ReadModel};
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query, runs_natively};
@@ -38,6 +43,76 @@ impl Rng {
 
     fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.below(items.len() as u64) as usize]
+    }
+}
+
+/// Cases for a second oracle (benches/oracle/README.md): with `NRESE_ORACLE_DUMP=<dir>`, a
+/// test writes `<dir>/<test>/d<N>/data.nq` per dataset and `q<M>.rq` with `q<M>.nrese` (a
+/// line of the variables, then the native rows, one per line, terms separated by tabs;
+/// `q<M>.ordered` if their order counts) per compared query.
+struct Dump(Option<PathBuf>);
+
+impl Dump {
+    fn new(test: &str) -> Self {
+        Self(std::env::var_os("NRESE_ORACLE_DUMP").map(|dir| PathBuf::from(dir).join(test)))
+    }
+
+    fn dir(&self, dataset: usize) -> Option<PathBuf> {
+        let dir = self.0.as_ref()?.join(format!("d{dataset}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        Some(dir)
+    }
+
+    /// Writes the dataset as NRESE loads it (`data.nq`) and with numbers in their canonical
+    /// lexical forms (`data.canonical.nq`, for the oracle): NRESE's `STR` of `"07"^^xsd:integer`
+    /// is `"7"`, a known deviation (benches/oracle/README.md) that would otherwise hide the
+    /// unknown ones.
+    fn dataset(&self, dataset: usize, quads: &[Quad]) {
+        if let Some(dir) = self.dir(dataset) {
+            let text: String = quads.iter().map(|q| format!("{q} .\n")).collect();
+            std::fs::write(dir.join("data.nq"), text).unwrap();
+            let canonical: String = quads
+                .iter()
+                .map(|q| {
+                    let object = match &q.object {
+                        Term::Literal(l) => Term::Literal(canonical_number(l)),
+                        other => other.clone(),
+                    };
+                    let quad = Quad::new(
+                        q.subject.clone(),
+                        q.predicate.clone(),
+                        object,
+                        q.graph_name.clone(),
+                    );
+                    format!("{quad} .\n")
+                })
+                .collect();
+            std::fs::write(dir.join("data.canonical.nq"), canonical).unwrap();
+        }
+    }
+
+    /// `variables` gives the result's variables (evaluated only when dumping).
+    fn query(
+        &self,
+        dataset: usize,
+        query: usize,
+        text: &str,
+        ordered: bool,
+        rows: &[String],
+        variables: impl FnOnce() -> Vec<String>,
+    ) {
+        if let Some(dir) = self.dir(dataset) {
+            std::fs::write(dir.join(format!("q{query}.rq")), text).unwrap();
+            let header = variables().join("\t");
+            let lines: String = std::iter::once(&header)
+                .chain(rows)
+                .map(|r| format!("{r}\n"))
+                .collect();
+            std::fs::write(dir.join(format!("q{query}.nrese")), lines).unwrap();
+            if ordered {
+                std::fs::write(dir.join(format!("q{query}.ordered")), "").unwrap();
+            }
+        }
     }
 }
 
@@ -329,6 +404,42 @@ fn by_value(term: &Term) -> Term {
     }
 }
 
+/// A numeric literal in the lexical form NRESE's `STR` gives it; other literals unchanged.
+fn canonical_number(literal: &Literal) -> Literal {
+    use oxsdatatypes::{Decimal, Double, Float, Integer};
+    use std::str::FromStr;
+    let value = literal.value();
+    let text = match literal
+        .datatype()
+        .as_str()
+        .strip_prefix("http://www.w3.org/2001/XMLSchema#")
+    {
+        Some("integer" | "int" | "long" | "short" | "byte") => {
+            Integer::from_str(value).ok().map(|v| v.to_string())
+        }
+        Some("decimal") => Decimal::from_str(value).ok().map(|v| v.to_string()),
+        Some("double") => Double::from_str(value).ok().map(|v| v.to_string()),
+        Some("float") => Float::from_str(value).ok().map(|v| v.to_string()),
+        _ => None,
+    };
+    match text {
+        Some(text) => Literal::new_typed_literal(text, literal.datatype().into_owned()),
+        None => literal.clone(),
+    }
+}
+
+/// The variables of a query's result (`ASK` for an ASK), as a dump's header.
+fn variables(snapshot: &nrese_engine::Snapshot, query: &spargebra::Query) -> Vec<String> {
+    match evaluate_query(snapshot, query, &QueryOptions::default()).unwrap() {
+        QueryResults::Solutions(solutions) => solutions
+            .variables()
+            .iter()
+            .map(|v| v.as_str().to_owned())
+            .collect(),
+        _ => vec!["ASK".to_owned()],
+    }
+}
+
 /// The rows of a SELECT, as strings; an ASK is one row, `true` or `false`.
 fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
     let solutions = match results {
@@ -348,7 +459,7 @@ fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
                         .map_or("UNDEF".to_owned(), |t| by_value(t).to_string())
                 })
                 .collect::<Vec<_>>()
-                .join(" ")
+                .join("\t")
         })
         .collect();
     if !ordered {
@@ -369,10 +480,13 @@ fn native_results_equal_spareval_on_random_queries() {
     let mut rng = Rng(20_260_927);
     let (mut checked, mut fallbacks) = (0, Vec::new());
     let mut with_solutions = 0;
+    let dump = Dump::new("random");
     for dataset_case in 0..150 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
-        for quad in random_dataset(&mut rng) {
+        let quads = random_dataset(&mut rng);
+        dump.dataset(dataset_case, &quads);
+        for quad in quads {
             if quad.graph_name.is_default_graph() && rng.below(3) == 0 {
                 let triple = EncodedTriple::new(
                     tx.intern(quad.subject.as_ref().into()),
@@ -436,6 +550,11 @@ fn native_results_equal_spareval_on_random_queries() {
                 native, expected,
                 "dataset {dataset_case}, query {query_case}, {model:?}: {text}"
             );
+            if model == ReadModel::Materialised {
+                dump.query(dataset_case, query_case, &text, ordered, &native, || {
+                    variables(&snapshot, &query)
+                });
+            }
             checked += 1;
             with_solutions += usize::from(!expected.is_empty());
         }
@@ -548,10 +667,13 @@ fn pushed_filters_equal_spareval() {
         force_spareval: true,
         ..QueryOptions::default()
     };
+    let dump = Dump::new("pushed-filters");
     for dataset_case in 0..60 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
-        for quad in random_dataset(&mut rng) {
+        let quads = random_dataset(&mut rng);
+        dump.dataset(dataset_case, &quads);
+        for quad in quads {
             tx.insert(quad.as_ref());
         }
         tx.commit().unwrap();
@@ -596,6 +718,9 @@ only spareval: {:#?}",
                     only(&expected, &native)
                 );
             }
+            dump.query(dataset_case, query_case, &text, false, &native, || {
+                variables(&snapshot, &query)
+            });
             checked += 1;
             with_solutions += usize::from(!expected.is_empty());
         }
@@ -963,10 +1088,13 @@ fn computed_values_equal_spareval() {
         force_spareval: true,
         ..QueryOptions::default()
     };
+    let dump = Dump::new("computed-values");
     for dataset_case in 0..60 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
-        for quad in random_dataset(&mut rng) {
+        let quads = random_dataset(&mut rng);
+        dump.dataset(dataset_case, &quads);
+        for quad in quads {
             tx.insert(quad.as_ref());
         }
         tx.commit().unwrap();
@@ -993,6 +1121,9 @@ fn computed_values_equal_spareval() {
                 &expected,
                 &format!("dataset {dataset_case}, query {query_case}: {text}"),
             );
+            dump.query(dataset_case, query_case, &text, ordered, &native, || {
+                variables(&snapshot, &query)
+            });
             checked += 1;
             with_solutions += usize::from(!expected.is_empty());
         }
@@ -1881,7 +2012,7 @@ fn string_functions_casts_and_group_concat_equal_spareval() {
     // language tag (the result is a simple literal, SPARQL 1.1 §18.5.1.7; spareval keeps a
     // tag all values share).
     let sorted_parts = |row: &str| -> String {
-        row.split(' ')
+        row.split('\t')
             .map(
                 |term| match term.strip_prefix('"').and_then(|t| t.split_once('"')) {
                     Some((value, rest)) => {
@@ -1894,7 +2025,7 @@ fn string_functions_casts_and_group_concat_equal_spareval() {
                 },
             )
             .collect::<Vec<_>>()
-            .join(" ")
+            .join("\t")
     };
     let mut checked = 0;
     for _ in 0..40 {
@@ -2927,9 +3058,9 @@ fn a_dataset_is_what_the_query_names() {
     assert_eq!(
         rows(evaluate_query(&snapshot, &query, &plain).unwrap(), false),
         [
-            format!("{g0} \"2\"{integer}"),
-            format!("{g1} \"2\"{integer}"),
-            format!("{g2} \"1\"{integer}"),
+            format!("{g0}\t\"2\"{integer}"),
+            format!("{g1}\t\"2\"{integer}"),
+            format!("{g2}\t\"1\"{integer}"),
         ],
         "a subquery under GRAPH ?g runs in each graph"
     );
