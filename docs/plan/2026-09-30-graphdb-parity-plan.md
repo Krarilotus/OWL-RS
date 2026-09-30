@@ -167,9 +167,13 @@ Secondary indexes (F1–F3) follow the review's publication rule: an index names
    - A library is allowed if its licence permits commercial use without conditions on our code (MIT, Apache-2.0, BSD, and similar), and it is maintained.
    - Each one sits behind our own trait, is measured in the perf lab, and is replaced by our own Rust implementation where it costs us: an architecture that doesn't fit the engine (its own storage, its own threading), or measured inefficiency.
    - Starting points: tantivy (MIT) for full-text, an R-tree crate for geo, and our own HNSW unless a crate measures better.
-2. **Licence model: open.** The owner asked for an explanation of Apache-2.0 versus AGPL-3.0 first. Until a choice is made:
-   - no `LICENSE` file is added;
-   - the `license = "Apache-2.0"` line that the Cargo manifests have carried since March 2026 stays as it is, and is part of that decision.
+2. **Licence model: AGPL-3.0-only, plus commercial licences from the copyright holder** (decided 30 September 2026, after the explanation).
+   - `LICENSE` holds the AGPL text; the Cargo manifests say `AGPL-3.0-only`. "Only" and not "or later", because widening to later versions stays possible and narrowing doesn't.
+   - Checked before applying it: all 283 third-party crates are permissively licensed; the owner is the only human author; the engine-v2 branch had never been published.
+   - The v1 prototype on `main` (up to `8088e9a`) was published with `Apache-2.0` in its metadata and stays available under that.
+   - Outside contributions need a contributor agreement ([CONTRIBUTING.md](../../CONTRIBUTING.md)); none exists yet, so none are merged.
+   - **Open points for a lawyer before the first sale:** the contributor agreement and the commercial licence text; the legal name on the copyright line; whether an employer has a claim; and how far copyright protects the parts written with an AI assistant, which differs by country.
+   - Packaging (E5) must ship the third-party notices with binaries.
 3. **Order: SHACL (phase C) before RDF4J and full-text (D2, F1).**
 4. **Implementation language:** protocols and formats still to come (RDF4J, Binary RDF, JSON-LD, federation) are implemented natively in Rust, in the server and its crates. No JVM sidecar, no wrapped reference implementation, no interpreted glue on a request path.
 

@@ -355,3 +355,23 @@ Seed and compare against a reference endpoint:
 ## Documentation
 
 The document index lives in one place: [Spezifikation.md](Spezifikation.md). Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+
+## Licence
+
+Copyright (C) 2026 Krarilotus.
+
+NRESE is free software: you can redistribute it and modify it under the terms of the **GNU Affero General Public License, version 3** ([LICENSE](LICENSE)), as published by the Free Software Foundation. It comes without any warranty.
+
+In short, and without replacing the licence text:
+- You may use, study, change and redistribute it, also commercially.
+- If you distribute it, or let others use a modified version over a network, you must offer them the complete corresponding source under the same licence.
+- Applications that only talk to a server over its HTTP protocols aren't covered by that obligation, and neither is the data you store.
+
+**Commercial licences** without these obligations are available from the copyright holder: open an issue on the repository to get in touch.
+
+Third-party material keeps its own licence:
+- the Rust and JavaScript dependencies (MIT, Apache-2.0, BSD and similar);
+- the vendored vocabularies under `benches/nrese-bench-harness/fixtures/catalog-cache/` (see the README there);
+- the W3C test suites, which are fetched and not part of this repository.
+
+The v1 prototype published before October 2026 (the `main` branch up to commit `8088e9a`) carried `Apache-2.0` in its package metadata; that statement stands for those commits. Contributions: see [CONTRIBUTING.md](CONTRIBUTING.md).
