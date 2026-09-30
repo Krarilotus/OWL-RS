@@ -198,6 +198,20 @@ fn split_top_level(text: &str) -> Vec<String> {
     parts
 }
 
+/// A ground triple `s p o` of prefixed names or typed literals, as ids.
+pub fn parse_triple(text: &str, vocabulary: &mut impl Vocabulary) -> Result<[u64; 3], String> {
+    let parts = tokens(text);
+    let [s, p, o] = parts.as_slice() else {
+        return Err(format!("expected three terms: {text}"));
+    };
+    let mut variables = Vec::new();
+    let mut constant = |t: &str| match term(t, &mut variables, vocabulary)? {
+        Term::Const(id) => Ok(id),
+        Term::Var(_) => Err(format!("a ground triple has no variables: {text}")),
+    };
+    Ok([constant(s)?, constant(p)?, constant(o)?])
+}
+
 fn atom(
     text: &str,
     variables: &mut Vec<String>,

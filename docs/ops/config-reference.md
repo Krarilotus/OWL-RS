@@ -156,10 +156,14 @@ api_key = "replace-me"
 - env override: `NRESE_REASONING_MODE`
 - values:
   - `disabled` (aliases `none`, `off`): no reasoning; reads see asserted statements only
-  - `rdfs`: the RDFS closure is materialised into the inferred stack
+  - `rdfs`: the RDFS closure is materialised into the inferred stack (the six rules queries over data use)
+  - `rdfs-full`: every RDFS entailment rule and the axiomatic triples
+  - `rdfs-plus`: RDFS with equality, inverse, symmetric, transitive, functional and inverse functional properties, equivalent classes and properties
+  - `owl-horst`: RDFS-Plus with `hasValue`, `someValuesFrom` and `allValuesFrom` (ter Horst's pD*)
+  - `owl2-ql`: OWL 2 QL materialised; commits that violate its disjointness axioms are rejected
   - `owl2-rl`: the OWL 2 RL/RDF closure is materialised, and commits that violate a consistency rule are rejected with the rule and the facts it matched
 - unknown values are a startup error (a typo must not silently disable consistency checking); `rules-mvp`, the removed v1 reasoner, is an error that names its replacement
-- with `rdfs` or `owl2-rl`:
+- with any mode but `disabled`:
   - `nrese-server load` and startup materialise the closure (startup skips it when `reasoning.state` in the data directory records that the inferred stack is current for this build's semantics; `/version` reports them as `reasoning_semantics`, e.g. `owl2-rl v2 <fingerprint>`)
   - what each mode derives and omits: [reasoning-semantics.md](../spec/reasoning-semantics.md)
   - every commit maintains it incrementally, inside the same transaction

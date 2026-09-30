@@ -43,6 +43,9 @@ pub struct Program {
     rules: Vec<Rule>,
     lists: Option<ListVocabulary>,
     schema: Schema,
+    /// The ruleset's axiomatic triples, sorted: they seed every closure, and a commit
+    /// never retracts them.
+    axioms: Vec<Triple>,
 }
 
 impl std::fmt::Debug for Program {
@@ -74,11 +77,16 @@ impl Program {
             .has_list_rules()
             .then(|| ListVocabulary::new(&mut constants));
         let schema = Schema::owl(&mut constants);
+        let mut axioms = ruleset
+            .axiom_triples(&mut constants)
+            .expect("the built-in axioms parse (tested)");
+        axioms.sort_unstable();
         Self {
             ruleset,
             rules,
             lists,
             schema,
+            axioms,
         }
     }
 }
@@ -223,10 +231,25 @@ fn triple(quad: EncodedQuad) -> Triple {
     [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()]
 }
 
-/// The closure of `asserted` (any graphs) under `program`.
+/// The closure of `asserted` (any graphs) under `program`, its axioms included.
 pub fn materialise(program: &Program, snapshot: &Snapshot) -> Closure {
+    let mut input = asserted_by_predicate(snapshot);
+    // Axioms nothing asserts are inferred statements, and premises of the rules.
+    let mut axioms: Vec<Triple> = Vec::new();
+    for &axiom in &program.axioms {
+        let [s, p, o] = axiom;
+        let at = input.partition_point(|(predicate, _)| *predicate < p);
+        match input.get_mut(at) {
+            Some((predicate, pairs)) if *predicate == p => match pairs.binary_search(&(o, s)) {
+                Ok(_) => continue,
+                Err(position) => pairs.insert(position, (o, s)),
+            },
+            _ => input.insert(at, (p, vec![(o, s)])),
+        }
+        axioms.push(axiom);
+    }
     let result = batch::materialise_grouped(
-        asserted_by_predicate(snapshot),
+        input,
         &program.rules,
         program.lists.as_ref(),
         &program.schema,
@@ -235,6 +258,7 @@ pub fn materialise(program: &Program, snapshot: &Snapshot) -> Closure {
         inferred: result
             .derived
             .into_iter()
+            .chain(axioms)
             .filter(|&t| storable(t))
             .map(encode)
             .collect(),
@@ -287,15 +311,18 @@ pub struct EngineBase<'a> {
     snapshot: &'a Snapshot,
     inserts: MemoryBase,
     deletes: HashSet<EncodedQuad>,
+    /// The ruleset's axioms (sorted): they count as asserted, so no deletion retracts them.
+    axioms: &'a [Triple],
 }
 
 impl<'a> EngineBase<'a> {
-    pub fn new(tx: &'a Transaction<'_>) -> Self {
+    pub fn new(tx: &'a Transaction<'_>, axioms: &'a [Triple]) -> Self {
         let inserts: Vec<Triple> = tx.inserted().map(triple).collect();
         Self {
             snapshot: tx.base(),
             inserts: MemoryBase::new(&inserts, &[]),
             deletes: tx.deleted().collect(),
+            axioms,
         }
     }
 
@@ -344,7 +371,9 @@ impl Base for EngineBase<'_> {
     }
 
     fn is_asserted(&self, fact: Triple) -> bool {
-        self.inserts.contains(fact) || self.committed(ReadModel::Asserted, fact)
+        self.inserts.contains(fact)
+            || self.axioms.binary_search(&fact).is_ok()
+            || self.committed(ReadModel::Asserted, fact)
     }
 }
 
@@ -361,14 +390,25 @@ pub fn apply_delta(
     stop: nrese_reasoner::v2::eval::Stop<'_>,
 ) -> Result<(Vec<Violation>, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
     let started = Instant::now();
+    // Axioms the state lacks (a store that never rematerialised): added with this commit.
+    let mut missing_axioms: Vec<Triple> = Vec::new();
     let update = {
-        let base = EngineBase::new(tx);
+        let base = EngineBase::new(tx, &program.axioms);
         // Facts new to the state: in no graph and not inferred before the transaction.
         let mut inserted: Vec<Triple> = tx
             .inserted()
             .map(triple)
             .filter(|&t| !base.known_before(t))
             .collect();
+        if !(inserted.is_empty() && tx.deleted().next().is_none()) {
+            missing_axioms = program
+                .axioms
+                .iter()
+                .copied()
+                .filter(|&axiom| !base.known_before(axiom) && !base.inserts.contains(axiom))
+                .collect();
+            inserted.extend(missing_axioms.iter().copied());
+        }
         inserted.sort_unstable();
         inserted.dedup();
         // A triple deleted from one graph but still asserted in another stays a fact.
@@ -394,7 +434,12 @@ pub fn apply_delta(
             removed += 1;
         }
     }
-    for &fact in update.insert.iter().filter(|&&t| storable(t)) {
+    for &fact in update
+        .insert
+        .iter()
+        .chain(&missing_axioms)
+        .filter(|&&t| storable(t))
+    {
         if tx.insert_inferred(encode(fact)) {
             inserted += 1;
         }

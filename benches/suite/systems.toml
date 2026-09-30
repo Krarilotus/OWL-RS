@@ -31,11 +31,12 @@ publish = "free"
 runs = ["docker", "native"]
 capabilities = [
   "load", "query", "update",
-  "reason-owl2-rl", "reason-incremental", "consistency", "explain",
+  "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
+  "reason-incremental", "consistency", "explain",
   "shacl-core",
 ]
 # What the suite needs and NRESE lacks; each names its step in the parity plan.
-missing = { "reason-rdfs" = "B1 (today: a six-rule subset)", "reason-owl-horst" = "B1", "reason-owl2-ql" = "B1", "reason-custom-rules" = "B2", "shacl-sparql" = "C3", "fulltext" = "F1", "geosparql" = "F2", "federation" = "D4", "classify" = "R8, not planned" }
+missing = { "reason-custom-rules" = "B2", "shacl-sparql" = "C3", "fulltext" = "F1", "geosparql" = "F2", "federation" = "D4", "classify" = "R8, not planned" }
 
 [qlever]
 name = "QLever"
