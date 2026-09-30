@@ -84,9 +84,9 @@ pub(crate) fn supported(name: &str, arity: usize) -> bool {
 }
 
 /// A geometry and its coordinate reference system.
-struct Shape {
-    geometry: Geometry<f64>,
-    crs: String,
+pub(super) struct Shape {
+    pub(super) geometry: Geometry<f64>,
+    pub(super) crs: String,
 }
 
 impl Shape {
@@ -95,7 +95,8 @@ impl Shape {
     }
 }
 
-fn parse(term: &Term) -> Option<Shape> {
+/// The shape of a `geo:wktLiteral`; `None` for anything else.
+pub(super) fn parse(term: &Term) -> Option<Shape> {
     let Term::Literal(literal) = term else {
         return None;
     };
@@ -189,6 +190,75 @@ fn polygons(geometry: &Geometry<f64>) -> Option<MultiPolygon<f64>> {
     }
 }
 
+/// The topological relations, by their local names (functions in `geof:`, properties in
+/// `geo:`).
+pub(super) const RELATIONS: &[&str] = &[
+    "sfEquals",
+    "sfDisjoint",
+    "sfIntersects",
+    "sfTouches",
+    "sfCrosses",
+    "sfWithin",
+    "sfContains",
+    "sfOverlaps",
+    "ehEquals",
+    "ehDisjoint",
+    "ehMeet",
+    "ehOverlap",
+    "ehCovers",
+    "ehCoveredBy",
+    "ehInside",
+    "ehContains",
+    "rcc8eq",
+    "rcc8dc",
+    "rcc8ec",
+    "rcc8po",
+    "rcc8tppi",
+    "rcc8tpp",
+    "rcc8ntpp",
+    "rcc8ntppi",
+];
+
+/// Whether a relation can hold between shapes whose bounding boxes don't meet (the
+/// disjointness relations): these can't be looked up in a spatial index.
+pub(super) fn holds_apart(local: &str) -> bool {
+    matches!(local, "sfDisjoint" | "ehDisjoint" | "rcc8dc")
+}
+
+/// Whether relation `local` holds between `a` and `b`; `None` for an unknown name.
+pub(super) fn relation(local: &str, a: &Geometry<f64>, b: &Geometry<f64>) -> Option<bool> {
+    let pattern = match local {
+        "sfDisjoint" | "ehDisjoint" => "FF*FF****",
+        "ehOverlap" => "T*T***T**",
+        "ehCovers" => "T*TFT*FF*",
+        "ehCoveredBy" => "TFF*TFT**",
+        "ehInside" => "TFF*FFT**",
+        "ehContains" => "T*TFF*FF*",
+        "rcc8eq" => "TFFFTFFFT",
+        "rcc8dc" => "FFTFFTTTT",
+        "rcc8ec" => "FFTFTTTTT",
+        "rcc8po" => "TTTTTTTTT",
+        "rcc8tppi" => "TTTFTTFFT",
+        "rcc8tpp" => "TFFTTFTTT",
+        "rcc8ntpp" => "TFFTFFTTT",
+        "rcc8ntppi" => "TTTFFTFFT",
+        other => {
+            let m = a.relate(b);
+            return Some(match other {
+                "sfEquals" | "ehEquals" => m.is_equal_topo(),
+                "sfIntersects" => m.is_intersects(),
+                "sfTouches" | "ehMeet" => m.is_touches(),
+                "sfCrosses" => m.is_crosses(),
+                "sfWithin" => m.is_within(),
+                "sfContains" => m.is_contains(),
+                "sfOverlaps" => m.is_overlaps(),
+                _ => return None,
+            });
+        }
+    };
+    a.relate(b).matches(pattern).ok()
+}
+
 /// `geof:name(args)`; `None` is an error (a wrong argument, systems that differ).
 pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
     let local = name.strip_prefix(GEOF)?;
@@ -197,38 +267,11 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
         let (a, b) = (shape(0)?, shape(1)?);
         (a.crs == b.crs).then_some((a, b))
     };
-    let pattern = match local {
-        "sfDisjoint" | "ehDisjoint" => Some("FF*FF****"),
-        "ehOverlap" => Some("T*T***T**"),
-        "ehCovers" => Some("T*TFT*FF*"),
-        "ehCoveredBy" => Some("TFF*TFT**"),
-        "ehInside" => Some("TFF*FFT**"),
-        "ehContains" => Some("T*TFF*FF*"),
-        "rcc8eq" => Some("TFFFTFFFT"),
-        "rcc8dc" => Some("FFTFFTTTT"),
-        "rcc8ec" => Some("FFTFTTTTT"),
-        "rcc8po" => Some("TTTTTTTTT"),
-        "rcc8tppi" => Some("TTTFTTFFT"),
-        "rcc8tpp" => Some("TFFTTFTTT"),
-        "rcc8ntpp" => Some("TFFTFFTTT"),
-        "rcc8ntppi" => Some("TTTFFTFFT"),
-        _ => None,
-    };
-    let relation = |test: &dyn Fn(&geo::relate::IntersectionMatrix) -> bool| -> Option<Term> {
+    if RELATIONS.contains(&local) {
         let (a, b) = pair()?;
-        Some(boolean_term(test(&a.geometry.relate(&b.geometry))))
-    };
-    if let Some(pattern) = pattern {
-        return relation(&|m| m.matches(pattern).unwrap_or(false));
+        return relation(local, &a.geometry, &b.geometry).map(boolean_term);
     }
     match local {
-        "sfEquals" | "ehEquals" => relation(&|m| m.is_equal_topo()),
-        "sfIntersects" => relation(&|m| m.is_intersects()),
-        "sfTouches" | "ehMeet" => relation(&|m| m.is_touches()),
-        "sfCrosses" => relation(&|m| m.is_crosses()),
-        "sfWithin" => relation(&|m| m.is_within()),
-        "sfContains" => relation(&|m| m.is_contains()),
-        "sfOverlaps" => relation(&|m| m.is_overlaps()),
         "relate" => {
             let Some(Term::Literal(spec)) = args.get(2) else {
                 return None;

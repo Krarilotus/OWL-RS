@@ -38,7 +38,7 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 | Full-text search | yes (integrated) | yes (connectors/Lucene) | delivered: Blazegraph's `bds:search` with relevance, rank, all words, prefixes and limits; an in-memory index over string literals, built at the first search. Not yet: Jena's `text:query`, GraphDB's connectors, stemming, phrase search, a persisted index | T1 | ResearchSpace search; relevance tests |
 | Autocompletion | yes | partial | missing | T1 | latency benchmark |
 | OWL 2 EL classification | no | no (materialisation only) | delivered: `GET /dataset/classification`, the completion rules of CEL/ELK over the asserted ontology; equal to ELK on 300 random EL ontologies; axioms outside EL are reported, not used | R8 | ORE 2015 EL part against ELK |
-| GeoSPARQL | partial | yes | delivered: the filter functions over WKT (relations of all three families, DE-9IM, geodesic measures, constructions); not yet: relation properties in triple patterns (query rewrite), GML and GeoJSON, a spatial index | G1 | GeoSPARQL compliance subset |
+| GeoSPARQL | partial | yes | delivered: the filter functions over WKT (relations of all three families, DE-9IM, geodesic measures, constructions); the relations as triple patterns between features and geometries with an R-tree; not yet: GML and GeoJSON, the index for the filter functions | G1 | GeoSPARQL compliance subset |
 | Vector similarity | no | yes (similarity/connectors) | missing | V1 | recall@k |
 | RDF-star / RDF 1.2 triple terms | partial | yes | missing | R7 | RDF 1.2 tests |
 | Graph-level access control | no | yes (Enterprise) | missing | O1 | security matrix |

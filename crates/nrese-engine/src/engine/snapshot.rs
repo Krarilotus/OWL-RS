@@ -48,6 +48,11 @@ impl Snapshot {
         }
     }
 
+    /// Whether `other` shows the same version of the same engine (a cache key).
+    pub fn same_version(&self, other: &Snapshot) -> bool {
+        Arc::ptr_eq(&self.version, &other.version)
+    }
+
     /// A snapshot of `version` over this one's dictionary and statistics.
     pub(super) fn with_version(&self, version: Version) -> Snapshot {
         Snapshot {
