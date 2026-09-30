@@ -98,7 +98,11 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let report = command
-            .apply(&mut tx, ticket.evaluation_token())
+            .apply(
+                &mut tx,
+                ticket.evaluation_token(),
+                self.store.config().union_default_graph,
+            )
             .map_err(store_error)?;
 
         if let Some(ruleset) = self.reasoner.config().materialised_ruleset() {

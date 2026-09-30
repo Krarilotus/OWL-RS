@@ -1,0 +1,13 @@
+# The ABox contract of the module: what valid data looks like.
+@prefix ex: <https://example.org/model/petitions#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:PetitionShape a sh:NodeShape ;
+  sh:targetClass ex:Petition ;
+  sh:property [ sh:path ex:petitioner ; sh:minCount 1 ; sh:class ex:Person ;
+                sh:message "every petition has a petitioner" ] ;
+  sh:property [ sh:path ex:submittedOn ; sh:maxCount 1 ; sh:datatype xsd:date ] ;
+  sh:property [ sh:path prov:wasGeneratedBy ; sh:minCount 1 ;
+                sh:message "every petition records the extraction it comes from" ] .

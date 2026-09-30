@@ -1,0 +1,22 @@
+# Accepted data of one export, with its provenance (PROV-O), as one graph.
+@prefix ex: <https://example.org/model/petitions#> .
+@prefix d: <https://example.org/data/> .
+@prefix prov: <http://www.w3.org/ns/prov#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+d:petition-1 a ex:Petition ;
+  ex:petitioner d:person-1 ;
+  ex:submittedOn "1452-03-14"^^xsd:date ;
+  prov:wasGeneratedBy d:extraction-1 .
+d:petition-2 a ex:Petition ;
+  ex:petitioner d:person-2 ;
+  ex:submittedOn "1453-11-02"^^xsd:date ;
+  prov:wasGeneratedBy d:extraction-1 .
+d:person-1 a ex:Person ; ex:name "Johannes Textor" .
+d:person-2 a ex:Person ; ex:name "Margarethe Weber"@de .
+
+d:extraction-1 a prov:Activity ;
+  prov:used d:document-17 ;
+  prov:wasAssociatedWith d:model-run-a ;
+  prov:endedAtTime "2026-09-30T10:00:00Z"^^xsd:dateTime .
+d:document-17 a prov:Entity ; prov:value "Supplik 17" .

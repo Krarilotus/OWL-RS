@@ -46,6 +46,8 @@ pub(super) struct RawStoreConfig {
     pub ontology_path: Option<String>,
     #[serde(default)]
     pub query_cache_bytes: Option<usize>,
+    #[serde(default)]
+    pub default_graph: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

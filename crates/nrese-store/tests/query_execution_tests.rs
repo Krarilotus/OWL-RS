@@ -142,3 +142,101 @@ fn protocol_dataset_parameters_replace_from_clauses() {
     let error = service.execute_query(&invalid).unwrap_err();
     assert!(error.is_request_error(), "{error}");
 }
+
+/// `union_default_graph`: a query or an update `WHERE` without a dataset reads the merge
+/// of all graphs, where a statement counts once however many graphs hold it. `GRAPH`
+/// patterns and explicit datasets keep their meaning.
+#[test]
+fn the_default_graph_can_be_the_merge_of_all_graphs() {
+    const DATA: &str = "INSERT DATA {
+        <http://example.com/a> <http://example.com/p> 1 .
+        GRAPH <http://example.com/g1> {
+          <http://example.com/a> <http://example.com/p> 1 .
+          <http://example.com/b> <http://example.com/p> 2 }
+        GRAPH <http://example.com/g2> {
+          <http://example.com/b> <http://example.com/p> 2 .
+          <http://example.com/c> <http://example.com/p> 3 }
+      }";
+    let service = |union: bool| {
+        let service = StoreService::new(StoreConfig {
+            union_default_graph: union,
+            ..StoreConfig::in_memory()
+        })
+        .expect("store");
+        service.execute_update_str(DATA).expect("data");
+        service
+    };
+    // The values of ?s, in TSV without the header, sorted.
+    let subjects = |service: &StoreService, query: &str| -> Vec<String> {
+        let mut request = SparqlQueryRequest::new(query);
+        request.solutions_format = nrese_store::SolutionsResultFormat::Tsv;
+        let result = service.execute_query(&request).expect("query");
+        let text = String::from_utf8(result.payload).expect("utf8");
+        let mut rows: Vec<String> = text
+            .lines()
+            .skip(1)
+            .map(|line| {
+                line.trim_start_matches("<http://example.com/")
+                    .trim_end_matches('>')
+                    .to_owned()
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let plain = "SELECT ?s WHERE { ?s <http://example.com/p> ?o }";
+
+    let own = service(false);
+    assert_eq!(subjects(&own, plain), ["a"]);
+
+    let union = service(true);
+    // Three statements, each once: `a` is in two graphs, `b` in two.
+    assert_eq!(subjects(&union, plain), ["a", "b", "c"]);
+    // Joins, filters and aggregates read the same merge.
+    assert_eq!(
+        subjects(
+            &union,
+            "SELECT ?s WHERE { ?s <http://example.com/p> ?o . ?s ?q ?o FILTER(?o > 1) }"
+        ),
+        ["b", "c"]
+    );
+    assert_eq!(
+        subjects(&union, "SELECT (COUNT(*) AS ?s) WHERE { ?x ?y ?z }"),
+        ["3"]
+    );
+    // `GRAPH` still names graphs: every copy, per graph; the default graph isn't one.
+    assert_eq!(
+        subjects(&union, "SELECT ?s WHERE { GRAPH ?g { ?s ?p ?o } }"),
+        ["a", "b", "b", "c"]
+    );
+    assert_eq!(
+        subjects(
+            &union,
+            "SELECT ?s WHERE { GRAPH <http://example.com/g2> { ?s ?p ?o } }"
+        ),
+        ["b", "c"]
+    );
+    // A query that names its dataset gets that dataset.
+    assert_eq!(
+        subjects(
+            &union,
+            "SELECT ?s FROM <http://example.com/g1> WHERE { ?s ?p ?o }"
+        ),
+        ["a", "b"]
+    );
+    let mut protocol = SparqlQueryRequest::new(plain);
+    protocol.solutions_format = nrese_store::SolutionsResultFormat::Tsv;
+    protocol.default_graphs = vec!["http://example.com/g2".to_owned()];
+    let text = String::from_utf8(union.execute_query(&protocol).expect("query").payload).unwrap();
+    assert_eq!(text.lines().count(), 3, "{text}");
+
+    // An update's WHERE reads the merge too; what it writes without `GRAPH` goes to the
+    // default graph.
+    let mark =
+        "INSERT { ?s <http://example.com/seen> true } WHERE { ?s <http://example.com/p> ?o }";
+    union.execute_update_str(mark).expect("update");
+    own.execute_update_str(mark).expect("update");
+    let seen = "SELECT ?s WHERE { ?s <http://example.com/seen> true }";
+    assert_eq!(subjects(&union, seen), ["a", "b", "c"]);
+    assert_eq!(subjects(&own, seen), ["a"]);
+}
