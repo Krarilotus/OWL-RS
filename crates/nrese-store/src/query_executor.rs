@@ -46,6 +46,9 @@ pub(crate) struct StoreSettings {
     pub union_default_graph: bool,
     /// The budget for all running queries together, if the store has one.
     pub query_memory: Option<std::sync::Arc<nrese_sparql::SharedBudget>>,
+    /// Who answers `SERVICE` calls, once the application installs a client
+    /// ([`StoreService::set_service_client`](crate::StoreService::set_service_client)).
+    pub services: std::sync::Arc<std::sync::OnceLock<nrese_sparql::Services>>,
 }
 
 /// A parsed query with its protocol dataset and output format. Preparing is cheap and
@@ -233,6 +236,7 @@ pub(crate) fn run_query(
         as_written: prepared.as_written,
         shared_memory: store.query_memory.clone(),
         union_default_graph: store.union_default_graph,
+        services: store.services.get().cloned(),
         ..QueryOptions::default()
     };
     let alive = || match cancellation.is_cancelled() {
@@ -301,6 +305,7 @@ pub(crate) fn explain_prepared(
         as_written: prepared.as_written,
         shared_memory: store.query_memory.clone(),
         union_default_graph: store.union_default_graph,
+        services: store.services.get().cloned(),
         ..QueryOptions::default()
     };
     Ok(explain_query(view, &prepared.query, &options)?)

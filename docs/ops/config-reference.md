@@ -170,6 +170,14 @@ api_key = "replace-me"
   - queries see asserted and inferred statements by default; `infer=false` or `FROM <http://www.ontotext.com/explicit>` reads asserted statements only, `FROM <http://www.ontotext.com/implicit>` inferred ones
 - switching reasoning off clears the inferred stack at the next startup
 
+## Federation (`SERVICE`)
+
+- file table `[federation]`
+- `allow` (env `NRESE_FEDERATION_ALLOW`, comma-separated): the endpoints `SERVICE` may call, as full IRIs or prefixes (`https://query.wikidata.org/`), or `*` for any. Empty (the default): `SERVICE` is off, an error, and `SERVICE SILENT` one solution without bindings. Allowing `*` lets anyone who may query make the server fetch any URL
+- `timeout` (env `NRESE_FEDERATION_TIMEOUT_MS`, units as in [Budgets](#budgets)): per request to an endpoint; default `30s`
+- `max_rows` (env `NRESE_FEDERATION_MAX_ROWS`): rows one request may return; default 1,000,000
+- a `SERVICE` joined to a pattern sends the pattern's distinct values as `VALUES`, 200 rows per request (up to 20,000 values; beyond, the block goes once, unbound); redirects are not followed; queries with `SERVICE` are never answered from the result cache
+
 ## Budgets
 
 Every limit on memory, time and request size is in one table, `[budgets]`. Values are plain numbers (bytes, milliseconds) or numbers with a unit: `"4GiB"`, `"512MiB"`, `"2GB"`, `"30s"`, `"2min"`, and for memory a share of the machine, `"50%"`. `nrese-server check-config` prints the values in effect, and `/version` reports them under `budgets`.

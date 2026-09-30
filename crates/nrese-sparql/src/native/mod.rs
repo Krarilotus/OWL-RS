@@ -16,6 +16,7 @@
 mod exists;
 pub(crate) mod expr;
 mod fast;
+mod federation;
 mod output;
 mod paths;
 mod plan;
@@ -514,6 +515,11 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
     match pattern {
         GraphPattern::Bgp { patterns } => patterns.iter().all(supported_triple),
         GraphPattern::Graph { inner, .. } => supported(inner),
+        // The block runs at the endpoint.
+        GraphPattern::Service {
+            name: NamedNodePattern::NamedNode(_),
+            ..
+        } => true,
         GraphPattern::Path {
             subject, object, ..
         } => supported_term(subject) && supported_term(object),
@@ -834,6 +840,8 @@ struct Context<'a> {
     named: Option<Vec<TermId>>,
     /// Numbers the columns the executor adds for itself ([`exists`]).
     synthetic: Cell<usize>,
+    /// [`QueryOptions::services`].
+    services: Option<crate::Services>,
 }
 
 /// The active graph of triple patterns.
@@ -890,6 +898,7 @@ impl<'a> Context<'a> {
             depth: Cell::new(0),
             graph: RefCell::new(scope),
             synthetic: Cell::new(0),
+            services: options.services.clone(),
         }
     }
 
@@ -1078,6 +1087,49 @@ impl<'a> Context<'a> {
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns, &[], &mut Vec::new()),
             GraphPattern::Graph { name, inner } => self.graph(name, inner),
+            GraphPattern::Service {
+                name,
+                inner,
+                silent,
+            } => self.service(name, inner, *silent, None),
+            // A SERVICE joined to a pattern gets the values the pattern binds.
+            GraphPattern::Join { left, right }
+                if matches!(**right, GraphPattern::Service { .. })
+                    || matches!(**left, GraphPattern::Service { .. }) =>
+            {
+                let (local, remote) = match &**right {
+                    GraphPattern::Service { .. } => (left, right),
+                    _ => (right, left),
+                };
+                let GraphPattern::Service {
+                    name,
+                    inner,
+                    silent,
+                } = &**remote
+                else {
+                    unreachable!("matched above")
+                };
+                let bound = self.eval(local)?;
+                let found = self.service(name, inner, *silent, Some(&bound))?;
+                self.join(bound, found)
+            }
+            GraphPattern::LeftJoin {
+                left,
+                right,
+                expression,
+            } if matches!(**right, GraphPattern::Service { .. }) => {
+                let GraphPattern::Service {
+                    name,
+                    inner,
+                    silent,
+                } = &**right
+                else {
+                    unreachable!("matched above")
+                };
+                let left = self.eval(left)?;
+                let found = self.service(name, inner, *silent, Some(&left))?;
+                self.left_join(left, found, expression.as_ref())
+            }
             GraphPattern::Path {
                 subject,
                 path,
@@ -1310,6 +1362,8 @@ impl<'a> Context<'a> {
                 variables,
                 aggregates,
             } => self.group(inner, variables, aggregates, None),
+            // LATERAL, where a feature of spargebra enables it.
+            #[allow(unreachable_patterns)]
             _ => Err(NativeError::Fallback),
         }
     }

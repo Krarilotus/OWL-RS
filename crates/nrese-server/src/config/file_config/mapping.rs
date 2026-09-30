@@ -39,6 +39,23 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
 
     insert_option(&mut source, names::REASONING_MODE, config.reasoner.mode);
 
+    insert_joined(
+        &mut source,
+        names::FEDERATION_ALLOW,
+        config.federation.allow,
+        ",",
+    );
+    insert_option(
+        &mut source,
+        names::FEDERATION_TIMEOUT_MS,
+        config.federation.timeout.map(Amount::into_text),
+    );
+    insert_numeric(
+        &mut source,
+        names::FEDERATION_MAX_ROWS,
+        config.federation.max_rows,
+    );
+
     insert_numeric(
         &mut source,
         names::MAX_QUERY_BYTES,

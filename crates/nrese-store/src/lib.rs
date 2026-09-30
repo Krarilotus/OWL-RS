@@ -28,7 +28,9 @@ pub use backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
 };
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest};
-pub use config::{DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, StoreConfig, StoreMode};
+pub use config::{
+    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, StoreConfig, StoreMode,
+};
 pub use delta::MutationDeltaPreview;
 pub use error::{StoreError, StoreResult};
 pub use graph_store::{

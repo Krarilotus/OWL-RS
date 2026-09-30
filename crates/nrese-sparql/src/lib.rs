@@ -17,6 +17,7 @@ pub mod compat;
 pub mod dataset;
 mod native;
 pub mod query;
+pub mod service;
 pub mod update;
 pub mod view;
 
@@ -35,6 +36,7 @@ pub use query::{
     Explanation, PlanStep, QueryOptions, WriteResultsError, evaluate_query, explain_query,
     runs_natively, write_results,
 };
+pub use service::{ServiceClient, ServiceResults, Services};
 pub use spareval::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,
 };

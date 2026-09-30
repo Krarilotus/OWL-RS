@@ -102,6 +102,7 @@ impl MutationPipeline {
                 &mut tx,
                 ticket.evaluation_token(),
                 self.store.config().union_default_graph,
+                self.store.services(),
             )
             .map_err(store_error)?;
 

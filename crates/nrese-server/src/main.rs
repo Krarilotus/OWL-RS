@@ -71,6 +71,14 @@ async fn main() -> Result<()> {
             }
         }
     }
+    if config.store.federation.enabled() {
+        let client = nrese_server::federation::HttpServiceClient::new(
+            config.store.federation.clone(),
+            tokio::runtime::Handle::current(),
+        )?;
+        store.set_service_client(std::sync::Arc::new(client));
+        tracing::info!(allow = ?config.store.federation.allow, "SERVICE may call these endpoints");
+    }
     let reasoner = ReasonerService::new(config.reasoner.clone());
     let ai = AiSuggestionService::new(config.ai.clone())?;
     let ontology_path = store
