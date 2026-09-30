@@ -118,6 +118,13 @@ def w3c_shacl(root: Path, tier: str, settings: dict) -> Plan:
                          "--test", "w3c_shacl"])
 
 
+def w3c_owl2_rl(root: Path, tier: str, settings: dict) -> Plan:
+    return Plan("w3c-owl2-rl", tier, kind="kit", systems={"nrese"},
+                command=["bash", "scripts/cargo-guarded.sh", "test", "--locked", "-p", "nrese-store",
+                         "--test", "w3c_owl2_rl"],
+                note="the test cases come from scripts/fetch-w3c-tests.sh")
+
+
 def write_scaling(root: Path, tier: str, settings: dict) -> Plan:
     return Plan("write-scaling", tier, kind="writes", systems={"nrese"},
                 note="the harness drives NRESE's graph store API")
@@ -137,6 +144,7 @@ DEFINITIONS = {
     "basics-mix": (basics, ["olympics"]),
     "w3c-sparql11": (w3c_sparql, ["-"]),
     "w3c-shacl": (w3c_shacl, ["-"]),
+    "w3c-owl2-rl": (w3c_owl2_rl, ["-"]),
     "write-scaling": (write_scaling, ["1m"]),
     "clients": (clients, ["-"]),
 }

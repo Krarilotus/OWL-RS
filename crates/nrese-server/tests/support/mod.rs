@@ -32,7 +32,7 @@ pub fn test_app_with_posture(
     reasoner_config: ReasonerConfig,
     deployment_posture: DeploymentPosture,
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
-    let store = StoreService::new(StoreConfig::default())?;
+    let store = started(StoreService::new(StoreConfig::default())?, &reasoner_config)?;
     let reasoner = ReasonerService::new(reasoner_config);
     let state = AppState::new(
         store,
@@ -50,7 +50,33 @@ pub fn test_app_with_store_config(
     policy: PolicyConfig,
     reasoner_config: ReasonerConfig,
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
-    test_app_with_store(StoreService::new(store_config)?, policy, reasoner_config)
+    let store = started(StoreService::new(store_config)?, &reasoner_config)?;
+    test_app_with_store(store, policy, reasoner_config)
+}
+
+/// `store` as the server starts it: the inferred stack materialised for the configured
+/// ruleset (its axioms, for an empty store) unless it is current (nrese-server's main).
+fn started(
+    store: StoreService,
+    reasoner_config: &ReasonerConfig,
+) -> Result<StoreService, Box<dyn std::error::Error>> {
+    if let Some(ruleset) = reasoner_config.materialised_ruleset()
+        && !store.reasoning_is_current(ruleset)
+    {
+        store.rematerialise(ruleset)?;
+    }
+    Ok(store)
+}
+
+/// The revision `/readyz` reports.
+pub async fn ready_revision(app: axum::Router) -> Result<u64, Box<dyn std::error::Error>> {
+    let text = readyz_text(app).await?;
+    let at = text.find("\"revision\":").ok_or("no revision in /readyz")? + "\"revision\":".len();
+    let digits: String = text[at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    Ok(digits.parse()?)
 }
 
 /// An app serving `store` as it is (already loaded or materialised).

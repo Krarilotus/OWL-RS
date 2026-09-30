@@ -94,10 +94,12 @@ kind = "conformance"
 tasks = ["RT1", "RT4"]
 needs = ["load"]
 any = ["reason-owl2-rl"]
-source = "w3.org/2009/11/owl-test (the test case collection)"
+source = "w3.org/2009/11/owl-test (the test case collection; scripts/fetch-w3c-tests.sh)"
 licence = "W3C"
-state = "planned"
+state = "ready"
+kit = "crates/nrese-store/tests/w3c_owl2_rl"
 check = "the test suite's expected entailments"
+note = "Runs on NRESE in CI: 70 of 89 pass, 16 ask for conclusions outside the RL/RDF rules (expected-failures.txt), 3 skipped"
 
 [ore-2015]
 title = "ORE 2015: classification of 1,920 real ontologies"

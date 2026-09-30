@@ -6,7 +6,9 @@ use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::policy::PolicyConfig;
 use tower::util::ServiceExt;
 
-use support::{body_text, query_text, readyz_text, test_app, test_app_with_settings};
+use support::{
+    body_text, query_text, ready_revision, readyz_text, test_app, test_app_with_settings,
+};
 
 #[tokio::test]
 async fn graph_put_rejects_unsupported_content_type_with_problem_json()
@@ -185,6 +187,7 @@ async fn graph_put_uses_reasoner_gate_and_rejects_without_publish()
         PolicyConfig::default(),
         ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )?;
+    let revision_before = ready_revision(app.clone()).await?;
 
     let response = app
         .clone()
@@ -219,7 +222,7 @@ async fn graph_put_uses_reasoner_gate_and_rejects_without_publish()
     );
 
     let ready_text = readyz_text(app).await?;
-    assert!(ready_text.contains("\"revision\":0"));
+    assert!(ready_text.contains(&format!("\"revision\":{revision_before}")));
 
     Ok(())
 }
