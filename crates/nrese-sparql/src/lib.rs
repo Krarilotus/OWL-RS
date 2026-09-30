@@ -30,7 +30,7 @@ pub mod value {
 }
 
 pub use dataset::{EngineDataset, EvalTerm};
-pub use native::ResultsFormat;
+pub use native::{ResultsFormat, geometry_literal};
 pub use nrese_exec::{BudgetExceeded, SharedBudget};
 pub use query::{
     Explanation, PlanStep, QueryOptions, WriteResultsError, evaluate_query, explain_query,

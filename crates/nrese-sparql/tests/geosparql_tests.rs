@@ -291,6 +291,119 @@ fn constructions_and_properties() {
     );
     // Not a WKT literal: an error, so the BIND leaves the variable unbound.
     assert!(number(&engine, "geof:area(\"POINT(1 2)\", uom:metre)").is_none());
+
+    // Metres on CRS84: a 1 km buffer around Berlin covers about pi km² (geodesic area),
+    // and reaches 1 km north, not more.
+    let berlin = wkt("POINT(13.4 52.5)");
+    let disc = format!("geof:buffer({berlin}, 1000, uom:metre)");
+    let area = number(&engine, &format!("geof:area({disc}, uom:metre)")).unwrap();
+    assert!(
+        (area / (std::f64::consts::PI * 1e6) - 1.0).abs() < 0.02,
+        "{area}"
+    );
+    let within = |lat: f64| {
+        one(&format!(
+            "geof:sfWithin({}, {disc})",
+            wkt(&format!("POINT(13.4 {lat})"))
+        ))
+    };
+    // 990 m and 1010 m north: 1 degree of latitude is about 111.2 km.
+    assert!(matches!(
+        within(52.5 + 0.99 / 111.25).as_str(),
+        "true" | "1"
+    ));
+    assert!(matches!(
+        within(52.5 + 1.01 / 111.25).as_str(),
+        "false" | "0"
+    ));
+    // Constructed coordinates without the clipping arithmetic's noise.
+    let square = |x: f64| {
+        wkt(&format!(
+            "POLYGON(({x} 34.1, {} 34.1, {} 34.5, {x} 34.5, {x} 34.1))",
+            x + 0.4,
+            x + 0.4
+        ))
+    };
+    let intersection = one(&format!(
+        "geof:intersection({}, {})",
+        square(-83.6),
+        square(-83.4)
+    ));
+    assert!(!intersection.contains("0000000"), "{intersection}");
+
+    // The boundary: a polygon's ring, a line's end points, nothing for a point.
+    assert_eq!(
+        one(&format!(
+            "geof:boundary({})",
+            wkt("POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))")
+        )),
+        "LINESTRING(0 0,4 0,4 4,0 4,0 0)"
+    );
+    assert_eq!(
+        one(&format!(
+            "geof:boundary({})",
+            wkt("LINESTRING(0 0, 1 1, 2 0)")
+        )),
+        "MULTIPOINT((0 0),(2 0))"
+    );
+    assert!(matches!(
+        one(&format!(
+            "geof:isEmpty(geof:boundary({}))",
+            wkt("POINT(1 2)")
+        ))
+        .as_str(),
+        "true" | "1"
+    ));
+    // An empty literal is the empty geometry, equal to other empty ones.
+    assert!(matches!(
+        one(&format!(
+            "geof:sfEquals({}, {})",
+            wkt(""),
+            wkt("LINESTRING EMPTY")
+        ))
+        .as_str(),
+        "true" | "1"
+    ));
+}
+
+/// A relation stated in the data holds for the triple pattern, also between nodes without
+/// geometries; one both stated and computed is one solution.
+#[test]
+fn stated_relations_count_too() {
+    let engine = engine();
+    let mut tx = engine.transaction();
+    let geo = |local: &str| {
+        NamedNode::new_unchecked(format!("http://www.opengis.net/ont/geosparql#{local}"))
+    };
+    let ex = |local: &str| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+    for (s, p, o) in [("x", "sfTouches", "y"), ("square", "sfContains", "inner")] {
+        tx.insert(Quad::new(ex(s), geo(p), ex(o), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let names = |query: &str| -> Vec<String> {
+        select(&engine, query)
+            .into_iter()
+            .map(|row| match &row[0] {
+                Some(Term::NamedNode(n)) => n
+                    .as_str()
+                    .trim_start_matches("http://example.com/")
+                    .to_owned(),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(names("SELECT ?b WHERE { ex:x geo:sfTouches ?b }"), ["y"]);
+    assert_eq!(names("SELECT ?a WHERE { ?a geo:sfTouches ex:y }"), ["x"]);
+    assert_eq!(
+        names("SELECT ?a WHERE { ?a geo:sfTouches ?b FILTER(?b = ex:y) }"),
+        ["x"]
+    );
+    let contained = names("SELECT ?b WHERE { ex:square geo:sfContains ?b }");
+    assert_eq!(
+        contained.iter().filter(|n| *n == "inner").count(),
+        1,
+        "{contained:?}"
+    );
 }
 
 /// Relations as triple patterns: between random geometries, `?a geo:R ?b` equals the
