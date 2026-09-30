@@ -6,7 +6,7 @@
 
 - **The suite exists as four kits with four drivers.** They measure the right things, and each was built for its own question. There was no list of workloads, no statement of what each system can do, and no common result format. The list and the capability rule now exist ([benches/suite](../../benches/suite/README.md)); the common adapter, result format and driver don't.
 - **Of 20 workloads the suite should have, 7 run today, 1 runs in part, 8 are to add, and 4 wait for an NRESE capability.** The industry benchmarks missing are LDBC SPB for reasoning, and Sparqloscope, BSBM and WatDiv for queries.
-- **NRESE can run 15 of the 20.** It can't run LDBC SPB (full RDFS), keyword search, GeoSPARQL, federation and classification. Nine capabilities of the suite's seventeen are missing.
+- **NRESE could run 15 of the 20; since the same day's work, all 20.** Full RDFS and the other profiles, keyword search, GeoSPARQL functions, federation and EL classification were added (§4). Two capabilities of the suite's seventeen are still missing: custom rules and SHACL-SPARQL; no workload of the suite needs them yet.
 - **The published scorecard is out of date.** It was measured on 26 September, before the native executor, in single runs on a workstation, and it says NRESE answers joins 10 to 2000 times slower than QLever. Nothing in it should be quoted.
 - **One day of looking found four wrong-answer bugs, two planner defects and a 40 ms stall in the server** (§5), all fixed. Three of the bugs were found by test generators written for the purpose; the existing random test had let them through, because nine of ten of its queries had no solutions. The rate says there are more.
 - **Before any number is published:** the P0 and P1 items of §5, the capabilities of §4, and a reference machine.
@@ -76,14 +76,14 @@ The owner's rule: every capability implemented and tuned before the comparison r
 | Load, query, update | done | Tuned within a basic graph pattern; see §5 for the planner | — |
 | OWL 2 RL materialisation, incremental maintenance | done, with documented exceptions | Datatype reasoning; equality by representatives; unnamed-class typing | B3, W4, W7 |
 | Consistency with explanations | done for commits | The W3C RL consistency tests; proof trees for inferred statements | B3, R6 |
-| Full RDFS, OWL-Horst, OWL 2 QL profiles | **missing** (RDFS is a six-rule subset) | The profile registry | B1 |
+| Full RDFS, OWL-Horst, OWL 2 QL profiles | done: `rdfs-full` (all rules, axiomatic triples), `rdfs-plus`, `owl-horst`, `owl2-ql` (`d4ed398`) | Oracle comparisons beyond the rule tests (owlrl's RDFS with axioms) | B1 |
 | Custom rules | **missing** | `.pie` import into the rule IR | B2 |
 | SHACL Core | done on request | The commit gate, incremental validation, parallel evaluation | C2, C1c |
 | SHACL-SPARQL | **missing** | | C3 |
-| Full-text search | **missing** | | F1 |
-| GeoSPARQL | **missing** | | F2 |
-| Federation (`SERVICE`) | **missing** | | D4 |
-| Classification | **missing**, not planned | Decide: build, or leave RT6 to the DL reasoners | R8 |
+| Full-text search | done: Blazegraph's `bds:search` with relevance, rank and options, an in-memory index over string literals (`63252ac`) | Jena's `text:query`, stemming, phrases, a persisted index | F1 |
+| GeoSPARQL | done for the functions over WKT: the three relation families, DE-9IM, geodesic measures, constructions (`fd47edf`) | Relation properties in triple patterns (query rewrite), GML and GeoJSON, a spatial index | F2 |
+| Federation (`SERVICE`) | done: allow-listed endpoints, bind joins with `VALUES`, `SILENT` (`9c547e0`) | — | D4 |
+| Classification | done for OWL 2 EL: `GET /dataset/classification`; equal to ELK on 300 random EL ontologies | DL ontologies stay HermiT's and Konclude's | R8 |
 
 ## 5. Production-readiness: gaps and bugs
 

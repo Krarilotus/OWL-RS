@@ -255,6 +255,15 @@ pub async fn sparql_post(
     }
 }
 
+/// The OWL 2 EL class hierarchy of the asserted ontology.
+pub async fn classification_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_query_read(&state, &headers).await?;
+    super::classification::classify(state, &headers).await
+}
+
 /// Validates the data against the repository's shapes graph.
 pub async fn shacl_get(
     State(state): State<AppState>,

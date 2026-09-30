@@ -74,6 +74,15 @@ On the combined URL a form is a query or an update by its field, and a body by i
 
 `application/json` and `application/xml` are taken as the SPARQL results formats, `application/x-turtle` as Turtle, and `text/plain` as N-Triples.
 
+## Classification
+
+`GET /dataset/classification`: the OWL 2 EL class hierarchy of the asserted statements (all graphs), computed on request with the completion rules of CEL and ELK (conjunctions, existential restrictions, property hierarchies, chains and transitivity, domains, ranges, disjointness). On random EL ontologies it equals ELK's hierarchy.
+
+- `application/json` (the default): `subsumptions` (pairs `[sub, super]` of class IRIs, every one, equivalent classes both ways, without `owl:Thing`), `unsatisfiable` (classes that can have no instance), `skipped` (axioms outside EL by kind: unions, universal restrictions, cardinalities, inverses, nominals; the hierarchy is complete for the EL part), `micros`
+- `application/n-triples`: the same as `rdfs:subClassOf` statements, `owl:Nothing` as the superclass of unsatisfiable classes
+
+The hierarchy isn't stored; the reasoning modes materialise instance-level inferences (see [config-reference.md](config-reference.md)).
+
 ## Graph Store Protocol
 
 `/dataset/data?default` or `/dataset/data?graph=<IRI>`

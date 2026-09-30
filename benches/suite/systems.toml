@@ -33,10 +33,10 @@ capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
   "reason-incremental", "consistency", "explain",
-  "shacl-core", "fulltext", "federation", "geosparql",
+  "shacl-core", "fulltext", "federation", "geosparql", "classify",
 ]
 # What the suite needs and NRESE lacks; each names its step in the parity plan.
-missing = { "reason-custom-rules" = "B2", "shacl-sparql" = "C3", "classify" = "R8, not planned" }
+missing = { "reason-custom-rules" = "B2", "shacl-sparql" = "C3" }
 
 [qlever]
 name = "QLever"
@@ -87,7 +87,7 @@ runs = ["docker"]
 capabilities = ["load", "reason-rdfs", "reason-owl2-rl"]
 
 [dl-reasoners]
-name = "ELK, HermiT, Konclude (via ROBOT)"
+name = "ELK, HermiT, Konclude (ELK and HermiT via ROBOT, obolibrary/robot)"
 publish = "free"
 runs = []
 capabilities = ["classify", "consistency", "explain"]
@@ -111,7 +111,7 @@ capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-custom-rules",
   "reason-incremental", "consistency", "explain",
-  "shacl-core", "fulltext", "federation", "geosparql",
+  "shacl-core", "fulltext", "federation", "geosparql", "classify",
 ]
 
 [stardog]
