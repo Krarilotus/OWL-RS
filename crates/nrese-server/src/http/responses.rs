@@ -64,6 +64,8 @@ pub struct VersionResponse {
     pub operator_surface_enabled: bool,
     pub metrics_enabled: bool,
     pub user_console_path: &'static str,
+    /// Whether this binary was built with the user console.
+    pub user_console_embedded: bool,
     pub ai_query_suggestions_enabled: bool,
     pub ai_provider: &'static str,
 }
@@ -199,6 +201,7 @@ pub fn build_version_response(state: &AppState) -> VersionResponse {
         operator_surface_enabled: posture.operator_surface_enabled,
         metrics_enabled: posture.metrics_enabled,
         user_console_path: USER_CONSOLE_PATH,
+        user_console_embedded: crate::http::console::is_embedded(),
         ai_query_suggestions_enabled: posture.ai_query_suggestions_enabled,
         ai_provider: posture.ai_provider,
     }
