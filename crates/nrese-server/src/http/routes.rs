@@ -79,6 +79,7 @@ pub fn router(state: AppState) -> Router {
             crate::runtime_posture::SHACL_ENDPOINT,
             get(handlers::shacl_get).post(handlers::shacl_post),
         )
+        .route("/dataset/classification", get(handlers::classification_get))
         .route("/console/{*path}", get(handlers::console_file))
         .with_state(state)
 }

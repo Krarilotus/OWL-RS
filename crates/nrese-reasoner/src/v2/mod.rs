@@ -12,6 +12,7 @@
 //! Everything works on ids through a [`ir::Vocabulary`] that interns the rules' constants.
 
 pub mod batch;
+pub mod classify;
 pub mod delta;
 pub mod eval;
 pub mod ir;

@@ -4,6 +4,7 @@
 
 mod backup;
 mod bulk_load;
+mod classification;
 pub mod config;
 mod delta;
 pub mod error;
@@ -28,6 +29,7 @@ pub use backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
 };
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest};
+pub use classification::ClassificationReport;
 pub use config::{
     DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, StoreConfig, StoreMode,
 };
