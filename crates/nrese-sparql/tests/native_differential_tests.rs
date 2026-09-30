@@ -1285,3 +1285,333 @@ fn direct_results_equal_the_results_serialiser() {
     }
     assert!(checked > 3000, "{checked}");
 }
+
+/// A random dataset for the merged default graph: statements in the default graph and in
+/// three named graphs, a third of them in a second graph as well, and some default-graph
+/// statements inferred.
+fn load_spread_over_graphs(engine: &Engine, rng: &mut Rng) {
+    let graphs = |rng: &mut Rng| -> GraphName {
+        match rng.below(4) {
+            0 => GraphName::DefaultGraph,
+            1 => ex("g0").into(),
+            2 => ex("g1").into(),
+            _ => ex("e1").into(),
+        }
+    };
+    let mut tx = engine.transaction();
+    for quad in random_dataset(rng) {
+        let first = graphs(rng);
+        if first.is_default_graph() && rng.below(3) == 0 {
+            let triple = EncodedTriple::new(
+                tx.intern(quad.subject.as_ref().into()),
+                tx.intern(quad.predicate.as_ref().into()),
+                tx.intern(quad.object.as_ref()),
+            );
+            tx.insert_inferred(triple);
+        } else {
+            let copy = Quad::new(
+                quad.subject.clone(),
+                quad.predicate.clone(),
+                quad.object.clone(),
+                first,
+            );
+            tx.insert(copy.as_ref());
+        }
+        if rng.below(3) == 0 {
+            let second = graphs(rng);
+            let copy = Quad::new(quad.subject, quad.predicate, quad.object, second);
+            tx.insert(copy.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+}
+
+/// The merged default graph (`union_default_graph`): the native executor equals spareval
+/// over the merging dataset adapter, on the random queries of the main test and on
+/// queries that mix `GRAPH` blocks with merged patterns, under every read model. A
+/// statement held by several graphs counts once in both.
+#[test]
+fn the_merged_default_graph_equals_spareval() {
+    let mut rng = Rng(20_260_933);
+    let (mut checked, mut fallbacks, mut native_runs, mut native_runs_plain) = (0, 0, 0, 0);
+    for dataset_case in 0..120 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        load_spread_over_graphs(&engine, &mut rng);
+        let snapshot = engine.snapshot();
+        for query_case in 0..40 {
+            let model = *rng.pick(&[
+                ReadModel::Materialised,
+                ReadModel::Asserted,
+                ReadModel::Inferred,
+            ]);
+            let native_options = QueryOptions {
+                read_model: model,
+                union_default_graph: true,
+                ..QueryOptions::default()
+            };
+            let spareval = QueryOptions {
+                force_spareval: true,
+                ..native_options.clone()
+            };
+            let (text, ordered) = if rng.below(4) == 0 {
+                let inner = group_pattern(&mut rng, 0);
+                let other = triple(&mut rng);
+                let graph =
+                    *rng.pick(&["?g", "<http://example.com/g0>", "<http://example.com/e1>"]);
+                let text = match rng.below(3) {
+                    0 => format!("SELECT * WHERE {{ {other} GRAPH {graph} {{ {inner} }} }}"),
+                    1 => format!(
+                        "SELECT * WHERE {{ {inner} OPTIONAL {{ GRAPH ?g {{ {other} }} }} }}"
+                    ),
+                    _ => format!(
+                        "SELECT ?g (COUNT(*) AS ?n) WHERE {{ {other} GRAPH ?g {{ {inner} }} }} GROUP BY ?g"
+                    ),
+                };
+                (text, false)
+            } else {
+                random_query(&mut rng)
+            };
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            if !runs_natively(&query) {
+                fallbacks += 1;
+                continue;
+            }
+            let native_in = |options: &QueryOptions| {
+                explain_query(&snapshot, &query, options).unwrap().executor == "native"
+            };
+            native_runs += usize::from(native_in(&native_options));
+            native_runs_plain += usize::from(native_in(&QueryOptions {
+                read_model: model,
+                ..QueryOptions::default()
+            }));
+            let native = rows(
+                evaluate_query(&snapshot, &query, &native_options).unwrap(),
+                ordered,
+            );
+            let context = format!("dataset {dataset_case}, query {query_case}, {model:?}: {text}");
+            if let Some(limit) = limited(&text) {
+                let unlimited = text[..text.rfind(" LIMIT ").unwrap()].to_owned();
+                let query = SparqlParser::new().parse_query(&unlimited).unwrap();
+                let mut all = rows(evaluate_query(&snapshot, &query, &spareval).unwrap(), false);
+                assert_eq!(native.len(), all.len().min(limit), "{context}");
+                for row in &native {
+                    let position = all.iter().position(|r| r == row);
+                    assert!(position.is_some(), "{row} is not a solution: {context}");
+                    all.remove(position.unwrap());
+                }
+            } else {
+                let expected = rows(
+                    evaluate_query(&snapshot, &query, &spareval).unwrap(),
+                    ordered,
+                );
+                assert_eq!(native, expected, "{context}");
+            }
+            checked += 1;
+        }
+    }
+    // The queries must really have run on the native executor (a silent fallback would
+    // compare spareval with itself), and about as often as with the plain default graph:
+    // what hands a query back at run time (unbound join keys) isn't the merge.
+    assert!(
+        checked > 4000
+            && fallbacks * 20 < checked
+            && native_runs * 4 > checked * 3
+            && native_runs * 20 > native_runs_plain * 19,
+        "{checked} checked, {fallbacks} not native by shape, {native_runs} ran natively, \
+         {native_runs_plain} with the plain default graph"
+    );
+}
+
+/// The shortcuts that read counts or probe the index, in the merged default graph, over
+/// data where most statements are held by two or three graphs: `COUNT(*)` of one pattern,
+/// `GROUP BY` with row counts, a streamed `LIMIT`, and an index nested-loop join. Each
+/// statement must count once (the index itself counts one per graph).
+#[test]
+fn merged_default_graph_shortcuts_count_statements_once() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let graphs: [GraphName; 3] = [GraphName::DefaultGraph, ex("g0").into(), ex("g1").into()];
+    let mut statements = 0usize;
+    let mut insert = |subject: NamedNode, predicate: NamedNode, object: NamedNode, i: usize| {
+        statements += 1;
+        // In one, two or all three graphs.
+        for (n, graph) in graphs.iter().enumerate() {
+            if n == i % 3 || i.is_multiple_of(2) || (n == 0 && i.is_multiple_of(5)) {
+                let quad = Quad::new(
+                    subject.clone(),
+                    predicate.clone(),
+                    object.clone(),
+                    graph.clone(),
+                );
+                tx.insert(quad.as_ref());
+            }
+        }
+    };
+    for i in 0..3_000 {
+        insert(ex(&format!("t{i}")), rdf_type.clone(), ex("T"), i);
+        for j in 0..(i % 4) {
+            insert(
+                ex(&format!("t{i}")),
+                ex("p"),
+                ex(&format!("o{}", (i * 7 + j) % 900)),
+                i + j,
+            );
+        }
+    }
+    for i in 0..60_000 {
+        insert(
+            ex(&format!("u{}", i / 4)),
+            ex("p"),
+            ex(&format!("o{}", i % 900)),
+            i,
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let native_options = QueryOptions {
+        union_default_graph: true,
+        ..QueryOptions::default()
+    };
+    let spareval = QueryOptions {
+        force_spareval: true,
+        ..native_options.clone()
+    };
+    // More quads than statements: the copies are there.
+    assert!(snapshot.len() as usize > statements * 3 / 2);
+
+    let run = |text: &str, options: &QueryOptions| {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        assert!(runs_natively(&query), "{text}");
+        rows(evaluate_query(&snapshot, &query, options).unwrap(), false)
+    };
+    let integer = |n: usize| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
+    assert_eq!(
+        run(
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }",
+            &native_options
+        ),
+        [integer(statements)]
+    );
+    for text in [
+        format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?s a <{EX}T> }}"),
+        format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?s <{EX}p> ?o }}"),
+        "SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p".to_owned(),
+        format!("SELECT ?o (COUNT(*) AS ?n) WHERE {{ ?s <{EX}p> ?o }} GROUP BY ?o"),
+        format!("SELECT ?x ?y WHERE {{ ?x a <{EX}T> . ?x <{EX}p> ?y }}"),
+        format!("SELECT ?x ?y WHERE {{ ?x a <{EX}T> OPTIONAL {{ ?x <{EX}p> ?y }} }}"),
+        format!("SELECT ?x ?z WHERE {{ <{EX}t7> <{EX}p> ?y . ?x <{EX}p> ?y . ?x <{EX}p> ?z }}"),
+    ] {
+        let native = run(&text, &native_options);
+        assert!(!native.is_empty(), "{text}");
+        assert_eq!(native, run(&text, &spareval), "{text}");
+        let explained = explain_query(
+            &snapshot,
+            &SparqlParser::new().parse_query(&text).unwrap(),
+            &native_options,
+        )
+        .unwrap();
+        assert_eq!(explained.executor, "native", "{text}");
+    }
+    // The join above must have probed the index: that is the path under test.
+    let probes = explain_query(
+        &snapshot,
+        &SparqlParser::new()
+            .parse_query(&format!(
+                "SELECT ?x ?z WHERE {{ <{EX}t7> <{EX}p> ?y . ?x <{EX}p> ?y . ?x <{EX}p> ?z }}"
+            ))
+            .unwrap(),
+        &native_options,
+    )
+    .unwrap();
+    assert!(
+        probes
+            .steps
+            .iter()
+            .any(|step| step.operator == "index join"),
+        "{:?}",
+        probes
+            .steps
+            .iter()
+            .map(|s| s.operator.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // A streamed LIMIT: that many rows, each a distinct solution of the unlimited query.
+    let limited = format!("SELECT * WHERE {{ <{EX}t7> ?p ?o FILTER(isIRI(?o)) }} LIMIT 3");
+    let all = run(
+        &format!("SELECT * WHERE {{ <{EX}t7> ?p ?o FILTER(isIRI(?o)) }}"),
+        &spareval,
+    );
+    let native = run(&limited, &native_options);
+    assert_eq!(native.len(), all.len().min(3));
+    let distinct: HashSet<&String> = native.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        native.len(),
+        "a statement came out twice: {native:?}"
+    );
+    assert!(native.iter().all(|row| all.contains(row)));
+}
+
+/// Updates whose `WHERE` reads the merged default graph change the store the same way on
+/// both executors. What an update writes or deletes without `GRAPH` is the default graph.
+#[test]
+fn updates_over_the_merged_default_graph_equal_spareval() {
+    use nrese_sparql::{UpdateOptions, apply_update};
+    let mut rng = Rng(20_260_934);
+    let templates = [
+        (
+            "DELETE { ?a ?p ?b }",
+            "INSERT { ?b <http://example.com/q> ?a }",
+        ),
+        ("", "INSERT { GRAPH <http://example.com/g> { ?a ?p ?b } }"),
+        (
+            "DELETE { GRAPH <http://example.com/g0> { ?a ?p ?b } }",
+            "INSERT { ?a <http://example.com/moved> ?b }",
+        ),
+        ("DELETE { ?a ?p ?b }", ""),
+    ];
+    let mut changed = 0;
+    for _ in 0..60 {
+        let engines = [
+            Engine::new(EngineConfig::default()).unwrap(),
+            Engine::new(EngineConfig::default()).unwrap(),
+        ];
+        let seed = rng.0;
+        for engine in &engines {
+            rng.0 = seed;
+            load_spread_over_graphs(engine, &mut rng);
+        }
+        for _ in 0..8 {
+            // Half simple (so that many updates change something), half arbitrary.
+            let pattern = if rng.below(2) == 0 {
+                triple(&mut rng)
+            } else {
+                group_pattern(&mut rng, 0)
+            };
+            let (delete, insert) = *rng.pick(&templates);
+            let text = format!("{delete} {insert} WHERE {{ ?a ?p ?b . {pattern} }}");
+            let update = SparqlParser::new()
+                .parse_update(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let before = contents(&engines[0]);
+            for (engine, force_spareval) in engines.iter().zip([false, true]) {
+                let options = UpdateOptions {
+                    force_spareval,
+                    union_default_graph: true,
+                    ..UpdateOptions::default()
+                };
+                let mut tx = engine.transaction();
+                apply_update(&mut tx, &update, &options).unwrap();
+                tx.commit().unwrap();
+            }
+            let (native, spareval) = (contents(&engines[0]), contents(&engines[1]));
+            assert_eq!(native, spareval, "{text}");
+            changed += usize::from(native != before);
+        }
+    }
+    assert!(changed > 100, "only {changed} updates changed anything");
+}
