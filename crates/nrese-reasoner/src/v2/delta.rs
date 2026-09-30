@@ -40,8 +40,8 @@ use rayon::prelude::*;
 
 use super::batch::{Equality, Store, check, is_replacement_rule, sorted};
 use super::eval::{
-    AllFacts, GroundProgram, Job, RuleKey, Schema, Seg, Source, instantiate_head, rule_key,
-    run_jobs, run_jobs_acyclic, transitive_predicate,
+    AllFacts, GroundProgram, Job, NEVER, RuleKey, Schema, Seg, Source, Stop, instantiate_head,
+    rule_key, run_jobs, run_jobs_acyclic, transitive_predicate,
 };
 use super::ir::{Head, Rule};
 use super::lists::{ListVocabulary, instantiate};
@@ -203,6 +203,27 @@ pub fn update<B: Base + ?Sized>(
     rules: Rules<'_>,
     cache: Option<&GroundProgram>,
 ) -> Update {
+    match update_until(base, inserted, deleted, rules, cache, NEVER) {
+        Ok(update) => update,
+        Err(Interrupted) => unreachable!("NEVER doesn't stop"),
+    }
+}
+
+/// [`update`] stopped by `stop` (the caller gave up, a deadline passed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interrupted;
+
+/// [`update`], polling `stop` between rounds and per job morsel. When it fires, the work
+/// so far is discarded: nothing has been applied, so the state stays as it was.
+pub fn update_until<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: Stop<'_>,
+) -> Result<Update, Interrupted> {
+    let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut result = Update::default();
     let mut clock = std::time::Instant::now();
     let mut lap = |phase: usize, result: &mut Update| {
@@ -265,6 +286,7 @@ pub fn update<B: Base + ?Sized>(
         };
         let mut vanished_done: HashSet<RuleKey> = HashSet::new();
         loop {
+            check_stop()?;
             result.rounds += 1;
             let old = Overlay {
                 base,
@@ -393,7 +415,8 @@ pub fn update<B: Base + ?Sized>(
                     && !extra.contains(f)
                     && !inserted_set.contains(&f)
             };
-            let mut candidates = run_jobs_acyclic(&old, &jobs, &overdeletable);
+            let mut candidates = run_jobs_acyclic(&old, &jobs, &overdeletable, stop);
+            check_stop()?;
             candidates.extend(bodiless.into_iter().filter(|&f| overdeletable(f)));
             candidates.extend(component.into_iter().filter(|&f| overdeletable(f)));
             drop(jobs);
@@ -406,7 +429,8 @@ pub fn update<B: Base + ?Sized>(
                 }
                 candidates.sort_unstable();
                 candidates.dedup();
-                candidates.retain(|&f| !prover.prove(&old, &extra, f, 0).0);
+                candidates.retain(|&f| stop() || !prover.prove(&old, &extra, f, 0).0);
+                check_stop()?;
             }
             let delta = extra.advance(candidates);
             if delta.is_empty() {
@@ -445,10 +469,12 @@ pub fn update<B: Base + ?Sized>(
         .par_iter()
         .copied()
         .filter(|&fact| {
-            !base.is_asserted(fact)
+            !stop()
+                && !base.is_asserted(fact)
                 && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]))
         })
         .collect();
+    check_stop()?;
     let settled_consistency = program.consistency.len();
 
     lap(2, &mut result);
@@ -464,6 +490,7 @@ pub fn update<B: Base + ?Sized>(
     let replaced = |rule: &Rule| module_equality && is_replacement_rule(rule);
     let mut reclose = recloses;
     loop {
+        check_stop()?;
         result.rounds += 1;
         let state = Overlay {
             base,
@@ -505,7 +532,8 @@ pub fn update<B: Base + ?Sized>(
                 jobs.extend(Job::full(&state, rule));
             }
         }
-        candidates.extend(run_jobs(&state, &jobs, &|fact| !state.contains(fact)));
+        candidates.extend(run_jobs(&state, &jobs, &|fact| !state.contains(fact), stop));
+        check_stop()?;
         if let Some(equality) = &mut equality {
             candidates.extend(equality.run(&state));
         }
@@ -544,6 +572,7 @@ pub fn update<B: Base + ?Sized>(
         }
     }
 
+    check_stop()?;
     lap(3, &mut result);
     // The changes to the inferred stack.
     let mut added: Vec<Triple> = Vec::new();
@@ -591,6 +620,7 @@ pub fn update<B: Base + ?Sized>(
         &variants,
         &mut found,
     );
+    check_stop()?;
     result.violations = sorted(found);
     lap(4, &mut result);
     result.diagnostics = program
@@ -604,7 +634,7 @@ pub fn update<B: Base + ?Sized>(
         Cow::Borrowed(_) => None,
     }
     .or(computed);
-    result
+    Ok(result)
 }
 
 /// Backward proofs for B/F deletion (Motik et al., AAAI 2015): a fact is kept if it has a

@@ -339,6 +339,60 @@ mod tests {
         assert_eq!(batch.diagnostics, result.diagnostics);
     }
 
+    /// A stopped update ends at its next check with `Interrupted`, wherever the stop comes:
+    /// between rounds, in a job morsel, in proofs, rederivation or the consistency phase.
+    #[test]
+    fn stopped_updates_are_interrupted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use super::delta::{Interrupted, MemoryBase, Rules, update, update_until};
+        let mut vocabulary = LocalVocabulary::default();
+        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let compiled = Rules {
+            rules: &rules,
+            lists: Some(&lists),
+            schema: &schema,
+        };
+        let mut text: Vec<String> = (0..30)
+            .map(|i| format!("ex:C{i} rdfs:subClassOf ex:C{}", i + 1))
+            .collect();
+        text.extend((0..300).map(|j| format!("ex:x{j} rdf:type ex:D")));
+        text.push("ex:C0 owl:disjointWith ex:E".to_owned());
+        let mut asserted = load(
+            &mut vocabulary,
+            &text.join(
+                "
+",
+            ),
+        );
+        asserted.sort_unstable();
+        let inferred = batch::materialise(&asserted, &rules, Some(&lists), &schema).derived;
+        let added = load(&mut vocabulary, "ex:D rdfs:subClassOf ex:C0");
+        asserted.extend(&added);
+        asserted.sort_unstable();
+        let base = MemoryBase::new(&asserted, &inferred);
+        let full = update(&base, &added, &[], compiled, None);
+        assert!(full.insert.len() > 300 * 30, "{}", full.insert.len());
+
+        let polls = AtomicUsize::new(0);
+        let counting = || {
+            polls.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let counted = update_until(&base, &added, &[], compiled, None, &counting).expect("runs");
+        assert_eq!(counted.insert, full.insert);
+        let n = polls.load(Ordering::Relaxed);
+        assert!(n > 10, "{n} polls");
+        for k in [0, 1, n / 2, n - 1] {
+            let seen = AtomicUsize::new(0);
+            let stop = || seen.fetch_add(1, Ordering::Relaxed) >= k;
+            let result = update_until(&base, &added, &[], compiled, None, &stop);
+            assert_eq!(result.err(), Some(Interrupted), "stop at poll {k} of {n}");
+        }
+    }
+
     /// A commit reports the list axioms it made uninstantiable, and only those: a broken
     /// list already in the state isn't reported again.
     #[test]

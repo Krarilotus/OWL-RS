@@ -544,12 +544,26 @@ impl<'r> Job<'r> {
 
 /// Runs `jobs` in parallel morsels; returns the facts their heads derive that `keep`
 /// accepts (typically: not yet in the source).
+/// Asked between units of work: `true` means stop (the caller gave up). Polling it is an
+/// atomic load in practice, so it is checked per morsel.
+pub type Stop<'a> = &'a (dyn Fn() -> bool + Sync);
+
+fn never() -> bool {
+    false
+}
+
+/// A [`Stop`] that never fires.
+pub const NEVER: Stop<'static> = &never;
+
+/// Every fact `jobs` derive that `keep` accepts. If `stop` fires, the remaining morsels
+/// are skipped and the result is incomplete: the caller must check `stop` and discard it.
 pub fn run_jobs<S: Source + ?Sized>(
     source: &S,
     jobs: &[Job<'_>],
     keep: &(dyn Fn(Triple) -> bool + Sync),
+    stop: Stop<'_>,
 ) -> Vec<Triple> {
-    run_jobs_with(source, jobs, keep, false)
+    run_jobs_with(source, jobs, keep, false, stop)
 }
 
 /// [`run_jobs`] without circular derivations: those whose head is one of their own
@@ -560,8 +574,9 @@ pub fn run_jobs_acyclic<S: Source + ?Sized>(
     source: &S,
     jobs: &[Job<'_>],
     keep: &(dyn Fn(Triple) -> bool + Sync),
+    stop: Stop<'_>,
 ) -> Vec<Triple> {
-    run_jobs_with(source, jobs, keep, true)
+    run_jobs_with(source, jobs, keep, true, stop)
 }
 
 fn run_jobs_with<S: Source + ?Sized>(
@@ -569,6 +584,7 @@ fn run_jobs_with<S: Source + ?Sized>(
     jobs: &[Job<'_>],
     keep: &(dyn Fn(Triple) -> bool + Sync),
     acyclic: bool,
+    stop: Stop<'_>,
 ) -> Vec<Triple> {
     let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
         .iter()
@@ -586,6 +602,9 @@ fn run_jobs_with<S: Source + ?Sized>(
             let Head::Facts(heads) = &job.rule.head else {
                 return Vec::new();
             };
+            if stop() {
+                return Vec::new();
+            }
             let mut out = Vec::new();
             job.run(source, range.clone(), &mut |bindings| {
                 for head in heads {
