@@ -7,6 +7,10 @@
 #   ResearchSpace   http://localhost:10214   (its default login: admin / admin)
 #   NRESE           http://localhost:10215   (console, SPARQL at /dataset/sparql)
 #
+# Both ports are published on localhost only: ResearchSpace starts with a default
+# password and NRESE without authentication. Change the passwords and configure
+# authentication before publishing them elsewhere (NRESE_BIND_IP=0.0.0.0).
+#
 # See docs/integration/researchspace.md for what works and what doesn't yet.
 
 services:
@@ -16,7 +20,7 @@ services:
     image: nrese:local
     restart: unless-stopped
     ports:
-      - "10215:8080"
+      - "${NRESE_BIND_IP:-127.0.0.1}:10215:8080"
     environment:
       # ResearchSpace writes into named graphs and queries without naming them.
       NRESE_DEFAULT_GRAPH: union
@@ -32,7 +36,7 @@ services:
     depends_on:
       - nrese
     ports:
-      - "10214:8080"
+      - "${NRESE_BIND_IP:-127.0.0.1}:10214:8080"
     environment:
       # One URL for queries and updates: NRESE's combined SPARQL endpoint.
       PLATFORM_OPTS: >-
