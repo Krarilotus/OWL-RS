@@ -99,6 +99,7 @@ pub(crate) fn supported(expr: &Expression) -> bool {
                         | Function::Sha512
                 )
                 || matches!(function, Function::Custom(name) if args.len() == 1 && is_cast(name.as_str()))
+                || matches!(function, Function::Custom(name) if super::geo::supported(name.as_str(), args.len()))
                 // BNODE(label) is the same blank node within one solution and a different
                 // one in the next: the evaluator doesn't know solutions apart.
                 || (matches!(function, Function::BNode) && args.is_empty())
@@ -384,6 +385,10 @@ impl Evaluator {
                     _ => hex::encode(Sha512::digest(bytes)),
                 };
                 Some(Literal::new_simple_literal(hash).into())
+            }
+            Function::Custom(name) if name.as_str().starts_with(super::geo::GEOF) => {
+                let values: Option<Vec<Term>> = (0..args.len()).map(arg).collect();
+                super::geo::call(name.as_str(), &values?)
             }
             Function::Custom(name) => cast(name.as_str(), arg(0)?),
             Function::Str => match arg(0)? {
