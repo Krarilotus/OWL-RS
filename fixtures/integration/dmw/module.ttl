@@ -1,0 +1,16 @@
+# A datamodel module as the Datamodel Workflow exports it: classes and properties of one
+# module version, in a graph of its own.
+@prefix ex: <https://example.org/model/petitions#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://example.org/model/petitions> a owl:Ontology ;
+  owl:versionInfo "1.0.0" .
+
+ex:Document a owl:Class .
+ex:Petition a owl:Class ; rdfs:subClassOf ex:Document .
+ex:Person a owl:Class .
+ex:petitioner a owl:ObjectProperty ; rdfs:domain ex:Petition ; rdfs:range ex:Person .
+ex:submittedOn a owl:DatatypeProperty ; rdfs:domain ex:Petition ; rdfs:range xsd:date .
+ex:name a owl:DatatypeProperty ; rdfs:domain ex:Person .

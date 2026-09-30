@@ -20,10 +20,15 @@ pub enum EvalTerm {
     Value(Term),
 }
 
-/// Adapter handed to spareval. Cheap to copy: a reference to the view and the read model.
+/// Adapter handed to spareval. Cheap to copy: a reference to the view, the read model and
+/// what the default graph is.
 pub struct EngineDataset<'a, V> {
     view: &'a V,
     model: ReadModel,
+    /// The default graph is the RDF merge of every graph: a statement counts once, however
+    /// many graphs hold it. (spareval's own union mode repeats it per graph, so the merge
+    /// is done here and spareval sees an ordinary default graph.)
+    union_default: bool,
 }
 
 impl<'a, V> EngineDataset<'a, V> {
@@ -33,7 +38,19 @@ impl<'a, V> EngineDataset<'a, V> {
     }
 
     pub fn with_model(view: &'a V, model: ReadModel) -> Self {
-        Self { view, model }
+        Self {
+            view,
+            model,
+            union_default: false,
+        }
+    }
+
+    /// Whether the default graph is the merge of all graphs (when the query names no
+    /// dataset of its own).
+    #[must_use]
+    pub fn union_default_graph(mut self, union: bool) -> Self {
+        self.union_default = union;
+        self
     }
 }
 
@@ -65,6 +82,23 @@ fn graph_selector(graph: Option<Option<&EvalTerm>>) -> Result<GraphSelector, ()>
     })
 }
 
+/// Whether `quad` is the copy of its statement in the first graph that holds it (graphs
+/// in id order, the default graph first). Keeping only that copy merges the graphs
+/// whatever order a scan returns them in.
+fn is_first_copy<V: ReadView>(view: &V, model: ReadModel, quad: &EncodedQuad) -> bool {
+    if quad.graph.is_default_graph() {
+        return true;
+    }
+    let copies = QuadPattern {
+        subject: Some(quad.subject),
+        predicate: Some(quad.predicate),
+        object: Some(quad.object),
+        graph: GraphSelector::Any,
+    };
+    view.quads_for_pattern_in(model, &copies)
+        .all(|copy| copy.graph >= quad.graph)
+}
+
 fn to_internal(quad: EncodedQuad) -> InternalQuad<EvalTerm> {
     InternalQuad {
         subject: EvalTerm::Stored(quad.subject),
@@ -85,12 +119,19 @@ impl<'a, V: ReadView> QueryableDataset<'a> for EngineDataset<'a, V> {
         object: Option<&EvalTerm>,
         graph_name: Option<Option<&EvalTerm>>,
     ) -> impl Iterator<Item = Result<InternalQuad<EvalTerm>, EngineError>> + use<'a, V> {
+        // The default graph as the merge of all graphs: read every graph, keep each
+        // statement once, and present it as a default-graph statement.
+        let merge = self.union_default && matches!(graph_name, Some(None));
         let pattern = (|| {
             Ok::<_, ()>(QuadPattern {
                 subject: bound(subject)?,
                 predicate: bound(predicate)?,
                 object: bound(object)?,
-                graph: graph_selector(graph_name)?,
+                graph: if merge {
+                    GraphSelector::Any
+                } else {
+                    graph_selector(graph_name)?
+                },
             })
         })();
         let (view, model): (&'a V, ReadModel) = (self.view, self.model);
@@ -98,7 +139,13 @@ impl<'a, V: ReadView> QueryableDataset<'a> for EngineDataset<'a, V> {
             .ok()
             .into_iter()
             .flat_map(move |pattern| view.quads_for_pattern_in(model, &pattern))
-            .map(|quad| Ok(to_internal(quad)))
+            .filter(move |quad| !merge || is_first_copy(view, model, quad))
+            .map(move |mut quad| {
+                if merge {
+                    quad.graph = TermId::DEFAULT_GRAPH;
+                }
+                Ok(to_internal(quad))
+            })
     }
 
     fn internal_named_graphs(

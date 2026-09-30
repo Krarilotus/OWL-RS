@@ -24,7 +24,22 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         shapes_graph: source
             .get(names::SHACL_SHAPES_GRAPH)
             .unwrap_or(defaults.shapes_graph),
+        union_default_graph: parse_default_graph(source.get(names::DEFAULT_GRAPH).as_deref())?,
     })
+}
+
+/// What a query without a dataset reads as its default graph: `default` (only the
+/// default graph, as the SPARQL specification describes a plain dataset) or `union` (the
+/// merge of all graphs, as GraphDB, RDF4J stores and Blazegraph do).
+fn parse_default_graph(input: Option<&str>) -> Result<bool> {
+    match input.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("default") => Ok(false),
+        Some("union") => Ok(true),
+        Some(unknown) => bail!(
+            "unsupported value '{unknown}' in {} (expected 'default' or 'union')",
+            names::DEFAULT_GRAPH
+        ),
+    }
 }
 
 /// Unknown values are a startup error rather than a silent switch to another storage mode.
@@ -67,6 +82,15 @@ mod tests {
             parse_store_mode(Some("on-disk")).unwrap(),
             StoreMode::OnDisk
         );
+    }
+
+    #[test]
+    fn default_graph_parser_knows_two_modes() {
+        use super::parse_default_graph;
+        assert!(!parse_default_graph(None).unwrap());
+        assert!(!parse_default_graph(Some("default")).unwrap());
+        assert!(parse_default_graph(Some("Union")).unwrap());
+        assert!(parse_default_graph(Some("all")).is_err());
     }
 
     #[test]

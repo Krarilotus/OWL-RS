@@ -22,6 +22,9 @@ pub struct StoreConfig {
     pub query_cache_bytes: usize,
     /// The graph that holds the repository's SHACL shapes.
     pub shapes_graph: String,
+    /// The default graph of queries and update `WHERE` clauses that name no dataset is
+    /// the merge of all graphs, not only the default graph.
+    pub union_default_graph: bool,
 }
 
 /// Default query result cache: 64 MiB.
@@ -45,6 +48,7 @@ impl StoreConfig {
             ontology_path: None,
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
+            union_default_graph: false,
         }
     }
 
@@ -55,6 +59,7 @@ impl StoreConfig {
             ontology_path: None,
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
+            union_default_graph: false,
         }
     }
 

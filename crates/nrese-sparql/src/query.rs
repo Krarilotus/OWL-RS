@@ -26,6 +26,10 @@ pub struct QueryOptions {
     /// Which statements the query reads: asserted and inferred (the default), or one
     /// stack (GraphDB's `infer=false`, `FROM onto:explicit` / `onto:implicit`).
     pub read_model: nrese_engine::ReadModel,
+    /// The default graph of a query without a dataset of its own is the merge of all
+    /// graphs (as in GraphDB, RDF4J stores and Blazegraph), not only the default graph.
+    /// Such queries run on spareval for now.
+    pub union_default_graph: bool,
 }
 
 /// Evaluates `query` against `view`. Queries the native executor supports run there
@@ -47,7 +51,10 @@ pub fn evaluate_query<'a, V: ReadView>(
     if let Some(dataset) = &options.dataset {
         *prepared.dataset_mut() = dataset.clone();
     }
-    prepared.execute(EngineDataset::with_model(view, options.read_model))
+    prepared.execute(
+        EngineDataset::with_model(view, options.read_model)
+            .union_default_graph(options.union_default_graph),
+    )
 }
 
 /// A failure while writing results directly ([`write_results`]).

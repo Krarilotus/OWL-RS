@@ -206,8 +206,9 @@ impl StoreService {
         out: impl std::io::Write,
     ) -> StoreResult<()> {
         let snapshot = self.engine.snapshot();
+        let union = self.config.union_default_graph;
         if !self.query_cache.enabled() || prepared.volatile() {
-            return run_query(&snapshot, prepared, cancellation, out);
+            return run_query(&snapshot, prepared, union, cancellation, out);
         }
         let key = crate::query_cache::CacheKey {
             request: prepared.cache_request(),
@@ -223,7 +224,7 @@ impl StoreService {
             copy: Some(Vec::new()),
             limit: self.query_cache.max_entry(),
         };
-        run_query(&snapshot, prepared, cancellation, &mut tee)?;
+        run_query(&snapshot, prepared, union, cancellation, &mut tee)?;
         if let Some(copy) = tee.copy {
             self.query_cache.insert(key, copy);
         }
@@ -237,7 +238,12 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::Explanation> {
-        explain_prepared(&self.engine.snapshot(), prepared, cancellation)
+        explain_prepared(
+            &self.engine.snapshot(),
+            prepared,
+            self.config.union_default_graph,
+            cancellation,
+        )
     }
 
     pub fn execute_query_str(&self, query: &str) -> StoreResult<SerializedQueryResult> {
@@ -252,7 +258,11 @@ impl StoreService {
     pub fn apply(&self, command: &MutationCommand) -> StoreResult<MutationCommitReport> {
         self.invalidate_reasoning()?;
         let mut tx = self.engine.transaction();
-        let report = command.apply(&mut tx, &CancellationToken::new())?;
+        let report = command.apply(
+            &mut tx,
+            &CancellationToken::new(),
+            self.config.union_default_graph,
+        )?;
         let summary = tx.commit()?;
         Ok(report.committed(summary.revision))
     }

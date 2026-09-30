@@ -25,6 +25,8 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 
 Other parameters are ignored, so clients that send their own (`queryLn`, `timeout`) work.
 
+Without dataset parameters and `FROM` clauses, a query reads the default graph, or the merge of all graphs if the server is configured with `store.default_graph = "union"` ([config-reference.md](config-reference.md)). `/version` says which.
+
 **Updates:**
 - `POST` with a form and an `update` field
 - `POST` with `Content-Type: application/sparql-update` and the update as the body

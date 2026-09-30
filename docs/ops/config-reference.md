@@ -127,6 +127,18 @@ api_key = "replace-me"
 - env override: `NRESE_DATA_DIR`
 - default: `./data`
 
+- file key: `store.default_graph`
+- env override: `NRESE_DEFAULT_GRAPH`
+- values: `default` (the default), `union`
+- what a query, or an update's `WHERE`, reads when it names no dataset:
+  - `default`: only the default graph, as the SPARQL specification describes a plain dataset;
+  - `union`: the merge of all graphs, as GraphDB, RDF4J stores and Blazegraph do. A statement counts once, however many graphs hold it.
+- use `union` for clients that write into named graphs and query without naming them (ResearchSpace, the Datamodel Workflow's exports)
+- `GRAPH` patterns, `FROM` clauses and the protocol's dataset parameters mean the same in both modes
+- an update without `GRAPH` still writes to, and deletes from, the default graph only
+- cost today: in `union` mode queries run on the general evaluator, not the native executor, so they are slower; native support is the next step for this setting
+- `/version` reports the mode as `default_graph`
+
 - file key: `shacl.shapes_graph`
 - env override: `NRESE_SHACL_SHAPES_GRAPH`
 - default: `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph` (the graph RDF4J and GraphDB use)
