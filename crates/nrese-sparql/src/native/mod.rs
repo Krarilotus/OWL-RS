@@ -34,7 +34,8 @@ use std::time::Instant;
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
-    anti_join, join, join_keeping_left_order, join_with_undef, left_join, semi_join,
+    anti_join, compatible_mask, join, join_keeping_left_order, join_with_undef, left_join,
+    outer_join_with_undef, semi_join,
 };
 use nrese_exec::{
     Budget, BudgetExceeded, IdTable, UNDEF, computed_id, computed_index, group::group_rows,
@@ -1081,10 +1082,15 @@ impl<'a> Context<'a> {
                 if lk.is_empty() {
                     return Ok(left);
                 }
-                if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
-                    return Err(NativeError::Fallback);
-                }
-                let table = anti_join(&left.table, &right.table, &lk, &rk);
+                let table = if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
+                    // A row goes if a compatible row shares a variable both bind.
+                    let removed = compatible_mask(&left.table, &right.table, &lk, &rk, true);
+                    let mut table = left.table.clone();
+                    table.retain_mask(&removed.iter().map(|r| !r).collect::<Vec<_>>());
+                    table
+                } else {
+                    anti_join(&left.table, &right.table, &lk, &rk)
+                };
                 self.consumed(&right);
                 self.produced(Solutions {
                     vars: left.vars,
@@ -1939,9 +1945,10 @@ impl<'a> Context<'a> {
         let max_rows = self.max_rows(vars.len());
         let table = if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
             if left.ordered {
-                return Err(NativeError::Fallback);
+                outer_join_with_undef(&left.table, &right.table, &lk, &rk, None, false, max_rows)
+            } else {
+                join_with_undef(&left.table, &right.table, &lk, &rk, max_rows)
             }
-            join_with_undef(&left.table, &right.table, &lk, &rk, max_rows)
         } else if left.ordered {
             join_keeping_left_order(&left.table, &right.table, &lk, &rk, max_rows)
         } else {
@@ -1965,24 +1972,24 @@ impl<'a> Context<'a> {
         expression: Option<&Expression>,
     ) -> NativeResult<Solutions> {
         let (lk, rk) = shared_columns(&left, &right);
-        if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
-            return Err(NativeError::Fallback);
-        }
+        // A variable that may be unbound on either side (from an earlier OPTIONAL) is
+        // compatible with any value and takes it.
+        let unbound_keys = has_undef(&left.table, &lk) || has_undef(&right.table, &rk);
         let vars = joined_vars(&left, &right, &rk);
         let hash_table = self.charge_hash_table(right.table.len())?;
         let max_rows = self.max_rows(vars.len());
-        let table = match expression {
-            None => left_join(&left.table, &right.table, &lk, &rk, None, max_rows),
-            Some(expression) => {
-                let accept = |row: &[u64]| {
-                    let binding = |v: &Variable| {
-                        let column = vars.iter().position(|x| x == v)?;
-                        self.term(row[column])
-                    };
-                    self.evaluator.filter(expression, &binding)
-                };
-                left_join(&left.table, &right.table, &lk, &rk, Some(&accept), max_rows)
-            }
+        let accept = |row: &[u64]| {
+            let binding = |v: &Variable| {
+                let column = vars.iter().position(|x| x == v)?;
+                self.term(row[column])
+            };
+            expression.is_none_or(|expression| self.evaluator.filter(expression, &binding))
+        };
+        let accept: Option<&dyn Fn(&[u64]) -> bool> = expression.is_some().then_some(&accept);
+        let table = if unbound_keys {
+            outer_join_with_undef(&left.table, &right.table, &lk, &rk, accept, true, max_rows)
+        } else {
+            left_join(&left.table, &right.table, &lk, &rk, accept, max_rows)
         }
         .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
         self.budget.release(hash_table);
@@ -2221,10 +2228,18 @@ impl<'a> Context<'a> {
     ) -> NativeResult<Solutions> {
         let inner = self.eval(pattern)?;
         let (lk, rk) = shared_columns(&solutions, &inner);
-        if has_undef(&solutions.table, &lk) {
-            return Err(NativeError::Fallback);
-        }
-        let table = if keep_matching {
+        let table = if has_undef(&solutions.table, &lk) || has_undef(&inner.table, &rk) {
+            // An unbound variable isn't substituted into the pattern: any value matches.
+            let found = compatible_mask(&solutions.table, &inner.table, &lk, &rk, false);
+            let mut table = solutions.table.clone();
+            table.retain_mask(
+                &found
+                    .iter()
+                    .map(|f| *f == keep_matching)
+                    .collect::<Vec<_>>(),
+            );
+            table
+        } else if keep_matching {
             semi_join(&solutions.table, &inner.table, &lk, &rk)
         } else {
             anti_join(&solutions.table, &inner.table, &lk, &rk)
