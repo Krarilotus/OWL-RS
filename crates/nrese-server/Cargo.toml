@@ -15,7 +15,9 @@ mimalloc = { version = "0.1", default-features = false }
 nrese-core = { path = "../nrese-core" }
 nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-store = { path = "../nrese-store" }
-reqwest = { version = "0.12.24", features = ["json", "rustls-tls"] }
+# rustls only (no OpenSSL: the binary needs no system TLS library), trusting the bundled
+# roots and the machine's CA store (an identity provider with an internal certificate).
+reqwest = { version = "0.12.24", default-features = false, features = ["charset", "http2", "json", "rustls-tls", "rustls-tls-native-roots"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_urlencoded = "0.7.1"
