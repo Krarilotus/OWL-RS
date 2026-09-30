@@ -187,6 +187,22 @@ Owner request of 30 September 2026. The parity phases stay as they are; this is 
 
 U1 to U4 make a prototype both can run against. U5 to U7 remove the remaining workarounds (regex-based search templates in ResearchSpace; validation only on request for DMW).
 
+## 5b. What a real integration workload asks of the engine
+
+Found on 30 September 2026 with the RG × GS × GND integration workload ([benches/integration](../../benches/integration/README.md); measurements in [reasoning-benchmark.md](../design/reasoning-benchmark.md), §7): persons of three sources linked by `owl:sameAs`, reasoned under OWL 2 RL, queried with the project's competency questions. The workload is small on its example data (66 k statements after reasoning) and already showed each of these.
+
+| Step | Scope | Done when |
+|---|---|---|
+| X1 ✅ | `HAVING` may name a `SELECT` alias (a query returned no rows here and rows on Fuseki) | `compat.rs`; unit tests and a store test |
+| X2 ✅ | Filter pushdown below joins, OPTIONAL, UNION, MINUS, BIND and into subqueries. Two questions ran out of the memory budget or took 11 s because a group's filters ran after its joins | `native/pushdown.rs`; 3,600-query differential test, each rule mutation-checked. CQ06 11 s → 2.5 ms, CQ08 from "memory budget exceeded" to 0.28 s |
+| X3 | **One join order per group.** Triple patterns are ordered by cost only within a basic graph pattern; a property path or a subquery splits the group, and the parts are joined as written. Paths with a bound end must be evaluated from that end: `?x (owl:sameAs\|^owl:sameAs)* ?y` is computed for all 9,099 pairs to keep 4 | The group's patterns, paths and subpatterns are ordered together; a path joined to bound values starts from them. Differential tests; the questions' plans show it |
+| X4 | **Equality by representatives.** OWL 2 RL's equality rules copy every statement to every identity of its terms: 883 `owl:sameAs` statements for 65 resources, and answers repeated per identity. Keep one representative per identity group in the inferred stack and expand in answers on request, as a reasoning mode (GraphDB and RDFox document this optimisation). Belongs with the profiles of phase B | Closure and answers equal the replicated ones after expansion (property test); closure size and the questions' times recorded |
+| X5 | **Aggregates over independent OPTIONALs without their product.** CQ05 joins a person's dates, places, affiliations and co-mentions and then counts and concatenates distinct values: about 10¹⁰ rows on the example data. Its aggregates ignore duplicates, so each can be computed on its own branch | CQ05 answers within the memory budget; differential test for the rewrite |
+| X6 | **Bounded memory for large intermediate results.** The executor builds each operator's result as a table. A query that fails at the 4 GiB budget had the server at 5.8 GB. Pipelined execution through joins into aggregation, and admission control over all running queries (E4) | Peak memory of the question mix stays within the configured budget |
+| X7 | **Types in unnamed classes.** With the GND ontology, 120,627 of 219,840 inferred statements say that a resource is a member of an unnamed `owl:unionOf` class (the ontology's domains and ranges). A mode that derives such a membership only where a rule or a query needs it | Inferred set equal on named classes; closure size recorded |
+
+Order: X3 first (it decides whether the larger tiers answer at all), then X4 with phase B, then X6, X5, X7.
+
 ## 6. Owner decisions (30 September 2026)
 
 1. **Dependencies for the specialised indexes (F1–F3): use libraries, replace what underperforms.**
