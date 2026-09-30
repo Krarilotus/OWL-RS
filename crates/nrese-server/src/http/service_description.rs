@@ -1,6 +1,6 @@
 use crate::runtime_posture::{
     GRAPH_STORE_ENDPOINT, METRICS_ENDPOINT, OPERATOR_UI_PATH, QUERY_ENDPOINT,
-    SERVICE_DESCRIPTION_ENDPOINT, SPARQL_ENDPOINT, TELL_ENDPOINT, UPDATE_ENDPOINT,
+    SERVICE_DESCRIPTION_ENDPOINT, SHACL_ENDPOINT, SPARQL_ENDPOINT, TELL_ENDPOINT, UPDATE_ENDPOINT,
 };
 use crate::state::AppState;
 
@@ -47,6 +47,7 @@ pub fn build_service_description(state: &AppState) -> String {
 {update_endpoint}\
 {tell_endpoint}\
    nrese:graphStoreEndpoint <{GRAPH_STORE_ENDPOINT}> ;\n\
+   nrese:shaclEndpoint <{SHACL_ENDPOINT}> ;\n\
 {metrics_endpoint}\
 {operator_endpoint}\
    nrese:reasoningMode \"{reasoning_mode}\" ;\n\

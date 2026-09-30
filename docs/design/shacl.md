@@ -32,7 +32,7 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 - **What is validated** is a graph selection plus a read model:
   - graphs: the default graph, one named graph, or every graph except the shapes graph (the default for the commit gate);
   - read model: asserted and inferred statements (the default, so `sh:class` sees inferred types), or asserted only.
-- A shapes graph given with a request (validate-only) is loaded into a scratch graph of a snapshot-local overlay; it isn't stored. (C1b.)
+- A shapes graph given with a request (validate-only) is put into a graph of a transaction that is never committed, so it shares the repository's dictionary like stored shapes and leaves nothing behind. That transaction holds the writer while it validates; a snapshot-local overlay would avoid that and is the follow-up.
 
 ## 4. Compilation
 
@@ -109,7 +109,7 @@ This slice needs the per-repository configuration of D1 first.
 | Slice | Scope | Done when |
 |---|---|---|
 | C1a ✅ | `nrese-shacl`: compiler, all Core components, paths, targets, severities, report | W3C Core suite passes: 98 of 98, no listed failures |
-| C1b | Store operation and server endpoint: validate the repository, or a posted shapes graph, and return the report; configuration | HTTP tests; the report round-trips as RDF |
+| C1b ✅ | Store operation and server endpoint: validate the repository, or a posted shapes graph, and return the report; configuration | HTTP tests; the report round-trips as RDF |
 | C1c | Parallel and set-at-a-time evaluation | Same reports as C1a on the suite and on random data; perf-lab numbers recorded |
 | C2 | Commit gate, incremental validation, policy, cancellation | Differential test; a rejected commit changes nothing |
 | C3 | SHACL-SPARQL constraints and targets | W3C SHACL-SPARQL tests |

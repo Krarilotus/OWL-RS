@@ -21,6 +21,9 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             names::QUERY_CACHE_BYTES,
             nrese_store::DEFAULT_QUERY_CACHE_BYTES,
         )?,
+        shapes_graph: source
+            .get(names::SHACL_SHAPES_GRAPH)
+            .unwrap_or(defaults.shapes_graph),
     })
 }
 

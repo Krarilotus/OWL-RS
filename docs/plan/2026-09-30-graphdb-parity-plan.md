@@ -33,7 +33,7 @@ Legend: ✅ done · 🟡 partial · ❌ missing · ➖ deliberately different.
 | 2.1 | Rules compiled to id-level code | ✅ | Schema-grounded rule instances, dispatch index, parallel joins |
 | 2.2 | Semi-naive fixpoint, consistency rules | ✅ | Batch = naive on 400 random ontologies |
 | 2.3 | TMS, retraction, atomic rollback | ✅ | DRed + B/F; incremental = rematerialisation on 84 k random changes |
-| 3.1–3.2 | SHACL Core, SHACL-SPARQL, commit gate, incremental validation | 🟡 | The Core validator is built (`nrese-shacl`, W3C Core 98 of 98). Not yet: endpoint, commit gate, incremental validation, SHACL-SPARQL. Design: [shacl.md](../design/shacl.md) |
+| 3.1–3.2 | SHACL Core, SHACL-SPARQL, commit gate, incremental validation | 🟡 | The Core validator is built (`nrese-shacl`, W3C Core 98 of 98) and served at `/dataset/shacl`. Not yet: commit gate, incremental validation, SHACL-SPARQL. Design: [shacl.md](../design/shacl.md) |
 | 4.1 | SPARQL 1.1 Query, Update | ✅ | W3C suite 485/495; native executor covers almost all queries |
 | 4.1 | Federated `SERVICE` | ❌ | X2 (with SSRF guards) |
 | 4.1 | Graph Store Protocol | 🟡 | Works; status codes for missing graphs differ from the spec (review) |
@@ -102,7 +102,7 @@ GraphDB's value is its rulesets. Ours are data (rule text), so breadth is mostly
 | Slice | Scope | Done when |
 |---|---|---|
 | C1a ✅ | `nrese-shacl` crate: shapes compiled to an id-level program; SHACL Core components, all property paths, severities; the report as a graph | W3C SHACL Core suite: 98 of 98 |
-| C1b | Store operation and server endpoint: validate the repository, or a posted shapes graph; the report as RDF and JSON; configuration | HTTP tests; the report round-trips as RDF |
+| C1b ✅ | Store operation and server endpoint: validate the repository, or a posted shapes graph; the report as RDF and JSON; configuration | HTTP tests; the report round-trips as RDF (`shacl_api_tests.rs`) |
 | C1c | Parallel and set-at-a-time evaluation | Same reports as C1a; perf-lab numbers recorded |
 | C2 | Commit gate after reasoning, in store orchestration; a target index; incremental validation from Δ⁺/Δ⁻ | Incremental = full revalidation on random deltas; cost proportional to affected focus nodes |
 | C3 | SHACL-SPARQL constraints and targets through `nrese-sparql` | W3C SHACL-SPARQL tests |
@@ -177,7 +177,7 @@ Owner request of 30 September 2026. The parity phases stay as they are; this is 
 | Step | For | Scope | Done when |
 |---|---|---|---|
 | U1 ✅ | both | The HTTP surface as real clients use it: content negotiation with weights and wildcards; one SPARQL endpoint for queries and updates; `using-graph-uri`; Graph Store status codes (D5); N-Quads, TriG and JSON-LD for graph results | Protocol tests with RDF4J's and common HTTP clients' request shapes (`client_compat_tests.rs`); reference: [http-api.md](../ops/http-api.md) |
-| U2 | DMW | SHACL validation over HTTP (C1b): the repository's shapes graph, or shapes sent with the request | A report as RDF and JSON for DMW's shapes |
+| U2 ✅ | DMW | SHACL validation over HTTP (C1b): the repository's shapes graph, or shapes sent with the request | A report as RDF and JSON for DMW's shapes |
 | U3 | both | The package: a container image with the console, a compose file with ResearchSpace, a quickstart, one integration guide per consumer | A clean machine reaches a working setup from the guide |
 | U4 | both | Smoke tests against the real clients: the ResearchSpace platform in Docker on NRESE; DMW's export protocol replayed (export, re-export, provenance query, validation) | Both run from a script; what doesn't work yet is listed |
 | U5 | ResearchSpace | Full-text search and the `bds:search` shim (F1) | ResearchSpace's keyword search works on its stock templates |

@@ -8,6 +8,7 @@ license.workspace = true
 nrese-core = { path = "../nrese-core" }
 nrese-engine = { path = "../nrese-engine" }
 nrese-reasoner = { path = "../nrese-reasoner" }
+nrese-shacl = { path = "../nrese-shacl" }
 nrese-sparql = { path = "../nrese-sparql" }
 oxrdf = "=0.3.3"
 oxrdfio = "=0.2.4"

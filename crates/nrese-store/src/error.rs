@@ -26,6 +26,9 @@ pub enum StoreError {
     InvalidGraphIri(String),
     #[error("RDF parse error: {0}")]
     RdfParse(#[from] RdfParseError),
+    /// The shapes graph is ill-formed; one message per problem.
+    #[error("ill-formed SHACL shapes: {}", .0.join("; "))]
+    ShaclShapes(Vec<String>),
     #[error("RDF parse error in {}: {source}", path.display())]
     FileParse {
         path: PathBuf,
@@ -55,6 +58,7 @@ impl StoreError {
             | Self::SparqlUpdate(_)
             | Self::InvalidGraphIri(_)
             | Self::RdfParse(_)
+            | Self::ShaclShapes(_)
             | Self::FileParse { .. } => true,
             Self::SparqlEvaluation(error) => !matches!(
                 error,

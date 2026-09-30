@@ -1058,6 +1058,7 @@ dependencies = [
  "nrese-core",
  "nrese-engine",
  "nrese-reasoner",
+ "nrese-shacl",
  "nrese-sparql",
  "oxrdf",
  "oxrdfio",

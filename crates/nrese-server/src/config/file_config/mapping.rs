@@ -24,6 +24,12 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> KeyValueSource {
         config.store.query_cache_bytes,
     );
 
+    insert_option(
+        &mut source,
+        names::SHACL_SHAPES_GRAPH,
+        config.shacl.shapes_graph,
+    );
+
     insert_option(&mut source, names::REASONING_MODE, config.reasoner.mode);
 
     insert_numeric(

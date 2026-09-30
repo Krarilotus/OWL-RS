@@ -18,6 +18,7 @@ mod rdf_io;
 pub mod reasoning;
 pub mod reasoning_state;
 pub mod service;
+pub mod shacl;
 mod stats;
 mod tell;
 pub mod update;
@@ -27,7 +28,7 @@ pub use backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
 };
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest};
-pub use config::{DEFAULT_QUERY_CACHE_BYTES, StoreConfig, StoreMode};
+pub use config::{DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, StoreConfig, StoreMode};
 pub use delta::MutationDeltaPreview;
 pub use error::{StoreError, StoreResult};
 pub use graph_store::{
@@ -40,6 +41,7 @@ pub use mutation::{
     RejectAttributionCandidate,
 };
 pub use nrese_engine::{EngineError, ReadModel};
+pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{CancellationToken, Explanation, PlanStep, QueryEvaluationError};
 pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
@@ -50,6 +52,9 @@ pub use query_executor::PreparedQuery;
 pub use reasoning::{MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
 pub use service::StoreService;
+pub use shacl::{
+    ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource, ValidatedGraphs,
+};
 pub use stats::StoreStats;
 pub use tell::TellRequest;
 pub use update::{SparqlUpdateRequest, UpdateExecutionReport};
