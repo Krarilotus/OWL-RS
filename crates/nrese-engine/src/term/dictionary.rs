@@ -69,6 +69,9 @@ pub(crate) struct Base {
     /// Open addressing with linear probing by [`key_hash`]: entry index + 1, or 0 for an
     /// empty slot; a power of two long, with at least one empty slot.
     pub(crate) slots: Mapped<u32>,
+    /// The entries with a text, sorted by it ([`super::order`]); `None` in checkpoints
+    /// written before format 7.
+    pub(crate) order: Option<Mapped<u32>>,
 }
 
 impl Base {
@@ -99,7 +102,8 @@ impl Base {
     }
 
     fn bytes(&self) -> u64 {
-        (self.arena.len() + self.ends.len() * 8 + self.slots.len() * 4) as u64
+        let order = self.order.as_ref().map_or(0, |order| order.len() * 4);
+        (self.arena.len() + self.ends.len() * 8 + self.slots.len() * 4 + order) as u64
     }
 
     /// Checks every key and that the hash table finds each entry: reads all of the base.
@@ -112,6 +116,19 @@ impl Base {
             validate_key(key).map_err(|error| format!("dictionary entry {index}: {error}"))?;
             if self.find(key_hash(key), key) != Some(index) {
                 return Err(format!("the dictionary's hash table misses entry {index}"));
+            }
+        }
+        if let Some(order) = &self.order {
+            let text = |index: u32| {
+                (u64::from(index) < self.len)
+                    .then(|| super::order::text_of(self.key(u64::from(index))))
+                    .flatten()
+            };
+            for pair in order.windows(2) {
+                match (text(pair[0]), text(pair[1])) {
+                    (Some(a), Some(b)) if (a, pair[0]) < (b, pair[1]) => {}
+                    _ => return Err("the dictionary's text order is out of order".into()),
+                }
             }
         }
         Ok(())
@@ -210,6 +227,8 @@ pub struct Dictionary {
     text: RwLock<super::text::TextIndex>,
     /// Built at the first triple-term match, extended at later ones.
     triples: RwLock<TripleIndex>,
+    /// The text order of the entries the mapped base doesn't order ([`super::order`]).
+    order: RwLock<super::order::TextOrder>,
 }
 
 impl std::fmt::Debug for Dictionary {
@@ -391,6 +410,15 @@ impl Dictionary {
     /// The ids of the entries `0..limit` whose text passes `test`, sorted: one parallel
     /// substring search over the arena ([`super::strings`]).
     pub fn matching_strings(&self, test: &super::StringTest<'_>, limit: u64) -> Vec<TermId> {
+        // A prefix: a range of the text order, where it is at hand.
+        if matches!(
+            test.placement,
+            super::Placement::Start | super::Placement::Whole
+        ) && !test.needle.is_empty()
+            && self.text_order_ready()
+        {
+            return self.prefix_matches(test, limit);
+        }
         let inner = self.inner.read();
         let base_len = inner.base_len();
         let mut ids = match &inner.base {
@@ -408,6 +436,90 @@ impl Dictionary {
         }
         ids.sort_unstable();
         ids
+    }
+
+    /// Whether a prefix search is a few binary searches: the entries are in text order
+    /// (the mapped base's, and the others' in memory), or few enough to sort on the way.
+    pub fn text_order_ready(&self) -> bool {
+        const SORTED_ON_THE_WAY: u64 = 1 << 20;
+        let inner = self.inner.read();
+        let first = match &inner.base {
+            Some(base) if base.order.is_some() => base.len,
+            Some(_) => 0,
+            None => 0,
+        };
+        let order = self.order.read();
+        let covered = if order.first == first {
+            order.covered
+        } else {
+            first
+        };
+        inner.len().saturating_sub(covered) <= SORTED_ON_THE_WAY
+    }
+
+    /// The entries below `limit` that pass `test`, a prefix test, from the text order.
+    fn prefix_matches(&self, test: &super::StringTest<'_>, limit: u64) -> Vec<TermId> {
+        let inner = self.inner.read();
+        let key = |index: u64| inner.key(index);
+        let needle = test.needle.as_bytes();
+        let mut candidates: Vec<u64> = Vec::new();
+        let first = match inner.base.as_ref().and_then(|base| base.order.as_ref()) {
+            Some(order) => {
+                let (start, end) = super::order::prefix_range(order, &key, needle);
+                candidates.extend(order[start..end].iter().map(|&i| u64::from(i)));
+                inner.base_len()
+            }
+            None => 0,
+        };
+        {
+            let mut order = self.order.write();
+            order.extend(first, inner.len(), &key);
+            let (start, end) = super::order::prefix_range(&order.order, &key, needle);
+            candidates.extend_from_slice(&order.order[start..end]);
+        }
+        let mut ids: Vec<TermId> = candidates
+            .into_iter()
+            .filter(|&index| index < limit)
+            .filter_map(|index| super::strings::passes(key(index), index, 0, test))
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The text order of the entries `0..len` as checkpoint indices: the mapped base's
+    /// order merged with the in-memory order of the others (sorting what isn't yet).
+    pub(crate) fn text_order(&self, len: u64) -> Vec<u32> {
+        let inner = self.inner.read();
+        let key = |index: u64| inner.key(index);
+        let text = |index: u64| super::order::text_of(key(index)).unwrap_or_default();
+        let (base, first): (&[u32], u64) =
+            match inner.base.as_ref().and_then(|base| base.order.as_ref()) {
+                Some(order) => (order, inner.base_len()),
+                None => (&[], 0),
+            };
+        let mut order = self.order.write();
+        order.extend(first, inner.len(), &key);
+        let rest: Vec<u64> = order.order.iter().copied().filter(|&i| i < len).collect();
+        drop(order);
+        let base: Vec<u64> = base
+            .iter()
+            .map(|&i| u64::from(i))
+            .filter(|&i| i < len)
+            .collect();
+        let mut merged = Vec::with_capacity(base.len() + rest.len());
+        let (mut i, mut j) = (0, 0);
+        while i < base.len() && j < rest.len() {
+            if (text(base[i]), base[i]) <= (text(rest[j]), rest[j]) {
+                merged.push(base[i] as u32);
+                i += 1;
+            } else {
+                merged.push(rest[j] as u32);
+                j += 1;
+            }
+        }
+        merged.extend(base[i..].iter().map(|&i| i as u32));
+        merged.extend(rest[j..].iter().map(|&i| i as u32));
+        merged
     }
 
     /// Decodes an id back into a term. Returns `None` for ids that do not belong to this

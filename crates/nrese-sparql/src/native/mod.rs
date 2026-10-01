@@ -2007,7 +2007,11 @@ impl<'a> Context<'a> {
                     continue;
                 };
                 let rows = self.snapshot.count_in(self.model, &s.quad_pattern());
-                if rows < self.snapshot.dictionary_bytes() / strings::DICTIONARY_BYTES_PER_ROW
+                // A prefix found by binary search in the text order costs nothing worth
+                // weighing; otherwise the dictionary pass must be worth its size.
+                let cheap = condition.is_prefix() && self.snapshot.text_order_ready();
+                if (!cheap
+                    && rows < self.snapshot.dictionary_bytes() / strings::DICTIONARY_BYTES_PER_ROW)
                     || rows > smallest.saturating_mul(PROBE_FACTOR)
                 {
                     continue;
