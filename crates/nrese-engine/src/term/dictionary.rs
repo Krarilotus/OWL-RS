@@ -703,6 +703,32 @@ impl Dictionary {
         Ok(())
     }
 
+    /// Serves the entries `0..base.len` from `base`, a checkpoint of them that this engine
+    /// has written, instead of from memory or an older checkpoint; later entries stay in
+    /// memory. `false` (and nothing changes) if the dictionary already uses a longer base.
+    pub(crate) fn rebase(&self, base: Base) -> EngineResult<bool> {
+        let mut inner = self.inner.write();
+        let len = base.len;
+        if len <= inner.base_len() {
+            return Ok(false);
+        }
+        if len > inner.len() || base.key(len - 1) != inner.key(len - 1) {
+            return Err(EngineError::Corruption(
+                "a checkpoint's dictionary doesn't match the dictionary".to_owned(),
+            ));
+        }
+        let mut next = Inner {
+            base: Some(base),
+            ..Inner::default()
+        };
+        for index in len..inner.len() {
+            let key = inner.key(index);
+            next.push(key, key_hash(key));
+        }
+        *inner = next;
+        Ok(true)
+    }
+
     /// Restores a checkpoint's dictionary into this empty one: `keys` in id order. Keys are
     /// validated and hashed in parallel, appended to the arena at once and indexed in a
     /// table sized up front; a duplicate key is corruption.

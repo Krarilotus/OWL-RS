@@ -16,7 +16,9 @@
 //! Restart maps the file and uses all of that in place ([`crate::mapped`]): the dictionary
 //! as the dictionary's base, the packed bits as the index runs' data. That is most of a
 //! store, and it stays in the file, read by the OS as queries touch it, instead of being
-//! copied to the heap and hashed again.
+//! copied to the heap and hashed again. A running engine does the same with a checkpoint
+//! it has just written ([`map_written`]), so after a bulk load or a background checkpoint
+//! memory holds what queries touch, as after a restart.
 //!
 //! Format 5 had the dictionary as `len u64 | (key_len u32, key)*` and no padding (it is
 //! copied into memory); format 4 stored the stacks as quad lists (`quad_count u64 | (s p o
@@ -35,6 +37,7 @@ use std::path::{Path, PathBuf};
 use super::codec::{Reader, put_u32, put_u64};
 use crate::engine::{Snapshot, Stack};
 use crate::error::{EngineError, EngineResult};
+use crate::index::IndexVersion;
 use crate::index::keys::PackedKeys;
 use crate::mapped::{Map, Mapped};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation};
@@ -259,6 +262,12 @@ fn read_dictionary(reader: &mut Reader<'_>, map: &Map, with_order: bool) -> Resu
     Ok(base)
 }
 
+/// Whether there is a checkpoint of `revision` (its content is that revision's: a committed
+/// revision is never reused).
+pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
+    checkpoint_path(dir, revision, EXTENSION).exists()
+}
+
 /// Writes a checkpoint of `snapshot` and returns its path.
 pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
     let revision = snapshot.revision();
@@ -391,29 +400,8 @@ pub(crate) fn load_latest(
     }
     lap("dictionary");
     if packed {
-        let mut stacks: [Vec<(Permutation, PackedKeys)>; 2] = Default::default();
-        for stack in &mut stacks {
-            let count = reader.u32().ok_or_else(|| corrupt("truncated stack"))?;
-            for _ in 0..count {
-                let id = reader.bytes(1).ok_or_else(|| corrupt("truncated stack"))?[0];
-                let permutation = *Permutation::ALL
-                    .get(id as usize)
-                    .ok_or_else(|| corrupt("unknown permutation"))?;
-                let rest = reader.bytes(reader.remaining()).expect("remaining bytes");
-                let at = (rest.as_ptr() as usize - bytes.as_ptr() as usize) as u64;
-                let (keys, used) = if aligned {
-                    PackedKeys::read(rest, Some(at), Some(&map), verify)
-                } else {
-                    PackedKeys::read(rest, None, None, true)
-                }
-                .map_err(|error| corrupt(&error))?;
-                reader = Reader::new(&rest[used..]);
-                stack.push((permutation, keys));
-            }
-        }
-        if !reader.is_done() {
-            return Err(corrupt("trailing bytes"));
-        }
+        let stacks = read_stacks(&mut reader, bytes, aligned.then_some(&map), verify)
+            .map_err(|error| corrupt(&error))?;
         lap("packed permutations");
         return Ok(Some(Loaded {
             revision,
@@ -440,6 +428,68 @@ pub(crate) fn load_latest(
         revision,
         stacks: Stacks::Quads { quads, inferred },
     }))
+}
+
+/// Reads the stacks (module docs) from `reader`, positioned after the dictionary, to the
+/// end of `bytes`, the file's body: used in place from `map` where given (format 6 on), else
+/// copied and checked.
+fn read_stacks<'a>(
+    reader: &mut Reader<'a>,
+    bytes: &'a [u8],
+    map: Option<&Map>,
+    verify: bool,
+) -> Result<[Vec<(Permutation, PackedKeys)>; 2], String> {
+    let mut stacks: [Vec<(Permutation, PackedKeys)>; 2] = Default::default();
+    for stack in &mut stacks {
+        let count = reader.u32().ok_or("truncated stack")?;
+        for _ in 0..count {
+            let id = reader.bytes(1).ok_or("truncated stack")?[0];
+            let permutation = *Permutation::ALL
+                .get(id as usize)
+                .ok_or("unknown permutation")?;
+            let rest = reader.bytes(reader.remaining()).expect("remaining bytes");
+            let at = (rest.as_ptr() as usize - bytes.as_ptr() as usize) as u64;
+            let (keys, used) = match map {
+                Some(map) => PackedKeys::read(rest, Some(at), Some(map), verify),
+                None => PackedKeys::read(rest, None, None, true),
+            }?;
+            *reader = Reader::new(&rest[used..]);
+            stack.push((permutation, keys));
+        }
+    }
+    if !reader.is_done() {
+        return Err("trailing bytes".into());
+    }
+    Ok(stacks)
+}
+
+/// The checkpoint at `path`, which this engine has just written, mapped: its dictionary
+/// base and both stacks, each one run, to be used in place of the copies in memory. Only
+/// the structure is read (the file was checked as it was written).
+pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])> {
+    let corrupt =
+        |what: &str| EngineError::Corruption(format!("checkpoint {}: {what}", path.display()));
+    let map = crate::mapped::map(path)?;
+    let bytes: &[u8] = &map;
+    let body = &bytes[..bytes.len().saturating_sub(4)];
+    let mut reader = Reader::new(body);
+    if reader.bytes(MAGIC.len()) != Some(MAGIC.as_slice()) {
+        return Err(corrupt("bad magic"));
+    }
+    reader.u64().ok_or_else(|| corrupt("truncated header"))?;
+    let base = read_dictionary(&mut reader, &map, true).map_err(|error| corrupt(&error))?;
+    let [asserted, inferred] =
+        read_stacks(&mut reader, body, Some(&map), false).map_err(|error| corrupt(&error))?;
+    let index = |stack: Stack, packed| {
+        IndexVersion::from_packed(stack.layout(), packed).map_err(|error| corrupt(&error))
+    };
+    Ok((
+        base,
+        [
+            index(Stack::Asserted, asserted)?,
+            index(Stack::Inferred, inferred)?,
+        ],
+    ))
 }
 
 /// Deletes checkpoints older than `revision`. One still mapped can't be deleted on Windows

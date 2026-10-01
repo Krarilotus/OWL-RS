@@ -402,6 +402,23 @@ impl IndexVersion {
         }
     }
 
+    /// A new version where the first `covered` runs are replaced by the runs of `base`, which
+    /// must hold exactly what those runs make visible (a checkpoint of them).
+    pub(crate) fn with_base(&self, covered: usize, base: &IndexVersion) -> Self {
+        debug_assert_eq!(base.layout, self.layout, "base built for another stack");
+        let runs = base
+            .runs
+            .iter()
+            .chain(&self.runs[covered..])
+            .cloned()
+            .collect();
+        Self {
+            layout: self.layout,
+            runs,
+            len: self.len,
+        }
+    }
+
     /// A new version where the runs in `window` are replaced by `merged`, which must be
     /// [`compaction::merge_runs`] of exactly those runs.
     pub(crate) fn with_compacted(&self, window: Range<usize>, merged: Run) -> Self {
