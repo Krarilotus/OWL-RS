@@ -1136,6 +1136,12 @@ fn dictionary_first_string_tests_equal_the_reference() {
     let values: Vec<Term> = values
         .into_iter()
         .chain((0..200).map(|i| Literal::new_simple_literal(format!("filler {i}")).into()))
+        // Enough language-tagged terms that a language test passes over a thousand of
+        // them: matched by a scan against a bitmap rather than a seek each.
+        .chain((0..3000).map(|i| {
+            let language = if i % 3 == 0 { "de" } else { "en" };
+            Literal::new_language_tagged_literal_unchecked(format!("filler {i}"), language).into()
+        }))
         .collect();
     for (i, value) in values.iter().enumerate() {
         for p in ["label", "other"] {
@@ -1160,6 +1166,10 @@ fn dictionary_first_string_tests_equal_the_reference() {
         "CONTAINS(?l, \"Semantic\") && LANG(?l) = \"en\"",
         "CONTAINS(?l, \"nope\")",
         "CONTAINS(?l, \"Semantic\"@en)",
+        "LANG(?l) = \"en\"",
+        "\"de\" = LANG(?l)",
+        "LANG(?l) = \"en\" && STRSTARTS(?l, \"filler 1\")",
+        "LANG(?l) = \"fr\" && CONTAINS(STR(?l), \"Web\")",
     ] {
         for pattern in [
             format!("?s <{EX}label> ?l"),
