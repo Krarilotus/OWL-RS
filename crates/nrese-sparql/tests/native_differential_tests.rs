@@ -2794,6 +2794,85 @@ fn direct_results_equal_the_results_serialiser() {
     assert!(checked > 3000, "{checked}");
 }
 
+/// Results of many blocks are serialised in parallel ([`nrese_sparql::write_results`]):
+/// the same bytes as the results serialiser, rows in order, unbound values included.
+#[test]
+fn large_direct_results_equal_the_results_serialiser() {
+    use nrese_sparql::{ResultsFormat, write_results};
+    use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
+
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for n in 0..30_000u32 {
+        let object: Term = match n % 3 {
+            0 => Literal::new_simple_literal(format!(
+                "text \"{n}\"
+"
+            ))
+            .into(),
+            1 => Literal::new_language_tagged_literal_unchecked(format!("label {n}"), "en").into(),
+            _ => Literal::new_typed_literal(format!("{n}"), xsd::INTEGER).into(),
+        };
+        let quad = Quad::new(
+            ex(&format!("s{}", n % 9_000)),
+            ex("p"),
+            object,
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+        if n % 7 == 0 {
+            let quad = Quad::new(
+                ex(&format!("s{}", n % 9_000)),
+                ex("q"),
+                ex(&format!("o{n}")),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let text = "SELECT ?s ?o ?x WHERE { ?s <http://example.com/p> ?o OPTIONAL { ?s <http://example.com/q> ?x } }";
+    let query = SparqlParser::new().parse_query(text).unwrap();
+    for (format, reference) in [
+        (ResultsFormat::Json, QueryResultsFormat::Json),
+        (ResultsFormat::Tsv, QueryResultsFormat::Tsv),
+        (ResultsFormat::Csv, QueryResultsFormat::Csv),
+    ] {
+        let mut direct = Vec::new();
+        write_results(
+            &snapshot,
+            &query,
+            &QueryOptions::default(),
+            format,
+            &mut direct,
+        )
+        .expect("written directly")
+        .unwrap();
+        let QueryResults::Solutions(solutions) =
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap()
+        else {
+            unreachable!()
+        };
+        let mut expected = Vec::new();
+        let mut writer = QueryResultsSerializer::from_format(reference)
+            .serialize_solutions_to_writer(&mut expected, solutions.variables().to_vec())
+            .unwrap();
+        let mut rows = 0;
+        for solution in solutions {
+            writer.serialize(&solution.unwrap()).unwrap();
+            rows += 1;
+        }
+        writer.finish().unwrap();
+        assert_eq!(rows, 30_000);
+        assert_eq!(
+            String::from_utf8(direct).unwrap(),
+            String::from_utf8(expected).unwrap(),
+            "{format:?}"
+        );
+    }
+}
+
 /// A random dataset for the merged default graph: statements in the default graph and in
 /// three named graphs, a third of them in a second graph as well, and some default-graph
 /// statements inferred.

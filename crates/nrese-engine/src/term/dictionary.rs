@@ -586,6 +586,22 @@ impl Dictionary {
         Some(f(view_key(inner.key(id.payload()))))
     }
 
+    /// Calls `f` with a lookup of entry views below `limit`, all under one read lock: for
+    /// writing many terms (result serialisation) without a lock per term.
+    pub fn with_views<R>(
+        &self,
+        limit: u64,
+        f: impl for<'v> FnOnce(&'v dyn Fn(TermId) -> Option<TermView<'v>>) -> R,
+    ) -> R {
+        let inner = self.inner.read();
+        let len = inner.len().min(limit);
+        let view = |id: TermId| {
+            (id.kind().is_dictionary() && id.payload() < len)
+                .then(|| view_key(inner.key(id.payload())))
+        };
+        f(&view)
+    }
+
     /// Interns all four components of `quad`. Only the engine's writer calls this.
     pub(crate) fn intern_quad(&self, quad: QuadRef<'_>) -> EncodedQuad {
         let mut inner = self.inner.write();
