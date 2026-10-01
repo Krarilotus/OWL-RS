@@ -625,8 +625,50 @@ Oxigraph project, and the vendored `oxsdatatypes` copy is gone (git history keep
   - SHACL Core: 98 of 98;
   - OWL 2 RL: 70 passed, the 16 expected failures, 3 skipped;
   - the bundle's own suites, as in steps 2–4.
-- **Still to do for step 5:** the end-to-end comparison with the baseline branch on the
-  perf-lab workloads (bulk load, query latency, reasoning).
+- **End to end against the baseline branch**
+  (`benches/oxigraph-comparison/results/2026-10-01-step-5-end-to-end.md`): LUBM(1),
+  LUBM(100) and OWL2Bench RL-1 with OWL 2 RL reasoning, and the Olympics basics mix, three
+  runs each.
+  - The same statements, and every query correct.
+  - Loading with reasoning in 0.87–1.0 of the baseline's time.
+  - Query times and memory equal within the spread of the runs.
+
+  Step 5 is done.
 - **Gap noted:** the embedded `SparqlQueryRequest` has no memory budget unless one is set.
   A default derived from the machine's memory (as the server's) would protect embedders
   too.
+
+**6: design, before writing it** (forced vs chosen, as for step 4b).
+
+*Forced.*
+- **The SPARQL 1.2 semantics.** Triple terms in patterns, templates, updates and
+  `VALUES`. The functions `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`,
+  `LANGDIR`, `hasLANG`, `hasLANGDIR` and `STRLANGDIR`. RDF-term equality of triple terms.
+  `rdf:dirLangString` with its direction in equality and `DATATYPE`. The W3C `sparql12`
+  evaluation tests: 63 query, 3 update.
+- **Storage.** Triple terms and directional strings in the store, in its log and
+  backups, and in the reasoner's and SHACL's views.
+
+*Chosen.*
+- **Keys from the components (R7).** A triple term's dictionary key becomes its three
+  component ids: fixed 25 bytes, whatever the terms' lengths. Equal triple terms then
+  share an id however they are written. The components are interned first, so their ids
+  are lower and the log and checkpoints, which replay keys in id order, find them.
+  - Keys of the step-5 form (N-Triples text) are still read; no store needs a migration.
+- **Matching by rewriting, not a new operator.** Before execution, each triple-term
+  pattern with variables becomes a fresh variable, bound by the scan it stands in (RDF 1.2
+  allows triple terms only as objects, so some scan always binds it). Its parts are taken
+  apart with `SUBJECT`, `PREDICATE` and `OBJECT`: a `BIND` where a variable first
+  appears, a `FILTER(sameTerm(…))` where it is already bound. Every existing operator and
+  optimisation applies unchanged. Ground triple terms are dictionary lookups like any
+  constant.
+  - The dictionary also keeps a lazily built index of its triple terms by component
+    (`Dictionary::triple_terms`), for when measurements call for a selective start from
+    the triple term instead of the scan.
+- **The reference evaluator first.** `nrese-sparql-reference` gets SPARQL 1.2 straight
+  from the specification and must pass the W3C `sparql12` evaluation tests by itself.
+  Then the native executor, checked against it by the differential tests, with triple
+  terms and directional literals in the generators.
+- **Reasoning and SHACL** treat triple terms as opaque terms: no rule looks inside them,
+  as in RDF 1.2 Semantics, where a triple term doesn't assert its triple. Reified
+  statements reason like any other.
