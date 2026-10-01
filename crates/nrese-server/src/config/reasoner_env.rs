@@ -24,24 +24,31 @@ pub(super) fn parse_reasoner_config(source: &dyn ConfigSource) -> Result<Reasone
 /// The user's rules from `path`, checked now: a mistake stops the startup, with the
 /// rule it is in.
 fn load_rules(path: &Path) -> Result<UserRules> {
-    let is_n3 = path
+    let extension = path
         .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("n3"));
-    if !is_n3 {
-        bail!(
-            "{}: {} isn't a Notation3 file (.n3), the rule format NRESE reads",
+        .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+    let pie = match extension.as_deref() {
+        Some("n3") => false,
+        Some("pie") => true,
+        _ => bail!(
+            "{}: {} is neither a Notation3 file (.n3) nor a GraphDB ruleset (.pie), the \
+             rule formats NRESE reads",
             names::REASONING_RULES,
             path.display()
-        );
-    }
+        ),
+    };
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("{}: reading {}", names::REASONING_RULES, path.display()))?;
     let name = path.file_name().map_or_else(
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
-    UserRules::n3(name, text)
-        .with_context(|| format!("{}: in {}", names::REASONING_RULES, path.display()))
+    let rules = if pie {
+        UserRules::pie(name, text)
+    } else {
+        UserRules::n3(name, text)
+    };
+    rules.with_context(|| format!("{}: in {}", names::REASONING_RULES, path.display()))
 }
 
 /// Unknown values are a startup error: silently falling back to `disabled` would turn a

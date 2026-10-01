@@ -283,6 +283,11 @@ impl Vocabulary for Constants<'_> {
         let literal = LiteralRef::new_language_tagged_literal_unchecked(lexical, language);
         (self.intern)(literal.into()).raw()
     }
+
+    fn blank_node_ids(&self) -> Option<(u64, u64)> {
+        let (low, high) = TermId::kind_range(TermKind::BlankNode);
+        Some((low.raw(), high.raw()))
+    }
 }
 
 /// Whether RDF can store the triple: an IRI or blank node subject and an IRI predicate.

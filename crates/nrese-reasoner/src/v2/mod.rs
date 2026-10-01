@@ -19,6 +19,7 @@ pub mod ir;
 pub mod lists;
 pub mod n3;
 pub mod naive;
+pub mod pie;
 pub mod program;
 pub mod representatives;
 pub mod rulesets;

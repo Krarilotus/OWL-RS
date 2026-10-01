@@ -1,5 +1,6 @@
 //! What a store materialises: a built-in ruleset, the user's rules (Notation3, compiled by
-//! [`super::n3`]), or both, the user's on top.
+//! [`super::n3`], or a GraphDB ruleset, compiled by [`super::pie`]), or both, the user's
+//! on top.
 //!
 //! A program's [`RuleProgram::name`] and [`RuleProgram::fingerprint`] identify what it
 //! derives; the store records them with the inferred stack, so changing the rules (a
@@ -13,22 +14,50 @@ use super::n3::{self, N3Program};
 use super::rulesets::{Ruleset, SEMANTICS_VERSION};
 use super::testing::LocalVocabulary;
 
-/// User rules: their name (the file's, usually) and their Notation3 text.
+/// User rules: their name (the file's, usually), their text, and its format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRules {
     name: String,
     text: String,
+    format: RuleFormat,
+}
+
+/// The languages user rules are read in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleFormat {
+    /// Notation3 ([`super::n3`]).
+    N3,
+    /// A GraphDB ruleset, `.pie` ([`super::pie`]).
+    Pie,
 }
 
 impl UserRules {
     /// N3 rules, checked now: a mistake is an error at startup, not at the first commit.
     pub fn n3(name: impl Into<String>, text: impl Into<String>) -> Result<Self, ParseError> {
+        Self::new(name, text, RuleFormat::N3)
+    }
+
+    /// A GraphDB ruleset (`.pie`), checked now.
+    pub fn pie(name: impl Into<String>, text: impl Into<String>) -> Result<Self, ParseError> {
+        Self::new(name, text, RuleFormat::Pie)
+    }
+
+    fn new(
+        name: impl Into<String>,
+        text: impl Into<String>,
+        format: RuleFormat,
+    ) -> Result<Self, ParseError> {
         let rules = Self {
             name: name.into(),
             text: text.into(),
+            format,
         };
         rules.compile(&mut LocalVocabulary::default())?;
         Ok(rules)
+    }
+
+    pub fn format(&self) -> RuleFormat {
+        self.format
     }
 
     pub fn name(&self) -> &str {
@@ -40,7 +69,10 @@ impl UserRules {
     }
 
     fn compile(&self, vocabulary: &mut impl Vocabulary) -> Result<N3Program, ParseError> {
-        n3::compile(&self.name, &self.text, vocabulary)
+        match self.format {
+            RuleFormat::N3 => n3::compile(&self.name, &self.text, vocabulary),
+            RuleFormat::Pie => super::pie::compile(&self.name, &self.text, vocabulary),
+        }
     }
 }
 

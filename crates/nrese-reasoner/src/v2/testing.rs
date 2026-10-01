@@ -29,6 +29,11 @@ impl LocalVocabulary {
 }
 
 impl Vocabulary for LocalVocabulary {
+    /// No blank nodes are interned here; the top half of the ids stands for them.
+    fn blank_node_ids(&self) -> Option<(u64, u64)> {
+        Some((1 << 63, u64::MAX))
+    }
+
     fn iri(&mut self, iri: &str) -> u64 {
         self.term(&format!("<{iri}>"))
     }

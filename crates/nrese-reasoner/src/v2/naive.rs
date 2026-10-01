@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::ir::{Atom, Guard, Head, Rule, Term};
+use super::ir::{Atom, Head, Rule, Term};
 use super::lists::{Facts, ListVocabulary, instantiate};
 
 pub type Triple = [u64; 3];
@@ -106,9 +106,11 @@ fn matches(rule: &Rule, index: &Index, emit: &mut dyn FnMut(&[Option<u64>])) {
         emit: &mut dyn FnMut(&[Option<u64>]),
     ) {
         if atom == rule.body.len() {
-            let guards_hold = rule.guards.iter().all(|g| match g {
-                Guard::NotEqual(a, b) => value(*a, bindings) != value(*b, bindings),
-            });
+            // Every term is bound here, so `holds` decides each guard.
+            let guards_hold = rule
+                .guards
+                .iter()
+                .all(|guard| guard.holds(|term| value(term, bindings)));
             if guards_hold {
                 emit(bindings);
             }

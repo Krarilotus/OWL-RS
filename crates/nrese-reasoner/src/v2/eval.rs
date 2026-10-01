@@ -261,12 +261,9 @@ pub fn unbind(atom: &Atom, newly: u8, bindings: &mut [Option<u64>]) {
 
 /// Guards whose terms are both bound; unbound ones are decided later.
 pub fn guards_hold(guards: &[Guard], bindings: &[Option<u64>]) -> bool {
-    guards.iter().all(|guard| match guard {
-        Guard::NotEqual(a, b) => match (value(*a, bindings), value(*b, bindings)) {
-            (Some(a), Some(b)) => a != b,
-            _ => true,
-        },
-    })
+    guards
+        .iter()
+        .all(|guard| guard.holds(|term| value(term, bindings)))
 }
 
 /// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding.
@@ -386,11 +383,19 @@ fn instance(
 ) -> Option<Grounded> {
     let mut guards = Vec::new();
     for guard in &rule.guards {
-        let Guard::NotEqual(a, b) = *guard;
-        match (substitute(a, substitution), substitute(b, substitution)) {
-            (Term::Const(a), Term::Const(b)) if a == b => return None,
-            (Term::Const(_), Term::Const(_)) => {}
-            (a, b) => guards.push(Guard::NotEqual(a, b)),
+        match *guard {
+            Guard::NotEqual(a, b) => {
+                match (substitute(a, substitution), substitute(b, substitution)) {
+                    (Term::Const(a), Term::Const(b)) if a == b => return None,
+                    (Term::Const(_), Term::Const(_)) => {}
+                    (a, b) => guards.push(Guard::NotEqual(a, b)),
+                }
+            }
+            Guard::NotIn(term, low, high) => match substitute(term, substitution) {
+                Term::Const(v) if (low..=high).contains(&v) => return None,
+                Term::Const(_) => {}
+                term => guards.push(Guard::NotIn(term, low, high)),
+            },
         }
     }
     let head = match &rule.head {

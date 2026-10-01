@@ -149,3 +149,80 @@ fn changed_rules_make_the_recorded_closure_stale() {
     .expect("a program");
     assert!(!store.reasoning_is_current(&added));
 }
+
+/// The family rules as a GraphDB ruleset (`.pie`): the same closure, and the consistency
+/// check rejecting the same commit.
+const FAMILY_PIE: &str = r#"
+Prefices
+{
+  ex : http://example.com/
+}
+
+Axioms
+{
+  <ex:parent> <ex:label> "parent"@en
+}
+
+Rules
+{
+Id: grandparent
+  x <ex:parent> y
+  y <ex:parent> z
+  ---------------
+  x <ex:grandparent> z
+
+Id: sibling_symmetric
+  x <ex:sibling> y
+  ---------------
+  y <ex:sibling> x
+
+Id: siblings
+  x <ex:parent> p
+  y <ex:parent> p     [Constraint x != y]
+  ---------------
+  x <ex:sibling> y
+
+Consistency: own_parent
+  x <ex:parent> x
+  ---------------
+}
+"#;
+
+#[test]
+fn graphdb_rulesets_are_read_as_user_rules() {
+    let store = StoreService::new(in_memory_store_config()).expect("store");
+    let rules = Arc::new(UserRules::pie("family.pie", FAMILY_PIE).expect("the ruleset compiles"));
+    let config = ReasonerConfig::for_mode(ReasoningMode::Custom)
+        .with_rules(Some(rules))
+        .expect("custom rules");
+    let pipeline = MutationPipeline::new(Arc::new(store), Arc::new(ReasonerService::new(config)));
+    pipeline
+        .apply(
+            insert(&format!(
+                "<{EX}anna> <{EX}parent> <{EX}ben> . <{EX}ben> <{EX}parent> <{EX}carl> .
+                 <{EX}dora> <{EX}parent> <{EX}ben> ."
+            )),
+            &MutationTicket::new(),
+        )
+        .expect("facts");
+    for inferred in [
+        format!("<{EX}anna> <{EX}grandparent> <{EX}carl>"),
+        format!("<{EX}anna> <{EX}sibling> <{EX}dora>"),
+        format!("<{EX}dora> <{EX}sibling> <{EX}anna>"),
+        format!("<{EX}parent> <{EX}label> \"parent\"@en"),
+    ] {
+        assert!(contains(&pipeline, &inferred), "{inferred}");
+    }
+    assert!(!contains(
+        &pipeline,
+        &format!("<{EX}anna> <{EX}sibling> <{EX}anna>")
+    ));
+    let rejected = pipeline.apply(
+        insert(&format!("<{EX}eve> <{EX}parent> <{EX}eve>")),
+        &MutationTicket::new(),
+    );
+    assert!(
+        matches!(rejected, Err(MutationError::Rejected(_))),
+        "{rejected:?}"
+    );
+}
