@@ -8,4 +8,5 @@ license.workspace = true
 [dependencies]
 memchr = "2.8"
 nrese-rdf = { path = "../nrese-rdf", default-features = false }
+quick-xml = "0.42"
 thiserror.workspace = true

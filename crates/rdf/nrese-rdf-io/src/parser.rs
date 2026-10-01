@@ -13,6 +13,7 @@ use crate::error::{RdfParseError, RdfSyntaxError, TextPosition};
 use crate::format::RdfFormat;
 use crate::input::Lines;
 use crate::ntriples::LineParser;
+use crate::rdfxml::{RdfXmlParser, RdfXmlSettings};
 use crate::turtle::{TurtleParser, TurtleSettings};
 
 /// How to read a document: its format, and the settings that apply to every format.
@@ -95,6 +96,10 @@ impl RdfParser {
                 let settings = self.turtle_settings();
                 self.wrap(Inner::Turtle(TurtleParser::from_slice(bytes, settings)))
             }
+            RdfFormat::RdfXml => {
+                let settings = self.rdf_xml_settings();
+                self.wrap(Inner::RdfXmlSlice(RdfXmlParser::new(bytes, settings)))
+            }
             _ => self.parser(Lines::from_slice(bytes, 0)),
         }
     }
@@ -105,6 +110,13 @@ impl RdfParser {
             RdfFormat::Turtle | RdfFormat::TriG => {
                 let settings = self.turtle_settings();
                 self.wrap(Inner::Turtle(TurtleParser::from_reader(reader, settings)))
+            }
+            RdfFormat::RdfXml => {
+                let settings = self.rdf_xml_settings();
+                self.wrap(Inner::RdfXmlReader(RdfXmlParser::new(
+                    BufReader::new(reader),
+                    settings,
+                )))
             }
             _ => self.parser(Lines::from_reader(reader, 0)),
         }
@@ -117,6 +129,14 @@ impl RdfParser {
             blank_nodes: self.blank_nodes.clone(),
             unchecked: self.unchecked,
             max_depth: self.max_nesting,
+        }
+    }
+
+    fn rdf_xml_settings(&self) -> RdfXmlSettings {
+        RdfXmlSettings {
+            base: self.base_iri.clone(),
+            blank_nodes: self.blank_nodes.clone(),
+            unchecked: self.unchecked,
         }
     }
 
@@ -240,19 +260,21 @@ fn boundaries(
 // One per parser, never in a collection: boxing the large variant would only add an
 // indirection on the hot path.
 #[allow(clippy::large_enum_variant)]
-enum Inner<'a, R> {
+enum Inner<'a, R: Read> {
     Lines {
         lines: Lines<'a, R>,
         parser: LineParser,
     },
     Turtle(TurtleParser<'a, R>),
+    RdfXmlSlice(RdfXmlParser<&'a [u8]>),
+    RdfXmlReader(RdfXmlParser<BufReader<R>>),
     /// A format this crate doesn't read yet: one error, then the end.
     Unsupported(Option<RdfFormat>),
 }
 
 /// The quads of one document. [`QuadParser::next_ref`] borrows each quad from the parser's
 /// buffers (no allocation per term); as an `Iterator` it gives owned quads.
-pub struct QuadParser<'a, R> {
+pub struct QuadParser<'a, R: Read> {
     inner: Inner<'a, R>,
     default_graph: GraphName,
     without_named_graphs: bool,
@@ -275,6 +297,16 @@ impl<R: Read> QuadParser<'_, R> {
                 )
                 .into()));
             }
+            Inner::RdfXmlSlice(parser) => match parser.advance() {
+                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+                Ok(false) => return None,
+                Err(error) => return Some(Err(error)),
+            },
+            Inner::RdfXmlReader(parser) => match parser.advance() {
+                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+                Ok(false) => return None,
+                Err(error) => return Some(Err(error)),
+            },
             Inner::Turtle(parser) => match parser.next_ref()? {
                 Ok(quad) => (quad, TextPosition::default()),
                 Err(error) => return Some(Err(error)),
