@@ -27,7 +27,10 @@ nodes, RAM, cache sizes, CPU features and the disks' kind, and derives its setti
 them: thread pools per workload (queries, bulk load, reasoning, compaction), memory budgets,
 run sizes, whether to memory-map. Every derived value can be overridden in the
 configuration, and `nrese-server --check-config` shows what was detected and chosen. One
-place owns this (`nrese-engine`'s hardware module), so the layers don't each guess.
+place owns this (`nrese-engine`'s hardware module), so the layers don't each guess. Small
+machines are a profile of their own, not an afterthought (the owner: clever design should
+stay fast whatever it runs on): compressed runs, memory mapping instead of loading,
+budgets that spill rather than fail, and plans chosen for few cores.
 
 **H2. Machine code per CPU.** Hot kernels (dictionary hashing, run merging and search,
 intersections of sorted id lists, filters over id columns, decoding packed runs) get

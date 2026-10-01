@@ -1,4 +1,5 @@
 //! The Turtle and TriG parser: a statement at a time, by recursive descent, into an arena.
+//! It also reads Notation3 ([`n3`]), whose grammar extends Turtle's.
 //!
 //! - **Statements.** [`TurtleParser::next_ref`] parses one statement (a directive, or the
 //!   triples of one subject; in TriG, also the opening and closing of a graph block), then
@@ -26,6 +27,8 @@ use crate::blank::BlankNodes;
 use crate::error::{RdfParseError, RdfSyntaxError, TextPosition};
 use crate::text::{NOT_IN_IRI, decode_iri, decode_string};
 
+mod n3;
+
 /// The settings a Turtle or TriG parser takes from [`crate::RdfParser`].
 #[derive(Debug, Clone)]
 pub(crate) struct TurtleSettings {
@@ -34,6 +37,8 @@ pub(crate) struct TurtleSettings {
     pub(crate) blank_nodes: BlankNodes,
     pub(crate) unchecked: bool,
     pub(crate) max_depth: usize,
+    /// Notation3 rather than Turtle or TriG.
+    pub(crate) n3: bool,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -159,7 +164,12 @@ enum Term {
     Iri(Span),
     Static(NamedNodeRef<'static>),
     Blank(Span),
-    Literal { value: Span, kind: Lit },
+    Literal {
+        value: Span,
+        kind: Lit,
+    },
+    /// An N3 quick variable (`?name`): its name.
+    Variable(Span),
 }
 
 #[derive(Clone, Copy)]
@@ -175,6 +185,8 @@ struct Triple {
     subject: Term,
     predicate: Term,
     object: Term,
+    /// The N3 formula the triple is in (its blank node); `None` outside formulas.
+    formula: Option<Term>,
 }
 
 /// The graph a TriG block's statements go to.
@@ -209,6 +221,8 @@ pub(crate) struct TurtleParser<'a, R> {
     resolved: String,
     /// Whether a byte order mark at the start has been looked for.
     started: bool,
+    /// N3: the formulas being read, innermost last.
+    formulas: Vec<Term>,
 }
 
 const INITIAL_BUFFER: usize = 64 * 1024;
@@ -263,6 +277,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             scratch: String::new(),
             resolved: String::new(),
             started: false,
+            formulas: Vec::new(),
         }
     }
 
@@ -294,6 +309,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 Term::Iri(s) => NamedNodeRef::new_unchecked(text(s)).into(),
                 Term::Static(n) => n.into(),
                 Term::Blank(s) => BlankNodeRef::new_unchecked(text(s)).into(),
+                Term::Variable(_) => unreachable!("variables only come out of an N3 parser"),
                 Term::Literal { value, kind } => match kind {
                     Lit::Simple => LiteralRef::new_simple_literal(text(value)).into(),
                     Lit::Language(tag) => {
@@ -349,6 +365,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 &self.input.data()[position..],
                 self.input.eof(),
                 self.after_string,
+                self.settings.n3,
             );
             match lexed {
                 Lexed::Token(mut token) => {
@@ -492,9 +509,21 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     }
                 };
                 let (prefix, local) = (&text[..colon], &text[colon + 1..]);
-                let Some(namespace) = self.prefixes.get(prefix) else {
-                    let message = format!("the prefix '{prefix}:' isn't declared");
-                    return Err(self.error(token.start, message));
+                let default;
+                let namespace = match self.prefixes.get(prefix) {
+                    Some(namespace) => namespace.as_str(),
+                    // N3: an undeclared empty prefix is the document's own `<#>`.
+                    None if self.settings.n3 && prefix.is_empty() => {
+                        default = match &self.base {
+                            Some(base) => base.resolve_unchecked("#").into_inner(),
+                            None => "#".to_owned(),
+                        };
+                        default.as_str()
+                    }
+                    None => {
+                        let message = format!("the prefix '{prefix}:' isn't declared");
+                        return Err(self.error(token.start, message));
+                    }
                 };
                 self.arena.push_str(namespace);
                 if escaped {
@@ -549,12 +578,16 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             subject,
             predicate,
             object,
+            formula: self.formulas.last().copied(),
         });
     }
 
     // --- Statements ----------------------------------------------------------------------
 
     fn statement(&mut self) -> Step<()> {
+        if self.settings.n3 {
+            return self.n3_statement();
+        }
         let token = self.take()?;
         let trig = self.settings.trig;
         match token.kind {
@@ -795,37 +828,12 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         let object = match token.kind {
             Kind::IriRef { .. } | Kind::PrefixedName { .. } => Term::Iri(self.iri(&token)?),
             Kind::BlankLabel => Term::Blank(self.blank_label(&token)?),
-            Kind::String { escaped } => {
-                let value = self.push_string(&token, escaped)?;
-                let kind = match self.peek()? {
-                    Kind::LangTag => {
-                        let tag = self.take()?;
-                        let span = self.push_text(&tag)?;
-                        self.arena[span.start as usize..span.end as usize].make_ascii_lowercase();
-                        Lit::Language(span)
-                    }
-                    Kind::Datatype => {
-                        self.take()?;
-                        let datatype = self.take()?;
-                        Lit::Typed(self.iri(&datatype)?)
-                    }
-                    _ => Lit::Simple,
-                };
-                Term::Literal { value, kind }
-            }
-            Kind::Integer | Kind::Decimal | Kind::Double | Kind::True | Kind::False => {
-                let value = self.push_text(&token)?;
-                let datatype = match token.kind {
-                    Kind::Integer => xsd::INTEGER,
-                    Kind::Decimal => xsd::DECIMAL,
-                    Kind::Double => xsd::DOUBLE,
-                    _ => xsd::BOOLEAN,
-                };
-                Term::Literal {
-                    value,
-                    kind: Lit::TypedStatic(datatype),
-                }
-            }
+            Kind::String { .. }
+            | Kind::Integer
+            | Kind::Decimal
+            | Kind::Double
+            | Kind::True
+            | Kind::False => self.literal(&token)?,
             Kind::OpenBracket => {
                 let depth = self.deeper(depth, token.start)?;
                 let node = self.fresh();
@@ -846,6 +854,40 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         };
         self.emit(subject, predicate, object);
         Ok(())
+    }
+
+    /// A literal from its first token (a string, a number, `true` or `false`); a string's
+    /// language tag or datatype follows.
+    fn literal(&mut self, token: &Token) -> Step<Term> {
+        if let Kind::String { escaped } = token.kind {
+            let value = self.push_string(token, escaped)?;
+            let kind = match self.peek()? {
+                Kind::LangTag => {
+                    let tag = self.take()?;
+                    let span = self.push_text(&tag)?;
+                    self.arena[span.start as usize..span.end as usize].make_ascii_lowercase();
+                    Lit::Language(span)
+                }
+                Kind::Datatype => {
+                    self.take()?;
+                    let datatype = self.take()?;
+                    Lit::Typed(self.iri(&datatype)?)
+                }
+                _ => Lit::Simple,
+            };
+            return Ok(Term::Literal { value, kind });
+        }
+        let value = self.push_text(token)?;
+        let datatype = match token.kind {
+            Kind::Integer => xsd::INTEGER,
+            Kind::Decimal => xsd::DECIMAL,
+            Kind::Double => xsd::DOUBLE,
+            _ => xsd::BOOLEAN,
+        };
+        Ok(Term::Literal {
+            value,
+            kind: Lit::TypedStatic(datatype),
+        })
     }
 
     /// `'(' object* ')'` after the '(': its first node, or `rdf:nil`.

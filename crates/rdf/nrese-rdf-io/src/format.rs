@@ -17,16 +17,21 @@ pub enum RdfFormat {
     RdfXml,
     /// [JSON-LD 1.1](https://www.w3.org/TR/json-ld11/)
     JsonLd,
+    /// [Notation3](https://w3c.github.io/N3/spec/) (W3C Community Group). As an RDF
+    /// format it reads documents RDF can hold and writes Turtle, which is N3; formulas,
+    /// variables and rules go through [`crate::n3`].
+    N3,
 }
 
 impl RdfFormat {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::NTriples,
         Self::NQuads,
         Self::Turtle,
         Self::TriG,
         Self::RdfXml,
         Self::JsonLd,
+        Self::N3,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -37,6 +42,7 @@ impl RdfFormat {
             Self::TriG => "TriG",
             Self::RdfXml => "RDF/XML",
             Self::JsonLd => "JSON-LD",
+            Self::N3 => "N3",
         }
     }
 
@@ -49,6 +55,7 @@ impl RdfFormat {
             Self::TriG => "application/trig",
             Self::RdfXml => "application/rdf+xml",
             Self::JsonLd => "application/ld+json",
+            Self::N3 => "text/n3",
         }
     }
 
@@ -61,6 +68,7 @@ impl RdfFormat {
             Self::TriG => "trig",
             Self::RdfXml => "rdf",
             Self::JsonLd => "jsonld",
+            Self::N3 => "n3",
         }
     }
 
@@ -78,6 +86,7 @@ impl RdfFormat {
             "trig" => Self::TriG,
             "rdf" | "xml" | "owl" | "rdfxml" => Self::RdfXml,
             "jsonld" | "json" => Self::JsonLd,
+            "n3" => Self::N3,
             _ => return None,
         })
     }
@@ -98,6 +107,7 @@ impl RdfFormat {
             "application/trig" | "application/x-trig" => Self::TriG,
             "application/rdf+xml" | "application/xml" | "text/xml" => Self::RdfXml,
             "application/ld+json" | "application/json" => Self::JsonLd,
+            "text/n3" | "text/rdf+n3" | "application/n3" => Self::N3,
             _ => return None,
         })
     }

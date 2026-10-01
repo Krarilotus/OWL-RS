@@ -1,4 +1,6 @@
-//! The tokens of Turtle and TriG (RDF 1.1), from the unconsumed bytes of the input.
+//! The tokens of Turtle and TriG (RDF 1.1), and of Notation3 (N3), from the unconsumed
+//! bytes of the input. N3's own tokens are only recognised in N3 mode; each starts with a
+//! byte Turtle doesn't allow there, so the Turtle path doesn't pay for them.
 //!
 //! [`lex`] skips whitespace and comments, then reads one token and returns its kind and
 //! where its text is. When the bytes end inside a token and more input may come, it says
@@ -52,6 +54,26 @@ pub(crate) enum Kind {
     CloseBrace,
     /// `^^`
     Datatype,
+    // N3 only.
+    /// `?name`: the text is the name.
+    Variable,
+    /// `=>`
+    Implies,
+    /// `<=`
+    ImpliedBy,
+    /// `=`
+    Equals,
+    /// `<-`
+    Inverse,
+    /// `!`
+    Bang,
+    /// `^`
+    Caret,
+    /// The words `has`, `is`, `of`, and `id` (in `[ id <iri> … ]`).
+    Has,
+    Is,
+    Of,
+    Id,
     Eof,
 }
 
@@ -75,8 +97,9 @@ pub(crate) enum Lexed {
 }
 
 /// Reads the next token of `input`. `eof`: no more input will come. `after_string`: the
-/// previous token was a string, so `@` starts a language tag (not `@prefix`).
-pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool) -> Lexed {
+/// previous token was a string, so `@` starts a language tag (not `@prefix`). `n3`: N3's
+/// tokens too.
+pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexed {
     let len = input.len();
     let mut i = 0;
     // Whitespace and comments.
@@ -114,6 +137,13 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool) -> Lexed {
         };
     }
     match input[start] {
+        b'<' if n3 => n3_angle(input, start, eof),
+        b'=' if n3 => match need!(1) {
+            Some(b'>') => token(Kind::Implies, start, start..start + 2, start + 2),
+            _ => token(Kind::Equals, start, start..start + 1, start + 1),
+        },
+        b'!' if n3 => token(Kind::Bang, start, start..start + 1, start + 1),
+        b'?' if n3 => variable(input, start, eof),
         b'<' => match memchr::memchr(b'>', &input[start..]) {
             Some(k) => {
                 let text = start + 1..start + k;
@@ -160,11 +190,56 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool) -> Lexed {
         b'}' => token(Kind::CloseBrace, start, start..start + 1, start + 1),
         b'^' => match need!(1) {
             Some(b'^') => token(Kind::Datatype, start, start..start + 2, start + 2),
+            _ if n3 => token(Kind::Caret, start, start..start + 1, start + 1),
             _ => Lexed::Error(start, "expected '^^'"),
         },
         b':' => prefixed_name(input, start, start, eof),
-        _ => name(input, start, eof),
+        _ => name(input, start, eof, n3),
     }
+}
+
+/// In N3, `<` starts an IRI, `<=` or `<-`. An IRI is the longest match: `<=x>` is one.
+fn n3_angle(input: &[u8], start: usize, eof: bool) -> Lexed {
+    let mut i = start + 1;
+    while let Some(&b) = input.get(i) {
+        match b {
+            b'>' => {
+                let text = start + 1..i;
+                let escaped = input[text.clone()].contains(&b'\\');
+                return token(Kind::IriRef { escaped }, start, text, i + 1);
+            }
+            // Not in an IRI reference: so not one.
+            b'<' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | 0..=0x20 => break,
+            _ => i += 1,
+        }
+    }
+    if i == input.len() && !eof {
+        return Lexed::NeedMore;
+    }
+    match input.get(start + 1) {
+        Some(b'=') => token(Kind::ImpliedBy, start, start..start + 2, start + 2),
+        Some(b'-') => token(Kind::Inverse, start, start..start + 2, start + 2),
+        _ => Lexed::Error(start, "an IRI without its closing '>'"),
+    }
+}
+
+/// `?name`: `'?' PN_CHARS_U PN_CHARS*`.
+fn variable(input: &[u8], start: usize, eof: bool) -> Lexed {
+    let name = start + 1;
+    match char_at(input, name, eof) {
+        Ok(Some(c)) if is_pn_chars_u(c) => {}
+        Ok(_) => return Lexed::Error(name, "a variable without a name"),
+        Err(lexed) => return lexed,
+    }
+    let mut i = name;
+    loop {
+        match char_at(input, i, eof) {
+            Ok(Some(c)) if is_pn_chars(c) => i += c.len_utf8(),
+            Ok(_) => break,
+            Err(lexed) => return lexed,
+        }
+    }
+    token(Kind::Variable, start, name..i, i)
 }
 
 fn token(kind: Kind, start: usize, text: Range<usize>, consumed: usize) -> Lexed {
@@ -400,8 +475,9 @@ fn number(input: &[u8], start: usize, eof: bool) -> Lexed {
     token(kind, start, start..i, i)
 }
 
-/// A name: a prefixed name, or a keyword (`a`, `true`, `false`, `PREFIX`, `BASE`, `GRAPH`).
-fn name(input: &[u8], start: usize, eof: bool) -> Lexed {
+/// A name: a prefixed name, or a keyword (`a`, `true`, `false`, `PREFIX`, `BASE`, `GRAPH`;
+/// in N3 also `has`, `is`, `of`, `id`).
+fn name(input: &[u8], start: usize, eof: bool, n3: bool) -> Lexed {
     match char_at(input, start, eof) {
         Ok(Some(c)) if is_pn_chars_base(c) => {}
         Ok(_) => return Lexed::Error(start, "unexpected character"),
@@ -429,7 +505,11 @@ fn name(input: &[u8], start: usize, eof: bool) -> Lexed {
         b"false" => Kind::False,
         _ if word.eq_ignore_ascii_case(b"PREFIX") => Kind::Prefix,
         _ if word.eq_ignore_ascii_case(b"BASE") => Kind::Base,
-        _ if word.eq_ignore_ascii_case(b"GRAPH") => Kind::Graph,
+        _ if word.eq_ignore_ascii_case(b"GRAPH") && !n3 => Kind::Graph,
+        b"has" if n3 => Kind::Has,
+        b"is" if n3 => Kind::Is,
+        b"of" if n3 => Kind::Of,
+        b"id" if n3 => Kind::Id,
         _ => return Lexed::Error(start, "a name without ':' that is no keyword"),
     };
     token(kind, start, start..end, end)
@@ -510,7 +590,7 @@ mod tests {
         let mut out = Vec::new();
         let mut after_string = false;
         loop {
-            match lex(&bytes[at..], true, after_string) {
+            match lex(&bytes[at..], true, after_string, false) {
                 Lexed::Token(t) => {
                     let piece =
                         String::from_utf8(bytes[at + t.text.start..at + t.text.end].to_vec())
@@ -591,14 +671,14 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    lex(&text.as_bytes()[..cut], false, text.starts_with('@')),
+                    lex(&text.as_bytes()[..cut], false, text.starts_with('@'), false),
                     Lexed::NeedMore
                 ),
                 "{text}"
             );
             assert!(
                 matches!(
-                    lex(text.as_bytes(), true, text.starts_with('@')),
+                    lex(text.as_bytes(), true, text.starts_with('@'), false),
                     Lexed::Token(_)
                 ),
                 "{text}"
@@ -612,7 +692,7 @@ mod tests {
             "\"open", "<open", "_:", "ex.:x", "@pre", "^x", "\"a\nb\"", "word",
         ] {
             assert!(
-                matches!(lex(text.as_bytes(), true, false), Lexed::Error(..)),
+                matches!(lex(text.as_bytes(), true, false, false), Lexed::Error(..)),
                 "{text}"
             );
         }
