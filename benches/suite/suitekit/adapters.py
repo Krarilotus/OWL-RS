@@ -562,7 +562,10 @@ GRAPHDB_RULESETS = {"none": "empty", "rdfs": "rdfs", "owl-horst": "owl-horst",
 
 class Graphdb(Adapter):
     """importrdf into a fresh home (preload without reasoning; load with a ruleset, which
-    infers while loading: UNVERIFIED until a licensed run). Queries need GRAPHDB_LICENSE."""
+    infers while loading: UNVERIFIED until a licensed run). Queries need a licence:
+    GRAPHDB_EDITION=free (default; one core, two concurrent queries) or enterprise (all
+    cores, and 40-bit entity IDs for more than two billion distinct values, which full
+    Wikidata needs)."""
 
     key = "graphdb"
     regimes = GRAPHDB_RULESETS
@@ -570,9 +573,18 @@ class Graphdb(Adapter):
     def images(self, ctx):
         return [ctx.setting("GRAPHDB_IMAGE", "ontotext/graphdb:11.5.1")]
 
+    def enterprise(self, ctx) -> bool:
+        return ctx.setting("GRAPHDB_EDITION", "free") == "enterprise"
+
+    def licence(self, ctx) -> str:
+        if self.enterprise(ctx):
+            return ctx.licence("GRAPHDB_LICENSE", "graphdb-enterprise.license")
+        return ctx.licence("GRAPHDB_LICENSE", "graphdb.license")
+
     def supports(self, ctx, inputs, regime):
-        if not ctx.licence("GRAPHDB_LICENSE", "graphdb.license"):
-            return ("needs graphdb.license in the licences directory, or GRAPHDB_LICENSE=/path "
+        if not self.licence(ctx):
+            file = "graphdb-enterprise.license" if self.enterprise(ctx) else "graphdb.license"
+            return (f"needs {file} in the licences directory, or GRAPHDB_LICENSE=/path "
                     "(it answers no queries without one)")
         return super().supports(ctx, inputs, regime)
 
@@ -582,18 +594,23 @@ class Graphdb(Adapter):
     def load(self, ctx, store, inputs, regime):
         template = (ctx.root / "benches/competitors/graphdb/repo-owl2-rl.ttl").read_text(encoding="utf-8")
         config = template.replace('graphdb:ruleset "owl2-rl"', f'graphdb:ruleset "{self.regimes[regime]}"')
+        if self.enterprise(ctx):
+            config = config.replace('graphdb:entity-id-size "32"', 'graphdb:entity-id-size "40"')
         (ctx.work / "repo.ttl").write_text(config, encoding="utf-8")
         mode = ["preload", "-f"] if regime == "none" else ["load", "-f", "-m", "parallel"]
+        # The load runs under the same licence as the server: the edition decides the cores
+        # it may use and whether 40-bit IDs are allowed.
         spec = Spec(ctx.name("load"), self.images(ctx)[0],
                     ["/opt/graphdb/dist/bin/importrdf", *mode, "-c", "/work/repo.ttl", *inputs],
-                    self.env(ctx, "-Dgraphdb.home=/opt/graphdb/home"),
-                    ctx.mounts(Mount(store, "/opt/graphdb/home", readonly=False)), memory=ctx.memory)
+                    self.env(ctx, "-Dgraphdb.home=/opt/graphdb/home -Dgraphdb.license.file=/license/graphdb.license"),
+                    ctx.mounts(Mount(self.licence(ctx), "/license/graphdb.license"),
+                               Mount(store, "/opt/graphdb/home", readonly=False)), memory=ctx.memory)
         return Step(ctx.runtime.run(spec, ctx.logs / "load.log", ctx.timeout_s),
                     note="" if regime == "none" else "UNVERIFIED: importrdf load with a ruleset")
 
     def serve(self, ctx, store, regime):
         port = ctx.listen(7200, fixed=True)
-        licence = Mount(ctx.licence("GRAPHDB_LICENSE", "graphdb.license"), "/license/graphdb.license")
+        licence = Mount(self.licence(ctx), "/license/graphdb.license")
         spec = Spec(ctx.name("serve"), self.images(ctx)[0], [],
                     self.env(ctx, "-Dgraphdb.license.file=/license/graphdb.license"),
                     ctx.mounts(licence, Mount(store, "/opt/graphdb/home", readonly=False)), port=port,
