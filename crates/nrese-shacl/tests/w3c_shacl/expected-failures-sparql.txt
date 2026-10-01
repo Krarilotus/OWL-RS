@@ -1,0 +1,2 @@
+# W3C SHACL-SPARQL tests that are known to fail, one per line: `<test IRI> # reason`.
+# The run fails on a failure that is not listed and on a listed test that passes.

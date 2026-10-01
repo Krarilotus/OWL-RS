@@ -144,8 +144,9 @@ pub async fn validate(
     Ok(response)
 }
 
-/// The JSON report: `conforms`, what was validated, and one object per result with
-/// SHACL's property names.
+/// The JSON report: `conforms`, what was validated, one object per result with SHACL's
+/// property names, and the failures (SPARQL-based constraints that couldn't be
+/// evaluated; `conforms` is then false).
 fn report_json(validation: &ShaclValidation) -> serde_json::Value {
     let results: Vec<serde_json::Value> = validation
         .results_text()
@@ -167,6 +168,7 @@ fn report_json(validation: &ShaclValidation) -> serde_json::Value {
         "revision": validation.revision,
         "shapes": validation.shapes,
         "results": results,
+        "failures": validation.report.failures,
     })
 }
 

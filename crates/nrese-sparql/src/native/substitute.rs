@@ -113,6 +113,38 @@ impl Values<'_> {
         }
     }
 
+    /// A whole query's pattern with the values put in: as [`Self::pattern`], except that
+    /// the query's own projection doesn't hide them (they are pre-bound for the whole
+    /// query); it only stops listing them.
+    pub(super) fn top(&self, pattern: &GraphPattern) -> GraphPattern {
+        match pattern {
+            GraphPattern::Slice {
+                inner,
+                start,
+                length,
+            } => GraphPattern::Slice {
+                inner: Box::new(self.top(inner)),
+                start: *start,
+                length: *length,
+            },
+            GraphPattern::Distinct { inner } => GraphPattern::Distinct {
+                inner: Box::new(self.top(inner)),
+            },
+            GraphPattern::Reduced { inner } => GraphPattern::Reduced {
+                inner: Box::new(self.top(inner)),
+            },
+            GraphPattern::Project { inner, variables } => GraphPattern::Project {
+                inner: Box::new(self.pattern(inner)),
+                variables: variables
+                    .iter()
+                    .filter(|v| !self.terms.contains_key(*v))
+                    .cloned()
+                    .collect(),
+            },
+            other => self.pattern(other),
+        }
+    }
+
     /// `pattern` with the values put in.
     pub(super) fn pattern(&self, pattern: &GraphPattern) -> GraphPattern {
         let p = |x: &GraphPattern| Box::new(self.pattern(x));

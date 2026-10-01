@@ -17,6 +17,8 @@ pub const SH: &str = "http://www.w3.org/ns/shacl#";
 pub struct Shapes {
     pub(crate) shapes: Vec<Shape>,
     pub(crate) index: HashMap<TermId, ShapeRef>,
+    /// The shapes graph's name, if it is a named graph: `$shapesGraph` in SHACL-SPARQL.
+    pub(crate) graph: Option<TermId>,
 }
 
 impl Shapes {
@@ -149,6 +151,27 @@ pub(crate) enum Constraint {
     Closed(BTreeSet<TermId>),
     HasValue(TermId),
     In(BTreeSet<TermId>),
+    /// SHACL-SPARQL: an `sh:sparql` constraint, or a SPARQL-based constraint component's
+    /// validator with the shape's parameter values.
+    Sparql(Box<SparqlCheck>),
+}
+
+/// A SPARQL query that checks a focus node (SHACL §5, §6).
+#[derive(Debug)]
+pub(crate) struct SparqlCheck {
+    /// `sh:sourceConstraint`: the `sh:sparql` value, or the component's validator.
+    pub(crate) source: TermId,
+    /// `sh:SPARQLConstraintComponent`, or the custom component.
+    pub(crate) component: Component,
+    /// The query, with its prefixes and `$PATH` put in.
+    pub(crate) query: nrese_sparql_syntax::Query,
+    /// An ASK validator: run per value node, with `$value`; a value fails when it answers
+    /// false. Otherwise a SELECT: each solution is a result.
+    pub(crate) ask: bool,
+    /// The component's parameters: the variable each is pre-bound as, and the value.
+    pub(crate) parameters: Vec<(nrese_rdf::Variable, TermId)>,
+    /// The `sh:message`s of the constraint or validator (else the component's).
+    pub(crate) messages: Vec<TermId>,
 }
 
 /// A constraint component, as `sh:sourceConstraintComponent` names it.
@@ -182,12 +205,19 @@ pub enum Component {
     Closed,
     HasValue,
     In,
+    /// `sh:sparql` constraints.
+    Sparql,
+    /// A SPARQL-based constraint component of the shapes graph: its node.
+    Custom(TermId),
 }
 
 impl Component {
-    /// The component's local name in the SHACL namespace.
+    /// The component's local name in the SHACL namespace (a custom component's IRI is the
+    /// shapes graph's: [`Self::iri`] can't name it).
     pub const fn local_name(self) -> &'static str {
         match self {
+            Self::Sparql => "SPARQLConstraintComponent",
+            Self::Custom(_) => "ConstraintComponent",
             Self::Class => "ClassConstraintComponent",
             Self::Datatype => "DatatypeConstraintComponent",
             Self::NodeKind => "NodeKindConstraintComponent",

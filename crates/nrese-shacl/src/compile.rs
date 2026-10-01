@@ -7,19 +7,23 @@
 use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
-use nrese_engine::{TermId, TermKind};
-use nrese_rdf::Term;
+use nrese_engine::{GraphSelector, TermId, TermKind};
+use nrese_rdf::{Term, Variable};
 use nrese_sparql::ReadView;
 use nrese_sparql::value::{Value, compile_regex};
+use nrese_sparql_syntax::Query;
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{
-    Bound, Constraint, Logical, NodeKind, Path, SH, Severity, Shape, ShapeRef, Shapes, Target,
+    Bound, Component, Constraint, Logical, NodeKind, Path, SH, Severity, Shape, ShapeRef, Shapes,
+    SparqlCheck, Target,
 };
+use crate::sparql;
 
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS_CLASS: &str = "http://www.w3.org/2000/01/rdf-schema#Class";
 const OWL_CLASS: &str = "http://www.w3.org/2002/07/owl#Class";
+const OWL_IMPORTS: &str = "http://www.w3.org/2002/07/owl#imports";
 
 /// The deepest path nesting accepted; a deeper (or cyclic) path is ill-formed.
 const MAX_PATH_DEPTH: usize = 64;
@@ -57,7 +61,9 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
         shapes: Vec::new(),
         index: HashMap::new(),
         errors: Vec::new(),
+        components: Vec::new(),
     };
+    compiler.components = compiler.discover_components();
     let mut roots: BTreeSet<TermId> = BTreeSet::new();
     for target in [
         "targetNode",
@@ -79,6 +85,10 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
         Ok(Shapes {
             shapes: compiler.shapes,
             index: compiler.index,
+            graph: match shapes_graph.graphs {
+                GraphSelector::Exact(graph) if !graph.is_default_graph() => Some(graph),
+                _ => None,
+            },
         })
     } else {
         Err(compiler.errors)
@@ -94,6 +104,8 @@ struct Compiler<'a, V: ReadView> {
     shapes: Vec<Shape>,
     index: HashMap<TermId, ShapeRef>,
     errors: Vec<ShapeError>,
+    /// The shapes graph's SPARQL-based constraint components.
+    components: Vec<ComponentDef>,
 }
 
 impl<V: ReadView> Compiler<'_, V> {
@@ -296,7 +308,7 @@ impl<V: ReadView> Compiler<'_, V> {
             .one(node, "deactivated")
             .is_some_and(|value| self.is_true(value));
         let messages = self.values(node, "message");
-        let constraints = self.constraints(node);
+        let constraints = self.constraints(node, path.as_ref());
         self.shapes[shape] = Shape {
             node,
             path,
@@ -342,7 +354,7 @@ impl<V: ReadView> Compiler<'_, V> {
         targets
     }
 
-    fn constraints(&mut self, node: TermId) -> Vec<Constraint> {
+    fn constraints(&mut self, node: TermId, path: Option<&Path>) -> Vec<Constraint> {
         let mut out = Vec::new();
 
         // Value type.
@@ -512,6 +524,12 @@ impl<V: ReadView> Compiler<'_, V> {
                 Err(problem) => self.error(node, format!("sh:in {problem}")),
             }
         }
+
+        // SHACL-SPARQL.
+        self.sparql_constraints(node, path, &mut out);
+        let components = std::mem::take(&mut self.components);
+        self.component_constraints(node, path, &components, &mut out);
+        self.components = components;
         out
     }
 
@@ -572,5 +590,276 @@ impl<V: ReadView> Compiler<'_, V> {
             }
         }
         allowed
+    }
+}
+
+/// A SPARQL-based constraint component of the shapes graph (SHACL §6).
+#[derive(Debug, Clone)]
+struct ComponentDef {
+    node: TermId,
+    /// Each parameter: its predicate, the variable it is pre-bound as, whether optional.
+    parameters: Vec<(TermId, Variable, bool)>,
+    validator: Option<TermId>,
+    node_validator: Option<TermId>,
+    property_validator: Option<TermId>,
+    messages: Vec<TermId>,
+}
+
+impl<V: ReadView> Compiler<'_, V> {
+    /// The text of a string-valued parameter.
+    fn string(&self, node: TermId, local: &str) -> Option<String> {
+        self.values(node, local)
+            .first()
+            .and_then(|&value| self.literal(value))
+            .map(|literal| literal.value().to_owned())
+    }
+
+    /// The `PREFIX` lines `node`'s `sh:prefixes` declare: the `sh:declare`s of each value
+    /// and of what it imports (`owl:imports`), transitively.
+    fn prefixes(&self, node: TermId) -> String {
+        let imports = self.graph.iri(OWL_IMPORTS);
+        let mut pending = self.values(node, "prefixes");
+        let mut seen = BTreeSet::new();
+        let mut out = String::new();
+        while let Some(ontology) = pending.pop() {
+            if !seen.insert(ontology) {
+                continue;
+            }
+            for declaration in self.values(ontology, "declare") {
+                if let (Some(prefix), Some(namespace)) = (
+                    self.string(declaration, "prefix"),
+                    self.string(declaration, "namespace"),
+                ) {
+                    out.push_str(&format!("PREFIX {prefix}: <{namespace}>\n"));
+                }
+            }
+            if let Some(imports) = imports {
+                pending.extend(self.graph.objects(ontology, imports));
+            }
+        }
+        out
+    }
+
+    /// The query of `source` (a SPARQL constraint or validator) from `text`: its prefixes,
+    /// `$PATH` replaced by `path`, parsed, of the expected form, and pre-bindable with
+    /// `pre_bound`. `None` (and an error on `shape`) if not.
+    fn sparql_query(
+        &mut self,
+        shape: TermId,
+        source: TermId,
+        text: &str,
+        path: Option<&Path>,
+        pre_bound: &[String],
+        ask: bool,
+    ) -> Option<Query> {
+        let mut text = text.to_owned();
+        if text.contains("$PATH") {
+            let graph = &self.graph;
+            let iri = |id: TermId| match graph.decode(id) {
+                Some(Term::NamedNode(iri)) => Some(iri.into_string()),
+                _ => None,
+            };
+            match path.and_then(|path| sparql::path_text(path, &iri)) {
+                Some(path) => text = text.replace("$PATH", &path),
+                None => {
+                    self.error(shape, "a SPARQL query uses $PATH outside a property shape");
+                    return None;
+                }
+            }
+        }
+        let text = format!("{}{text}", self.prefixes(source));
+        let query = match Query::parse(&text, None) {
+            Ok(query) => query,
+            Err(error) => {
+                self.error(shape, format!("a SPARQL query doesn't parse: {error}"));
+                return None;
+            }
+        };
+        let pattern = match (&query, ask) {
+            (Query::Ask { pattern, .. }, true) | (Query::Select { pattern, .. }, false) => pattern,
+            _ => {
+                let expected = if ask { "ASK" } else { "SELECT" };
+                self.error(shape, format!("a SPARQL query isn't an {expected} query"));
+                return None;
+            }
+        };
+        if let Some(problem) = sparql::prebinding_problem(pattern, pre_bound) {
+            self.error(shape, format!("a SPARQL query {problem} (SHACL §5.6.2)"));
+            return None;
+        }
+        Some(query)
+    }
+
+    /// `sh:sparql` constraints (SHACL §5).
+    fn sparql_constraints(&mut self, node: TermId, path: Option<&Path>, out: &mut Vec<Constraint>) {
+        for constraint in self.values(node, "sparql") {
+            if self
+                .one(constraint, "deactivated")
+                .is_some_and(|value| self.is_true(value))
+            {
+                continue;
+            }
+            let Some(select) = self.string(constraint, "select") else {
+                self.error(node, "an sh:sparql constraint has no sh:select");
+                continue;
+            };
+            let pre_bound =
+                [sparql::THIS, sparql::SHAPES_GRAPH, sparql::CURRENT_SHAPE].map(str::to_owned);
+            let Some(query) = self.sparql_query(node, constraint, &select, path, &pre_bound, false)
+            else {
+                continue;
+            };
+            out.push(Constraint::Sparql(Box::new(SparqlCheck {
+                source: constraint,
+                component: Component::Sparql,
+                query,
+                ask: false,
+                parameters: Vec::new(),
+                messages: self.values(constraint, "message"),
+            })));
+        }
+    }
+
+    /// The SPARQL-based constraint components of the shapes graph: nodes with parameters
+    /// and a validator.
+    fn discover_components(&mut self) -> Vec<ComponentDef> {
+        let Some(parameter) = self.sh("parameter") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for node in self.graph.subjects_of(parameter) {
+            let (validator, node_validator, property_validator) = (
+                self.one(node, "validator"),
+                self.one(node, "nodeValidator"),
+                self.one(node, "propertyValidator"),
+            );
+            if validator.is_none() && node_validator.is_none() && property_validator.is_none() {
+                continue;
+            }
+            let mut parameters = Vec::new();
+            for declared in self.graph.objects(node, parameter) {
+                let Some(predicate) = self.one(declared, "path") else {
+                    self.error(node, "a parameter has no sh:path");
+                    continue;
+                };
+                let Some(Term::NamedNode(iri)) = self.graph.decode(predicate) else {
+                    self.error(node, "a parameter's sh:path isn't an IRI");
+                    continue;
+                };
+                let name = iri
+                    .as_str()
+                    .rsplit(['#', '/'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                let optional = self
+                    .one(declared, "optional")
+                    .is_some_and(|value| self.is_true(value));
+                parameters.push((predicate, Variable::new_unchecked(name), optional));
+            }
+            out.push(ComponentDef {
+                node,
+                parameters,
+                validator,
+                node_validator,
+                property_validator,
+                messages: self.values(node, "message"),
+            });
+        }
+        out
+    }
+
+    /// The constraints of the SPARQL-based components that constrain `node`: one per
+    /// combination of its values for the components' parameters (SHACL §6.2).
+    fn component_constraints(
+        &mut self,
+        node: TermId,
+        path: Option<&Path>,
+        components: &[ComponentDef],
+        out: &mut Vec<Constraint>,
+    ) {
+        for component in components {
+            let mut values: Vec<(Variable, Vec<TermId>)> = Vec::new();
+            let mut applies = true;
+            for (predicate, variable, optional) in &component.parameters {
+                let found = self.graph.objects(node, *predicate);
+                if found.is_empty() && !optional {
+                    applies = false;
+                    break;
+                }
+                if !found.is_empty() {
+                    values.push((variable.clone(), found));
+                }
+            }
+            if !applies || values.is_empty() {
+                continue;
+            }
+            let validator = match path {
+                Some(_) => component.property_validator.or(component.validator),
+                None => component.node_validator.or(component.validator),
+            };
+            let Some(validator) = validator else {
+                continue;
+            };
+            let (ask, text) = match (
+                self.string(validator, "ask"),
+                self.string(validator, "select"),
+            ) {
+                (Some(ask), _) => (true, ask),
+                (None, Some(select)) if Some(validator) != component.validator => (false, select),
+                _ => {
+                    self.error(
+                        node,
+                        "a constraint component's validator has no usable query",
+                    );
+                    continue;
+                }
+            };
+            let mut pre_bound: Vec<String> =
+                [sparql::THIS, sparql::SHAPES_GRAPH, sparql::CURRENT_SHAPE]
+                    .map(str::to_owned)
+                    .into();
+            pre_bound.extend(
+                component
+                    .parameters
+                    .iter()
+                    .map(|(_, variable, _)| variable.as_str().to_owned()),
+            );
+            if ask {
+                pre_bound.push(sparql::VALUE.to_owned());
+            }
+            let Some(query) = self.sparql_query(node, validator, &text, path, &pre_bound, ask)
+            else {
+                continue;
+            };
+            let messages = match self.values(validator, "message") {
+                messages if messages.is_empty() => component.messages.clone(),
+                messages => messages,
+            };
+            // Every combination of the parameters' values.
+            let mut combinations: Vec<Vec<(Variable, TermId)>> = vec![Vec::new()];
+            for (variable, found) in &values {
+                combinations = combinations
+                    .into_iter()
+                    .flat_map(|chosen| {
+                        found.iter().map(move |&value| {
+                            let mut chosen = chosen.clone();
+                            chosen.push((variable.clone(), value));
+                            chosen
+                        })
+                    })
+                    .collect();
+            }
+            for parameters in combinations {
+                out.push(Constraint::Sparql(Box::new(SparqlCheck {
+                    source: validator,
+                    component: Component::Custom(component.node),
+                    query: query.clone(),
+                    ask,
+                    parameters,
+                    messages: messages.clone(),
+                })));
+            }
+        }
     }
 }

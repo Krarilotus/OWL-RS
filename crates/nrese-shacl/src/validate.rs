@@ -12,9 +12,10 @@ use nrese_sparql::value::{Value, compare, lang_matches};
 use crate::datatype::well_formed;
 use crate::graph::{GraphView, Selection};
 use crate::model::{
-    Bound, Component, Constraint, Logical, NodeKind, Path, Shape, ShapeRef, Shapes, Target,
+    Bound, Component, Constraint, Logical, NodeKind, Path, Shape, ShapeRef, Shapes, SparqlCheck,
+    Target,
 };
-use crate::path;
+use crate::{path, sparql};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
@@ -28,14 +29,19 @@ pub(crate) struct RawResult {
     pub(crate) value: Option<TermId>,
     pub(crate) shape: ShapeRef,
     pub(crate) component: Component,
+    /// `sh:sourceConstraint` (SHACL-SPARQL).
+    pub(crate) source: Option<TermId>,
+    /// The result's messages, where they aren't the shape's (SHACL-SPARQL).
+    pub(crate) messages: Option<Vec<TermId>>,
 }
 
-/// Validates the data in `data` against every targeted shape.
+/// Validates the data in `data` against every targeted shape: the results, and the
+/// failures (SPARQL-based constraints that couldn't be evaluated).
 pub(crate) fn validate_raw<V: ReadView>(
     view: &V,
     shapes: &Shapes,
     data: Selection,
-) -> Vec<RawResult> {
+) -> (Vec<RawResult>, Vec<String>) {
     let validator = Validator::new(view, shapes, data);
     let mut results = Vec::new();
     for shape in shapes.targeted() {
@@ -43,12 +49,13 @@ pub(crate) fn validate_raw<V: ReadView>(
             validator.validate_node(shape, focus, &mut results, &mut Vec::new());
         }
     }
-    results
+    (results, validator.failures.into_inner())
 }
 
 struct Validator<'a, V: ReadView> {
     graph: GraphView<'a, V>,
     shapes: &'a Shapes,
+    failures: std::cell::RefCell<Vec<String>>,
     rdf_type: Option<TermId>,
     /// Each class the shapes name, with its subclasses (itself included).
     classes: HashMap<TermId, BTreeSet<TermId>>,
@@ -71,6 +78,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
             rdf_type: graph.iri(RDF_TYPE),
             graph,
             shapes,
+            failures: std::cell::RefCell::default(),
             classes: HashMap::new(),
         };
         let sub_class_of = graph.iri(RDFS_SUB_CLASS_OF);
@@ -221,6 +229,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
             value,
             shape: shape_ref,
             component,
+            source: None,
+            messages: None,
         };
         // One result per value node that fails `ok`.
         let mut each = |component: Component, ok: &mut dyn FnMut(TermId) -> bool| {
@@ -408,6 +418,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
                                 value: Some(object),
                                 shape: shape_ref,
                                 component: Component::Closed,
+                                source: None,
+                                messages: None,
                             });
                         }
                     }
@@ -419,6 +431,74 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 }
             }
             Constraint::In(allowed) => each(Component::In, &mut |v| allowed.contains(&v)),
+            Constraint::Sparql(check) => self.sparql(shape_ref, focus, values, check, results),
+        }
+    }
+
+    /// A SHACL-SPARQL check for `focus` ([`sparql`]): its results, or a failure.
+    fn sparql(
+        &self,
+        shape_ref: ShapeRef,
+        focus: TermId,
+        values: &[TermId],
+        check: &SparqlCheck,
+        results: &mut Vec<RawResult>,
+    ) {
+        let shape = &self.shapes.shapes[shape_ref];
+        let (view, data) = self.graph.parts();
+        let raw = |value: Option<TermId>, path: Option<Path>| RawResult {
+            focus,
+            path,
+            value,
+            shape: shape_ref,
+            component: check.component,
+            source: Some(check.source),
+            messages: (!check.messages.is_empty()).then(|| check.messages.clone()),
+        };
+        let failure = |problem: &str| {
+            let at = self
+                .graph
+                .decode(focus)
+                .map_or_else(String::new, |term| term.to_string());
+            self.failures
+                .borrow_mut()
+                .push(format!("a SPARQL constraint at focus node {at}: {problem}"));
+        };
+        let outcome = sparql::run(
+            view,
+            data,
+            check,
+            focus,
+            values,
+            shape.node,
+            self.shapes.graph,
+        );
+        match outcome {
+            Err(error) => failure(&error),
+            Ok(sparql::Outcome::Failed(failed)) => {
+                for value in failed {
+                    results.push(raw(Some(value), shape.path.clone()));
+                }
+            }
+            Ok(sparql::Outcome::Solutions(found)) => {
+                for solution in found {
+                    if solution.failure {
+                        failure("the query reported ?failure");
+                        continue;
+                    }
+                    let value = match &solution.value {
+                        Some(term) => self.graph.lookup(term),
+                        // A node shape's value is its focus node.
+                        None => shape.path.is_none().then_some(focus),
+                    };
+                    let path = solution
+                        .path
+                        .and_then(|path| self.graph.lookup(&Term::NamedNode(path)))
+                        .map(Path::Predicate)
+                        .or_else(|| shape.path.clone());
+                    results.push(raw(value, path));
+                }
+            }
         }
     }
 }
