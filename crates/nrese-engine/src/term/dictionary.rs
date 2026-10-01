@@ -499,26 +499,26 @@ impl Dictionary {
             };
         let mut order = self.order.write();
         order.extend(first, inner.len(), &key);
-        let rest: Vec<u64> = order.order.iter().copied().filter(|&i| i < len).collect();
-        drop(order);
-        let base: Vec<u64> = base
+        let order = parking_lot::RwLockWriteGuard::downgrade(order);
+        // Merged straight from both orders: no copies of them.
+        let capacity = base.len() + order.order.len();
+        let mut base = base
             .iter()
             .map(|&i| u64::from(i))
             .filter(|&i| i < len)
-            .collect();
-        let mut merged = Vec::with_capacity(base.len() + rest.len());
-        let (mut i, mut j) = (0, 0);
-        while i < base.len() && j < rest.len() {
-            if (text(base[i]), base[i]) <= (text(rest[j]), rest[j]) {
-                merged.push(base[i] as u32);
-                i += 1;
-            } else {
-                merged.push(rest[j] as u32);
-                j += 1;
-            }
+            .peekable();
+        let mut rest = order.order.iter().copied().filter(|&i| i < len).peekable();
+        let mut merged = Vec::with_capacity(capacity);
+        loop {
+            let next = match (base.peek(), rest.peek()) {
+                (Some(&b), Some(&r)) if (text(b), b) <= (text(r), r) => base.next(),
+                (Some(_), Some(_)) => rest.next(),
+                (Some(_), None) => base.next(),
+                (None, Some(_)) => rest.next(),
+                (None, None) => break,
+            };
+            merged.push(next.expect("peeked") as u32);
         }
-        merged.extend(base[i..].iter().map(|&i| i as u32));
-        merged.extend(rest[j..].iter().map(|&i| i as u32));
         merged
     }
 
@@ -726,6 +726,8 @@ impl Dictionary {
             next.push(key, key_hash(key));
         }
         *inner = next;
+        // The in-memory text order covered entries the base orders now.
+        *self.order.write() = super::order::TextOrder::default();
         Ok(true)
     }
 

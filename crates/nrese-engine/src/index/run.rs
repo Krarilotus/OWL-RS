@@ -128,19 +128,24 @@ impl Run {
     pub(crate) fn from_quads(layout: Layout, mut quads: Vec<EncodedQuad>) -> Self {
         quads.par_sort_unstable();
         quads.dedup();
-        let build = |permutation: Permutation| {
-            let mut keys: Vec<Key> = quads.par_iter().map(|q| permutation.to_key(q)).collect();
-            keys.par_sort_unstable();
-            PermutationRun {
+        // One array of keys, 32 bytes per quad, in the quads' place (the same size): each
+        // permutation in turn reorders the keys in place, sorts them and packs them. Building
+        // the permutations at once, or from copies, would hold several such arrays.
+        let mut keys: Vec<Key> = quads.into_iter().map(EncodedQuad::components).collect();
+        let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
+        let mut previous = Permutation::Spog;
+        for &permutation in layout.permutations() {
+            if permutation != previous {
+                keys.par_iter_mut().for_each(|key| {
+                    *key = permutation.to_key(&previous.key_to_quad(key));
+                });
+                keys.par_sort_unstable();
+                previous = permutation;
+            }
+            perms[permutation as usize] = PermutationRun {
                 keys: PackedKeys::from_sorted(&keys),
                 tombstones: Box::default(),
-            }
-        };
-        // One permutation at a time (each sort is parallel): building them all at once would
-        // hold every uncompressed key array together, 32 bytes per quad each.
-        let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
-        for &permutation in layout.permutations() {
-            perms[permutation as usize] = build(permutation);
+            };
         }
         Self::from_permutations(layout, perms)
     }
