@@ -1,19 +1,22 @@
-//! The W3C RDF 1.1 syntax test suites (w3c/rdf-tests): N-Triples, N-Quads, and the formats
-//! this crate reads as they are added.
+//! The W3C RDF 1.1 and RDF 1.2 syntax test suites (w3c/rdf-tests): N-Triples, N-Quads,
+//! Turtle, TriG and RDF/XML, and canonical N-Triples and N-Quads (1.2).
 //!
 //! - **Source.** The pinned checkout `scripts/fetch-w3c-tests.sh` puts in `.cache/rdf-tests`,
 //!   or wherever `NRESE_W3C_TESTS` points. Without it the test is skipped, unless
 //!   `NRESE_W3C_REQUIRED` is set (as in CI).
 //! - **Kinds.** Positive syntax: the document parses. Negative syntax: it doesn't.
 //!   Evaluation: the document's statements equal the expected N-Triples or N-Quads, up to
-//!   blank node names (`nrese-rdf`'s canonicalisation).
+//!   blank node names (`nrese-rdf`'s canonicalisation). Canonicalisation (C14N): each
+//!   statement written back is, byte for byte, a line of the expected canonical document.
 //! - **Manifests** are Turtle, read with this crate's own parser.
 //! - **Streaming.** Every document is also read through a reader that gives one byte per
 //!   call, so that every token is cut by the buffer somewhere: the outcome must be the
 //!   same (the same statements up to blank node names, or an error).
 //! - **Round trips.** Every document that parses is written back, in its own format, as
 //!   N-Quads and as JSON-LD (Turtle, TriG, RDF/XML and JSON-LD with a few prefixes, to
-//!   exercise abbreviation), and read again: the statements must be the same.
+//!   exercise abbreviation), and read again: the statements must be the same. JSON-LD 1.1
+//!   has no triple terms, and reads `@direction` back without the direction (unless the
+//!   `rdfDirection` option is set), so documents with either skip that one.
 //! - **Parallel parsing.** Every Turtle and TriG document that parses is also cut into 2,
 //!   3 and 8 chunks by the exact splitter and parsed chunk by chunk: the same statements.
 //! - `expected-failures.txt` lists tests that fail on purpose, each with its reason; a new
@@ -30,13 +33,22 @@ const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const MF: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#";
 const RDFT: &str = "http://www.w3.org/ns/rdftest#";
 
-/// The suites, by directory under `rdf/rdf11`.
-const SUITES: [&str; 5] = [
-    "rdf-n-triples",
-    "rdf-n-quads",
-    "rdf-turtle",
-    "rdf-trig",
-    "rdf-xml",
+/// The suites, by the directory of their manifest under `rdf/`.
+const SUITES: [&str; 14] = [
+    "rdf11/rdf-n-triples",
+    "rdf11/rdf-n-quads",
+    "rdf11/rdf-turtle",
+    "rdf11/rdf-trig",
+    "rdf11/rdf-xml",
+    "rdf12/rdf-n-triples/syntax",
+    "rdf12/rdf-n-triples/c14n",
+    "rdf12/rdf-n-quads/syntax",
+    "rdf12/rdf-n-quads/c14n",
+    "rdf12/rdf-turtle/syntax",
+    "rdf12/rdf-turtle/eval",
+    "rdf12/rdf-trig/syntax",
+    "rdf12/rdf-trig/eval",
+    "rdf12/rdf-xml/eval",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +57,7 @@ enum Kind {
     NegativeSyntax,
     Eval,
     NegativeEval,
+    C14n,
 }
 
 struct Test {
@@ -60,13 +73,13 @@ fn suite_root() -> Option<PathBuf> {
         || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.cache/rdf-tests"),
         PathBuf::from,
     );
-    root.join("rdf/rdf11").is_dir().then_some(root)
+    root.join("rdf/rdf12").is_dir().then_some(root)
 }
 
 /// The manifest's tests.
 fn read_manifest(root: &Path, suite: &str) -> Vec<Test> {
-    let directory = format!("{BASE}rdf/rdf11/{suite}/");
-    let text = std::fs::read(root.join("rdf/rdf11").join(suite).join("manifest.ttl")).unwrap();
+    let directory = format!("{BASE}rdf/{suite}/");
+    let text = std::fs::read(root.join("rdf").join(suite).join("manifest.ttl")).unwrap();
     let quads: Vec<Quad> = RdfParser::from_format(RdfFormat::Turtle)
         .with_base_iri(format!("{directory}manifest.ttl"))
         .unwrap()
@@ -87,12 +100,15 @@ fn read_manifest(root: &Path, suite: &str) -> Vec<Test> {
             .find(|(p, _)| p == predicate)
             .map(|(_, o)| o.clone())
     };
-    // The entries list, in order.
+    // The entries list of the manifest, in order.
+    let entries_iri = format!("{MF}entries");
+    let manifest = by_subject
+        .iter()
+        .find(|(_, properties)| properties.iter().any(|(p, _)| *p == entries_iri))
+        .map(|(subject, _)| subject.clone())
+        .expect("a manifest with entries");
     let mut entries = Vec::new();
-    let mut node = object(
-        &format!("<{directory}manifest.ttl>"),
-        &format!("{MF}entries"),
-    );
+    let mut node = object(&manifest, &entries_iri);
     while let Some(current) = node {
         let key = current.to_string();
         if key == format!("<{RDF}nil>") {
@@ -126,6 +142,8 @@ fn read_manifest(root: &Path, suite: &str) -> Vec<Test> {
                 "TestTrigNegativeEval" => (RdfFormat::TriG, Kind::NegativeEval),
                 "TestXMLEval" => (RdfFormat::RdfXml, Kind::Eval),
                 "TestXMLNegativeSyntax" => (RdfFormat::RdfXml, Kind::NegativeSyntax),
+                "TestNTriplesPositiveC14N" => (RdfFormat::NTriples, Kind::C14n),
+                "TestNQuadsPositiveC14N" => (RdfFormat::NQuads, Kind::C14n),
                 _ => return None,
             };
             Some(Test {
@@ -198,7 +216,15 @@ fn parse(root: &Path, format: RdfFormat, iri: &str) -> Result<BTreeSet<Quad>, St
 
 /// The statements written in `format` and read back must be the same.
 fn round_trip(format: RdfFormat, quads: &BTreeSet<Quad>) -> Result<(), String> {
+    let beyond_json_ld = quads.iter().any(|q| match &q.object {
+        Term::Triple(_) => true,
+        Term::Literal(l) => l.direction().is_some(),
+        _ => false,
+    });
     for format in [format, RdfFormat::NQuads, RdfFormat::JsonLd] {
+        if format == RdfFormat::JsonLd && beyond_json_ld {
+            continue;
+        }
         let mut serializer = RdfSerializer::from_format(format);
         if matches!(
             format,
@@ -279,6 +305,25 @@ fn run(root: &Path, test: &Test) -> Result<(), String> {
     }
     match test.kind {
         Kind::PositiveSyntax => round_trip(test.format, &action?),
+        Kind::C14n => {
+            let quads = action?;
+            let mut writer = RdfSerializer::from_format(test.format).for_writer(Vec::new());
+            for quad in &quads {
+                writer.serialize_quad(quad).map_err(|e| e.to_string())?;
+            }
+            let written = String::from_utf8(writer.finish().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            let result = test.result.as_deref().ok_or("a C14N test without result")?;
+            let expected =
+                std::fs::read_to_string(file(root, result)).map_err(|e| e.to_string())?;
+            let lines =
+                |text: &str| -> BTreeSet<String> { text.lines().map(str::to_owned).collect() };
+            if lines(&written) == lines(&expected) {
+                Ok(())
+            } else {
+                Err(format!("written:\n{written}expected:\n{expected}"))
+            }
+        }
         Kind::NegativeSyntax | Kind::NegativeEval => match action {
             Ok(_) => Err("parsed, but must not".to_owned()),
             Err(_) => Ok(()),
@@ -335,7 +380,7 @@ fn w3c_rdf_syntax_suites() {
     };
     let expected = expected_failures();
     let mut unexpected = Vec::new();
-    println!("W3C RDF 1.1 syntax suites: passed / failed (expected failures)");
+    println!("W3C RDF syntax suites: passed / failed (expected failures)");
     for suite in SUITES {
         let tests = read_manifest(&root, suite);
         assert!(!tests.is_empty(), "no tests in {suite}");

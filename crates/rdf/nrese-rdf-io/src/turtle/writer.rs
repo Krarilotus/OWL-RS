@@ -119,10 +119,27 @@ impl TurtleWriter {
             out.push(b' ');
             self.predicate = Some(quad.predicate.into_owned());
         }
-        match quad.object {
+        self.write_term(out, quad.object)
+    }
+
+    /// An object: a triple term as `<<( s p o )>>`.
+    fn write_term(&self, out: &mut Vec<u8>, term: TermRef<'_>) -> io::Result<()> {
+        match term {
             TermRef::NamedNode(n) => self.write_iri(out, n),
             TermRef::BlankNode(b) => write!(out, "_:{}", b.as_str())?,
             TermRef::Literal(literal) => self.write_literal(out, literal),
+            TermRef::Triple(triple) => {
+                out.extend_from_slice(b"<<( ");
+                match triple.subject.as_ref() {
+                    NamedOrBlankNodeRef::NamedNode(n) => self.write_iri(out, n),
+                    NamedOrBlankNodeRef::BlankNode(b) => write!(out, "_:{}", b.as_str())?,
+                }
+                out.push(b' ');
+                self.write_iri(out, triple.predicate.as_ref());
+                out.push(b' ');
+                self.write_term(out, triple.object.as_ref())?;
+                out.extend_from_slice(b" )>>");
+            }
         }
         Ok(())
     }
@@ -174,6 +191,10 @@ impl TurtleWriter {
         if let Some(language) = literal.language() {
             out.push(b'@');
             out.extend_from_slice(language.as_bytes());
+            if let Some(direction) = literal.direction() {
+                out.extend_from_slice(b"--");
+                out.extend_from_slice(direction.as_str().as_bytes());
+            }
         } else if datatype != xsd::STRING {
             out.extend_from_slice(b"^^");
             self.write_iri(out, datatype);

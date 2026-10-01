@@ -1,4 +1,4 @@
-//! The tokens of Turtle and TriG (RDF 1.1), and of Notation3 (N3), from the unconsumed
+//! The tokens of Turtle and TriG (RDF 1.2), and of Notation3 (N3), from the unconsumed
 //! bytes of the input. N3's own tokens are only recognised in N3 mode; each starts with a
 //! byte Turtle doesn't allow there, so the Turtle path doesn't pay for them.
 //!
@@ -8,6 +8,8 @@
 //! refill. Text is not decoded here (escapes, prefixes, relative IRIs are the parser's).
 
 use std::ops::Range;
+
+use nrese_rdf::BaseDirection;
 
 /// What a token is. Text positions are in the token's [`Token::text`] range unless noted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,8 +30,10 @@ pub(crate) enum Kind {
     String {
         escaped: bool,
     },
-    /// `@tag` after a string: the text is the tag.
-    LangTag,
+    /// `@tag` or `@tag--dir` after a string: the text is the tag.
+    LangTag {
+        direction: Option<BaseDirection>,
+    },
     Integer,
     Decimal,
     Double,
@@ -39,9 +43,11 @@ pub(crate) enum Kind {
     A,
     AtPrefix,
     AtBase,
-    /// SPARQL-style `PREFIX`, `BASE`, and TriG's `GRAPH` (any letter case).
+    AtVersion,
+    /// SPARQL-style `PREFIX`, `BASE`, `VERSION`, and TriG's `GRAPH` (any letter case).
     Prefix,
     Base,
+    Version,
     Graph,
     Dot,
     Semicolon,
@@ -54,6 +60,18 @@ pub(crate) enum Kind {
     CloseBrace,
     /// `^^`
     Datatype,
+    // RDF 1.2.
+    /// `<<(` and `)>>` around a triple term.
+    TripleTermOpen,
+    TripleTermClose,
+    /// `<<` and `>>` around a reified triple.
+    ReifiedOpen,
+    ReifiedClose,
+    /// `~`, before a reifier.
+    Tilde,
+    /// `{|` and `|}` around an annotation block.
+    AnnotationOpen,
+    AnnotationClose,
     // N3 only.
     /// `?name`: the text is the name.
     Variable,
@@ -144,6 +162,19 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
         },
         b'!' if n3 => token(Kind::Bang, start, start..start + 1, start + 1),
         b'?' if n3 => variable(input, start, eof),
+        b'<' if need!(1) == Some(b'<') => match need!(2) {
+            Some(b'(') => token(Kind::TripleTermOpen, start, start..start + 3, start + 3),
+            _ => token(Kind::ReifiedOpen, start, start..start + 2, start + 2),
+        },
+        b'>' => match need!(1) {
+            Some(b'>') => token(Kind::ReifiedClose, start, start..start + 2, start + 2),
+            _ => Lexed::Error(start, "expected '>>'"),
+        },
+        b'~' => token(Kind::Tilde, start, start..start + 1, start + 1),
+        b'|' => match need!(1) {
+            Some(b'}') => token(Kind::AnnotationClose, start, start..start + 2, start + 2),
+            _ => Lexed::Error(start, "expected '|}'"),
+        },
         b'<' => match memchr::memchr(b'>', &input[start..]) {
             Some(k) => {
                 let text = start + 1..start + k;
@@ -172,7 +203,8 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
             match &input[start + 1..end] {
                 b"prefix" => token(Kind::AtPrefix, start, start..end, end),
                 b"base" => token(Kind::AtBase, start, start..end, end),
-                _ => Lexed::Error(start, "expected @prefix or @base"),
+                b"version" => token(Kind::AtVersion, start, start..end, end),
+                _ => Lexed::Error(start, "expected @prefix, @base or @version"),
             }
         }
         b'.' => match need!(1) {
@@ -185,7 +217,13 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
         b'[' => token(Kind::OpenBracket, start, start..start + 1, start + 1),
         b']' => token(Kind::CloseBracket, start, start..start + 1, start + 1),
         b'(' => token(Kind::OpenParen, start, start..start + 1, start + 1),
+        b')' if !n3 && need!(1) == Some(b'>') && need!(2) == Some(b'>') => {
+            token(Kind::TripleTermClose, start, start..start + 3, start + 3)
+        }
         b')' => token(Kind::CloseParen, start, start..start + 1, start + 1),
+        b'{' if !n3 && need!(1) == Some(b'|') => {
+            token(Kind::AnnotationOpen, start, start..start + 2, start + 2)
+        }
         b'{' => token(Kind::OpenBrace, start, start..start + 1, start + 1),
         b'}' => token(Kind::CloseBrace, start, start..start + 1, start + 1),
         b'^' => match need!(1) {
@@ -381,7 +419,8 @@ fn blank_label(input: &[u8], start: usize, eof: bool) -> Lexed {
     token(Kind::BlankLabel, start, label..end, end)
 }
 
-/// `@tag` after a string: `[a-zA-Z]+ ('-' [a-zA-Z0-9]+)*`.
+/// `@tag` after a string: `[a-zA-Z]+ ('-' [a-zA-Z0-9]+)* ('--' [a-zA-Z]+)?` (`LANG_DIR`),
+/// the direction `ltr` or `rtl`.
 fn language_tag(input: &[u8], start: usize, eof: bool) -> Lexed {
     let len = input.len();
     let mut end = start + 1;
@@ -398,6 +437,12 @@ fn language_tag(input: &[u8], start: usize, eof: bool) -> Lexed {
         if input.get(end) != Some(&b'-') {
             break;
         }
+        if end + 1 == len && !eof {
+            return Lexed::NeedMore;
+        }
+        if input.get(end + 1) == Some(&b'-') {
+            return direction(input, start, end, eof);
+        }
         let part = end + 1;
         let mut stop = part;
         while stop < len && input[stop].is_ascii_alphanumeric() {
@@ -411,7 +456,37 @@ fn language_tag(input: &[u8], start: usize, eof: bool) -> Lexed {
         }
         end = stop;
     }
-    token(Kind::LangTag, start, start + 1..end, end)
+    token(
+        Kind::LangTag { direction: None },
+        start,
+        start + 1..end,
+        end,
+    )
+}
+
+/// The `--ltr` or `--rtl` at `at` after the tag `input[start + 1..at]`.
+fn direction(input: &[u8], start: usize, at: usize, eof: bool) -> Lexed {
+    let from = at + 2;
+    let mut stop = from;
+    while stop < input.len() && input[stop].is_ascii_alphabetic() {
+        stop += 1;
+    }
+    if stop == input.len() && !eof {
+        return Lexed::NeedMore;
+    }
+    let direction = match &input[from..stop] {
+        b"ltr" => BaseDirection::Ltr,
+        b"rtl" => BaseDirection::Rtl,
+        _ => return Lexed::Error(at, "a base direction other than ltr or rtl"),
+    };
+    token(
+        Kind::LangTag {
+            direction: Some(direction),
+        },
+        start,
+        start + 1..at,
+        stop,
+    )
 }
 
 /// `INTEGER`, `DECIMAL` or `DOUBLE`. A '.' not followed by a digit (nor by an exponent
@@ -505,6 +580,7 @@ fn name(input: &[u8], start: usize, eof: bool, n3: bool) -> Lexed {
         b"false" => Kind::False,
         _ if word.eq_ignore_ascii_case(b"PREFIX") => Kind::Prefix,
         _ if word.eq_ignore_ascii_case(b"BASE") => Kind::Base,
+        _ if word.eq_ignore_ascii_case(b"VERSION") && !n3 => Kind::Version,
         _ if word.eq_ignore_ascii_case(b"GRAPH") && !n3 => Kind::Graph,
         b"has" if n3 => Kind::Has,
         b"is" if n3 => Kind::Is,
@@ -626,7 +702,7 @@ mod tests {
                 Kind::Dot
             ]
         );
-        assert!(t.contains(&(Kind::LangTag, "en-GB".into())));
+        assert!(t.contains(&(Kind::LangTag { direction: None }, "en-GB".into())));
         assert!(t.contains(&(Kind::String { escaped: false }, "long \"q\" ".into())));
         assert!(t.contains(&(Kind::Decimal, "-2.5".into())));
         assert!(t.contains(&(Kind::Double, "3e4".into())));

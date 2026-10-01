@@ -17,7 +17,7 @@ macro_rules! vocabulary {
 }
 
 vocabulary!(
-    /// RDF 1.1 (`rdf:`).
+    /// RDF 1.2 (`rdf:`).
     rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#" {
         ALT = "Alt",
         BAG = "Bag",
@@ -32,6 +32,7 @@ vocabulary!(
         PLAIN_LITERAL = "PlainLiteral",
         PREDICATE = "predicate",
         PROPERTY = "Property",
+        REIFIES = "reifies",
         REST = "rest",
         SEQ = "Seq",
         STATEMENT = "Statement",

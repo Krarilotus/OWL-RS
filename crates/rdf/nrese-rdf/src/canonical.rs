@@ -27,13 +27,16 @@
 //!    by their form: no branching across them at all. A node alone in its colour keeps it
 //!    during refinement, so a choice in one part can't reach another through it.
 //!
+//! 6. **Triple terms** (RDF 1.2) that hold blank nodes become nodes of their own before
+//!    all this (see [`encode`]), so the same search covers them, nested ones included.
+//!
 //! The names depend on the hash function, so they are stable only within one build.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
 
-use crate::term::{BlankNode, GraphName, NamedOrBlankNode, Term};
-use crate::triple::Quad;
+use crate::term::{BlankNode, GraphName, NamedNode, NamedOrBlankNode, Term};
+use crate::triple::{Quad, Triple};
 
 /// A fixed seed: colours must be the same in every run (foldhash, much faster than SipHash
 /// on the many small values refinement hashes).
@@ -93,6 +96,124 @@ struct Component<'a> {
 
 /// The quads with their blank nodes renamed canonically.
 pub(crate) fn canonical(quads: BTreeSet<Quad>) -> BTreeSet<Quad> {
+    let encoded;
+    let names = if quads.iter().any(|q| holds_blank_node(&q.object)) {
+        encoded = encode(&quads);
+        names(&encoded)
+    } else {
+        names(&quads)
+    };
+    if names.is_empty() {
+        return quads;
+    }
+    quads.into_iter().map(|q| renamed(q, &names)).collect()
+}
+
+/// Whether `term` is a blank node or a triple term holding one.
+fn holds_blank_node(term: &Term) -> bool {
+    match term {
+        Term::BlankNode(_) => true,
+        Term::Triple(t) => triple_holds_blank_node(t),
+        _ => false,
+    }
+}
+
+fn triple_holds_blank_node(triple: &Triple) -> bool {
+    triple.subject.is_blank_node() || holds_blank_node(&triple.object)
+}
+
+/// The predicates of the encoding: not IRIs, so no data has them.
+fn marker(part: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!(" triple term {part}"))
+}
+
+/// The quads with each distinct triple term that holds blank nodes replaced by a node of
+/// its own, which has three edges under the [`marker`] predicates: to the term's subject,
+/// predicate and object (an encoded node again where the object is such a term). Equal
+/// triple terms share their node, and no other node has those edges, so the isomorphisms
+/// of the encoding are exactly those of the quads.
+fn encode(quads: &BTreeSet<Quad>) -> BTreeSet<Quad> {
+    fn node<'a>(
+        term: &'a Term,
+        nodes: &mut HashMap<&'a Triple, BlankNode>,
+        out: &mut BTreeSet<Quad>,
+    ) -> Term {
+        let Term::Triple(triple) = term else {
+            return term.clone();
+        };
+        if !holds_blank_node(term) {
+            return term.clone();
+        }
+        if let Some(node) = nodes.get(&**triple) {
+            return node.clone().into();
+        }
+        // A label no data has (it isn't a blank node label).
+        let encoded = BlankNode::new_unchecked(format!(" t{}", nodes.len()));
+        nodes.insert(triple, encoded.clone());
+        let object = node(&triple.object, nodes, out);
+        for (part, value) in [
+            ("subject", triple.subject.clone().into()),
+            ("predicate", triple.predicate.clone().into()),
+            ("object", object),
+        ] {
+            out.insert(Quad::new(
+                encoded.clone(),
+                marker(part),
+                value,
+                GraphName::DefaultGraph,
+            ));
+        }
+        encoded.into()
+    }
+    let mut nodes = HashMap::new();
+    let mut out = BTreeSet::new();
+    for quad in quads {
+        let object = node(&quad.object, &mut nodes, &mut out);
+        out.insert(Quad {
+            subject: quad.subject.clone(),
+            predicate: quad.predicate.clone(),
+            object,
+            graph_name: quad.graph_name.clone(),
+        });
+    }
+    out
+}
+
+/// `quad` with its blank nodes, in triple terms too, renamed by `names`.
+fn renamed(quad: Quad, names: &HashMap<BlankNode, BlankNode>) -> Quad {
+    fn subject(node: NamedOrBlankNode, names: &HashMap<BlankNode, BlankNode>) -> NamedOrBlankNode {
+        match node {
+            NamedOrBlankNode::BlankNode(b) => names[&b].clone().into(),
+            other => other,
+        }
+    }
+    fn object(term: Term, names: &HashMap<BlankNode, BlankNode>) -> Term {
+        match term {
+            Term::BlankNode(b) => names[&b].clone().into(),
+            Term::Triple(t) if triple_holds_blank_node(&t) => {
+                let Triple {
+                    subject: s,
+                    predicate,
+                    object: o,
+                } = *t;
+                Triple::new(subject(s, names), predicate, object(o, names)).into()
+            }
+            other => other,
+        }
+    }
+    Quad {
+        subject: subject(quad.subject, names),
+        predicate: quad.predicate,
+        object: object(quad.object, names),
+        graph_name: match quad.graph_name {
+            GraphName::BlankNode(b) => names[&b].clone().into(),
+            other => other,
+        },
+    }
+}
+
+/// The canonical name of every blank node of `quads`.
+fn names(quads: &BTreeSet<Quad>) -> HashMap<BlankNode, BlankNode> {
     // Exact ids for every other term, with content hashes for colouring.
     let mut fixed: HashMap<Term, u32> = HashMap::new();
     let mut fixed_hash: Vec<u64> = Vec::new();
@@ -114,9 +235,8 @@ pub(crate) fn canonical(quads: BTreeSet<Quad>) -> BTreeSet<Quad> {
         }
         x
     }
-    let mut result = BTreeSet::new();
     let mut with_blanks: Vec<(&Quad, [Option<usize>; 3])> = Vec::new();
-    for quad in &quads {
+    for quad in quads {
         let blanks = [
             match &quad.subject {
                 NamedOrBlankNode::BlankNode(b) => Some(b),
@@ -132,7 +252,6 @@ pub(crate) fn canonical(quads: BTreeSet<Quad>) -> BTreeSet<Quad> {
             },
         ];
         if blanks.iter().all(Option::is_none) {
-            result.insert(quad.clone());
             continue;
         }
         let ids = blanks.map(|b| {
@@ -154,7 +273,7 @@ pub(crate) fn canonical(quads: BTreeSet<Quad>) -> BTreeSet<Quad> {
         with_blanks.push((quad, ids));
     }
     if blank_nodes.is_empty() {
-        return result;
+        return HashMap::new();
     }
     // The quads of each component, with slots numbered within it.
     let mut groups: HashMap<usize, Group<'_>> = HashMap::new();
@@ -225,31 +344,16 @@ pub(crate) fn canonical(quads: BTreeSet<Quad>) -> BTreeSet<Quad> {
         .collect();
     forms.sort_by(|a, b| a.0.cmp(&b.0));
     // The final names: the component's place in that order, and the node's colour.
-    let mut name_of: HashMap<&BlankNode, BlankNode> = HashMap::new();
+    let mut name_of: HashMap<BlankNode, BlankNode> = HashMap::new();
     for (i, (_, names)) in forms.iter().enumerate() {
         for &(b, colour) in names {
-            name_of.insert(b, BlankNode::new_unchecked(format!("c{i}x{colour:016x}")));
+            name_of.insert(
+                b.clone(),
+                BlankNode::new_unchecked(format!("c{i}x{colour:016x}")),
+            );
         }
     }
-    for (quad, _) in &with_blanks {
-        let rename = |b: &BlankNode| name_of[b].clone();
-        result.insert(Quad {
-            subject: match &quad.subject {
-                NamedOrBlankNode::BlankNode(b) => rename(b).into(),
-                other => other.clone(),
-            },
-            predicate: quad.predicate.clone(),
-            object: match &quad.object {
-                Term::BlankNode(b) => rename(b).into(),
-                other => other.clone(),
-            },
-            graph_name: match &quad.graph_name {
-                GraphName::BlankNode(b) => rename(b).into(),
-                other => other.clone(),
-            },
-        });
-    }
-    result
+    name_of
 }
 
 impl<'a> Component<'a> {
@@ -645,7 +749,7 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::*;
-    use crate::term::{Literal, NamedNode};
+    use crate::term::Literal;
 
     fn p(name: &str) -> NamedNode {
         NamedNode::new_unchecked(format!("http://e/{name}"))
@@ -776,6 +880,70 @@ mod tests {
         ]
         .into();
         assert_ne!(canonical(g), canonical(k));
+    }
+
+    /// `<<( s p o )>>` with blank node labels for `s` and `o` (a nested term for `o` when
+    /// it starts with `(`, as `(s p o)`).
+    fn triple_term(s: &str, pred: &str, o: &str) -> Term {
+        let object: Term = match o.strip_prefix('(').and_then(|o| o.strip_suffix(')')) {
+            Some(inner) => {
+                let parts: Vec<&str> = inner.split(' ').collect();
+                triple_term(parts[0], parts[1], parts[2])
+            }
+            None => BlankNode::new_unchecked(o).into(),
+        };
+        Triple::new(BlankNode::new_unchecked(s), p(pred), object).into()
+    }
+
+    fn reifies(r: &str, term: Term) -> Quad {
+        Quad::new(
+            BlankNode::new_unchecked(r),
+            p("reifies"),
+            term,
+            GraphName::DefaultGraph,
+        )
+    }
+
+    #[test]
+    fn blank_nodes_in_triple_terms_are_renamed_canonically() {
+        // Two reifiers of terms about the same blank nodes, one of them nested.
+        let g: BTreeSet<Quad> = [
+            reifies("r1", triple_term("a", "knows", "b")),
+            reifies("r2", triple_term("b", "says", "(a knows b)")),
+            quad("a", "name", "x"),
+        ]
+        .into();
+        let h = {
+            let rename = |n: &str| format!("z{n}");
+            let rename_term = |s: &str, pred: &str, o: &str| triple_term(&rename(s), pred, o);
+            BTreeSet::from([
+                reifies("zr1", rename_term("a", "knows", "zb")),
+                reifies("zr2", rename_term("b", "says", "(za knows zb)")),
+                quad("za", "name", "zx"),
+            ])
+        };
+        let (cg, ch) = (canonical(g.clone()), canonical(h));
+        assert_eq!(cg, ch);
+        // No encoding node leaks out, and the terms keep their shape.
+        assert!(cg.iter().all(|q| !q.predicate.as_str().starts_with(' ')));
+        assert_eq!(cg.len(), 3);
+        // The blank nodes inside the terms are the graph's: renaming only one occurrence
+        // gives a different graph.
+        let k: BTreeSet<Quad> = [
+            reifies("r1", triple_term("a", "knows", "b")),
+            reifies("r2", triple_term("b", "says", "(c knows b)")),
+            quad("a", "name", "x"),
+        ]
+        .into();
+        assert_ne!(canonical(k), cg);
+    }
+
+    #[test]
+    fn a_triple_term_without_blank_nodes_stays_as_it_is() {
+        let term: Term = Triple::new(p("s"), p("p"), p("o")).into();
+        let g: BTreeSet<Quad> = [reifies("r", term.clone())].into();
+        let c = canonical(g);
+        assert_eq!(c.iter().next().unwrap().object, term);
     }
 
     /// Random graphs and random renamings and orders of them canonicalise alike, and a
