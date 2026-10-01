@@ -414,3 +414,12 @@ the same file in 6.7 ms in release; the existing tests run in half the time.
 **Test data byte-exact.** The fetch script checked the suites out with Git's line-end
 conversion on Windows; now `core.autocrlf=false`, and existing checkouts are rewritten from
 local objects. Every suite still passes on the exact files.
+
+**Comparison batch, first round (1 October; `benches/oxigraph-comparison/results/2026-10-01-step-3-io.md`).**
+Every reader and writer against oxttl, oxrdfxml and oxjsonld on the same generated
+documents, and the engine against the baseline branch. Three gaps found and closed in the
+same batch: RDF/XML parsing (was up to 1.3× slower, now 1.1–1.2× faster), Turtle and TriG in
+parallel (new, exact; 1.5× oxttl's heuristic splitter on 16 threads), N-Triples and N-Quads
+writing (was 1.1× slower, now 1.7–1.9× faster). The engine end to end is at parity with the
+baseline, as expected before the switch-over (load through oxttl until step 5), commits
+about 20% faster.

@@ -13,8 +13,10 @@
 //!   ancestor in the literal hasn't declared them, attributes sorted, text and attribute
 //!   values escaped as canonicalisation says.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
+use std::sync::Arc;
 
 use nrese_rdf::vocab::rdf;
 use nrese_rdf::{BlankNode, GraphName, Iri, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -81,15 +83,21 @@ enum Frame {
 /// A frame with the scope it opened in.
 struct Scope {
     frame: Frame,
-    base: Option<Iri<String>>,
-    language: Option<String>,
+    /// Shared with the scopes inside: an element's scope costs no copy of either.
+    base: Option<Arc<Iri<String>>>,
+    language: Option<Arc<str>>,
 }
 
 pub(crate) struct RdfXmlParser<R: BufRead> {
     reader: Reader<R>,
     /// The namespaces each open element declares (prefix, IRI; "" for the default), with
     /// entities expanded: `xmlns:rdf="&rdf;"` is common in OWL files.
-    namespaces: Vec<Vec<(String, String)>>,
+    namespaces: Vec<Vec<(String, Arc<str>)>>,
+    /// The IRIs of element and attribute names, checked once per document.
+    iri_cache: RefCell<HashMap<String, NamedNode>>,
+    key: RefCell<String>,
+    no_namespace: Arc<str>,
+    xml_namespace: Arc<str>,
     buffer: Vec<u8>,
     settings: RdfXmlSettings,
     stack: Vec<Scope>,
@@ -105,27 +113,26 @@ pub(crate) struct RdfXmlParser<R: BufRead> {
 
 type Step<T> = Result<T, RdfParseError>;
 
+/// A scope's base and language.
+type ScopeParts = (Option<Arc<Iri<String>>>, Option<Arc<str>>);
+
 /// The parts of an element: its IRI and its attributes (resolved, values unescaped).
 struct Element {
     /// The namespace and local name.
-    namespace: String,
+    namespace: Arc<str>,
     local: String,
     attributes: Vec<Attribute>,
 }
 
 struct Attribute {
-    namespace: String,
+    namespace: Arc<str>,
     local: String,
     value: String,
 }
 
 impl Element {
-    fn iri(&self) -> String {
-        format!("{}{}", self.namespace, self.local)
-    }
-
     fn is_rdf(&self, local: &str) -> bool {
-        self.namespace == RDF && self.local == local
+        &*self.namespace == RDF && self.local == local
     }
 }
 
@@ -141,6 +148,10 @@ impl<R: BufRead> RdfXmlParser<R> {
             settings,
             stack: Vec::new(),
             namespaces: Vec::new(),
+            iri_cache: RefCell::new(HashMap::new()),
+            key: RefCell::new(String::new()),
+            no_namespace: Arc::from(""),
+            xml_namespace: Arc::from(XML),
             entities: HashMap::new(),
             ids: HashSet::new(),
             generated_key: {
@@ -186,11 +197,36 @@ impl<R: BufRead> RdfXmlParser<R> {
     fn base(&self) -> Option<&Iri<String>> {
         self.stack
             .last()
-            .map_or(self.settings.base.as_ref(), |s| s.base.as_ref())
+            .map_or(self.settings.base.as_ref(), |s| s.base.as_deref())
     }
 
-    fn language(&self) -> Option<&str> {
-        self.stack.last().and_then(|s| s.language.as_deref())
+    /// The IRI of a qualified name, checked the first time it is met in the document.
+    fn name_iri(&self, namespace: &str, local: &str) -> Step<NamedNode> {
+        let mut key = self.key.borrow_mut();
+        key.clear();
+        key.push_str(namespace);
+        key.push_str(local);
+        if let Some(iri) = self.iri_cache.borrow().get(key.as_str()) {
+            return Ok(iri.clone());
+        }
+        let iri = self.iri(key.clone())?;
+        let mut cache = self.iri_cache.borrow_mut();
+        // Bounded: a document with ever new names can't grow it without end.
+        if cache.len() >= 65_536 {
+            cache.clear();
+        }
+        cache.insert(key.clone(), iri.clone());
+        Ok(iri)
+    }
+
+    /// An attribute's value: entities expanded and whitespace normalised; one allocation
+    /// when there is neither to do.
+    fn attribute_value(&self, raw: &str) -> String {
+        if raw.contains(['&', '\t', '\n', '\r']) {
+            normalize_attribute(&self.expand(raw))
+        } else {
+            raw.to_owned()
+        }
     }
 
     /// An IRI reference resolved against the base in scope.
@@ -441,37 +477,37 @@ impl<R: BufRead> RdfXmlParser<R> {
                 },
                 None => continue,
             };
-            declared.push((prefix.to_owned(), self.expand(&attribute.value)));
+            declared.push((prefix.to_owned(), Arc::from(self.expand(&attribute.value))));
         }
         self.namespaces.push(declared);
         Ok(())
     }
 
     /// The IRI bound to `prefix` ("" for the default namespace), if any.
-    fn namespace_of(&self, prefix: &str) -> Option<&str> {
+    fn namespace_of(&self, prefix: &str) -> Option<&Arc<str>> {
         if prefix == "xml" {
-            return Some(XML);
+            return Some(&self.xml_namespace);
         }
         self.namespaces
             .iter()
             .rev()
             .flat_map(|declared| declared.iter().rev())
             .find(|(p, _)| p == prefix)
-            .map(|(_, ns)| ns.as_str())
+            .map(|(_, ns)| ns)
             .filter(|ns| !ns.is_empty())
     }
 
     /// A qualified name: its namespace and local name. An element without a prefix is in
     /// the default namespace; an attribute without one is in none.
-    fn resolve_name(&self, name: &str, attribute: bool) -> Step<(String, String)> {
+    fn resolve_name(&self, name: &str, attribute: bool) -> Step<(Arc<str>, String)> {
         match name.split_once(':') {
             Some((prefix, local)) => match self.namespace_of(prefix) {
-                Some(ns) => Ok((ns.to_owned(), local.to_owned())),
+                Some(ns) => Ok((ns.clone(), local.to_owned())),
                 None => Err(self.error(format!("the namespace prefix {prefix:?} isn't declared"))),
             },
-            None if attribute => Ok((String::new(), name.to_owned())),
+            None if attribute => Ok((self.no_namespace.clone(), name.to_owned())),
             None => Ok((
-                self.namespace_of("").unwrap_or("").to_owned(),
+                self.namespace_of("").unwrap_or(&self.no_namespace).clone(),
                 name.to_owned(),
             )),
         }
@@ -493,7 +529,7 @@ impl<R: BufRead> RdfXmlParser<R> {
             attributes.push(Attribute {
                 namespace,
                 local,
-                value: normalize_attribute(&self.expand(&attribute.value)),
+                value: self.attribute_value(&attribute.value),
             });
         }
         Ok(Element {
@@ -504,11 +540,13 @@ impl<R: BufRead> RdfXmlParser<R> {
     }
 
     /// The scope a new element opens: its `xml:base` and `xml:lang`, or those around it.
-    fn scope(&self, element: &Element) -> Step<(Option<Iri<String>>, Option<String>)> {
-        let mut base = self.base().cloned();
-        let mut language = self.language().map(str::to_owned);
+    fn scope(&self, element: &Element) -> Step<ScopeParts> {
+        let (mut base, mut language) = match self.stack.last() {
+            Some(scope) => (scope.base.clone(), scope.language.clone()),
+            None => (self.settings.base.clone().map(Arc::new), None),
+        };
         for attribute in &element.attributes {
-            if attribute.namespace != XML {
+            if &*attribute.namespace != XML {
                 continue;
             }
             match attribute.local.as_str() {
@@ -516,14 +554,14 @@ impl<R: BufRead> RdfXmlParser<R> {
                     // The base without its fragment.
                     let reference = attribute.value.split('#').next().unwrap_or("");
                     let resolved = self.resolve(reference)?;
-                    base = Some(
+                    base = Some(Arc::new(
                         Iri::parse(resolved.into_string())
                             .map_err(|e| self.error(format!("an invalid xml:base: {e}")))?,
-                    );
+                    ));
                 }
                 "lang" => {
-                    language =
-                        (!attribute.value.is_empty()).then(|| attribute.value.to_ascii_lowercase());
+                    language = (!attribute.value.is_empty())
+                        .then(|| Arc::from(attribute.value.to_ascii_lowercase()));
                 }
                 _ => {}
             }
@@ -558,10 +596,10 @@ impl<R: BufRead> RdfXmlParser<R> {
     fn node_element(
         &mut self,
         element: Element,
-        base: Option<Iri<String>>,
-        language: Option<String>,
+        base: Option<Arc<Iri<String>>>,
+        language: Option<Arc<str>>,
     ) -> Step<()> {
-        if element.namespace == RDF
+        if &*element.namespace == RDF
             && matches!(
                 element.local.as_str(),
                 "RDF"
@@ -614,7 +652,7 @@ impl<R: BufRead> RdfXmlParser<R> {
             self.statement(s, p, subject.clone().into(), r);
         }
         if !element.is_rdf("Description") {
-            let class = self.iri(element.iri())?;
+            let class = self.name_iri(&element.namespace, &element.local)?;
             self.emit(subject.clone(), rdf::TYPE.into_owned(), class.into());
         }
         for (predicate, object) in properties {
@@ -635,7 +673,7 @@ impl<R: BufRead> RdfXmlParser<R> {
     ) -> Step<(NamedOrBlankNode, Vec<(NamedNode, Term)>)> {
         let mut subject: Option<NamedOrBlankNode> = None;
         let mut properties = Vec::new();
-        let language = self.language().map(str::to_owned);
+        let language = self.stack.last().and_then(|s| s.language.clone());
         for attribute in &element.attributes {
             let rdf_name = rdf_attribute(attribute);
             match rdf_name {
@@ -680,7 +718,7 @@ impl<R: BufRead> RdfXmlParser<R> {
 
     /// A property attribute's predicate; `None` for attributes RDF ignores (`xml:…`).
     fn property_attribute(&self, attribute: &Attribute) -> Step<Option<NamedNode>> {
-        if attribute.namespace == XML
+        if &*attribute.namespace == XML
             || attribute.local.starts_with("xml") && attribute.namespace.is_empty()
         {
             return Ok(None);
@@ -691,7 +729,7 @@ impl<R: BufRead> RdfXmlParser<R> {
                 attribute.local
             )));
         }
-        if attribute.namespace == RDF
+        if &*attribute.namespace == RDF
             && matches!(
                 attribute.local.as_str(),
                 "RDF"
@@ -713,18 +751,15 @@ impl<R: BufRead> RdfXmlParser<R> {
                 attribute.local
             )));
         }
-        Ok(Some(self.iri(format!(
-            "{}{}",
-            attribute.namespace, attribute.local
-        ))?))
+        Ok(Some(self.name_iri(&attribute.namespace, &attribute.local)?))
     }
 
     /// A property element (§7.2.14–7.2.21).
     fn property_element(
         &mut self,
         element: Element,
-        base: Option<Iri<String>>,
-        language: Option<String>,
+        base: Option<Arc<Iri<String>>>,
+        language: Option<Arc<str>>,
     ) -> Step<()> {
         let Some(Scope {
             frame: Frame::Node { subject, li },
@@ -738,7 +773,7 @@ impl<R: BufRead> RdfXmlParser<R> {
             *li += 1;
             NamedNode::new_unchecked(format!("{RDF}_{li}"))
         } else {
-            if element.namespace == RDF
+            if &*element.namespace == RDF
                 && matches!(
                     element.local.as_str(),
                     "Description"
@@ -761,7 +796,7 @@ impl<R: BufRead> RdfXmlParser<R> {
             if element.namespace.is_empty() {
                 return Err(self.error(format!("the element {:?} has no namespace", element.local)));
             }
-            self.iri(element.iri())?
+            self.name_iri(&element.namespace, &element.local)?
         };
         self.stack.push(Scope {
             frame: Frame::Rdf,
@@ -786,7 +821,7 @@ impl<R: BufRead> RdfXmlParser<R> {
         subject: NamedOrBlankNode,
         predicate: NamedNode,
     ) -> Step<Frame> {
-        let language = self.language().map(str::to_owned);
+        let language = self.stack.last().and_then(|s| s.language.clone());
         let (mut reified, mut parse_type, mut resource, mut node_id, mut datatype) =
             (None, None, None, None, None);
         let mut properties = Vec::new();
@@ -886,7 +921,7 @@ impl<R: BufRead> RdfXmlParser<R> {
         let name = start.name().as_ref().to_owned();
         // The prefixes the element uses ("" for the default namespace), with their IRIs.
         let mut used: Vec<(String, String)> = Vec::new();
-        let namespace_of = |prefix: &str| self.namespace_of(prefix).map(str::to_owned);
+        let namespace_of = |prefix: &str| self.namespace_of(prefix).map(|ns| ns.to_string());
         let prefix: String = start
             .name()
             .prefix()
@@ -903,7 +938,7 @@ impl<R: BufRead> RdfXmlParser<R> {
             if key_text == "xmlns" || key_text.starts_with("xmlns:") {
                 continue;
             }
-            let value = normalize_attribute(&self.expand(&attribute.value));
+            let value = self.attribute_value(&attribute.value);
             let (namespace, local) = match key.prefix() {
                 Some(p) => {
                     let ns = namespace_of(p.as_ref()).unwrap_or_default();
@@ -1029,7 +1064,7 @@ impl<R: BufRead> RdfXmlParser<R> {
                         Some(datatype) => Literal::new_typed_literal(text, datatype),
                         None => match &language {
                             Some(tag) => {
-                                Literal::new_language_tagged_literal_unchecked(text, tag.clone())
+                                Literal::new_language_tagged_literal_unchecked(text, &**tag)
                             }
                             None => Literal::new_simple_literal(text),
                         },
@@ -1080,7 +1115,7 @@ impl<R: BufRead> RdfXmlParser<R> {
 /// The RDF name of an attribute: `rdf:x`, or one of the unqualified names RDF/XML still
 /// takes for compatibility (§6.1.4).
 fn rdf_attribute(attribute: &Attribute) -> Option<&str> {
-    if attribute.namespace == RDF {
+    if &*attribute.namespace == RDF {
         return Some(attribute.local.as_str());
     }
     if attribute.namespace.is_empty()

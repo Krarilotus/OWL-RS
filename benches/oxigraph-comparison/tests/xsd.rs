@@ -30,8 +30,12 @@ impl Differences {
 }
 
 /// Parses `text` with both, and compares acceptance and output.
-fn compare<A, B>(datatype: &str, text: &str, differences: &mut Differences, explain: impl Fn(&str, Option<&str>, Option<&str>) -> bool)
-where
+fn compare<A, B>(
+    datatype: &str,
+    text: &str,
+    differences: &mut Differences,
+    explain: impl Fn(&str, Option<&str>, Option<&str>) -> bool,
+) where
     A: FromStr + Display,
     B: FromStr + Display,
 {
@@ -39,11 +43,14 @@ where
     let theirs = B::from_str(text).ok().map(|v| v.to_string());
     if ours != theirs && !explain(text, ours.as_deref(), theirs.as_deref()) {
         differences.add(
-            &format!("{datatype}: {}", match (&ours, &theirs) {
-                (Some(_), None) => "accepted only by nrese",
-                (None, Some(_)) => "accepted only by oxsdatatypes",
-                _ => "written differently",
-            }),
+            &format!(
+                "{datatype}: {}",
+                match (&ours, &theirs) {
+                    (Some(_), None) => "accepted only by nrese",
+                    (None, Some(_)) => "accepted only by oxsdatatypes",
+                    _ => "written differently",
+                }
+            ),
             format!("{text:?}: nrese {ours:?}, oxsdatatypes {theirs:?}"),
         );
     }
@@ -53,7 +60,8 @@ where
 /// any case and `+NaN`; XSD takes only `INF`, `+INF`, `-INF` and `NaN`.
 fn rust_only_special(text: &str) -> bool {
     let unsigned = text.trim_start_matches(['+', '-']).to_ascii_lowercase();
-    matches!(unsigned.as_str(), "inf" | "infinity" | "nan") && !matches!(text, "INF" | "+INF" | "-INF" | "NaN")
+    matches!(unsigned.as_str(), "inf" | "infinity" | "nan")
+        && !matches!(text, "INF" | "+INF" | "-INF" | "NaN")
 }
 
 /// XPath writes magnitudes below 10⁻⁶ and from 10⁶ up in scientific notation (`1.0E6`);
@@ -71,20 +79,45 @@ fn numbers_parse_and_print_alike() {
     let mut differences = Differences::default();
     for _ in 0..300_000 {
         let text = numeric_lexical(&mut rng);
-        compare::<nrese_xsd::Integer, oxsdatatypes::Integer>("integer", &text, &mut differences, |_, _, _| false);
+        compare::<nrese_xsd::Integer, oxsdatatypes::Integer>(
+            "integer",
+            &text,
+            &mut differences,
+            |_, _, _| false,
+        );
         // Decimals: oxsdatatypes rejects more than 18 fractional digits, unless they are
         // zeros; nrese-xsd truncates them (the lexical form is valid XSD).
-        compare::<nrese_xsd::Decimal, oxsdatatypes::Decimal>("decimal", &text, &mut differences, |text, ours, theirs| {
-            let fraction = text.split_once('.').map_or("", |(_, f)| f);
-            ours.is_some() && theirs.is_none() && fraction.trim_end_matches('0').len() > 18
-        });
-        compare::<nrese_xsd::Double, oxsdatatypes::Double>("double", &text, &mut differences, |text, ours, theirs| {
-            (ours.is_none() && rust_only_special(text)) || scientific_by_xpath(ours, theirs)
-        });
-        compare::<nrese_xsd::Float, oxsdatatypes::Float>("float", &text, &mut differences, |text, ours, theirs| {
-            (ours.is_none() && rust_only_special(text)) || scientific_by_xpath(ours, theirs)
-        });
-        compare::<nrese_xsd::Boolean, oxsdatatypes::Boolean>("boolean", &text, &mut differences, |_, _, _| false);
+        compare::<nrese_xsd::Decimal, oxsdatatypes::Decimal>(
+            "decimal",
+            &text,
+            &mut differences,
+            |text, ours, theirs| {
+                let fraction = text.split_once('.').map_or("", |(_, f)| f);
+                ours.is_some() && theirs.is_none() && fraction.trim_end_matches('0').len() > 18
+            },
+        );
+        compare::<nrese_xsd::Double, oxsdatatypes::Double>(
+            "double",
+            &text,
+            &mut differences,
+            |text, ours, theirs| {
+                (ours.is_none() && rust_only_special(text)) || scientific_by_xpath(ours, theirs)
+            },
+        );
+        compare::<nrese_xsd::Float, oxsdatatypes::Float>(
+            "float",
+            &text,
+            &mut differences,
+            |text, ours, theirs| {
+                (ours.is_none() && rust_only_special(text)) || scientific_by_xpath(ours, theirs)
+            },
+        );
+        compare::<nrese_xsd::Boolean, oxsdatatypes::Boolean>(
+            "boolean",
+            &text,
+            &mut differences,
+            |_, _, _| false,
+        );
     }
     differences.assert_empty("numbers");
 }
@@ -110,17 +143,72 @@ fn dates_times_and_durations_parse_and_print_alike() {
     };
     for _ in 0..300_000 {
         let text = temporal_lexical(&mut rng);
-        compare::<nrese_xsd::DateTime, oxsdatatypes::DateTime>("dateTime", &text, &mut differences, long_fraction);
-        compare::<nrese_xsd::Date, oxsdatatypes::Date>("date", &text, &mut differences, long_fraction);
-        compare::<nrese_xsd::Time, oxsdatatypes::Time>("time", &text, &mut differences, long_fraction);
-        compare::<nrese_xsd::GYearMonth, oxsdatatypes::GYearMonth>("gYearMonth", &text, &mut differences, long_fraction);
-        compare::<nrese_xsd::GYear, oxsdatatypes::GYear>("gYear", &text, &mut differences, long_fraction);
-        compare::<nrese_xsd::GMonthDay, oxsdatatypes::GMonthDay>("gMonthDay", &text, &mut differences, long_fraction);
-        compare::<nrese_xsd::GDay, oxsdatatypes::GDay>("gDay", &text, &mut differences, long_fraction);
-        compare::<nrese_xsd::GMonth, oxsdatatypes::GMonth>("gMonth", &text, &mut differences, long_fraction);
-        compare::<nrese_xsd::Duration, oxsdatatypes::Duration>("duration", &text, &mut differences, long_fraction);
-        compare::<nrese_xsd::YearMonthDuration, oxsdatatypes::YearMonthDuration>("yearMonthDuration", &text, &mut differences, long_fraction);
-        compare::<nrese_xsd::DayTimeDuration, oxsdatatypes::DayTimeDuration>("dayTimeDuration", &text, &mut differences, long_fraction);
+        compare::<nrese_xsd::DateTime, oxsdatatypes::DateTime>(
+            "dateTime",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
+        compare::<nrese_xsd::Date, oxsdatatypes::Date>(
+            "date",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
+        compare::<nrese_xsd::Time, oxsdatatypes::Time>(
+            "time",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
+        compare::<nrese_xsd::GYearMonth, oxsdatatypes::GYearMonth>(
+            "gYearMonth",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
+        compare::<nrese_xsd::GYear, oxsdatatypes::GYear>(
+            "gYear",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
+        compare::<nrese_xsd::GMonthDay, oxsdatatypes::GMonthDay>(
+            "gMonthDay",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
+        compare::<nrese_xsd::GDay, oxsdatatypes::GDay>(
+            "gDay",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
+        compare::<nrese_xsd::GMonth, oxsdatatypes::GMonth>(
+            "gMonth",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
+        compare::<nrese_xsd::Duration, oxsdatatypes::Duration>(
+            "duration",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
+        compare::<nrese_xsd::YearMonthDuration, oxsdatatypes::YearMonthDuration>(
+            "yearMonthDuration",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
+        compare::<nrese_xsd::DayTimeDuration, oxsdatatypes::DayTimeDuration>(
+            "dayTimeDuration",
+            &text,
+            &mut differences,
+            long_fraction,
+        );
     }
     differences.assert_empty("dates, times and durations");
 }
@@ -129,7 +217,10 @@ fn dates_times_and_durations_parse_and_print_alike() {
 fn end_of_day_misused(text: &str) -> bool {
     let time = text.split_once('T').map_or(text, |(_, t)| t);
     time.starts_with("24:") && !time.starts_with("24:00:00")
-        || time.starts_with("24:00:00.") && time[9..].trim_start_matches('0').starts_with(|c: char| c.is_ascii_digit())
+        || time.starts_with("24:00:00.")
+            && time[9..]
+                .trim_start_matches('0')
+                .starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// Decimal arithmetic. Where the two differ, ours must equal the exact result truncated
@@ -140,13 +231,31 @@ fn decimal_arithmetic_is_exact_to_truncation() {
     let mut differences = Differences::default();
     for _ in 0..200_000 {
         let (a, b) = (decimal_lexical(&mut rng), decimal_lexical(&mut rng));
-        let (x, y): (nrese_xsd::Decimal, nrese_xsd::Decimal) = (a.parse().unwrap(), b.parse().unwrap());
-        let (p, q): (oxsdatatypes::Decimal, oxsdatatypes::Decimal) = (a.parse().unwrap(), b.parse().unwrap());
+        let (x, y): (nrese_xsd::Decimal, nrese_xsd::Decimal) =
+            (a.parse().unwrap(), b.parse().unwrap());
+        let (p, q): (oxsdatatypes::Decimal, oxsdatatypes::Decimal) =
+            (a.parse().unwrap(), b.parse().unwrap());
         for (op, ours, theirs) in [
-            ("+", x.checked_add(y).map(|v| v.to_string()), p.checked_add(q).map(|v| v.to_string())),
-            ("-", x.checked_sub(y).map(|v| v.to_string()), p.checked_sub(q).map(|v| v.to_string())),
-            ("*", x.checked_mul(y).map(|v| v.to_string()), p.checked_mul(q).map(|v| v.to_string())),
-            ("/", x.checked_div(y).map(|v| v.to_string()), p.checked_div(q).map(|v| v.to_string())),
+            (
+                "+",
+                x.checked_add(y).map(|v| v.to_string()),
+                p.checked_add(q).map(|v| v.to_string()),
+            ),
+            (
+                "-",
+                x.checked_sub(y).map(|v| v.to_string()),
+                p.checked_sub(q).map(|v| v.to_string()),
+            ),
+            (
+                "*",
+                x.checked_mul(y).map(|v| v.to_string()),
+                p.checked_mul(q).map(|v| v.to_string()),
+            ),
+            (
+                "/",
+                x.checked_div(y).map(|v| v.to_string()),
+                p.checked_div(q).map(|v| v.to_string()),
+            ),
         ] {
             if ours == theirs {
                 continue;
@@ -156,25 +265,53 @@ fn decimal_arithmetic_is_exact_to_truncation() {
                 continue;
             };
             if ours != exact {
-                differences.add(&format!("{op}: nrese not exact"), format!("{a} {op} {b}: nrese {ours:?}, exact {exact:?}, oxsdatatypes {theirs:?}"));
+                differences.add(
+                    &format!("{op}: nrese not exact"),
+                    format!(
+                        "{a} {op} {b}: nrese {ours:?}, exact {exact:?}, oxsdatatypes {theirs:?}"
+                    ),
+                );
             }
         }
         for (name, ours, theirs) in [
-            ("round", x.checked_round(), p.checked_round().map(|v| v.to_string().parse().unwrap())),
-            ("ceil", x.checked_ceil(), p.checked_ceil().map(|v| v.to_string().parse().unwrap())),
-            ("floor", x.checked_floor(), p.checked_floor().map(|v| v.to_string().parse().unwrap())),
+            (
+                "round",
+                x.checked_round(),
+                p.checked_round().map(|v| v.to_string().parse().unwrap()),
+            ),
+            (
+                "ceil",
+                x.checked_ceil(),
+                p.checked_ceil().map(|v| v.to_string().parse().unwrap()),
+            ),
+            (
+                "floor",
+                x.checked_floor(),
+                p.checked_floor().map(|v| v.to_string().parse().unwrap()),
+            ),
         ] {
             // fn:round is floor(x + 0.5) (halves towards positive infinity); oxsdatatypes
             // looks at the first fractional digit only (round(-8.52) = -8).
-            let by_definition = x.checked_add("0.5".parse::<nrese_xsd::Decimal>().unwrap()).and_then(|v| v.checked_floor());
+            let by_definition = x
+                .checked_add("0.5".parse::<nrese_xsd::Decimal>().unwrap())
+                .and_then(|v| v.checked_floor());
             if ours != theirs && !(name == "round" && ours == by_definition) {
-                differences.add(name, format!("{a}: nrese {ours:?}, oxsdatatypes {theirs:?}"));
+                differences.add(
+                    name,
+                    format!("{a}: nrese {ours:?}, oxsdatatypes {theirs:?}"),
+                );
             }
         }
-        let (ours, theirs) = (f64::from(nrese_xsd::Double::from(x)), f64::from(oxsdatatypes::Double::from(p)));
+        let (ours, theirs) = (
+            f64::from(nrese_xsd::Double::from(x)),
+            f64::from(oxsdatatypes::Double::from(p)),
+        );
         let correctly_rounded: f64 = a.parse().unwrap();
         if ours != theirs && ours != correctly_rounded {
-            differences.add("to double: nrese not correctly rounded", format!("{a}: nrese {ours:e}, oxsdatatypes {theirs:e}"));
+            differences.add(
+                "to double: nrese not correctly rounded",
+                format!("{a}: nrese {ours:e}, oxsdatatypes {theirs:e}"),
+            );
         }
     }
     differences.assert_empty("decimal arithmetic");
@@ -209,6 +346,15 @@ fn exact(a: &str, op: &str, b: &str) -> Option<Option<String>> {
             x.checked_mul(e18)? / y
         }
     };
-    let text = format!("{}{}.{:018}", if raw < 0 { "-" } else { "" }, raw.unsigned_abs() / e18 as u128, raw.unsigned_abs() % e18 as u128);
-    Some(nrese_xsd::Decimal::from_str(&text).ok().map(|d| d.to_string()))
+    let text = format!(
+        "{}{}.{:018}",
+        if raw < 0 { "-" } else { "" },
+        raw.unsigned_abs() / e18 as u128,
+        raw.unsigned_abs() % e18 as u128
+    );
+    Some(
+        nrese_xsd::Decimal::from_str(&text)
+            .ok()
+            .map(|d| d.to_string()),
+    )
 }

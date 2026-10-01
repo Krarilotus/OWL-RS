@@ -251,6 +251,32 @@ impl<R: Read> TurtleParser<'static, R> {
 type Step<T> = Result<T, RdfParseError>;
 
 impl<'a, R: Read> TurtleParser<'a, R> {
+    /// This parser for a chunk of a larger document ([`super::split`]): where the chunk
+    /// starts there (so errors give the document's lines), and the directives in force at
+    /// its start, read now.
+    pub(crate) fn for_chunk(
+        mut self,
+        offset: u64,
+        line: u64,
+        line_start: u64,
+        directives: &str,
+    ) -> Result<Self, RdfParseError> {
+        self.input.base = offset;
+        self.input.line = line;
+        self.input.line_start = line_start;
+        // A byte order mark can only be at the document's start.
+        self.started = offset > 0;
+        if !directives.is_empty() {
+            let mut header = TurtleParser::from_slice(directives.as_bytes(), self.settings.clone());
+            while let Some(step) = header.next_ref() {
+                step?;
+            }
+            self.prefixes = header.prefixes;
+            self.base = header.base;
+        }
+        Ok(self)
+    }
+
     fn new(source: Source<'a, R>, settings: TurtleSettings) -> Self {
         let input = Input {
             source,
