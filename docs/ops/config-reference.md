@@ -155,6 +155,11 @@ api_key = "replace-me"
 - default: `false`
 - on disk, the newest checkpoint is used in place from a memory map: opening reads only its structure, so a restart takes milliseconds and memory grows with what queries touch. `true` checks the whole checkpoint when opening (its CRC, every index block, every dictionary key): opening then reads the whole file once, and a damaged checkpoint is refused at once instead of failing when a query reaches the damage
 
+- file key: `store.map_checkpoints`
+- env override: `NRESE_MAP_CHECKPOINTS`
+- default: `true`
+- on disk, once a checkpoint is written (after a bulk load, and by background or explicit checkpoints) the data it holds is served from the file, mapped, as after a restart, and its copies in memory are freed: memory then grows with what queries touch, and the OS can page out the rest. `false` keeps everything in memory as well (the file is still written)
+
 - file key: `store.ontology_path`
 - env override: `NRESE_ONTOLOGY_PATH`
 - optional; when set, the file is loaded at startup and a missing file is a startup error

@@ -69,6 +69,7 @@ impl StoreService {
                 let engine_config = EngineConfig {
                     durability: nrese_engine::DurabilityConfig {
                         verify_on_open: config.verify_on_open,
+                        map_checkpoints: config.map_checkpoints,
                         ..defaults.durability
                     },
                     ..defaults

@@ -30,6 +30,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
         names::VERIFY_ON_OPEN,
         config.store.verify_on_open,
     );
+    insert_bool(
+        &mut source,
+        names::MAP_CHECKPOINTS,
+        config.store.map_checkpoints,
+    );
 
     insert_option(
         &mut source,

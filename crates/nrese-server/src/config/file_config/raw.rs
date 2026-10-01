@@ -114,6 +114,8 @@ pub(super) struct RawStoreConfig {
     pub default_graph: Option<String>,
     #[serde(default)]
     pub verify_on_open: Option<bool>,
+    #[serde(default)]
+    pub map_checkpoints: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]

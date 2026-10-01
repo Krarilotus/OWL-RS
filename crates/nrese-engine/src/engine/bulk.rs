@@ -153,8 +153,9 @@ impl<'e> BulkLoad<'e> {
 }
 
 /// Installs `next` as the latest version, the bulk way: in durable mode a checkpoint of it
-/// is written first, so no WAL record is needed. The caller holds the writer and compaction
-/// slots.
+/// is written first, so no WAL record is needed, and with `map_checkpoints` the version
+/// installed is the checkpoint's, mapped (same content: memory then holds what queries
+/// touch, as after a restart). The caller holds the writer and compaction slots.
 fn publish(engine: &Inner, next: Version) -> EngineResult<()> {
     let shared = &engine.shared;
     let next = Arc::new(next);
@@ -167,7 +168,29 @@ fn publish(engine: &Inner, next: Version) -> EngineResult<()> {
                 Arc::clone(&shared.dictionary),
                 Arc::clone(&shared.statistics),
             );
-            checkpoint::write(durable.root(), &image)?;
+            let path = checkpoint::write(durable.root(), &image)?;
+            drop(image);
+            let mut base = None;
+            let next = match durable
+                .config
+                .map_checkpoints
+                .then(|| checkpoint::map_written(&path))
+            {
+                Some(Ok((dictionary, [asserted, inferred]))) => {
+                    base = Some(dictionary);
+                    Arc::new(Version {
+                        asserted,
+                        inferred,
+                        revision,
+                        dictionary_len: next.dictionary_len,
+                    })
+                }
+                Some(Err(error)) => {
+                    tracing::warn!(%error, "checkpoint not mapped; data stays in memory");
+                    next
+                }
+                None => next,
+            };
             // The checkpoint covers every logged revision: later commits start a new
             // segment, and all older segments can go.
             let mut wal = durable.wal.lock();
@@ -175,6 +198,11 @@ fn publish(engine: &Inner, next: Version) -> EngineResult<()> {
             shared.versions.install(next);
             wal.release_through(revision)?;
             drop(wal);
+            if let Some(base) = base
+                && let Err(error) = shared.dictionary.rebase(base)
+            {
+                tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
+            }
             checkpoint::remove_older_than(durable.root(), revision)?;
         }
         None => shared.versions.install(next),
