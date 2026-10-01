@@ -329,7 +329,7 @@ class Nrese(Adapter):
             "NRESE_READ_REQUESTS_PER_WINDOW": "100000000",
         }
         if ctx.cache == "off":
-            # Repeated runs measure evaluation; on, the default cache (64 MiB) answers them.
+            # Repeated runs measure evaluation; on, the default cache (2% of memory) answers them.
             env["NRESE_QUERY_CACHE_BYTES"] = "0"
         if ctx.setting("QUERY_MEMORY_MIB"):
             env["NRESE_MAX_QUERY_MEMORY_BYTES"] = str(int(ctx.setting("QUERY_MEMORY_MIB")) * 1048576)

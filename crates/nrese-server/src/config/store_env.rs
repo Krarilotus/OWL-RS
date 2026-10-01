@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use nrese_store::{GateSeverity, ShaclGate, StoreConfig, StoreMode};
 
 use super::env_names as names;
-use super::env_values::{parse_bool, parse_bytes};
+use super::env_values::parse_bool;
 use super::source::ConfigSource;
 
 pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfig> {
@@ -16,11 +16,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             .map(PathBuf::from)
             .unwrap_or(defaults.data_dir),
         ontology_path: source.get(names::ONTOLOGY_PATH).map(PathBuf::from),
-        query_cache_bytes: parse_bytes(
-            source,
-            names::QUERY_CACHE_BYTES,
-            nrese_store::DEFAULT_QUERY_CACHE_BYTES,
-        )?,
+        query_cache_bytes: parse_cache_bytes(source.get(names::QUERY_CACHE_BYTES).as_deref())?,
         shapes_graph: source
             .get(names::SHACL_SHAPES_GRAPH)
             .unwrap_or(defaults.shapes_graph),
@@ -38,6 +34,22 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             source.get(names::SHACL_GATE_SEVERITY).as_deref(),
         )?,
     })
+}
+
+/// The result cache's budget: a size, or a share of the memory the server may use (`5%`).
+/// By default 2% of it, at least 64 MiB and at most 8 GiB: on a 64 GB machine 1.3 GB, so
+/// results of hundreds of megabytes are kept, as QLever's default cache keeps them.
+fn parse_cache_bytes(input: Option<&str>) -> Result<usize> {
+    const MAX_DEFAULT: u64 = 8 << 30;
+    let floor = nrese_store::DEFAULT_QUERY_CACHE_BYTES as u64;
+    let bytes = match input {
+        Some(text) => super::units::parse_memory(text)
+            .with_context(|| format!("failed to parse {}", names::QUERY_CACHE_BYTES))?
+            .unwrap_or(floor),
+        None => super::units::machine_memory_bytes()
+            .map_or(floor, |memory| (memory / 50).clamp(floor, MAX_DEFAULT)),
+    };
+    Ok(bytes as usize)
 }
 
 /// The SHACL commit gate: `off` (the default), `report`, or `enforce` at a severity

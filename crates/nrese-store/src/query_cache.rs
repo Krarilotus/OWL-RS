@@ -4,7 +4,7 @@
 //! part of the key and no invalidation logic is needed: a commit makes older entries
 //! unreachable, and they are dropped when a newer revision shows up. Entries are the
 //! serialised response bytes, so a hit is a copy into the output. The cache holds at most
-//! its byte budget, evicting the oldest entries first; results larger than a fraction of
+//! its byte budget, evicting the oldest entries first; results larger than a quarter of
 //! the budget are not kept.
 //!
 //! Queries that must not repeat their answer (`NOW()`, `RAND()`, `UUID()`, `STRUUID()`,
@@ -63,9 +63,9 @@ impl QueryCache {
         self.capacity > 0
     }
 
-    /// The largest result kept: an eighth of the budget, so one query can't evict all.
+    /// The largest result kept: a quarter of the budget, so one query can't evict all.
     pub(crate) fn max_entry(&self) -> usize {
-        self.capacity / 8
+        self.capacity / 4
     }
 
     fn lock(&self) -> MutexGuard<'_, Entries> {
@@ -189,7 +189,7 @@ mod tests {
         assert!(cache.stats().bytes <= 800);
         assert!(cache.get(&key("q9", 2)).is_some());
         assert!(cache.get(&key("q0", 2)).is_none());
-        cache.insert(key("huge", 2), vec![0; 101]);
+        cache.insert(key("huge", 2), vec![0; 201]);
         assert!(cache.get(&key("huge", 2)).is_none());
         let stats = cache.stats();
         assert!(stats.hits >= 2 && stats.misses >= 5, "{stats:?}");
