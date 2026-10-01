@@ -27,7 +27,8 @@ documented interface, so that each can later be replaced on its own:
 |---|---|---|
 | `nrese-rdf` | `oxrdf`, `oxiri` | terms and their borrowed forms, triples, quads, graphs and datasets, vocabularies, IRI parsing and resolution, blank node canonicalisation |
 | `nrese-xsd` | `oxsdatatypes` | the XSD datatypes SPARQL and OWL 2 use, their lexical forms kept |
-| `nrese-rdf-io` | `oxrdfio`, `oxttl` | N-Triples and N-Quads (parallel), Turtle, TriG, RDF/XML, JSON-LD; readers and writers |
+| `nrese-json` | `json-event-parser` | JSON: pull parser over text or a reader, tree, writer, RFC 8785 canonical form; shared by JSON-LD and the SPARQL JSON results |
+| `nrese-rdf-io` | `oxrdfio`, `oxttl`, `oxrdfxml`, `oxjsonld` | N-Triples and N-Quads (parallel), Turtle, TriG, RDF/XML, JSON-LD; readers and writers |
 | `nrese-sparql-syntax` | `spargebra` | SPARQL 1.1 query and update: parser, algebra, writer |
 | `nrese-sparql-results` | `sparesults` | JSON, XML, CSV, TSV: readers and writers |
 | `nrese-sparql` (existing) | `spareval` | its own result, error and cancellation types; the native executor as the only one |
@@ -135,17 +136,88 @@ The crate is built in five parts, each with its W3C suites and tests before the 
 - **3d. JSON-LD 1.1**: to RDF (context processing, expansion, remote contexts only through
   a caller-supplied loader, none by default, for the server's safety) and from RDF
   (expanded, or compacted with a given context). Own streaming JSON lexer; it is shared
-  with `nrese-sparql-results` in step 4.
-- **3e. Comparison batch**: the conformance matrix and throughput against `oxttl`,
-  `oxrdfxml` and `oxjsonld` on generated documents (no third-party data), the end of
-  step 3.
+  with `nrese-sparql-results` in step 4. The design:
+  - **`nrese-json`**, a crate of its own (`memchr` and `thiserror` only): a pull parser over a `&str`
+    (strings without escapes borrowed, so no copy) or a reader (refilled, never splitting
+    a token), strict RFC 8259 with a depth limit; a DOM (`Value`, borrowed where it can
+    be, object entries in document order); a writer with fast escaping; the JSON
+    Canonicalization Scheme (RFC 8785) with ECMAScript number formatting, for `@json`
+    literals.
+  - **Streaming where it is exact.** JSON-LD's algorithms work on whole documents, but a
+    top-level array, and the `@graph` of a top-level object whose only other entry is
+    `@context` (wherever it is written), are expanded and converted one element at a
+    time: memory is the document's bytes plus one element, not a tree of all of it.
+    Anything else is read whole. oxjsonld buffers the whole document unless its streaming
+    profile is asked for, which requires a key order.
+  - **Typed expanded form.** Expansion produces node, value and list objects as Rust types
+    (IRIs shared as `Arc<str>` from the term definitions), not JSON maps; toRdf walks
+    them directly. That gives the node map's triples without building the node map (the
+    output is a set either way). The `expand` suite checks expansion through a writer of
+    the typed form.
+  - **Contexts** are cheap to clone (shared term table, copied on write); processing a
+    scoped context against the same active context is memoised, as in data every node of
+    a type or every value of a property applies the same one. Remote contexts and
+    `@import` only through a loader the caller supplies, cached per document, with a
+    depth limit against recursion.
+  - **Blank nodes** need no table: a label that is a valid N-Triples label and doesn't
+    start with `j` stays as written, any other one becomes `jx` and its bytes in
+    hexadecimal, and nodes without `@id` get `jg` and a counter: three disjoint sets.
+    Under `rename_blank_nodes` all of them get fresh names, as in the other formats.
+  - **Options**: processing mode (1.0, 1.1), `rdfDirection` (none, `i18n-datatype`,
+    `compound-literal`), an expand context, the loader, and the parser's base IRI.
+  - **Writers**: a streaming one (subjects grouped, IRIs compacted with the given
+    prefixes, plain strings as JSON strings) for CONSTRUCT and the graph store; and the
+    spec's "Serialize RDF as JSON-LD" (expanded, lists as `@list`, native types and
+    `rdf:type` options), which needs the whole dataset and so collects the quads until
+    `finish`. oxjsonld has only the first, without lists.
+  - Out of scope: compaction, flattening and framing as API algorithms, HTML script
+    extraction, generalized RDF (blank-node predicates are dropped, as the spec does by
+    default).
+  - Suites: `toRdf`, `expand` and `fromRdf` from `w3c/json-ld-api`.
+- **3e. RDF 1.2** in `nrese-rdf` and every reader and writer (see "The newest standards"
+  below).
+- **3f. Comparison batch**: the conformance matrix and throughput against `oxttl`,
+  `oxrdfxml` and `oxjsonld` (with Oxigraph's `rdf-12` feature) on generated documents (no
+  third-party data), the end of step 3.
 
 Suites (fetched by `scripts/fetch-w3c-tests.sh`): RDF 1.1 N-Triples, N-Quads, Turtle,
 TriG, RDF/XML (positive and negative syntax, evaluation compared by isomorphism through
-`nrese-rdf`'s canonicalisation), and JSON-LD 1.1 `toRdf` and `fromRdf`. RDF 1.2 (triple
-terms, base direction) waits until the engine can store triple terms; Oxigraph has it
-behind a feature, so until then it is a known gap. N3 (a W3C Community Group format
-oxttl reads) is not used here and stays out unless asked for.
+`nrese-rdf`'s canonicalisation), and JSON-LD 1.1 `toRdf` and `fromRdf`. N3 (a W3C
+Community Group format oxttl reads) is not used here and stays out unless asked for.
+
+**The newest standards: RDF 1.2 and SPARQL 1.2** (the owner's request, 2026-10-01: the
+engine must be usable with, and optimised for, the newest versions). W3C status in October
+2026: RDF 1.2 Concepts is a Candidate Recommendation (April 2026) and RDF 1.2 Semantics a
+CR draft; N-Triples, N-Quads, Turtle, TriG and RDF/XML 1.2, and all of SPARQL 1.2 (query,
+update, results formats, protocols, entailment), are Working Drafts revised through
+September 2026; SHACL 1.2 and JSON-LD 1.2 are in drafts too. No 1.3 of any of them
+exists or is chartered. Following the newest standards was one of the reasons to keep
+the Oxigraph libraries, so 1.2 is part of the replacement itself, not a later feature: the
+migration is finished only when step 6 is. The baseline's support was partial (triple
+terms in queries through spareval's general evaluator, none in the store); step 1 removed
+that evaluator, so such queries are errors until step 6, the one temporary regression of
+the migration. Readers keep accepting 1.1 documents unchanged:
+- **`nrese-rdf`**: triple terms as the fourth kind of term (in object position), and
+  language-tagged strings with a base direction (`rdf:dirLangString`), through `Term`,
+  `TermRef`, canonicalisation, `Graph` and `Dataset`.
+- **`nrese-rdf-io`**, as part 3e before the comparison batch: RDF 1.2 in every reader and
+  writer — triple terms `<<( s p o )>>`, reified triples `<< s p o ~ r >>`, annotations
+  `{| … |}`, `VERSION`, directional literals `"x"@en--ltr`; in RDF/XML
+  `rdf:parseType="Triple"`, `rdf:annotation` and `its:dir`; in JSON-LD, `@direction` as
+  a directional literal. The W3C `rdf12` suites (already fetched) must pass. Writers
+  write 1.2 syntax only when the data needs it.
+- **`nrese-sparql-syntax` and `nrese-sparql-results`** (step 4): the SPARQL 1.2 grammar
+  (triple terms and reifiers in patterns and templates, `TRIPLE`, `SUBJECT`,
+  `PREDICATE`, `OBJECT`, `isTRIPLE`, `LANGDIR`, `hasLANG`, `hasLANGDIR`, `STRLANGDIR`,
+  `VERSION`) with the W3C `sparql12` syntax tests, and triple terms in all four results
+  formats.
+- **The engine** (step 6, after the switch-over): triple terms and directional literals
+  in the store's encoding, evaluation and functions (the W3C `sparql12` evaluation
+  tests), SHACL 1.2 where its draft has settled.
+- The drafts still change: every suite stays pinned to a commit (as the others are), and
+  moving a pin is a deliberate change with its test results.
+
+Oxigraph has RDF 1.2 behind its `rdf-12` feature; the comparisons turn it on.
 
 **`nrese-sparql-syntax`.** A syntax tree that keeps what the query says (prefixed names,
 source positions for error messages) is separate from the algebra of SPARQL 1.1 §18, and
@@ -172,11 +244,14 @@ Each step ends green (fmt, clippy, all tests with the W3C suites required) and c
 |---|---|---|
 | 1 | **spareval out of the runtime.** Own `QueryResults`, solution and triple iterators, `QueryEvaluationError`, `CancellationToken`, `QueryDatasetSpecification`. The native executor takes every query: `BNODE(label)` per solution, unknown functions as errors, `SERVICE ?endpoint`, EXISTS by substitution where correlation isn't safe, paths under `GRAPH ?g`; queries over a transaction run on its pending snapshot. The reference evaluator replaces spareval as the differential tests' oracle. | `spareval` gone from every `Cargo.toml`; the differential and W3C tests pass |
 | 2 | **`nrese-rdf`, `nrese-xsd`,** and `benches/oxigraph-comparison` with their differential tests and benchmarks. | Own tests; at least `oxrdf`'s, `oxiri`'s and `oxsdatatypes`' coverage and speed, or the gap documented; the vendored `oxsdatatypes` is gone |
-| 3 | **`nrese-rdf-io`.** Readers and writers; N-Triples and N-Quads chunked and parallel, handing terms to the engine without intermediate strings where it can. | The W3C N-Triples, N-Quads, Turtle, TriG and RDF/XML test suites pass; bulk load at least as fast as before |
-| 4 | **`nrese-sparql-syntax`, `nrese-sparql-results`.** | The W3C SPARQL 1.1 syntax tests (positive and negative) pass; results round-trip |
+| 3 | **`nrese-rdf-io`.** Readers and writers, RDF 1.1 and 1.2; N-Triples and N-Quads chunked and parallel, handing terms to the engine without intermediate strings where it can. | The W3C N-Triples, N-Quads, Turtle, TriG and RDF/XML test suites, 1.1 and 1.2, and the JSON-LD suites pass; bulk load at least as fast as before |
+| 4 | **`nrese-sparql-syntax`, `nrese-sparql-results`,** SPARQL 1.1 and 1.2. | The W3C SPARQL 1.1 and 1.2 syntax tests (positive and negative) pass; results round-trip, triple terms included |
 | 5 | **Switch-over.** Every crate on the bundle; the `oxigraph` oracle in the W3C runner and the bench harness replaced. | `cargo tree` lists no crate of the Oxigraph project; all tests pass; the comparison's conformance matrix and benchmarks published in `docs/`; end to end against the baseline branch: the same conformance results or better (W3C SPARQL 1.1, OWL 2 RL, GeoSPARQL, SHACL) and no performance regression on the perf-lab workloads (bulk load, query latency, reasoning), or each one explained and accepted by the owner |
+| 6 | **SPARQL 1.2 and RDF 1.2 in the engine.** Triple terms and directional literals in the store's encoding, evaluation and functions; SHACL 1.2 where its draft has settled. | The W3C `sparql12` syntax and evaluation tests pass; no regression on the perf-lab workloads |
 
 Steps 3 and 4 are each done only when they also meet the yardstick above for their crates.
+The migration is steps 1 to 6: it is finished when the engine runs on the bundle and
+supports RDF 1.2 and SPARQL 1.2.
 
 ## Status
 
@@ -292,3 +367,27 @@ overflows a 1 MiB stack on it.
   declarations) reads and round trips. That needed namespaces resolved by the parser
   itself: quick-xml's resolver takes `xmlns:rdf="&rdf;"` unexpanded.
 - XML literals in exclusive canonical form.
+
+**Step 3d (JSON-LD 1.1).**
+- W3C JSON-LD 1.1 suites, every test a JSON-LD 1.1 processor runs: toRdf 455/455,
+  expand 376/376, fromRdf 53/53. Not run: the 21 tests for JSON-LD 1.0 processors only,
+  and one of generalized RDF (blank-node predicates, which RDF can't hold).
+- Each toRdf document is also read through a reader, and its quads round trip through
+  both writers. Every dataset of the RDF 1.1 suites (Turtle, TriG, N-Quads, RDF/XML…)
+  now round trips through the streaming JSON-LD writer too.
+- `nrese-json` is the JSON layer: strict RFC 8259, strings borrowed unless escaped, a
+  depth limit, and RFC 8785 canonical JSON for `@json` literals.
+- Streaming as designed: a top-level array, or the `@graph` of a top-level object with
+  only a context besides (in any key order), is converted one element at a time; quads
+  of earlier elements come out before an error in a later one.
+- Remote contexts only through a caller's loader; none by default (an error, not a
+  network access).
+- The two writers: streaming (prefix-compacted, the streaming profile's key order; an IRI
+  that looks like a compact IRI turns its prefix off locally rather than being misread)
+  and expanded by the specification's algorithm (lists, native types). Lists of lists
+  needed the conversion done innermost first: the specification shares values by
+  reference, which owned values don't.
+- Found by the suites on the way: an `@id` with the form of a keyword is kept as `null`
+  (no triples) rather than dropped; `@included` values are expanded so that non-nodes are
+  rejected; a term with a slash is expanded without defining terms; `@base` accepts an
+  absolute IRI that isn't well formed, and what resolves against it is dropped.

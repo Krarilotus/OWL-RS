@@ -9,6 +9,7 @@ members = [
     "crates/nrese-store",
     "crates/nrese-reasoner",
     "crates/nrese-server",
+    "crates/rdf/nrese-json",
     "crates/rdf/nrese-rdf",
     "crates/rdf/nrese-rdf-io",
     "crates/rdf/nrese-xsd",
