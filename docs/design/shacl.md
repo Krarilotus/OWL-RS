@@ -1,6 +1,6 @@
 # SHACL validation: design
 
-Status: design for phase C of the [parity plan](../plan/2026-09-30-graphdb-parity-plan.md) (30 September 2026). Slices C1a, C1b and C3 are done (C3 on 2 October 2026); C1c and C2 are planned.
+Status: design for phase C of the [parity plan](../plan/2026-09-30-graphdb-parity-plan.md) (30 September 2026). Slices C1a, C1b, C2 and C3 are done (C2 and C3 on 2 October 2026); C1c is planned.
 
 ## 1. Goal and scope
 
@@ -111,5 +111,5 @@ This slice needs the per-repository configuration of D1 first.
 | C1a ✅ | `nrese-shacl`: compiler, all Core components, paths, targets, severities, report | W3C Core suite passes: 98 of 98, no listed failures |
 | C1b ✅ | Store operation and server endpoint: validate the repository, or a posted shapes graph, and return the report; configuration | HTTP tests; the report round-trips as RDF |
 | C1c | Parallel and set-at-a-time evaluation | Same reports as C1a on the suite and on random data; perf-lab numbers recorded |
-| C2 | Commit gate, incremental validation, policy, cancellation | Differential test; a rejected commit changes nothing |
+| C2 ✅ | Commit gate (`shacl.gate`: off, report, enforce at a severity), incremental validation (`nrese_shacl::validate_changes`: the focus nodes a change can reach backwards along every path prefix, before and after) | Differential test against full validation (200 random rounds); store tests: a rejected commit changes nothing, earlier invalid data doesn't block |
 | C3 ✅ | SHACL-SPARQL: `sh:sparql` constraints and SPARQL-based constraint components, pre-binding by substitution (`nrese-shacl/src/sparql.rs`) | W3C SHACL-SPARQL suite passes: 22 of 22 |

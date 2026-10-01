@@ -7,6 +7,7 @@ use super::command::{MutationCommand, MutationCommitReport};
 use super::error::{MutationError, MutationReject};
 use super::record::ReasoningRunRecord;
 use super::ticket::MutationTicket;
+use crate::config::{GateSeverity, ShaclGate};
 use crate::delta::MutationDeltaPreview;
 use crate::error::StoreError;
 use crate::service::StoreService;
@@ -166,6 +167,7 @@ impl MutationPipeline {
                 None,
                 None,
             ));
+            self.shacl_gate(&tx)?;
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -203,6 +205,7 @@ impl MutationPipeline {
 
         // Without reasoning, commits don't maintain the inferred stack.
         self.store.invalidate_reasoning().map_err(store_error)?;
+        self.shacl_gate(&tx)?;
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }
@@ -211,6 +214,58 @@ impl MutationPipeline {
             source: StoreError::Engine(error),
         })?;
         Ok(report.committed(summary.revision))
+    }
+
+    /// The SHACL commit gate (C2): validates what the transaction's changes can affect,
+    /// after reasoning, and rejects the commit if the policy says so.
+    fn shacl_gate(&self, tx: &nrese_engine::Transaction<'_>) -> Result<(), MutationError> {
+        let gate = self.store.config().shacl_gate;
+        if gate == ShaclGate::Off {
+            return Ok(());
+        }
+        let report = crate::shacl::introduced(tx, &self.store.config().shapes_graph)
+            .map_err(|error| MutationError::Gate(error.to_string()))?;
+        let Some(report) = report else {
+            return Ok(());
+        };
+        if report.results.is_empty() && report.failures.is_empty() {
+            return Ok(());
+        }
+        let severity = |iri: &str| match iri {
+            "http://www.w3.org/ns/shacl#Info" => GateSeverity::Info,
+            "http://www.w3.org/ns/shacl#Warning" => GateSeverity::Warning,
+            _ => GateSeverity::Violation,
+        };
+        let first = report.results.first().map_or_else(String::new, |result| {
+            format!(
+                "; first: focus node {}, {}",
+                result.focus_node, result.component
+            )
+        });
+        let detail = format!(
+            "the commit introduces {} SHACL result(s) and {} failure(s){first}",
+            report.results.len(),
+            report.failures.len()
+        );
+        match gate {
+            ShaclGate::Enforce(least)
+                if !report.failures.is_empty()
+                    || report
+                        .results
+                        .iter()
+                        .any(|result| severity(result.severity.as_str()) >= least) =>
+            {
+                Err(MutationError::Rejected(Box::new(MutationReject {
+                    detail,
+                    explanation: None,
+                    attribution: None,
+                })))
+            }
+            _ => {
+                tracing::warn!("{detail} (SHACL gate: not rejected)");
+                Ok(())
+            }
+        }
     }
 
     fn record_run(&self, run: ReasoningRunRecord) {

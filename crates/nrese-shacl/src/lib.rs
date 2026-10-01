@@ -5,6 +5,8 @@
 //!
 //! - [`compile`] reads the shapes graph ([`Shapes`]); an ill-formed one is an error
 //! - [`validate`] checks the data against every targeted shape ([`ValidationReport`])
+//! - [`validate_changes`] reports only what a change introduces, validating the focus
+//!   nodes it can affect (the commit gate's check)
 //!
 //! Both read through [`nrese_sparql::ReadView`], so the same code validates a committed
 //! snapshot and the state inside an open transaction. Value comparison is SPARQL's
@@ -19,6 +21,7 @@
 mod compile;
 mod datatype;
 mod graph;
+mod incremental;
 mod model;
 mod path;
 mod report;
@@ -27,6 +30,7 @@ mod validate;
 
 pub use compile::{ShapeError, compile};
 pub use graph::Selection;
+pub use incremental::validate_changes;
 pub use model::{Component, SH, Severity, ShapeRef, Shapes};
 pub use report::{PropertyPath, ValidationReport, ValidationResult};
 

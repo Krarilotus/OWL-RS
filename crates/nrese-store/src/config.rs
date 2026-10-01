@@ -38,6 +38,32 @@ pub struct StoreConfig {
     /// `nrese_engine::DurabilityConfig::verify_on_open`). Off: the checkpoint is used in
     /// place and opening reads only its structure.
     pub verify_on_open: bool,
+    /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
+    /// may introduce against the shapes graph.
+    pub shacl_gate: ShaclGate,
+}
+
+/// The SHACL commit gate's policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShaclGate {
+    /// Commits aren't validated (the default: validation is a request, as in GraphDB
+    /// without a SHACL repository).
+    #[default]
+    Off,
+    /// Commits are validated and what they introduce is logged; nothing is rejected.
+    Report,
+    /// A commit that introduces a result at or above this severity is rejected and
+    /// changes nothing.
+    Enforce(GateSeverity),
+}
+
+/// The least severity the enforcing gate rejects for. A shape's own severity IRI counts
+/// as a violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GateSeverity {
+    Info,
+    Warning,
+    Violation,
 }
 
 /// SPARQL 1.1 Federated Query: the endpoints `SERVICE` may call, and how long and how much
@@ -102,6 +128,7 @@ impl StoreConfig {
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             verify_on_open: false,
+            shacl_gate: ShaclGate::Off,
         }
     }
 
@@ -117,6 +144,7 @@ impl StoreConfig {
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             verify_on_open: false,
+            shacl_gate: ShaclGate::Off,
         }
     }
 
