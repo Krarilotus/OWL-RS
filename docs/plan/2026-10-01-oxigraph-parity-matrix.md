@@ -62,6 +62,7 @@ do), **decide** (the owner decides whether the use case needs it).
 
 | Oxigraph | NRESE | Status |
 |---|---|---|
+| Throughput against oxttl, oxrdfxml, oxjsonld | Faster in every case measured (`benches/oxigraph-comparison/results/2026-10-01-step-3-io.md`): parsing 1.1–3.3×, writing 1.1–2×, N-Triples on 16 threads 3.2×; Turtle and TriG split exactly for parallel parsing (oxttl's splitter is a heuristic) | **have** |
 | Streaming parsers with bounded memory | `nrese-rdf-io`: borrowed quads (`next_ref`, no allocation per term), readers that refill without splitting tokens; JSON-LD streams by top-level element | **have** |
 | Exact error positions | Line, column, byte offset | **have** |
 | Error recovery (skip a bad statement, go on) | Line formats go on after a bad line; Turtle, TriG and RDF/XML stop at the first error | **partial**: a recovery mode for Turtle and TriG (skip to the next `.` at statement level) belongs to 3f |

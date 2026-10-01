@@ -5,7 +5,7 @@
 //! that goes into scratch strings the parser keeps, so nothing is allocated per line once
 //! they have grown.
 
-use std::io::{self, Write};
+use std::io;
 use std::ops::Range;
 
 use memchr::{memchr, memchr2};
@@ -459,12 +459,191 @@ fn syntax(
 // ---------------------------------------------------------------------------------------
 // Writing
 
-/// Writes a quad as one N-Quads line (N-Triples if it is in the default graph).
-pub(crate) fn write_quad(out: &mut impl Write, quad: QuadRef<'_>) -> io::Result<()> {
-    writeln!(out, "{quad} .")
+/// Bytes a string can't hold as they are (N-Triples §4): `"`, `\\`, the control characters
+/// and DEL. 0xEF may start U+FFFE or U+FFFF, which are written as `\\u` escapes too.
+const fn special() -> [bool; 256] {
+    let mut table = [false; 256];
+    let mut b = 0;
+    while b < 0x20 {
+        table[b] = true;
+        b += 1;
+    }
+    table[b'"' as usize] = true;
+    table[b'\\' as usize] = true;
+    table[0x7F] = true;
+    table[0xEF] = true;
+    table
+}
+const SPECIAL: [bool; 256] = special();
+
+/// `text` quoted and escaped as N-Triples writes a string: what needs no escape is
+/// copied in one piece.
+fn quoted(out: &mut Vec<u8>, text: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let bytes = text.as_bytes();
+    out.push(b'"');
+    let mut run = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !SPECIAL[b as usize] {
+            i += 1;
+            continue;
+        }
+        if b == 0xEF {
+            // U+FFFE and U+FFFF; any other character starting with 0xEF is written as is.
+            match bytes.get(i + 1..i + 3) {
+                Some([0xBF, last @ (0xBE | 0xBF)]) => {
+                    out.extend_from_slice(&bytes[run..i]);
+                    out.extend_from_slice(if *last == 0xBE {
+                        b"\\uFFFE"
+                    } else {
+                        b"\\uFFFF"
+                    });
+                    i += 3;
+                    run = i;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        out.extend_from_slice(&bytes[run..i]);
+        match b {
+            0x08 => out.extend_from_slice(b"\\b"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            0x0C => out.extend_from_slice(b"\\f"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            _ => out.extend_from_slice(&[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX[(b >> 4) as usize],
+                HEX[(b & 15) as usize],
+            ]),
+        }
+        i += 1;
+        run = i;
+    }
+    out.extend_from_slice(&bytes[run..]);
+    out.push(b'"');
+}
+
+fn named(out: &mut Vec<u8>, iri: &str) {
+    out.push(b'<');
+    out.extend_from_slice(iri.as_bytes());
+    out.push(b'>');
+}
+
+fn node(out: &mut Vec<u8>, node: NamedOrBlankNodeRef<'_>) {
+    match node {
+        NamedOrBlankNodeRef::NamedNode(n) => named(out, n.as_str()),
+        NamedOrBlankNodeRef::BlankNode(b) => {
+            out.extend_from_slice(b"_:");
+            out.extend_from_slice(b.as_str().as_bytes());
+        }
+    }
+}
+
+fn term(out: &mut Vec<u8>, term: TermRef<'_>) {
+    match term {
+        TermRef::NamedNode(n) => named(out, n.as_str()),
+        TermRef::BlankNode(b) => {
+            out.extend_from_slice(b"_:");
+            out.extend_from_slice(b.as_str().as_bytes());
+        }
+        TermRef::Literal(literal) => {
+            quoted(out, literal.value());
+            if let Some(language) = literal.language() {
+                out.push(b'@');
+                out.extend_from_slice(language.as_bytes());
+            } else if literal.datatype() != nrese_rdf::vocab::xsd::STRING {
+                out.extend_from_slice(b"^^");
+                named(out, literal.datatype().as_str());
+            }
+        }
+    }
+}
+
+/// Writes a quad as one N-Quads line (the same bytes as its `Display` form and " .").
+pub(crate) fn write_quad(out: &mut Vec<u8>, quad: QuadRef<'_>) -> io::Result<()> {
+    node(out, quad.subject);
+    out.push(b' ');
+    named(out, quad.predicate.as_str());
+    out.push(b' ');
+    term(out, quad.object);
+    match quad.graph_name {
+        GraphNameRef::DefaultGraph => {}
+        GraphNameRef::NamedNode(n) => {
+            out.push(b' ');
+            named(out, n.as_str());
+        }
+        GraphNameRef::BlankNode(b) => {
+            out.extend_from_slice(b" _:");
+            out.extend_from_slice(b.as_str().as_bytes());
+        }
+    }
+    out.extend_from_slice(b" .\n");
+    Ok(())
 }
 
 /// Writes a triple as one N-Triples line.
-pub(crate) fn write_triple(out: &mut impl Write, triple: TripleRef<'_>) -> io::Result<()> {
-    writeln!(out, "{triple} .")
+pub(crate) fn write_triple(out: &mut Vec<u8>, triple: TripleRef<'_>) -> io::Result<()> {
+    node(out, triple.subject);
+    out.push(b' ');
+    named(out, triple.predicate.as_str());
+    out.push(b' ');
+    term(out, triple.object);
+    out.extend_from_slice(b" .\n");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Quad};
+
+    use super::*;
+
+    /// The byte writer writes exactly what the terms' `Display` writes.
+    #[test]
+    fn writes_what_display_writes() {
+        let mut text: String = (0_u32..0x80).filter_map(char::from_u32).collect();
+        text.push_str("é€😀\u{FFFE}\u{FFFF}\u{FFFD}\u{EFFF}");
+        let s = NamedNode::new_unchecked("http://e/s");
+        let p = NamedNode::new_unchecked("http://e/p");
+        let objects: Vec<nrese_rdf::Term> = vec![
+            Literal::new_simple_literal(text.clone()).into(),
+            Literal::new_language_tagged_literal_unchecked(text.clone(), "en-gb").into(),
+            Literal::new_typed_literal(text, NamedNode::new_unchecked("http://e/dt")).into(),
+            BlankNode::new_unchecked("b1").into(),
+            s.clone().into(),
+        ];
+        for object in objects {
+            for graph in [
+                GraphName::DefaultGraph,
+                NamedNode::new_unchecked("http://e/g").into(),
+                BlankNode::new_unchecked("g").into(),
+            ] {
+                let quad = Quad::new(s.clone(), p.clone(), object.clone(), graph);
+                let mut out = Vec::new();
+                write_quad(&mut out, quad.as_ref()).unwrap();
+                assert_eq!(String::from_utf8(out).unwrap(), format!("{quad} .\n"));
+            }
+            let quad = Quad::new(
+                s.clone(),
+                p.clone(),
+                object.clone(),
+                GraphName::DefaultGraph,
+            );
+            let mut out = Vec::new();
+            write_triple(&mut out, quad.as_ref().into()).unwrap();
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!("{} .\n", TripleRef::from(quad.as_ref()))
+            );
+        }
+    }
 }

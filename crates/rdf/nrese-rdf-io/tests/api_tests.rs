@@ -177,7 +177,7 @@ fn chunks_of_any_size_cover_the_document_once() {
     }
     std::fs::remove_file(&path).unwrap();
     assert!(
-        RdfParser::from_format(RdfFormat::Turtle)
+        RdfParser::from_format(RdfFormat::RdfXml)
             .split_slice_for_parallel_parsing(&text, 2)
             .is_err()
     );

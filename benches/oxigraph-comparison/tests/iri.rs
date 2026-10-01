@@ -36,7 +36,13 @@ impl Differences {
 }
 
 /// RFC 3986 Appendix B: scheme, authority, path, query, fragment.
-type Components<'a> = (Option<&'a str>, Option<&'a str>, &'a str, Option<&'a str>, Option<&'a str>);
+type Components<'a> = (
+    Option<&'a str>,
+    Option<&'a str>,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+);
 
 fn split(text: &str) -> Components<'_> {
     let (rest, fragment) = match text.split_once('#') {
@@ -98,11 +104,18 @@ fn rfc_resolve(base: &str, reference: &str) -> String {
     let (r_scheme, r_authority, r_path, r_query, r_fragment) = split(reference);
     let (scheme, authority, path, query);
     if r_scheme.is_some() {
-        (scheme, authority, path, query) = (r_scheme, r_authority, remove_dot_segments(r_path), r_query);
+        (scheme, authority, path, query) =
+            (r_scheme, r_authority, remove_dot_segments(r_path), r_query);
     } else if r_authority.is_some() {
-        (scheme, authority, path, query) = (b_scheme, r_authority, remove_dot_segments(r_path), r_query);
+        (scheme, authority, path, query) =
+            (b_scheme, r_authority, remove_dot_segments(r_path), r_query);
     } else if r_path.is_empty() {
-        (scheme, authority, path, query) = (b_scheme, b_authority, b_path.to_owned(), r_query.or(b_query));
+        (scheme, authority, path, query) = (
+            b_scheme,
+            b_authority,
+            b_path.to_owned(),
+            r_query.or(b_query),
+        );
     } else {
         let merged = if r_path.starts_with('/') {
             r_path.to_owned()
@@ -114,7 +127,8 @@ fn rfc_resolve(base: &str, reference: &str) -> String {
                 None => r_path.to_owned(),
             }
         };
-        (scheme, authority, path, query) = (b_scheme, b_authority, remove_dot_segments(&merged), r_query);
+        (scheme, authority, path, query) =
+            (b_scheme, b_authority, remove_dot_segments(&merged), r_query);
     }
     let mut out = format!("{}:", scheme.unwrap_or_default());
     if let Some(a) = authority {
@@ -141,7 +155,8 @@ fn rfc_resolve(base: &str, reference: &str) -> String {
 /// authority (`a:/b` + `../` is `a:/`), and no result where the path would start with
 /// `//`.
 fn explained(base: &str, reference: &str, ours: &Result<String, nrese_rdf::IriParseError>) -> bool {
-    ours.as_ref().is_ok_and(|ours| *ours == rfc_resolve(base, reference))
+    ours.as_ref()
+        .is_ok_and(|ours| *ours == rfc_resolve(base, reference))
 }
 
 #[test]
@@ -157,25 +172,50 @@ fn acceptance_and_resolution_agree() {
         let theirs = oxiri::Iri::parse(reference.as_str()).is_ok();
         if ours != theirs {
             differences.add(
-                if ours { "accepted only by nrese" } else { "accepted only by oxiri" },
+                if ours {
+                    "accepted only by nrese"
+                } else {
+                    "accepted only by oxiri"
+                },
                 format!("{reference:?}"),
             );
         }
         for base in BASES {
-            let ours = nrese_rdf::Iri::parse(base).unwrap().resolve(&reference).map(|i| i.into_inner());
-            let theirs = oxiri::Iri::parse(base).unwrap().resolve(&reference).map(|i| i.into_inner());
+            let ours = nrese_rdf::Iri::parse(base)
+                .unwrap()
+                .resolve(&reference)
+                .map(|i| i.into_inner());
+            let theirs = oxiri::Iri::parse(base)
+                .unwrap()
+                .resolve(&reference)
+                .map(|i| i.into_inner());
             if ours.as_ref().ok() != theirs.as_ref().ok() && explained(base, &reference, &ours) {
                 departures += 1;
                 continue;
             }
             match (ours, theirs) {
-                (Ok(a), Ok(b)) if a != b => differences.add("resolved differently", format!("{base} + {reference:?}: nrese {a:?}, oxiri {b:?}")),
-                (Ok(a), Err(_)) => differences.add("resolved only by nrese", format!("{base} + {reference:?} = {a:?}")),
-                (Err(_), Ok(b)) => differences.add("resolved only by oxiri", format!("{base} + {reference:?} = {b:?}")),
+                (Ok(a), Ok(b)) if a != b => differences.add(
+                    "resolved differently",
+                    format!("{base} + {reference:?}: nrese {a:?}, oxiri {b:?}"),
+                ),
+                (Ok(a), Err(_)) => differences.add(
+                    "resolved only by nrese",
+                    format!("{base} + {reference:?} = {a:?}"),
+                ),
+                (Err(_), Ok(b)) => differences.add(
+                    "resolved only by oxiri",
+                    format!("{base} + {reference:?} = {b:?}"),
+                ),
                 _ => {}
             }
         }
     }
-    assert!(differences.0.is_empty(), "{compared} references compared\n{}", differences.report());
-    println!("{compared} references; {departures} resolutions where oxiri departs from RFC 3986 and nrese follows it");
+    assert!(
+        differences.0.is_empty(),
+        "{compared} references compared\n{}",
+        differences.report()
+    );
+    println!(
+        "{compared} references; {departures} resolutions where oxiri departs from RFC 3986 and nrese follows it"
+    );
 }

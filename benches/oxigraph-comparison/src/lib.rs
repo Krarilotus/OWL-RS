@@ -17,26 +17,49 @@ fn pick<'a>(rng: &mut StdRng, items: &[&'a str]) -> &'a str {
 pub fn iri_reference(rng: &mut StdRng) -> String {
     let mut out = String::new();
     if rng.random_bool(0.6) {
-        out.push_str(pick(rng, &["http:", "https:", "urn:", "a:", "file:", "mailto:", "tag:", "g:", "1a:", "a+b.c-d:"]));
+        out.push_str(pick(
+            rng,
+            &[
+                "http:", "https:", "urn:", "a:", "file:", "mailto:", "tag:", "g:", "1a:",
+                "a+b.c-d:",
+            ],
+        ));
     }
     if rng.random_bool(0.5) {
         out.push_str("//");
         if rng.random_bool(0.2) {
             out.push_str(pick(rng, &["user@", "u:p@", "%41@", "a b@"]));
         }
-        out.push_str(pick(rng, &[
-            "example.org", "h", "[::1]", "[2001:db8::7]", "[v7.a]", "[1:2:3:4:5:6:7:8]",
-            "[::ffff:1.2.3.4]", "[1::2::3]", "[zz]", "", "ex%2Eorg", "Übung.de", "a_b~c",
-        ]));
+        out.push_str(pick(
+            rng,
+            &[
+                "example.org",
+                "h",
+                "[::1]",
+                "[2001:db8::7]",
+                "[v7.a]",
+                "[1:2:3:4:5:6:7:8]",
+                "[::ffff:1.2.3.4]",
+                "[1::2::3]",
+                "[zz]",
+                "",
+                "ex%2Eorg",
+                "Übung.de",
+                "a_b~c",
+            ],
+        ));
         if rng.random_bool(0.3) {
             out.push_str(pick(rng, &[":80", ":", ":8a", ":65536"]));
         }
     }
     for _ in 0..rng.random_range(0..4) {
-        out.push_str(pick(rng, &[
-            "/", "a", "b/", "..", ".", "../", "./", "c;p", "%20", "%zz", "%a", " ", "ü", "\u{E000}",
-            "<", "{", "\\", "@", ":", "d:e", "=", "!", "'", "(x)", "*", "+", ",",
-        ]));
+        out.push_str(pick(
+            rng,
+            &[
+                "/", "a", "b/", "..", ".", "../", "./", "c;p", "%20", "%zz", "%a", " ", "ü",
+                "\u{E000}", "<", "{", "\\", "@", ":", "d:e", "=", "!", "'", "(x)", "*", "+", ",",
+            ],
+        ));
     }
     if rng.random_bool(0.3) {
         out.push('?');
@@ -56,7 +79,10 @@ pub fn numeric_lexical(rng: &mut StdRng) -> String {
         out.push_str(pick(rng, &["+", "-"]));
     }
     match rng.random_range(0..10) {
-        0 => out.push_str(pick(rng, &["INF", "NaN", "inf", "nan", "infinity", "Infinity"])),
+        0 => out.push_str(pick(
+            rng,
+            &["INF", "NaN", "inf", "nan", "infinity", "Infinity"],
+        )),
         _ => {
             for _ in 0..rng.random_range(0..6) {
                 out.push(char::from(b'0' + rng.random_range(0..10)));
@@ -93,7 +119,9 @@ pub fn decimal_lexical(rng: &mut StdRng) -> String {
         _ => rng.random_range(0..10_000_000_000),
     };
     let digits = rng.random_range(0..12);
-    let fraction: String = (0..digits).map(|_| char::from(b'0' + rng.random_range(0..10))).collect();
+    let fraction: String = (0..digits)
+        .map(|_| char::from(b'0' + rng.random_range(0..10)))
+        .collect();
     if fraction.is_empty() {
         format!("{sign}{whole}")
     } else {
@@ -104,9 +132,28 @@ pub fn decimal_lexical(rng: &mut StdRng) -> String {
 /// A random text near the lexical forms of dates, times and durations.
 pub fn temporal_lexical(rng: &mut StdRng) -> String {
     let two = |rng: &mut StdRng, max: u32| format!("{:02}", rng.random_range(0..=max));
-    let year = pick(rng, &["2002", "0000", "-0045", "12000", "02002", "1999", "2000", "1900", "999"]).to_owned();
-    let tz = pick(rng, &["", "", "Z", "+01:00", "-05:00", "+14:00", "-14:01", "+00:00", "z"]).to_owned();
-    let seconds = format!("{}{}", two(rng, 61), pick(rng, &["", "", ".5", ".123456789", ".", ".0000000000000000001"]));
+    let year = pick(
+        rng,
+        &[
+            "2002", "0000", "-0045", "12000", "02002", "1999", "2000", "1900", "999",
+        ],
+    )
+    .to_owned();
+    let tz = pick(
+        rng,
+        &[
+            "", "", "Z", "+01:00", "-05:00", "+14:00", "-14:01", "+00:00", "z",
+        ],
+    )
+    .to_owned();
+    let seconds = format!(
+        "{}{}",
+        two(rng, 61),
+        pick(
+            rng,
+            &["", "", ".5", ".123456789", ".", ".0000000000000000001"]
+        )
+    );
     let time = format!("{}:{}:{}", two(rng, 25), two(rng, 61), seconds);
     let date = format!("{year}-{}-{}", two(rng, 13), two(rng, 32));
     match rng.random_range(0..9) {
@@ -121,7 +168,14 @@ pub fn temporal_lexical(rng: &mut StdRng) -> String {
         _ => {
             let mut d = String::from(pick(rng, &["", "", "-", "+"]));
             d.push('P');
-            for (designator, time) in [("Y", false), ("M", false), ("D", false), ("H", true), ("M", true), ("S", true)] {
+            for (designator, time) in [
+                ("Y", false),
+                ("M", false),
+                ("D", false),
+                ("H", true),
+                ("M", true),
+                ("S", true),
+            ] {
                 if time && !d.contains('T') && rng.random_bool(0.5) {
                     d.push('T');
                 }

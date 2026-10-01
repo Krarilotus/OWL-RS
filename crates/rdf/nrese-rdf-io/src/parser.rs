@@ -17,6 +17,7 @@ use crate::jsonld::JsonLdOptions;
 use crate::jsonld::parser::{JsonLdParser, JsonLdSettings};
 use crate::ntriples::LineParser;
 use crate::rdfxml::{RdfXmlParser, RdfXmlSettings};
+use crate::turtle::split::{Skimmer, directives_before};
 use crate::turtle::{TurtleParser, TurtleSettings};
 
 /// How to read a document: its format, and the settings that apply to every format.
@@ -190,13 +191,39 @@ impl RdfParser {
         }
     }
 
-    /// `bytes` in up to `parts` chunks that parse independently (cut at line ends), for
-    /// N-Triples and N-Quads; with renamed blank nodes, every chunk names a label alike.
+    /// `bytes` in up to `parts` chunks that parse independently, for parsing in parallel:
+    /// N-Triples and N-Quads cut at line ends; Turtle and TriG at statement ends found by
+    /// a skim of the document (exact, see [`crate::turtle::split`]), each chunk starting
+    /// with the prefixes and base in force there. With renamed blank nodes, every chunk
+    /// names a label alike.
     pub fn split_slice_for_parallel_parsing(
         self,
         bytes: &[u8],
         parts: usize,
     ) -> Result<Vec<QuadParser<'_, io::Empty>>, RdfParseError> {
+        if matches!(self.format, RdfFormat::Turtle | RdfFormat::TriG) {
+            let mut skimmer = Skimmer::new(bytes.len() as u64, parts);
+            skimmer.feed(bytes);
+            let skim = skimmer.finish();
+            let mut starts = vec![(0, 0, 0)];
+            starts.extend(skim.cuts.iter().copied());
+            let mut parsers = Vec::with_capacity(starts.len());
+            for (i, &(start, line, line_start)) in starts.iter().enumerate() {
+                let end = starts.get(i + 1).map_or(bytes.len() as u64, |s| s.0);
+                let parser = TurtleParser::from_slice(
+                    &bytes[start as usize..end as usize],
+                    self.turtle_settings(),
+                )
+                .for_chunk(
+                    start,
+                    line,
+                    line_start,
+                    &directives_before(&skim, start),
+                )?;
+                parsers.push(self.clone().wrap(Inner::Turtle(parser)));
+            }
+            return Ok(parsers);
+        }
         self.line_based()?;
         let bounds = boundaries(bytes.len() as u64, parts, |at| {
             Ok(memchr2(b'\n', b'\r', &bytes[at as usize..])
@@ -219,6 +246,38 @@ impl RdfParser {
         path: &Path,
         parts: usize,
     ) -> Result<Vec<QuadParser<'static, Take<BufReader<File>>>>, RdfParseError> {
+        if matches!(self.format, RdfFormat::Turtle | RdfFormat::TriG) {
+            // The skim reads the file once, in large pieces.
+            let mut file = BufReader::with_capacity(1 << 20, File::open(path)?);
+            let length = file.get_ref().metadata()?.len();
+            let mut skimmer = Skimmer::new(length, parts);
+            let mut buffer = vec![0_u8; 1 << 20];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                skimmer.feed(&buffer[..read]);
+            }
+            let skim = skimmer.finish();
+            let mut starts = vec![(0, 0, 0)];
+            starts.extend(skim.cuts.iter().copied());
+            let mut parsers = Vec::with_capacity(starts.len());
+            for (i, &(start, line, line_start)) in starts.iter().enumerate() {
+                let end = starts.get(i + 1).map_or(length, |s| s.0);
+                let mut file = File::open(path)?;
+                file.seek(SeekFrom::Start(start))?;
+                let reader = BufReader::with_capacity(256 * 1024, file).take(end - start);
+                let parser = TurtleParser::from_reader(reader, self.turtle_settings()).for_chunk(
+                    start,
+                    line,
+                    line_start,
+                    &directives_before(&skim, start),
+                )?;
+                parsers.push(self.clone().wrap(Inner::Turtle(parser)));
+            }
+            return Ok(parsers);
+        }
         self.line_based()?;
         let mut file = File::open(path)?;
         let length = file.metadata()?.len();
