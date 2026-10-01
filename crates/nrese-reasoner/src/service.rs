@@ -42,16 +42,16 @@ impl ReasonerService {
         self.profile.semantic_tier
     }
 
-    /// The ruleset's name, semantics version and fingerprint (`owl2-rl v2 1f…`): what the
-    /// materialised closure means. It changes exactly when a build derives something
-    /// different for the same data. `None` without reasoning.
+    /// The program's name, semantics version and fingerprint (`owl2-rl v2 1f…`): what the
+    /// materialised closure means. It changes exactly when a build or the user's rules
+    /// derive something different for the same data. `None` without reasoning.
     pub fn semantics(&self) -> Option<String> {
-        self.config.materialised_ruleset().map(|ruleset| {
+        self.config.materialised_program().map(|program| {
             format!(
                 "{} v{} {:016x}",
-                ruleset.name(),
+                program.name(),
                 crate::v2::rulesets::SEMANTICS_VERSION,
-                ruleset.fingerprint()
+                program.fingerprint()
             )
         })
     }

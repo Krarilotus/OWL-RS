@@ -9,7 +9,7 @@ use crate::reasoning::{MaterialisationReport, OntologyDiagnostic};
 pub struct ReasoningRunRecord {
     pub revision: u64,
     pub status: ReasonerRunStatus,
-    pub ruleset: &'static str,
+    pub ruleset: String,
     /// Inferred statements after the run, and those it added and removed.
     pub inferred_triples: u64,
     pub inferred_inserted: u64,
@@ -38,7 +38,7 @@ impl ReasoningRunRecord {
             } else {
                 ReasonerRunStatus::Completed
             },
-            ruleset: report.ruleset,
+            ruleset: report.ruleset.clone(),
             inferred_triples: report.inferred,
             inferred_inserted: report.inferred_inserted,
             inferred_deleted: report.inferred_deleted,

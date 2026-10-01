@@ -100,14 +100,7 @@ impl StoreService {
     /// Whether the recorded reasoning closes the data under `owl:sameAs` (a ruleset with
     /// the equality rules): queries may then rely on it.
     fn note_equality(&self, state: &crate::ReasoningState) {
-        let closed = nrese_reasoner::v2::rulesets::Ruleset::from_name(&state.ruleset).is_some_and(
-            |ruleset| {
-                ruleset.owl_rules().map_or(
-                    ruleset == nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl,
-                    |rules| rules.contains(&"eq-rep-s"),
-                )
-            },
-        );
+        let closed = nrese_reasoner::RuleProgram::closes_equality(&state.ruleset);
         self.settings
             .equality_closed
             .store(closed, std::sync::atomic::Ordering::Release);
@@ -363,45 +356,46 @@ impl StoreService {
         bulk_load(&self.engine, request)
     }
 
-    /// Replaces the inferred stack with `ruleset`'s closure over the asserted data, as one
-    /// revision (see [`crate::reasoning`]). For after bulk loads, at startup and after a
-    /// ruleset change; commits keep it current afterwards.
-    /// Whether the inferred stack is `ruleset`'s closure as this store computes it.
-    pub fn reasoning_is_current(&self, ruleset: nrese_reasoner::v2::rulesets::Ruleset) -> bool {
+    /// Whether the inferred stack is `program`'s closure as this store computes it.
+    pub fn reasoning_is_current(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> bool {
+        let program = program.into();
         self.reasoning_state()
-            .is_some_and(|state| state.is_current_with(ruleset, self.config.hide_unnamed_classes))
+            .is_some_and(|state| state.is_current_with(&program, self.config.hide_unnamed_classes))
     }
 
     /// The closure's size with equality replicated and over representatives, for
-    /// `ruleset` on the asserted data ([`crate::reasoning::equality_report`]).
-    pub fn equality_report(&self, ruleset: nrese_reasoner::v2::rulesets::Ruleset) -> String {
+    /// `program` on the asserted data ([`crate::reasoning::equality_report`]).
+    pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
         let tx = self.engine.transaction();
-        let program = crate::reasoning::Program::new(ruleset, &|term| tx.intern(term));
+        let program = crate::reasoning::Program::new(&program.into(), &|term| tx.intern(term));
         crate::reasoning::equality_report(&program, tx.base())
     }
 
+    /// Replaces the inferred stack with `program`'s closure over the asserted data, as one
+    /// revision (see [`crate::reasoning`]). For after bulk loads, at startup and after a
+    /// change of rules; commits keep it current afterwards.
     pub fn rematerialise(
         &self,
-        ruleset: nrese_reasoner::v2::rulesets::Ruleset,
+        program: impl Into<nrese_reasoner::RuleProgram>,
     ) -> StoreResult<crate::reasoning::MaterialisationReport> {
-        self.rematerialise_until(ruleset, nrese_reasoner::v2::eval::NEVER)
+        self.rematerialise_until(program, nrese_reasoner::v2::eval::NEVER)
     }
 
     /// [`Self::rematerialise`], stopped when `stop` fires: then nothing changes and
     /// [`StoreError::MaterialisationCancelled`](crate::StoreError) is returned.
     pub fn rematerialise_until(
         &self,
-        ruleset: nrese_reasoner::v2::rulesets::Ruleset,
+        program: impl Into<nrese_reasoner::RuleProgram>,
         stop: nrese_reasoner::v2::eval::Stop<'_>,
     ) -> StoreResult<crate::reasoning::MaterialisationReport> {
+        let rules = &program.into();
         let started = std::time::Instant::now();
         let rematerialisation = self.engine.rematerialisation();
         let asserted = rematerialisation
             .base()
             .len_in(nrese_engine::ReadModel::Asserted);
-        let program =
-            crate::reasoning::Program::new(ruleset, &|term| rematerialisation.intern(term))
-                .hiding_unnamed_classes(self.config.hide_unnamed_classes);
+        let program = crate::reasoning::Program::new(rules, &|term| rematerialisation.intern(term))
+            .hiding_unnamed_classes(self.config.hide_unnamed_classes);
         let closure = crate::reasoning::materialise_until(&program, rematerialisation.base(), stop)
             .map_err(|_| crate::StoreError::MaterialisationCancelled)?;
         let inferred = closure.inferred.len() as u64;
@@ -417,19 +411,19 @@ impl StoreService {
         );
         let summary = rematerialisation.finish(closure.inferred)?;
         self.record_reasoning(crate::ReasoningState::of_with(
-            ruleset,
+            rules,
             self.config.hide_unnamed_classes,
             closure.violations.len(),
         ))?;
         if !closure.violations.is_empty() {
             tracing::error!(
-                ruleset = ruleset.name(),
+                ruleset = %rules.name(),
                 violations = closure.violations.len(),
                 "the data is inconsistent: the store is in quarantine until it is repaired"
             );
         }
         tracing::info!(
-            ruleset = ruleset.name(),
+            ruleset = %rules.name(),
             revision = summary.revision,
             asserted,
             inferred,
@@ -441,7 +435,7 @@ impl StoreService {
             "inferred stack rematerialised"
         );
         let report = crate::reasoning::MaterialisationReport {
-            ruleset: ruleset.name(),
+            ruleset: rules.name(),
             revision: summary.revision,
             asserted,
             inferred,

@@ -31,7 +31,7 @@ pub struct OntologyDiagnosticView {
 #[derive(Debug, Serialize)]
 pub struct MaterialisationView {
     pub revision: u64,
-    pub ruleset: &'static str,
+    pub ruleset: String,
     pub asserted: u64,
     pub inferred: u64,
     pub consistency_violations: usize,
@@ -62,7 +62,7 @@ pub struct RejectDiagnosticsBaseline {
 pub struct LastReasoningRunView {
     pub revision: u64,
     pub status: &'static str,
-    pub ruleset: &'static str,
+    pub ruleset: String,
     pub inferred_triples: u64,
     pub inferred_inserted: u64,
     pub inferred_deleted: u64,

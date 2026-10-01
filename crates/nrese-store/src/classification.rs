@@ -53,6 +53,17 @@ impl Vocabulary for Lookup<'_> {
             TermId::raw,
         )
     }
+
+    fn language_literal(&mut self, lexical: &str, language: &str) -> u64 {
+        let literal = LiteralRef::new_language_tagged_literal_unchecked(lexical, language);
+        self.snapshot.lookup(literal.into()).map_or_else(
+            || {
+                self.missing -= 1;
+                self.missing
+            },
+            TermId::raw,
+        )
+    }
 }
 
 impl StoreService {
