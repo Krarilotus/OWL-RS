@@ -1,0 +1,145 @@
+//! Writing results: a boolean, or solutions one at a time into a reused byte buffer that
+//! goes to the writer in large pieces.
+
+use std::io::{self, Write};
+
+use nrese_rdf::{TermRef, Variable};
+
+use crate::format::QueryResultsFormat;
+use crate::{csv, json, tsv, xml};
+
+/// Bytes collected before they go to the writer.
+const FLUSH_AT: usize = 8 * 1024;
+
+/// Writes query results in a [`QueryResultsFormat`].
+#[derive(Debug, Clone, Copy)]
+pub struct QueryResultsSerializer {
+    format: QueryResultsFormat,
+}
+
+impl QueryResultsSerializer {
+    pub fn from_format(format: QueryResultsFormat) -> Self {
+        Self { format }
+    }
+
+    /// The result of an `ASK` query.
+    pub fn serialize_boolean_to_writer<W: Write>(
+        self,
+        mut writer: W,
+        value: bool,
+    ) -> io::Result<W> {
+        let mut out = Vec::with_capacity(128);
+        match self.format {
+            QueryResultsFormat::Json => json::write_boolean(&mut out, value),
+            QueryResultsFormat::Xml => xml::write_boolean(&mut out, value),
+            QueryResultsFormat::Csv | QueryResultsFormat::Tsv => {
+                out.extend_from_slice(if value { b"true" } else { b"false" });
+            }
+        }
+        writer.write_all(&out)?;
+        Ok(writer)
+    }
+
+    /// The solutions of a `SELECT` query over `variables`: write them with
+    /// [`WriterSolutionsSerializer::serialize`] or [`WriterSolutionsSerializer::serialize_row`],
+    /// then [`WriterSolutionsSerializer::finish`].
+    pub fn serialize_solutions_to_writer<W: Write>(
+        self,
+        writer: W,
+        variables: Vec<Variable>,
+    ) -> io::Result<WriterSolutionsSerializer<W>> {
+        let mut out = Vec::with_capacity(FLUSH_AT + 4096);
+        match self.format {
+            QueryResultsFormat::Json => json::write_head(&mut out, &variables),
+            QueryResultsFormat::Xml => xml::write_head(&mut out, &variables),
+            QueryResultsFormat::Csv => csv::write_head(&mut out, &variables),
+            QueryResultsFormat::Tsv => tsv::write_head(&mut out, &variables),
+        }
+        Ok(WriterSolutionsSerializer {
+            format: self.format,
+            variables,
+            out,
+            writer,
+            first: true,
+        })
+    }
+}
+
+/// Writes solutions; see [`QueryResultsSerializer::serialize_solutions_to_writer`].
+#[must_use]
+pub struct WriterSolutionsSerializer<W: Write> {
+    format: QueryResultsFormat,
+    variables: Vec<Variable>,
+    out: Vec<u8>,
+    writer: W,
+    first: bool,
+}
+
+impl<W: Write> WriterSolutionsSerializer<W> {
+    /// One solution, as the values of named variables (the others are unbound; names not
+    /// among the variables are left out).
+    pub fn serialize<'a>(
+        &mut self,
+        solution: impl IntoIterator<Item = (&'a str, TermRef<'a>)>,
+    ) -> io::Result<()> {
+        // Most queries have few variables: their row stays on the stack.
+        let mut stack = [None; 16];
+        let mut heap = Vec::new();
+        let row: &mut [Option<TermRef<'a>>] = if self.variables.len() <= stack.len() {
+            &mut stack[..self.variables.len()]
+        } else {
+            heap.resize(self.variables.len(), None);
+            &mut heap
+        };
+        // Values usually come in the variables' order: try the next one first.
+        let mut next = 0;
+        for (name, value) in solution {
+            let i = match self.variables.get(next) {
+                Some(v) if v.as_str() == name => Some(next),
+                _ => self.variables.iter().position(|v| v.as_str() == name),
+            };
+            if let Some(i) = i {
+                row[i] = Some(value);
+                next = i + 1;
+            }
+        }
+        self.serialize_row(row)
+    }
+
+    /// One solution, as a value or `None` per variable, in their order.
+    pub fn serialize_row(&mut self, row: &[Option<TermRef<'_>>]) -> io::Result<()> {
+        if row.len() != self.variables.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "a row of {} values for {} variables",
+                    row.len(),
+                    self.variables.len()
+                ),
+            ));
+        }
+        let first = std::mem::replace(&mut self.first, false);
+        match self.format {
+            QueryResultsFormat::Json => json::write_row(&mut self.out, &self.variables, row, first),
+            QueryResultsFormat::Xml => xml::write_row(&mut self.out, &self.variables, row),
+            QueryResultsFormat::Csv => csv::write_row(&mut self.out, row),
+            QueryResultsFormat::Tsv => tsv::write_row(&mut self.out, row),
+        }
+        if self.out.len() >= FLUSH_AT {
+            self.writer.write_all(&self.out)?;
+            self.out.clear();
+        }
+        Ok(())
+    }
+
+    /// Writes the end of the document, and returns the writer.
+    pub fn finish(mut self) -> io::Result<W> {
+        match self.format {
+            QueryResultsFormat::Json => json::write_end(&mut self.out),
+            QueryResultsFormat::Xml => xml::write_end(&mut self.out),
+            QueryResultsFormat::Csv | QueryResultsFormat::Tsv => {}
+        }
+        self.writer.write_all(&self.out)?;
+        Ok(self.writer)
+    }
+}
