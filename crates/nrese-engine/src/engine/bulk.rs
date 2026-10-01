@@ -77,7 +77,12 @@ impl<'e> BulkLoad<'e> {
         let _compaction = shared.versions.compaction_slot.lock();
         let base = shared.snapshot();
         let started = Instant::now();
-        let mut quads: Vec<EncodedQuad> = batches.into_inner().concat();
+        // The batches into one array, each freed once copied (not all held twice).
+        let batches = batches.into_inner();
+        let mut quads: Vec<EncodedQuad> = Vec::with_capacity(batches.iter().map(Vec::len).sum());
+        for batch in batches {
+            quads.extend_from_slice(&batch);
+        }
         quads.par_sort_unstable();
         quads.dedup();
 
