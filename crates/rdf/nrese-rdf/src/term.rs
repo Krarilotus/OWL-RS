@@ -1,10 +1,12 @@
-//! RDF terms (RDF 1.1 Concepts §3): IRIs ([`NamedNode`]), blank nodes, literals, and their
-//! unions ([`NamedOrBlankNode`], [`Term`], [`GraphName`]); each with a borrowed form
-//! (`…Ref`) that costs no allocation. They print in N-Triples syntax.
+//! RDF terms (RDF 1.2 Concepts §3): IRIs ([`NamedNode`]), blank nodes, literals (with a
+//! base direction where RDF 1.2 has one), triple terms, and their unions
+//! ([`NamedOrBlankNode`], [`Term`], [`GraphName`]); each with a borrowed form (`…Ref`) that
+//! costs no allocation. They print in N-Triples syntax.
 
 use std::fmt::{self, Write};
 
 use crate::iri::{Iri, IriParseError};
+use crate::triple::Triple;
 use crate::vocab::{rdf, xsd};
 
 /// Why a text isn't a blank node identifier or a language tag.
@@ -262,8 +264,9 @@ impl From<BlankNodeRef<'_>> for BlankNode {
 // ---------------------------------------------------------------------------------------
 // Literals
 
-/// A literal (RDF 1.1 Concepts §3.3): a lexical form with a language tag or a datatype. A
-/// simple literal's datatype is `xsd:string`, a language-tagged string's `rdf:langString`.
+/// A literal (RDF 1.2 Concepts §3.3): a lexical form with a language tag (and possibly a
+/// base direction) or a datatype. A simple literal's datatype is `xsd:string`, a
+/// language-tagged string's `rdf:langString`, a directional one's `rdf:dirLangString`.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Literal {
     value: String,
@@ -274,6 +277,7 @@ pub struct Literal {
 enum Kind {
     Simple,
     Language(String),
+    DirectionalLanguage(String, BaseDirection),
     Typed(NamedNode),
 }
 
@@ -288,7 +292,47 @@ pub struct LiteralRef<'a> {
 enum KindRef<'a> {
     Simple,
     Language(&'a str),
+    DirectionalLanguage(&'a str, BaseDirection),
     Typed(NamedNodeRef<'a>),
+}
+
+/// The base direction of a directional language-tagged string (RDF 1.2 Concepts §3.3):
+/// `ltr` or `rtl`, as in `"…"@ar--rtl`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum BaseDirection {
+    Ltr,
+    Rtl,
+}
+
+impl BaseDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ltr => "ltr",
+            Self::Rtl => "rtl",
+        }
+    }
+}
+
+impl std::str::FromStr for BaseDirection {
+    type Err = TermParseError;
+
+    /// `ltr` or `rtl`, in lower case: RDF 1.2 allows no other spelling.
+    fn from_str(text: &str) -> Result<Self, TermParseError> {
+        match text {
+            "ltr" => Ok(Self::Ltr),
+            "rtl" => Ok(Self::Rtl),
+            _ => Err(TermParseError {
+                what: "base direction",
+                text: text.to_owned(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for BaseDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl Literal {
@@ -317,15 +361,10 @@ impl Literal {
         value: impl Into<String>,
         language: impl Into<String>,
     ) -> Result<Self, TermParseError> {
-        let mut language = language.into();
-        language.make_ascii_lowercase();
-        if !crate::language::is_well_formed(&language) {
-            return Err(TermParseError {
-                what: "language tag",
-                text: language,
-            });
-        }
-        Ok(Self::new_language_tagged_literal_unchecked(value, language))
+        Ok(Self::new_language_tagged_literal_unchecked(
+            value,
+            checked_language(language.into())?,
+        ))
     }
 
     /// Without checking: `language` must be a lower-case BCP 47 tag.
@@ -339,13 +378,47 @@ impl Literal {
         }
     }
 
+    /// A directional language-tagged string (RDF 1.2); the tag is checked against BCP 47
+    /// and put in lower case.
+    pub fn new_directional_language_tagged_literal(
+        value: impl Into<String>,
+        language: impl Into<String>,
+        direction: BaseDirection,
+    ) -> Result<Self, TermParseError> {
+        Ok(Self::new_directional_language_tagged_literal_unchecked(
+            value,
+            checked_language(language.into())?,
+            direction,
+        ))
+    }
+
+    /// Without checking: `language` must be a lower-case BCP 47 tag.
+    pub fn new_directional_language_tagged_literal_unchecked(
+        value: impl Into<String>,
+        language: impl Into<String>,
+        direction: BaseDirection,
+    ) -> Self {
+        Self {
+            value: value.into(),
+            kind: Kind::DirectionalLanguage(language.into(), direction),
+        }
+    }
+
     pub fn value(&self) -> &str {
         &self.value
     }
 
     pub fn language(&self) -> Option<&str> {
         match &self.kind {
-            Kind::Language(tag) => Some(tag),
+            Kind::Language(tag) | Kind::DirectionalLanguage(tag, _) => Some(tag),
+            _ => None,
+        }
+    }
+
+    /// The base direction of a directional language-tagged string.
+    pub fn direction(&self) -> Option<BaseDirection> {
+        match self.kind {
+            Kind::DirectionalLanguage(_, direction) => Some(direction),
             _ => None,
         }
     }
@@ -354,9 +427,9 @@ impl Literal {
         self.as_ref().datatype()
     }
 
-    /// A simple literal or a language-tagged string.
+    /// A simple literal or a language-tagged string (with or without a direction).
     pub fn is_plain(&self) -> bool {
-        matches!(self.kind, Kind::Simple | Kind::Language(_))
+        self.as_ref().is_plain()
     }
 
     pub fn as_ref(&self) -> LiteralRef<'_> {
@@ -365,18 +438,45 @@ impl Literal {
             kind: match &self.kind {
                 Kind::Simple => KindRef::Simple,
                 Kind::Language(tag) => KindRef::Language(tag),
+                Kind::DirectionalLanguage(tag, direction) => {
+                    KindRef::DirectionalLanguage(tag, *direction)
+                }
                 Kind::Typed(datatype) => KindRef::Typed(datatype.as_ref()),
             },
         }
     }
 
-    /// The lexical form, and the language tag or datatype (`None` for a simple literal).
-    pub fn destruct(self) -> (String, Option<NamedNode>, Option<String>) {
+    /// The lexical form, the datatype (`None` for a simple literal or a language-tagged
+    /// string), the language tag and the base direction.
+    pub fn destruct(
+        self,
+    ) -> (
+        String,
+        Option<NamedNode>,
+        Option<String>,
+        Option<BaseDirection>,
+    ) {
         match self.kind {
-            Kind::Simple => (self.value, None, None),
-            Kind::Language(tag) => (self.value, None, Some(tag)),
-            Kind::Typed(datatype) => (self.value, Some(datatype), None),
+            Kind::Simple => (self.value, None, None, None),
+            Kind::Language(tag) => (self.value, None, Some(tag), None),
+            Kind::DirectionalLanguage(tag, direction) => {
+                (self.value, None, Some(tag), Some(direction))
+            }
+            Kind::Typed(datatype) => (self.value, Some(datatype), None, None),
         }
+    }
+}
+
+/// `language` in lower case, if it is a well-formed BCP 47 tag.
+fn checked_language(mut language: String) -> Result<String, TermParseError> {
+    language.make_ascii_lowercase();
+    if crate::language::is_well_formed(&language) {
+        Ok(language)
+    } else {
+        Err(TermParseError {
+            what: "language tag",
+            text: language,
+        })
     }
 }
 
@@ -407,13 +507,31 @@ impl<'a> LiteralRef<'a> {
         }
     }
 
+    pub const fn new_directional_language_tagged_literal_unchecked(
+        value: &'a str,
+        language: &'a str,
+        direction: BaseDirection,
+    ) -> Self {
+        Self {
+            value,
+            kind: KindRef::DirectionalLanguage(language, direction),
+        }
+    }
+
     pub const fn value(self) -> &'a str {
         self.value
     }
 
     pub const fn language(self) -> Option<&'a str> {
         match self.kind {
-            KindRef::Language(tag) => Some(tag),
+            KindRef::Language(tag) | KindRef::DirectionalLanguage(tag, _) => Some(tag),
+            _ => None,
+        }
+    }
+
+    pub const fn direction(self) -> Option<BaseDirection> {
+        match self.kind {
+            KindRef::DirectionalLanguage(_, direction) => Some(direction),
             _ => None,
         }
     }
@@ -422,12 +540,16 @@ impl<'a> LiteralRef<'a> {
         match self.kind {
             KindRef::Simple => xsd::STRING,
             KindRef::Language(_) => rdf::LANG_STRING,
+            KindRef::DirectionalLanguage(..) => rdf::DIR_LANG_STRING,
             KindRef::Typed(datatype) => datatype,
         }
     }
 
     pub const fn is_plain(self) -> bool {
-        matches!(self.kind, KindRef::Simple | KindRef::Language(_))
+        matches!(
+            self.kind,
+            KindRef::Simple | KindRef::Language(_) | KindRef::DirectionalLanguage(..)
+        )
     }
 
     pub fn into_owned(self) -> Literal {
@@ -436,6 +558,9 @@ impl<'a> LiteralRef<'a> {
             kind: match self.kind {
                 KindRef::Simple => Kind::Simple,
                 KindRef::Language(tag) => Kind::Language(tag.to_owned()),
+                KindRef::DirectionalLanguage(tag, direction) => {
+                    Kind::DirectionalLanguage(tag.to_owned(), direction)
+                }
                 KindRef::Typed(datatype) => Kind::Typed(datatype.into_owned()),
             },
         }
@@ -470,6 +595,7 @@ impl fmt::Display for LiteralRef<'_> {
         match self.kind {
             KindRef::Simple => Ok(()),
             KindRef::Language(tag) => write!(f, "@{tag}"),
+            KindRef::DirectionalLanguage(tag, direction) => write!(f, "@{tag}--{direction}"),
             KindRef::Typed(datatype) => write!(f, "^^{datatype}"),
         }
     }
@@ -632,11 +758,121 @@ union!(NamedOrBlankNode, NamedOrBlankNodeRef {
     BlankNode(BlankNode, BlankNodeRef)
 });
 
-union!(Term, TermRef {
+/// Any RDF term: an IRI, a blank node, a literal, or a triple term (RDF 1.2 Concepts §3.6,
+/// in object position only). Triple terms nest, so the owned form boxes them.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum Term {
+    NamedNode(NamedNode),
+    BlankNode(BlankNode),
+    Literal(Literal),
+    Triple(Box<Triple>),
+}
+
+/// A borrowed [`Term`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum TermRef<'a> {
+    NamedNode(NamedNodeRef<'a>),
+    BlankNode(BlankNodeRef<'a>),
+    Literal(LiteralRef<'a>),
+    Triple(&'a Triple),
+}
+
+impl Term {
+    pub fn as_ref(&self) -> TermRef<'_> {
+        match self {
+            Self::NamedNode(n) => TermRef::NamedNode(n.as_ref()),
+            Self::BlankNode(b) => TermRef::BlankNode(b.as_ref()),
+            Self::Literal(l) => TermRef::Literal(l.as_ref()),
+            Self::Triple(t) => TermRef::Triple(t),
+        }
+    }
+}
+
+impl TermRef<'_> {
+    pub fn into_owned(self) -> Term {
+        match self {
+            Self::NamedNode(n) => Term::NamedNode(n.into_owned()),
+            Self::BlankNode(b) => Term::BlankNode(b.into_owned()),
+            Self::Literal(l) => Term::Literal(l.into_owned()),
+            Self::Triple(t) => Term::Triple(Box::new(t.clone())),
+        }
+    }
+}
+
+impl fmt::Display for Term {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_ref().fmt(f)
+    }
+}
+
+/// A triple term prints as N-Triples 1.2 writes it: `<<( s p o )>>`.
+impl fmt::Display for TermRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NamedNode(n) => n.fmt(f),
+            Self::BlankNode(b) => b.fmt(f),
+            Self::Literal(l) => l.fmt(f),
+            Self::Triple(t) => write!(f, "<<( {t} )>>"),
+        }
+    }
+}
+
+impl<'a> From<&'a Term> for TermRef<'a> {
+    fn from(term: &'a Term) -> Self {
+        term.as_ref()
+    }
+}
+
+impl From<TermRef<'_>> for Term {
+    fn from(term: TermRef<'_>) -> Self {
+        term.into_owned()
+    }
+}
+
+macro_rules! term_variants {
+    ($($variant:ident($ty:ident, $ref:ident)),*) => {$(
+        impl From<$ty> for Term {
+            fn from(value: $ty) -> Self {
+                Self::$variant(value)
+            }
+        }
+
+        impl<'a> From<$ref<'a>> for TermRef<'a> {
+            fn from(value: $ref<'a>) -> Self {
+                Self::$variant(value)
+            }
+        }
+
+        impl<'a> From<&'a $ty> for TermRef<'a> {
+            fn from(value: &'a $ty) -> Self {
+                Self::$variant(value.as_ref())
+            }
+        }
+    )*};
+}
+term_variants!(
     NamedNode(NamedNode, NamedNodeRef),
     BlankNode(BlankNode, BlankNodeRef),
     Literal(Literal, LiteralRef)
-});
+);
+
+impl From<Triple> for Term {
+    fn from(triple: Triple) -> Self {
+        Self::Triple(Box::new(triple))
+    }
+}
+
+impl From<Box<Triple>> for Term {
+    fn from(triple: Box<Triple>) -> Self {
+        Self::Triple(triple)
+    }
+}
+
+impl<'a> From<&'a Triple> for TermRef<'a> {
+    fn from(triple: &'a Triple) -> Self {
+        Self::Triple(triple)
+    }
+}
 
 /// The subject of a triple: an IRI or a blank node.
 pub type Subject = NamedOrBlankNode;
@@ -664,6 +900,10 @@ impl Term {
     pub fn is_literal(&self) -> bool {
         matches!(self, Self::Literal(_))
     }
+
+    pub fn is_triple(&self) -> bool {
+        matches!(self, Self::Triple(_))
+    }
 }
 
 impl TermRef<'_> {
@@ -677,6 +917,10 @@ impl TermRef<'_> {
 
     pub fn is_literal(&self) -> bool {
         matches!(self, Self::Literal(_))
+    }
+
+    pub fn is_triple(&self) -> bool {
+        matches!(self, Self::Triple(_))
     }
 }
 
@@ -698,7 +942,7 @@ impl<'a> From<NamedOrBlankNodeRef<'a>> for TermRef<'a> {
     }
 }
 
-/// A term that isn't an IRI or a blank node.
+/// A term that isn't an IRI or a blank node (or not the kind asked for).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0} is not an IRI or a blank node")]
 pub struct NotANodeError(pub String);
@@ -710,7 +954,7 @@ impl TryFrom<Term> for NamedOrBlankNode {
         match term {
             Term::NamedNode(n) => Ok(n.into()),
             Term::BlankNode(b) => Ok(b.into()),
-            Term::Literal(l) => Err(NotANodeError(l.to_string())),
+            other => Err(NotANodeError(other.to_string())),
         }
     }
 }
@@ -722,7 +966,7 @@ impl<'a> TryFrom<TermRef<'a>> for NamedOrBlankNodeRef<'a> {
         match term {
             TermRef::NamedNode(n) => Ok(n.into()),
             TermRef::BlankNode(b) => Ok(b.into()),
-            TermRef::Literal(l) => Err(NotANodeError(l.to_string())),
+            other => Err(NotANodeError(other.to_string())),
         }
     }
 }
@@ -960,6 +1204,51 @@ mod tests {
         assert_eq!(Literal::from(f64::NEG_INFINITY).value(), "-INF");
         assert_eq!(Variable::new_unchecked("x").to_string(), "?x");
         assert_eq!(GraphName::DefaultGraph.to_string(), "DEFAULT");
+    }
+
+    #[test]
+    fn rdf_1_2_terms_print_as_n_triples_1_2() {
+        let rtl = Literal::new_directional_language_tagged_literal("x", "AR", BaseDirection::Rtl)
+            .unwrap();
+        assert_eq!(rtl.to_string(), "\"x\"@ar--rtl");
+        assert_eq!(rtl.language(), Some("ar"));
+        assert_eq!(rtl.direction(), Some(BaseDirection::Rtl));
+        assert_eq!(rtl.datatype(), rdf::DIR_LANG_STRING);
+        assert!(rtl.is_plain());
+        assert_ne!(
+            rtl,
+            Literal::new_language_tagged_literal_unchecked("x", "ar")
+        );
+        assert!(
+            Literal::new_directional_language_tagged_literal("x", "a-", BaseDirection::Ltr)
+                .is_err()
+        );
+        assert_eq!("ltr".parse::<BaseDirection>().unwrap(), BaseDirection::Ltr);
+        assert!("LTR".parse::<BaseDirection>().is_err());
+        assert!("up".parse::<BaseDirection>().is_err());
+        let inner = Triple::new(
+            BlankNode::new_unchecked("b"),
+            NamedNode::new_unchecked("http://e/p"),
+            rtl.clone(),
+        );
+        let nested: Term = Triple::new(
+            NamedNode::new_unchecked("http://e/s"),
+            NamedNode::new_unchecked("http://e/q"),
+            inner,
+        )
+        .into();
+        assert_eq!(
+            nested.to_string(),
+            "<<( <http://e/s> <http://e/q> <<( _:b <http://e/p> \"x\"@ar--rtl )>> )>>"
+        );
+        assert!(nested.is_triple());
+        assert_eq!(nested.as_ref().into_owned(), nested);
+        assert!(NamedOrBlankNode::try_from(nested).is_err());
+        let (value, datatype, language, direction) = rtl.destruct();
+        assert_eq!(
+            (value.as_str(), datatype, language.as_deref(), direction),
+            ("x", None, Some("ar"), Some(BaseDirection::Rtl))
+        );
     }
 
     #[test]

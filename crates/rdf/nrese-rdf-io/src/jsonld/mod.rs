@@ -173,6 +173,9 @@ pub enum JsonLdErrorCode {
     LoadingRemoteContextFailed,
     ProcessingModeConflict,
     ProtectedTermRedefinition,
+    /// Not a code of the specification: RDF 1.2 triple terms, which JSON-LD 1.1 can't
+    /// express (until JSON-LD 1.2 defines them).
+    UnsupportedTripleTerm,
 }
 
 impl JsonLdErrorCode {
@@ -225,6 +228,7 @@ impl JsonLdErrorCode {
             Self::LoadingRemoteContextFailed => "loading remote context failed",
             Self::ProcessingModeConflict => "processing mode conflict",
             Self::ProtectedTermRedefinition => "protected term redefinition",
+            Self::UnsupportedTripleTerm => "unsupported triple term",
         }
     }
 }

@@ -36,7 +36,7 @@ do), **decide** (the owner decides whether the use case needs it).
 |---|---|---|
 | RDF 1.1 Concepts and abstract syntax | `nrese-rdf` | **have** |
 | RDF 1.1 Semantics, literal value spaces | `nrese-xsd` (strict XSD lexical forms, XPath operations) | **have** |
-| RDF 1.2 (`rdf-12` feature): triple terms | Part of the migration: terms (3e), syntaxes (3e), SPARQL (4), engine (6) | **planned** |
+| RDF 1.2 (`rdf-12` feature): triple terms | Part of the model, not a feature: terms and every syntax (3e, all W3C `rdf12` syntax suites pass); SPARQL (4), engine (6) | **have** (model, syntaxes); SPARQL and engine **planned** |
 | RDF Dataset Canonicalization (RDFC-1.0) | `nrese-rdf` canonicalises blank nodes for comparison (fast, our own algorithm), but not by the W3C algorithm, whose output is a standard | **gap** → RDFC-1.0 in `nrese-rdf` with the W3C `rdf-canon` test suite, in 3e |
 | SPARQL 1.1 query, patterns, paths, aggregates, modifiers, functions (hashes included) | Native executor: W3C 491/495 (one known deviation, zero-length paths from a term outside the graph) | **have** |
 | SPARQL 1.1 Update (all operations) | W3C update 94/94 | **have** |
@@ -75,7 +75,7 @@ do), **decide** (the owner decides whether the use case needs it).
 
 | Oxigraph | NRESE | Status |
 |---|---|---|
-| RDF 1.2 triple terms, `rdf:reifies`, `<<( … )>>`, `<< … ~ r >>`, `{| … |}` | 3e (terms and all syntaxes), with the W3C `rdf12` suites | **planned** |
+| RDF 1.2 triple terms, `rdf:reifies`, `<<( … )>>`, `<< … ~ r >>`, `{| … |}`, directional literals | 3e: terms and all syntaxes (N-Triples, N-Quads, Turtle, TriG, RDF/XML with `parseType="Triple"`, `rdf:annotation` and `its:dir`); all 336 W3C `rdf12` syntax tests pass | **have** |
 | Triple terms interned by hash-derived ids, so the permutations stay as they are | The roadmap's R7: a triple term's dictionary key is its three component ids; the seven permutations are unchanged | **planned** (step 6) |
 | SPARQL 1.2 matching of triple terms and reifiers, `BIND(<<( … )>> AS ?t)`, `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, update over triple terms | Step 4 (grammar), step 6 (evaluation), with the W3C `sparql12` tests | **planned** |
 | SEP-0006 / SEP-0007 `LATERAL` | Never supported (the baseline's `spargebra` didn't enable it) | **gap** → step 4 (grammar, behind a feature) and step 6 (evaluation: per-row correlation, as Jena does) |
@@ -84,10 +84,12 @@ do), **decide** (the owner decides whether the use case needs it).
 | SPARQL 1.2 Protocol and Graph Store Protocol drafts (4xx for bad requests, 5xx for failures; RDF 1.2 media types) | 4xx/5xx already differentiated; 1.2 media types and profiles with step 6 | **partial** |
 | Results formats with triple terms (JSON `"type": "triple"`, XML, TSV escaping) | Step 4 | **planned** |
 
-**Feature flags.** As Oxigraph does with `rdf-12`, `sep-0002`, `sep-0006`: draft features
-sit behind Cargo features of the crates that implement them (`rdf-12`, `sparql-12`,
-`sep-0002`, `sep-0006`), on by default in the server once their W3C suites pass, so that
-an embedder can build without a draft.
+**Feature flags.** As Oxigraph does with `sep-0002` and `sep-0006`: draft features sit
+behind Cargo features of the crates that implement them (`sparql-12`, `sep-0002`,
+`sep-0006`), on by default in the server once their W3C suites pass, so that an embedder
+can build without a draft. RDF 1.2 itself is not one (decided with 3e, see the migration
+plan's status): a gated `Term` variant would split every match into two builds, RDF 1.2
+Concepts is a Candidate Recommendation, and 1.1 documents read and write unchanged.
 
 **Draft volatility.** Every suite is pinned to a commit. A change of a draft that breaks
 syntax or behaviour is a deliberate update of the pin, with its test results, and a

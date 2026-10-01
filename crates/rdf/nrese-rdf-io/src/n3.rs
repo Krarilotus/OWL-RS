@@ -13,19 +13,21 @@ use std::io::{self, Read, Write};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{
     BlankNode, GraphName, Iri, IriParseError, Literal, NamedNode, NamedOrBlankNode, Quad, Term,
-    Variable,
+    Triple, Variable,
 };
 
 use crate::blank::BlankNodes;
 use crate::error::RdfParseError;
 use crate::turtle::{TurtleParser, TurtleSettings};
 
-/// A term of N3: what RDF has, and variables.
+/// A term of N3: what RDF has (triple terms too, written as RDF 1.2 writes them), and
+/// variables.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum N3Term {
     NamedNode(NamedNode),
     BlankNode(BlankNode),
     Literal(Literal),
+    Triple(Box<Triple>),
     Variable(Variable),
 }
 
@@ -44,6 +46,7 @@ impl fmt::Display for N3Term {
             Self::NamedNode(n) => n.fmt(f),
             Self::BlankNode(b) => b.fmt(f),
             Self::Literal(l) => l.fmt(f),
+            Self::Triple(t) => write!(f, "<<( {t} )>>"),
             Self::Variable(v) => v.fmt(f),
         }
     }
@@ -55,6 +58,7 @@ impl From<Term> for N3Term {
             Term::NamedNode(n) => Self::NamedNode(n),
             Term::BlankNode(b) => Self::BlankNode(b),
             Term::Literal(l) => Self::Literal(l),
+            Term::Triple(t) => Self::Triple(t),
         }
     }
 }
@@ -85,6 +89,7 @@ impl N3Quad {
             N3Term::NamedNode(n) => Term::NamedNode(n.clone()),
             N3Term::BlankNode(b) => Term::BlankNode(b.clone()),
             N3Term::Literal(l) => Term::Literal(l.clone()),
+            N3Term::Triple(t) => Term::Triple(t.clone()),
             N3Term::Variable(_) => return Err(Box::new(self)),
         };
         Ok(Quad {
@@ -341,8 +346,27 @@ impl Writer<'_> {
                     out.push_str(&l.to_string());
                 }
             }
+            N3Term::Triple(triple) => self.triple_term(triple, out),
             N3Term::Variable(v) => out.push_str(&v.to_string()),
         }
+    }
+
+    /// `<<( s p o )>>`: its blank nodes are nodes, never formulas.
+    fn triple_term(&self, triple: &Triple, out: &mut String) {
+        out.push_str("<<( ");
+        match &triple.subject {
+            NamedOrBlankNode::NamedNode(n) => self.iri(n.as_str(), out),
+            NamedOrBlankNode::BlankNode(b) => out.push_str(&b.to_string()),
+        }
+        out.push(' ');
+        self.iri(triple.predicate.as_str(), out);
+        out.push(' ');
+        match &triple.object {
+            Term::NamedNode(n) => self.iri(n.as_str(), out),
+            Term::Triple(inner) => self.triple_term(inner, out),
+            other => out.push_str(&other.to_string()),
+        }
+        out.push_str(" )>>");
     }
 
     fn iri(&self, iri: &str, out: &mut String) {

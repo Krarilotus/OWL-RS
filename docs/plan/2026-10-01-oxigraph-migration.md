@@ -55,8 +55,8 @@ replaces, and is done only when it is at least as good on every count:
    with fat LTO and one codegen unit (already the workspace profile).
 4. **Separation and configuration.** Each crate does one thing and depends only on the
    crates below it (`nrese-xsd` knows nothing of RDF; `nrese-rdf` connects to it through
-   an optional feature). Optional parts sit behind features (formats, RDF 1.2, parallel
-   parsing). Behaviour that depends on the use case is an option with a tuned default
+   an optional feature). Optional parts sit behind features (formats, parallel parsing;
+   RDF 1.2 is part of the model, see 3e). Behaviour that depends on the use case is an option with a tuned default
    (strict or lenient validation, error recovery, input limits for the server).
 5. **Fewer bugs over time.** Conformance suites in CI; round-trip properties
    (`parse(write(x)) == x`); fuzz targets for every parser; and, while the migration
@@ -78,8 +78,8 @@ the implementation and its tests.
 plus: language tags checked against BCP 47's full grammar (RFC 5646), IRIs against RFC
 3987 in one pass with the positions of their parts kept; graphs and datasets as ordered
 sets with range lookups; canonicalisation by hashing neighbourhoods to a stable partition
-and branching on ties. Later, behind a feature: RDF 1.2 triple terms and base direction
-(`@en--ltr`), once the engine can store them. To measure: IRI parsing and resolution,
+and branching on ties. RDF 1.2 triple terms and base direction (`@en--ltr`) are part of
+the model (3e), not a feature. To measure: IRI parsing and resolution,
 term formatting, canonicalisation against `oxiri`/`oxrdf`.
 
 **`nrese-xsd`.** No RDF dependency. Values are `Copy`:
@@ -175,7 +175,7 @@ The crate is built in five parts, each with its W3C suites and tests before the 
     default).
   - Suites: `toRdf`, `expand` and `fromRdf` from `w3c/json-ld-api`.
 - **3e. RDF 1.2** in `nrese-rdf` and every reader and writer (see "The newest standards"
-  below).
+  below). Done 1 October (see Status); RDFC-1.0 follows.
 - **3f. Comparison batch**: the conformance matrix and throughput against `oxttl`,
   `oxrdfxml` and `oxjsonld` (with Oxigraph's `rdf-12` feature) on generated documents (no
   third-party data), the end of step 3.
@@ -423,3 +423,37 @@ parallel (new, exact; 1.5× oxttl's heuristic splitter on 16 threads), N-Triples
 writing (was 1.1× slower, now 1.7–1.9× faster). The engine end to end is at parity with the
 baseline, as expected before the switch-over (load through oxttl until step 5), commits
 about 20% faster.
+
+**3e: RDF 1.2 in the model and every syntax (1 October).** All W3C RDF 1.2 syntax suites
+pass, 336 tests: N-Triples, N-Quads and their canonical forms, Turtle, TriG, RDF/XML. The
+RDF 1.1 suites still pass all 993. The runner reads both, writes every document back
+through nrese's own writers, and reads Turtle and TriG in 2, 3 and 8 parallel chunks.
+- **Model.** `Term::Triple` (object position, nested) and directional language-tagged
+  strings (`rdf:dirLangString`). Canonicalisation turns each triple term that holds blank
+  nodes into a node with three marker edges, which no data can have, so the existing
+  search covers nested terms unchanged.
+- **Not a Cargo feature** (deciding §8 of the parity matrix for RDF 1.2):
+  - A feature-gated variant of `Term` would split every match in the bundle and the
+    engine into two builds.
+  - RDF 1.2 Concepts is a Candidate Recommendation.
+  - RDF 1.1 documents read unchanged, and writers write 1.2 syntax only for 1.2 data.
+  - The drafts' later changes are handled by the pinned suites.
+- **Syntaxes.**
+  - N-Triples and N-Quads: `VERSION`, `<<( … )>>`, `LANG_DIR`, whitespace inside a
+    literal.
+  - Turtle and TriG: reified triples `<< s p o ~ r >>`, annotations `~ r {| … |}`,
+    `@version` and `VERSION`.
+  - RDF/XML: `rdf:version`, `its:dir`, `rdf:parseType="Triple"` (its content's statements
+    collected in its frame; ignored without RDF 1.2 in scope), `rdf:annotation` and
+    `rdf:annotationNodeID`.
+  - N3 terms can hold triple terms (written as RDF 1.2 writes them).
+  - JSON-LD writes a directional literal as `@direction`, and refuses triple terms with a
+    clear error: JSON-LD 1.1 has none, and JSON-LD 1.2 hasn't defined them yet.
+- **Stricter, as the 1.2 suites require.** Language tags must be well-formed BCP 47 (now
+  allocation-free, so the checked parsers lose nothing); a direction is exactly `ltr` or
+  `rtl`; `^^rdf:langString` and `^^rdf:dirLangString` are errors. The lenient
+  (`unchecked`) mode skips the tag check.
+- **The exact parallel splitter** counts `<<`/`>>` as nesting and never takes the `|}` of
+  an annotation for the end of a TriG block.
+- **Throughput unchanged.** A check with the I/O comparison: nrese reads N-Triples in
+  0.42 of Oxigraph's time, Turtle in 0.61 and RDF/XML in 0.93 (owned quads), as before.

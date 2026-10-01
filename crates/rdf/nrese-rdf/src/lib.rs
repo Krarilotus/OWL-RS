@@ -21,8 +21,8 @@ mod xsd_literals;
 pub use graph::{Dataset, Graph};
 pub use iri::{Iri, IriParseError};
 pub use term::{
-    BlankNode, BlankNodeRef, GraphName, GraphNameRef, Literal, LiteralRef, NamedNode, NamedNodeRef,
-    NamedOrBlankNode, NamedOrBlankNodeRef, NotANodeError, Subject, SubjectRef, Term,
-    TermParseError, TermRef, Variable,
+    BaseDirection, BlankNode, BlankNodeRef, GraphName, GraphNameRef, Literal, LiteralRef,
+    NamedNode, NamedNodeRef, NamedOrBlankNode, NamedOrBlankNodeRef, NotANodeError, Subject,
+    SubjectRef, Term, TermParseError, TermRef, Variable,
 };
 pub use triple::{Quad, QuadRef, Triple, TripleRef};

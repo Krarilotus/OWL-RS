@@ -2,7 +2,9 @@
 //!
 //! A [`Skimmer`] reads the document once, sequentially, but only far enough to know what
 //! is a string (four quote forms, with escapes), an IRI, a comment or an escaped character
-//! in a name, and how deep `[`, `(` and `{` nest: a table lookup per byte outside those,
+//! in a name, and how deep `[`, `(`, `{` and RDF 1.2's `<<` nest (`<<(` counts its `(`
+//! too, and `)>>` closes all three; `{|` opens with its `{`, and `|}` closes an annotation,
+//! never a TriG block): a table lookup per byte outside those,
 //! `memchr` inside them. A `.` at depth 0 followed by whitespace (or the end, or a
 //! comment), and a `}` that closes a TriG block, end a statement for certain; every other
 //! `.` is left alone (a boundary missed costs nothing, a wrong one would corrupt the parse).
@@ -18,7 +20,7 @@
 /// Bytes the skimmer must look at outside strings, IRIs and comments.
 const fn interesting() -> [bool; 256] {
     let mut table = [false; 256];
-    let bytes = b"\"'<#.[]{}()\\";
+    let bytes = b"\"'<>|#.[]{}()\\";
     let mut i = 0;
     while i < bytes.len() {
         table[bytes[i] as usize] = true;
@@ -36,7 +38,11 @@ enum State {
     /// After `\` outside a string: the next byte is escaped.
     Escape,
     Comment,
+    /// After `<`: an IRI, or `<<` (the second byte decides).
+    Angle,
     Iri,
+    /// After `|` (outside strings and IRIs): `|}` closes an annotation block.
+    Pipe,
     /// In a short string with this quote; `escaped`: the previous byte was `\`.
     Short {
         quote: u8,
@@ -230,7 +236,9 @@ impl Skimmer {
                     }
                     match b {
                         b'"' | b'\'' => self.state = State::Opening { quote: b, count: 1 },
-                        b'<' => self.state = State::Iri,
+                        b'<' => self.state = State::Angle,
+                        b'>' => self.depth -= 1,
+                        b'|' => self.state = State::Pipe,
                         b'#' => self.state = State::Comment,
                         b'\\' => self.state = State::Escape,
                         b'[' | b'(' | b'{' => self.depth += 1,
@@ -262,6 +270,31 @@ impl Skimmer {
                 State::Escape => {
                     self.state = State::Normal;
                     i += 1;
+                }
+                State::Angle => {
+                    if b == b'<' {
+                        // `<<`: a reified triple or a triple term opens.
+                        self.depth += 2;
+                        self.state = State::Normal;
+                        i += 1;
+                    } else {
+                        // An IRI: this byte is its first, read again in that state.
+                        if let Some((text, _)) = &mut self.directive {
+                            text.pop();
+                        }
+                        self.state = State::Iri;
+                    }
+                }
+                State::Pipe => {
+                    self.state = State::Normal;
+                    if b == b'}' {
+                        // `|}`: an annotation block closes.
+                        self.depth -= 1;
+                        i += 1;
+                    } else if let Some((text, _)) = &mut self.directive {
+                        // Read again in the normal state.
+                        text.pop();
+                    }
                 }
                 State::Comment => match memchr::memchr2(b'\n', b'\r', &bytes[i..]) {
                     Some(k) => {
