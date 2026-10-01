@@ -109,6 +109,44 @@ Turtle and TriG (prefixes, grouping), RDF/XML, JSON-LD. Checked by the W3C rdf-t
 the JSON-LD 1.1 toRdf/fromRdf suites. To measure: throughput per format in MB/s
 and triples/s against `oxttl`, `oxrdfxml` and `oxjsonld`, and bulk load end to end.
 
+**Step 3 in detail (`nrese-rdf-io`).** What the code needs today:
+- the six formats, by file extension or media type;
+- parsers with a base IRI, fresh blank nodes per payload, "no named graphs", a default
+  graph, input from `Read` or a byte slice;
+- N-Triples/N-Quads split into chunks for bulk load on all cores;
+- streaming serialisers for CONSTRUCT results, the graph store protocol and backups;
+- tests that read Turtle manifests and the OWL 2 RDF/XML file.
+
+The crate is built in five parts, each with its W3C suites and tests before the next:
+- **3a. Core.** `RdfFormat`; parse errors with line, column and byte offset; parser and
+  serialiser options (base IRI, prefixes, default graph, blank-node renaming, unchecked
+  IRIs, size limits); the input layer (a byte slice, or a buffered reader that refills
+  without splitting a token). Then N-Triples and N-Quads: a line lexer over bytes with
+  `memchr`; terms borrowed from the buffer unless an escape needs a copy; splitting at
+  line boundaries for parallel parsing; writers.
+- **3b. Turtle and TriG**, one lexer and parser (TriG is a superset): prefixes, base, the
+  abbreviations (`;` `,` `[]` collections `a`), numeric and boolean literals, relative
+  IRIs resolved into a reused buffer. Writers with prefixes, grouping by subject and
+  predicate, and lists.
+- **3c. RDF/XML** on `quick-xml` events (MIT; already in the dependency tree through
+  `sparesults`, and kept in the replacement): the full grammar (property attributes,
+  `rdf:parseType` Resource/Literal/Collection, containers `rdf:li`, `xml:base`,
+  `xml:lang`, reification with `rdf:ID`). A writer that nests by subject.
+- **3d. JSON-LD 1.1**: to RDF (context processing, expansion, remote contexts only through
+  a caller-supplied loader, none by default, for the server's safety) and from RDF
+  (expanded, or compacted with a given context). Own streaming JSON lexer; it is shared
+  with `nrese-sparql-results` in step 4.
+- **3e. Comparison batch**: the conformance matrix and throughput against `oxttl`,
+  `oxrdfxml` and `oxjsonld` on generated documents (no third-party data), the end of
+  step 3.
+
+Suites (fetched by `scripts/fetch-w3c-tests.sh`): RDF 1.1 N-Triples, N-Quads, Turtle,
+TriG, RDF/XML (positive and negative syntax, evaluation compared by isomorphism through
+`nrese-rdf`'s canonicalisation), and JSON-LD 1.1 `toRdf` and `fromRdf`. RDF 1.2 (triple
+terms, base direction) waits until the engine can store triple terms; Oxigraph has it
+behind a feature, so until then it is a known gap. N3 (a W3C Community Group format
+oxttl reads) is not used here and stays out unless asked for.
+
 **`nrese-sparql-syntax`.** A syntax tree that keeps what the query says (prefixed names,
 source positions for error messages) is separate from the algebra of SPARQL 1.1 §18, and
 the translation is a module of its own. The algebra keeps `spargebra`'s variant names
