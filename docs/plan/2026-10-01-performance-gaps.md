@@ -91,7 +91,10 @@ native build; medians of 3 runs. "Before" is the 27 September perf lab on the ma
 |---|---:|---:|---|
 | q08 `CONTAINS` on labels | 1,882 ms | 36 ms | A1: dictionary-first string test, one parallel `memmem` pass over the arena |
 | q03 top birthplaces (group count) | 26 ms | 14 ms | A3: group walk on the index (galloping over constant blocks, column decode) |
-| Sum of query medians | 2,279 ms | 407 ms | |
+| q12 `SUM` per team, 3-way star | 206 ms | 41 ms | columnar scans: a block and a column at a time, not a quad at a time |
+| q09 OPTIONAL, `LIMIT 100000` | 96 ms | 58 ms | A5 (part): LIMIT pushed into the OPTIONAL's left side and BGP morsels |
+| q13 `FILTER NOT EXISTS` count | 25 ms | 9 ms | columnar scans |
+| Sum of query medians | 2,279 ms | 187 ms | |
 | Restart (open) | 4.5 s | 0.000 s | A6: checkpoint format 6 used in place (memory map) |
 | Resident after open | 5.8 GB (peak 10 GB) | 13 MiB | A6: index runs, dictionary text and hash table stay in the file |
 | Resident after all queries | 5.5 GB | 2.8 GB | the pages the queries touched (file-backed, reclaimable) |
@@ -108,7 +111,15 @@ Done, with differential tests against the reference evaluator:
   only; `store.verify_on_open` checks everything (CRC, every block, every key).
 
 Still open:
-- A5, pipelined execution with early LIMIT exit (Wikidata q04, DBpedia q09).
+- A5, the rest: a pipelined executor. LIMIT without ORDER BY already stops early in basic
+  graph patterns (morsels of the first pattern, each twice the last, through the joins)
+  and below OPTIONAL and projections; other operators still evaluate whole.
+- Columnar scans answer one tombstone-free run; matches in both stacks (asserted and
+  inferred) or several runs still go quad by quad: merge them column-wise next.
+- DBpedia q05 (21 ms): populations are `xsd:nonNegativeInteger`, dictionary literals, so
+  the numeric range hint can't narrow them. An inline kind for the integer-derived
+  datatypes (value first, datatype code last, so ids still sort by value) would; it is a
+  term-encoding change.
 - A6, second part: after a checkpoint or bulk load the running process keeps its heap
   copy until restart; compaction into the base writes a heap run. Next: remap after a
   checkpoint, then merged base runs written to files (LSM), and an external-sort bulk
