@@ -105,7 +105,7 @@ pub(crate) fn matching(
 /// occurrence of the needle in the key at `hit`. A later occurrence may be the one that
 /// counts (an end placement, or a first hit inside a language tag or datatype), so the
 /// text is searched again where the first hit doesn't decide.
-fn passes(key: &[u8], index: u64, hit: usize, test: &StringTest<'_>) -> Option<TermId> {
+pub(crate) fn passes(key: &[u8], index: u64, hit: usize, test: &StringTest<'_>) -> Option<TermId> {
     if let Some(language) = test.language {
         let tag_end = 1 + memchr::memchr(0, key.get(1..)?)?;
         if !matches!(key[0], b'L' | b'D') || &key[1..tag_end] != language.as_bytes() {

@@ -42,6 +42,14 @@ pub(crate) struct Condition<'e> {
     language: Option<&'e str>,
 }
 
+impl Condition<'_> {
+    /// A prefix test: answered by binary search where the dictionary's text order is at
+    /// hand ([`Snapshot::text_order_ready`]), whatever the pattern's size.
+    pub(crate) fn is_prefix(&self) -> bool {
+        matches!(self.placement, Placement::Start | Placement::Whole) && !self.needle.is_empty()
+    }
+}
+
 /// The string tests `conjuncts` make on `variable`, as one condition: a text test and a
 /// language, each the first found.
 pub(crate) fn combined<'e>(

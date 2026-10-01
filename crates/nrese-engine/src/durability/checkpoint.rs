@@ -5,8 +5,10 @@
 //! - The dictionary is `len u64 | arena_len u64 | slot_count u64 | padding | ends: len ×
 //!   u64 | arena: arena_len bytes | padding | slots: slot_count × u32`: the keys one after
 //!   another, their end offsets, and an open-addressing hash table of them (linear probing
-//!   by the fixed [`key_hash`], entry index + 1 per slot, 0 empty). Padding is zero bytes
-//!   up to an 8-byte boundary of the file.
+//!   by the fixed [`key_hash`], entry index + 1 per slot, 0 empty), then `padding |
+//!   order_len u64 | order: order_len × u32`, the entries with a text sorted by it
+//!   ([`crate::term::order`]: prefix searches). Padding is zero bytes up to an 8-byte
+//!   boundary of the file. Format 6 is format 7 without the order.
 //! - Each stack (asserted, then inferred) is `count u32 | (permutation u8, packed keys)*`:
 //!   every permutation of the stack's layout, compressed as in memory
 //!   ([`PackedKeys::write`]), its packed bits padded to an 8-byte boundary.
@@ -42,9 +44,12 @@ use crate::term::hash::key_hash;
 
 /// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
 /// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
-/// stores the packed permutations (Pf2); version 6 aligns them for mapping.
-const MAGIC: &[u8; 8] = b"NRESECK6";
-/// Earlier formats, still read (same terms): unaligned packed permutations, quad lists.
+/// stores the packed permutations (Pf2); version 6 aligns them for mapping; version 7 adds
+/// the dictionary's text order.
+const MAGIC: &[u8; 8] = b"NRESECK7";
+/// Earlier formats, still read (same terms): without the text order, unaligned packed
+/// permutations, quad lists.
+const MAGIC_V6: &[u8; 8] = b"NRESECK6";
 const MAGIC_V5: &[u8; 8] = b"NRESECK5";
 const MAGIC_V4: &[u8; 8] = b"NRESECK4";
 /// Magic prefix shared by every checkpoint format version.
@@ -189,12 +194,19 @@ fn write_dictionary<W: Write>(
         put_u32(&mut out.buffer, slot);
         out.drain()?;
     }
+    let order = dictionary.text_order(len);
+    out.pad();
+    put_u64(&mut out.buffer, order.len() as u64);
+    for index in order {
+        put_u32(&mut out.buffer, index);
+        out.drain()?;
+    }
     Ok(())
 }
 
 /// Reads the dictionary section (module docs) from `reader`, positioned after the
-/// revision, as a [`Base`] of `map`.
-fn read_dictionary(reader: &mut Reader<'_>, map: &Map) -> Result<Base, String> {
+/// revision, as a [`Base`] of `map`; `with_order` from format 7 on.
+fn read_dictionary(reader: &mut Reader<'_>, map: &Map, with_order: bool) -> Result<Base, String> {
     let truncated = || "truncated dictionary".to_owned();
     let len = reader.u64().ok_or_else(truncated)?;
     let arena_len = reader.u64().ok_or_else(truncated)?;
@@ -218,12 +230,28 @@ fn read_dictionary(reader: &mut Reader<'_>, map: &Map) -> Result<Base, String> {
     let arena_at = section(arena_len, 1)?;
     section(padding(arena_at + arena_len as usize), 1)?;
     let slots_at = section(slot_count, 4)?;
+    let order = if with_order {
+        let at = section(0, 1)?;
+        section(padding(at), 1)?;
+        let at = section(1, 8)?;
+        let count = u64::from_le_bytes(map[at..at + 8].try_into().expect("8 bytes"));
+        if count > len {
+            return Err("the dictionary's text order is longer than the dictionary".into());
+        }
+        Some((section(count, 4)?, count as usize))
+    } else {
+        None
+    };
     let unmappable = || "the dictionary can't be mapped on this machine".to_owned();
     let base = Base {
         len,
         arena: Mapped::new(map, arena_at, arena_len as usize).ok_or_else(unmappable)?,
         ends: Mapped::new(map, ends_at, len as usize).ok_or_else(unmappable)?,
         slots: Mapped::new(map, slots_at, slot_count as usize).ok_or_else(unmappable)?,
+        order: match order {
+            Some((at, count)) => Some(Mapped::new(map, at, count).ok_or_else(unmappable)?),
+            None => None,
+        },
     };
     if base.ends.last().copied().unwrap_or(0) != arena_len {
         return Err("dictionary end offsets don't match its keys".into());
@@ -317,10 +345,11 @@ pub(crate) fn load_latest(
         .split_at_checked(bytes.len().saturating_sub(4))
         .ok_or_else(|| corrupt("truncated"))?;
     let mut reader = Reader::new(body);
-    let (packed, aligned) = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC => (true, true),
-        Some(magic) if magic == MAGIC_V5 => (true, false),
-        Some(magic) if magic == MAGIC_V4 => (false, false),
+    let (packed, aligned, with_order) = match reader.bytes(MAGIC.len()) {
+        Some(magic) if magic == MAGIC => (true, true, true),
+        Some(magic) if magic == MAGIC_V6 => (true, true, false),
+        Some(magic) if magic == MAGIC_V5 => (true, false, false),
+        Some(magic) if magic == MAGIC_V4 => (false, false, false),
         Some(magic) if magic.starts_with(FAMILY) => {
             return Err(EngineError::UnsupportedFormat(path));
         }
@@ -336,7 +365,8 @@ pub(crate) fn load_latest(
     lap("crc");
     let revision = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
     if aligned {
-        let base = read_dictionary(&mut reader, &map).map_err(|error| corrupt(&error))?;
+        let base =
+            read_dictionary(&mut reader, &map, with_order).map_err(|error| corrupt(&error))?;
         if verify {
             base.verify().map_err(|error| corrupt(&error))?;
         }
