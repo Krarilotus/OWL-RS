@@ -279,6 +279,12 @@ reference got hash joins, adjacency lists for closures and per-term indexes). W3
 1.1: 491 of 495, the 4 failures one known deviation (zero-length paths from a term outside
 the graph); the reference passes the same 491. Workspace: 535 tests, all green.
 
+**A regression of step 1, found by the parity matrix and fixed (1 October).** The
+baseline evaluated date, time and duration arithmetic, `ADJUST` and the g-type extractors
+through spareval's `sep-0002` and `calendar-ext` features; the native executor only did
+numbers, so such expressions were errors. Now in the executor (`native/calendar.rs`), by
+XPath F&O 3.1, with `SUM` and `AVG` of durations besides.
+
 **Deviations kept from the spareval era, now fixed.** They sat in code the reference
 shares, so no differential test could see them, and W3C doesn't test them:
 - `STR` of a typed literal gave the canonical form (`STR("03"^^xsd:integer)` = `"3"`);

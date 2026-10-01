@@ -11,6 +11,7 @@
 //! smaller than the next pattern, and otherwise by merge joins on sorted scans or hash joins.
 //! `COUNT(*)` over a single pattern reads the count from the index.
 
+mod calendar;
 mod equality;
 mod exists;
 pub(crate) mod expr;
@@ -3790,6 +3791,9 @@ pub fn group_concat(values: &[Term], separator: &str) -> Option<Term> {
 }
 
 pub fn sum(values: &[Term]) -> Option<Term> {
+    if let Some(durations) = durations(values) {
+        return calendar::sum(&durations);
+    }
     let mut total = Numeric::Integer(Integer::from(0));
     for value in values {
         total = total.add(Numeric::of(value)?)?;
@@ -3800,6 +3804,9 @@ pub fn sum(values: &[Term]) -> Option<Term> {
 pub fn average(values: &[Term]) -> Option<Term> {
     if values.is_empty() {
         return Some(integer(0));
+    }
+    if let Some(durations) = durations(values) {
+        return calendar::average(&durations);
     }
     let mut total = Numeric::Integer(Integer::from(0));
     for value in values {
@@ -3814,6 +3821,16 @@ pub fn average(values: &[Term]) -> Option<Term> {
         Numeric::Float(f) => Numeric::Float(f / Float::from(count as f32)).term(),
         Numeric::Double(d) => Numeric::Double(d / Double::from(count as f64)).term(),
     })
+}
+
+/// The values, if the first is a year-month or day-time duration (`SUM` and `AVG` of
+/// durations, SEP-0002); `None` for numbers.
+fn durations(values: &[Term]) -> Option<Vec<Value>> {
+    let first = value::Value::of(values.first()?);
+    if !calendar::is_summable_duration(&first) {
+        return None;
+    }
+    Some(values.iter().map(value::Value::of).collect())
 }
 
 /// Columns of the variables `left` and `right` share, pairwise.
