@@ -502,6 +502,12 @@ impl Snapshot {
             .matching_strings(test, self.version.dictionary_len)
     }
 
+    /// Whether a prefix test ([`crate::Placement::Start`]) is answered from the text order
+    /// by binary search, rather than by a pass over the dictionary.
+    pub fn text_order_ready(&self) -> bool {
+        self.dictionary.text_order_ready()
+    }
+
     /// The size of this snapshot's dictionary text in bytes (the arena: what
     /// [`matching_strings`](Self::matching_strings) reads).
     pub fn dictionary_bytes(&self) -> u64 {

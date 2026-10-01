@@ -11,6 +11,7 @@
 pub(crate) mod dictionary;
 pub(crate) mod hash;
 mod inline;
+pub(crate) mod order;
 mod strings;
 pub mod text;
 

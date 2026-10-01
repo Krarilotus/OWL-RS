@@ -105,7 +105,7 @@ YAGO tiny (16.5 M quads), same machine:
 |---|---:|---:|---|
 | q08 `COUNT(*)` of `rdfs:subClassOf*` | 11,432 ms | 135 ms | A4; most of what is left counts the graph's nodes (zero-length pairs) |
 | q02 `YEAR(?birth) = 1879`, `LANG` = en | 1,522 ms | 0.6 ms | A2 |
-| q06 `STRSTARTS` on alternate names | 95 ms | 13 ms | A1 |
+| q06 `STRSTARTS` on alternate names | 95 ms | 0.5 ms | the text order |
 | q10 `LANG(?l) = "en"` on 6.8 M labels | 602 ms | 267 ms | A1 for languages: the passing terms from the dictionary, matched by a bitmap in one columnar scan |
 | Sum of query medians | 13,678 ms | 428 ms | |
 
@@ -117,8 +117,8 @@ HTTP on the main PC, so the comparison is indicative:
 | q04 3-way join, `LIMIT 100000` | 3,380 ms (QLever 1,024) | 21 ms | A5 (part): adaptive morsels by observed fan-out; small morsels probe the index |
 | q07 count per feature | 2,101 ms | 0.18 ms | A3 |
 | q05 senses, OPTIONAL, `LIMIT 100000` | – | 38 ms | the OPTIONAL's left side cut at the limit |
-| q06 `STRSTARTS` on 452 k lemmas | 148 ms | 27 ms | columnar scan; the dictionary pass is too large to pay off here |
-| Sum of query medians | – | 111 ms | |
+| q06 `STRSTARTS` on 452 k lemmas | 148 ms | 0.06 ms | the dictionary's text order (checkpoint format 7): a prefix is two binary searches |
+| Sum of query medians | – | 80 ms | |
 
 Done, with differential tests against the reference evaluator:
 - **A1** CONTAINS / STRSTARTS / STRENDS on a large pattern's object or STR of it, and
@@ -140,10 +140,8 @@ Still open:
   and below OPTIONAL and projections; other operators still evaluate whole.
 - Columnar scans answer one tombstone-free run; matches in both stacks (asserted and
   inferred) or several runs still go quad by quad: merge them column-wise next.
-- STRSTARTS on a few hundred thousand rows (Wikidata q06, 27 ms): neither the per-row
-  test nor a dictionary pass is cheap. A prefix index (string literal ids sorted by text,
-  built at load, mapped like the rest) turns it into a binary search and an id range,
-  as QLever's sorted vocabulary does.
+- The text order could also answer string ranges (`?s >= "M"`) and ORDER BY on strings
+  (a rank per entry instead of decoding and comparing terms).
 - YAGO q08: keep the node count of each graph in the statistics (it only changes with
   commits), so `COUNT` over `p*` needs only the closure.
 - DBpedia q05 (21 ms): populations are `xsd:nonNegativeInteger`, dictionary literals, so
