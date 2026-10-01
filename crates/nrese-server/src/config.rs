@@ -90,6 +90,7 @@ impl ServerConfig {
                 },
             ),
             ("shacl.shapes_graph", store.shapes_graph.clone()),
+            ("shacl.gate", format!("{:?}", store.shacl_gate)),
             ("reasoner.mode", self.reasoner.mode().as_str().to_owned()),
             (
                 "reasoner.rules",

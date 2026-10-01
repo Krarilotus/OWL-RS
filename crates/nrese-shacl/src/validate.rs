@@ -52,10 +52,10 @@ pub(crate) fn validate_raw<V: ReadView>(
     (results, validator.failures.into_inner())
 }
 
-struct Validator<'a, V: ReadView> {
+pub(crate) struct Validator<'a, V: ReadView> {
     graph: GraphView<'a, V>,
     shapes: &'a Shapes,
-    failures: std::cell::RefCell<Vec<String>>,
+    pub(crate) failures: std::cell::RefCell<Vec<String>>,
     rdf_type: Option<TermId>,
     /// Each class the shapes name, with its subclasses (itself included).
     classes: HashMap<TermId, BTreeSet<TermId>>,
@@ -72,7 +72,7 @@ fn is_literal(id: TermId) -> bool {
 }
 
 impl<'a, V: ReadView> Validator<'a, V> {
-    fn new(view: &'a V, shapes: &'a Shapes, data: Selection) -> Self {
+    pub(crate) fn new(view: &'a V, shapes: &'a Shapes, data: Selection) -> Self {
         let graph = GraphView::new(view, data);
         let mut validator = Self {
             rdf_type: graph.iri(RDF_TYPE),
@@ -104,7 +104,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         validator
     }
 
-    fn focus_nodes(&self, shape: &Shape) -> Vec<TermId> {
+    pub(crate) fn focus_nodes(&self, shape: &Shape) -> Vec<TermId> {
         let mut nodes: Vec<TermId> = Vec::new();
         for target in &shape.targets {
             match *target {
@@ -146,7 +146,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         results.is_empty()
     }
 
-    fn validate_node(
+    pub(crate) fn validate_node(
         &self,
         shape_ref: ShapeRef,
         focus: TermId,

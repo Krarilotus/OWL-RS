@@ -15,6 +15,16 @@ pub(crate) fn values<V: ReadView>(
     reach(graph, path, &[node], false)
 }
 
+/// The nodes that reach any of `from` (a sorted set) along `path`: the path followed
+/// backwards.
+pub(crate) fn back<V: ReadView>(
+    graph: &GraphView<'_, V>,
+    path: &Path,
+    from: &[TermId],
+) -> Vec<TermId> {
+    reach(graph, path, from, true)
+}
+
 fn union(mut nodes: Vec<TermId>) -> Vec<TermId> {
     nodes.sort_unstable();
     nodes.dedup();

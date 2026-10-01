@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use nrese_store::{StoreConfig, StoreMode};
+use nrese_store::{GateSeverity, ShaclGate, StoreConfig, StoreMode};
 
 use super::env_names as names;
 use super::env_values::{parse_bool, parse_bytes};
@@ -33,6 +33,33 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             source.get(names::REASONING_UNNAMED_CLASSES).as_deref(),
         )?,
         verify_on_open: parse_bool(source, names::VERIFY_ON_OPEN, defaults.verify_on_open)?,
+        shacl_gate: parse_shacl_gate(
+            source.get(names::SHACL_GATE).as_deref(),
+            source.get(names::SHACL_GATE_SEVERITY).as_deref(),
+        )?,
+    })
+}
+
+/// The SHACL commit gate: `off` (the default), `report`, or `enforce` at a severity
+/// (`violation`, the default, `warning` or `info`).
+fn parse_shacl_gate(gate: Option<&str>, severity: Option<&str>) -> Result<ShaclGate> {
+    let severity = match severity.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("violation") => GateSeverity::Violation,
+        Some("warning") => GateSeverity::Warning,
+        Some("info") => GateSeverity::Info,
+        Some(unknown) => bail!(
+            "unsupported value '{unknown}' in {} (expected 'violation', 'warning' or 'info')",
+            names::SHACL_GATE_SEVERITY
+        ),
+    };
+    Ok(match gate.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("off") => ShaclGate::Off,
+        Some("report") => ShaclGate::Report,
+        Some("enforce") => ShaclGate::Enforce(severity),
+        Some(unknown) => bail!(
+            "unsupported value '{unknown}' in {} (expected 'off', 'report' or 'enforce')",
+            names::SHACL_GATE
+        ),
     })
 }
 
