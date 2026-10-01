@@ -47,7 +47,11 @@ where
     let mut entries: Vec<T> = range
         .into_par_iter()
         .filter(|&index| text_of(key(index)).is_some())
-        .map(|index| T::try_from(index).ok().expect("an index of the order's width"))
+        .map(|index| {
+            T::try_from(index)
+                .ok()
+                .expect("an index of the order's width")
+        })
         .collect();
     let text = |index: T| text_of(key(index.into())).unwrap_or_default();
     entries.par_sort_unstable_by(|&a, &b| text(a).cmp(text(b)).then(a.cmp(&b)));
