@@ -26,9 +26,9 @@ Legend: ✅ done · 🟡 partial · ❌ missing · ➖ deliberately different.
 | 1.2 | Dictionary cache eviction | ➖ | Only meaningful with an on-disk dictionary (Pf5) |
 | 1.2 | Rollback of dictionary ids | ➖ | Rejected: unreferenced ids are reclaimed at checkpoint rebuild |
 | 1.3 | MVCC, WAL, checkpoints, compaction | ✅ | Crash and torn-tail tests; background compaction; checkpoint format 7, used in place (memory-mapped index, dictionary and text order; restart in milliseconds) |
-| 2.1 | `.pie` rule language | ❌ | Own rule IR; `.pie` import planned (R1) |
-| 2.1 | Profiles: `rdfs` | 🟡 | A 6-rule subset; full RDFS (and optional axiomatic triples) missing |
-| 2.1 | Profiles: `owl-horst`, `owl2-ql`, `rdfs-plus` | 🟡 | `owl-horst` and `owl2-ql` (materialisable part) run in the benchmark suite; `rdfs-plus` missing |
+| 2.1 | `.pie` rule language | 🟡 | `.pie` import into the rule IR (B2, 2 October 2026): 8 of GraphDB's 12 built-in rulesets compile (RDFS, RDFS-Plus, OWL-Horst, Publishing); OWL 2 RL/QL need contexts on variable predicates and existentials. No export yet |
+| 2.1 | Profiles: `rdfs` | ✅ | `rdfs` and `rdfs-full` (every RDFS rule and the axiomatic triples) |
+| 2.1 | Profiles: `owl-horst`, `owl2-ql`, `rdfs-plus` | ✅ | `owl-horst`, `owl2-ql` (materialisable part) and `rdfs-plus` modes |
 | 2.1 | Profiles: `owl2-rl` | 🟡 | 57 rules; `eq-ref` omitted (self-difference is accepted), datatype Table 8 missing |
 | 2.1 | Rules compiled to id-level code | ✅ | Schema-grounded rule instances, dispatch index, parallel joins |
 | 2.2 | Semi-naive fixpoint, consistency rules | ✅ | Batch = naive on 400 random ontologies |

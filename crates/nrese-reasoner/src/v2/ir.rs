@@ -31,6 +31,11 @@ pub trait Vocabulary {
     fn literal(&mut self, lexical: &str, datatype: &str) -> u64;
     /// A language-tagged string (user rules may mention one).
     fn language_literal(&mut self, lexical: &str, language: &str) -> u64;
+    /// The ids blank nodes take, `low..=high`, where they are one range: GraphDB's
+    /// `[Constraint x != blank_node]` ([`Guard::NotIn`]). `None`: rules can't test it.
+    fn blank_node_ids(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -47,6 +52,21 @@ pub struct Atom(pub [Term; 3]);
 pub enum Guard {
     /// The two terms must be bound to different ids.
     NotEqual(Term, Term),
+    /// The term's id must lie outside `low..=high` (a kind of term: blank nodes).
+    NotIn(Term, u64, u64),
+}
+
+impl Guard {
+    /// Whether the guard holds for the terms' values (`None`: unbound, decided later).
+    pub fn holds(self, value: impl Fn(Term) -> Option<u64>) -> bool {
+        match self {
+            Guard::NotEqual(a, b) => match (value(a), value(b)) {
+                (Some(a), Some(b)) => a != b,
+                _ => true,
+            },
+            Guard::NotIn(term, low, high) => value(term).is_none_or(|v| v < low || v > high),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
