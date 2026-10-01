@@ -41,7 +41,7 @@ do), **decide** (the owner decides whether the use case needs it).
 | SPARQL 1.1 query, patterns, paths, aggregates, modifiers, functions (hashes included) | Native executor: W3C 491/495 (one known deviation, zero-length paths from a term outside the graph) | **have** |
 | SPARQL 1.1 Update (all operations) | W3C update 94/94 | **have** |
 | SPARQL 1.1 Federated Query | `SERVICE` to allow-listed endpoints (off by default), bind joins, `SILENT` | **have** |
-| SPARQL 1.2 / SPARQL-star | Results formats done (step 4a); grammar step 4b; evaluation step 6 | **partial** |
+| SPARQL 1.2 / SPARQL-star | Results formats (step 4a) and grammar (step 4b, all W3C `sparql12` syntax tests) done; evaluation step 6 | **partial** |
 | SPARQL 1.1 Protocol | GET, POST form and direct, dataset parameters | **have** |
 | Graph Store HTTP Protocol | GET/HEAD/PUT/POST/DELETE, W3C status codes, six formats | **have** |
 | XSD date/time and duration arithmetic and ordering | `nrese-xsd`, used by the executor (see §5) | **have** |
@@ -51,7 +51,7 @@ do), **decide** (the owner decides whether the use case needs it).
 
 | Oxigraph | NRESE | Status |
 |---|---|---|
-| Recursive descent parser to algebra (`spargebra`) | `spargebra` still parses; `nrese-sparql-syntax` replaces it (syntax tree separate from the algebra, source positions) | **planned** (step 4) |
+| Recursive descent parser to algebra (`spargebra`) | `nrese-sparql-syntax`: one pass, no backtracking, deterministic generated names, bounded nesting, errors with line and column; all 1,289 W3C syntax tests of SPARQL 1.0–1.2 pass with exact write–parse round trips; 1,189 of 1,197 files parse to spargebra's algebra, the 8 others are spargebra errors (`results/2026-10-01-step-4b-syntax.md`); parsing in 0.35–0.66 and writing in 0.53–0.79 of spargebra's time. The engine still parses with spargebra until step 5 | **have** (crate); switch-over step 5 |
 | Heuristic optimiser (`sparopt`): filter pushdown, join reordering by bound variables, constant folding | Cost-based: distinct statistics, dynamic-programming join order within a basic graph pattern, filter pushdown below joins, OPTIONAL, UNION, MINUS, BIND and into subqueries, `explain` with estimated and actual rows | **have** within a BGP; **partial** across BGPs, paths and subqueries (Pf4) |
 | Volcano pull pipeline | Vectorised id tables, streaming results in 64 KiB chunks with backpressure | **have** |
 | Nested-loop, hash and merge joins | Merge, hash and index joins on permutation order, worst-case-optimal (leapfrog) joins for cyclic patterns, parallel joins | **have** |
@@ -77,8 +77,8 @@ do), **decide** (the owner decides whether the use case needs it).
 |---|---|---|
 | RDF 1.2 triple terms, `rdf:reifies`, `<<( … )>>`, `<< … ~ r >>`, `{| … |}`, directional literals | 3e: terms and all syntaxes (N-Triples, N-Quads, Turtle, TriG, RDF/XML with `parseType="Triple"`, `rdf:annotation` and `its:dir`); all 336 W3C `rdf12` syntax tests pass | **have** |
 | Triple terms interned by hash-derived ids, so the permutations stay as they are | The roadmap's R7: a triple term's dictionary key is its three component ids; the seven permutations are unchanged | **planned** (step 6) |
-| SPARQL 1.2 matching of triple terms and reifiers, `BIND(<<( … )>> AS ?t)`, `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, update over triple terms | Step 4 (grammar), step 6 (evaluation), with the W3C `sparql12` tests | **planned** |
-| SEP-0006 / SEP-0007 `LATERAL` | Never supported (the baseline's `spargebra` didn't enable it) | **gap** → step 4 (grammar, behind a feature) and step 6 (evaluation: per-row correlation, as Jena does) |
+| SPARQL 1.2 matching of triple terms and reifiers, `BIND(<<( … )>> AS ?t)`, `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, update over triple terms | Grammar done (step 4b); evaluation step 6, with the W3C `sparql12` evaluation tests | **partial** |
+| SEP-0006 / SEP-0007 `LATERAL` | Parsed (step 4b; a parser option, on by default, as the algebra carries it unconditionally); evaluation step 6 (per-row correlation, as Jena does) | **partial** |
 | SEP-0002: date, time and duration arithmetic, `ADJUST`, `SUM`/`AVG` of durations, g-types | A regression found while writing this matrix (the baseline ran these through spareval's `sep-0002` and `calendar-ext`; step 1 removed spareval), **fixed**: XPath F&O 3.1 arithmetic on dates, times and the two duration subtypes, `ADJUST` for dateTime, date and time, the duration partial order in comparisons and `ORDER BY`, the extractors on `xsd:time` and the g-types, casts to all of them, and `SUM`/`AVG` of durations, which spareval 0.2.6 didn't have. What XPath leaves undefined (arithmetic on `xsd:duration` itself, `ADJUST` of g-types) is an error, where spareval answered | **have** (`nrese-sparql/tests/calendar_tests.rs`, the F&O examples in `native/calendar.rs`) |
 | Extractors `YEAR` … `TZ` across all calendar types | `YEAR`, `MONTH`, `DAY` for dates and the g-types that have the part; `HOURS`, `MINUTES`, `SECONDS` for `dateTime` and `time`; `TIMEZONE`, `TZ` for all | **have** |
 | SPARQL 1.2 Protocol and Graph Store Protocol drafts (4xx for bad requests, 5xx for failures; RDF 1.2 media types) | 4xx/5xx already differentiated; 1.2 media types and profiles with step 6 | **partial** |
@@ -101,7 +101,7 @@ version bump of the crates it changes (minor while they are 0.x).
 |---|---|---|
 | `oxrdf`, `oxsdatatypes`, `oxttl`, `oxrdfxml`, `oxjsonld`, `oxrdfio` | `nrese-rdf`, `nrese-xsd`, `nrese-rdf-io` (+ `nrese-json`) | **have** |
 | `sparesults` | `nrese-sparql-results` | **have** (step 4a; users switch in step 5) |
-| `spargebra` | `nrese-sparql-syntax` | **planned** (step 4b) |
+| `spargebra` | `nrese-sparql-syntax` | **have** (step 4b; users switch in step 5) |
 | `sparopt`, `spareval` | `nrese-sparql` (planner, native executor), `nrese-exec` | **have** |
 | `spargeo` | GeoSPARQL in `nrese-sparql` with an R-tree | **have** |
 | `oxigraph` (`Store`, transactions, bulk load) | `nrese-engine` and `nrese-store` | **have** |
