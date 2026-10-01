@@ -142,8 +142,8 @@ api_key = "replace-me"
 
 - file key: `store.query_cache_bytes`
 - env override: `NRESE_QUERY_CACHE_BYTES`
-- default: `67108864` (64 MiB); `0` disables the cache
-- serialised results of repeated queries on an unchanged store are answered from memory. Every commit starts a new revision, so a cached result is never stale; queries using `NOW()`, `RAND()`, `UUID()`, `STRUUID()` or `BNODE()` are not cached, and no single result takes more than an eighth of the budget
+- default: 2% of the memory the server may use (the container's limit, else the machine's), at least 64 MiB and at most 8 GiB; a size, or a share such as `5%`; `0` disables the cache
+- serialised results of repeated queries on an unchanged store are answered from memory. Every commit starts a new revision, so a cached result is never stale; queries using `NOW()`, `RAND()`, `UUID()`, `STRUUID()` or `BNODE()` are not cached, and no single result takes more than a quarter of the budget
 
 - file keys: `shacl.gate`, `shacl.gate_severity`
 - env overrides: `NRESE_SHACL_GATE`, `NRESE_SHACL_GATE_SEVERITY`
@@ -212,7 +212,7 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 | `budgets.query_text` | `NRESE_MAX_QUERY_BYTES` | 1 MiB | The text of a query |
 | `budgets.update_size` | `NRESE_MAX_UPDATE_BYTES` | 16 MiB | A SPARQL update request |
 | `budgets.upload_size` | `NRESE_MAX_RDF_UPLOAD_BYTES` | 128 MiB | An RDF payload (Graph Store, TELL, SHACL shapes); larger data goes through `nrese-server load` |
-| `budgets.result_cache` | `NRESE_QUERY_CACHE_BYTES` | 64 MiB | Serialised results kept for repeated queries. `0` switches the cache off |
+| `budgets.result_cache` | `NRESE_QUERY_CACHE_BYTES` | 2% of memory (64 MiB to 8 GiB) | Serialised results kept for repeated queries; a size or a share (`5%`). `0` switches the cache off |
 
 How the two memory budgets work:
 - They count what queries hold between their operators: the tables of joins, groups and sorts, and the hash tables of joins. A table that is being built may take half of what is left, because growing it, and merging the parts of a parallel join, holds its rows twice for a moment.
