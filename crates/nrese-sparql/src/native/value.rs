@@ -5,7 +5,10 @@
 use std::cmp::Ordering;
 use std::str::FromStr;
 
-use nrese_xsd::{Boolean, Date, DateTime, Decimal, Double, Float, Integer};
+use nrese_xsd::{
+    Boolean, Date, DateTime, DayTimeDuration, Decimal, Double, Duration, Float, GDay, GMonth,
+    GMonthDay, GYear, GYearMonth, Integer, Time, YearMonthDuration,
+};
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{Literal, Term};
 
@@ -22,6 +25,15 @@ pub enum Value {
     LangString(String, String),
     Date(Date),
     DateTime(DateTime),
+    Time(Time),
+    GYear(GYear),
+    GYearMonth(GYearMonth),
+    GMonth(GMonth),
+    GMonthDay(GMonthDay),
+    GDay(GDay),
+    Duration(Duration),
+    YearMonthDuration(YearMonthDuration),
+    DayTimeDuration(DayTimeDuration),
     Iri(String),
     Blank(String),
     /// A literal of another datatype, or an ill-formed typed literal: compared by identity.
@@ -75,6 +87,28 @@ impl Value {
             Date::from_str(value).ok().map(Self::Date)
         } else if datatype == xsd::DATE_TIME {
             DateTime::from_str(value).ok().map(Self::DateTime)
+        } else if datatype == xsd::TIME {
+            Time::from_str(value).ok().map(Self::Time)
+        } else if datatype == xsd::DAY_TIME_DURATION {
+            DayTimeDuration::from_str(value)
+                .ok()
+                .map(Self::DayTimeDuration)
+        } else if datatype == xsd::YEAR_MONTH_DURATION {
+            YearMonthDuration::from_str(value)
+                .ok()
+                .map(Self::YearMonthDuration)
+        } else if datatype == xsd::DURATION {
+            Duration::from_str(value).ok().map(Self::Duration)
+        } else if datatype == xsd::G_YEAR {
+            GYear::from_str(value).ok().map(Self::GYear)
+        } else if datatype == xsd::G_YEAR_MONTH {
+            GYearMonth::from_str(value).ok().map(Self::GYearMonth)
+        } else if datatype == xsd::G_MONTH {
+            GMonth::from_str(value).ok().map(Self::GMonth)
+        } else if datatype == xsd::G_MONTH_DAY {
+            GMonthDay::from_str(value).ok().map(Self::GMonthDay)
+        } else if datatype == xsd::G_DAY {
+            GDay::from_str(value).ok().map(Self::GDay)
         } else if INTEGER_TYPES.contains(&datatype.as_str()) {
             Integer::from_str(value).ok().map(Self::Integer)
         } else {
@@ -88,6 +122,16 @@ impl Value {
             self,
             Self::Integer(_) | Self::Decimal(_) | Self::Float(_) | Self::Double(_)
         )
+    }
+
+    /// A duration of any of the three types, as an `xsd:duration`.
+    pub(crate) fn duration(&self) -> Option<Duration> {
+        match self {
+            Self::Duration(d) => Some(*d),
+            Self::YearMonthDuration(d) => Some((*d).into()),
+            Self::DayTimeDuration(d) => Some((*d).into()),
+            _ => None,
+        }
     }
 }
 
@@ -140,7 +184,13 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Boolean(x), Value::Boolean(y)) => Some(x.cmp(y)),
         (Value::Date(x), Value::Date(y)) => x.partial_cmp(y),
         (Value::DateTime(x), Value::DateTime(y)) => x.partial_cmp(y),
-        _ => None,
+        (Value::Time(x), Value::Time(y)) => x.partial_cmp(y),
+        (Value::GYear(x), Value::GYear(y)) => x.partial_cmp(y),
+        (Value::GYearMonth(x), Value::GYearMonth(y)) => x.partial_cmp(y),
+        (Value::GMonth(x), Value::GMonth(y)) => x.partial_cmp(y),
+        (Value::GMonthDay(x), Value::GMonthDay(y)) => x.partial_cmp(y),
+        (Value::GDay(x), Value::GDay(y)) => x.partial_cmp(y),
+        _ => a.duration()?.partial_cmp(&b.duration()?),
     }
 }
 
@@ -160,6 +210,16 @@ pub fn equals(a: &Value, b: &Value) -> Option<bool> {
         // but the two are not equal: `=` is false and `!=` true.
         (Value::Date(x), Value::Date(y)) => Some(x == y),
         (Value::DateTime(x), Value::DateTime(y)) => Some(x == y),
+        (Value::Time(x), Value::Time(y)) => Some(x == y),
+        (Value::GYear(x), Value::GYear(y)) => Some(x == y),
+        (Value::GYearMonth(x), Value::GYearMonth(y)) => Some(x == y),
+        (Value::GMonth(x), Value::GMonth(y)) => Some(x == y),
+        (Value::GMonthDay(x), Value::GMonthDay(y)) => Some(x == y),
+        (Value::GDay(x), Value::GDay(y)) => Some(x == y),
+        // Durations are equal across their types (`"P1Y"^^xsd:duration` = `"P12M"^^xsd:yearMonthDuration`).
+        (x, y) if x.duration().is_some() && y.duration().is_some() => {
+            Some(x.duration() == y.duration())
+        }
         (Value::Other(x), Value::Other(y)) if x == y => Some(true),
         // Different kinds of term (IRI vs literal, …) are simply unequal; two literals of
         // types we can't compare are a type error unless identical.
@@ -256,6 +316,15 @@ pub fn canonical(term: Term) -> Term {
         Value::Boolean(b) => canonical(b.to_string()),
         Value::Date(d) => canonical(d.to_string()),
         Value::DateTime(d) => canonical(d.to_string()),
+        Value::Time(d) => canonical(d.to_string()),
+        Value::GYear(d) => canonical(d.to_string()),
+        Value::GYearMonth(d) => canonical(d.to_string()),
+        Value::GMonth(d) => canonical(d.to_string()),
+        Value::GMonthDay(d) => canonical(d.to_string()),
+        Value::GDay(d) => canonical(d.to_string()),
+        Value::Duration(d) => canonical(d.to_string()),
+        Value::YearMonthDuration(d) => canonical(d.to_string()),
+        Value::DayTimeDuration(d) => canonical(d.to_string()),
         _ => term,
     }
 }

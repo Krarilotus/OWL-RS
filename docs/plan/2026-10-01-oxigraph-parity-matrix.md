@@ -44,7 +44,7 @@ do), **decide** (the owner decides whether the use case needs it).
 | SPARQL 1.2 / SPARQL-star | Step 4 (syntax, results formats), step 6 (evaluation) | **planned** |
 | SPARQL 1.1 Protocol | GET, POST form and direct, dataset parameters | **have** |
 | Graph Store HTTP Protocol | GET/HEAD/PUT/POST/DELETE, W3C status codes, six formats | **have** |
-| XSD date/time and duration arithmetic and ordering | `nrese-xsd` has all of it; the executor exposes it since this matrix (see §5) | **have** after the SEP-0002 fix |
+| XSD date/time and duration arithmetic and ordering | `nrese-xsd`, used by the executor (see §5) | **have** |
 | GeoSPARQL (WKT, simple features, relations) | Filter functions over WKT, GeoJSON and GML, DE-9IM, geodesic measures, relations as triple patterns, **with an R-tree** | **have** (beyond Oxigraph's `spargeo`) |
 
 ## 3. Query pipeline
@@ -78,8 +78,8 @@ do), **decide** (the owner decides whether the use case needs it).
 | Triple terms interned by hash-derived ids, so the permutations stay as they are | The roadmap's R7: a triple term's dictionary key is its three component ids; the seven permutations are unchanged | **planned** (step 6) |
 | SPARQL 1.2 matching of triple terms and reifiers, `BIND(<<( … )>> AS ?t)`, `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, update over triple terms | Step 4 (grammar), step 6 (evaluation), with the W3C `sparql12` tests | **planned** |
 | SEP-0006 / SEP-0007 `LATERAL` | Never supported (the baseline's `spargebra` didn't enable it) | **gap** → step 4 (grammar, behind a feature) and step 6 (evaluation: per-row correlation, as Jena does) |
-| SEP-0002: date, time and duration arithmetic, `ADJUST`, `SUM`/`AVG` of durations, g-types | **Regression found while writing this matrix**: the baseline ran these through spareval's `sep-0002` and `calendar-ext` features; since step 1 removed spareval, the native executor only does numeric arithmetic, so such expressions are errors | **fix now**, with tests against the XPath definitions (nrese-xsd has the arithmetic) |
-| Extractors `YEAR` … `TZ` across all calendar types | `YEAR`, `MONTH`, `DAY` for `date` and `dateTime`; `HOURS`, `MINUTES`, `SECONDS` only for `dateTime`; `TIMEZONE`, `TZ` | **partial**: `xsd:time` and the g-types with the SEP-0002 fix |
+| SEP-0002: date, time and duration arithmetic, `ADJUST`, `SUM`/`AVG` of durations, g-types | A regression found while writing this matrix (the baseline ran these through spareval's `sep-0002` and `calendar-ext`; step 1 removed spareval), **fixed**: XPath F&O 3.1 arithmetic on dates, times and the two duration subtypes, `ADJUST` for dateTime, date and time, the duration partial order in comparisons and `ORDER BY`, the extractors on `xsd:time` and the g-types, casts to all of them, and `SUM`/`AVG` of durations, which spareval 0.2.6 didn't have. What XPath leaves undefined (arithmetic on `xsd:duration` itself, `ADJUST` of g-types) is an error, where spareval answered | **have** (`nrese-sparql/tests/calendar_tests.rs`, the F&O examples in `native/calendar.rs`) |
+| Extractors `YEAR` … `TZ` across all calendar types | `YEAR`, `MONTH`, `DAY` for dates and the g-types that have the part; `HOURS`, `MINUTES`, `SECONDS` for `dateTime` and `time`; `TIMEZONE`, `TZ` for all | **have** |
 | SPARQL 1.2 Protocol and Graph Store Protocol drafts (4xx for bad requests, 5xx for failures; RDF 1.2 media types) | 4xx/5xx already differentiated; 1.2 media types and profiles with step 6 | **partial** |
 | Results formats with triple terms (JSON `"type": "triple"`, XML, TSV escaping) | Step 4 | **planned** |
 
@@ -146,7 +146,7 @@ the plan knows; parity on them is a choice:
 
 ## 9. What this matrix added to the plan
 
-- Now: the SEP-0002 regression (calendar arithmetic, `ADJUST`, duration aggregates) fixed
+- Done: the SEP-0002 regression (calendar arithmetic, `ADJUST`, duration aggregates) fixed
   in the native executor.
 - 3e: RDFC-1.0 next to RDF 1.2 in `nrese-rdf`; 3f: an error-recovery mode for Turtle and
   TriG.
