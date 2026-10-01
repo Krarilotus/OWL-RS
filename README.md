@@ -395,14 +395,14 @@ The HTTP interface is described in [docs/ops/http-api.md](docs/ops/http-api.md).
 
 Copyright (C) 2026 Krarilotus.
 
-NRESE is free software: you can redistribute it and modify it under the terms of the **GNU Affero General Public License, version 3** ([LICENSE](LICENSE)), as published by the Free Software Foundation. It comes without any warranty.
+NRESE is licensed under either of
 
-In short, and without replacing the licence text:
-- You may use, study, change and redistribute it, also commercially.
-- If you distribute it, or let others use a modified version over a network, you must offer them the complete corresponding source under the same licence.
-- Applications that only talk to a server over its HTTP protocols aren't covered by that obligation, and neither is the data you store.
+- the **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE)), or
+- the **MIT licence** ([LICENSE-MIT](LICENSE-MIT)),
 
-**Commercial licences** without these obligations are available from the copyright holder: open an issue on the repository to get in touch.
+at your option. You may use, change, embed and redistribute it, also in closed-source and
+commercial products, keeping the copyright and licence notices. It comes without any
+warranty.
 
 Third-party material keeps its own licence:
 - the Rust and JavaScript dependencies (MIT, Apache-2.0, BSD and similar);
@@ -410,3 +410,5 @@ Third-party material keeps its own licence:
 - the W3C test suites, which are fetched and not part of this repository.
 
 The v1 prototype published before October 2026 (the `main` branch up to commit `8088e9a`) carried `Apache-2.0` in its package metadata; that statement stands for those commits. Contributions: see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in NRESE by you, as defined in the Apache-2.0 licence, shall be dual licensed as above, without any additional terms or conditions.

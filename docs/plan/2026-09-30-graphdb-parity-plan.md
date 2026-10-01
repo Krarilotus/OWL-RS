@@ -210,7 +210,9 @@ Order: W3b and W6 first (they decide whether the larger tiers answer at all), th
    - A library is allowed if its licence permits commercial use without conditions on our code (MIT, Apache-2.0, BSD, and similar), and it is maintained.
    - Each one sits behind our own trait, is measured in the perf lab, and is replaced by our own Rust implementation where it costs us: an architecture that doesn't fit the engine (its own storage, its own threading), or measured inefficiency.
    - Starting points: tantivy (MIT) for full-text, an R-tree crate for geo, and our own HNSW unless a crate measures better.
-2. **Licence model: AGPL-3.0-only, plus commercial licences from the copyright holder** (decided 30 September 2026, after the explanation).
+2. **Licence model: MIT OR Apache-2.0**, as Oxigraph (changed by the owner on 1 October 2026; it replaces the decision below, kept for the record). `LICENSE-MIT` and `LICENSE-APACHE` hold the texts, the Cargo manifests say `MIT OR Apache-2.0`, and contributions come in under the same terms (Apache-2.0 §5), so no contributor agreement is needed. Nothing under the AGPL had been published. Dependencies stay permissive. Open for a lawyer still: the legal name on the copyright line, an employer's claim, and copyright in AI-assisted code.
+
+   *Superseded:* **AGPL-3.0-only, plus commercial licences from the copyright holder** (decided 30 September 2026, after the explanation).
    - `LICENSE` holds the AGPL text; the Cargo manifests say `AGPL-3.0-only`. "Only" and not "or later", because widening to later versions stays possible and narrowing doesn't.
    - Checked before applying it: all 283 third-party crates are permissively licensed; the owner is the only human author; the engine-v2 branch had never been published.
    - The v1 prototype on `main` (up to `8088e9a`) was published with `Apache-2.0` in its metadata and stays available under that.
