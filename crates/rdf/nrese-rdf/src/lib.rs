@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod canonical;
 pub mod graph;
 pub mod iri;
 pub mod language;

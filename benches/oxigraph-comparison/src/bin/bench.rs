@@ -69,6 +69,19 @@ fn main() {
         oxiri::Iri::parse("http://a/b/c/d;p?q").unwrap(),
     );
     let relative: Vec<String> = (0..100_000).map(|i| format!("../x{}/y{}#f", i % 13, i)).collect();
+    // The shapes Turtle documents use most: a name, a fragment, a path under the base.
+    let plain: Vec<String> = (0..100_000)
+        .map(|i| match i % 3 {
+            0 => format!("item{i}"),
+            1 => format!("#part{i}"),
+            _ => format!("data/{}/x{i}", i % 7),
+        })
+        .collect();
+    report.case("IRI resolve (names, fragments, sub-paths)", plain.len(), || {
+        plain.iter().filter_map(|t| our_base.resolve(t).ok()).map(|i| i.as_str().len()).sum()
+    }, || {
+        plain.iter().filter_map(|t| their_base.resolve(t).ok()).map(|i| i.as_str().len()).sum()
+    });
     report.case("IRI resolve (relative)", relative.len(), || {
         relative.iter().filter_map(|t| our_base.resolve(t).ok()).map(|i| i.as_str().len()).sum()
     }, || {
@@ -100,6 +113,11 @@ fn main() {
         numerics.iter().filter(|t| t.parse::<nrese_xsd::Double>().is_ok()).count()
     }, || {
         numerics.iter().filter(|t| t.parse::<oxsdatatypes::Double>().is_ok()).count()
+    });
+    report.case("xsd:double parse (mixed) vs Rust's f64 parse", numerics.len(), || {
+        numerics.iter().filter(|t| t.parse::<nrese_xsd::Double>().is_ok()).count()
+    }, || {
+        numerics.iter().filter(|t| t.parse::<f64>().is_ok()).count()
     });
     report.case("xsd:integer parse (mixed texts)", numerics.len(), || {
         numerics.iter().filter(|t| t.parse::<nrese_xsd::Integer>().is_ok()).count()
@@ -147,10 +165,19 @@ fn main() {
     });
     let our_dates: Vec<nrese_xsd::DateTime> = temporals.iter().filter_map(|t| t.parse().ok()).collect();
     let their_dates: Vec<oxsdatatypes::DateTime> = temporals.iter().filter_map(|t| t.parse().ok()).collect();
-    report.case("xsd:dateTime compare", our_dates.len(), || {
+    report.case("xsd:dateTime compare (mixed timezones)", our_dates.len(), || {
         our_dates.windows(2).filter(|w| w[0] < w[1]).count()
     }, || {
         their_dates.windows(2).filter(|w| w[0] < w[1]).count()
+    });
+    let our_zoned: Vec<nrese_xsd::DateTime> =
+        our_dates.iter().copied().filter(|d| d.timezone_offset().is_some()).collect();
+    let their_zoned: Vec<oxsdatatypes::DateTime> =
+        their_dates.iter().copied().filter(|d| d.timezone_offset().is_some()).collect();
+    report.case("xsd:dateTime compare (all with timezones)", our_zoned.len(), || {
+        our_zoned.windows(2).filter(|w| w[0] < w[1]).count()
+    }, || {
+        their_zoned.windows(2).filter(|w| w[0] < w[1]).count()
     });
     report.case("xsd:dateTime to string", our_dates.len(), || {
         our_dates.iter().map(|d| d.to_string().len()).sum()
@@ -158,19 +185,34 @@ fn main() {
         their_dates.iter().map(|d| d.to_string().len()).sum()
     });
 
-    // Graph canonicalisation: chains, stars and cycles of blank nodes.
-    for (name, size) in [("canonicalise (chains of 1,000 blank nodes)", 1000), ("canonicalise (5 cycles of 8 blank nodes)", 8)] {
-        let (ours, theirs) = blank_graphs(name.contains("cycles"), size);
-        report.case(name, 1, || {
-            let mut g = ours.clone();
-            g.canonicalize();
-            g.len()
-        }, || {
-            let mut g = theirs.clone();
-            g.canonicalize(oxrdf::graph::CanonicalizationAlgorithm::Unstable);
-            g.len()
-        });
-    }
+    // Graph canonicalisation: a chain and cycles of blank nodes. On a thread with a large
+    // stack: oxrdf's canonicalisation overflows the 1 MiB main-thread stack on the chain.
+    let filter = report.filter.clone();
+    let rows = std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || {
+            let mut inner = Report { filter, rows: Vec::new() };
+            for (name, size) in [
+                ("canonicalise (a chain of 1,000 blank nodes)", 1000),
+                ("canonicalise (5 cycles of 8 blank nodes)", 8),
+            ] {
+                let (ours, theirs) = blank_graphs(name.contains("cycles"), size);
+                inner.case(name, 1, || {
+                    let mut g = ours.clone();
+                    g.canonicalize();
+                    g.len()
+                }, || {
+                    let mut g = theirs.clone();
+                    g.canonicalize(oxrdf::graph::CanonicalizationAlgorithm::Unstable);
+                    g.len()
+                });
+            }
+            inner.rows
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    report.rows.extend(rows);
 
     let geometric: f64 = report.rows.iter().map(|(_, a, b)| (a / b).ln()).sum::<f64>() / report.rows.len().max(1) as f64;
     println!("\ngeometric mean of time ratios (nrese / oxigraph): {:.2}", geometric.exp());

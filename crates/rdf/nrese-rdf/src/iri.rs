@@ -152,14 +152,14 @@ impl<T: AsRef<str>> Iri<T> {
             out.push_str(&reference[..r.authority_end]);
             parts.scheme_end = r.scheme_end;
             parts.authority_end = out.len();
-            remove_dot_segments(r_path, out);
+            push_without_dot_segments(r_path, out);
         } else {
             out.push_str(&base[..b.scheme_end]);
             parts.scheme_end = out.len();
             if r.has_authority() {
                 out.push_str(&reference[..r.authority_end]);
                 parts.authority_end = out.len();
-                remove_dot_segments(r_path, out);
+                push_without_dot_segments(r_path, out);
             } else {
                 out.push_str(&base[b.scheme_end..b.authority_end]);
                 parts.authority_end = out.len();
@@ -173,17 +173,23 @@ impl<T: AsRef<str>> Iri<T> {
                     out.push_str(r_fragment);
                     return Ok(parts);
                 } else if r_path.starts_with('/') {
-                    remove_dot_segments(r_path, out);
-                } else if b.has_authority() && b_path.is_empty() {
-                    // Merge (§5.2.3), then remove dot segments.
-                    let merged = format!("/{r_path}");
-                    remove_dot_segments(&merged, out);
+                    push_without_dot_segments(r_path, out);
                 } else {
-                    let merged = match b_path.rfind('/') {
-                        Some(i) => format!("{}{r_path}", &b_path[..=i]),
-                        None => r_path.to_owned(),
+                    // Merge (§5.2.3): the base path up to its last '/', then the
+                    // reference's; then remove dot segments (§5.2.4) if there are any.
+                    let directory = if b.has_authority() && b_path.is_empty() {
+                        "/"
+                    } else {
+                        b_path.rfind('/').map_or("", |i| &b_path[..=i])
                     };
-                    remove_dot_segments(&merged, out);
+                    if !merge_leading_dots(directory, r_path, out) {
+                        let start = out.len();
+                        out.push_str(directory);
+                        out.push_str(r_path);
+                        if has_dot_segment(directory) || has_dot_segment(r_path) {
+                            remove_dot_segments(out, start);
+                        }
+                    }
                 }
             }
         }
@@ -219,46 +225,128 @@ impl<T: AsRef<str>> AsRef<str> for Iri<T> {
     }
 }
 
-/// RFC 3986 §5.2.4, appending the result to `out`.
-fn remove_dot_segments(path: &str, out: &mut String) {
+/// Whether a segment of `path` is `.` or `..`.
+fn has_dot_segment(path: &str) -> bool {
+    path.as_bytes().contains(&b'.') && path.split('/').any(|s| s == "." || s == "..")
+}
+
+/// `path` without dot segments, appended to `out`.
+fn push_without_dot_segments(path: &str, out: &mut String) {
     let start = out.len();
-    let mut input = path;
-    while !input.is_empty() {
-        if let Some(rest) = input.strip_prefix("../") {
-            input = rest;
-        } else if let Some(rest) = input.strip_prefix("./") {
-            input = rest;
-        } else if input.starts_with("/./") {
-            input = &input[2..];
-        } else if input == "/." {
-            input = "/";
-        } else if input.starts_with("/../") || input == "/.." {
-            input = if input == "/.." { "/" } else { &input[3..] };
-            let kept = out[start..].rfind('/').map_or(start, |i| start + i);
-            out.truncate(kept);
-        } else if input == "." || input == ".." {
-            input = "";
+    out.push_str(path);
+    if has_dot_segment(path) {
+        remove_dot_segments(out, start);
+    }
+}
+
+/// The merge of an absolute base directory (ending in '/') and a relative reference path
+/// whose only dot segments lead it (`../../x`, `./x`), written straight to `out`: the
+/// directory without a segment per `..`, then the rest. `false` (nothing written) for any
+/// other shape, which [`remove_dot_segments`] handles.
+fn merge_leading_dots(directory: &str, reference: &str, out: &mut String) -> bool {
+    if !directory.starts_with('/') || has_dot_segment(directory) {
+        return false;
+    }
+    let mut rest = reference;
+    let mut ups = 0;
+    loop {
+        if let Some(r) = rest.strip_prefix("../") {
+            ups += 1;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("./") {
+            rest = r;
         } else {
-            let first = usize::from(input.starts_with('/'));
-            let end = input[first..].find('/').map_or(input.len(), |i| i + first);
-            out.push_str(&input[..end]);
-            input = &input[end..];
+            break;
         }
     }
+    if has_dot_segment(rest) {
+        return false;
+    }
+    let mut keep = directory.len();
+    for _ in 0..ups {
+        if keep <= 1 {
+            break;
+        }
+        keep = directory[..keep - 1].rfind('/').map_or(1, |i| i + 1);
+    }
+    out.push_str(&directory[..keep]);
+    out.push_str(rest);
+    true
+}
+
+/// RFC 3986 §5.2.4 on `out[start..]`, in place: a read and a write position in one
+/// buffer (the output never outgrows the input it has consumed), so no allocation.
+fn remove_dot_segments(out: &mut String, start: usize) {
+    let mut bytes = std::mem::take(out).into_bytes();
+    let end = bytes.len();
+    let (mut read, mut write) = (start, start);
+    // The output without its last segment and that segment's '/'.
+    let pop = |bytes: &[u8], write: usize| {
+        bytes[start..write]
+            .iter()
+            .rposition(|&b| b == b'/')
+            .map_or(start, |i| start + i)
+    };
+    while read < end {
+        let input = &bytes[read..end];
+        if input.starts_with(b"../") {
+            read += 3;
+        } else if input.starts_with(b"./") || input.starts_with(b"/./") {
+            read += 2;
+        } else if input == b"/." {
+            // "/." becomes "/": reuse its last byte.
+            bytes[end - 1] = b'/';
+            read = end - 1;
+        } else if input.starts_with(b"/../") {
+            read += 3;
+            write = pop(&bytes, write);
+        } else if input == b"/.." {
+            bytes[end - 1] = b'/';
+            read = end - 1;
+            write = pop(&bytes, write);
+        } else if input == b"." || input == b".." {
+            read = end;
+        } else {
+            let first = usize::from(input[0] == b'/');
+            let length = input[first..]
+                .iter()
+                .position(|&b| b == b'/')
+                .map_or(input.len(), |i| i + first);
+            bytes.copy_within(read..read + length, write);
+            write += length;
+            read += length;
+        }
+    }
+    bytes.truncate(write);
+    // Whole segments, cut at ASCII '/', are copied: the bytes stay UTF-8.
+    *out = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
 }
 
 // ---------------------------------------------------------------------------------------
 // Validation
 
-/// Character classes of ASCII bytes, as bit flags.
-const UNRESERVED: u8 = 1; // ALPHA DIGIT - . _ ~
-const SUB_DELIM: u8 = 2; // ! $ & ' ( ) * + , ; =
-const SCHEME: u8 = 4; // ALPHA DIGIT + - .
-const HEX: u8 = 8;
-const DIGIT: u8 = 16;
+/// Character classes of ASCII bytes, as bit flags: the grammar's classes, and each
+/// delimiter its own bit, so that a scan tests one mask per byte.
+const UNRESERVED: u16 = 1; // ALPHA DIGIT - . _ ~
+const SUB_DELIM: u16 = 2; // ! $ & ' ( ) * + , ; =
+const SCHEME: u16 = 4; // ALPHA DIGIT + - .
+const HEX: u16 = 8;
+const DIGIT: u16 = 16;
+const COLON: u16 = 32;
+const AT: u16 = 64;
+const SLASH: u16 = 128;
+const QUESTION: u16 = 256;
+const HASH: u16 = 512;
 
-const fn classes() -> [u8; 128] {
-    let mut table = [0u8; 128];
+/// What each component allows besides percent encodings (and `iprivate` in the query).
+const HOST: u16 = UNRESERVED | SUB_DELIM;
+const USERINFO: u16 = HOST | COLON;
+const PATH: u16 = HOST | COLON | AT | SLASH;
+const QUERY: u16 = PATH | QUESTION;
+
+const fn classes() -> [u16; 128] {
+    let mut table = [0u16; 128];
     let mut b = 0;
     while b < 128 {
         let c = b as u8;
@@ -281,15 +369,23 @@ const fn classes() -> [u8; 128] {
         if c.is_ascii_digit() {
             class |= DIGIT;
         }
+        class |= match c {
+            b':' => COLON,
+            b'@' => AT,
+            b'/' => SLASH,
+            b'?' => QUESTION,
+            b'#' => HASH,
+            _ => 0,
+        };
         table[b] = class;
         b += 1;
     }
     table
 }
 
-static CLASSES: [u8; 128] = classes();
+static CLASSES: [u16; 128] = classes();
 
-fn is(b: u8, class: u8) -> bool {
+fn is(b: u8, class: u16) -> bool {
     b < 128 && CLASSES[b as usize] & class != 0
 }
 
@@ -307,59 +403,61 @@ fn is_iprivate(c: char) -> bool {
     matches!(c, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
 }
 
-/// Checks `bytes[start..end]`: `iunreserved`, `pct-encoded`, `sub-delims`, the ASCII bytes
-/// in `extra`, and `iprivate` if `private`.
-fn check(
+/// The character at `text[i]`, a UTF-8 lead byte of a valid string (so the continuation
+/// bytes are there), decoded from the bytes.
+fn decode(text: &[u8], i: usize) -> char {
+    let tail = |k: usize| u32::from(text[i + k] & 0x3F);
+    let lead = u32::from(text[i]);
+    let code = match lead {
+        0xF0.. => ((lead & 0x07) << 18) | (tail(1) << 12) | (tail(2) << 6) | tail(3),
+        0xE0.. => ((lead & 0x0F) << 12) | (tail(1) << 6) | tail(2),
+        _ => ((lead & 0x1F) << 6) | tail(1),
+    };
+    char::from_u32(code).unwrap_or('\u{FFFD}')
+}
+
+/// Scans `text[i..end]` up to a byte of the classes `stop`, checking each character
+/// against `allowed` (and `iprivate` if `private`) when `validate`; percent encodings are
+/// always allowed. Returns where it stopped.
+fn scan(
     text: &[u8],
-    start: usize,
+    mut i: usize,
     end: usize,
-    extra: &[u8],
+    stop: u16,
+    allowed: u16,
     private: bool,
-) -> Result<(), IriParseError> {
-    let mut i = start;
+    validate: bool,
+) -> Result<usize, IriParseError> {
     while i < end {
         let b = text[i];
         if b < 128 {
-            if b == b'%' {
-                if i + 2 >= end {
-                    return error("a truncated percent encoding", i);
-                }
-                if !is(text[i + 1], HEX) || !is(text[i + 2], HEX) {
+            let class = CLASSES[b as usize];
+            if class & stop != 0 {
+                break;
+            }
+            if !validate || class & allowed != 0 {
+                i += 1;
+            } else if b == b'%' {
+                if i + 2 >= end || !is(text[i + 1], HEX) || !is(text[i + 2], HEX) {
                     return error("a malformed percent encoding", i);
                 }
                 i += 3;
-                continue;
-            }
-            if !(is(b, UNRESERVED | SUB_DELIM) || extra.contains(&b)) {
+            } else {
                 return error("a character IRIs don't allow", i);
             }
-            i += 1;
         } else {
-            // A valid &str: decode the character starting here.
             let c = decode(text, i);
-            if !(is_ucschar(c) || (private && is_iprivate(c))) {
+            if validate && !(is_ucschar(c) || (private && is_iprivate(c))) {
                 return error("a character IRIs don't allow", i);
             }
             i += c.len_utf8();
         }
     }
-    Ok(())
+    Ok(i)
 }
 
-/// The character at `text[i]` (a UTF-8 lead byte of a valid string).
-fn decode(text: &[u8], i: usize) -> char {
-    let len = match text[i] {
-        0xF0.. => 4,
-        0xE0.. => 3,
-        _ => 2,
-    };
-    std::str::from_utf8(&text[i..i + len])
-        .ok()
-        .and_then(|s| s.chars().next())
-        .unwrap_or('\u{FFFD}')
-}
-
-/// The parts of an IRI reference (RFC 3987 `IRI-reference`); validated if `validate`.
+/// The parts of an IRI reference (RFC 3987 `IRI-reference`), in one pass over the bytes;
+/// validated if `validate`.
 fn parse_reference(text: &[u8], validate: bool) -> Result<Parts, IriParseError> {
     let len = text.len();
     // Scheme: a letter, then scheme characters, then ':'.
@@ -373,94 +471,107 @@ fn parse_reference(text: &[u8], validate: bool) -> Result<Parts, IriParseError> 
             scheme_end = i + 1;
         }
     }
-    // The ends of the hierarchical part, query and fragment.
-    let mut query_start = len;
-    let mut fragment_start = len;
-    for (i, &b) in text.iter().enumerate().skip(scheme_end) {
-        if b == b'#' {
-            fragment_start = i;
-            break;
-        }
-        if b == b'?' && query_start == len {
-            query_start = i;
-        }
-    }
-    let query_start = query_start.min(fragment_start);
-
+    // Authority: after "//", up to '/', '?' or '#'.
     let mut authority_end = scheme_end;
-    if text[scheme_end..query_start].starts_with(b"//") {
+    if text[scheme_end..].starts_with(b"//") {
         let start = scheme_end + 2;
-        authority_end = text[start..query_start]
-            .iter()
-            .position(|&b| b == b'/')
-            .map_or(query_start, |i| start + i);
-        if validate {
-            check_authority(text, start, authority_end)?;
-        }
+        authority_end = if validate {
+            authority(text, start)?
+        } else {
+            scan(text, start, len, SLASH | QUESTION | HASH, 0, false, false)?
+        };
     }
-    if validate {
-        check(text, authority_end, query_start, b":@/", false)?;
-        if scheme_end == 0 && authority_end == 0 {
-            // `ipath-noscheme`: no ':' in the first segment.
-            let first = text[..query_start]
-                .iter()
-                .position(|&b| b == b'/')
-                .unwrap_or(query_start);
-            if let Some(i) = text[..first].iter().position(|&b| b == b':') {
-                return error("a ':' in the first segment of a relative path", i);
-            }
+    // Path. A relative path's first segment can't hold a ':' (it would read as a scheme).
+    let path_end = if validate && scheme_end == 0 && authority_end == 0 {
+        let first = scan(
+            text,
+            0,
+            len,
+            SLASH | QUESTION | HASH | COLON,
+            PATH,
+            false,
+            true,
+        )?;
+        if text.get(first) == Some(&b':') {
+            return error("a ':' in the first segment of a relative path", first);
         }
-        if query_start < fragment_start {
-            check(text, query_start + 1, fragment_start, b":@/?", true)?;
-        }
-        if fragment_start < len {
-            check(text, fragment_start + 1, len, b":@/?", false)?;
-        }
+        scan(text, first, len, QUESTION | HASH, PATH, false, true)?
+    } else {
+        scan(
+            text,
+            authority_end,
+            len,
+            QUESTION | HASH,
+            PATH,
+            false,
+            validate,
+        )?
+    };
+    // Query, then fragment.
+    let query_end = if text.get(path_end) == Some(&b'?') {
+        scan(text, path_end + 1, len, HASH, QUERY, true, validate)?
+    } else {
+        path_end
+    };
+    if query_end < len {
+        // text[query_end] is '#'; a second '#' is invalid.
+        scan(text, query_end + 1, len, 0, QUERY, false, validate)?;
     }
     Ok(Parts {
         scheme_end,
         authority_end,
-        path_end: query_start,
-        query_end: fragment_start,
+        path_end,
+        query_end,
     })
 }
 
-/// `iauthority = [ iuserinfo "@" ] ihost [ ":" port ]`
-fn check_authority(text: &[u8], start: usize, end: usize) -> Result<(), IriParseError> {
-    let host_start = match text[start..end].iter().rposition(|&b| b == b'@') {
-        Some(at) => {
-            check(text, start, start + at, b":", false)?;
-            start + at + 1
+/// `iauthority = [ iuserinfo "@" ] ihost [ ":" port ]` from `start`, validated in one pass;
+/// returns where it ends (at '/', '?', '#' or the end).
+fn authority(text: &[u8], start: usize) -> Result<usize, IriParseError> {
+    let len = text.len();
+    let delimiters = SLASH | QUESTION | HASH;
+    let mut host = start;
+    if text.get(start) != Some(&b'[') {
+        // A reg-name, or the userinfo: they differ by the ':' a userinfo may hold.
+        let i = scan(text, start, len, delimiters | COLON | AT, HOST, false, true)?;
+        match text.get(i) {
+            Some(b'@') => host = i + 1,
+            Some(b':') => {
+                let j = scan(text, i + 1, len, delimiters | AT, USERINFO, false, true)?;
+                if text.get(j) == Some(&b'@') {
+                    host = j + 1;
+                } else {
+                    return port(text, i, j);
+                }
+            }
+            _ => return Ok(i),
         }
-        None => start,
-    };
-    if text.get(host_start) == Some(&b'[') {
-        let Some(close) = text[host_start..end].iter().position(|&b| b == b']') else {
-            return error("an unclosed IP literal", host_start);
-        };
-        let close = host_start + close;
-        check_ip_literal(&text[host_start + 1..close], host_start + 1)?;
-        return check_port(text, close + 1, end);
     }
-    let port = text[host_start..end]
-        .iter()
-        .rposition(|&b| b == b':')
-        .map_or(end, |i| host_start + i);
-    check(text, host_start, port, b"", false)?;
-    check_port(text, port, end)
+    if text.get(host) == Some(&b'[') {
+        let Some(close) = text[host..].iter().position(|&b| b == b']') else {
+            return error("an unclosed IP literal", host);
+        };
+        let close = host + close;
+        check_ip_literal(&text[host + 1..close], host + 1)?;
+        let end = scan(text, close + 1, len, delimiters, 0, false, false)?;
+        return port(text, close + 1, end);
+    }
+    let i = scan(text, host, len, delimiters | COLON, HOST, false, true)?;
+    let end = scan(text, i, len, delimiters, 0, false, false)?;
+    port(text, i, end)
 }
 
-/// `[ ":" port ]` from `start` to `end`.
-fn check_port(text: &[u8], start: usize, end: usize) -> Result<(), IriParseError> {
+/// `[ ":" port ]` in `text[start..end]`; returns `end`.
+fn port(text: &[u8], start: usize, end: usize) -> Result<usize, IriParseError> {
     if start == end {
-        return Ok(());
+        return Ok(end);
     }
     if text[start] != b':' {
-        return error("a character after the IP literal", start);
+        return error("a character after the host", start);
     }
     match text[start + 1..end].iter().position(|&b| !is(b, DIGIT)) {
         Some(i) => error("a port that isn't a number", start + 1 + i),
-        None => Ok(()),
+        None => Ok(end),
     }
 }
 
