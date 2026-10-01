@@ -1,17 +1,21 @@
 //! Append-only term dictionary.
 //!
-//! All dictionary-backed terms are stored once in a single byte arena (`bytes` + `ends`)
-//! and indexed by a SwissTable (`hashbrown::HashTable`) that stores only the arena index.
+//! All dictionary-backed terms are stored once in a byte arena (`bytes` + `ends`) and
+//! indexed by a SwissTable (`hashbrown::HashTable`) that stores only the arena index.
 //! Memory per term is the key length plus 8 bytes (end offset) plus ~9 bytes of table
 //! slot, with no per-term heap allocation.
+//!
+//! A dictionary restored from a checkpoint keeps the checkpoint's entries where they are:
+//! the [`Base`], the arena, end offsets and an open-addressing hash table of a mapped file
+//! ([`crate::mapped`]). Only the entries interned since are on the heap. Lookups probe the
+//! base's table, then the heap's. Both hash keys with the fixed [`key_hash`], which the
+//! checkpoint's table was built with.
 //!
 //! Concurrency: writers intern under an exclusive lock; readers look up and decode under a
 //! shared lock. Bulk loads intern from many threads through
 //! [`intern_quads`](Dictionary::intern_quads), which encodes, hashes and deduplicates a batch
 //! before taking the lock, so the critical section is only table probes and arena appends. Ids are dense and assigned in insertion order, which is what the
 //! write-ahead log relies on to replay dictionary growth deterministically.
-
-use std::hash::BuildHasher;
 
 use hashbrown::HashTable;
 use nrese_rdf::{
@@ -20,8 +24,10 @@ use nrese_rdf::{
 };
 use parking_lot::RwLock;
 
+use super::hash::key_hash;
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
+use crate::mapped::Mapped;
 use crate::quad::EncodedQuad;
 
 const TAG_IRI: u8 = b'I';
@@ -46,29 +52,145 @@ const SEP: u8 = 0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DictionaryStats {
     pub terms: u64,
-    /// The terms' keys, one after another.
+    /// The terms' keys, one after another (mapped and on the heap).
     pub arena_bytes: u64,
-    /// What finds them: the end offsets and the hash table, as allocated.
+    /// What finds them on the heap: the end offsets and the hash table, as allocated.
     pub index_bytes: u64,
+    /// Bytes used in place from a mapped checkpoint: keys, end offsets and hash table.
+    pub mapped_bytes: u64,
+}
+
+/// Dictionary entries `0..len` in a mapped checkpoint: their keys one after another, the
+/// end offsets, and a hash table of them.
+pub(crate) struct Base {
+    pub(crate) len: u64,
+    pub(crate) arena: Mapped<u8>,
+    pub(crate) ends: Mapped<u64>,
+    /// Open addressing with linear probing by [`key_hash`]: entry index + 1, or 0 for an
+    /// empty slot; a power of two long, with at least one empty slot.
+    pub(crate) slots: Mapped<u32>,
+}
+
+impl Base {
+    /// Entry `index`'s key; empty where a damaged file's offsets point nowhere.
+    fn key(&self, index: u64) -> &[u8] {
+        let i = index as usize;
+        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        self.arena
+            .get(start..self.ends[i] as usize)
+            .unwrap_or_default()
+    }
+
+    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
+        let mask = self.slots.len() - 1;
+        let mut slot = hash as usize & mask;
+        // At most one round (a damaged, full table must not loop forever).
+        for _ in 0..self.slots.len() {
+            let entry = u64::from(self.slots[slot]);
+            if entry == 0 {
+                return None;
+            }
+            if entry <= self.len && self.key(entry - 1) == key {
+                return Some(entry - 1);
+            }
+            slot = (slot + 1) & mask;
+        }
+        None
+    }
+
+    fn bytes(&self) -> u64 {
+        (self.arena.len() + self.ends.len() * 8 + self.slots.len() * 4) as u64
+    }
+
+    /// Checks every key and that the hash table finds each entry: reads all of the base.
+    pub(crate) fn verify(&self) -> Result<(), String> {
+        if !self.ends.is_sorted() {
+            return Err("dictionary end offsets are out of order".into());
+        }
+        for index in 0..self.len {
+            let key = self.key(index);
+            validate_key(key).map_err(|error| format!("dictionary entry {index}: {error}"))?;
+            if self.find(key_hash(key), key) != Some(index) {
+                return Err(format!("the dictionary's hash table misses entry {index}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The number of slots of a base's hash table for `len` entries: a power of two, at most
+/// three quarters full.
+pub(crate) fn base_slots(len: u64) -> u64 {
+    (len + len / 3 + 1).next_power_of_two()
 }
 
 #[derive(Default)]
 struct Inner {
+    /// Entries `0..base.len` from a mapped checkpoint.
+    base: Option<Base>,
+    /// The keys of the entries after the base, one after another.
     bytes: Vec<u8>,
+    /// Their end offsets in `bytes`.
     ends: Vec<u64>,
+    /// Their indexes, by [`key_hash`].
     table: HashTable<u64>,
 }
 
 impl Inner {
-    fn key(&self, index: u64) -> &[u8] {
-        let index = index as usize;
-        let start = if index == 0 {
-            0
-        } else {
-            self.ends[index - 1] as usize
-        };
-        &self.bytes[start..self.ends[index] as usize]
+    fn base_len(&self) -> u64 {
+        self.base.as_ref().map_or(0, |base| base.len)
     }
+
+    fn len(&self) -> u64 {
+        self.base_len() + self.ends.len() as u64
+    }
+
+    fn key(&self, index: u64) -> &[u8] {
+        let base_len = self.base_len();
+        if index < base_len {
+            return self
+                .base
+                .as_ref()
+                .expect("an index below the base")
+                .key(index);
+        }
+        heap_key(&self.bytes, &self.ends, (index - base_len) as usize)
+    }
+
+    /// The index of `key`, whose hash is `hash`, if it is an entry.
+    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
+        if let Some(index) = self.base.as_ref().and_then(|base| base.find(hash, key)) {
+            return Some(index);
+        }
+        self.table
+            .find(hash, |&index| self.key(index) == key)
+            .copied()
+    }
+
+    /// Appends `key` (not an entry yet), whose hash is `hash`, and returns its index.
+    fn push(&mut self, key: &[u8], hash: u64) -> u64 {
+        let index = self.len();
+        let base_len = self.base_len();
+        self.bytes.extend_from_slice(key);
+        self.ends.push(self.bytes.len() as u64);
+        let Inner {
+            table, bytes, ends, ..
+        } = self;
+        table.insert_unique(hash, index, |&i| {
+            key_hash(heap_key(bytes, ends, (i - base_len) as usize))
+        });
+        index
+    }
+}
+
+/// Heap entry `local` (counted from the end of the base).
+fn heap_key<'a>(bytes: &'a [u8], ends: &[u64], local: usize) -> &'a [u8] {
+    let start = if local == 0 {
+        0
+    } else {
+        ends[local - 1] as usize
+    };
+    &bytes[start..ends[local] as usize]
 }
 
 /// The triple terms of the dictionary by their components, built lazily from the arena (the
@@ -81,24 +203,13 @@ struct TripleIndex {
     rows: Vec<[TermId; 4]>,
 }
 
+#[derive(Default)]
 pub struct Dictionary {
     inner: RwLock<Inner>,
-    hasher: foldhash::fast::FixedState,
     /// Built at the first search, extended at later ones ([`super::text`]).
     text: RwLock<super::text::TextIndex>,
     /// Built at the first triple-term match, extended at later ones.
     triples: RwLock<TripleIndex>,
-}
-
-impl Default for Dictionary {
-    fn default() -> Self {
-        Self {
-            inner: RwLock::default(),
-            hasher: foldhash::fast::FixedState::with_seed(0x6e72_6573_655f_6474),
-            text: RwLock::default(),
-            triples: RwLock::default(),
-        }
-    }
 }
 
 impl std::fmt::Debug for Dictionary {
@@ -112,7 +223,7 @@ impl std::fmt::Debug for Dictionary {
 impl Dictionary {
     /// Number of dictionary entries (inline terms are not counted).
     pub fn len(&self) -> u64 {
-        self.inner.read().ends.len() as u64
+        self.inner.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -121,11 +232,13 @@ impl Dictionary {
 
     pub fn stats(&self) -> DictionaryStats {
         let inner = self.inner.read();
+        let base = inner.base.as_ref();
         DictionaryStats {
-            terms: inner.ends.len() as u64,
-            arena_bytes: inner.bytes.len() as u64,
+            terms: inner.len(),
+            arena_bytes: inner.bytes.len() as u64 + base.map_or(0, |b| b.arena.len() as u64),
             // A slot is the stored index plus one control byte.
             index_bytes: (inner.ends.capacity() * 8 + inner.table.capacity() * 9) as u64,
+            mapped_bytes: base.map_or(0, Base::bytes),
         }
     }
 
@@ -154,13 +267,12 @@ impl Dictionary {
             }
             _ => encode_key(term, &mut key),
         };
-        let hash = self.hasher.hash_one(&key[..]);
-        let inner = self.inner.read();
-        inner
-            .table
-            .find(hash, |&index| inner.key(index) == &key[..])
-            .filter(|&&index| index < limit)
-            .map(|&index| TermId::new(kind, index))
+        let hash = key_hash(&key);
+        self.inner
+            .read()
+            .find(hash, &key)
+            .filter(|&index| index < limit)
+            .map(|index| TermId::new(kind, index))
     }
 
     /// Returns the id of `term`, adding it to the dictionary if needed. O(len(term)) amortised.
@@ -215,7 +327,7 @@ impl Dictionary {
         if self.triples.read().covered < len {
             let mut index = self.triples.write();
             let inner = self.inner.read();
-            let end = inner.ends.len() as u64;
+            let end = inner.len();
             for entry in index.covered..end {
                 if let Some(ids) = triple_ids(inner.key(entry)) {
                     let [s, p, o] = ids;
@@ -242,25 +354,15 @@ impl Dictionary {
     }
 
     fn intern_key_locked(&self, inner: &mut Inner, key: &[u8]) -> u64 {
-        self.intern_hashed_locked(inner, key, self.hasher.hash_one(key))
+        self.intern_hashed_locked(inner, key, key_hash(key))
     }
 
-    /// Interns `key` whose hash (with this dictionary's hasher) is `hash`.
+    /// Interns `key` whose hash ([`key_hash`]) is `hash`.
     fn intern_hashed_locked(&self, inner: &mut Inner, key: &[u8], hash: u64) -> u64 {
-        if let Some(&index) = inner.table.find(hash, |&index| inner.key(index) == key) {
-            return index;
+        match inner.find(hash, key) {
+            Some(index) => index,
+            None => inner.push(key, hash),
         }
-        let index = inner.ends.len() as u64;
-        inner.bytes.extend_from_slice(key);
-        let end = inner.bytes.len() as u64;
-        inner.ends.push(end);
-        let Inner { table, bytes, ends } = inner;
-        table.insert_unique(hash, index, |&i| {
-            let i = i as usize;
-            let start = if i == 0 { 0 } else { ends[i - 1] as usize };
-            self.hasher.hash_one(&bytes[start..ends[i] as usize])
-        });
-        index
     }
 
     /// The string literals matching `query`, best first; the text index first takes in the
@@ -269,7 +371,7 @@ impl Dictionary {
         if self.text.read().covered() < self.len() {
             let mut text = self.text.write();
             let inner = self.inner.read();
-            let end = inner.ends.len() as u64;
+            let end = inner.len();
             for index in text.covered()..end {
                 match view_key(inner.key(index)) {
                     TermView::String(value) => {
@@ -290,7 +392,22 @@ impl Dictionary {
     /// substring search over the arena ([`super::strings`]).
     pub fn matching_strings(&self, test: &super::StringTest<'_>, limit: u64) -> Vec<TermId> {
         let inner = self.inner.read();
-        super::strings::matching(&inner.bytes, &inner.ends, limit, test)
+        let base_len = inner.base_len();
+        let mut ids = match &inner.base {
+            Some(base) => super::strings::matching(&base.arena, &base.ends, 0, limit, test),
+            None => Vec::new(),
+        };
+        if limit > base_len {
+            ids.extend(super::strings::matching(
+                &inner.bytes,
+                &inner.ends,
+                base_len,
+                limit - base_len,
+                test,
+            ));
+        }
+        ids.sort_unstable();
+        ids
     }
 
     /// Decodes an id back into a term. Returns `None` for ids that do not belong to this
@@ -311,7 +428,7 @@ impl Dictionary {
             | TermKind::Triple => {
                 let ids = {
                     let inner = self.inner.read();
-                    if id.payload() >= inner.ends.len() as u64 {
+                    if id.payload() >= inner.len() {
                         return None;
                     }
                     let key = inner.key(id.payload());
@@ -344,7 +461,7 @@ impl Dictionary {
             return None;
         }
         let inner = self.inner.read();
-        if id.payload() >= inner.ends.len() as u64 {
+        if id.payload() >= inner.len() {
             return None;
         }
         Some(f(view_key(inner.key(id.payload()))))
@@ -448,9 +565,30 @@ impl Dictionary {
     /// Raw key bytes of entries `[from, to)`, in id order. Used by the WAL and checkpoints.
     pub(crate) fn export_keys(&self, from: u64, to: u64) -> Vec<Vec<u8>> {
         let inner = self.inner.read();
-        (from..to.min(inner.ends.len() as u64))
+        (from..to.min(inner.len()))
             .map(|index| inner.key(index).to_vec())
             .collect()
+    }
+
+    /// Calls `f` with the key of each entry in `from..to`, in id order, holding the read
+    /// lock for the range: checkpoints read the dictionary in chunks with this.
+    pub(crate) fn for_each_key(&self, from: u64, to: u64, mut f: impl FnMut(&[u8])) {
+        let inner = self.inner.read();
+        for index in from..to.min(inner.len()) {
+            f(inner.key(index));
+        }
+    }
+
+    /// Restores a checkpoint's mapped entries into this empty dictionary.
+    pub(crate) fn restore_base(&self, base: Base) -> EngineResult<()> {
+        let mut inner = self.inner.write();
+        if inner.len() != 0 {
+            return Err(EngineError::Corruption(
+                "checkpoint dictionary restored into a non-empty dictionary".to_owned(),
+            ));
+        }
+        inner.base = Some(base);
+        Ok(())
     }
 
     /// Restores a checkpoint's dictionary into this empty one: `keys` in id order. Keys are
@@ -460,15 +598,17 @@ impl Dictionary {
         use rayon::prelude::*;
         let hashes: Vec<u64> = keys
             .par_iter()
-            .map(|key| validate_key(key).map(|()| self.hasher.hash_one(key)))
+            .map(|key| validate_key(key).map(|()| key_hash(key)))
             .collect::<EngineResult<_>>()?;
         let mut inner = self.inner.write();
-        if !inner.ends.is_empty() {
+        if inner.len() != 0 {
             return Err(EngineError::Corruption(
                 "checkpoint dictionary restored into a non-empty dictionary".to_owned(),
             ));
         }
-        let Inner { table, bytes, ends } = &mut *inner;
+        let Inner {
+            table, bytes, ends, ..
+        } = &mut *inner;
         bytes.reserve_exact(keys.iter().map(|key| key.len()).sum());
         ends.reserve_exact(keys.len());
         for key in keys {
@@ -491,7 +631,7 @@ impl Dictionary {
                     "duplicate dictionary key at {index}"
                 )));
             }
-            table.insert_unique(hash, index, |&i| self.hasher.hash_one(key(i)));
+            table.insert_unique(hash, index, |&i| key_hash(key(i)));
         }
         Ok(())
     }
@@ -500,7 +640,7 @@ impl Dictionary {
     pub(crate) fn restore_key(&self, expected_index: u64, key: &[u8]) -> EngineResult<()> {
         validate_key(key)?;
         let mut inner = self.inner.write();
-        let len = inner.ends.len() as u64;
+        let len = inner.len();
         if expected_index < len {
             return if inner.key(expected_index) == key {
                 Ok(())
@@ -568,7 +708,7 @@ impl KeyBatch {
         }
         let start = self.arena.len();
         let kind = encode_key(term, &mut self.arena);
-        let hash = dictionary.hasher.hash_one(&self.arena[start..]);
+        let hash = key_hash(&self.arena[start..]);
         let Self { arena, keys, table } = self;
         let key = &arena[start..];
         if let Some(&index) = table.find(hash, |&i| {

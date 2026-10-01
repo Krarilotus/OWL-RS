@@ -81,3 +81,38 @@ After each approach change, the hot loops of the profile:
   local (GraphDB Free counts as licensed).
 - **Every change:** perf lab before and after on the dataset of its gap, and the
   differential tests.
+
+## 5. Progress (1–2 October 2026)
+
+Perf lab, DBpedia core (67 M quads), office PC (Ryzen 9 5950X, 32 GB), on-disk store,
+native build; medians of 3 runs. "Before" is the 27 September perf lab on the main PC.
+
+| | Before | Now | What changed |
+|---|---:|---:|---|
+| q08 `CONTAINS` on labels | 1,882 ms | 36 ms | A1: dictionary-first string test, one parallel `memmem` pass over the arena |
+| q03 top birthplaces (group count) | 26 ms | 14 ms | A3: group walk on the index (galloping over constant blocks, column decode) |
+| Sum of query medians | 2,279 ms | 407 ms | |
+| Restart (open) | 4.5 s | 0.000 s | A6: checkpoint format 6 used in place (memory map) |
+| Resident after open | 5.8 GB (peak 10 GB) | 13 MiB | A6: index runs, dictionary text and hash table stay in the file |
+| Resident after all queries | 5.5 GB | 2.8 GB | the pages the queries touched (file-backed, reclaimable) |
+
+Done, with differential tests against the reference evaluator:
+- **A1** CONTAINS / STRSTARTS / STRENDS on a large pattern's object or STR of it.
+- **A2** `YEAR(?d) op c` as id ranges of inline dates and dateTimes (YAGO q02's filter).
+- **A3** group counts and distinct values by a group walk instead of a search per group.
+- **A4** `COUNT` of open `p*`/`p+` closures from the closure size per strongly connected
+  component plus the node count, no pairs built; open closures per component.
+- **A6, first part**: checkpoint format 6 is mapped: packed index runs (headers, first keys,
+  bits) and the dictionary (arena, end offsets, an open-addressing table with the fixed
+  `key_hash`). New terms and runs live on the heap on top. Opening checks the structure
+  only; `store.verify_on_open` checks everything (CRC, every block, every key).
+
+Still open:
+- A5, pipelined execution with early LIMIT exit (Wikidata q04, DBpedia q09).
+- A6, second part: after a checkpoint or bulk load the running process keeps its heap
+  copy until restart; compaction into the base writes a heap run. Next: remap after a
+  checkpoint, then merged base runs written to files (LSM), and an external-sort bulk
+  load with bounded memory (the load peaks at about 10 GB for DBpedia).
+- DBpedia q12 (`SUM` per team over a 3-way star, 202 ms) and q09 (100 k rows with an
+  OPTIONAL, 98 ms): profile next (EXPLAIN in the perf lab: `--explain`).
+- The remeasurement of every gap in the suite, with cache on and off, after batch A.

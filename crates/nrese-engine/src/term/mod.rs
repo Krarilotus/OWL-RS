@@ -9,6 +9,7 @@
 //! different terms and get different ids). See ADR-0002.
 
 pub(crate) mod dictionary;
+pub(crate) mod hash;
 mod inline;
 mod strings;
 pub mod text;

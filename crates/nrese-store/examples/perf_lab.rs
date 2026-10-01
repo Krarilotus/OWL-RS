@@ -3,7 +3,8 @@
 //! ```text
 //! cargo run --release -p nrese-store --example perf_lab -- \
 //!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
-//!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON]
+//!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
+//!     [--explain]
 //! ```
 //!
 //! - **Data:** `--load` bulk-loads files, into memory or, with `--store`, into an on-disk
@@ -14,6 +15,9 @@
 //!   counting sink, so evaluation, term decoding and serialisation are all included.
 //! - **Report:** rows, p50, min and max per query, peak memory (Linux), and a JSON file
 //!   for `benches/baselines/`. `--baseline` adds the ratio against an earlier JSON report.
+//!   `--explain` prints each query's plan after its measurement: every operator with its
+//!   estimated and actual rows and its time (inputs included), where the time goes when a
+//!   profiler isn't at hand.
 //!
 //! This is the loop every Phase 2–5 work package is measured with before the Docker
 //! scorecard confirms it against other systems. It runs anywhere the data is; the wrapper
@@ -45,6 +49,7 @@ struct Args {
     label: String,
     json: Option<PathBuf>,
     baseline: Option<PathBuf>,
+    explain: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -59,6 +64,7 @@ fn parse_args() -> Result<Args, String> {
         label: "nrese".into(),
         json: None,
         baseline: None,
+        explain: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -77,6 +83,7 @@ fn parse_args() -> Result<Args, String> {
             "--label" => args.label = value()?,
             "--json" => args.json = Some(value()?.into()),
             "--baseline" => args.baseline = Some(value()?.into()),
+            "--explain" => args.explain = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -196,6 +203,44 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
+/// Prints how `text` runs: each operator, indented by depth, with estimated and actual
+/// rows and its time.
+fn explain(store: &StoreService, text: &str) {
+    let explained = PreparedQuery::parse(&SparqlQueryRequest::new(text))
+        .map_err(|e| e.to_string())
+        .and_then(|prepared| {
+            store
+                .explain_query(&prepared, &CancellationToken::new())
+                .map_err(|e| e.to_string())
+        });
+    match explained {
+        Ok(explanation) => {
+            for step in &explanation.steps {
+                let mut detail = step.detail.clone();
+                if detail.len() > 90 {
+                    let cut = (0..=90)
+                        .rev()
+                        .find(|&i| detail.is_char_boundary(i))
+                        .unwrap_or(0);
+                    detail.truncate(cut);
+                    detail.push('…');
+                }
+                println!(
+                    "    {:indent$}{} {detail}  [est {} rows {} {:.2} ms]",
+                    "",
+                    step.operator,
+                    step.estimated_rows
+                        .map_or("-".to_owned(), |n| n.to_string()),
+                    step.rows,
+                    step.micros as f64 / 1000.0,
+                    indent = 2 * step.depth,
+                );
+            }
+        }
+        Err(error) => println!("    explain failed: {error}"),
+    }
+}
+
 /// Peak and current resident memory in MiB, where the OS reports it (Linux).
 fn memory_mib() -> Option<(u64, u64)> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -270,14 +315,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats = store.engine_stats();
     let mib = |bytes: u64| bytes / 1048576;
     eprintln!(
-        "held: {} quads + {} inferred in {} runs; index {} MiB, dictionary {} terms: text {} MiB, index {} MiB",
+        "held: {} quads + {} inferred in {} runs; index {} MiB heap + {} MiB mapped; \
+         dictionary {} terms: text {} MiB, heap index {} MiB, mapped {} MiB",
         stats.quads,
         stats.inferred,
         stats.runs,
         mib(stats.index_bytes),
+        mib(stats.index_mapped_bytes),
         stats.dictionary.terms,
         mib(stats.dictionary.arena_bytes),
         mib(stats.dictionary.index_bytes),
+        mib(stats.dictionary.mapped_bytes),
     );
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&args.queries)?
@@ -307,6 +355,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let name = file.file_stem().unwrap().to_string_lossy().into_owned();
         let text = std::fs::read_to_string(file)?;
         let m = measure(&store, &text, &args);
+        if args.explain {
+            explain(&store, &text);
+        }
         if let Some(error) = &m.error {
             println!("{name:<28} error: {error}");
             report.push(format!(

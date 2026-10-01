@@ -192,10 +192,19 @@ impl Run {
         self.inserts as i64 - self.deletes as i64
     }
 
+    /// Heap bytes held.
     pub(crate) fn memory_bytes(&self) -> u64 {
         self.perms
             .iter()
             .map(|p| (p.keys.memory_bytes() + p.tombstones.len() * 8) as u64)
+            .sum()
+    }
+
+    /// Bytes used in place from a mapped checkpoint.
+    pub(crate) fn mapped_bytes(&self) -> u64 {
+        self.perms
+            .iter()
+            .map(|p| p.keys.mapped_bytes() as u64)
             .sum()
     }
 

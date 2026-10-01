@@ -74,8 +74,10 @@ pub struct EngineStats {
     pub inferred: u64,
     /// Runs of both stacks.
     pub runs: usize,
-    /// Index memory of both stacks.
+    /// Index memory of both stacks on the heap.
     pub index_bytes: u64,
+    /// Index data of both stacks used in place from a mapped checkpoint.
+    pub index_mapped_bytes: u64,
     pub dictionary: DictionaryStats,
 }
 
@@ -525,6 +527,7 @@ impl Engine {
             inferred: version.inferred.len(),
             runs: version.runs().count(),
             index_bytes: version.runs().map(|run| run.memory_bytes()).sum(),
+            index_mapped_bytes: version.runs().map(|run| run.mapped_bytes()).sum(),
             dictionary: self.inner.shared.dictionary.stats(),
         }
     }
