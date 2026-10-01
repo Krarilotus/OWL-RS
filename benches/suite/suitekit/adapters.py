@@ -77,6 +77,14 @@ class Context:
     def setting(self, key: str, default: str = "") -> str:
         return self.settings.get(key) or default
 
+    def licence(self, key: str, file: str) -> str:
+        """A licence file: the setting `key`, else `file` in the licences directory
+        (NRESE_LICENSES, default ~/nrese-bench/licenses) if it is there; "" if neither."""
+        if self.setting(key):
+            return self.setting(key)
+        path = Path(self.setting("NRESE_LICENSES", str(Path.home() / "nrese-bench" / "licenses"))) / file
+        return str(path) if path.is_file() else ""
+
     @property
     def heap(self) -> str:
         return self.setting("JAVA_HEAP", "16g")
@@ -251,9 +259,20 @@ class Nrese(Adapter):
     regimes = {"none": "disabled", "rdfs": "rdfs", "owl-horst": "owl-horst",
                "owl2-rl": "owl2-rl", "owl2-ql": "owl2-ql"}
     runtimes = {"docker", "apptainer", "process"}
+    target_volume = "nrese-target"  # the Docker build's output, mounted at /target
+    bin_setting = "NRESE_BIN"
+
+    def source(self, ctx: Context) -> Path:
+        """The source tree the server is built from."""
+        return ctx.root
+
+    def supports(self, ctx, inputs, regime):
+        if not (self.source(ctx) / "Cargo.toml").is_file():
+            return f"no source tree at {self.source(ctx)}"
+        return super().supports(ctx, inputs, regime)
 
     def rust_image(self, ctx: Context) -> str:
-        toolchain = (ctx.root / "rust-toolchain.toml").read_text()
+        toolchain = (self.source(ctx) / "rust-toolchain.toml").read_text()
         channel = re.search(r'channel = "(.*)"', toolchain).group(1)
         return ctx.setting("RUST_IMAGE", f"rust:{channel}-bookworm")
 
@@ -263,16 +282,20 @@ class Nrese(Adapter):
         return [self.rust_image(ctx)] if docker else []
 
     def binary(self, ctx: Context) -> str:
-        if ctx.setting("NRESE_BIN"):
-            return ctx.setting("NRESE_BIN")
-        target = Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
+        if ctx.setting(self.bin_setting):
+            return ctx.setting(self.bin_setting)
+        target = self.target_dir(ctx)
         return str(target / "release" / ("nrese-server.exe" if os.name == "nt" else "nrese-server"))
+
+    def target_dir(self, ctx: Context) -> Path:
+        """The host build's output directory."""
+        return Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
 
     def spec(self, ctx: Context, name: str, store: str, command: list[str], env: dict) -> Spec:
         env = {"NRESE_STORE_MODE": "on-disk", "NRESE_DATA_DIR": "/store", "RUST_LOG": "info", **env}
         if ctx.runtime.kind == "docker":
             return Spec(name, self.rust_image(ctx), ["/target/release/nrese-server", *command], env,
-                        ctx.mounts(Mount("nrese-target", "/target"), Mount(store, "/store", readonly=False)),
+                        ctx.mounts(Mount(self.target_volume, "/target"), Mount(store, "/store", readonly=False)),
                         memory=ctx.memory)
         # Apptainer and processes: the host's release build, on the host.
         return Spec(name, None, [self.binary(ctx), *command], env,
@@ -317,6 +340,24 @@ class Nrese(Adapter):
                 return json.loads(response.read()).get("version", "-")
         except (OSError, ValueError):
             return "-"
+
+
+class NreseOxigraph(Nrese):
+    """NRESE on the Oxigraph libraries: the same server built from the branch
+    baseline/pre-oxigraph-migration, the last commit before the migration to the own RDF
+    libraries. Next to `nrese` it shows what the migration changed, end to end. The branch
+    is checked out beside this repository (`git worktree add ../OWL-RS-baseline
+    baseline/pre-oxigraph-migration`) or wherever NRESE_OXIGRAPH_SRC points."""
+
+    key = "nrese-oxigraph"
+    target_volume = "nrese-oxigraph-target"
+    bin_setting = "NRESE_OXIGRAPH_BIN"
+
+    def source(self, ctx):
+        return Path(ctx.setting("NRESE_OXIGRAPH_SRC", str(ctx.root.parent / "OWL-RS-baseline")))
+
+    def target_dir(self, ctx):
+        return self.source(ctx) / "target"
 
 
 # --- the other SPARQL stores ------------------------------------------------------------------
@@ -530,8 +571,9 @@ class Graphdb(Adapter):
         return [ctx.setting("GRAPHDB_IMAGE", "ontotext/graphdb:11.5.1")]
 
     def supports(self, ctx, inputs, regime):
-        if not ctx.setting("GRAPHDB_LICENSE"):
-            return "needs GRAPHDB_LICENSE=/path/graphdb.license (it answers no queries without one)"
+        if not ctx.licence("GRAPHDB_LICENSE", "graphdb.license"):
+            return ("needs graphdb.license in the licences directory, or GRAPHDB_LICENSE=/path "
+                    "(it answers no queries without one)")
         return super().supports(ctx, inputs, regime)
 
     def env(self, ctx, options: str) -> dict:
@@ -551,7 +593,7 @@ class Graphdb(Adapter):
 
     def serve(self, ctx, store, regime):
         port = ctx.listen(7200, fixed=True)
-        licence = Mount(ctx.setting("GRAPHDB_LICENSE"), "/license/graphdb.license")
+        licence = Mount(ctx.licence("GRAPHDB_LICENSE", "graphdb.license"), "/license/graphdb.license")
         spec = Spec(ctx.name("serve"), self.images(ctx)[0], [],
                     self.env(ctx, "-Dgraphdb.license.file=/license/graphdb.license"),
                     ctx.mounts(licence, Mount(store, "/opt/graphdb/home", readonly=False)), port=port,
@@ -574,8 +616,8 @@ class Rdfox(Adapter):
         return [ctx.setting("RDFOX_IMAGE", "oxfordsemantic/rdfox:7.6b")]
 
     def supports(self, ctx, inputs, regime):
-        if not ctx.setting("RDFOX_LICENSE"):
-            return "needs RDFOX_LICENSE=/path/RDFox.lic"
+        if not ctx.licence("RDFOX_LICENSE", "RDFox.lic"):
+            return "needs RDFox.lic in the licences directory, or RDFOX_LICENSE=/path"
         return super().supports(ctx, inputs, regime)
 
     def load(self, ctx, store, inputs, regime):
@@ -587,7 +629,7 @@ class Rdfox(Adapter):
         (ctx.work / "load.rdfox").write_text("\n".join(script) + "\n", encoding="utf-8")
         spec = Spec(ctx.name("serve"), self.images(ctx)[0],
                     ["-license-file", "/license/RDFox.lic", "sandbox", "/work", "exec /work/load.rdfox"],
-                    mounts=ctx.mounts(Mount(ctx.setting("RDFOX_LICENSE"), "/license/RDFox.lic")),
+                    mounts=ctx.mounts(Mount(ctx.licence("RDFOX_LICENSE", "RDFox.lic"), "/license/RDFox.lic")),
                     port=port, entrypoint=True, keep_stdin=True, memory=ctx.memory)
         base = ctx.runtime.url(spec) + "/datastores/bench/sparql"
         self.endpoint = self.start(ctx, spec, Endpoint(base, base), timeout_s=ctx.timeout_s)
@@ -725,7 +767,7 @@ class Owlrl(ClosureAdapter):
                     reason_ms=float(seconds[-1]) * 1000 if seconds else None)
 
 
-ADAPTERS = {a.key: a for a in (Nrese, Qlever, Oxigraph, Jena, Virtuoso, Graphdb, Rdfox, Anzograph, Nemo, Owlrl)}
+ADAPTERS = {a.key: a for a in (Nrese, NreseOxigraph, Qlever, Oxigraph, Jena, Virtuoso, Graphdb, Rdfox, Anzograph, Nemo, Owlrl)}
 
 
 def adapter(key: str) -> Adapter | None:
