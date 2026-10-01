@@ -56,9 +56,9 @@ use nrese_exec::join::{
 use nrese_exec::{
     Budget, BudgetExceeded, IdTable, UNDEF, computed_id, computed_index, group::group_rows,
 };
+use nrese_xsd::{Decimal, Double, Float, Integer};
 use oxrdf::vocab::xsd;
 use oxrdf::{Literal, Term, Variable};
-use oxsdatatypes::{Decimal, Double, Float, Integer};
 use rayon::prelude::*;
 use spargebra::Query;
 use spargebra::algebra::{
@@ -3657,28 +3657,22 @@ impl Aggregator<'_> {
                 }
                 let result = match name {
                     AggregateFunction::Count => Some(integer(values.len() as u64)),
-                    AggregateFunction::Sample => values.into_iter().next().map(value::canonical),
+                    AggregateFunction::Sample => values.into_iter().next(),
                     // The first of equal extremes.
-                    AggregateFunction::Min => values
-                        .into_iter()
-                        .reduce(|best, v| {
-                            if value::order(Some(&v), Some(&best)).is_lt() {
-                                v
-                            } else {
-                                best
-                            }
-                        })
-                        .map(value::canonical),
-                    AggregateFunction::Max => values
-                        .into_iter()
-                        .reduce(|best, v| {
-                            if value::order(Some(&v), Some(&best)).is_gt() {
-                                v
-                            } else {
-                                best
-                            }
-                        })
-                        .map(value::canonical),
+                    AggregateFunction::Min => values.into_iter().reduce(|best, v| {
+                        if value::order(Some(&v), Some(&best)).is_lt() {
+                            v
+                        } else {
+                            best
+                        }
+                    }),
+                    AggregateFunction::Max => values.into_iter().reduce(|best, v| {
+                        if value::order(Some(&v), Some(&best)).is_gt() {
+                            v
+                        } else {
+                            best
+                        }
+                    }),
                     AggregateFunction::Sum => sum(&values),
                     AggregateFunction::Avg => average(&values),
                     AggregateFunction::GroupConcat { separator } => {

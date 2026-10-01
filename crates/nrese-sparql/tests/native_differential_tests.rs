@@ -324,14 +324,13 @@ fn group_pattern(rng: &mut Rng, depth: u32) -> String {
                     0 => format!("<{EX}e{}>", rng.below(7)),
                     _ => rng.pick(&VARS).to_string(),
                 };
-                // A path that matches with length zero starts from a constant or from
-                // `?z`, which no filter names. From a variable that a literal is bound to,
-                // spareval's optimiser takes the start for a node and decides `?v = 2`
-                // from that; SPARQL lets a zero-length path start at any term of the
-                // graph. `paths_from_bound_values_equal_the_reference` covers bound starts.
+                // A path that matches with length zero may start anywhere: a constant,
+                // `?z`, or a variable other patterns bind, to a literal too (SPARQL lets
+                // a zero-length path start at any term of the graph).
                 let subject = if path.ends_with('*') || path.ends_with('?') {
-                    match rng.below(3) {
+                    match rng.below(4) {
                         0 => format!("<{EX}e{}>", rng.below(7)),
+                        1 => rng.pick(&VARS).to_string(),
                         _ => "?z".to_owned(),
                     }
                 } else {
@@ -432,29 +431,9 @@ fn random_query(rng: &mut Rng) -> (String, bool) {
     }
 }
 
-/// Integer literals by value: spareval's ORDER BY + LIMIT path outputs `"07"` and
-/// `"7"^^xsd:int` as `"7"^^xsd:integer`, while the native executor returns the stored
-/// terms (RDF term identity). Both are the same values; the test compares values there.
-fn by_value(term: &Term) -> Term {
-    const INTEGERS: [&str; 3] = [
-        "http://www.w3.org/2001/XMLSchema#integer",
-        "http://www.w3.org/2001/XMLSchema#int",
-        "http://www.w3.org/2001/XMLSchema#long",
-    ];
-    match term {
-        Term::Literal(l) if INTEGERS.contains(&l.datatype().as_str()) => {
-            match l.value().parse::<i64>() {
-                Ok(v) => Literal::new_typed_literal(v.to_string(), xsd::INTEGER).into(),
-                Err(_) => term.clone(),
-            }
-        }
-        _ => term.clone(),
-    }
-}
-
 /// A numeric literal in the lexical form NRESE's `STR` gives it; other literals unchanged.
 fn canonical_number(literal: &Literal) -> Literal {
-    use oxsdatatypes::{Decimal, Double, Float, Integer};
+    use nrese_xsd::{Decimal, Double, Float, Integer};
     use std::str::FromStr;
     let value = literal.value();
     let text = match literal
@@ -490,6 +469,17 @@ fn variables(snapshot: &nrese_engine::Snapshot, query: &spargebra::Query) -> Vec
 
 /// The rows of a SELECT, as strings; an ASK is one row, `true` or `false`.
 fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
+    rows_with(results, ordered, false)
+}
+
+/// [`rows`], with integer literals by value where SPARQL leaves open which of equal values
+/// comes out: `ORDER BY` puts `"02"` and `"2"` in either order (and a `LIMIT` may cut
+/// between them), and `MIN`/`MAX` may give either as the extreme (`open` for those).
+fn rows_up_to_equal_values(results: QueryResults<'_>, ordered: bool, open: bool) -> Vec<String> {
+    rows_with(results, ordered, ordered || open)
+}
+
+fn rows_with(results: QueryResults<'_>, ordered: bool, by_values: bool) -> Vec<String> {
     let solutions = match results {
         QueryResults::Solutions(solutions) => solutions,
         QueryResults::Boolean(answer) => return vec![answer.to_string()],
@@ -502,9 +492,9 @@ fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
             variables
                 .iter()
                 .map(|v| {
-                    solution
-                        .get(v)
-                        .map_or("UNDEF".to_owned(), |t| by_value(t).to_string())
+                    solution.get(v).map_or("UNDEF".to_owned(), |t| {
+                        if by_values { by_value(t) } else { t.clone() }.to_string()
+                    })
                 })
                 .collect::<Vec<_>>()
                 .join("\t")
@@ -514,6 +504,43 @@ fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
         out.sort();
     }
     out
+}
+
+/// An integer literal (of `xsd:integer`, `int` or `long`) as its value's canonical
+/// `xsd:integer`; other terms unchanged.
+fn by_value(term: &Term) -> Term {
+    const INTEGERS: [&str; 3] = [
+        "http://www.w3.org/2001/XMLSchema#integer",
+        "http://www.w3.org/2001/XMLSchema#int",
+        "http://www.w3.org/2001/XMLSchema#long",
+    ];
+    match term {
+        Term::Literal(l) if INTEGERS.contains(&l.datatype().as_str()) => {
+            match l.value().parse::<i64>() {
+                Ok(v) => Literal::new_typed_literal(v.to_string(), xsd::INTEGER).into(),
+                Err(_) => term.clone(),
+            }
+        }
+        _ => term.clone(),
+    }
+}
+
+/// [`by_value`] for a cell of [`rows`] (an integer literal in N-Triples syntax).
+fn cell_by_value(cell: &str) -> String {
+    let Some((lexical, datatype)) = cell
+        .strip_prefix('"')
+        .and_then(|rest| rest.split_once("\"^^<"))
+    else {
+        return cell.to_owned();
+    };
+    let datatype = datatype.trim_end_matches('>');
+    by_value(&Literal::new_typed_literal(lexical, NamedNode::new_unchecked(datatype)).into())
+        .to_string()
+}
+
+/// Whether a query's results hold a `MIN` or `MAX`, whose extreme may be any of equal values.
+fn has_extremes(text: &str) -> bool {
+    text.contains("MIN(") || text.contains("MAX(")
 }
 
 /// The LIMIT of a generated `SELECT * … LIMIT n` query without ORDER BY.
@@ -570,16 +597,21 @@ fn native_results_equal_the_reference_on_random_queries() {
                 fallbacks.push(text);
                 continue;
             }
-            let native = rows(
+            let native = rows_up_to_equal_values(
                 evaluate_query(&snapshot, &query, &native_options).unwrap(),
                 ordered,
+                has_extremes(&text),
             );
             if let Some(limit) = limited(&text) {
                 // LIMIT without ORDER BY may return any `limit` solutions: the native rows
                 // must be that many, and all of them solutions of the unlimited query.
                 let unlimited = text[..text.rfind(" LIMIT ").unwrap()].to_owned();
                 let query = SparqlParser::new().parse_query(&unlimited).unwrap();
-                let mut all = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
+                let mut all = rows_up_to_equal_values(
+                    reference(&snapshot, &query, &oracle).unwrap(),
+                    false,
+                    has_extremes(&text),
+                );
                 assert_eq!(native.len(), all.len().min(limit), "{text}");
                 for row in &native {
                     let position = all.iter().position(|r| r == row);
@@ -589,7 +621,11 @@ fn native_results_equal_the_reference_on_random_queries() {
                 checked += 1;
                 continue;
             }
-            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), ordered);
+            let expected = rows_up_to_equal_values(
+                reference(&snapshot, &query, &oracle).unwrap(),
+                ordered,
+                has_extremes(&text),
+            );
             assert_eq!(
                 native, expected,
                 "dataset {dataset_case}, query {query_case}, {model:?}: {text}"
@@ -610,8 +646,7 @@ fn native_results_equal_the_reference_on_random_queries() {
         with_solutions * 6 > checked,
         "only {with_solutions} of {checked} queries have solutions"
     );
-    // Queries outside native coverage run on spareval, which is correct by construction;
-    // the generator's shapes must still be almost all native.
+    // The generator's shapes must be almost all native (the executor refuses the rest).
     assert!(
         fallbacks.len() * 20 < checked,
         "{} of {} generated queries not native, e.g. {:#?}",
@@ -634,7 +669,7 @@ fn filtered_group(rng: &mut Rng) -> String {
         let (from, to) = (*rng.pick(&["?a", "?b"]), *rng.pick(&["?c", "?d"]));
         let (p1, p2) = (p(rng), p(rng));
         // BIND needs a variable the group hasn't used: `?f`, once.
-        let choice = match rng.below(12) {
+        let choice = match rng.below(13) {
             7 | 8 if bind => 0,
             choice => choice,
         };
@@ -642,11 +677,10 @@ fn filtered_group(rng: &mut Rng) -> String {
         parts.push(match choice {
             0 => format!("OPTIONAL {{ {from} {p1} {to} }}"),
             1 => format!("OPTIONAL {{ {from} {p1} {to} FILTER(isIRI({to})) }}"),
-            // The zero-length path starts at `?a`, an IRI. From a variable bound to a
-            // literal, spareval's optimiser takes the path's start for a node and compares
-            // it as a term (`"04"^^xsd:integer != "4"^^xsd:int`), where SPARQL compares
-            // values.
+            // A zero-length path from `?a` (an IRI) and from `?b` (a literal too): the
+            // filter compares values (`"04"^^xsd:integer` = `"4"^^xsd:int`).
             2 => format!("OPTIONAL {{ {from} {p1} {to} . ?a {p2}* ?e FILTER({to} != ?b) }}"),
+            12 => format!("OPTIONAL {{ {from} {p1} {to} . ?b {p2}* ?e FILTER({to} != ?e) }}"),
             3 => format!("{from} {p1}+ {to} ."),
             4 => format!("{from} ({p1}|{p2}) {to} ."),
             5 => format!("{{ {from} {p1} ?c }} UNION {{ {from} {p2} ?d }}"),
@@ -700,7 +734,7 @@ fn filtered_group(rng: &mut Rng) -> String {
 }
 
 /// Filter pushdown (`native/pushdown.rs`): filters written at the end of a group give
-/// spareval's results wherever the executor moves them: below joins, OPTIONALs, UNIONs,
+/// the reference evaluator's results wherever the executor moves them: below joins, OPTIONALs, UNIONs,
 /// MINUS and BINDs, and into subqueries. Each rule of the pushdown was mutation-checked
 /// against this test.
 #[test]
@@ -780,10 +814,31 @@ only reference: {:#?}",
     );
 }
 
-/// The rows of two evaluations, or a panic that shows the rows only one of them has.
+/// The rows of two evaluations, or a panic that shows the rows only one of them has. For a
+/// query (in `context`) with `MIN`, `MAX` or `ORDER BY`, integer literals may differ where
+/// they are equal values: which of them comes out, or first, is open (see
+/// [`rows_up_to_equal_values`]).
 fn assert_same_rows(native: &[String], expected: &[String], context: &str) {
     if native == expected {
         return;
+    }
+    if has_extremes(context) || context.contains("ORDER BY") {
+        let by_values = |rows: &[String]| -> Vec<String> {
+            let mut out: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    row.split('\t')
+                        .map(cell_by_value)
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        if by_values(native) == by_values(expected) {
+            return;
+        }
     }
     let only = |rows: &[String], other: &[String]| -> Vec<String> {
         let mut other = other.to_vec();
@@ -874,13 +929,14 @@ fn paths_from_bound_values_equal_the_reference() {
                 .pick(&[PATHS[0], PATHS[1], PATHS[2], PATHS[6], PATHS[8], PATHS[10]])
                 .replace("<P", &format!("<{EX}p"));
             let first = format!("?a <{EX}p{}> ?b .", rng.below(4));
-            let group = match rng.below(12) {
+            let group = match rng.below(13) {
                 0 => format!("{first} ?b {p} ?c"),
                 1 => format!("{first} ?c {p} ?b"),
-                // Both ends bound. Only closures: where a path has a pair twice (two
-                // statements behind `!(…)`, two ways through a sequence), spareval tests
-                // for the path per row and returns the row once; SPARQL counts both.
+                // Both ends bound: a closure (each pair once), or any path, where a pair
+                // two ways connect counts twice (two statements behind `!(…)`, two ways
+                // through a sequence), as SPARQL counts it.
                 2 => format!("{first} ?a {closure} ?b"),
+                12 => format!("{first} ?a {p} ?b"),
                 3 => format!("{first} ?b {p} ?b"),
                 4 => format!("{first} OPTIONAL {{ ?b {p} ?c }}"),
                 5 => format!("{first} OPTIONAL {{ ?c {p} ?a FILTER(isIRI(?c) && ?c != ?a) }}"),
@@ -978,9 +1034,6 @@ fn closures_from_many_bound_values_equal_the_reference() {
 /// deduplicating, joining and filtering on the results of `BIND` and `SELECT` expressions
 /// and of aggregates in subqueries. The patterns are single statements and joins on `?a`,
 /// so nearly every query has solutions. Returns the query and whether its rows are ordered.
-///
-/// Left out, because spareval differs from the specification there: `DATATYPE` of a
-/// literal of a derived integer type (spareval answers `xsd:integer` for an `xsd:int`).
 fn computed_query(rng: &mut Rng) -> (String, bool) {
     let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
     let base = match rng.below(3) {
@@ -1006,6 +1059,8 @@ fn computed_query(rng: &mut Rng) -> (String, bool) {
             "?b = 3 || isIRI(?b)",
             "ABS(?b - 4)",
             "STRDT(STR(?b), <http://www.w3.org/2001/XMLSchema#integer>)",
+            // Derived integer types keep their datatype.
+            "DATATYPE(?b)",
         ])
         .to_string();
     let bound = format!("{base} BIND({expression} AS ?k)");
@@ -1148,11 +1203,17 @@ fn computed_values_equal_the_reference() {
                 fallbacks += 1;
                 continue;
             }
-            let native = rows(
+            let open = has_extremes(&text);
+            let native = rows_up_to_equal_values(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 ordered,
+                open,
             );
-            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), ordered);
+            let expected = rows_up_to_equal_values(
+                reference(&snapshot, &query, &oracle).unwrap(),
+                ordered,
+                open,
+            );
             assert_same_rows(
                 &native,
                 &expected,
@@ -1221,7 +1282,7 @@ fn set_query(rng: &mut Rng) -> (String, bool) {
     let mut ordered = false;
     let aggregates: Vec<String> = (0..1 + rng.below(3))
         .map(|i| {
-            let aggregate = match rng.below(16) {
+            let aggregate = match rng.below(17) {
                 0 | 1 => "COUNT(DISTINCT ?c)",
                 2 | 3 => "COUNT(DISTINCT ?d)",
                 4 => "COUNT(DISTINCT ?e)",
@@ -1229,18 +1290,15 @@ fn set_query(rng: &mut Rng) -> (String, bool) {
                 6 => "MAX(?d)",
                 7 => "MAX(STR(?e))",
                 8 => "COUNT(DISTINCT ?g)",
-                // Compared with the as-written evaluation only: SPARQL's DISTINCT is over
-                // terms ("03" and "3" are two), spareval's SUM(DISTINCT) over values.
-                9 => {
-                    ordered = true;
-                    "SUM(DISTINCT ?d)"
-                }
-                // Over two OPTIONALs at once. COALESCE keeps the argument free of errors:
-                // for a COUNT(DISTINCT ...) whose argument fails in every row, spareval
-                // answers unbound, where SPARQL drops the errors and counts 0.
+                // DISTINCT is over terms ("03" and "3" are two), the sum over values.
+                9 => "SUM(DISTINCT ?d)",
+                // Over two OPTIONALs at once, with the argument free of errors, and
+                // failing in every row where a side is unbound (errors are dropped, so a
+                // group of only errors counts 0).
                 10 => {
                     "COUNT(DISTINCT CONCAT(COALESCE(STR(?c), \"-\"), \"/\", COALESCE(STR(?d), \"-\")))"
                 }
+                16 => "COUNT(DISTINCT CONCAT(STR(?c), \"/\", STR(?d)))",
                 11 => "MIN(?h)",
                 12 => {
                     ordered = true;
@@ -1312,7 +1370,17 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
             );
             assert_same_rows(&native, &plain, &format!("against as written: {context}"));
             if !order_dependent {
-                let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
+                let open = has_extremes(&text);
+                let native = rows_up_to_equal_values(
+                    evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                    false,
+                    open,
+                );
+                let expected = rows_up_to_equal_values(
+                    reference(&snapshot, &query, &oracle).unwrap(),
+                    false,
+                    open,
+                );
                 assert_same_rows(&native, &expected, &context);
             }
             checked += 1;
@@ -1390,8 +1458,8 @@ fn joins_on_unbound_variables_equal_the_reference() {
 
 /// A filter on a variable that a subquery binds but doesn't project sees it unbound: the
 /// filter is an error and the row is dropped. Checked against the answer the specification
-/// gives, not against spareval, whose optimiser moves such a filter into the subquery
-/// (where the variable is bound) and returns the rows.
+/// gives (spareval's optimiser used to move such a filter into the subquery, where the
+/// variable is bound, and return the rows).
 #[test]
 fn a_filter_sees_a_variable_a_subquery_hides_as_unbound() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -2076,9 +2144,8 @@ fn string_functions_casts_and_group_concat_equal_the_reference() {
     let oracle = QueryOptions {
         ..QueryOptions::default()
     };
-    // GROUP_CONCAT values in a canonical order: the parts of each literal sorted, and no
-    // language tag (the result is a simple literal, SPARQL 1.1 §18.5.1.7; spareval keeps a
-    // tag all values share).
+    // GROUP_CONCAT values in a canonical order: the parts of each literal sorted (the
+    // order of concatenation is open); the result is a simple literal (§18.5.1.7).
     let sorted_parts = |row: &str| -> String {
         row.split('\t')
             .map(
@@ -2498,8 +2565,8 @@ fn the_merged_default_graph_equals_the_reference() {
             checked += 1;
         }
     }
-    // The queries must really have run on the native executor (a silent fallback would
-    // compare spareval with itself), and about as often as with the plain default graph:
+    // The queries must really have run on the native executor, and about as often as with
+    // the plain default graph:
     // what hands a query back at run time (unbound join keys) isn't the merge.
     assert!(
         checked > 4000
@@ -2708,14 +2775,9 @@ fn updates_over_the_merged_default_graph_equal_the_reference() {
 /// `GRAPH`, the graph variable as a subject or object), and joins of the two. Patterns
 /// are connected, so that they have solutions.
 ///
-/// Where spareval departs from SPARQL 1.1 §18.6, the generator stays out and
-/// [`a_dataset_is_what_the_query_names`] checks the native executor by example: a pattern
-/// that gives rows without reading a statement is only put under `GRAPH ?g`, and isn't
-/// `VALUES` (under the name of a graph outside the dataset spareval gives its rows, where
-/// the standard gives none; under `GRAPH ?g` it leaves `?g` unbound in the rows of
-/// `VALUES`), and a subquery or a `MINUS` without a variable in common is only put under
-/// a graph's name (under `GRAPH ?g` spareval evaluates the subquery once over all graphs,
-/// with `?g` unbound, and takes `?g` for a variable the two sides of `MINUS` share).
+/// The reference evaluator follows SPARQL 1.1 §18.6 in all of these, so nothing is left
+/// out: rows no statement gives (`BIND`, `VALUES`) under any graph name, one outside the
+/// dataset too; subqueries and `MINUS` without a variable in common under `GRAPH ?g`.
 fn dataset_body(rng: &mut Rng) -> String {
     let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
     let graph = |rng: &mut Rng| {
@@ -2772,32 +2834,30 @@ fn dataset_body(rng: &mut Rng) -> String {
         // A subquery.
         6 => format!(
             "GRAPH {} {{ {{ SELECT ?a (COUNT(?b) AS ?n) (MAX(?b) AS ?m) WHERE {{ ?a {} ?b }} GROUP BY ?a }} }}",
-            rng.pick(&[
-                "<http://example.com/g0>",
-                "<http://example.com/e1>",
-                "<http://example.com/g9>"
-            ]),
+            graph(rng),
             p(rng)
         ),
         // MINUS: no variable in common removes nothing.
         7 => {
-            let graph = graph(rng);
-            let shared: &[&str] = if graph == "?g" {
-                &["?a", "?b"]
-            } else {
-                &["?a", "?b", "?c"]
-            };
             format!(
-                "GRAPH {graph} {{ ?a {} ?b MINUS {{ {} {} ?d }} }}",
+                "GRAPH {} {{ ?a {} ?b MINUS {{ {} {} ?d }} }}",
+                graph(rng),
                 p(rng),
-                rng.pick(shared),
+                rng.pick(&["?a", "?b", "?c"]),
                 p(rng)
             )
         }
         // Rows that no triple pattern gives.
         8 | 9 => format!(
-            "GRAPH ?g {{ {} }}",
-            *rng.pick(&["", "BIND(1 AS ?x)", "{ BIND(1 AS ?x) } { BIND(2 AS ?y) }"])
+            "GRAPH {} {{ {} }}",
+            graph(rng),
+            *rng.pick(&[
+                "",
+                "BIND(1 AS ?x)",
+                "{ BIND(1 AS ?x) } { BIND(2 AS ?y) }",
+                "VALUES ?x { 1 2 }",
+                "VALUES (?x ?g) { (1 <http://example.com/g0>) (2 UNDEF) }",
+            ])
         ),
         10 => format!(
             "GRAPH {} {{ ?a {} ?b GRAPH ?h {{ ?b {} ?c }} }}",
@@ -3091,11 +3151,14 @@ fn a_dataset_is_what_the_query_names() {
             options.dataset
         );
     }
-    // spareval evaluates the pattern in a graph that isn't there: only the native executor
-    // is checked.
+    // Rows no statement gives, under names in and outside the dataset: checked by example
+    // and against the reference evaluator.
     let native_count = |text: &str| {
         let query = SparqlParser::new().parse_query(text).unwrap();
-        rows(evaluate_query(&snapshot, &query, &plain).unwrap(), false).len()
+        let native = rows(evaluate_query(&snapshot, &query, &plain).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &plain).unwrap(), false);
+        assert_eq!(native, expected, "{text}");
+        native.len()
     };
     let subquery = "SELECT ?g ?n WHERE { GRAPH ?g { SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o } } }";
     let query = SparqlParser::new().parse_query(subquery).unwrap();
@@ -3384,9 +3447,7 @@ fn exists_equal_the_reference() {
                     rng.below(4),
                     rng.below(4)
                 ),
-                // Under GRAPH ?g spareval evaluates a subquery once over all graphs
-                // (`dataset_body`).
-                5 if !exists.contains("SELECT") => format!(
+                5 => format!(
                     "SELECT * WHERE {{ GRAPH ?g {{ {outer} FILTER {not}EXISTS {{ {exists} }} }} }}"
                 ),
                 _ => format!(

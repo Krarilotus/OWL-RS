@@ -999,27 +999,21 @@ impl<'d> Context<'d> {
                 }
                 Ok(match name {
                     AggregateFunction::Count => integer(values.len()),
-                    AggregateFunction::Sample => values.into_iter().next().map(value::canonical),
-                    AggregateFunction::Min => values
-                        .into_iter()
-                        .reduce(|best, v| {
-                            if value::order(Some(&v), Some(&best)).is_lt() {
-                                v
-                            } else {
-                                best
-                            }
-                        })
-                        .map(value::canonical),
-                    AggregateFunction::Max => values
-                        .into_iter()
-                        .reduce(|best, v| {
-                            if value::order(Some(&v), Some(&best)).is_gt() {
-                                v
-                            } else {
-                                best
-                            }
-                        })
-                        .map(value::canonical),
+                    AggregateFunction::Sample => values.into_iter().next(),
+                    AggregateFunction::Min => values.into_iter().reduce(|best, v| {
+                        if value::order(Some(&v), Some(&best)).is_lt() {
+                            v
+                        } else {
+                            best
+                        }
+                    }),
+                    AggregateFunction::Max => values.into_iter().reduce(|best, v| {
+                        if value::order(Some(&v), Some(&best)).is_gt() {
+                            v
+                        } else {
+                            best
+                        }
+                    }),
                     AggregateFunction::Sum => value::sum(&values),
                     AggregateFunction::Avg => value::average(&values),
                     AggregateFunction::GroupConcat { separator } => {
@@ -1530,13 +1524,18 @@ fn template_quad(
     ))
 }
 
+/// The graph an update template's quad goes to. A variable bound to a blank node names a
+/// graph too: RDF 1.1 datasets allow blank node graph names, the store holds them, and
+/// `GRAPH ?g` finds them, so an update can reach the graphs a query sees. (SPARQL 1.1
+/// Update lists literals, not blank nodes, among the constructs a template leaves out.)
 fn graph_pattern(graph: &GraphNamePattern, solution: &Solution) -> Option<GraphName> {
     Some(match graph {
         GraphNamePattern::NamedNode(n) => n.clone().into(),
         GraphNamePattern::DefaultGraph => GraphName::DefaultGraph,
         GraphNamePattern::Variable(v) => match solution.get(v)? {
             Term::NamedNode(n) => n.clone().into(),
-            _ => return None,
+            Term::BlankNode(b) => b.clone().into(),
+            Term::Literal(_) => return None,
         },
     })
 }

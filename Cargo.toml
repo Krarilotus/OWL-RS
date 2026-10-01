@@ -12,7 +12,8 @@ members = [
     "crates/rdf/nrese-rdf",
     "crates/rdf/nrese-xsd",
 ]
-# Patched copies of published crates, used through [patch.crates-io] below.
+# A patched copy of oxsdatatypes, used only by the bench harness (a workspace of its own)
+# until it leaves the Oxigraph libraries too; the workspace uses nrese-xsd.
 exclude = ["vendor"]
 resolver = "2"
 
@@ -40,9 +41,3 @@ codegen-units = 1
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
-
-# oxsdatatypes 0.2.2 with decimal multiplication and division fixed for zero operands and
-# products past 18 fractional digits (vendor/oxsdatatypes/NRESE-PATCH.md). The bench
-# harness, a workspace of its own, patches it the same way.
-[patch.crates-io]
-oxsdatatypes = { path = "vendor/oxsdatatypes" }

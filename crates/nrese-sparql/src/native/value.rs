@@ -5,9 +5,9 @@
 use std::cmp::Ordering;
 use std::str::FromStr;
 
+use nrese_xsd::{Boolean, Date, DateTime, Decimal, Double, Float, Integer};
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{Literal, Term};
-use oxsdatatypes::{Boolean, Date, DateTime, Decimal, Double, Float, Integer};
 
 /// A term's value, as far as operators distinguish them.
 #[derive(Debug, Clone)]
@@ -237,10 +237,8 @@ pub fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
     }
 }
 
-/// The term an evaluator returns for a computed value (MIN, MAX, SAMPLE): literals of the
-/// core XSD types in canonical form (derived integer types as xsd:integer). A deviation
-/// kept from the spareval era (the specification returns the term itself); see the
-/// migration plan's status;
+/// A literal of a core XSD type in its value's canonical form (derived integer types as
+/// xsd:integer), for casts and for the implementation-defined tail of the ORDER BY order;
 /// other terms unchanged. Stored terms that are bound directly keep their lexical form.
 pub fn canonical(term: Term) -> Term {
     let Term::Literal(literal) = &term else {
@@ -250,7 +248,7 @@ pub fn canonical(term: Term) -> Term {
     let canonical =
         |lexical: String| Literal::new_typed_literal(lexical, datatype.into_owned()).into();
     match Value::of_literal(literal) {
-        // Every integer type becomes xsd:integer (the deviation above).
+        // Every integer type becomes xsd:integer.
         Value::Integer(i) => Literal::new_typed_literal(i.to_string(), xsd::INTEGER).into(),
         Value::Decimal(d) => canonical(d.to_string()),
         Value::Double(d) => canonical(d.to_string()),

@@ -166,16 +166,30 @@ reference got hash joins, adjacency lists for closures and per-term indexes). W3
 1.1: 491 of 495, the 4 failures one known deviation (zero-length paths from a term outside
 the graph); the reference passes the same 491. Workspace: 535 tests, all green.
 
-**Deviations kept from the spareval era, to fix for conformance** (they sit in code the
-reference shares, so no differential test can see them; W3C doesn't test them):
-- `STR` of a typed literal gives the canonical form (`STR("03"^^xsd:integer)` = `"3"`);
-  §17.4.2.5 gives the lexical form. It was changed to match spareval on purpose (ROADMAP).
-- `MIN`, `MAX` and `SAMPLE` return canonicalised terms, derived integer types as
-  `xsd:integer`; the specification returns the term itself.
-- The generator carve-outs of the differential tests that exist only because spareval
-  departed from the specification (DATATYPE of derived integers, subqueries and VALUES
-  under `GRAPH`, a filter moved into a subquery): re-enable them now that the oracle is
-  the specification.
+**Deviations kept from the spareval era, now fixed.** They sat in code the reference
+shares, so no differential test could see them, and W3C doesn't test them:
+- `STR` of a typed literal gave the canonical form (`STR("03"^^xsd:integer)` = `"3"`);
+  §17.4.2.5 gives the lexical form, which storage keeps (only canonical literals are
+  inlined). Now the lexical form; a cast to `xsd:string` stays canonical (XPath §19).
+- `MIN`, `MAX` and `SAMPLE` returned canonicalised terms, derived integer types as
+  `xsd:integer`; they now return the term itself (§18.5.1).
+
+**Every generator carve-out is gone.** The differential tests had stayed out of what
+spareval got wrong; with the reference as oracle they now cover these too:
+- `DATATYPE` of derived integers;
+- zero-length paths from variables bound to literals;
+- paths of every kind with both ends bound;
+- rows without statements (`BIND`, `VALUES`) under any graph name, including one outside
+  the dataset;
+- subqueries and `MINUS` under `GRAPH ?g`;
+- EXISTS with subqueries under `GRAPH ?g`;
+- `SUM(DISTINCT)` and an all-errors `COUNT(DISTINCT …)`.
+
+Only where SPARQL leaves the choice open are integer literals compared by value: which of
+equal values `MIN`/`MAX` give, and their order under `ORDER BY`. This found one more
+divergence, resolved in the native executor's favour: an update template may put quads
+in a graph named by a blank node (RDF 1.1 datasets allow it, the store holds such graphs,
+and `GRAPH ?g` finds them), and the reference now does the same.
 
 **Step 2 (`nrese-rdf`, `nrese-xsd`), first comparison with Oxigraph.** Both crates are
 written and tested on their own. `benches/oxigraph-comparison` runs them against
@@ -200,6 +214,13 @@ difference was one of these:
   - Decimal multiplication and division are exact to truncation, and every result the
     test could compute exactly matched it.
 
-Acceptance of IRIs agrees completely. Still to do in step 2: the throughput benchmarks
-(run in bulk at the end of the step), then the switch of `nrese-sparql`'s value code to
-`nrese-xsd` and the removal of `vendor/oxsdatatypes`.
+Acceptance of IRIs agrees completely.
+
+**`nrese-xsd` in use.** `nrese-sparql`, `nrese-store` and `nrese-shacl` use it;
+`oxsdatatypes` is in no manifest of the workspace and not in its lockfile, and the
+workspace's `[patch]` of it is gone. `vendor/oxsdatatypes` stays only for the bench
+harness, a workspace of its own that still uses `oxigraph` as an oracle store; it goes
+with step 5. With the stricter lexical forms, XPath string forms, exact decimals and
+XPath `ROUND`, the W3C suites and all 535 workspace tests pass unchanged.
+
+Still to do in step 2: the throughput benchmarks (in bulk, at the end of the step).
