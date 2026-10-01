@@ -36,6 +36,9 @@ pub struct StringTest<'a> {
     pub lang_strings: bool,
     /// The lexical form of literals of other datatypes.
     pub typed: bool,
+    /// Only language-tagged strings with this tag, as stored (what `LANG` returns); the
+    /// kinds above are then ignored. With an empty needle, the language alone decides.
+    pub language: Option<&'a str>,
 }
 
 /// Entries per parallel slice.
@@ -60,6 +63,15 @@ pub(crate) fn matching(
         .into_par_iter()
         .flat_map_iter(|slice| {
             let (first, last) = (slice * SLICE, ((slice + 1) * SLICE).min(entries));
+            // No text to find: every entry is tested (a language alone).
+            if test.needle.is_empty() {
+                return (first..last)
+                    .filter_map(|entry| {
+                        let key = &bytes[start_of(entry)..ends[entry] as usize];
+                        passes(key, first_index + entry as u64, 0, test)
+                    })
+                    .collect::<Vec<_>>();
+            }
             let (from, to) = (start_of(first), ends[last - 1] as usize);
             let mut found = Vec::new();
             let mut entry = first;
@@ -94,6 +106,15 @@ pub(crate) fn matching(
 /// counts (an end placement, or a first hit inside a language tag or datatype), so the
 /// text is searched again where the first hit doesn't decide.
 fn passes(key: &[u8], index: u64, hit: usize, test: &StringTest<'_>) -> Option<TermId> {
+    if let Some(language) = test.language {
+        let tag_end = 1 + memchr::memchr(0, key.get(1..)?)?;
+        if !matches!(key[0], b'L' | b'D') || &key[1..tag_end] != language.as_bytes() {
+            return None;
+        }
+        let text_start = after_separators(key, if key[0] == b'L' { 1 } else { 2 })?;
+        return placed(&key[text_start..], key.len(), text_start, hit, test)
+            .then(|| TermId::new(TermKind::LangString, index));
+    }
     let (kind, text_start) = match key[0] {
         b'I' if test.iris => (TermKind::Iri, 1),
         b'S' if test.strings => (TermKind::String, 1),
@@ -102,18 +123,28 @@ fn passes(key: &[u8], index: u64, hit: usize, test: &StringTest<'_>) -> Option<T
         b'T' if test.typed => (TermKind::TypedLiteral, after_separators(key, 1)?),
         _ => return None,
     };
-    let text = &key[text_start..];
+    placed(&key[text_start..], key.len(), text_start, hit, test).then(|| TermId::new(kind, index))
+}
+
+/// Whether the needle is where `test` wants it in `text`, the part of a key of `key_len`
+/// bytes from `text_start` on, given a first hit at `hit` in the key.
+fn placed(
+    text: &[u8],
+    key_len: usize,
+    text_start: usize,
+    hit: usize,
+    test: &StringTest<'_>,
+) -> bool {
     let needle = test.needle.as_bytes();
-    let ok = match test.placement {
+    match test.placement {
         Placement::Anywhere => {
-            (hit >= text_start && hit + needle.len() <= key.len())
+            (hit >= text_start && hit + needle.len() <= key_len)
                 || memchr::memmem::find(text, needle).is_some()
         }
         Placement::Start => text.starts_with(needle),
         Placement::End => text.ends_with(needle),
         Placement::Whole => text == needle,
-    };
-    ok.then(|| TermId::new(kind, index))
+    }
 }
 
 /// The position after the `n`th separator (a zero byte) of `key`.
@@ -194,6 +225,7 @@ mod tests {
                         strings,
                         lang_strings,
                         typed,
+                        language: None,
                     };
                     let mut expected: Vec<TermId> = ids
                         .iter()
@@ -233,6 +265,43 @@ mod tests {
                     assert_eq!(bounded, visible, "{test:?} below {limit}");
                 }
             }
+        }
+        // A language, alone or with text: only language-tagged strings with that tag.
+        for (language, needle) in [
+            ("en", ""),
+            ("sem", ""),
+            ("en", "Sem"),
+            ("sem", "web"),
+            ("de", ""),
+        ] {
+            let test = StringTest {
+                needle,
+                placement: Placement::Anywhere,
+                iris: true,
+                strings: true,
+                lang_strings: true,
+                typed: true,
+                language: Some(language),
+            };
+            let mut expected: Vec<TermId> = ids
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    dictionary
+                        .with_view(id, |view| {
+                            matches!(view, TermView::LangString { value, language: tag, .. }
+                                if tag == language && value.contains(needle))
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
+            expected.sort_unstable();
+            expected.dedup();
+            assert_eq!(
+                dictionary.matching_strings(&test, u64::MAX),
+                expected,
+                "{test:?}"
+            );
         }
     }
 }

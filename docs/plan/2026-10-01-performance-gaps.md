@@ -99,8 +99,21 @@ native build; medians of 3 runs. "Before" is the 27 September perf lab on the ma
 | Resident after open | 5.8 GB (peak 10 GB) | 13 MiB | A6: index runs, dictionary text and hash table stay in the file |
 | Resident after all queries | 5.5 GB | 2.8 GB | the pages the queries touched (file-backed, reclaimable) |
 
+YAGO tiny (16.5 M quads), same machine:
+
+| | 27 September | Now | What changed |
+|---|---:|---:|---|
+| q08 `COUNT(*)` of `rdfs:subClassOf*` | 11,432 ms | 135 ms | A4; most of what is left counts the graph's nodes (zero-length pairs) |
+| q02 `YEAR(?birth) = 1879`, `LANG` = en | 1,522 ms | 0.6 ms | A2 |
+| q06 `STRSTARTS` on alternate names | 95 ms | 13 ms | A1 |
+| q10 `LANG(?l) = "en"` on 6.8 M labels | 602 ms | 267 ms | A1 for languages: the passing terms from the dictionary, matched by a bitmap in one columnar scan |
+| Sum of query medians | 13,678 ms | 428 ms | |
+
 Done, with differential tests against the reference evaluator:
-- **A1** CONTAINS / STRSTARTS / STRENDS on a large pattern's object or STR of it.
+- **A1** CONTAINS / STRSTARTS / STRENDS on a large pattern's object or STR of it, and
+  `LANG(?v) = "tag"`, alone or with one of them. Only for patterns that will be scanned:
+  one many times larger than the smallest pattern is probed instead, and the pass would
+  be wasted. Many passing terms are matched by a bitmap in one scan, not a seek each.
 - **A2** `YEAR(?d) op c` as id ranges of inline dates and dateTimes (YAGO q02's filter).
 - **A3** group counts and distinct values by a group walk instead of a search per group.
 - **A4** `COUNT` of open `p*`/`p+` closures from the closure size per strongly connected
@@ -116,6 +129,8 @@ Still open:
   and below OPTIONAL and projections; other operators still evaluate whole.
 - Columnar scans answer one tombstone-free run; matches in both stacks (asserted and
   inferred) or several runs still go quad by quad: merge them column-wise next.
+- YAGO q08: keep the node count of each graph in the statistics (it only changes with
+  commits), so `COUNT` over `p*` needs only the closure.
 - DBpedia q05 (21 ms): populations are `xsd:nonNegativeInteger`, dictionary literals, so
   the numeric range hint can't narrow them. An inline kind for the integer-derived
   datatypes (value first, datatype code last, so ids still sort by value) would; it is a

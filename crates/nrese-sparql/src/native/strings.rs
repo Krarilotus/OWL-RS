@@ -12,10 +12,13 @@
 //! |---|---|
 //! | `CONTAINS/STRSTARTS/STRENDS(?v, "text")` | simple and language-tagged literals with the text (others are errors) |
 //! | the same on `STR(?v)` | IRIs and literals of every kind with the text, plus every inline literal (numbers and dates: their text isn't in the dictionary) |
+//! | `LANG(?v) = "tag"` | language-tagged strings with that tag; with one of the above on `?v`, those of them with the text |
 //!
 //! The pass costs the dictionary's size, so it runs only for patterns with at least one
 //! row per [`DICTIONARY_BYTES_PER_ROW`] bytes of dictionary text; for smaller ones the
-//! per-row test is cheaper. It is dropped where too many terms pass to prune much.
+//! per-row test is cheaper. It is dropped where more terms pass than the pattern has rows.
+//! Many passing terms are matched by a scan of the whole pattern against a bitmap of them
+//! rather than a seek each (`Context::scan_ranges`).
 
 use nrese_engine::{Placement, Snapshot, StringTest, TermId, TermKind};
 use nrese_rdf::Variable;
@@ -26,17 +29,72 @@ use nrese_sparql_syntax::algebra::{Expression, Function};
 /// cache miss against memory bandwidth, the pass running on all cores).
 pub(crate) const DICTIONARY_BYTES_PER_ROW: u64 = 512;
 
-/// A string test on one variable, from a filter conjunct.
+/// A string test on one variable, from filter conjuncts.
+#[derive(Clone, Copy)]
 pub(crate) struct Condition<'e> {
     pub(crate) variable: &'e Variable,
+    /// Empty: no text test (a language alone).
     needle: &'e str,
     placement: Placement,
     /// The test is on `STR(?v)`: every kind of term has a text.
     of_str: bool,
+    /// `LANG(?v) = "tag"`.
+    language: Option<&'e str>,
+}
+
+/// The string tests `conjuncts` make on `variable`, as one condition: a text test and a
+/// language, each the first found.
+pub(crate) fn combined<'e>(
+    conjuncts: impl IntoIterator<Item = &'e Expression>,
+    variable: &Variable,
+) -> Option<Condition<'e>> {
+    let mut result: Option<Condition<'e>> = None;
+    for condition in conjuncts.into_iter().filter_map(condition) {
+        if condition.variable != variable {
+            continue;
+        }
+        result = Some(match result {
+            None => condition,
+            Some(mut found) => {
+                if found.needle.is_empty() && !condition.needle.is_empty() {
+                    found.needle = condition.needle;
+                    found.placement = condition.placement;
+                    found.of_str = condition.of_str;
+                }
+                found.language = found.language.or(condition.language);
+                found
+            }
+        });
+    }
+    result
 }
 
 /// The string test `conjunct` makes on a variable, if it is one of the shapes above.
 pub(crate) fn condition(conjunct: &Expression) -> Option<Condition<'_>> {
+    if let Expression::Equal(a, b) = conjunct {
+        let (call, tag) = match (&**a, &**b) {
+            (call @ Expression::FunctionCall(..), Expression::Literal(tag))
+            | (Expression::Literal(tag), call @ Expression::FunctionCall(..)) => (call, tag),
+            _ => return None,
+        };
+        let Expression::FunctionCall(Function::Lang, args) = call else {
+            return None;
+        };
+        let [Expression::Variable(variable)] = args.as_slice() else {
+            return None;
+        };
+        // LANG returns a simple literal; equality with another kind is false or an error.
+        if tag.datatype() != xsd::STRING || tag.value().is_empty() {
+            return None;
+        }
+        return Some(Condition {
+            variable,
+            needle: "",
+            placement: Placement::Anywhere,
+            of_str: false,
+            language: Some(tag.value()),
+        });
+    }
     let Expression::FunctionCall(function, args) = conjunct else {
         return None;
     };
@@ -66,6 +124,7 @@ pub(crate) fn condition(conjunct: &Expression) -> Option<Condition<'_>> {
         needle: needle.value(),
         placement,
         of_str,
+        language: None,
     })
 }
 
@@ -83,10 +142,10 @@ pub(crate) fn ranges(
         strings: true,
         lang_strings: true,
         typed: condition.of_str,
+        language: condition.language,
     };
     let ids = snapshot.matching_strings(&test);
-    // Each id is a seek in the scan: past a quarter of the rows, scanning them is cheaper.
-    if ids.len() as u64 > rows / 4 {
+    if ids.len() as u64 > rows {
         return None;
     }
     let mut ranges: Vec<(TermId, TermId)> = Vec::with_capacity(ids.len());
@@ -96,7 +155,8 @@ pub(crate) fn ranges(
             _ => ranges.push((id, id)),
         }
     }
-    if condition.of_str {
+    // A language admits language-tagged strings only.
+    if condition.of_str && condition.language.is_none() {
         ranges.extend(
             [
                 TermKind::Integer,
