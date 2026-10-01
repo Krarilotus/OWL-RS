@@ -1,7 +1,14 @@
-/target/
+# Build output, at any depth (the vendored crates and the bench workspaces build their own)
+target/
 /target-*/
-/benches/**/target/
 **/*.rs.bk
+# Profiler output (perf, samply, cargo-flamegraph, coverage)
+perf.data*
+*.profraw
+flamegraph*.svg
+# Patch leftovers
+*.orig
+*.rej
 
 /.idea/
 /.vscode/
@@ -45,7 +52,9 @@ pnpm-debug.log*
 # Suite results (licensed systems write there too); the suite's Python caches
 /benches/suite/results/
 /benches/oracle/results/
-/benches/suite/suitekit/__pycache__/
+# Python caches, anywhere
+__pycache__/
+*.py[cod]
 
 # Lockfiles of the vendored crates, made when their own tests run
 /vendor/*/Cargo.lock
