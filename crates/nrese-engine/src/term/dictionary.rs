@@ -500,14 +500,13 @@ impl Dictionary {
             };
         let order = self.order.read();
         let sorted: Vec<u32>;
-        let rest: Box<dyn Iterator<Item = u64>> = if order.first == first
-            && order.covered >= len.max(first)
-        {
-            Box::new(order.order.iter().copied().filter(|&i| i < len))
-        } else {
-            sorted = super::order::sorted(first.min(len)..len, &key);
-            Box::new(sorted.iter().map(|&i| u64::from(i)))
-        };
+        let rest: Box<dyn Iterator<Item = u64>> =
+            if order.first == first && order.covered >= len.max(first) {
+                Box::new(order.order.iter().copied().filter(|&i| i < len))
+            } else {
+                sorted = super::order::sorted(first.min(len)..len, &key);
+                Box::new(sorted.iter().map(|&i| u64::from(i)))
+            };
         // Merged straight from both orders: no copies of them.
         let capacity = base.len() + len.saturating_sub(first) as usize;
         let mut base = base
@@ -646,9 +645,9 @@ impl Dictionary {
         // 64 bytes per quad for 32 (twice the memory of every batch a bulk load holds).
         let mut quads = Vec::with_capacity(slots.len());
         quads.extend(
-            slots
-                .iter()
-                .map(|&[s, p, o, g]| EncodedQuad::new(resolve(s), resolve(p), resolve(o), resolve(g))),
+            slots.iter().map(|&[s, p, o, g]| {
+                EncodedQuad::new(resolve(s), resolve(p), resolve(o), resolve(g))
+            }),
         );
         quads
     }
