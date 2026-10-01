@@ -1,16 +1,13 @@
 //! In-memory graphs and datasets: sets of triples and quads in a deterministic order,
 //! with blank node canonicalisation to compare them up to isomorphism.
 
+use std::collections::BTreeSet;
 use std::collections::btree_set;
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::ops::Bound;
 
 use crate::term::{
-    BlankNode, GraphName, GraphNameRef, NamedNode, NamedNodeRef, NamedOrBlankNode,
-    NamedOrBlankNodeRef, Term, TermRef,
+    GraphName, GraphNameRef, NamedNode, NamedNodeRef, NamedOrBlankNodeRef, Term, TermRef,
 };
 use crate::triple::{Quad, QuadRef, Triple, TripleRef};
 
@@ -125,7 +122,10 @@ impl Graph {
             .into_iter()
             .map(|t| t.in_graph(GraphName::DefaultGraph))
             .collect();
-        self.triples = canonical(quads).into_iter().map(Triple::from).collect();
+        self.triples = crate::canonical::canonical(quads)
+            .into_iter()
+            .map(Triple::from)
+            .collect();
     }
 }
 
@@ -236,13 +236,11 @@ impl Dataset {
             .map(TripleRef::from)
     }
 
-    /// Renames the blank nodes so that isomorphic datasets become equal: blank nodes are
-    /// told apart by hashing their neighbourhoods until the partition is stable (Hogan,
-    /// "Canonical Forms for Isomorphic and Equivalent RDF Graphs", 2017); a tie is broken
-    /// by trying each node of the smallest tied class and keeping the least result. The
-    /// names depend on the hash function, so they are stable only within one build.
+    /// Renames the blank nodes so that isomorphic datasets become equal (see
+    /// [`crate::canonical`]: components, colour refinement, individualisation with twins
+    /// pruned). The names are stable only within one build.
     pub fn canonicalize(&mut self) {
-        self.quads = canonical(std::mem::take(&mut self.quads));
+        self.quads = crate::canonical::canonical(std::mem::take(&mut self.quads));
     }
 }
 
@@ -300,176 +298,11 @@ impl fmt::Display for Dataset {
     }
 }
 
-// ---------------------------------------------------------------------------------------
-// Canonicalisation
-
-/// A quad position: a blank node (by index) or another term (by hash).
-#[derive(Clone, Copy)]
-enum Slot {
-    Blank(usize),
-    Fixed(u64),
-}
-
-struct Canon {
-    quads: Vec<Quad>,
-    /// Per quad its subject, object and graph name.
-    slots: Vec<[Slot; 3]>,
-    /// Per quad the hash of its predicate.
-    predicates: Vec<u64>,
-    /// Per blank node the quads it is in.
-    incident: Vec<Vec<usize>>,
-    blank_nodes: Vec<BlankNode>,
-}
-
-fn hash_of(value: &impl Hash) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn distinct(hashes: &[u64]) -> usize {
-    hashes.iter().collect::<BTreeSet<_>>().len()
-}
-
-fn canonical(quads: BTreeSet<Quad>) -> BTreeSet<Quad> {
-    let mut index: HashMap<BlankNode, usize> = HashMap::new();
-    let blank = |node: &BlankNode, index: &mut HashMap<BlankNode, usize>| {
-        let next = index.len();
-        *index.entry(node.clone()).or_insert(next)
-    };
-    let mut slots = Vec::with_capacity(quads.len());
-    let mut predicates = Vec::with_capacity(quads.len());
-    for quad in &quads {
-        let subject = match &quad.subject {
-            NamedOrBlankNode::BlankNode(b) => Slot::Blank(blank(b, &mut index)),
-            other => Slot::Fixed(hash_of(other)),
-        };
-        let object = match &quad.object {
-            Term::BlankNode(b) => Slot::Blank(blank(b, &mut index)),
-            other => Slot::Fixed(hash_of(other)),
-        };
-        let graph = match &quad.graph_name {
-            GraphName::BlankNode(b) => Slot::Blank(blank(b, &mut index)),
-            other => Slot::Fixed(hash_of(other)),
-        };
-        slots.push([subject, object, graph]);
-        predicates.push(hash_of(&quad.predicate));
-    }
-    if index.is_empty() {
-        return quads;
-    }
-    let mut blank_nodes = vec![BlankNode::new_unchecked(""); index.len()];
-    for (node, i) in index {
-        blank_nodes[i] = node;
-    }
-    let mut incident = vec![Vec::new(); blank_nodes.len()];
-    for (q, quad_slots) in slots.iter().enumerate() {
-        for slot in quad_slots {
-            if let Slot::Blank(b) = *slot
-                && incident[b].last() != Some(&q)
-            {
-                incident[b].push(q);
-            }
-        }
-    }
-    let canon = Canon {
-        quads: quads.into_iter().collect(),
-        slots,
-        predicates,
-        incident,
-        blank_nodes,
-    };
-    let hashes = canon.refine(vec![0; canon.blank_nodes.len()]);
-    canon.distinguish(hashes)
-}
-
-impl Canon {
-    /// Rehashes each blank node with its neighbourhood until the partition is stable.
-    fn refine(&self, mut hashes: Vec<u64>) -> Vec<u64> {
-        let mut classes = distinct(&hashes);
-        loop {
-            let next: Vec<u64> = (0..hashes.len())
-                .map(|b| {
-                    let mut signatures: Vec<u64> = self.incident[b]
-                        .iter()
-                        .map(|&q| {
-                            let positions = self.slots[q].map(|slot| match slot {
-                                Slot::Blank(other) if other == b => (0, 0),
-                                Slot::Blank(other) => (1, hashes[other]),
-                                Slot::Fixed(h) => (2, h),
-                            });
-                            hash_of(&(self.predicates[q], positions))
-                        })
-                        .collect();
-                    signatures.sort_unstable();
-                    hash_of(&(hashes[b], signatures))
-                })
-                .collect();
-            let next_classes = distinct(&next);
-            hashes = next;
-            if next_classes == classes {
-                return hashes;
-            }
-            classes = next_classes;
-        }
-    }
-
-    fn distinguish(&self, hashes: Vec<u64>) -> BTreeSet<Quad> {
-        let mut classes: HashMap<u64, Vec<usize>> = HashMap::new();
-        for (b, &h) in hashes.iter().enumerate() {
-            classes.entry(h).or_default().push(b);
-        }
-        let tied = classes
-            .into_iter()
-            .filter(|(_, members)| members.len() > 1)
-            .min_by_key(|(h, members)| (members.len(), *h));
-        let Some((_, members)) = tied else {
-            return self.relabel(&hashes);
-        };
-        members
-            .into_iter()
-            .map(|b| {
-                let mut split = hashes.clone();
-                split[b] = hash_of(&(split[b], "distinguished"));
-                self.distinguish(self.refine(split))
-            })
-            .min()
-            .expect("a tied class has members")
-    }
-
-    fn relabel(&self, hashes: &[u64]) -> BTreeSet<Quad> {
-        let label: HashMap<&BlankNode, BlankNode> = self
-            .blank_nodes
-            .iter()
-            .zip(hashes)
-            .map(|(node, h)| (node, BlankNode::new_unchecked(format!("c{h:016x}"))))
-            .collect();
-        let rename = |node: &BlankNode| label[node].clone();
-        self.quads
-            .iter()
-            .map(|quad| Quad {
-                subject: match &quad.subject {
-                    NamedOrBlankNode::BlankNode(b) => rename(b).into(),
-                    other => other.clone(),
-                },
-                predicate: quad.predicate.clone(),
-                object: match &quad.object {
-                    Term::BlankNode(b) => rename(b).into(),
-                    other => other.clone(),
-                },
-                graph_name: match &quad.graph_name {
-                    GraphName::BlankNode(b) => rename(b).into(),
-                    other => other.clone(),
-                },
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::term::Literal;
+    use crate::term::{BlankNode, NamedOrBlankNode};
 
     fn n(iri: &str) -> NamedNode {
         NamedNode::new_unchecked(format!("http://e/{iri}"))

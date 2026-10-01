@@ -1,4 +1,4 @@
-use std::fmt::{self, Write};
+use std::fmt;
 use std::str::FromStr;
 
 use crate::{Boolean, Double, Float, Integer, ParseError, RangeError};
@@ -67,12 +67,7 @@ impl Decimal {
         if let Some(shifted) = a.checked_mul(SCALE) {
             return shifted.checked_div(b).map(Self);
         }
-        let numerator = wide::mul(a.unsigned_abs(), SCALE as u128);
-        let divisor = b.unsigned_abs();
-        let magnitude = match u64::try_from(divisor) {
-            Ok(small) => wide::div_by_u64(numerator, small)?,
-            Err(_) => wide::div(numerator, divisor)?,
-        };
+        let magnitude = divide_scaled(a.unsigned_abs(), b.unsigned_abs())?;
         signed(magnitude, (a < 0) != (b < 0)).map(Self)
     }
 
@@ -150,15 +145,108 @@ impl Decimal {
         self.to_string()
     }
 
-    /// The value as `mantissa × 10^-exponent` with no trailing zeros in the mantissa.
-    fn reduced(self) -> (i128, u32) {
-        let (mut mantissa, mut exponent) = (self.0, DIGITS);
-        while exponent > 0 && mantissa % 10 == 0 {
-            mantissa /= 10;
-            exponent -= 1;
-        }
-        (mantissa, exponent)
+    /// The sign, the integer part, and the 18 fractional digits: one 128-bit division,
+    /// after which the fraction is 64-bit arithmetic.
+    fn parts(self) -> (bool, u128, u64) {
+        let magnitude = self.0.unsigned_abs();
+        let scale = SCALE as u128;
+        (self.0 < 0, magnitude / scale, (magnitude % scale) as u64)
     }
+
+    /// The decimal's string form (as `Display` writes it), into `buffer`.
+    fn write_ascii(self, buffer: &mut [u8; 48]) -> &str {
+        let (negative, whole, mut fraction) = self.parts();
+        let mut at = buffer.len();
+        let mut put = |byte: u8| {
+            at -= 1;
+            buffer[at] = byte;
+        };
+        if fraction != 0 {
+            let mut width = DIGITS;
+            while fraction % 10 == 0 {
+                fraction /= 10;
+                width -= 1;
+            }
+            for _ in 0..width {
+                put(b'0' + (fraction % 10) as u8);
+                fraction /= 10;
+            }
+            put(b'.');
+        }
+        // The integer part is below 2 × 10²⁰: at most two 64-bit halves of 19 digits.
+        const E19: u128 = 10_000_000_000_000_000_000;
+        let (high, mut low) = ((whole / E19) as u64, (whole % E19) as u64);
+        let digits_of_low = if high == 0 { 1 } else { 19 };
+        let mut written = 0;
+        while low != 0 || written < digits_of_low {
+            put(b'0' + (low % 10) as u8);
+            low /= 10;
+            written += 1;
+        }
+        let mut high = high;
+        while high != 0 {
+            put(b'0' + (high % 10) as u8);
+            high /= 10;
+        }
+        if negative && (whole != 0 || self.0 != 0) {
+            put(b'-');
+        }
+        std::str::from_utf8(&buffer[at..]).unwrap_or("0")
+    }
+}
+
+/// 10^k for k in 0..=38.
+const POW10: [u128; 39] = {
+    let mut table = [1_u128; 39];
+    let mut k = 1;
+    while k < 39 {
+        table[k] = table[k - 1] * 10;
+        k += 1;
+    }
+    table
+};
+
+/// `u128::MAX / 10^k`: the largest value that may be multiplied by 10^k.
+const MULTIPLIABLE: [u128; 39] = {
+    let mut table = [0_u128; 39];
+    let mut k = 0;
+    while k < 39 {
+        table[k] = u128::MAX / POW10[k];
+        k += 1;
+    }
+    table
+};
+
+/// `⌊a × 10¹⁸ / b⌋` for `b > 0`, if it fits in 128 bits: the integer part, then the
+/// fraction digits by long division in decimal chunks, each as large as the remainder
+/// allows without overflow (two or three native divisions in all).
+fn divide_scaled(a: u128, b: u128) -> Option<u128> {
+    let mut result = (a / b).checked_mul(SCALE as u128)?;
+    let mut remainder = a % b;
+    let mut digits = DIGITS;
+    let mut fraction: u128 = 0;
+    while digits > 0 && remainder != 0 {
+        // The largest k ≤ digits with remainder × 10^k < 2^128.
+        let mut k = digits as usize;
+        while k > 0 && remainder > MULTIPLIABLE[k] {
+            k -= 1;
+        }
+        if k == 0 {
+            // The remainder is too close to 2^128 for a decimal step: shift and subtract.
+            let numerator = wide::mul(a, SCALE as u128);
+            return match u64::try_from(b) {
+                Ok(small) => wide::div_by_u64(numerator, small),
+                Err(_) => wide::div(numerator, b),
+            };
+        }
+        let shifted = remainder * POW10[k];
+        fraction = fraction * POW10[k] + shifted / b;
+        remainder = shifted % b;
+        digits -= k as u32;
+    }
+    fraction *= POW10[digits as usize];
+    result = result.checked_add(fraction)?;
+    Some(result)
 }
 
 /// `magnitude` with a sign, if it fits.
@@ -297,22 +385,36 @@ impl TryFrom<Float> for Decimal {
 impl From<Decimal> for Double {
     #[allow(clippy::cast_precision_loss)]
     fn from(value: Decimal) -> Self {
-        let (mantissa, exponent) = value.reduced();
-        if mantissa.unsigned_abs() <= 1 << 53 && exponent <= 22 {
-            return Double::from(mantissa as f64 / 10_f64.powi(exponent as i32));
+        let (negative, whole, fraction) = value.parts();
+        if fraction == 0 && whole <= 1 << 53 {
+            let v = whole as f64;
+            return Double::from(if negative { -v } else { v });
         }
-        Double::from(value.to_string().parse::<f64>().unwrap_or(f64::NAN))
+        let mut buffer = [0; 48];
+        Double::from(
+            value
+                .write_ascii(&mut buffer)
+                .parse::<f64>()
+                .unwrap_or(f64::NAN),
+        )
     }
 }
 
 impl From<Decimal> for Float {
     #[allow(clippy::cast_precision_loss)]
     fn from(value: Decimal) -> Self {
-        let (mantissa, exponent) = value.reduced();
-        if mantissa.unsigned_abs() <= 1 << 24 && exponent <= 10 {
-            return Float::from(mantissa as f32 / 10_f32.powi(exponent as i32));
+        let (negative, whole, fraction) = value.parts();
+        if fraction == 0 && whole <= 1 << 24 {
+            let v = whole as f32;
+            return Float::from(if negative { -v } else { v });
         }
-        Float::from(value.to_string().parse::<f32>().unwrap_or(f32::NAN))
+        let mut buffer = [0; 48];
+        Float::from(
+            value
+                .write_ascii(&mut buffer)
+                .parse::<f32>()
+                .unwrap_or(f32::NAN),
+        )
     }
 }
 
@@ -366,23 +468,8 @@ impl FromStr for Decimal {
 /// for an integer value, otherwise no trailing zeros (`1`, `-0.5`, `12.25`).
 impl fmt::Display for Decimal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let magnitude = self.0.unsigned_abs();
-        let whole = magnitude / SCALE as u128;
-        let mut fraction = magnitude % SCALE as u128;
-        let mut out = String::with_capacity(42);
-        if self.0 < 0 {
-            out.push('-');
-        }
-        write!(out, "{whole}")?;
-        if fraction != 0 {
-            let mut width = DIGITS as usize;
-            while fraction.is_multiple_of(10) {
-                fraction /= 10;
-                width -= 1;
-            }
-            write!(out, ".{fraction:0width$}")?;
-        }
-        f.pad(&out)
+        let mut buffer = [0; 48];
+        f.pad(self.write_ascii(&mut buffer))
     }
 }
 
