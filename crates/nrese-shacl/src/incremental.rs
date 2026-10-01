@@ -40,7 +40,7 @@ const RDFS_SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf
 /// introduce in `data`: validation of the focus nodes the change can affect, in `after`,
 /// minus the same validation in `before`. Both views must share one dictionary (a
 /// transaction and its base snapshot do), and `shapes` must be compiled from it.
-pub fn validate_changes<A: ReadView, B: ReadView>(
+pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     before: &A,
     after: &B,
     shapes: &Shapes,
@@ -84,21 +84,22 @@ pub fn validate_changes<A: ReadView, B: ReadView>(
                     .collect::<Vec<_>>(),
                 None => validator_focus,
             };
-            let mut after_results = Vec::new();
-            for node in focus(validator_after.focus_nodes(&shapes.shapes[shape])) {
-                validator_after.validate_node(shape, node, &mut after_results, &mut Vec::new());
-            }
+            let work = |nodes: Vec<TermId>| -> Vec<(ShapeRef, TermId)> {
+                nodes.into_iter().map(|node| (shape, node)).collect()
+            };
+            let after_results = validator_after.validate_all(&work(focus(
+                validator_after.focus_nodes(&shapes.shapes[shape]),
+            )));
             if after_results.is_empty() {
                 continue;
             }
-            let mut before_results = Vec::new();
-            for node in focus(validator_before.focus_nodes(&shapes.shapes[shape])) {
-                validator_before.validate_node(shape, node, &mut before_results, &mut Vec::new());
-            }
+            let before_results = validator_before.validate_all(&work(focus(
+                validator_before.focus_nodes(&shapes.shapes[shape]),
+            )));
             let before: BTreeSet<RawResult> = before_results.into_iter().collect();
             introduced.extend(after_results.into_iter().filter(|r| !before.contains(r)));
         }
-        failures.extend(validator_after.failures.into_inner());
+        failures.extend(validator_after.into_failures());
     }
     let raw: Vec<RawResult> = introduced.into_iter().collect();
     decode(after, shapes, &raw, failures)

@@ -36,26 +36,31 @@ pub(crate) struct RawResult {
 }
 
 /// Validates the data in `data` against every targeted shape: the results, and the
-/// failures (SPARQL-based constraints that couldn't be evaluated).
-pub(crate) fn validate_raw<V: ReadView>(
+/// failures (SPARQL-based constraints that couldn't be evaluated). Focus nodes are
+/// validated in parallel; the results keep the sequential order.
+pub(crate) fn validate_raw<V: ReadView + Sync>(
     view: &V,
     shapes: &Shapes,
     data: Selection,
 ) -> (Vec<RawResult>, Vec<String>) {
     let validator = Validator::new(view, shapes, data);
-    let mut results = Vec::new();
-    for shape in shapes.targeted() {
-        for focus in validator.focus_nodes(&shapes.shapes[shape]) {
-            validator.validate_node(shape, focus, &mut results, &mut Vec::new());
-        }
-    }
-    (results, validator.failures.into_inner())
+    let work: Vec<(ShapeRef, TermId)> = shapes
+        .targeted()
+        .flat_map(|shape| {
+            validator
+                .focus_nodes(&shapes.shapes[shape])
+                .into_iter()
+                .map(move |focus| (shape, focus))
+        })
+        .collect();
+    let results = validator.validate_all(&work);
+    (results, validator.into_failures())
 }
 
 pub(crate) struct Validator<'a, V: ReadView> {
     graph: GraphView<'a, V>,
     shapes: &'a Shapes,
-    pub(crate) failures: std::cell::RefCell<Vec<String>>,
+    failures: std::sync::Mutex<Vec<String>>,
     rdf_type: Option<TermId>,
     /// Each class the shapes name, with its subclasses (itself included).
     classes: HashMap<TermId, BTreeSet<TermId>>,
@@ -78,7 +83,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
             rdf_type: graph.iri(RDF_TYPE),
             graph,
             shapes,
-            failures: std::cell::RefCell::default(),
+            failures: std::sync::Mutex::default(),
             classes: HashMap::new(),
         };
         let sub_class_of = graph.iri(RDFS_SUB_CLASS_OF);
@@ -102,6 +107,30 @@ impl<'a, V: ReadView> Validator<'a, V> {
             }
         }
         validator
+    }
+
+    /// The failures recorded while validating.
+    pub(crate) fn into_failures(self) -> Vec<String> {
+        self.failures
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The results of validating each `(shape, focus node)` of `work`, in that order: in
+    /// parallel, a few dozen nodes per task.
+    pub(crate) fn validate_all(&self, work: &[(ShapeRef, TermId)]) -> Vec<RawResult>
+    where
+        V: Sync,
+    {
+        use rayon::prelude::*;
+        work.par_iter()
+            .with_min_len(32)
+            .flat_map_iter(|&(shape, focus)| {
+                let mut results = Vec::new();
+                self.validate_node(shape, focus, &mut results, &mut Vec::new());
+                results
+            })
+            .collect()
     }
 
     pub(crate) fn focus_nodes(&self, shape: &Shape) -> Vec<TermId> {
@@ -461,7 +490,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 .decode(focus)
                 .map_or_else(String::new, |term| term.to_string());
             self.failures
-                .borrow_mut()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(format!("a SPARQL constraint at focus node {at}: {problem}"));
         };
         let outcome = sparql::run(

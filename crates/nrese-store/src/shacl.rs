@@ -136,7 +136,7 @@ fn shapes_error(errors: Vec<ShapeError>) -> StoreError {
 
 /// Validates `view` against the shapes in the graph `shapes` (none, if the graph holds
 /// nothing), leaving `also_excluded` out of the data as well.
-fn validate_view<V: ReadView>(
+fn validate_view<V: ReadView + Sync>(
     view: &V,
     shapes: Option<TermId>,
     also_excluded: Option<TermId>,

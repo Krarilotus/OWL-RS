@@ -984,6 +984,7 @@ dependencies = [
  "nrese-sparql",
  "nrese-sparql-syntax",
  "nrese-xsd",
+ "rayon",
  "regex",
 ]
 
