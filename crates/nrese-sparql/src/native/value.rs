@@ -70,6 +70,10 @@ impl Value {
 
     fn of_literal(literal: &Literal) -> Self {
         if let Some(language) = literal.language() {
+            // A base direction (RDF 1.2): equal only to the same term.
+            if literal.direction().is_some() {
+                return Self::Other(literal.clone());
+            }
             return Self::LangString(literal.value().to_owned(), language.to_owned());
         }
         let datatype = literal.datatype();
@@ -224,6 +228,15 @@ pub fn equals(a: &Value, b: &Value) -> Option<bool> {
             Some(x.duration() == y.duration())
         }
         (Value::Other(x), Value::Other(y)) if x == y => Some(true),
+        // Triple terms (SPARQL 1.2): the same subject and predicate, and objects equal as
+        // values (`<<( :a :b 123 )>> = <<( :a :b 123.0 )>>`).
+        (Value::Triple(x), Value::Triple(y)) => {
+            if x.subject != y.subject || x.predicate != y.predicate {
+                return Some(false);
+            }
+            equals(&Value::of(&x.object), &Value::of(&y.object))
+        }
+        (Value::Triple(_), _) | (_, Value::Triple(_)) => Some(false),
         // Different kinds of term (IRI vs literal, …) are simply unequal; two literals of
         // types we can't compare are a type error unless identical.
         (Value::Iri(_) | Value::Blank(_), _) | (_, Value::Iri(_) | Value::Blank(_)) => Some(false),
@@ -297,11 +310,19 @@ pub fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
                     else {
                         unreachable!("canonical keeps literals literals")
                     };
-                    (x.value(), x.datatype(), x.language()).cmp(&(
-                        y.value(),
-                        y.datatype(),
-                        y.language(),
-                    ))
+                    // The base direction last, so strings differing only in it don't tie.
+                    (
+                        x.value(),
+                        x.datatype(),
+                        x.language(),
+                        x.direction().map(|d| d.as_str()),
+                    )
+                        .cmp(&(
+                            y.value(),
+                            y.datatype(),
+                            y.language(),
+                            y.direction().map(|d| d.as_str()),
+                        ))
                 }
             }
         }

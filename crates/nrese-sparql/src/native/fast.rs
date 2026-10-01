@@ -312,7 +312,7 @@ fn on_text(id: TermId, str: bool, snapshot: &Snapshot, test: impl FnOnce(&str) -
             (TermView::Iri(text), true) => Tri::of(test(text)),
             // STR of a typed literal is its lexical form (§17.4.2.5).
             (TermView::Typed { value, .. }, true) => Tri::of(test(value)),
-            (TermView::BlankNode(_) | TermView::Triple(_), _) | (_, false) => Tri::Error,
+            (TermView::BlankNode(_) | TermView::Triple, _) | (_, false) => Tri::Error,
         })
         .unwrap_or(Tri::Unknown)
 }

@@ -35,6 +35,7 @@ mod sets;
 mod sideways;
 mod spatial;
 mod substitute;
+mod triple_terms;
 pub(crate) mod value;
 mod wcoj;
 
@@ -63,7 +64,7 @@ use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
 };
-use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
+use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_xsd::{Decimal, Double, Float, Integer};
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -251,6 +252,13 @@ pub(crate) fn delete_insert(
     options: &QueryOptions,
 ) -> Result<QuadChanges, QueryEvaluationError> {
     use nrese_sparql_syntax::term::{GraphNamePattern, GroundTermPattern};
+    let rewritten;
+    let pattern = if triple_terms::has_open(pattern) {
+        rewritten = triple_terms::rewrite(pattern);
+        &rewritten
+    } else {
+        pattern
+    };
     if let Some(what) = unsupported_part(pattern) {
         return Err(QueryEvaluationError::Unsupported(what));
     }
@@ -298,22 +306,7 @@ pub(crate) fn delete_insert(
             deletes.extend(filled);
         }
         let mut fresh: HashMap<String, nrese_rdf::BlankNode> = HashMap::new();
-        let mut term = |t: &TermPattern| -> Option<Term> {
-            match t {
-                TermPattern::NamedNode(n) => Some(n.clone().into()),
-                TermPattern::Literal(l) => Some(l.clone().into()),
-                TermPattern::BlankNode(b) => Some(
-                    fresh
-                        .entry(b.as_str().to_owned())
-                        .or_default()
-                        .clone()
-                        .into(),
-                ),
-                TermPattern::Variable(v) => value(v),
-                #[allow(unreachable_patterns)]
-                _ => None,
-            }
-        };
+        let mut term = |t: &TermPattern| fill_template(t, &value, &mut fresh);
         for quad in insert {
             let Some(s) = term(&quad.subject).and_then(subject) else {
                 continue;
@@ -346,17 +339,6 @@ fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
 ) -> Result<(GraphPattern, Form<'q>), QueryEvaluationError> {
-    if !query_supported(query) {
-        let pattern = match query {
-            Query::Select { pattern, .. }
-            | Query::Ask { pattern, .. }
-            | Query::Construct { pattern, .. }
-            | Query::Describe { pattern, .. } => pattern,
-        };
-        return Err(QueryEvaluationError::Unsupported(
-            unsupported_part(pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
-        ));
-    }
     let (pattern, form) = match query {
         Query::Select { pattern, .. } => (pattern, Form::Select),
         Query::Ask { pattern, .. } => (pattern, Form::Ask),
@@ -365,6 +347,23 @@ fn native_pattern<'q>(
         } => (pattern, Form::Construct(template)),
         Query::Describe { pattern, .. } => (pattern, Form::Describe),
     };
+    // SPARQL 1.2 triple-term patterns with variables, as plain algebra.
+    let rewritten;
+    let pattern = if triple_terms::has_open(pattern) {
+        rewritten = triple_terms::rewrite(pattern);
+        &rewritten
+    } else {
+        pattern
+    };
+    let template_supported = match &form {
+        Form::Construct(template) => template.iter().all(supported_template_triple),
+        _ => true,
+    };
+    if !supported(pattern) || !template_supported {
+        return Err(QueryEvaluationError::Unsupported(
+            unsupported_part(pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
+        ));
+    }
     let pattern = if options.as_written {
         pattern.clone()
     } else {
@@ -385,8 +384,47 @@ fn unsupported_part(pattern: &GraphPattern) -> Option<String> {
     ))
 }
 
+/// A CONSTRUCT template's term against the solution columns; template blank nodes are
+/// numbered by label (`labels`).
+fn resolve_template(
+    term: &TermPattern,
+    solutions: &Solutions,
+    labels: &mut Vec<String>,
+) -> TemplateTerm {
+    match term {
+        TermPattern::NamedNode(n) => TemplateTerm::Constant(n.clone().into()),
+        TermPattern::Literal(l) => TemplateTerm::Constant(l.clone().into()),
+        TermPattern::BlankNode(b) => {
+            let label = b.as_str().to_owned();
+            let index = labels.iter().position(|l| *l == label).unwrap_or_else(|| {
+                labels.push(label);
+                labels.len() - 1
+            });
+            TemplateTerm::Fresh(index)
+        }
+        TermPattern::Variable(v) => solutions
+            .column(v)
+            .map_or(TemplateTerm::Unbound, TemplateTerm::Column),
+        TermPattern::Triple(t) => {
+            let predicate = match &t.predicate {
+                NamedNodePattern::NamedNode(n) => TemplateTerm::Constant(n.clone().into()),
+                NamedNodePattern::Variable(v) => solutions
+                    .column(v)
+                    .map_or(TemplateTerm::Unbound, TemplateTerm::Column),
+            };
+            TemplateTerm::Triple(Box::new([
+                resolve_template(&t.subject, solutions, labels),
+                predicate,
+                resolve_template(&t.object, solutions, labels),
+            ]))
+        }
+    }
+}
+
 /// A position of a CONSTRUCT template, resolved against the solution columns.
 enum TemplateTerm {
+    /// A triple term of the template, its parts resolved.
+    Triple(Box<[TemplateTerm; 3]>),
     Constant(Term),
     Column(usize),
     /// A variable the solutions don't bind: the template triple never applies.
@@ -406,23 +444,7 @@ fn construct<'a>(
     template: &[TriplePattern],
 ) -> impl Iterator<Item = nrese_rdf::Triple> + 'a {
     let mut labels: Vec<String> = Vec::new();
-    let mut resolve = |term: &TermPattern| match term {
-        TermPattern::NamedNode(n) => TemplateTerm::Constant(n.clone().into()),
-        TermPattern::Literal(l) => TemplateTerm::Constant(l.clone().into()),
-        TermPattern::BlankNode(b) => {
-            let label = b.as_str().to_owned();
-            let index = labels.iter().position(|l| *l == label).unwrap_or_else(|| {
-                labels.push(label);
-                labels.len() - 1
-            });
-            TemplateTerm::Fresh(index)
-        }
-        TermPattern::Variable(v) => solutions
-            .column(v)
-            .map_or(TemplateTerm::Unbound, TemplateTerm::Column),
-        #[allow(unreachable_patterns)]
-        _ => TemplateTerm::Unbound,
-    };
+    let mut resolve = |term: &TermPattern| resolve_template(term, &solutions, &mut labels);
     let resolved: Vec<[TemplateTerm; 3]> = template
         .iter()
         .map(|t| {
@@ -451,14 +473,33 @@ fn construct<'a>(
             let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
                 .map(|_| nrese_rdf::BlankNode::default())
                 .collect();
-            let value = |term: &TemplateTerm| -> Option<Term> {
+            fn template_value(
+                term: &TemplateTerm,
+                column: &dyn Fn(usize) -> Option<Term>,
+                fresh: &[nrese_rdf::BlankNode],
+            ) -> Option<Term> {
                 match term {
                     TemplateTerm::Constant(term) => Some(term.clone()),
-                    TemplateTerm::Column(c) => decode(snapshot, &computed, table.get(row, *c)),
+                    TemplateTerm::Column(c) => column(*c),
                     TemplateTerm::Unbound => None,
                     TemplateTerm::Fresh(i) => Some(fresh[*i].clone().into()),
+                    TemplateTerm::Triple(parts) => {
+                        let subject = match template_value(&parts[0], column, fresh)? {
+                            Term::NamedNode(n) => nrese_rdf::NamedOrBlankNode::from(n),
+                            Term::BlankNode(b) => b.into(),
+                            Term::Literal(_) | Term::Triple(_) => return None,
+                        };
+                        let Term::NamedNode(predicate) = template_value(&parts[1], column, fresh)?
+                        else {
+                            return None;
+                        };
+                        let object = template_value(&parts[2], column, fresh)?;
+                        Some(nrese_rdf::Triple::new(subject, predicate, object).into())
+                    }
                 }
-            };
+            }
+            let column = |c: usize| decode(snapshot, &computed, table.get(row, c));
+            let value = |term: &TemplateTerm| template_value(term, &column, &fresh);
             for [s, p, o] in &resolved {
                 let subject = match value(s) {
                     Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
@@ -521,11 +562,31 @@ pub(crate) fn query_supported(query: &Query) -> bool {
     match query {
         Query::Select { pattern, .. }
         | Query::Ask { pattern, .. }
-        | Query::Describe { pattern, .. } => supported(pattern),
+        | Query::Describe { pattern, .. } => supported_rewritten(pattern),
         Query::Construct {
             template, pattern, ..
-        } => supported(pattern) && template.iter().all(supported_triple),
+        } => supported_rewritten(pattern) && template.iter().all(supported_template_triple),
     }
+}
+
+/// [`supported`] for the pattern as it runs, triple-term patterns rewritten.
+fn supported_rewritten(pattern: &GraphPattern) -> bool {
+    if triple_terms::has_open(pattern) {
+        supported(&triple_terms::rewrite(pattern))
+    } else {
+        supported(pattern)
+    }
+}
+
+/// A template's triple: any term, triple terms with variables included.
+fn supported_template_triple(triple: &TriplePattern) -> bool {
+    fn term(t: &TermPattern) -> bool {
+        match t {
+            TermPattern::Triple(t) => term(&t.subject) && term(&t.object),
+            _ => true,
+        }
+    }
+    term(&triple.subject) && term(&triple.object)
 }
 
 /// True if the native executor supports every operator in `pattern`.
@@ -567,11 +628,7 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
             bound_variables(inner, &mut outer);
             supported(inner) && exists::supported_expression(expression, &outer)
         }
-        GraphPattern::Values { bindings, .. } => bindings
-            .iter()
-            .flatten()
-            .flatten()
-            .all(|term| matches!(term, GroundTerm::NamedNode(_) | GroundTerm::Literal(_))),
+        GraphPattern::Values { .. } => true,
         GraphPattern::OrderBy { inner, expression } => {
             supported(inner)
                 && expression.iter().all(|e| match e {
@@ -763,14 +820,10 @@ fn supported_term(term: &TermPattern) -> bool {
 }
 
 fn supported_triple(triple: &TriplePattern) -> bool {
-    let term = |t: &TermPattern| {
-        matches!(
-            t,
-            TermPattern::NamedNode(_)
-                | TermPattern::BlankNode(_)
-                | TermPattern::Literal(_)
-                | TermPattern::Variable(_)
-        )
+    let term = |t: &TermPattern| match t {
+        // Ground triple terms are constants; others are rewritten first (`triple_terms`).
+        TermPattern::Triple(t) => triple_terms::ground(t),
+        _ => true,
     };
     term(&triple.subject) && term(&triple.object)
 }
@@ -1374,9 +1427,8 @@ impl<'a> Context<'a> {
                     let row: Vec<u64> = binding
                         .iter()
                         .map(|term| match term {
-                            Some(GroundTerm::NamedNode(n)) => self.id(&n.clone().into()),
-                            Some(GroundTerm::Literal(l)) => self.id(&l.clone().into()),
-                            _ => UNDEF,
+                            Some(term) => self.id(&Term::from(term.clone())),
+                            None => UNDEF,
                         })
                         .collect();
                     table.push_row(&row);
@@ -2342,8 +2394,10 @@ impl<'a> Context<'a> {
                 }
                 TermPattern::NamedNode(n) => Slot::Const(self.lookup_const(n.as_ref().into())?),
                 TermPattern::Literal(l) => Slot::Const(self.lookup_const(l.as_ref().into())?),
-                #[allow(unreachable_patterns)]
-                _ => return None,
+                TermPattern::Triple(t) => {
+                    let term: Term = nrese_rdf::Triple::try_from(t.as_ref().clone()).ok()?.into();
+                    Slot::Const(self.lookup_const(term.as_ref())?)
+                }
             })
         };
         let predicate = match &triple.predicate {
@@ -4025,6 +4079,42 @@ impl ScanPattern {
             .or_else(|| candidates.iter().copied().find(usable))
             .expect("GSPO or SPOG/POSG/OSPG answer every pattern with a bound prefix")
     }
+}
+
+/// An `INSERT` template's term with the row's values: template blank nodes fresh per row
+/// (`fresh` maps their labels), triple terms filled part by part. `None` if a variable is
+/// unbound or a triple term would get a subject that is no IRI or blank node.
+fn fill_template(
+    t: &TermPattern,
+    value: &dyn Fn(&Variable) -> Option<Term>,
+    fresh: &mut HashMap<String, nrese_rdf::BlankNode>,
+) -> Option<Term> {
+    Some(match t {
+        TermPattern::NamedNode(n) => n.clone().into(),
+        TermPattern::Literal(l) => l.clone().into(),
+        TermPattern::BlankNode(b) => fresh
+            .entry(b.as_str().to_owned())
+            .or_default()
+            .clone()
+            .into(),
+        TermPattern::Variable(v) => value(v)?,
+        TermPattern::Triple(t) => {
+            let subject = match fill_template(&t.subject, value, fresh)? {
+                Term::NamedNode(n) => nrese_rdf::NamedOrBlankNode::from(n),
+                Term::BlankNode(b) => b.into(),
+                Term::Literal(_) | Term::Triple(_) => return None,
+            };
+            let predicate = match &t.predicate {
+                NamedNodePattern::NamedNode(n) => n.clone(),
+                NamedNodePattern::Variable(v) => match value(v)? {
+                    Term::NamedNode(n) => n,
+                    _ => return None,
+                },
+            };
+            nrese_rdf::Triple::new(subject, predicate, fill_template(&t.object, value, fresh)?)
+                .into()
+        }
+    })
 }
 
 /// A `DELETE` template's term with the row's values; `None` if a variable is unbound or a

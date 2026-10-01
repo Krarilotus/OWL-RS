@@ -672,3 +672,36 @@ Oxigraph project, and the vendored `oxsdatatypes` copy is gone (git history keep
 - **Reasoning and SHACL** treat triple terms as opaque terms: no rule looks inside them,
   as in RDF 1.2 Semantics, where a triple term doesn't assert its triple. Reified
   statements reason like any other.
+
+**6: SPARQL 1.2 and RDF 1.2 in the engine (1 October).** Built as designed above.
+- **Conformance.**
+  - The W3C SPARQL 1.2 suite passes, all 269 tests, on the native executor and on the
+    reference evaluator. That is 102 positive and 81 negative syntax tests, 63 query
+    and 3 update evaluation tests, 18 and 2 update syntax tests.
+  - SPARQL 1.1 is unchanged: 491 of 495.
+  - A new differential test runs 2,400 random queries over RDF 1.2 data, with results
+    compared ordered and unordered: triple-term patterns at any depth, the reified-triple
+    syntax, the new functions in `FILTER`, `BIND` and `ORDER BY`.
+  - A store test loads reified triples and directional strings in bulk and by update,
+    queries them, and reopens the on-disk store.
+- **The engine.**
+  - Dictionary keys from component ids (R7), and a lazy triple-term index.
+  - The triple-term rewrite (`native/triple_terms.rs`).
+  - Triple terms in `VALUES`, CONSTRUCT and update templates.
+  - The functions in the shared evaluator. String functions keep a base direction; a
+    directional string equals only the same term.
+  - `=` on triple terms compares the objects by value
+    (`<<( :a :b 123 )>> = <<( :a :b 123.0 )>>`), while `sameTerm` compares identity.
+- **Found by the suite.**
+  - Blank nodes inside triple terms were left out of per-document scoping, in the bulk
+    loader and in the test runner. A nested reified triple then pointed at another
+    document's blank node.
+  - The runner flattened TriG data into one graph.
+  - Ordering tied strings that differ only in their base direction.
+
+  All fixed.
+- **Still open from the parity matrix:** `LATERAL` evaluation (the grammar has it), and
+  the SPARQL 1.2 protocol's media types.
+
+With step 6 the migration is finished: the engine runs on the bundle and supports RDF 1.2
+and SPARQL 1.2.

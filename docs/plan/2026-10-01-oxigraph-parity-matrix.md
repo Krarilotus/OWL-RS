@@ -41,7 +41,7 @@ do), **decide** (the owner decides whether the use case needs it).
 | SPARQL 1.1 query, patterns, paths, aggregates, modifiers, functions (hashes included) | Native executor: W3C 491/495 (one known deviation, zero-length paths from a term outside the graph) | **have** |
 | SPARQL 1.1 Update (all operations) | W3C update 94/94 | **have** |
 | SPARQL 1.1 Federated Query | `SERVICE` to allow-listed endpoints (off by default), bind joins, `SILENT` | **have** |
-| SPARQL 1.2 / SPARQL-star | Results formats (step 4a) and grammar (step 4b, all W3C `sparql12` syntax tests) done; evaluation step 6 | **partial** |
+| SPARQL 1.2 / SPARQL-star | Results formats (4a), grammar (4b) and evaluation (6): all 269 W3C `sparql12` tests pass on the native executor and on the reference | **have** |
 | SPARQL 1.1 Protocol | GET, POST form and direct, dataset parameters | **have** |
 | Graph Store HTTP Protocol | GET/HEAD/PUT/POST/DELETE, W3C status codes, six formats | **have** |
 | XSD date/time and duration arithmetic and ordering | `nrese-xsd`, used by the executor (see §5) | **have** |
@@ -76,13 +76,13 @@ do), **decide** (the owner decides whether the use case needs it).
 | Oxigraph | NRESE | Status |
 |---|---|---|
 | RDF 1.2 triple terms, `rdf:reifies`, `<<( … )>>`, `<< … ~ r >>`, `{| … |}`, directional literals | 3e: terms and all syntaxes (N-Triples, N-Quads, Turtle, TriG, RDF/XML with `parseType="Triple"`, `rdf:annotation` and `its:dir`); all 336 W3C `rdf12` syntax tests pass | **have** |
-| Triple terms interned by hash-derived ids, so the permutations stay as they are | The roadmap's R7: a triple term's dictionary key is its three component ids; the seven permutations are unchanged | **planned** (step 6) |
-| SPARQL 1.2 matching of triple terms and reifiers, `BIND(<<( … )>> AS ?t)`, `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, update over triple terms | Grammar done (step 4b); evaluation step 6, with the W3C `sparql12` evaluation tests | **partial** |
+| Triple terms interned by hash-derived ids, so the permutations stay as they are | R7: a triple term's dictionary key is its three component ids (25 bytes); the seven permutations are unchanged; a lazily built index of triple terms by component | **have** (step 6) |
+| SPARQL 1.2 matching of triple terms and reifiers, `BIND(<<( … )>> AS ?t)`, `TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, `isTRIPLE`, update over triple terms | Step 6: triple-term patterns rewritten to scans and `SUBJECT`/`PREDICATE`/`OBJECT` (every operator applies), triple terms in `VALUES`, CONSTRUCT and update templates; `LANGDIR`, `hasLANG`, `hasLANGDIR`, `STRLANGDIR`; `=` on triple terms by value part by part. W3C `sparql12` 269/269; a differential test (2,400 queries, ordered and not) against the reference | **have** |
 | SEP-0006 / SEP-0007 `LATERAL` | Parsed (step 4b; a parser option, on by default, as the algebra carries it unconditionally); evaluation step 6 (per-row correlation, as Jena does) | **partial** |
 | SEP-0002: date, time and duration arithmetic, `ADJUST`, `SUM`/`AVG` of durations, g-types | A regression found while writing this matrix (the baseline ran these through spareval's `sep-0002` and `calendar-ext`; step 1 removed spareval), **fixed**: XPath F&O 3.1 arithmetic on dates, times and the two duration subtypes, `ADJUST` for dateTime, date and time, the duration partial order in comparisons and `ORDER BY`, the extractors on `xsd:time` and the g-types, casts to all of them, and `SUM`/`AVG` of durations, which spareval 0.2.6 didn't have. What XPath leaves undefined (arithmetic on `xsd:duration` itself, `ADJUST` of g-types) is an error, where spareval answered | **have** (`nrese-sparql/tests/calendar_tests.rs`, the F&O examples in `native/calendar.rs`) |
 | Extractors `YEAR` … `TZ` across all calendar types | `YEAR`, `MONTH`, `DAY` for dates and the g-types that have the part; `HOURS`, `MINUTES`, `SECONDS` for `dateTime` and `time`; `TIMEZONE`, `TZ` for all | **have** |
 | SPARQL 1.2 Protocol and Graph Store Protocol drafts (4xx for bad requests, 5xx for failures; RDF 1.2 media types) | 4xx/5xx already differentiated; 1.2 media types and profiles with step 6 | **partial** |
-| Results formats with triple terms (JSON `"type": "triple"`, XML, TSV escaping) | `nrese-sparql-results`: triple terms and directional literals (`its:dir`) in all four formats, read and written | **have** (crate); in the engine with step 6 |
+| Results formats with triple terms (JSON `"type": "triple"`, XML, TSV escaping) | `nrese-sparql-results`: triple terms and directional literals (`its:dir`) in all four formats, read and written; the engine writes them through it | **have** |
 
 **Feature flags.** As Oxigraph does with `sep-0002` and `sep-0006`: draft features sit
 behind Cargo features of the crates that implement them (`sparql-12`, `sep-0002`,
