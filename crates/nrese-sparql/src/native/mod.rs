@@ -1968,20 +1968,8 @@ impl<'a> Context<'a> {
                             .find(|h| &h.variable == object)
                             .and_then(|hint| {
                                 let permutation = s.permutation_for(Some(object));
-                                (s.first_free(permutation) == Some(2)).then(|| {
-                                    hint.ranges
-                                        .iter()
-                                        .filter_map(|&(low, high)| {
-                                            self.snapshot.count_range_in(
-                                                self.model,
-                                                &s.quad_pattern(),
-                                                permutation,
-                                                low,
-                                                high,
-                                            )
-                                        })
-                                        .sum::<u64>()
-                                })
+                                (s.first_free(permutation) == Some(2))
+                                    .then(|| self.count_ranges(s, permutation, &hint.ranges))
                             }),
                         _ => None,
                     };
@@ -2054,18 +2042,11 @@ impl<'a> Context<'a> {
             .iter()
             .zip(&ranged)
             .map(|(s, ranged)| match ranged {
-                Some((permutation, ranges)) => ranges
-                    .iter()
-                    .filter_map(|&(low, high)| {
-                        self.snapshot.count_range_in(
-                            self.model,
-                            &s.quad_pattern(),
-                            *permutation,
-                            low,
-                            high,
-                        )
-                    })
-                    .sum(),
+                // One pattern: nothing to order, and the ranges are read once anyway.
+                Some(_) if scans.len() == 1 => {
+                    self.snapshot.count_in(self.model, &s.quad_pattern())
+                }
+                Some((permutation, ranges)) => self.count_ranges(s, *permutation, ranges),
                 None => self.snapshot.count_in(self.model, &s.quad_pattern()),
             })
             .collect();
@@ -2344,6 +2325,42 @@ impl<'a> Context<'a> {
             result = self.filter_among(result, filters, &bound)?;
         }
         Ok(result)
+    }
+
+    /// The matches of `scan` in the object `ranges` of `permutation`, for planning: exact
+    /// for a few ranges. For many (the terms a dictionary string test passed), a seek per
+    /// range costs more than the scan it plans (YAGO q10: 655 k ranges, 100 ms of seeks),
+    /// so the count is estimated: the widest ranges, which can hold most of the matches,
+    /// are counted exactly and an even sample of the others stands for them. The
+    /// evaluation reads the ranges themselves, so an estimate only moves the plan.
+    fn count_ranges(
+        &self,
+        scan: &ScanPattern,
+        permutation: Permutation,
+        ranges: &[(TermId, TermId)],
+    ) -> u64 {
+        let pattern = scan.quad_pattern();
+        let count = |&(low, high): &(TermId, TermId)| {
+            self.snapshot
+                .count_range_in(self.model, &pattern, permutation, low, high)
+                .unwrap_or(0)
+        };
+        if ranges.len() < MANY_RANGES {
+            return ranges.iter().map(count).sum();
+        }
+        let width = |&(low, high): &(TermId, TermId)| high.raw() - low.raw();
+        let mut by_width: Vec<&(TermId, TermId)> = ranges.iter().collect();
+        let widest = MANY_RANGES / 2;
+        by_width.select_nth_unstable_by_key(widest, |range| std::cmp::Reverse(width(range)));
+        let (wide, rest) = by_width.split_at(widest);
+        let exact: u64 = wide.iter().map(|range| count(range)).sum();
+        let step = rest.len().div_ceil(MANY_RANGES - widest);
+        let (sampled, sum) = rest
+            .iter()
+            .step_by(step)
+            .fold((0u64, 0u64), |(n, sum), range| (n + 1, sum + count(range)));
+        let estimate = exact + (sum as f64 * rest.len() as f64 / sampled as f64).round() as u64;
+        estimate.min(self.snapshot.count_in(self.model, &pattern))
     }
 
     /// Applies, and removes from `filters`, the conjuncts whose variables `solutions` binds.
