@@ -219,14 +219,60 @@ the migration. Readers keep accepting 1.1 documents unchanged:
 
 Oxigraph has RDF 1.2 behind its `rdf-12` feature; the comparisons turn it on.
 
-**`nrese-sparql-syntax`.** A syntax tree that keeps what the query says (prefixed names,
-source positions for error messages) is separate from the algebra of SPARQL 1.1 §18, and
-the translation is a module of its own. The algebra keeps `spargebra`'s variant names
-where the meaning is the same, so porting the executor stays mechanical. The writer
-prints the syntax tree. Later, behind a feature: SPARQL 1.2. Checked by the W3C SPARQL 1.1
-syntax tests (positive and negative, query and update) and by round-trips of every query
-in the repository. To measure: parse time over the W3C and benchmark query corpora
-against `spargebra`.
+**`nrese-sparql-syntax`: what is forced, what is ours** (revised 1 October, before
+writing it, by rethinking the problem rather than porting `spargebra`).
+
+*Forced.*
+- **The SPARQL 1.1 and 1.2 grammars and the algebra translation of §18:** what is
+  accepted, what is an error, and what each query means.
+- **The engine's needs:**
+  - an algebra to plan from;
+  - SPARQL text from algebra, because federation sends the inner pattern of a `SERVICE`
+    to the remote endpoint;
+  - the parser options the engine and tests use (base IRI, prefixes, custom aggregate
+    functions);
+  - the dataset accessors.
+- **Porting.** Variant names stay `spargebra`'s where the meaning is the same. That keeps
+  the step-5 port mechanical; it doesn't constrain the design.
+
+*Chosen, and why.*
+- **One pass, hand-written.** A recursive-descent parser over the bytes, dispatching on
+  the next byte or keyword instead of trying alternatives in order as a PEG does. It
+  builds the algebra directly, with no token list and no intermediate tree.
+  - The separate syntax tree planned earlier is dropped. Its only users would be editor
+    tooling (formatting, diagnostics), which can later get source spans in a side table
+    without touching the algebra.
+- **Deterministic generated names.** Aggregate results, `GROUP BY` expressions, `DESCRIBE`
+  IRIs and anonymous blank nodes get numbered names, renumbered past anything the query
+  itself uses. `spargebra` uses random 128-bit names, so the same query parses to a
+  different algebra each time. Deterministic names make the algebra reproducible: plans
+  can be cached by its structure, tests can state the expected algebra, and logs compare.
+- **Spec-exact where `spargebra` isn't** (each one checked against the spec and listed in
+  the step's results):
+  - left-associative `-` and `/` (`spargebra` reads `10 - 5 - 2` as `10 - (5 - 2)`);
+  - `-1` in an expression is the literal −1, not a negation computed at run time.
+- **A writer that round-trips exactly.** Writing algebra and parsing it back gives the same
+  algebra for everything the parser produces. Where SPARQL can't express an
+  engine-built shape exactly, the writer chooses an equivalent subquery. `spargebra`'s
+  writer can move a `FILTER` over a following join (`Join(Filter(A), B)` comes back as
+  `Filter(Join(A, B))`), which changes what a federated query means.
+- **Limits instead of crashes.** Nesting depth is bounded and reported as an error. A
+  recursive parser without a bound overflows its stack on deeply nested input, which a
+  public endpoint can't allow.
+- **Configurable.** Base IRI, prefixes, custom aggregates; SPARQL 1.2 and `LATERAL`
+  (SEP-0006) can be switched off for strict 1.1 behaviour.
+  - The algebra types carry the 1.2 and `LATERAL` variants unconditionally, as `Term`
+    carries triple terms (see 3e), so no match splits into two builds.
+- **Errors with line, column and what was expected.**
+
+*Checked by.*
+- the W3C syntax tests of SPARQL 1.0, 1.1 and 1.2 (positive and negative, query and
+  update);
+- a differential against `spargebra` over every query of those suites and of the
+  repository, comparing algebra up to generated names, with each difference explained;
+- write–parse round trips of the same corpus.
+
+*Measured.* Parse time over the same corpus, against `spargebra`.
 
 **`nrese-sparql-results`.** Streaming readers and writers for JSON (no DOM), XML
 (`quick-xml`), CSV and TSV. Checked by the W3C result-format tests and round-trips.
@@ -507,3 +553,32 @@ for a slice or a reader, serializer), so step 5 can port its users mechanically.
   Four cases were slower at first and were fixed: CSV and TSV writing, reading XML, and
   the copies in reading JSON. `nrese-json`'s string scan became a single pass over 8-byte
   words, which also serves the JSON-LD reader.
+
+**4b: `nrese-sparql-syntax` (1 October).** The SPARQL 1.1 and 1.2 parser, algebra and
+writer, designed as the "forced vs chosen" note above says. It is one pass of hand-written
+recursive descent: about 3,800 lines of parser and 6,200 in all.
+- **Conformance.**
+  - All 1,289 W3C syntax tests of SPARQL 1.0, 1.1 and 1.2 pass: queries and updates,
+    positive and negative, plus the queries of every evaluation test. Each one written
+    back parses to the same algebra.
+  - Against `spargebra`: 1,189 files parse to the same algebra and both reject 198. The
+    8 differences are each a `spargebra` error against the specification or a W3C test:
+    - it accepts four W3C negative tests and rejects two valid queries;
+    - it makes `+`, `-`, `*` and `/` right-associative, so `10 - 5 - 2` is 7;
+    - it keeps dot segments in absolute IRIs.
+- **Faster than `spargebra`.** Parsing takes 0.35–0.66 of its time, writing 0.53–0.79
+  (`benches/oxigraph-comparison/results/2026-10-01-step-4b-syntax.md`).
+- **Found along the way.**
+  - `SELECT *` removed duplicate variables with a list search, which is quadratic. It
+    does so in `spargebra` too.
+  - `nrese-rdf` quoted literals one character at a time. It now writes plain runs in one
+    piece, which every N-Triples-style output gains from.
+- **Choices recorded in tests:**
+  - deterministic generated names;
+  - nesting bounded at 128: about 330 KiB of stack in a release build, safe on a 1 MiB
+    thread;
+  - aggregates only in SELECT, HAVING and ORDER BY;
+  - SPARQL 1.2 and `LATERAL` as parser options;
+  - a writer that keeps a `FILTER`'s scope.
+
+Step 4 is complete. Next is step 5: moving the engine onto the bundle.

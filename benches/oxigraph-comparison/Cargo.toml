@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 nrese-rdf = { path = "../../crates/rdf/nrese-rdf" }
 nrese-rdf-io = { path = "../../crates/rdf/nrese-rdf-io" }
+nrese-sparql-syntax = { path = "../../crates/rdf/nrese-sparql-syntax" }
 nrese-sparql-results = { path = "../../crates/rdf/nrese-sparql-results" }
 nrese-xsd = { path = "../../crates/rdf/nrese-xsd" }
 # The released crates, unpatched: the comparison is with Oxigraph as it ships, with RDF 1.2
@@ -23,6 +24,7 @@ oxttl = { version = "=0.2.3", features = ["rdf-12"] }
 oxrdf = { version = "=0.3.3", features = ["rdfc-10", "rdf-12"] }
 oxsdatatypes = "=0.2.2"
 sparesults = { version = "=0.3.3", features = ["sparql-12"] }
+spargebra = { version = "=0.4.6", features = ["sparql-12", "sep-0002", "sep-0006"] }
 rand = "0.9"
 
 [profile.release]

@@ -13,6 +13,7 @@ members = [
     "crates/rdf/nrese-rdf",
     "crates/rdf/nrese-rdf-io",
     "crates/rdf/nrese-sparql-results",
+    "crates/rdf/nrese-sparql-syntax",
     "crates/rdf/nrese-xsd",
 ]
 # A patched copy of oxsdatatypes, used only by the bench harness (a workspace of its own)
