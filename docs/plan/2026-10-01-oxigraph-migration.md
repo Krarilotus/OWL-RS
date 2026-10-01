@@ -397,3 +397,20 @@ overflows a 1 MiB stack on it.
   (no triples) rather than dropped; `@included` values are expanded so that non-nodes are
   rejected; a term with a slash is expanded without defining terms; `@base` accepts an
   absolute IRI that isn't well formed, and what resolves against it is dropped.
+
+**N3 (1 October, the owner's decision).** Notation3 as a dialect of the Turtle lexer and
+parser (no second copy of input, IRI and error handling; the Turtle path is unchanged),
+with its own term type for formulas and variables, a writer that nests formulas back, and
+`RdfFormat::N3` for plain RDF in N3. W3C N3 parser suites (w3c-cg/N3, pinned): 1,084 of
+1,085, each document also through the trickling reader and a round trip.
+
+**Found on the way: blank node canonicalisation could take unbounded time.** N3 documents
+whose formulas share a blank node made `nrese-rdf`'s canonicalisation branch factorially
+(over a minute, without end in sight, for 908 statements). It now prunes by automorphisms
+(as nauty and bliss do) and canonicalises parts that only touch already distinguished
+nodes on their own (component recursion), with foldhash instead of SipHash in refinement:
+the same file in 6.7 ms in release; the existing tests run in half the time.
+
+**Test data byte-exact.** The fetch script checked the suites out with Git's line-end
+conversion on Windows; now `core.autocrlf=false`, and existing checkouts are rewritten from
+local objects. Every suite still passes on the exact files.

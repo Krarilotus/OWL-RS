@@ -104,6 +104,10 @@ impl RdfParser {
     /// Parses `bytes`.
     pub fn for_slice(self, bytes: &[u8]) -> QuadParser<'_, io::Empty> {
         match self.format {
+            RdfFormat::N3 => {
+                let settings = self.turtle_settings();
+                self.wrap(Inner::N3(TurtleParser::from_slice(bytes, settings), None))
+            }
             RdfFormat::JsonLd => {
                 let settings = self.json_ld_settings();
                 self.wrap(Inner::JsonLd(Box::new(JsonLdParser::new(
@@ -126,6 +130,10 @@ impl RdfParser {
     /// Parses what `reader` gives (buffered here: an unbuffered reader is fine).
     pub fn for_reader<R: Read>(self, reader: R) -> QuadParser<'static, R> {
         match self.format {
+            RdfFormat::N3 => {
+                let settings = self.turtle_settings();
+                self.wrap(Inner::N3(TurtleParser::from_reader(reader, settings), None))
+            }
             RdfFormat::JsonLd => {
                 let settings = self.json_ld_settings();
                 self.wrap(Inner::JsonLdReader(Some((reader, settings)), None))
@@ -152,6 +160,7 @@ impl RdfParser {
             blank_nodes: self.blank_nodes.clone(),
             unchecked: self.unchecked,
             max_depth: self.max_nesting,
+            n3: self.format == RdfFormat::N3,
         }
     }
 
@@ -299,6 +308,8 @@ enum Inner<'a, R: Read> {
         parser: LineParser,
     },
     Turtle(TurtleParser<'a, R>),
+    /// N3 read as RDF: the current quad, owned (N3 statements are converted one by one).
+    N3(TurtleParser<'a, R>, Option<Quad>),
     RdfXmlSlice(RdfXmlParser<&'a [u8]>),
     RdfXmlReader(RdfXmlParser<BufReader<R>>),
     JsonLd(Box<JsonLdParser<'a>>),
@@ -363,6 +374,19 @@ impl<R: Read> QuadParser<'_, R> {
                     Err(error) => return Some(Err(error)),
                 }
             }
+            Inner::N3(parser, current) => match parser.next_n3()? {
+                Ok(quad) => match quad.into_quad() {
+                    Ok(quad) => (current.insert(quad).as_ref(), TextPosition::default()),
+                    Err(quad) => {
+                        return Some(Err(RdfSyntaxError::new(
+                            format!("not RDF (read it with nrese_rdf_io::n3): {quad}"),
+                            TextPosition::default()..TextPosition::default(),
+                        )
+                        .into()));
+                    }
+                },
+                Err(error) => return Some(Err(error)),
+            },
             Inner::Turtle(parser) => match parser.next_ref()? {
                 Ok(quad) => (quad, TextPosition::default()),
                 Err(error) => return Some(Err(error)),

@@ -14,6 +14,7 @@ mod error;
 mod format;
 mod input;
 pub mod jsonld;
+pub mod n3;
 mod ntriples;
 mod parser;
 mod rdfxml;

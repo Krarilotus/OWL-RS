@@ -14,22 +14,34 @@
 //!    refinement runs again; each choice is tried and the least result kept. Twins, nodes
 //!    whose swap maps the quads onto themselves, lead to the same result, so only one per
 //!    group of twins is tried: a node with a thousand equal blank children costs linear time,
-//!    not a thousand factorial. Where there is no choice, the search loops, so its depth on
-//!    the call stack is the number of real branchings only.
+//!    not a thousand factorial.
+//! 4. **Automorphisms** (as nauty and bliss prune): symmetric parts that aren't twins (a
+//!    node and its formula, swapped together with another such pair) would still branch
+//!    factorially. When a leaf of the search has the same form as the best leaf, the map
+//!    between the two is an automorphism: the search goes straight back to the node where
+//!    their paths parted, and every choice there in the same orbit is skipped. Symmetric
+//!    structures cost about one path per member instead of a path per permutation.
+//! 5. **Modules** (component recursion, as in bliss): once refinement has told some nodes
+//!    apart, the tied rest may fall into parts that share no quad (the formulas that share
+//!    only a told-apart node). Each part is searched on its own, and equal parts are ranked
+//!    by their form: no branching across them at all. A node alone in its colour keeps it
+//!    during refinement, so a choice in one part can't reach another through it.
 //!
 //! The names depend on the hash function, so they are stable only within one build.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 
 use crate::term::{BlankNode, GraphName, NamedOrBlankNode, Term};
 use crate::triple::Quad;
 
+/// A fixed seed: colours must be the same in every run (foldhash, much faster than SipHash
+/// on the many small values refinement hashes).
+const HASHER: foldhash::fast::FixedState =
+    foldhash::fast::FixedState::with_seed(0x6e72_6573_652d_7264);
+
 fn hash_of(value: &impl Hash) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
+    HASHER.hash_one(value)
 }
 
 /// A position of a quad (subject, object, graph name): a blank node of the component (by
@@ -242,29 +254,40 @@ pub(crate) fn canonical(quads: BTreeSet<Quad>) -> BTreeSet<Quad> {
 
 impl<'a> Component<'a> {
     /// Rehashes each blank node with its neighbourhood until the partition is stable.
-    fn refine(&self, mut colours: Vec<u64>) -> Vec<u64> {
+    /// A node alone in its colour keeps it (it is told apart already, and its colour then
+    /// carries nothing from one part of the component to another), and so does a node
+    /// outside `scope`, when only part of the component is being searched.
+    fn refine(&self, mut colours: Vec<u64>, scope: Option<&[bool]>) -> Vec<u64> {
         let mut classes = distinct(&colours);
+        // Reused across nodes and rounds: no allocation per node.
+        let mut signatures: Vec<u64> = Vec::new();
+        let mut next: Vec<u64> = vec![0; colours.len()];
+        let mut sizes: HashMap<u64, u32> = HashMap::new();
         loop {
-            let next: Vec<u64> = (0..colours.len())
-                .map(|b| {
-                    let mut signatures: Vec<u64> = self.incident[b]
-                        .iter()
-                        .map(|&q| {
-                            let (slots, predicate) = self.keys[q];
-                            let positions = slots.map(|slot| match slot {
-                                Slot::Blank(other) if other == b => (0, 0),
-                                Slot::Blank(other) => (1, colours[other]),
-                                Slot::Fixed(id) => (2, self.fixed_hash[id as usize]),
-                            });
-                            hash_of(&(self.fixed_hash[predicate as usize], positions))
-                        })
-                        .collect();
-                    signatures.sort_unstable();
-                    hash_of(&(colours[b], signatures))
-                })
-                .collect();
+            sizes.clear();
+            for &c in &colours {
+                *sizes.entry(c).or_default() += 1;
+            }
+            for (b, slot) in next.iter_mut().enumerate() {
+                if sizes[&colours[b]] == 1 || scope.is_some_and(|s| !s[b]) {
+                    *slot = colours[b];
+                    continue;
+                }
+                signatures.clear();
+                signatures.extend(self.incident[b].iter().map(|&q| {
+                    let (slots, predicate) = self.keys[q];
+                    let positions = slots.map(|slot| match slot {
+                        Slot::Blank(other) if other == b => (0_u8, 0),
+                        Slot::Blank(other) => (1, colours[other]),
+                        Slot::Fixed(id) => (2, self.fixed_hash[id as usize]),
+                    });
+                    hash_of(&(self.fixed_hash[predicate as usize], positions))
+                }));
+                signatures.sort_unstable();
+                *slot = hash_of(&(colours[b], signatures.as_slice()));
+            }
             let next_classes = distinct(&next);
-            colours = next;
+            std::mem::swap(&mut colours, &mut next);
             if next_classes == classes {
                 return colours;
             }
@@ -285,44 +308,101 @@ impl<'a> Component<'a> {
         })
     }
 
-    /// The colours of the least labelling: refinement, then individualisation of tied
-    /// classes, branching only over choices that aren't twins.
+    /// The colours of the least labelling (see the module's documentation).
     fn search(&self, colours: Vec<u64>) -> Vec<u64> {
-        let mut colours = self.refine(colours);
-        loop {
-            let mut classes: HashMap<u64, Vec<usize>> = HashMap::new();
-            for (b, &c) in colours.iter().enumerate() {
+        let mut search = Search::new(self, None);
+        search.node(colours, &mut Vec::new());
+        search.best.map(|leaf| leaf.colours).unwrap_or_default()
+    }
+
+    /// The members of the class to split next (the smallest tied one, then the least
+    /// colour), or `None` if every colour in `scope` is distinct.
+    fn tied_class(colours: &[u64], scope: Option<&[bool]>) -> Option<Vec<usize>> {
+        let mut classes: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (b, &c) in colours.iter().enumerate() {
+            if scope.is_none_or(|s| s[b]) {
                 classes.entry(c).or_default().push(b);
             }
-            let tied = classes
-                .into_iter()
-                .filter(|(_, members)| members.len() > 1)
-                .min_by_key(|(c, members)| (members.len(), *c));
-            let Some((_, members)) = tied else {
-                return colours;
-            };
-            // One representative per group of twins.
-            let mut representatives: Vec<usize> = Vec::new();
-            for &m in &members {
-                if !representatives.iter().any(|&r| self.twins(r, m)) {
-                    representatives.push(m);
+        }
+        classes
+            .into_iter()
+            .filter(|(_, members)| members.len() > 1)
+            .min_by_key(|(c, members)| (members.len(), *c))
+            .map(|(_, members)| members)
+    }
+
+    /// The tied nodes of `scope` in parts that share no quad, once the nodes alone in
+    /// their colour are set aside; `None` unless there are at least two parts.
+    fn modules(&self, colours: &[u64], scope: Option<&[bool]>) -> Option<Vec<Vec<usize>>> {
+        let mut sizes: HashMap<u64, u32> = HashMap::new();
+        for &c in colours {
+            *sizes.entry(c).or_default() += 1;
+        }
+        let tied: Vec<bool> = (0..colours.len())
+            .map(|b| sizes[&colours[b]] > 1 && scope.is_none_or(|s| s[b]))
+            .collect();
+        let mut parent: Vec<usize> = (0..colours.len()).collect();
+        for (slots, _) in &self.keys {
+            let mut first = None;
+            for slot in slots {
+                if let Slot::Blank(b) = *slot
+                    && tied[b]
+                {
+                    match first {
+                        None => first = Some(b),
+                        Some(a) => {
+                            let (x, y) = (find(&mut parent, a), find(&mut parent, b));
+                            parent[x] = y;
+                        }
+                    }
                 }
             }
-            let individualise = |colours: &[u64], m: usize| {
-                let mut split = colours.to_vec();
-                split[m] = hash_of(&(split[m], "individualised"));
-                self.refine(split)
-            };
-            if let [only] = representatives[..] {
-                colours = individualise(&colours, only);
-                continue;
-            }
-            return representatives
-                .into_iter()
-                .map(|m| self.search(individualise(&colours, m)))
-                .min_by(|a, b| self.relabel(a, "p").cmp(&self.relabel(b, "p")))
-                .expect("a tied class has members");
         }
+        let mut parts: HashMap<usize, Vec<usize>> = HashMap::new();
+        for b in (0..colours.len()).filter(|&b| tied[b]) {
+            parts.entry(find(&mut parent, b)).or_default().push(b);
+        }
+        (parts.len() > 1).then(|| parts.into_values().collect())
+    }
+
+    /// The form of the quads that hold a node of `module`, under `colours`.
+    fn module_certificate(&self, colours: &[u64], module: &[usize]) -> Vec<[u64; 4]> {
+        let mut quads: Vec<usize> = module
+            .iter()
+            .flat_map(|&b| self.incident[b].iter().copied())
+            .collect();
+        quads.sort_unstable();
+        quads.dedup();
+        let mut certificate: Vec<[u64; 4]> = quads
+            .iter()
+            .map(|&q| self.certificate_row(colours, q))
+            .collect();
+        certificate.sort_unstable();
+        certificate
+    }
+
+    fn certificate_row(&self, colours: &[u64], q: usize) -> [u64; 4] {
+        let slot = |s: Slot| match s {
+            Slot::Blank(b) => colours[b] << 1,
+            Slot::Fixed(id) => (self.fixed_hash[id as usize] << 1) | 1,
+        };
+        let (slots, predicate) = self.keys[q];
+        [
+            slot(slots[0]),
+            self.fixed_hash[predicate as usize],
+            slot(slots[1]),
+            slot(slots[2]),
+        ]
+    }
+
+    /// A form of the quads under a colouring that compares as the relabelled quads would
+    /// (blank nodes by colour, other terms by content), without building them.
+    fn certificate(&self, colours: &[u64]) -> Vec<[u64; 4]> {
+        let mut certificate: Vec<[u64; 4]> = (0..self.keys.len())
+            .map(|q| self.certificate_row(colours, q))
+            .collect();
+        certificate.sort_unstable();
+        certificate
     }
 
     /// The component's quads with each blank node named by its colour.
@@ -356,6 +436,202 @@ impl<'a> Component<'a> {
             .zip(colours.iter().copied())
             .collect()
     }
+}
+
+/// A leaf of the search: a colouring discrete in the search's scope, the choices that led
+/// to it, and its form.
+struct Leaf {
+    colours: Vec<u64>,
+    path: Vec<usize>,
+    certificate: Vec<[u64; 4]>,
+}
+
+/// Individualisation and refinement with automorphism pruning and module decomposition,
+/// over one component, or one module of it (`scope`).
+struct Search<'s, 'a> {
+    component: &'s Component<'a>,
+    scope: Option<Vec<bool>>,
+    best: Option<Leaf>,
+    /// Automorphisms found (each maps a blank node to its image).
+    automorphisms: Vec<Vec<usize>>,
+}
+
+impl<'s, 'a> Search<'s, 'a> {
+    fn new(component: &'s Component<'a>, scope: Option<Vec<bool>>) -> Self {
+        Self {
+            component,
+            scope,
+            best: None,
+            automorphisms: Vec::new(),
+        }
+    }
+
+    fn in_scope(&self, b: usize) -> bool {
+        self.scope.as_ref().is_none_or(|s| s[b])
+    }
+
+    /// Searches below the node with `colours`, reached by the choices `path`. Returns the
+    /// level to go back to when a leaf proved an automorphism with the best leaf (the level
+    /// where their paths parted).
+    fn node(&mut self, colours: Vec<u64>, path: &mut Vec<usize>) -> Option<usize> {
+        let component = self.component;
+        let mut colours = component.refine(colours, self.scope.as_deref());
+        loop {
+            let Some(members) = Component::tied_class(&colours, self.scope.as_deref()) else {
+                return self.leaf(colours, path);
+            };
+            // Parts that share no quad are canonicalised each on its own.
+            if let Some(modules) = component.modules(&colours, self.scope.as_deref()) {
+                let combined = self.modules(&colours, modules);
+                return self.leaf(combined, path);
+            }
+            // One representative per group of twins.
+            let mut representatives: Vec<usize> = Vec::new();
+            for &m in &members {
+                if !representatives.iter().any(|&r| component.twins(r, m)) {
+                    representatives.push(m);
+                }
+            }
+            if let [only] = representatives[..] {
+                // No real choice: follow it without a level of recursion.
+                path.push(only);
+                colours = component.refine(individualised(&colours, only), self.scope.as_deref());
+                continue;
+            }
+            let level = path.len();
+            let mut orbits: Vec<usize> = (0..colours.len()).collect();
+            let mut explored: Vec<usize> = Vec::new();
+            for &m in &representatives {
+                if explored
+                    .iter()
+                    .any(|&e| find(&mut orbits, e) == find(&mut orbits, m))
+                {
+                    continue;
+                }
+                path.push(m);
+                let back = self.node(individualised(&colours, m), path);
+                path.truncate(level);
+                explored.push(m);
+                // Automorphisms that keep this node's colouring join its choices' orbits.
+                for gamma in &self.automorphisms {
+                    if (0..colours.len()).all(|v| colours[v] == colours[gamma[v]]) {
+                        for &r in &representatives {
+                            let (a, b) = (find(&mut orbits, r), find(&mut orbits, gamma[r]));
+                            orbits[a] = b;
+                        }
+                    }
+                }
+                if let Some(target) = back
+                    && target < level
+                {
+                    return Some(target);
+                }
+            }
+            return None;
+        }
+    }
+
+    /// Each module searched on its own; equal modules (swapping them is an automorphism)
+    /// told apart by their rank among the modules' forms, which can't depend on labels.
+    fn modules(&self, colours: &[u64], modules: Vec<Vec<usize>>) -> Vec<u64> {
+        let n = colours.len();
+        let mut combined = colours.to_vec();
+        let mut forms: Vec<(Vec<[u64; 4]>, Vec<usize>)> = Vec::with_capacity(modules.len());
+        for module in modules {
+            let mut scope = vec![false; n];
+            for &b in &module {
+                scope[b] = true;
+            }
+            let mut sub = Search::new(self.component, Some(scope));
+            sub.node(colours.to_vec(), &mut Vec::new());
+            let leaf = sub
+                .best
+                .map(|leaf| leaf.colours)
+                .unwrap_or_else(|| colours.to_vec());
+            for &b in &module {
+                combined[b] = leaf[b];
+            }
+            forms.push((self.component.module_certificate(&leaf, &module), module));
+        }
+        forms.sort_by(|a, b| a.0.cmp(&b.0));
+        for (rank, (_, module)) in forms.iter().enumerate() {
+            for &b in module {
+                combined[b] = hash_of(&(combined[b], rank));
+            }
+        }
+        combined
+    }
+
+    fn leaf(&mut self, colours: Vec<u64>, path: &[usize]) -> Option<usize> {
+        let certificate = self.component.certificate(&colours);
+        let Some(best) = &self.best else {
+            self.best = Some(Leaf {
+                colours,
+                path: path.to_vec(),
+                certificate,
+            });
+            return None;
+        };
+        match certificate.cmp(&best.certificate) {
+            std::cmp::Ordering::Less => {
+                self.best = Some(Leaf {
+                    colours,
+                    path: path.to_vec(),
+                    certificate,
+                });
+                None
+            }
+            std::cmp::Ordering::Greater => None,
+            std::cmp::Ordering::Equal => {
+                // The same form: the map from the best leaf to this one (by colour, in the
+                // scope; the rest stays) is an automorphism.
+                let by_colour: HashMap<u64, usize> = (0..colours.len())
+                    .filter(|&v| self.in_scope(v))
+                    .map(|v| (colours[v], v))
+                    .collect();
+                let gamma: Option<Vec<usize>> = (0..colours.len())
+                    .map(|v| {
+                        if self.in_scope(v) {
+                            by_colour.get(&best.colours[v]).copied()
+                        } else {
+                            Some(v)
+                        }
+                    })
+                    .collect();
+                let gamma = gamma?;
+                let parted = best
+                    .path
+                    .iter()
+                    .zip(path)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(path.len().min(best.path.len()));
+                // It must map the best path onto this one to stand for the whole subtree.
+                let maps_path = best
+                    .path
+                    .iter()
+                    .zip(path)
+                    .take(parted + 1)
+                    .all(|(&a, &b)| gamma[a] == b);
+                self.automorphisms.push(gamma);
+                maps_path.then_some(parted)
+            }
+        }
+    }
+}
+
+fn individualised(colours: &[u64], member: usize) -> Vec<u64> {
+    let mut split = colours.to_vec();
+    split[member] = hash_of(&(split[member], "individualised"));
+    split
+}
+
+/// Union-find: the representative of `x`'s set.
+fn find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
 }
 
 fn distinct(colours: &[u64]) -> usize {

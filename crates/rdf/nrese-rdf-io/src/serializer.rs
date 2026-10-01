@@ -70,7 +70,7 @@ impl RdfSerializer {
     /// Writes to `writer`, through a buffer of its own (an unbuffered writer is fine).
     pub fn for_writer<W: Write>(self, writer: W) -> QuadSerializer<W> {
         let (turtle, rdf_xml) = match self.format {
-            RdfFormat::Turtle | RdfFormat::TriG => (
+            RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::N3 => (
                 Some(TurtleWriter::new(
                     self.format == RdfFormat::TriG,
                     self.prefixes.clone(),
@@ -129,7 +129,7 @@ impl<W: Write> QuadSerializer<W> {
                 }
                 ntriples::write_triple(&mut self.buffer, quad.into())?;
             }
-            RdfFormat::Turtle | RdfFormat::TriG => {
+            RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::N3 => {
                 if let Some(turtle) = &mut self.turtle {
                     turtle.write(&mut self.buffer, quad)?;
                 }
