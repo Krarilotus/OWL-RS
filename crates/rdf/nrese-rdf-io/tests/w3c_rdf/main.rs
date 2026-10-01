@@ -29,7 +29,13 @@ const MF: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#";
 const RDFT: &str = "http://www.w3.org/ns/rdftest#";
 
 /// The suites, by directory under `rdf/rdf11`.
-const SUITES: [&str; 4] = ["rdf-n-triples", "rdf-n-quads", "rdf-turtle", "rdf-trig"];
+const SUITES: [&str; 5] = [
+    "rdf-n-triples",
+    "rdf-n-quads",
+    "rdf-turtle",
+    "rdf-trig",
+    "rdf-xml",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -192,7 +198,10 @@ fn parse(root: &Path, format: RdfFormat, iri: &str) -> Result<BTreeSet<Quad>, St
 fn round_trip(format: RdfFormat, quads: &BTreeSet<Quad>) -> Result<(), String> {
     for format in [format, RdfFormat::NQuads] {
         let mut serializer = RdfSerializer::from_format(format);
-        if matches!(format, RdfFormat::Turtle | RdfFormat::TriG) {
+        if matches!(
+            format,
+            RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml
+        ) {
             for (name, iri) in [
                 ("ex", "http://example/"),
                 ("", "http://www.w3.org/2013/TurtleTests/"),
