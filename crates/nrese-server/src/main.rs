@@ -18,6 +18,8 @@ fn main() -> Result<()> {
     // reason, before any code compiled for that CPU runs (the async runtime is built after
     // this), not on an illegal instruction later.
     nrese_engine::cpu::exit_if_missing();
+    // What threads freed goes back to the system after bulk loads and reasoning.
+    nrese_engine::memory::set_release(|force| unsafe { libmimalloc_sys::mi_collect(force) });
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

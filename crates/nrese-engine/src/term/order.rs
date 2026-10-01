@@ -34,17 +34,24 @@ pub(crate) fn text_of(key: &[u8]) -> Option<&[u8]> {
     }
 }
 
-/// The indices `range` with a text, sorted by it (ties by index). Parallel.
-pub(crate) fn sorted<'a>(
+/// The indices `range` with a text, sorted by it (ties by index). Parallel, and in place:
+/// the indices alone (4 or 8 bytes each) are sorted, each comparison reading the texts,
+/// rather than (text, index) pairs of 24 bytes (2 GB more at DBpedia's 40 M terms).
+pub(crate) fn sorted<'a, T>(
     range: std::ops::Range<u64>,
     key: &(dyn Fn(u64) -> &'a [u8] + Sync),
-) -> Vec<u64> {
-    let mut entries: Vec<(&[u8], u64)> = range
+) -> Vec<T>
+where
+    T: Copy + Ord + Send + Into<u64> + TryFrom<u64>,
+{
+    let mut entries: Vec<T> = range
         .into_par_iter()
-        .filter_map(|index| text_of(key(index)).map(|text| (text, index)))
+        .filter(|&index| text_of(key(index)).is_some())
+        .map(|index| T::try_from(index).ok().expect("an index of the order's width"))
         .collect();
-    entries.par_sort_unstable();
-    entries.into_iter().map(|(_, index)| index).collect()
+    let text = |index: T| text_of(key(index.into())).unwrap_or_default();
+    entries.par_sort_unstable_by(|&a, &b| text(a).cmp(text(b)).then(a.cmp(&b)));
+    entries
 }
 
 /// The positions `start..end` of `order` whose text starts with `prefix`.
@@ -101,7 +108,7 @@ impl TextOrder {
         if self.covered >= len {
             return;
         }
-        let added = sorted(self.covered..len, key);
+        let added: Vec<u64> = sorted(self.covered..len, key);
         let text = |index: u64| text_of(key(index)).unwrap_or_default();
         let old = std::mem::take(&mut self.order);
         let mut merged = Vec::with_capacity(old.len() + added.len());
@@ -144,7 +151,7 @@ mod tests {
         .map(|k| k.to_vec())
         .collect();
         let key = |i: u64| keys[i as usize].as_slice();
-        let all = sorted(0..keys.len() as u64, &key);
+        let all: Vec<u64> = sorted(0..keys.len() as u64, &key);
         let texts: Vec<&[u8]> = all.iter().map(|&i| text_of(key(i)).unwrap()).collect();
         assert_eq!(
             texts,

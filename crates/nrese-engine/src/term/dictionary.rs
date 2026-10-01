@@ -487,7 +487,8 @@ impl Dictionary {
     }
 
     /// The text order of the entries `0..len` as checkpoint indices: the mapped base's
-    /// order merged with the in-memory order of the others (sorting what isn't yet).
+    /// order merged with that of the others, from the in-memory order where it covers them,
+    /// else sorted here (and not kept: the checkpoint's base takes them over).
     pub(crate) fn text_order(&self, len: u64) -> Vec<u32> {
         let inner = self.inner.read();
         let key = |index: u64| inner.key(index);
@@ -497,17 +498,24 @@ impl Dictionary {
                 Some(order) => (order, inner.base_len()),
                 None => (&[], 0),
             };
-        let mut order = self.order.write();
-        order.extend(first, inner.len(), &key);
-        let order = parking_lot::RwLockWriteGuard::downgrade(order);
+        let order = self.order.read();
+        let sorted: Vec<u32>;
+        let rest: Box<dyn Iterator<Item = u64>> = if order.first == first
+            && order.covered >= len.max(first)
+        {
+            Box::new(order.order.iter().copied().filter(|&i| i < len))
+        } else {
+            sorted = super::order::sorted(first.min(len)..len, &key);
+            Box::new(sorted.iter().map(|&i| u64::from(i)))
+        };
         // Merged straight from both orders: no copies of them.
-        let capacity = base.len() + order.order.len();
+        let capacity = base.len() + len.saturating_sub(first) as usize;
         let mut base = base
             .iter()
             .map(|&i| u64::from(i))
             .filter(|&i| i < len)
             .peekable();
-        let mut rest = order.order.iter().copied().filter(|&i| i < len).peekable();
+        let mut rest = rest.peekable();
         let mut merged = Vec::with_capacity(capacity);
         loop {
             let next = match (base.peek(), rest.peek()) {
@@ -634,10 +642,15 @@ impl Dictionary {
                 TermId::new(batch.keys[key].kind, indexes[key])
             }
         };
-        slots
-            .into_iter()
-            .map(|[s, p, o, g]| EncodedQuad::new(resolve(s), resolve(p), resolve(o), resolve(g)))
-            .collect()
+        // A new array of the quads' size: `collect` from `slots` would keep its allocation,
+        // 64 bytes per quad for 32 (twice the memory of every batch a bulk load holds).
+        let mut quads = Vec::with_capacity(slots.len());
+        quads.extend(
+            slots
+                .iter()
+                .map(|&[s, p, o, g]| EncodedQuad::new(resolve(s), resolve(p), resolve(o), resolve(g))),
+        );
+        quads
     }
 
     /// Encodes `quad` without interning; `None` if any term is unknown (below `limit`).

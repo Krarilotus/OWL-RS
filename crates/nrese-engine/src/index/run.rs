@@ -125,25 +125,12 @@ impl Run {
     /// Builds a tombstone-free run from arbitrary quads, removing duplicates. Used for bulk
     /// replacement and checkpoint loading. O(n log n), parallel over permutations and within
     /// each sort.
-    pub(crate) fn from_quads(layout: Layout, mut quads: Vec<EncodedQuad>) -> Self {
-        quads.par_sort_unstable();
-        quads.dedup();
-        // One array of keys, 32 bytes per quad, in the quads' place (the same size): each
-        // permutation in turn reorders the keys in place, sorts them and packs them. Building
-        // the permutations at once, or from copies, would hold several such arrays.
-        let mut keys: Vec<Key> = quads.into_iter().map(EncodedQuad::components).collect();
+    pub(crate) fn from_quads(layout: Layout, quads: Vec<EncodedQuad>) -> Self {
+        let mut builder = PermutationBuilder::new(quads);
         let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
-        let mut previous = Permutation::Spog;
         for &permutation in layout.permutations() {
-            if permutation != previous {
-                keys.par_iter_mut().for_each(|key| {
-                    *key = permutation.to_key(&previous.key_to_quad(key));
-                });
-                keys.par_sort_unstable();
-                previous = permutation;
-            }
             perms[permutation as usize] = PermutationRun {
-                keys: PackedKeys::from_sorted(&keys),
+                keys: builder.packed(permutation),
                 tombstones: Box::default(),
             };
         }
@@ -222,6 +209,41 @@ impl Run {
             (start, _) if perm.is_tombstone(start) => -1,
             _ => 1,
         }
+    }
+}
+
+/// The packed permutations of a set of quads, one after another, from one array of keys,
+/// 32 bytes per quad, in the quads' place (the same size): each permutation in turn
+/// reorders the keys in place, sorts them and packs them. Building the permutations at
+/// once, or from copies, would hold several such arrays.
+pub(crate) struct PermutationBuilder {
+    keys: Vec<Key>,
+    /// The order the keys are in.
+    order: Permutation,
+}
+
+impl PermutationBuilder {
+    /// For `quads`, in any order and with duplicates.
+    pub(crate) fn new(mut quads: Vec<EncodedQuad>) -> Self {
+        quads.par_sort_unstable();
+        quads.dedup();
+        Self {
+            keys: quads.into_iter().map(EncodedQuad::components).collect(),
+            order: Permutation::Spog,
+        }
+    }
+
+    /// The quads' keys in `permutation`, packed.
+    pub(crate) fn packed(&mut self, permutation: Permutation) -> PackedKeys {
+        if permutation != self.order {
+            let order = self.order;
+            self.keys.par_iter_mut().for_each(|key| {
+                *key = permutation.to_key(&order.key_to_quad(key));
+            });
+            self.keys.par_sort_unstable();
+            self.order = permutation;
+        }
+        PackedKeys::from_sorted(&self.keys)
     }
 }
 
