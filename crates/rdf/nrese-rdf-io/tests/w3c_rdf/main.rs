@@ -14,6 +14,8 @@
 //! - **Round trips.** Every document that parses is written back, in its own format, as
 //!   N-Quads and as JSON-LD (Turtle, TriG, RDF/XML and JSON-LD with a few prefixes, to
 //!   exercise abbreviation), and read again: the statements must be the same.
+//! - **Parallel parsing.** Every Turtle and TriG document that parses is also cut into 2,
+//!   3 and 8 chunks by the exact splitter and parsed chunk by chunk: the same statements.
 //! - `expected-failures.txt` lists tests that fail on purpose, each with its reason; a new
 //!   failure, or a pass of a listed test, fails the run.
 
@@ -239,9 +241,42 @@ fn round_trip(format: RdfFormat, quads: &BTreeSet<Quad>) -> Result<(), String> {
     Ok(())
 }
 
+/// Turtle and TriG cut into chunks and parsed chunk by chunk give the same statements.
+fn parallel(
+    root: &Path,
+    format: RdfFormat,
+    iri: &str,
+    sequential: &BTreeSet<Quad>,
+) -> Result<(), String> {
+    if !matches!(format, RdfFormat::Turtle | RdfFormat::TriG) {
+        return Ok(());
+    }
+    let bytes = std::fs::read(file(root, iri)).map_err(|e| e.to_string())?;
+    for parts in [2, 3, 8] {
+        let parsers = RdfParser::from_format(format)
+            .with_base_iri(iri)
+            .map_err(|e| e.to_string())?
+            .split_slice_for_parallel_parsing(&bytes, parts)
+            .map_err(|e| format!("splitting into {parts}: {e}"))?;
+        let mut quads = BTreeSet::new();
+        for parser in parsers {
+            for quad in parser {
+                quads.insert(quad.map_err(|e| format!("a chunk of {parts}: {e}"))?);
+            }
+        }
+        if canonical(quads) != canonical(sequential.clone()) {
+            return Err(format!("parsed in {parts} chunks, the statements differ"));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a test passes, and why not.
 fn run(root: &Path, test: &Test) -> Result<(), String> {
     let action = parse(root, test.format, &test.action);
+    if let Ok(quads) = &action {
+        parallel(root, test.format, &test.action, quads)?;
+    }
     match test.kind {
         Kind::PositiveSyntax => round_trip(test.format, &action?),
         Kind::NegativeSyntax | Kind::NegativeEval => match action {

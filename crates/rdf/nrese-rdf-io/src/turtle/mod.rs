@@ -2,6 +2,7 @@
 
 mod lexer;
 mod parser;
+pub(crate) mod split;
 mod writer;
 
 pub(crate) use parser::{TurtleParser, TurtleSettings};

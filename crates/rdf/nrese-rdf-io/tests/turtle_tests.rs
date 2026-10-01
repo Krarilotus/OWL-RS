@@ -253,3 +253,56 @@ fn large_documents_through_a_reader_equal_the_slice() {
     assert_eq!(a, b);
     assert_eq!(a.len(), 5000 * 7);
 }
+
+/// Turtle and TriG cut for parallel parsing give what one parser gives, whatever the
+/// number of parts: directives in the middle (a prefix redefined), strings that look like
+/// Turtle, comments, lists, nested blank nodes, graph blocks.
+#[test]
+fn parallel_parsing_is_exact() {
+    let mut turtle = String::from("@prefix ex: <http://a/> .\n");
+    let mut trig = String::from("PREFIX ex: <http://a/>\n");
+    for i in 0..400 {
+        if i == 200 {
+            // From here on, ex: is another namespace.
+            turtle.push_str("@prefix ex: <http://b/> .\n# ex:fake ex:p ex:o .\n");
+            trig.push_str("PREFIX ex:<http://b/>\n");
+        }
+        turtle.push_str(&format!(
+            "ex:s{i} ex:p \"a . b\" , '''x .\nex:not ex:a ex:triple .''' ; ex:q ( 1 2.5 [ ex:r ex:t{i} ] ) .\n"
+        ));
+        trig.push_str(&format!(
+            "ex:g{i} {{ ex:s{i} ex:p \"}} . {{\" . _:b{i} ex:q ex:o{i} . }}\n"
+        ));
+    }
+    for (format, text) in [(RdfFormat::Turtle, &turtle), (RdfFormat::TriG, &trig)] {
+        let sequential: BTreeSet<Quad> = parse(format, text).unwrap().into_iter().collect();
+        assert!(
+            sequential
+                .iter()
+                .any(|q| q.subject.to_string() == "<http://b/s399>")
+        );
+        let canonical = |quads: BTreeSet<Quad>| {
+            let mut dataset: Dataset = quads.into_iter().collect();
+            dataset.canonicalize();
+            dataset
+        };
+        let expected = canonical(sequential);
+        for parts in 2..30 {
+            let parsers = RdfParser::from_format(format)
+                .split_slice_for_parallel_parsing(text.as_bytes(), parts)
+                .unwrap();
+            assert!(parsers.len() > 1, "{format} wasn't cut into {parts}");
+            let quads: BTreeSet<Quad> = parsers.into_iter().flatten().map(|q| q.unwrap()).collect();
+            assert_eq!(canonical(quads), expected, "{format} in {parts} parts");
+        }
+        // The same through a file.
+        let path = std::env::temp_dir().join(format!("nrese-rdf-io-split-{}.{}", std::process::id(), format.file_extension()));
+        std::fs::write(&path, text).unwrap();
+        for parts in [2, 5, 17] {
+            let parsers = RdfParser::from_format(format).split_file_for_parallel_parsing(&path, parts).unwrap();
+            let quads: BTreeSet<Quad> = parsers.into_iter().flatten().map(|q| q.unwrap()).collect();
+            assert_eq!(canonical(quads), expected, "{format} file in {parts} parts");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+}
