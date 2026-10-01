@@ -11,6 +11,7 @@ Workloads without a definition here are planned: the driver skips them and says 
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -97,7 +98,9 @@ def integration(root: Path, tier: str, settings: dict) -> Plan:
 
 
 def basics(root: Path, tier: str, settings: dict) -> Plan:
-    family = "entities" if tier.startswith("entities-") else tier
+    # The query set of a sized slice is its family's: wikidata-lexemes-60m reads
+    # queries/wikidata-lexemes.
+    family = "entities" if tier.startswith("entities-") else re.sub(r"-\d+m$", "", tier)
     return Plan("basics-mix", tier, inputs=[f"/data/{tier}.nt"],
                 queries=root / f"benches/competitors/queries/{family}",
                 prepare=None if tier.startswith("entities-") else
