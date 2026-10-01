@@ -7,7 +7,13 @@
 //! that all systems answer the same question.
 //!
 //! Two phases:
-//! - **sequential:** every query, one at a time: warm-up, then measured runs
+//! - **sequential:** every query, one at a time: warm-up, then measured runs. In file
+//!   order, each query's runs back to back (`--order fixed`, the default), or in rounds
+//!   over all queries, each round in a new order drawn from `--seed` (`--order shuffled`):
+//!   then no query runs right after itself, and no fixed order favours a system whose
+//!   caches the previous query happened to warm. Each query's first execution is reported
+//!   apart (`first_ms`): on a fresh server it is the cold run, before any result cache
+//!   could hold it.
 //! - **throughput** (`--clients N`): N clients cycle through the *interactive* part of the
 //!   mix (queries whose sequential p50 stayed under `--interactive-ms`) for `--duration-s`.
 //!   It reports queries/s and per-query p50/p99 under load.
@@ -33,6 +39,9 @@ pub struct QueryMixReport {
     pub endpoint: String,
     pub warmup: usize,
     pub runs: usize,
+    /// `fixed` or `shuffled`.
+    pub order: &'static str,
+    pub seed: Option<u64>,
     pub queries: Vec<QueryResult>,
     pub throughput: Option<ThroughputReport>,
 }
@@ -71,6 +80,8 @@ pub struct QueryResult {
     pub id: String,
     /// Solutions (SELECT), 0/1 (ASK) or triples (CONSTRUCT/DESCRIBE) of the last run.
     pub rows: Option<u64>,
+    /// The query's first execution (a warm-up run unless `--warmup 0`).
+    pub first_ms: Option<f64>,
     pub latencies_ms: Vec<f64>,
     pub min_ms: Option<f64>,
     pub p50_ms: Option<f64>,
@@ -91,12 +102,7 @@ pub async fn run_query_mix(config: &QueryMixConfig) -> Result<QueryMixReport> {
     if files.is_empty() {
         bail!("no .rq files in {}", config.queries.display());
     }
-    let mut queries = Vec::new();
-    for file in &files {
-        let result = run_one(&client, config, file).await;
-        print_row(&result);
-        queries.push(result);
-    }
+    let queries = run_sequential(&client, config, &files).await;
     let throughput = match config.clients {
         0 => None,
         clients => {
@@ -121,6 +127,12 @@ pub async fn run_query_mix(config: &QueryMixConfig) -> Result<QueryMixReport> {
         endpoint: config.endpoint.clone(),
         warmup: config.warmup,
         runs: config.runs,
+        order: if config.shuffle_seed.is_some() {
+            "shuffled"
+        } else {
+            "fixed"
+        },
+        seed: config.shuffle_seed,
         queries,
         throughput,
     };
@@ -288,43 +300,104 @@ async fn write_loop(
     (micros, errors, first_error)
 }
 
-async fn run_one(client: &Client, config: &QueryMixConfig, file: &Path) -> QueryResult {
-    let id = file
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let mut result = QueryResult {
-        id,
-        rows: None,
-        latencies_ms: Vec::new(),
-        min_ms: None,
-        p50_ms: None,
-        max_ms: None,
-        error: None,
-    };
-    let query = match std::fs::read_to_string(file) {
-        Ok(query) => query,
-        Err(error) => {
-            result.error = Some(error.to_string());
-            return result;
+/// The sequential phase: every query's warm-up and measured runs, in the configured order.
+async fn run_sequential(
+    client: &Client,
+    config: &QueryMixConfig,
+    files: &[std::path::PathBuf],
+) -> Vec<QueryResult> {
+    let mut results: Vec<QueryResult> = files.iter().map(|file| new_result(file)).collect();
+    let texts: Vec<Option<String>> = files
+        .iter()
+        .zip(&mut results)
+        .map(|(file, result)| match std::fs::read_to_string(file) {
+            Ok(query) => Some(query),
+            Err(error) => {
+                result.error = Some(error.to_string());
+                None
+            }
+        })
+        .collect();
+    let iterations = config.warmup + config.runs;
+    for (index, iteration) in schedule(files.len(), iterations, config.shuffle_seed) {
+        let (result, Some(query)) = (&mut results[index], &texts[index]) else {
+            continue;
+        };
+        if result.error.is_some() {
+            continue;
         }
-    };
-    for iteration in 0..config.warmup + config.runs {
         let started = Instant::now();
-        match execute(client, &config.endpoint, &query).await {
+        match execute(client, &config.endpoint, query).await {
             Ok(rows) => {
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                if iteration == 0 {
+                    result.first_ms = Some(elapsed);
+                }
                 if iteration >= config.warmup {
                     result.latencies_ms.push(elapsed);
                 }
                 result.rows = Some(rows);
             }
-            Err(error) => {
-                result.error = Some(format!("{error:#}"));
-                return result;
+            Err(error) => result.error = Some(format!("{error:#}")),
+        }
+        if iteration + 1 == iterations || result.error.is_some() {
+            summarise(result);
+            if config.shuffle_seed.is_none() {
+                print_row(result);
             }
         }
     }
+    if config.shuffle_seed.is_some() {
+        results.iter().for_each(print_row);
+    }
+    results
+}
+
+/// The order of `(query, iteration)` runs: each query's iterations back to back, or with a
+/// seed, rounds of every query, each round shuffled anew.
+fn schedule(queries: usize, iterations: usize, seed: Option<u64>) -> Vec<(usize, usize)> {
+    let Some(seed) = seed else {
+        return (0..queries)
+            .flat_map(|q| (0..iterations).map(move |i| (q, i)))
+            .collect();
+    };
+    // SplitMix64: a small, well-mixed generator, so a seed names the same orders anywhere.
+    let mut state = seed;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut out = Vec::with_capacity(queries * iterations);
+    for iteration in 0..iterations {
+        let mut round: Vec<usize> = (0..queries).collect();
+        for i in (1..round.len()).rev() {
+            round.swap(i, (next() % (i as u64 + 1)) as usize);
+        }
+        out.extend(round.into_iter().map(|q| (q, iteration)));
+    }
+    out
+}
+
+fn new_result(file: &Path) -> QueryResult {
+    QueryResult {
+        id: file
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        rows: None,
+        first_ms: None,
+        latencies_ms: Vec::new(),
+        min_ms: None,
+        p50_ms: None,
+        max_ms: None,
+        error: None,
+    }
+}
+
+fn summarise(result: &mut QueryResult) {
     let mut micros: Vec<u128> = result
         .latencies_ms
         .iter()
@@ -335,7 +408,6 @@ async fn run_one(client: &Client, config: &QueryMixConfig, file: &Path) -> Query
     result.min_ms = micros.first().map(|&m| ms(m));
     result.p50_ms = (!micros.is_empty()).then(|| ms(percentile(&micros, 50)));
     result.max_ms = micros.last().map(|&m| ms(m));
-    result
 }
 
 /// Sends one query and returns the result size once the whole body has arrived.
@@ -398,5 +470,32 @@ fn print_row(result: &QueryResult) {
             result.max_ms.unwrap_or(0.0)
         ),
         (None, None) => println!("{:<32} (no measured runs)", result.id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::schedule;
+
+    #[test]
+    fn a_schedule_runs_every_query_every_iteration_once() {
+        assert_eq!(
+            schedule(2, 2, None),
+            vec![(0, 0), (0, 1), (1, 0), (1, 1)]
+        );
+        let shuffled = schedule(10, 3, Some(7));
+        assert_eq!(shuffled, schedule(10, 3, Some(7)), "a seed names one order");
+        assert_ne!(shuffled, schedule(10, 3, Some(8)));
+        for iteration in 0..3 {
+            let mut round: Vec<usize> = shuffled[iteration * 10..(iteration + 1) * 10]
+                .iter()
+                .map(|&(q, i)| {
+                    assert_eq!(i, iteration);
+                    q
+                })
+                .collect();
+            round.sort_unstable();
+            assert_eq!(round, (0..10).collect::<Vec<_>>());
+        }
     }
 }

@@ -17,11 +17,16 @@
 # It also keeps a build from taking the whole machine: half the cores unless
 # CARGO_BUILD_JOBS says otherwise, and low process priority, so other work on the same
 # machine and disk (editors, containers, WSL) stays responsive.
+#
+# Code is generated for this machine's CPU unless NRESE_TARGET_CPU says otherwise
+# (`portable`, `x86-64-v3`, …; see scripts/lib/target-cpu.sh).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=lib/disk.sh
 . "$ROOT/scripts/lib/disk.sh"
+# shellcheck source=lib/target-cpu.sh
+. "$ROOT/scripts/lib/target-cpu.sh"
 
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 BUDGET_GB="${NRESE_TARGET_BUDGET_GB:-25}"
@@ -69,6 +74,8 @@ if [ $((now - last)) -ge 600 ]; then
   shrink
 fi
 require_free_gb "$MIN_FREE_GB" "cargo $*" "$ROOT"
+
+export_target_cpu_rustflags
 
 if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
   cores=$(nproc 2>/dev/null || printf 4)

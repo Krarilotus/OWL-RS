@@ -415,6 +415,107 @@ impl PackedKeys {
         }
     }
 
+    /// Calls `f(value, from, to)` for each run `from..to` of keys with the same value at
+    /// `position` among the keys `start..end`, in order. The values at `position` must be
+    /// sorted in the range: the positions before it are the same throughout.
+    ///
+    /// No search per group. Runs of blocks that begin with the current value hold nothing
+    /// else and are skipped by galloping over the blocks' first keys; the blocks where the
+    /// value changes are decoded one column at a time. Few large groups cost
+    /// O(d · log(n / d)) block probes, many small ones a sequential decode of the column:
+    /// the cheaper of a search per group and a scan.
+    pub(crate) fn groups(
+        &self,
+        start: usize,
+        end: usize,
+        position: usize,
+        mut f: impl FnMut(u64, usize, usize),
+    ) {
+        if start >= end {
+            return;
+        }
+        let mut value = self.get(start)[position];
+        let mut from = start;
+        let mut i = start;
+        let mut column = Vec::with_capacity(BLOCK);
+        while i < end {
+            let mut block = i / BLOCK;
+            if i == block * BLOCK {
+                // Blocks whose first key has the current value: everything before the last
+                // of them has it too.
+                let (mut last, mut step) = (block, 1);
+                while last + step < self.firsts.len()
+                    && (last + step) * BLOCK < end
+                    && self.firsts[last + step][position] == value
+                {
+                    last += step;
+                    step *= 2;
+                }
+                while step > 1 {
+                    step /= 2;
+                    if last + step < self.firsts.len()
+                        && (last + step) * BLOCK < end
+                        && self.firsts[last + step][position] == value
+                    {
+                        last += step;
+                    }
+                }
+                if last > block {
+                    block = last;
+                    i = block * BLOCK;
+                }
+            }
+            let block_end = ((block + 1) * BLOCK).min(end);
+            let header = &self.headers[block];
+            let (tw, pw) = (header.widths[2 * position], header.widths[2 * position + 1]);
+            if tw == 0 && pw == 0 {
+                let constant = (u64::from(header.tag_min[position]) << TAG_SHIFT)
+                    | header.payload_min[position];
+                if constant != value {
+                    f(value, from, i);
+                    (value, from) = (constant, i);
+                }
+            } else {
+                column.clear();
+                self.decode_column(
+                    block,
+                    i - block * BLOCK,
+                    block_end - block * BLOCK,
+                    position,
+                    &mut column,
+                );
+                for (k, &v) in column.iter().enumerate() {
+                    if v != value {
+                        f(value, from, i + k);
+                        (value, from) = (v, i + k);
+                    }
+                }
+            }
+            i = block_end;
+        }
+        f(value, from, end);
+    }
+
+    /// Appends component `c` of the keys `j0..j1` of `block` (indices within the block).
+    fn decode_column(&self, block: usize, j0: usize, j1: usize, c: usize, out: &mut Vec<u64>) {
+        let header = &self.headers[block];
+        let data = &self.data[header.offset as usize..];
+        let (tw, pw) = (header.widths[2 * c], header.widths[2 * c + 1]);
+        let tag_min = u64::from(header.tag_min[c]);
+        let payload_min = header.payload_min[c];
+        let (mut tag_bit, mut payload_bit) = (
+            header.starts[2 * c] as usize + j0 * tw as usize,
+            header.starts[2 * c + 1] as usize + j0 * pw as usize,
+        );
+        out.extend((j0..j1).map(|_| {
+            let value = ((tag_min + read(data, tag_bit, tw)) << TAG_SHIFT)
+                | (payload_min + read(data, payload_bit, pw));
+            tag_bit += tw as usize;
+            payload_bit += pw as usize;
+            value
+        }));
+    }
+
     /// The index range of keys in `[low, high]`: a lower bound, then the upper bound found
     /// by galloping over the block first keys from the lower bound's block (short ranges end
     /// in the same or a nearby block).
@@ -437,9 +538,9 @@ impl PackedKeys {
     }
 
     /// The first index in `start..end` whose key is not below `key` (`inclusive`: not at or
-    /// below it): a lower (upper) bound. Like [`partition_point_in`](Self::partition_point_in)
-    /// with a lexicographic comparison, but inside the block each probe decodes components
-    /// only until the first difference.
+    /// below it): a lower (upper) bound. A binary search over the blocks' first keys, then
+    /// inside one block, where each probe decodes components only until the first
+    /// difference.
     pub(crate) fn bound_in(&self, start: usize, end: usize, key: &Key, inclusive: bool) -> usize {
         if start >= end {
             return start;
@@ -464,37 +565,6 @@ impl PackedKeys {
             }
             let is_below = ordering.is_lt() || (inclusive && ordering.is_eq());
             if is_below {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-        low
-    }
-
-    /// The first index in `start..end` whose key fails `pred`, or `end` (as
-    /// `slice::partition_point` on `keys[start..end]`, but as an absolute index). `pred` must
-    /// hold for a prefix of the range. O(log n).
-    pub(crate) fn partition_point_in(
-        &self,
-        start: usize,
-        end: usize,
-        pred: impl Fn(&Key) -> bool,
-    ) -> usize {
-        if start >= end {
-            return start;
-        }
-        // The first block starting inside the range whose first key fails `pred`: the answer
-        // lies between the start of the block before it and that block's start.
-        let (first_block, last_block) = (start / BLOCK, (end - 1) / BLOCK);
-        let failing = first_block
-            + 1
-            + self.firsts[first_block + 1..=last_block].partition_point(|k| pred(k));
-        let mut low = start.max((failing - 1) * BLOCK);
-        let mut high = end.min(failing * BLOCK);
-        while low < high {
-            let mid = low + (high - low) / 2;
-            if pred(&self.get(mid)) {
                 low = mid + 1;
             } else {
                 high = mid;
@@ -563,7 +633,7 @@ mod tests {
             assert_eq!(decoded, keys, "decode_range, n {n}");
             for _ in 0..200 {
                 if keys.is_empty() {
-                    assert_eq!(packed.partition_point_in(0, 0, |_| true), 0);
+                    assert_eq!(packed.bound_in(0, 0, &[0; 4], false), 0);
                     break;
                 }
                 let probe = keys[(rng(&mut state) as usize) % keys.len()];
@@ -571,10 +641,6 @@ mod tests {
                 let b = (rng(&mut state) as usize) % (keys.len() + 1);
                 let (start, end) = (a.min(b), a.max(b));
                 let expected = start + keys[start..end].partition_point(|k| k < &probe);
-                assert_eq!(
-                    packed.partition_point_in(start, end, |k| k < &probe),
-                    expected
-                );
                 assert_eq!(packed.bound_in(start, end, &probe, false), expected);
                 let high = [probe[0], u64::MAX, u64::MAX, u64::MAX];
                 let from = keys.partition_point(|k| k < &probe);
@@ -586,15 +652,53 @@ mod tests {
                 let between = [probe[0], probe[1], probe[2] + 1, 0];
                 let expected = start + keys[start..end].partition_point(|k| k < &between);
                 assert_eq!(packed.bound_in(start, end, &between, false), expected);
-                let position = (rng(&mut state) % 4) as usize;
-                let expected = start
-                    + keys[start..end]
-                        .partition_point(|k| k[0] <= probe[0] && k[position] < u64::MAX);
-                assert_eq!(
-                    packed.partition_point_in(start, end, |k| k[0] <= probe[0]
-                        && k[position] < u64::MAX),
-                    expected
-                );
+            }
+        }
+    }
+
+    #[test]
+    fn groups_are_the_runs_of_equal_values() {
+        let mut state = 23;
+        // Few large groups (position 1 has 8 values under each subject) and many small
+        // ones (position 0), plus long constant stretches.
+        let mut long: Vec<Key> = (0..20_000u64)
+            .map(|i| {
+                [
+                    (1 << TAG_SHIFT) | (i / 3000),
+                    (1 << TAG_SHIFT) | (i % 7),
+                    i,
+                    0,
+                ]
+            })
+            .collect();
+        long.sort_unstable();
+        for keys in [
+            random_keys(&mut state, 70_000),
+            random_keys(&mut state, 300),
+            long,
+        ] {
+            let packed = PackedKeys::from_sorted(&keys);
+            for _ in 0..100 {
+                // A range with a fixed first component, grouped on the second; or the whole
+                // array grouped on the first.
+                let (start, end, position) = if rng(&mut state).is_multiple_of(4) {
+                    (0, keys.len(), 0)
+                } else {
+                    let probe = keys[(rng(&mut state) as usize) % keys.len()][0];
+                    let start = keys.partition_point(|k| k[0] < probe);
+                    let end = keys.partition_point(|k| k[0] <= probe);
+                    (start, end, 1)
+                };
+                let mut expected = Vec::new();
+                let mut i = start;
+                while i < end {
+                    let j = i + keys[i..end].partition_point(|k| k[position] == keys[i][position]);
+                    expected.push((keys[i][position], i, j));
+                    i = j;
+                }
+                let mut got = Vec::new();
+                packed.groups(start, end, position, |v, from, to| got.push((v, from, to)));
+                assert_eq!(got, expected, "{start}..{end} at {position}");
             }
         }
     }

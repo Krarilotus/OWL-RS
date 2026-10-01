@@ -60,7 +60,7 @@ Results: [SCORECARD.md](SCORECARD.md) holds the run of 26 September 2026 (free-t
   - Everything else runs with defaults.
 - **Timing.** Wall-clock from the start of the load until the store is durable and queryable. Container and JVM start-up are included (≈ 0.3–1 s); Virtuoso's server start-up is not.
 - **Vendor defaults changed for fairness:**
-  - QLever's query-result cache is capped at 1 MB, so repeated runs measure evaluation rather than cache hits.
+  - QLever's query-result cache is off (`-k 0`: a 1 MB cap alone still kept every small result, such as a count, so until 1 October 2026 repeated runs of small-result queries were cache hits), so repeated runs measure evaluation. This scorecard measures that cold mode only. The suite (`benches/suite`) runs every system that has a result cache (QLever, NRESE) both ways: with it off, and on with the system's defaults. It also shuffles the query order and reports each query's first execution apart.
   - Virtuoso's result-row cap and cost-based query rejection are disabled, so it returns complete results.
   - NRESE's rate limits are lifted.
   - All systems use the same per-query timeout (`QUERY_TIMEOUT_S`, default 120 s).

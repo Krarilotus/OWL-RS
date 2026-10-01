@@ -229,6 +229,27 @@ pub(crate) fn date_widened(id: TermId, later: bool) -> Option<TermId> {
     ))
 }
 
+/// Bits below the year in a date payload (month, day, timezone) and in a dateTime payload
+/// (month, day, time of day, timezone).
+const DATE_YEAR_SHIFT: u32 = 9 + TIMEZONE_BITS;
+const DATE_TIME_YEAR_SHIFT: u32 = 9 + 27 + TIMEZONE_BITS;
+
+/// See [`TermId::year_range`].
+pub(crate) fn year_range(kind: TermKind, low: u32, high: u32) -> Option<(TermId, TermId)> {
+    let shift = match kind {
+        TermKind::Date => DATE_YEAR_SHIFT,
+        TermKind::DateTime => DATE_TIME_YEAR_SHIFT,
+        _ => return None,
+    };
+    if low > high || high > 9999 {
+        return None;
+    }
+    Some((
+        TermId::new(kind, u64::from(low) << shift),
+        TermId::new(kind, ((u64::from(high) + 1) << shift) - 1),
+    ))
+}
+
 fn parse_date_part(s: &str) -> Option<u64> {
     if s.len() != 10 || s.as_bytes()[4] != b'-' || s.as_bytes()[7] != b'-' {
         return None;
@@ -566,6 +587,34 @@ mod tests {
                 "2026-09-25T00:00:00",
             ],
         );
+    }
+
+    #[test]
+    fn year_ranges_hold_exactly_the_years_dates() {
+        for (lexical, datatype, year) in [
+            ("1879-03-14", xsd::DATE, 1879),
+            ("1879-12-31-14:00", xsd::DATE, 1879),
+            ("1879-01-01+14:00", xsd::DATE, 1879),
+            ("1879-12-31T23:59:59.999-14:00", xsd::DATE_TIME, 1879),
+            ("1879-01-01T00:00:00Z", xsd::DATE_TIME, 1879),
+            ("0000-01-01T00:00:00", xsd::DATE_TIME, 0),
+            ("9999-12-31", xsd::DATE, 9999),
+        ] {
+            let id = try_inline_literal(LiteralRef::new_typed_literal(lexical, datatype)).unwrap();
+            let within = |low, high| {
+                let (first, last) = year_range(id.kind(), low, high).unwrap();
+                first <= id && id <= last
+            };
+            assert!(within(year, year), "{lexical}");
+            if year < 9999 {
+                assert!(!within(year + 1, 9999), "{lexical}");
+            }
+            if year > 0 {
+                assert!(!within(0, year - 1), "{lexical}");
+            }
+        }
+        assert!(year_range(TermKind::Integer, 0, 1).is_none());
+        assert!(year_range(TermKind::Date, 0, 10_000).is_none());
     }
 
     #[test]

@@ -904,6 +904,7 @@ dependencies = [
  "crc32fast",
  "foldhash 0.2.0",
  "hashbrown 0.16.1",
+ "memchr",
  "nrese-rdf",
  "nrese-rdf-io",
  "parking_lot",

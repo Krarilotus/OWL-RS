@@ -30,10 +30,12 @@ For every workload tier and every system that can run it, `--runs` times (defaul
 1. **load**, and reasoning where the system reasons at load (NRESE, GraphDB, RDFox, Nemo, owlrl); wall time and peak memory
 2. **size** of the store on disk; **restart**: the server on the loaded store, until it answers
 3. **count** of every statement it answers with; lazy reasoners (Jena's rule reasoners) do their work here
-4. **queries** through the harness's `query-mix`: one warm-up, then `--query-runs` measured runs each (default 3); answer counts checked against the expected ones where the workload has them, and cross-checked between systems within one regime at the end
+4. **queries** through the harness's `query-mix`: one warm-up, then `--query-runs` measured runs each (default 3); answer counts checked against the expected ones where the workload has them, and cross-checked between systems within one regime at the end. Each query's first execution on the fresh server is reported apart (`repeat` 0)
 5. **serve**: the server's peak memory over the run
 
 Then its containers, store and scratch are removed. At the end of the run, what the run made is removed too: the datasets it prepared, the NRESE build volume, images it pulled or built. `--keep` (or `NRESE_BENCH_KEEP=1`) keeps them for the next run of a batch; installed tools (`install-tools.sh`) always stay. A dry run prints every command and writes nothing that stays.
+
+**Caches and order: every system's strengths count.** No system's advantage is switched off to level the field. Systems with a result cache (QLever, NRESE) run the queries twice: with the cache off (repeated runs measure evaluation), then, after a restart that empties it, with the system's default cache (repeated runs measure what a user sending the same query again sees). Both lines are reported (`--cache off,on`, the default; `off` or `on` alone). Queries run in rounds over the whole mix, each round shuffled (`--order shuffled`, the default; `--order fixed` runs each query's runs back to back). Repetition r uses seed `seed·1000 + r` (`--seed`, default 1), the same orders for every system, recorded in the `order` column. The first execution of each query is reported apart: on a fresh server, the cold case.
 
 **Regimes.** A reasoning workload names the regimes it accepts, in order of preference (LUBM: OWL 2 RL, else OWL-Horst); each system runs the first it has. Results are compared within one regime only.
 

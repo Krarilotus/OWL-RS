@@ -284,7 +284,7 @@ impl Snapshot {
     /// bound components aren't a prefix of that order, or an included stack can't answer it.
     ///
     /// This answers `GROUP BY ?x` with `COUNT(*)` over one triple pattern without reading its
-    /// matches: O(r · d · log n) for d groups (see `IndexVersion::group_counts`).
+    /// matches: a walk over the groups of each run (see `IndexVersion::group_counts`).
     pub fn group_counts_in(
         &self,
         model: ReadModel,
@@ -310,16 +310,30 @@ impl Snapshot {
         if !supported {
             return None;
         }
-        let mut totals = std::collections::BTreeMap::new();
+        let mut counts = Vec::new();
+        let mut sources = 0;
         for stack in Stack::ALL {
             if model.includes(stack) {
+                let before = counts.len();
                 self.version
                     .stack(stack)
-                    .group_counts(&plan, bound, &mut totals);
+                    .group_counts(&plan, bound, &mut counts);
+                sources += usize::from(counts.len() > before);
             }
         }
+        // One run of one stack yields each value once, in order; otherwise merge.
+        if sources > 1 || !counts.is_sorted_by(|a, b| a.0 < b.0) {
+            counts.sort_unstable_by_key(|&(value, _)| value);
+            counts.dedup_by(|later, kept| {
+                let same = later.0 == kept.0;
+                if same {
+                    kept.1 += later.1;
+                }
+                same
+            });
+        }
         Some(
-            totals
+            counts
                 .into_iter()
                 .filter(|&(_, count)| count > 0)
                 .map(|(value, count)| (TermId::from_raw(value), count as u64))
@@ -328,7 +342,7 @@ impl Snapshot {
     }
 
     /// The number of distinct values of the first unbound component of `pattern` in
-    /// `permutation`'s order, among its matches in `model`. O(r · d · log n) for d values,
+    /// `permutation`'s order, among its matches in `model`: a walk over each run's groups,
     /// with d values of memory. Exact unless deleted quads still shadow values in unmerged
     /// runs (then an upper bound). `None` if the pattern's bound components aren't a prefix
     /// of that order, or an included stack can't answer it. Planners should call the cached
@@ -439,6 +453,21 @@ impl Snapshot {
 
     pub fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
         self.dictionary.decode_quad(quad)
+    }
+
+    /// The dictionary terms this snapshot knows whose text passes `test`, sorted (whether
+    /// statements still use them is the caller's to check). One pass over the dictionary:
+    /// worth it where a pattern has many more rows than the dictionary has bytes per row
+    /// of a random read.
+    pub fn matching_strings(&self, test: &crate::StringTest<'_>) -> Vec<TermId> {
+        self.dictionary
+            .matching_strings(test, self.version.dictionary_len)
+    }
+
+    /// The size of this snapshot's dictionary text in bytes (the arena: what
+    /// [`matching_strings`](Self::matching_strings) reads).
+    pub fn dictionary_bytes(&self) -> u64 {
+        self.dictionary.stats().arena_bytes
     }
 
     /// The string literals this snapshot's dictionary holds that match `query`, best first
