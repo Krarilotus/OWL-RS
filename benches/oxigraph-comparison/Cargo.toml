@@ -3,7 +3,7 @@ name = "oxigraph-comparison"
 description = "NRESE's RDF bundle side by side with the Oxigraph crates it replaces: differential tests and throughput benchmarks"
 version = "0.1.0"
 edition = "2024"
-license = "AGPL-3.0-only"
+license = "MIT OR Apache-2.0"
 publish = false
 
 # A workspace of its own: the NRESE workspace stays free of Oxigraph crates.
