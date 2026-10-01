@@ -1,4 +1,4 @@
-//! RDF parsing and serialisation for the store: the only place that knows `oxrdfio`.
+//! RDF parsing and serialisation for the store: the only place that knows `nrese_rdf_io`.
 //!
 //! Blank nodes: request payloads get fresh blank nodes ([`BlankNodes::Fresh`]), so labels
 //! are scoped to one payload and two documents that both use `_:b0` never merge. Within a
@@ -9,8 +9,8 @@
 use std::io::Read;
 use std::path::Path;
 
-use oxrdf::{GraphName, Quad, Triple};
-use oxrdfio::{RdfFormat, RdfParser, RdfSerializer};
+use nrese_rdf::{GraphName, Quad, Triple};
+use nrese_rdf_io::{RdfFormat, RdfParser, RdfSerializer};
 use url::Url;
 
 use crate::error::{StoreError, StoreResult};
@@ -24,9 +24,7 @@ impl GraphResultFormat {
             Self::RdfXml => RdfFormat::RdfXml,
             Self::NQuads => RdfFormat::NQuads,
             Self::TriG => RdfFormat::TriG,
-            Self::JsonLd => RdfFormat::JsonLd {
-                profile: oxrdfio::JsonLdProfileSet::empty(),
-            },
+            Self::JsonLd => RdfFormat::JsonLd,
         }
     }
 }
@@ -76,7 +74,7 @@ pub(crate) fn parse_graph(
 pub(crate) fn parse_dataset(format: RdfFormat, payload: &[u8]) -> StoreResult<Vec<Quad>> {
     parser(format, None, BlankNodes::Fresh)?
         .for_slice(payload)
-        .map(|quad| quad.map_err(|error| StoreError::RdfParse(error.into())))
+        .map(|quad| quad.map_err(StoreError::RdfParse))
         .collect()
 }
 

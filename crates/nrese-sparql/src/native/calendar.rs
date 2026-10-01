@@ -7,9 +7,9 @@
 //! general type) has no arithmetic of its own, a time has no years or months to add, and
 //! a sum mixes no two duration types.
 
+use nrese_rdf::vocab::xsd;
+use nrese_rdf::{Literal, NamedNodeRef, Term};
 use nrese_xsd::{DayTimeDuration, Decimal, TimezoneOffset, YearMonthDuration};
-use oxrdf::vocab::xsd;
-use oxrdf::{Literal, NamedNodeRef, Term};
 
 use super::value::Value;
 

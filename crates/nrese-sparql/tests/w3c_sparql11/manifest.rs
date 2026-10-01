@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-use oxrdf::{Graph, NamedNode, NamedNodeRef, NamedOrBlankNodeRef, Term, TermRef};
-use oxrdfio::{RdfFormat, RdfParser};
+use nrese_rdf::{Graph, NamedNode, NamedNodeRef, NamedOrBlankNodeRef, Term, TermRef};
+use nrese_rdf_io::{RdfFormat, RdfParser};
 
 const MF: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#";
 const QT: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-query#";
@@ -112,7 +112,7 @@ impl Suite {
             .with_base_iri(iri.as_str())
             .map_err(|error| error.to_string())?
             .for_slice(text.as_bytes())
-            .map(|quad| quad.map(Into::<oxrdf::Triple>::into))
+            .map(|quad| quad.map(Into::<nrese_rdf::Triple>::into))
             .collect::<Result<Graph, _>>()
             .map_err(|error| format!("{iri}: {error}"))
     }

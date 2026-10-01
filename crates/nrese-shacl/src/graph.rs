@@ -4,8 +4,8 @@
 //! here: every accessor returns a sorted set of ids.
 
 use nrese_engine::{EncodedQuad, GraphSelector, QuadPattern, ReadModel, TermId};
+use nrese_rdf::{NamedNodeRef, Term};
 use nrese_sparql::ReadView;
-use oxrdf::{NamedNodeRef, Term};
 
 /// Which statements a validation reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -13,9 +13,11 @@
 
 use std::collections::HashMap;
 
-use oxrdf::{NamedNode, Term, Variable};
-use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
-use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
+use nrese_rdf::{NamedNode, Term, Variable};
+use nrese_sparql_syntax::algebra::{
+    AggregateExpression, Expression, GraphPattern, OrderExpression,
+};
+use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
 /// The namespace of the alias IRIs that stand for blank nodes.
 pub(super) const ALIAS: &str = "urn:nrese:substituted-blank-node:";
@@ -76,7 +78,7 @@ impl Values<'_> {
                 None => expression.clone(),
             },
             Expression::Bound(v) if self.terms.contains_key(v) => {
-                Expression::Literal(oxrdf::Literal::from(true))
+                Expression::Literal(nrese_rdf::Literal::from(true))
             }
             Expression::NamedNode(_) | Expression::Literal(_) | Expression::Bound(_) => {
                 expression.clone()
@@ -297,7 +299,7 @@ impl Values<'_> {
 
 enum Constant {
     Iri(NamedNode),
-    Literal(oxrdf::Literal),
+    Literal(nrese_rdf::Literal),
 }
 
 impl Constant {
@@ -317,7 +319,7 @@ pub(super) fn alias(label: &str) -> NamedNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spargebra::SparqlParser;
+    use nrese_sparql_syntax::SparqlParser;
 
     #[test]
     fn values_go_in_everywhere_a_variable_is_read() {
@@ -326,17 +328,17 @@ mod tests {
                 "SELECT * WHERE { ?x <http://e/p> ?y OPTIONAL { ?y <http://e/q> ?z FILTER(?z > ?o) } BIND(?o AS ?w) VALUES ?o { 1 2 } }",
             )
             .unwrap();
-        let spargebra::Query::Select { pattern, .. } = query else {
+        let nrese_sparql_syntax::Query::Select { pattern, .. } = query else {
             panic!()
         };
         let terms = HashMap::from([
             (
                 Variable::new_unchecked("o"),
-                Term::from(oxrdf::Literal::from(1)),
+                Term::from(nrese_rdf::Literal::from(1)),
             ),
             (
                 Variable::new_unchecked("x"),
-                Term::from(oxrdf::BlankNode::new_unchecked("b7")),
+                Term::from(nrese_rdf::BlankNode::new_unchecked("b7")),
             ),
         ]);
         let text = Values { terms: &terms }.pattern(&pattern).to_string();

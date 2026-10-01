@@ -8,8 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use nrese_engine::{DurabilityConfig, Engine, EngineConfig, EngineError, QuadPattern, SyncPolicy};
-use oxrdf::vocab::xsd;
-use oxrdf::{GraphName, Literal, NamedNode, Quad};
+use nrese_rdf::vocab::xsd;
+use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 
 fn config() -> EngineConfig {
     EngineConfig {

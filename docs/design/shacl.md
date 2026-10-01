@@ -24,7 +24,7 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 | When to validate, and what a failure means for a commit | `nrese-store` (mutation pipeline) | Gates are store orchestration |
 | Endpoints, formats, configuration | `nrese-server` | Transport and policy |
 
-`nrese-shacl` depends on `nrese-sparql` (never the reverse) and on `nrese-engine` for ids and patterns. It adds no external dependency: `oxrdf`, `oxsdatatypes` and `regex` are already in the workspace.
+`nrese-shacl` depends on `nrese-sparql` (never the reverse) and on `nrese-engine` for ids and patterns. It adds no external dependency: `nrese-rdf`, `nrese-xsd` and `regex` are already in the workspace.
 
 ## 3. Data model
 

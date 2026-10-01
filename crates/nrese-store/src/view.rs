@@ -1,8 +1,8 @@
 //! Reading engine views as RDF: the store's one decoding path and graph-target mapping.
 
 use nrese_engine::{EngineError, QuadPattern, ReadModel, TermId};
+use nrese_rdf::{GraphName, NamedNode, Quad};
 use nrese_sparql::ReadView;
-use oxrdf::{GraphName, NamedNode, Quad};
 
 use crate::error::{StoreError, StoreResult};
 use crate::graph_store::GraphTarget;

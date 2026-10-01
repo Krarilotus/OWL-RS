@@ -71,7 +71,7 @@ pub(crate) fn write_end(out: &mut Vec<u8>) {
     out.extend_from_slice(b"]}}");
 }
 
-fn write_term(out: &mut Vec<u8>, term: TermRef<'_>) {
+pub(crate) fn write_term(out: &mut Vec<u8>, term: TermRef<'_>) {
     match term {
         TermRef::NamedNode(iri) => {
             out.extend_from_slice(b"{\"type\":\"uri\",\"value\":");

@@ -27,7 +27,7 @@
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::graph::{Adjacency, closure, reachable};
-use spargebra::algebra::PropertyPathExpression;
+use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
 /// A path with its IRIs resolved to ids; `None` marks an IRI the store doesn't know (no
 /// edges).
@@ -45,7 +45,7 @@ pub(crate) enum Path {
 
 impl Path {
     pub(crate) fn resolve(path: &PropertyPathExpression, snapshot: &Snapshot) -> Self {
-        let id = |n: &oxrdf::NamedNode| snapshot.lookup(n.as_ref().into()).map(TermId::raw);
+        let id = |n: &nrese_rdf::NamedNode| snapshot.lookup(n.as_ref().into()).map(TermId::raw);
         let boxed = |p: &PropertyPathExpression| Box::new(Self::resolve(p, snapshot));
         match path {
             PropertyPathExpression::NamedNode(n) => Self::Link(id(n)),

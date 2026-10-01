@@ -3,8 +3,8 @@
 //! RDF merge (SPARQL 1.1 §13.2): a statement two of them hold counts once.
 
 use nrese_engine::TermId;
-use oxrdf::{GraphName, NamedOrBlankNodeRef};
-use spargebra::algebra::QueryDataset;
+use nrese_rdf::{GraphName, NamedOrBlankNodeRef};
+use nrese_sparql_syntax::algebra::QueryDataset;
 
 use crate::results::QueryDatasetSpecification;
 use crate::view::ReadView;

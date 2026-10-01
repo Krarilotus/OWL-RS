@@ -1,7 +1,7 @@
 //! Write transactions: exact deltas over a base snapshot, published atomically on commit.
 
 use hashbrown::HashSet;
-use oxrdf::{Quad, QuadRef, Term, TermRef};
+use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 use parking_lot::MutexGuard;
 
 use super::{Inner, ReadModel, Snapshot, Stack, Version};

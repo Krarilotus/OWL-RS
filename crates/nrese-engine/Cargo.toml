@@ -9,7 +9,8 @@ license.workspace = true
 crc32fast = "1.5"
 foldhash = "0.2"
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
-oxrdf = "=0.3.3"
+nrese-rdf = { path = "../rdf/nrese-rdf" }
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 parking_lot = "0.12"
 rayon = "1.10"
 thiserror.workspace = true

@@ -23,6 +23,7 @@ pub mod join;
 pub mod table;
 
 pub use budget::{Budget, BudgetExceeded, SharedBudget};
+pub use join::RowLimit;
 pub use table::IdTable;
 
 /// An unbound value (SPARQL `UNDEF`, from OPTIONAL or VALUES). Tag 15, which the engine never

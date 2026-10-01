@@ -14,9 +14,9 @@
 use std::hash::BuildHasher;
 
 use hashbrown::HashTable;
-use oxrdf::{
-    BlankNode, GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad, QuadRef, Term,
-    TermRef,
+use nrese_rdf::{
+    BaseDirection, BlankNode, GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad,
+    QuadRef, Term, TermRef,
 };
 use parking_lot::RwLock;
 
@@ -29,6 +29,11 @@ const TAG_BNODE: u8 = b'B';
 const TAG_STRING: u8 = b'S';
 const TAG_LANG: u8 = b'L';
 const TAG_TYPED: u8 = b'T';
+/// A language-tagged string with a base direction (RDF 1.2): tag, direction, value.
+const TAG_DIR_LANG: u8 = b'D';
+/// A triple term (RDF 1.2), keyed by its N-Triples text for now; the roadmap's R7 keys it
+/// by its components' ids instead.
+const TAG_TRIPLE: u8 = b'R';
 const SEP: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -209,7 +214,8 @@ impl Dictionary {
             | TermKind::BlankNode
             | TermKind::String
             | TermKind::LangString
-            | TermKind::TypedLiteral => {
+            | TermKind::TypedLiteral
+            | TermKind::Triple => {
                 let inner = self.inner.read();
                 if id.payload() >= inner.ends.len() as u64 {
                     return None;
@@ -498,11 +504,21 @@ fn encode_key(term: TermRef<'_>, out: &mut Vec<u8>) -> TermKind {
         }
         TermRef::Literal(literal) => {
             let kind = if let Some(language) = literal.language() {
-                out.push(TAG_LANG);
-                out.extend_from_slice(language.as_bytes());
+                match literal.direction() {
+                    Some(direction) => {
+                        out.push(TAG_DIR_LANG);
+                        out.extend_from_slice(language.as_bytes());
+                        out.push(SEP);
+                        out.extend_from_slice(direction.as_str().as_bytes());
+                    }
+                    None => {
+                        out.push(TAG_LANG);
+                        out.extend_from_slice(language.as_bytes());
+                    }
+                }
                 out.push(SEP);
                 TermKind::LangString
-            } else if literal.datatype() == oxrdf::vocab::xsd::STRING {
+            } else if literal.datatype() == nrese_rdf::vocab::xsd::STRING {
                 out.push(TAG_STRING);
                 TermKind::String
             } else {
@@ -513,6 +529,11 @@ fn encode_key(term: TermRef<'_>, out: &mut Vec<u8>) -> TermKind {
             };
             out.extend_from_slice(literal.value().as_bytes());
             kind
+        }
+        TermRef::Triple(_) => {
+            out.push(TAG_TRIPLE);
+            out.extend_from_slice(term.to_string().as_bytes());
+            TermKind::Triple
         }
     }
 }
@@ -537,11 +558,15 @@ pub enum TermView<'a> {
     LangString {
         value: &'a str,
         language: &'a str,
+        /// The base direction (RDF 1.2), if the string has one.
+        direction: Option<BaseDirection>,
     },
     Typed {
         value: &'a str,
         datatype: &'a str,
     },
+    /// A triple term (RDF 1.2), as N-Triples text: `<<( s p o )>>`.
+    Triple(&'a str),
 }
 
 impl<'a> TermView<'a> {
@@ -551,7 +576,7 @@ impl<'a> TermView<'a> {
         match self {
             Self::Iri(s) | Self::String(s) => Some(s),
             Self::LangString { value, .. } | Self::Typed { value, .. } => Some(value),
-            Self::BlankNode(_) => None,
+            Self::BlankNode(_) | Self::Triple(_) => None,
         }
     }
 }
@@ -565,8 +590,22 @@ fn view_key(key: &[u8]) -> TermView<'_> {
         TAG_STRING => TermView::String(text()),
         TAG_LANG => {
             let (language, value) = split_sep(rest);
-            TermView::LangString { value, language }
+            TermView::LangString {
+                value,
+                language,
+                direction: None,
+            }
         }
+        TAG_DIR_LANG => {
+            let (language, rest) = split_sep(rest);
+            let (direction, value) = split_sep(rest.as_bytes());
+            TermView::LangString {
+                value,
+                language,
+                direction: direction.parse().ok(),
+            }
+        }
+        TAG_TRIPLE => TermView::Triple(text()),
         _ => {
             let (datatype, value) = split_sep(rest);
             TermView::Typed { value, datatype }
@@ -585,6 +624,14 @@ fn decode_key(key: &[u8]) -> Term {
             let (language, lexical) = split_sep(rest);
             Literal::new_language_tagged_literal_unchecked(lexical, language).into()
         }
+        TAG_DIR_LANG => {
+            let (language, rest) = split_sep(rest);
+            let (direction, lexical) = split_sep(rest.as_bytes());
+            let direction = direction.parse().unwrap_or(BaseDirection::Ltr);
+            Literal::new_directional_language_tagged_literal_unchecked(lexical, language, direction)
+                .into()
+        }
+        TAG_TRIPLE => parse_triple_term(&text()),
         _ => {
             let (datatype, lexical) = split_sep(rest);
             Literal::new_typed_literal(lexical, NamedNode::new_unchecked(datatype)).into()
@@ -592,11 +639,24 @@ fn decode_key(key: &[u8]) -> Term {
     }
 }
 
+/// A triple term from the N-Triples text its key holds (written by [`encode_key`]).
+fn parse_triple_term(text: &str) -> Term {
+    let line = format!("<urn:x> <urn:x> {text} .");
+    nrese_rdf_io::RdfParser::from_format(nrese_rdf_io::RdfFormat::NTriples)
+        .for_slice(line.as_bytes())
+        .next()
+        .and_then(Result::ok)
+        .map_or_else(
+            || Literal::new_simple_literal(text).into(),
+            |quad| quad.object,
+        )
+}
+
 fn validate_key(key: &[u8]) -> EngineResult<()> {
     let ok = !key.is_empty()
         && matches!(
             key[0],
-            TAG_IRI | TAG_BNODE | TAG_STRING | TAG_LANG | TAG_TYPED
+            TAG_IRI | TAG_BNODE | TAG_STRING | TAG_LANG | TAG_TYPED | TAG_DIR_LANG | TAG_TRIPLE
         )
         && std::str::from_utf8(&key[1..]).is_ok();
     if ok {
@@ -610,8 +670,8 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use oxrdf::vocab::xsd;
-    use oxrdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
+    use nrese_rdf::vocab::xsd;
+    use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
 
     use super::*;
 
@@ -662,6 +722,41 @@ mod tests {
     }
 
     #[test]
+    fn rdf_1_2_terms_round_trip() {
+        let dict = Dictionary::default();
+        let directional = Term::from(Literal::new_directional_language_tagged_literal_unchecked(
+            "x",
+            "en",
+            BaseDirection::Ltr,
+        ));
+        let plain = Term::from(Literal::new_language_tagged_literal_unchecked("x", "en"));
+        let triple: Term = nrese_rdf::Triple::new(
+            BlankNode::new_unchecked("b"),
+            NamedNode::new_unchecked("http://e/p"),
+            nrese_rdf::Triple::new(
+                NamedNode::new_unchecked("http://e/s"),
+                NamedNode::new_unchecked("http://e/q"),
+                directional.clone(),
+            ),
+        )
+        .into();
+        let ids: Vec<TermId> = [&directional, &plain, &triple]
+            .into_iter()
+            .map(|t| dict.intern(t.as_ref()))
+            .collect();
+        // The direction makes a term of its own.
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids[2].kind(), TermKind::Triple);
+        for (id, term) in ids.iter().zip([&directional, &plain, &triple]) {
+            assert_eq!(dict.decode(*id).as_ref(), Some(term));
+        }
+        assert_eq!(
+            dict.with_view(ids[2], |v| format!("{v:?}")).unwrap(),
+            "Triple(\"<<( _:b <http://e/p> <<( <http://e/s> <http://e/q> \\\"x\\\"@en--ltr )>> )>>\")"
+        );
+    }
+
+    #[test]
     fn views_expose_text_kind_language_and_datatype() {
         let dict = Dictionary::default();
         let view = |term: TermRef<'_>| {
@@ -682,7 +777,19 @@ mod tests {
         );
         assert_eq!(
             view(LiteralRef::new_language_tagged_literal_unchecked("Haus", "de").into()).unwrap(),
-            "LangString { value: \"Haus\", language: \"de\" }"
+            "LangString { value: \"Haus\", language: \"de\", direction: None }"
+        );
+        assert_eq!(
+            view(
+                LiteralRef::new_directional_language_tagged_literal_unchecked(
+                    "Haus",
+                    "de",
+                    nrese_rdf::BaseDirection::Rtl
+                )
+                .into()
+            )
+            .unwrap(),
+            "LangString { value: \"Haus\", language: \"de\", direction: Some(Rtl) }"
         );
         assert_eq!(
             view(LiteralRef::new_typed_literal("01", xsd::INTEGER).into()).unwrap(),

@@ -9,8 +9,8 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 anyhow = "1.0.100"
 nrese-store = { path = "../../crates/nrese-store" }
-oxigraph = { version = "0.5.6", default-features = false }
-oxrdf = "0.3.3"
+nrese-rdf = { path = "../../crates/rdf/nrese-rdf" }
+nrese-rdf-io = { path = "../../crates/rdf/nrese-rdf-io" }
 # rustls only (no OpenSSL: the binary needs no system TLS library), trusting the bundled
 # roots and the machine's CA store (an identity provider with an internal certificate).
 reqwest = { version = "0.12.24", default-features = false, features = ["charset", "http2", "json", "rustls-tls", "rustls-tls-native-roots"] }
@@ -21,7 +21,3 @@ toml = "0.9.12"
 
 [dev-dependencies]
 tempfile = "3.23.0"
-
-# The workspace's patched oxsdatatypes (vendor/oxsdatatypes/NRESE-PATCH.md).
-[patch.crates-io]
-oxsdatatypes = { path = "../../vendor/oxsdatatypes" }

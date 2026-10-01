@@ -9,11 +9,10 @@
 //! (`"2.0E-1"^^xsd:double`) where evaluators print `"0.2"`. The same normalisation applies
 //! to every backend; all other terms compare exactly.
 
-use oxrdf::graph::CanonicalizationAlgorithm;
-use oxrdf::{
+use nrese_rdf::{
     BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, Term, Triple, TripleRef, Variable,
 };
-use sparesults::{QueryResultsFormat, QueryResultsParser, SliceQueryResultsParserOutput};
+use nrese_sparql_results::{QueryResultsFormat, QueryResultsParser, SliceQueryResultsParserOutput};
 
 const RS: &str = "http://www.w3.org/2001/sw/DataAccess/tests/result-set#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -39,7 +38,7 @@ pub fn canonical(graph: Graph) -> Graph {
             )
         })
         .collect();
-    graph.canonicalize(CanonicalizationAlgorithm::Unstable);
+    graph.canonicalize();
     graph
 }
 
@@ -126,7 +125,7 @@ pub fn solutions(rows: impl IntoIterator<Item = Row>, ordered: bool) -> Results 
             ));
         }
     }
-    graph.canonicalize(CanonicalizationAlgorithm::Unstable);
+    graph.canonicalize();
     Results::Solutions(graph)
 }
 
@@ -189,7 +188,7 @@ fn from_graph(graph: Graph) -> Results {
         let index = graph
             .object_for_subject_predicate(&solution, &rs("index"))
             .and_then(|term| match term {
-                oxrdf::TermRef::Literal(literal) => literal.value().parse().ok(),
+                nrese_rdf::TermRef::Literal(literal) => literal.value().parse().ok(),
                 _ => None,
             });
         ordered |= index.is_some();
@@ -200,7 +199,7 @@ fn from_graph(graph: Graph) -> Results {
             };
             let variable = graph.object_for_subject_predicate(&binding, &rs("variable"));
             let value = graph.object_for_subject_predicate(&binding, &rs("value"));
-            if let (Some(oxrdf::TermRef::Literal(variable)), Some(value)) = (variable, value) {
+            if let (Some(nrese_rdf::TermRef::Literal(variable)), Some(value)) = (variable, value) {
                 row.push((
                     Variable::new_unchecked(variable.value()),
                     value.into_owned(),

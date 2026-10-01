@@ -25,10 +25,10 @@ use std::cmp::Ordering;
 
 use nrese_engine::{Snapshot, TermId, TermKind, TermView};
 use nrese_exec::{UNDEF, computed_index};
-use oxrdf::Variable;
-use oxrdf::vocab::xsd;
+use nrese_rdf::Variable;
+use nrese_rdf::vocab::xsd;
+use nrese_sparql_syntax::algebra::{Expression, Function};
 use regex::Regex;
-use spargebra::algebra::{Expression, Function};
 
 use super::expr::compile_regex;
 
@@ -312,7 +312,7 @@ fn on_text(id: TermId, str: bool, snapshot: &Snapshot, test: impl FnOnce(&str) -
             (TermView::Iri(text), true) => Tri::of(test(text)),
             // STR of a typed literal is its lexical form (§17.4.2.5).
             (TermView::Typed { value, .. }, true) => Tri::of(test(value)),
-            (TermView::BlankNode(_), _) | (_, false) => Tri::Error,
+            (TermView::BlankNode(_) | TermView::Triple(_), _) | (_, false) => Tri::Error,
         })
         .unwrap_or(Tri::Unknown)
 }

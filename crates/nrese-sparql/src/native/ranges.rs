@@ -16,9 +16,9 @@
 //! < TypedLiteral, so the ranges come out increasing, and the scan stays sorted.
 
 use nrese_engine::{Snapshot, TermId, TermKind};
-use oxrdf::Variable;
-use oxrdf::vocab::xsd;
-use spargebra::algebra::Expression;
+use nrese_rdf::Variable;
+use nrese_rdf::vocab::xsd;
+use nrese_sparql_syntax::algebra::Expression;
 
 pub(crate) struct Hint {
     pub(crate) variable: Variable,

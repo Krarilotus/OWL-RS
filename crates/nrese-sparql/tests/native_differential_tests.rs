@@ -20,17 +20,17 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, ReadModel};
+use nrese_rdf::vocab::xsd;
+use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query, runs_natively};
-use oxrdf::vocab::xsd;
-use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
-use spargebra::SparqlParser;
+use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
 
 /// The reference evaluator's answer on what `snapshot` holds in `options.read_model`.
 fn reference(
     snapshot: &nrese_engine::Snapshot,
-    query: &spargebra::Query,
+    query: &nrese_sparql_syntax::Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'static>, nrese_sparql::QueryEvaluationError> {
     nrese_sparql_reference::evaluate_query(snapshot, query, options)
@@ -40,7 +40,7 @@ fn reference(
 /// copy of the engine's statements, written back as the engine's asserted statements.
 fn update_engine(
     engine: &Engine,
-    update: &spargebra::Update,
+    update: &nrese_sparql_syntax::Update,
     options: &nrese_sparql::UpdateOptions,
     reference: bool,
 ) {
@@ -456,7 +456,7 @@ fn canonical_number(literal: &Literal) -> Literal {
 }
 
 /// The variables of a query's result (`ASK` for an ASK), as a dump's header.
-fn variables(snapshot: &nrese_engine::Snapshot, query: &spargebra::Query) -> Vec<String> {
+fn variables(snapshot: &nrese_engine::Snapshot, query: &nrese_sparql_syntax::Query) -> Vec<String> {
     match evaluate_query(snapshot, query, &QueryOptions::default()).unwrap() {
         QueryResults::Solutions(solutions) => solutions
             .variables()
@@ -1970,11 +1970,11 @@ fn graph(results: QueryResults<'_>) -> Vec<String> {
 /// not, constants, a blank node and a literal in subject position) equals the reference evaluator.
 #[test]
 fn construct_equals_the_reference() {
-    use spargebra::term::{BlankNode, NamedNodePattern, TermPattern, TriplePattern};
-    use spargebra::{Query, algebra::GraphPattern};
+    use nrese_sparql_syntax::term::{BlankNode, NamedNodePattern, TermPattern, TriplePattern};
+    use nrese_sparql_syntax::{Query, algebra::GraphPattern};
 
     let mut rng = Rng(20_260_929);
-    let var = |name: &str| TermPattern::Variable(oxrdf::Variable::new_unchecked(name));
+    let var = |name: &str| TermPattern::Variable(nrese_rdf::Variable::new_unchecked(name));
     let template = vec![
         TriplePattern {
             subject: var("a"),
@@ -1988,7 +1988,7 @@ fn construct_equals_the_reference() {
         },
         TriplePattern {
             subject: var("b"),
-            predicate: NamedNodePattern::Variable(oxrdf::Variable::new_unchecked("c")),
+            predicate: NamedNodePattern::Variable(nrese_rdf::Variable::new_unchecked("c")),
             object: TermPattern::Literal(Literal::new_simple_literal("k")),
         },
         TriplePattern {
@@ -2339,7 +2339,7 @@ fn deletions_precede_insertions() {
 #[test]
 fn direct_results_equal_the_results_serialiser() {
     use nrese_sparql::{ResultsFormat, write_results};
-    use sparesults::{QueryResultsFormat, QueryResultsSerializer};
+    use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 
     let serialised = |results: QueryResults<'_>, format: QueryResultsFormat| -> Vec<u8> {
         let serializer = QueryResultsSerializer::from_format(format);
@@ -2371,7 +2371,7 @@ fn direct_results_equal_the_results_serialiser() {
         Literal::new_typed_literal("custom", NamedNode::new_unchecked("http://example.com/dt"))
             .into(),
         Literal::new_typed_literal("typed string", xsd::STRING).into(),
-        oxrdf::BlankNode::new_unchecked("b1").into(),
+        nrese_rdf::BlankNode::new_unchecked("b1").into(),
         NamedNode::new_unchecked("http://example.com/a\"b").into(),
         Literal::new_simple_literal("comma, and \"quotes\"").into(),
         Literal::new_typed_literal("+007", xsd::INTEGER).into(),
@@ -3495,7 +3495,7 @@ fn exists_equal_the_reference() {
 /// the native executor answers it, as the reference evaluator does.
 #[test]
 fn describe_equals_the_reference() {
-    use oxrdf::BlankNode;
+    use nrese_rdf::BlankNode;
     let mut rng = Rng(20_260_938);
     let mut checked = 0;
     for _ in 0..40 {
@@ -3509,7 +3509,7 @@ fn describe_equals_the_reference() {
             (b1.clone().into(), ex("p2"), b0.clone().into()),
             (b1.clone().into(), ex("p3"), ex("e2").into()),
         ] {
-            let s: oxrdf::NamedOrBlankNode = s;
+            let s: nrese_rdf::NamedOrBlankNode = s;
             tx.insert(Quad::new(s, p, o, GraphName::DefaultGraph).as_ref());
         }
         tx.commit().unwrap();

@@ -17,6 +17,22 @@ pub struct Graph {
     triples: BTreeSet<Triple>,
 }
 
+/// The triples of a [`Graph`] with one predicate.
+pub struct TriplesForPredicate<'a> {
+    triples: btree_set::Iter<'a, Triple>,
+    predicate: NamedNode,
+}
+
+impl<'a> Iterator for TriplesForPredicate<'a> {
+    type Item = TripleRef<'a>;
+
+    fn next(&mut self) -> Option<TripleRef<'a>> {
+        self.triples
+            .find(|t| t.predicate == self.predicate)
+            .map(Triple::as_ref)
+    }
+}
+
 /// The least term in the order of [`Term`].
 fn least_term() -> Term {
     Term::NamedNode(NamedNode::new_unchecked(""))
@@ -93,13 +109,35 @@ impl Graph {
             .map(|t| t.object.as_ref())
     }
 
-    pub fn object_for_subject_predicate<'a>(
+    /// The first object of this subject and predicate (which may be borrowed for less
+    /// long than the graph).
+    pub fn object_for_subject_predicate<'a, 'b>(
         &'a self,
-        subject: impl Into<NamedOrBlankNodeRef<'a>>,
-        predicate: impl Into<NamedNodeRef<'a>>,
+        subject: impl Into<NamedOrBlankNodeRef<'b>>,
+        predicate: impl Into<NamedNodeRef<'b>>,
     ) -> Option<TermRef<'a>> {
-        self.objects_for_subject_predicate(subject, predicate)
+        let start = Triple {
+            subject: subject.into().into_owned(),
+            predicate: predicate.into().into_owned(),
+            object: least_term(),
+        };
+        self.triples
+            .range((Bound::Included(&start), Bound::Unbounded))
             .next()
+            .filter(|t| t.subject == start.subject && t.predicate == start.predicate)
+            .map(|t| t.object.as_ref())
+    }
+
+    /// The triples with this predicate (a full scan; the predicate may be borrowed for
+    /// less long than the graph).
+    pub fn triples_for_predicate<'b>(
+        &self,
+        predicate: impl Into<NamedNodeRef<'b>>,
+    ) -> TriplesForPredicate<'_> {
+        TriplesForPredicate {
+            triples: self.triples.iter(),
+            predicate: predicate.into().into_owned(),
+        }
     }
 
     /// The subjects with this predicate and object (a full scan).

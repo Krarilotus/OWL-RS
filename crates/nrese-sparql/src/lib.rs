@@ -2,7 +2,7 @@
 //!
 //! Owns SPARQL semantics over the engine: query evaluation (its own executor over the
 //! engine's id tables), protocol dataset parameters, cancellation, and SPARQL Update
-//! execution into an engine transaction. Parsing is `spargebra`'s.
+//! execution into an engine transaction. Parsing is `nrese_sparql_syntax`'s.
 //!
 //! Not owned here: storage and visibility (L1 `nrese-engine`), whether a delta may be
 //! committed (L3 mutation pipeline: validation, deadlines, commit), HTTP (L4).

@@ -1186,6 +1186,13 @@ impl Variable {
     }
 }
 
+/// The name, without `?` (which `Display` writes).
+impl AsRef<str> for Variable {
+    fn as_ref(&self) -> &str {
+        &self.name
+    }
+}
+
 impl fmt::Display for Variable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "?{}", self.name)

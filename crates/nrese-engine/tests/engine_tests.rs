@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nrese_engine::{Engine, EngineConfig, GraphSelector, QuadPattern};
-use oxrdf::vocab::xsd;
-use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Term};
+use nrese_rdf::vocab::xsd;
+use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Term};
 
 fn iri(n: u64) -> NamedNode {
     NamedNode::new_unchecked(format!("http://example.com/{n}"))
@@ -228,8 +228,8 @@ fn random_transactions_match_a_model() {
         let mut pending = model.clone();
         let ops = 1 + (random_term(&mut state).to_string().len() % 8);
         for _ in 0..ops {
-            let subject: oxrdf::NamedOrBlankNode = match random_term(&mut state) {
-                Term::Literal(_) => iri(0).into(),
+            let subject: nrese_rdf::NamedOrBlankNode = match random_term(&mut state) {
+                Term::Literal(_) | Term::Triple(_) => iri(0).into(),
                 Term::NamedNode(n) => n.into(),
                 Term::BlankNode(b) => b.into(),
             };

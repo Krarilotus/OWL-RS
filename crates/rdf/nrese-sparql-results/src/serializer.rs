@@ -78,9 +78,9 @@ pub struct WriterSolutionsSerializer<W: Write> {
 impl<W: Write> WriterSolutionsSerializer<W> {
     /// One solution, as the values of named variables (the others are unbound; names not
     /// among the variables are left out).
-    pub fn serialize<'a>(
+    pub fn serialize<'a, V: AsRef<str>>(
         &mut self,
-        solution: impl IntoIterator<Item = (&'a str, TermRef<'a>)>,
+        solution: impl IntoIterator<Item = (V, impl Into<TermRef<'a>>)>,
     ) -> io::Result<()> {
         // Most queries have few variables: their row stays on the stack.
         let mut stack = [None; 16];
@@ -94,12 +94,13 @@ impl<W: Write> WriterSolutionsSerializer<W> {
         // Values usually come in the variables' order: try the next one first.
         let mut next = 0;
         for (name, value) in solution {
+            let name = name.as_ref();
             let i = match self.variables.get(next) {
                 Some(v) if v.as_str() == name => Some(next),
                 _ => self.variables.iter().position(|v| v.as_str() == name),
             };
             if let Some(i) = i {
-                row[i] = Some(value);
+                row[i] = Some(value.into());
                 next = i + 1;
             }
         }
@@ -141,5 +142,18 @@ impl<W: Write> WriterSolutionsSerializer<W> {
         }
         self.writer.write_all(&self.out)?;
         Ok(self.writer)
+    }
+}
+
+/// One term as it stands in a solution of `format`: a JSON term object, an XML term
+/// element, a TSV term, a CSV field. For writers that lay out the rows themselves (the
+/// engine writes them from its id tables) and must still write terms exactly as
+/// [`WriterSolutionsSerializer`] does.
+pub fn write_term(format: QueryResultsFormat, term: TermRef<'_>, out: &mut Vec<u8>) {
+    match format {
+        QueryResultsFormat::Json => json::write_term(out, term),
+        QueryResultsFormat::Xml => xml::write_term(out, term),
+        QueryResultsFormat::Csv => csv::write_term(out, term),
+        QueryResultsFormat::Tsv => tsv::write_term(out, term),
     }
 }

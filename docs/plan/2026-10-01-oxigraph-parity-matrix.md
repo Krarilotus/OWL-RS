@@ -51,7 +51,7 @@ do), **decide** (the owner decides whether the use case needs it).
 
 | Oxigraph | NRESE | Status |
 |---|---|---|
-| Recursive descent parser to algebra (`spargebra`) | `nrese-sparql-syntax`: one pass, no backtracking, deterministic generated names, bounded nesting, errors with line and column; all 1,289 W3C syntax tests of SPARQL 1.0–1.2 pass with exact write–parse round trips; 1,189 of 1,197 files parse to spargebra's algebra, the 8 others are spargebra errors (`results/2026-10-01-step-4b-syntax.md`); parsing in 0.35–0.66 and writing in 0.53–0.79 of spargebra's time. The engine still parses with spargebra until step 5 | **have** (crate); switch-over step 5 |
+| Recursive descent parser to algebra (`spargebra`) | `nrese-sparql-syntax`: one pass, no backtracking, deterministic generated names, bounded nesting, errors with line and column; all 1,289 W3C syntax tests of SPARQL 1.0–1.2 pass with exact write–parse round trips; 1,189 of 1,197 files parse to spargebra's algebra, the 8 others are spargebra errors (`results/2026-10-01-step-4b-syntax.md`); parsing in 0.35–0.66 and writing in 0.53–0.79 of spargebra's time. The engine parses with it since step 5 | **have** |
 | Heuristic optimiser (`sparopt`): filter pushdown, join reordering by bound variables, constant folding | Cost-based: distinct statistics, dynamic-programming join order within a basic graph pattern, filter pushdown below joins, OPTIONAL, UNION, MINUS, BIND and into subqueries, `explain` with estimated and actual rows | **have** within a BGP; **partial** across BGPs, paths and subqueries (Pf4) |
 | Volcano pull pipeline | Vectorised id tables, streaming results in 64 KiB chunks with backpressure | **have** |
 | Nested-loop, hash and merge joins | Merge, hash and index joins on permutation order, worst-case-optimal (leapfrog) joins for cyclic patterns, parallel joins | **have** |
@@ -69,7 +69,7 @@ do), **decide** (the owner decides whether the use case needs it).
 | N-Triples, N-Quads, Turtle, TriG, RDF/XML | Every W3C 1.1 test passes (70, 87, 313, 357, 166); N-Triples and N-Quads in parallel chunks | **have** |
 | JSON-LD 1.1 | toRdf 455/455, expand 376/376, fromRdf 53/53; streaming and expanded writers. (The list says `oxjsonld` does compaction; version 0.2.4 has expansion and toRdf, and a streaming writer, but no compaction or fromRdf algorithm.) | **have** (beyond `oxjsonld`) |
 | N3 (lexing and structure) | Read and written (`nrese_rdf_io::n3`): formulas, quick variables, paths, `has`/`is … of`/`<-`, `=`/`=>`/`<=`, any term anywhere; plain RDF in N3 loads like Turtle. W3C N3 parser suites 1,084 of 1,085 (the one: cwm's own literal canonicalisation). N3 rules are the reasoner's user rules (`NRESE_REASONING_RULES`): datalog rules, `=> false` consistency rules, `log:equalTo`/`log:notEqualTo`, facts; materialised and maintained on commits like the built-in rulesets; the W3C N3 reasoner tests in that scope pass (13/13) | **have** (syntax, datalog rules); builtins **planned** |
-| SPARQL results: XML, JSON, CSV, TSV, booleans | `nrese-sparql-results`: streaming readers (JSON, XML, TSV) and writers (all four), the W3C result files read as `sparesults` reads them (372/372), faster in every case (writing 0.29–0.91 of its time, reading 0.45–0.90; `benches/oxigraph-comparison/results/2026-10-01-step-4a-results.md`); CSV quotes IRIs with commas and writes triple terms as §2.2 says, where `sparesults` doesn't. The engine still writes through `sparesults` until step 5 | **have** (crate); switch-over step 5 |
+| SPARQL results: XML, JSON, CSV, TSV, booleans | `nrese-sparql-results`: streaming readers (JSON, XML, TSV) and writers (all four), the W3C result files read as `sparesults` reads them (372/372), faster in every case (writing 0.29–0.91 of its time, reading 0.45–0.90; `benches/oxigraph-comparison/results/2026-10-01-step-4a-results.md`); CSV quotes IRIs with commas and writes triple terms as §2.2 says, where `sparesults` doesn't. The engine writes every results term through it (`write_term`) since step 5 | **have** |
 
 ## 5. Modern and draft standards
 
@@ -100,8 +100,8 @@ version bump of the crates it changes (minor while they are 0.x).
 | Oxigraph | NRESE | Status |
 |---|---|---|
 | `oxrdf`, `oxsdatatypes`, `oxttl`, `oxrdfxml`, `oxjsonld`, `oxrdfio` | `nrese-rdf`, `nrese-xsd`, `nrese-rdf-io` (+ `nrese-json`) | **have** |
-| `sparesults` | `nrese-sparql-results` | **have** (step 4a; users switch in step 5) |
-| `spargebra` | `nrese-sparql-syntax` | **have** (step 4b; users switch in step 5) |
+| `sparesults` | `nrese-sparql-results` | **have** (step 4a; the engine uses it since step 5) |
+| `spargebra` | `nrese-sparql-syntax` | **have** (step 4b; the engine uses it since step 5) |
 | `sparopt`, `spareval` | `nrese-sparql` (planner, native executor), `nrese-exec` | **have** |
 | `spargeo` | GeoSPARQL in `nrese-sparql` with an R-tree | **have** |
 | `oxigraph` (`Store`, transactions, bulk load) | `nrese-engine` and `nrese-store` | **have** |

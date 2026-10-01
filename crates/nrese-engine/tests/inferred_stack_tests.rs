@@ -9,7 +9,7 @@ use nrese_engine::{
     EncodedQuad, EncodedTriple, Engine, EngineConfig, GraphSelector, QuadPattern, ReadModel,
     Snapshot, TermId, Transaction, quad::Permutation,
 };
-use oxrdf::NamedNode;
+use nrese_rdf::NamedNode;
 
 const MODELS: [ReadModel; 3] = [
     ReadModel::Materialised,

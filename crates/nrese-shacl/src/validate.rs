@@ -5,9 +5,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use nrese_engine::{TermId, TermKind};
+use nrese_rdf::Term;
 use nrese_sparql::ReadView;
 use nrese_sparql::value::{Value, compare, lang_matches};
-use oxrdf::Term;
 
 use crate::datatype::well_formed;
 use crate::graph::{GraphView, Selection};
@@ -168,7 +168,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         match self.graph.decode(node)? {
             Term::NamedNode(node) => Some(node.into_string()),
             Term::Literal(literal) => Some(literal.value().to_owned()),
-            Term::BlankNode(_) => None,
+            Term::BlankNode(_) | Term::Triple(_) => None,
         }
     }
 

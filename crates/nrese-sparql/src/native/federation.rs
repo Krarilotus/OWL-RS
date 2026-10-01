@@ -4,12 +4,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use spargebra::Query;
-use spargebra::algebra::GraphPattern;
-use spargebra::term::{GroundTerm, NamedNodePattern};
+use nrese_sparql_syntax::Query;
+use nrese_sparql_syntax::algebra::GraphPattern;
+use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern};
 
 use nrese_exec::{IdTable, UNDEF};
-use oxrdf::{Term, Variable};
+use nrese_rdf::{Term, Variable};
 
 use crate::results::QueryEvaluationError;
 
@@ -207,6 +207,8 @@ fn bind_values(
             row.push(Some(match ctx.term(id)? {
                 Term::NamedNode(n) => GroundTerm::NamedNode(n),
                 Term::Literal(l) => GroundTerm::Literal(l),
+                // A triple term goes along if it holds no blank node.
+                triple @ Term::Triple(_) => GroundTerm::try_from(triple).ok()?,
                 Term::BlankNode(_) => return None,
             }));
         }

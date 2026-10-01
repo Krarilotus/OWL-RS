@@ -25,7 +25,7 @@ pub(crate) fn write_row(out: &mut Vec<u8>, row: &[Option<TermRef<'_>>]) {
     out.extend_from_slice(b"\r\n");
 }
 
-fn write_term(out: &mut Vec<u8>, term: TermRef<'_>) {
+pub(crate) fn write_term(out: &mut Vec<u8>, term: TermRef<'_>) {
     match term {
         // Of the characters CSV quotes, an IRI can only hold `,`.
         TermRef::NamedNode(iri) => {

@@ -33,5 +33,5 @@ pub use parser::{
     QueryResultsParser, ReaderQueryResultsParserOutput, ReaderSolutionsParser,
     SliceQueryResultsParserOutput, SliceSolutionsParser,
 };
-pub use serializer::{QueryResultsSerializer, WriterSolutionsSerializer};
-pub use solution::QuerySolution;
+pub use serializer::{QueryResultsSerializer, WriterSolutionsSerializer, write_term};
+pub use solution::{QuerySolution, SolutionIndex};

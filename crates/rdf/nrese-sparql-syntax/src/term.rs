@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use nrese_rdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
+pub use nrese_rdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple, Variable};
 
 use crate::writer::{fmt_iri, fmt_literal, fmt_term, fmt_variable};
 
