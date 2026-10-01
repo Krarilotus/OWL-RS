@@ -67,7 +67,7 @@ do), **decide** (the owner decides whether the use case needs it).
 | Error recovery (skip a bad statement, go on) | Line formats go on after a bad line; Turtle, TriG and RDF/XML stop at the first error | **partial**: a recovery mode for Turtle and TriG (skip to the next `.` at statement level) belongs to 3f |
 | N-Triples, N-Quads, Turtle, TriG, RDF/XML | Every W3C 1.1 test passes (70, 87, 313, 357, 166); N-Triples and N-Quads in parallel chunks | **have** |
 | JSON-LD 1.1 | toRdf 455/455, expand 376/376, fromRdf 53/53; streaming and expanded writers. (The list says `oxjsonld` does compaction; version 0.2.4 has expansion and toRdf, and a streaming writer, but no compaction or fromRdf algorithm.) | **have** (beyond `oxjsonld`) |
-| N3 (lexing and structure) | Not read | **decide** (see §8) |
+| N3 (lexing and structure) | Read and written (`nrese_rdf_io::n3`): formulas, quick variables, paths, `has`/`is … of`/`<-`, `=`/`=>`/`<=`, any term anywhere; plain RDF in N3 loads like Turtle. W3C N3 parser suites 1,084 of 1,085 (the one: cwm's own literal canonicalisation). N3 rules as the reasoner's user-defined rule sets are next (§9) | **have** (syntax); rules **planned** |
 | SPARQL results: XML, JSON, CSV, TSV, booleans | Written natively from id tables (JSON, TSV, CSV); XML and the readers through `sparesults` until `nrese-sparql-results` | **planned** (step 4) |
 
 ## 5. Modern and draft standards
@@ -138,7 +138,8 @@ These are requirements, not just comparisons:
 
 Each is outside the current use cases (DMW, ResearchSpace, the HisQu workload) as far as
 the plan knows; parity on them is a choice:
-- **N3** (a W3C Community Group format, not a Recommendation): read it, or leave it out.
+- **N3**: decided 1 October (owner: as much compatibility as can be optimised): read
+  and written; N3 rules as user-defined rule sets of the reasoner.
 - **Python bindings** (PyO3, an RDFLib store) and **WASM/npm**: the bundle crates could be
   published for both cheaply; the full engine in WASM needs a single-threaded in-memory
   build.
@@ -154,3 +155,11 @@ the plan knows; parity on them is a choice:
 - Engine backlog: spilling for sorts, `DISTINCT` and grouping; group commit; more inlined
   types; the CLI's `convert` and `query`.
 - Feature flags for the drafts and the versioning rule for draft changes (§5).
+- N3 (owner's decision, 1 October): the syntax is done; next, N3 rules (datalog form,
+  `=> false`, `log:notEqualTo` and the common comparison and arithmetic builtins) compiled
+  into the reasoner's rule IR as user-defined rule sets, which GraphDB's custom rulesets
+  are also a parity item for. Full EYE-level N3 (backward rules, scoped negation, the
+  whole builtin library) only if a use case needs it.
+- Benchmark targets (owner, 1 October): NRESE on the Oxigraph libraries (the baseline
+  branch) is a system of its own in the suite, next to NRESE on the bundle and the other
+  engines.
