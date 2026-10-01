@@ -1177,6 +1177,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-sparql-results"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "nrese-json",
+ "nrese-rdf",
+ "quick-xml 0.42.0",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "nrese-store"
 version = "0.1.0"
 dependencies = [

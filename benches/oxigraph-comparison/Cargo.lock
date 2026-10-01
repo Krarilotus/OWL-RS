@@ -130,6 +130,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-sparql-results"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "nrese-json",
+ "nrese-rdf",
+ "quick-xml 0.42.0",
+ "thiserror",
+]
+
+[[package]]
 name = "nrese-xsd"
 version = "0.1.0"
 dependencies = [
@@ -142,6 +153,7 @@ version = "0.1.0"
 dependencies = [
  "nrese-rdf",
  "nrese-rdf-io",
+ "nrese-sparql-results",
  "nrese-xsd",
  "oxiri",
  "oxjsonld",
@@ -150,6 +162,7 @@ dependencies = [
  "oxsdatatypes",
  "oxttl",
  "rand",
+ "sparesults",
 ]
 
 [[package]]
@@ -353,6 +366,19 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "sparesults"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e13362decdcbeb3fefadff1631238c835c112027221e83d217cc5779f5a81c2"
+dependencies = [
+ "json-event-parser",
+ "memchr",
+ "oxrdf",
+ "quick-xml 0.37.5",
+ "thiserror",
 ]
 
 [[package]]

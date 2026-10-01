@@ -81,9 +81,7 @@ pub fn compile_quads(
             N3Term::NamedNode(p) if p.as_str() == implies => (&quad.subject, &quad.object),
             N3Term::NamedNode(p) if p.as_str() == implied_by => (&quad.object, &quad.subject),
             _ => {
-                program
-                    .facts
-                    .push(fact(quad, vocabulary).map_err(&error)?);
+                program.facts.push(fact(quad, vocabulary).map_err(&error)?);
                 continue;
             }
         };
