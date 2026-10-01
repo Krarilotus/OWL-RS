@@ -171,7 +171,7 @@ fn recursive_shapes_terminate() {
     let snapshot = engine_broken.snapshot();
     let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
     assert_eq!(report.results.len(), 1, "{report:#?}");
-    assert_eq!(report.results[0].component, Component::Node);
+    assert_eq!(report.results[0].component.as_str(), Component::Node.iri());
     assert_eq!(
         report.results[0].value.as_ref().map(ToString::to_string),
         Some(ex("b"))

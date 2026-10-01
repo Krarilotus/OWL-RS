@@ -1030,6 +1030,47 @@ fn closures_from_many_bound_values_equal_the_reference() {
     }
 }
 
+/// Patterns without variables have solutions too (one empty row, or none): a UNION or
+/// filter of them must keep the rows, as SHACL-SPARQL's pre-bound queries rely on.
+#[test]
+fn patterns_without_variables_keep_their_rows() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let quad = Quad::new(ex("a"), ex("p"), ex("b"), GraphName::DefaultGraph);
+    tx.insert(quad.as_ref());
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for (text, count) in [
+        (
+            "SELECT * WHERE { { FILTER(false) } UNION { FILTER(true) } }",
+            1,
+        ),
+        (
+            "SELECT * WHERE { { FILTER(true) } UNION { FILTER(true) } }",
+            2,
+        ),
+        (
+            "SELECT * WHERE { { FILTER(false) } UNION { FILTER(false) } }",
+            0,
+        ),
+        (
+            "SELECT * WHERE { { <http://example.com/a> <http://example.com/p> <http://example.com/b> } UNION { FILTER(true) } }",
+            2,
+        ),
+        (
+            "ASK { { FILTER(false) } UNION { FILTER(<http://example.com/a> = <http://example.com/a>) } }",
+            1,
+        ),
+    ] {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        let options = QueryOptions::default();
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+        assert_eq!(native.len(), count, "{text}");
+        assert_same_rows(&native, &expected, text);
+    }
+}
+
 /// LIMIT without ORDER BY may return any rows of the result, and the native evaluator stops
 /// joining once it has enough (morsels of the first pattern; the left side of an OPTIONAL):
 /// it must return exactly min(limit, all) rows, each a row of the full result, with

@@ -1,4 +1,5 @@
-//! C1 gate: the W3C SHACL test suite (Core) against `nrese-shacl`.
+//! C1 and C3 gates: the W3C SHACL test suite (Core, and SHACL-SPARQL) against
+//! `nrese-shacl`.
 //!
 //! - **Source.** The pinned `w3c/data-shapes` checkout fetched by
 //!   `scripts/fetch-w3c-tests.sh` into `.cache/data-shapes`, or wherever
@@ -8,8 +9,10 @@
 //!   expected ones as multisets of (focus node, path, value, source shape, component,
 //!   severity). Blank nodes compare equal to each other; messages aren't compared (the
 //!   specification leaves them free).
+//! - **Failures.** A test whose result is `sht:Failure` passes if the shapes graph is
+//!   refused as ill-formed, or validation reports a failure.
 //! - **Expected failures.** Every known failure is listed with its reason in
-//!   `expected-failures.txt`. The run fails on any failure not in the list, and on any
+//!   `expected-failures.txt` (Core) and `expected-failures-sparql.txt` (SHACL-SPARQL). The run fails on any failure not in the list, and on any
 //!   listed test that now passes. The full report is written to
 //!   `<target tmp>/w3c-shacl-report.txt`.
 
@@ -27,10 +30,10 @@ use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_shacl::{PropertyPath, Selection, compile, validate};
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
+const EXPECTED_FAILURES_SPARQL: &str = include_str!("expected-failures-sparql.txt");
 
 /// The IRI the suite's `tests` directory is parsed under.
 const BASE: &str = "http://w3c.test/shacl/";
-const SHAPES_GRAPH: &str = "urn:nrese:test:shapes";
 
 const MF: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#";
 const SHT: &str = "http://www.w3.org/ns/shacl-test#";
@@ -193,11 +196,14 @@ fn expected_path(graph: &Graph, term: TermRef<'_>) -> Result<PropertyPath, Strin
 /// `sh:conforms` and the sorted result keys.
 type Outcome = (bool, Vec<String>);
 
-fn expected(graph: &Graph, test: &Test) -> Result<Outcome, String> {
+/// `None` if the test expects a failure (`sht:Failure`).
+fn expected(graph: &Graph, test: &Test) -> Result<Option<Outcome>, String> {
     let entry = NamedNode::new_unchecked(test.id.trim_matches(['<', '>']));
-    let report = object(graph, entry.as_ref().into(), &iri(MF, "result"))
-        .and_then(node)
-        .ok_or("no mf:result")?;
+    let result = object(graph, entry.as_ref().into(), &iri(MF, "result")).ok_or("no mf:result")?;
+    if result == TermRef::NamedNode(iri(SHT, "Failure").as_ref()) {
+        return Ok(None);
+    }
+    let report = node(result).ok_or("no mf:result")?;
     let conforms = match object(graph, report, &iri(SH, "conforms")) {
         Some(TermRef::Literal(literal)) => literal.value() == "true",
         _ => return Err("no sh:conforms".to_owned()),
@@ -219,7 +225,7 @@ fn expected(graph: &Graph, test: &Test) -> Result<Outcome, String> {
         ));
     }
     results.sort();
-    Ok((conforms, results))
+    Ok(Some((conforms, results)))
 }
 
 fn result_key(
@@ -251,7 +257,10 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
         }
     };
     let engine = Engine::new(EngineConfig::default()).map_err(|error| error.to_string())?;
-    let shapes_graph = NamedNodeRef::new_unchecked(SHAPES_GRAPH);
+    // The shapes go to a graph named after their file, as in a repository: SHACL-SPARQL
+    // reads it as `$shapesGraph`. A shapes graph that is the data graph is in the default
+    // graph as data too.
+    let shapes_graph = test.shapes.as_ref();
     let mut tx = engine.transaction();
     for triple in &triples(&test.data)? {
         tx.insert(QuadRef::new(
@@ -261,28 +270,19 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
             GraphNameRef::DefaultGraph,
         ));
     }
-    // A shapes graph that is the data graph is read from there; another one gets a graph
-    // of its own, as in a repository.
-    let separate = test.shapes != test.data;
-    if separate {
-        for triple in &triples(&test.shapes)? {
-            tx.insert(QuadRef::new(
-                &triple.subject,
-                &triple.predicate,
-                &triple.object,
-                shapes_graph,
-            ));
-        }
+    for triple in &triples(&test.shapes)? {
+        tx.insert(QuadRef::new(
+            &triple.subject,
+            &triple.predicate,
+            &triple.object,
+            shapes_graph,
+        ));
     }
     tx.commit().map_err(|error| error.to_string())?;
     let snapshot = engine.snapshot();
-    let shapes_selector = if separate {
-        match snapshot.lookup(shapes_graph.into()) {
-            Some(graph) => GraphSelector::Exact(graph),
-            None => return Err("empty shapes graph".to_owned()),
-        }
-    } else {
-        GraphSelector::Exact(TermId::DEFAULT_GRAPH)
+    let shapes_selector = match snapshot.lookup(shapes_graph.into()) {
+        Some(graph) => GraphSelector::Exact(graph),
+        None => return Err("empty shapes graph".to_owned()),
     };
     let shapes = compile(&snapshot, Selection::asserted(shapes_selector)).map_err(|errors| {
         let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
@@ -293,6 +293,9 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
         &shapes,
         Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
     );
+    if !report.failures.is_empty() {
+        return Err(format!("validation failed: {}", report.failures.join("; ")));
+    }
     let mut results: Vec<String> = report
         .results
         .iter()
@@ -303,7 +306,7 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
                 result.path.as_ref(),
                 result.value.as_ref().map(term),
                 Some(term(&result.source_shape)),
-                Some(format!("<{}>", result.component.iri())),
+                Some(format!("<{}>", result.component.as_str())),
                 Some(result.severity.to_string()),
             )
         })
@@ -322,7 +325,12 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
 fn run(root: &Path, test: &Test) -> Result<(), String> {
     let file = parse(root, test.file.as_ref())?;
     let graph: Graph = file.iter().cloned().collect();
-    let expected = expected(&graph, test)?;
+    let Some(expected) = expected(&graph, test)? else {
+        return match actual(root, test, &file) {
+            Err(_) => Ok(()),
+            Ok(_) => Err("expected a failure (ill-formed shapes or a validation failure)".into()),
+        };
+    };
     let actual = actual(root, test, &file)?;
     if expected == actual {
         return Ok(());
@@ -352,6 +360,29 @@ fn run(root: &Path, test: &Test) -> Result<(), String> {
 
 #[test]
 fn w3c_shacl_core() {
+    suite(
+        "core/manifest.ttl",
+        "W3C SHACL Core",
+        98,
+        EXPECTED_FAILURES,
+        "w3c-shacl-report.txt",
+    );
+}
+
+#[test]
+fn w3c_shacl_sparql() {
+    suite(
+        "sparql/manifest.ttl",
+        "W3C SHACL-SPARQL",
+        20,
+        EXPECTED_FAILURES_SPARQL,
+        "w3c-shacl-sparql-report.txt",
+    );
+}
+
+/// Runs the tests of `manifest` (under the suite's `tests` directory) and checks the
+/// failures against `expected_failures`.
+fn suite(manifest: &str, name: &str, at_least: usize, expected_failures: &str, report_file: &str) {
     let Some(root) = suite_root() else {
         assert!(
             std::env::var_os("NRESE_W3C_REQUIRED").is_none_or(|value| value.is_empty()),
@@ -361,8 +392,8 @@ fn w3c_shacl_core() {
         return;
     };
     let mut all = Vec::new();
-    tests(&root, &iri(BASE, "core/manifest.ttl"), &mut all).expect("manifests");
-    assert!(all.len() >= 98, "only {} tests found", all.len());
+    tests(&root, &iri(BASE, manifest), &mut all).expect("manifests");
+    assert!(all.len() >= at_least, "only {} tests found", all.len());
 
     let outcomes: Vec<(&Test, Result<(), String>)> = all
         .iter()
@@ -379,7 +410,7 @@ fn w3c_shacl_core() {
         .map(|(test, _)| test.id.as_str())
         .collect();
     let mut report = format!(
-        "W3C SHACL Core: {} of {} pass\n",
+        "{name}: {} of {} pass\n",
         outcomes.len() - failed.len(),
         outcomes.len()
     );
@@ -388,13 +419,13 @@ fn w3c_shacl_core() {
             writeln!(report, "FAIL {}\n    {difference}", test.id).unwrap();
         }
     }
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("w3c-shacl-report.txt");
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(report_file);
     std::fs::write(&path, &report).expect("report");
     eprintln!("{}", report.lines().next().unwrap_or_default());
     eprintln!("full report: {}", path.display());
 
     // Entries are `<iri> # reason`.
-    let listed: BTreeSet<&str> = EXPECTED_FAILURES
+    let listed: BTreeSet<&str> = expected_failures
         .lines()
         .filter(|line| line.starts_with('<'))
         .filter_map(|line| line.find('>').map(|end| &line[..=end]))
@@ -404,6 +435,6 @@ fn w3c_shacl_core() {
     assert!(
         new_failures.is_empty() && fixed.is_empty(),
         "new failures (fix, or list them with a reason): {new_failures:#?}\n\
-         listed but now passing (remove from expected-failures.txt): {fixed:#?}"
+         listed but now passing (remove them from the expected failures): {fixed:#?}"
     );
 }

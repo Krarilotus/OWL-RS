@@ -1,6 +1,6 @@
 # SHACL validation: design
 
-Status: design for phase C of the [parity plan](../plan/2026-09-30-graphdb-parity-plan.md) (30 September 2026). Slice C1a is done; the others are planned.
+Status: design for phase C of the [parity plan](../plan/2026-09-30-graphdb-parity-plan.md) (30 September 2026). Slices C1a, C1b and C3 are done (C3 on 2 October 2026); C1c and C2 are planned.
 
 ## 1. Goal and scope
 
@@ -10,7 +10,7 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
   - SHACL Core: every constraint component, every property path, all four target kinds, severities, deactivation, messages.
   - The validation report, as RDF and as JSON.
   - A commit gate with incremental validation (C2).
-  - SHACL-SPARQL constraints and targets (C3).
+  - SHACL-SPARQL: `sh:sparql` constraints and SPARQL-based constraint components (C3). SPARQL-based targets belong to SHACL Advanced Features.
 - **Out of scope for now:** SHACL Advanced Features (rules, functions, node expressions) and SHACL-JS. SHACL rules overlap with the reasoner's rule IR and would be compiled into it, not interpreted here.
 
 ## 2. Where it lives
@@ -99,7 +99,7 @@ This slice needs the per-repository configuration of D1 first.
 
 ## 8. Evidence
 
-- **Conformance:** the W3C SHACL test suite (`w3c/data-shapes`, pinned, fetched by `scripts/fetch-w3c-tests.sh`): 98 Core tests for C1 (all pass), 23 SHACL-SPARQL tests for C3. As for SPARQL, every known failure is listed with its reason, and the run fails on a new failure or on a listed test that now passes.
+- **Conformance:** the W3C SHACL test suite (`w3c/data-shapes`, pinned, fetched by `scripts/fetch-w3c-tests.sh`): 98 Core tests for C1 (all pass), 22 SHACL-SPARQL tests for C3 (all pass). As for SPARQL, every known failure is listed with its reason, and the run fails on a new failure or on a listed test that now passes.
 - **Reports are compared** by their result sets: focus node, path (structurally), value, source shape, component and severity. Messages aren't compared (the specification leaves them free).
 - **Differential:** incremental against full validation (C2).
 - **Licensed references** (GraphDB's SHACL) are compared locally only.
@@ -112,4 +112,4 @@ This slice needs the per-repository configuration of D1 first.
 | C1b ✅ | Store operation and server endpoint: validate the repository, or a posted shapes graph, and return the report; configuration | HTTP tests; the report round-trips as RDF |
 | C1c | Parallel and set-at-a-time evaluation | Same reports as C1a on the suite and on random data; perf-lab numbers recorded |
 | C2 | Commit gate, incremental validation, policy, cancellation | Differential test; a rejected commit changes nothing |
-| C3 | SHACL-SPARQL constraints and targets | W3C SHACL-SPARQL tests |
+| C3 ✅ | SHACL-SPARQL: `sh:sparql` constraints and SPARQL-based constraint components, pre-binding by substitution (`nrese-shacl/src/sparql.rs`) | W3C SHACL-SPARQL suite passes: 22 of 22 |

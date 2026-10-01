@@ -147,4 +147,13 @@ impl<'a, V: ReadView> GraphView<'a, V> {
     pub(crate) fn decode(&self, id: TermId) -> Option<Term> {
         self.view.decode(id)
     }
+
+    pub(crate) fn lookup(&self, term: &Term) -> Option<TermId> {
+        self.view.lookup(term.as_ref())
+    }
+
+    /// The view and the statements it reads: what SHACL-SPARQL queries run over.
+    pub(crate) fn parts(&self) -> (&'a V, Selection) {
+        (self.view, self.selection)
+    }
 }

@@ -113,7 +113,7 @@ impl ShaclValidation {
                 }),
                 value: result.value.as_ref().map(text),
                 source_shape: text(&result.source_shape),
-                component: result.component.iri(),
+                component: result.component.as_str().to_owned(),
                 severity: result.severity.as_str().to_owned(),
                 messages: result
                     .messages

@@ -15,6 +15,9 @@ use crate::validate::RawResult;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ValidationReport {
     pub results: Vec<ValidationResult>,
+    /// Validation failures (SHACL §3.6.2): a SPARQL-based constraint that couldn't be
+    /// evaluated or reported `?failure`. A report with failures is no verdict.
+    pub failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +27,11 @@ pub struct ValidationResult {
     pub path: Option<PropertyPath>,
     pub value: Option<Term>,
     pub source_shape: Term,
-    pub component: Component,
+    /// `sh:sourceConstraintComponent`: a built-in component, or a SPARQL-based one of the
+    /// shapes graph.
+    pub component: NamedNode,
+    /// `sh:sourceConstraint`: the SPARQL constraint or validator that found it.
+    pub source_constraint: Option<Term>,
     /// `sh:Violation`, `sh:Warning`, `sh:Info` or the shape's own severity IRI.
     pub severity: NamedNode,
     /// The source shape's `sh:message` literals.
@@ -96,6 +103,7 @@ pub(crate) fn decode<V: ReadView>(
     view: &V,
     shapes: &Shapes,
     raw: &[RawResult],
+    failures: Vec<String>,
 ) -> ValidationReport {
     let term = |id: TermId| view.decode(id).expect("ids read from the view decode");
     let results = raw
@@ -119,10 +127,19 @@ pub(crate) fn decode<V: ReadView>(
                     .and_then(|path| decode_path(view, path)),
                 value: result.value.map(term),
                 source_shape: term(shape.node),
-                component: result.component,
+                component: match result.component {
+                    Component::Custom(component) => match term(component) {
+                        Term::NamedNode(component) => component,
+                        _ => sh("ConstraintComponent"),
+                    },
+                    component => NamedNode::new_unchecked(component.iri()),
+                },
+                source_constraint: result.source.map(term),
                 severity,
-                messages: shape
+                messages: result
                     .messages
+                    .as_deref()
+                    .unwrap_or(&shape.messages)
                     .iter()
                     .filter_map(|&message| match term(message) {
                         Term::Literal(message) => Some(message),
@@ -132,13 +149,13 @@ pub(crate) fn decode<V: ReadView>(
             }
         })
         .collect();
-    ValidationReport { results }
+    ValidationReport { results, failures }
 }
 
 impl ValidationReport {
-    /// Whether the data conforms: no result of any severity.
+    /// Whether the data conforms: no result of any severity (and no failure).
     pub fn conforms(&self) -> bool {
-        self.results.is_empty()
+        self.results.is_empty() && self.failures.is_empty()
     }
 
     /// The report as an RDF graph (`sh:ValidationReport`), with fresh blank nodes.
@@ -174,8 +191,11 @@ impl ValidationReport {
             add(
                 &node,
                 sh("sourceConstraintComponent"),
-                NamedNode::new_unchecked(result.component.iri()).into(),
+                result.component.clone().into(),
             );
+            if let Some(source) = &result.source_constraint {
+                add(&node, sh("sourceConstraint"), source.clone());
+            }
             add(&node, sh("resultSeverity"), result.severity.clone().into());
             for message in &result.messages {
                 add(&node, sh("resultMessage"), message.clone().into());
