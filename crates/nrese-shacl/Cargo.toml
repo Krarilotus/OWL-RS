@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 nrese-engine = { path = "../nrese-engine" }
 nrese-sparql = { path = "../nrese-sparql" }
+nrese-sparql-syntax = { path = "../rdf/nrese-sparql-syntax" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
 regex = "1.12"

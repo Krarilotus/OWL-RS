@@ -39,6 +39,12 @@ pub struct QueryOptions {
     /// rules): every fact about one identity holds for the others. Some operators then
     /// work on one representative per identity class where the answer can't tell.
     pub equality_closed: bool,
+    /// Pre-bound variables (SHACL-SPARQL's `$this`, `$value`, parameters): their values
+    /// are put in for them throughout the query before it is evaluated, as SHACL §5.6
+    /// defines pre-binding. A subquery sees them only where it projects them; the query's
+    /// own projection drops them (the caller knows their values).
+    pub pre_bound:
+        Option<std::sync::Arc<std::collections::HashMap<nrese_rdf::Variable, nrese_rdf::Term>>>,
 }
 
 /// Evaluates `query` against `view` over the engine's id tables (`native`); a transaction

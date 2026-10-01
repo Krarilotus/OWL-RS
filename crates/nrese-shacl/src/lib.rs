@@ -13,7 +13,8 @@
 //! Not owned here: when a store validates and what a failed validation means for a
 //! commit (L3 mutation pipeline), endpoints and formats (L4).
 //!
-//! Supported: SHACL Core. Not yet: SHACL-SPARQL (design slice C3).
+//! Supported: SHACL Core and SHACL-SPARQL (`sh:sparql` constraints and SPARQL-based
+//! constraint components, with pre-binding by substitution: [`sparql`]).
 
 mod compile;
 mod datatype;
@@ -21,6 +22,7 @@ mod graph;
 mod model;
 mod path;
 mod report;
+mod sparql;
 mod validate;
 
 pub use compile::{ShapeError, compile};
@@ -35,6 +37,6 @@ use nrese_sparql::ReadView;
 /// `shapes` must have been compiled from the same view (or one of the same repository):
 /// it holds that dictionary's term ids.
 pub fn validate<V: ReadView>(view: &V, shapes: &Shapes, data: Selection) -> ValidationReport {
-    let raw = validate::validate_raw(view, shapes, data);
-    report::decode(view, shapes, &raw)
+    let (raw, failures) = validate::validate_raw(view, shapes, data);
+    report::decode(view, shapes, &raw, failures)
 }

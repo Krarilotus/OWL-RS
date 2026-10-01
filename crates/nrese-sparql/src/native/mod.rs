@@ -129,6 +129,20 @@ pub(crate) fn evaluate<'a>(
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
     let (pattern, form) = native_pattern(query, options)?;
     let ctx = Context::new(&snapshot, options, query_dataset(query), query_base(query));
+    let pattern = match &options.pre_bound {
+        Some(values) => {
+            // A blank node is put in as an alias IRI that stands for the node.
+            for term in values.values() {
+                if let nrese_rdf::Term::BlankNode(b) = term
+                    && let Some(id) = snapshot.lookup(term.as_ref())
+                {
+                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
+                }
+            }
+            substitute::Values { terms: values }.top(&pattern)
+        }
+        None => pattern,
+    };
     let solutions = ctx.eval(&pattern)?;
     match form {
         Form::Select => {}
@@ -2931,6 +2945,10 @@ impl<'a> Context<'a> {
             }
         }
         let widen = |s: &Solutions| {
+            // No variables on either side: rows without columns, as many as there are.
+            if vars.is_empty() {
+                return IdTable::from_rows(0, std::iter::repeat_n(&[][..], s.table.len()));
+            }
             let columns: Vec<Vec<u64>> = vars
                 .iter()
                 .map(|v| match s.column(v) {
