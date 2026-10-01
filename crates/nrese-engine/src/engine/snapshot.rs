@@ -528,6 +528,15 @@ impl Snapshot {
         self.dictionary.with_view(id, f)
     }
 
+    /// Calls `f` with a lookup of the views of this snapshot's dictionary terms, under one
+    /// read lock ([`Self::with_view`] for many terms).
+    pub fn with_views<R>(
+        &self,
+        f: impl for<'v> FnOnce(&'v dyn Fn(TermId) -> Option<crate::TermView<'v>>) -> R,
+    ) -> R {
+        self.dictionary.with_views(self.version.dictionary_len, f)
+    }
+
     pub fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
         self.dictionary.decode_quad(quad)
     }

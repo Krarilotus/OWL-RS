@@ -7,9 +7,15 @@
 //! the serialised bytes, since joins repeat ids), and output goes out in 64 KiB chunks.
 //! Each term is written by `nrese_sparql_results::write_term`, so the bytes are those of
 //! its serialiser, RDF 1.2 terms included.
+//!
+//! Large results are written by every core: blocks of rows are serialised in parallel,
+//! each under one read lock of the dictionary, and written out in order a window of
+//! blocks at a time, so output still streams and memory stays bounded.
 
 use std::collections::HashMap;
 use std::io::Write;
+
+use rayon::prelude::*;
 
 use nrese_engine::{Snapshot, TermId, TermView};
 use nrese_exec::{IdTable, UNDEF, computed_index};
@@ -20,6 +26,10 @@ use nrese_sparql_results::QueryResultsFormat;
 const CACHE_ENTRIES: usize = 1 << 16;
 /// Output is written in chunks of this size.
 const CHUNK: usize = 1 << 16;
+/// Rows serialised together, by one thread.
+const BLOCK_ROWS: usize = 4096;
+/// Blocks serialised in parallel before they are written, per thread.
+const BLOCKS_PER_THREAD: usize = 4;
 
 /// Writes `s` as a JSON string, escaped as `json-event-parser` does: `\` and `"`, and
 /// control characters as `\b \f \n \r \t` or `\u00xx`; everything else verbatim.
@@ -112,8 +122,9 @@ pub(super) struct DirectResults<'a> {
 }
 
 impl DirectResults<'_> {
-    /// Appends id `id` (a stored, inline or computed term) in the format.
-    fn id(&self, id: u64, out: &mut Vec<u8>) {
+    /// Appends id `id` (a stored, inline or computed term) in the format; `view` looks up
+    /// dictionary terms ([`Snapshot::with_views`]).
+    fn id<'v>(&self, id: u64, view: &'v dyn Fn(TermId) -> Option<TermView<'v>>, out: &mut Vec<u8>) {
         let format = self.format.results_format();
         if let Some(index) = computed_index(id) {
             if let Some(t) = self.computed.get(index as usize) {
@@ -122,19 +133,74 @@ impl DirectResults<'_> {
             return;
         }
         let id = TermId::from_raw(id);
-        let written = self.snapshot.with_view(id, |v| match view_term(v) {
-            Some(term) => {
-                nrese_sparql_results::write_term(format, term, out);
-                true
-            }
-            None => false,
-        });
+        if let Some(term) = view(id).and_then(view_term) {
+            nrese_sparql_results::write_term(format, term, out);
+            return;
+        }
         // Inline ids and triple terms: through the decoded term.
-        if written != Some(true)
-            && let Some(t) = self.snapshot.decode(id)
-        {
+        if let Some(t) = self.snapshot.decode(id) {
             nrese_sparql_results::write_term(format, t.as_ref(), out);
         }
+    }
+
+    /// Appends the rows `rows` of `table` (`keys`: each column's JSON object key).
+    fn rows(
+        &self,
+        table: &IdTable,
+        rows: std::ops::Range<usize>,
+        keys: &[Vec<u8>],
+        buffer: &mut Vec<u8>,
+    ) {
+        let json = self.format == ResultsFormat::Json;
+        let (separator, end_of_row): (u8, &[u8]) = match self.format {
+            ResultsFormat::Json => (b',', b"}"),
+            ResultsFormat::Tsv => (b'\t', b"\n"),
+            ResultsFormat::Csv => (b',', b"\r\n"),
+        };
+        let mut cache: HashMap<u64, Box<[u8]>> = HashMap::new();
+        let mut scratch = Vec::new();
+        self.snapshot.with_views(|view| {
+            for row in rows {
+                if json {
+                    if row > 0 {
+                        buffer.push(b',');
+                    }
+                    buffer.push(b'{');
+                }
+                let mut first = true;
+                for (column, key) in keys.iter().enumerate() {
+                    let id = table.get(row, column);
+                    if json {
+                        // Unbound variables are left out of the binding object.
+                        if id == UNDEF {
+                            continue;
+                        }
+                        if !first {
+                            buffer.push(b',');
+                        }
+                    } else if column > 0 {
+                        // Every column has a field; unbound ones are empty.
+                        buffer.push(separator);
+                    }
+                    first = false;
+                    if id == UNDEF {
+                        continue;
+                    }
+                    buffer.extend_from_slice(key);
+                    if let Some(bytes) = cache.get(&id) {
+                        buffer.extend_from_slice(bytes);
+                    } else {
+                        scratch.clear();
+                        self.id(id, view, &mut scratch);
+                        buffer.extend_from_slice(&scratch);
+                        if cache.len() < CACHE_ENTRIES {
+                            cache.insert(id, scratch.as_slice().into());
+                        }
+                    }
+                }
+                buffer.extend_from_slice(end_of_row);
+            }
+        });
     }
 
     /// Writes the result document; `alive` is polled every few thousand rows (it fails
@@ -189,55 +255,38 @@ impl DirectResults<'_> {
                 key
             })
             .collect();
-        let mut cache: HashMap<u64, Box<[u8]>> = HashMap::new();
-        let mut scratch = Vec::new();
-        for row in 0..table.len() {
-            if row % 4096 == 0 {
+        let rows = table.len();
+        let blocks = rows.div_ceil(BLOCK_ROWS);
+        let block = |b: usize| b * BLOCK_ROWS..((b + 1) * BLOCK_ROWS).min(rows);
+        if blocks <= 1 {
+            self.rows(table, 0..rows, &keys, &mut buffer);
+        } else {
+            // A window of blocks serialised in parallel, then written in order. A
+            // cancelled query stops within one chunk of output (and one window of work).
+            let window = rayon::current_num_threads() * BLOCKS_PER_THREAD;
+            for start in (0..blocks).step_by(window) {
                 alive()?;
-            }
-            if json {
-                if row > 0 {
-                    buffer.push(b',');
-                }
-                buffer.push(b'{');
-            }
-            let mut first = true;
-            for (column, key) in keys.iter().enumerate() {
-                let id = table.get(row, column);
-                if json {
-                    // Unbound variables are left out of the binding object.
-                    if id == UNDEF {
-                        continue;
-                    }
-                    if !first {
-                        buffer.push(b',');
-                    }
-                } else if column > 0 {
-                    // Every column has a field; unbound ones are empty.
-                    buffer.push(separator);
-                }
-                first = false;
-                if id == UNDEF {
-                    continue;
-                }
-                buffer.extend_from_slice(key);
-                if let Some(bytes) = cache.get(&id) {
-                    buffer.extend_from_slice(bytes);
-                } else {
-                    scratch.clear();
-                    self.id(id, &mut scratch);
-                    buffer.extend_from_slice(&scratch);
-                    if cache.len() < CACHE_ENTRIES {
-                        cache.insert(id, scratch.as_slice().into());
+                let parts: Vec<Vec<u8>> = (start..(start + window).min(blocks))
+                    .into_par_iter()
+                    .map(|b| {
+                        let mut part = Vec::with_capacity(CHUNK);
+                        self.rows(table, block(b), &keys, &mut part);
+                        part
+                    })
+                    .collect();
+                for part in parts {
+                    let mut rest = part.as_slice();
+                    while !rest.is_empty() {
+                        let (now, later) = rest.split_at((CHUNK - buffer.len()).min(rest.len()));
+                        buffer.extend_from_slice(now);
+                        rest = later;
+                        if buffer.len() >= CHUNK {
+                            out.write_all(&buffer)?;
+                            buffer.clear();
+                            alive()?;
+                        }
                     }
                 }
-            }
-            buffer.extend_from_slice(end_of_row);
-            if buffer.len() >= CHUNK {
-                out.write_all(&buffer)?;
-                buffer.clear();
-                // A cancelled query stops within one chunk of output.
-                alive()?;
             }
         }
         if json {
