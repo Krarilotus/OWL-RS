@@ -34,6 +34,7 @@ mod search;
 mod sets;
 mod sideways;
 mod spatial;
+mod strings;
 mod substitute;
 mod triple_terms;
 pub(crate) mod value;
@@ -1878,6 +1879,44 @@ impl<'a> Context<'a> {
         if scans.is_empty() {
             return Ok(Solutions::unit());
         }
+        // A string test on a large pattern's object: the terms that pass, from the
+        // dictionary first (`strings`), as a hint.
+        let string_hints: Vec<ranges::Hint> = if self.as_written {
+            Vec::new()
+        } else {
+            let mut found: Vec<ranges::Hint> = Vec::new();
+            for s in &scans {
+                let Slot::Var(object) = &s.slots[2] else {
+                    continue;
+                };
+                if hints.iter().chain(&found).any(|h| &h.variable == object) {
+                    continue;
+                }
+                let Some(condition) = filters
+                    .iter()
+                    .filter(|(_, read)| read.as_slice() == std::slice::from_ref(object))
+                    .find_map(|(conjunct, _)| strings::condition(conjunct))
+                else {
+                    continue;
+                };
+                let rows = self.snapshot.count_in(self.model, &s.quad_pattern());
+                if rows < self.snapshot.dictionary_bytes() / strings::DICTIONARY_BYTES_PER_ROW {
+                    continue;
+                }
+                let start = Instant::now();
+                if let Some(ranges) = strings::ranges(self.snapshot, &condition, rows) {
+                    if self.trace.is_some() {
+                        let detail = format!("terms {object} can take");
+                        self.note("dictionary string test", detail, None, ranges.len(), start);
+                    }
+                    found.push(ranges::Hint {
+                        variable: condition.variable.clone(),
+                        ranges,
+                    });
+                }
+            }
+            found
+        };
         // Each pattern's id ranges, if a hint narrows its object and the object comes first
         // after the bound prefix in the permutation that sorts on it.
         let ranged: Vec<Option<RangedScan<'_>>> = scans
@@ -1889,7 +1928,10 @@ impl<'a> Context<'a> {
                 if !s.in_default_graph() {
                     return None;
                 }
-                let hint = hints.iter().find(|h| &h.variable == object)?;
+                let hint = hints
+                    .iter()
+                    .chain(&string_hints)
+                    .find(|h| &h.variable == object)?;
                 let permutation = s.permutation_for(Some(object));
                 (s.first_free(permutation) == Some(2) && !s.repeats_variable())
                     .then_some((permutation, hint.ranges.as_slice()))
@@ -3145,6 +3187,30 @@ impl<'a> Context<'a> {
                 Some(scan) => self.scan(&scan, None)?.table.len() as u64,
                 None => 0,
             };
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(count))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // COUNT(*) of an open closure (`?a p* ?b`, `?a p+ ?b`): from the closure's size
+        // per node, without building its pairs. Its pairs are distinct, so DISTINCT counts
+        // the same.
+        if variables.is_empty()
+            && let [(target, AggregateExpression::CountSolutions { .. })] = aggregates
+            && let GraphPattern::Path {
+                subject,
+                path,
+                object,
+            } = inner
+            && let (Ok(start), Ok(end)) = (self.path_end(subject), self.path_end(object))
+            && start != end
+            && let Some(count) = self
+                .path_evaluator()?
+                .count_open(&paths::Path::resolve(path, self.snapshot))
+        {
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
             return Ok(Solutions {

@@ -1030,6 +1030,230 @@ fn closures_from_many_bound_values_equal_the_reference() {
     }
 }
 
+/// String tests on a pattern's object (`CONTAINS`, `STRSTARTS`, `STRENDS`, on `?v` or
+/// `STR(?v)`) narrow its scan to the terms the dictionary says can pass: the same answers as
+/// the reference, over values of every kind (IRIs, simple, typed and language-tagged
+/// strings with and without direction, numbers, dates, blank nodes).
+#[test]
+fn dictionary_first_string_tests_equal_the_reference() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let values: Vec<Term> = vec![
+        Literal::new_simple_literal("Semantic Web").into(),
+        Literal::new_simple_literal("the semantic web").into(),
+        Literal::new_language_tagged_literal_unchecked("Semantic Web", "en").into(),
+        Literal::new_language_tagged_literal_unchecked("Web sémantique", "fr").into(),
+        Literal::new_language_tagged_literal_unchecked("Semantic", "semantic").into(),
+        Literal::new_typed_literal("Semantic", xsd::STRING).into(),
+        Literal::new_typed_literal("Semantic", ex("Semantic")).into(),
+        Literal::new_typed_literal("1879", xsd::INTEGER).into(),
+        Literal::new_typed_literal("18790", xsd::INTEGER).into(),
+        Literal::new_typed_literal("1879-03-14", xsd::DATE).into(),
+        ex("SemanticThing").into(),
+        ex("other").into(),
+        nrese_rdf::BlankNode::new_unchecked("Semantic").into(),
+        Literal::new_simple_literal("Saint Petersburg").into(),
+        Literal::new_simple_literal("windsurf").into(),
+        Literal::new_language_tagged_literal_unchecked("windsurf", "en").into(),
+    ];
+    // Filler: the pattern is large against the few terms that pass, so the dictionary
+    // pass runs (checked below by EXPLAIN).
+    let values: Vec<Term> = values
+        .into_iter()
+        .chain((0..200).map(|i| Literal::new_simple_literal(format!("filler {i}")).into()))
+        .collect();
+    for (i, value) in values.iter().enumerate() {
+        for p in ["label", "other"] {
+            let quad = Quad::new(
+                ex(&format!("s{i}")),
+                ex(p),
+                value.clone(),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for filter in [
+        "CONTAINS(?l, \"Semantic\")",
+        "CONTAINS(STR(?l), \"Semantic\")",
+        "STRSTARTS(?l, \"wind\")",
+        "STRSTARTS(STR(?l), \"1879\")",
+        "STRENDS(?l, \"Web\")",
+        "STRENDS(STR(?l), \"Thing\")",
+        "CONTAINS(?l, \"Semantic\") && LANG(?l) = \"en\"",
+        "CONTAINS(?l, \"nope\")",
+        "CONTAINS(?l, \"Semantic\"@en)",
+    ] {
+        for pattern in [
+            format!("?s <{EX}label> ?l"),
+            format!("?s <{EX}label> ?l ; <{EX}other> ?l"),
+        ] {
+            let text = format!("SELECT ?s ?l WHERE {{ {pattern} FILTER({filter}) }}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "{text}");
+            let options = QueryOptions::default();
+            let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+            assert_same_rows(&native, &expected, &text);
+            if !filter.contains("nope") && !filter.contains("@en") {
+                let explanation = explain_query(&snapshot, &query, &options).unwrap();
+                let operators: Vec<&str> = explanation
+                    .steps
+                    .iter()
+                    .map(|s| s.operator.as_str())
+                    .collect();
+                assert!(
+                    operators.contains(&"dictionary string test"),
+                    "{text}: {operators:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Bounds on `YEAR(?d)` narrow the scan of `?d` to id ranges (inline dates and dateTimes of
+/// those years, plus all dictionary typed literals): the same answers as the reference, on
+/// dates with timezones at the year's edges, non-canonical forms, g-types and non-dates.
+#[test]
+fn year_bounds_equal_the_reference() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let values: Vec<Literal> = [
+        ("1879-03-14", xsd::DATE),
+        ("1879-01-01+14:00", xsd::DATE),
+        ("1878-12-31-14:00", xsd::DATE),
+        ("1880-01-01", xsd::DATE),
+        ("1879-12-31T23:59:59Z", xsd::DATE_TIME),
+        ("1880-01-01T00:30:00+01:00", xsd::DATE_TIME),
+        ("1879-06-01T12:00:00.500", xsd::DATE_TIME),
+        ("1879-06-01T24:00:00", xsd::DATE_TIME),
+        ("01879-06-01", xsd::DATE),
+        ("12000-01-01", xsd::DATE),
+        ("1879", xsd::G_YEAR),
+        ("1879-05", xsd::G_YEAR_MONTH),
+        ("1879", xsd::INTEGER),
+        ("not a date", xsd::DATE),
+    ]
+    .into_iter()
+    .map(|(lexical, datatype)| Literal::new_typed_literal(lexical, datatype))
+    .chain([Literal::new_simple_literal("1879-03-14")])
+    .collect();
+    for (i, value) in values.iter().enumerate() {
+        let person = ex(&format!("p{i}"));
+        for quad in [
+            Quad::new(
+                person.clone(),
+                ex("born"),
+                value.clone(),
+                GraphName::DefaultGraph,
+            ),
+            Quad::new(person, ex("type"), ex("Person"), GraphName::DefaultGraph),
+        ] {
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for filter in [
+        "YEAR(?d) = 1879",
+        "1879 = YEAR(?d)",
+        "YEAR(?d) >= 1879 && YEAR(?d) < 1881",
+        "YEAR(?d) > 1878 && YEAR(?d) <= 1879",
+        "YEAR(?d) < 1879",
+        "YEAR(?d) > 9999",
+        "YEAR(?d) = 1879 && ?d > \"1879-06-01\"^^<http://www.w3.org/2001/XMLSchema#date>",
+    ] {
+        for pattern in [
+            format!("?p <{EX}born> ?d"),
+            format!("?p <{EX}type> <{EX}Person> ; <{EX}born> ?d"),
+        ] {
+            let text = format!("SELECT ?p ?d WHERE {{ {pattern} FILTER({filter}) }}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "{text}");
+            let options = QueryOptions::default();
+            let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+            assert_same_rows(&native, &expected, &text);
+        }
+    }
+}
+
+/// Open closures (`?a p+ ?b`, `?a p* ?b`) and their counts, which the native evaluator
+/// computes from the closure's size per node without building pairs, on random graphs with
+/// cycles and self-loops, in the default graph, a named graph and the merge of graphs.
+#[test]
+fn open_closures_and_their_counts_equal_the_reference() {
+    let mut rng = Rng(20_261_001);
+    for round in 0..12 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let nodes = 5 + rng.below(40);
+        for _ in 0..rng.below(3 * nodes) {
+            let (a, b) = (rng.below(nodes), rng.below(nodes));
+            let graph = if rng.below(3) == 0 {
+                GraphName::NamedNode(ex("g"))
+            } else {
+                GraphName::DefaultGraph
+            };
+            let p = if rng.below(4) == 0 { "other" } else { "next" };
+            let quad = Quad::new(ex(&format!("n{a}")), ex(p), ex(&format!("n{b}")), graph);
+            tx.insert(quad.as_ref());
+        }
+        // Nodes that only a literal or a type touches: zero-length paths start there too.
+        for i in 0..rng.below(5) {
+            let quad = Quad::new(
+                ex(&format!("lone{i}")),
+                ex("label"),
+                Literal::new_simple_literal(format!("l{i}")),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for path in [
+            format!("<{EX}next>+"),
+            format!("<{EX}next>*"),
+            format!("(<{EX}next>|^<{EX}other>)+"),
+            format!("(<{EX}next>/<{EX}next>)*"),
+            format!("^<{EX}next>*"),
+        ] {
+            for (dataset, group, union) in [
+                (String::new(), format!("?a {path} ?b"), false),
+                (
+                    String::new(),
+                    format!("GRAPH <{EX}g> {{ ?a {path} ?b }}"),
+                    false,
+                ),
+                (format!("FROM <{EX}g>"), format!("?a {path} ?b"), false),
+                (String::new(), format!("?a {path} ?b"), true),
+            ] {
+                let options = QueryOptions {
+                    union_default_graph: union,
+                    ..QueryOptions::default()
+                };
+                for select in ["?a ?b", "(COUNT(*) AS ?n)", "(COUNT(DISTINCT *) AS ?n)"] {
+                    let text = format!("SELECT {select} {dataset} WHERE {{ {group} }}");
+                    let query = SparqlParser::new()
+                        .parse_query(&text)
+                        .unwrap_or_else(|e| panic!("{e}: {text}"));
+                    assert!(runs_natively(&query), "{text}");
+                    let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+                    let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+                    let context = format!("round {round}, union {union}: {text}");
+                    assert_same_rows(&native, &expected, &context);
+                }
+            }
+        }
+    }
+}
+
 /// A query over values the query computes itself: grouping, aggregating, ordering,
 /// deduplicating, joining and filtering on the results of `BIND` and `SELECT` expressions
 /// and of aggregates in subqueries. The patterns are single statements and joins on `?a`,

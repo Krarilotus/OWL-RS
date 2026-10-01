@@ -266,6 +266,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ", memory: peak {peak} MiB, resident {rss} MiB"
         ))
     );
+    // Where the resident memory goes: the indexes, the dictionary's text and its index.
+    let stats = store.engine_stats();
+    let mib = |bytes: u64| bytes / 1048576;
+    eprintln!(
+        "held: {} quads + {} inferred in {} runs; index {} MiB, dictionary {} terms: text {} MiB, index {} MiB",
+        stats.quads,
+        stats.inferred,
+        stats.runs,
+        mib(stats.index_bytes),
+        stats.dictionary.terms,
+        mib(stats.dictionary.arena_bytes),
+        mib(stats.dictionary.index_bytes),
+    );
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(&args.queries)?
         .filter_map(|e| e.ok().map(|e| e.path()))

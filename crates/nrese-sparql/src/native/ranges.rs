@@ -11,14 +11,19 @@
 //!   timezones compare indeterminately within ±14 h, and the FILTER decides those), plus
 //!   every dictionary typed literal (non-canonical dates)
 //!
+//! - a bound on `YEAR(?v)` covers the inline dates and dateTimes of those years exactly
+//!   (an inline id's payload starts with the local year, which is what `YEAR` returns),
+//!   plus every dictionary typed literal (non-canonical forms, the g-types, years outside
+//!   0000–9999)
+//!
 //! Other kinds (IRIs, strings, dateTimes against a date, …) make the comparison an error,
 //! so they can't pass and are skipped. The kinds' tags are ordered Integer < Decimal < Date
-//! < TypedLiteral, so the ranges come out increasing, and the scan stays sorted.
+//! < DateTime < TypedLiteral, so the ranges come out increasing, and the scan stays sorted.
 
 use nrese_engine::{Snapshot, TermId, TermKind};
 use nrese_rdf::Variable;
 use nrese_rdf::vocab::xsd;
-use nrese_sparql_syntax::algebra::Expression;
+use nrese_sparql_syntax::algebra::{Expression, Function};
 
 pub(crate) struct Hint {
     pub(crate) variable: Variable,
@@ -29,9 +34,12 @@ pub(crate) struct Hint {
 enum Domain {
     Integer,
     Date,
+    /// Bounds on `YEAR(?v)`: inclusive years in `low` and `high`.
+    Year,
 }
 
-/// Bounds collected for one variable: inclusive integer bounds, or date ids.
+/// Bounds collected for one variable: inclusive integer bounds (of the value, or of its
+/// year), or date ids.
 struct Bounds {
     domain: Domain,
     low: Option<i64>,
@@ -55,7 +63,11 @@ pub(crate) fn hints(expr: &Expression, snapshot: &Snapshot) -> Vec<Hint> {
         .collect()
 }
 
-fn collect(expr: &Expression, snapshot: &Snapshot, out: &mut Vec<(Variable, Option<Bounds>)>) {
+fn collect<'e>(
+    expr: &'e Expression,
+    snapshot: &Snapshot,
+    out: &mut Vec<(Variable, Option<Bounds>)>,
+) {
     use std::cmp::Ordering::{Equal, Greater, Less};
     let (a, b, orderings): (&Expression, &Expression, &[std::cmp::Ordering]) = match expr {
         Expression::And(a, b) => {
@@ -70,15 +82,37 @@ fn collect(expr: &Expression, snapshot: &Snapshot, out: &mut Vec<(Variable, Opti
         Expression::Equal(a, b) => (a, b, &[Equal]),
         _ => return,
     };
-    // Normalise to `?v <ordering> constant`.
-    let (variable, literal, orderings): (_, _, Vec<_>) = match (a, b) {
-        (Expression::Variable(v), Expression::Literal(l)) => (v, l, orderings.to_vec()),
-        (Expression::Literal(l), Expression::Variable(v)) => {
-            (v, l, orderings.iter().map(|o| o.reverse()).collect())
+    // Normalise to `?v <ordering> constant` or `YEAR(?v) <ordering> constant`.
+    let operand = |e: &'e Expression| -> Option<(&'e Variable, bool)> {
+        match e {
+            Expression::Variable(v) => Some((v, false)),
+            Expression::FunctionCall(Function::Year, args) => match args.as_slice() {
+                [Expression::Variable(v)] => Some((v, true)),
+                _ => None,
+            },
+            _ => None,
         }
+    };
+    let ((variable, year), literal, orderings): (_, _, Vec<_>) = match (a, b) {
+        (e, Expression::Literal(l)) if operand(e).is_some() => {
+            (operand(e).expect("checked"), l, orderings.to_vec())
+        }
+        (Expression::Literal(l), e) if operand(e).is_some() => (
+            operand(e).expect("checked"),
+            l,
+            orderings.iter().map(|o| o.reverse()).collect(),
+        ),
         _ => return,
     };
-    let (domain, integer, id) = if literal.datatype() == xsd::INTEGER {
+    let (domain, integer, id) = if year {
+        match (literal.datatype() == xsd::INTEGER)
+            .then(|| literal.value().parse::<i64>().ok())
+            .flatten()
+        {
+            Some(value) => (Domain::Year, Some(value), None),
+            None => return,
+        }
+    } else if literal.datatype() == xsd::INTEGER {
         match literal.value().parse::<i64>() {
             Ok(value) => (Domain::Integer, Some(value), None),
             Err(_) => return,
@@ -120,7 +154,7 @@ fn collect(expr: &Expression, snapshot: &Snapshot, out: &mut Vec<(Variable, Opti
     let upper = orderings.contains(&Less) || orderings == [Equal];
     let strict = !orderings.contains(&Equal);
     match domain {
-        Domain::Integer => {
+        Domain::Integer | Domain::Year => {
             let value = integer.expect("integer domain");
             if lower {
                 let low = if strict {
@@ -180,6 +214,21 @@ fn ranges(bounds: Bounds) -> Option<Vec<(TermId, TermId)>> {
             let mut ranges = Vec::new();
             if low <= high {
                 ranges.push((low, high));
+            }
+            ranges.push(typed);
+            ranges
+        }
+        Domain::Year => {
+            // Inline years are 0000-9999; the rest are in the dictionary.
+            let low = bounds.low.unwrap_or(0).max(0);
+            let high = bounds.high.unwrap_or(9999).min(9999);
+            let mut ranges = Vec::new();
+            if low <= high {
+                for kind in [TermKind::Date, TermKind::DateTime] {
+                    let (first, last) = TermId::year_range(kind, low as u32, high as u32)
+                        .expect("a date kind and inline years");
+                    ranges.push((first, last));
+                }
             }
             ranges.push(typed);
             ranges

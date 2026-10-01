@@ -25,7 +25,7 @@
 #   - a cross-check of result counts across systems at the end
 #
 # Fairness settings that differ from vendor defaults (all documented in README.md):
-#   - QLever's query-result cache is capped at 1 MB, so repeated runs measure evaluation
+#   - QLever's query-result cache is off (`-k 0`; a 1 MB cap still kept every small result), so repeated runs measure evaluation
 #     rather than cache hits
 #   - Virtuoso's result-row cap and cost-based query rejection are disabled
 #   - NRESE's rate limits are lifted
@@ -167,7 +167,7 @@ serve_qlever() {
   UPDATE_ENDPOINT=$ENDPOINT # in-memory delta; -n allows updates without an access token
   serve qlever-sc "$ENDPOINT" -u root -p "$PORT:7001" -v "$1:/index" -w /index \
     --entrypoint /qlever/qlever-server "$QLEVER_IMAGE" \
-    -i /index/idx -p 7001 -n -j 8 -m 16G -c 1MB -e 1MB -s "${QUERY_TIMEOUT_S}s"
+    -i /index/idx -p 7001 -n -j 8 -m 16G -c 1MB -e 1MB -k 0 -s "${QUERY_TIMEOUT_S}s"
 }
 
 load_oxigraph() {

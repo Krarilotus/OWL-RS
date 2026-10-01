@@ -219,6 +219,17 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
                     .map(|value| value.parse::<usize>())
                     .transpose()?
                     .unwrap_or(5),
+                shuffle_seed: match options.get("--order").map(String::as_str) {
+                    None | Some("fixed") => None,
+                    Some("shuffled") => Some(
+                        options
+                            .get("--seed")
+                            .map(|value| value.parse::<u64>())
+                            .transpose()?
+                            .unwrap_or(1),
+                    ),
+                    Some(other) => bail!("--order is fixed or shuffled, not {other}"),
+                },
                 timeout_s: options
                     .get("--timeout-s")
                     .map(|value| value.parse::<u64>())
@@ -463,7 +474,7 @@ USAGE:
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validate [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] --workload-pack <PATH> [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--execution-mode <full|compat-only>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- generate --out <PATH> [--triples <N>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- query-mix --endpoint <URL> --queries <DIR> [--label <NAME>] [--warmup <N>] [--runs <N>] [--timeout-s <S>] [--clients <N> --duration-s <S> --interactive-ms <MS> [--update-endpoint <URL> --write-interval-ms <MS> --write-graph <IRI>]] [--report-json <PATH>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- query-mix --endpoint <URL> --queries <DIR> [--label <NAME>] [--warmup <N>] [--runs <N>] [--order fixed|shuffled [--seed <N>]] [--timeout-s <S>] [--clients <N> --duration-s <S> --interactive-ms <MS> [--update-endpoint <URL> --write-interval-ms <MS> --write-graph <IRI>]] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- write-scaling --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--steps <triples,...>] [--chunk-triples <N>] [--samples <N>] [--reset <true|false>] [--report-json <PATH>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--dataset <PATH>] [--dataset-base-iri <IRI>] [--content-type <TYPE>] [--replace <true|false>]
 "

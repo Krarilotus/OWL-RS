@@ -263,14 +263,15 @@ impl IndexVersion {
     }
 
     /// For each distinct value at key `position` of `plan`'s permutation (the first component
-    /// after the plan's bound prefix), the signed number of visible quads with that value,
-    /// accumulated into `totals`. Each run is walked group by group with a binary search for
-    /// each group's end, so the cost is O(r · d · log n) for d distinct values, not O(k).
+    /// after the plan's bound prefix), the signed number of quads with that value in each
+    /// run, appended to `out`: sorted by value within a run, a value once per run that has
+    /// it. Each run's range is walked group by group ([`PackedKeys::groups`]): no search per
+    /// group, so many small groups cost a scan of the column, few large ones a search each.
     pub(crate) fn group_counts(
         &self,
         plan: &AccessPlan,
         position: usize,
-        totals: &mut std::collections::BTreeMap<u64, i64>,
+        out: &mut Vec<(u64, i64)>,
     ) {
         let Some(adapted) = self.layout.adapt(plan) else {
             return;
@@ -284,7 +285,7 @@ impl IndexVersion {
         let position = if adapted.permutation == plan.permutation {
             position
         } else if position == 0 {
-            *totals.entry(TermId::DEFAULT_GRAPH.raw()).or_default() += self.count_plan(plan) as i64;
+            out.push((TermId::DEFAULT_GRAPH.raw(), self.count_plan(plan) as i64));
             return;
         } else {
             position - 1
@@ -292,16 +293,9 @@ impl IndexVersion {
         for run in self.runs.iter() {
             let perm = run.permutation(adapted.permutation);
             let (start, end) = perm.range(&adapted.low, &adapted.high);
-            let mut i = start;
-            while i < end {
-                let value = perm.keys.get(i)[position];
-                let j = perm
-                    .keys
-                    .partition_point_in(i, end, |key| key[position] <= value);
-                let signed = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
-                *totals.entry(value).or_default() += signed;
-                i = j;
-            }
+            perm.keys.groups(start, end, position, |value, i, j| {
+                out.push((value, (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64));
+            });
         }
     }
 
@@ -324,14 +318,8 @@ impl IndexVersion {
         for run in self.runs.iter() {
             let perm = run.permutation(adapted.permutation);
             let (start, end) = perm.range(&adapted.low, &adapted.high);
-            let mut i = start;
-            while i < end {
-                let value = perm.keys.get(i)[position];
-                out.push(value);
-                i = perm
-                    .keys
-                    .partition_point_in(i, end, |key| key[position] <= value);
-            }
+            perm.keys
+                .groups(start, end, position, |value, _, _| out.push(value));
         }
     }
 

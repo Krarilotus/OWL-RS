@@ -56,6 +56,8 @@ class Context:
     settings: dict  # the environment: images, licences, heap sizes
     run_id: str
     tier_small: bool = False
+    # The result cache of a system that has one (`result_cache`): off, or on (its default).
+    cache: str = "off"
 
     @property
     def dry(self) -> bool:
@@ -199,6 +201,9 @@ class Adapter:
     answers_only = False
     serves_from_load = False
     persistent = True  # the store is on disk (a size and a restart are measured)
+    # Whether the system keeps query results for repeated queries; then the suite runs the
+    # queries with it off and on (ctx.cache), and `serve` must honour the setting.
+    result_cache = False
 
     def __init__(self):
         self.server: Server | None = None
@@ -256,6 +261,7 @@ class Adapter:
 
 class Nrese(Adapter):
     key = "nrese"
+    result_cache = True
     regimes = {"none": "disabled", "rdfs": "rdfs", "owl-horst": "owl-horst",
                "owl2-rl": "owl2-rl", "owl2-ql": "owl2-ql"}
     runtimes = {"docker", "apptainer", "process"}
@@ -319,10 +325,12 @@ class Nrese(Adapter):
             "NRESE_REASONING_MODE": self.regimes[regime],
             "NRESE_BIND_ADDR": f"{host}:{port}",
             "NRESE_QUERY_TIMEOUT_MS": str(ctx.timeout_s * 1000),
-            # No rate limits and no result cache: repeated runs measure evaluation.
+            # No rate limits.
             "NRESE_READ_REQUESTS_PER_WINDOW": "100000000",
-            "NRESE_QUERY_CACHE_BYTES": "0",
         }
+        if ctx.cache == "off":
+            # Repeated runs measure evaluation; on, the default cache (64 MiB) answers them.
+            env["NRESE_QUERY_CACHE_BYTES"] = "0"
         if ctx.setting("QUERY_MEMORY_MIB"):
             env["NRESE_MAX_QUERY_MEMORY_BYTES"] = str(int(ctx.setting("QUERY_MEMORY_MIB")) * 1048576)
         spec = self.spec(ctx, ctx.name("serve"), store, [], env)
@@ -364,6 +372,7 @@ class NreseOxigraph(Nrese):
 
 class Qlever(Adapter):
     key = "qlever"
+    result_cache = True
 
     def images(self, ctx):
         return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:latest")]
@@ -380,11 +389,13 @@ class Qlever(Adapter):
 
     def serve(self, ctx, store, regime):
         port = ctx.listen(7001)
-        # The result cache is capped at 1 MB: repeated runs measure evaluation.
+        # Cache off: `-k 0`, no entries (size caps alone would still keep every small
+        # result, such as a count, so a repeated run would be a cache hit). On: QLever's
+        # default cache.
+        cache = ["-k", "0"] if ctx.cache == "off" else []
         spec = Spec(ctx.name("serve"), self.images(ctx)[0],
                     ["/qlever/qlever-server", "-i", "/index/idx", "-p", str(port), "-n", "-j", "8",
-                     "-m", ctx.setting("QLEVER_MEMORY", "16G"), "-c", "1MB", "-e", "1MB",
-                     "-s", f"{ctx.timeout_s}s"],
+                     "-m", ctx.setting("QLEVER_MEMORY", "16G"), *cache, "-s", f"{ctx.timeout_s}s"],
                     mounts=ctx.mounts(Mount(store, "/index", readonly=False)), port=port,
                     workdir="/index", user="root", memory=ctx.memory)
         base = ctx.runtime.url(spec) + "/"
