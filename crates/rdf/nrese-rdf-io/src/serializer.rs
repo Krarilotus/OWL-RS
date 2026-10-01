@@ -2,9 +2,11 @@
 
 use std::io::{self, Write};
 
-use nrese_rdf::{GraphNameRef, Iri, QuadRef, TripleRef};
+use nrese_rdf::{GraphNameRef, Iri, Quad, QuadRef, TripleRef};
 
 use crate::format::RdfFormat;
+use crate::jsonld::writer::JsonLdWriter;
+use crate::jsonld::{FromRdfOptions, from_rdf};
 use crate::ntriples;
 use crate::rdfxml::RdfXmlWriter;
 use crate::turtle::TurtleWriter;
@@ -14,6 +16,7 @@ use crate::turtle::TurtleWriter;
 pub struct RdfSerializer {
     format: RdfFormat,
     prefixes: Vec<(String, String)>,
+    json_ld_expanded: Option<FromRdfOptions>,
 }
 
 impl RdfSerializer {
@@ -21,14 +24,24 @@ impl RdfSerializer {
         Self {
             format,
             prefixes: Vec::new(),
+            json_ld_expanded: None,
         }
+    }
+
+    /// JSON-LD in expanded form, by the specification's algorithm (Serialize RDF as
+    /// JSON-LD): collections as `@list`, and the options' native types. It needs the whole
+    /// dataset, so the quads are kept until [`QuadSerializer::finish`]. Without this, JSON-LD
+    /// is written as it comes, compacted with the prefixes (the streaming profile).
+    pub fn with_json_ld_expanded(mut self, options: FromRdfOptions) -> Self {
+        self.json_ld_expanded = Some(options);
+        self
     }
 
     pub fn format(&self) -> RdfFormat {
         self.format
     }
 
-    /// A prefix for IRIs in that namespace (Turtle, TriG): `name` empty or a prefix name
+    /// A prefix for IRIs in that namespace (Turtle, TriG, RDF/XML, JSON-LD): `name` empty or a prefix name
     /// (`PN_PREFIX`), `iri` absolute. Formats without prefixes ignore it.
     pub fn with_prefix(
         mut self,
@@ -60,12 +73,17 @@ impl RdfSerializer {
             RdfFormat::Turtle | RdfFormat::TriG => (
                 Some(TurtleWriter::new(
                     self.format == RdfFormat::TriG,
-                    self.prefixes,
+                    self.prefixes.clone(),
                 )),
                 None,
             ),
-            RdfFormat::RdfXml => (None, Some(RdfXmlWriter::new(self.prefixes))),
+            RdfFormat::RdfXml => (None, Some(RdfXmlWriter::new(self.prefixes.clone()))),
             _ => (None, None),
+        };
+        let json_ld = match (self.format, self.json_ld_expanded) {
+            (RdfFormat::JsonLd, Some(options)) => Some(JsonLd::Expanded(options, Vec::new())),
+            (RdfFormat::JsonLd, None) => Some(JsonLd::Streaming(JsonLdWriter::new(self.prefixes))),
+            _ => None,
         };
         QuadSerializer {
             format: self.format,
@@ -73,6 +91,7 @@ impl RdfSerializer {
             buffer: Vec::with_capacity(BUFFER),
             turtle,
             rdf_xml,
+            json_ld,
         }
     }
 }
@@ -87,6 +106,12 @@ pub struct QuadSerializer<W: Write> {
     buffer: Vec<u8>,
     turtle: Option<TurtleWriter>,
     rdf_xml: Option<RdfXmlWriter>,
+    json_ld: Option<JsonLd>,
+}
+
+enum JsonLd {
+    Streaming(JsonLdWriter),
+    Expanded(FromRdfOptions, Vec<Quad>),
 }
 
 impl<W: Write> QuadSerializer<W> {
@@ -114,12 +139,11 @@ impl<W: Write> QuadSerializer<W> {
                     rdf_xml.write(&mut self.buffer, quad)?;
                 }
             }
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("writing {other} is not implemented yet"),
-                ));
-            }
+            RdfFormat::JsonLd => match &mut self.json_ld {
+                Some(JsonLd::Streaming(writer)) => writer.write(&mut self.buffer, quad)?,
+                Some(JsonLd::Expanded(_, quads)) => quads.push(quad.into_owned()),
+                None => {}
+            },
         }
         self.flush_full()
     }
@@ -136,6 +160,18 @@ impl<W: Write> QuadSerializer<W> {
         }
         if let Some(rdf_xml) = &mut self.rdf_xml {
             rdf_xml.finish(&mut self.buffer);
+        }
+        match self.json_ld.take() {
+            Some(JsonLd::Streaming(mut writer)) => writer.finish(&mut self.buffer)?,
+            Some(JsonLd::Expanded(options, quads)) => {
+                let document = from_rdf(quads.iter().map(Quad::as_ref), &options)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let mut text = String::new();
+                nrese_json::write_value(&document, &mut text);
+                self.buffer.extend_from_slice(text.as_bytes());
+                self.buffer.push(b'\n');
+            }
+            None => {}
         }
         self.writer.write_all(&self.buffer)?;
         self.buffer.clear();

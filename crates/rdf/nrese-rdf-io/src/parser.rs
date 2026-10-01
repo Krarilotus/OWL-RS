@@ -1,6 +1,7 @@
 //! The parser: settings, then a document from a slice, a reader, or in chunks for parsing
 //! in parallel.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Take};
 use std::path::Path;
@@ -12,6 +13,8 @@ use crate::blank::BlankNodes;
 use crate::error::{RdfParseError, RdfSyntaxError, TextPosition};
 use crate::format::RdfFormat;
 use crate::input::Lines;
+use crate::jsonld::JsonLdOptions;
+use crate::jsonld::parser::{JsonLdParser, JsonLdSettings};
 use crate::ntriples::LineParser;
 use crate::rdfxml::{RdfXmlParser, RdfXmlSettings};
 use crate::turtle::{TurtleParser, TurtleSettings};
@@ -26,6 +29,7 @@ pub struct RdfParser {
     blank_nodes: BlankNodes,
     unchecked: bool,
     max_nesting: usize,
+    json_ld: JsonLdOptions,
 }
 
 /// How deep `[ … ]` and `( … )` may nest in Turtle and TriG by default: far beyond real
@@ -42,6 +46,7 @@ impl RdfParser {
             blank_nodes: BlankNodes::AsWritten,
             unchecked: false,
             max_nesting: MAX_NESTING,
+            json_ld: JsonLdOptions::default(),
         }
     }
 
@@ -89,9 +94,23 @@ impl RdfParser {
         self
     }
 
+    /// The JSON-LD settings: processing mode, `rdfDirection`, an expand context, and the
+    /// loader of remote contexts (none by default).
+    pub fn with_json_ld_options(mut self, options: JsonLdOptions) -> Self {
+        self.json_ld = options;
+        self
+    }
+
     /// Parses `bytes`.
     pub fn for_slice(self, bytes: &[u8]) -> QuadParser<'_, io::Empty> {
         match self.format {
+            RdfFormat::JsonLd => {
+                let settings = self.json_ld_settings();
+                self.wrap(Inner::JsonLd(Box::new(JsonLdParser::new(
+                    Cow::Borrowed(bytes),
+                    settings,
+                ))))
+            }
             RdfFormat::Turtle | RdfFormat::TriG => {
                 let settings = self.turtle_settings();
                 self.wrap(Inner::Turtle(TurtleParser::from_slice(bytes, settings)))
@@ -107,6 +126,10 @@ impl RdfParser {
     /// Parses what `reader` gives (buffered here: an unbuffered reader is fine).
     pub fn for_reader<R: Read>(self, reader: R) -> QuadParser<'static, R> {
         match self.format {
+            RdfFormat::JsonLd => {
+                let settings = self.json_ld_settings();
+                self.wrap(Inner::JsonLdReader(Some((reader, settings)), None))
+            }
             RdfFormat::Turtle | RdfFormat::TriG => {
                 let settings = self.turtle_settings();
                 self.wrap(Inner::Turtle(TurtleParser::from_reader(reader, settings)))
@@ -129,6 +152,16 @@ impl RdfParser {
             blank_nodes: self.blank_nodes.clone(),
             unchecked: self.unchecked,
             max_depth: self.max_nesting,
+        }
+    }
+
+    fn json_ld_settings(&self) -> JsonLdSettings {
+        JsonLdSettings {
+            base: self.base_iri.clone(),
+            blank_nodes: self.blank_nodes.clone(),
+            unchecked: self.unchecked,
+            max_depth: self.max_nesting,
+            options: self.json_ld.clone(),
         }
     }
 
@@ -268,6 +301,12 @@ enum Inner<'a, R: Read> {
     Turtle(TurtleParser<'a, R>),
     RdfXmlSlice(RdfXmlParser<&'a [u8]>),
     RdfXmlReader(RdfXmlParser<BufReader<R>>),
+    JsonLd(Box<JsonLdParser<'a>>),
+    /// JSON-LD from a reader: read whole at the first call (see [`crate::jsonld`]).
+    JsonLdReader(
+        Option<(R, JsonLdSettings)>,
+        Option<Box<JsonLdParser<'static>>>,
+    ),
     /// A format this crate doesn't read yet: one error, then the end.
     Unsupported(Option<RdfFormat>),
 }
@@ -307,6 +346,23 @@ impl<R: Read> QuadParser<'_, R> {
                 Ok(false) => return None,
                 Err(error) => return Some(Err(error)),
             },
+            Inner::JsonLd(parser) => match parser.next_ref()? {
+                Ok(quad) => (quad, TextPosition::default()),
+                Err(error) => return Some(Err(error)),
+            },
+            Inner::JsonLdReader(pending, parser) => {
+                if let Some((mut reader, settings)) = pending.take() {
+                    let mut bytes = Vec::new();
+                    if let Err(error) = reader.read_to_end(&mut bytes) {
+                        return Some(Err(error.into()));
+                    }
+                    *parser = Some(Box::new(JsonLdParser::new(Cow::Owned(bytes), settings)));
+                }
+                match parser.as_mut()?.next_ref()? {
+                    Ok(quad) => (quad, TextPosition::default()),
+                    Err(error) => return Some(Err(error)),
+                }
+            }
             Inner::Turtle(parser) => match parser.next_ref()? {
                 Ok(quad) => (quad, TextPosition::default()),
                 Err(error) => return Some(Err(error)),
