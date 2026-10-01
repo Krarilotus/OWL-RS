@@ -98,16 +98,19 @@ native build; medians of 3 runs. "Before" is the 27 September perf lab on the ma
 | Restart (open) | 4.5 s | 0.000 s | A6: checkpoint format 6 used in place (memory map) |
 | Resident after open | 5.8 GB (peak 10 GB) | 13 MiB | A6: index runs, dictionary text and hash table stay in the file |
 | Resident after all queries | 5.5 GB | 2.8 GB | the pages the queries touched (file-backed, reclaimable) |
+| Bulk load: peak | 10 GB | 6.0 GB | exact batch arrays, lean text order, permutations streamed into the checkpoint |
+| Bulk load: resident after it | 5.8 GB | 57 MiB | the checkpoint served mapped; freed memory given back on every pool thread |
 
 YAGO tiny (16.5 M quads), same machine:
 
 | | 27 September | Now | What changed |
 |---|---:|---:|---|
-| q08 `COUNT(*)` of `rdfs:subClassOf*` | 11,432 ms | 135 ms | A4; most of what is left counts the graph's nodes (zero-length pairs) |
+| q08 `COUNT(*)` of `rdfs:subClassOf*` | 11,432 ms | 24 ms | A4, and the graph's node count (zero-length pairs) as a per-version statistic |
 | q02 `YEAR(?birth) = 1879`, `LANG` = en | 1,522 ms | 0.6 ms | A2 |
 | q06 `STRSTARTS` on alternate names | 95 ms | 0.5 ms | the text order |
 | q10 `LANG(?l) = "en"` on 6.8 M labels | 602 ms | 267 ms | A1 for languages: the passing terms from the dictionary, matched by a bitmap in one columnar scan |
-| Sum of query medians | 13,678 ms | 428 ms | |
+| Sum of query medians | 13,678 ms | 310 ms | |
+| Bulk load: peak / resident after it | 4.1 GB / 1.9 GB | 2.4 GB / 41 MiB | as for DBpedia |
 
 Wikidata lexemes (60 M quads), same machine; "before" is the 26 September scorecard over
 HTTP on the main PC, so the comparison is indicative:
@@ -142,16 +145,19 @@ Still open:
   inferred) or several runs still go quad by quad: merge them column-wise next.
 - The text order could also answer string ranges (`?s >= "M"`) and ORDER BY on strings
   (a rank per entry instead of decoding and comparing terms).
-- YAGO q08: keep the node count of each graph in the statistics (it only changes with
-  commits), so `COUNT` over `p*` needs only the closure.
 - DBpedia q05 (21 ms): populations are `xsd:nonNegativeInteger`, dictionary literals, so
   the numeric range hint can't narrow them. An inline kind for the integer-derived
   datatypes (value first, datatype code last, so ids still sort by value) would; it is a
   term-encoding change.
-- A6, second part: after a checkpoint or bulk load the running process keeps its heap
-  copy until restart; compaction into the base writes a heap run. Next: remap after a
-  checkpoint, then merged base runs written to files (LSM), and an external-sort bulk
-  load with bounded memory (the load peaks at about 10 GB for DBpedia).
-- DBpedia q12 (`SUM` per team over a 3-way star, 202 ms) and q09 (100 k rows with an
-  OPTIONAL, 98 ms): profile next (EXPLAIN in the perf lab: `--explain`).
+- A6, second part: done for checkpoints and bulk loads (`store.map_checkpoints`, on by
+  default: what a checkpoint holds is served from the file once written). Compaction
+  into the base still writes a heap run until the next checkpoint; merged base runs
+  written to files (LSM) would avoid that.
+- Bulk loads with bounded memory: the peak (6.0 GB for DBpedia) is now the heap
+  dictionary (2.3 GB, needed for interning) plus one array of the loaded quads (2.2 GB,
+  sorted once per permutation) plus one packed permutation. Below that takes an external
+  sort, as QLever's index builder does: sorted runs of quads spilled to disk and merged
+  into each permutation, and the dictionary built from sorted, spilled term runs (ids
+  assigned after the sort). That would bound the load by a configurable budget at the
+  cost of disk passes; worth it for datasets beyond the machine's memory.
 - The remeasurement of every gap in the suite, with cache on and off, after batch A.
