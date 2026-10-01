@@ -60,10 +60,10 @@ fn started(
     store: StoreService,
     reasoner_config: &ReasonerConfig,
 ) -> Result<StoreService, Box<dyn std::error::Error>> {
-    if let Some(ruleset) = reasoner_config.materialised_ruleset()
-        && !store.reasoning_is_current(ruleset)
+    if let Some(program) = reasoner_config.materialised_program()
+        && !store.reasoning_is_current(&program)
     {
-        store.rematerialise(ruleset)?;
+        store.rematerialise(&program)?;
     }
     Ok(store)
 }

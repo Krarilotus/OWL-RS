@@ -115,6 +115,10 @@ pub(super) struct RawStoreConfig {
 pub(super) struct RawReasonerConfig {
     #[serde(default)]
     pub mode: Option<String>,
+    /// A Notation3 rules file: user rules, added to the mode's ruleset (or the whole
+    /// program in the `custom` mode).
+    #[serde(default)]
+    pub rules: Option<String>,
     #[serde(default)]
     pub unnamed_classes: Option<String>,
 }

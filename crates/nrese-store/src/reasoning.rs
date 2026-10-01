@@ -25,6 +25,7 @@ use nrese_engine::{
     EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TermKind,
     Transaction,
 };
+use nrese_reasoner::RuleProgram;
 use nrese_reasoner::v2::batch::{self, Phases, Schema};
 use nrese_reasoner::v2::delta::{self, Base, MemoryBase};
 use nrese_reasoner::v2::eval::GroundProgram;
@@ -32,15 +33,14 @@ use nrese_reasoner::v2::ir::{Rule, Vocabulary};
 use nrese_reasoner::v2::lists::ListDiagnostic;
 use nrese_reasoner::v2::lists::ListVocabulary;
 use nrese_reasoner::v2::naive::{Triple, Violation};
-use nrese_reasoner::v2::rulesets::Ruleset;
 use nrese_reasoner::v2::unnamed::UnnamedVocabulary;
 use oxrdf::{LiteralRef, NamedNodeRef, TermRef};
 use std::collections::HashSet;
 
-/// A ruleset compiled against the engine dictionary: its rules, list vocabulary and schema
-/// vocabulary as engine ids. Ids never change once interned, so it is built once.
+/// A rule program compiled against the engine dictionary: its rules, list vocabulary and
+/// schema vocabulary as engine ids. Ids never change once interned, so it is built once.
 pub struct Program {
-    pub ruleset: Ruleset,
+    pub program: RuleProgram,
     rules: Vec<Rule>,
     lists: Option<ListVocabulary>,
     schema: Schema,
@@ -60,7 +60,7 @@ pub struct Program {
 impl std::fmt::Debug for Program {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Program")
-            .field("ruleset", &self.ruleset.name())
+            .field("program", &self.program.name())
             .field("rules", &self.rules.len())
             .finish_non_exhaustive()
     }
@@ -76,13 +76,13 @@ impl Program {
         }
     }
 
-    /// Compiles `ruleset`; `intern` gives ids to the constants.
-    pub fn new(ruleset: Ruleset, intern: &dyn Fn(TermRef<'_>) -> TermId) -> Self {
+    /// Compiles `program`; `intern` gives ids to the constants.
+    pub fn new(program: &RuleProgram, intern: &dyn Fn(TermRef<'_>) -> TermId) -> Self {
         let mut constants = Constants { intern };
-        let rules = ruleset
+        let rules = program
             .rules(&mut constants)
-            .expect("the built-in rulesets parse (tested)");
-        let lists = ruleset
+            .expect("the built-in rulesets parse (tested), user rules are checked at startup");
+        let lists = program
             .has_list_rules()
             .then(|| ListVocabulary::new(&mut constants));
         let schema = Schema::owl(&mut constants);
@@ -90,12 +90,12 @@ impl Program {
         let things = rules.iter().any(|rule| rule.name == "scm-cls");
         let rdf_type = constants.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
         let same_as = nrese_reasoner::v2::representatives::same_as(&rules);
-        let mut axioms = ruleset
+        let mut axioms = program
             .axiom_triples(&mut constants)
-            .expect("the built-in axioms parse (tested)");
+            .expect("the built-in axioms parse (tested), user facts are checked at startup");
         axioms.sort_unstable();
         Self {
-            ruleset,
+            program: program.clone(),
             rules,
             lists,
             schema,
@@ -226,7 +226,8 @@ pub(crate) fn log_diagnostics(diagnostics: &[OntologyDiagnostic], total: usize, 
 /// What a rematerialisation or a commit-path run did.
 #[derive(Debug, Clone, Default)]
 pub struct MaterialisationReport {
-    pub ruleset: &'static str,
+    /// The rule program's name ([`RuleProgram::name`]).
+    pub ruleset: String,
     /// The revision holding the new inferred stack (for commits: the commit's).
     pub revision: u64,
     pub asserted: u64,
@@ -275,6 +276,11 @@ impl Vocabulary for Constants<'_> {
 
     fn literal(&mut self, lexical: &str, datatype: &str) -> u64 {
         let literal = LiteralRef::new_typed_literal(lexical, NamedNodeRef::new_unchecked(datatype));
+        (self.intern)(literal.into()).raw()
+    }
+
+    fn language_literal(&mut self, lexical: &str, language: &str) -> u64 {
+        let literal = LiteralRef::new_language_tagged_literal_unchecked(lexical, language);
         (self.intern)(literal.into()).raw()
     }
 }
@@ -598,7 +604,7 @@ pub fn apply_delta(
         }
     }
     let report = MaterialisationReport {
-        ruleset: program.ruleset.name(),
+        ruleset: program.program.name(),
         revision: tx.base().revision() + 1,
         asserted: tx.len_in(ReadModel::Asserted),
         inferred: tx.len_in(ReadModel::Inferred),

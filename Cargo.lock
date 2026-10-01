@@ -1088,7 +1088,10 @@ dependencies = [
  "hashbrown 0.16.1",
  "nrese-core",
  "nrese-exec",
+ "nrese-rdf",
+ "nrese-rdf-io",
  "rayon",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

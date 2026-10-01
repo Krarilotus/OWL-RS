@@ -91,6 +91,13 @@ impl ServerConfig {
             ("shacl.shapes_graph", store.shapes_graph.clone()),
             ("reasoner.mode", self.reasoner.mode().as_str().to_owned()),
             (
+                "reasoner.rules",
+                self.reasoner
+                    .rules
+                    .as_ref()
+                    .map_or_else(|| "(none)".to_owned(), |rules| rules.name().to_owned()),
+            ),
+            (
                 "reasoner.unnamed_classes",
                 if store.hide_unnamed_classes {
                     "skip"

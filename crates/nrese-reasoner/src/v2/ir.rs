@@ -29,6 +29,8 @@ pub const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 pub trait Vocabulary {
     fn iri(&mut self, iri: &str) -> u64;
     fn literal(&mut self, lexical: &str, datatype: &str) -> u64;
+    /// A language-tagged string (user rules may mention one).
+    fn language_literal(&mut self, lexical: &str, language: &str) -> u64;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

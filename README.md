@@ -188,7 +188,9 @@ Optional environment variables:
 - `NRESE_ONTOLOGY_PATH`
   Path to an ontology file to preload.
 - `NRESE_REASONING_MODE`
-  `disabled`, `rdfs` or `owl2-rl`
+  `disabled`, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl` or `custom`
+- `NRESE_REASONING_RULES`
+  A Notation3 file of user rules: added to the mode's ruleset, or the whole program with `custom`
 - `NRESE_DEPLOYMENT_POSTURE`
   Example: `read-only-demo`, `internal-authenticated`, or `replacement-grade`
 - `NRESE_SPARQL_PARSE_ERROR_PROFILE`

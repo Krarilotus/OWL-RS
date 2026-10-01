@@ -8,7 +8,8 @@ pub mod profile;
 pub mod service;
 pub mod v2;
 
-pub use config::{ReasonerConfig, ReasoningMode};
+pub use config::{ConfigError, ReasonerConfig, ReasoningMode};
 pub use output::{RejectEvidence, RejectExplanation};
 pub use profile::{ReasonerProfile, mode_name, profile_for_config, profile_for_mode};
 pub use service::ReasonerService;
+pub use v2::program::{RuleProgram, UserRules};
