@@ -437,21 +437,57 @@ async fn execute(client: &Client, endpoint: &str, query: &str) -> Result<u64> {
         );
     }
     if content_type.contains("json") {
-        let value: serde_json::Value = serde_json::from_slice(&body)?;
-        if let Some(boolean) = value.get("boolean").and_then(|b| b.as_bool()) {
-            return Ok(u64::from(boolean));
-        }
-        let bindings = value
-            .pointer("/results/bindings")
-            .and_then(|b| b.as_array())
-            .context("JSON results without bindings")?;
-        return Ok(bindings.len() as u64);
+        return json_rows(&body);
     }
     // Line-based RDF (N-Triples): one triple per non-empty line.
     Ok(body
         .split(|&b| b == b'\n')
         .filter(|line| line.iter().any(|b| !b.is_ascii_whitespace()))
         .count() as u64)
+}
+
+/// The solutions in a SPARQL JSON results document (1 or 0 for a boolean), counted while
+/// it is parsed: the bindings are skipped, never built as values, so the client's cost
+/// per row stays small next to the server's.
+fn json_rows(body: &[u8]) -> Result<u64> {
+    use serde::Deserialize;
+    use serde::de::{IgnoredAny, SeqAccess, Visitor};
+
+    struct Count(u64);
+    impl<'de> Deserialize<'de> for Count {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Counter;
+            impl<'de> Visitor<'de> for Counter {
+                type Value = Count;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("an array of bindings")
+                }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Count, A::Error> {
+                    let mut n = 0;
+                    while seq.next_element::<IgnoredAny>()?.is_some() {
+                        n += 1;
+                    }
+                    Ok(Count(n))
+                }
+            }
+            deserializer.deserialize_seq(Counter)
+        }
+    }
+    #[derive(Deserialize)]
+    struct Results {
+        bindings: Count,
+    }
+    #[derive(Deserialize)]
+    struct Document {
+        boolean: Option<bool>,
+        results: Option<Results>,
+    }
+    let document: Document = serde_json::from_slice(body)?;
+    match (document.boolean, document.results) {
+        (Some(boolean), _) => Ok(u64::from(boolean)),
+        (None, Some(results)) => Ok(results.bindings.0),
+        (None, None) => bail!("JSON results without bindings"),
+    }
 }
 
 fn print_row(result: &QueryResult) {
@@ -475,14 +511,21 @@ fn print_row(result: &QueryResult) {
 
 #[cfg(test)]
 mod tests {
-    use super::schedule;
+    use super::{json_rows, schedule};
+
+    #[test]
+    fn json_results_are_counted_without_building_them() {
+        let select = br#"{"head":{"vars":["s"]},"results":{"bindings":[
+            {"s":{"type":"uri","value":"http://e/a"}},{"s":{"type":"literal","value":"x"}},{}]}}"#;
+        assert_eq!(json_rows(select).unwrap(), 3);
+        assert_eq!(json_rows(br#"{"head":{},"boolean":true}"#).unwrap(), 1);
+        assert_eq!(json_rows(br#"{"head":{},"boolean":false}"#).unwrap(), 0);
+        assert!(json_rows(br#"{"head":{}}"#).is_err());
+    }
 
     #[test]
     fn a_schedule_runs_every_query_every_iteration_once() {
-        assert_eq!(
-            schedule(2, 2, None),
-            vec![(0, 0), (0, 1), (1, 0), (1, 1)]
-        );
+        assert_eq!(schedule(2, 2, None), vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
         let shuffled = schedule(10, 3, Some(7));
         assert_eq!(shuffled, schedule(10, 3, Some(7)), "a seed names one order");
         assert_ne!(shuffled, schedule(10, 3, Some(8)));
