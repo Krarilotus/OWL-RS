@@ -18,6 +18,8 @@ const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 
 /// Official location of the SPARQL 1.1 tests, which the manifests' IRIs are relative to.
 pub const OFFICIAL_BASE: &str = "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/";
+/// Official location of the SPARQL 1.2 tests.
+pub const OFFICIAL_BASE_12: &str = "https://w3c.github.io/rdf-tests/sparql/sparql12/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
@@ -55,17 +57,19 @@ pub struct Test {
 
 pub struct Suite {
     root: PathBuf,
+    base: &'static str,
 }
 
 impl Suite {
-    /// `root` is the local `sparql/sparql11` directory of `w3c/rdf-tests`.
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    /// `root` is the local directory of a suite of `w3c/rdf-tests` (`sparql/sparql11`),
+    /// `base` its official location.
+    pub fn new(root: PathBuf, base: &'static str) -> Self {
+        Self { root, base }
     }
 
     pub fn local_path(&self, iri: NamedNodeRef<'_>) -> Option<PathBuf> {
         iri.as_str()
-            .strip_prefix(OFFICIAL_BASE)
+            .strip_prefix(self.base)
             .map(|relative| self.root.join(relative))
     }
 
@@ -81,7 +85,7 @@ impl Suite {
     pub fn tests(&self, manifest: &str) -> Result<Vec<Test>, String> {
         let mut tests = Vec::new();
         self.collect(
-            &NamedNode::new_unchecked(format!("{OFFICIAL_BASE}{manifest}")),
+            &NamedNode::new_unchecked(format!("{}{manifest}", self.base)),
             &mut tests,
         )?;
         Ok(tests)
@@ -89,18 +93,43 @@ impl Suite {
 
     fn collect(&self, manifest: &NamedNode, tests: &mut Vec<Test>) -> Result<(), String> {
         let graph = self.parse_graph(manifest.as_ref())?;
-        let this = NamedOrBlankNodeRef::from(manifest.as_ref());
-        for include in list(&graph, object(&graph, this, &mf("include"))) {
-            if let Term::NamedNode(include) = include {
-                self.collect(&include, tests)?;
+        // The manifest resource is the file in SPARQL 1.1 and a resource of its own in
+        // SPARQL 1.2 (`trs:manifest`): follow whatever includes and lists entries.
+        let heads = |predicate: &str| -> Vec<Term> {
+            graph
+                .triples_for_predicate(&mf(predicate))
+                .map(|t| t.object.into_owned())
+                .collect()
+        };
+        for head in heads("include") {
+            for include in list(&graph, Some(head.as_ref())) {
+                if let Term::NamedNode(include) = include {
+                    self.collect(&include, tests)?;
+                }
             }
         }
-        for entry in list(&graph, object(&graph, this, &mf("entries"))) {
-            if let Some(test) = read_test(&graph, &entry) {
-                tests.push(test);
+        for head in heads("entries") {
+            for entry in list(&graph, Some(head.as_ref())) {
+                if let Some(test) = read_test(&graph, &entry) {
+                    tests.push(test);
+                }
             }
         }
         Ok(())
+    }
+
+    /// Parses an RDF file of the suite with its official IRI as base, keeping the graph
+    /// names of a dataset format (TriG, N-Quads).
+    pub fn parse_quads(&self, iri: NamedNodeRef<'_>) -> Result<Vec<nrese_rdf::Quad>, String> {
+        let format = RdfFormat::from_extension(iri.as_str().rsplit('.').next().unwrap_or(""))
+            .ok_or_else(|| format!("unknown RDF format: {iri}"))?;
+        let text = self.read(iri)?;
+        RdfParser::from_format(format)
+            .with_base_iri(iri.as_str())
+            .map_err(|error| error.to_string())?
+            .for_slice(text.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("{iri}: {error}"))
     }
 
     /// Parses an RDF file of the suite with its official IRI as base.
@@ -185,10 +214,10 @@ fn read_test(graph: &Graph, entry: &Term) -> Option<Test> {
     {
         "QueryEvaluationTest" => Kind::QueryEvaluation,
         "UpdateEvaluationTest" => Kind::UpdateEvaluation,
-        "PositiveSyntaxTest11" => Kind::PositiveSyntax,
-        "NegativeSyntaxTest11" => Kind::NegativeSyntax,
-        "PositiveUpdateSyntaxTest11" => Kind::PositiveUpdateSyntax,
-        "NegativeUpdateSyntaxTest11" => Kind::NegativeUpdateSyntax,
+        "PositiveSyntaxTest11" | "PositiveSyntaxTest" => Kind::PositiveSyntax,
+        "NegativeSyntaxTest11" | "NegativeSyntaxTest" => Kind::NegativeSyntax,
+        "PositiveUpdateSyntaxTest11" | "PositiveUpdateSyntaxTest" => Kind::PositiveUpdateSyntax,
+        "NegativeUpdateSyntaxTest11" | "NegativeUpdateSyntaxTest" => Kind::NegativeUpdateSyntax,
         "CSVResultFormatTest" => Kind::CsvResultFormat,
         _ => return None, // protocol, service description, graph store: HTTP-level suites
     };
@@ -272,9 +301,14 @@ fn update_graphs(graph: &Graph, node: NamedOrBlankNodeRef<'_>) -> Vec<GraphFile>
 }
 
 pub fn suite_root() -> Option<PathBuf> {
+    suite_dir("sparql11")
+}
+
+/// The local directory of the suite `name` (`sparql11`, `sparql12`).
+pub fn suite_dir(name: &str) -> Option<PathBuf> {
     let root = std::env::var_os("NRESE_W3C_TESTS")
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache/rdf-tests"));
-    let sparql11 = root.join("sparql/sparql11");
-    sparql11.is_dir().then_some(sparql11)
+    let dir = root.join("sparql").join(name);
+    dir.is_dir().then_some(dir)
 }

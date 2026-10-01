@@ -31,9 +31,16 @@ const TAG_LANG: u8 = b'L';
 const TAG_TYPED: u8 = b'T';
 /// A language-tagged string with a base direction (RDF 1.2): tag, direction, value.
 const TAG_DIR_LANG: u8 = b'D';
-/// A triple term (RDF 1.2), keyed by its N-Triples text for now; the roadmap's R7 keys it
-/// by its components' ids instead.
+/// A triple term (RDF 1.2) keyed by its N-Triples text: written by the first RDF 1.2
+/// version (step 5 of the migration), still read.
 const TAG_TRIPLE: u8 = b'R';
+/// A triple term (RDF 1.2) keyed by its components' ids (roadmap R7): the tag, then the
+/// subject, predicate and object ids, 8 bytes each, big-endian. Fixed 25 bytes whatever the
+/// terms' lengths; equal triple terms share an id however they are written. The components
+/// are interned first, so their ids are lower: the log and checkpoints replay keys in id
+/// order and find them.
+const TAG_TRIPLE_IDS: u8 = b'Q';
+const TRIPLE_KEY_LEN: usize = 25;
 const SEP: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -61,11 +68,23 @@ impl Inner {
     }
 }
 
+/// The triple terms of the dictionary by their components, built lazily from the arena (the
+/// dictionary only grows): what matching `<<( ?s :p ?o )>>` scans.
+#[derive(Default)]
+struct TripleIndex {
+    /// Dictionary entries up to here are in `rows`.
+    covered: u64,
+    /// `[subject, predicate, object, triple term]` ids.
+    rows: Vec<[TermId; 4]>,
+}
+
 pub struct Dictionary {
     inner: RwLock<Inner>,
     hasher: foldhash::fast::FixedState,
     /// Built at the first search, extended at later ones ([`super::text`]).
     text: RwLock<super::text::TextIndex>,
+    /// Built at the first triple-term match, extended at later ones.
+    triples: RwLock<TripleIndex>,
 }
 
 impl Default for Dictionary {
@@ -74,6 +93,7 @@ impl Default for Dictionary {
             inner: RwLock::default(),
             hasher: foldhash::fast::FixedState::with_seed(0x6e72_6573_655f_6474),
             text: RwLock::default(),
+            triples: RwLock::default(),
         }
     }
 }
@@ -117,7 +137,18 @@ impl Dictionary {
             return Some(id);
         }
         let mut key = Vec::with_capacity(64);
-        let kind = encode_key(term, &mut key);
+        let kind = match term {
+            TermRef::Triple(triple) => {
+                let ids = [
+                    self.lookup_bounded(triple.subject.as_ref().into(), limit)?,
+                    self.lookup_bounded(triple.predicate.as_ref().into(), limit)?,
+                    self.lookup_bounded(triple.object.as_ref(), limit)?,
+                ];
+                triple_key(ids, &mut key);
+                TermKind::Triple
+            }
+            _ => encode_key(term, &mut key),
+        };
         let hash = self.hasher.hash_one(&key[..]);
         let inner = self.inner.read();
         inner
@@ -150,9 +181,59 @@ impl Dictionary {
         if let Some(id) = inline_id(term) {
             return id;
         }
+        if let TermRef::Triple(triple) = term {
+            // The components first: their ids are part of the key, and lower than its own.
+            let ids = [
+                self.intern_locked(inner, key, triple.subject.as_ref().into()),
+                self.intern_locked(inner, key, triple.predicate.as_ref().into()),
+                self.intern_locked(inner, key, triple.object.as_ref()),
+            ];
+            key.clear();
+            triple_key(ids, key);
+            return TermId::new(TermKind::Triple, self.intern_key_locked(inner, key));
+        }
         key.clear();
         let kind = encode_key(term, key);
         TermId::new(kind, self.intern_key_locked(inner, key))
+    }
+
+    /// The triple terms matching the given components (`None`: any) among the entries below
+    /// `limit` (a snapshot's dictionary length): `[subject, predicate, object, triple term]`.
+    pub fn triple_terms(
+        &self,
+        subject: Option<TermId>,
+        predicate: Option<TermId>,
+        object: Option<TermId>,
+        limit: u64,
+    ) -> Vec<[TermId; 4]> {
+        let len = self.len();
+        if self.triples.read().covered < len {
+            let mut index = self.triples.write();
+            let inner = self.inner.read();
+            let end = inner.ends.len() as u64;
+            for entry in index.covered..end {
+                if let Some(ids) = triple_ids(inner.key(entry)) {
+                    let [s, p, o] = ids;
+                    index
+                        .rows
+                        .push([s, p, o, TermId::new(TermKind::Triple, entry)]);
+                }
+            }
+            index.covered = end;
+        }
+        let matches = |want: Option<TermId>, have: TermId| want.is_none_or(|w| w == have);
+        self.triples
+            .read()
+            .rows
+            .iter()
+            .filter(|[s, p, o, id]| {
+                id.payload() < limit
+                    && matches(subject, *s)
+                    && matches(predicate, *p)
+                    && matches(object, *o)
+            })
+            .copied()
+            .collect()
     }
 
     fn intern_key_locked(&self, inner: &mut Inner, key: &[u8]) -> u64 {
@@ -216,11 +297,29 @@ impl Dictionary {
             | TermKind::LangString
             | TermKind::TypedLiteral
             | TermKind::Triple => {
-                let inner = self.inner.read();
-                if id.payload() >= inner.ends.len() as u64 {
+                let ids = {
+                    let inner = self.inner.read();
+                    if id.payload() >= inner.ends.len() as u64 {
+                        return None;
+                    }
+                    let key = inner.key(id.payload());
+                    match triple_ids(key) {
+                        Some(ids) => ids,
+                        None => return Some(decode_key(key)),
+                    }
+                };
+                let [s, p, o] = ids;
+                let Term::NamedNode(predicate) = self.decode(p)? else {
                     return None;
-                }
-                Some(decode_key(inner.key(id.payload())))
+                };
+                Some(
+                    nrese_rdf::Triple::new(
+                        NamedOrBlankNode::try_from(self.decode(s)?).ok()?,
+                        predicate,
+                        self.decode(o)?,
+                    )
+                    .into(),
+                )
             }
         }
     }
@@ -451,6 +550,10 @@ impl KeyBatch {
         if let Some(id) = inline_id(term) {
             return Slot::Id(id);
         }
+        // Rare, and its key needs its components' ids: interned at once, under the lock.
+        if let TermRef::Triple(_) = term {
+            return Slot::Id(dictionary.intern(term));
+        }
         let start = self.arena.len();
         let kind = encode_key(term, &mut self.arena);
         let hash = dictionary.hasher.hash_one(&self.arena[start..]);
@@ -565,8 +668,8 @@ pub enum TermView<'a> {
         value: &'a str,
         datatype: &'a str,
     },
-    /// A triple term (RDF 1.2), as N-Triples text: `<<( s p o )>>`.
-    Triple(&'a str),
+    /// A triple term (RDF 1.2): decode it ([`Dictionary::decode`]) for its parts.
+    Triple,
 }
 
 impl<'a> TermView<'a> {
@@ -576,7 +679,7 @@ impl<'a> TermView<'a> {
         match self {
             Self::Iri(s) | Self::String(s) => Some(s),
             Self::LangString { value, .. } | Self::Typed { value, .. } => Some(value),
-            Self::BlankNode(_) | Self::Triple(_) => None,
+            Self::BlankNode(_) | Self::Triple => None,
         }
     }
 }
@@ -605,7 +708,7 @@ fn view_key(key: &[u8]) -> TermView<'_> {
                 direction: direction.parse().ok(),
             }
         }
-        TAG_TRIPLE => TermView::Triple(text()),
+        TAG_TRIPLE | TAG_TRIPLE_IDS => TermView::Triple,
         _ => {
             let (datatype, value) = split_sep(rest);
             TermView::Typed { value, datatype }
@@ -639,7 +742,27 @@ fn decode_key(key: &[u8]) -> Term {
     }
 }
 
-/// A triple term from the N-Triples text its key holds (written by [`encode_key`]).
+/// The key of a triple term with these component ids.
+fn triple_key(ids: [TermId; 3], out: &mut Vec<u8>) {
+    out.push(TAG_TRIPLE_IDS);
+    for id in ids {
+        out.extend_from_slice(&id.raw().to_be_bytes());
+    }
+}
+
+/// The component ids of a triple term's key, if `key` is one.
+fn triple_ids(key: &[u8]) -> Option<[TermId; 3]> {
+    if key.len() != TRIPLE_KEY_LEN || key[0] != TAG_TRIPLE_IDS {
+        return None;
+    }
+    let id = |i: usize| {
+        let bytes: [u8; 8] = key[1 + 8 * i..9 + 8 * i].try_into().unwrap_or_default();
+        TermId::from_raw(u64::from_be_bytes(bytes))
+    };
+    Some([id(0), id(1), id(2)])
+}
+
+/// A triple term from the N-Triples text of a key the first RDF 1.2 version wrote.
 fn parse_triple_term(text: &str) -> Term {
     let line = format!("<urn:x> <urn:x> {text} .");
     nrese_rdf_io::RdfParser::from_format(nrese_rdf_io::RdfFormat::NTriples)
@@ -658,7 +781,8 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
             key[0],
             TAG_IRI | TAG_BNODE | TAG_STRING | TAG_LANG | TAG_TYPED | TAG_DIR_LANG | TAG_TRIPLE
         )
-        && std::str::from_utf8(&key[1..]).is_ok();
+        && std::str::from_utf8(&key[1..]).is_ok()
+        || (key.len() == TRIPLE_KEY_LEN && key[0] == TAG_TRIPLE_IDS);
     if ok {
         Ok(())
     } else {
@@ -750,9 +874,23 @@ mod tests {
         for (id, term) in ids.iter().zip([&directional, &plain, &triple]) {
             assert_eq!(dict.decode(*id).as_ref(), Some(term));
         }
+        // Found by its predicate among the triple terms.
+        assert_eq!(
+            dict.triple_terms(
+                None,
+                Some(
+                    dict.lookup(NamedNodeRef::new_unchecked("http://e/p").into())
+                        .unwrap()
+                ),
+                None,
+                u64::MAX
+            )
+            .len(),
+            1
+        );
         assert_eq!(
             dict.with_view(ids[2], |v| format!("{v:?}")).unwrap(),
-            "Triple(\"<<( _:b <http://e/p> <<( <http://e/s> <http://e/q> \\\"x\\\"@en--ltr )>> )>>\")"
+            "Triple"
         );
     }
 
