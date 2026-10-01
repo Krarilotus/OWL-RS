@@ -16,6 +16,7 @@ use nrese_rdf::{
 
 use crate::blank::BlankNodes;
 use crate::error::{RdfSyntaxError, TextPosition};
+use crate::text::{NOT_IN_IRI, unicode_escape};
 
 /// Text of a term: a range of the line, or one of the parser's scratch strings.
 #[derive(Clone)]
@@ -57,23 +58,6 @@ pub(crate) struct LineParser {
     pub(crate) blank_nodes: BlankNodes,
     scratch: [String; 6],
 }
-
-/// Bytes an IRIREF can't hold as they are (`[^#x00-#x20<>"{}|^`\]`): `true` to reject.
-const NOT_IN_IRI: [bool; 256] = {
-    let mut table = [false; 256];
-    let mut b = 0;
-    while b <= 0x20 {
-        table[b] = true;
-        b += 1;
-    }
-    let others = *b"<>\"{}|^`\\";
-    let mut i = 0;
-    while i < others.len() {
-        table[others[i] as usize] = true;
-        i += 1;
-    }
-    table
-};
 
 impl LineParser {
     pub(crate) fn new(quads: bool, unchecked: bool, blank_nodes: BlankNodes) -> Self {
@@ -422,21 +406,6 @@ impl LineParser {
             Ok(Text::Line(start..end))
         }
     }
-}
-
-/// The character of a `\uXXXX` or `\UXXXXXXXX` escape at `bytes[at]` (on '\').
-fn unicode_escape(bytes: &[u8], at: usize) -> Option<char> {
-    let digits = match bytes.get(at + 1)? {
-        b'u' => 4,
-        b'U' => 8,
-        _ => return None,
-    };
-    let hex = bytes.get(at + 2..at + 2 + digits)?;
-    let code = u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
-    if !hex.iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    char::from_u32(code)
 }
 
 fn skip_space(bytes: &[u8], mut i: usize) -> usize {
