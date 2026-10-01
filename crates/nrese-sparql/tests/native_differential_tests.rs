@@ -1090,7 +1090,7 @@ fn limits_stop_early_with_rows_of_the_full_result() {
         )
         .into_iter()
         .collect();
-        for limit in [1, 10, 4095, 4096, 4097, 9000, 20_000, 100_000] {
+        for limit in [1, 10, 1023, 1024, 1025, 4097, 9000, 20_000, 100_000] {
             let text = format!("SELECT * WHERE {{ {body} }} LIMIT {limit}");
             let query = SparqlParser::new().parse_query(&text).unwrap();
             let limited = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
