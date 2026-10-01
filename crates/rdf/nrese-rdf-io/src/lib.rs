@@ -15,6 +15,7 @@ mod format;
 mod input;
 mod ntriples;
 mod parser;
+mod rdfxml;
 mod serializer;
 mod text;
 mod turtle;

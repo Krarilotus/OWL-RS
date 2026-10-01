@@ -283,3 +283,12 @@ overflows a 1 MiB stack on it.
   needed.
 - Nesting is limited (128 by default, configurable), so hostile input gets an error rather
   than a stack overflow.
+
+**Step 3c (RDF/XML).**
+- W3C RDF/XML 166/166 (the whole active suite; the manifest comments out 7). Each test
+  also goes through the trickling reader, and round trips through our own RDF/XML writer
+  and through N-Quads.
+- The OWL 2 test-case file (over 10,000 statements, DTD entities in namespace
+  declarations) reads and round trips. That needed namespaces resolved by the parser
+  itself: quick-xml's resolver takes `xmlns:rdf="&rdf;"` unexpanded.
+- XML literals in exclusive canonical form.

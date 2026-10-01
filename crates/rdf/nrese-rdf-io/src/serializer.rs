@@ -6,6 +6,7 @@ use nrese_rdf::{GraphNameRef, Iri, QuadRef, TripleRef};
 
 use crate::format::RdfFormat;
 use crate::ntriples;
+use crate::rdfxml::RdfXmlWriter;
 use crate::turtle::TurtleWriter;
 
 /// How to write a document.
@@ -55,18 +56,23 @@ impl RdfSerializer {
 
     /// Writes to `writer`, through a buffer of its own (an unbuffered writer is fine).
     pub fn for_writer<W: Write>(self, writer: W) -> QuadSerializer<W> {
-        let turtle = match self.format {
-            RdfFormat::Turtle | RdfFormat::TriG => Some(TurtleWriter::new(
-                self.format == RdfFormat::TriG,
-                self.prefixes,
-            )),
-            _ => None,
+        let (turtle, rdf_xml) = match self.format {
+            RdfFormat::Turtle | RdfFormat::TriG => (
+                Some(TurtleWriter::new(
+                    self.format == RdfFormat::TriG,
+                    self.prefixes,
+                )),
+                None,
+            ),
+            RdfFormat::RdfXml => (None, Some(RdfXmlWriter::new(self.prefixes))),
+            _ => (None, None),
         };
         QuadSerializer {
             format: self.format,
             writer,
             buffer: Vec::with_capacity(BUFFER),
             turtle,
+            rdf_xml,
         }
     }
 }
@@ -80,6 +86,7 @@ pub struct QuadSerializer<W: Write> {
     writer: W,
     buffer: Vec<u8>,
     turtle: Option<TurtleWriter>,
+    rdf_xml: Option<RdfXmlWriter>,
 }
 
 impl<W: Write> QuadSerializer<W> {
@@ -102,6 +109,11 @@ impl<W: Write> QuadSerializer<W> {
                     turtle.write(&mut self.buffer, quad)?;
                 }
             }
+            RdfFormat::RdfXml => {
+                if let Some(rdf_xml) = &mut self.rdf_xml {
+                    rdf_xml.write(&mut self.buffer, quad)?;
+                }
+            }
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -121,6 +133,9 @@ impl<W: Write> QuadSerializer<W> {
     pub fn finish(mut self) -> io::Result<W> {
         if let Some(turtle) = &mut self.turtle {
             turtle.finish(&mut self.buffer);
+        }
+        if let Some(rdf_xml) = &mut self.rdf_xml {
+            rdf_xml.finish(&mut self.buffer);
         }
         self.writer.write_all(&self.buffer)?;
         self.buffer.clear();
