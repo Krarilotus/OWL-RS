@@ -3,7 +3,7 @@
 
 use std::str::FromStr;
 
-use oxsdatatypes::{
+use nrese_xsd::{
     Boolean, Date, DateTime, DayTimeDuration, Double, Duration, Float, GDay, GMonth, GMonthDay,
     GYear, GYearMonth, Time, YearMonthDuration,
 };

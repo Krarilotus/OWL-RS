@@ -9,10 +9,10 @@ license.workspace = true
 rayon = "1.10"
 nrese-engine = { path = "../nrese-engine" }
 nrese-exec = { path = "../nrese-exec" }
-oxsdatatypes = "=0.2.2"
+nrese-xsd = { path = "../rdf/nrese-xsd" }
 regex = "1.12"
 # The conversions from XSD values to literals (until nrese-rdf replaces oxrdf).
-oxrdf = { version = "=0.3.3", features = ["oxsdatatypes"] }
+oxrdf = "=0.3.3"
 # SPARQL functions (RAND, UUID, the hashes, IRI against BASE).
 # GeoSPARQL: geometries and their relations; WKT, GeoJSON and GML literals.
 geo = "0.33"

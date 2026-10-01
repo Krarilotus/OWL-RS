@@ -310,8 +310,8 @@ fn on_text(id: TermId, str: bool, snapshot: &Snapshot, test: impl FnOnce(&str) -
                 Tri::of(test(text))
             }
             (TermView::Iri(text), true) => Tri::of(test(text)),
-            // STR of a typed literal is its canonical form (see `value::canonical`).
-            (TermView::Typed { .. }, true) => Tri::Unknown,
+            // STR of a typed literal is its lexical form (§17.4.2.5).
+            (TermView::Typed { value, .. }, true) => Tri::of(test(value)),
             (TermView::BlankNode(_), _) | (_, false) => Tri::Error,
         })
         .unwrap_or(Tri::Unknown)

@@ -11,7 +11,7 @@ nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-shacl = { path = "../nrese-shacl" }
 nrese-sparql = { path = "../nrese-sparql" }
 oxrdf = "=0.3.3"
-oxsdatatypes = "=0.2.2"
+nrese-xsd = { path = "../rdf/nrese-xsd" }
 oxrdfio = "=0.2.4"
 oxttl = "=0.2.3"
 rayon = "1.10"
