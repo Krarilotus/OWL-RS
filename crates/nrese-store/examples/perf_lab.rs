@@ -4,7 +4,7 @@
 //! cargo run --release -p nrese-store --example perf_lab -- \
 //!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
-//!     [--explain]
+//!     [--explain] [--format tsv|json|xml|csv]
 //! ```
 //!
 //! - **Data:** `--load` bulk-loads files, into memory or, with `--store`, into an on-disk
@@ -15,6 +15,8 @@
 //!   counting sink, so evaluation, term decoding and serialisation are all included.
 //! - **Report:** rows, p50, min and max per query, peak memory (Linux), and a JSON file
 //!   for `benches/baselines/`. `--baseline` adds the ratio against an earlier JSON report.
+//!   `--format` serialises SELECT results in another format than TSV (JSON is what most
+//!   clients ask for).
 //!   `--explain` prints each query's plan after its measurement: every operator with its
 //!   estimated and actual rows and its time (inputs included), where the time goes when a
 //!   profiler isn't at hand.
@@ -50,6 +52,7 @@ struct Args {
     json: Option<PathBuf>,
     baseline: Option<PathBuf>,
     explain: bool,
+    format: SolutionsResultFormat,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -65,6 +68,7 @@ fn parse_args() -> Result<Args, String> {
         json: None,
         baseline: None,
         explain: false,
+        format: SolutionsResultFormat::Tsv,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -84,6 +88,15 @@ fn parse_args() -> Result<Args, String> {
             "--json" => args.json = Some(value()?.into()),
             "--baseline" => args.baseline = Some(value()?.into()),
             "--explain" => args.explain = true,
+            "--format" => {
+                args.format = match value()?.as_str() {
+                    "tsv" => SolutionsResultFormat::Tsv,
+                    "json" => SolutionsResultFormat::Json,
+                    "xml" => SolutionsResultFormat::Xml,
+                    "csv" => SolutionsResultFormat::Csv,
+                    other => return Err(format!("--format: unknown format {other}")),
+                }
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -160,7 +173,7 @@ fn run_once(
 
 fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
     let mut request = SparqlQueryRequest::new(text);
-    request.solutions_format = SolutionsResultFormat::Tsv;
+    request.solutions_format = args.format;
     let prepared = match PreparedQuery::parse(&request) {
         Ok(prepared) if prepared.kind() != QueryResultKind::Boolean => prepared,
         Ok(_) => {
