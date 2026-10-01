@@ -140,6 +140,12 @@ impl JsonLdWriter {
     }
 
     pub(crate) fn write(&mut self, out: &mut Vec<u8>, quad: QuadRef<'_>) -> io::Result<()> {
+        if let TermRef::Triple(triple) = quad.object {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("JSON-LD 1.1 can't express the triple term <<( {triple} )>>"),
+            ));
+        }
         self.start(out);
         let same = self
             .subject
@@ -212,7 +218,7 @@ impl JsonLdWriter {
             match object {
                 Term::NamedNode(n) => note(n.as_str()),
                 Term::Literal(l) => note(l.datatype().as_str()),
-                Term::BlankNode(_) => {}
+                Term::BlankNode(_) | Term::Triple(_) => {}
             }
         }
         let mut off = inherited.to_vec();
@@ -294,6 +300,10 @@ impl JsonLdWriter {
                     string(literal.value(), out);
                     out.extend_from_slice(b",\"@language\":");
                     string(language, out);
+                    if let Some(direction) = literal.direction() {
+                        out.extend_from_slice(b",\"@direction\":");
+                        string(direction.as_str(), out);
+                    }
                     out.push(b'}');
                 } else if literal.datatype() == xsd::STRING {
                     string(literal.value(), out);
@@ -305,6 +315,7 @@ impl JsonLdWriter {
                     out.push(b'}');
                 }
             }
+            TermRef::Triple(_) => unreachable!("refused in `write`"),
         }
     }
 

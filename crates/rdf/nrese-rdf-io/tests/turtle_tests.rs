@@ -296,10 +296,16 @@ fn parallel_parsing_is_exact() {
             assert_eq!(canonical(quads), expected, "{format} in {parts} parts");
         }
         // The same through a file.
-        let path = std::env::temp_dir().join(format!("nrese-rdf-io-split-{}.{}", std::process::id(), format.file_extension()));
+        let path = std::env::temp_dir().join(format!(
+            "nrese-rdf-io-split-{}.{}",
+            std::process::id(),
+            format.file_extension()
+        ));
         std::fs::write(&path, text).unwrap();
         for parts in [2, 5, 17] {
-            let parsers = RdfParser::from_format(format).split_file_for_parallel_parsing(&path, parts).unwrap();
+            let parsers = RdfParser::from_format(format)
+                .split_file_for_parallel_parsing(&path, parts)
+                .unwrap();
             let quads: BTreeSet<Quad> = parsers.into_iter().flatten().map(|q| q.unwrap()).collect();
             assert_eq!(canonical(quads), expected, "{format} file in {parts} parts");
         }

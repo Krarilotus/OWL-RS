@@ -7,13 +7,18 @@
 //! names that are (an injective encoding). What XML 1.0 can't hold is an error rather than
 //! a silent loss: a statement in a named graph, a predicate with no XML name at its end, a
 //! character XML 1.0 doesn't allow.
+//!
+//! RDF 1.2 (only where the data needs it): a triple term is a property element with
+//! `rdf:parseType="Triple"` holding one description, and a directional literal carries
+//! `its:dir`; the outermost such element announces `rdf:version="1.2"`, which both need.
 
 use std::io;
 
 use nrese_rdf::vocab::xsd;
-use nrese_rdf::{NamedOrBlankNode, NamedOrBlankNodeRef, QuadRef, TermRef};
+use nrese_rdf::{NamedNodeRef, NamedOrBlankNode, NamedOrBlankNodeRef, QuadRef, TermRef};
 
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const ITS: &str = "http://www.w3.org/2005/11/its";
 
 pub(crate) struct RdfXmlWriter {
     prefixes: Vec<(String, String)>,
@@ -41,22 +46,25 @@ impl RdfXmlWriter {
         self.start(out);
         if self.subject.as_ref().map(NamedOrBlankNode::as_ref) != Some(quad.subject) {
             self.close_description(out);
-            out.extend_from_slice(b"\t<rdf:Description ");
-            match quad.subject {
-                NamedOrBlankNodeRef::NamedNode(n) => {
-                    out.extend_from_slice(b"rdf:about=\"");
-                    escape_attribute(n.as_str(), out)?;
-                }
-                NamedOrBlankNodeRef::BlankNode(b) => {
-                    out.extend_from_slice(b"rdf:nodeID=\"");
-                    node_id(b.as_str(), out);
-                }
-            }
-            out.extend_from_slice(b"\">\n");
+            out.push(b'\t');
+            description(quad.subject, out)?;
             self.subject = Some(quad.subject.into_owned());
         }
+        self.property(out, quad.predicate, quad.object, 2, false)
+    }
+
+    /// The property element of `predicate object`, `depth` tabs in; `versioned`: an
+    /// enclosing element announces RDF 1.2 already.
+    fn property(
+        &self,
+        out: &mut Vec<u8>,
+        predicate: NamedNodeRef<'_>,
+        object: TermRef<'_>,
+        depth: usize,
+        versioned: bool,
+    ) -> io::Result<()> {
         // The predicate as a qualified name.
-        let predicate = quad.predicate.as_str();
+        let predicate = predicate.as_str();
         let split = predicate.len() - local_name_length(predicate);
         let (namespace, local) = predicate.split_at(split);
         if local.is_empty() {
@@ -72,7 +80,8 @@ impl RdfXmlWriter {
                 .find(|(_, ns)| ns == namespace)
                 .map(|(p, _)| p.as_str())
         };
-        out.extend_from_slice(b"\t\t<");
+        indent(out, depth);
+        out.push(b'<');
         let name = match prefix {
             Some(p) => format!("{p}:{local}"),
             None => format!("ns:{local}"),
@@ -83,7 +92,15 @@ impl RdfXmlWriter {
             escape_attribute(namespace, out)?;
             out.push(b'"');
         }
-        match quad.object {
+        let needs_version = match object {
+            TermRef::Triple(_) => true,
+            TermRef::Literal(literal) => literal.direction().is_some(),
+            _ => false,
+        };
+        if needs_version && !versioned {
+            out.extend_from_slice(b" rdf:version=\"1.2\"");
+        }
+        match object {
             TermRef::NamedNode(n) => {
                 out.extend_from_slice(b" rdf:resource=\"");
                 escape_attribute(n.as_str(), out)?;
@@ -99,6 +116,13 @@ impl RdfXmlWriter {
                     out.extend_from_slice(b" xml:lang=\"");
                     escape_attribute(language, out)?;
                     out.push(b'"');
+                    if let Some(direction) = literal.direction() {
+                        out.extend_from_slice(b" xmlns:its=\"");
+                        out.extend_from_slice(ITS.as_bytes());
+                        out.extend_from_slice(b"\" its:dir=\"");
+                        out.extend_from_slice(direction.as_str().as_bytes());
+                        out.push(b'"');
+                    }
                 } else if literal.datatype() != xsd::STRING {
                     out.extend_from_slice(b" rdf:datatype=\"");
                     escape_attribute(literal.datatype().as_str(), out)?;
@@ -106,6 +130,24 @@ impl RdfXmlWriter {
                 }
                 out.push(b'>');
                 escape_text(literal.value(), out)?;
+                out.extend_from_slice(b"</");
+                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(b">\n");
+            }
+            TermRef::Triple(triple) => {
+                out.extend_from_slice(b" rdf:parseType=\"Triple\">\n");
+                indent(out, depth + 1);
+                description(triple.subject.as_ref(), out)?;
+                self.property(
+                    out,
+                    triple.predicate.as_ref(),
+                    triple.object.as_ref(),
+                    depth + 2,
+                    true,
+                )?;
+                indent(out, depth + 1);
+                out.extend_from_slice(b"</rdf:Description>\n");
+                indent(out, depth);
                 out.extend_from_slice(b"</");
                 out.extend_from_slice(name.as_bytes());
                 out.extend_from_slice(b">\n");
@@ -146,6 +188,27 @@ impl RdfXmlWriter {
             out.extend_from_slice(b"\t</rdf:Description>\n");
         }
     }
+}
+
+fn indent(out: &mut Vec<u8>, depth: usize) {
+    out.resize(out.len() + depth, b'\t');
+}
+
+/// The opening `rdf:Description` element of `subject`, and the line's end.
+fn description(subject: NamedOrBlankNodeRef<'_>, out: &mut Vec<u8>) -> io::Result<()> {
+    out.extend_from_slice(b"<rdf:Description ");
+    match subject {
+        NamedOrBlankNodeRef::NamedNode(n) => {
+            out.extend_from_slice(b"rdf:about=\"");
+            escape_attribute(n.as_str(), out)?;
+        }
+        NamedOrBlankNodeRef::BlankNode(b) => {
+            out.extend_from_slice(b"rdf:nodeID=\"");
+            node_id(b.as_str(), out);
+        }
+    }
+    out.extend_from_slice(b"\">\n");
+    Ok(())
 }
 
 /// The length of the longest suffix of `iri` that is an XML name (0 if none).

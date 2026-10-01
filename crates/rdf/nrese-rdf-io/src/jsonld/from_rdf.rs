@@ -197,6 +197,12 @@ fn rdf_to_object(
         TermRef::NamedNode(n) => return Ok(reference(n.as_str())),
         TermRef::BlankNode(b) => return Ok(reference(&format!("_:{}", b.as_str()))),
         TermRef::Literal(literal) => literal,
+        TermRef::Triple(triple) => {
+            return Err(JsonLdError::new(
+                Code::UnsupportedTripleTerm,
+                format!("JSON-LD 1.1 can't express the triple term <<( {triple} )>>"),
+            ));
+        }
     };
     let mut result = Object::new();
     let datatype = literal.datatype();
@@ -243,6 +249,10 @@ fn rdf_to_object(
                 text(lexical)
             } else if let Some(language) = literal.language() {
                 result.insert("@language", text(language));
+                if let Some(direction) = literal.direction() {
+                    // An RDF 1.2 directional literal: JSON-LD's own base direction.
+                    result.insert("@direction", text(direction.as_str()));
+                }
                 text(lexical)
             } else {
                 if datatype != xsd::STRING {

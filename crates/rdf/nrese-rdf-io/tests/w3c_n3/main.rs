@@ -165,6 +165,7 @@ fn object(term: &N3Term) -> Term {
         N3Term::NamedNode(n) => n.clone().into(),
         N3Term::BlankNode(b) => b.clone().into(),
         N3Term::Literal(l) => l.clone().into(),
+        N3Term::Triple(t) => Term::Triple(t.clone()),
         v @ N3Term::Variable(_) => NamedNode::new_unchecked(reserved(v)).into(),
     }
 }

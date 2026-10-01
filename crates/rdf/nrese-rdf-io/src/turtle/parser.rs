@@ -11,6 +11,9 @@
 //!   gets an error, not a stack overflow.
 //! - **Generated blank nodes** (`[]`, lists) are named from a key random per document and a
 //!   counter, so they can't meet a label the document writes.
+//! - **RDF 1.2** triple terms (`<<( s p o )>>`), reified triples (`<< s p o ~ r >>`) and
+//!   annotations (`s p o ~ r {| … |}`) are terms of the statement's table of triple terms;
+//!   the statement's triples borrow owned copies of them, built once per statement.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -18,8 +21,8 @@ use std::io::{self, Read};
 
 use nrese_rdf::vocab::{rdf, xsd};
 use nrese_rdf::{
-    BlankNodeRef, GraphNameRef, Iri, LiteralRef, NamedNodeRef, NamedOrBlankNodeRef, QuadRef,
-    TermRef,
+    BaseDirection, BlankNodeRef, GraphNameRef, Iri, LiteralRef, NamedNodeRef, NamedOrBlankNodeRef,
+    QuadRef, TermRef, TripleRef,
 };
 
 use super::lexer::{Kind, Lexed, Token, lex};
@@ -170,12 +173,15 @@ enum Term {
     },
     /// An N3 quick variable (`?name`): its name.
     Variable(Span),
+    /// A triple term: its index in the statement's table of triple terms.
+    Triple(u32),
 }
 
 #[derive(Clone, Copy)]
 enum Lit {
     Simple,
     Language(Span),
+    DirectionalLanguage(Span, BaseDirection),
     Typed(Span),
     TypedStatic(NamedNodeRef<'static>),
 }
@@ -223,6 +229,10 @@ pub(crate) struct TurtleParser<'a, R> {
     started: bool,
     /// N3: the formulas being read, innermost last.
     formulas: Vec<Term>,
+    /// The statement's triple terms (inner ones first), and owned copies of them that its
+    /// triples borrow.
+    triple_terms: Vec<Triple>,
+    owned_triple_terms: Vec<nrese_rdf::Triple>,
 }
 
 const INITIAL_BUFFER: usize = 64 * 1024;
@@ -304,6 +314,8 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             resolved: String::new(),
             started: false,
             formulas: Vec::new(),
+            triple_terms: Vec::new(),
+            owned_triple_terms: Vec::new(),
         }
     }
 
@@ -320,11 +332,23 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             }
             self.arena.clear();
             self.triples.clear();
+            self.triple_terms.clear();
             self.handed_out = 0;
             if let Err(error) = self.statement() {
                 self.done = true;
                 return Some(Err(error));
             }
+            self.own_triple_terms();
+        }
+    }
+
+    /// Owned copies of the statement's triple terms, for its triples to borrow. An inner
+    /// term comes before the terms holding it, so its copy is there when they need it.
+    fn own_triple_terms(&mut self) {
+        self.owned_triple_terms.clear();
+        for i in 0..self.triple_terms.len() {
+            let owned = TripleRef::from(self.quad(self.triple_terms[i])).into_owned();
+            self.owned_triple_terms.push(owned);
         }
     }
 
@@ -342,6 +366,14 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                         LiteralRef::new_language_tagged_literal_unchecked(text(value), text(tag))
                             .into()
                     }
+                    Lit::DirectionalLanguage(tag, direction) => {
+                        LiteralRef::new_directional_language_tagged_literal_unchecked(
+                            text(value),
+                            text(tag),
+                            direction,
+                        )
+                        .into()
+                    }
                     Lit::Typed(datatype) => LiteralRef::new_typed_literal(
                         text(value),
                         NamedNodeRef::new_unchecked(text(datatype)),
@@ -351,12 +383,13 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                         LiteralRef::new_typed_literal(text(value), datatype).into()
                     }
                 },
+                Term::Triple(i) => (&self.owned_triple_terms[i as usize]).into(),
             }
         };
         let subject = match term(triple.subject) {
             TermRef::NamedNode(n) => NamedOrBlankNodeRef::NamedNode(n),
             TermRef::BlankNode(b) => NamedOrBlankNodeRef::BlankNode(b),
-            TermRef::Literal(_) => unreachable!("subjects are nodes"),
+            TermRef::Literal(_) | TermRef::Triple(_) => unreachable!("subjects are nodes"),
         };
         let TermRef::NamedNode(predicate) = term(triple.predicate) else {
             unreachable!("predicates are IRIs")
@@ -624,13 +657,22 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 self.done = true;
                 Ok(())
             }
-            Kind::AtPrefix | Kind::Prefix | Kind::AtBase | Kind::Base if self.in_block => {
+            Kind::AtPrefix
+            | Kind::Prefix
+            | Kind::AtBase
+            | Kind::Base
+            | Kind::AtVersion
+            | Kind::Version
+                if self.in_block =>
+            {
                 Err(self.error(token.start, "a directive inside a graph block"))
             }
             Kind::AtPrefix => self.prefix(true),
             Kind::Prefix => self.prefix(false),
             Kind::AtBase => self.base(true),
             Kind::Base => self.base(false),
+            Kind::AtVersion => self.version(true),
+            Kind::Version => self.version(false),
             Kind::Graph if trig && !self.in_block => {
                 let label = self.take()?;
                 let label = self.graph_label(&label)?;
@@ -772,9 +814,32 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         Ok(())
     }
 
-    /// `triples ::= subject predicateObjectList | blankNodePropertyList predicateObjectList?`
+    /// `@version "…" .` or `VERSION "…"`: a short string; every version label is accepted.
+    fn version(&mut self, dot: bool) -> Step<()> {
+        let label = self.take()?;
+        // A version label isn't a literal: no language tag can follow it.
+        self.after_string = false;
+        let long = label.text.start - label.start == 3;
+        if !matches!(label.kind, Kind::String { .. }) || long {
+            return Err(self.error(label.start, "expected the version label as a short string"));
+        }
+        if dot {
+            self.expect(Kind::Dot, "expected '.' after @version")?;
+        }
+        Ok(())
+    }
+
+    /// `triples ::= subject predicateObjectList | blankNodePropertyList predicateObjectList?
+    /// | reifiedTriple predicateObjectList?`
     fn triples_from(&mut self, first: Token) -> Step<()> {
         match first.kind {
+            Kind::ReifiedOpen => {
+                let subject = self.reified_triple(0)?;
+                if self.peek_is_verb()? {
+                    self.predicate_object_list(subject, 0)?;
+                }
+                Ok(())
+            }
             Kind::IriRef { .. } | Kind::PrefixedName { .. } => {
                 let subject = Term::Iri(self.iri(&first)?);
                 self.predicate_object_list(subject, 0)
@@ -812,19 +877,16 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         ))
     }
 
-    /// `verb objectList (';' (verb objectList)?)*`
+    /// `verb objectList (';' (verb objectList)?)*`, each object with its annotation.
     fn predicate_object_list(&mut self, subject: Term, depth: usize) -> Step<()> {
         loop {
-            let verb = self.take()?;
-            let predicate = match verb.kind {
-                Kind::A => Term::Static(rdf::TYPE),
-                Kind::IriRef { .. } | Kind::PrefixedName { .. } => Term::Iri(self.iri(&verb)?),
-                _ => return Err(self.error(verb.start, "expected a predicate")),
-            };
-            self.object(subject, predicate, depth)?;
+            let predicate = self.verb()?;
+            let object = self.object(subject, predicate, depth)?;
+            self.annotation(subject, predicate, object, depth)?;
             while self.peek()? == Kind::Comma {
                 self.take()?;
-                self.object(subject, predicate, depth)?;
+                let object = self.object(subject, predicate, depth)?;
+                self.annotation(subject, predicate, object, depth)?;
             }
             if self.peek()? != Kind::Semicolon {
                 return Ok(());
@@ -848,8 +910,18 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         Ok(depth + 1)
     }
 
-    /// One object of `subject predicate`.
-    fn object(&mut self, subject: Term, predicate: Term, depth: usize) -> Step<()> {
+    /// `verb`: `a` or an IRI.
+    fn verb(&mut self) -> Step<Term> {
+        let verb = self.take()?;
+        match verb.kind {
+            Kind::A => Ok(Term::Static(rdf::TYPE)),
+            Kind::IriRef { .. } | Kind::PrefixedName { .. } => Ok(Term::Iri(self.iri(&verb)?)),
+            _ => Err(self.error(verb.start, "expected a predicate")),
+        }
+    }
+
+    /// One object of `subject predicate`, emitted; the object, for its annotation.
+    fn object(&mut self, subject: Term, predicate: Term, depth: usize) -> Step<Term> {
         let token = self.take()?;
         let object = match token.kind {
             Kind::IriRef { .. } | Kind::PrefixedName { .. } => Term::Iri(self.iri(&token)?),
@@ -868,18 +940,191 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     self.predicate_object_list(node, depth)?;
                 }
                 self.expect(Kind::CloseBracket, "expected ']'")?;
-                return Ok(());
+                return Ok(node);
             }
             Kind::OpenParen => {
                 let depth = self.deeper(depth, token.start)?;
                 let head = self.collection(depth)?;
                 self.emit(subject, predicate, head);
-                return Ok(());
+                return Ok(head);
+            }
+            Kind::TripleTermOpen => {
+                let depth = self.deeper(depth, token.start)?;
+                self.triple_term(depth)?
+            }
+            Kind::ReifiedOpen => {
+                let depth = self.deeper(depth, token.start)?;
+                self.reified_triple(depth)?
             }
             _ => return Err(self.error(token.start, "expected an object")),
         };
         self.emit(subject, predicate, object);
-        Ok(())
+        Ok(object)
+    }
+
+    /// The triple term of `subject predicate object`, added to the statement's table.
+    fn add_triple_term(&mut self, subject: Term, predicate: Term, object: Term) -> Term {
+        self.triple_terms.push(Triple {
+            subject,
+            predicate,
+            object,
+            formula: None,
+        });
+        Term::Triple(self.triple_terms.len() as u32 - 1)
+    }
+
+    /// An IRI or a blank node (a label or `[]`) from its first token: the subject of a
+    /// triple term or a reified triple, or a reifier.
+    fn node(&mut self, token: &Token, what: &'static str) -> Step<Term> {
+        match token.kind {
+            Kind::IriRef { .. } | Kind::PrefixedName { .. } => Ok(Term::Iri(self.iri(token)?)),
+            Kind::BlankLabel => Ok(Term::Blank(self.blank_label(token)?)),
+            Kind::OpenBracket => {
+                self.expect(
+                    Kind::CloseBracket,
+                    "expected ']': only '[]' is allowed here",
+                )?;
+                Ok(self.fresh())
+            }
+            _ => Err(self.error(token.start, what)),
+        }
+    }
+
+    /// A literal's first token.
+    fn starts_literal(kind: Kind) -> bool {
+        matches!(
+            kind,
+            Kind::String { .. }
+                | Kind::Integer
+                | Kind::Decimal
+                | Kind::Double
+                | Kind::True
+                | Kind::False
+        )
+    }
+
+    /// `tripleTerm ::= '<<(' ttSubject verb ttObject ')>>'` after the '<<('.
+    fn triple_term(&mut self, depth: usize) -> Step<Term> {
+        let token = self.take()?;
+        let subject = self.node(&token, "expected an IRI or a blank node as subject")?;
+        let predicate = self.verb()?;
+        let token = self.take()?;
+        let object = match token.kind {
+            Kind::TripleTermOpen => {
+                let depth = self.deeper(depth, token.start)?;
+                self.triple_term(depth)?
+            }
+            kind if Self::starts_literal(kind) => self.literal(&token)?,
+            _ => self.node(
+                &token,
+                "expected an IRI, a blank node, a literal or a triple term as object",
+            )?,
+        };
+        self.expect(
+            Kind::TripleTermClose,
+            "expected ')>>' after the triple term",
+        )?;
+        Ok(self.add_triple_term(subject, predicate, object))
+    }
+
+    /// `reifiedTriple ::= '<<' rtSubject verb rtObject reifier? '>>'` after the '<<': emits
+    /// `reifier rdf:reifies <<( s p o )>>`, and is the reifier.
+    fn reified_triple(&mut self, depth: usize) -> Step<Term> {
+        let token = self.take()?;
+        let subject = match token.kind {
+            Kind::ReifiedOpen => {
+                let depth = self.deeper(depth, token.start)?;
+                self.reified_triple(depth)?
+            }
+            _ => self.node(
+                &token,
+                "expected an IRI, a blank node or a reified triple as subject",
+            )?,
+        };
+        let predicate = self.verb()?;
+        let token = self.take()?;
+        let object = match token.kind {
+            Kind::ReifiedOpen => {
+                let depth = self.deeper(depth, token.start)?;
+                self.reified_triple(depth)?
+            }
+            Kind::TripleTermOpen => {
+                let depth = self.deeper(depth, token.start)?;
+                self.triple_term(depth)?
+            }
+            kind if Self::starts_literal(kind) => self.literal(&token)?,
+            _ => self.node(&token, "expected an object of the reified triple")?,
+        };
+        let reifier = if self.peek()? == Kind::Tilde {
+            self.take()?;
+            self.reifier()?
+        } else {
+            self.fresh()
+        };
+        self.expect(Kind::ReifiedClose, "expected '>>' after the reified triple")?;
+        let term = self.add_triple_term(subject, predicate, object);
+        self.emit(reifier, Term::Static(rdf::REIFIES), term);
+        Ok(reifier)
+    }
+
+    /// `reifier ::= '~' (iri | BlankNode)?` after the '~': the named node, or a fresh one.
+    fn reifier(&mut self) -> Step<Term> {
+        match self.peek()? {
+            Kind::IriRef { .. }
+            | Kind::PrefixedName { .. }
+            | Kind::BlankLabel
+            | Kind::OpenBracket => {
+                let token = self.take()?;
+                self.node(&token, "expected an IRI or a blank node as the reifier")
+            }
+            _ => Ok(self.fresh()),
+        }
+    }
+
+    /// `annotation ::= (reifier | annotationBlock)*` after `subject predicate object`: each
+    /// reifier, and each block without one before it (a fresh one), reifies the triple.
+    fn annotation(
+        &mut self,
+        subject: Term,
+        predicate: Term,
+        object: Term,
+        depth: usize,
+    ) -> Step<()> {
+        let mut term = None;
+        let mut reifier = None;
+        loop {
+            match self.peek()? {
+                Kind::Tilde => {
+                    self.take()?;
+                    let named = self.reifier()?;
+                    let triple = match term {
+                        Some(triple) => triple,
+                        None => *term.insert(self.add_triple_term(subject, predicate, object)),
+                    };
+                    self.emit(named, Term::Static(rdf::REIFIES), triple);
+                    reifier = Some(named);
+                }
+                Kind::AnnotationOpen => {
+                    let token = self.take()?;
+                    let depth = self.deeper(depth, token.start)?;
+                    let triple = match term {
+                        Some(triple) => triple,
+                        None => *term.insert(self.add_triple_term(subject, predicate, object)),
+                    };
+                    let block_subject = match reifier.take() {
+                        Some(named) => named,
+                        None => {
+                            let fresh = self.fresh();
+                            self.emit(fresh, Term::Static(rdf::REIFIES), triple);
+                            fresh
+                        }
+                    };
+                    self.predicate_object_list(block_subject, depth)?;
+                    self.expect(Kind::AnnotationClose, "expected '|}' after the annotation")?;
+                }
+                _ => return Ok(()),
+            }
+        }
     }
 
     /// A literal from its first token (a string, a number, `true` or `false`); a string's
@@ -888,16 +1133,36 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         if let Kind::String { escaped } = token.kind {
             let value = self.push_string(token, escaped)?;
             let kind = match self.peek()? {
-                Kind::LangTag => {
+                Kind::LangTag { direction } => {
                     let tag = self.take()?;
                     let span = self.push_text(&tag)?;
                     self.arena[span.start as usize..span.end as usize].make_ascii_lowercase();
-                    Lit::Language(span)
+                    if !self.settings.unchecked
+                        && !nrese_rdf::language::is_well_formed(
+                            &self.arena[span.start as usize..span.end as usize],
+                        )
+                    {
+                        return Err(
+                            self.error(tag.start, "a language tag that isn't well-formed BCP 47")
+                        );
+                    }
+                    match direction {
+                        None => Lit::Language(span),
+                        Some(direction) => Lit::DirectionalLanguage(span, direction),
+                    }
                 }
                 Kind::Datatype => {
                     self.take()?;
                     let datatype = self.take()?;
-                    Lit::Typed(self.iri(&datatype)?)
+                    let span = self.iri(&datatype)?;
+                    let iri = &self.arena[span.start as usize..span.end as usize];
+                    if crate::ntriples::is_language_string(iri) {
+                        return Err(self.error(
+                            datatype.start,
+                            "a language-string datatype without a language tag",
+                        ));
+                    }
+                    Lit::Typed(span)
                 }
                 _ => Lit::Simple,
             };

@@ -1,28 +1,50 @@
 //! Language tags: well-formedness by BCP 47's grammar (RFC 5646 §2.1).
 
-/// Whether `tag` is a well-formed BCP 47 language tag (any letter case).
+/// Whether `tag` is a well-formed BCP 47 language tag (any letter case). Parsers call it
+/// for every language-tagged literal, so it allocates nothing for tags of up to 16
+/// subtags.
 pub fn is_well_formed(tag: &str) -> bool {
     if !tag.is_ascii() || tag.is_empty() {
         return false;
     }
-    let lower = tag.to_ascii_lowercase();
-    if GRANDFATHERED.contains(&lower.as_str()) {
+    if GRANDFATHERED.iter().any(|g| g.eq_ignore_ascii_case(tag)) {
         return true;
     }
-    let subtags: Vec<&str> = lower.split('-').collect();
-    if subtags
-        .iter()
-        .any(|s| s.is_empty() || s.len() > 8 || !is_alphanumeric(s))
-    {
-        return false;
+    const ON_STACK: usize = 16;
+    let mut stack = [""; ON_STACK];
+    let mut more = Vec::new();
+    let mut count = 0;
+    for subtag in tag.split('-') {
+        if subtag.is_empty() || subtag.len() > 8 || !is_alphanumeric(subtag) {
+            return false;
+        }
+        if count < ON_STACK {
+            stack[count] = subtag;
+        } else {
+            if more.is_empty() {
+                more.extend_from_slice(&stack);
+            }
+            more.push(subtag);
+        }
+        count += 1;
     }
-    if subtags[0] == "x" {
+    let subtags = if count <= ON_STACK {
+        &stack[..count]
+    } else {
+        &more[..]
+    };
+    if is_x(subtags[0]) {
         return private_use(&subtags[1..]);
     }
-    langtag(&subtags)
+    langtag(subtags)
 }
 
-/// The tags the grammar lists as grandfathered, in lower case.
+/// The private-use singleton, in either case.
+fn is_x(subtag: &str) -> bool {
+    subtag.eq_ignore_ascii_case("x")
+}
+
+/// The tags the grammar lists as grandfathered.
 const GRANDFATHERED: [&str; 26] = [
     "en-gb-oed",
     "i-ami",
@@ -106,7 +128,7 @@ fn langtag(subtags: &[&str]) -> bool {
         i += 1;
     }
     // extension = singleton 1*("-" (2*8alphanum)), singleton any alphanumeric but x
-    while i < n && subtags[i].len() == 1 && subtags[i] != "x" {
+    while i < n && subtags[i].len() == 1 && !is_x(subtags[i]) {
         i += 1;
         let start = i;
         while i < n && subtags[i].len() >= 2 {
@@ -117,7 +139,7 @@ fn langtag(subtags: &[&str]) -> bool {
         }
     }
     // ["-" privateuse]
-    if i < n && subtags[i] == "x" {
+    if i < n && is_x(subtags[i]) {
         return private_use(&subtags[i + 1..]);
     }
     i == n

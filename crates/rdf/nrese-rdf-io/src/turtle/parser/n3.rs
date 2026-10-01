@@ -72,12 +72,22 @@ impl<R: Read> TurtleParser<'_, R> {
                     Lit::Language(tag) => {
                         Literal::new_language_tagged_literal_unchecked(value, self.span(tag))
                     }
+                    Lit::DirectionalLanguage(tag, direction) => {
+                        Literal::new_directional_language_tagged_literal_unchecked(
+                            value,
+                            self.span(tag),
+                            direction,
+                        )
+                    }
                     Lit::Typed(datatype) => Literal::new_typed_literal(
                         value,
                         NamedNode::new_unchecked(self.span(datatype)),
                     ),
                     Lit::TypedStatic(datatype) => Literal::new_typed_literal(value, datatype),
                 })
+            }
+            Term::Triple(i) => {
+                N3Term::Triple(Box::new(self.owned_triple_terms[i as usize].clone()))
             }
         }
     }
