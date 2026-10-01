@@ -16,8 +16,8 @@
 
 use nrese_engine::{TermId, TermKind};
 use nrese_reasoner::v2::naive::{Triple, Violation};
+use nrese_xsd::{DateTime, Decimal, Double, Float, Integer};
 use oxrdf::{Literal, Term};
-use oxsdatatypes::{DateTime, Decimal, Double, Float, Integer};
 use std::str::FromStr;
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";

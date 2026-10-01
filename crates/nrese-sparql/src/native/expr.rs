@@ -17,7 +17,7 @@ use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 use spargebra::algebra::{Expression, Function};
 
-use oxsdatatypes::{
+use nrese_xsd::{
     Date, DateTime, DayTimeDuration, Decimal, Double, Float, GDay, GMonth, GMonthDay, GYear,
     GYearMonth, Integer, Time, TimezoneOffset,
 };
@@ -393,7 +393,13 @@ impl Evaluator {
                     ),
                 }
             }
-            Function::Now => Some(Literal::from(*self.now.get_or_init(DateTime::now)).into()),
+            Function::Now => Some(
+                Literal::new_typed_literal(
+                    self.now.get_or_init(DateTime::now).to_string(),
+                    xsd::DATE_TIME,
+                )
+                .into(),
+            ),
             Function::Rand => Some(Literal::from(rand::random::<f64>()).into()),
             Function::Uuid => Some(NamedNode::new_unchecked(format!("urn:uuid:{}", uuid())).into()),
             Function::StrUuid => Some(Literal::new_simple_literal(uuid()).into()),
@@ -449,15 +455,9 @@ impl Evaluator {
             Function::Custom(name) => cast(name.as_str(), arg(0)?),
             Function::Str => match arg(0)? {
                 Term::NamedNode(node) => Some(Literal::new_simple_literal(node.as_str()).into()),
-                // Typed literals are read as values: STR gives the canonical form. A
-                // deviation (SPARQL 1.1 §17.4.2.5 gives the lexical form), kept from the
-                // spareval era; see the migration plan's status.
-                literal @ Term::Literal(_) => match canonical(literal) {
-                    Term::Literal(literal) => {
-                        Some(Literal::new_simple_literal(literal.value()).into())
-                    }
-                    _ => None,
-                },
+                // The lexical form, as written (SPARQL 1.1 §17.4.2.5): STR("03"^^xsd:integer)
+                // is "03". (A cast to xsd:string gives the canonical form: XPath §19.)
+                Term::Literal(literal) => Some(Literal::new_simple_literal(literal.value()).into()),
                 Term::BlankNode(_) => None,
             },
             Function::Lang => match arg(0)? {
@@ -517,16 +517,20 @@ impl Evaluator {
                     Function::Month => i64::from(month),
                     _ => i64::from(day),
                 };
-                Some(Literal::from(Integer::from(part)).into())
+                Some(Literal::new_typed_literal(part.to_string(), xsd::INTEGER).into())
             }
             Function::Hours | Function::Minutes | Function::Seconds => {
                 let Value::DateTime(d) = Value::of(&arg(0)?) else {
                     return None;
                 };
                 Some(match function {
-                    Function::Hours => Literal::from(Integer::from(i64::from(d.hour()))).into(),
-                    Function::Minutes => Literal::from(Integer::from(i64::from(d.minute()))).into(),
-                    _ => Literal::from(d.second()).into(),
+                    Function::Hours => {
+                        Literal::new_typed_literal(d.hour().to_string(), xsd::INTEGER).into()
+                    }
+                    Function::Minutes => {
+                        Literal::new_typed_literal(d.minute().to_string(), xsd::INTEGER).into()
+                    }
+                    _ => Literal::new_typed_literal(d.second().to_string(), xsd::DECIMAL).into(),
                 })
             }
             Function::Concat => {
@@ -694,10 +698,10 @@ impl Numeric {
 
     fn term(self) -> Term {
         match self {
-            Self::Integer(i) => Literal::from(i),
-            Self::Decimal(d) => Literal::from(d),
-            Self::Float(f) => Literal::from(f),
-            Self::Double(d) => Literal::from(d),
+            Self::Integer(i) => Literal::new_typed_literal(i.to_string(), xsd::INTEGER),
+            Self::Decimal(d) => Literal::new_typed_literal(d.to_string(), xsd::DECIMAL),
+            Self::Float(f) => Literal::new_typed_literal(f.to_string(), xsd::FLOAT),
+            Self::Double(d) => Literal::new_typed_literal(d.to_string(), xsd::DOUBLE),
         }
         .into()
     }
@@ -799,7 +803,7 @@ fn arithmetic(operator: Operator, (a, b): (Value, Value)) -> Option<Term> {
 /// `name(term)` for a cast (XPath §19): the value read from the literal, converted, in
 /// canonical form.
 fn cast(name: &str, term: Term) -> Option<Term> {
-    use oxsdatatypes::{Boolean, Date, DateTime};
+    use nrese_xsd::{Boolean, Date, DateTime};
     let typed = |value: String, datatype: oxrdf::NamedNodeRef<'_>| -> Option<Term> {
         Some(Literal::new_typed_literal(value, datatype).into())
     };
@@ -877,7 +881,7 @@ fn cast(name: &str, term: Term) -> Option<Term> {
     if name == xsd::DATE.as_str() {
         let v: Date = match value {
             Value::Date(v) => v,
-            Value::DateTime(v) => v.try_into().ok()?,
+            Value::DateTime(v) => v.into(),
             Value::String(s) => s.parse().ok()?,
             _ => return None,
         };
@@ -886,7 +890,7 @@ fn cast(name: &str, term: Term) -> Option<Term> {
     if name == xsd::DATE_TIME.as_str() {
         let v: DateTime = match value {
             Value::DateTime(v) => v,
-            Value::Date(v) => v.try_into().ok()?,
+            Value::Date(v) => v.into(),
             Value::String(s) => s.parse().ok()?,
             _ => return None,
         };
