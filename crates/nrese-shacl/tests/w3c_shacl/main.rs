@@ -19,12 +19,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
 use nrese_engine::{Engine, EngineConfig, GraphSelector, TermId};
-use nrese_shacl::{PropertyPath, Selection, compile, validate};
-use oxrdf::{
+use nrese_rdf::{
     Graph, GraphNameRef, NamedNode, NamedNodeRef, NamedOrBlankNodeRef, QuadRef, Term, TermRef,
     Triple,
 };
-use oxrdfio::{RdfFormat, RdfParser};
+use nrese_rdf_io::{RdfFormat, RdfParser};
+use nrese_shacl::{PropertyPath, Selection, compile, validate};
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
 
@@ -83,7 +83,7 @@ fn node(term: TermRef<'_>) -> Option<NamedOrBlankNodeRef<'_>> {
     match term {
         TermRef::NamedNode(node) => Some(node.into()),
         TermRef::BlankNode(node) => Some(node.into()),
-        TermRef::Literal(_) => None,
+        TermRef::Literal(_) | TermRef::Triple(_) => None,
     }
 }
 
@@ -160,7 +160,9 @@ fn expected_path(graph: &Graph, term: TermRef<'_>) -> Result<PropertyPath, Strin
             return Ok(PropertyPath::Predicate(predicate.into_owned()));
         }
         TermRef::BlankNode(blank) => NamedOrBlankNodeRef::from(blank),
-        TermRef::Literal(_) => return Err("a literal as path".to_owned()),
+        TermRef::Literal(_) | TermRef::Triple(_) => {
+            return Err("a literal or triple term as path".to_owned());
+        }
     };
     let inner = |local: &str| {
         object(graph, blank, &iri(SH, local))

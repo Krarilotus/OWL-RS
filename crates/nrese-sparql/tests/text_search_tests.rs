@@ -3,9 +3,9 @@
 //! no longer uses.
 
 use nrese_engine::{Engine, EngineConfig};
+use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query};
-use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
-use spargebra::SparqlParser;
+use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
 const PREFIXES: &str = "PREFIX bds: <http://www.bigdata.com/rdf/search#> \

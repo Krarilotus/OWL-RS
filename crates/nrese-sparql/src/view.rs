@@ -8,7 +8,7 @@
 //! stack alone.
 
 use nrese_engine::{EncodedQuad, QuadPattern, ReadModel, Snapshot, TermId, Transaction};
-use oxrdf::{Quad, Term, TermRef};
+use nrese_rdf::{Quad, Term, TermRef};
 use std::borrow::Cow;
 
 pub trait ReadView {

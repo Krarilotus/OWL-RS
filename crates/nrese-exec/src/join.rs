@@ -21,7 +21,8 @@
 
 use std::cmp::Ordering;
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 
 use hashbrown::HashMap;
 use rayon::prelude::*;
@@ -51,23 +52,50 @@ impl std::fmt::Display for TooManyRows {
 
 impl std::error::Error for TooManyRows {}
 
+/// How far a join may go: at most `max_rows` output rows, and no further once `stop` is set
+/// (the query was cancelled). Both are checked every [`LIMIT_STEP`] output rows, so a
+/// join that would run for hours stops within a few thousand rows of either.
+#[derive(Debug, Clone, Default)]
+pub struct RowLimit {
+    pub max_rows: usize,
+    pub stop: Option<Arc<AtomicBool>>,
+}
+
+impl From<usize> for RowLimit {
+    fn from(max_rows: usize) -> Self {
+        Self {
+            max_rows,
+            stop: None,
+        }
+    }
+}
+
 /// The output rows of one join so far, shared by its parallel parts.
 struct Limit {
     max_rows: usize,
     rows: AtomicUsize,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl Limit {
-    fn new(max_rows: usize) -> Self {
+    fn new(limit: impl Into<RowLimit>) -> Self {
+        let limit = limit.into();
         Self {
-            max_rows,
+            max_rows: limit.max_rows,
             rows: AtomicUsize::new(0),
+            stop: limit.stop,
         }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(AtomicOrdering::Relaxed))
     }
 
     fn grow(&self, rows: usize) -> Result<(), TooManyRows> {
         let total = self.rows.fetch_add(rows, AtomicOrdering::Relaxed) + rows;
-        if total > self.max_rows {
+        if total > self.max_rows || self.stopped() {
             return Err(TooManyRows {
                 max_rows: self.max_rows,
             });
@@ -182,10 +210,10 @@ pub fn join(
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
-    max_rows: usize,
+    limit: impl Into<RowLimit>,
 ) -> Result<IdTable, TooManyRows> {
     assert_eq!(left_keys.len(), right_keys.len(), "join key arity");
-    let limit = Limit::new(max_rows);
+    let limit = Limit::new(limit);
     if left_keys.is_empty() {
         return cross_product(left, right, &limit);
     }
@@ -206,10 +234,10 @@ pub fn join_keeping_left_order(
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
-    max_rows: usize,
+    limit: impl Into<RowLimit>,
 ) -> Result<IdTable, TooManyRows> {
     assert_eq!(left_keys.len(), right_keys.len(), "join key arity");
-    let limit = Limit::new(max_rows);
+    let limit = Limit::new(limit);
     if left_keys.is_empty() {
         return cross_product(left, right, &limit);
     }
@@ -238,6 +266,11 @@ fn cross_product(left: &IdTable, right: &IdTable, limit: &Limit) -> Result<IdTab
                     row[left.width() + i] = c[r];
                 }
                 out.push_row(&row);
+            }
+            if limit.stopped() {
+                return Err(TooManyRows {
+                    max_rows: limit.max_rows,
+                });
             }
         }
         Ok(out)
@@ -466,11 +499,11 @@ pub fn left_join(
     left_keys: &[usize],
     right_keys: &[usize],
     accept: Option<RowFilter<'_>>,
-    max_rows: usize,
+    limit: impl Into<RowLimit>,
 ) -> Result<IdTable, TooManyRows> {
     let width = left.width() + right_payload(right.width(), right_keys).len();
     let table = (!left_keys.is_empty()).then(|| BuildTable::new(right, right_keys));
-    let limit = Limit::new(max_rows);
+    let limit = Limit::new(limit);
     let inputs = LeftJoin {
         left,
         right,
@@ -608,7 +641,7 @@ pub fn join_with_undef(
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
-    max_rows: usize,
+    limit: impl Into<RowLimit>,
 ) -> Result<IdTable, TooManyRows> {
     let has_undef =
         |t: &IdTable, row: usize, keys: &[usize]| keys.iter().any(|&k| t.get(row, k) == UNDEF);
@@ -621,8 +654,15 @@ pub fn join_with_undef(
     };
     let (left_bound, left_open) = split(left, left_keys);
     let (right_bound, right_open) = split(right, right_keys);
-    let joined = join(&left_bound, &right_bound, left_keys, right_keys, max_rows)?;
-    let limit = Limit::new(max_rows);
+    let limit = limit.into();
+    let joined = join(
+        &left_bound,
+        &right_bound,
+        left_keys,
+        right_keys,
+        limit.clone(),
+    )?;
+    let limit = Limit::new(limit);
     limit.grow(joined.len())?;
     let payload = right_payload(right.width(), right_keys);
     let mut row = vec![0; joined.width()];
@@ -739,11 +779,11 @@ pub fn outer_join_with_undef(
     right_keys: &[usize],
     accept: Option<RowFilter<'_>>,
     keep_unmatched: bool,
-    max_rows: usize,
+    limit: impl Into<RowLimit>,
 ) -> Result<IdTable, TooManyRows> {
     let payload = right_payload(right.width(), right_keys);
     let width = left.width() + payload.len();
-    let limit = Limit::new(max_rows);
+    let limit = Limit::new(limit);
     let mut out = Sink::new(width, &limit);
     let compatible = Compatible::new(right, left_keys, right_keys);
     let mut row = vec![0; width];
@@ -1106,5 +1146,30 @@ mod tests {
         );
         assert!(left_join(&left, &right, &[0], &[0], None, 1000).is_err());
         assert!(join_with_undef(&left, &right, &[0], &[0], 1000).is_err());
+    }
+
+    #[test]
+    fn a_set_stop_flag_stops_every_join() {
+        let mut rng = Rng(5);
+        let left = random_table(&mut rng, 2, 3000, 4, false);
+        let right = random_table(&mut rng, 2, 3000, 4, false);
+        let stopped = || RowLimit {
+            max_rows: usize::MAX,
+            stop: Some(Arc::new(AtomicBool::new(true))),
+        };
+        assert!(join(&left, &right, &[0], &[0], stopped()).is_err());
+        assert!(join(&left, &right, &[], &[], stopped()).is_err());
+        assert!(join_keeping_left_order(&left, &right, &[0], &[0], stopped()).is_err());
+        assert!(left_join(&left, &right, &[0], &[0], None, stopped()).is_err());
+        assert!(join_with_undef(&left, &right, &[0], &[0], stopped()).is_err());
+        // An unset flag changes nothing.
+        let running = RowLimit {
+            max_rows: usize::MAX,
+            stop: Some(Arc::new(AtomicBool::new(false))),
+        };
+        assert_eq!(
+            join(&left, &right, &[0], &[0], running).map(|t| t.len()),
+            join(&left, &right, &[0], &[0], usize::MAX).map(|t| t.len())
+        );
     }
 }

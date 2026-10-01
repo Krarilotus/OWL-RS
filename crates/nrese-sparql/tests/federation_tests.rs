@@ -5,12 +5,12 @@
 use std::sync::{Arc, Mutex};
 
 use nrese_engine::{Engine, EngineConfig};
+use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 use nrese_sparql::{
     CancellationToken, QueryOptions, QueryResults, ServiceClient, ServiceResults, Services,
     evaluate_query, explain_query,
 };
-use oxrdf::{GraphName, Literal, NamedNode, Quad};
-use spargebra::SparqlParser;
+use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
 const REMOTE: &str = "http://remote.example/sparql";

@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use md5::{Digest, Md5};
-use oxiri::Iri;
-use oxrdf::vocab::xsd;
-use oxrdf::{BlankNode, Literal, NamedNode, Term, Variable};
+use nrese_rdf::Iri;
+use nrese_rdf::vocab::xsd;
+use nrese_rdf::{BlankNode, Literal, NamedNode, Term, Variable};
+use nrese_sparql_syntax::algebra::{Expression, Function};
 use regex::Regex;
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
-use spargebra::algebra::{Expression, Function};
 
 use nrese_xsd::{
     Date, DateTime, DayTimeDuration, Decimal, Double, Duration, Float, GDay, GMonth, GMonthDay,
@@ -467,7 +467,8 @@ impl Evaluator {
                 // The lexical form, as written (SPARQL 1.1 §17.4.2.5): STR("03"^^xsd:integer)
                 // is "03". (A cast to xsd:string gives the canonical form: XPath §19.)
                 Term::Literal(literal) => Some(Literal::new_simple_literal(literal.value()).into()),
-                Term::BlankNode(_) => None,
+                // SPARQL 1.2: STR of a triple term is an error.
+                Term::BlankNode(_) | Term::Triple(_) => None,
             },
             Function::Lang => match arg(0)? {
                 Term::Literal(literal) => {
@@ -481,9 +482,9 @@ impl Evaluator {
                 Some(boolean_term(super::value::lang_matches(&tag, &range)))
             }
             Function::Datatype => match arg(0)? {
-                Term::Literal(literal) if is_lang_string(&literal) => {
-                    Some(NamedNode::new_unchecked(oxrdf::vocab::rdf::LANG_STRING.as_str()).into())
-                }
+                Term::Literal(literal) if is_lang_string(&literal) => Some(
+                    NamedNode::new_unchecked(nrese_rdf::vocab::rdf::LANG_STRING.as_str()).into(),
+                ),
                 Term::Literal(literal) => Some(literal.datatype().into_owned().into()),
                 _ => None,
             },
@@ -832,13 +833,13 @@ fn arithmetic(operator: Operator, (x, y): (Value, Value)) -> Option<Term> {
 /// canonical form.
 fn cast(name: &str, term: Term) -> Option<Term> {
     use nrese_xsd::{Boolean, Date, DateTime};
-    let typed = |value: String, datatype: oxrdf::NamedNodeRef<'_>| -> Option<Term> {
+    let typed = |value: String, datatype: nrese_rdf::NamedNodeRef<'_>| -> Option<Term> {
         Some(Literal::new_typed_literal(value, datatype).into())
     };
     if name == xsd::STRING.as_str() {
         return match term {
             Term::NamedNode(node) => Some(Literal::new_simple_literal(node.into_string()).into()),
-            Term::BlankNode(_) => None,
+            Term::BlankNode(_) | Term::Triple(_) => None,
             literal @ Term::Literal(_) => match canonical(literal) {
                 Term::Literal(literal) => Some(Literal::new_simple_literal(literal.value()).into()),
                 _ => None,

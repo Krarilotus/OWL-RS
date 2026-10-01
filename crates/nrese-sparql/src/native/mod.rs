@@ -22,7 +22,7 @@ mod geo_formats;
 
 /// The reference system (an IRI) and geometry of a GeoSPARQL literal: WKT, GeoJSON or
 /// GML; `None` for other terms. EPSG:4326 is read as CRS84 (longitude first).
-pub fn geometry_literal(term: &oxrdf::Term) -> Option<(String, ::geo::Geometry<f64>)> {
+pub fn geometry_literal(term: &nrese_rdf::Term) -> Option<(String, ::geo::Geometry<f64>)> {
     geo::parse(term).map(|shape| (shape.crs, shape.geometry))
 }
 mod output;
@@ -57,15 +57,15 @@ use nrese_exec::join::{
 use nrese_exec::{
     Budget, BudgetExceeded, IdTable, UNDEF, computed_id, computed_index, group::group_rows,
 };
-use nrese_xsd::{Decimal, Double, Float, Integer};
-use oxrdf::vocab::xsd;
-use oxrdf::{Literal, Term, Variable};
-use rayon::prelude::*;
-use spargebra::Query;
-use spargebra::algebra::{
+use nrese_rdf::vocab::xsd;
+use nrese_rdf::{Literal, Term, Variable};
+use nrese_sparql_syntax::Query;
+use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
 };
-use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
+use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
+use nrese_xsd::{Decimal, Double, Float, Integer};
+use rayon::prelude::*;
 use std::borrow::Cow;
 
 use crate::query::{PlanStep, QueryOptions};
@@ -232,7 +232,7 @@ pub(crate) fn write_results(
 }
 
 /// The quads an update removes and adds, in that order.
-pub(crate) type QuadChanges = (Vec<oxrdf::Quad>, Vec<oxrdf::Quad>);
+pub(crate) type QuadChanges = (Vec<nrese_rdf::Quad>, Vec<nrese_rdf::Quad>);
 
 /// The quads a `DELETE`/`INSERT … WHERE` removes and adds, with its `WHERE` evaluated on
 /// `snapshot`. `using`
@@ -244,13 +244,13 @@ pub(crate) type QuadChanges = (Vec<oxrdf::Quad>, Vec<oxrdf::Quad>);
 pub(crate) fn delete_insert(
     snapshot: &Snapshot,
     pattern: &GraphPattern,
-    delete: &[spargebra::term::GroundQuadPattern],
-    insert: &[spargebra::term::QuadPattern],
-    using: Option<&spargebra::algebra::QueryDataset>,
-    base: Option<&oxiri::Iri<String>>,
+    delete: &[nrese_sparql_syntax::term::GroundQuadPattern],
+    insert: &[nrese_sparql_syntax::term::QuadPattern],
+    using: Option<&nrese_sparql_syntax::algebra::QueryDataset>,
+    base: Option<&nrese_rdf::Iri<String>>,
     options: &QueryOptions,
 ) -> Result<QuadChanges, QueryEvaluationError> {
-    use spargebra::term::{GraphNamePattern, GroundTermPattern};
+    use nrese_sparql_syntax::term::{GraphNamePattern, GroundTermPattern};
     if let Some(what) = unsupported_part(pattern) {
         return Err(QueryEvaluationError::Unsupported(what));
     }
@@ -265,9 +265,9 @@ pub(crate) fn delete_insert(
             decode(snapshot, &computed, table.get(row, solutions.column(v)?))
         };
         let subject = |term: Term| match term {
-            Term::NamedNode(n) => Some(oxrdf::NamedOrBlankNode::from(n)),
-            Term::BlankNode(b) => Some(oxrdf::NamedOrBlankNode::from(b)),
-            Term::Literal(_) => None,
+            Term::NamedNode(n) => Some(nrese_rdf::NamedOrBlankNode::from(n)),
+            Term::BlankNode(b) => Some(nrese_rdf::NamedOrBlankNode::from(b)),
+            Term::Literal(_) | Term::Triple(_) => None,
         };
         let predicate = |p: &NamedNodePattern| match p {
             NamedNodePattern::NamedNode(n) => Some(n.clone()),
@@ -277,24 +277,18 @@ pub(crate) fn delete_insert(
             },
         };
         let graph = |g: &GraphNamePattern| match g {
-            GraphNamePattern::NamedNode(n) => Some(oxrdf::GraphName::from(n.clone())),
-            GraphNamePattern::DefaultGraph => Some(oxrdf::GraphName::DefaultGraph),
+            GraphNamePattern::NamedNode(n) => Some(nrese_rdf::GraphName::from(n.clone())),
+            GraphNamePattern::DefaultGraph => Some(nrese_rdf::GraphName::DefaultGraph),
             GraphNamePattern::Variable(v) => match value(v)? {
                 Term::NamedNode(n) => Some(n.into()),
                 Term::BlankNode(b) => Some(b.into()),
-                Term::Literal(_) => None,
+                Term::Literal(_) | Term::Triple(_) => None,
             },
         };
-        let ground = |t: &GroundTermPattern| match t {
-            GroundTermPattern::NamedNode(n) => Some(Term::from(n.clone())),
-            GroundTermPattern::Literal(l) => Some(Term::from(l.clone())),
-            GroundTermPattern::Variable(v) => value(v),
-            #[allow(unreachable_patterns)]
-            _ => None,
-        };
+        let ground = |t: &GroundTermPattern| fill_ground(t, &value);
         for quad in delete {
             let filled = (|| {
-                Some(oxrdf::Quad::new(
+                Some(nrese_rdf::Quad::new(
                     subject(ground(&quad.subject)?)?,
                     predicate(&quad.predicate)?,
                     ground(&quad.object)?,
@@ -303,7 +297,7 @@ pub(crate) fn delete_insert(
             })();
             deletes.extend(filled);
         }
-        let mut fresh: HashMap<String, oxrdf::BlankNode> = HashMap::new();
+        let mut fresh: HashMap<String, nrese_rdf::BlankNode> = HashMap::new();
         let mut term = |t: &TermPattern| -> Option<Term> {
             match t {
                 TermPattern::NamedNode(n) => Some(n.clone().into()),
@@ -330,7 +324,7 @@ pub(crate) fn delete_insert(
             let (Some(p), Some(g)) = (predicate(&quad.predicate), graph(&quad.graph_name)) else {
                 continue;
             };
-            inserts.push(oxrdf::Quad::new(s, p, o, g));
+            inserts.push(nrese_rdf::Quad::new(s, p, o, g));
         }
     }
     Ok((deletes, inserts))
@@ -410,7 +404,7 @@ fn construct<'a>(
     computed: Vec<Term>,
     solutions: Solutions,
     template: &[TriplePattern],
-) -> impl Iterator<Item = oxrdf::Triple> + 'a {
+) -> impl Iterator<Item = nrese_rdf::Triple> + 'a {
     let mut labels: Vec<String> = Vec::new();
     let mut resolve = |term: &TermPattern| match term {
         TermPattern::NamedNode(n) => TemplateTerm::Constant(n.clone().into()),
@@ -443,8 +437,8 @@ fn construct<'a>(
         .collect();
     let fresh_count = labels.len();
     let table = solutions.table;
-    let mut emitted: HashSet<oxrdf::Triple> = HashSet::new();
-    let mut buffer: Vec<oxrdf::Triple> = Vec::new();
+    let mut emitted: HashSet<nrese_rdf::Triple> = HashSet::new();
+    let mut buffer: Vec<nrese_rdf::Triple> = Vec::new();
     let mut row = 0;
     std::iter::from_fn(move || {
         loop {
@@ -454,8 +448,8 @@ fn construct<'a>(
             if row >= table.len() {
                 return None;
             }
-            let fresh: Vec<oxrdf::BlankNode> = (0..fresh_count)
-                .map(|_| oxrdf::BlankNode::default())
+            let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
+                .map(|_| nrese_rdf::BlankNode::default())
                 .collect();
             let value = |term: &TemplateTerm| -> Option<Term> {
                 match term {
@@ -467,8 +461,8 @@ fn construct<'a>(
             };
             for [s, p, o] in &resolved {
                 let subject = match value(s) {
-                    Some(Term::NamedNode(n)) => oxrdf::NamedOrBlankNode::from(n),
-                    Some(Term::BlankNode(b)) => oxrdf::NamedOrBlankNode::from(b),
+                    Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
+                    Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
                     _ => continue,
                 };
                 let Some(Term::NamedNode(predicate)) = value(p) else {
@@ -477,7 +471,7 @@ fn construct<'a>(
                 let Some(object) = value(o) else {
                     continue;
                 };
-                let triple = oxrdf::Triple::new(subject, predicate, object);
+                let triple = nrese_rdf::Triple::new(subject, predicate, object);
                 let new = triple.subject.is_blank_node()
                     || triple.object.is_blank_node()
                     || emitted.insert(triple.clone());
@@ -505,7 +499,7 @@ fn decode(snapshot: &Snapshot, computed: &[Term], id: u64) -> Option<Term> {
 }
 
 /// The query's own dataset (`FROM`, `FROM NAMED`), if it names one.
-fn query_dataset(query: &Query) -> Option<&spargebra::algebra::QueryDataset> {
+fn query_dataset(query: &Query) -> Option<&nrese_sparql_syntax::algebra::QueryDataset> {
     let (Query::Select { dataset, .. }
     | Query::Ask { dataset, .. }
     | Query::Construct { dataset, .. }
@@ -514,7 +508,7 @@ fn query_dataset(query: &Query) -> Option<&spargebra::algebra::QueryDataset> {
 }
 
 /// The query's `BASE`, against which `IRI()` resolves relative IRIs.
-fn query_base(query: &Query) -> Option<&oxiri::Iri<String>> {
+fn query_base(query: &Query) -> Option<&nrese_rdf::Iri<String>> {
     let (Query::Select { base_iri, .. }
     | Query::Ask { base_iri, .. }
     | Query::Construct { base_iri, .. }
@@ -784,7 +778,7 @@ fn supported_triple(triple: &TriplePattern) -> bool {
 /// A property path pattern, with the filter directly on it, if any.
 struct PathPattern<'q> {
     subject: &'q TermPattern,
-    path: &'q spargebra::algebra::PropertyPathExpression,
+    path: &'q nrese_sparql_syntax::algebra::PropertyPathExpression,
     object: &'q TermPattern,
     filter: Option<&'q Expression>,
 }
@@ -937,8 +931,8 @@ impl<'a> Context<'a> {
     fn new(
         snapshot: &'a Snapshot,
         options: &QueryOptions,
-        dataset: Option<&spargebra::algebra::QueryDataset>,
-        base: Option<&oxiri::Iri<String>>,
+        dataset: Option<&nrese_sparql_syntax::algebra::QueryDataset>,
+        base: Option<&nrese_rdf::Iri<String>>,
     ) -> Self {
         use crate::dataset::{DefaultGraph, ResolvedDataset};
         let resolved = ResolvedDataset::resolve(
@@ -980,8 +974,8 @@ impl<'a> Context<'a> {
 
     /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
     /// blank node.
-    fn lookup_const(&self, term: oxrdf::TermRef<'_>) -> Option<TermId> {
-        if let oxrdf::TermRef::NamedNode(n) = term
+    fn lookup_const(&self, term: nrese_rdf::TermRef<'_>) -> Option<TermId> {
+        if let nrese_rdf::TermRef::NamedNode(n) = term
             && n.as_str().starts_with(substitute::ALIAS)
         {
             return self
@@ -1060,7 +1054,21 @@ impl<'a> Context<'a> {
     }
 
     /// The error for an operator that would outgrow the budget.
+    /// The row limit of a join: what the budget leaves for a table `width` columns wide,
+    /// and the query's cancellation flag, which stops the join at its next row check.
+    fn row_limit(&self, width: usize) -> nrese_exec::RowLimit {
+        nrese_exec::RowLimit {
+            max_rows: self.max_rows(width),
+            stop: self.cancellation.as_ref().map(CancellationToken::flag),
+        }
+    }
+
+    /// The error of a join stopped by its row limit: the query was cancelled, or the join
+    /// would outgrow the budget.
     fn too_large(&self, rows: usize, width: usize) -> NativeError {
+        if let Err(cancelled) = self.check() {
+            return cancelled;
+        }
         let requested = rows.saturating_mul(width.max(1) * 8);
         QueryEvaluationError::Dataset(Box::new(BudgetExceeded {
             limit: self.budget.used().saturating_add(self.budget.remaining()),
@@ -1477,7 +1485,7 @@ impl<'a> Context<'a> {
                 variables,
                 aggregates,
             } => self.group(inner, variables, aggregates, None),
-            // LATERAL, where a feature of spargebra enables it.
+            // LATERAL, where a feature of nrese_sparql_syntax enables it.
             #[allow(unreachable_patterns)]
             _ => unsupported("LATERAL"),
         }
@@ -1707,7 +1715,7 @@ impl<'a> Context<'a> {
     fn path(
         &self,
         subject: &TermPattern,
-        path: &spargebra::algebra::PropertyPathExpression,
+        path: &nrese_sparql_syntax::algebra::PropertyPathExpression,
         object: &TermPattern,
     ) -> NativeResult<Solutions> {
         let resolved = paths::Path::resolve(path, self.snapshot);
@@ -2255,7 +2263,7 @@ impl<'a> Context<'a> {
     /// `DESCRIBE` (its answer is implementation-defined, §16.4): each term the solutions bind, once, with the
     /// statements of the default graph it is the subject of; a blank node such a statement
     /// has as its object is described in turn.
-    fn describe(&self, solutions: &Solutions) -> NativeResult<Vec<oxrdf::Triple>> {
+    fn describe(&self, solutions: &Solutions) -> NativeResult<Vec<nrese_rdf::Triple>> {
         let (predicate, object) = (
             Variable::new_unchecked("described predicate"),
             Variable::new_unchecked("described object"),
@@ -2277,7 +2285,7 @@ impl<'a> Context<'a> {
             while let Some(node) = todo.pop() {
                 let Some(subject) = self
                     .term(node)
-                    .and_then(|t| oxrdf::NamedOrBlankNode::try_from(t).ok())
+                    .and_then(|t| nrese_rdf::NamedOrBlankNode::try_from(t).ok())
                 else {
                     continue;
                 };
@@ -2305,7 +2313,7 @@ impl<'a> Context<'a> {
                     if o.is_blank_node() && described.insert(o_id) {
                         todo.push(o_id);
                     }
-                    out.push(oxrdf::Triple::new(subject.clone(), p, o));
+                    out.push(nrese_rdf::Triple::new(subject.clone(), p, o));
                 }
                 self.consumed(&statements);
             }
@@ -2563,7 +2571,7 @@ impl<'a> Context<'a> {
         let (lk, rk) = shared_columns(&left, &right);
         let vars = joined_vars(&left, &right, &rk);
         let hash_table = self.charge_hash_table(left.table.len().min(right.table.len()))?;
-        let max_rows = self.max_rows(vars.len());
+        let max_rows = self.row_limit(vars.len());
         let table = if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
             if left.ordered {
                 outer_join_with_undef(&left.table, &right.table, &lk, &rk, None, false, max_rows)
@@ -2603,7 +2611,7 @@ impl<'a> Context<'a> {
         let unbound_keys = has_undef(&left.table, &lk) || has_undef(&right.table, &rk);
         let vars = joined_vars(&left, &right, &rk);
         let hash_table = self.charge_hash_table(right.table.len())?;
-        let max_rows = self.max_rows(vars.len());
+        let max_rows = self.row_limit(vars.len());
         let accept = |row: &[u64]| {
             let binding = |v: &Variable| {
                 let column = vars.iter().position(|x| x == v)?;
@@ -4017,4 +4025,34 @@ impl ScanPattern {
             .or_else(|| candidates.iter().copied().find(usable))
             .expect("GSPO or SPOG/POSG/OSPG answer every pattern with a bound prefix")
     }
+}
+
+/// A `DELETE` template's term with the row's values; `None` if a variable is unbound or a
+/// triple term would get a subject that is no IRI or blank node.
+fn fill_ground(
+    t: &nrese_sparql_syntax::term::GroundTermPattern,
+    value: &dyn Fn(&Variable) -> Option<Term>,
+) -> Option<Term> {
+    Some(match t {
+        nrese_sparql_syntax::term::GroundTermPattern::NamedNode(n) => Term::from(n.clone()),
+        nrese_sparql_syntax::term::GroundTermPattern::Literal(l) => Term::from(l.clone()),
+        nrese_sparql_syntax::term::GroundTermPattern::Variable(v) => value(v)?,
+        nrese_sparql_syntax::term::GroundTermPattern::Triple(t) => {
+            let subject = match fill_ground(&t.subject, value)? {
+                Term::NamedNode(n) => nrese_rdf::NamedOrBlankNode::from(n),
+                Term::BlankNode(b) => b.into(),
+                Term::Literal(_) | Term::Triple(_) => return None,
+            };
+            let predicate = match &t.predicate {
+                nrese_sparql_syntax::term::NamedNodePattern::NamedNode(n) => n.clone(),
+                nrese_sparql_syntax::term::NamedNodePattern::Variable(v) => {
+                    match value(&v.clone())? {
+                        Term::NamedNode(n) => n,
+                        _ => return None,
+                    }
+                }
+            };
+            nrese_rdf::Triple::new(subject, predicate, fill_ground(&t.object, value)?).into()
+        }
+    })
 }

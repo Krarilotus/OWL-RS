@@ -8,9 +8,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
 use nrese_engine::{TermId, TermKind};
+use nrese_rdf::Term;
 use nrese_sparql::ReadView;
 use nrese_sparql::value::{Value, compile_regex};
-use oxrdf::Term;
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{
@@ -145,7 +145,7 @@ impl<V: ReadView> Compiler<'_, V> {
         values.first().copied()
     }
 
-    fn literal(&self, id: TermId) -> Option<oxrdf::Literal> {
+    fn literal(&self, id: TermId) -> Option<nrese_rdf::Literal> {
         match self.graph.decode(id)? {
             Term::Literal(literal) => Some(literal),
             _ => None,
@@ -167,7 +167,7 @@ impl<V: ReadView> Compiler<'_, V> {
     /// specification names that value, and `"1"^^xsd:boolean` is a different term.
     fn is_true(&self, id: TermId) -> bool {
         self.literal(id).is_some_and(|literal| {
-            literal.value() == "true" && literal.datatype() == oxrdf::vocab::xsd::BOOLEAN
+            literal.value() == "true" && literal.datatype() == nrese_rdf::vocab::xsd::BOOLEAN
         })
     }
 

@@ -7,8 +7,8 @@ use nrese_engine::{
     BulkMode, EncodedQuad, EncodedTriple, Engine, EngineConfig, QuadPattern, ReadModel, Snapshot,
     TermId, Transaction,
 };
-use oxrdf::vocab::xsd;
-use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad};
+use nrese_rdf::vocab::xsd;
+use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Quad};
 
 fn config() -> EngineConfig {
     EngineConfig {
@@ -19,7 +19,7 @@ fn config() -> EngineConfig {
 
 /// Varied term shapes: IRIs, blank nodes, inline and dictionary literals, named graphs.
 fn quad(n: u64) -> Quad {
-    let object: oxrdf::Term = match n % 4 {
+    let object: nrese_rdf::Term = match n % 4 {
         0 => NamedNode::new_unchecked(format!("http://example.com/o{}", n % 50)).into(),
         1 => Literal::new_typed_literal(format!("{}", n % 70), xsd::INTEGER).into(),
         2 => Literal::new_language_tagged_literal_unchecked(format!("label {n}"), "en").into(),

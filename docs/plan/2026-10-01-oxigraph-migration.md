@@ -582,3 +582,51 @@ recursive descent: about 3,800 lines of parser and 6,200 in all.
   - a writer that keeps a `FILTER`'s scope.
 
 Step 4 is complete. Next is step 5: moving the engine onto the bundle.
+
+**5: the engine on the bundle (1 October).** Every crate of the workspace and the
+benchmark harness now runs on `nrese-rdf`, `nrese-xsd`, `nrese-rdf-io`,
+`nrese-sparql-syntax` and `nrese-sparql-results`. `cargo tree` lists no crate of the
+Oxigraph project, and the vendored `oxsdatatypes` copy is gone (git history keeps it).
+- **Mostly a rename.** The bundle keeps the item names the engine used. Where an API
+  differed, the bundle gained what is useful in general rather than the call site working
+  around it:
+  - `Graph::triples_for_predicate`, and lookups whose arguments may be borrowed for less
+    long than the graph;
+  - `QuerySolution::get` by name, `Variable` or index;
+  - the results serialiser taking a solution directly;
+  - `nrese_sparql_results::write_term`.
+- **RDF 1.2 terms reach the engine.** `oxrdf`, as the baseline built it, had no triple
+  terms or base directions; the bundle always has them. The term dictionary now keys
+  directional strings and triple terms losslessly: a tag of their own, with N-Triples text
+  for triple terms, until R7 keys them by their components' ids in step 6. Other changes:
+  - triple terms sort after literals;
+  - `STR` of a triple term is an error;
+  - an `INSERT DATA` renames blank nodes inside triple terms;
+  - a `DELETE` template may hold triple terms;
+  - federation sends triple terms without blank nodes as `VALUES`.
+- **One results writer.** The engine's direct JSON/TSV/CSV writer had its own copy of the
+  term serialisation, which would have dropped a base direction. Each term now goes
+  through `nrese_sparql_results::write_term`, about 200 fewer lines.
+- **Parallel load of Turtle and TriG.** `nrese-rdf-io` splits these exactly at statement
+  ends, which `oxttl` could not, so the bulk loader now parses Turtle and TriG on every
+  thread as it does N-Triples and N-Quads.
+- **A runaway query could exhaust the machine, before the port too.** In a release build,
+  a three-way cross product with no memory budget committed over 200 GB in the 200 ms
+  before cancellation reached it: joins never looked at the cancellation flag. Now:
+  - the joins' row limit carries the flag and checks it every 1,024 output rows;
+  - the cross product checks it after each left row;
+  - the test query stops 43 ms after cancelling.
+
+  (The server always had a budget: 4 GiB per query and half the memory for all queries by
+  default. The embedded API's default stays unlimited, see the gaps below.)
+- **Tests.** All 87 test binaries of the workspace pass in release, 644 tests. The W3C
+  results are unchanged:
+  - SPARQL 1.1: 491 of 495, the 4 failures shared with the reference evaluator;
+  - SHACL Core: 98 of 98;
+  - OWL 2 RL: 70 passed, the 16 expected failures, 3 skipped;
+  - the bundle's own suites, as in steps 2–4.
+- **Still to do for step 5:** the end-to-end comparison with the baseline branch on the
+  perf-lab workloads (bulk load, query latency, reasoning).
+- **Gap noted:** the embedded `SparqlQueryRequest` has no memory budget unless one is set.
+  A default derived from the machine's memory (as the server's) would protect embedders
+  too.

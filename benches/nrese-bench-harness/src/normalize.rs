@@ -1,10 +1,8 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, anyhow};
-use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
-use oxigraph::model::GraphNameRef;
-use oxigraph::store::Store;
-use oxrdf::graph::{CanonicalizationAlgorithm, Graph};
+use nrese_rdf::{Graph, GraphName};
+use nrese_rdf_io::{RdfFormat, RdfParser};
 use serde_json::Value;
 
 use crate::model::LatencySummary;
@@ -30,31 +28,17 @@ pub fn canonicalize_rdf_graph_set(
 ) -> Result<BTreeSet<String>> {
     let format = infer_rdf_format_from_content_type(content_type)
         .ok_or_else(|| anyhow!("unsupported RDF graph content type for canonicalization"))?;
-    let store = Store::new().context("failed to allocate temporary RDF canonicalization store")?;
-    let parser = RdfParser::from_format(format).without_named_graphs();
-    store
-        .load_from_slice(parser, payload)
-        .context("failed to parse RDF graph payload")?;
-
     let mut graph = Graph::new();
-    for quad in store.quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph)) {
-        graph.insert(quad?.as_ref());
+    for quad in RdfParser::from_format(format).for_slice(payload) {
+        let quad = quad.context("failed to parse RDF graph payload")?;
+        if quad.graph_name != GraphName::DefaultGraph {
+            return Err(anyhow!("a named graph in a single-graph RDF payload"));
+        }
+        graph.insert(&nrese_rdf::Triple::from(quad));
     }
-    graph.canonicalize(CanonicalizationAlgorithm::Unstable);
-
-    let mut writer = RdfSerializer::from_format(RdfFormat::NTriples).for_writer(Vec::new());
-    for triple in &graph {
-        writer
-            .serialize_triple(triple)
-            .context("failed to serialize canonical graph triple")?;
-    }
-
-    let canonical = writer
-        .finish()
-        .context("failed to finish canonical graph serializer")?;
-    let text = std::str::from_utf8(&canonical).context("graph payload is not valid utf-8")?;
-
-    Ok(text
+    graph.canonicalize();
+    let canonical: String = graph.iter().map(|triple| format!("{triple} .\n")).collect();
+    Ok(canonical
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())

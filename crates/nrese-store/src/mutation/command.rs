@@ -1,6 +1,6 @@
 use nrese_engine::Transaction;
 use nrese_sparql::{CancellationToken, UpdateOptions, apply_update};
-use spargebra::SparqlParser;
+use nrese_sparql_syntax::SparqlParser;
 
 use crate::backup::{DatasetRestoreReport, DatasetRestoreRequest, apply_restore};
 use crate::error::StoreError;

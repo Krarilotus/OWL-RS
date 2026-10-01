@@ -9,6 +9,5 @@ publish = false
 [dependencies]
 nrese-engine = { path = "../nrese-engine" }
 nrese-sparql = { path = "../nrese-sparql" }
-oxrdf = "=0.3.3"
-oxiri = "0.2"
-spargebra = "=0.4.6"
+nrese-rdf = { path = "../rdf/nrese-rdf" }
+nrese-sparql-syntax = { path = "../rdf/nrese-sparql-syntax" }

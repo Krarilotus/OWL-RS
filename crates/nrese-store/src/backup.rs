@@ -1,5 +1,5 @@
 use nrese_engine::{QuadPattern, ReadModel, Snapshot, Transaction};
-use oxrdfio::RdfFormat;
+use nrese_rdf_io::RdfFormat;
 use sha2::{Digest, Sha256};
 
 use crate::error::StoreResult;

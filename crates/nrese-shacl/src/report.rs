@@ -4,9 +4,9 @@
 use std::fmt;
 
 use nrese_engine::TermId;
+use nrese_rdf::vocab::{rdf, xsd};
+use nrese_rdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use nrese_sparql::ReadView;
-use oxrdf::vocab::{rdf, xsd};
-use oxrdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 
 use crate::model::{Component, Path, SH, Severity, Shapes};
 use crate::validate::RawResult;

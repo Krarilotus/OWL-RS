@@ -12,10 +12,10 @@
 use std::collections::HashMap;
 
 use nrese_engine::{GraphSelector, QuadPattern, TermId, Transaction};
-use oxrdf::{BlankNode, GraphName as OxGraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use spargebra::algebra::GraphTarget;
-use spargebra::term::{GraphName, GroundQuad, GroundTerm, Quad as DataQuad};
-use spargebra::{GraphUpdateOperation, Update};
+use nrese_rdf::{BlankNode, GraphName as OxGraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use nrese_sparql_syntax::algebra::GraphTarget;
+use nrese_sparql_syntax::term::{GraphName, GroundQuad, Quad as DataQuad};
+use nrese_sparql_syntax::{GraphUpdateOperation, Update};
 use thiserror::Error;
 
 use crate::results::{CancellationToken, QueryDatasetSpecification, QueryEvaluationError};
@@ -176,22 +176,33 @@ fn fresh_quad(quad: &DataQuad, fresh: &mut HashMap<BlankNode, BlankNode>) -> Qua
             NamedOrBlankNode::BlankNode(node) => rename(node).into(),
         },
         quad.predicate.clone(),
-        match &quad.object {
-            Term::BlankNode(node) => rename(node).into(),
-            term => term.clone(),
-        },
+        fresh_term(&quad.object, &mut rename),
         graph_name(&quad.graph_name),
     )
+}
+
+/// `term` with its blank nodes, inside triple terms too, renamed fresh.
+fn fresh_term(term: &Term, rename: &mut impl FnMut(&BlankNode) -> BlankNode) -> Term {
+    match term {
+        Term::BlankNode(node) => rename(node).into(),
+        Term::Triple(triple) => nrese_rdf::Triple::new(
+            match &triple.subject {
+                NamedOrBlankNode::NamedNode(node) => NamedOrBlankNode::from(node.clone()),
+                NamedOrBlankNode::BlankNode(node) => rename(node).into(),
+            },
+            triple.predicate.clone(),
+            fresh_term(&triple.object, rename),
+        )
+        .into(),
+        term => term.clone(),
+    }
 }
 
 fn ground_quad(quad: &GroundQuad) -> Quad {
     Quad::new(
         quad.subject.clone(),
         quad.predicate.clone(),
-        match &quad.object {
-            GroundTerm::NamedNode(node) => Term::from(node.clone()),
-            GroundTerm::Literal(literal) => literal.clone().into(),
-        },
+        Term::from(quad.object.clone()),
         graph_name(&quad.graph_name),
     )
 }

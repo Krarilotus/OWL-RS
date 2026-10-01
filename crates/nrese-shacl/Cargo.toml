@@ -8,13 +8,13 @@ license.workspace = true
 [dependencies]
 nrese-engine = { path = "../nrese-engine" }
 nrese-sparql = { path = "../nrese-sparql" }
-oxrdf = "=0.3.3"
+nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
 regex = "1.12"
 
 [dev-dependencies]
 # W3C suite runner: manifests, data and shapes files.
-oxrdfio = "=0.2.4"
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 
 [[test]]
 name = "w3c_shacl"

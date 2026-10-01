@@ -26,7 +26,7 @@ use geo::{
     Relate,
 };
 use geo::{Geometry, MultiPolygon, Point};
-use oxrdf::{Literal, NamedNode, Term};
+use nrese_rdf::{Literal, NamedNode, Term};
 use wkt::{ToWkt, TryFromWkt};
 
 use super::geo_formats;

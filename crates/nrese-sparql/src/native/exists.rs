@@ -21,9 +21,11 @@
 
 use std::collections::HashMap;
 
-use oxrdf::{Literal, Term, Variable};
-use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
-use spargebra::term::{NamedNodePattern, TermPattern};
+use nrese_rdf::{Literal, Term, Variable};
+use nrese_sparql_syntax::algebra::{
+    AggregateExpression, Expression, GraphPattern, OrderExpression,
+};
+use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
 
 use nrese_exec::join::{anti_join, compatible_mask, outer_join_with_undef, semi_join};
 use nrese_exec::{IdTable, UNDEF};
@@ -590,7 +592,7 @@ impl Context<'_> {
         numbered.vars.push(row_variable.clone());
         let (lk, rk) = shared_columns(&numbered, &right);
         let vars = super::joined_vars(&numbered, &right, &rk);
-        let max_rows = self.max_rows(vars.len());
+        let max_rows = self.row_limit(vars.len());
         let pairs = outer_join_with_undef(
             &numbered.table,
             &right.table,

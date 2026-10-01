@@ -4,9 +4,9 @@
 use nrese_engine::{
     EncodedTriple, Engine, EngineConfig, GraphSelector, ReadModel, Snapshot, TermId,
 };
+use nrese_rdf::{Graph, GraphNameRef, NamedNode, NamedNodeRef, QuadRef, TermRef};
+use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_shacl::{Component, PropertyPath, Selection, Shapes, compile, validate};
-use oxrdf::{Graph, GraphNameRef, NamedNode, NamedNodeRef, QuadRef, TermRef};
-use oxrdfio::{RdfFormat, RdfParser};
 
 const PREFIXES: &str = "@prefix ex: <http://example.com/> .
 @prefix sh: <http://www.w3.org/ns/shacl#> .

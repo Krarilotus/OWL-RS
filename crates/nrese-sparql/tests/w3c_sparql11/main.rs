@@ -24,12 +24,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use manifest::{GraphFile, Kind, Suite, Test};
 use nrese_engine::{Engine, EngineConfig, QuadPattern};
+use nrese_rdf::{BlankNode, Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Variable};
 use nrese_sparql::{QueryOptions, QueryResults, UpdateOptions, apply_update, evaluate_query};
-use oxrdf::graph::CanonicalizationAlgorithm;
-use oxrdf::{BlankNode, Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Variable};
+use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
+use nrese_sparql_syntax::{Query, SparqlParser, Update};
 use results::{Results, canonical, parse_expected};
-use sparesults::{QueryResultsFormat, QueryResultsSerializer};
-use spargebra::{Query, SparqlParser, Update};
 use std::cell::RefCell;
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
@@ -266,7 +265,7 @@ impl Backend {
             }
             Self::Oracle(dataset) => dataset.borrow().quads().cloned().collect(),
         };
-        dataset.canonicalize(CanonicalizationAlgorithm::Unstable);
+        dataset.canonicalize();
         dataset
     }
 }
@@ -310,7 +309,7 @@ fn run(suite: &Suite, test: &Test, backend: Backend) -> Result<(), String> {
             backend.update(&update)?;
             let actual = backend.dataset();
             let mut expected: Dataset = quads(suite, &test.expected_data)?.into_iter().collect();
-            expected.canonicalize(CanonicalizationAlgorithm::Unstable);
+            expected.canonicalize();
             match actual == expected {
                 true => Ok(()),
                 false => Err(format!("expected dataset\n{expected}\ngot\n{actual}")),

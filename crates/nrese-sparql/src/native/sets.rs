@@ -37,8 +37,10 @@
 //! from the full join.
 
 use nrese_exec::{IdTable, UNDEF, group::group_rows};
-use oxrdf::Variable;
-use spargebra::algebra::{AggregateExpression, AggregateFunction, Expression, GraphPattern};
+use nrese_rdf::Variable;
+use nrese_sparql_syntax::algebra::{
+    AggregateExpression, AggregateFunction, Expression, GraphPattern,
+};
 
 use super::{
     Agg, Context, NativeResult, Solutions, as_path, bound_variables, expression_variables, pushdown,

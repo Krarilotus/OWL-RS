@@ -15,9 +15,9 @@
 //! A datatype outside OWL 2's list is not judged either.
 
 use nrese_engine::{TermId, TermKind};
+use nrese_rdf::{Literal, Term};
 use nrese_reasoner::v2::naive::{Triple, Violation};
 use nrese_xsd::{DateTime, Decimal, Double, Float, Integer};
-use oxrdf::{Literal, Term};
 use std::str::FromStr;
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -225,7 +225,7 @@ pub(crate) fn violations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxrdf::NamedNode;
+    use nrese_rdf::NamedNode;
 
     fn typed(value: &str, local: &str) -> Literal {
         Literal::new_typed_literal(value, NamedNode::new_unchecked(format!("{XSD}{local}")))

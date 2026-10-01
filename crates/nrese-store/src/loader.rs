@@ -3,7 +3,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use nrese_engine::Engine;
-use oxrdf::GraphName;
+use nrese_rdf::GraphName;
 use tracing::info;
 
 use crate::config::StoreConfig;

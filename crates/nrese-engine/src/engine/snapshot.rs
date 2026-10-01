@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use oxrdf::{Quad, QuadRef, Term, TermRef};
+use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};

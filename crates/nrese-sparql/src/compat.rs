@@ -10,9 +10,9 @@
 
 use std::collections::HashMap;
 
-use oxrdf::Variable;
-use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
-use spargebra::{Query, SparqlParser, SparqlSyntaxError};
+use nrese_rdf::Variable;
+use nrese_sparql_syntax::algebra::{Expression, GraphPattern, OrderExpression};
+use nrese_sparql_syntax::{Query, SparqlParser, SparqlSyntaxError};
 
 /// Parses a query and applies the compatibility rewrites.
 pub fn parse_query(text: &str) -> Result<Query, SparqlSyntaxError> {
@@ -196,13 +196,13 @@ fn substitute(expression: &Expression, definitions: &HashMap<Variable, Expressio
 
 #[cfg(test)]
 mod tests {
-    use spargebra::SparqlParser;
+    use nrese_sparql_syntax::SparqlParser;
 
     use super::parse_query;
 
     /// The algebra of a query with the names the parser generates for aggregates (random
     /// per parse) numbered in order of appearance.
-    fn shape(query: &spargebra::Query) -> String {
+    fn shape(query: &nrese_sparql_syntax::Query) -> String {
         let printed = query.to_string();
         let mut names: Vec<String> = Vec::new();
         let mut out = String::new();

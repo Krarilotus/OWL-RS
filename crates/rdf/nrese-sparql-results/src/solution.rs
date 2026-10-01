@@ -13,9 +13,10 @@ pub struct QuerySolution {
 }
 
 impl QuerySolution {
-    /// The value of variable `name` (without `?`).
-    pub fn get(&self, name: &str) -> Option<&Term> {
-        let i = self.variables.iter().position(|v| v.as_str() == name)?;
+    /// The value of a variable: by name (without `?`), by [`Variable`], or by its index in
+    /// [`Self::variables`].
+    pub fn get(&self, variable: impl SolutionIndex) -> Option<&Term> {
+        let i = variable.index(&self.variables)?;
         self.values.get(i)?.as_ref()
     }
 
@@ -51,12 +52,44 @@ impl QuerySolution {
     }
 }
 
+/// What picks a variable of a solution: its name, the variable, or its index.
+pub trait SolutionIndex {
+    fn index(self, variables: &[Variable]) -> Option<usize>;
+}
+
+impl SolutionIndex for usize {
+    fn index(self, variables: &[Variable]) -> Option<usize> {
+        (self < variables.len()).then_some(self)
+    }
+}
+
+impl SolutionIndex for &str {
+    fn index(self, variables: &[Variable]) -> Option<usize> {
+        variables.iter().position(|v| v.as_str() == self)
+    }
+}
+
+impl SolutionIndex for &Variable {
+    fn index(self, variables: &[Variable]) -> Option<usize> {
+        self.as_str().index(variables)
+    }
+}
+
 impl<V: Into<Arc<[Variable]>>, S: Into<Vec<Option<Term>>>> From<(V, S)> for QuerySolution {
     fn from((variables, values): (V, S)) -> Self {
         Self {
             variables: variables.into(),
             values: values.into(),
         }
+    }
+}
+
+impl<'a> IntoIterator for &'a QuerySolution {
+    type Item = (&'a Variable, &'a Term);
+    type IntoIter = Box<dyn Iterator<Item = (&'a Variable, &'a Term)> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
     }
 }
 

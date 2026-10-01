@@ -20,8 +20,8 @@
 use std::collections::HashSet;
 
 use nrese_exec::{IdTable, UNDEF};
-use oxrdf::Variable;
-use spargebra::algebra::{Expression, GraphPattern};
+use nrese_rdf::Variable;
+use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
 
 use super::exists::deep_variables;
 use super::exists::mentioned;
@@ -217,7 +217,11 @@ impl Context<'_> {
 
     /// Whether joining `seed` pattern by pattern will probe the index: the seed is small
     /// against some triple pattern it shares a variable with.
-    fn probes_pay(&self, seed: &Solutions, patterns: &[spargebra::term::TriplePattern]) -> bool {
+    fn probes_pay(
+        &self,
+        seed: &Solutions,
+        patterns: &[nrese_sparql_syntax::term::TriplePattern],
+    ) -> bool {
         patterns.iter().any(|triple| {
             super::triple_variables(triple)
                 .iter()

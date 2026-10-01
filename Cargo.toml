@@ -16,9 +16,6 @@ members = [
     "crates/rdf/nrese-sparql-syntax",
     "crates/rdf/nrese-xsd",
 ]
-# A patched copy of oxsdatatypes, used only by the bench harness (a workspace of its own)
-# until it leaves the Oxigraph libraries too; the workspace uses nrese-xsd.
-exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]

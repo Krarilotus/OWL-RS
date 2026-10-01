@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use nrese_engine::{EncodedQuad, Transaction};
-use oxrdf::{NamedOrBlankNode, Quad, Term};
+use nrese_rdf::{NamedOrBlankNode, Quad, Term};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MutationDeltaPreview {

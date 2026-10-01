@@ -30,9 +30,9 @@
 //! `STRUUID` or `BNODE` (evaluated per row: fewer rows, other draws), and without
 //! variables.
 
-use oxrdf::Variable;
-use spargebra::algebra::{Expression, Function, GraphPattern};
-use spargebra::term::{NamedNodePattern, TermPattern};
+use nrese_rdf::Variable;
+use nrese_sparql_syntax::algebra::{Expression, Function, GraphPattern};
+use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
 
 use super::expression_variables;
 
@@ -441,7 +441,7 @@ pub(super) fn certain(pattern: &GraphPattern) -> Vec<Variable> {
 
 #[cfg(test)]
 mod tests {
-    use spargebra::{Query, SparqlParser};
+    use nrese_sparql_syntax::{Query, SparqlParser};
 
     use super::push_filters;
 
