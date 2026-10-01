@@ -402,6 +402,47 @@ fn main() {
                     },
                 );
             }
+            // RDFC-1.0, the W3C algorithm, on the same graphs and on data where each blank
+            // node has values of its own (the common case: no ties to break).
+            let rdfc = oxrdf::graph::CanonicalizationAlgorithm::Rdfc10 {
+                hash_algorithm: oxrdf::graph::CanonicalizationHashAlgorithm::Sha256,
+            };
+            for (name, graphs) in [
+                (
+                    "RDFC-1.0 (a chain of 1,000 blank nodes)",
+                    blank_graphs(false, 1000),
+                ),
+                (
+                    "RDFC-1.0 (5 cycles of 8 blank nodes)",
+                    blank_graphs(true, 8),
+                ),
+                (
+                    "RDFC-1.0 (2,000 distinct blank nodes)",
+                    distinct_graphs(2000),
+                ),
+            ] {
+                let (ours, theirs) = graphs;
+                inner.case(
+                    name,
+                    1,
+                    || {
+                        nrese_rdf::rdfc::Rdfc10::new()
+                            .with_work_limit(u64::MAX)
+                            .canonicalize(
+                                ours.iter()
+                                    .map(|t| t.in_graph(nrese_rdf::GraphNameRef::DefaultGraph)),
+                            )
+                            .unwrap()
+                            .quads
+                            .len()
+                    },
+                    || {
+                        let mut g = theirs.clone();
+                        g.canonicalize(rdfc);
+                        g.len()
+                    },
+                );
+            }
             inner.rows
         })
         .unwrap()
@@ -419,6 +460,54 @@ fn main() {
         "\ngeometric mean of time ratios (nrese / oxigraph): {:.2}",
         geometric.exp()
     );
+}
+
+/// The same graph in both models: `size` blank nodes, each with a name of its own and a
+/// link to another, all hanging off one IRI.
+fn distinct_graphs(size: usize) -> (nrese_rdf::Graph, oxrdf::Graph) {
+    let (root, has, name, knows) = (
+        "http://example.org/root",
+        "http://example.org/has",
+        "http://example.org/name",
+        "http://example.org/knows",
+    );
+    let mut ours = nrese_rdf::Graph::new();
+    let mut theirs = oxrdf::Graph::new();
+    for i in 0..size {
+        let (node, other) = (format!("b{i}"), format!("b{}", (i * 7 + 3) % size));
+        let value = format!("person {i}");
+        ours.insert(&nrese_rdf::Triple::new(
+            nrese_rdf::NamedNode::new_unchecked(root),
+            nrese_rdf::NamedNode::new_unchecked(has),
+            nrese_rdf::BlankNode::new_unchecked(node.as_str()),
+        ));
+        ours.insert(&nrese_rdf::Triple::new(
+            nrese_rdf::BlankNode::new_unchecked(node.as_str()),
+            nrese_rdf::NamedNode::new_unchecked(name),
+            nrese_rdf::Literal::new_simple_literal(value.as_str()),
+        ));
+        ours.insert(&nrese_rdf::Triple::new(
+            nrese_rdf::BlankNode::new_unchecked(node.as_str()),
+            nrese_rdf::NamedNode::new_unchecked(knows),
+            nrese_rdf::BlankNode::new_unchecked(other.as_str()),
+        ));
+        theirs.insert(&oxrdf::Triple::new(
+            oxrdf::NamedNode::new_unchecked(root),
+            oxrdf::NamedNode::new_unchecked(has),
+            oxrdf::BlankNode::new_unchecked(node.as_str()),
+        ));
+        theirs.insert(&oxrdf::Triple::new(
+            oxrdf::BlankNode::new_unchecked(node.as_str()),
+            oxrdf::NamedNode::new_unchecked(name),
+            oxrdf::Literal::new_simple_literal(value.as_str()),
+        ));
+        theirs.insert(&oxrdf::Triple::new(
+            oxrdf::BlankNode::new_unchecked(node.as_str()),
+            oxrdf::NamedNode::new_unchecked(knows),
+            oxrdf::BlankNode::new_unchecked(other.as_str()),
+        ));
+    }
+    (ours, theirs)
 }
 
 /// The same blank-node graph in both models: chains (`size` nodes, each with a literal)
