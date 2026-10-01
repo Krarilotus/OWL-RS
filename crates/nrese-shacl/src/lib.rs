@@ -40,7 +40,11 @@ use nrese_sparql::ReadView;
 ///
 /// `shapes` must have been compiled from the same view (or one of the same repository):
 /// it holds that dictionary's term ids.
-pub fn validate<V: ReadView>(view: &V, shapes: &Shapes, data: Selection) -> ValidationReport {
+pub fn validate<V: ReadView + Sync>(
+    view: &V,
+    shapes: &Shapes,
+    data: Selection,
+) -> ValidationReport {
     let (raw, failures) = validate::validate_raw(view, shapes, data);
     report::decode(view, shapes, &raw, failures)
 }

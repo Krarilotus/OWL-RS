@@ -4,7 +4,7 @@
 //! cargo run --release -p nrese-store --example perf_lab -- \
 //!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
-//!     [--explain] [--format tsv|json|xml|csv]
+//!     [--explain] [--format tsv|json|xml|csv] [--shapes FILE]
 //! ```
 //!
 //! - **Data:** `--load` bulk-loads files, into memory or, with `--store`, into an on-disk
@@ -15,6 +15,8 @@
 //!   counting sink, so evaluation, term decoding and serialisation are all included.
 //! - **Report:** rows, p50, min and max per query, peak memory (Linux), and a JSON file
 //!   for `benches/baselines/`. `--baseline` adds the ratio against an earlier JSON report.
+//!   `--shapes` loads a SHACL shapes file into the shapes graph and times validating the
+//!   data against it (`--runs` times), before the queries.
 //!   `--format` serialises SELECT results in another format than TSV (JSON is what most
 //!   clients ask for).
 //!   `--explain` prints each query's plan after its measurement: every operator with its
@@ -32,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use nrese_store::{
     BulkLoadRequest, CancellationToken, GraphTarget, PreparedQuery, QueryResultKind,
-    SolutionsResultFormat, SparqlQueryRequest, StoreConfig, StoreService,
+    ShaclValidationRequest, SolutionsResultFormat, SparqlQueryRequest, StoreConfig, StoreService,
 };
 
 /// mimalloc, as in the server; `RUSTFLAGS="--cfg system_alloc"` measures the system allocator.
@@ -53,6 +55,7 @@ struct Args {
     baseline: Option<PathBuf>,
     explain: bool,
     format: SolutionsResultFormat,
+    shapes: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -69,6 +72,7 @@ fn parse_args() -> Result<Args, String> {
         baseline: None,
         explain: false,
         format: SolutionsResultFormat::Tsv,
+        shapes: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -88,6 +92,7 @@ fn parse_args() -> Result<Args, String> {
             "--json" => args.json = Some(value()?.into()),
             "--baseline" => args.baseline = Some(value()?.into()),
             "--explain" => args.explain = true,
+            "--shapes" => args.shapes = Some(value()?.into()),
             "--format" => {
                 args.format = match value()?.as_str() {
                     "tsv" => SolutionsResultFormat::Tsv,
@@ -316,6 +321,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         load_s = started.elapsed().as_secs_f64();
         eprintln!("loaded {} quads in {load_s:.2} s", report.inserted);
+    }
+    if let Some(shapes) = &args.shapes {
+        store.bulk_load(&BulkLoadRequest {
+            files: vec![shapes.clone()],
+            replace: false,
+            graph: GraphTarget::NamedGraph(nrese_store::DEFAULT_SHAPES_GRAPH.to_owned()),
+        })?;
+        let mut times = Vec::new();
+        let mut results = 0;
+        for _ in 0..args.runs {
+            let started = Instant::now();
+            let validation = store.validate_shacl(&ShaclValidationRequest::default())?;
+            times.push(started.elapsed());
+            results = validation.report.results.len();
+        }
+        times.sort();
+        eprintln!(
+            "shacl: {results} results, p50 {:.2} ms (min {:.2})",
+            ms(times[times.len() / 2]),
+            ms(times[0])
+        );
     }
     let memory_after_load = memory_mib();
     eprintln!(
