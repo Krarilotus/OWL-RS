@@ -323,6 +323,47 @@ impl IndexVersion {
         }
     }
 
+    /// Appends, for each of `components` (quad components: subject 0, predicate 1, object
+    /// 2, graph 3), its values among the quads matching `plan`, in the plan's order, to
+    /// the matching vector of `out`, decoded a block and a column at a time. Answers only
+    /// for a version of at most one run without tombstones (`false`, nothing appended,
+    /// otherwise: then quads must be merged and cancelled one by one).
+    pub(crate) fn scan_columns(
+        &self,
+        plan: &AccessPlan,
+        components: &[usize],
+        out: &mut [Vec<u64>],
+    ) -> bool {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return true; // nothing this layout holds matches
+        };
+        if adapted.exclude_default_graph {
+            return false;
+        }
+        let run = match &*self.runs {
+            [] => return true,
+            [run] => run,
+            _ => return false,
+        };
+        let perm = run.permutation(adapted.permutation);
+        if !perm.tombstones.is_empty() {
+            return false;
+        }
+        let order = adapted.permutation.order();
+        let positions: Vec<usize> = components
+            .iter()
+            .map(|c| {
+                order
+                    .iter()
+                    .position(|x| x == c)
+                    .expect("every component has a key position")
+            })
+            .collect();
+        let (start, end) = perm.range(&adapted.low, &adapted.high);
+        perm.keys.decode_columns(start, end, &positions, out);
+        true
+    }
+
     pub(crate) fn scan_plan(&self, plan: &AccessPlan) -> QuadScan<'_> {
         let Some(plan) = self.layout.adapt(plan) else {
             return QuadScan {

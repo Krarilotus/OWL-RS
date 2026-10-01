@@ -634,6 +634,30 @@ impl PackedKeys {
         f(value, from, end);
     }
 
+    /// Appends, for each of `positions`, the key component at that position of the keys
+    /// `start..end` to the matching vector of `out`: block by block, a column at a time.
+    pub(crate) fn decode_columns(
+        &self,
+        start: usize,
+        end: usize,
+        positions: &[usize],
+        out: &mut [Vec<u64>],
+    ) {
+        for column in out.iter_mut() {
+            column.reserve(end.saturating_sub(start));
+        }
+        let mut i = start;
+        while i < end {
+            let block = i / BLOCK;
+            let block_end = ((block + 1) * BLOCK).min(end);
+            let (j0, j1) = (i - block * BLOCK, block_end - block * BLOCK);
+            for (&position, column) in positions.iter().zip(out.iter_mut()) {
+                self.decode_column(block, j0, j1, position, column);
+            }
+            i = block_end;
+        }
+    }
+
     /// Appends component `c` of the keys `j0..j1` of `block` (indices within the block).
     fn decode_column(&self, block: usize, j0: usize, j1: usize, c: usize, out: &mut Vec<u64>) {
         let header = &self.headers[block];
