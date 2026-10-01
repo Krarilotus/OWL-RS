@@ -481,3 +481,29 @@ The recursion goes one level deeper per tie along a chain, so inputs over 128 bl
 run on a thread with a stack sized to them. A test on a 256 KiB caller stack shows the
 need (it overflows without that thread). `oxrdf` overflows the 1 MiB main-thread stack on
 the same chain.
+
+**4a: `nrese-sparql-results` (1 October).** Readers and writers for SPARQL results in
+JSON, XML, CSV (written only: it is lossy) and TSV, booleans included, with RDF 1.2 triple
+terms and directional literals in all four. The API follows `sparesults` (format, parser
+for a slice or a reader, serializer), so step 5 can port its users mechanically.
+- **How it reads and writes.**
+  - Readers stream: JSON on `nrese-json` events, without building a tree. A document
+    with `results` before `head` is buffered and still read.
+  - XML is read from `quick-xml` events by local name, so a prefixed results namespace
+    reads too.
+  - Writers fill a reused buffer that goes to the writer in 8 KiB pieces. Their bytes are
+    `sparesults`' bytes.
+- **Conformance.**
+  - Every result file of the W3C SPARQL 1.1 and 1.2 suites reads as `sparesults` reads
+    it: 372 of 372.
+  - Round trips through a reader that gives one byte per call.
+  - Two corrections of `sparesults` in CSV:
+    - a triple term is written as SPARQL 1.2 CSV/TSV §2.2 says;
+    - an IRI with a comma is quoted.
+- **Faster than `sparesults` in every case** (`benches/oxigraph-comparison/results/2026-10-01-step-4a-results.md`):
+  - writing JSON and XML takes 0.3 of its time, TSV and CSV 0.76–0.91;
+  - reading JSON 0.45–0.59, TSV 0.61–0.68, XML 0.80–0.90.
+
+  Four cases were slower at first and were fixed: CSV and TSV writing, reading XML, and
+  the copies in reading JSON. `nrese-json`'s string scan became a single pass over 8-byte
+  words, which also serves the JSON-LD reader.

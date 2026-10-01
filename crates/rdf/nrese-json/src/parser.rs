@@ -15,8 +15,6 @@ use std::borrow::Cow;
 use std::io::Read;
 use std::ops::Range;
 
-use memchr::memchr2;
-
 use crate::error::{JsonParseError, JsonSyntaxError};
 use crate::value::{Object, Value};
 
@@ -317,18 +315,19 @@ impl Lexer {
         let mut i = start;
         let mut escaped = false;
         loop {
-            let Some(k) = memchr2(b'"', b'\\', &bytes[i..]) else {
-                self.check_controls(bytes, i, bytes.len())?;
+            let Some(j) = string_stop(bytes, i) else {
                 return if eof {
                     Err(self.error("a string isn't closed", start - 1))
                 } else {
                     Ok(None)
                 };
             };
-            let j = i + k;
-            self.check_controls(bytes, i, j)?;
-            if bytes[j] == b'"' {
-                return Ok(Some((j, escaped)));
+            match bytes[j] {
+                b'"' => return Ok(Some((j, escaped))),
+                b'\\' => {}
+                _ => {
+                    return Err(self.error("a control character in a string must be escaped", j));
+                }
             }
             escaped = true;
             let Some(&e) = bytes.get(j + 1) else {
@@ -356,15 +355,6 @@ impl Lexer {
                 _ => return Err(self.error("not a JSON escape sequence", j)),
             };
         }
-    }
-
-    fn check_controls(&self, bytes: &[u8], from: usize, to: usize) -> Result<(), JsonSyntaxError> {
-        // A plain loop over the run: the compiler vectorises it.
-        if bytes[from..to].iter().any(|&b| b < 0x20) {
-            let at = from + bytes[from..to].iter().position(|&b| b < 0x20).unwrap_or(0);
-            return Err(self.error("a control character in a string must be escaped", at));
-        }
-        Ok(())
     }
 
     /// The end of the number starting at `start`; `None` if the text ends where the
@@ -464,6 +454,32 @@ impl Lexer {
         unescape(content, &mut out).map_err(|(message, i)| self.error(message, start + i))?;
         Ok(Cow::Owned(out))
     }
+}
+
+/// The first byte at or after `from` that ends a string's plain run: `"`, `\` or a control
+/// character. Eight bytes at a time in a word (most strings are short, where a vector
+/// search costs more than it saves): per byte, a high bit where it equals `"` or `\` or is
+/// below 0x20. Borrows can set bits above a byte that matches, never below the first one,
+/// so the lowest bit is exact.
+fn string_stop(bytes: &[u8], from: usize) -> Option<usize> {
+    const ONES: u64 = u64::from_ne_bytes([1; 8]);
+    const HIGH: u64 = ONES << 7;
+    let zero_byte = |x: u64| x.wrapping_sub(ONES) & !x & HIGH;
+    let mut i = from;
+    while let Some(word) = bytes.get(i..i + 8) {
+        let x = u64::from_le_bytes(word.try_into().expect("eight bytes"));
+        let stops = zero_byte(x ^ (ONES * u64::from(b'"')))
+            | zero_byte(x ^ (ONES * u64::from(b'\\')))
+            | (x.wrapping_sub(ONES * 0x20) & !x & HIGH);
+        if stops != 0 {
+            return Some(i + (stops.trailing_zeros() / 8) as usize);
+        }
+        i += 8;
+    }
+    bytes[i..]
+        .iter()
+        .position(|&b| b == b'"' || b == b'\\' || b < 0x20)
+        .map(|k| i + k)
 }
 
 /// Decodes the escapes of a string's content (already checked to be well formed but for
@@ -984,5 +1000,38 @@ mod tests {
         let mut parser = SliceJsonParser::value_at(text, 1);
         assert!(parser.next_value().unwrap().is_some());
         assert_eq!(parser.next_event().unwrap(), JsonEvent::Eof);
+    }
+
+    #[test]
+    fn the_word_search_finds_what_a_byte_search_finds() {
+        // Every stop byte at every offset and alignment, behind every kind of byte (the
+        // borrows of the word arithmetic come from below the first match).
+        let fillers = [b'a', 0x7f, 0x80, 0xff, 0x20, 0x21, 0x5b, 0x5d];
+        for stop in [b'"', b'\\', 0x00, 0x1f, 0x0a] {
+            for filler in fillers {
+                for len in 0..20 {
+                    for at in 0..=len {
+                        let mut bytes = vec![filler; len];
+                        if at < len {
+                            bytes[at] = stop;
+                            if at + 1 < len {
+                                bytes[at + 1] = 0x01;
+                            }
+                        }
+                        for from in 0..=len.min(9) {
+                            let expected = bytes[from..]
+                                .iter()
+                                .position(|&b| b == b'"' || b == b'\\' || b < 0x20)
+                                .map(|k| from + k);
+                            assert_eq!(
+                                super::string_stop(&bytes, from),
+                                expected,
+                                "{bytes:?} from {from}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

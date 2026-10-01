@@ -41,7 +41,7 @@ do), **decide** (the owner decides whether the use case needs it).
 | SPARQL 1.1 query, patterns, paths, aggregates, modifiers, functions (hashes included) | Native executor: W3C 491/495 (one known deviation, zero-length paths from a term outside the graph) | **have** |
 | SPARQL 1.1 Update (all operations) | W3C update 94/94 | **have** |
 | SPARQL 1.1 Federated Query | `SERVICE` to allow-listed endpoints (off by default), bind joins, `SILENT` | **have** |
-| SPARQL 1.2 / SPARQL-star | Step 4 (syntax, results formats), step 6 (evaluation) | **planned** |
+| SPARQL 1.2 / SPARQL-star | Results formats done (step 4a); grammar step 4b; evaluation step 6 | **partial** |
 | SPARQL 1.1 Protocol | GET, POST form and direct, dataset parameters | **have** |
 | Graph Store HTTP Protocol | GET/HEAD/PUT/POST/DELETE, W3C status codes, six formats | **have** |
 | XSD date/time and duration arithmetic and ordering | `nrese-xsd`, used by the executor (see §5) | **have** |
@@ -69,7 +69,7 @@ do), **decide** (the owner decides whether the use case needs it).
 | N-Triples, N-Quads, Turtle, TriG, RDF/XML | Every W3C 1.1 test passes (70, 87, 313, 357, 166); N-Triples and N-Quads in parallel chunks | **have** |
 | JSON-LD 1.1 | toRdf 455/455, expand 376/376, fromRdf 53/53; streaming and expanded writers. (The list says `oxjsonld` does compaction; version 0.2.4 has expansion and toRdf, and a streaming writer, but no compaction or fromRdf algorithm.) | **have** (beyond `oxjsonld`) |
 | N3 (lexing and structure) | Read and written (`nrese_rdf_io::n3`): formulas, quick variables, paths, `has`/`is … of`/`<-`, `=`/`=>`/`<=`, any term anywhere; plain RDF in N3 loads like Turtle. W3C N3 parser suites 1,084 of 1,085 (the one: cwm's own literal canonicalisation). N3 rules are the reasoner's user rules (`NRESE_REASONING_RULES`): datalog rules, `=> false` consistency rules, `log:equalTo`/`log:notEqualTo`, facts; materialised and maintained on commits like the built-in rulesets; the W3C N3 reasoner tests in that scope pass (13/13) | **have** (syntax, datalog rules); builtins **planned** |
-| SPARQL results: XML, JSON, CSV, TSV, booleans | Written natively from id tables (JSON, TSV, CSV); XML and the readers through `sparesults` until `nrese-sparql-results` | **planned** (step 4) |
+| SPARQL results: XML, JSON, CSV, TSV, booleans | `nrese-sparql-results`: streaming readers (JSON, XML, TSV) and writers (all four), the W3C result files read as `sparesults` reads them (372/372), faster in every case (writing 0.29–0.91 of its time, reading 0.45–0.90; `benches/oxigraph-comparison/results/2026-10-01-step-4a-results.md`); CSV quotes IRIs with commas and writes triple terms as §2.2 says, where `sparesults` doesn't. The engine still writes through `sparesults` until step 5 | **have** (crate); switch-over step 5 |
 
 ## 5. Modern and draft standards
 
@@ -82,7 +82,7 @@ do), **decide** (the owner decides whether the use case needs it).
 | SEP-0002: date, time and duration arithmetic, `ADJUST`, `SUM`/`AVG` of durations, g-types | A regression found while writing this matrix (the baseline ran these through spareval's `sep-0002` and `calendar-ext`; step 1 removed spareval), **fixed**: XPath F&O 3.1 arithmetic on dates, times and the two duration subtypes, `ADJUST` for dateTime, date and time, the duration partial order in comparisons and `ORDER BY`, the extractors on `xsd:time` and the g-types, casts to all of them, and `SUM`/`AVG` of durations, which spareval 0.2.6 didn't have. What XPath leaves undefined (arithmetic on `xsd:duration` itself, `ADJUST` of g-types) is an error, where spareval answered | **have** (`nrese-sparql/tests/calendar_tests.rs`, the F&O examples in `native/calendar.rs`) |
 | Extractors `YEAR` … `TZ` across all calendar types | `YEAR`, `MONTH`, `DAY` for dates and the g-types that have the part; `HOURS`, `MINUTES`, `SECONDS` for `dateTime` and `time`; `TIMEZONE`, `TZ` for all | **have** |
 | SPARQL 1.2 Protocol and Graph Store Protocol drafts (4xx for bad requests, 5xx for failures; RDF 1.2 media types) | 4xx/5xx already differentiated; 1.2 media types and profiles with step 6 | **partial** |
-| Results formats with triple terms (JSON `"type": "triple"`, XML, TSV escaping) | Step 4 | **planned** |
+| Results formats with triple terms (JSON `"type": "triple"`, XML, TSV escaping) | `nrese-sparql-results`: triple terms and directional literals (`its:dir`) in all four formats, read and written | **have** (crate); in the engine with step 6 |
 
 **Feature flags.** As Oxigraph does with `sep-0002` and `sep-0006`: draft features sit
 behind Cargo features of the crates that implement them (`sparql-12`, `sep-0002`,
@@ -100,7 +100,8 @@ version bump of the crates it changes (minor while they are 0.x).
 | Oxigraph | NRESE | Status |
 |---|---|---|
 | `oxrdf`, `oxsdatatypes`, `oxttl`, `oxrdfxml`, `oxjsonld`, `oxrdfio` | `nrese-rdf`, `nrese-xsd`, `nrese-rdf-io` (+ `nrese-json`) | **have** |
-| `spargebra`, `sparesults` | `nrese-sparql-syntax`, `nrese-sparql-results` | **planned** (step 4) |
+| `sparesults` | `nrese-sparql-results` | **have** (step 4a; users switch in step 5) |
+| `spargebra` | `nrese-sparql-syntax` | **planned** (step 4b) |
 | `sparopt`, `spareval` | `nrese-sparql` (planner, native executor), `nrese-exec` | **have** |
 | `spargeo` | GeoSPARQL in `nrese-sparql` with an R-tree | **have** |
 | `oxigraph` (`Store`, transactions, bulk load) | `nrese-engine` and `nrese-store` | **have** |
