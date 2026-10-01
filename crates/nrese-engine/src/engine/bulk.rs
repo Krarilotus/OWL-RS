@@ -22,8 +22,13 @@ use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version};
 use crate::durability::checkpoint;
 use crate::error::EngineResult;
 use crate::index::IndexVersion;
-use crate::index::run::Run;
+use crate::index::keys::PackedKeys;
+use crate::index::run::{PermutationBuilder, Run};
 use crate::quad::{EncodedQuad, EncodedTriple, QuadPattern};
+
+/// Batches copied between releases of their memory ([`crate::memory`]): about 256 MiB at
+/// the stores' batch size.
+const RELEASE_EVERY: usize = 256;
 
 /// What a bulk load does with the existing data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,14 +85,41 @@ impl<'e> BulkLoad<'e> {
         // The batches into one array, each freed once copied (not all held twice).
         let batches = batches.into_inner();
         let mut quads: Vec<EncodedQuad> = Vec::with_capacity(batches.iter().map(Vec::len).sum());
-        for batch in batches {
+        // What the copied batches held stays with the threads that interned them until
+        // released: without, the batches would count twice at the peak.
+        for (i, batch) in batches.into_iter().enumerate() {
             quads.extend_from_slice(&batch);
+            if i % RELEASE_EVERY == RELEASE_EVERY - 1 {
+                drop(batch);
+                crate::memory::release_all();
+            }
         }
         quads.par_sort_unstable();
         quads.dedup();
 
         let current = base.version();
+        // Nothing else in the new version: its permutations go straight into the checkpoint.
+        let streamed = shared
+            .durable
+            .as_ref()
+            .is_some_and(|durable| durable.config.map_checkpoints)
+            && (mode == BulkMode::Replace || current.asserted.len() + current.inferred.len() == 0);
         let (next, summary) = match mode {
+            _ if streamed => {
+                let summary = CommitSummary {
+                    revision: current.revision + 1,
+                    inserted: quads.len() as u64,
+                    deleted: current.asserted.len(),
+                    inferred_inserted: 0,
+                    inferred_deleted: current.inferred.len(),
+                };
+                let next = Next::Streamed {
+                    builder: PermutationBuilder::new(quads),
+                    revision: summary.revision,
+                    dictionary_len: shared.dictionary.len(),
+                };
+                (next, summary)
+            }
             BulkMode::Replace => {
                 let summary = CommitSummary {
                     revision: current.revision + 1,
@@ -102,7 +134,7 @@ impl<'e> BulkLoad<'e> {
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                 };
-                (next, summary)
+                (Next::Built(next), summary)
             }
             BulkMode::Append => {
                 let inserts: Vec<EncodedQuad> = quads
@@ -132,7 +164,7 @@ impl<'e> BulkLoad<'e> {
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                 };
-                (next, summary)
+                (Next::Built(next), summary)
             }
         };
         if summary.inserted + summary.deleted + summary.inferred_deleted == 0 {
@@ -157,12 +189,34 @@ impl<'e> BulkLoad<'e> {
     }
 }
 
+/// The version a bulk load publishes.
+enum Next {
+    /// Built in memory.
+    Built(Version),
+    /// Asserted quads and nothing else: their permutations are built one at a time, each
+    /// written to the checkpoint and dropped before the next (durable, `map_checkpoints`).
+    /// The load's peak then holds one packed permutation instead of all of them.
+    Streamed {
+        builder: PermutationBuilder,
+        revision: u64,
+        dictionary_len: u64,
+    },
+}
+
 /// Installs `next` as the latest version, the bulk way: in durable mode a checkpoint of it
 /// is written first, so no WAL record is needed, and with `map_checkpoints` the version
 /// installed is the checkpoint's, mapped (same content: memory then holds what queries
 /// touch, as after a restart). The caller holds the writer and compaction slots.
-fn publish(engine: &Inner, next: Version) -> EngineResult<()> {
+fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     let shared = &engine.shared;
+    let next = match next {
+        Next::Built(version) => version,
+        Next::Streamed {
+            builder,
+            revision,
+            dictionary_len,
+        } => return publish_streamed(engine, builder, revision, dictionary_len),
+    };
     let next = Arc::new(next);
     match &shared.durable {
         Some(durable) => {
@@ -212,6 +266,74 @@ fn publish(engine: &Inner, next: Version) -> EngineResult<()> {
         }
         None => shared.versions.install(next),
     }
+    Ok(())
+}
+
+/// [`publish`] of [`Next::Streamed`]: the checkpoint written from `builder`, then installed
+/// mapped. In memory (no checkpoint), the permutations are built into a version.
+fn publish_streamed(
+    engine: &Inner,
+    mut builder: PermutationBuilder,
+    revision: u64,
+    dictionary_len: u64,
+) -> EngineResult<()> {
+    let shared = &engine.shared;
+    let Some(durable) = &shared.durable else {
+        let layout = Stack::Asserted.layout();
+        let packed = layout
+            .permutations()
+            .iter()
+            .map(|&permutation| (permutation, builder.packed(permutation)))
+            .collect();
+        let asserted = IndexVersion::from_packed(layout, packed)
+            .map_err(crate::error::EngineError::Corruption)?;
+        let next = Version {
+            asserted,
+            inferred: IndexVersion::empty(Stack::Inferred.layout()),
+            revision,
+            dictionary_len,
+        };
+        return publish(engine, Next::Built(next));
+    };
+    let _checkpoint = durable.checkpoint_slot.lock();
+    let empty = PackedKeys::from_sorted(&[]);
+    let path = checkpoint::write_parts(
+        durable.root(),
+        revision,
+        &shared.dictionary,
+        dictionary_len,
+        &mut |stack, permutation| {
+            Ok(match stack {
+                Stack::Asserted => std::borrow::Cow::Owned(builder.packed(permutation)),
+                Stack::Inferred => std::borrow::Cow::Borrowed(&empty),
+            })
+        },
+    )?;
+    drop(builder);
+    let (base, [asserted, inferred]) = match checkpoint::map_written(&path) {
+        Ok(mapped) => mapped,
+        Err(error) => {
+            // Nothing else holds the data: the load fails, and the checkpoint goes so that
+            // a restart doesn't recover what was never published.
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+    };
+    let next = Arc::new(Version {
+        asserted,
+        inferred,
+        revision,
+        dictionary_len,
+    });
+    let mut wal = durable.wal.lock();
+    wal.rotate(revision + 1)?;
+    shared.versions.install(next);
+    wal.release_through(revision)?;
+    drop(wal);
+    if let Err(error) = shared.dictionary.rebase(base) {
+        tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
+    }
+    checkpoint::remove_older_than(durable.root(), revision)?;
     Ok(())
 }
 
@@ -302,7 +424,7 @@ impl<'e> Rematerialisation<'e> {
             revision: summary.revision,
             dictionary_len: shared.dictionary.len(),
         };
-        publish(engine, next)?;
+        publish(engine, Next::Built(next))?;
         drop(_compaction);
         tracing::info!(
             revision = summary.revision,

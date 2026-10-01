@@ -20,6 +20,7 @@ pub mod engine;
 pub mod error;
 mod index;
 mod mapped;
+pub mod memory;
 pub mod quad;
 pub mod term;
 

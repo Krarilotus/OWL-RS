@@ -17,7 +17,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use nrese_engine::{BulkLoad, BulkMode, Engine};
+use nrese_engine::{BulkLoad, BulkMode, Engine, memory};
 use nrese_rdf::{BlankNode, GraphName, NamedOrBlankNode, Quad, Term};
 use nrese_rdf_io::{RdfFormat, RdfParseError, RdfParser};
 use rayon::prelude::*;
@@ -29,6 +29,10 @@ use crate::rdf_io::file_base_iri;
 /// Quads per interning batch: large enough to amortise the dictionary lock, small enough
 /// to keep all cores busy.
 const BATCH: usize = 32 * 1024;
+/// Batches a parsing thread adds between releases of the memory it freed ([`memory`]):
+/// about 256 thousand quads. Each release takes well under a millisecond; at one per two
+/// million quads per thread, freed memory reached 3 GB at the end of DBpedia's parse.
+const BATCHES_PER_RELEASE: u64 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkLoadRequest {
@@ -69,7 +73,9 @@ pub(crate) fn bulk_load(engine: &Engine, request: &BulkLoadRequest) -> StoreResu
     for source in &sources {
         parsed += source.load_into(&load, &graph, &blank_nodes)?;
     }
-    let summary = load.finish()?;
+    let summary = load.finish();
+    memory::release_all();
+    let summary = summary?;
     Ok(BulkLoadReport {
         revision: summary.revision,
         parsed,
@@ -175,6 +181,9 @@ fn feed(
             load.add(&batch);
             parsed += batch.len() as u64;
             batch.clear();
+            if (parsed / BATCH as u64).is_multiple_of(BATCHES_PER_RELEASE) {
+                memory::release_thread();
+            }
         }
     }
     load.add(&batch);

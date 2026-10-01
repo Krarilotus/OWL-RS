@@ -30,6 +30,7 @@
 //! to `checkpoint-<revision>.nck`; a crash at any point leaves either the old or the new
 //! checkpoint, never a partial one. Leftover `.tmp` files are deleted on open.
 
+use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -270,7 +271,26 @@ pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
 
 /// Writes a checkpoint of `snapshot` and returns its path.
 pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
-    let revision = snapshot.revision();
+    write_parts(
+        dir,
+        snapshot.revision(),
+        snapshot.dictionary(),
+        snapshot.dictionary_len(),
+        &mut |stack, permutation| Ok(snapshot.version().stack(stack).packed(permutation)),
+    )
+}
+
+/// Writes a checkpoint of `revision` from its parts and returns its path: the dictionary's
+/// entries `0..dictionary_len`, and each stack's permutations as `packed` gives them, in
+/// the order of the stack's layout. Each is written before the next is asked for, so a
+/// caller can build one at a time and drop it (bulk loads).
+pub(crate) fn write_parts<'a>(
+    dir: &Path,
+    revision: u64,
+    dictionary: &Dictionary,
+    dictionary_len: u64,
+    packed: &mut dyn FnMut(Stack, Permutation) -> EngineResult<Cow<'a, PackedKeys>>,
+) -> EngineResult<PathBuf> {
     let tmp = checkpoint_path(dir, revision, "tmp");
     let file = File::create(&tmp)?;
     let mut out = Checksummed {
@@ -281,14 +301,13 @@ pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
     };
     out.buffer.extend_from_slice(MAGIC);
     put_u64(&mut out.buffer, revision);
-    write_dictionary(&mut out, snapshot.dictionary(), snapshot.dictionary_len())?;
+    write_dictionary(&mut out, dictionary, dictionary_len)?;
     for stack in Stack::ALL {
-        let index = snapshot.version().stack(stack);
         let permutations = stack.layout().permutations();
         put_u32(&mut out.buffer, permutations.len() as u32);
         for &permutation in permutations {
             out.buffer.push(permutation as u8);
-            let keys = index.packed(permutation);
+            let keys = packed(stack, permutation)?;
             let at = out.position();
             keys.write(Some(at), &mut |piece| out.write_bytes(piece))?;
         }
