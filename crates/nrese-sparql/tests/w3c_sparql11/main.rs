@@ -32,6 +32,7 @@ use results::{Results, canonical, parse_expected};
 use std::cell::RefCell;
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
+const EXPECTED_FAILURES_12: &str = include_str!("expected-failures-12.txt");
 
 #[derive(Debug)]
 enum Outcome {
@@ -62,13 +63,51 @@ fn w3c_sparql11() {
         eprintln!("skipped: W3C rdf-tests not found (run scripts/fetch-w3c-tests.sh)");
         return;
     };
-    let suite = Suite::new(root);
+    check_suite(
+        "SPARQL 1.1",
+        &Suite::new(root, manifest::OFFICIAL_BASE),
+        &[
+            "manifest-sparql11-query.ttl",
+            "manifest-sparql11-update.ttl",
+            "manifest-sparql11-results.ttl",
+        ],
+        EXPECTED_FAILURES,
+        "w3c-sparql11-report.txt",
+    );
+}
+
+/// The SPARQL 1.2 suite: its syntax and evaluation tests (triple terms, base directions,
+/// the new functions), with the same reference and the same rules as SPARQL 1.1.
+#[test]
+fn w3c_sparql12() {
+    let Some(root) = manifest::suite_dir("sparql12") else {
+        assert!(
+            std::env::var_os("NRESE_W3C_REQUIRED").is_none_or(|value| value.is_empty()),
+            "W3C rdf-tests not found; run scripts/fetch-w3c-tests.sh"
+        );
+        eprintln!("skipped: W3C rdf-tests not found (run scripts/fetch-w3c-tests.sh)");
+        return;
+    };
+    check_suite(
+        "SPARQL 1.2",
+        &Suite::new(root, manifest::OFFICIAL_BASE_12),
+        &["manifest.ttl"],
+        EXPECTED_FAILURES_12,
+        "w3c-sparql12-report.txt",
+    );
+}
+
+/// Runs a suite's tests on ours and on the reference, writes the report, and fails on any
+/// failure not listed in `expected_failures` and on any listed test that now passes.
+fn check_suite(
+    title: &str,
+    suite: &Suite,
+    manifests: &[&str],
+    expected_failures: &str,
+    report_name: &str,
+) {
     let mut tests = Vec::new();
-    for manifest in [
-        "manifest-sparql11-query.ttl",
-        "manifest-sparql11-update.ttl",
-        "manifest-sparql11-results.ttl",
-    ] {
+    for manifest in manifests {
         tests.extend(suite.tests(manifest).expect("manifest"));
     }
     let rows: BTreeMap<String, Row> = tests
@@ -76,15 +115,15 @@ fn w3c_sparql11() {
         .map(|test| {
             let row = Row {
                 kind: test.kind,
-                ours: outcome(&suite, test, Backend::ours),
-                oracle: outcome(&suite, test, Backend::oracle),
+                ours: outcome(suite, test, Backend::ours),
+                oracle: outcome(suite, test, Backend::oracle),
             };
             (test.id.clone(), row)
         })
         .collect();
 
     // Entries are `<iri> # reason`; the IRIs contain `#` themselves.
-    let expected: BTreeSet<&str> = EXPECTED_FAILURES
+    let expected: BTreeSet<&str> = expected_failures
         .lines()
         .filter(|line| line.starts_with('<'))
         .filter_map(|line| line.find('>').map(|end| &line[..=end]))
@@ -94,8 +133,8 @@ fn w3c_sparql11() {
         .filter(|(_, row)| row.ours.failed())
         .map(|(id, _)| id.as_str())
         .collect();
-    let report = report(&rows);
-    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("w3c-sparql11-report.txt");
+    let report = report(title, &rows);
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(report_name);
     std::fs::write(&path, &report).expect("report");
     eprintln!("{}", report.lines().take(12).collect::<Vec<_>>().join("\n"));
     eprintln!("full report: {}", path.display());
@@ -105,7 +144,7 @@ fn w3c_sparql11() {
     assert!(
         new_failures.is_empty() && fixed.is_empty(),
         "new failures (fix, or list them with a reason): {new_failures:#?}\n\
-         listed but now passing (remove from expected-failures.txt): {fixed:#?}"
+         listed but now passing (remove from the expected failures): {fixed:#?}"
     );
 }
 
@@ -120,7 +159,7 @@ fn outcome(suite: &Suite, test: &Test, backend: fn() -> Backend) -> Outcome {
     }
 }
 
-fn report(rows: &BTreeMap<String, Row>) -> String {
+fn report(title: &str, rows: &BTreeMap<String, Row>) -> String {
     // passed, failed, skipped for ours; then failures shared with the oracle.
     let mut by_kind: BTreeMap<Kind, [usize; 4]> = BTreeMap::new();
     let mut oracle_passed = 0;
@@ -136,8 +175,8 @@ fn report(rows: &BTreeMap<String, Row>) -> String {
         }
         oracle_passed += usize::from(matches!(row.oracle, Outcome::Passed));
     }
-    let mut out = String::from(
-        "W3C SPARQL 1.1 on engine v2: passed / failed / skipped (failures shared with the reference)\n",
+    let mut out = format!(
+        "W3C {title} on engine v2: passed / failed / skipped (failures shared with the reference)\n"
     );
     let mut total = [0; 4];
     for (kind, counts) in &by_kind {
@@ -164,6 +203,10 @@ fn report(rows: &BTreeMap<String, Row>) -> String {
                 };
                 let message: String = message.chars().take(3_000).collect();
                 let _ = writeln!(out, "FAIL ({scope}) {id}\n  {message}\n");
+                if let Outcome::Failed(reference) = &row.oracle {
+                    let reference: String = reference.chars().take(20_000).collect();
+                    let _ = writeln!(out, "  reference: {reference}\n");
+                }
             }
             Outcome::Skipped(reason) => {
                 let _ = writeln!(out, "SKIP {id}: {reason}");
@@ -326,20 +369,45 @@ fn quads(suite: &Suite, files: &[GraphFile]) -> Result<Vec<Quad>, String> {
             .name
             .clone()
             .map_or(GraphName::DefaultGraph, GraphName::from);
-        let scoped =
-            |node: &BlankNode| BlankNode::new_unchecked(format!("d{document}x{}", node.as_str()));
-        for triple in &suite.parse_graph(file.file.as_ref())? {
-            let mut quad = triple.into_owned().in_graph(graph_name.clone());
+        for mut quad in suite.parse_quads(file.file.as_ref())? {
+            // A dataset file (TriG) keeps its named graphs; its default graph, and every
+            // other file, goes where the manifest puts it.
+            if quad.graph_name == GraphName::DefaultGraph {
+                quad.graph_name = graph_name.clone();
+            }
             if let NamedOrBlankNode::BlankNode(node) = &quad.subject {
-                quad.subject = scoped(node).into();
+                quad.subject = scoped(document, node).into();
             }
-            if let Term::BlankNode(node) = &quad.object {
-                quad.object = scoped(node).into();
-            }
+            quad.object = scoped_term(document, quad.object);
             quads.push(quad);
         }
     }
     Ok(quads)
+}
+
+/// A blank node of document `document`, apart from every other document's.
+fn scoped(document: usize, node: &BlankNode) -> BlankNode {
+    BlankNode::new_unchecked(format!("d{document}x{}", node.as_str()))
+}
+
+/// `term` with its blank nodes, inside triple terms too, scoped to `document`.
+fn scoped_term(document: usize, term: Term) -> Term {
+    match term {
+        Term::BlankNode(node) => scoped(document, &node).into(),
+        Term::Triple(triple) => {
+            let triple = *triple;
+            nrese_rdf::Triple::new(
+                match triple.subject {
+                    NamedOrBlankNode::BlankNode(node) => scoped(document, &node).into(),
+                    subject => subject,
+                },
+                triple.predicate,
+                scoped_term(document, triple.object),
+            )
+            .into()
+        }
+        term => term,
+    }
 }
 
 fn run_query(suite: &Suite, test: &Test, query: &Query, backend: &Backend) -> Result<(), String> {

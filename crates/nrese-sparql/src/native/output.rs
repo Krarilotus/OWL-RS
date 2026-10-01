@@ -90,7 +90,7 @@ fn view_term(view: TermView<'_>) -> Option<TermRef<'_>> {
         TermView::Typed { value, datatype } => {
             LiteralRef::new_typed_literal(value, NamedNodeRef::new_unchecked(datatype)).into()
         }
-        TermView::Triple(_) => return None,
+        TermView::Triple => return None,
     })
 }
 

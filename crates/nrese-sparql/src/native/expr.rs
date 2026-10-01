@@ -99,6 +99,15 @@ pub(crate) fn supported(expr: &Expression) -> bool {
                         | Function::Sha384
                         | Function::Sha512
                         | Function::Adjust
+                        | Function::Triple
+                        | Function::Subject
+                        | Function::Predicate
+                        | Function::Object
+                        | Function::IsTriple
+                        | Function::LangDir
+                        | Function::HasLang
+                        | Function::HasLangDir
+                        | Function::StrLangDir
                 )
                 // Casts, GeoSPARQL; any other IRI is an unknown function: an error.
                 || matches!(function, Function::Custom(_))
@@ -285,11 +294,18 @@ impl Evaluator {
         binding: &dyn Fn(&Variable) -> Option<Term>,
     ) -> Option<Term> {
         let arg = |i: usize| self.eval(args.get(i)?, binding);
+        // A string argument and its language tag; a base direction (RDF 1.2) is kept with
+        // the tag as `tag--dir`, so that string functions keep it and arguments with
+        // different directions are incompatible.
         let string = |term: &Term| -> Option<(String, Option<String>)> {
             match term {
-                Term::Literal(l) if l.language().is_some() => {
-                    Some((l.value().to_owned(), l.language().map(str::to_owned)))
-                }
+                Term::Literal(l) if l.language().is_some() => Some((
+                    l.value().to_owned(),
+                    l.language().map(|tag| match l.direction() {
+                        Some(direction) => format!("{tag}--{direction}"),
+                        None => tag.to_owned(),
+                    }),
+                )),
                 Term::Literal(l) if l.datatype() == xsd::STRING => {
                     Some((l.value().to_owned(), None))
                 }
@@ -308,9 +324,18 @@ impl Evaluator {
         };
         let plain = |value: String, language: Option<String>| -> Term {
             match language {
-                Some(language) => {
-                    Literal::new_language_tagged_literal_unchecked(value, language).into()
-                }
+                Some(language) => match language.split_once("--") {
+                    Some((tag, direction)) => match direction.parse() {
+                        Ok(direction) => {
+                            Literal::new_directional_language_tagged_literal_unchecked(
+                                value, tag, direction,
+                            )
+                            .into()
+                        }
+                        Err(_) => Literal::new_language_tagged_literal_unchecked(value, tag).into(),
+                    },
+                    None => Literal::new_language_tagged_literal_unchecked(value, language).into(),
+                },
                 None => Literal::new_simple_literal(value).into(),
             }
         };
@@ -606,6 +631,67 @@ impl Evaluator {
                     Literal::new_language_tagged_literal(value.value(), language)
                         .ok()
                         .map(Term::from)
+                })
+                .flatten()
+            }
+            // SPARQL 1.2: triple terms.
+            Function::Triple => {
+                let subject = match arg(0)? {
+                    Term::NamedNode(n) => nrese_rdf::NamedOrBlankNode::from(n),
+                    Term::BlankNode(b) => b.into(),
+                    Term::Literal(_) | Term::Triple(_) => return None,
+                };
+                let Term::NamedNode(predicate) = arg(1)? else {
+                    return None;
+                };
+                Some(nrese_rdf::Triple::new(subject, predicate, arg(2)?).into())
+            }
+            Function::Subject => match arg(0)? {
+                Term::Triple(t) => Some(Term::from(t.subject)),
+                _ => None,
+            },
+            Function::Predicate => match arg(0)? {
+                Term::Triple(t) => Some(t.predicate.into()),
+                _ => None,
+            },
+            Function::Object => match arg(0)? {
+                Term::Triple(t) => Some(t.object),
+                _ => None,
+            },
+            Function::IsTriple => arg(0).map(|t| boolean_term(matches!(t, Term::Triple(_)))),
+            // SPARQL 1.2: base directions.
+            Function::LangDir => match arg(0)? {
+                Term::Literal(l) => Some(
+                    Literal::new_simple_literal(l.direction().map_or("", |d| d.as_str())).into(),
+                ),
+                _ => None,
+            },
+            Function::HasLang => match arg(0)? {
+                Term::Literal(l) => Some(boolean_term(l.language().is_some())),
+                _ => Some(boolean_term(false)),
+            },
+            Function::HasLangDir => match arg(0)? {
+                Term::Literal(l) => Some(boolean_term(l.direction().is_some())),
+                _ => Some(boolean_term(false)),
+            },
+            Function::StrLangDir => {
+                let Term::Literal(value) = arg(0)? else {
+                    return None;
+                };
+                let (language, _) = string(&arg(1)?)?;
+                let (direction, _) = string(&arg(2)?)?;
+                let direction = direction.parse().ok()?;
+                (value.language().is_none()
+                    && value.datatype() == xsd::STRING
+                    && !language.is_empty())
+                .then(|| {
+                    Literal::new_directional_language_tagged_literal(
+                        value.value(),
+                        language,
+                        direction,
+                    )
+                    .ok()
+                    .map(Term::from)
                 })
                 .flatten()
             }

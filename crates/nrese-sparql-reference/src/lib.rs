@@ -38,7 +38,7 @@ use nrese_sparql_syntax::algebra::{
     PropertyPathExpression, QueryDataset,
 };
 use nrese_sparql_syntax::term::{
-    GraphNamePattern, GroundQuadPattern, GroundTerm, GroundTermPattern, NamedNodePattern,
+    GraphNamePattern, GroundQuadPattern, GroundTermPattern, NamedNodePattern,
     QuadPattern as PatternQuad, TermPattern, TriplePattern,
 };
 use nrese_sparql_syntax::{GraphUpdateOperation, Query, Update};
@@ -241,12 +241,7 @@ impl Dataset {
                 }
                 GraphUpdateOperation::DeleteData { data } => {
                     for quad in data {
-                        let object = match &quad.object {
-                            GroundTerm::NamedNode(n) => Term::from(n.clone()),
-                            GroundTerm::Literal(l) => l.clone().into(),
-                            #[allow(unreachable_patterns)]
-                            _ => continue,
-                        };
+                        let object = Term::from(quad.object.clone());
                         self.quads.remove(&Quad::new(
                             quad.subject.clone(),
                             quad.predicate.clone(),
@@ -730,12 +725,7 @@ impl<'d> Context<'d> {
                     let mut s = Solution::new();
                     for (v, value) in variables.iter().zip(row) {
                         if let Some(value) = value {
-                            let term: Term = match value {
-                                GroundTerm::NamedNode(n) => n.clone().into(),
-                                GroundTerm::Literal(l) => l.clone().into(),
-                                #[allow(unreachable_patterns)]
-                                _ => return None,
-                            };
+                            let term = Term::from(value.clone());
                             if outer.get(v).is_some_and(|o| o != &term) {
                                 return None;
                             }
@@ -1296,8 +1286,71 @@ fn bind_term(
         TermPattern::Literal(l) => matches!(value, Term::Literal(m) if m == l),
         TermPattern::BlankNode(b) => bind_variable(&blank_variable(b), value, solution, outer),
         TermPattern::Variable(v) => bind_variable(v, value, solution, outer),
-        #[allow(unreachable_patterns)]
-        _ => false,
+        // SPARQL 1.2: a triple term pattern matches a triple term part by part.
+        TermPattern::Triple(pattern) => match value {
+            Term::Triple(triple) => {
+                bind_term(
+                    &pattern.subject,
+                    &Term::from(triple.subject.clone()),
+                    solution,
+                    outer,
+                ) && bind_predicate(&pattern.predicate, &triple.predicate, solution, outer)
+                    && bind_term(&pattern.object, &triple.object, solution, outer)
+            }
+            _ => false,
+        },
+    }
+}
+
+/// A template's term with a solution's values; a blank node is fresh per solution
+/// (`fresh` maps its label). `None` if a variable is unbound or a triple term would get a
+/// subject that is no IRI or blank node.
+fn instantiate(
+    t: &TermPattern,
+    solution: &Solution,
+    fresh: &mut HashMap<String, BlankNode>,
+) -> Option<Term> {
+    Some(match t {
+        TermPattern::NamedNode(n) => n.clone().into(),
+        TermPattern::Literal(l) => l.clone().into(),
+        TermPattern::BlankNode(b) => fresh
+            .entry(b.as_str().to_owned())
+            .or_default()
+            .clone()
+            .into(),
+        TermPattern::Variable(v) => solution.get(v)?.clone(),
+        TermPattern::Triple(t) => Triple::new(
+            NamedOrBlankNode::try_from(instantiate(&t.subject, solution, fresh)?).ok()?,
+            predicate_of(&t.predicate, solution)?,
+            instantiate(&t.object, solution, fresh)?,
+        )
+        .into(),
+    })
+}
+
+/// A `DELETE` template's term with a solution's values.
+fn instantiate_ground(t: &GroundTermPattern, solution: &Solution) -> Option<Term> {
+    Some(match t {
+        GroundTermPattern::NamedNode(n) => n.clone().into(),
+        GroundTermPattern::Literal(l) => l.clone().into(),
+        GroundTermPattern::Variable(v) => solution.get(v)?.clone(),
+        GroundTermPattern::Triple(t) => Triple::new(
+            NamedOrBlankNode::try_from(instantiate_ground(&t.subject, solution)?).ok()?,
+            predicate_of(&t.predicate, solution)?,
+            instantiate_ground(&t.object, solution)?,
+        )
+        .into(),
+    })
+}
+
+/// A template's predicate with a solution's values.
+fn predicate_of(p: &NamedNodePattern, solution: &Solution) -> Option<NamedNode> {
+    match p {
+        NamedNodePattern::NamedNode(n) => Some(n.clone()),
+        NamedNodePattern::Variable(v) => match solution.get(v)? {
+            Term::NamedNode(n) => Some(n.clone()),
+            _ => None,
+        },
     }
 }
 
@@ -1420,22 +1473,7 @@ fn construct(template: &[TriplePattern], solutions: &[Solution]) -> Vec<Triple> 
     let mut seen = HashSet::new();
     for solution in solutions {
         let mut fresh: HashMap<String, BlankNode> = HashMap::new();
-        let mut term = |t: &TermPattern| -> Option<Term> {
-            match t {
-                TermPattern::NamedNode(n) => Some(n.clone().into()),
-                TermPattern::Literal(l) => Some(l.clone().into()),
-                TermPattern::BlankNode(b) => Some(
-                    fresh
-                        .entry(b.as_str().to_owned())
-                        .or_default()
-                        .clone()
-                        .into(),
-                ),
-                TermPattern::Variable(v) => solution.get(v).cloned(),
-                #[allow(unreachable_patterns)]
-                _ => None,
-            }
-        };
+        let mut term = |t: &TermPattern| instantiate(t, solution, &mut fresh);
         for triple in template {
             let (Some(s), Some(o)) = (term(&triple.subject), term(&triple.object)) else {
                 continue;
@@ -1460,15 +1498,7 @@ fn construct(template: &[TriplePattern], solutions: &[Solution]) -> Vec<Triple> 
 }
 
 fn ground_quad(quad: &GroundQuadPattern, solution: &Solution) -> Option<Quad> {
-    let term = |t: &GroundTermPattern| -> Option<Term> {
-        match t {
-            GroundTermPattern::NamedNode(n) => Some(n.clone().into()),
-            GroundTermPattern::Literal(l) => Some(l.clone().into()),
-            GroundTermPattern::Variable(v) => solution.get(v).cloned(),
-            #[allow(unreachable_patterns)]
-            _ => None,
-        }
-    };
+    let term = |t: &GroundTermPattern| instantiate_ground(t, solution);
     let subject = NamedOrBlankNode::try_from(term(&quad.subject)?).ok()?;
     let predicate = match &quad.predicate {
         NamedNodePattern::NamedNode(n) => n.clone(),
@@ -1491,22 +1521,7 @@ fn template_quad(
     solution: &Solution,
     fresh: &mut HashMap<String, BlankNode>,
 ) -> Option<Quad> {
-    let mut term = |t: &TermPattern| -> Option<Term> {
-        match t {
-            TermPattern::NamedNode(n) => Some(n.clone().into()),
-            TermPattern::Literal(l) => Some(l.clone().into()),
-            TermPattern::BlankNode(b) => Some(
-                fresh
-                    .entry(b.as_str().to_owned())
-                    .or_default()
-                    .clone()
-                    .into(),
-            ),
-            TermPattern::Variable(v) => solution.get(v).cloned(),
-            #[allow(unreachable_patterns)]
-            _ => None,
-        }
-    };
+    let mut term = |t: &TermPattern| instantiate(t, solution, fresh);
     let subject = NamedOrBlankNode::try_from(term(&quad.subject)?).ok()?;
     let object = term(&quad.object)?;
     let predicate = match &quad.predicate {

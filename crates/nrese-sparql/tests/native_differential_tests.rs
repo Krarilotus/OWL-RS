@@ -4013,3 +4013,175 @@ fn selective_filters_move_their_pattern_first() {
     );
     assert_eq!(optimised.len(), 1);
 }
+
+/// A random term of RDF 1.2 data: IRIs, numbers, plain, language-tagged and directional
+/// strings, blank nodes, and triple terms of them (nested up to `depth`).
+fn rdf12_object(rng: &mut Rng, depth: u32) -> Term {
+    match rng.below(if depth > 0 { 9 } else { 7 }) {
+        0 | 1 => ex(&format!("e{}", rng.below(4))).into(),
+        2 => Literal::new_typed_literal(rng.below(4).to_string(), xsd::INTEGER).into(),
+        3 => Literal::new_language_tagged_literal_unchecked(format!("s{}", rng.below(2)), "en")
+            .into(),
+        4 => Literal::new_directional_language_tagged_literal_unchecked(
+            format!("s{}", rng.below(2)),
+            "en",
+            *rng.pick(&[nrese_rdf::BaseDirection::Ltr, nrese_rdf::BaseDirection::Rtl]),
+        )
+        .into(),
+        5 => nrese_rdf::BlankNode::new_unchecked(format!("b{}", rng.below(3))).into(),
+        6 => Literal::new_simple_literal(format!("s{}", rng.below(2))).into(),
+        _ => rdf12_triple(rng, depth - 1).into(),
+    }
+}
+
+fn rdf12_triple(rng: &mut Rng, depth: u32) -> nrese_rdf::Triple {
+    let subject: nrese_rdf::NamedOrBlankNode = if rng.below(4) == 0 {
+        nrese_rdf::BlankNode::new_unchecked(format!("b{}", rng.below(3))).into()
+    } else {
+        ex(&format!("e{}", rng.below(4))).into()
+    };
+    nrese_rdf::Triple::new(
+        subject,
+        ex(&format!("p{}", rng.below(3))),
+        rdf12_object(rng, depth),
+    )
+}
+
+/// A part of a triple term pattern: a variable, a constant or a nested pattern.
+fn rdf12_part(rng: &mut Rng, depth: u32, object: bool) -> String {
+    match rng.below(if object && depth > 0 { 6 } else { 5 }) {
+        0..=2 => rng.pick(&["?s", "?o", "?x", "?y"]).to_string(),
+        3 => format!("<{EX}e{}>", rng.below(4)),
+        4 if object => rng
+            .pick(&["1", "\"s0\"@en", "\"s1\"@en--rtl", "\"s0\""])
+            .to_string(),
+        4 => format!("<{EX}e{}>", rng.below(4)),
+        _ => rdf12_pattern(rng, depth - 1),
+    }
+}
+
+fn rdf12_pattern(rng: &mut Rng, depth: u32) -> String {
+    let predicate = if rng.below(4) == 0 {
+        "?p".to_owned()
+    } else {
+        format!("<{EX}p{}>", rng.below(3))
+    };
+    format!(
+        "<<( {} {predicate} {} )>>",
+        rdf12_part(rng, depth, false),
+        rdf12_part(rng, depth, true)
+    )
+}
+
+/// The SPARQL 1.2 executor against the reference: triple-term patterns (variables at any
+/// depth, repeated, shared with plain positions, blank nodes), reified-triple syntax,
+/// triple terms in `VALUES`, and the functions on triple terms and base directions in
+/// `FILTER`, `BIND` and `ORDER BY`.
+#[test]
+fn triple_terms_and_base_directions_equal_the_reference() {
+    let mut rng = Rng(20_261_001);
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    let mut checked = 0;
+    let mut with_solutions = 0;
+    for dataset_case in 0..60 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for _ in 0..10 + rng.below(30) {
+            let quad = match rng.below(3) {
+                // A reification: a reifier, its triple term, a statement about it.
+                0 => {
+                    let reifier = ex(&format!("r{}", rng.below(5)));
+                    let triple = rdf12_triple(&mut rng, 2);
+                    tx.insert(
+                        Quad::new(
+                            reifier.clone(),
+                            ex("q"),
+                            rdf12_object(&mut rng, 0),
+                            GraphName::DefaultGraph,
+                        )
+                        .as_ref(),
+                    );
+                    Quad::new(
+                        reifier,
+                        NamedNode::new_unchecked(&reifies[1..reifies.len() - 1]),
+                        triple,
+                        GraphName::DefaultGraph,
+                    )
+                }
+                _ => {
+                    let t = rdf12_triple(&mut rng, 2);
+                    Quad::new(t.subject, t.predicate, t.object, GraphName::DefaultGraph)
+                }
+            };
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..40 {
+            let pattern = match rng.below(4) {
+                0 => format!(
+                    "?r {reifies} {} . ?r <{EX}q> ?z .",
+                    rdf12_pattern(&mut rng, 2)
+                ),
+                1 => format!("?x ?p {} .", rdf12_pattern(&mut rng, 2)),
+                2 => format!(
+                    "?r {reifies} ?t . ?r <{EX}q> ?z . FILTER(isTRIPLE(?t) && {})",
+                    rng.pick(&[
+                        "SUBJECT(?t) = ?r || isIRI(SUBJECT(?t))",
+                        "hasLANG(OBJECT(?t))",
+                        "LANGDIR(OBJECT(?t)) = \"rtl\"",
+                        "OBJECT(?t) = 1",
+                        "isTRIPLE(OBJECT(?t))",
+                    ])
+                ),
+                _ => format!(
+                    "?x ?p ?t . BIND(TRIPLE(?x, ?p, ?t) AS ?u) FILTER(?t != ?u) {}",
+                    rng.pick(&[
+                        "",
+                        "FILTER(hasLANGDIR(?t))",
+                        "FILTER(sameTerm(PREDICATE(?u), ?p))",
+                    ])
+                ),
+            };
+            // Ordered by every variable a pattern may bind, so ties are identical rows and
+            // the sequences must match.
+            let modifier = rng
+                .pick(&[
+                    "",
+                    " ORDER BY ?t ?u ?x ?z ?o ?s ?y ?r ?p",
+                    " ORDER BY DESC(?t) ?u ?x ?z ?o ?s ?y ?r ?p",
+                ])
+                .to_string();
+            let text = format!("SELECT * WHERE {{ {pattern} }}{modifier}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "runs natively: {text}");
+            let options = QueryOptions::default();
+            let ordered = !modifier.is_empty();
+            let native = rows(
+                evaluate_query(&snapshot, &query, &options).unwrap(),
+                ordered,
+            );
+            let expected = rows(reference(&snapshot, &query, &options).unwrap(), ordered);
+            if native != expected {
+                let at = native.iter().zip(&expected).position(|(a, b)| a != b);
+                panic!(
+                    "dataset {dataset_case}, query {query_case}: {text}\n{} rows against {}; \
+                     first difference at {at:?}:\n  native:    {:?}\n  reference: {:?}",
+                    native.len(),
+                    expected.len(),
+                    at.map(|i| &native[i]),
+                    at.map(|i| &expected[i]),
+                );
+            }
+            checked += 1;
+            with_solutions += usize::from(!expected.is_empty());
+        }
+    }
+    assert_eq!(checked, 60 * 40);
+    assert!(
+        with_solutions > checked / 4,
+        "{with_solutions} of {checked} with solutions"
+    );
+}

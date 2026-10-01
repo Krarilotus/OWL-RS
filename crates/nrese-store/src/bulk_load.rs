@@ -202,6 +202,26 @@ impl BlankNodeScope {
         BlankNode::new_unchecked(format!("{}{}", self.prefix, node.as_str()))
     }
 
+    /// `term` with its blank nodes, inside triple terms too, in this load's scope.
+    fn term(&self, term: Term) -> Term {
+        match term {
+            Term::BlankNode(node) => self.node(&node).into(),
+            Term::Triple(triple) => {
+                let triple = *triple;
+                nrese_rdf::Triple::new(
+                    match triple.subject {
+                        NamedOrBlankNode::BlankNode(node) => self.node(&node).into(),
+                        named => named,
+                    },
+                    triple.predicate,
+                    self.term(triple.object),
+                )
+                .into()
+            }
+            other => other,
+        }
+    }
+
     fn scope(&self, quad: Quad) -> Quad {
         let Quad {
             subject,
@@ -215,10 +235,7 @@ impl BlankNodeScope {
                 named => named,
             },
             predicate,
-            object: match object {
-                Term::BlankNode(node) => self.node(&node).into(),
-                other => other,
-            },
+            object: self.term(object),
             graph_name: match graph_name {
                 GraphName::BlankNode(node) => self.node(&node).into(),
                 other => other,
