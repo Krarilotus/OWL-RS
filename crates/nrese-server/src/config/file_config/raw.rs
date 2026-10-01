@@ -84,6 +84,10 @@ pub(super) struct RawFederationConfig {
 pub(super) struct RawShaclConfig {
     #[serde(default)]
     pub shapes_graph: Option<String>,
+    #[serde(default)]
+    pub gate: Option<String>,
+    #[serde(default)]
+    pub gate_severity: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

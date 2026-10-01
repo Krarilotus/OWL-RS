@@ -41,6 +41,12 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
         names::SHACL_SHAPES_GRAPH,
         config.shacl.shapes_graph,
     );
+    insert_option(&mut source, names::SHACL_GATE, config.shacl.gate);
+    insert_option(
+        &mut source,
+        names::SHACL_GATE_SEVERITY,
+        config.shacl.gate_severity,
+    );
 
     insert_option(&mut source, names::REASONING_MODE, config.reasoner.mode);
     insert_option(&mut source, names::REASONING_RULES, config.reasoner.rules);

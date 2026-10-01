@@ -145,6 +145,11 @@ api_key = "replace-me"
 - default: `67108864` (64 MiB); `0` disables the cache
 - serialised results of repeated queries on an unchanged store are answered from memory. Every commit starts a new revision, so a cached result is never stale; queries using `NOW()`, `RAND()`, `UUID()`, `STRUUID()` or `BNODE()` are not cached, and no single result takes more than an eighth of the budget
 
+- file keys: `shacl.gate`, `shacl.gate_severity`
+- env overrides: `NRESE_SHACL_GATE`, `NRESE_SHACL_GATE_SEVERITY`
+- default: `off`; severity `violation`
+- SHACL as a commit gate: `report` validates every commit against the shapes graph (`shacl.shapes_graph`) and logs what it introduces; `enforce` also rejects a commit that introduces a result at or above `gate_severity` (`violation`, `warning` or `info`), or a validation failure, and the commit changes nothing. Only what a commit introduces counts: data that was invalid before doesn't block writes (validation at `/dataset/shacl` reports it). The check validates the focus nodes the commit can affect, after reasoning; a commit that changes the shapes graph is validated in full
+
 - file key: `store.verify_on_open`
 - env override: `NRESE_VERIFY_ON_OPEN`
 - default: `false`

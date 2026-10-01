@@ -6,10 +6,11 @@
 //!
 //! [`StoreConfig::shapes_graph`]: crate::StoreConfig::shapes_graph
 
-use nrese_engine::{GraphSelector, ReadModel, TermId};
+use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, TermId, Transaction};
 use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
 use nrese_shacl::{
     PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, validate,
+    validate_changes,
 };
 use nrese_sparql::ReadView;
 
@@ -164,6 +165,54 @@ fn validate_view<V: ReadView>(
     };
     data.model = request.read_model;
     Ok((validate(view, &shapes, data), shapes.len()))
+}
+
+/// What the commit in `tx` introduces against the shapes in the graph `shapes_graph` (the
+/// commit gate, C2): the results present after it and not before, over every data graph.
+/// If the commit changes the shapes, both states are validated in full; otherwise only the
+/// focus nodes the changes can affect ([`validate_changes`]). `None` without shapes.
+pub(crate) fn introduced(
+    tx: &Transaction<'_>,
+    shapes_graph: &str,
+) -> StoreResult<Option<ValidationReport>> {
+    let iri = graph_iri(shapes_graph)?;
+    let Some(shapes_id) = tx.lookup(iri.as_ref().into()) else {
+        return Ok(None);
+    };
+    let before = tx.base();
+    let after = tx.pending_snapshot();
+    let data = Selection::of(GraphSelector::Any).excluding(shapes_id);
+    let shapes_selection = Selection::asserted(GraphSelector::Exact(shapes_id));
+    let shapes_changed = tx
+        .inserted()
+        .chain(tx.deleted())
+        .any(|quad| quad.graph == shapes_id);
+    if shapes_changed {
+        let shapes_after = compile(&after, shapes_selection).map_err(shapes_error)?;
+        let mut report = validate(&after, &shapes_after, data);
+        // Shapes that didn't compile before had no results.
+        if let Ok(shapes_before) = compile(before, shapes_selection) {
+            let earlier = validate(before, &shapes_before, data).results;
+            report.results.retain(|result| !earlier.contains(result));
+        }
+        return Ok(Some(report));
+    }
+    let shapes = compile(before, shapes_selection).map_err(shapes_error)?;
+    if shapes.is_empty() {
+        return Ok(None);
+    }
+    let changed: Vec<EncodedQuad> = tx
+        .inserted()
+        .chain(tx.deleted())
+        .chain(
+            tx.inferred_inserted()
+                .chain(tx.inferred_deleted())
+                .map(nrese_engine::EncodedTriple::in_default_graph),
+        )
+        .collect();
+    Ok(Some(validate_changes(
+        before, &after, &shapes, data, &changed,
+    )))
 }
 
 impl StoreService {
