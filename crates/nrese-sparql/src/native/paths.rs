@@ -160,8 +160,20 @@ impl PathEvaluator<'_> {
         nodes
     }
 
-    /// The number of [`Self::nodes`], without collecting them.
+    /// The number of [`Self::nodes`], without collecting them (from the engine's
+    /// statistics where the graph is one graph or all of them).
     fn node_count(&self) -> u64 {
+        let graphs = match self.graph {
+            PathGraph::Default => Some(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
+            PathGraph::Named(graph) => Some(GraphSelector::Exact(graph)),
+            PathGraph::Merged(None) => Some(GraphSelector::Any),
+            PathGraph::Merged(Some(_)) => None,
+        };
+        if let Some(count) =
+            graphs.and_then(|graphs| self.snapshot.node_count_in(self.model, graphs))
+        {
+            return count;
+        }
         let (subjects, objects) = self.subjects_and_objects();
         let mut count = 0;
         merge_union(&subjects, &objects, |_| count += 1);
@@ -170,18 +182,20 @@ impl PathEvaluator<'_> {
 
     /// The distinct subjects and the distinct objects of the graph, each sorted.
     fn subjects_and_objects(&self) -> (Vec<u64>, Vec<u64>) {
+        // Reads the statements: for a set of graphs, which the walks don't know, and where
+        // the walks can't answer.
+        let read = || {
+            let (mut subjects, mut objects): (Vec<u64>, Vec<u64>) =
+                self.quads(None, None, None).map(|(s, _, o)| (s, o)).unzip();
+            for values in [&mut subjects, &mut objects] {
+                values.sort_unstable();
+                values.dedup();
+            }
+            (subjects, objects)
+        };
         let (pattern, by_subject, by_object) = match self.graph {
             PathGraph::Merged(None) => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
-            // The statistics know no set of graphs: read its statements.
-            PathGraph::Merged(Some(_)) => {
-                let (mut subjects, mut objects): (Vec<u64>, Vec<u64>) =
-                    self.quads(None, None, None).map(|(s, _, o)| (s, o)).unzip();
-                for values in [&mut subjects, &mut objects] {
-                    values.sort_unstable();
-                    values.dedup();
-                }
-                return (subjects, objects);
-            }
+            PathGraph::Merged(Some(_)) => return read(),
             PathGraph::Default => (
                 QuadPattern::in_graph(TermId::DEFAULT_GRAPH),
                 Permutation::Gspo,
@@ -193,15 +207,16 @@ impl PathEvaluator<'_> {
                 Permutation::Gosp,
             ),
         };
-        let distinct = |permutation| -> Vec<u64> {
-            self.snapshot
-                .group_counts_in(self.model, &pattern, permutation)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(id, _)| id.raw())
-                .collect()
+        let distinct = |permutation| -> Option<Vec<u64>> {
+            let counts = self
+                .snapshot
+                .group_counts_in(self.model, &pattern, permutation)?;
+            Some(counts.into_iter().map(|(id, _)| id.raw()).collect())
         };
-        (distinct(by_subject), distinct(by_object))
+        match (distinct(by_subject), distinct(by_object)) {
+            (Some(subjects), Some(objects)) => (subjects, objects),
+            _ => read(),
+        }
     }
 
     /// The number of pairs [`Self::open`] gives for a closure (`p+`, `p*`), from the

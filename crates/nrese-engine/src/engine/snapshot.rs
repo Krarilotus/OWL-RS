@@ -379,6 +379,45 @@ impl Snapshot {
         Some(out)
     }
 
+    /// The number of distinct terms used as subject or object in `graphs` (one graph, or
+    /// every graph) in `model`: what zero-length property paths start from. Exact; kept
+    /// for this version once computed. The two walks (subjects, objects) run in parallel.
+    /// `None` where [`Self::group_counts_in`] can't walk the graphs.
+    pub fn node_count_in(&self, model: ReadModel, graphs: GraphSelector) -> Option<u64> {
+        self.statistics
+            .node_count(&self.version, model, graphs, || {
+                let (pattern, by_subject, by_object) = match graphs {
+                    GraphSelector::Exact(graph) => (
+                        QuadPattern::in_graph(graph),
+                        Permutation::Gspo,
+                        Permutation::Gosp,
+                    ),
+                    _ => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
+                };
+                let distinct = |permutation| -> Option<Vec<TermId>> {
+                    let counts = self.group_counts_in(model, &pattern, permutation)?;
+                    Some(counts.into_iter().map(|(id, _)| id).collect())
+                };
+                let (subjects, objects) =
+                    rayon::join(|| distinct(by_subject), || distinct(by_object));
+                let (subjects, objects) = (subjects?, objects?);
+                // |S ∪ O| by a merge of the two sorted lists.
+                let (mut i, mut j, mut both) = (0, 0, 0u64);
+                while i < subjects.len() && j < objects.len() {
+                    match subjects[i].cmp(&objects[j]) {
+                        std::cmp::Ordering::Less => i += 1,
+                        std::cmp::Ordering::Greater => j += 1,
+                        std::cmp::Ordering::Equal => {
+                            both += 1;
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                }
+                Some(subjects.len() as u64 + objects.len() as u64 - both)
+            })
+    }
+
     /// The number of distinct values of the first unbound component of `pattern` in
     /// `permutation`'s order, among its matches in `model`: a walk over each run's groups,
     /// with d values of memory. Exact unless deleted quads still shadow values in unmerged
