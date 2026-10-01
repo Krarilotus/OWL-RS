@@ -16,6 +16,8 @@ mod input;
 mod ntriples;
 mod parser;
 mod serializer;
+mod text;
+mod turtle;
 
 pub use error::{RdfParseError, RdfSyntaxError, TextPosition};
 pub use format::RdfFormat;

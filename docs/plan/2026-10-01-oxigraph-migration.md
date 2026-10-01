@@ -272,3 +272,14 @@ slower in places; profiling-led rewrites made them faster:
 What remains above 1 is within noise, except random invalid IRI text (about 10% slower).
 Canonicalising a 1,000-node blank chain takes 47 ms here and 6.9 s in oxrdf, which also
 overflows a 1 MiB stack on it.
+
+**Step 3a, 3b (N-Triples, N-Quads, Turtle, TriG).**
+- W3C RDF 1.1 suites, every test: N-Triples 70/70, N-Quads 87/87, Turtle 313/313, TriG
+  357/357.
+- Each document also goes through a reader that gives one byte per call (every token cut
+  by the buffer); each document that parses is written back in its own format and as
+  N-Quads, and read again.
+- The suite manifests are read with this crate's own Turtle parser; oxttl is no longer
+  needed.
+- Nesting is limited (128 by default, configurable), so hostile input gets an error rather
+  than a stack overflow.

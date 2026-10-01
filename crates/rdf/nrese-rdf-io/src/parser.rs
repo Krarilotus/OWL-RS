@@ -13,6 +13,7 @@ use crate::error::{RdfParseError, RdfSyntaxError, TextPosition};
 use crate::format::RdfFormat;
 use crate::input::Lines;
 use crate::ntriples::LineParser;
+use crate::turtle::{TurtleParser, TurtleSettings};
 
 /// How to read a document: its format, and the settings that apply to every format.
 #[derive(Debug, Clone)]
@@ -23,7 +24,12 @@ pub struct RdfParser {
     without_named_graphs: bool,
     blank_nodes: BlankNodes,
     unchecked: bool,
+    max_nesting: usize,
 }
+
+/// How deep `[ … ]` and `( … )` may nest in Turtle and TriG by default: far beyond real
+/// data (lists are flat), and safe for the stack of any thread, debug builds included.
+const MAX_NESTING: usize = 128;
 
 impl RdfParser {
     pub fn from_format(format: RdfFormat) -> Self {
@@ -34,6 +40,7 @@ impl RdfParser {
             without_named_graphs: false,
             blank_nodes: BlankNodes::AsWritten,
             unchecked: false,
+            max_nesting: MAX_NESTING,
         }
     }
 
@@ -73,14 +80,52 @@ impl RdfParser {
         self
     }
 
+    /// How deep blank node property lists and collections may nest (Turtle, TriG): deeper
+    /// input is an error rather than a risk to the stack. 128 by default; parsing is
+    /// recursive, so a higher limit needs a thread with a stack to match.
+    pub fn with_max_nesting(mut self, depth: usize) -> Self {
+        self.max_nesting = depth;
+        self
+    }
+
     /// Parses `bytes`.
     pub fn for_slice(self, bytes: &[u8]) -> QuadParser<'_, io::Empty> {
-        self.parser(Lines::from_slice(bytes, 0))
+        match self.format {
+            RdfFormat::Turtle | RdfFormat::TriG => {
+                let settings = self.turtle_settings();
+                self.wrap(Inner::Turtle(TurtleParser::from_slice(bytes, settings)))
+            }
+            _ => self.parser(Lines::from_slice(bytes, 0)),
+        }
     }
 
     /// Parses what `reader` gives (buffered here: an unbuffered reader is fine).
     pub fn for_reader<R: Read>(self, reader: R) -> QuadParser<'static, R> {
-        self.parser(Lines::from_reader(reader, 0))
+        match self.format {
+            RdfFormat::Turtle | RdfFormat::TriG => {
+                let settings = self.turtle_settings();
+                self.wrap(Inner::Turtle(TurtleParser::from_reader(reader, settings)))
+            }
+            _ => self.parser(Lines::from_reader(reader, 0)),
+        }
+    }
+
+    fn turtle_settings(&self) -> TurtleSettings {
+        TurtleSettings {
+            trig: self.format == RdfFormat::TriG,
+            base: self.base_iri.clone(),
+            blank_nodes: self.blank_nodes.clone(),
+            unchecked: self.unchecked,
+            max_depth: self.max_nesting,
+        }
+    }
+
+    fn wrap<'a, R: Read>(self, inner: Inner<'a, R>) -> QuadParser<'a, R> {
+        QuadParser {
+            inner,
+            default_graph: self.default_graph,
+            without_named_graphs: self.without_named_graphs,
+        }
     }
 
     /// `bytes` in up to `parts` chunks that parse independently (cut at line ends), for
@@ -160,16 +205,12 @@ impl RdfParser {
                 parser: LineParser::new(
                     self.format == RdfFormat::NQuads,
                     self.unchecked,
-                    self.blank_nodes,
+                    self.blank_nodes.clone(),
                 ),
             },
             other => Inner::Unsupported(Some(other)),
         };
-        QuadParser {
-            inner,
-            default_graph: self.default_graph,
-            without_named_graphs: self.without_named_graphs,
-        }
+        self.wrap(inner)
     }
 }
 
@@ -204,6 +245,7 @@ enum Inner<'a, R> {
         lines: Lines<'a, R>,
         parser: LineParser,
     },
+    Turtle(TurtleParser<'a, R>),
     /// A format this crate doesn't read yet: one error, then the end.
     Unsupported(Option<RdfFormat>),
 }
@@ -233,6 +275,10 @@ impl<R: Read> QuadParser<'_, R> {
                 )
                 .into()));
             }
+            Inner::Turtle(parser) => match parser.next_ref()? {
+                Ok(quad) => (quad, TextPosition::default()),
+                Err(error) => return Some(Err(error)),
+            },
             Inner::Lines { lines, parser } => {
                 // Find the next line with a statement without holding a borrow.
                 let range = loop {
