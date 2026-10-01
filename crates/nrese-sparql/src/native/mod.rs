@@ -78,9 +78,9 @@ use value::Value;
 /// probing the index once per result row instead of scanning it.
 const PROBE_FACTOR: u64 = 32;
 
-/// Rows of the first pattern in the first morsel of a basic graph pattern under LIMIT
-/// (at least the limit; each later morsel doubles).
-const MIN_MORSEL: usize = 4096;
+/// Rows of the first pattern in the first (and smallest) morsel of a basic graph pattern
+/// under LIMIT.
+const MIN_MORSEL: usize = 1024;
 
 /// A range scan over at least this many id ranges scans the whole pattern and keeps the
 /// rows whose object is in one ([`IdSet`]).
@@ -2153,17 +2153,27 @@ impl<'a> Context<'a> {
             }
             Ok(result)
         };
-        // LIMIT (`eval_limited`): any `limit` rows will do. The first pattern's rows go
-        // through the joins in morsels, each twice the last, until enough come out; the
-        // joins after a selective first pattern then never see most of its rows.
-        let Some(limit) = limit.filter(|&limit| {
-            order.len() > 1 && result.table.width() > 0 && result.table.len() > limit
-        }) else {
+        // LIMIT (`eval_limited`): any `limit` rows will do. One pattern: its first rows.
+        // Several: the first pattern's rows go through the joins in morsels until enough
+        // come out. The first morsel is small; each next one is sized by the rows still
+        // needed over the rows a first-pattern row has yielded so far (the fan-out), at
+        // most eight times the last. Small morsels also make the later joins probe the
+        // index instead of scanning whole patterns.
+        let Some(limit) = limit.filter(|_| result.table.width() > 0) else {
             return join_rest(result, filters);
         };
+        if order.len() == 1 {
+            if result.table.len() > limit {
+                result.table.slice(0, Some(limit));
+            }
+            return Ok(result);
+        }
+        if result.table.len() <= MIN_MORSEL {
+            return join_rest(result, filters);
+        }
         let sorted = result.table.sorted_by().to_vec();
         let mut parts: Vec<Solutions> = Vec::new();
-        let (mut rows, mut from, mut size) = (0, 0, limit.max(MIN_MORSEL));
+        let (mut rows, mut from, mut size) = (0, 0, MIN_MORSEL);
         let mut applied = None;
         while from < result.table.len() && rows < limit {
             let to = (from + size).min(result.table.len());
@@ -2185,7 +2195,13 @@ impl<'a> Context<'a> {
             rows += part.table.len();
             parts.push(part);
             from = to;
-            size = size.saturating_mul(2);
+            // Rows still needed over the fan-out so far, with a quarter to spare.
+            let wanted = match rows {
+                0 => usize::MAX,
+                rows => (limit.saturating_sub(rows) as f64 * from as f64 / rows as f64 * 1.25)
+                    .ceil() as usize,
+            };
+            size = wanted.clamp(MIN_MORSEL, size.saturating_mul(8));
         }
         if let Some(applied) = applied {
             *filters = applied;
