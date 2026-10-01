@@ -1,0 +1,16 @@
+[package]
+name = "nrese-rdf-io"
+description = "NRESE's RDF readers and writers: N-Triples, N-Quads, Turtle, TriG, RDF/XML, JSON-LD"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+memchr = "2.8"
+nrese-rdf = { path = "../nrese-rdf", default-features = false }
+thiserror.workspace = true
+
+[dev-dependencies]
+# Reads the W3C manifests (Turtle) until this crate reads Turtle itself (step 3b).
+oxttl = "=0.2.3"
+oxrdf = "=0.3.3"

@@ -1060,6 +1060,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-rdf-io"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "nrese-rdf",
+ "oxrdf",
+ "oxttl",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "nrese-reasoner"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,301 @@
+//! The parser: settings, then a document from a slice, a reader, or in chunks for parsing
+//! in parallel.
+
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Take};
+use std::path::Path;
+
+use memchr::memchr2;
+use nrese_rdf::{GraphName, Iri, IriParseError, Quad, QuadRef};
+
+use crate::blank::BlankNodes;
+use crate::error::{RdfParseError, RdfSyntaxError, TextPosition};
+use crate::format::RdfFormat;
+use crate::input::Lines;
+use crate::ntriples::LineParser;
+
+/// How to read a document: its format, and the settings that apply to every format.
+#[derive(Debug, Clone)]
+pub struct RdfParser {
+    format: RdfFormat,
+    base_iri: Option<Iri<String>>,
+    default_graph: GraphName,
+    without_named_graphs: bool,
+    blank_nodes: BlankNodes,
+    unchecked: bool,
+}
+
+impl RdfParser {
+    pub fn from_format(format: RdfFormat) -> Self {
+        Self {
+            format,
+            base_iri: None,
+            default_graph: GraphName::DefaultGraph,
+            without_named_graphs: false,
+            blank_nodes: BlankNodes::AsWritten,
+            unchecked: false,
+        }
+    }
+
+    pub fn format(&self) -> RdfFormat {
+        self.format
+    }
+
+    /// The base IRI relative IRIs are resolved against (formats that have them).
+    pub fn with_base_iri(mut self, base_iri: impl Into<String>) -> Result<Self, IriParseError> {
+        self.base_iri = Some(Iri::parse(base_iri.into())?);
+        Ok(self)
+    }
+
+    /// The graph for statements the document puts in the default graph.
+    pub fn with_default_graph(mut self, graph: impl Into<GraphName>) -> Self {
+        self.default_graph = graph.into();
+        self
+    }
+
+    /// A statement in a named graph is an error (for a payload that is one graph).
+    pub fn without_named_graphs(mut self) -> Self {
+        self.without_named_graphs = true;
+        self
+    }
+
+    /// Fresh blank nodes for this document: a label means the same node throughout the
+    /// document, and another one than in any other document.
+    pub fn rename_blank_nodes(mut self) -> Self {
+        self.blank_nodes = BlankNodes::fresh();
+        self
+    }
+
+    /// Takes IRIs as they are written, without checking they are well formed: faster, for
+    /// input known to be valid.
+    pub fn unchecked(mut self) -> Self {
+        self.unchecked = true;
+        self
+    }
+
+    /// Parses `bytes`.
+    pub fn for_slice(self, bytes: &[u8]) -> QuadParser<'_, io::Empty> {
+        self.parser(Lines::from_slice(bytes, 0))
+    }
+
+    /// Parses what `reader` gives (buffered here: an unbuffered reader is fine).
+    pub fn for_reader<R: Read>(self, reader: R) -> QuadParser<'static, R> {
+        self.parser(Lines::from_reader(reader, 0))
+    }
+
+    /// `bytes` in up to `parts` chunks that parse independently (cut at line ends), for
+    /// N-Triples and N-Quads; with renamed blank nodes, every chunk names a label alike.
+    pub fn split_slice_for_parallel_parsing(
+        self,
+        bytes: &[u8],
+        parts: usize,
+    ) -> Result<Vec<QuadParser<'_, io::Empty>>, RdfParseError> {
+        self.line_based()?;
+        let bounds = boundaries(bytes.len() as u64, parts, |at| {
+            Ok(memchr2(b'\n', b'\r', &bytes[at as usize..])
+                .map_or(bytes.len() as u64, |i| at + i as u64 + 1))
+        })?;
+        Ok(bounds
+            .windows(2)
+            .map(|w| {
+                let (start, end) = (w[0] as usize, w[1] as usize);
+                self.clone()
+                    .parser(Lines::from_slice(&bytes[start..end], w[0]))
+            })
+            .collect())
+    }
+
+    /// The file at `path` in up to `parts` chunks that parse independently, each read
+    /// through its own handle (see [`RdfParser::split_slice_for_parallel_parsing`]).
+    pub fn split_file_for_parallel_parsing(
+        self,
+        path: &Path,
+        parts: usize,
+    ) -> Result<Vec<QuadParser<'static, Take<BufReader<File>>>>, RdfParseError> {
+        self.line_based()?;
+        let mut file = File::open(path)?;
+        let length = file.metadata()?.len();
+        let mut probe = [0_u8; 4096];
+        let bounds = boundaries(length, parts, |at| {
+            // The first line end at or after `at`.
+            file.seek(SeekFrom::Start(at))?;
+            let mut position = at;
+            loop {
+                let read = file.read(&mut probe)?;
+                if read == 0 {
+                    return Ok(length);
+                }
+                if let Some(i) = memchr2(b'\n', b'\r', &probe[..read]) {
+                    return Ok(position + i as u64 + 1);
+                }
+                position += read as u64;
+            }
+        })?;
+        bounds
+            .windows(2)
+            .map(|w| {
+                let mut file = File::open(path)?;
+                file.seek(SeekFrom::Start(w[0]))?;
+                let reader = BufReader::with_capacity(256 * 1024, file).take(w[1] - w[0]);
+                Ok(self.clone().parser(Lines::from_reader(reader, w[0])))
+            })
+            .collect()
+    }
+
+    fn line_based(&self) -> Result<(), RdfParseError> {
+        match self.format {
+            RdfFormat::NTriples | RdfFormat::NQuads => Ok(()),
+            other => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{other} can't be split for parallel parsing"),
+            )
+            .into()),
+        }
+    }
+
+    fn parser<'a, R: Read>(self, lines: Lines<'a, R>) -> QuadParser<'a, R> {
+        let inner = match self.format {
+            RdfFormat::NTriples | RdfFormat::NQuads => Inner::Lines {
+                lines,
+                parser: LineParser::new(
+                    self.format == RdfFormat::NQuads,
+                    self.unchecked,
+                    self.blank_nodes,
+                ),
+            },
+            other => Inner::Unsupported(Some(other)),
+        };
+        QuadParser {
+            inner,
+            default_graph: self.default_graph,
+            without_named_graphs: self.without_named_graphs,
+        }
+    }
+}
+
+/// Chunk bounds: `0`, a line end at or after each `length × k / parts`, then `length`.
+fn boundaries(
+    length: u64,
+    parts: usize,
+    mut line_end_from: impl FnMut(u64) -> io::Result<u64>,
+) -> io::Result<Vec<u64>> {
+    let parts = parts.max(1) as u64;
+    let mut bounds = vec![0];
+    for k in 1..parts {
+        let nominal = length * k / parts;
+        let last = *bounds.last().unwrap_or(&0);
+        if nominal <= last {
+            continue;
+        }
+        let at = line_end_from(nominal)?;
+        if at > last && at < length {
+            bounds.push(at);
+        }
+    }
+    bounds.push(length);
+    Ok(bounds)
+}
+
+// One per parser, never in a collection: boxing the large variant would only add an
+// indirection on the hot path.
+#[allow(clippy::large_enum_variant)]
+enum Inner<'a, R> {
+    Lines {
+        lines: Lines<'a, R>,
+        parser: LineParser,
+    },
+    /// A format this crate doesn't read yet: one error, then the end.
+    Unsupported(Option<RdfFormat>),
+}
+
+/// The quads of one document. [`QuadParser::next_ref`] borrows each quad from the parser's
+/// buffers (no allocation per term); as an `Iterator` it gives owned quads.
+pub struct QuadParser<'a, R> {
+    inner: Inner<'a, R>,
+    default_graph: GraphName,
+    without_named_graphs: bool,
+}
+
+impl<R: Read> QuadParser<'_, R> {
+    /// The next quad, borrowed until the next call; `None` at the end.
+    pub fn next_ref(&mut self) -> Option<Result<QuadRef<'_>, RdfParseError>> {
+        let Self {
+            inner,
+            default_graph,
+            without_named_graphs,
+        } = self;
+        let (quad, at) = match inner {
+            Inner::Unsupported(format) => {
+                let format = format.take()?;
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("reading {format} is not implemented yet"),
+                )
+                .into()));
+            }
+            Inner::Lines { lines, parser } => {
+                // Find the next line with a statement without holding a borrow.
+                let range = loop {
+                    match lines.next() {
+                        Ok(Some(range)) => {
+                            if has_statement(lines.slice(range.clone())) {
+                                break range;
+                            }
+                        }
+                        Ok(None) => return None,
+                        Err(error) => return Some(Err(error.into())),
+                    }
+                };
+                let (line, offset) = lines.position();
+                match parser.parse(lines.slice(range), line, offset) {
+                    Ok(Some(quad)) => (
+                        quad,
+                        TextPosition {
+                            line,
+                            column: 0,
+                            offset,
+                        },
+                    ),
+                    Ok(None) => unreachable!("a line with a statement"),
+                    Err(error) => return Some(Err(error.into())),
+                }
+            }
+        };
+        Some(place(quad, default_graph, *without_named_graphs, at))
+    }
+}
+
+/// The quad in the graph the settings say.
+fn place<'b>(
+    mut quad: QuadRef<'b>,
+    default_graph: &'b GraphName,
+    without_named_graphs: bool,
+    at: TextPosition,
+) -> Result<QuadRef<'b>, RdfParseError> {
+    if quad.graph_name.is_default_graph() {
+        quad.graph_name = default_graph.as_ref();
+    } else if without_named_graphs {
+        return Err(RdfSyntaxError::new(
+            format!("a statement in the named graph {}", quad.graph_name),
+            at..at,
+        )
+        .into());
+    }
+    Ok(quad)
+}
+
+/// Whether a line holds a statement (not only whitespace or a comment).
+fn has_statement(line: &[u8]) -> bool {
+    match line.iter().find(|&&b| b != b' ' && b != b'\t') {
+        None | Some(b'#') => false,
+        Some(_) => true,
+    }
+}
+
+impl<R: Read> Iterator for QuadParser<'_, R> {
+    type Item = Result<Quad, RdfParseError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.next_ref()?.map(QuadRef::into_owned))
+    }
+}

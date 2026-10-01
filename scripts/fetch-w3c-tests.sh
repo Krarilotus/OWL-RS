@@ -1,31 +1,39 @@
 #!/usr/bin/env bash
 # Fetches the W3C test suites at pinned commits into .cache, where the suite runners look
 # for them:
-# - RDF/SPARQL (w3c/rdf-tests) into .cache/rdf-tests (override: NRESE_W3C_TESTS)
+# - RDF/SPARQL (w3c/rdf-tests) into .cache/rdf-tests (override: NRESE_W3C_TESTS): the
+#   SPARQL 1.1 suites, and the RDF 1.1 and 1.2 syntax suites (N-Triples, N-Quads, Turtle,
+#   TriG, RDF/XML) for nrese-rdf-io
+# - JSON-LD 1.1 (w3c/json-ld-api) into .cache/json-ld-api (override: NRESE_W3C_JSONLD_TESTS)
 # - SHACL (w3c/data-shapes) into .cache/data-shapes (the runner's override,
 #   NRESE_W3C_SHACL_TESTS, names the suite's `tests` directory)
 set -euo pipefail
 
 CACHE="$(dirname "$0")/../.cache"
 
-# fetch <repository> <commit> <target directory> <sparse path>
+# fetch <repository> <commit> <target directory> <sparse path>...
 fetch() {
-  local repository=$1 commit=$2 target=$3 path=$4
+  local repository=$1 commit=$2 target=$3
+  shift 3
   if [ -d "$target/.git" ] && [ "$(git -C "$target" rev-parse HEAD)" = "$commit" ]; then
+    # Already there: make sure every path is checked out (missing blobs are fetched).
+    git -C "$target" sparse-checkout set "$@"
     echo "$repository already at $commit in $target"
     return
   fi
   rm -rf "$target"
   git init -q "$target"
   git -C "$target" remote add origin "https://github.com/$repository.git"
-  git -C "$target" sparse-checkout set "$path"
+  git -C "$target" sparse-checkout set "$@"
   git -C "$target" fetch -q --depth 1 --filter=blob:none origin "$commit"
   git -C "$target" checkout -q FETCH_HEAD
   echo "$repository $commit in $target"
 }
 
 fetch w3c/rdf-tests 369a90d1a60c021b746df2e411da0ff36258a758 \
-  "${NRESE_W3C_TESTS:-$CACHE/rdf-tests}" sparql/sparql11
+  "${NRESE_W3C_TESTS:-$CACHE/rdf-tests}" sparql/sparql11 rdf/rdf11 rdf/rdf12
+fetch w3c/json-ld-api ffdb326121ea89b7b8280e76a5caea923834bcef \
+  "${NRESE_W3C_JSONLD_TESTS:-$CACHE/json-ld-api}" tests
 fetch w3c/data-shapes d556a1fc90c5d5ffdf388124cbb687cf43c5a35e \
   "$CACHE/data-shapes" data-shapes-test-suite/tests
 
