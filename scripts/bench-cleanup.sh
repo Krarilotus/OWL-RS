@@ -14,7 +14,7 @@
 # prunes "everything unused": other projects' containers, volumes and images are not its
 # business.
 #   containers  <system>-sc, <system>-sc-load, rsc-*      (with their anonymous volumes)
-#   volumes     sc-*, qlever-index-*, nrese-target, nrese-cargo, jena-dist,
+#   volumes     sc-*, qlever-index-*, nrese-target, nrese-oxigraph-target, nrese-cargo, jena-dist,
 #               and the dataset volume nrese-bench-data
 #   images      nrese-bench/* (built here), and the images a run pulled itself (it notes
 #               them in tmp/bench-pulled-images; an image that was already on the
@@ -70,7 +70,7 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   for name in $(docker ps -a --format '{{.Names}}' | grep -E -- '(-sc|-sc-load)$|^rsc-' || true); do
     run docker rm -f -v "$name"
   done
-  for volume in $(docker volume ls -q | grep -E '^(sc-.*|qlever-index-.*|nrese-target|nrese-cargo|jena-dist)$' || true); do
+  for volume in $(docker volume ls -q | grep -E '^(sc-.*|qlever-index-.*|nrese-target|nrese-oxigraph-target|nrese-cargo|jena-dist)$' || true); do
     run docker volume rm -f "$volume"
   done
   if [ -z "$KEEP" ] && docker volume inspect nrese-bench-data >/dev/null 2>&1; then

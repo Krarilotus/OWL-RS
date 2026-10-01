@@ -26,7 +26,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from .adapters import ADAPTERS, Context, Endpoint, adapter, count_all
+from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all
 from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime,
                       run_quiet, shell)
 from .schema import Result, Writer
@@ -143,18 +143,20 @@ class Suite:
     def say(self, text: str):
         print(text, flush=True)
 
-    def host_command(self, command: list[str], log: Path | None = None, timeout: float | None = None) -> int:
-        """Runs a command on the host from the repository root (echoed in a dry run)."""
+    def host_command(self, command: list[str], log: Path | None = None, timeout: float | None = None,
+                     cwd: Path | None = None) -> int:
+        """Runs a command on the host, from the repository root unless `cwd` says otherwise
+        (echoed in a dry run)."""
         if command[0] == "bash":
             command = [bash(), *command[1:]]
         if self.args.dry_run:
             self.say(f"    [host] {shell(command)}")
             return 0
         if log is None:
-            return subprocess.run(command, cwd=self.root, timeout=timeout).returncode
+            return subprocess.run(command, cwd=cwd or self.root, timeout=timeout).returncode
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "w", encoding="utf-8", errors="replace") as f:
-            return subprocess.run(command, cwd=self.root, stdout=f, stderr=subprocess.STDOUT,
+            return subprocess.run(command, cwd=cwd or self.root, stdout=f, stderr=subprocess.STDOUT,
                                   timeout=timeout).returncode
 
     def emit(self, base: dict, **fields):
@@ -197,27 +199,31 @@ class Suite:
             self.made_images.append(image)
 
     def build_nrese(self, nrese) -> bool:
+        """Builds an NRESE server (`nrese` or `nrese-oxigraph`) from its source tree."""
         if self.args.skip_build:
             return True
-        self.say("building NRESE (release)")
-        log = self.results / "logs" / f"nrese-build-{self.stamp}.log"
+        ctx = self.context_for_images()
+        source = nrese.source(ctx)
+        self.say(f"building {nrese.key} (release) from {source}")
+        log = self.results / "logs" / f"{nrese.key}-build-{self.stamp}.log"
         if self.args.runtime == "docker":
-            for volume in ("nrese-target", "nrese-cargo"):
+            for volume in (nrese.target_volume, "nrese-cargo"):
                 if run_quiet(["docker", "volume", "inspect", volume]).returncode != 0:
                     self.made_volumes.append(volume)
             # Built in the pinned Rust image, as the scorecards do: the binary runs in it.
             # Half the cores, like scripts/cargo-guarded.sh: the machine stays usable.
             cpus = str(max(1, (os.cpu_count() or 2) // 2))
-            rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{self.root.as_posix()}:/src:ro",
-                                    "-v", "nrese-target:/target", "-v", "nrese-cargo:/usr/local/cargo/registry",
-                                    "-w", "/src", nrese.rust_image(self.context_for_images()),
+            rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{source.as_posix()}:/src:ro",
+                                    "-v", f"{nrese.target_volume}:/target", "-v", "nrese-cargo:/usr/local/cargo/registry",
+                                    "-w", "/src", nrese.rust_image(ctx),
                                     "cargo", "build", "--release", "--locked", "-j", cpus, "-p", "nrese-server",
                                     "--target-dir", "/target"], log)
         else:
+            # From the source tree: its own toolchain, budget and target directory.
             rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked",
-                                    "-p", "nrese-server"], log)
+                                    "-p", "nrese-server"], log, cwd=source)
         if rc != 0:
-            self.say(f"the NRESE build failed; see {log}")
+            self.say(f"the {nrese.key} build failed; see {log}")
         return rc == 0
 
     def harness(self) -> str:
@@ -246,13 +252,16 @@ class Suite:
         return [f for f in files if not (Path(self.data.source) / f[len("/data/"):]).is_file()]
 
     def ensure_data(self, plan) -> str | None:
+        # Looking for the inputs mounts the volume, which creates it: whether this run made
+        # it (and so removes it) is decided before.
+        if (self.data_volume and not self.args.dry_run and self.data_volume not in self.made_volumes
+                and run_quiet(["docker", "volume", "inspect", self.data_volume]).returncode != 0):
+            self.made_volumes.append(self.data_volume)
         missing = self.data_missing(plan.inputs)
         if not missing:
             return None
         if not (self.data_volume and plan.prepare):
             return f"missing inputs: {', '.join(missing)} (prepare them on a machine with Docker)"
-        if run_quiet(["docker", "volume", "inspect", self.data_volume]).returncode != 0:
-            self.made_volumes.append(self.data_volume)
         self.say(f"preparing {plan.workload} {plan.tier}: {shell(plan.prepare)}")
         log = self.results / "logs" / f"prepare-{slug(plan.workload)}-{slug(plan.tier)}-{self.stamp}.log"
         rc = self.host_command(plan.prepare, log)
@@ -446,8 +455,8 @@ class Suite:
         if self.args.runtime == "docker":
             images.setdefault("alpine:latest", None)
         self.ensure_images(images)
-        if any(key == "nrese" and system is not None for _, key, system, _ in chosen):
-            if not self.build_nrese(adapter("nrese")):
+        for key in dict.fromkeys(key for _, key, system, _ in chosen if isinstance(system, Nrese)):
+            if not self.build_nrese(adapter(key)):
                 return 1
         if any(system is not None and plan.kind != "kit" for plan, _, system, _ in chosen):
             if not self.build_harness():

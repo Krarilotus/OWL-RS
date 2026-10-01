@@ -37,9 +37,11 @@ Then its containers, store and scratch are removed. At the end of the run, what 
 
 **Regimes.** A reasoning workload names the regimes it accepts, in order of preference (LUBM: OWL 2 RL, else OWL-Horst); each system runs the first it has. Results are compared within one regime only.
 
+**NRESE on Oxigraph** (`nrese-oxigraph`) is the same server built from the branch `baseline/pre-oxigraph-migration`, the last commit before the migration to the own RDF libraries. The suite builds it from a checkout beside the repository (`git worktree add ../OWL-RS-baseline baseline/pre-oxigraph-migration`, or `NRESE_OXIGRAPH_SRC`) into its own build volume. Next to `nrese` it shows what the migration changed.
+
 **Systems without SPARQL** (Nemo, the owlrl reference closure) have their closure answered by Oxigraph: their answer counts check the others, their query times aren't theirs and are left empty.
 
-**Licensed systems** run only with their licence files (`GRAPHDB_LICENSE`, `RDFOX_LICENSE`). Their rows carry `publish = permission`; `suite.py report` leaves them out unless `--include-restricted`, and they may not leave the machine without the vendor's written consent ([../competitors/README.md](../competitors/README.md)). The RDFox adapter and GraphDB with a ruleset haven't run yet (no licence): the first licensed run confirms their commands.
+**Licensed systems** run only with their licence files: `graphdb.license` and `RDFox.lic` in the licences directory (`~/nrese-bench/licenses`, outside the repository; `NRESE_LICENSES` elsewhere), or one by one through `GRAPHDB_LICENSE` and `RDFOX_LICENSE`. Their rows carry `publish = permission`; `suite.py report` leaves them out unless `--include-restricted`, and they may not leave the machine without the vendor's written consent ([../competitors/README.md](../competitors/README.md)). The RDFox adapter and GraphDB with a ruleset haven't run yet (no licence): the first licensed run confirms their commands.
 
 ## The result schema
 
