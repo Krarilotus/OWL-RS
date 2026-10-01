@@ -18,10 +18,11 @@ use sha2::{Sha256, Sha384, Sha512};
 use spargebra::algebra::{Expression, Function};
 
 use nrese_xsd::{
-    Date, DateTime, DayTimeDuration, Decimal, Double, Float, GDay, GMonth, GMonthDay, GYear,
-    GYearMonth, Integer, Time, TimezoneOffset,
+    Date, DateTime, DayTimeDuration, Decimal, Double, Duration, Float, GDay, GMonth, GMonthDay,
+    GYear, GYearMonth, Integer, Time, TimezoneOffset, YearMonthDuration,
 };
 
+use super::calendar;
 use super::value::{
     Value, boolean_term, canonical, compare, effective_boolean, equals, is_lang_string,
 };
@@ -97,6 +98,7 @@ pub(crate) fn supported(expr: &Expression) -> bool {
                         | Function::Sha256
                         | Function::Sha384
                         | Function::Sha512
+                        | Function::Adjust
                 )
                 // Casts, GeoSPARQL; any other IRI is an unknown function: an error.
                 || matches!(function, Function::Custom(_))
@@ -261,9 +263,16 @@ impl Evaluator {
             Expression::Divide(a, b) => arithmetic(Operator::Divide, values(a, b)?),
             Expression::UnaryPlus(a) => {
                 let term = self.eval(a, binding)?;
-                Numeric::of(&Value::of(&term)).map(|_| term)
+                let value = Value::of(&term);
+                (Numeric::of(&value).is_some() || value.duration().is_some()).then_some(term)
             }
-            Expression::UnaryMinus(a) => Numeric::of(&Value::of(&self.eval(a, binding)?))?.negate(),
+            Expression::UnaryMinus(a) => {
+                let value = Value::of(&self.eval(a, binding)?);
+                match Numeric::of(&value) {
+                    Some(n) => n.negate(),
+                    None => calendar::negate(&value),
+                }
+            }
             Expression::FunctionCall(function, args) => self.call(function, args, binding),
             _ => None,
         }
@@ -506,33 +515,44 @@ impl Evaluator {
             Function::Abs | Function::Ceil | Function::Floor | Function::Round => {
                 Numeric::of(&Value::of(&arg(0)?))?.rounding(function)
             }
+            // The calendar types that have the part (dates, and the Gregorian g-types).
             Function::Year | Function::Month | Function::Day => {
-                let (year, month, day) = match Value::of(&arg(0)?) {
-                    Value::Date(d) => (d.year(), d.month(), d.day()),
-                    Value::DateTime(d) => (d.year(), d.month(), d.day()),
+                let value = Value::of(&arg(0)?);
+                let part: i64 = match (function, value) {
+                    (Function::Year, Value::Date(d)) => d.year(),
+                    (Function::Year, Value::DateTime(d)) => d.year(),
+                    (Function::Year, Value::GYear(d)) => d.year(),
+                    (Function::Year, Value::GYearMonth(d)) => d.year(),
+                    (Function::Month, Value::Date(d)) => d.month().into(),
+                    (Function::Month, Value::DateTime(d)) => d.month().into(),
+                    (Function::Month, Value::GYearMonth(d)) => d.month().into(),
+                    (Function::Month, Value::GMonth(d)) => d.month().into(),
+                    (Function::Month, Value::GMonthDay(d)) => d.month().into(),
+                    (Function::Day, Value::Date(d)) => d.day().into(),
+                    (Function::Day, Value::DateTime(d)) => d.day().into(),
+                    (Function::Day, Value::GMonthDay(d)) => d.day().into(),
+                    (Function::Day, Value::GDay(d)) => d.day().into(),
                     _ => return None,
-                };
-                let part = match function {
-                    Function::Year => year,
-                    Function::Month => i64::from(month),
-                    _ => i64::from(day),
                 };
                 Some(Literal::new_typed_literal(part.to_string(), xsd::INTEGER).into())
             }
             Function::Hours | Function::Minutes | Function::Seconds => {
-                let Value::DateTime(d) = Value::of(&arg(0)?) else {
-                    return None;
+                let (hour, minute, second) = match Value::of(&arg(0)?) {
+                    Value::DateTime(d) => (d.hour(), d.minute(), d.second()),
+                    Value::Time(t) => (t.hour(), t.minute(), t.second()),
+                    _ => return None,
                 };
                 Some(match function {
                     Function::Hours => {
-                        Literal::new_typed_literal(d.hour().to_string(), xsd::INTEGER).into()
+                        Literal::new_typed_literal(hour.to_string(), xsd::INTEGER).into()
                     }
                     Function::Minutes => {
-                        Literal::new_typed_literal(d.minute().to_string(), xsd::INTEGER).into()
+                        Literal::new_typed_literal(minute.to_string(), xsd::INTEGER).into()
                     }
-                    _ => Literal::new_typed_literal(d.second().to_string(), xsd::DECIMAL).into(),
+                    _ => Literal::new_typed_literal(second.to_string(), xsd::DECIMAL).into(),
                 })
             }
+            Function::Adjust => calendar::adjust(&Value::of(&arg(0)?), &Value::of(&arg(1)?)),
             Function::Concat => {
                 // The common language tag if every argument has it, else a simple literal.
                 let mut text = String::new();
@@ -741,9 +761,17 @@ impl Numeric {
     }
 }
 
-fn arithmetic(operator: Operator, (a, b): (Value, Value)) -> Option<Term> {
+fn arithmetic(operator: Operator, (x, y): (Value, Value)) -> Option<Term> {
     use Numeric::{Decimal as D, Double as Db, Float as F, Integer as I};
-    let (a, b) = (Numeric::of(&a)?, Numeric::of(&b)?);
+    let (Some(a), Some(b)) = (Numeric::of(&x), Numeric::of(&y)) else {
+        // Dates, times and durations (SEP-0002).
+        return match operator {
+            Operator::Add => calendar::add(&x, &y),
+            Operator::Subtract => calendar::subtract(&x, &y),
+            Operator::Multiply => calendar::multiply(&x, &y),
+            Operator::Divide => calendar::divide(&x, &y),
+        };
+    };
     let decimal = |n: Numeric| match n {
         I(i) => Some(Decimal::from(i)),
         D(d) => Some(d),
@@ -896,5 +924,100 @@ fn cast(name: &str, term: Term) -> Option<Term> {
         };
         return typed(v.to_string(), xsd::DATE_TIME);
     }
-    None
+    if name == xsd::TIME.as_str() {
+        let v: Time = match value {
+            Value::Time(v) => v,
+            Value::DateTime(v) => v.into(),
+            Value::String(s) => s.parse().ok()?,
+            _ => return None,
+        };
+        return typed(v.to_string(), xsd::TIME);
+    }
+    // Durations: from a string, or from another duration type (XPath §19.1.5: the part the
+    // target lacks is dropped).
+    if name == xsd::DURATION.as_str() {
+        let v: Duration = match value {
+            Value::String(s) => s.parse().ok()?,
+            other => other.duration()?,
+        };
+        return typed(v.to_string(), xsd::DURATION);
+    }
+    if name == xsd::YEAR_MONTH_DURATION.as_str() {
+        let v: YearMonthDuration = match value {
+            Value::String(s) => s.parse().ok()?,
+            other => other.duration()?.into(),
+        };
+        return typed(v.to_string(), xsd::YEAR_MONTH_DURATION);
+    }
+    if name == xsd::DAY_TIME_DURATION.as_str() {
+        let v: DayTimeDuration = match value {
+            Value::String(s) => s.parse().ok()?,
+            other => other.duration()?.into(),
+        };
+        return typed(v.to_string(), xsd::DAY_TIME_DURATION);
+    }
+    g_cast(name, value)
+}
+
+/// Casts to the Gregorian g-types: from a string, the same type, or a date or dateTime,
+/// whose parts and timezone they keep (XPath §19.1.4).
+fn g_cast(name: &str, value: Value) -> Option<Term> {
+    let parts = |date: Date| {
+        (
+            date.year(),
+            date.month(),
+            date.day(),
+            date.timezone_offset(),
+        )
+    };
+    let (year, month, day, zone) = match &value {
+        Value::Date(d) => parts(*d),
+        Value::DateTime(d) => parts(Date::from(*d)),
+        Value::String(_) => (0, 0, 0, None),
+        _ => (i64::MIN, 0, 0, None),
+    };
+    let from_date = year != i64::MIN && !matches!(value, Value::String(_));
+    let zone = zone.map(|z| z.to_string()).unwrap_or_default();
+    let year_text = if year < 0 {
+        format!("-{:04}", year.unsigned_abs())
+    } else {
+        format!("{year:04}")
+    };
+    macro_rules! g {
+        ($type:ty, $variant:ident, $datatype:expr, $lexical:expr) => {{
+            let v: $type = match value {
+                Value::$variant(v) => v,
+                Value::String(s) => s.parse().ok()?,
+                _ if from_date => $lexical.parse().ok()?,
+                _ => return None,
+            };
+            return Some(Literal::new_typed_literal(v.to_string(), $datatype).into());
+        }};
+    }
+    match name {
+        n if n == xsd::G_YEAR.as_str() => {
+            g!(GYear, GYear, xsd::G_YEAR, format!("{year_text}{zone}"))
+        }
+        n if n == xsd::G_YEAR_MONTH.as_str() => {
+            g!(
+                GYearMonth,
+                GYearMonth,
+                xsd::G_YEAR_MONTH,
+                format!("{year_text}-{month:02}{zone}")
+            )
+        }
+        n if n == xsd::G_MONTH.as_str() => {
+            g!(GMonth, GMonth, xsd::G_MONTH, format!("--{month:02}{zone}"))
+        }
+        n if n == xsd::G_MONTH_DAY.as_str() => {
+            g!(
+                GMonthDay,
+                GMonthDay,
+                xsd::G_MONTH_DAY,
+                format!("--{month:02}-{day:02}{zone}")
+            )
+        }
+        n if n == xsd::G_DAY.as_str() => g!(GDay, GDay, xsd::G_DAY, format!("---{day:02}{zone}")),
+        _ => None,
+    }
 }
