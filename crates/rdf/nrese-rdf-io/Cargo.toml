@@ -12,3 +12,7 @@ nrese-json = { path = "../nrese-json" }
 nrese-rdf = { path = "../nrese-rdf", default-features = false }
 quick-xml = "0.42"
 thiserror.workspace = true
+
+[dev-dependencies]
+# The W3C RDFC-1.0 suite runs here, where N-Quads can be read.
+nrese-rdf = { path = "../nrese-rdf", default-features = false, features = ["rdfc"] }

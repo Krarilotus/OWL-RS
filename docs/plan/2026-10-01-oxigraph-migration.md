@@ -175,7 +175,7 @@ The crate is built in five parts, each with its W3C suites and tests before the 
     default).
   - Suites: `toRdf`, `expand` and `fromRdf` from `w3c/json-ld-api`.
 - **3e. RDF 1.2** in `nrese-rdf` and every reader and writer (see "The newest standards"
-  below). Done 1 October (see Status); RDFC-1.0 follows.
+  below). Done 1 October with RDFC-1.0 (see Status).
 - **3f. Comparison batch**: the conformance matrix and throughput against `oxttl`,
   `oxrdfxml` and `oxjsonld` (with Oxigraph's `rdf-12` feature) on generated documents (no
   third-party data), the end of step 3.
@@ -457,3 +457,27 @@ through nrese's own writers, and reads Turtle and TriG in 2, 3 and 8 parallel ch
   an annotation for the end of a TriG block.
 - **Throughput unchanged.** A check with the I/O comparison: nrese reads N-Triples in
   0.42 of Oxigraph's time, Turtle in 0.61 and RDF/XML in 0.93 (owned quads), as before.
+
+**3e: RDFC-1.0 (1 October).** `nrese_rdf::rdfc` implements the W3C Recommendation as
+written:
+- first-degree hashes, canonical labels for unique hashes, N-degree hashes over
+  permutations for the rest;
+- SHA-256 or SHA-384;
+- the label map;
+- a work limit against poison graphs, by default 100,000 plus 2,000 per blank node, so long
+  chains of ties (quadratic work) pass and crafted cliques stop.
+
+W3C `rdf-canon` (pinned in the fetch script): 86 of 86, the two poison graphs included.
+
+Against `oxrdf`'s RDFC-1.0 (feature `rdfc-10`, same graphs, `bench RDFC`), nrese takes
+0.70 of its time with 2,000 distinct blank nodes, 0.38 on five 8-cycles, and 0.03 on a
+chain of 1,000 ties (0.2 s against 6.9 s). That needed a second pass: the first version,
+written straight from the specification, was 2.7× slower than `oxrdf` on the chain, because
+every permutation copied an issuer holding blank-node strings in a SipHash map. Blank nodes
+are now numbered once, issuers are small integer tables, and first-degree lines are
+written without building quads.
+
+The recursion goes one level deeper per tie along a chain, so inputs over 128 blank nodes
+run on a thread with a stack sized to them. A test on a 256 KiB caller stack shows the
+need (it overflows without that thread). `oxrdf` overflows the 1 MiB main-thread stack on
+the same chain.

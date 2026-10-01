@@ -8,6 +8,7 @@
 # - SHACL (w3c/data-shapes) into .cache/data-shapes (the runner's override,
 #   NRESE_W3C_SHACL_TESTS, names the suite's `tests` directory)
 # - Notation3 (w3c/N3) into .cache/n3
+# - RDF Dataset Canonicalization (w3c/rdf-canon) into .cache/rdf-canon
 set -euo pipefail
 
 CACHE="$(dirname "$0")/../.cache"
@@ -50,6 +51,8 @@ fetch w3c/data-shapes d556a1fc90c5d5ffdf388124cbb687cf43c5a35e \
 # Notation3 (W3C N3 Community Group, w3c/N3) into .cache/n3: the parser and reasoner
 # manifests the N3 runners of nrese-rdf-io and nrese-reasoner read.
 fetch w3c/N3 1d29dea774d3e5a97883ebbc8ab033a176ac11b5 "$CACHE/n3" tests
+# RDFC-1.0 (W3C Recommendation): the tests nrese-rdf's canonicaliser runs.
+fetch w3c/rdf-canon 15619df2fda7a4ca88308733789b6774517f9638 "$CACHE/rdf-canon" tests
 
 # The OWL 2 test cases (approved by the OWL Working Group; one RDF/XML file, pinned by its
 # checksum): crates/nrese-store/tests/w3c_owl2_rl runs the OWL 2 RL ones.
