@@ -64,6 +64,7 @@ impl ServerConfig {
             ),
             ("store.mode", format!("{:?}", store.mode)),
             ("store.data_dir", store.data_dir.display().to_string()),
+            ("store.verify_on_open", store.verify_on_open.to_string()),
             (
                 "store.ontology_path",
                 store

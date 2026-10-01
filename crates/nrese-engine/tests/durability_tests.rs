@@ -340,6 +340,7 @@ fn background_checkpoints_bound_the_wal() {
             wal_segment_bytes: 512,
             checkpoint_after_wal_bytes: 2048,
             sync: SyncPolicy::OsBuffered,
+            verify_on_open: false,
         },
         ..EngineConfig::default()
     };
@@ -448,4 +449,83 @@ fn format_4_checkpoints_are_read() {
     let expected: HashSet<Quad> = [quad(0)].into_iter().collect();
     assert_eq!(contents(&engine), expected);
     assert_eq!(engine.stats().revision, 7);
+}
+
+/// A reopened store uses its checkpoint in place: the index data and the dictionary stay
+/// in the mapped file (no heap copy), and the store keeps growing on top of them, through
+/// the WAL and through further checkpoints.
+#[test]
+fn checkpoints_are_used_in_place_and_grow() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        let states = commit_all(&engine, &batches(0..20));
+        engine.checkpoint().unwrap();
+        states[19].clone()
+    };
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), first);
+    let stats = engine.stats();
+    assert_eq!(stats.index_bytes, 0, "no index data on the heap: {stats:?}");
+    assert!(stats.index_mapped_bytes > 0, "{stats:?}");
+    assert!(stats.dictionary.mapped_bytes > 0, "{stats:?}");
+    // New terms go to the heap part of the dictionary; old ones are still found.
+    let mut expected = first.clone();
+    let mut tx = engine.transaction();
+    for n in 1000..1040 {
+        tx.insert(label(n).as_ref());
+        tx.insert(quad(n % 20).as_ref());
+        expected.insert(label(n));
+        expected.insert(quad(n % 20));
+    }
+    tx.commit().unwrap();
+    assert_eq!(contents(&engine), expected);
+    drop(engine);
+    // Recovery: the mapped checkpoint plus the WAL.
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), expected);
+    // A second checkpoint of mapped and heap terms, then reopened with a full check.
+    engine.checkpoint().unwrap();
+    drop(engine);
+    let verified = EngineConfig {
+        durability: DurabilityConfig {
+            verify_on_open: true,
+            ..config().durability
+        },
+        ..config()
+    };
+    let engine = Engine::open(dir.path(), verified).unwrap();
+    assert_eq!(contents(&engine), expected);
+}
+
+/// With `verify_on_open`, damage anywhere in a checkpoint is refused at open (without, the
+/// open reads only the structure, and finds damage only where it reads).
+#[test]
+fn verify_on_open_refuses_a_damaged_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit_all(&engine, &batches(0..20));
+        engine.checkpoint().unwrap();
+    }
+    let checkpoint = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "nck"))
+        .unwrap();
+    let mut bytes = fs::read(&checkpoint).unwrap();
+    let at = bytes.len() * 3 / 4;
+    bytes[at] ^= 0x01;
+    fs::write(&checkpoint, bytes).unwrap();
+    let verified = EngineConfig {
+        durability: DurabilityConfig {
+            verify_on_open: true,
+            ..config().durability
+        },
+        ..config()
+    };
+    match Engine::open(dir.path(), verified) {
+        Err(EngineError::Corruption(_)) => {}
+        other => panic!("expected corruption, got {other:?}"),
+    }
 }

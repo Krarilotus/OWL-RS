@@ -64,7 +64,17 @@ impl StoreService {
         config.validate()?;
         let engine = match config.mode {
             StoreMode::InMemory => Engine::new(EngineConfig::default())?,
-            StoreMode::OnDisk => Engine::open(&config.data_dir, EngineConfig::default())?,
+            StoreMode::OnDisk => {
+                let defaults = EngineConfig::default();
+                let engine_config = EngineConfig {
+                    durability: nrese_engine::DurabilityConfig {
+                        verify_on_open: config.verify_on_open,
+                        ..defaults.durability
+                    },
+                    ..defaults
+                };
+                Engine::open(&config.data_dir, engine_config)?
+            }
         };
         let before = engine.snapshot().revision();
         let preloaded_ontology = preload_ontology(&engine, &config)?;

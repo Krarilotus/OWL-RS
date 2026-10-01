@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use nrese_store::{StoreConfig, StoreMode};
 
 use super::env_names as names;
-use super::env_values::parse_bytes;
+use super::env_values::{parse_bool, parse_bytes};
 use super::source::ConfigSource;
 
 pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfig> {
@@ -32,6 +32,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         hide_unnamed_classes: parse_unnamed_classes(
             source.get(names::REASONING_UNNAMED_CLASSES).as_deref(),
         )?,
+        verify_on_open: parse_bool(source, names::VERIFY_ON_OPEN, defaults.verify_on_open)?,
     })
 }
 

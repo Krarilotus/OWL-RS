@@ -41,11 +41,12 @@ pub struct StringTest<'a> {
 /// Entries per parallel slice.
 const SLICE: usize = 1 << 16;
 
-/// The ids of the entries `0..limit` of the arena (`bytes`, entry `i` ending at
-/// `ends[i]`) that pass `test`, sorted.
+/// The ids of the first `limit` entries of an arena (`bytes`, entry `i` ending at
+/// `ends[i]`, its id index `first_index + i`) that pass `test`, sorted.
 pub(crate) fn matching(
     bytes: &[u8],
     ends: &[u64],
+    first_index: u64,
     limit: u64,
     test: &StringTest<'_>,
 ) -> Vec<TermId> {
@@ -67,7 +68,12 @@ pub(crate) fn matching(
             while let Some(hit) = finder.find(&bytes[at..to]).map(|offset| at + offset) {
                 entry += ends[entry..last].partition_point(|&end| end as usize <= hit);
                 let (start, end) = (start_of(entry), ends[entry] as usize);
-                if let Some(id) = passes(&bytes[start..end], entry as u64, hit - start, test) {
+                if let Some(id) = passes(
+                    &bytes[start..end],
+                    first_index + entry as u64,
+                    hit - start,
+                    test,
+                ) {
                     found.push(id);
                 }
                 at = end;
