@@ -6,12 +6,15 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["xsd"]
+default = ["xsd", "rdfc"]
 # Literals from and to the XSD values of nrese-xsd.
 xsd = ["dep:nrese-xsd"]
+# RDF Dataset Canonicalization (RDFC-1.0), with its hash functions.
+rdfc = ["dep:sha2"]
 
 [dependencies]
 foldhash = "0.2"
 nrese-xsd = { path = "../nrese-xsd", optional = true }
 rand = "0.9"
+sha2 = { version = "0.10", optional = true }
 thiserror.workspace = true

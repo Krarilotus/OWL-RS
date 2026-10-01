@@ -1,5 +1,6 @@
 //! NRESE's RDF model: IRIs, terms, triples and quads, in-memory graphs and datasets with
-//! canonicalisation, and the common vocabularies.
+//! canonicalisation (this crate's own, and RDFC-1.0 with the `rdfc` feature), and the
+//! common vocabularies.
 //!
 //! Part of the RDF bundle (`crates/rdf`), which replaces the Oxigraph crates: the API
 //! follows `oxrdf` closely so that the switch is mechanical, and nothing here depends on
@@ -12,6 +13,8 @@ pub mod canonical;
 pub mod graph;
 pub mod iri;
 pub mod language;
+#[cfg(feature = "rdfc")]
+pub mod rdfc;
 pub mod term;
 pub mod triple;
 pub mod vocab;

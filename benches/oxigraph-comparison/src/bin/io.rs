@@ -186,11 +186,24 @@ impl Read for Chunks<'_> {
     }
 }
 
+/// Counts the items of a parse, failing on the first error.
+trait CountOk {
+    fn count_ok(self) -> usize;
+}
+
+impl<T, E: std::fmt::Debug, I: Iterator<Item = Result<T, E>>> CountOk for I {
+    fn count_ok(self) -> usize {
+        let mut count = 0;
+        for item in self {
+            item.unwrap();
+            count += 1;
+        }
+        count
+    }
+}
+
 fn ours(format: RdfFormat, bytes: &[u8]) -> usize {
-    RdfParser::from_format(format)
-        .for_slice(bytes)
-        .map(|q| q.unwrap())
-        .count()
+    RdfParser::from_format(format).for_slice(bytes).count_ok()
 }
 
 fn ours_borrowed(format: RdfFormat, bytes: &[u8]) -> usize {
@@ -247,34 +260,13 @@ fn main() {
         let len = bytes.len();
         let theirs = |bytes: &[u8]| -> usize {
             match format {
-                RdfFormat::NTriples => oxttl::NTriplesParser::new()
-                    .for_slice(bytes)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::NQuads => oxttl::NQuadsParser::new()
-                    .for_slice(bytes)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::Turtle => oxttl::TurtleParser::new()
-                    .for_slice(bytes)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::TriG => oxttl::TriGParser::new()
-                    .for_slice(bytes)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::RdfXml => oxrdfxml::RdfXmlParser::new()
-                    .for_slice(bytes)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::JsonLd => oxjsonld::JsonLdParser::new()
-                    .for_slice(bytes)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::N3 => oxttl::N3Parser::new()
-                    .for_slice(bytes)
-                    .map(|q| q.unwrap())
-                    .count(),
+                RdfFormat::NTriples => oxttl::NTriplesParser::new().for_slice(bytes).count_ok(),
+                RdfFormat::NQuads => oxttl::NQuadsParser::new().for_slice(bytes).count_ok(),
+                RdfFormat::Turtle => oxttl::TurtleParser::new().for_slice(bytes).count_ok(),
+                RdfFormat::TriG => oxttl::TriGParser::new().for_slice(bytes).count_ok(),
+                RdfFormat::RdfXml => oxrdfxml::RdfXmlParser::new().for_slice(bytes).count_ok(),
+                RdfFormat::JsonLd => oxjsonld::JsonLdParser::new().for_slice(bytes).count_ok(),
+                RdfFormat::N3 => oxttl::N3Parser::new().for_slice(bytes).count_ok(),
             }
         };
         let theirs_reader = |bytes: &[u8]| -> usize {
@@ -283,39 +275,18 @@ fn main() {
                 chunk: 64 * 1024,
             };
             match format {
-                RdfFormat::NTriples => oxttl::NTriplesParser::new()
-                    .for_reader(reader)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::NQuads => oxttl::NQuadsParser::new()
-                    .for_reader(reader)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::Turtle => oxttl::TurtleParser::new()
-                    .for_reader(reader)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::TriG => oxttl::TriGParser::new()
-                    .for_reader(reader)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::RdfXml => oxrdfxml::RdfXmlParser::new()
-                    .for_reader(reader)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::JsonLd => oxjsonld::JsonLdParser::new()
-                    .for_reader(reader)
-                    .map(|q| q.unwrap())
-                    .count(),
-                RdfFormat::N3 => oxttl::N3Parser::new()
-                    .for_reader(reader)
-                    .map(|q| q.unwrap())
-                    .count(),
+                RdfFormat::NTriples => oxttl::NTriplesParser::new().for_reader(reader).count_ok(),
+                RdfFormat::NQuads => oxttl::NQuadsParser::new().for_reader(reader).count_ok(),
+                RdfFormat::Turtle => oxttl::TurtleParser::new().for_reader(reader).count_ok(),
+                RdfFormat::TriG => oxttl::TriGParser::new().for_reader(reader).count_ok(),
+                RdfFormat::RdfXml => oxrdfxml::RdfXmlParser::new().for_reader(reader).count_ok(),
+                RdfFormat::JsonLd => oxjsonld::JsonLdParser::new().for_reader(reader).count_ok(),
+                RdfFormat::N3 => oxttl::N3Parser::new().for_reader(reader).count_ok(),
             }
         };
         let name = format.name();
         if *format == RdfFormat::N3 {
-            let n3 = |bytes: &[u8]| N3Parser::new().for_slice(bytes).map(|q| q.unwrap()).count();
+            let n3 = |bytes: &[u8]| N3Parser::new().for_slice(bytes).count_ok();
             report.case(
                 &format!("{name} slice, owned"),
                 len,
@@ -383,7 +354,7 @@ fn main() {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = parts
                     .into_iter()
-                    .map(|part| scope.spawn(move || part.map(|q| q.unwrap()).count()))
+                    .map(|part| scope.spawn(move || part.count_ok()))
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).sum()
             })
@@ -420,7 +391,7 @@ fn main() {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = parts
                     .into_iter()
-                    .map(|part| scope.spawn(move || part.map(|q| q.unwrap()).count()))
+                    .map(|part| scope.spawn(move || part.count_ok()))
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).sum()
             })
