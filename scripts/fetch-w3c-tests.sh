@@ -43,7 +43,7 @@ fetch() {
 }
 
 fetch w3c/rdf-tests 369a90d1a60c021b746df2e411da0ff36258a758 \
-  "${NRESE_W3C_TESTS:-$CACHE/rdf-tests}" sparql/sparql11 sparql/sparql12 rdf/rdf11 rdf/rdf12
+  "${NRESE_W3C_TESTS:-$CACHE/rdf-tests}" sparql/sparql10 sparql/sparql11 sparql/sparql12 rdf/rdf11 rdf/rdf12
 fetch w3c/json-ld-api ffdb326121ea89b7b8280e76a5caea923834bcef \
   "${NRESE_W3C_JSONLD_TESTS:-$CACHE/json-ld-api}" tests
 fetch w3c/data-shapes d556a1fc90c5d5ffdf388124cbb687cf43c5a35e \

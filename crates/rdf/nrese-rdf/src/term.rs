@@ -571,21 +571,41 @@ impl<'a> LiteralRef<'a> {
 /// and `UCHAR` for the other control characters).
 pub fn write_quoted_str(text: &str, f: &mut impl Write) -> fmt::Result {
     f.write_char('"')?;
-    for c in text.chars() {
-        match c {
-            '\u{8}' => f.write_str("\\b"),
-            '\t' => f.write_str("\\t"),
-            '\n' => f.write_str("\\n"),
-            '\u{C}' => f.write_str("\\f"),
-            '\r' => f.write_str("\\r"),
-            '"' => f.write_str("\\\""),
-            '\\' => f.write_str("\\\\"),
-            '\0'..='\u{1F}' | '\u{7F}' | '\u{FFFE}' | '\u{FFFF}' => {
-                write!(f, "\\u{:04X}", u32::from(c))
-            }
-            _ => f.write_char(c),
-        }?;
+    // Runs without anything to escape go out in one piece; only the escaped characters
+    // are looked at one by one. U+FFFE and U+FFFF are the only escaped characters beyond
+    // ASCII, and both start with the byte 0xEF.
+    let bytes = text.as_bytes();
+    let mut run = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let escape: Option<(&str, usize)> = match b {
+            0x08 => Some(("\\b", 1)),
+            b'\t' => Some(("\\t", 1)),
+            b'\n' => Some(("\\n", 1)),
+            0x0C => Some(("\\f", 1)),
+            b'\r' => Some(("\\r", 1)),
+            b'"' => Some(("\\\"", 1)),
+            b'\\' => Some(("\\\\", 1)),
+            0x00..=0x1F | 0x7F => Some(("", 1)),
+            0xEF if matches!(bytes.get(i + 1..i + 3), Some([0xBF, 0xBE | 0xBF])) => Some(("", 3)),
+            _ => None,
+        };
+        let Some((replacement, len)) = escape else {
+            i += 1;
+            continue;
+        };
+        f.write_str(&text[run..i])?;
+        if replacement.is_empty() {
+            let c = text[i..].chars().next().unwrap_or_default();
+            write!(f, "\\u{:04X}", u32::from(c))?;
+        } else {
+            f.write_str(replacement)?;
+        }
+        i += len;
+        run = i;
     }
+    f.write_str(&text[run..])?;
     f.write_char('"')
 }
 
@@ -1175,6 +1195,65 @@ impl fmt::Display for Variable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Character by character, as the N-Triples grammar states the escapes.
+    fn quoted_by_chars(text: &str) -> String {
+        let mut out = String::from("\"");
+        for c in text.chars() {
+            match c {
+                '\u{8}' => out.push_str("\\b"),
+                '\t' => out.push_str("\\t"),
+                '\n' => out.push_str("\\n"),
+                '\u{C}' => out.push_str("\\f"),
+                '\r' => out.push_str("\\r"),
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\0'..='\u{1F}' | '\u{7F}' | '\u{FFFE}' | '\u{FFFF}' => {
+                    out.push_str(&format!("\\u{:04X}", u32::from(c)));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    #[test]
+    fn quoting_by_runs_matches_quoting_by_characters() {
+        let pieces = [
+            "",
+            "a",
+            "plain text",
+            "\"",
+            "\\",
+            "\n",
+            "\r\n",
+            "\t",
+            "\u{8}",
+            "\u{C}",
+            "\u{0}",
+            "\u{1F}",
+            "\u{7F}",
+            "é",
+            "日本",
+            "😀",
+            "\u{FFFE}",
+            "\u{FFFF}",
+            "\u{FFFD}",
+            "\u{EFBF}",
+            "\u{FEFF}",
+        ];
+        for a in pieces {
+            for b in pieces {
+                for c in pieces {
+                    let text = format!("{a}{b}{c}");
+                    let mut quoted = String::new();
+                    write_quoted_str(&text, &mut quoted).unwrap();
+                    assert_eq!(quoted, quoted_by_chars(&text), "{text:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn terms_print_as_n_triples() {

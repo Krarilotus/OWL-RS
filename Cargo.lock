@@ -1188,6 +1188,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-sparql-syntax"
+version = "0.1.0"
+dependencies = [
+ "nrese-rdf",
+ "nrese-rdf-io",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "nrese-store"
 version = "0.1.0"
 dependencies = [
