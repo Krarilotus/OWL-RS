@@ -9,8 +9,3 @@ license.workspace = true
 memchr = "2.8"
 nrese-rdf = { path = "../nrese-rdf", default-features = false }
 thiserror.workspace = true
-
-[dev-dependencies]
-# Reads the W3C manifests (Turtle) until this crate reads Turtle itself (step 3b).
-oxttl = "=0.2.3"
-oxrdf = "=0.3.3"
