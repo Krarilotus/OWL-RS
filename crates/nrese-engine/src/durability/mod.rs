@@ -56,6 +56,12 @@ pub struct DurabilityConfig {
     /// grows with what queries touch. On, opening reads the whole file once (and a damaged
     /// one is refused at once rather than failing when a query reaches the damage).
     pub verify_on_open: bool,
+    /// Serve the data from a checkpoint once it is written (after a bulk load, and by
+    /// background or explicit checkpoints): the index runs and dictionary entries it covers
+    /// are then used in place from the file, as after a restart, and their copies in memory
+    /// are freed once no snapshot holds them. Memory then grows with what queries touch,
+    /// and the OS can page the rest out. Off: the data stays in memory too.
+    pub map_checkpoints: bool,
 }
 
 impl Default for DurabilityConfig {
@@ -65,6 +71,7 @@ impl Default for DurabilityConfig {
             wal_segment_bytes: 64 << 20,
             checkpoint_after_wal_bytes: 256 << 20,
             verify_on_open: false,
+            map_checkpoints: true,
         }
     }
 }

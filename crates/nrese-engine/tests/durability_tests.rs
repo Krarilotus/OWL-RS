@@ -7,7 +7,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use nrese_engine::{DurabilityConfig, Engine, EngineConfig, EngineError, QuadPattern, SyncPolicy};
+use nrese_engine::{
+    BulkMode, DurabilityConfig, Engine, EngineConfig, EngineError, QuadPattern, SyncPolicy,
+};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 
@@ -341,6 +343,7 @@ fn background_checkpoints_bound_the_wal() {
             checkpoint_after_wal_bytes: 2048,
             sync: SyncPolicy::OsBuffered,
             verify_on_open: false,
+            map_checkpoints: true,
         },
         ..EngineConfig::default()
     };
@@ -527,5 +530,69 @@ fn verify_on_open_refuses_a_damaged_checkpoint() {
     match Engine::open(dir.path(), verified) {
         Err(EngineError::Corruption(_)) => {}
         other => panic!("expected corruption, got {other:?}"),
+    }
+}
+
+/// A running engine serves what it has checkpointed from the file, as after a restart: no
+/// index data stays on the heap, snapshots taken before keep their data, and the store
+/// grows on top and recovers.
+#[test]
+fn checkpoints_are_served_mapped_while_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let states = commit_all(&engine, &batches(0..20));
+    let before = engine.snapshot();
+    engine.checkpoint().unwrap();
+    let stats = engine.stats();
+    assert_eq!(stats.index_bytes, 0, "no index data on the heap: {stats:?}");
+    assert!(stats.index_mapped_bytes > 0, "{stats:?}");
+    assert!(stats.dictionary.mapped_bytes > 0, "{stats:?}");
+    assert_eq!(contents(&engine), states[19]);
+    let old: HashSet<Quad> = before
+        .quads_for_pattern(&QuadPattern::all())
+        .map(|q| before.decode_quad(q).expect("decodable"))
+        .collect();
+    assert_eq!(old, states[19]);
+    drop(before);
+    // A checkpoint of an unchanged store writes nothing (its file is in use).
+    engine.checkpoint().unwrap();
+    let states = commit_all(&engine, &batches(20..40));
+    assert_eq!(contents(&engine), states[19]);
+    engine.checkpoint().unwrap();
+    assert_eq!(engine.stats().index_bytes, 0);
+    let states = commit_all(&engine, &batches(40..45));
+    drop(engine);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), states[4]);
+}
+
+/// A durable bulk load installs its checkpoint, mapped; with `map_checkpoints` off the
+/// data stays on the heap.
+#[test]
+fn bulk_loads_are_served_from_their_checkpoint() {
+    for map in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            durability: DurabilityConfig {
+                map_checkpoints: map,
+                ..config().durability
+            },
+            ..config()
+        };
+        let engine = Engine::open(dir.path(), config).unwrap();
+        let data: Vec<Quad> = (0..500).flat_map(|n| [quad(n), label(n)]).collect();
+        let load = engine.bulk_load(BulkMode::Append);
+        load.add(&data);
+        load.finish().unwrap();
+        let expected: HashSet<Quad> = data.into_iter().collect();
+        assert_eq!(contents(&engine), expected);
+        let stats = engine.stats();
+        assert_eq!(stats.index_bytes == 0, map, "{stats:?}");
+        assert_eq!(stats.dictionary.mapped_bytes > 0, map, "{stats:?}");
+        let states = commit_all(&engine, &batches(1000..1010));
+        assert_eq!(contents(&engine), states[9]);
+        drop(engine);
+        let engine = Engine::open(dir.path(), config).unwrap();
+        assert_eq!(contents(&engine), states[9]);
     }
 }

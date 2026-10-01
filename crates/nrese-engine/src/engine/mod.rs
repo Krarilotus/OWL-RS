@@ -13,8 +13,9 @@
 //!   The WAL mutex is held across append and publish, so a checkpoint that snapshots under the
 //!   WAL mutex sees exactly the logged revisions.
 //! - Compaction is serialised by its own slot and installs under the same short write lock.
-//!   Commits only append runs and only the compactor replaces them, so a window planned from
-//!   any version keeps its position and contents until the compactor installs the merge.
+//!   Commits only append runs, and only holders of the compaction slot replace them (the
+//!   compactor, and a checkpoint that maps runs it covers), so a window planned from any
+//!   version keeps its position and contents until the compactor installs the merge.
 //!   Small windows are merged inside the commit; larger ones, and checkpoints, go to the
 //!   background worker.
 
@@ -299,22 +300,77 @@ impl Shared {
     }
 
     /// Writes a checkpoint of the latest revision and releases the WAL it covers. Writers
-    /// continue during the (long) file write. Returns the checkpointed revision.
+    /// continue during the (long) file write. Returns the checkpointed revision. With
+    /// `map_checkpoints`, the data is then served from the file ([`Self::serve_mapped`]).
     fn checkpoint(&self) -> EngineResult<u64> {
         let Some(durable) = &self.durable else {
             return Ok(self.versions.load().revision);
         };
-        let _slot = durable.checkpoint_slot.lock();
-        let snapshot = {
-            let mut wal = durable.wal.lock();
-            let snapshot = self.snapshot();
-            wal.rotate(snapshot.revision() + 1)?;
-            snapshot
+        let (snapshot, path) = {
+            let _slot = durable.checkpoint_slot.lock();
+            let snapshot = {
+                let mut wal = durable.wal.lock();
+                let snapshot = self.snapshot();
+                if checkpoint::exists(durable.root(), snapshot.revision()) {
+                    // Nothing was committed since (and the file may be in use, mapped).
+                    return Ok(snapshot.revision());
+                }
+                wal.rotate(snapshot.revision() + 1)?;
+                snapshot
+            };
+            let path = checkpoint::write(durable.root(), &snapshot)?;
+            durable.wal.lock().release_through(snapshot.revision())?;
+            (snapshot, path)
         };
-        checkpoint::write(durable.root(), &snapshot)?;
-        durable.wal.lock().release_through(snapshot.revision())?;
-        checkpoint::remove_older_than(durable.root(), snapshot.revision())?;
-        Ok(snapshot.revision())
+        let revision = snapshot.revision();
+        if durable.config.map_checkpoints {
+            // After the checkpoint slot: the compaction slot comes first (bulk loads).
+            self.serve_mapped(&path, snapshot);
+        } else {
+            drop(snapshot);
+        }
+        checkpoint::remove_older_than(durable.root(), revision)?;
+        Ok(revision)
+    }
+
+    /// Serves what `written`, just checkpointed to `path`, holds from the mapped file: the
+    /// runs of the current version that it covers are replaced by the file's (where the
+    /// version still starts with them), and the dictionary entries by the file's. Their
+    /// copies in memory are freed once no snapshot holds them. A failure leaves everything
+    /// in memory (the checkpoint is written either way).
+    fn serve_mapped(&self, path: &Path, written: Snapshot) {
+        let (base, [asserted, inferred]) = match checkpoint::map_written(path) {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "checkpoint not mapped; data stays in memory");
+                return;
+            }
+        };
+        let covered = |stack: Stack, current: &Version| {
+            let runs = written.version().stack(stack).runs();
+            let now = current.stack(stack).runs();
+            (now.len() >= runs.len() && runs.iter().zip(now).all(|(a, b)| Arc::ptr_eq(a, b)))
+                .then_some(runs.len())
+        };
+        {
+            let _compaction = self.versions.compaction_slot.lock();
+            self.versions.publish(|current| {
+                let index = |stack: Stack, mapped: &IndexVersion| match covered(stack, current) {
+                    Some(runs) => current.stack(stack).with_base(runs, mapped),
+                    None => current.stack(stack).clone(),
+                };
+                Version {
+                    asserted: index(Stack::Asserted, &asserted),
+                    inferred: index(Stack::Inferred, &inferred),
+                    revision: current.revision,
+                    dictionary_len: current.dictionary_len,
+                }
+            });
+        }
+        drop(written);
+        if let Err(error) = self.dictionary.rebase(base) {
+            tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
+        }
     }
 
     /// Runs whatever maintenance was requested. Called by the background worker.

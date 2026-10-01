@@ -38,6 +38,9 @@ pub struct StoreConfig {
     /// `nrese_engine::DurabilityConfig::verify_on_open`). Off: the checkpoint is used in
     /// place and opening reads only its structure.
     pub verify_on_open: bool,
+    /// On disk: serve the data from each checkpoint once written, freeing its copies in
+    /// memory (see `nrese_engine::DurabilityConfig::map_checkpoints`).
+    pub map_checkpoints: bool,
     /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
@@ -128,6 +131,7 @@ impl StoreConfig {
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             verify_on_open: false,
+            map_checkpoints: true,
             shacl_gate: ShaclGate::Off,
         }
     }
@@ -144,6 +148,7 @@ impl StoreConfig {
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             verify_on_open: false,
+            map_checkpoints: true,
             shacl_gate: ShaclGate::Off,
         }
     }
