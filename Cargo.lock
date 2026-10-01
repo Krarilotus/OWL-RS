@@ -1138,6 +1138,7 @@ dependencies = [
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-sparql",
+ "nrese-sparql-syntax",
  "nrese-xsd",
  "regex",
 ]
