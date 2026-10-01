@@ -20,27 +20,27 @@ Legend: ✅ done · 🟡 partial · ❌ missing · ➖ deliberately different.
 | # | Item | Status | Evidence / gap |
 |---|---|---|---|
 | 1.1 | Provenance-aware quad indexing | ✅ ➖ | Two stacks (asserted/inferred) instead of per-entry flags; read models and `onto:explicit`/`onto:implicit`; differential-tested |
-| 1.1 | RDF-star / triple terms | ❌ | R7 (`TermKind::Triple`) |
+| 1.1 | RDF-star / triple terms | ✅ | RDF 1.2 triple terms (`TermKind::Triple`, keyed by component ids) in every layer; W3C SPARQL 1.2 and RDF 1.2 suites |
 | 1.2 | Arena dictionary, sequential ids | ✅ | Engine dictionary; bulk restore |
 | 1.2 | Inline native literals | ✅ | integer, decimal, boolean, date, dateTime (canonical forms only) |
 | 1.2 | Dictionary cache eviction | ➖ | Only meaningful with an on-disk dictionary (Pf5) |
 | 1.2 | Rollback of dictionary ids | ➖ | Rejected: unreferenced ids are reclaimed at checkpoint rebuild |
-| 1.3 | MVCC, WAL, checkpoints, compaction | ✅ | Crash and torn-tail tests; background compaction; checkpoint format 5 |
+| 1.3 | MVCC, WAL, checkpoints, compaction | ✅ | Crash and torn-tail tests; background compaction; checkpoint format 7, used in place (memory-mapped index, dictionary and text order; restart in milliseconds) |
 | 2.1 | `.pie` rule language | ❌ | Own rule IR; `.pie` import planned (R1) |
 | 2.1 | Profiles: `rdfs` | 🟡 | A 6-rule subset; full RDFS (and optional axiomatic triples) missing |
-| 2.1 | Profiles: `owl-horst`, `owl2-ql`, `rdfs-plus` | ❌ | Rulesets are data, so these are mostly rule text plus tests |
+| 2.1 | Profiles: `owl-horst`, `owl2-ql`, `rdfs-plus` | 🟡 | `owl-horst` and `owl2-ql` (materialisable part) run in the benchmark suite; `rdfs-plus` missing |
 | 2.1 | Profiles: `owl2-rl` | 🟡 | 57 rules; `eq-ref` omitted (self-difference is accepted), datatype Table 8 missing |
 | 2.1 | Rules compiled to id-level code | ✅ | Schema-grounded rule instances, dispatch index, parallel joins |
 | 2.2 | Semi-naive fixpoint, consistency rules | ✅ | Batch = naive on 400 random ontologies |
 | 2.3 | TMS, retraction, atomic rollback | ✅ | DRed + B/F; incremental = rematerialisation on 84 k random changes |
-| 3.1–3.2 | SHACL Core, SHACL-SPARQL, commit gate, incremental validation | 🟡 | The Core validator is built (`nrese-shacl`, W3C Core 98 of 98) and served at `/dataset/shacl`. Not yet: commit gate, incremental validation, SHACL-SPARQL. Design: [shacl.md](../design/shacl.md) |
+| 3.1–3.2 | SHACL Core, SHACL-SPARQL, commit gate, incremental validation | ✅ | `nrese-shacl`: W3C Core 98 of 98, SHACL-SPARQL 22 of 22; served at `/dataset/shacl`; commit gate (off, report, enforce) with incremental validation of the affected focus nodes (2 October 2026). Not yet: parallel, set-at-a-time evaluation (C1c). Design: [shacl.md](../design/shacl.md) |
 | 4.1 | SPARQL 1.1 Query, Update | ✅ | W3C suite 485/495; native executor covers almost all queries |
-| 4.1 | Federated `SERVICE` | ❌ | X2 (with SSRF guards) |
+| 4.1 | Federated `SERVICE` | ✅ | Allowlist, timeouts and row limits (`store.federation`) |
 | 4.1 | Graph Store Protocol | 🟡 | Works; status codes for missing graphs differ from the spec (review) |
 | 4.2 | RDF4J protocol, repositories, transactions | ❌ | X1; server state is single-repository today |
 | 4.2 | Formats | 🟡 | N-Triples, N-Quads, Turtle, TriG, RDF/XML; JSON-LD and Binary RDF missing |
-| 5.1 | Full-text search, `luc:` predicates | ❌ | T1 |
-| 5.2 | GeoSPARQL, R-tree | ❌ | G1 |
+| 5.1 | Full-text search, `luc:` predicates | 🟡 | Full-text search with Blazegraph's `bds:` vocabulary (BM25); GraphDB's `luc:` predicates missing |
+| 5.2 | GeoSPARQL, R-tree | ✅ | GeoSPARQL functions and relations with an R-tree (benchmarked with the GeoSPARQL compliance kit) |
 | 5.3 | Vector similarity | ❌ | V1 |
 | 6.1 | Online backup/restore | 🟡 | Snapshot-consistent export and restore through the pipeline; no manifest/versioning or point-in-time restore |
 | 6.1 | Parallel bulk loader | ✅ | E5; Binary RDF input missing (follows the format) |
