@@ -341,6 +341,44 @@ impl Snapshot {
         )
     }
 
+    /// The values of `components` (subject 0, predicate 1, object 2, graph 3) of the quads
+    /// matching `pattern` in `model`, as columns in `permutation`'s order: what
+    /// [`scan_sorted_in`](Self::scan_sorted_in) yields, decoded a block and a column at a
+    /// time instead of a quad at a time. `None` where that can't answer: the matches lie
+    /// in both stacks, or in several runs or a run with deletions, which must be merged
+    /// quad by quad; or the plan needs a post-filter.
+    pub fn scan_columns_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        components: &[usize],
+    ) -> Option<Vec<Vec<u64>>> {
+        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        if plan.exclude_default_graph {
+            return None;
+        }
+        let mut out = vec![Vec::new(); components.len()];
+        let mut answered = false;
+        for stack in Stack::ALL {
+            if !model.includes(stack) {
+                continue;
+            }
+            if !stack.layout().supports(permutation) {
+                return None;
+            }
+            let index = self.version.stack(stack);
+            if !index.any_plan(&plan) {
+                continue;
+            }
+            if answered || !index.scan_columns(&plan, components, &mut out) {
+                return None;
+            }
+            answered = true;
+        }
+        Some(out)
+    }
+
     /// The number of distinct values of the first unbound component of `pattern` in
     /// `permutation`'s order, among its matches in `model`: a walk over each run's groups,
     /// with d values of memory. Exact unless deleted quads still shadow values in unmerged

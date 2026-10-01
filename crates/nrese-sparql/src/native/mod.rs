@@ -78,6 +78,10 @@ use value::Value;
 /// probing the index once per result row instead of scanning it.
 const PROBE_FACTOR: u64 = 32;
 
+/// Rows of the first pattern in the first morsel of a basic graph pattern under LIMIT
+/// (at least the limit; each later morsel doubles).
+const MIN_MORSEL: usize = 4096;
+
 /// Result rows per parallel task of an index nested-loop join; smaller results probe on
 /// one thread.
 const PROBE_CHUNK: usize = 4096;
@@ -949,6 +953,9 @@ struct Context<'a> {
     trace: Option<RefCell<Vec<PlanStep>>>,
     /// Nesting depth of the operator being evaluated (for the trace).
     depth: Cell<usize>,
+    /// A LIMIT for the next basic graph pattern: any this many of its rows will do
+    /// ([`Context::eval_limited`]). Taken by the pattern, so nothing nested sees it.
+    limit: Cell<Option<usize>>,
     /// The graph that triple patterns match in (`GRAPH`).
     graph: RefCell<GraphScope>,
     /// [`QueryOptions::as_written`].
@@ -1019,6 +1026,7 @@ impl<'a> Context<'a> {
                 .within(options.shared_memory.clone()),
             trace: None,
             depth: Cell::new(0),
+            limit: Cell::new(None),
             graph: RefCell::new(scope),
             synthetic: Cell::new(0),
             services: options.services.clone(),
@@ -1213,6 +1221,48 @@ impl<'a> Context<'a> {
             step.micros = start.elapsed().as_micros() as u64;
         }
         result
+    }
+
+    /// `pattern`'s solutions where any `limit` of them will do (a LIMIT without ORDER BY):
+    /// at least `limit` rows if there are as many, else all. The limit goes down to where
+    /// rows are made: a basic graph pattern stops joining once it has enough
+    /// ([`Context::bgp`]), an OPTIONAL needs only `limit` rows of its left side (a left join
+    /// keeps every left row), a projection passes it through. Anything else is evaluated
+    /// whole.
+    fn eval_limited(&self, pattern: &GraphPattern, limit: usize) -> NativeResult<Solutions> {
+        match pattern {
+            GraphPattern::Project { inner, variables } => {
+                let solutions = self.eval_limited(inner, limit)?;
+                Ok(self.project(solutions, variables))
+            }
+            GraphPattern::LeftJoin {
+                left,
+                right,
+                expression,
+            } if !self.as_written => {
+                let left = self.eval_limited(left, limit)?;
+                self.optional(left, right, expression.as_ref())
+            }
+            GraphPattern::Bgp { .. } => {
+                self.limit.set(Some(limit));
+                let solutions = self.eval(pattern);
+                self.limit.set(None);
+                solutions
+            }
+            // Every conjunct must be applied inside the pattern, where the joins stop: one
+            // applied after it could drop rows below the limit.
+            GraphPattern::Filter { expr, inner }
+                if !self.as_written
+                    && let GraphPattern::Bgp { patterns } = &**inner
+                    && placed_in(expr, patterns) =>
+            {
+                self.limit.set(Some(limit));
+                let solutions = self.eval(pattern);
+                self.limit.set(None);
+                solutions
+            }
+            _ => self.eval(pattern),
+        }
     }
 
     /// `BIND(expression AS variable)`: a column with the expression's value per row, unbound
@@ -1529,7 +1579,10 @@ impl<'a> Context<'a> {
                     solutions.table.slice(*start, *length);
                     return Ok(solutions);
                 }
-                let mut solutions = self.eval(inner)?;
+                let mut solutions = match length {
+                    Some(length) => self.eval_limited(inner, start + length)?,
+                    None => self.eval(inner)?,
+                };
                 solutions.table.slice(*start, *length);
                 Ok(solutions)
             }
@@ -1818,6 +1871,7 @@ impl<'a> Context<'a> {
         hints: &[ranges::Hint],
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
     ) -> NativeResult<Solutions> {
+        let limit = self.limit.take();
         // GeoSPARQL relations between features (`spatial`): those with a constant side
         // start the joins, the others follow them.
         if let Some((first, later, rest)) = spatial::split(triples) {
@@ -2020,40 +2074,97 @@ impl<'a> Context<'a> {
             self.note(operator, detail, estimate(0), result.table.len(), start);
         }
         result = self.filter_bound(result, filters)?;
-        for (step, &next) in order.iter().enumerate().skip(1) {
-            let start = Instant::now();
-            let shared: Vec<Variable> = scans[next]
-                .vars()
-                .into_iter()
-                .filter(|v| result.column(v).is_some())
-                .collect();
-            // (A default graph merged from listed graphs is read by scans, which filter.)
-            let probe = !shared.is_empty()
-                && self.merge_set.is_none()
-                && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
-            result = if probe {
-                self.probe_join(result, &scans[next], &shared)?
-            } else {
-                let scanned = match ranged[next] {
-                    Some((permutation, ranges)) => {
-                        self.scan_ranges(&scans[next], permutation, ranges)?
-                    }
-                    None => self.scan(&scans[next], shared.first())?,
+        let join_rest = |mut result: Solutions,
+                         filters: &mut Vec<(&Expression, Vec<Variable>)>|
+         -> NativeResult<Solutions> {
+            for (step, &next) in order.iter().enumerate().skip(1) {
+                let start = Instant::now();
+                let shared: Vec<Variable> = scans[next]
+                    .vars()
+                    .into_iter()
+                    .filter(|v| result.column(v).is_some())
+                    .collect();
+                // (A default graph merged from listed graphs is read by scans, which filter.)
+                let probe = !shared.is_empty()
+                    && self.merge_set.is_none()
+                    && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
+                result = if probe {
+                    self.probe_join(result, &scans[next], &shared)?
+                } else {
+                    let scanned = match ranged[next] {
+                        Some((permutation, ranges)) => {
+                            self.scan_ranges(&scans[next], permutation, ranges)?
+                        }
+                        None => self.scan(&scans[next], shared.first())?,
+                    };
+                    self.join(result, scanned)?
                 };
-                self.join(result, scanned)?
-            };
-            if self.trace.is_some() {
-                let operator = match (probe, shared.is_empty()) {
-                    (true, _) => "index join",
-                    (false, true) => "cross product",
-                    (false, false) => "join",
-                };
-                let detail = triples[next].to_string();
-                self.note(operator, detail, estimate(step), result.table.len(), start);
+                if self.trace.is_some() {
+                    let operator = match (probe, shared.is_empty()) {
+                        (true, _) => "index join",
+                        (false, true) => "cross product",
+                        (false, false) => "join",
+                    };
+                    let detail = triples[next].to_string();
+                    self.note(operator, detail, estimate(step), result.table.len(), start);
+                }
+                result = self.filter_bound(result, filters)?;
             }
-            result = self.filter_bound(result, filters)?;
+            Ok(result)
+        };
+        // LIMIT (`eval_limited`): any `limit` rows will do. The first pattern's rows go
+        // through the joins in morsels, each twice the last, until enough come out; the
+        // joins after a selective first pattern then never see most of its rows.
+        let Some(limit) = limit.filter(|&limit| {
+            order.len() > 1 && result.table.width() > 0 && result.table.len() > limit
+        }) else {
+            return join_rest(result, filters);
+        };
+        let sorted = result.table.sorted_by().to_vec();
+        let mut parts: Vec<Solutions> = Vec::new();
+        let (mut rows, mut from, mut size) = (0, 0, limit.max(MIN_MORSEL));
+        let mut applied = None;
+        while from < result.table.len() && rows < limit {
+            let to = (from + size).min(result.table.len());
+            let columns = result
+                .table
+                .columns()
+                .iter()
+                .map(|column| column[from..to].to_vec())
+                .collect();
+            let morsel = Solutions {
+                vars: result.vars.clone(),
+                table: IdTable::from_columns(columns).assume_sorted_by(sorted.clone()),
+                ordered: false,
+            };
+            // Each morsel applies the same conjuncts at the same steps.
+            let mut left = filters.clone();
+            let part = join_rest(morsel, &mut left)?;
+            applied = Some(left);
+            rows += part.table.len();
+            parts.push(part);
+            from = to;
+            size = size.saturating_mul(2);
         }
-        Ok(result)
+        if let Some(applied) = applied {
+            *filters = applied;
+        }
+        let vars = parts[0].vars.clone();
+        let tables = parts
+            .into_iter()
+            .map(|part| {
+                if part.vars == vars {
+                    part.table
+                } else {
+                    self.project(part, &vars).table
+                }
+            })
+            .collect();
+        Ok(Solutions {
+            table: IdTable::concat(vars.len(), tables),
+            vars,
+            ordered: false,
+        })
     }
 
     /// Joins `triples` to `result`, a pattern connected to what is bound first, each by
@@ -2466,13 +2577,33 @@ impl<'a> Context<'a> {
             .iter()
             .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
+        let merged = scan.merged();
+        // One run, no deletions, nothing to merge: whole columns, decoded a block at a time.
+        if !merged && !scan.repeats_variable() {
+            let components: Vec<usize> = columns_of.iter().map(|positions| positions[0]).collect();
+            if let Some(columns) =
+                self.snapshot
+                    .scan_columns_in(self.model, &pattern, permutation, &components)
+            {
+                let table = if vars.is_empty() {
+                    let rows = self.snapshot.count_in(self.model, &pattern) as usize;
+                    IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
+                } else {
+                    IdTable::from_columns(columns)
+                };
+                return self.produced(Solutions {
+                    vars: vars.clone(),
+                    table: table.assume_sorted_by(sorted_columns(scan, permutation, &vars)),
+                    ordered: false,
+                });
+            }
+        }
         let mut table = IdTable::new(vars.len());
         let mut row = vec![0u64; vars.len()];
         let quads = self
             .snapshot
             .scan_sorted_in(self.model, &pattern, permutation)
             .expect("permutation_for returns a usable permutation");
-        let merged = scan.merged();
         let mut previous: Option<[u64; 3]> = None;
         'quads: for (n, quad) in quads.enumerate() {
             if n % (1 << 16) == 0 {
@@ -2502,22 +2633,7 @@ impl<'a> Context<'a> {
             }
             table.push_row(&row);
         }
-        // The scan is sorted on the free components in permutation order.
-        let order: Vec<usize> = permutation
-            .order()
-            .iter()
-            .filter_map(|&component| match &scan.slots[component] {
-                Slot::Var(v) => vars.iter().position(|x| x == v),
-                Slot::Const(_) | Slot::Merged => None,
-            })
-            .collect();
-        let mut sorted = Vec::new();
-        for column in order {
-            if !sorted.contains(&column) {
-                sorted.push(column);
-            }
-        }
-        let table = table.assume_sorted_by(sorted);
+        let table = table.assume_sorted_by(sorted_columns(scan, permutation, &vars));
         self.produced(Solutions {
             vars,
             table,
@@ -4002,6 +4118,36 @@ fn drop_last_columns(mut solutions: Solutions, count: usize) -> Solutions {
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {
     columns.iter().any(|&c| table.column(c).contains(&UNDEF))
+}
+
+/// True if every conjunct of `expr` is applied while the joins of `patterns` run: it can
+/// move (no EXISTS, no draws per row) and the patterns bind all its variables.
+fn placed_in(expr: &Expression, patterns: &[TriplePattern]) -> bool {
+    let bound: Vec<Variable> = patterns.iter().flat_map(triple_variables).collect();
+    let mut conjuncts = Vec::new();
+    pushdown::conjuncts_of(expr, &mut conjuncts);
+    conjuncts.into_iter().all(|conjunct| {
+        !contains_any_exists(conjunct)
+            && pushdown::movable(conjunct)
+            && expression_variables(conjunct)
+                .iter()
+                .all(|v| bound.contains(v))
+    })
+}
+
+/// The columns (indexes into `vars`) a scan of `scan` in `permutation` is sorted on: its
+/// free components in permutation order.
+fn sorted_columns(scan: &ScanPattern, permutation: Permutation, vars: &[Variable]) -> Vec<usize> {
+    let mut sorted = Vec::new();
+    for &component in permutation.order().iter() {
+        if let Slot::Var(v) = &scan.slots[component]
+            && let Some(column) = vars.iter().position(|x| x == v)
+            && !sorted.contains(&column)
+        {
+            sorted.push(column);
+        }
+    }
+    sorted
 }
 
 fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {

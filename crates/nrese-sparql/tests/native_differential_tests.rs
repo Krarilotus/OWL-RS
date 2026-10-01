@@ -1030,6 +1030,81 @@ fn closures_from_many_bound_values_equal_the_reference() {
     }
 }
 
+/// LIMIT without ORDER BY may return any rows of the result, and the native evaluator stops
+/// joining once it has enough (morsels of the first pattern; the left side of an OPTIONAL):
+/// it must return exactly min(limit, all) rows, each a row of the full result, with
+/// filters applied inside the joins, after them, and OPTIONALs, at limits around the
+/// morsel size.
+#[test]
+fn limits_stop_early_with_rows_of_the_full_result() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..30_000u32 {
+        let s = ex(&format!("s{i}"));
+        let quads = [
+            Quad::new(
+                s.clone(),
+                ex("type"),
+                ex(&format!("C{}", i % 3)),
+                GraphName::DefaultGraph,
+            ),
+            Quad::new(
+                s.clone(),
+                ex("value"),
+                Literal::new_typed_literal(format!("{}", i % 1000), xsd::INTEGER),
+                GraphName::DefaultGraph,
+            ),
+            Quad::new(
+                s.clone(),
+                ex("link"),
+                ex(&format!("s{}", (i * 7) % 30_000)),
+                GraphName::DefaultGraph,
+            ),
+        ];
+        for quad in &quads {
+            tx.insert(quad.as_ref());
+        }
+        if i % 4 == 0 {
+            let quad = Quad::new(s, ex("extra"), ex("x"), GraphName::DefaultGraph);
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    for body in [
+        format!("?s <{EX}type> <{EX}C1> ; <{EX}value> ?v ; <{EX}link> ?t"),
+        format!("?s <{EX}type> ?c ; <{EX}link> ?t . ?t <{EX}value> ?v FILTER(?v > 500)"),
+        format!("?s <{EX}value> ?v ; <{EX}link> ?t FILTER(?v < 3)"),
+        format!("?s <{EX}type> ?c ; <{EX}value> ?v OPTIONAL {{ ?s <{EX}extra> ?t }}"),
+        format!(
+            "?s <{EX}type> ?c ; <{EX}value> ?v OPTIONAL {{ ?s <{EX}extra> ?t }} FILTER(BOUND(?t))"
+        ),
+        format!("?s <{EX}type> ?c ; <{EX}value> ?v FILTER NOT EXISTS {{ ?s <{EX}extra> ?t }}"),
+    ] {
+        let full_text = format!("SELECT * WHERE {{ {body} }}");
+        let full_query = SparqlParser::new().parse_query(&full_text).unwrap();
+        let full: HashSet<String> = rows(
+            evaluate_query(&snapshot, &full_query, &options).unwrap(),
+            false,
+        )
+        .into_iter()
+        .collect();
+        for limit in [1, 10, 4095, 4096, 4097, 9000, 20_000, 100_000] {
+            let text = format!("SELECT * WHERE {{ {body} }} LIMIT {limit}");
+            let query = SparqlParser::new().parse_query(&text).unwrap();
+            let limited = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            assert_eq!(limited.len(), limit.min(full.len()), "{text}");
+            for row in &limited {
+                assert!(
+                    full.contains(row),
+                    "{text}: {row} isn't a row of the full result"
+                );
+            }
+        }
+    }
+}
+
 /// String tests on a pattern's object (`CONTAINS`, `STRSTARTS`, `STRENDS`, on `?v` or
 /// `STR(?v)`) narrow its scan to the terms the dictionary says can pass: the same answers as
 /// the reference, over values of every kind (IRIs, simple, typed and language-tagged
