@@ -1,17 +1,16 @@
 # Contributing
 
-NRESE is licensed under the GNU Affero General Public License, version 3 ([LICENSE](LICENSE)), and is also offered under commercial licences by its copyright holder. Offering both is only possible while the copyright holder can license every part of the code.
+NRESE is licensed under the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) or the MIT licence ([LICENSE-MIT](LICENSE-MIT)), at your option.
 
-## Outside contributions
+## Contributions
 
-- **A contribution needs a signed contributor agreement** that gives the copyright holder the right to license it under the AGPL and under commercial terms. You keep the copyright in what you wrote.
-- **No agreement is in place yet.** Until there is one, pull requests from people other than the copyright holder can't be merged. Issues, bug reports and test cases in issues are welcome.
+- Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in NRESE by you, as defined in the Apache-2.0 licence, shall be dual licensed as above, without any additional terms or conditions. No separate contributor agreement is needed.
 - Don't paste code from other projects into an issue or pull request unless its licence is MIT, Apache-2.0, BSD or similar, and say where it comes from.
 
 ## Dependencies
 
-- A new dependency must be licensed under terms that allow commercial use without conditions on our code: MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, MPL-2.0 (unmodified) and similar.
-- GPL, LGPL (statically linked), AGPL and source-available dependencies aren't accepted: they would bind the commercial licence too.
+- A new dependency must be permissively licensed, so that NRESE stays usable under MIT or Apache-2.0 alone: MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, and similar. MPL-2.0 only unmodified, and only after asking.
+- GPL, LGPL (statically linked), AGPL and source-available dependencies aren't accepted: they would impose their terms on everyone who uses NRESE.
 - Prefer none at all: see the rules in [docs/plan/2026-09-30-graphdb-parity-plan.md](docs/plan/2026-09-30-graphdb-parity-plan.md) §6.
 
 ## Working rules
