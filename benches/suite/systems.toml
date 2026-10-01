@@ -40,6 +40,20 @@ capabilities = [
 # What the suite needs and NRESE lacks; each names its step in the parity plan.
 missing = { "reason-custom-rules" = "B2", "shacl-sparql" = "C3" }
 
+# The same server on the Oxigraph libraries: the branch baseline/pre-oxigraph-migration,
+# checked out beside the repository (NRESE_OXIGRAPH_SRC elsewhere). Next to `nrese` it
+# shows what the migration to the own RDF libraries changed.
+[nrese-oxigraph]
+name = "NRESE on Oxigraph (baseline/pre-oxigraph-migration)"
+publish = "free"
+runs = ["docker", "apptainer", "native"]
+capabilities = [
+  "load", "query", "update",
+  "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
+  "reason-incremental", "consistency", "explain",
+  "shacl-core", "fulltext", "federation", "geosparql", "classify",
+]
+
 [qlever]
 name = "QLever"
 publish = "free"
