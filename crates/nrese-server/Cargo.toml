@@ -12,6 +12,8 @@ dotenvy = "0.15.7"
 futures-util = { version = "0.3", default-features = false }
 jsonwebtoken = "9.3.1"
 mimalloc = { version = "0.1", default-features = false }
+# mimalloc's `mi_collect`: memory given back after bulk loads and reasoning.
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
 nrese-core = { path = "../nrese-core" }
 nrese-engine = { path = "../nrese-engine" }
 nrese-reasoner = { path = "../nrese-reasoner" }

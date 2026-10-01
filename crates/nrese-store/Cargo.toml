@@ -22,6 +22,7 @@ tracing.workspace = true
 url = "2.5.7"
 
 [dev-dependencies]
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
 mimalloc = { version = "0.1", default-features = false }
 tempfile = "3.23.0"
 

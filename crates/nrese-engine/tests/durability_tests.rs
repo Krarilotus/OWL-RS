@@ -596,3 +596,26 @@ fn bulk_loads_are_served_from_their_checkpoint() {
         assert_eq!(contents(&engine), states[9]);
     }
 }
+
+/// A bulk replacement of a durable store with commits in its WAL: the loaded quads only,
+/// served from the checkpoint, and so after a restart; later commits go to the WAL.
+#[test]
+fn bulk_replacement_is_streamed_into_its_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    commit_all(&engine, &batches(0..30));
+    let data: Vec<Quad> = (100..400).flat_map(|n| [quad(n), label(n)]).collect();
+    let load = engine.bulk_load(BulkMode::Replace);
+    load.add(&data);
+    load.finish().unwrap();
+    let mut expected: HashSet<Quad> = data.into_iter().collect();
+    assert_eq!(contents(&engine), expected);
+    assert_eq!(engine.stats().index_bytes, 0);
+    let mut tx = engine.transaction();
+    tx.insert(label(5000).as_ref());
+    tx.commit().unwrap();
+    expected.insert(label(5000));
+    drop(engine);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), expected);
+}

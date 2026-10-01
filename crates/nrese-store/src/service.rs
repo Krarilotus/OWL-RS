@@ -426,6 +426,7 @@ impl StoreService {
             "materialisation skipped an ontology axiom",
         );
         let summary = rematerialisation.finish(closure.inferred)?;
+        nrese_engine::memory::release_all();
         self.record_reasoning(crate::ReasoningState::of_with(
             rules,
             self.config.hide_unnamed_classes,
