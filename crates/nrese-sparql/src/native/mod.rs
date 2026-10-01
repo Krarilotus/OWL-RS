@@ -82,6 +82,10 @@ const PROBE_FACTOR: u64 = 32;
 /// (at least the limit; each later morsel doubles).
 const MIN_MORSEL: usize = 4096;
 
+/// A range scan over at least this many id ranges scans the whole pattern and keeps the
+/// rows whose object is in one ([`IdSet`]).
+const MANY_RANGES: usize = 1024;
+
 /// Result rows per parallel task of an index nested-loop join; smaller results probe on
 /// one thread.
 const PROBE_CHUNK: usize = 4096;
@@ -1938,6 +1942,39 @@ impl<'a> Context<'a> {
         let string_hints: Vec<ranges::Hint> = if self.as_written {
             Vec::new()
         } else {
+            // The smallest pattern, with its range hint if it has one: a pattern many times
+            // larger is joined by probing from the rows before it, never scanned, and a
+            // dictionary pass for it would be wasted.
+            let smallest = scans
+                .iter()
+                .map(|s| {
+                    let hinted = match &s.slots[2] {
+                        Slot::Var(object) if s.in_default_graph() && !s.repeats_variable() => hints
+                            .iter()
+                            .find(|h| &h.variable == object)
+                            .and_then(|hint| {
+                                let permutation = s.permutation_for(Some(object));
+                                (s.first_free(permutation) == Some(2)).then(|| {
+                                    hint.ranges
+                                        .iter()
+                                        .filter_map(|&(low, high)| {
+                                            self.snapshot.count_range_in(
+                                                self.model,
+                                                &s.quad_pattern(),
+                                                permutation,
+                                                low,
+                                                high,
+                                            )
+                                        })
+                                        .sum::<u64>()
+                                })
+                            }),
+                        _ => None,
+                    };
+                    hinted.unwrap_or_else(|| self.snapshot.count_in(self.model, &s.quad_pattern()))
+                })
+                .min()
+                .unwrap_or(0);
             let mut found: Vec<ranges::Hint> = Vec::new();
             for s in &scans {
                 let Slot::Var(object) = &s.slots[2] else {
@@ -1946,15 +1983,19 @@ impl<'a> Context<'a> {
                 if hints.iter().chain(&found).any(|h| &h.variable == object) {
                     continue;
                 }
-                let Some(condition) = filters
-                    .iter()
-                    .filter(|(_, read)| read.as_slice() == std::slice::from_ref(object))
-                    .find_map(|(conjunct, _)| strings::condition(conjunct))
-                else {
+                let Some(condition) = strings::combined(
+                    filters
+                        .iter()
+                        .filter(|(_, read)| read.as_slice() == std::slice::from_ref(object))
+                        .map(|(conjunct, _)| *conjunct),
+                    object,
+                ) else {
                     continue;
                 };
                 let rows = self.snapshot.count_in(self.model, &s.quad_pattern());
-                if rows < self.snapshot.dictionary_bytes() / strings::DICTIONARY_BYTES_PER_ROW {
+                if rows < self.snapshot.dictionary_bytes() / strings::DICTIONARY_BYTES_PER_ROW
+                    || rows > smallest.saturating_mul(PROBE_FACTOR)
+                {
                     continue;
                 }
                 let start = Instant::now();
@@ -2659,6 +2700,22 @@ impl<'a> Context<'a> {
                     .expect("variable of the pattern")
             })
             .collect();
+        // Many ranges (the terms a dictionary string test passed): one scan of the whole
+        // pattern against a bitmap of them beats a seek per range.
+        if ranges.len() >= MANY_RANGES
+            && let Slot::Var(object) = &scan.slots[2]
+        {
+            let mut solutions = self.scan(scan, Some(object))?;
+            let column = solutions
+                .column(object)
+                .expect("the pattern binds its object");
+            let set = IdSet::new(ranges);
+            self.consumed(&solutions);
+            solutions
+                .table
+                .par_retain(|table, row| set.contains(table.get(row, column)));
+            return self.produced(solutions);
+        }
         let mut table = IdTable::new(vars.len());
         let mut row = vec![0u64; vars.len()];
         for &(low, high) in ranges {
@@ -4133,6 +4190,48 @@ fn placed_in(expr: &Expression, patterns: &[TriplePattern]) -> bool {
                 .iter()
                 .all(|v| bound.contains(v))
     })
+}
+
+/// Sorted, disjoint id ranges for membership tests: single ids of one kind in a bitmap over
+/// their payloads, the few wider ranges (whole kinds) in a list.
+struct IdSet {
+    /// Per kind tag: a bitmap over payloads, if the kind has single ids.
+    bits: Vec<Vec<u64>>,
+    wide: Vec<(u64, u64)>,
+}
+
+impl IdSet {
+    fn new(ranges: &[(TermId, TermId)]) -> Self {
+        let mut set = IdSet {
+            bits: vec![Vec::new(); 16],
+            wide: Vec::new(),
+        };
+        for &(low, high) in ranges {
+            if low.kind() != high.kind() || high.payload() - low.payload() >= 64 {
+                set.wide.push((low.raw(), high.raw()));
+                continue;
+            }
+            let bits = &mut set.bits[low.kind() as usize];
+            for payload in low.payload()..=high.payload() {
+                let word = (payload / 64) as usize;
+                if bits.len() <= word {
+                    bits.resize(word + 1, 0);
+                }
+                bits[word] |= 1 << (payload % 64);
+            }
+        }
+        set
+    }
+
+    #[inline]
+    fn contains(&self, id: u64) -> bool {
+        let term = TermId::from_raw(id);
+        let payload = term.payload();
+        let in_bits = self.bits[term.kind() as usize]
+            .get((payload / 64) as usize)
+            .is_some_and(|word| word & (1 << (payload % 64)) != 0);
+        in_bits || self.wide.iter().any(|&(low, high)| low <= id && id <= high)
+    }
 }
 
 /// The columns (indexes into `vars`) a scan of `scan` in `permutation` is sorted on: its
