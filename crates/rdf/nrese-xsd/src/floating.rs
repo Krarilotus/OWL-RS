@@ -8,8 +8,10 @@ use std::str::FromStr;
 
 use crate::{Boolean, Integer, ParseError};
 
-/// Whether `text` is an XSD float or double lexical form:
+/// Whether `text` is an XSD float or double lexical form (the grammar `FromStr` must
+/// agree with; checked in the tests):
 /// `(\+|-)?([0-9]+(\.[0-9]*)?|\.[0-9]+)([Ee](\+|-)?[0-9]+)?|(\+|-)?INF|NaN`.
+#[cfg(test)]
 fn is_lexical_form(text: &[u8]) -> bool {
     if text == b"NaN" {
         return true;
@@ -153,22 +155,24 @@ macro_rules! floating {
             }
         }
 
-        /// Only the XSD lexical forms (not Rust's `inf`, `infinity` or `nan`).
+        /// Only the XSD lexical forms (not Rust's `inf`, `infinity` or `nan`). Rust's
+        /// parser accepts exactly the XSD numerals, plus words for infinity and NaN, so a
+        /// finite result is valid as is (and correctly rounded); an infinite or NaN one
+        /// is valid only from `INF`, `+INF`, `-INF`, `NaN` or a numeral beyond the range.
         impl FromStr for $name {
             type Err = ParseError;
 
             fn from_str(input: &str) -> Result<Self, ParseError> {
-                if !is_lexical_form(input.as_bytes()) {
-                    return Err(ParseError::new($xsd, "not a number, INF, -INF or NaN"));
+                let invalid = || ParseError::new($xsd, "not a number, INF, -INF or NaN");
+                let value: $t = input.parse().map_err(|_| invalid())?;
+                if value.is_finite()
+                    || matches!(input, "INF" | "+INF" | "-INF" | "NaN")
+                    || input.bytes().all(|b| matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E'))
+                {
+                    Ok(Self(value))
+                } else {
+                    Err(invalid())
                 }
-                Ok(Self(match input {
-                    "INF" | "+INF" => <$t>::INFINITY,
-                    "-INF" => <$t>::NEG_INFINITY,
-                    "NaN" => <$t>::NAN,
-                    _ => input
-                        .parse()
-                        .map_err(|_| ParseError::new($xsd, "not a number"))?,
-                }))
             }
         }
 
@@ -303,6 +307,36 @@ mod tests {
         assert_eq!("0.1".parse::<Float>().unwrap().to_string(), "0.1");
         assert_eq!("3.4028235E38".parse::<Float>().unwrap(), Float::MAX);
         assert_eq!(Float::from(1e10_f32).to_string(), "1.0E10");
+    }
+
+    /// `FromStr` accepts exactly the grammar, over every short string of the relevant
+    /// characters.
+    #[test]
+    fn parsing_agrees_with_the_grammar() {
+        let alphabet: Vec<char> = "0159+-.eEINFa ".chars().collect();
+        let mut texts = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for text in &texts {
+                for c in &alphabet {
+                    next.push(format!("{text}{c}"));
+                }
+            }
+            texts.extend(next);
+        }
+        texts.extend(["INF", "+INF", "-INF", "NaN", "+NaN", "inf", "nan"].map(String::from));
+        for text in texts {
+            assert_eq!(
+                text.parse::<Double>().is_ok(),
+                is_lexical_form(text.as_bytes()),
+                "{text:?}"
+            );
+            assert_eq!(
+                text.parse::<Float>().is_ok(),
+                is_lexical_form(text.as_bytes()),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

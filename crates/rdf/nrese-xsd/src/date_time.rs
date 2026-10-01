@@ -207,11 +207,11 @@ impl Props {
         Self::from_local(moved.local().checked_add(seconds.raw())?, self.timezone)
     }
 
-    /// XSD's partial order (or the total one when both or neither have a timezone).
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        let (a, b) = (self.timeline(), other.timeline());
+    /// XSD's partial order (or the total one when both or neither have a timezone), of
+    /// instants `a` and `b` computed with [`Props::timeline`].
+    fn order(a: i128, a_zoned: bool, b: i128, b_zoned: bool) -> Option<Ordering> {
         let window = 14 * 3600 * SCALE;
-        match (self.timezone.is_some(), other.timezone.is_some()) {
+        match (a_zoned, b_zoned) {
             (true, true) | (false, false) => Some(a.cmp(&b)),
             (true, false) => {
                 let (early, late) = (a.cmp(&(b - window)), a.cmp(&(b + window)));
@@ -222,10 +222,6 @@ impl Props {
                 (early == late).then_some(early)
             }
         }
-    }
-
-    fn eq(&self, other: &Self) -> bool {
-        self.timezone.is_some() == other.timezone.is_some() && self.timeline() == other.timeline()
     }
 
     /// `fn:adjust-dateTime-to-timezone`: `None` drops the timezone keeping the local
@@ -429,47 +425,77 @@ fn write_timezone(out: &mut String, timezone: Option<TimezoneOffset>) {
 macro_rules! temporal {
     ($(#[$doc:meta])* $name:ident, $xsd:literal) => {
         $(#[$doc])*
+        ///
+        /// Stored as its instant on the timeline and its timezone (32 bytes): comparing
+        /// reads the instant, and the seven properties are derived from the two.
         #[derive(Debug, Clone, Copy)]
-        pub struct $name(Props);
+        pub struct $name {
+            instant: i128,
+            timezone: Option<TimezoneOffset>,
+        }
 
         impl $name {
+            fn wrap(props: Props) -> Self {
+                $name { instant: props.timeline(), timezone: props.timezone }
+            }
+
+            /// The seven properties: the local time is the instant shifted by the zone.
+            fn props(self) -> Props {
+                let offset = self.timezone.map_or(0, |tz| i128::from(tz.minutes) * 60 * SCALE);
+                Props::from_local(self.instant + offset, self.timezone)
+                    .unwrap_or(Props::REFERENCE)
+            }
+
             /// The timezone as a duration (`fn:timezone-from-…`).
             pub fn timezone(self) -> Option<DayTimeDuration> {
-                self.0.timezone.map(Into::into)
+                self.timezone.map(Into::into)
             }
 
             pub fn timezone_offset(self) -> Option<TimezoneOffset> {
-                self.0.timezone
+                self.timezone
             }
 
             /// With `timezone` if it has none: XPath's implicit timezone.
             pub fn or_timezone(self, timezone: TimezoneOffset) -> Self {
-                Self(Props { timezone: Some(self.0.timezone.unwrap_or(timezone)), ..self.0 })
+                let props = self.props();
+                Self::wrap(Props { timezone: Some(props.timezone.unwrap_or(timezone)), ..props })
             }
 
             /// XSD identity: the same properties, timezone included.
             pub fn is_identical_with(self, other: Self) -> bool {
-                self.0 == other.0
+                self.instant == other.instant && self.timezone == other.timezone
             }
         }
 
         /// The same instant, both with a timezone or both without.
         impl PartialEq for $name {
+            #[inline]
             fn eq(&self, other: &Self) -> bool {
-                self.0.eq(&other.0)
+                self.instant == other.instant
+                    && self.timezone.is_some() == other.timezone.is_some()
             }
         }
 
         impl PartialOrd for $name {
+            #[inline]
             fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                self.0.partial_cmp(&other.0)
+                // Both with a timezone or both without: a total order of instants.
+                if self.timezone.is_some() == other.timezone.is_some() {
+                    return Some(self.instant.cmp(&other.instant));
+                }
+                Props::order(
+                    self.instant,
+                    self.timezone.is_some(),
+                    other.instant,
+                    other.timezone.is_some(),
+                )
             }
         }
 
         impl Hash for $name {
             fn hash<H: Hasher>(&self, state: &mut H) {
-                self.0.timeline().hash(state);
-                self.0.timezone.is_some().hash(state);
+                self.instant.hash(state);
+                self.timezone.is_some().hash(state);
             }
         }
 
@@ -533,7 +559,7 @@ impl DateTime {
             .unwrap_or_default();
         let raw =
             i128::from(since.as_secs()) * SCALE + i128::from(since.subsec_nanos()) * 1_000_000_000;
-        Self(Props::from_local(raw, Some(TimezoneOffset::UTC)).unwrap_or(Props::REFERENCE))
+        Self::wrap(Props::from_local(raw, Some(TimezoneOffset::UTC)).unwrap_or(Props::REFERENCE))
     }
 
     fn read(c: &mut Cursor<'_>) -> Result<Self, ParseError> {
@@ -561,45 +587,47 @@ impl DateTime {
             // 24:00:00 is midnight at the end of the day.
             return props
                 .plus(0, Decimal::from(86_400))
-                .map(Self)
+                .map(Self::wrap)
                 .ok_or(ParseError::new("dateTime", "a year out of range"));
         }
-        Ok(Self(props))
+        Ok(Self::wrap(props))
     }
 
     pub fn year(self) -> i64 {
-        self.0.year
+        self.props().year
     }
 
     pub fn month(self) -> u8 {
-        self.0.month
+        self.props().month
     }
 
     pub fn day(self) -> u8 {
-        self.0.day
+        self.props().day
     }
 
     pub fn hour(self) -> u8 {
-        self.0.hour
+        self.props().hour
     }
 
     pub fn minute(self) -> u8 {
-        self.0.minute
+        self.props().minute
     }
 
     pub fn second(self) -> Decimal {
-        self.0.second
+        self.props().second
     }
 
     /// `fn:adjust-dateTime-to-timezone`.
     pub fn adjust(self, timezone: Option<TimezoneOffset>) -> Option<Self> {
-        self.0.adjust(timezone).map(Self)
+        self.props().adjust(timezone).map(Self::wrap)
     }
 
     /// `op:add-yearMonthDuration-to-dateTime`, `op:add-dayTimeDuration-to-dateTime`.
     pub fn checked_add_duration(self, duration: impl Into<Duration>) -> Option<Self> {
         let d = duration.into();
-        self.0.plus(d.all_months(), d.as_seconds()).map(Self)
+        self.props()
+            .plus(d.all_months(), d.as_seconds())
+            .map(Self::wrap)
     }
 
     /// `op:subtract-…Duration-from-dateTime`.
@@ -610,7 +638,7 @@ impl DateTime {
     /// `op:subtract-dateTimes`; `None` if only one has a timezone (see
     /// [`DateTime::or_timezone`]).
     pub fn checked_sub(self, other: Self) -> Option<DayTimeDuration> {
-        difference(&self.0, &other.0)
+        difference(&self.props(), &other.props())
     }
 }
 
@@ -625,7 +653,7 @@ impl Date {
             return c.fail("a day out of range");
         }
         let timezone = c.timezone_and_end()?;
-        Ok(Self(Props {
+        Ok(Self::wrap(Props {
             year,
             month,
             day,
@@ -635,21 +663,21 @@ impl Date {
     }
 
     pub fn year(self) -> i64 {
-        self.0.year
+        self.props().year
     }
 
     pub fn month(self) -> u8 {
-        self.0.month
+        self.props().month
     }
 
     pub fn day(self) -> u8 {
-        self.0.day
+        self.props().day
     }
 
     /// `fn:adjust-date-to-timezone`.
     pub fn adjust(self, timezone: Option<TimezoneOffset>) -> Option<Self> {
-        let moved = self.0.adjust(timezone)?;
-        Some(Self(Props {
+        let moved = self.props().adjust(timezone)?;
+        Some(Self::wrap(Props {
             hour: 0,
             minute: 0,
             second: Decimal::ZERO,
@@ -661,8 +689,8 @@ impl Date {
     /// part of the dateTime result.
     pub fn checked_add_duration(self, duration: impl Into<Duration>) -> Option<Self> {
         let d = duration.into();
-        let moved = self.0.plus(d.all_months(), d.as_seconds())?;
-        Some(Self(Props {
+        let moved = self.props().plus(d.all_months(), d.as_seconds())?;
+        Some(Self::wrap(Props {
             hour: 0,
             minute: 0,
             second: Decimal::ZERO,
@@ -676,7 +704,7 @@ impl Date {
 
     /// `op:subtract-dates`.
     pub fn checked_sub(self, other: Self) -> Option<DayTimeDuration> {
-        difference(&self.0, &other.0)
+        difference(&self.props(), &other.props())
     }
 }
 
@@ -684,7 +712,7 @@ impl Time {
     fn read(c: &mut Cursor<'_>) -> Result<Self, ParseError> {
         let (hour, minute, second) = c.time()?;
         let timezone = c.timezone_and_end()?;
-        Ok(Self(Props {
+        Ok(Self::wrap(Props {
             hour: hour % 24,
             minute,
             second,
@@ -694,21 +722,21 @@ impl Time {
     }
 
     pub fn hour(self) -> u8 {
-        self.0.hour
+        self.props().hour
     }
 
     pub fn minute(self) -> u8 {
-        self.0.minute
+        self.props().minute
     }
 
     pub fn second(self) -> Decimal {
-        self.0.second
+        self.props().second
     }
 
     /// `fn:adjust-time-to-timezone`.
     pub fn adjust(self, timezone: Option<TimezoneOffset>) -> Option<Self> {
-        let moved = self.0.adjust(timezone)?;
-        Some(Self(Props {
+        let moved = self.props().adjust(timezone)?;
+        Some(Self::wrap(Props {
             year: 1972,
             month: 12,
             day: 31,
@@ -718,8 +746,8 @@ impl Time {
 
     /// `op:add-dayTimeDuration-to-time`: modulo 24 hours.
     pub fn checked_add_duration(self, duration: impl Into<DayTimeDuration>) -> Option<Self> {
-        let moved = self.0.plus(0, duration.into().as_seconds())?;
-        Some(Self(Props {
+        let moved = self.props().plus(0, duration.into().as_seconds())?;
+        Some(Self::wrap(Props {
             year: 1972,
             month: 12,
             day: 31,
@@ -733,7 +761,7 @@ impl Time {
 
     /// `op:subtract-times`.
     pub fn checked_sub(self, other: Self) -> Option<DayTimeDuration> {
-        difference(&self.0, &other.0)
+        difference(&self.props(), &other.props())
     }
 }
 
@@ -752,15 +780,15 @@ impl GYearMonth {
         c.expect(b'-')?;
         let month = c.month()?;
         let timezone = c.timezone_and_end()?;
-        Ok(Self(g_props(Some(year), Some(month), None, timezone)))
+        Ok(Self::wrap(g_props(Some(year), Some(month), None, timezone)))
     }
 
     pub fn year(self) -> i64 {
-        self.0.year
+        self.props().year
     }
 
     pub fn month(self) -> u8 {
-        self.0.month
+        self.props().month
     }
 }
 
@@ -768,11 +796,11 @@ impl GYear {
     fn read(c: &mut Cursor<'_>) -> Result<Self, ParseError> {
         let year = c.year()?;
         let timezone = c.timezone_and_end()?;
-        Ok(Self(g_props(Some(year), None, None, timezone)))
+        Ok(Self::wrap(g_props(Some(year), None, None, timezone)))
     }
 
     pub fn year(self) -> i64 {
-        self.0.year
+        self.props().year
     }
 }
 
@@ -788,15 +816,15 @@ impl GMonthDay {
             return c.fail("a day out of range");
         }
         let timezone = c.timezone_and_end()?;
-        Ok(Self(g_props(None, Some(month), Some(day), timezone)))
+        Ok(Self::wrap(g_props(None, Some(month), Some(day), timezone)))
     }
 
     pub fn month(self) -> u8 {
-        self.0.month
+        self.props().month
     }
 
     pub fn day(self) -> u8 {
-        self.0.day
+        self.props().day
     }
 }
 
@@ -810,11 +838,11 @@ impl GDay {
             return c.fail("a day out of range");
         }
         let timezone = c.timezone_and_end()?;
-        Ok(Self(g_props(None, None, Some(day), timezone)))
+        Ok(Self::wrap(g_props(None, None, Some(day), timezone)))
     }
 
     pub fn day(self) -> u8 {
-        self.0.day
+        self.props().day
     }
 }
 
@@ -824,11 +852,11 @@ impl GMonth {
         c.expect(b'-')?;
         let month = c.month()?;
         let timezone = c.timezone_and_end()?;
-        Ok(Self(g_props(None, Some(month), None, timezone)))
+        Ok(Self::wrap(g_props(None, Some(month), None, timezone)))
     }
 
     pub fn month(self) -> u8 {
-        self.0.month
+        self.props().month
     }
 }
 
@@ -837,7 +865,7 @@ impl GMonth {
 
 impl fmt::Display for DateTime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let p = self.0;
+        let p = self.props();
         let mut out = String::with_capacity(32);
         write_year(&mut out, p.year);
         let _ = write!(
@@ -853,7 +881,7 @@ impl fmt::Display for DateTime {
 
 impl fmt::Display for Date {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let p = self.0;
+        let p = self.props();
         let mut out = String::with_capacity(16);
         write_year(&mut out, p.year);
         let _ = write!(out, "-{:02}-{:02}", p.month, p.day);
@@ -864,7 +892,7 @@ impl fmt::Display for Date {
 
 impl fmt::Display for Time {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let p = self.0;
+        let p = self.props();
         let mut out = String::with_capacity(24);
         let _ = write!(out, "{:02}:{:02}:", p.hour, p.minute);
         write_seconds(&mut out, p.second);
@@ -876,9 +904,9 @@ impl fmt::Display for Time {
 impl fmt::Display for GYearMonth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = String::with_capacity(16);
-        write_year(&mut out, self.0.year);
-        let _ = write!(out, "-{:02}", self.0.month);
-        write_timezone(&mut out, self.0.timezone);
+        write_year(&mut out, self.props().year);
+        let _ = write!(out, "-{:02}", self.props().month);
+        write_timezone(&mut out, self.props().timezone);
         f.pad(&out)
     }
 }
@@ -886,32 +914,32 @@ impl fmt::Display for GYearMonth {
 impl fmt::Display for GYear {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = String::with_capacity(12);
-        write_year(&mut out, self.0.year);
-        write_timezone(&mut out, self.0.timezone);
+        write_year(&mut out, self.props().year);
+        write_timezone(&mut out, self.props().timezone);
         f.pad(&out)
     }
 }
 
 impl fmt::Display for GMonthDay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut out = format!("--{:02}-{:02}", self.0.month, self.0.day);
-        write_timezone(&mut out, self.0.timezone);
+        let mut out = format!("--{:02}-{:02}", self.props().month, self.props().day);
+        write_timezone(&mut out, self.props().timezone);
         f.pad(&out)
     }
 }
 
 impl fmt::Display for GDay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut out = format!("---{:02}", self.0.day);
-        write_timezone(&mut out, self.0.timezone);
+        let mut out = format!("---{:02}", self.props().day);
+        write_timezone(&mut out, self.props().timezone);
         f.pad(&out)
     }
 }
 
 impl fmt::Display for GMonth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut out = format!("--{:02}", self.0.month);
-        write_timezone(&mut out, self.0.timezone);
+        let mut out = format!("--{:02}", self.props().month);
+        write_timezone(&mut out, self.props().timezone);
         f.pad(&out)
     }
 }
@@ -921,28 +949,28 @@ impl fmt::Display for GMonth {
 
 impl From<DateTime> for Date {
     fn from(value: DateTime) -> Self {
-        Self(Props {
+        Self::wrap(Props {
             hour: 0,
             minute: 0,
             second: Decimal::ZERO,
-            ..value.0
+            ..value.props()
         })
     }
 }
 
 impl From<Date> for DateTime {
     fn from(value: Date) -> Self {
-        Self(value.0)
+        Self::wrap(value.props())
     }
 }
 
 impl From<DateTime> for Time {
     fn from(value: DateTime) -> Self {
-        Self(Props {
+        Self::wrap(Props {
             year: 1972,
             month: 12,
             day: 31,
-            ..value.0
+            ..value.props()
         })
     }
 }
@@ -951,10 +979,10 @@ macro_rules! cast_to_g {
     ($from:ident => $to:ident ($year:expr, $month:expr, $day:expr)) => {
         impl From<$from> for $to {
             fn from(value: $from) -> Self {
-                let p = value.0;
+                let p = value.props();
                 let (year, month, day): (Option<i64>, Option<u8>, Option<u8>) =
                     ($year(p.year), $month(p.month), $day(p.day));
-                Self(g_props(year, month, day, p.timezone))
+                Self::wrap(g_props(year, month, day, p.timezone))
             }
         }
     };

@@ -223,4 +223,14 @@ harness, a workspace of its own that still uses `oxigraph` as an oracle store; i
 with step 5. With the stricter lexical forms, XPath string forms, exact decimals and
 XPath `ROUND`, the W3C suites and all 535 workspace tests pass unchanged.
 
-Still to do in step 2: the throughput benchmarks (in bulk, at the end of the step).
+**Step 2 done: speed.** [Results](../../benches/oxigraph-comparison/results/2026-10-01-step-2.md):
+geometric mean 0.43 of Oxigraph's time over 21 cases. The first versions were up to 12×
+slower in places; profiling-led rewrites made them faster:
+- IRI parsing in one pass, and resolution that writes once;
+- decimal division in decimal chunks, and output through a 64-bit fraction;
+- dates of 32 bytes;
+- canonicalisation by components with twin pruning.
+
+What remains above 1 is within noise, except random invalid IRI text (about 10% slower).
+Canonicalising a 1,000-node blank chain takes 47 ms here and 6.9 s in oxrdf, which also
+overflows a 1 MiB stack on it.
