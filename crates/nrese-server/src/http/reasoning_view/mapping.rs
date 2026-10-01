@@ -20,7 +20,7 @@ pub fn last_run_view(run: &ReasoningRunRecord) -> LastReasoningRunView {
     LastReasoningRunView {
         revision: run.revision,
         status: run_status_name(run.status),
-        ruleset: run.ruleset,
+        ruleset: run.ruleset.clone(),
         inferred_triples: run.inferred_triples,
         inferred_inserted: run.inferred_inserted,
         inferred_deleted: run.inferred_deleted,
@@ -40,7 +40,7 @@ pub fn last_run_view(run: &ReasoningRunRecord) -> LastReasoningRunView {
 pub fn materialisation_view(report: &MaterialisationReport) -> MaterialisationView {
     MaterialisationView {
         revision: report.revision,
-        ruleset: report.ruleset,
+        ruleset: report.ruleset.clone(),
         asserted: report.asserted,
         inferred: report.inferred,
         consistency_violations: report.violations,

@@ -14,13 +14,13 @@
 //! (repairs) are accepted, but the store doesn't report itself ready, and every commit
 //! revalidates until no violation is left.
 
-use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::RuleProgram;
 
 /// The persisted reasoning state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReasoningState {
     pub ruleset: String,
-    /// [`Ruleset::fingerprint`] of the semantics the stack was computed with.
+    /// [`RuleProgram::fingerprint`] of the semantics the stack was computed with.
     pub fingerprint: u64,
     /// Consistency violations in the materialised closure.
     pub violations: usize,
@@ -48,11 +48,11 @@ impl ConsistencyStatus {
     }
 }
 
-/// The fingerprint of `ruleset` as the store runs it: leaving out unnamed classes' memberships
-/// is another closure.
-pub(crate) fn fingerprint(ruleset: Ruleset, hide_unnamed_classes: bool) -> u64 {
+/// The fingerprint of `program` as the store runs it: leaving out unnamed classes'
+/// memberships is another closure.
+pub(crate) fn fingerprint(program: &RuleProgram, hide_unnamed_classes: bool) -> u64 {
     const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0007;
-    ruleset.fingerprint()
+    program.fingerprint()
         ^ if hide_unnamed_classes {
             HIDDEN_UNNAMED_CLASSES
         } else {
@@ -62,27 +62,31 @@ pub(crate) fn fingerprint(ruleset: Ruleset, hide_unnamed_classes: bool) -> u64 {
 
 impl ReasoningState {
     #[cfg(test)]
-    pub(crate) fn of(ruleset: Ruleset, violations: usize) -> Self {
-        Self::of_with(ruleset, false, violations)
+    pub(crate) fn of(program: &RuleProgram, violations: usize) -> Self {
+        Self::of_with(program, false, violations)
     }
 
-    pub(crate) fn of_with(ruleset: Ruleset, hide_unnamed_classes: bool, violations: usize) -> Self {
+    pub(crate) fn of_with(
+        program: &RuleProgram,
+        hide_unnamed_classes: bool,
+        violations: usize,
+    ) -> Self {
         Self {
-            ruleset: ruleset.name().to_owned(),
-            fingerprint: fingerprint(ruleset, hide_unnamed_classes),
+            ruleset: program.name(),
+            fingerprint: fingerprint(program, hide_unnamed_classes),
             violations,
         }
     }
 
-    /// Whether the inferred stack is exactly `ruleset`'s closure of the asserted data.
-    pub fn is_current_for(&self, ruleset: Ruleset) -> bool {
-        self.is_current_with(ruleset, false)
+    /// Whether the inferred stack is exactly `program`'s closure of the asserted data.
+    pub fn is_current_for(&self, program: impl Into<RuleProgram>) -> bool {
+        self.is_current_with(&program.into(), false)
     }
 
     /// [`Self::is_current_for`] with unnamed classes' memberships left out or not.
-    pub fn is_current_with(&self, ruleset: Ruleset, hide_unnamed_classes: bool) -> bool {
-        self.ruleset == ruleset.name()
-            && self.fingerprint == fingerprint(ruleset, hide_unnamed_classes)
+    pub fn is_current_with(&self, program: &RuleProgram, hide_unnamed_classes: bool) -> bool {
+        self.ruleset == program.name()
+            && self.fingerprint == fingerprint(program, hide_unnamed_classes)
     }
 
     pub fn consistency(&self) -> ConsistencyStatus {
@@ -123,11 +127,13 @@ impl ReasoningState {
 
 #[cfg(test)]
 mod tests {
+    use nrese_reasoner::v2::rulesets::Ruleset;
+
     use super::*;
 
     #[test]
     fn state_round_trips_and_old_markers_are_not_current() {
-        let state = ReasoningState::of(Ruleset::Owl2Rl, 3);
+        let state = ReasoningState::of(&RuleProgram::builtin(Ruleset::Owl2Rl), 3);
         assert_eq!(
             ReasoningState::from_text(&state.to_text()),
             Some(state.clone())

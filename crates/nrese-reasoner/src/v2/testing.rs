@@ -36,4 +36,8 @@ impl Vocabulary for LocalVocabulary {
     fn literal(&mut self, lexical: &str, datatype: &str) -> u64 {
         self.term(&format!("\"{lexical}\"^^<{datatype}>"))
     }
+
+    fn language_literal(&mut self, lexical: &str, language: &str) -> u64 {
+        self.term(&format!("\"{lexical}\"@{language}"))
+    }
 }

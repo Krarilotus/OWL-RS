@@ -27,35 +27,35 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let store = StoreService::new(config.store.clone())?;
-    let ruleset = config.reasoner.materialised_ruleset();
+    let program = config.reasoner.materialised_program();
     if let CliCommand::Load(load) = cli.command {
         bulk_load(&store, load)?;
-        if let Some(ruleset) = ruleset {
+        if let Some(program) = &program {
             let report = store
-                .rematerialise(ruleset)
+                .rematerialise(program)
                 .context("reasoning after the bulk load failed")?;
             if report.violations > 0 {
                 // The data stays loaded (for diagnosis and repair); the server will start
                 // in quarantine.
                 anyhow::bail!(
                     "the loaded data is inconsistent under {}: {} violation(s)",
-                    ruleset.name(),
+                    program.name(),
                     report.violations
                 );
             }
         }
         return Ok(());
     }
-    // Reasoner v2: bring the inferred stack in line with the configured ruleset, unless
-    // the recorded state says it already is (same ruleset and semantics). Without v2
-    // reasoning, a leftover stack is cleared so reads never see stale inferences.
-    match ruleset {
-        Some(ruleset) if store.reasoning_is_current(ruleset) => {
-            tracing::info!(ruleset = ruleset.name(), "inferred stack is current");
+    // Reasoner v2: bring the inferred stack in line with the configured rules, unless the
+    // recorded state says it already is (same rules and semantics). Without reasoning, a
+    // leftover stack is cleared so reads never see stale inferences.
+    match program {
+        Some(program) if store.reasoning_is_current(&program) => {
+            tracing::info!(ruleset = %program.name(), "inferred stack is current");
         }
-        Some(ruleset) => {
+        Some(program) => {
             store
-                .rematerialise(ruleset)
+                .rematerialise(&program)
                 .context("startup reasoning failed")?;
         }
         None => {

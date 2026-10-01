@@ -85,12 +85,12 @@ impl MutationPipeline {
 
         // Reasoner v2 maintains the inferred stack from a correct one: materialise it first
         // if nothing records that it is current (a fresh or preloaded store).
-        if let Some(ruleset) = self.reasoner.config().materialised_ruleset()
-            && !self.store.reasoning_is_current(ruleset)
+        if let Some(rules) = self.reasoner.config().materialised_program()
+            && !self.store.reasoning_is_current(&rules)
         {
             // The request's cancellation stops it; the store stays as it was.
             let stop = || ticket.is_cancelled();
-            match self.store.rematerialise_until(ruleset, &stop) {
+            match self.store.rematerialise_until(&rules, &stop) {
                 Ok(_) => {}
                 Err(StoreError::MaterialisationCancelled) => return Err(MutationError::Cancelled),
                 Err(error) => return Err(store_error(error)),
@@ -109,11 +109,11 @@ impl MutationPipeline {
             )
             .map_err(store_error)?;
 
-        if let Some(ruleset) = self.reasoner.config().materialised_ruleset() {
+        if let Some(rules) = self.reasoner.config().materialised_program() {
             // Reasoner v2: the closure goes into the inferred stack, in this transaction.
             let program = self.program.get_or_init(|| {
                 let tx = &tx;
-                crate::reasoning::Program::new(ruleset, &|term| tx.intern(term))
+                crate::reasoning::Program::new(&rules, &|term| tx.intern(term))
                     .hiding_unnamed_classes(self.store.config().hide_unnamed_classes)
             });
             let revision = tx.base().revision();
@@ -185,7 +185,7 @@ impl MutationPipeline {
             drop(ground);
             // A class left out became consumable: its memberships are computed in full.
             if materialisation.needs_rematerialisation
-                && let Err(error) = self.store.rematerialise(ruleset)
+                && let Err(error) = self.store.rematerialise(&rules)
             {
                 tracing::error!(%error, "rematerialisation for an unnamed class that became used failed");
             }
@@ -194,7 +194,7 @@ impl MutationPipeline {
             if matches!(
                 self.store.consistency(),
                 crate::ConsistencyStatus::Inconsistent { .. }
-            ) && let Err(error) = self.store.rematerialise(ruleset)
+            ) && let Err(error) = self.store.rematerialise(&rules)
             {
                 tracing::error!(%error, "revalidation after a commit in quarantine failed");
             }

@@ -162,6 +162,14 @@ api_key = "replace-me"
   - `owl-horst`: RDFS-Plus with `hasValue`, `someValuesFrom` and `allValuesFrom` (ter Horst's pD*)
   - `owl2-ql`: OWL 2 QL materialised; commits that violate its disjointness axioms are rejected
   - `owl2-rl`: the OWL 2 RL/RDF closure is materialised, and commits that violate a consistency rule are rejected with the rule and the facts it matched
+  - `custom`: the user's rules only (`reasoner.rules`, below)
+- file key `reasoner.rules`, env `NRESE_REASONING_RULES`: a Notation3 file (`.n3`) of user rules. With `custom` they are the whole program; with any other reasoning mode they are added to its ruleset. They are compiled at startup, and a rule the reasoner can't run stops the startup with the rule and the reason. What compiles:
+  - `{ premises } => { conclusions } .` (and `<=`), with quick variables `?x`; blank nodes in the premises are variables
+  - `{ premises } => false .`: a consistency rule; commits that make it hold are rejected, naming it (`rules.n3#4`)
+  - `log:notEqualTo` and `log:equalTo` in the premises
+  - plain triples outside formulas: facts that hold whatever the data
+  - not (yet): other builtins (`math:`, `string:`, `list:`, `time:`), blank nodes in conclusions (existentials), formulas as terms
+  - a different rules file (one character is enough) makes the recorded closure stale, so the next startup rematerialises
 - unknown values are a startup error (a typo must not silently disable consistency checking); `rules-mvp`, the removed v1 reasoner, is an error that names its replacement
 - file key `reasoner.unnamed_classes`, env `NRESE_REASONING_UNNAMED_CLASSES`: `derive` (the default, OWL 2 RL as written) or `skip`: memberships in unnamed union classes that nothing consumes (an anonymous union used only as a domain or range, as the GND ontology does) are not derived. Everything else stays; members of such a class declared `owl:Class` are still `owl:Thing`s. With the GND ontology on the integration workload's example tier: 219,840 inferred statements become 99,213, with the same answers to its questions. A commit that makes such a class used (a subclass axiom on it) triggers a rematerialisation
 - with any mode but `disabled`:

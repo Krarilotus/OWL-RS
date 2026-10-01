@@ -4,7 +4,7 @@ This is the contract for what NRESE's reasoning computes, as implemented on 30 S
 
 ## Modes
 
-`reasoner.mode` / `NRESE_REASONING_MODE`: `disabled`, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql` or `owl2-rl`. The profiles between `rdfs` and `owl2-rl` are the RDFS rules plus named OWL 2 RL rules, as GraphDB's rulesets of the same names are.
+`reasoner.mode` / `NRESE_REASONING_MODE`: `disabled`, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl` or `custom`. The profiles between `rdfs` and `owl2-rl` are the RDFS rules plus named OWL 2 RL rules, as GraphDB's rulesets of the same names are. User rules in Notation3 (`reasoner.rules`) are added to any of them, or are the whole program with `custom` (see "User rules" below).
 
 | Mode | Rules |
 |---|---|
@@ -99,3 +99,20 @@ Startup skips rematerialisation only if the ruleset and the fingerprint match. A
 
 - Commits maintain the inferred stack incrementally: DRed with backward/forward proofs, transitive and equality modules.
 - It's equal to full rematerialisation on 84,000 random changes and 3,000 random engine commits (differential tests).
+
+## User rules (Notation3)
+
+`reasoner.rules` / `NRESE_REASONING_RULES` names a Notation3 file. Its rules compile into the same rule IR as the built-in rulesets (`crates/nrese-reasoner/src/v2/n3.rs`), so they are materialised, maintained on every commit, and checked for consistency the same way.
+
+| N3 | Meaning |
+|---|---|
+| `{ ?x :p ?y . ?y :p ?z } => { ?x :q ?z } .` | a rule; `?x` are its variables, and so are blank nodes in the premises |
+| `{ head } <= { body } .` | the same rule written the other way round |
+| `{ … } => false .` | a consistency rule: commits that make it hold are rejected |
+| `?x log:notEqualTo ?y` | a guard |
+| `?x log:equalTo ?y` | the two are one (a variable takes the other's place) |
+| plain triples | facts that hold whatever the data, never retracted |
+
+The rules' name in the materialisation state and on `/version` is `custom:<file>` (`owl2-rl+custom:<file>` when added to a ruleset). Its fingerprint covers the file's text, so a changed file rebuilds the closure.
+
+Not supported, with a startup error naming the rule: other builtins (`math:`, `string:`, `list:`, `time:`, and the rest of `log:`), blank nodes in conclusions (existentials), formulas as terms and rules inside formulas. W3C N3 Community Group reasoner tests: all 13 within this scope pass (`crates/nrese-reasoner/tests/w3c_n3_reasoner`). Of the other 76, 49 use cwm options other than "rules to a fixpoint, then the data", 13 need builtins, and the rest need formulas or generalised triples.
