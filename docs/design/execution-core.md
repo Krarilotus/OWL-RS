@@ -32,7 +32,7 @@ Across the whole mix, every query should be within 2× of QLever or faster (ROAD
 ## 2. Architecture
 
 ```
-nrese-sparql   planner: spargebra algebra ──► native plan (fully supported) ──► nrese-exec
+nrese-sparql   planner: nrese-sparql-syntax algebra ──► native plan (fully supported) ──► nrese-exec
                                          └──► spareval (anything else, unchanged semantics)
 nrese-reasoner rule bodies (R2 batch, R4 delta) ─────────────────────────────► nrese-exec
 nrese-exec     IdTable, operators, joins, sort, aggregation, budgets, parallelism
@@ -72,7 +72,7 @@ nrese-engine   permutations, cursors with seek, exact range counts, statistics, 
 - **`IdTable`:** column-major `u64` columns (QLever's layout), a variable per column, and metadata: the columns it's sorted on and the number of rows. `UNDEF` is a reserved id (`TermKind` tag 15), used by OPTIONAL and by aggregates without values.
 - **Batches:** operators exchange batches of up to 64 k rows. Scans, filters and index nested-loop joins stream batch by batch. Sorts, hash builds, group-by and join inputs that need full materialisation are pipeline breakers.
 - **Late materialisation:** ids stay ids until the output serialiser.
-  - The serialisers write TSV, JSON and N-Triples straight from dictionary bytes and inline values, without building `oxrdf::Term`s.
+  - The serialisers write TSV, JSON and N-Triples straight from dictionary bytes and inline values, without building `nrese_rdf::Term`s; each term is written by `nrese_sparql_results::write_term`, so the bytes are those of the results serialiser, RDF 1.2 terms included.
   - A per-query decode cache covers repeated ids.
 
 ## 5. Operators

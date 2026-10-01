@@ -48,6 +48,8 @@ pub enum TermKind {
     LangString = 9,
     /// A literal of any other datatype, including non-canonical forms of the inline ones.
     TypedLiteral = 10,
+    /// A triple term (RDF 1.2); after the literals, as SPARQL 1.2 orders terms.
+    Triple = 11,
 }
 
 impl TermKind {
@@ -64,6 +66,7 @@ impl TermKind {
             8 => Self::DateTime,
             9 => Self::LangString,
             10 => Self::TypedLiteral,
+            11 => Self::Triple,
             _ => return None,
         })
     }
@@ -72,7 +75,12 @@ impl TermKind {
     pub const fn is_dictionary(self) -> bool {
         matches!(
             self,
-            Self::Iri | Self::BlankNode | Self::String | Self::LangString | Self::TypedLiteral
+            Self::Iri
+                | Self::BlankNode
+                | Self::String
+                | Self::LangString
+                | Self::TypedLiteral
+                | Self::Triple
         )
     }
 

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot};
-use oxrdf::NamedNodeRef;
+use nrese_rdf::NamedNodeRef;
 
 use super::{Context, GraphScope};
 

@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use nrese_engine::{Engine, EngineConfig};
-use oxrdf::{GraphName, Literal, NamedNode, Quad};
+use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 
 fn quad(n: u64) -> Quad {
     Quad::new(

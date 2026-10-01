@@ -5,12 +5,12 @@
 use std::cmp::Ordering;
 use std::str::FromStr;
 
+use nrese_rdf::vocab::{rdf, xsd};
+use nrese_rdf::{Literal, Term};
 use nrese_xsd::{
     Boolean, Date, DateTime, DayTimeDuration, Decimal, Double, Duration, Float, GDay, GMonth,
     GMonthDay, GYear, GYearMonth, Integer, Time, YearMonthDuration,
 };
-use oxrdf::vocab::{rdf, xsd};
-use oxrdf::{Literal, Term};
 
 /// A term's value, as far as operators distinguish them.
 #[derive(Debug, Clone)]
@@ -38,6 +38,8 @@ pub enum Value {
     Blank(String),
     /// A literal of another datatype, or an ill-formed typed literal: compared by identity.
     Other(Literal),
+    /// A triple term (SPARQL 1.2): compared by identity.
+    Triple(Box<nrese_rdf::Triple>),
 }
 
 /// Datatypes derived from `xsd:integer` that SPARQL treats as integers.
@@ -62,6 +64,7 @@ impl Value {
             Term::NamedNode(node) => Self::Iri(node.as_str().to_owned()),
             Term::BlankNode(node) => Self::Blank(node.as_str().to_owned()),
             Term::Literal(literal) => Self::of_literal(literal),
+            Term::Triple(triple) => Self::Triple(triple.clone()),
         }
     }
 
@@ -267,9 +270,18 @@ pub fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
             Some(Term::BlankNode(_)) => 1,
             Some(Term::NamedNode(_)) => 2,
             Some(Term::Literal(_)) => 3,
+            // SPARQL 1.2: triple terms after literals.
+            Some(Term::Triple(_)) => 4,
         }
     }
     match (a, b) {
+        // Triple terms by subject, then predicate, then object.
+        (Some(Term::Triple(x)), Some(Term::Triple(y))) => {
+            let subject = |t: &nrese_rdf::Triple| Term::from(t.subject.clone());
+            order(Some(&subject(x)), Some(&subject(y)))
+                .then_with(|| x.predicate.as_str().cmp(y.predicate.as_str()))
+                .then_with(|| order(Some(&x.object), Some(&y.object)))
+        }
         (Some(Term::BlankNode(x)), Some(Term::BlankNode(y))) => x.as_str().cmp(y.as_str()),
         (Some(Term::NamedNode(x)), Some(Term::NamedNode(y))) => x.as_str().cmp(y.as_str()),
         (Some(Term::Literal(x)), Some(Term::Literal(y))) => {

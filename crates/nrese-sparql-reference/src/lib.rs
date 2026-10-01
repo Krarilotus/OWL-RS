@@ -24,24 +24,24 @@
 use std::collections::{HashMap, HashSet};
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot};
+use nrese_rdf::{
+    BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable,
+};
 use nrese_sparql::expression::Evaluator;
 use nrese_sparql::value;
 use nrese_sparql::{
     QueryDatasetSpecification, QueryEvaluationError, QueryOptions, QueryResults, QuerySolutionIter,
     QueryTripleIter,
 };
-use oxrdf::{
-    BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term, Triple, Variable,
-};
-use spargebra::algebra::{
+use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
     PropertyPathExpression, QueryDataset,
 };
-use spargebra::term::{
+use nrese_sparql_syntax::term::{
     GraphNamePattern, GroundQuadPattern, GroundTerm, GroundTermPattern, NamedNodePattern,
     QuadPattern as PatternQuad, TermPattern, TriplePattern,
 };
-use spargebra::{GraphUpdateOperation, Query, Update};
+use nrese_sparql_syntax::{GraphUpdateOperation, Query, Update};
 
 /// The executor's known deviations from the specification that the reference follows too.
 #[derive(Debug, Clone, Copy)]
@@ -294,7 +294,7 @@ impl Dataset {
                 GraphUpdateOperation::Create { .. } => {}
                 GraphUpdateOperation::Clear { graph, .. }
                 | GraphUpdateOperation::Drop { graph, .. } => {
-                    use spargebra::algebra::GraphTarget;
+                    use nrese_sparql_syntax::algebra::GraphTarget;
                     self.quads.retain(|q| match graph {
                         GraphTarget::NamedNode(n) => {
                             q.graph_name != GraphName::NamedNode(n.clone())
@@ -310,10 +310,10 @@ impl Dataset {
     }
 }
 
-fn graph_of(graph: &spargebra::term::GraphName) -> GraphName {
+fn graph_of(graph: &nrese_sparql_syntax::term::GraphName) -> GraphName {
     match graph {
-        spargebra::term::GraphName::NamedNode(n) => n.clone().into(),
-        spargebra::term::GraphName::DefaultGraph => GraphName::DefaultGraph,
+        nrese_sparql_syntax::term::GraphName::NamedNode(n) => n.clone().into(),
+        nrese_sparql_syntax::term::GraphName::DefaultGraph => GraphName::DefaultGraph,
     }
 }
 
@@ -503,7 +503,7 @@ impl<'d> Context<'d> {
         dataset: &'d Dataset,
         options: &QueryOptions,
         own: Option<&QueryDataset>,
-        base: Option<oxiri::Iri<String>>,
+        base: Option<nrese_rdf::Iri<String>>,
     ) -> Self {
         let specification: Option<QueryDatasetSpecification> = options
             .dataset
@@ -1279,7 +1279,7 @@ fn merge(dataset: &Dataset, graphs: Option<&[GraphName]>) -> Graph {
 /// Blank nodes of a pattern are variables no query can name (§18.2.1): they join where
 /// the parser's translation shares them (a path sequence becomes two paths through one),
 /// and no projection lists them.
-fn blank_variable(b: &spargebra::term::BlankNode) -> Variable {
+fn blank_variable(b: &nrese_sparql_syntax::term::BlankNode) -> Variable {
     Variable::new_unchecked(format!("{BLANK}{}", b.as_str()))
 }
 
@@ -1535,7 +1535,7 @@ fn graph_pattern(graph: &GraphNamePattern, solution: &Solution) -> Option<GraphN
         GraphNamePattern::Variable(v) => match solution.get(v)? {
             Term::NamedNode(n) => n.clone().into(),
             Term::BlankNode(b) => b.clone().into(),
-            Term::Literal(_) => return None,
+            Term::Literal(_) | Term::Triple(_) => return None,
         },
     })
 }

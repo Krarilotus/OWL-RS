@@ -10,9 +10,9 @@ use std::error::Error;
 use std::time::Duration;
 
 use nrese_sparql::{CancellationToken, ServiceClient, ServiceResults};
+use nrese_sparql_results::{QueryResultsFormat, QueryResultsParser, SliceQueryResultsParserOutput};
 use nrese_store::FederationConfig;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
-use sparesults::{QueryResultsFormat, QueryResultsParser, SliceQueryResultsParserOutput};
 
 pub struct HttpServiceClient {
     client: reqwest::Client,

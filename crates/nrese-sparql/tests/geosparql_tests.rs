@@ -1,9 +1,9 @@
 //! GeoSPARQL filter functions (native/geo.rs) against known answers.
 
 use nrese_engine::{Engine, EngineConfig};
+use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query};
-use oxrdf::{GraphName, Literal, NamedNode, Quad, Term};
-use spargebra::SparqlParser;
+use nrese_sparql_syntax::SparqlParser;
 
 const PREFIXES: &str = "PREFIX geo: <http://www.opengis.net/ont/geosparql#> \
     PREFIX geof: <http://www.opengis.net/def/function/geosparql/> \

@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use nrese_engine::EngineError;
+use nrese_rdf_io::RdfParseError;
 use nrese_sparql::{QueryEvaluationError, UpdateError};
-use oxrdfio::RdfParseError;
-use spargebra::SparqlSyntaxError;
+use nrese_sparql_syntax::SparqlSyntaxError;
 use thiserror::Error;
 
 pub type StoreResult<T> = Result<T, StoreError>;

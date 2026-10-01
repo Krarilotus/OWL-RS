@@ -126,7 +126,7 @@ impl StoreConfig {
                 "data_dir must not be empty in on-disk mode".to_owned(),
             ));
         }
-        if oxrdf::NamedNode::new(self.shapes_graph.as_str()).is_err() {
+        if nrese_rdf::NamedNode::new(self.shapes_graph.as_str()).is_err() {
             return Err(StoreError::Configuration(format!(
                 "shapes_graph must be an IRI, not '{}'",
                 self.shapes_graph

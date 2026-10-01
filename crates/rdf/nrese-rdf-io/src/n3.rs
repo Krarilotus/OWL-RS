@@ -347,7 +347,10 @@ impl Writer<'_> {
                 }
             }
             N3Term::Triple(triple) => self.triple_term(triple, out),
-            N3Term::Variable(v) => out.push_str(&v.to_string()),
+            N3Term::Variable(v) => {
+                out.push('?');
+                out.push_str(v.as_str());
+            }
         }
     }
 

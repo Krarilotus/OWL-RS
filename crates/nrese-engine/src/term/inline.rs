@@ -16,8 +16,8 @@
 //! Timezones are inlined when they are a multiple of 15 minutes (all real-world offsets);
 //! canonically, a zero offset is written `Z`.
 
-use oxrdf::vocab::xsd;
-use oxrdf::{Literal, LiteralRef};
+use nrese_rdf::vocab::xsd;
+use nrese_rdf::{Literal, LiteralRef};
 
 use super::{PAYLOAD_BITS, TermId, TermKind};
 
@@ -73,7 +73,8 @@ pub(crate) fn inline_to_literal(id: TermId) -> Option<Literal> {
         | TermKind::BlankNode
         | TermKind::String
         | TermKind::LangString
-        | TermKind::TypedLiteral => {
+        | TermKind::TypedLiteral
+        | TermKind::Triple => {
             return None;
         }
     };
@@ -365,7 +366,7 @@ fn decode_date_time(payload: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use oxrdf::NamedNodeRef;
+    use nrese_rdf::NamedNodeRef;
 
     use super::*;
 

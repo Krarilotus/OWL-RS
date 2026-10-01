@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TermKind};
+use nrese_rdf::{LiteralRef, NamedNodeRef};
 use nrese_reasoner::v2::classify::classify;
 use nrese_reasoner::v2::ir::Vocabulary;
-use oxrdf::{LiteralRef, NamedNodeRef};
 
 use crate::{StoreResult, StoreService};
 
@@ -93,7 +93,7 @@ impl StoreService {
             TermId::from_raw(id).kind() == TermKind::Iri
         });
         let text = |id: u64| match snapshot.decode(TermId::from_raw(id)) {
-            Some(oxrdf::Term::NamedNode(n)) => n.into_string(),
+            Some(nrese_rdf::Term::NamedNode(n)) => n.into_string(),
             other => format!("{other:?}"),
         };
         let mut skipped = BTreeMap::new();

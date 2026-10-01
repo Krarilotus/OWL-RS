@@ -12,16 +12,16 @@ use std::io::Write;
 
 use nrese_engine::ReadModel;
 
+use nrese_rdf::{GraphName, NamedNode, NamedOrBlankNode};
+use nrese_rdf_io::RdfSerializer;
 use nrese_sparql::{
     CancellationToken, Explanation, QueryDatasetSpecification, QueryEvaluationError, QueryOptions,
     QueryResults, ReadView, ResultsFormat, WriteResultsError, evaluate_query, explain_query,
     write_results,
 };
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode};
-use oxrdfio::RdfSerializer;
-use sparesults::{QueryResultsFormat, QueryResultsSerializer};
-use spargebra::Query;
-use spargebra::algebra::QueryDataset;
+use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
+use nrese_sparql_syntax::Query;
+use nrese_sparql_syntax::algebra::QueryDataset;
 
 use crate::error::{StoreError, StoreResult};
 use crate::query::{GraphResultFormat, QueryResultKind, SolutionsResultFormat, SparqlQueryRequest};

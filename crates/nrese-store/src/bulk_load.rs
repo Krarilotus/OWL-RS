@@ -18,9 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use nrese_engine::{BulkLoad, BulkMode, Engine};
-use oxrdf::{BlankNode, GraphName, NamedOrBlankNode, Quad, Term, Triple};
-use oxrdfio::{RdfFormat, RdfParseError, RdfParser};
-use oxttl::{NQuadsParser, NTriplesParser};
+use nrese_rdf::{BlankNode, GraphName, NamedOrBlankNode, Quad, Term};
+use nrese_rdf_io::{RdfFormat, RdfParseError, RdfParser};
 use rayon::prelude::*;
 
 use crate::error::{StoreError, StoreResult};
@@ -108,31 +107,21 @@ impl<'a> Source<'a> {
         blank_nodes: &BlankNodeScope,
     ) -> StoreResult<u64> {
         let threads = rayon::current_num_threads();
-        let in_graph = |triple: Triple| triple.in_graph(graph.clone());
         match self.format {
-            RdfFormat::NTriples => {
-                let chunks =
-                    NTriplesParser::new().split_file_for_parallel_parsing(self.path, threads)?;
+            // Split exactly (Turtle and TriG at statement ends, by a skim of the file) and
+            // parsed on every thread.
+            RdfFormat::NTriples | RdfFormat::NQuads | RdfFormat::Turtle | RdfFormat::TriG => {
+                let parser = RdfParser::from_format(self.format)
+                    .with_base_iri(file_base_iri(self.path)?)
+                    .map_err(|error| StoreError::Configuration(error.to_string()))?;
+                let parser = match self.format.supports_datasets() {
+                    true => parser,
+                    false => parser.with_default_graph(graph.clone()),
+                };
+                let chunks = parser.split_file_for_parallel_parsing(self.path, threads)?;
                 chunks
                     .into_par_iter()
-                    .map(|chunk| {
-                        let quads = chunk.map(|triple| triple.map(in_graph).map_err(Into::into));
-                        feed(load, quads, blank_nodes)
-                    })
-                    .sum()
-            }
-            RdfFormat::NQuads => {
-                let chunks =
-                    NQuadsParser::new().split_file_for_parallel_parsing(self.path, threads)?;
-                chunks
-                    .into_par_iter()
-                    .map(|chunk| {
-                        feed(
-                            load,
-                            chunk.map(|quad| quad.map_err(Into::into)),
-                            blank_nodes,
-                        )
-                    })
+                    .map(|chunk| feed(load, chunk, blank_nodes))
                     .sum()
             }
             format => {

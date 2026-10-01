@@ -25,6 +25,7 @@ use nrese_engine::{
     EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TermKind,
     Transaction,
 };
+use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 use nrese_reasoner::RuleProgram;
 use nrese_reasoner::v2::batch::{self, Phases, Schema};
 use nrese_reasoner::v2::delta::{self, Base, MemoryBase};
@@ -34,7 +35,6 @@ use nrese_reasoner::v2::lists::ListDiagnostic;
 use nrese_reasoner::v2::lists::ListVocabulary;
 use nrese_reasoner::v2::naive::{Triple, Violation};
 use nrese_reasoner::v2::unnamed::UnnamedVocabulary;
-use oxrdf::{LiteralRef, NamedNodeRef, TermRef};
 use std::collections::HashSet;
 
 /// A rule program compiled against the engine dictionary: its rules, list vocabulary and
@@ -260,7 +260,7 @@ impl MaterialisationReport {
 }
 
 /// An id decoded for reports ([`term_text`]); `#id` if the dictionary lacks it.
-pub(crate) fn decoded(term: Option<oxrdf::Term>, id: u64) -> String {
+pub(crate) fn decoded(term: Option<nrese_rdf::Term>, id: u64) -> String {
     term.map_or_else(|| format!("#{id}"), |term| term_text(&term))
 }
 
@@ -643,9 +643,9 @@ fn describe(rule: &str) -> &'static str {
 }
 
 /// A term as reject reports show it: an IRI plainly, anything else in N-Triples form.
-fn term_text(term: &oxrdf::Term) -> String {
+fn term_text(term: &nrese_rdf::Term) -> String {
     match term {
-        oxrdf::Term::NamedNode(node) => node.as_str().to_owned(),
+        nrese_rdf::Term::NamedNode(node) => node.as_str().to_owned(),
         other => other.to_string(),
     }
 }

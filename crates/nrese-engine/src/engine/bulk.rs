@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use oxrdf::Quad;
+use nrese_rdf::Quad;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
 
@@ -212,7 +212,7 @@ impl<'e> Rematerialisation<'e> {
     }
 
     /// The id of `term`, interning it: rules mention constants the data may not contain.
-    pub fn intern(&self, term: oxrdf::TermRef<'_>) -> crate::TermId {
+    pub fn intern(&self, term: nrese_rdf::TermRef<'_>) -> crate::TermId {
         self.engine.shared.dictionary.intern(term)
     }
 

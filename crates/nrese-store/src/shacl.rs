@@ -7,11 +7,11 @@
 //! [`StoreConfig::shapes_graph`]: crate::StoreConfig::shapes_graph
 
 use nrese_engine::{GraphSelector, ReadModel, TermId};
+use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
 use nrese_shacl::{
     PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, validate,
 };
 use nrese_sparql::ReadView;
-use oxrdf::{GraphName, NamedNode, NamedNodeRef, Term};
 
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;

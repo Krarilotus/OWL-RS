@@ -22,11 +22,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use nrese_engine::{Engine, EngineConfig};
+use nrese_rdf::{GraphName, Quad, Term};
+use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query};
-use oxrdf::{GraphName, Quad, Term};
-use oxrdfio::{RdfFormat, RdfParser};
-use sparesults::{QueryResultsFormat, QueryResultsParser, ReaderQueryResultsParserOutput};
-use spargebra::SparqlParser;
+use nrese_sparql_results::{
+    QueryResultsFormat, QueryResultsParser, ReaderQueryResultsParserOutput,
+};
+use nrese_sparql_syntax::SparqlParser;
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -73,6 +75,7 @@ impl PartialEq for Value {
 fn value(term: &Term) -> Value {
     match term {
         Term::BlankNode(_) => Value::Text("_:b".to_owned()),
+        Term::Triple(t) => Value::Text(t.to_string()),
         Term::NamedNode(n) => Value::Text(format!("<{}>", n.as_str())),
         Term::Literal(l) => {
             let datatype = l.datatype().as_str();

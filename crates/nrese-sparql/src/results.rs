@@ -9,8 +9,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use oxrdf::{GraphName, NamedOrBlankNode, Term, Triple, Variable};
-use spargebra::algebra::QueryDataset;
+use nrese_rdf::{GraphName, NamedOrBlankNode, Term, Triple, Variable};
+use nrese_sparql_syntax::algebra::QueryDataset;
 
 /// Why a query failed.
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +47,11 @@ impl CancellationToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+
+    /// The flag itself, for loops that check it without knowing the token.
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        self.0.clone()
     }
 }
 
@@ -287,7 +292,7 @@ pub enum QueryResults<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxrdf::NamedNode;
+    use nrese_rdf::NamedNode;
 
     #[test]
     fn solutions_answer_by_position_name_and_variable() {

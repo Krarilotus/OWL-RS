@@ -1,6 +1,6 @@
 //! SPARQL query execution over a [`ReadView`].
 
-use spargebra::Query;
+use nrese_sparql_syntax::Query;
 
 use crate::results::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,

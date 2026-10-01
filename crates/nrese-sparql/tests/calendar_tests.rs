@@ -3,9 +3,9 @@
 //! `sep-0002` and `calendar-ext` features, on the native executor.
 
 use nrese_engine::{Engine, EngineConfig};
+use nrese_rdf::Term;
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query};
-use oxrdf::Term;
-use spargebra::SparqlParser;
+use nrese_sparql_syntax::SparqlParser;
 
 const PREFIXES: &str = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
 

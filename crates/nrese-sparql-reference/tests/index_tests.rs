@@ -2,10 +2,10 @@
 //! a pattern's known terms is still matched in full. Paths, where a lookup by object once
 //! let triples of another predicate through.
 
+use nrese_rdf::{GraphName, NamedNode, Quad};
 use nrese_sparql::{QueryOptions, QueryResults};
 use nrese_sparql_reference::Dataset;
-use oxrdf::{GraphName, NamedNode, Quad};
-use spargebra::SparqlParser;
+use nrese_sparql_syntax::SparqlParser;
 
 fn ex(l: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("http://e/{l}"))

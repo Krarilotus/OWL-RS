@@ -19,12 +19,12 @@ use std::sync::{Arc, Mutex};
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::{IdTable, UNDEF};
-use oxrdf::Term;
-use oxrdf::{NamedNodeRef, Variable};
+use nrese_rdf::Term;
+use nrese_rdf::{NamedNodeRef, Variable};
+use nrese_sparql_syntax::algebra::{Expression, Function};
+use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use rstar::primitives::{GeomWithData, Rectangle};
 use rstar::{AABB, RTree};
-use spargebra::algebra::{Expression, Function};
-use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use super::geo::{RELATIONS, Shape, holds_apart, parse, relation};
 use super::{Context, NativeResult, Solutions};

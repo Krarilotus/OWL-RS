@@ -11,10 +11,10 @@ use nrese_engine::{Engine, EngineConfig};
 use nrese_sparql::{QueryOptions, QueryResults, UpdateOptions, apply_update, evaluate_query};
 use std::cell::RefCell;
 
+use nrese_rdf::vocab::xsd;
+use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Term};
 use nrese_sparql_reference::Dataset;
-use oxrdf::vocab::xsd;
-use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Term};
-use spargebra::SparqlParser;
+use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
 

@@ -24,8 +24,8 @@
 //! pattern's joins, so the other triple patterns are read for them only.
 
 use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery};
-use oxrdf::{Literal, Term, Variable};
-use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
+use nrese_rdf::{Literal, Term, Variable};
+use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use nrese_exec::IdTable;
 
