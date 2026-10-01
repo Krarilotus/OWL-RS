@@ -164,8 +164,12 @@ fn assert_matches_model(version: &IndexVersion, model: &BTreeSet<EncodedQuad>, c
                 .take_while(|(l, h)| l == h)
                 .count();
             if bound < 4 && !plan.exclude_default_graph {
+                let mut counts = Vec::new();
+                version.group_counts(&plan, bound, &mut counts);
                 let mut totals = std::collections::BTreeMap::new();
-                version.group_counts(&plan, bound, &mut totals);
+                for (value, count) in counts {
+                    *totals.entry(value).or_insert(0i64) += count;
+                }
                 totals.retain(|_, count| *count != 0);
                 let mut grouped = std::collections::BTreeMap::new();
                 for quad in &expected {

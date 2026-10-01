@@ -10,9 +10,11 @@
 
 pub(crate) mod dictionary;
 mod inline;
+mod strings;
 pub mod text;
 
 pub use dictionary::{Dictionary, DictionaryStats, TermView};
+pub use strings::{Placement, StringTest};
 pub use text::{TextMatch, TextQuery};
 
 /// Number of bits used by the payload of a [`TermId`].
@@ -150,6 +152,13 @@ impl TermId {
     /// `inline::date_widened`). `None` for other ids.
     pub fn date_widened(self, later: bool) -> Option<Self> {
         inline::date_widened(self, later)
+    }
+
+    /// The smallest and largest inline ids of `kind` (`Date` or `DateTime`) whose local
+    /// year is in `low..=high` (0000-9999): the ids for which `YEAR` gives those years, as
+    /// one range, since the year leads the payload. `None` for other kinds or years.
+    pub fn year_range(kind: TermKind, low: u32, high: u32) -> Option<(Self, Self)> {
+        inline::year_range(kind, low, high)
     }
 
     /// The smallest and largest ids of `kind`: the id range a scan restricted to one kind

@@ -47,6 +47,15 @@ def arguments(argv: list[str]) -> argparse.Namespace:
                    help="a tier to run (repeatable), e.g. lubm=10, owl2bench=ql-1, basics-mix=yago-tiny")
     p.add_argument("--runs", type=int, default=3, help="repetitions, each from a fresh store (default 3)")
     p.add_argument("--query-runs", type=int, default=3, help="measured runs per query after one warm-up (default 3)")
+    p.add_argument("--cache", default="off,on",
+                   help="result-cache modes for systems that have a result cache, in this order: "
+                        "off, on (the system's default) or both (default off,on; the server restarts "
+                        "between them, which empties the cache)")
+    p.add_argument("--order", choices=["shuffled", "fixed"], default="shuffled",
+                   help="query order: rounds over all queries, each round shuffled (default), or each "
+                        "query's runs back to back in file order")
+    p.add_argument("--seed", type=int, default=1,
+                   help="the shuffle seed; repetition r uses seed*1000+r, the same for every system")
     p.add_argument("--timeout-s", type=int, default=3600, help="per load (default 3600)")
     p.add_argument("--query-timeout-s", type=int, default=300, help="per query run (default 300)")
     p.add_argument("--runtime", choices=["docker", "apptainer", "process"], default="docker")
@@ -58,7 +67,11 @@ def arguments(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--keep", action="store_true",
                    help="keep datasets, the NRESE build and images for the next run of a batch")
     p.add_argument("--skip-build", action="store_true", help="use the existing NRESE and harness builds")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    args.cache = [m.strip() for m in args.cache.split(",") if m.strip()]
+    if not args.cache or any(m not in ("off", "on") for m in args.cache) or len(set(args.cache)) != len(args.cache):
+        p.error("--cache is off, on, or both in some order (off,on)")
+    return args
 
 
 def bash() -> str:
@@ -213,7 +226,12 @@ class Suite:
             # Built in the pinned Rust image, as the scorecards do: the binary runs in it.
             # Half the cores, like scripts/cargo-guarded.sh: the machine stays usable.
             cpus = str(max(1, (os.cpu_count() or 2) // 2))
+            # Code for this machine's CPU, where the containers run (NRESE_TARGET_CPU, as
+            # scripts/lib/target-cpu.sh reads it; `portable` for none).
+            cpu = os.environ.get("NRESE_TARGET_CPU", "native")
+            rustflags = "" if cpu in ("", "portable") else f"-C target-cpu={cpu}"
             rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{source.as_posix()}:/src:ro",
+                                    "-e", f"RUSTFLAGS={rustflags}",
                                     "-v", f"{nrese.target_volume}:/target", "-v", "nrese-cargo:/usr/local/cargo/registry",
                                     "-w", "/src", nrese.rust_image(ctx),
                                     "cargo", "build", "--release", "--locked", "-j", cpus, "-p", "nrese-server",
@@ -317,6 +335,8 @@ class Suite:
             if system.persistent and not in_memory:
                 size = self.runtime.store_bytes(store)
                 self.emit(base, task="size", bytes=size if size is not None else "")
+            modes = self.args.cache if system.result_cache else ["-"]
+            ctx.cache = modes[0] if modes[0] != "-" else "off"
             endpoint = system.serve(ctx, store, regime)
             base["version"] = system.version(ctx, endpoint)
             if system.persistent and not in_memory:
@@ -326,7 +346,21 @@ class Suite:
                       ms="" if system.answers_only else ms, rows=n if n is not None else "",
                       note=error or ("the rules run at this first query" if system.lazy(regime) else ""))
             if plan.queries:
-                self.queries(ctx, plan, key, system, endpoint, base)
+                for i, mode in enumerate(modes):
+                    if i > 0:
+                        # A restart in the next mode: the cache starts empty, so each
+                        # query's first execution is a miss in every mode.
+                        if not system.persistent or in_memory:
+                            break
+                        peak = system.stop(ctx)
+                        endpoint = None
+                        if peak is not None:
+                            self.emit({**base, "cache": modes[i - 1]}, task="serve", peak_mib=peak,
+                                      note="server peak over the run")
+                        ctx.cache = mode
+                        endpoint = system.serve(ctx, store, regime)
+                    self.queries(ctx, plan, key, system, endpoint, {**base, "cache": mode}, run)
+                base["cache"] = modes[-1]
         except Exception as e:  # a system that fails mustn't stop the suite
             self.emit(base, task="load" if endpoint is None else "serve", status="failed", note=str(e)[:300])
         finally:
@@ -337,12 +371,19 @@ class Suite:
                 self.runtime.remove_store(store)
             shutil.rmtree(work, ignore_errors=True)
 
-    def queries(self, ctx: Context, plan, key: str, system, endpoint: Endpoint, base: dict):
-        report = ctx.logs / "queries.json"
+    def queries(self, ctx: Context, plan, key: str, system, endpoint: Endpoint, base: dict, run: int):
+        suffix = "" if base["cache"] == "-" else f"-cache-{base['cache']}"
+        report = ctx.logs / f"queries{suffix}.json"
         command = [self.harness(), "query-mix", "--endpoint", endpoint.query, "--queries", str(plan.queries),
                    "--label", key, "--warmup", "1", "--runs", str(self.args.query_runs),
                    "--timeout-s", str(self.args.query_timeout_s), "--report-json", str(report)]
-        self.host_command(command, ctx.logs / "queries.txt")
+        if self.args.order == "shuffled":
+            seed = self.args.seed * 1000 + run
+            command += ["--order", "shuffled", "--seed", str(seed)]
+            base = {**base, "order": f"shuffled:{seed}"}
+        else:
+            base = {**base, "order": "fixed"}
+        self.host_command(command, ctx.logs / f"queries{suffix}.txt")
         if self.args.dry_run:
             return
         try:
@@ -361,6 +402,10 @@ class Suite:
             note = f"expected {expected}" if wrong else ""
             if system.answers_only:
                 note = (note + "; " if note else "") + "answered by Oxigraph over the closure"
+            if q.get("first_ms") is not None and not system.answers_only:
+                self.emit(base, task="query", item=q["id"], repeat=0, status="wrong" if wrong else "ok",
+                          ms=q["first_ms"], rows=q.get("rows") if q.get("rows") is not None else "",
+                          note=(note + "; " if note else "") + "first execution")
             for i, latency in enumerate(q.get("latencies_ms") or [None], start=1):
                 self.emit(base, task="query", item=q["id"], repeat=i, status="wrong" if wrong else "ok",
                           ms="" if system.answers_only or latency is None else latency,

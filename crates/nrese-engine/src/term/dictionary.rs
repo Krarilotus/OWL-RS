@@ -46,7 +46,10 @@ const SEP: u8 = 0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DictionaryStats {
     pub terms: u64,
+    /// The terms' keys, one after another.
     pub arena_bytes: u64,
+    /// What finds them: the end offsets and the hash table, as allocated.
+    pub index_bytes: u64,
 }
 
 #[derive(Default)]
@@ -121,6 +124,8 @@ impl Dictionary {
         DictionaryStats {
             terms: inner.ends.len() as u64,
             arena_bytes: inner.bytes.len() as u64,
+            // A slot is the stored index plus one control byte.
+            index_bytes: (inner.ends.capacity() * 8 + inner.table.capacity() * 9) as u64,
         }
     }
 
@@ -279,6 +284,13 @@ impl Dictionary {
             text.cover(end);
         }
         self.text.read().search(query)
+    }
+
+    /// The ids of the entries `0..limit` whose text passes `test`, sorted: one parallel
+    /// substring search over the arena ([`super::strings`]).
+    pub fn matching_strings(&self, test: &super::StringTest<'_>, limit: u64) -> Vec<TermId> {
+        let inner = self.inner.read();
+        super::strings::matching(&inner.bytes, &inner.ends, limit, test)
     }
 
     /// Decodes an id back into a term. Returns `None` for ids that do not belong to this

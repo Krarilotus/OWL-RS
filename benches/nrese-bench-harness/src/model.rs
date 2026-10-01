@@ -32,6 +32,9 @@ pub struct QueryMixConfig {
     pub label: String,
     pub warmup: usize,
     pub runs: usize,
+    /// `None`: each query's runs back to back, in file order. `Some(seed)`: rounds over
+    /// every query, each round in a new order drawn from the seed.
+    pub shuffle_seed: Option<u64>,
     pub timeout_s: u64,
     /// Concurrent clients for the throughput phase; 0 skips it.
     pub clients: usize,

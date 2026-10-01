@@ -1,6 +1,8 @@
 """`suite.py report`: result files as Markdown tables, one per workload tier and regime.
 
-Medians over the repetitions. Systems whose results need the vendor's permission are left
+Medians over the repetitions. A system with a result cache gets one line per cache mode
+(off, on). "First" is the sum of the queries' first executions on a fresh server (their
+medians over the repetitions); "Repeated" the sum of the medians of the later runs. Systems whose results need the vendor's permission are left
 out unless --include-restricted (their numbers stay on this machine: benches/competitors/
 README.md).
 """
@@ -45,31 +47,44 @@ def main(argv: list[str]) -> int:
     for (workload, tier, regime), group in sorted(groups.items()):
         print(f"\n### {workload} {tier} ({regime})\n")
         print("| System | Load ms | Load peak MiB | Asserted | Inferred | Store MiB | Restart ms | Count ms | "
-              "Statements | Queries ok | Sum of query medians ms | Wrong | Serve peak MiB |")
-        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+              "Statements | Queries ok | First, sum ms | Repeated, sum of medians ms | Wrong | Serve peak MiB |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         by_system: dict[str, list[dict]] = defaultdict(list)
         for r in group:
             by_system[r["system"]].append(r)
-        for system, rs in sorted(by_system.items()):
+        # A system with a result cache: one line per mode; the load, store and count
+        # figures (measured once per run, before the queries) appear on each.
+        lines: dict[str, list[dict]] = {}
+        for system, rs in by_system.items():
+            modes = sorted({r.get("cache") or "-" for r in rs if r["task"] == "query"} - {"-"})
+            if not modes:
+                lines[system] = rs
+            for mode in modes:
+                lines[f"{system} (cache {mode})"] = [
+                    r for r in rs if r["task"] != "query" and r["task"] != "serve"
+                    or (r.get("cache") or "-") in (mode, "-")]
+        for system, rs in sorted(lines.items()):
             def of(task, key="ms"):
                 return [number(r[key]) for r in rs if r["task"] == task and r["status"] == "ok"]
             if all(r["status"] == "skipped" for r in rs):
-                print(f"| {system} | skipped: {rs[0]['note']} |" + " |" * 11)
+                print(f"| {system} | skipped: {rs[0]['note']} |" + " |" * 12)
                 continue
             queries = [r for r in rs if r["task"] == "query"]
             per_query: dict[str, list[float]] = defaultdict(list)
+            first: dict[str, list[float]] = defaultdict(list)
             for r in queries:
                 if r["status"] in ("ok", "wrong") and number(r["ms"]) is not None:
-                    per_query[r["item"]].append(number(r["ms"]))
+                    (first if r["repeat"] == "0" else per_query)[r["item"]].append(number(r["ms"]))
             items = {r["item"] for r in queries}
             ok_items = {r["item"] for r in queries if r["status"] == "ok"}
             wrong = sorted({r["item"] for r in queries if r["status"] == "wrong"})
             total = sum(median(v) for v in per_query.values()) if per_query else None
+            first_total = sum(median(v) for v in first.values()) if first else None
             store = [b / 1048576 for b in of("size", "bytes") if b is not None]
             print(f"| {system} | {med(of('load'))} | {med(of('load', 'peak_mib'))} | {med(of('load', 'rows'))} | "
                   f"{med(of('reason', 'rows'))} | {med(store)} | {med(of('restart'))} | {med(of('count'))} | "
                   f"{med(of('count', 'rows'))} | {len(ok_items)}/{len(items)} | "
-                  f"{'-' if total is None else f'{total:,.1f}'} | {', '.join(wrong) or '-'} | "
+                  f"{'-' if first_total is None else f'{first_total:,.1f}'} | {'-' if total is None else f'{total:,.1f}'} | {', '.join(wrong) or '-'} | "
                   f"{med(of('serve', 'peak_mib'))} |")
     if restricted and not args.include_restricted:
         print(f"\n(left out, publication needs the vendor's permission: {', '.join(sorted(restricted))})")

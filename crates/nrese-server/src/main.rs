@@ -13,8 +13,19 @@ use nrese_server::{AppState, CliCommand, CliConfig, LoadCommand, ServerConfig, b
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Built for a CPU with more than this one has (NRESE_TARGET_CPU): stop here, with the
+    // reason, before any code compiled for that CPU runs (the async runtime is built after
+    // this), not on an illegal instruction later.
+    nrese_engine::cpu::exit_if_missing();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime failed")?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let _ = dotenvy::dotenv();
     init_tracing();
 
@@ -23,6 +34,7 @@ async fn main() -> Result<()> {
     if cli.command == CliCommand::CheckConfig {
         // Loading validated everything; show what takes effect.
         print!("{}", config.summary());
+        println!("cpu: {}", nrese_engine::cpu::summary());
         println!("configuration is valid");
         return Ok(());
     }

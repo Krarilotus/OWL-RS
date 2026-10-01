@@ -16,8 +16,12 @@
 //! copies of a statement in several graphs are adjacent, and keeps one.
 //!
 //! A bound end is followed by index probes, so `ex:Cat rdfs:subClassOf* ?c` touches only the
-//! nodes it reaches. Open closures build an [`Adjacency`] from the step's pairs and walk it
-//! from every start.
+//! nodes it reaches. Open closures are computed per strongly connected component of the
+//! step's pairs ([`transitive_closure`]); the zero-length pairs of `p*` are every node with
+//! itself, without a search. `COUNT` over an open closure ([`PathEvaluator::count_open`])
+//! needs only the closure's size per node and the number of nodes, not its pairs: on YAGO,
+//! `?c rdfs:subClassOf* ?d` has 1.7 million pairs from 133,000 classes and one per node of
+//! the graph, tens of millions.
 //!
 //! A path joined to a pattern that binds one of its ends is evaluated from those values
 //! only ([`PathEvaluator::reached_from`], [`PathEvaluator::reaching`]): the rows an open
@@ -26,7 +30,7 @@
 
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
-use nrese_exec::graph::{Adjacency, closure, reachable};
+use nrese_exec::graph::{Adjacency, closure, closure_sizes_until, reachable, transitive_closure};
 use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
 /// A path with its IRIs resolved to ids; `None` marks an IRI the store doesn't know (no
@@ -150,17 +154,33 @@ impl PathEvaluator<'_> {
 
     /// Every subject and object of the graph, each once, sorted.
     fn nodes(&self) -> Vec<u64> {
+        let (subjects, objects) = self.subjects_and_objects();
+        let mut nodes = Vec::with_capacity(subjects.len().max(objects.len()));
+        merge_union(&subjects, &objects, |node| nodes.push(node));
+        nodes
+    }
+
+    /// The number of [`Self::nodes`], without collecting them.
+    fn node_count(&self) -> u64 {
+        let (subjects, objects) = self.subjects_and_objects();
+        let mut count = 0;
+        merge_union(&subjects, &objects, |_| count += 1);
+        count
+    }
+
+    /// The distinct subjects and the distinct objects of the graph, each sorted.
+    fn subjects_and_objects(&self) -> (Vec<u64>, Vec<u64>) {
         let (pattern, by_subject, by_object) = match self.graph {
             PathGraph::Merged(None) => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
             // The statistics know no set of graphs: read its statements.
             PathGraph::Merged(Some(_)) => {
-                let mut nodes: Vec<u64> = self
-                    .quads(None, None, None)
-                    .flat_map(|(s, _, o)| [s, o])
-                    .collect();
-                nodes.sort_unstable();
-                nodes.dedup();
-                return nodes;
+                let (mut subjects, mut objects): (Vec<u64>, Vec<u64>) =
+                    self.quads(None, None, None).map(|(s, _, o)| (s, o)).unzip();
+                for values in [&mut subjects, &mut objects] {
+                    values.sort_unstable();
+                    values.dedup();
+                }
+                return (subjects, objects);
             }
             PathGraph::Default => (
                 QuadPattern::in_graph(TermId::DEFAULT_GRAPH),
@@ -173,17 +193,35 @@ impl PathEvaluator<'_> {
                 Permutation::Gosp,
             ),
         };
-        let distinct = |permutation| {
+        let distinct = |permutation| -> Vec<u64> {
             self.snapshot
                 .group_counts_in(self.model, &pattern, permutation)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(id, _)| id.raw())
+                .collect()
         };
-        let mut nodes: Vec<u64> = distinct(by_subject).chain(distinct(by_object)).collect();
-        nodes.sort_unstable();
-        nodes.dedup();
-        nodes
+        (distinct(by_subject), distinct(by_object))
+    }
+
+    /// The number of pairs [`Self::open`] gives for a closure (`p+`, `p*`), from the
+    /// closure's size per node and, for `p*`, the number of nodes: no pair is built.
+    /// `None` for other paths.
+    pub(crate) fn count_open(&self, path: &Path) -> Option<u64> {
+        let (Path::OneOrMore(step) | Path::ZeroOrMore(step)) = path else {
+            return None;
+        };
+        let sizes = closure_sizes_until(&self.open(step), &|| false)?;
+        if matches!(path, Path::OneOrMore(_)) {
+            return Some(sizes.iter().map(|&(_, reached, _)| reached).sum());
+        }
+        // Every node with itself, plus what each start reaches besides itself. The starts
+        // are nodes: their pairs come from the graph's statements.
+        let beyond: u64 = sizes
+            .iter()
+            .map(|&(_, reached, on_cycle)| reached - u64::from(on_cycle))
+            .sum();
+        Some(self.node_count() + beyond)
     }
 
     /// Ends reachable from `start` (a bag).
@@ -378,14 +416,23 @@ impl PathEvaluator<'_> {
                 pairs.extend(self.open(b));
                 dedup_pairs(pairs)
             }
-            Path::OneOrMore(p) => {
-                let adjacency = Adjacency::new(self.open(p));
-                let starts = adjacency.sources().to_vec();
-                pairs_of(closure(&adjacency, starts, false))
-            }
+            Path::OneOrMore(p) => transitive_closure(&self.open(p)),
             Path::ZeroOrMore(p) => {
-                let adjacency = Adjacency::new(self.open(p));
-                pairs_of(closure(&adjacency, self.nodes(), true))
+                let mut pairs = transitive_closure(&self.open(p));
+                // Every node with itself, unless the closure has it already (on a cycle).
+                let mut on_cycle: Vec<u64> = pairs
+                    .iter()
+                    .filter(|(a, b)| a == b)
+                    .map(|&(a, _)| a)
+                    .collect();
+                on_cycle.sort_unstable();
+                pairs.extend(
+                    self.nodes()
+                        .into_iter()
+                        .filter(|node| on_cycle.binary_search(node).is_err())
+                        .map(|node| (node, node)),
+                );
+                pairs
             }
             Path::ZeroOrOne(p) => {
                 let mut pairs: Vec<(u64, u64)> = self.nodes().into_iter().map(|n| (n, n)).collect();
@@ -408,4 +455,27 @@ fn pairs_of(table: nrese_exec::IdTable) -> Vec<(u64, u64)> {
         .copied()
         .zip(table.column(1).iter().copied())
         .collect()
+}
+
+/// Calls `f` for each value of the union of two sorted, distinct lists, in order.
+fn merge_union(a: &[u64], b: &[u64], mut f: impl FnMut(u64)) {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                f(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                f(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                f(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    a[i..].iter().chain(&b[j..]).for_each(|&x| f(x));
 }

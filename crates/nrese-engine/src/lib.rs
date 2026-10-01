@@ -14,6 +14,7 @@
 //! policy (L3 `nrese-store`), transport (L4). Fix storage-layout, visibility and durability
 //! bugs here and nowhere else.
 
+pub mod cpu;
 mod durability;
 pub mod engine;
 pub mod error;
@@ -29,4 +30,7 @@ pub use engine::{
 pub use error::{EngineError, EngineResult};
 pub use index::CompactionPolicy;
 pub use quad::{EncodedQuad, EncodedTriple, GraphSelector, QuadPattern};
-pub use term::{Dictionary, DictionaryStats, TermId, TermKind, TermView, TextMatch, TextQuery};
+pub use term::{
+    Dictionary, DictionaryStats, Placement, StringTest, TermId, TermKind, TermView, TextMatch,
+    TextQuery,
+};

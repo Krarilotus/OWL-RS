@@ -197,6 +197,11 @@ impl StoreService {
         Ok(collect_stats(&self.engine.snapshot()))
     }
 
+    /// The engine's sizes: quads, runs, index and dictionary memory.
+    pub fn engine_stats(&self) -> nrese_engine::EngineStats {
+        self.engine.stats()
+    }
+
     pub fn export_dataset(
         &self,
         format: DatasetBackupFormat,

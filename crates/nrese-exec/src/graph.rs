@@ -134,12 +134,10 @@ pub fn closure(
 /// The transitive closure of `edges`: every `(a, b)` with `b` reachable from `a` in one or
 /// more steps, each once, in no particular order.
 ///
-/// Nodes in one strongly connected component reach the same set, so reachability is
-/// computed per component (Nuutila's approach). Tarjan's algorithm finds the components
-/// in reverse topological order, so each component's reach is the union of its
-/// successors' reach, computed after theirs. Apart from the output, the cost is
-/// O(n + m) plus the total size of the components' reach sets. On a clique of k nodes
-/// that's O(k²), the size of the output, where a search per node ([`closure`]) is O(k³).
+/// Computed per strongly connected component ([`Condensation`]). Apart from the output,
+/// the cost is O(n + m) plus the total size of the components' reach sets. On a clique of
+/// k nodes that's O(k²), the size of the output, where a search per node ([`closure`]) is
+/// O(k³).
 pub fn transitive_closure(edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     transitive_closure_until(edges, &|| false).expect("never stopped")
 }
@@ -153,158 +151,248 @@ pub fn transitive_closure_until(
 ) -> Option<Vec<(u64, u64)>> {
     use rayon::prelude::*;
 
-    // Dense node numbering and CSR over it.
-    let mut nodes: Vec<u64> = edges.iter().flat_map(|&(a, b)| [a, b]).collect();
-    nodes.par_sort_unstable();
-    nodes.dedup();
-    let n = nodes.len();
-    let dense = |id: u64| nodes.binary_search(&id).expect("every endpoint is a node") as u32;
-    let mut pairs: Vec<(u32, u32)> = edges
-        .par_iter()
-        .map(|&(a, b)| (dense(a), dense(b)))
+    let g = Condensation::of(edges, stop)?;
+    let out: Vec<(u64, u64)> = (0..g.components())
+        .into_par_iter()
+        .flat_map_iter(|c| {
+            let g = &g;
+            // A stopped run produces nothing more; the caller discards what it has.
+            let stopped = c % 256 == 0 && stop();
+            g.members_of(if stopped { usize::MAX } else { c })
+                .iter()
+                .flat_map(move |&x| {
+                    g.reach[c].iter().flat_map(move |&d| {
+                        g.members_of(d as usize)
+                            .iter()
+                            .map(move |&y| (g.nodes[x as usize], g.nodes[y as usize]))
+                    })
+                })
+        })
         .collect();
-    pairs.par_sort_unstable();
-    pairs.dedup();
-    let mut offsets = vec![0u32; n + 1];
-    for &(a, _) in &pairs {
-        offsets[a as usize + 1] += 1;
-    }
-    for i in 0..n {
-        offsets[i + 1] += offsets[i];
-    }
-    let targets: Vec<u32> = pairs.iter().map(|&(_, b)| b).collect();
-    let successors =
-        |v: u32| &targets[offsets[v as usize] as usize..offsets[v as usize + 1] as usize];
+    (!stop()).then_some(out)
+}
 
-    // Tarjan's algorithm, iterative. Components come out sinks first.
-    const UNSEEN: u32 = u32::MAX;
-    struct Tarjan {
-        order: Vec<u32>,
-        low: Vec<u32>,
-        on_stack: Vec<bool>,
-        stack: Vec<u32>,
-        /// The depth-first path: each node with the index of its next successor.
-        calls: Vec<(u32, usize)>,
-        counter: u32,
+/// For every node of `edges` with at least one edge out, sorted: the node, the number of
+/// nodes it reaches in one or more steps, and whether it reaches itself (it lies on a
+/// cycle). The size of the transitive closure without building it, which is what `COUNT`
+/// over `p+` and `p*` needs. Cost as [`transitive_closure`] without the output. `None` if
+/// `stop` fired.
+pub fn closure_sizes_until(
+    edges: &[(u64, u64)],
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Option<Vec<(u64, u64, bool)>> {
+    let g = Condensation::of(edges, stop)?;
+    let size: Vec<u64> = (0..g.components())
+        .map(|c| {
+            g.reach[c]
+                .iter()
+                .map(|&d| g.members_of(d as usize).len() as u64)
+                .sum()
+        })
+        .collect();
+    // Dense ids follow the sorted node ids, so the output comes out sorted.
+    Some(
+        (0..g.nodes.len() as u32)
+            .filter(|&x| g.has_successors(x))
+            .map(|x| {
+                let c = g.component[x as usize] as usize;
+                (g.nodes[x as usize], size[c], g.cyclic[c])
+            })
+            .collect(),
+    )
+}
+
+/// A relation's strongly connected components and, per component, the components it
+/// reaches.
+///
+/// Nodes in one strongly connected component reach the same set, so reachability is
+/// computed per component (Nuutila's approach). Tarjan's algorithm finds the components
+/// in reverse topological order, so each component's reach is the union of its
+/// successors' reach, computed after theirs. The cost is O(n + m) plus the total size of
+/// the components' reach sets.
+struct Condensation {
+    /// The relation's nodes, sorted: dense node `x` is `nodes[x]`.
+    nodes: Vec<u64>,
+    offsets: Vec<u32>,
+    targets: Vec<u32>,
+    /// Per dense node, its component.
+    component: Vec<u32>,
+    /// `members[starts[c]..starts[c + 1]]` are component c's nodes.
+    members: Vec<u32>,
+    starts: Vec<usize>,
+    /// Per component: whether it reaches itself (more than one node, or a self-loop).
+    cyclic: Vec<bool>,
+    /// Per component, the components it reaches in one or more steps (itself if cyclic).
+    reach: Vec<Vec<u32>>,
+}
+
+impl Condensation {
+    fn of(edges: &[(u64, u64)], stop: &(dyn Fn() -> bool + Sync)) -> Option<Self> {
+        use rayon::prelude::*;
+
+        // Dense node numbering and CSR over it.
+        let mut nodes: Vec<u64> = edges.iter().flat_map(|&(a, b)| [a, b]).collect();
+        nodes.par_sort_unstable();
+        nodes.dedup();
+        let n = nodes.len();
+        let dense = |id: u64| nodes.binary_search(&id).expect("every endpoint is a node") as u32;
+        let mut pairs: Vec<(u32, u32)> = edges
+            .par_iter()
+            .map(|&(a, b)| (dense(a), dense(b)))
+            .collect();
+        pairs.par_sort_unstable();
+        pairs.dedup();
+        let mut offsets = vec![0u32; n + 1];
+        for &(a, _) in &pairs {
+            offsets[a as usize + 1] += 1;
+        }
+        for i in 0..n {
+            offsets[i + 1] += offsets[i];
+        }
+        let targets: Vec<u32> = pairs.iter().map(|&(_, b)| b).collect();
+        let mut g = Self {
+            nodes,
+            offsets,
+            targets,
+            component: vec![0; n],
+            members: Vec::with_capacity(n),
+            starts: vec![0],
+            cyclic: Vec::new(),
+            reach: Vec::new(),
+        };
+        g.tarjan(stop)?;
+        g.reach(stop)?;
+        Some(g)
     }
-    impl Tarjan {
-        fn visit(&mut self, v: u32) {
-            self.order[v as usize] = self.counter;
-            self.low[v as usize] = self.counter;
-            self.counter += 1;
-            self.stack.push(v);
-            self.on_stack[v as usize] = true;
-            self.calls.push((v, 0));
+
+    fn successors(&self, v: u32) -> &[u32] {
+        &self.targets[self.offsets[v as usize] as usize..self.offsets[v as usize + 1] as usize]
+    }
+
+    fn has_successors(&self, v: u32) -> bool {
+        self.offsets[v as usize] < self.offsets[v as usize + 1]
+    }
+
+    fn components(&self) -> usize {
+        self.starts.len() - 1
+    }
+
+    /// Component `c`'s nodes; none for an index past the last component.
+    fn members_of(&self, c: usize) -> &[u32] {
+        match self.starts.get(c..c.saturating_add(2)) {
+            Some(&[start, end]) => &self.members[start..end],
+            _ => &[],
         }
     }
-    let mut t = Tarjan {
-        order: vec![UNSEEN; n],
-        low: vec![0; n],
-        on_stack: vec![false; n],
-        stack: Vec::new(),
-        calls: Vec::new(),
-        counter: 0,
-    };
-    let mut component = vec![0u32; n];
-    // `members[starts[c]..starts[c + 1]]` are component c's nodes.
-    let (mut members, mut starts) = (Vec::with_capacity(n), vec![0usize]);
-    for root in 0..n as u32 {
-        if root % 4096 == 0 && stop() {
-            return None;
+
+    /// Tarjan's algorithm, iterative. Components come out sinks first.
+    fn tarjan(&mut self, stop: &(dyn Fn() -> bool + Sync)) -> Option<()> {
+        const UNSEEN: u32 = u32::MAX;
+        struct Tarjan {
+            order: Vec<u32>,
+            low: Vec<u32>,
+            on_stack: Vec<bool>,
+            stack: Vec<u32>,
+            /// The depth-first path: each node with the index of its next successor.
+            calls: Vec<(u32, usize)>,
+            counter: u32,
         }
-        if t.order[root as usize] != UNSEEN {
-            continue;
+        impl Tarjan {
+            fn visit(&mut self, v: u32) {
+                self.order[v as usize] = self.counter;
+                self.low[v as usize] = self.counter;
+                self.counter += 1;
+                self.stack.push(v);
+                self.on_stack[v as usize] = true;
+                self.calls.push((v, 0));
+            }
         }
-        t.visit(root);
-        while let Some(&(v, next)) = t.calls.last() {
-            if let Some(&w) = successors(v).get(next) {
-                t.calls.last_mut().expect("not empty").1 += 1;
-                if t.order[w as usize] == UNSEEN {
-                    t.visit(w);
-                } else if t.on_stack[w as usize] {
-                    t.low[v as usize] = t.low[v as usize].min(t.order[w as usize]);
-                }
+        let n = self.nodes.len();
+        let mut t = Tarjan {
+            order: vec![UNSEEN; n],
+            low: vec![0; n],
+            on_stack: vec![false; n],
+            stack: Vec::new(),
+            calls: Vec::new(),
+            counter: 0,
+        };
+        for root in 0..n as u32 {
+            if root % 4096 == 0 && stop() {
+                return None;
+            }
+            if t.order[root as usize] != UNSEEN {
                 continue;
             }
-            t.calls.pop();
-            if let Some(&(u, _)) = t.calls.last() {
-                t.low[u as usize] = t.low[u as usize].min(t.low[v as usize]);
-            }
-            if t.low[v as usize] == t.order[v as usize] {
-                let c = starts.len() as u32 - 1;
-                loop {
-                    let w = t.stack.pop().expect("v is on the stack");
-                    t.on_stack[w as usize] = false;
-                    component[w as usize] = c;
-                    members.push(w);
-                    if w == v {
-                        break;
+            t.visit(root);
+            while let Some(&(v, next)) = t.calls.last() {
+                if let Some(&w) = self.successors(v).get(next) {
+                    t.calls.last_mut().expect("not empty").1 += 1;
+                    if t.order[w as usize] == UNSEEN {
+                        t.visit(w);
+                    } else if t.on_stack[w as usize] {
+                        t.low[v as usize] = t.low[v as usize].min(t.order[w as usize]);
                     }
-                }
-                starts.push(members.len());
-            }
-        }
-    }
-
-    // Reach per component, successors first. A component reaches itself if it has a
-    // cycle: more than one node, or a self-loop.
-    let components = starts.len() - 1;
-    let mut reach: Vec<Vec<u32>> = Vec::with_capacity(components);
-    let mut stamp = vec![u32::MAX; components];
-    for c in 0..components {
-        if c % 1024 == 0 && stop() {
-            return None;
-        }
-        let mut set = Vec::new();
-        let nodes_of_c = &members[starts[c]..starts[c + 1]];
-        let mut cyclic = nodes_of_c.len() > 1;
-        for &x in nodes_of_c {
-            for &y in successors(x) {
-                let d = component[y as usize];
-                if d as usize == c {
-                    cyclic = true;
                     continue;
                 }
-                if stamp[d as usize] != c as u32 {
-                    stamp[d as usize] = c as u32;
-                    set.push(d);
-                    for &e in &reach[d as usize] {
-                        if stamp[e as usize] != c as u32 {
-                            stamp[e as usize] = c as u32;
-                            set.push(e);
+                t.calls.pop();
+                if let Some(&(u, _)) = t.calls.last() {
+                    t.low[u as usize] = t.low[u as usize].min(t.low[v as usize]);
+                }
+                if t.low[v as usize] == t.order[v as usize] {
+                    let c = self.starts.len() as u32 - 1;
+                    loop {
+                        let w = t.stack.pop().expect("v is on the stack");
+                        t.on_stack[w as usize] = false;
+                        self.component[w as usize] = c;
+                        self.members.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    self.starts.push(self.members.len());
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// Reach per component, successors first.
+    fn reach(&mut self, stop: &(dyn Fn() -> bool + Sync)) -> Option<()> {
+        let components = self.components();
+        let mut stamp = vec![u32::MAX; components];
+        for c in 0..components {
+            if c % 1024 == 0 && stop() {
+                return None;
+            }
+            let mut set = Vec::new();
+            let mut cyclic = self.members_of(c).len() > 1;
+            for &x in self.members_of(c) {
+                for &y in self.successors(x) {
+                    let d = self.component[y as usize];
+                    if d as usize == c {
+                        cyclic = true;
+                        continue;
+                    }
+                    if stamp[d as usize] != c as u32 {
+                        stamp[d as usize] = c as u32;
+                        set.push(d);
+                        for &e in &self.reach[d as usize] {
+                            if stamp[e as usize] != c as u32 {
+                                stamp[e as usize] = c as u32;
+                                set.push(e);
+                            }
                         }
                     }
                 }
             }
+            if cyclic {
+                set.push(c as u32);
+            }
+            self.cyclic.push(cyclic);
+            self.reach.push(set);
         }
-        if cyclic {
-            set.push(c as u32);
-        }
-        reach.push(set);
+        Some(())
     }
-
-    let out: Vec<(u64, u64)> = (0..components)
-        .into_par_iter()
-        .flat_map_iter(|c| {
-            let (members, starts, reach, nodes) = (&members, &starts, &reach, &nodes);
-            // A stopped run produces nothing more; the caller discards what it has.
-            let stopped = c % 256 == 0 && stop();
-            members[if stopped {
-                0..0
-            } else {
-                starts[c]..starts[c + 1]
-            }]
-            .iter()
-            .flat_map(move |&x| {
-                reach[c].iter().flat_map(move |&d| {
-                    members[starts[d as usize]..starts[d as usize + 1]]
-                        .iter()
-                        .map(move |&y| (nodes[x as usize], nodes[y as usize]))
-                })
-            })
-        })
-        .collect();
-    (!stop()).then_some(out)
 }
 
 #[cfg(test)]
@@ -335,6 +423,23 @@ mod tests {
             let mut got = transitive_closure(&edges);
             got.sort_unstable();
             assert_eq!(got, expected, "{edges:?}");
+            let sizes: Vec<(u64, u64, bool)> = adjacency
+                .sources()
+                .iter()
+                .map(|&s| {
+                    let reached = expected.iter().filter(|&&(a, _)| a == s);
+                    (
+                        s,
+                        reached.clone().count() as u64,
+                        reached.into_iter().any(|&(_, b)| b == s),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                closure_sizes_until(&edges, &|| false).expect("never stopped"),
+                sizes,
+                "{edges:?}"
+            );
         }
         // A clique: every pair, including each node with itself.
         let clique: Vec<(u64, u64)> = (0..50)

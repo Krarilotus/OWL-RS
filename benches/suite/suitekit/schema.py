@@ -9,13 +9,15 @@
 | run | the repetition (a fresh store each) |
 | task | load, reason, size, restart, count, query, update, serve, conformance (a skipped pair: load, status skipped) |
 | item | the query or test the row is about (task query, conformance) |
-| repeat | the measured repetition of a query within a run |
+| repeat | the measured repetition of a query within a run; 0 is its first execution on the fresh server (a warm-up run, not in the medians) |
 | status | ok, failed, timeout, wrong (an answer count differs from the expected one), skipped |
 | ms | wall time |
 | peak_mib | peak resident memory of the step |
 | rows | answers (query), statements (load: asserted; reason: inferred; count: all answered) |
 | bytes | store size (task size) |
 | note | what else the row needs to be read right |
+| cache | the system's result cache while the queries ran: off, on (the system's default), or - (it has none) |
+| order | the query order: fixed (each query's runs back to back), or shuffled:SEED (rounds over all queries, each in a new order; the same seed gives every system the same orders) |
 
 The results of systems with publish = permission stay in the result files; `suite.py
 report` leaves them out unless asked (and they may not leave the machine without the
@@ -53,6 +55,8 @@ class Result:
     rows: int | str = ""
     bytes: int | str = ""
     note: str = ""
+    cache: str = "-"
+    order: str = "-"
 
 
 FIELDS = [f.name for f in fields(Result)]
@@ -74,9 +78,14 @@ def problems(result: Result) -> list[str]:
 
 
 class Writer:
-    """Appends results to a CSV file (with its header when new)."""
+    """Appends results to a CSV file (with its header when new). A file written with other
+    fields (an older schema) is left alone: the rows go to results-2.csv, -3, … instead."""
 
     def __init__(self, path: Path, echo=None):
+        n = 1
+        while path.exists() and path.stat().st_size > 0 and header(path) != FIELDS:
+            n += 1
+            path = path.with_name(f"{path.stem.split('-')[0]}-{n}{path.suffix}")
         self.path = path
         self.echo = echo
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,8 +104,12 @@ class Writer:
             csv.DictWriter(f, FIELDS).writerow(row)
         if self.echo:
             shown = [result.system, result.workload, result.tier, f"run {result.run}", result.task]
+            if result.cache != "-":
+                shown.append(f"cache {result.cache}")
             if result.item:
                 shown.append(result.item)
+            if result.task == "query" and result.repeat == 0:
+                shown.append("first")
             shown.append(result.status)
             for key, unit in (("ms", " ms"), ("peak_mib", " MiB"), ("rows", " rows"), ("bytes", " bytes")):
                 value = row[key]
@@ -105,6 +118,11 @@ class Writer:
             if result.note:
                 shown.append(f"({result.note})")
             self.echo("  " + " ".join(str(s) for s in shown))
+
+
+def header(path: Path) -> list[str]:
+    with open(path, newline="", encoding="utf-8") as f:
+        return next(csv.reader(f), [])
 
 
 def read(path: Path) -> list[dict]:
