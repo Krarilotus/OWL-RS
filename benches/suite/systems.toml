@@ -34,11 +34,13 @@ runs = ["docker", "apptainer", "native"]
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
-  "reason-incremental", "consistency", "explain",
+  "reason-custom-rules", "reason-incremental", "consistency", "explain",
   "shacl-core", "fulltext", "federation", "geosparql", "classify",
 ]
 # What the suite needs and NRESE lacks; each names its step in the parity plan.
-missing = { "reason-custom-rules" = "B2", "shacl-sparql" = "C3" }
+# (reason-custom-rules: user rules in Notation3 since 2026-10-01; builtins and .pie
+# import are B2's rest.)
+missing = { "shacl-sparql" = "C3" }
 
 # The same server on the Oxigraph libraries: the branch baseline/pre-oxigraph-migration,
 # checked out beside the repository (NRESE_OXIGRAPH_SRC elsewhere). Next to `nrese` it
