@@ -11,9 +11,9 @@
 //! - **Streaming.** Every document is also read through a reader that gives one byte per
 //!   call, so that every token is cut by the buffer somewhere: the outcome must be the
 //!   same (the same statements up to blank node names, or an error).
-//! - **Round trips.** Every document that parses is written back, in its own format and as
-//!   N-Quads (Turtle and TriG with a few prefixes, to exercise abbreviation), and read again:
-//!   the statements must be the same.
+//! - **Round trips.** Every document that parses is written back, in its own format, as
+//!   N-Quads and as JSON-LD (Turtle, TriG, RDF/XML and JSON-LD with a few prefixes, to
+//!   exercise abbreviation), and read again: the statements must be the same.
 //! - `expected-failures.txt` lists tests that fail on purpose, each with its reason; a new
 //!   failure, or a pass of a listed test, fails the run.
 
@@ -196,11 +196,11 @@ fn parse(root: &Path, format: RdfFormat, iri: &str) -> Result<BTreeSet<Quad>, St
 
 /// The statements written in `format` and read back must be the same.
 fn round_trip(format: RdfFormat, quads: &BTreeSet<Quad>) -> Result<(), String> {
-    for format in [format, RdfFormat::NQuads] {
+    for format in [format, RdfFormat::NQuads, RdfFormat::JsonLd] {
         let mut serializer = RdfSerializer::from_format(format);
         if matches!(
             format,
-            RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml
+            RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml | RdfFormat::JsonLd
         ) {
             for (name, iri) in [
                 ("ex", "http://example/"),

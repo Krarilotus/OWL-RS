@@ -1051,6 +1051,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-json"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "nrese-rdf"
 version = "0.1.0"
 dependencies = [
@@ -1063,7 +1071,9 @@ dependencies = [
 name = "nrese-rdf-io"
 version = "0.1.0"
 dependencies = [
+ "foldhash 0.2.0",
  "memchr",
+ "nrese-json",
  "nrese-rdf",
  "quick-xml 0.42.0",
  "thiserror 2.0.21",

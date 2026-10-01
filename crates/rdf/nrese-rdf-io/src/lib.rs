@@ -1,5 +1,5 @@
-//! NRESE's RDF readers and writers: N-Triples and N-Quads (also in parallel chunks), with
-//! Turtle, TriG, RDF/XML and JSON-LD to follow (see the migration plan's step 3).
+//! NRESE's RDF readers and writers: N-Triples and N-Quads (also in parallel chunks),
+//! Turtle, TriG, RDF/XML and JSON-LD.
 //!
 //! Part of the RDF bundle (`crates/rdf`), replacing `oxrdfio`, `oxttl`, `oxrdfxml` and
 //! `oxjsonld`. A [`RdfParser`] reads a document from a slice or any `Read`; its
@@ -13,6 +13,7 @@ mod blank;
 mod error;
 mod format;
 mod input;
+pub mod jsonld;
 mod ntriples;
 mod parser;
 mod rdfxml;
