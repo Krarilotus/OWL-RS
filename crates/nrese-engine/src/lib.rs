@@ -19,6 +19,7 @@ mod durability;
 pub mod engine;
 pub mod error;
 mod index;
+mod mapped;
 pub mod quad;
 pub mod term;
 

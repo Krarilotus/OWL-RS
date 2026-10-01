@@ -34,6 +34,10 @@ pub struct StoreConfig {
     /// Reasoning leaves out memberships in unnamed union classes that nothing consumes
     /// (`reasoner.unnamed_classes = "skip"`; work package W7).
     pub hide_unnamed_classes: bool,
+    /// On disk: check the whole checkpoint when opening (see
+    /// `nrese_engine::DurabilityConfig::verify_on_open`). Off: the checkpoint is used in
+    /// place and opening reads only its structure.
+    pub verify_on_open: bool,
 }
 
 /// SPARQL 1.1 Federated Query: the endpoints `SERVICE` may call, and how long and how much
@@ -97,6 +101,7 @@ impl StoreConfig {
             total_query_memory_bytes: 0,
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            verify_on_open: false,
         }
     }
 
@@ -111,6 +116,7 @@ impl StoreConfig {
             total_query_memory_bytes: 0,
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            verify_on_open: false,
         }
     }
 

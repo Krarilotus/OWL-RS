@@ -25,6 +25,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
         names::QUERY_CACHE_BYTES,
         config.store.query_cache_bytes,
     );
+    insert_bool(
+        &mut source,
+        names::VERIFY_ON_OPEN,
+        config.store.verify_on_open,
+    );
 
     insert_option(
         &mut source,

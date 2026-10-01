@@ -108,6 +108,8 @@ pub(super) struct RawStoreConfig {
     pub query_cache_bytes: Option<usize>,
     #[serde(default)]
     pub default_graph: Option<String>,
+    #[serde(default)]
+    pub verify_on_open: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]

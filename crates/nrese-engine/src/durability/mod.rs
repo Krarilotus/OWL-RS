@@ -50,6 +50,12 @@ pub struct DurabilityConfig {
     /// A background checkpoint is requested once this many WAL bytes were written since the
     /// last one. Needs background maintenance; otherwise call `Engine::checkpoint`.
     pub checkpoint_after_wal_bytes: u64,
+    /// Check the whole checkpoint when opening: its CRC, every index block and every
+    /// dictionary key. Off by default: a checkpoint is used in place from a memory map, and
+    /// opening then reads only its headers, so a restart costs milliseconds and memory
+    /// grows with what queries touch. On, opening reads the whole file once (and a damaged
+    /// one is refused at once rather than failing when a query reaches the damage).
+    pub verify_on_open: bool,
 }
 
 impl Default for DurabilityConfig {
@@ -58,6 +64,7 @@ impl Default for DurabilityConfig {
             sync: SyncPolicy::EveryCommit,
             wal_segment_bytes: 64 << 20,
             checkpoint_after_wal_bytes: 256 << 20,
+            verify_on_open: false,
         }
     }
 }
@@ -94,7 +101,7 @@ impl Durable {
         checkpoint::remove_temporaries(root)?;
         let timing = std::env::var_os("NRESE_RECOVERY_TIMING").is_some();
         let clock = std::time::Instant::now();
-        let loaded = checkpoint::load_latest(root, dictionary)?;
+        let loaded = checkpoint::load_latest(root, dictionary, config.verify_on_open)?;
         if timing {
             eprintln!(
                 "recovery: checkpoint read {:.3} s",

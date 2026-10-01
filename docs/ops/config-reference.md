@@ -145,6 +145,11 @@ api_key = "replace-me"
 - default: `67108864` (64 MiB); `0` disables the cache
 - serialised results of repeated queries on an unchanged store are answered from memory. Every commit starts a new revision, so a cached result is never stale; queries using `NOW()`, `RAND()`, `UUID()`, `STRUUID()` or `BNODE()` are not cached, and no single result takes more than an eighth of the budget
 
+- file key: `store.verify_on_open`
+- env override: `NRESE_VERIFY_ON_OPEN`
+- default: `false`
+- on disk, the newest checkpoint is used in place from a memory map: opening reads only its structure, so a restart takes milliseconds and memory grows with what queries touch. `true` checks the whole checkpoint when opening (its CRC, every index block, every dictionary key): opening then reads the whole file once, and a damaged checkpoint is refused at once instead of failing when a query reaches the damage
+
 - file key: `store.ontology_path`
 - env override: `NRESE_ONTOLOGY_PATH`
 - optional; when set, the file is loaded at startup and a missing file is a startup error

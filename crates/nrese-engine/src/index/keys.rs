@@ -13,6 +13,7 @@
 
 use rayon::prelude::*;
 
+use crate::mapped::{Map, Mapped, Plain};
 use crate::quad::Key;
 
 /// Keys per block.
@@ -23,7 +24,11 @@ const PAYLOAD_MASK: u64 = (1 << TAG_SHIFT) - 1;
 
 /// Frame of reference of one block: per key position, the minimum tag and payload, the bit
 /// widths of the packed offsets from them, and where each sub-column starts.
+///
+/// `repr(C)` with explicit padding: its memory image is what checkpoints store, so a
+/// mapped checkpoint's headers are used in place.
 #[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
 struct Header {
     /// Word offset of the block's bits in `data`.
     offset: u64,
@@ -33,6 +38,7 @@ struct Header {
     widths: [u8; 8],
     /// Bit offsets of the sub-columns within the block (at most 128 keys × 256 bits).
     starts: [u16; 8],
+    _padding: [u8; 4],
 }
 
 impl Header {
@@ -101,18 +107,81 @@ impl Header {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PackedKeys {
     len: usize,
-    headers: Box<[Header]>,
+    headers: Storage<Header>,
     /// The first key of every block, for the block-level binary search.
-    firsts: Box<[Key]>,
+    firsts: Storage<Key>,
     /// Packed bits; one spare word at the end, so reads never cross the slice end.
-    data: Box<[u64]>,
+    data: Storage<u64>,
 }
 
-/// Serialised size of a [`Header`].
-const HEADER_BYTES: usize = 8 + 32 + 4 + 8 + 16;
+/// An array on the heap, or in a memory-mapped checkpoint ([`crate::mapped`]).
+#[derive(Debug, Clone)]
+enum Storage<T: Plain> {
+    Owned(Box<[T]>),
+    Mapped(Mapped<T>),
+}
+
+impl<T: Plain> Default for Storage<T> {
+    fn default() -> Self {
+        Self::Owned(Box::default())
+    }
+}
+
+impl<T: Plain> std::ops::Deref for Storage<T> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Owned(values) => values,
+            Self::Mapped(values) => values,
+        }
+    }
+}
+
+impl<T: Plain> Storage<T> {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Owned(values) => size_of_val::<[T]>(values),
+            Self::Mapped(_) => 0,
+        }
+    }
+
+    fn mapped_bytes(&self) -> usize {
+        match self {
+            Self::Owned(_) => 0,
+            Self::Mapped(values) => size_of_val::<[T]>(values),
+        }
+    }
+}
+
+// SAFETY: `Header` is `repr(C)` of integers with its padding spelled out as a field.
+unsafe impl Plain for Header {}
+// SAFETY: a key is four `u64`s.
+unsafe impl Plain for Key {}
+
+/// Serialised size of a [`Header`] in format 5.
+const HEADER_BYTES_V5: usize = 8 + 32 + 4 + 8 + 16;
+/// Serialised size of a [`Header`] since format 6: its in-memory image, padding included.
+const HEADER_BYTES: usize = size_of::<Header>();
+const _: () = assert!(HEADER_BYTES == HEADER_BYTES_V5 + 4);
 
 /// Arrays at least this long are packed in parallel.
 const PARALLEL_PACK: usize = 1 << 16;
+
+/// `count` values of `T` at `raw`, in place in `map` if `raw` lies in it and they can be
+/// mapped.
+fn in_place<T: Plain>(map: Option<&Map>, raw: &[u8], count: usize) -> Option<Mapped<T>> {
+    let map = map?;
+    let offset = (raw.as_ptr() as usize).checked_sub(map.as_ptr() as usize)?;
+    Mapped::new(map, offset, count)
+}
+
+/// Zero bytes after `len` bytes written from file position `at`, up to the next multiple
+/// of 8.
+fn padding(at: u64, len: usize) -> usize {
+    ((8 - (at + len as u64) % 8) % 8) as usize
+}
 
 /// Bits needed for values `0..=max`.
 fn width(max: u64) -> u8 {
@@ -183,9 +252,9 @@ impl PackedKeys {
         }
         Self {
             len: keys.len(),
-            headers: headers.into_boxed_slice(),
-            firsts: keys.chunks(BLOCK).map(|block| block[0]).collect(),
-            data: data.into_boxed_slice(),
+            headers: Storage::Owned(headers.into_boxed_slice()),
+            firsts: Storage::Owned(keys.chunks(BLOCK).map(|block| block[0]).collect()),
+            data: Storage::Owned(data.into_boxed_slice()),
         }
     }
 
@@ -220,16 +289,23 @@ impl PackedKeys {
             flush(&mut block, &mut data);
         }
         data.push(0);
-        packed.headers = headers.into_boxed_slice();
-        packed.firsts = firsts.into_boxed_slice();
-        packed.data = data.into_boxed_slice();
+        packed.headers = Storage::Owned(headers.into_boxed_slice());
+        packed.firsts = Storage::Owned(firsts.into_boxed_slice());
+        packed.data = Storage::Owned(data.into_boxed_slice());
         packed
     }
 
-    /// Serialises the array: `len | blocks | words | headers | firsts | data`, little-endian;
-    /// `emit` receives consecutive pieces (large arrays in chunks).
+    /// Serialises the array, little-endian; `emit` receives consecutive pieces (large
+    /// arrays in chunks).
+    ///
+    /// With `at`, the position in the file where the array starts (format 6): `len u64 |
+    /// blocks u64 | words u64 | padding | headers | firsts | data`, the headers as their
+    /// 72-byte in-memory image, zero padding to an 8-byte boundary of the file, so all three
+    /// can be used in place from a memory map. Without (format 5): no padding, 68-byte
+    /// headers.
     pub(crate) fn write(
         &self,
+        at: Option<u64>,
         emit: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         let mut buffer: Vec<u8> = Vec::with_capacity(1 << 16);
@@ -240,6 +316,9 @@ impl PackedKeys {
         ] {
             buffer.extend_from_slice(&value.to_le_bytes());
         }
+        if let Some(at) = at {
+            buffer.resize(buffer.len() + padding(at, 24), 0);
+        }
         let mut drain = |buffer: &mut Vec<u8>, force: bool| -> std::io::Result<()> {
             if force || buffer.len() >= 1 << 16 {
                 emit(buffer)?;
@@ -247,7 +326,7 @@ impl PackedKeys {
             }
             Ok(())
         };
-        for header in &self.headers {
+        for header in self.headers.iter() {
             buffer.extend_from_slice(&header.offset.to_le_bytes());
             for min in header.payload_min {
                 buffer.extend_from_slice(&min.to_le_bytes());
@@ -257,15 +336,18 @@ impl PackedKeys {
             for start in header.starts {
                 buffer.extend_from_slice(&start.to_le_bytes());
             }
+            if at.is_some() {
+                buffer.extend_from_slice(&[0; 4]);
+            }
             drain(&mut buffer, false)?;
         }
-        for key in &self.firsts {
+        for key in self.firsts.iter() {
             for component in key {
                 buffer.extend_from_slice(&component.to_le_bytes());
             }
             drain(&mut buffer, false)?;
         }
-        for word in &self.data {
+        for word in self.data.iter() {
             buffer.extend_from_slice(&word.to_le_bytes());
             drain(&mut buffer, false)?;
         }
@@ -273,12 +355,24 @@ impl PackedKeys {
     }
 
     /// Reads what [`write`](Self::write) wrote from `bytes`, returning the array and the
-    /// bytes consumed. The structure is checked (block counts, widths, offsets), so a
-    /// damaged file fails here instead of in a later lookup.
-    pub(crate) fn read(bytes: &[u8]) -> Result<(Self, usize), String> {
-        let mut at = 0;
+    /// bytes consumed.
+    ///
+    /// `file_at` is the file position of `bytes` for format 6 (as `write`'s `at`); `map` the
+    /// mapped file `bytes` lie in, if any: the headers, first keys and packed bits are then
+    /// used in place, and only the counts are checked, so opening reads nothing else. With
+    /// `verify`, or when the array is copied, every block is checked (widths, offsets, first
+    /// keys), so a damaged file fails here instead of in a later lookup.
+    pub(crate) fn read(
+        bytes: &[u8],
+        file_at: Option<u64>,
+        map: Option<&Map>,
+        verify: bool,
+    ) -> Result<(Self, usize), String> {
+        let mut at: usize = 0;
         let mut take = |n: usize| -> Result<&[u8], String> {
-            let piece = bytes.get(at..at + n).ok_or("truncated packed keys")?;
+            let piece = bytes
+                .get(at..at.checked_add(n).ok_or("truncated packed keys")?)
+                .ok_or("truncated packed keys")?;
             at += n;
             Ok(piece)
         };
@@ -293,27 +387,92 @@ impl PackedKeys {
         if blocks != len.div_ceil(BLOCK) || words == 0 {
             return Err("inconsistent packed key counts".into());
         }
-        let raw = take(
+        if let Some(file_at) = file_at {
+            take(padding(file_at, 24))?;
+        }
+        let header_bytes = if file_at.is_some() {
+            HEADER_BYTES
+        } else {
+            HEADER_BYTES_V5
+        };
+        let raw_headers = take(
             blocks
-                .checked_mul(HEADER_BYTES)
+                .checked_mul(header_bytes)
                 .ok_or("header size overflows")?,
         )?;
-        let mut headers = Vec::with_capacity(blocks);
+        let raw_firsts = take(blocks.checked_mul(32).ok_or("first keys overflow")?)?;
+        let raw_data = take(words.checked_mul(8).ok_or("data size overflows")?)?;
+        // Format 6 in a mapped file: the arrays in place.
+        let map = map.filter(|_| file_at.is_some());
+        let keys = match (
+            in_place(map, raw_headers, blocks),
+            in_place(map, raw_firsts, blocks),
+            in_place(map, raw_data, words),
+        ) {
+            (Some(headers), Some(firsts), Some(data)) => Self {
+                len,
+                headers: Storage::Mapped(headers),
+                firsts: Storage::Mapped(firsts),
+                data: Storage::Mapped(data),
+            },
+            _ => {
+                let headers: Vec<Header> = raw_headers
+                    .chunks_exact(header_bytes)
+                    .map(|piece| {
+                        let mut header = Header {
+                            offset: u64_at(piece, 0),
+                            ..Header::default()
+                        };
+                        for c in 0..4 {
+                            header.payload_min[c] = u64_at(piece, 1 + c);
+                        }
+                        header.tag_min.copy_from_slice(&piece[40..44]);
+                        header.widths.copy_from_slice(&piece[44..52]);
+                        for (i, start) in header.starts.iter_mut().enumerate() {
+                            *start = u16::from_le_bytes([piece[52 + 2 * i], piece[53 + 2 * i]]);
+                        }
+                        header
+                    })
+                    .collect();
+                let firsts: Vec<Key> = raw_firsts
+                    .as_chunks::<32>()
+                    .0
+                    .iter()
+                    .map(|piece| std::array::from_fn(|c| u64_at(piece, c)))
+                    .collect();
+                let data: Vec<u64> = raw_data
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| u64::from_le_bytes(*b))
+                    .collect();
+                Self {
+                    len,
+                    headers: Storage::Owned(headers.into_boxed_slice()),
+                    firsts: Storage::Owned(firsts.into_boxed_slice()),
+                    data: Storage::Owned(data.into_boxed_slice()),
+                }
+            }
+        };
+        let in_place = matches!(keys.data, Storage::Mapped(_));
+        if verify || !in_place {
+            keys.verify()?;
+        } else if let Some(last) = keys.headers.last() {
+            // In place: the last block must end where the data does (one header read).
+            let n = len - (blocks - 1) * BLOCK;
+            if last.offset + last.words(n) as u64 + 1 != words as u64 {
+                return Err("packed data length does not match its blocks".into());
+            }
+        }
+        Ok((keys, at))
+    }
+
+    /// Checks every block's header (widths, sub-column starts, word offsets) and first key
+    /// against the data: reads all of it.
+    pub(crate) fn verify(&self) -> Result<(), String> {
         let mut expected_offset = 0u64;
-        for (b, piece) in raw.as_chunks::<HEADER_BYTES>().0.iter().enumerate() {
-            let mut header = Header {
-                offset: u64_at(piece, 0),
-                ..Header::default()
-            };
-            for c in 0..4 {
-                header.payload_min[c] = u64_at(piece, 1 + c);
-            }
-            header.tag_min.copy_from_slice(&piece[40..44]);
-            header.widths.copy_from_slice(&piece[44..52]);
-            for (i, start) in header.starts.iter_mut().enumerate() {
-                *start = u16::from_le_bytes([piece[52 + 2 * i], piece[53 + 2 * i]]);
-            }
-            let n = BLOCK.min(len - b * BLOCK);
+        for (b, header) in self.headers.iter().enumerate() {
+            let n = BLOCK.min(self.len - b * BLOCK);
             let valid_widths = header.widths.chunks(2).all(|w| w[0] <= 4 && w[1] <= 60);
             let mut bit = 0;
             let valid_starts = header
@@ -329,35 +488,14 @@ impl PackedKeys {
                 return Err(format!("damaged header of block {b}"));
             }
             expected_offset += header.words(n) as u64;
-            headers.push(header);
         }
-        if expected_offset + 1 != words as u64 {
+        if expected_offset + 1 != self.data.len() as u64 {
             return Err("packed data length does not match its blocks".into());
         }
-        let raw = take(blocks.checked_mul(32).ok_or("first keys overflow")?)?;
-        let firsts: Vec<Key> = raw
-            .as_chunks::<32>()
-            .0
-            .iter()
-            .map(|piece| std::array::from_fn(|c| u64_at(piece, c)))
-            .collect();
-        let raw = take(words.checked_mul(8).ok_or("data size overflows")?)?;
-        let data: Vec<u64> = raw
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|b| u64::from_le_bytes(*b))
-            .collect();
-        let keys = Self {
-            len,
-            headers: headers.into_boxed_slice(),
-            firsts: firsts.into_boxed_slice(),
-            data: data.into_boxed_slice(),
-        };
-        if (0..blocks).any(|b| keys.get(b * BLOCK) != keys.firsts[b]) {
+        if (0..self.headers.len()).any(|b| self.get(b * BLOCK) != self.firsts[b]) {
             return Err("packed first keys do not match their blocks".into());
         }
-        Ok((keys, at))
+        Ok(())
     }
 
     #[inline]
@@ -573,11 +711,14 @@ impl PackedKeys {
         low
     }
 
-    /// Bytes held (headers, block firsts and packed bits).
+    /// Heap bytes held (headers, block firsts and packed bits); mapped ones are the file's.
     pub(crate) fn memory_bytes(&self) -> usize {
-        self.headers.len() * size_of::<Header>()
-            + self.firsts.len() * size_of::<Key>()
-            + self.data.len() * 8
+        self.headers.heap_bytes() + self.firsts.heap_bytes() + self.data.heap_bytes()
+    }
+
+    /// Bytes used in place from a mapped file.
+    pub(crate) fn mapped_bytes(&self) -> usize {
+        self.headers.mapped_bytes() + self.firsts.mapped_bytes() + self.data.mapped_bytes()
     }
 }
 
@@ -712,21 +853,21 @@ mod tests {
             let streamed = PackedKeys::from_sorted_iter(keys.iter().copied());
             let mut bytes = Vec::new();
             packed
-                .write(&mut |piece| {
+                .write(None, &mut |piece| {
                     bytes.extend_from_slice(piece);
                     Ok(())
                 })
                 .unwrap();
             let mut streamed_bytes = Vec::new();
             streamed
-                .write(&mut |piece| {
+                .write(None, &mut |piece| {
                     streamed_bytes.extend_from_slice(piece);
                     Ok(())
                 })
                 .unwrap();
             assert_eq!(bytes, streamed_bytes, "streaming packs identically, n {n}");
             bytes.extend_from_slice(b"trailing");
-            let (read, used) = PackedKeys::read(&bytes).unwrap();
+            let (read, used) = PackedKeys::read(&bytes, None, None, true).unwrap();
             assert_eq!(used, bytes.len() - 8);
             assert_eq!(
                 (0..read.len()).map(|i| read.get(i)).collect::<Vec<_>>(),
@@ -735,9 +876,46 @@ mod tests {
             if n > 0 {
                 let mut damaged = bytes.clone();
                 damaged[24 + 44] = 61; // a tag width no header can have
-                assert!(PackedKeys::read(&damaged).is_err());
-                assert!(PackedKeys::read(&bytes[..bytes.len() - 16]).is_err());
+                assert!(PackedKeys::read(&damaged, None, None, true).is_err());
+                assert!(PackedKeys::read(&bytes[..bytes.len() - 16], None, None, true).is_err());
             }
+        }
+    }
+
+    /// Written at any file position with padding, the data is used in place from a map
+    /// of the file, and reads like the original.
+    #[test]
+    fn padded_keys_are_used_in_place_from_a_map() {
+        let mut state = 29;
+        let dir = tempfile::tempdir().unwrap();
+        for (n, at) in [(1000, 0u64), (70_000, 3), (129, 13), (0, 5)] {
+            let keys = random_keys(&mut state, n);
+            let packed = PackedKeys::from_sorted(&keys);
+            let mut bytes = vec![0xaa; at as usize];
+            packed
+                .write(Some(at), &mut |piece| {
+                    bytes.extend_from_slice(piece);
+                    Ok(())
+                })
+                .unwrap();
+            let path = dir.path().join(format!("keys-{n}"));
+            std::fs::write(&path, &bytes).unwrap();
+            let map = crate::mapped::map(&path).unwrap();
+            let (read, used) =
+                PackedKeys::read(&map[at as usize..], Some(at), Some(&map), false).unwrap();
+            assert_eq!(used, bytes.len() - at as usize);
+            assert_eq!(read.memory_bytes(), 0, "n {n} at {at}");
+            assert_eq!(read.mapped_bytes(), packed.memory_bytes(), "n {n} at {at}");
+            read.verify().unwrap();
+            assert_eq!(
+                (0..read.len()).map(|i| read.get(i)).collect::<Vec<_>>(),
+                keys
+            );
+            // Without the map, the same bytes are copied.
+            let (copied, _) =
+                PackedKeys::read(&bytes[at as usize..], Some(at), None, false).unwrap();
+            assert_eq!(copied.mapped_bytes(), 0);
+            assert_eq!(copied.len(), keys.len());
         }
     }
 
