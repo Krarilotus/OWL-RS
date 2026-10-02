@@ -4760,3 +4760,65 @@ fn grouped_cross_products_equal_the_reference() {
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
+
+/// `FILTER(?x = ?y)` and `sameTerm` between two patterns that share no variable
+/// (`native/equijoin.rs`): joined on the two variables, IRIs and blank nodes by id, other
+/// terms by value against the other side's (equal numbers with different ids: `1`,
+/// `"01"^^xsd:integer`, `"1"^^xsd:int`). Equal to the reference evaluator.
+#[test]
+fn equalities_across_patterns_equal_the_reference() {
+    let mut rng = Rng(20_261_005);
+    let (mut checked, mut with_solutions) = (0, 0);
+    for dataset_case in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..40 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+            let (left, right) = (p(&mut rng), p(&mut rng));
+            // The compared variables in object or subject positions.
+            let (x, y) = match rng.below(3) {
+                0 => ("?x", "?y"),
+                1 => ("?a", "?y"),
+                _ => ("?x", "?b"),
+            };
+            let test = match rng.below(3) {
+                0 => format!("sameTerm({x}, {y})"),
+                1 => format!("{y} = {x}"),
+                _ => format!("{x} = {y}"),
+            };
+            let extra = match rng.below(3) {
+                0 => format!(" ?b {} ?z .", p(&mut rng)),
+                1 => " FILTER(?a != ?b)".to_owned(),
+                _ => String::new(),
+            };
+            let text = format!(
+                "SELECT * WHERE {{ ?a {left} ?x . ?b {right} ?y .{extra} FILTER({test}) }}"
+            );
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "{text}");
+            let context = format!("dataset {dataset_case}, query {query_case}: {text}");
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let expected = rows(
+                reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            assert_same_rows(&native, &expected, &context);
+            checked += 1;
+            with_solutions += usize::from(!native.is_empty());
+        }
+    }
+    assert!(
+        with_solutions * 2 > checked,
+        "only {with_solutions} of {checked} queries have solutions"
+    );
+}

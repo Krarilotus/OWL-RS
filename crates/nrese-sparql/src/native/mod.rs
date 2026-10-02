@@ -13,6 +13,7 @@
 
 mod calendar;
 mod equality;
+mod equijoin;
 mod exists;
 pub(crate) mod expr;
 mod fast;
@@ -2183,7 +2184,14 @@ impl<'a> Context<'a> {
                 let probe = !shared.is_empty()
                     && self.merge_set.is_none()
                     && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
-                result = if probe {
+                // No shared variable, but `?a = ?b` between them: a join, not a cross
+                // product (`equijoin`).
+                let linked = (shared.is_empty() && !self.as_written && ranged[next].is_none())
+                    .then(|| equijoin::link(filters, &result, &scans[next].vars()))
+                    .flatten();
+                result = if let Some((a, b, same_term)) = &linked {
+                    self.equality_join(result, &scans[next], counts[next], a, b, *same_term)?
+                } else if probe {
                     self.probe_join(result, &scans[next], &shared)?
                 } else {
                     let scanned = match ranged[next] {
@@ -2196,6 +2204,7 @@ impl<'a> Context<'a> {
                 };
                 if self.trace.is_some() {
                     let operator = match (probe, shared.is_empty()) {
+                        _ if linked.is_some() => "equality join",
                         (true, _) => "index join",
                         (false, true) => "cross product",
                         (false, false) => "join",
