@@ -16,9 +16,11 @@ mimalloc = { version = "0.1", default-features = false }
 libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
 nrese-core = { path = "../nrese-core" }
 nrese-engine = { path = "../nrese-engine" }
+nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-sparql = { path = "../nrese-sparql" }
 nrese-store = { path = "../nrese-store" }
+parking_lot = "0.12"
 # rustls only (no OpenSSL: the binary needs no system TLS library), trusting the bundled
 # roots and the machine's CA store (an identity provider with an internal certificate).
 reqwest = { version = "0.12.24", default-features = false, features = ["charset", "http2", "json", "rustls-tls", "rustls-tls-native-roots"] }

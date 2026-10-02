@@ -114,6 +114,28 @@ The hierarchy isn't stored; the reasoning modes materialise instance-level infer
 - `Content-Location` gives the base IRI for relative IRIs in the payload.
 - Writing the same content twice leaves the same graph: blank nodes are scoped to the payload, and a `PUT` replaces.
 
+## RDF4J protocol
+
+The RDF4J REST protocol, as RDF4J's `HTTPRepository`, GraphDB's clients and the tools built on them speak it, over this server's one dataset: every repository id names it (the list calls it `nrese`), so a client configured for `http://host:8080/repositories/repo` works as is.
+
+| Path | What |
+|---|---|
+| `GET /protocol` | the protocol version, `12` |
+| `GET /repositories` | the repository list (SPARQL results) |
+| `GET`, `POST /repositories/{id}` | a SPARQL query (`query`, `infer`, the dataset parameters); a form with `update` is an update |
+| `GET /repositories/{id}/statements` | the statements matching `subj`, `pred`, `obj`, `context` (repeatable), `infer`, in the negotiated RDF format (N-Quads and TriG with their graphs) |
+| `POST /repositories/{id}/statements` | an RDF payload added (into each `context` if given, else into the graphs it names), or a SPARQL update (`update=` form, `application/sparql-update`) |
+| `PUT /repositories/{id}/statements` | the statements of the `context`s (or all) replaced by the payload |
+| `DELETE /repositories/{id}/statements` | the statements matching `subj`, `pred`, `obj`, `context` removed |
+| `GET /repositories/{id}/size` | the number of statements (in the `context`s) |
+| `GET /repositories/{id}/contexts` | the named graphs (`contextID`) |
+| `GET`, `DELETE /repositories/{id}/namespaces`; `GET`, `PUT`, `DELETE /repositories/{id}/namespaces/{prefix}` | namespace prefixes |
+| `/repositories/{id}/rdf-graphs/service` | the Graph Store protocol, as `/dataset/data` |
+| `POST /repositories/{id}/transactions` | begins a transaction: `201` with its URL in `Location` |
+| `PUT /…/transactions/{txid}?action=ADD`, `DELETE`, `UPDATE`, `COMMIT`, `PING`, `QUERY`, `GET`, `SIZE`; `DELETE /…/transactions/{txid}` | a transaction's operations; `COMMIT` applies them in one commit, `DELETE` rolls back |
+
+Terms in `subj`, `pred`, `obj` and `context` are written as in N-Triples (`<iri>`, `_:b`, `"text"@en`, `"1"^^<…#int>`), and `context=null` is the default graph. Writes go through the same pipeline as SPARQL updates (validation, reasoning, the SHACL gate) and need the update permission. Limits: a transaction's operations wait on the server and are applied at its commit, so its reads (`QUERY`, `GET`, `SIZE`) see the committed state, not its own changes; transactions untouched for ten minutes are dropped; namespaces live in memory and start as `rdf`, `rdfs`, `owl` and `xsd` at every start.
+
 ## SHACL validation
 
 `/dataset/shacl`
