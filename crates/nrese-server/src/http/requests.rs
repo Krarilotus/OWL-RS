@@ -14,6 +14,8 @@ pub struct QueryOperation {
     pub infer: Option<bool>,
     /// `explain=true`: run the query and return how it ran (JSON) instead of its results.
     pub explain: bool,
+    /// The graphs the requester may read (graph-level access control); `None`: every graph.
+    pub access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
 }
 
 impl QueryOperation {
@@ -47,6 +49,10 @@ pub struct UpdateOperation {
     pub update: String,
     pub using_graphs: Vec<String>,
     pub using_named_graphs: Vec<String>,
+    /// The graphs the requester may read and write (graph-level access control); `None`:
+    /// every graph.
+    pub access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
+    pub writable: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
 }
 
 impl UpdateOperation {
@@ -243,6 +249,7 @@ mod tests {
                 named_graphs: vec!["http://ex/a".to_owned(), "http://ex/b".to_owned()],
                 infer: None,
                 explain: false,
+                access: None,
             }
         );
     }

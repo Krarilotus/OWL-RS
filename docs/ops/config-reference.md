@@ -311,6 +311,29 @@ Use `fuseki-plain-text` when you want local or live parity runs to match Fuseki-
 - `auth.oidc_introspection.admin_role` -> `NRESE_AUTH_OIDC_ADMIN_ROLE`
 - `auth.oidc_introspection.timeout_ms` -> `NRESE_AUTH_OIDC_TIMEOUT_MS`
 
+### Graph-Level Access Control
+
+- `auth.access_policy` -> `NRESE_ACCESS_POLICY`: the path of an access policy file. Without one, every user reads and writes what its authentication grants allow.
+- the file (TOML), per role:
+
+```toml
+default = "deny"        # roles no rule names: nothing ("deny") or everything ("allow")
+inferred = "hidden"     # inferred statements for users who may not read every graph: "hidden" or "visible"
+
+[[role]]
+name = "analyst"
+read = ["https://kg.example/graphs/public/*", "https://kg.example/graphs/sales"]
+write = ["https://kg.example/graphs/analyst/*"]
+deny = ["https://kg.example/graphs/public/hr/*"]
+default_graph = "read"  # the store's default graph: "none" (default), "read", "write" or "deny"
+```
+
+- graphs by IRI, or by IRI prefix (an entry ending in `*`): ontologies and data sets usually differ by prefix, so one entry covers a family of graphs.
+- role names: a token's `scope`, `scp`, `role` and `roles` claims (`bearer-jwt`, `oidc-introspection`); `reader` for the static read token; the subject and `reader` for a listed client certificate; `anonymous` without authentication.
+- a user's rights are the union of its roles' rules, and what it may write it may read; an explicit deny (`deny`, `default_graph = "deny"`) in any of its roles wins. Administrators are unrestricted.
+- the policy grants as well as restricts: a role with a rule may query and read graphs even without the read role, and a role that may write a graph may update. So a role can edit some graphs without being an administrator.
+- what it means for requests: [HTTP API, access control](http-api.md#graph-level-access-control).
+
 ## AI Query Suggestions
 
 - file key: `ai.enabled`

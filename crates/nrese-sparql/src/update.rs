@@ -8,8 +8,15 @@
 //! Graph existence follows ADR-0002: a named graph exists iff it holds a quad. `CREATE GRAPH`
 //! therefore only fails (without `SILENT`) on a non-empty graph and otherwise stores
 //! nothing; `CLEAR`/`DROP` of a named graph fail (without `SILENT`) if it's empty.
+//!
+//! Graph-level access control: `WHERE` clauses read only what [`UpdateOptions::access`]
+//! allows, `CLEAR`/`DROP`/`CREATE` see only those graphs (the others are absent), and an
+//! operation that would insert or delete a quad in a graph outside
+//! [`UpdateOptions::writable`] fails the request ([`UpdateError::Forbidden`]), whether the
+//! quad is there or not: the answer says nothing about graphs the user may not read.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use nrese_engine::{GraphSelector, QuadPattern, TermId, Transaction};
 use nrese_rdf::{BlankNode, GraphName as OxGraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -32,7 +39,31 @@ pub struct UpdateOptions {
     /// Who answers `SERVICE` calls in `WHERE` clauses ([`crate::service`]).
     pub services: Option<crate::Services>,
     /// The graphs `WHERE` clauses may read ([`crate::QueryOptions::access`]).
-    pub access: Option<std::sync::Arc<crate::GraphAccess>>,
+    pub access: Option<Arc<crate::GraphAccess>>,
+    /// The graphs the update may change. `None`: every graph.
+    pub writable: Option<Arc<crate::GraphAccess>>,
+}
+
+impl UpdateOptions {
+    /// Fails unless the update may change `graph`.
+    fn check_writable(&self, graph: &OxGraphName) -> Result<(), UpdateError> {
+        match &self.writable {
+            Some(writable) if !writable.allows_graph(graph) => {
+                Err(UpdateError::Forbidden(match graph {
+                    OxGraphName::DefaultGraph => "the default graph".to_owned(),
+                    graph => graph.to_string(),
+                }))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the update sees the graph `id` (its user may read it).
+    fn sees(&self, tx: &Transaction<'_>, id: TermId) -> bool {
+        self.access
+            .as_ref()
+            .is_none_or(|access| access.allows_id(tx, id))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -45,6 +76,9 @@ pub enum UpdateError {
     LoadNotAllowed(NamedNode),
     #[error("update cancelled")]
     Cancelled,
+    /// The update would change a graph its user may not write.
+    #[error("the update would change {0}, which the requester may not write")]
+    Forbidden(String),
 }
 
 /// Applies all operations of `update` to `tx`. On error, `tx` may hold part of the request;
@@ -78,12 +112,16 @@ fn apply_operation(
             // Blank nodes in INSERT DATA are fresh per request (SPARQL 1.1 Update §3.1.1).
             let mut fresh = HashMap::new();
             for quad in data {
-                tx.insert(fresh_quad(quad, &mut fresh).as_ref());
+                let quad = fresh_quad(quad, &mut fresh);
+                options.check_writable(&quad.graph_name)?;
+                tx.insert(quad.as_ref());
             }
         }
         GraphUpdateOperation::DeleteData { data } => {
             for quad in data {
-                tx.remove(ground_quad(quad).as_ref());
+                let quad = ground_quad(quad);
+                options.check_writable(&quad.graph_name)?;
+                tx.remove(quad.as_ref());
             }
         }
         GraphUpdateOperation::DeleteInsert {
@@ -114,6 +152,9 @@ fn apply_operation(
                 update.base_iri.as_ref(),
                 &query_options,
             )?;
+            for quad in deletes.iter().chain(&inserts) {
+                options.check_writable(&quad.graph_name)?;
+            }
             // Every deletion before any insertion (SPARQL 1.1 Update 3.1.3): a quad one
             // solution deletes and another inserts is present afterwards.
             for quad in &deletes {
@@ -131,13 +172,13 @@ fn apply_operation(
         GraphUpdateOperation::Create { graph, silent } => {
             let exists = tx
                 .lookup(graph.as_ref().into())
-                .is_some_and(|id| tx.contains_named_graph(id));
+                .is_some_and(|id| tx.contains_named_graph(id) && options.sees(tx, id));
             if exists && !silent {
                 return Err(UpdateError::GraphAlreadyExists(graph.clone()));
             }
         }
         GraphUpdateOperation::Clear { graph, .. } | GraphUpdateOperation::Drop { graph, .. } => {
-            clear(tx, graph);
+            clear(tx, graph, options)?;
         }
     }
     Ok(())
@@ -148,20 +189,70 @@ fn apply_operation(
 /// graph that holds nothing succeeds, with or without `SILENT` (SPARQL 1.1 Update §3.2
 /// leaves that to stores that don't record empty graphs; RDF4J clients, and so
 /// ResearchSpace, clear a graph before they write it, whether it exists or not).
-fn clear(tx: &mut Transaction<'_>, target: &GraphTarget) {
-    let graph = match target {
-        GraphTarget::NamedNode(name) => match tx.lookup(name.as_ref().into()) {
-            Some(id) => GraphSelector::Exact(id),
-            None => return,
-        },
-        GraphTarget::DefaultGraph => GraphSelector::Exact(TermId::DEFAULT_GRAPH),
-        GraphTarget::NamedGraphs => GraphSelector::AnyNamed,
-        GraphTarget::AllGraphs => GraphSelector::Any,
+///
+/// Under access control a graph the user may not read is absent: clearing it does nothing,
+/// and `CLEAR NAMED`/`ALL` clear the readable graphs only, each of which must be writable.
+fn clear(
+    tx: &mut Transaction<'_>,
+    target: &GraphTarget,
+    options: &UpdateOptions,
+) -> Result<(), UpdateError> {
+    let remove = |tx: &mut Transaction<'_>, graph| {
+        tx.remove_matching(&QuadPattern {
+            graph,
+            ..QuadPattern::all()
+        });
     };
-    tx.remove_matching(&QuadPattern {
-        graph,
-        ..QuadPattern::all()
-    });
+    let restricted = options.access.is_some() || options.writable.is_some();
+    let graphs: Vec<TermId> = match target {
+        GraphTarget::NamedNode(name) => match tx.lookup(name.as_ref().into()) {
+            Some(id) => vec![id],
+            None => return Ok(()),
+        },
+        GraphTarget::DefaultGraph => vec![TermId::DEFAULT_GRAPH],
+        GraphTarget::NamedGraphs if !restricted => {
+            remove(tx, GraphSelector::AnyNamed);
+            return Ok(());
+        }
+        GraphTarget::AllGraphs if !restricted => {
+            remove(tx, GraphSelector::Any);
+            return Ok(());
+        }
+        GraphTarget::NamedGraphs => tx.named_graphs(),
+        GraphTarget::AllGraphs => {
+            let mut graphs = tx.named_graphs();
+            graphs.push(TermId::DEFAULT_GRAPH);
+            graphs
+        }
+    };
+    let graphs: Vec<TermId> = graphs
+        .into_iter()
+        .filter(|&id| options.sees(tx, id))
+        .collect();
+    for &id in &graphs {
+        let empty = tx
+            .quads_for_pattern(&QuadPattern::in_graph(id))
+            .next()
+            .is_none();
+        // Clearing an empty graph changes nothing.
+        if empty {
+            continue;
+        }
+        let graph = if id == TermId::DEFAULT_GRAPH {
+            OxGraphName::DefaultGraph
+        } else {
+            match tx.decode(id) {
+                Some(Term::NamedNode(node)) => node.into(),
+                Some(Term::BlankNode(node)) => node.into(),
+                _ => continue,
+            }
+        };
+        options.check_writable(&graph)?;
+    }
+    for id in graphs {
+        remove(tx, GraphSelector::Exact(id));
+    }
+    Ok(())
 }
 
 fn graph_name(graph: &GraphName) -> OxGraphName {

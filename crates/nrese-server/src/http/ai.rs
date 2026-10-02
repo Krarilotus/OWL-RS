@@ -23,9 +23,8 @@ pub async fn query_suggestions(
     headers: HeaderMap,
     Json(request): Json<QuerySuggestionRequest>,
 ) -> Result<Response, ApiError> {
-    state
-        .enforce_policy_action(PolicyAction::QueryRead, &headers)
-        .await?;
+    // The suggestions describe the whole dataset.
+    crate::http::guard::enforce_whole_read(&state, &headers).await?;
     let stats = state
         .store()
         .stats()

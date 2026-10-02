@@ -211,6 +211,7 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
     );
 
     insert_option(&mut source, names::AUTH_MODE, config.auth.mode);
+    insert_option(&mut source, names::ACCESS_POLICY, config.auth.access_policy);
     insert_option(
         &mut source,
         names::AUTH_READ_TOKEN,

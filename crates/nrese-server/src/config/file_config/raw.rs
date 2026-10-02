@@ -215,6 +215,9 @@ pub(super) struct RawAuthConfig {
     pub mtls: RawMtlsConfig,
     #[serde(default)]
     pub oidc_introspection: RawOidcIntrospectionConfig,
+    /// The graph access policy file ([`crate::access`]).
+    #[serde(default)]
+    pub access_policy: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

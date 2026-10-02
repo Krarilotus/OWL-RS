@@ -166,12 +166,22 @@ Limits today:
 - A `POST` holds the writer while it validates (its shapes live in a transaction that is never committed), so other writes wait.
 - The shapes graph is an ordinary graph: queries see it, and reasoning reads it like any other.
 
+## Graph-level access control
+
+With an access policy (`auth.access_policy`, [configuration](config-reference.md#graph-level-access-control)) each user has its own dataset: the graphs its roles may read.
+
+- **Queries** evaluate over that dataset, restricted before anything is evaluated: the other graphs are absent, not forbidden. `GRAPH ?g` never binds them, `FROM` and `GRAPH` with their names match nothing, counts don't see them, and a union default graph merges the readable graphs only. The same holds for the `WHERE` clauses of updates, RDF4J's `/statements`, `/size` and `/contexts`, and reads inside RDF4J transactions.
+- **Inferred statements** come from statements in any graph; users who may not read every graph see the asserted statements only, unless the policy sets `inferred = "visible"`.
+- **Graph Store reads** of an unreadable graph answer 404, as for a graph that doesn't exist.
+- **Writes** that would insert or delete a statement in a graph the user may not write are refused as a whole with 403, whether the statement is there or not, so the answer says nothing about graphs the user can't read. `CLEAR`/`DROP ALL` and `NAMED`, and RDF4J deletions without a context, act on the readable graphs only; clearing an unreadable graph does nothing.
+- **Endpoints over the whole dataset** (autocomplete, classification, SHACL validation, query suggestions) answer 403 to users who may not read every graph.
+
 ## Status codes
 
 | Code | When |
 |---|---|
 | 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) |
-| 401, 403 | Authentication or authorisation failed |
+| 401, 403 | Authentication or authorisation failed; 403 also for a write to a graph the access policy doesn't let the user write |
 | 404 | The surface is disabled, or the named graph doesn't exist |
 | 406 | The client accepts no format the result has |
 | 408 | The policy timeout passed; a timed-out write was not committed |

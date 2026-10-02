@@ -60,6 +60,15 @@ impl MutationCommand {
     /// Applies the command to `tx` without committing it; reports carry revision 0 until
     /// [`MutationCommitReport::committed`]. The evaluation token lets the caller stop a
     /// long-running `WHERE` clause.
+    /// The graphs the command may change, if its requester is restricted.
+    pub(crate) fn writable(&self) -> Option<&nrese_sparql::GraphAccess> {
+        match self {
+            Self::Update(request) => request.writable.as_deref(),
+            Self::Statements(request) => request.writable.as_deref(),
+            Self::Tell(_) | Self::GraphWrite(_) | Self::GraphDelete(_) | Self::Restore(_) => None,
+        }
+    }
+
     pub(crate) fn apply(
         &self,
         tx: &mut Transaction<'_>,
@@ -118,9 +127,14 @@ pub(crate) fn apply_sparql_update(
         union_default_graph,
         services,
         access: request.access.clone(),
+        writable: request.writable.clone(),
     };
-    apply_update(tx, &update, &options)?;
-    Ok(())
+    apply_update(tx, &update, &options).map_err(|error| match error {
+        nrese_sparql::UpdateError::Forbidden(graph) => StoreError::Forbidden(format!(
+            "the update would change {graph}, which the requester may not write"
+        )),
+        error => error.into(),
+    })
 }
 
 impl MutationCommitReport {

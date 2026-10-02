@@ -52,6 +52,8 @@ fn map_error(policy: &PolicyConfig, error: MutationError, timeout_message: &str)
                 ApiError::payload_too_large(format!(
                     "{source} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"
                 ))
+            } else if matches!(source, StoreError::Forbidden(_)) {
+                ApiError::forbidden(source.to_string())
             } else if !source.is_request_error() {
                 ApiError::internal(format!("{} failed: {source}", kind_name(kind)))
             } else if matches!(source, StoreError::SparqlSyntax(_)) {
