@@ -75,6 +75,12 @@ export const en: AppStrings = {
   queryAcceptLabel: "Result format",
   namedGraphLabel: "Named graph IRI",
   noOutput: "(no response yet)",
+  searchTitle: "Find resources",
+  searchHint: "Resources whose labels or names have words beginning with what you type.",
+  searchPlaceholder: "albert ein",
+  searchNoResults: "No resource matches.",
+  searchUnavailable: "The search is unavailable.",
+  describeResource: "Describe",
   exampleLabels: {
     "overview-query": {
       title: "Top classes by instances",

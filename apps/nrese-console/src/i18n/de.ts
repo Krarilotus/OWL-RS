@@ -75,6 +75,12 @@ export const de: AppStrings = {
   queryAcceptLabel: "Antwortformat",
   namedGraphLabel: "Named-Graph-IRI",
   noOutput: "(noch keine Antwort)",
+  searchTitle: "Ressourcen finden",
+  searchHint: "Ressourcen, deren Labels oder Namen Wörter haben, die mit dem Eingegebenen beginnen.",
+  searchPlaceholder: "albert ein",
+  searchNoResults: "Keine Ressource passt.",
+  searchUnavailable: "Die Suche ist nicht verfügbar.",
+  describeResource: "Beschreiben",
   exampleLabels: {
     "overview-query": {
       title: "Top-Klassen nach Instanzen",
