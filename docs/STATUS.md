@@ -101,7 +101,7 @@ From the milestone review (R5–R9), low priority:
 | R6 Repository ids compared case-insensitively; Windows device names refused | open |
 | R7 Removing a repository by renaming it to `.trash-*` first, swept at start | open |
 | R8 Long `owl:AllDisjointProperties` (a self-join of the triple table): a note or a time-bounded test | open |
-| R9 `--set` refused or warned for secret settings | open |
+| R9 `--set` refused or warned for secret settings | done (refused, pointing to the file or the environment variable) |
 | R1 residue: a commit that adds a long list without deleting one keeps the older index rule beside the new one until the program is rebuilt (sound; bounded by list changes, not by commits) | open |
 
 ## Research designs

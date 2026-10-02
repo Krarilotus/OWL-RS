@@ -685,13 +685,20 @@ fn file_value(setting: &Setting, key: &str, value: &toml::Value) -> Result<Strin
     })
 }
 
-/// Command-line overrides (`--set key=value`) by environment name.
+/// Command-line overrides (`--set key=value`) by environment name. Secrets are refused:
+/// a command line is visible to every user of the machine (the process list).
 pub(super) fn from_overrides(overrides: &[(String, String)]) -> Result<KeyValueSource> {
     let mut source = KeyValueSource::default();
     for (key, value) in overrides {
         let Some(setting) = by_key(key) else {
             bail!("--set: unknown key '{key}'");
         };
+        if setting.secret {
+            bail!(
+                "--set: '{key}' is a secret, and a command line is visible in the process list; set it in the configuration file or as {}",
+                setting.env
+            );
+        }
         source.insert(setting.env, value.clone());
     }
     Ok(source)
@@ -771,6 +778,16 @@ fn property(setting: &Setting) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn secrets_are_refused_on_the_command_line() {
+        let set = |key: &str| super::from_overrides(&[(key.to_owned(), "x".to_owned())]);
+        let error = set("auth.bearer_jwt.shared_secret")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("secret"), "{error}");
+        assert!(set("auth.bearer_jwt.issuer").is_ok());
+    }
+
     use super::*;
 
     #[test]
