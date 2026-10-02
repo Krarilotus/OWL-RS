@@ -5,7 +5,7 @@
 //! See `docs/ARCHITECTURE.md` section 2.2.
 
 mod attribution;
-mod command;
+pub(crate) mod command;
 mod error;
 mod pipeline;
 mod record;

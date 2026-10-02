@@ -235,6 +235,39 @@ async fn transactions_commit_together_or_not_at_all() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(size(&app, None).await, 0);
+    // Reads inside the transaction see its changes; outside, nothing yet.
+    let (status, inside) = send(&app, Method::PUT, &action("SIZE"), None, None, "").await;
+    assert_eq!((status, inside.trim()), (StatusCode::OK, "3"));
+    let (status, results) = send(
+        &app,
+        Method::PUT,
+        &format!(
+            "{}&{}",
+            action("QUERY"),
+            encode(&[("query", "ASK { <http://example.com/d> ?p 4 }")])
+        ),
+        None,
+        Some("application/sparql-results+json"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(results.contains("true"), "{results}");
+    let (status, quads) = send(
+        &app,
+        Method::PUT,
+        &format!(
+            "{}&{}",
+            action("GET"),
+            encode(&[("subj", "<http://example.com/a>")])
+        ),
+        None,
+        Some("application/n-triples"),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(quads.lines().count(), 1, "{quads}");
     let (status, _) = send(&app, Method::PUT, &action("COMMIT"), None, None, "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(size(&app, None).await, 3);

@@ -68,18 +68,13 @@ impl MutationCommand {
         services: Option<nrese_sparql::Services>,
     ) -> Result<MutationCommitReport, StoreError> {
         let mut update = |tx: &mut Transaction<'_>, request: &SparqlUpdateRequest| {
-            let update = SparqlParser::new().parse_update(&request.update)?;
-            let options = UpdateOptions {
-                using: crate::query_executor::protocol_dataset(
-                    &request.using_graphs,
-                    &request.using_named_graphs,
-                )?,
-                cancellation: Some(cancellation.clone()),
+            apply_sparql_update(
+                tx,
+                request,
+                cancellation,
                 union_default_graph,
-                services: services.clone(),
-            };
-            apply_update(tx, &update, &options)?;
-            Ok::<(), StoreError>(())
+                services.clone(),
+            )
         };
         match self {
             Self::Update(request) => {
@@ -103,6 +98,28 @@ impl MutationCommand {
             Self::Restore(request) => apply_restore(tx, request).map(MutationCommitReport::Restore),
         }
     }
+}
+
+/// Applies a SPARQL update request to `tx`.
+pub(crate) fn apply_sparql_update(
+    tx: &mut Transaction<'_>,
+    request: &SparqlUpdateRequest,
+    cancellation: &CancellationToken,
+    union_default_graph: bool,
+    services: Option<nrese_sparql::Services>,
+) -> Result<(), StoreError> {
+    let update = SparqlParser::new().parse_update(&request.update)?;
+    let options = UpdateOptions {
+        using: crate::query_executor::protocol_dataset(
+            &request.using_graphs,
+            &request.using_named_graphs,
+        )?,
+        cancellation: Some(cancellation.clone()),
+        union_default_graph,
+        services,
+    };
+    apply_update(tx, &update, &options)?;
+    Ok(())
 }
 
 impl MutationCommitReport {
