@@ -1,0 +1,17 @@
+[package]
+name = "nrese-fuzz"
+description = "Fuzz targets for NRESE's parsers of untrusted input, run on stable from corpora and with cargo-fuzz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+nrese-rdf = { path = "../rdf/nrese-rdf", default-features = false }
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+nrese-sparql-results = { path = "../rdf/nrese-sparql-results" }
+nrese-sparql-syntax = { path = "../rdf/nrese-sparql-syntax" }
+
+[lints]
+workspace = true
