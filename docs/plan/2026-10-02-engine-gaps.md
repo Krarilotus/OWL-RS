@@ -35,7 +35,16 @@ by the coming frontend; the protocols only translate.
   JSON routes for repositories (create, read, remove), namespaces, sessions, imports,
   rematerialisation and explanations of inferences; users, workspaces, personal spaces,
   role rules, their history and local logins in the core (G2b, ADR-0008 accepted); the
-  OpenAPI description at `/api/v1/openapi.json`, checked against the router.
+  OpenAPI description at `/api/v1/openapi.json`, checked against the router; running
+  queries listed and cancelled; graphs with their sizes; a repository's reasoning changed
+  at runtime (`PATCH`); imports as jobs, also from a server-side import directory.
+  ResearchSpace and DMW pass their end-to-end runs on the server image (ResearchSpace:
+  its search templates' Blazegraph check and the knowledge map's query hints needed the
+  hint support; every query in its templates parses and runs).
+- **Still open in G2:** shapes and rulesets as managed objects (checked before they are
+  stored), saved queries per user and workspace, implicit prefixes from the repository's
+  namespaces (GraphDB-style; needs the query cache keyed by them), ResearchSpace's pages
+  and forms in a browser.
 - **State in the core.** Done: namespaces and client transactions (sessions) moved from
   the RDF4J adapter into the store; access policies, users and workspaces (G2b). Next:
   repository settings, the shapes graph and rulesets as managed store objects.
