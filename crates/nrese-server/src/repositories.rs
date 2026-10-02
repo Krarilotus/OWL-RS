@@ -136,6 +136,11 @@ impl Repositories {
         self.others.read().get(id).cloned()
     }
 
+    /// Repository `id`'s settings, if there is one besides the default.
+    pub fn settings(&self, id: &str) -> Option<RepositorySettings> {
+        self.others.read().get(id).map(|r| r.settings.clone())
+    }
+
     /// The ids of the repositories besides the default, sorted, with their titles.
     pub fn list(&self) -> Vec<(String, Option<String>)> {
         self.others
@@ -153,10 +158,16 @@ impl Repositories {
             )));
         }
         if id == DEFAULT_REPOSITORY || self.others.read().contains_key(id) {
-            return Err(ApiError::bad_request(format!(
+            return Err(ApiError::conflict(format!(
                 "repository '{id}' exists already"
             )));
         }
+        if let Some(name) = &settings.reasoning
+            && settings.reasoning_mode().is_none()
+        {
+            return Err(ApiError::bad_request(format!("no reasoning mode '{name}'")));
+        }
+        settings.reasoner_config().map_err(ApiError::bad_request)?;
         let repository = self
             .start(id, settings.clone())
             .map_err(ApiError::internal)?;

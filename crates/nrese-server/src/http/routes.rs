@@ -146,6 +146,12 @@ pub fn router(state: AppState) -> Router {
         // The engine API (ADR-0007): every capability for every repository, by the same
         // handlers as the default repository's `/dataset/…` routes.
         .route("/api/v1/repositories", get(api_v1::repositories))
+        .route(
+            "/api/v1/repositories/{id}",
+            get(api_v1::repository_get)
+                .put(api_v1::repository_put)
+                .delete(api_v1::repository_delete),
+        )
         .nest("/api/v1/repositories/{id}", repository_routes())
         // The RDF4J REST protocol (`rdf4j.rs`).
         .route("/protocol", get(rdf4j::protocol))
