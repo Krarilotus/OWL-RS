@@ -13,6 +13,10 @@
 //! literals whose words hold it as a sequence, and counts as one of the query's terms.
 //! Its words find the candidates in the index; each is checked against its text.
 //!
+//! A word after `-` is excluded: literals that have it don't match. A word ending in `~`
+//! (or `~1`, `~2`) matches the indexed words within that many edits (insertions, deletions,
+//! substitutions, transpositions; `~` is two), as Lucene's fuzzy queries do.
+//!
 //! With a stemming language ([`TextQuery::stem`]), words match by their Snowball stem
 //! (`connected` finds `connection` and `connecting`), phrases too. The index keeps the
 //! words as written; per language, a map from stems to the indexed words with that stem
@@ -63,6 +67,44 @@ pub fn stemmer(language: &str) -> Option<Stemmer> {
         _ => return None,
     };
     Some(Stemmer::create(algorithm))
+}
+
+/// How a query word matches indexed words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Match {
+    Exact,
+    Prefix,
+    /// Within this many edits.
+    Fuzzy(u8),
+}
+
+/// Whether `a` and `b` are at most `max` edits apart: insertions, deletions and
+/// substitutions of characters, and transpositions of neighbours, as Lucene counts them
+/// (optimal string alignment).
+fn within_edits(a: &str, b: &str, max: usize) -> bool {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    if a.len().abs_diff(b.len()) > max {
+        return false;
+    }
+    let mut before: Vec<usize> = Vec::new();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for i in 0..a.len() {
+        let mut next = vec![i + 1; b.len() + 1];
+        for j in 0..b.len() {
+            let mut cost = (row[j] + usize::from(a[i] != b[j]))
+                .min(row[j + 1] + 1)
+                .min(next[j] + 1);
+            if i > 0 && j > 0 && a[i] == b[j - 1] && a[i - 1] == b[j] {
+                cost = cost.min(before[j - 1] + 1);
+            }
+            next[j + 1] = cost;
+        }
+        if next.iter().min().is_some_and(|&least| least > max) {
+            return false;
+        }
+        before = std::mem::replace(&mut row, next);
+    }
+    row[b.len()] <= max
 }
 
 /// The key of a stemming language: its code, lower case, without a region.
@@ -195,29 +237,36 @@ impl TextIndex {
         stems.covered = self.words.len();
     }
 
-    /// The postings of `word`: of the words it starts with `prefix`, of the words with its
-    /// stem with `stems`, else its own; merged by literal (occurrences added up).
+    /// The postings of `word`: of the words it starts as a prefix, of the words within the
+    /// edits of a fuzzy match, of the words with its stem with `stems`, else its own; merged
+    /// by literal (occurrences added up).
     fn postings_of(
         &self,
         word: &str,
-        prefix: bool,
+        matching: Match,
         stems: Option<(&Stemmer, &Stems)>,
     ) -> Cow<'_, [(u64, u16)]> {
-        let lists: Vec<&Vec<(u64, u16)>> = match (prefix, stems) {
-            (true, _) => self
+        let lists: Vec<&Vec<(u64, u16)>> = match (matching, stems) {
+            (Match::Fuzzy(edits), _) => self
+                .postings
+                .iter()
+                .filter(|(key, _)| within_edits(key, word, usize::from(edits)))
+                .map(|(_, list)| list)
+                .collect(),
+            (Match::Prefix, _) => self
                 .postings
                 .range::<str, _>((std::ops::Bound::Included(word), std::ops::Bound::Unbounded))
                 .take_while(|(key, _)| key.starts_with(word))
                 .map(|(_, list)| list)
                 .collect(),
-            (false, Some((stemmer, stems))) => stems
+            (Match::Exact, Some((stemmer, stems))) => stems
                 .groups
                 .get(stemmer.stem(word).as_ref())
                 .into_iter()
                 .flatten()
                 .filter_map(|&i| self.postings.get(&self.words[i as usize]))
                 .collect(),
-            (false, None) => self.postings.get(word).into_iter().collect(),
+            (Match::Exact, None) => self.postings.get(word).into_iter().collect(),
         };
         match lists.as_slice() {
             [] => Cow::Borrowed(&[]),
@@ -263,24 +312,36 @@ impl TextIndex {
                 None => word.to_owned(),
             }
         };
-        // Quoted parts are phrases; the rest are words.
-        let mut terms: Vec<(String, bool)> = Vec::new();
+        // Quoted parts are phrases; the rest are words, and the words to exclude.
+        let mut terms: Vec<(String, Match)> = Vec::new();
+        let mut excluded: Vec<String> = Vec::new();
         let mut phrases: Vec<Vec<String>> = Vec::new();
         for (i, part) in query.text.split('"').enumerate() {
             if i % 2 == 1 {
                 let phrase: Vec<String> = words(part).collect();
                 match phrase.len() {
                     0 => {}
-                    1 => terms.push((phrase[0].clone(), false)),
+                    1 => terms.push((phrase[0].clone(), Match::Exact)),
                     _ => phrases.push(phrase),
                 }
                 continue;
             }
             for raw in part.split_whitespace() {
-                let prefix = query.prefix || raw.ends_with('*');
+                if let Some(rest) = raw.strip_prefix('-').filter(|rest| !rest.is_empty()) {
+                    excluded.extend(words(rest));
+                    continue;
+                }
+                let (raw, matching) = match raw.split_once('~') {
+                    Some((word, edits)) => {
+                        let edits = edits.parse::<u8>().unwrap_or(2).min(2);
+                        (word, Match::Fuzzy(edits))
+                    }
+                    None if query.prefix || raw.ends_with('*') => (raw, Match::Prefix),
+                    None => (raw, Match::Exact),
+                };
                 for word in words(raw) {
-                    if !terms.iter().any(|(w, p)| *w == word && *p == prefix) {
-                        terms.push((word, prefix));
+                    if !terms.iter().any(|(w, m)| *w == word && *m == matching) {
+                        terms.push((word, matching));
                     }
                 }
             }
@@ -303,7 +364,7 @@ impl TextIndex {
         for phrase in &phrases {
             let lists: Vec<Cow<'_, [(u64, u16)]>> = phrase
                 .iter()
-                .map(|word| self.postings_of(word, false, stems))
+                .map(|word| self.postings_of(word, Match::Exact, stems))
                 .collect();
             if lists.iter().any(|list| list.is_empty()) {
                 continue;
@@ -335,8 +396,8 @@ impl TextIndex {
                 }
             }
         }
-        for (word, prefix) in &terms {
-            let found = self.postings_of(word, *prefix, stems);
+        for (word, matching) in &terms {
+            let found = self.postings_of(word, *matching, stems);
             let frequency = found.len() as f64;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(id, count) in found.iter() {
@@ -353,9 +414,18 @@ impl TextIndex {
         } else {
             1
         };
+        let excluded: std::collections::HashSet<u64> = excluded
+            .iter()
+            .flat_map(|word| {
+                self.postings_of(word, Match::Exact, stems)
+                    .iter()
+                    .map(|&(id, _)| id)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let mut matches: Vec<TextMatch> = scores
             .into_iter()
-            .filter(|(_, (_, words))| *words >= needed)
+            .filter(|(id, (_, words))| *words >= needed && !excluded.contains(id))
             .map(|(id, (score, _))| TextMatch {
                 id,
                 relevance: score,
@@ -509,5 +579,44 @@ mod tests {
         );
         assert_eq!(local_name_text("urn:isbn:123").as_deref(), Some("123 123"));
         assert_eq!(local_name_text("http://example.com/"), None);
+    }
+
+    /// `-word` excludes the literals that have it; `word~` matches words within two edits,
+    /// `word~1` within one.
+    #[test]
+    fn exclusion_and_fuzzy_words() {
+        let texts = [
+            "the quick brown fox",
+            "a brown dog",
+            "the quack of a duck",
+            "quickly",
+        ];
+        let index = index(&texts);
+        let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
+        let query = |text: &str| {
+            let mut found = ids(&index.search(
+                &TextQuery {
+                    text: text.to_owned(),
+                    all_words: false,
+                    prefix: false,
+                    stem: None,
+                },
+                &text_of,
+            ));
+            found.sort_unstable();
+            found
+        };
+        assert_eq!(query("brown -fox"), [1]);
+        assert_eq!(query("brown -fox -dog"), Vec::<u64>::new());
+        assert_eq!(query("-fox"), Vec::<u64>::new());
+        assert_eq!(query("quick~1"), [0, 2]);
+        // Two edits: `quickly` (two letters more) and `duck` too.
+        assert_eq!(query("quick~"), [0, 2, 3]);
+        assert_eq!(query("quick~0"), [0]);
+        assert_eq!(query("quik~1"), [0]);
+        assert!(within_edits("kitten", "sitting", 3));
+        assert!(!within_edits("kitten", "sitting", 2));
+        assert!(within_edits("über", "uber", 1));
+        assert!(within_edits("brigde", "bridge", 1));
     }
 }
