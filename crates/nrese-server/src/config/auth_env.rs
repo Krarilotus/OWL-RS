@@ -55,16 +55,7 @@ pub(super) fn parse_auth_config(source: &dyn ConfigSource) -> Result<AuthConfig>
                 }
                 admin_subjects
             },
-            trusted_proxies: match source.get(names::AUTH_MTLS_TRUSTED_PROXIES) {
-                None => crate::auth::peers::AddressRange::loopback(),
-                Some(list) => list
-                    .split([',', ';'])
-                    .map(str::trim)
-                    .filter(|entry| !entry.is_empty())
-                    .map(|entry| entry.parse().map_err(anyhow::Error::msg))
-                    .collect::<anyhow::Result<Vec<_>>>()
-                    .with_context(|| names::AUTH_MTLS_TRUSTED_PROXIES)?,
-            },
+            trusted_proxies: parse_ranges(source, names::AUTH_MTLS_TRUSTED_PROXIES)?,
         })),
         ConfiguredAuthMode::OidcIntrospection => Ok(AuthConfig::OidcIntrospection(
             OidcIntrospectionConfig::new(
@@ -110,6 +101,23 @@ fn parse_semicolon_set(value: Option<String>) -> BTreeSet<String> {
             .map(ToOwned::to_owned)
             .collect(),
         None => BTreeSet::new(),
+    }
+}
+
+/// Addresses or ranges (comma- or semicolon-separated) from `name`; loopback by default.
+pub(crate) fn parse_ranges(
+    source: &dyn ConfigSource,
+    name: &str,
+) -> Result<Vec<crate::auth::peers::AddressRange>> {
+    match source.get(name) {
+        None => Ok(crate::auth::peers::AddressRange::loopback()),
+        Some(list) => list
+            .split([',', ';'])
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| entry.parse().map_err(anyhow::Error::msg))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .with_context(|| name.to_owned()),
     }
 }
 

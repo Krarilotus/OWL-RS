@@ -80,13 +80,26 @@ Open, in bulk at the end of a batch.
 
 | Gap | State | Notes |
 |---|---|---|
-| G1 Bug hunt | running | Random differential and property tests over many seeds (`scripts/fuzz-campaign.sh`). Fixed on 1–2 October: `ORDER BY` not total over terms of one canonical form (seeds 2329, 2458); a `LIMIT` cutting through equal sort keys; compact equality losing copies of a statement deleted from the default graph but asserted elsewhere (seeds 180, 192); path multiplicity between constants (seeds 1036, 1101, 1128); explanations differing between runs; the oracle's own mistakes (SAMPLE, CONSTRUCT with LIMIT, NOW, row order, GROUP_CONCAT seed 2051). Found by review on 2 October: sessions anyone could join (sequential ids, no owner); RDF4J computing graph access for the default repository instead of the one asked; request bodies read before authentication; ill-formed shapes stored; `SERVICE` open to every user; N-Triples `VERSION` lines panicking the line reader. Found by the Jena oracle once it compared again (it had compared nothing from 1 October): integer-derived literals outside their datatype's range (`"300"^^xsd:byte`) computed with as numbers (59 of 61 differences). Round 5 on the office PC (seeds from 3000) not yet reviewed (the machine is unreachable); a local run from seed 6000 is going |
+| G1 Bug hunt | running | Random differential and property tests over many seeds (`scripts/fuzz-campaign.sh`). Fixed on 1–2 October: `ORDER BY` not total over terms of one canonical form (seeds 2329, 2458); a `LIMIT` cutting through equal sort keys; compact equality losing copies of a statement deleted from the default graph but asserted elsewhere (seeds 180, 192); path multiplicity between constants (seeds 1036, 1101, 1128); explanations differing between runs; the oracle's own mistakes (SAMPLE, CONSTRUCT with LIMIT, NOW, row order, GROUP_CONCAT seed 2051). Found by review on 2 October: sessions anyone could join (sequential ids, no owner); RDF4J computing graph access for the default repository instead of the one asked; request bodies read before authentication; ill-formed shapes stored; `SERVICE` open to every user; N-Triples `VERSION` lines panicking the line reader. Found by the independent review of the A+B milestone (`cd75751..04f36eb`): long-list consistency rules piling up in the delta executor's program with every commit that touches a list (R1; the index compared by pointer); local logins lockable per user name by anyone, their failure counts unbounded, and their timing telling which names exist (R2–R4: now counted per name and client address with backoff and a per-address limit, bounded, with a dummy Argon2 check). Found by the Jena oracle once it compared again (it had compared nothing from 1 October): integer-derived literals outside their datatype's range (`"300"^^xsd:byte`) computed with as numbers (59 of 61 differences). Round 5 on the office PC (seeds from 3000) not yet reviewed (the machine is unreachable); locally, seeds 6000–6643: no failures |
 | G2 One engine API | done but the browser part | Namespaces, sessions, repositories, imports as jobs, rematerialisation, explanations, running queries, graphs, users and workspaces, OpenAPI; implicit prefixes; shapes and user rules as checked managed objects; saved queries. Open: ResearchSpace's pages and forms in a browser (with the frontend) |
 | G3 Reasoning that leads | open | Explanations through the API are done; inferences by premise graphs, OWL 2 DL and equality stage C are open (see D) |
 | G4 Queries | started | A path bound at both ends follows from the smaller end. Join ordering across groups, characteristic sets, aggregates over products: open (with C) |
 | G5 Vector search | open | |
 | G6 Hardware and scale-out | open | |
 | G7 Smaller items | started | RDF 1.2 `version` announced in results: done. Error recovery in the RDF/XML and JSON-LD parsers, multi-architecture images, missing benchmark kits, a second oracle, HTTP soak and fuzzing: open |
+
+## Next batch
+
+From the milestone review (R5–R9), low priority:
+
+| Item | State |
+|---|---|
+| R5 The verified-credential cache keyed by a keyed hash (HMAC, a per-process key) instead of SHA-256 | open |
+| R6 Repository ids compared case-insensitively; Windows device names refused | open |
+| R7 Removing a repository by renaming it to `.trash-*` first, swept at start | open |
+| R8 Long `owl:AllDisjointProperties` (a self-join of the triple table): a note or a time-bounded test | open |
+| R9 `--set` refused or warned for secret settings | open |
+| R1 residue: a commit that adds a long list without deleting one keeps the older index rule beside the new one until the program is rebuilt (sound; bounded by list changes, not by commits) | open |
 
 ## Research designs
 

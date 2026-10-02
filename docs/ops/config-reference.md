@@ -329,6 +329,7 @@ The rules are the server's access state (users, workspaces, personal spaces, rol
 
 - `auth.access_policy` -> `NRESE_ACCESS_POLICY`: the path of an access policy file, imported into the access state at the first start (it turns enforcement on). Later changes of the file are reported at start and apply once imported (`POST /api/v1/access/import`); `GET /api/v1/access/export` writes the state's rules in this form.
 - `auth.local_logins` -> `NRESE_AUTH_LOCAL_LOGINS` (default `true`): whether users of the access state with a password log in (`Basic` credentials, or a session from `POST /api/v1/access/login`) besides the authentication mode; for standalone and desktop installations without an identity provider.
+- `auth.trusted_proxies` -> `NRESE_AUTH_TRUSTED_PROXIES` (addresses or ranges, comma-separated; default loopback): the reverse proxies whose `X-Forwarded-For` names the client. Failed local logins are counted per user name and client address (past 10, each further attempt waits, from one second doubling up to five minutes) and per client address over all names (past 100); behind a proxy that isn't listed here, every client has the proxy's address, so list it
 - `auth.workspace_base` -> `NRESE_WORKSPACE_BASE`: what workspace graph prefixes start with (default `urn:nrese:`): a personal space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`.
 - the file (TOML), per role:
 

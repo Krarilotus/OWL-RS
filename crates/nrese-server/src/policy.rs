@@ -24,6 +24,9 @@ pub struct PolicyConfig {
     /// credentials, or a session from `POST /api/v1/access/login`), besides the
     /// authentication mode.
     pub local_logins: bool,
+    /// The reverse proxies whose `X-Forwarded-For` names the client
+    /// ([`crate::auth::peers::client`]); failed local logins are counted per client.
+    pub trusted_proxies: Vec<crate::auth::peers::AddressRange>,
     /// The directory administrators import files from by name
     /// (`POST /api/v1/repositories/{id}/import/files`); `None`: no server-side imports.
     pub import_directory: Option<std::path::PathBuf>,
@@ -42,6 +45,7 @@ impl Default for PolicyConfig {
             access: None,
             workspace_base: "urn:nrese:".to_owned(),
             local_logins: true,
+            trusted_proxies: crate::auth::peers::AddressRange::loopback(),
             import_directory: None,
         }
     }
