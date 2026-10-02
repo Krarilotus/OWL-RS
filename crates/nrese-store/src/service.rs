@@ -263,11 +263,30 @@ impl StoreService {
         export_dataset(&self.engine.snapshot(), format)
     }
 
+    /// What this store's updates are evaluated with.
+    fn update_context<'a>(
+        &self,
+        cancellation: &'a CancellationToken,
+    ) -> crate::mutation::command::UpdateContext<'a> {
+        crate::mutation::command::UpdateContext {
+            cancellation,
+            union_default_graph: self.config.union_default_graph,
+            services: self.services(),
+            namespaces: self.namespaces.all(),
+        }
+    }
+
+    /// `request` parsed for this store: a prefix it uses without declaring it means what the
+    /// store's namespaces bind it to ([`PreparedQuery::parse_with`]).
+    pub fn prepare_query(&self, request: &SparqlQueryRequest) -> StoreResult<PreparedQuery> {
+        PreparedQuery::parse_with(request, Some(&self.namespaces.all()))
+    }
+
     pub fn execute_query(
         &self,
         request: &SparqlQueryRequest,
     ) -> StoreResult<SerializedQueryResult> {
-        let prepared = PreparedQuery::parse(request)?;
+        let prepared = self.prepare_query(request)?;
         let mut payload = Vec::new();
         self.run_query(&prepared, &CancellationToken::new(), &mut payload)?;
         Ok(SerializedQueryResult {
@@ -390,17 +409,10 @@ impl StoreService {
         // read as the reader may; what they change is checked at the commit (the view is
         // the reader's own, and shows the graphs it may read only).
         let mut tx = self.engine.speculative();
-        let (union_default_graph, services) = (self.config.union_default_graph, self.services());
+        let context = self.update_context(cancellation);
         let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
         crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {
-            crate::mutation::command::apply_sparql_update(
-                tx,
-                request,
-                &requester,
-                cancellation,
-                union_default_graph,
-                services.clone(),
-            )
+            crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
         })?;
         let view = tx.pending_snapshot();
         self.sessions
@@ -604,13 +616,9 @@ impl StoreService {
     ) -> StoreResult<MutationCommitReport> {
         self.invalidate_reasoning()?;
         let mut tx = self.engine.transaction();
-        let report = command.apply(
-            &mut tx,
-            requester,
-            &CancellationToken::new(),
-            self.config.union_default_graph,
-            self.services(),
-        )?;
+        let cancellation = CancellationToken::new();
+        let context = self.update_context(&cancellation);
+        let report = command.apply(&mut tx, requester, &context)?;
         let summary = tx.commit()?;
         Ok(report.committed(summary.revision))
     }

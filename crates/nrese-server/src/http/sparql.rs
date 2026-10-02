@@ -1,8 +1,8 @@
 use axum::http::StatusCode;
 use axum::response::Response;
 use nrese_store::{
-    CancellationToken, GraphResultFormat, MutationCommand, PreparedQuery, QueryResultKind,
-    SolutionsResultFormat, SparqlQueryRequest, SparqlUpdateRequest, StoreError,
+    CancellationToken, GraphResultFormat, MutationCommand, QueryResultKind, SolutionsResultFormat,
+    SparqlQueryRequest, SparqlUpdateRequest, StoreError,
 };
 
 use crate::error::ApiError;
@@ -43,8 +43,11 @@ pub async fn execute_query_in(
     let mut request = build_query_request(operation);
     let memory = policy.limits.max_query_memory_bytes;
     request.memory_limit = (memory > 0).then_some(memory);
-    let mut prepared =
-        PreparedQuery::parse(&request).map_err(|error| map_query_error(&policy, error))?;
+    // Prefixes it doesn't declare mean what the repository's namespaces say.
+    let mut prepared = state
+        .store()
+        .prepare_query(&request)
+        .map_err(|error| map_query_error(&policy, error))?;
     if let Some(origin) = origin {
         prepared.set_origin(origin);
     }

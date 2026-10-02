@@ -69,15 +69,12 @@ impl MutationCommand {
         &self,
         tx: &mut Transaction<'_>,
         requester: &crate::Requester,
-        cancellation: &CancellationToken,
-        union_default_graph: bool,
-        services: Option<nrese_sparql::Services>,
+        context: &UpdateContext<'_>,
     ) -> Result<MutationCommitReport, StoreError> {
         if let Self::Restore(_) = self {
             requester.write.require_all("a restore")?;
         }
-        let report =
-            self.apply_unchecked(tx, requester, cancellation, union_default_graph, services)?;
+        let report = self.apply_unchecked(tx, requester, context)?;
         if let Some(writable) = requester.write.access() {
             check_writable(tx, writable)?;
         }
@@ -88,19 +85,10 @@ impl MutationCommand {
         &self,
         tx: &mut Transaction<'_>,
         requester: &crate::Requester,
-        cancellation: &CancellationToken,
-        union_default_graph: bool,
-        services: Option<nrese_sparql::Services>,
+        context: &UpdateContext<'_>,
     ) -> Result<MutationCommitReport, StoreError> {
         let mut update = |tx: &mut Transaction<'_>, request: &SparqlUpdateRequest| {
-            apply_sparql_update(
-                tx,
-                request,
-                requester,
-                cancellation,
-                union_default_graph,
-                services.clone(),
-            )
+            apply_sparql_update(tx, request, requester, context)
         };
         match self {
             Self::Update(request) => {
@@ -126,24 +114,49 @@ impl MutationCommand {
     }
 }
 
+/// What updates are evaluated with besides their transaction and requester.
+pub(crate) struct UpdateContext<'a> {
+    /// Stops a long-running `WHERE` clause.
+    pub cancellation: &'a CancellationToken,
+    pub union_default_graph: bool,
+    pub services: Option<nrese_sparql::Services>,
+    /// The repository's namespaces: what a prefix an update uses without declaring it
+    /// means (as for queries, [`crate::PreparedQuery::parse_with`]).
+    pub namespaces: crate::NamespaceMap,
+}
+
 /// Applies a SPARQL update request to `tx` for `requester`.
 pub(crate) fn apply_sparql_update(
     tx: &mut Transaction<'_>,
     request: &SparqlUpdateRequest,
     requester: &crate::Requester,
-    cancellation: &CancellationToken,
-    union_default_graph: bool,
-    services: Option<nrese_sparql::Services>,
+    context: &UpdateContext<'_>,
 ) -> Result<(), StoreError> {
-    let update = SparqlParser::new().parse_update(&request.update)?;
+    let update = match SparqlParser::new().parse_update(&request.update) {
+        Ok(update) => update,
+        Err(error) => {
+            let mut parser = SparqlParser::new();
+            for (prefix, namespace) in &context.namespaces {
+                parser = match parser
+                    .clone()
+                    .with_prefix(prefix.clone(), namespace.clone())
+                {
+                    Ok(with) => with,
+                    Err(_) => parser,
+                };
+            }
+            // A mistake of its own: the error without the namespaces.
+            parser.parse_update(&request.update).map_err(|_| error)?
+        }
+    };
     let options = UpdateOptions {
         using: crate::query_executor::protocol_dataset(
             &request.using_graphs,
             &request.using_named_graphs,
         )?,
-        cancellation: Some(cancellation.clone()),
-        union_default_graph,
-        services,
+        cancellation: Some(context.cancellation.clone()),
+        union_default_graph: context.union_default_graph,
+        services: context.services.clone(),
         access: requester.read.access().cloned(),
         writable: requester.write.access().cloned(),
     };
