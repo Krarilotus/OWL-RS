@@ -418,6 +418,11 @@ pub(crate) struct Equality {
     produced: HashSet<Triple>,
 }
 
+/// The `owl:sameAs` id of `rules`, if they reason with equality (`eq-rep-s`).
+pub fn same_as_of(rules: &[Rule]) -> Option<u64> {
+    Equality::for_rules(rules).map(|equality| equality.same_as)
+}
+
 /// The rules the equality module replaces.
 pub(crate) fn is_replacement_rule(rule: &Rule) -> bool {
     matches!(rule.name.as_str(), "eq-rep-s" | "eq-rep-p" | "eq-rep-o")
