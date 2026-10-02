@@ -1,0 +1,32 @@
+[package]
+name = "oxigraph-comparison"
+description = "NRESE's RDF bundle side by side with the Oxigraph crates it replaces: differential tests and throughput benchmarks"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A workspace of its own: the NRESE workspace stays free of Oxigraph crates.
+[workspace]
+
+[dependencies]
+nrese-rdf = { path = "../../crates/rdf/nrese-rdf" }
+nrese-rdf-io = { path = "../../crates/rdf/nrese-rdf-io" }
+nrese-sparql-syntax = { path = "../../crates/rdf/nrese-sparql-syntax" }
+nrese-sparql-results = { path = "../../crates/rdf/nrese-sparql-results" }
+nrese-xsd = { path = "../../crates/rdf/nrese-xsd" }
+# The released crates, unpatched: the comparison is with Oxigraph as it ships, with RDF 1.2
+# (`rdf-12`, `sparql-12`) switched on, as NRESE supports it.
+oxiri = "=0.2.11"
+oxjsonld = { version = "=0.2.4", features = ["rdf-12"] }
+oxrdfxml = { version = "=0.2.3", features = ["rdf-12"] }
+oxttl = { version = "=0.2.3", features = ["rdf-12"] }
+oxrdf = { version = "=0.3.3", features = ["rdfc-10", "rdf-12"] }
+oxsdatatypes = "=0.2.2"
+sparesults = { version = "=0.3.3", features = ["sparql-12"] }
+spargebra = { version = "=0.4.6", features = ["sparql-12", "sep-0002", "sep-0006"] }
+rand = "0.9"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

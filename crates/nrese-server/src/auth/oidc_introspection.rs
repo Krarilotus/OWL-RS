@@ -3,9 +3,8 @@ use reqwest::Url;
 use serde::Deserialize;
 
 use crate::auth::grants::{StringOrMany, grants_from_claim_parts};
-use crate::auth::{authorize_grants, extract_bearer_token};
+use crate::auth::{Authenticated, Identity, extract_bearer_token};
 use crate::error::ApiError;
-use crate::policy::PolicyAction;
 
 #[derive(Debug, Clone)]
 pub struct OidcIntrospectionConfig {
@@ -59,17 +58,18 @@ impl Eq for OidcIntrospectionConfig {}
 #[derive(Debug, Deserialize)]
 struct IntrospectionResponse {
     active: bool,
+    sub: Option<String>,
+    username: Option<String>,
     scope: Option<String>,
     scp: Option<StringOrMany>,
     role: Option<String>,
     roles: Option<StringOrMany>,
 }
 
-pub async fn authorize(
+pub async fn authenticate(
     config: &OidcIntrospectionConfig,
-    action: PolicyAction,
     headers: &HeaderMap,
-) -> Result<(), ApiError> {
+) -> Result<Authenticated, ApiError> {
     let token = extract_bearer_token(headers)?;
     let response = introspect_token(config, token).await?;
     if !response.active {
@@ -87,13 +87,20 @@ pub async fn authorize(
         response.roles.as_ref(),
     );
 
-    if authorize_grants(action, &grants) {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "bearer token does not grant access to this endpoint",
-        ))
-    }
+    let roles = super::grants::role_names_from_claim_parts(
+        response.scope.as_deref(),
+        response.scp.as_ref(),
+        response.role.as_deref(),
+        response.roles.as_ref(),
+    );
+    Ok(Authenticated {
+        identity: Identity::from_grants(&grants, roles)
+            .with_user(response.sub.as_deref().or(response.username.as_deref())),
+        grants,
+        // An active token is authenticated; its roles may get rights from the access policy.
+        known: true,
+        refusal: "bearer token does not grant access to this endpoint",
+    })
 }
 
 async fn introspect_token(

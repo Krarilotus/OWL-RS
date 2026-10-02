@@ -2,12 +2,15 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_store::{DatasetBackupFormat, DatasetRestoreRequest, StoreError};
+use nrese_store::{
+    DatasetBackupFormat, DatasetRestoreRequest, MutationCommand, MutationCommitReport, StoreError,
+};
 
 use crate::error::ApiError;
 use crate::http::media::{header_value_str, media_type_matches};
+use crate::http::mutation;
+use crate::http::request_metrics::BackupKind;
 use crate::http::responses::build_admin_restore_response;
-use crate::mutation_pipeline;
 use crate::state::AppState;
 
 const BACKUP_FORMAT_HEADER: &str = "x-nrese-backup-format";
@@ -16,14 +19,27 @@ const QUAD_COUNT_HEADER: &str = "x-nrese-quad-count";
 const CHECKSUM_HEADER: &str = "x-nrese-checksum-sha256";
 
 pub async fn backup(state: AppState) -> Result<Response, ApiError> {
-    ensure_ready(&state)?;
+    state.ensure_serving()?;
 
     let store = state.store();
+    let started = std::time::Instant::now();
     let artifact =
-        tokio::task::spawn_blocking(move || store.export_dataset(DatasetBackupFormat::NQuads))
+        // Administrators only (the caller's guard): every graph.
+        tokio::task::spawn_blocking(move || {
+            store.export_dataset(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)
+        })
             .await
-            .map_err(|error| ApiError::internal(error.to_string()))?
-            .map_err(map_backup_error)?;
+            .map_err(|error| ApiError::internal(error.to_string()))
+            .and_then(|result| result.map_err(map_backup_error));
+    state.request_metrics().record_backup(
+        BackupKind::Dump,
+        artifact
+            .as_ref()
+            .ok()
+            .map(|artifact| artifact.payload.len() as u64),
+        started.elapsed(),
+    );
+    let artifact = artifact?;
 
     let mut response = (StatusCode::OK, artifact.payload).into_response();
     response.headers_mut().insert(
@@ -55,29 +71,74 @@ pub async fn restore(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    ensure_ready(&state)?;
+    state.ensure_serving()?;
     let format = parse_restore_format(headers.get(header::CONTENT_TYPE))?;
     let request = DatasetRestoreRequest {
         format,
         payload: body.to_vec(),
     };
 
-    let report = tokio::time::timeout(
+    let started = std::time::Instant::now();
+    let result = mutation::run(
+        &state,
+        MutationCommand::Restore(request),
+        // Administrators only (the caller's guard): every graph.
+        nrese_store::Requester::all(),
         state.policy().timeouts.update,
-        mutation_pipeline::execute_restore(state, request),
+        "dataset restore exceeded policy timeout",
     )
-    .await
-    .map_err(|_| ApiError::timeout("dataset restore exceeded policy timeout"))??;
+    .await;
+    state.request_metrics().record_backup(
+        BackupKind::Restore,
+        result.as_ref().ok().map(|_| body.len() as u64),
+        started.elapsed(),
+    );
+    let report = match result? {
+        MutationCommitReport::Restore(report) => report,
+        other => {
+            return Err(ApiError::internal(format!(
+                "unexpected restore result: {other:?}"
+            )));
+        }
+    };
 
     Ok((StatusCode::OK, Json(build_admin_restore_response(&report))).into_response())
 }
 
-fn ensure_ready(state: &AppState) -> Result<(), ApiError> {
-    if state.is_ready() {
-        Ok(())
-    } else {
-        Err(ApiError::unavailable("server is not ready yet"))
-    }
+/// An image backup of repository `repository`'s latest snapshot into `backups/` of the
+/// default repository's data directory (`<seconds since 1970>`, or `<id>-<seconds>` for
+/// another repository), while writers go on; answers its manifest and directory.
+pub async fn image_backup(state: AppState, repository: &str) -> Result<Response, ApiError> {
+    state.ensure_serving()?;
+    let backups = state.store().config().data_dir.join("backups");
+    let store = state.for_repository(repository)?.store();
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let dir = backups.join(match repository {
+        crate::repositories::DEFAULT_REPOSITORY => seconds.to_string(),
+        other => format!("{other}-{seconds}"),
+    });
+    let target = dir.clone();
+    let started = std::time::Instant::now();
+    let manifest = tokio::task::spawn_blocking(move || store.backup_image(&target))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))
+        .and_then(|result| result.map_err(map_backup_error));
+    state.request_metrics().record_backup(
+        BackupKind::Image,
+        manifest.as_ref().ok().map(|manifest| manifest.bytes),
+        started.elapsed(),
+    );
+    let manifest = manifest?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "directory": dir.display().to_string(),
+            "manifest": manifest,
+        })),
+    )
+        .into_response())
 }
 
 fn parse_restore_format(

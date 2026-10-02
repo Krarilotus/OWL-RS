@@ -1,0 +1,6 @@
+# OWL2Bench Q19. Find all the instances of class Faculty. A Faculty is an Employee who teaches some Course.
+# Construct: ObjectSomeValuesFrom
+# Profiles: EL, QL, RL, DL
+PREFIX : <https://kracr.iiitd.edu.in/OWL2Bench#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?x WHERE { ?x rdf:type :Faculty }

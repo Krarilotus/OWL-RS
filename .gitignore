@@ -1,7 +1,14 @@
-/target/
+# Build output, at any depth (the vendored crates and the bench workspaces build their own)
+target/
 /target-*/
-/benches/**/target/
 **/*.rs.bk
+# Profiler output (perf, samply, cargo-flamegraph, coverage)
+perf.data*
+*.profraw
+flamegraph*.svg
+# Patch leftovers
+*.orig
+*.rej
 
 /.idea/
 /.vscode/
@@ -12,7 +19,7 @@ Thumbs.db
 /data/
 /artifacts/
 /tmp/
-/benches/nrese-bench-harness/fixtures/catalog-cache/
+/.cache/
 *.log
 *.out
 *.err
@@ -32,3 +39,22 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+# Competitor benchmark results: some vendors forbid publishing them (benches/competitors/README.md)
+/benches/competitors/results/
+/benches/reasoning/results/
+
+# Perf lab build logs (benches/perf-lab.sh); the JSON reports are committed.
+/benches/baselines/perf-lab/.build-*
+
+# Integration workload results (licensed systems may write there too)
+/benches/integration/results/
+# Suite results (licensed systems write there too); the suite's Python caches
+/benches/suite/results/
+/benches/oracle/results/
+# Python caches, anywhere
+__pycache__/
+*.py[cod]
+
+# Lockfiles of the vendored crates, made when their own tests run
+/vendor/*/Cargo.lock

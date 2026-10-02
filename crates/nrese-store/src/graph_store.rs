@@ -16,6 +16,9 @@ pub struct GraphReadRequest {
 pub struct GraphReadResult {
     pub media_type: &'static str,
     pub payload: Vec<u8>,
+    /// Whether the graph exists. A named graph exists while it holds statements; the
+    /// default graph always does.
+    pub exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

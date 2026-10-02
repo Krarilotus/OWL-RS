@@ -101,7 +101,11 @@ mod tests {
     fn rejects_missing_placeholder_value() {
         let error = expand_with_lookup("Bearer ${TOKEN}", |_| None).expect_err("missing value");
 
-        assert!(error.to_string().contains("missing environment variable 'TOKEN'"));
+        assert!(
+            error
+                .to_string()
+                .contains("missing environment variable 'TOKEN'")
+        );
     }
 
     #[test]

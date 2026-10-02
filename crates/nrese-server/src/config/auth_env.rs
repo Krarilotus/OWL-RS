@@ -55,6 +55,7 @@ pub(super) fn parse_auth_config(source: &dyn ConfigSource) -> Result<AuthConfig>
                 }
                 admin_subjects
             },
+            trusted_proxies: parse_ranges(source, names::AUTH_MTLS_TRUSTED_PROXIES)?,
         })),
         ConfiguredAuthMode::OidcIntrospection => Ok(AuthConfig::OidcIntrospection(
             OidcIntrospectionConfig::new(
@@ -103,15 +104,40 @@ fn parse_semicolon_set(value: Option<String>) -> BTreeSet<String> {
     }
 }
 
+/// Addresses or ranges (comma- or semicolon-separated) from `name`; loopback by default.
+pub(crate) fn parse_ranges(
+    source: &dyn ConfigSource,
+    name: &str,
+) -> Result<Vec<crate::auth::peers::AddressRange>> {
+    match source.get(name) {
+        None => Ok(crate::auth::peers::AddressRange::loopback()),
+        Some(list) => list
+            .split([',', ';'])
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| entry.parse().map_err(anyhow::Error::msg))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .with_context(|| name.to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use crate::auth::{AuthConfig, MtlsConfig, OidcIntrospectionConfig, StaticBearerConfig};
-    use crate::config::source::ProcessEnv;
-    use crate::config::test_support::{EnvGuard, env_lock};
+    use crate::config::source::KeyValueSource;
 
     use super::{ConfiguredAuthMode, parse_auth_config, parse_auth_mode};
+
+    /// The settings `values` as the parser reads them (the process environment untouched).
+    fn source(values: &[(&str, &str)]) -> KeyValueSource {
+        let mut source = KeyValueSource::default();
+        for (key, value) in values {
+            source.insert(*key, *value);
+        }
+        source
+    }
 
     #[test]
     fn auth_mode_parser_accepts_static_bearer() {
@@ -139,57 +165,21 @@ mod tests {
 
     #[test]
     fn bearer_static_config_requires_admin_token() {
-        let _lock = env_lock().lock().expect("env test lock");
-        let _guard = EnvGuard::set(&[
-            ("NRESE_AUTH_MODE", Some("bearer-static")),
-            ("NRESE_AUTH_READ_TOKEN", None),
-            ("NRESE_AUTH_ADMIN_TOKEN", None),
-            ("NRESE_AUTH_JWT_SECRET", None),
-            ("NRESE_AUTH_JWT_ISSUER", None),
-            ("NRESE_AUTH_JWT_AUDIENCE", None),
-            ("NRESE_AUTH_JWT_READ_ROLE", None),
-            ("NRESE_AUTH_JWT_ADMIN_ROLE", None),
-            ("NRESE_AUTH_JWT_LEEWAY_SECS", None),
-            ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
-            ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
-            ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
-            ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
-            ("NRESE_AUTH_OIDC_CLIENT_ID", None),
-            ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
-            ("NRESE_AUTH_OIDC_READ_ROLE", None),
-            ("NRESE_AUTH_OIDC_ADMIN_ROLE", None),
-            ("NRESE_AUTH_OIDC_TIMEOUT_MS", None),
-        ]);
+        let source = source(&[("NRESE_AUTH_MODE", "bearer-static")]);
 
-        assert!(parse_auth_config(&ProcessEnv).is_err());
+        assert!(parse_auth_config(&source).is_err());
     }
 
     #[test]
     fn bearer_static_config_parses_explicit_tokens() {
-        let _lock = env_lock().lock().expect("env test lock");
-        let _guard = EnvGuard::set(&[
-            ("NRESE_AUTH_MODE", Some("bearer-static")),
-            ("NRESE_AUTH_READ_TOKEN", Some("reader")),
-            ("NRESE_AUTH_ADMIN_TOKEN", Some("admin")),
-            ("NRESE_AUTH_JWT_SECRET", None),
-            ("NRESE_AUTH_JWT_ISSUER", None),
-            ("NRESE_AUTH_JWT_AUDIENCE", None),
-            ("NRESE_AUTH_JWT_READ_ROLE", None),
-            ("NRESE_AUTH_JWT_ADMIN_ROLE", None),
-            ("NRESE_AUTH_JWT_LEEWAY_SECS", None),
-            ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
-            ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
-            ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
-            ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
-            ("NRESE_AUTH_OIDC_CLIENT_ID", None),
-            ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
-            ("NRESE_AUTH_OIDC_READ_ROLE", None),
-            ("NRESE_AUTH_OIDC_ADMIN_ROLE", None),
-            ("NRESE_AUTH_OIDC_TIMEOUT_MS", None),
+        let source = source(&[
+            ("NRESE_AUTH_MODE", "bearer-static"),
+            ("NRESE_AUTH_READ_TOKEN", "reader"),
+            ("NRESE_AUTH_ADMIN_TOKEN", "admin"),
         ]);
 
         assert_eq!(
-            parse_auth_config(&ProcessEnv).expect("auth config"),
+            parse_auth_config(&source).expect("auth config"),
             AuthConfig::BearerStatic(StaticBearerConfig {
                 read_token: Some("reader".to_owned()),
                 admin_token: "admin".to_owned(),
@@ -199,90 +189,35 @@ mod tests {
 
     #[test]
     fn bearer_jwt_config_requires_shared_secret() {
-        let _lock = env_lock().lock().expect("env test lock");
-        let _guard = EnvGuard::set(&[
-            ("NRESE_AUTH_MODE", Some("bearer-jwt")),
-            ("NRESE_AUTH_READ_TOKEN", None),
-            ("NRESE_AUTH_ADMIN_TOKEN", None),
-            ("NRESE_AUTH_JWT_SECRET", None),
-            ("NRESE_AUTH_JWT_ISSUER", None),
-            ("NRESE_AUTH_JWT_AUDIENCE", None),
-            ("NRESE_AUTH_JWT_READ_ROLE", None),
-            ("NRESE_AUTH_JWT_ADMIN_ROLE", None),
-            ("NRESE_AUTH_JWT_LEEWAY_SECS", None),
-            ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
-            ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
-            ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
-            ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
-            ("NRESE_AUTH_OIDC_CLIENT_ID", None),
-            ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
-            ("NRESE_AUTH_OIDC_READ_ROLE", None),
-            ("NRESE_AUTH_OIDC_ADMIN_ROLE", None),
-            ("NRESE_AUTH_OIDC_TIMEOUT_MS", None),
-        ]);
+        let source = source(&[("NRESE_AUTH_MODE", "bearer-jwt")]);
 
-        assert!(parse_auth_config(&ProcessEnv).is_err());
+        assert!(parse_auth_config(&source).is_err());
     }
 
     #[test]
     fn mtls_config_requires_admin_subjects() {
-        let _lock = env_lock().lock().expect("env test lock");
-        let _guard = EnvGuard::set(&[
-            ("NRESE_AUTH_MODE", Some("mtls")),
-            ("NRESE_AUTH_READ_TOKEN", None),
-            ("NRESE_AUTH_ADMIN_TOKEN", None),
-            ("NRESE_AUTH_JWT_SECRET", None),
-            ("NRESE_AUTH_JWT_ISSUER", None),
-            ("NRESE_AUTH_JWT_AUDIENCE", None),
-            ("NRESE_AUTH_JWT_READ_ROLE", None),
-            ("NRESE_AUTH_JWT_ADMIN_ROLE", None),
-            ("NRESE_AUTH_JWT_LEEWAY_SECS", None),
-            ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
-            ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
-            ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
-            ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
-            ("NRESE_AUTH_OIDC_CLIENT_ID", None),
-            ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
-            ("NRESE_AUTH_OIDC_READ_ROLE", None),
-            ("NRESE_AUTH_OIDC_ADMIN_ROLE", None),
-            ("NRESE_AUTH_OIDC_TIMEOUT_MS", None),
-        ]);
+        let source = source(&[("NRESE_AUTH_MODE", "mtls")]);
 
-        assert!(parse_auth_config(&ProcessEnv).is_err());
+        assert!(parse_auth_config(&source).is_err());
     }
 
     #[test]
     fn mtls_config_parses_subject_mapping() {
-        let _lock = env_lock().lock().expect("env test lock");
-        let _guard = EnvGuard::set(&[
-            ("NRESE_AUTH_MODE", Some("mtls")),
-            ("NRESE_AUTH_READ_TOKEN", None),
-            ("NRESE_AUTH_ADMIN_TOKEN", None),
-            ("NRESE_AUTH_JWT_SECRET", None),
-            ("NRESE_AUTH_JWT_ISSUER", None),
-            ("NRESE_AUTH_JWT_AUDIENCE", None),
-            ("NRESE_AUTH_JWT_READ_ROLE", None),
-            ("NRESE_AUTH_JWT_ADMIN_ROLE", None),
-            ("NRESE_AUTH_JWT_LEEWAY_SECS", None),
-            ("NRESE_AUTH_MTLS_SUBJECT_HEADER", Some("x-ssl-client-s-dn")),
+        let source = source(&[
+            ("NRESE_AUTH_MODE", "mtls"),
+            ("NRESE_AUTH_MTLS_SUBJECT_HEADER", "x-ssl-client-s-dn"),
             (
                 "NRESE_AUTH_MTLS_READ_SUBJECTS",
-                Some("CN=reader-1,O=Test;CN=reader-2,O=Test"),
+                "CN=reader-1,O=Test;CN=reader-2,O=Test",
             ),
             (
                 "NRESE_AUTH_MTLS_ADMIN_SUBJECTS",
-                Some("CN=admin-1,O=Test;CN=admin-2,O=Test"),
+                "CN=admin-1,O=Test;CN=admin-2,O=Test",
             ),
-            ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
-            ("NRESE_AUTH_OIDC_CLIENT_ID", None),
-            ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
-            ("NRESE_AUTH_OIDC_READ_ROLE", None),
-            ("NRESE_AUTH_OIDC_ADMIN_ROLE", None),
-            ("NRESE_AUTH_OIDC_TIMEOUT_MS", None),
         ]);
 
         assert_eq!(
-            parse_auth_config(&ProcessEnv).expect("auth config"),
+            parse_auth_config(&source).expect("auth config"),
             AuthConfig::Mtls(MtlsConfig {
                 subject_header: "x-ssl-client-s-dn".to_owned(),
                 read_subjects: BTreeSet::from([
@@ -293,66 +228,35 @@ mod tests {
                     "CN=admin-1,O=Test".to_owned(),
                     "CN=admin-2,O=Test".to_owned()
                 ]),
+                trusted_proxies: crate::auth::peers::AddressRange::loopback(),
             })
         );
     }
 
     #[test]
     fn oidc_introspection_requires_introspection_url() {
-        let _lock = env_lock().lock().expect("env test lock");
-        let _guard = EnvGuard::set(&[
-            ("NRESE_AUTH_MODE", Some("oidc-introspection")),
-            ("NRESE_AUTH_READ_TOKEN", None),
-            ("NRESE_AUTH_ADMIN_TOKEN", None),
-            ("NRESE_AUTH_JWT_SECRET", None),
-            ("NRESE_AUTH_JWT_ISSUER", None),
-            ("NRESE_AUTH_JWT_AUDIENCE", None),
-            ("NRESE_AUTH_JWT_READ_ROLE", None),
-            ("NRESE_AUTH_JWT_ADMIN_ROLE", None),
-            ("NRESE_AUTH_JWT_LEEWAY_SECS", None),
-            ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
-            ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
-            ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
-            ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
-            ("NRESE_AUTH_OIDC_CLIENT_ID", None),
-            ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
-            ("NRESE_AUTH_OIDC_READ_ROLE", None),
-            ("NRESE_AUTH_OIDC_ADMIN_ROLE", None),
-            ("NRESE_AUTH_OIDC_TIMEOUT_MS", None),
-        ]);
+        let source = source(&[("NRESE_AUTH_MODE", "oidc-introspection")]);
 
-        assert!(parse_auth_config(&ProcessEnv).is_err());
+        assert!(parse_auth_config(&source).is_err());
     }
 
     #[test]
     fn oidc_introspection_parses_explicit_config() {
-        let _lock = env_lock().lock().expect("env test lock");
-        let _guard = EnvGuard::set(&[
-            ("NRESE_AUTH_MODE", Some("oidc-introspection")),
-            ("NRESE_AUTH_READ_TOKEN", None),
-            ("NRESE_AUTH_ADMIN_TOKEN", None),
-            ("NRESE_AUTH_JWT_SECRET", None),
-            ("NRESE_AUTH_JWT_ISSUER", None),
-            ("NRESE_AUTH_JWT_AUDIENCE", None),
-            ("NRESE_AUTH_JWT_READ_ROLE", None),
-            ("NRESE_AUTH_JWT_ADMIN_ROLE", None),
-            ("NRESE_AUTH_JWT_LEEWAY_SECS", None),
-            ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
-            ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
-            ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
+        let source = source(&[
+            ("NRESE_AUTH_MODE", "oidc-introspection"),
             (
                 "NRESE_AUTH_OIDC_INTROSPECTION_URL",
-                Some("http://127.0.0.1:43123/introspect"),
+                "http://127.0.0.1:43123/introspect",
             ),
-            ("NRESE_AUTH_OIDC_CLIENT_ID", Some("nrese-client")),
-            ("NRESE_AUTH_OIDC_CLIENT_SECRET", Some("secret")),
-            ("NRESE_AUTH_OIDC_READ_ROLE", Some("nrese.read")),
-            ("NRESE_AUTH_OIDC_ADMIN_ROLE", Some("nrese.admin")),
-            ("NRESE_AUTH_OIDC_TIMEOUT_MS", Some("7000")),
+            ("NRESE_AUTH_OIDC_CLIENT_ID", "nrese-client"),
+            ("NRESE_AUTH_OIDC_CLIENT_SECRET", "secret"),
+            ("NRESE_AUTH_OIDC_READ_ROLE", "nrese.read"),
+            ("NRESE_AUTH_OIDC_ADMIN_ROLE", "nrese.admin"),
+            ("NRESE_AUTH_OIDC_TIMEOUT_MS", "7000"),
         ]);
 
         assert_eq!(
-            parse_auth_config(&ProcessEnv).expect("auth config"),
+            parse_auth_config(&source).expect("auth config"),
             AuthConfig::OidcIntrospection(
                 OidcIntrospectionConfig::new(
                     "http://127.0.0.1:43123/introspect".parse().expect("url"),

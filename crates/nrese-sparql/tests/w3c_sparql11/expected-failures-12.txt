@@ -1,0 +1,1 @@
+# W3C SPARQL 1.2 tests engine v2 knowingly fails: `<test IRI> # reason`, one per line.

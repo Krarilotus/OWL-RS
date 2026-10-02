@@ -88,9 +88,9 @@ pub fn validate_pack_invocation_profiles(
                 suite_path,
             )?;
             require_profile(
-                &invocation_profiles.fuseki,
-                case.fuseki_profile.as_deref(),
-                "Fuseki",
+                &invocation_profiles.reference,
+                case.reference_profile.as_deref(),
+                "Reference",
                 &case.name,
                 suite_path,
             )?;
@@ -145,16 +145,20 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::io::{read_ontology_catalog, read_workload_pack};
     use crate::model::{
         CompatHeaders, OntologyFixture, OntologyReasoningFeature, OntologySemanticDialect,
         OntologySerialization, OntologyServiceSurface, ServiceInvocationProfiles,
         ServiceRequestProfile, WorkloadPackManifest,
     };
-    use crate::io::{read_ontology_catalog, read_workload_pack};
 
     use super::{validate_catalog_baseline_pack, validate_pack_invocation_profiles};
 
-    fn ontology_fixture(name: &str, serialization: OntologySerialization, filename: &str) -> OntologyFixture {
+    fn ontology_fixture(
+        name: &str,
+        serialization: OntologySerialization,
+        filename: &str,
+    ) -> OntologyFixture {
         OntologyFixture {
             name: name.to_owned(),
             title: name.to_owned(),
@@ -185,12 +189,16 @@ mod tests {
                 "fixtures/compat/ontologies/rdf_xml_cases.json".into(),
             ],
             nrese: Default::default(),
-            fuseki: Default::default(),
+            reference: Default::default(),
             invocation_profiles: Default::default(),
         };
 
-        validate_catalog_baseline_pack(&ontology, Path::new("fixtures/packs/foaf-baseline/pack.toml"), &manifest)
-            .expect("valid pack");
+        validate_catalog_baseline_pack(
+            &ontology,
+            Path::new("fixtures/packs/foaf-baseline/pack.toml"),
+            &manifest,
+        )
+        .expect("valid pack");
     }
 
     #[test]
@@ -204,7 +212,7 @@ mod tests {
             update_workload: "fixtures/workloads/update.json".into(),
             compat_suites: vec!["fixtures/compat/ontologies/baseline_cases.json".into()],
             nrese: Default::default(),
-            fuseki: Default::default(),
+            reference: Default::default(),
             invocation_profiles: Default::default(),
         };
 
@@ -232,7 +240,7 @@ mod tests {
                 "fixtures/compat/ontologies/skos_cases.json".into(),
             ],
             nrese: Default::default(),
-            fuseki: Default::default(),
+            reference: Default::default(),
             invocation_profiles: Default::default(),
         };
 
@@ -248,8 +256,8 @@ mod tests {
 
     #[test]
     fn checked_in_catalog_baseline_packs_validate_against_catalog_metadata() {
-        let catalog = read_ontology_catalog(Path::new("fixtures/catalog/ontologies.toml"))
-        .expect("catalog");
+        let catalog =
+            read_ontology_catalog(Path::new("fixtures/catalog/ontologies.toml")).expect("catalog");
 
         for ontology in &catalog.ontologies {
             let manifest_path = Path::new("fixtures/packs")
@@ -273,7 +281,7 @@ mod tests {
     "operation": "query",
     "query": "SELECT * WHERE { ?s ?p ?o } LIMIT 1",
     "nrese_profile": "invalid",
-    "fuseki_profile": "invalid",
+    "reference_profile": "invalid",
     "kind": "status-content-type-body-class"
   }
 ]"#,
@@ -282,11 +290,14 @@ mod tests {
 
         let mut profiles = ServiceInvocationProfiles::default();
         let invalid = ServiceRequestProfile {
-            headers: CompatHeaders::from([("authorization".to_owned(), "Bearer invalid".to_owned())]),
+            headers: CompatHeaders::from([(
+                "authorization".to_owned(),
+                "Bearer invalid".to_owned(),
+            )]),
             timeout_ms: None,
         };
         profiles.nrese.insert("invalid".to_owned(), invalid.clone());
-        profiles.fuseki.insert("invalid".to_owned(), invalid);
+        profiles.reference.insert("invalid".to_owned(), invalid);
 
         validate_pack_invocation_profiles(&[suite_path], &profiles).expect("valid profiles");
     }
@@ -309,12 +320,23 @@ mod tests {
         )
         .expect("suite");
 
-        let error = validate_pack_invocation_profiles(std::slice::from_ref(&suite_path), &ServiceInvocationProfiles::default())
-            .expect_err("missing profile");
+        let error = validate_pack_invocation_profiles(
+            std::slice::from_ref(&suite_path),
+            &ServiceInvocationProfiles::default(),
+        )
+        .expect_err("missing profile");
 
-        assert!(error.to_string().contains("selected live connection profile or workload pack"));
+        assert!(
+            error
+                .to_string()
+                .contains("selected live connection profile or workload pack")
+        );
         assert!(error.to_string().contains("invalid"));
         assert!(error.to_string().contains("query-invalid-auth-profile"));
-        assert!(error.to_string().contains(&suite_path.display().to_string()));
+        assert!(
+            error
+                .to_string()
+                .contains(&suite_path.display().to_string())
+        );
     }
 }

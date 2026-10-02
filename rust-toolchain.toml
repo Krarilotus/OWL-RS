@@ -1,0 +1,6 @@
+# The toolchain every build uses: the latest stable, bumped at each stable release after a
+# benchmark check (ROADMAP Pf7). CI and the Docker benchmark images follow this file.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

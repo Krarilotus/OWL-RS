@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The whole gate before a push (what CI runs): scripts/check.sh.
+# Enable the hooks with: git config core.hooksPath .githooks
+exec scripts/check.sh

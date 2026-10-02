@@ -15,20 +15,25 @@ Implementation ownership remains in `crates/nrese-server/src/config/`.
 
 ## Precedence
 
-Configuration is resolved in this order:
+Every setting has a key in the configuration file and an environment variable (the lists below; the server's registry of them is `crates/nrese-server/src/config/settings.rs`). A value is taken from the first of:
 
-1. CLI config path via `--config` or `-c`
-2. `NRESE_CONFIG_PATH` for selecting the config file path when no CLI path is given
-3. environment variable overrides for runtime values
-4. `config.toml`
-5. built-in defaults
+1. the command line: `--set KEY=VALUE` with a file key (`--set budgets.query_timeout=2min`), repeatable, for every command
+2. the environment variable
+3. the configuration file: the path from `--config` or `-c`, else `NRESE_CONFIG_PATH`
+4. the built-in default
 
 Notes:
 
-- CLI currently selects the config file path; individual runtime knobs are still configured through file or env.
 - Environment variables always override values loaded from `config.toml`.
 - If no config file path is provided by CLI or `NRESE_CONFIG_PATH`, the server runs from env/defaults only.
 - External reasoner input may still be expressed as `mode`, `preset`, and optional feature overrides, but the server resolves those inputs into one runtime profile/tier contract before diagnostics, capabilities, and frontend surfaces see them.
+
+## Validation
+
+- Unknown keys in the TOML file are a startup error that names the key (for example a misspelt `mdoe`). Known aliases such as `server.bind_addr` still work.
+- `nrese-server config-schema` prints the JSON Schema of the configuration file (2020-12): every key with its type, allowed values, description, environment variable (`x-env`), older keys (`x-older-keys`), and `writeOnly` for credentials. Editors and the console can validate and complete `config.toml` with it.
+- A value of the wrong kind (text for a flag, a negative number) is a startup error that names the key.
+- `nrese-server check-config [--config FILE]` loads and validates the configuration (file, then environment overrides), prints the effective settings and exits. Credentials are never printed: authentication and AI show their mode and provider only. `reasoner.semantics` shows the ruleset and its semantic fingerprint (the stored inferences are rebuilt when it changes).
 
 ## Minimal Example
 
@@ -43,38 +48,20 @@ data_dir = "./data"
 ontology_path = "C:/data/rg_ontology.ttl"
 
 [reasoner]
-mode = "rules-mvp"
-read_model = "asserted-only"
+mode = "owl2-rl"
 
-[reasoner.rules_mvp]
-tier = "bounded-owl"
-features = [
-  "rdfs-subclass-closure",
-  "rdfs-subproperty-closure",
-  "rdfs-type-propagation",
-  "rdfs-domain-range-typing",
-  "owl-property-assertion-closure",
-  "owl-equality-reasoning",
-  "owl-consistency-check",
-  "unsupported-diagnostics",
-]
-
-[policy.limits]
-max_query_bytes = 1048576
-max_update_bytes = 1048576
-max_rdf_upload_bytes = 10485760
+[budgets]
+query_memory = "4GiB"
+total_query_memory = "50%"
+query_timeout = "30s"
+update_timeout = "60s"
+upload_size = "128MiB"
 
 [policy.rate_limits]
 window_secs = 60
 read_requests_per_window = 0
 write_requests_per_window = 0
 admin_requests_per_window = 0
-
-[policy.timeouts]
-query_ms = 30000
-update_ms = 60000
-graph_read_ms = 30000
-graph_write_ms = 60000
 
 [policy]
 sparql_parse_error_profile = "problem-json"
@@ -123,76 +110,146 @@ api_key = "replace-me"
 - posture effects:
   - `read-only-demo` disables SPARQL Update, `TELL`, Graph Store writes, and admin mutation surfaces
   - `internal-authenticated` requires auth mode other than `none`
-  - `replacement-grade` additionally requires on-disk storage, `problem-json` SPARQL parse errors, and rejects `owl-dl-target` while it remains scaffolded
+  - `replacement-grade` additionally requires on-disk storage and `problem-json` SPARQL parse errors
 
 ## Store
 
 - file key: `store.mode`
 - env override: `NRESE_STORE_MODE`
-- values: `in-memory`, `on-disk`
+- values: `in-memory` (aliases `inmemory`, `memory`), `on-disk` (aliases `ondisk`, `disk`, `durable`)
+- unknown values are a startup error
 
 - file key: `store.data_dir`
 - env override: `NRESE_DATA_DIR`
 - default: `./data`
 
+- file key: `store.default_graph`
+- env override: `NRESE_DEFAULT_GRAPH`
+- values: `default` (the default), `union`
+- what a query, or an update's `WHERE`, reads when it names no dataset:
+  - `default`: only the default graph, as the SPARQL specification describes a plain dataset;
+  - `union`: the merge of all graphs, as GraphDB, RDF4J stores and Blazegraph do. A statement counts once, however many graphs hold it.
+- use `union` for clients that write into named graphs and query without naming them (ResearchSpace, the Datamodel Workflow's exports)
+- `GRAPH` patterns, `FROM` clauses and the protocol's dataset parameters mean the same in both modes
+- an update without `GRAPH` still writes to, and deletes from, the default graph only
+- cost: `union` runs on the native executor like `default`, but reads graph-last index orders and drops repeated statements, and the shortcuts that answer from index counts alone (`COUNT(*)` of one pattern, range filters, the worst-case-optimal join) don't apply. How much slower that is hasn't been measured yet
+- `/version` reports the mode as `default_graph`
+
+- file key: `shacl.shapes_graph`
+- env override: `NRESE_SHACL_SHAPES_GRAPH`
+- default: `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph` (the graph RDF4J and GraphDB use)
+- the graph whose shapes `GET /dataset/shacl` validates against ([http-api.md](http-api.md)); it must be an IRI
+
+- file key: `store.query_cache_bytes`
+- env override: `NRESE_QUERY_CACHE_BYTES`
+- default: 2% of the memory the server may use (the container's limit, else the machine's), at least 64 MiB and at most 8 GiB; a size, or a share such as `5%`; `0` disables the cache
+- serialised results of repeated queries on an unchanged store are answered from memory. Every commit starts a new revision, so a cached result is never stale; queries using `NOW()`, `RAND()`, `UUID()`, `STRUUID()` or `BNODE()` are not cached, and no single result takes more than a quarter of the budget
+
+- file keys: `shacl.gate`, `shacl.gate_severity`
+- env overrides: `NRESE_SHACL_GATE`, `NRESE_SHACL_GATE_SEVERITY`
+- default: `off`; severity `violation`
+- SHACL as a commit gate: `report` validates every commit against the shapes graph (`shacl.shapes_graph`) and logs what it introduces; `enforce` also rejects a commit that introduces a result at or above `gate_severity` (`violation`, `warning` or `info`), or a validation failure, and the commit changes nothing. Only what a commit introduces counts: data that was invalid before doesn't block writes (validation at `/dataset/shacl` reports it). The check validates the focus nodes the commit can affect, after reasoning; a commit that changes the shapes graph is validated in full
+
+- file key: `store.import_directory`
+- env override: `NRESE_IMPORT_DIR`
+- default: none
+- the directory administrators import files from by name (`POST /api/v1/repositories/{id}/import/files`): large loads without uploading them, as jobs. Paths can't leave it. Without it, server-side imports don't exist
+
+- file key: `store.verify_on_open`
+- env override: `NRESE_VERIFY_ON_OPEN`
+- default: `false`
+- on disk, the newest checkpoint is used in place from a memory map: opening reads only its structure, so a restart takes milliseconds and memory grows with what queries touch. `true` checks the whole checkpoint when opening (its CRC, every index block, every dictionary key): opening then reads the whole file once, and a damaged checkpoint is refused at once instead of failing when a query reaches the damage
+
+- file key: `store.map_checkpoints`
+- env override: `NRESE_MAP_CHECKPOINTS`
+- default: `true`
+- on disk, once a checkpoint is written (after a bulk load, and by background or explicit checkpoints) the data it holds is served from the file, mapped, as after a restart, and its copies in memory are freed: memory then grows with what queries touch, and the OS can page out the rest. `false` keeps everything in memory as well (the file is still written)
+
+- file key: `store.wal_archive`
+- env override: `NRESE_WAL_ARCHIVE`
+- default: `false`
+- on disk, keep the WAL segments that checkpoints cover in `wal-archive/` of the data directory instead of deleting them. With an image backup they restore the store to any later revision (`nrese-server restore DIR --wal ARCHIVE --wal DATA/wal --until-revision N`). The archive grows until pruned (`nrese-server prune-archive R`, with `R` the oldest image backup's revision plus one). Sync it to another machine for recovery from a lost disk
+
+- file key: `store.index_encoding`
+- env override: `NRESE_INDEX_ENCODING`
+- default: `fast`
+- how index blocks are encoded when they are built (loads, compactions, checkpoints): `fast` (frame of reference only, the fastest scans) or `compact` (a block position with few, far-apart values is stored as a palette of them; on the office PC DBpedia core's store is 3.3 % smaller with queries 7 % slower, Wikidata lexemes' 8.6 % smaller with queries even). Both are read either way, so switching needs no reload: blocks built later take the new encoding. Applies to every repository of the server. Checkpoints are format 11 (block offsets for the dictionary), which binaries before 2 October 2026 don't read; they read formats 8 to 10
+
+- file key: `store.vocabulary`
+- env override: `NRESE_VOCABULARY`
+- default: `plain`
+- how checkpoints store the dictionary's keys: `plain`, or `fsst` (compressed with two FSST symbol tables, one for IRIs and one for the other terms, trained on a sample when the checkpoint is written). On the office PC's stores the keys shrink to 39 % (Wikidata lexemes, 576 → 224 MiB), 45 % (DBpedia core) and 53 % (YAGO); a key read from a compressed checkpoint costs a decode (about 17 ns in order, more at random), so result-heavy and string-scanning queries pay for it. Terms interned since the last checkpoint stay plain until the next. Both forms are read whatever the setting: switching takes effect at the next checkpoint
+
 - file key: `store.ontology_path`
 - env override: `NRESE_ONTOLOGY_PATH`
-- optional explicit preload path
+- optional; when set, the file is loaded at startup and a missing file is a startup error
+- when unset, nothing is preloaded (there are no implicit fallback locations)
 
 ## Reasoner
 
 - file key: `reasoner.mode`
 - env override: `NRESE_REASONING_MODE`
-- values: `disabled`, `rules-mvp`, `owl-dl-target`
-
-- file key: `reasoner.read_model`
-- env override: `NRESE_REASONER_READ_MODEL`
 - values:
-  - `asserted-only`
-- current semantics:
-  - query and graph-read surfaces expose the latest committed asserted dataset state
-  - reasoning currently affects mutation acceptance and diagnostics, not the default query result set
+  - `disabled` (aliases `none`, `off`): no reasoning; reads see asserted statements only
+  - `rdfs`: the RDFS closure is materialised into the inferred stack (the six rules queries over data use)
+  - `rdfs-full`: every RDFS entailment rule and the axiomatic triples
+  - `rdfs-plus`: RDFS with equality, inverse, symmetric, transitive, functional and inverse functional properties, equivalent classes and properties
+  - `owl-horst`: RDFS-Plus with `hasValue`, `someValuesFrom` and `allValuesFrom` (ter Horst's pD*)
+  - `owl2-ql`: OWL 2 QL materialised; commits that violate its disjointness axioms are rejected
+  - `owl2-rl`: the OWL 2 RL/RDF closure is materialised, and commits that violate a consistency rule are rejected with the rule and the facts it matched
+  - `custom`: the user's rules only (`reasoner.rules`, below)
+- file key `reasoner.rules`, env `NRESE_REASONING_RULES`: a Notation3 file (`.n3`) or a GraphDB ruleset (`.pie`) of user rules. With `custom` they are the whole program; with any other reasoning mode they are added to its ruleset. They are compiled at startup, and a rule the reasoner can't run stops the startup with the rule and the reason. What compiles:
+  - `{ premises } => { conclusions } .` (and `<=`), with quick variables `?x`; blank nodes in the premises are variables
+  - `{ premises } => false .`: a consistency rule; commits that make it hold are rejected, naming it (`rules.n3#4`)
+  - `log:notEqualTo` and `log:equalTo` in the premises
+  - plain triples outside formulas: facts that hold whatever the data
+  - not (yet): other builtins (`math:`, `string:`, `list:`, `time:`), blank nodes in conclusions (existentials), formulas as terms
+  - a GraphDB ruleset (`.pie`) is read too: prefixes, axioms, `Id:` rules with `[Constraint a != b]` (and `!= blank_node`), `Consistency:` checks, `[Context <g>]` on statements with a constant predicate (their statements get a predicate of their own, `urn:nrese:pie-context:<g>#<p>`, and are in the inferred stack, where GraphDB hides them); `[Cut]` is ignored. GraphDB's RDFS, RDFS-Plus, OWL-Horst and Publishing rulesets (and their optimised variants) compile; its OWL 2 RL and QL ones don't (a context on a variable predicate, existential conclusions), and NRESE's own `owl2-rl` and `owl2-ql` modes cover those profiles
+  - a different rules file (one character is enough) makes the recorded closure stale, so the next startup rematerialises
+- unknown values are a startup error (a typo must not silently disable consistency checking); `rules-mvp`, the removed v1 reasoner, is an error that names its replacement
+- file key `reasoner.equality`, env `NRESE_REASONING_EQUALITY`: `representatives` (the default), `compact` or `replicate`. With a ruleset that reasons with equality (`owl:sameAs`: `owl-horst`, `owl2-rl`), a full materialisation (load, rematerialisation) computes the closure over one representative per `owl:sameAs` class and expands it to every identity, instead of the replacement rules copying every fact to every identity while the closure is computed. The stored closure is the same either way (W4 stage A; a property test checks it on random ontologies); on the integration workload's cohort tier the closure took 0.21 s instead of 3.09 s. Commits maintain it incrementally as before
+  - `compact` (W4 stage B) also keeps the closure over representatives in the store: one copy of each fact per class instead of one per combination of identities, and each identity stored as `identity owl:sameAs representative`. Reads of the default graph expand it to every identity, so queries answer as with the other modes (a differential test compares all three after inserts, deletions, merges and splits of classes, and named graphs). The trade-off: storage and commits shrink by the replication factor; scans of facts about identities pay the expansion, and the engine's columnar, range and group-count fast paths step aside while any class exists. A commit that merges or splits classes recomputes the closure after it. Changing the mode recomputes the closure at the next start.
+- file key `reasoner.unnamed_classes`, env `NRESE_REASONING_UNNAMED_CLASSES`: `derive` (the default, OWL 2 RL as written) or `skip`: memberships in unnamed union classes that nothing consumes (an anonymous union used only as a domain or range, as the GND ontology does) are not derived. Everything else stays; members of such a class declared `owl:Class` are still `owl:Thing`s. With the GND ontology on the integration workload's example tier: 219,840 inferred statements become 99,213, with the same answers to its questions. A commit that makes such a class used (a subclass axiom on it) triggers a rematerialisation
+- with any mode but `disabled`:
+  - `nrese-server load` and startup materialise the closure (startup skips it when `reasoning.state` in the data directory records that the inferred stack is current for this build's semantics; `/version` reports them as `reasoning_semantics`, e.g. `owl2-rl v2 <fingerprint>`)
+  - what each mode derives and omits: [reasoning-semantics.md](../spec/reasoning-semantics.md)
+  - every commit maintains it incrementally, inside the same transaction
+  - queries see asserted and inferred statements by default; `infer=false` or `FROM <http://www.ontotext.com/explicit>` reads asserted statements only, `FROM <http://www.ontotext.com/implicit>` inferred ones
+- switching reasoning off clears the inferred stack at the next startup
 
-- file key: `reasoner.rules_mvp.features`
-- env override: `NRESE_REASONER_RULES_MVP_FEATURES`
-- accepted values:
-  - `default`
-  - `all`
-  - `none`
-  - `rdfs-subclass-closure`
-  - `rdfs-subproperty-closure`
-  - `rdfs-type-propagation`
-  - `rdfs-domain-range-typing`
-  - `owl-property-assertion-closure`
-  - `owl-equality-reasoning`
-  - `owl-property-chain-axioms`
-  - `owl-consistency-check`
-  - `unsupported-diagnostics`
-- file format:
-  - string: `features = "default"`
-  - list: `features = ["rdfs-subclass-closure", "owl-consistency-check"]`
+## Federation (`SERVICE`)
 
-- file key: `reasoner.rules_mvp.preset`
-- file key alias: `reasoner.rules_mvp.tier`
-- env override: `NRESE_REASONER_RULES_MVP_PRESET`
-- values:
-  - `rdfs-core`
-  - `bounded-owl`
-- precedence:
-  - explicit `features` override `preset`
-  - `preset` overrides the built-in default
-- runtime resolution:
-  - parsed `mode`, `preset`, and optional feature overrides collapse into one resolved runtime reasoner profile and semantic tier
-  - general runtime/capability payloads expose that resolved profile/tier, while per-feature detail stays on the dedicated reasoning-diagnostics surface
-- semantic tiers:
-  - `rdfs-core`: bounded RDFS closure/type propagation only
-  - `bounded-owl`: bounded OWL rule slice on top of the RDFS core
+- file table `[federation]`
+- `federation.allow` (env `NRESE_FEDERATION_ALLOW`, comma-separated): the endpoints `SERVICE` may call, as full IRIs or prefixes (`https://query.wikidata.org/`), or `*` for any. Empty (the default): `SERVICE` is off, an error, and `SERVICE SILENT` one solution without bindings. Allowing `*` lets anyone who may query make the server fetch any URL
+- `federation.timeout` (env `NRESE_FEDERATION_TIMEOUT_MS`, units as in [Budgets](#budgets)): per request to an endpoint; default `30s`
+- `federation.max_rows` (env `NRESE_FEDERATION_MAX_ROWS`): rows one request may return; default 1,000,000
+- a `SERVICE` joined to a pattern sends the pattern's distinct values as `VALUES`, 200 rows per request (up to 20,000 values; beyond, the block goes once, unbound); redirects are not followed; queries with `SERVICE` are never answered from the result cache
 
-## Policy Limits
+## Budgets
 
-- `policy.limits.max_query_bytes` -> `NRESE_MAX_QUERY_BYTES`
-- `policy.limits.max_update_bytes` -> `NRESE_MAX_UPDATE_BYTES`
-- `policy.limits.max_rdf_upload_bytes` -> `NRESE_MAX_RDF_UPLOAD_BYTES`
+Every limit on memory, time and request size is in one table, `[budgets]`. Values are plain numbers (bytes, milliseconds) or numbers with a unit: `"4GiB"`, `"512MiB"`, `"2GB"`, `"30s"`, `"2min"`, and for memory a share of the machine, `"50%"`. `nrese-server check-config` prints the values in effect, and `/version` reports them under `budgets`.
+
+| Key | Environment | Default | What it bounds |
+|---|---|---|---|
+| `budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | 4 GiB | Intermediate results of one query. A query that needs more is answered `413`. `0` = unlimited |
+| `budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | 50 % of the machine's memory | Intermediate results of all running queries together. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
+| `budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | 25 % of the machine's memory | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
+| `budgets.query_timeout` | `NRESE_QUERY_TIMEOUT_MS` | 30 s | A query, until its last result is sent (`408`) |
+| `budgets.update_timeout` | `NRESE_UPDATE_TIMEOUT_MS` | 60 s | A SPARQL update, reasoning included |
+| `budgets.graph_read_timeout` | `NRESE_GRAPH_READ_TIMEOUT_MS` | 30 s | A Graph Store read |
+| `budgets.graph_write_timeout` | `NRESE_GRAPH_WRITE_TIMEOUT_MS` | 60 s | A Graph Store write |
+| `budgets.query_text` | `NRESE_MAX_QUERY_BYTES` | 1 MiB | The text of a query |
+| `budgets.update_size` | `NRESE_MAX_UPDATE_BYTES` | 16 MiB | A SPARQL update request |
+| `budgets.upload_size` | `NRESE_MAX_RDF_UPLOAD_BYTES` | 128 MiB | An RDF payload (Graph Store, TELL, SHACL shapes); larger data goes through `nrese-server load` |
+| `budgets.result_cache` | `NRESE_QUERY_CACHE_BYTES` | 2% of memory (64 MiB to 8 GiB) | Serialised results kept for repeated queries; a size or a share (`5%`). `0` switches the cache off |
+
+How the two memory budgets work:
+- They count what queries hold between their operators: the tables of joins, groups and sorts, and the hash tables of joins. A table that is being built may take half of what is left, because growing it, and merging the parts of a parallel join, holds its rows twice for a moment.
+- The machine's memory is the container's limit where there is one (cgroups), else the machine's. It is known on Linux; elsewhere a share such as `50%` means "no limit", so set a size.
+- The store's own memory (the data and its indexes) is not part of either budget.
+- A request over a size limit is answered `413`. Requests are held in memory while they are handled, so a size limit is also memory a request may take.
+
+The same settings have older names, which still work: `policy.limits.max_query_bytes`, `max_query_memory_bytes`, `max_update_bytes`, `max_rdf_upload_bytes`; `policy.timeouts.query_ms`, `update_ms`, `graph_read_ms`, `graph_write_ms`; `store.query_cache_bytes`. A setting under both names is a startup error.
 
 ## Policy Rate Limits
 
@@ -201,12 +258,15 @@ api_key = "replace-me"
 - `policy.rate_limits.write_requests_per_window` -> `NRESE_WRITE_REQUESTS_PER_WINDOW`
 - `policy.rate_limits.admin_requests_per_window` -> `NRESE_ADMIN_REQUESTS_PER_WINDOW`
 
-## Policy Timeouts
+## Timeouts and writes
 
-- `policy.timeouts.query_ms` -> `NRESE_QUERY_TIMEOUT_MS`
-- `policy.timeouts.update_ms` -> `NRESE_UPDATE_TIMEOUT_MS`
-- `policy.timeouts.graph_read_ms` -> `NRESE_GRAPH_READ_TIMEOUT_MS`
-- `policy.timeouts.graph_write_ms` -> `NRESE_GRAPH_WRITE_TIMEOUT_MS`
+A write that times out before its commit starts is never committed, and the request gets 408. The deadline reaches every phase of the write:
+- the `WHERE` evaluation of an update;
+- commit-path reasoning, polled between rounds and per work unit.
+
+A cancelled reasoning run discards the asserted and the inferred changes and frees the writer at once. Two steps don't poll the deadline:
+- the one-off full materialisation that runs when no current reasoning state is recorded;
+- closing a newly declared transitive property.
 
 ## SPARQL Parse Error Profile
 
@@ -249,6 +309,7 @@ Use `fuseki-plain-text` when you want local or live parity runs to match Fuseki-
 - `auth.mtls.subject_header` -> `NRESE_AUTH_MTLS_SUBJECT_HEADER`
 - `auth.mtls.read_subjects` -> `NRESE_AUTH_MTLS_READ_SUBJECTS`
 - `auth.mtls.admin_subjects` -> `NRESE_AUTH_MTLS_ADMIN_SUBJECTS`
+- `auth.mtls.trusted_proxies` -> `NRESE_AUTH_MTLS_TRUSTED_PROXIES` (addresses or ranges such as `10.0.0.0/8`, comma-separated; default loopback): the peers that terminate TLS and may pass the subject header on. From any other peer the header is dropped before authentication, so a client that reaches the server's port directly can't claim a subject. With the proxy in another container or host, list its address or network here
 - file format:
   - string: `admin_subjects = "CN=admin,O=Example"`
   - list: `admin_subjects = ["CN=admin-1,O=Example", "CN=admin-2,O=Example"]`
@@ -261,6 +322,37 @@ Use `fuseki-plain-text` when you want local or live parity runs to match Fuseki-
 - `auth.oidc_introspection.read_role` -> `NRESE_AUTH_OIDC_READ_ROLE`
 - `auth.oidc_introspection.admin_role` -> `NRESE_AUTH_OIDC_ADMIN_ROLE`
 - `auth.oidc_introspection.timeout_ms` -> `NRESE_AUTH_OIDC_TIMEOUT_MS`
+
+### Graph-Level Access Control
+
+The rules are the server's access state (users, workspaces, personal spaces, role rules; [ADR-0008](../adr/0008-users-workspaces-policies.md)), kept in `system/` of the data directory and changed through `/api/v1/access` ([HTTP API](http-api.md#users-workspaces-and-policies-apiv1access)). Until access is enforced, every user reads and writes what its authentication grants allow.
+
+- `auth.access_policy` -> `NRESE_ACCESS_POLICY`: the path of an access policy file, imported into the access state at the first start (it turns enforcement on). Later changes of the file are reported at start and apply once imported (`POST /api/v1/access/import`); `GET /api/v1/access/export` writes the state's rules in this form.
+- `auth.local_logins` -> `NRESE_AUTH_LOCAL_LOGINS` (default `true`): whether users of the access state with a password log in (`Basic` credentials, or a session from `POST /api/v1/access/login`) besides the authentication mode; for standalone and desktop installations without an identity provider.
+- `auth.trusted_proxies` -> `NRESE_AUTH_TRUSTED_PROXIES` (addresses or ranges, comma-separated; default loopback): the reverse proxies whose `X-Forwarded-For` names the client. Failed local logins are counted per user name and client address (past 10, each further attempt waits, from one second doubling up to five minutes) and per client address over all names (past 100); behind a proxy that isn't listed here, every client has the proxy's address, so list it
+- `auth.workspace_base` -> `NRESE_WORKSPACE_BASE`: what workspace graph prefixes start with (default `urn:nrese:`): a personal space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`.
+- the file (TOML), per role:
+
+```toml
+default = "deny"        # roles no rule names: nothing ("deny") or everything ("allow")
+inferred = "hidden"     # inferred statements for users who may not read every graph: "hidden" or "visible"
+
+[[role]]
+name = "analyst"
+read = ["https://kg.example/graphs/public/*", "https://kg.example/graphs/sales"]
+write = ["https://kg.example/graphs/analyst/*"]
+deny = ["https://kg.example/graphs/public/hr/*"]
+default_graph = "read"  # the store's default graph: "none" (default), "read", "write" or "deny"
+service = true          # may call other endpoints with SERVICE (default false)
+```
+
+- `SERVICE` is a privilege of its own (it makes the server fetch URLs): with access enforced, a user calls the endpoints `federation.allow` lists only if one of its roles says `service = true` (administrators always). Without the privilege a `SERVICE` is an error, `SERVICE SILENT` one solution without bindings.
+- graphs by IRI, or by IRI prefix (an entry ending in `*`): ontologies and data sets usually differ by prefix, so one entry covers a family of graphs.
+- role names: a token's `scope`, `scp`, `role` and `roles` claims (`bearer-jwt`, `oidc-introspection`); `reader` for the static read token; the subject and `reader` for a listed client certificate; `anonymous` without authentication.
+- user names: a token's `sub` (an introspection's `username` without one), a client certificate's subject, where they are letters, digits and `. _ @ + | : -`; a named user always has its personal space, and a user record can add roles or the administrator's right.
+- a user's rights are the union of its roles' rules and its workspaces', and what it may write it may read; an explicit deny (`deny`, `default_graph = "deny"`) in any of its roles wins. Administrators are unrestricted.
+- the policy grants as well as restricts: a role with a rule may query and read graphs even without the read role, and a role that may write a graph may update. So a role can edit some graphs without being an administrator.
+- what it means for requests: [HTTP API, access control](http-api.md#graph-level-access-control).
 
 ## AI Query Suggestions
 
@@ -301,5 +393,5 @@ Use `fuseki-plain-text` when you want local or live parity runs to match Fuseki-
 
 - typed runtime defaults and validation live in owning crates
 - external config parsing and precedence live in `crates/nrese-server/src/config/`
-- env variable names are centralized in `crates/nrese-server/src/config/env_names.rs`
+- every setting (file key, older keys, environment name, kind, description) is declared once in `crates/nrese-server/src/config/settings.rs`; a test checks that this reference names every key and environment variable
 - do not document runtime knobs in multiple operator docs

@@ -1,4 +1,3 @@
-use nrese_reasoner::ReasoningMode;
 use nrese_store::StoreMode;
 
 use crate::auth::AuthConfig;
@@ -10,8 +9,11 @@ pub const OPERATOR_UI_PATH: &str = "/ops";
 pub const REASONING_DIAGNOSTICS_PATH: &str = "/ops/api/diagnostics/reasoning";
 pub const QUERY_ENDPOINT: &str = "/dataset/query";
 pub const UPDATE_ENDPOINT: &str = "/dataset/update";
+/// Queries and updates on one URL (also served at `/dataset`).
+pub const SPARQL_ENDPOINT: &str = "/dataset/sparql";
 pub const TELL_ENDPOINT: &str = "/dataset/tell";
 pub const GRAPH_STORE_ENDPOINT: &str = "/dataset/data";
+pub const SHACL_ENDPOINT: &str = "/dataset/shacl";
 pub const ADMIN_BACKUP_ENDPOINT: &str = "/ops/api/admin/dataset/backup";
 pub const ADMIN_RESTORE_ENDPOINT: &str = "/ops/api/admin/dataset/restore";
 pub const AI_STATUS_ENDPOINT: &str = "/api/ai/status";
@@ -112,7 +114,6 @@ impl RuntimePosture {
 pub fn validate_configuration(
     deployment_posture: DeploymentPosture,
     store_mode: StoreMode,
-    reasoning_mode: ReasoningMode,
     policy: &PolicyConfig,
 ) -> Result<(), &'static str> {
     match deployment_posture {
@@ -125,11 +126,6 @@ pub fn validate_configuration(
             validate_authenticated_posture(policy)?;
             if store_mode != StoreMode::OnDisk {
                 return Err("replacement-grade posture requires on-disk durable storage");
-            }
-            if reasoning_mode == ReasoningMode::OwlDlTarget {
-                return Err(
-                    "replacement-grade posture cannot use owl-dl-target while it remains scaffolded",
-                );
             }
             if policy.sparql_parse_error_profile != SparqlParseErrorProfile::ProblemJson {
                 return Err("replacement-grade posture requires problem-json SPARQL parse errors");
@@ -148,7 +144,7 @@ fn validate_authenticated_posture(policy: &PolicyConfig) -> Result<(), &'static 
 
 #[cfg(test)]
 mod tests {
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_reasoner::{ReasonerConfig, ReasonerService};
     use nrese_store::{StoreConfig, StoreMode, StoreService};
 
     use crate::ai::AiSuggestionService;
@@ -231,7 +227,6 @@ mod tests {
         let result = validate_configuration(
             DeploymentPosture::ReplacementGrade,
             StoreMode::InMemory,
-            ReasoningMode::Disabled,
             &PolicyConfig {
                 auth: AuthConfig::BearerStatic(crate::auth::StaticBearerConfig {
                     read_token: Some("read".to_owned()),
@@ -252,7 +247,6 @@ mod tests {
         let result = validate_configuration(
             DeploymentPosture::InternalAuthenticated,
             StoreMode::OnDisk,
-            ReasoningMode::RulesMvp,
             &PolicyConfig::default(),
         );
 

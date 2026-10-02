@@ -1,0 +1,5 @@
+# Known failures of nrese-sparql on the W3C SPARQL 1.1 suite (rdf-tests pinned in
+# scripts/fetch-w3c-tests.sh). Format: <test IRI> # reason.
+#
+# None: the last ones (zero-length paths from a term the graph doesn't have,
+# zero_or_more_set_start and its three siblings) were fixed on 2 October 2026.

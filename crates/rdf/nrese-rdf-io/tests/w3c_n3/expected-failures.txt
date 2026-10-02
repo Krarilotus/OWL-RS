@@ -1,0 +1,2 @@
+# Tests of the W3C N3 parser suites that fail on purpose, with the reason.
+<https://w3c.github.io/N3/tests/N3Tests/manifest-parser.ttl#cwm_syntax_numbers.n3> # The expected result is cwm's output: number literals rewritten to canonical values ("00002" as "2", "2.0e3" as "2000.0"), which RDF doesn't do (a literal keeps its lexical form), and one triple with the author's local file: base

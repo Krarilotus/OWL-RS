@@ -19,6 +19,17 @@ pub fn grants_from_claim_parts(
     role: Option<&str>,
     roles: Option<&StringOrMany>,
 ) -> BTreeSet<AccessGrant> {
+    let role_names = role_names_from_claim_parts(scope, scp, role, roles);
+    grants_from_role_names(read_role, admin_role, &role_names)
+}
+
+/// Every role name the claims hold: `scope`, `scp`, `role`, `roles`.
+pub fn role_names_from_claim_parts(
+    scope: Option<&str>,
+    scp: Option<&StringOrMany>,
+    role: Option<&str>,
+    roles: Option<&StringOrMany>,
+) -> BTreeSet<String> {
     let mut role_names = BTreeSet::new();
     extend_space_delimited(&mut role_names, scope);
     extend_string_or_many(&mut role_names, scp);
@@ -26,7 +37,14 @@ pub fn grants_from_claim_parts(
         role_names.insert(role.to_owned());
     }
     extend_string_or_many(&mut role_names, roles);
+    role_names
+}
 
+pub fn grants_from_role_names(
+    read_role: &str,
+    admin_role: &str,
+    role_names: &BTreeSet<String>,
+) -> BTreeSet<AccessGrant> {
     let mut grants = BTreeSet::new();
     if role_names.contains(admin_role) {
         grants.insert(AccessGrant::Admin);

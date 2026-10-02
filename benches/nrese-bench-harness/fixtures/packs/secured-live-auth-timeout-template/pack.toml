@@ -13,7 +13,7 @@ compat_suites = [
 # ../../live/connection-profiles.template.toml or a local workspace copy.
 # Keep all live URLs, auth headers, and basic auth values in the connection profile.
 #
-# Use this pack only when NRESE and Fuseki are deployed with comparable
+# Use this pack only when NRESE and Reference are deployed with comparable
 # timeout ceilings and proxy behavior. The timeout suite is intentionally
 # separate from the generic secured-auth baseline for that reason.
 #
