@@ -26,8 +26,9 @@ jobs:
       - name: dump the differential tests' cases
         run: |
           NRESE_ORACLE_DUMP="$PWD/oracle-dump" cargo test --locked -p nrese-sparql \
-            --test native_differential_tests -- native_results_equal_spareval_on_random_queries \
-            pushed_filters_equal_spareval computed_values_equal_spareval
+            --test it -- native_differential_tests::native_results_equal_spareval_on_random_queries \
+            native_differential_tests::pushed_filters_equal_spareval \
+            native_differential_tests::computed_values_equal_spareval
       - name: Jena answers them
         run: |
           docker build -q -t nrese-bench/jena:6.2.0 benches/competitors/jena
