@@ -248,8 +248,6 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Vec<Variable>) {
             }
             walk_pattern(inner, out);
         }
-        #[allow(unreachable_patterns)]
-        _ => {}
     }
 }
 

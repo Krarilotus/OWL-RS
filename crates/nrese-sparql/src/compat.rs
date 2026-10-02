@@ -128,10 +128,10 @@ fn having_aliases(pattern: &mut GraphPattern) {
         | GraphPattern::Slice { inner, .. }
         | GraphPattern::Group { inner, .. }
         | GraphPattern::Service { inner, .. } => having_aliases(inner),
-        // `LATERAL` isn't part of the language the server parses: the variant exists only
-        // in builds where a test dependency switches the parser feature on.
-        #[allow(unreachable_patterns)]
-        _ => {}
+        GraphPattern::Lateral { left, right } => {
+            having_aliases(left);
+            having_aliases(right);
+        }
     }
 }
 

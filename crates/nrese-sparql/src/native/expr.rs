@@ -701,8 +701,6 @@ impl Evaluator {
                     Value::Integer(_) | Value::Decimal(_) | Value::Float(_) | Value::Double(_)
                 ))
             }),
-            #[allow(unreachable_patterns)]
-            _ => None,
         }
     }
 }
