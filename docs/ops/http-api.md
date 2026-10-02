@@ -207,7 +207,10 @@ Errors are `application/problem+json` documents. Every response carries `x-reque
 | `nrese_query_memory_bytes`, `nrese_query_memory_peak_bytes`, `nrese_query_memory_limit_bytes` | Intermediate results of running queries, against `budgets.total_query_memory` |
 | `nrese_http_responses_total{kind, status}` | Responses by kind of request (`query`, `update`, `sparql` for the single endpoint, `graph_store`, `shacl`, `other`) and status class (`2xx` … `5xx`) |
 | `nrese_http_request_duration_seconds{kind}` | Histogram of the time to the response's start, by kind |
+| `nrese_http_requests_in_flight{kind}` | Requests begun and not yet answered (active and queued work), by kind |
 | `nrese_index_runs`, `nrese_index_bytes{place}` | Index runs; index data on the heap and mapped from the checkpoint |
 | `nrese_dictionary_terms`, `nrese_dictionary_bytes{part}` | Dictionary terms; their text, the heap's index, and what is mapped |
 | `nrese_wal_bytes_since_checkpoint`, `nrese_compactions_total`, `nrese_checkpoints_total` | What a restart would replay; run merges and checkpoints since start |
 | `nrese_process_resident_bytes` | Resident memory (Linux; mapped file pages included, which the OS can drop) |
+| `nrese_backups_total{kind, outcome}` | Backups and restores (`dump`: N-Quads export, `image`, `restore`) that succeeded (`ok`) or `failed` |
+| `nrese_backup_last_success_timestamp_seconds{kind}`, `nrese_backup_last_duration_seconds{kind}`, `nrese_backup_last_bytes{kind}` | The last success of each kind: when it ended (0: none since start), how long it took, its size (for alerting on stale backups) |
