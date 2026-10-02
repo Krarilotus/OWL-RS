@@ -5,9 +5,8 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::Deserialize;
 
 use crate::auth::grants::{StringOrMany, grants_from_claim_parts};
-use crate::auth::{AccessGrant, Identity, authorize_grants, extract_bearer_token};
+use crate::auth::{AccessGrant, Authenticated, Identity, extract_bearer_token};
 use crate::error::ApiError;
-use crate::policy::PolicyAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JwtBearerConfig {
@@ -36,12 +35,10 @@ struct JwtClaims {
     roles: Option<StringOrMany>,
 }
 
-pub fn authorize(
+pub fn authenticate(
     config: &JwtBearerConfig,
-    action: PolicyAction,
     headers: &HeaderMap,
-    also: &(dyn Fn(&Identity) -> bool + Send + Sync),
-) -> Result<Identity, ApiError> {
+) -> Result<Authenticated, ApiError> {
     let token = extract_bearer_token(headers)?;
     let claims = decode_claims(config, token)?;
     let grants = grants_from_claims(config, &claims);
@@ -51,16 +48,13 @@ pub fn authorize(
         claims.role.as_deref(),
         claims.roles.as_ref(),
     );
-    let identity = Identity::from_grants(&grants, roles).with_user(claims.sub.as_deref());
-
-    // A valid token is authenticated; its roles may get rights from the access policy.
-    if authorize_grants(action, &grants) || also(&identity) {
-        Ok(identity)
-    } else {
-        Err(ApiError::forbidden(
-            "bearer token does not grant access to this endpoint",
-        ))
-    }
+    Ok(Authenticated {
+        identity: Identity::from_grants(&grants, roles).with_user(claims.sub.as_deref()),
+        grants,
+        // A valid token is authenticated; its roles may get rights from the access policy.
+        known: true,
+        refusal: "bearer token does not grant access to this endpoint",
+    })
 }
 
 fn decode_claims(config: &JwtBearerConfig, token: &str) -> Result<JwtClaims, ApiError> {

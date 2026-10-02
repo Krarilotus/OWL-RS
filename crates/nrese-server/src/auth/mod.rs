@@ -39,24 +39,55 @@ impl AuthConfig {
         }
     }
 
-    /// Checks that the request's credentials allow `action`; returns who it is.
-    ///
-    /// `also` may allow what the credentials' grants don't (the access state's rules,
-    /// [`nrese_store::access::AccessState::grants_read`]).
-    pub async fn authorize(
+    /// Who the request is, as its credentials prove, and what they grant ([`Authenticated`]);
+    /// 401 for missing or invalid credentials. Which actions that allows is decided after
+    /// ([`Authenticated::check`]): authentication runs once per request, before its body is
+    /// read.
+    pub async fn authenticate(&self, headers: &HeaderMap) -> Result<Authenticated, ApiError> {
+        match self {
+            // Without authentication every request may do everything.
+            Self::None => Ok(Authenticated {
+                identity: Identity::anonymous(),
+                grants: BTreeSet::from([AccessGrant::Admin]),
+                known: true,
+                refusal: "",
+            }),
+            Self::BearerStatic(config) => bearer_static::authenticate(config, headers),
+            Self::BearerJwt(config) => bearer_jwt::authenticate(config, headers),
+            Self::Mtls(config) => mtls::authenticate(config, headers),
+            Self::OidcIntrospection(config) => {
+                oidc_introspection::authenticate(config, headers).await
+            }
+        }
+    }
+}
+
+/// A request's authentication: who it is, what its credentials grant, and whether the
+/// access policy may grant it more.
+#[derive(Debug, Clone)]
+pub struct Authenticated {
+    pub identity: Identity,
+    pub grants: BTreeSet<AccessGrant>,
+    /// Whether the access state's rules may allow what `grants` don't: a valid token or a
+    /// local login, not a static token or certificate subject the configuration doesn't
+    /// list.
+    pub known: bool,
+    /// Why an action it may not do is refused.
+    pub refusal: &'static str,
+}
+
+impl Authenticated {
+    /// Who it is, if its grants allow `action` or `also` does (the access state's rules,
+    /// [`nrese_store::access::AccessState::grants_read`]); 403 otherwise.
+    pub fn check(
         &self,
         action: PolicyAction,
-        headers: &HeaderMap,
         also: &(dyn Fn(&Identity) -> bool + Send + Sync),
     ) -> Result<Identity, ApiError> {
-        match self {
-            Self::None => Ok(Identity::anonymous()),
-            Self::BearerStatic(config) => bearer_static::authorize(config, action, headers, also),
-            Self::BearerJwt(config) => bearer_jwt::authorize(config, action, headers, also),
-            Self::Mtls(config) => mtls::authorize(config, action, headers, also),
-            Self::OidcIntrospection(config) => {
-                oidc_introspection::authorize(config, action, headers, also).await
-            }
+        if authorize_grants(action, &self.grants) || (self.known && also(&self.identity)) {
+            Ok(self.identity.clone())
+        } else {
+            Err(ApiError::forbidden(self.refusal))
         }
     }
 }

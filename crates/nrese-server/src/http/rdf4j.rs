@@ -387,10 +387,11 @@ pub async fn protocol() -> Response {
 }
 
 pub async fn repositories(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_query_read(&state, &authenticated).await?;
     let writable = state.runtime_posture().sparql_update_enabled;
     let ids = std::iter::once((DEFAULT_REPOSITORY.to_owned(), Some("NRESE".to_owned())))
         .chain(state.repositories().list());
@@ -415,12 +416,13 @@ pub async fn repositories(
 /// Creates repository `id` (`PUT /repositories/{id}`) with the settings of the
 /// configuration in the body (RDF, Turtle when no type is given).
 pub async fn repository_put(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     let settings = match body.iter().all(u8::is_ascii_whitespace) {
         true => crate::repository_config::RepositorySettings::default(),
         false => {
@@ -444,23 +446,24 @@ pub async fn repository_put(
 
 /// Removes repository `id` and its data (`DELETE /repositories/{id}`).
 pub async fn repository_delete(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     state.repositories().delete(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn query_get(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
-    let identity = guard::enforce_query_read(&state, &headers).await?;
+    let identity = guard::enforce_query_read(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     let mut operation = query_from_url(raw.0.as_deref())?;
@@ -469,6 +472,7 @@ pub async fn query_get(
 }
 
 pub async fn query_post(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
@@ -482,12 +486,12 @@ pub async fn query_post(
         && serde_urlencoded::from_bytes::<Vec<(String, String)>>(&body)
             .is_ok_and(|pairs| pairs.iter().any(|(key, _)| key == "update"));
     if form_update || media_type_matches(content_type, "application/sparql-update") {
-        let access = guard::update_access(&state, &headers).await?;
+        let access = guard::update_access(&state, &authenticated).await?;
         let request = update(&raw, &headers, &body)?;
         apply(&state, vec![StatementOp::Update(request)], &access).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    let access = guard::query_access(&state, &headers).await?;
+    let access = guard::query_access(&state, &authenticated).await?;
     let mut operation =
         query_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), &body)?;
     operation.restrict(&access);
@@ -495,13 +499,14 @@ pub async fn query_post(
 }
 
 pub async fn statements_get(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
-    let identity = guard::enforce_graph_read(&state, &headers).await?;
+    let identity = guard::enforce_graph_read(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     statements(state, raw, headers, None, &access).await
@@ -546,6 +551,7 @@ async fn statements(
 }
 
 pub async fn statements_post(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
@@ -553,7 +559,7 @@ pub async fn statements_post(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
-    let identity = guard::enforce_update_write(&state, &headers).await?;
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     let op = if is_update(&headers) {
@@ -570,6 +576,7 @@ pub async fn statements_post(
 }
 
 pub async fn statements_put(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
@@ -577,7 +584,7 @@ pub async fn statements_put(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
-    let identity = guard::enforce_update_write(&state, &headers).await?;
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     state.policy().enforce_rdf_upload_bytes(body.len())?;
@@ -597,13 +604,13 @@ pub async fn statements_put(
 }
 
 pub async fn statements_delete(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
-    let identity = guard::enforce_update_write(&state, &headers).await?;
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     let pattern = pattern(&pairs(&raw)?)?;
@@ -612,13 +619,13 @@ pub async fn statements_delete(
 }
 
 pub async fn size(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
-    let identity = guard::enforce_query_read(&state, &headers).await?;
+    let identity = guard::enforce_query_read(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     count(state, raw, None, &access).await
@@ -653,12 +660,13 @@ async fn count(
 }
 
 pub async fn contexts_get(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
-    let identity = guard::enforce_query_read(&state, &headers).await?;
+    let identity = guard::enforce_query_read(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     state.ensure_serving()?;
@@ -672,11 +680,12 @@ pub async fn contexts_get(
 }
 
 pub async fn namespaces_get(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_query_read(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let rows = state
         .store()
@@ -689,22 +698,22 @@ pub async fn namespaces_get(
 }
 
 pub async fn namespaces_delete(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     state.store().namespaces().clear().map_err(store_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn namespace_get(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path((id, prefix)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_query_read(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     match state.store().namespaces().get(&prefix) {
         Some(iri) => Ok(text(iri)),
@@ -713,12 +722,12 @@ pub async fn namespace_get(
 }
 
 pub async fn namespace_put(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path((id, prefix)): Path<(String, String)>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let iri = std::str::from_utf8(&body)
         .map_err(|_| ApiError::bad_request("the namespace must be UTF-8"))?
@@ -736,11 +745,11 @@ pub async fn namespace_put(
 }
 
 pub async fn namespace_delete(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path((id, prefix)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     state
         .store()
@@ -751,16 +760,18 @@ pub async fn namespace_delete(
 }
 
 pub async fn graph_store_get(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let state = state.for_repository(&id)?;
-    graph_store::get_graph(state, raw, headers).await
+    graph_store::get_graph(state, authenticated, raw, headers).await
 }
 
 pub async fn graph_store_put(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
@@ -768,10 +779,11 @@ pub async fn graph_store_put(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let state = state.for_repository(&id)?;
-    graph_store::put_graph(state, raw, headers, body).await
+    graph_store::put_graph(state, authenticated, raw, headers, body).await
 }
 
 pub async fn graph_store_post(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
@@ -779,17 +791,17 @@ pub async fn graph_store_post(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let state = state.for_repository(&id)?;
-    graph_store::post_graph(state, raw, headers, body).await
+    graph_store::post_graph(state, authenticated, raw, headers, body).await
 }
 
 pub async fn graph_store_delete(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     raw: RawQuery,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let state = state.for_repository(&id)?;
-    graph_store::delete_graph(state, raw, headers).await
+    graph_store::delete_graph(state, authenticated, raw).await
 }
 
 /// `path` as an absolute URL of this server as the request reached it (the `Host` header,
@@ -813,12 +825,13 @@ fn absolute(headers: &HeaderMap, path: &str) -> String {
 }
 
 pub async fn transaction_begin(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
-    let identity = guard::enforce_update_write(&state, &headers).await?;
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     let txid = state
@@ -836,6 +849,7 @@ pub async fn transaction_begin(
 }
 
 pub async fn transaction_action(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path((id, txid)): Path<(String, String)>,
     raw: RawQuery,
@@ -843,7 +857,7 @@ pub async fn transaction_action(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
-    let identity = guard::enforce_update_write(&state, &headers).await?;
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     let pairs = pairs(&raw)?;
@@ -912,12 +926,12 @@ pub async fn transaction_action(
 }
 
 pub async fn transaction_rollback(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path((id, txid)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
-    let identity = guard::enforce_update_write(&state, &headers).await?;
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     match state
