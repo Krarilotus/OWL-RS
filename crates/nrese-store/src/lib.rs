@@ -14,6 +14,7 @@ pub mod error;
 pub mod graph_store;
 mod graph_store_executor;
 pub mod image_backup;
+pub mod jobs;
 mod loader;
 pub mod mutation;
 pub mod namespaces;
@@ -36,7 +37,7 @@ mod view;
 pub use backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
 };
-pub use bulk_load::{BulkLoadReport, BulkLoadRequest};
+pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
 pub use classification::ClassificationReport;
 pub use config::{
     DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity, ShaclGate,

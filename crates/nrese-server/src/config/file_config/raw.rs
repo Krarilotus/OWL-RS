@@ -106,6 +106,9 @@ pub(super) struct RawServerConfig {
 pub(super) struct RawStoreConfig {
     #[serde(default)]
     pub mode: Option<String>,
+    /// The directory server-side imports read from.
+    #[serde(default)]
+    pub import_directory: Option<String>,
     #[serde(default)]
     pub data_dir: Option<String>,
     #[serde(default)]

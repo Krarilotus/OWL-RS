@@ -31,6 +31,8 @@ pub struct AppState {
     access: Arc<nrese_store::access::AccessControl>,
     /// The repository this state serves.
     repository: Arc<str>,
+    /// Long operations (imports) running or finished ([`nrese_store::jobs`]).
+    jobs: Arc<nrese_store::jobs::Jobs>,
 }
 
 impl AppState {
@@ -76,6 +78,7 @@ impl AppState {
             repositories,
             access,
             repository: Arc::from(DEFAULT_REPOSITORY),
+            jobs: Arc::default(),
         })
     }
 
@@ -136,6 +139,11 @@ impl AppState {
             }
             Err(_) => Err(ApiError::unauthorized("wrong user name or password")),
         }
+    }
+
+    /// Long operations (imports), server-wide.
+    pub fn jobs(&self) -> &Arc<nrese_store::jobs::Jobs> {
+        &self.jobs
     }
 
     /// The access state ([`crate::access`]).

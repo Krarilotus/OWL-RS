@@ -780,3 +780,139 @@ async fn repository_settings_change_at_runtime() {
     let stored = std::fs::read_to_string(dir.path().join("repository.json")).unwrap();
     assert!(stored.contains("rdfs"), "{stored}");
 }
+
+/// Waits for job `path` to end; its last state.
+async fn finished(app: &Router, path: &str) -> serde_json::Value {
+    for _ in 0..500 {
+        let (status, text) = send(app, Method::GET, path, None, "").await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let job: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if job["state"] != "running" {
+            return job;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the job didn't end");
+}
+
+/// Imports run as jobs: an uploaded document with `async=true`, and files from the
+/// server's import directory (administrators), whose paths can't leave it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imports_run_as_jobs() {
+    let files = tempfile::tempdir().unwrap();
+    std::fs::write(files.path().join("a.ttl"), "<urn:a> <urn:p> 1 .").unwrap();
+    std::fs::create_dir(files.path().join("sub")).unwrap();
+    std::fs::write(
+        files.path().join("sub").join("b.nt"),
+        "<urn:b> <urn:p> \"2\" .\n",
+    )
+    .unwrap();
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig {
+            import_directory: Some(files.path().to_path_buf()),
+            ..PolicyConfig::default()
+        },
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let base = "/api/v1/repositories/nrese";
+    let (status, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/import?async=true&graph=urn:g"),
+        Some("text/turtle"),
+        "<urn:c> <urn:p> 3 .",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+    let started: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let job = finished(&app, started["path"].as_str().unwrap()).await;
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(job["report"]["inserted"], 1);
+    assert_eq!(job["files_done"], 1);
+
+    let (status, text) = send(&app, Method::GET, &format!("{base}/import/files"), None, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let names: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["a.ttl", "sub/b.nt"]);
+    let import = |files: &str| format!(r#"{{"files": {files}}}"#);
+    let json = Some("application/json");
+    let (status, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/import/files"),
+        json,
+        &import(r#"["a.ttl", "sub/b.nt"]"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+    let started: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let job = finished(&app, started["path"].as_str().unwrap()).await;
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(job["report"]["inserted"], 2);
+    assert_eq!(job["description"], "a.ttl, sub/b.nt");
+    let (_, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/query"),
+        Some("application/sparql-query"),
+        COUNT,
+    )
+    .await;
+    assert_eq!(count_of(&text), 2, "the default graph: a and b");
+    for (files, expected) in [
+        (r#"["../a.ttl"]"#, StatusCode::BAD_REQUEST),
+        (r#"["/etc/passwd"]"#, StatusCode::BAD_REQUEST),
+        (r#"["missing.ttl"]"#, StatusCode::NOT_FOUND),
+        (r#"[]"#, StatusCode::BAD_REQUEST),
+    ] {
+        let (status, _) = send(
+            &app,
+            Method::POST,
+            &format!("{base}/import/files"),
+            json,
+            &import(files),
+        )
+        .await;
+        assert_eq!(status, expected, "{files}");
+    }
+    let (status, text) = send(&app, Method::GET, "/api/v1/jobs", None, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let (status, _) = send(&app, Method::DELETE, "/api/v1/jobs/1", None, "").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a finished job isn't cancelled"
+    );
+    // Without an import directory, server-side imports don't exist.
+    let plain = test_app_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let (status, _) = send(
+        &plain,
+        Method::GET,
+        &format!("{base}/import/files"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
