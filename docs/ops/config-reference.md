@@ -168,7 +168,12 @@ api_key = "replace-me"
 - file key: `store.index_encoding`
 - env override: `NRESE_INDEX_ENCODING`
 - default: `fast`
-- how index blocks are encoded when they are built (loads, compactions, checkpoints): `fast` (frame of reference only, the fastest scans) or `compact` (a block position with few, far-apart values is stored as a palette of them; on the office PC DBpedia core's store is 3.3 % smaller with queries 7 % slower, Wikidata lexemes' 8.6 % smaller with queries even). Both are read either way, so switching needs no reload: blocks built later take the new encoding. Applies to every repository of the server. Checkpoints with palettes are format 10, which older binaries don't read
+- how index blocks are encoded when they are built (loads, compactions, checkpoints): `fast` (frame of reference only, the fastest scans) or `compact` (a block position with few, far-apart values is stored as a palette of them; on the office PC DBpedia core's store is 3.3 % smaller with queries 7 % slower, Wikidata lexemes' 8.6 % smaller with queries even). Both are read either way, so switching needs no reload: blocks built later take the new encoding. Applies to every repository of the server. Checkpoints are format 11 (block offsets for the dictionary), which binaries before 2 October 2026 don't read; they read formats 8 to 10
+
+- file key: `store.vocabulary`
+- env override: `NRESE_VOCABULARY`
+- default: `plain`
+- how checkpoints store the dictionary's keys: `plain`, or `fsst` (compressed with two FSST symbol tables, one for IRIs and one for the other terms, trained on a sample when the checkpoint is written). On the office PC's stores the keys shrink to 39 % (Wikidata lexemes, 576 → 224 MiB), 45 % (DBpedia core) and 53 % (YAGO); a key read from a compressed checkpoint costs a decode (about 17 ns in order, more at random), so result-heavy and string-scanning queries pay for it. Terms interned since the last checkpoint stay plain until the next. Both forms are read whatever the setting: switching takes effect at the next checkpoint
 
 - file key: `store.ontology_path`
 - env override: `NRESE_ONTOLOGY_PATH`

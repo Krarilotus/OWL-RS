@@ -71,6 +71,7 @@ impl ServerConfig {
                 "store.index_encoding",
                 store.index_encoding.as_str().to_owned(),
             ),
+            ("store.vocabulary", store.vocabulary.as_str().to_owned()),
             (
                 "store.ontology_path",
                 store

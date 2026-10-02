@@ -36,3 +36,4 @@ pub use term::{
     Dictionary, DictionaryStats, Placement, StringTest, TermId, TermKind, TermView, TextMatch,
     TextQuery,
 };
+pub use term::vocabulary::{VocabularyEncoding, set_vocabulary_encoding};

@@ -327,6 +327,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|name| nrese_engine::IndexEncoding::from_name(&name))
         .unwrap_or_default();
+    // The vocabulary as the server takes it (`NRESE_VOCABULARY`: plain, fsst).
+    let vocabulary = std::env::var("NRESE_VOCABULARY")
+        .ok()
+        .and_then(|name| nrese_engine::VocabularyEncoding::from_name(&name))
+        .unwrap_or_default();
     // Equality reasoning as the server takes it (`NRESE_REASONING_EQUALITY`).
     let equality = std::env::var("NRESE_REASONING_EQUALITY").unwrap_or_default();
     let equality_by_representatives = equality != "replicate";
@@ -335,6 +340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         query_cache_bytes: 0,
         bulk_load_memory_bytes,
         index_encoding,
+        vocabulary,
         equality_by_representatives,
         equality_compact,
         ..config

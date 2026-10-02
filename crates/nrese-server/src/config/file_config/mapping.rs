@@ -41,6 +41,7 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
         names::INDEX_ENCODING,
         config.store.index_encoding,
     );
+    insert_option(&mut source, names::VOCABULARY, config.store.vocabulary);
 
     insert_option(
         &mut source,
