@@ -52,3 +52,29 @@ scripts/smoke-dmw-export.sh http://127.0.0.1:8080
 ```
 
 The script exports a small module with data and provenance (`fixtures/integration/dmw/`), exports it again and compares, asks a competency and a provenance question, changes data with SPARQL Update, validates conforming and non-conforming data, and removes what it created. It stops at the first difference and says what differed.
+
+## Draft checks
+
+Before anything is exported, DMW checks drafts: a model proposal's data, its schema, its SHACL shapes and its competency queries. It does that offline by default, or through any store that implements its backend-agnostic store-check protocol, `dmw-store-check/1`. NRESE implements it at `/api/v1/draft-check` ([HTTP API](../ops/http-api.md#draft-checks-apiv1draft-check)).
+
+The protocol, as NRESE implements it:
+
+1. **Capabilities.** `GET /api/v1/draft-check/capabilities` answers `protocol`, `operations`, `profiles`, `semantics`, `build_id` and `max_seconds`. DMW pins them in a run's evidence.
+2. **Check.** `POST /api/v1/draft-check` with:
+   - `protocol` (`dmw-store-check/1`) and `operation` (`shacl`, `query` or `reasoning`)
+   - the check's identity, echoed unchanged: `request_sha256`, `scope`, `build_id`, `semantics_id`, `profile`, `input_hashes`
+   - `limits`: `max_seconds`, `max_results`, `max_triples`
+   - `inputs`: `data`, `schema`, `shapes` (N-Triples) and `query` (SPARQL), as the operation needs them
+3. **Reply.** The identity as asked, `effective_limits` (the limits asked, never silently lowered), and the outcome:
+   - `terminal_status` (`completed`, `failed`, `timeout`, `unsupported`), `complete`, `unsupported` and `detail`
+   - SHACL: `shacl_conforms`, `shacl_applicable` (some targeted shape had a focus node and a constraint), `shacl_meta_validated`
+   - query: `observed_ask`, or `observed_rows` with terms as `kind` (`uri`, `literal`, `bnode`), `value`, `datatype`, `language`
+   - reasoning: `logical_consistent` and `unsatisfiable_classes`
+
+What a check means (`nrese:draft-check/1`) follows DMW's offline checks, so both answer alike:
+
+- **SHACL:** data and schema together, asserted statements only, SHACL Core. The shapes are checked for well-formedness when they are compiled.
+- **Query:** the data alone, asserted statements only, `ASK` and `SELECT`. More rows than `max_results` is a failure, never a truncated answer.
+- **Reasoning:** the OWL 2 RL rules decide consistency; the OWL 2 EL classifier lists unsatisfiable classes. Whatever either skipped is listed as unsupported, and the answer is then not complete.
+
+The server refuses, in the reply, a request for another build, semantics or profile, a time limit above its own, and inputs that don't match their pinned SHA-256 (`@active_data`, `@active_schema`, `@active_shapes`, `@query`).

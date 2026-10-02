@@ -272,6 +272,8 @@ protocol!(
         super::access_api::saved_query,
         super::access_api::saved_query_put,
         super::access_api::saved_query_delete,
+        super::draft_check::capabilities,
+        super::draft_check::check,
         openapi,
     ),
     tags(
@@ -284,6 +286,7 @@ protocol!(
         (name = "shacl", description = "Validation"),
         (name = "access", description = "Users, workspaces, personal spaces, role rules, logins (ADR-0008)"),
         (name = "queries", description = "Saved queries, in personal spaces and workspaces"),
+        (name = "draft-check", description = "Isolated checks of pinned inputs for the Datamodel Workflow (dmw-store-check/1); no repository is read or written"),
     )
 )]
 pub struct ApiDoc;
