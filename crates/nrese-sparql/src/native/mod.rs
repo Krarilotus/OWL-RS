@@ -1148,7 +1148,7 @@ impl<'a> Context<'a> {
         self.check()?;
         self.budget
             .charge(solutions.table.memory_bytes())
-            .map_err(|e| QueryEvaluationError::Dataset(Box::new(e)))?;
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         Ok(solutions)
     }
 
@@ -1165,7 +1165,7 @@ impl<'a> Context<'a> {
         let bytes = rows.saturating_mul(32);
         self.budget
             .charge(bytes)
-            .map_err(|e| QueryEvaluationError::Dataset(Box::new(e)))?;
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         Ok(bytes)
     }
 
@@ -1186,13 +1186,13 @@ impl<'a> Context<'a> {
             return cancelled;
         }
         let requested = rows.saturating_mul(width.max(1) * 8);
-        QueryEvaluationError::Dataset(Box::new(BudgetExceeded {
+        QueryEvaluationError::MemoryLimit(BudgetExceeded {
             limit: self.budget.used().saturating_add(self.budget.remaining()),
             // A table may grow to half of what is left (`max_rows`).
             requested: requested.saturating_mul(2),
             used: self.budget.used(),
             shared: self.budget.bounded_by_shared(),
-        }))
+        })
         .into()
     }
 

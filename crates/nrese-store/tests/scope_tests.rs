@@ -12,9 +12,9 @@ use nrese_rdf::GraphName;
 use nrese_sparql::GraphAccess;
 use nrese_store::{
     DatasetBackupFormat, DatasetRestoreRequest, GraphReadRequest, GraphResultFormat, GraphTarget,
-    GraphWriteRequest, MutationCommand, ReadContext, ReadScope, Requester, SparqlQueryRequest,
-    SparqlUpdateRequest, StatementOp, StatementPattern, StatementsRequest, StoreService,
-    TellRequest, WriteScope,
+    GraphWriteRequest, MutationCommand, ReadContext, ReadScope, Refusal, Requester,
+    SparqlQueryRequest, SparqlUpdateRequest, StatementOp, StatementPattern, StatementsRequest,
+    StoreService, TellRequest, WriteScope,
 };
 use support::in_memory_store_config;
 
@@ -258,20 +258,36 @@ fn every_write_is_checked_against_its_requesters_scope() {
     ));
     assert!(store.apply(&graph_write("urn:g:public"), &writer).is_ok());
     let delete = MutationCommand::GraphDelete(GraphTarget::DefaultGraph);
-    assert!(forbidden(store.apply(&delete, &writer)));
+    // Refusals name what they refuse.
+    let refusal = |result: nrese_store::StoreResult<_>| match result {
+        Err(nrese_store::StoreError::Forbidden(refusal)) => refusal,
+        other => panic!("not refused: {other:?}"),
+    };
+    assert_eq!(
+        refusal(store.apply(&delete, &writer)),
+        Refusal::Write(GraphName::DefaultGraph)
+    );
     let tell = MutationCommand::Tell(TellRequest {
         target: GraphTarget::NamedGraph("urn:g:secret".to_owned()),
         format: GraphResultFormat::NTriples,
         base_iri: None,
         payload: b"<urn:n> <urn:p> \"5\" .".to_vec(),
     });
-    assert!(forbidden(store.apply(&tell, &writer)));
+    assert_eq!(
+        refusal(store.apply(&tell, &writer)),
+        Refusal::Write(GraphName::NamedNode(nrese_rdf::NamedNode::new_unchecked(
+            "urn:g:secret"
+        )))
+    );
     // A restore changes every graph.
     let restore = MutationCommand::Restore(DatasetRestoreRequest {
         format: DatasetBackupFormat::NQuads,
         payload: Vec::new(),
     });
-    assert!(forbidden(store.apply(&restore, &writer)));
+    assert_eq!(
+        refusal(store.apply(&restore, &writer)),
+        Refusal::WriteAll("a restore".to_owned())
+    );
     // Updates: the WHERE clause reads the readable graphs; changes elsewhere are refused.
     let update = |text: &str| MutationCommand::Update(SparqlUpdateRequest::new(text));
     assert!(forbidden(store.apply(

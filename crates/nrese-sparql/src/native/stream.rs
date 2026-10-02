@@ -153,8 +153,7 @@ impl<'a> Plan<'a> {
 pub(super) fn is_memory_limit(error: &NativeError) -> bool {
     matches!(
         error,
-        NativeError::Evaluation(QueryEvaluationError::Dataset(inner))
-            if inner.downcast_ref::<BudgetExceeded>().is_some()
+        NativeError::Evaluation(QueryEvaluationError::MemoryLimit(_))
     )
 }
 

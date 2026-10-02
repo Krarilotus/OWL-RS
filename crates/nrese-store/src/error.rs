@@ -43,10 +43,26 @@ pub enum StoreError {
     /// committed.
     #[error("the load was cancelled; nothing of it was committed")]
     LoadCancelled,
-    /// The request would change a graph its requester may not write (graph-level access
-    /// control); nothing of it is applied.
-    #[error("{0}")]
-    Forbidden(String),
+    /// Graph-level access control refused the request; nothing of it is applied.
+    #[error(transparent)]
+    Forbidden(#[from] Refusal),
+}
+
+/// Why graph-level access control refused a request.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum Refusal {
+    /// The request would change `graph`, which its requester may not write.
+    #[error(
+        "the request would change {}, which the requester may not write",
+        nrese_sparql::graph_label(.0)
+    )]
+    Write(nrese_rdf::GraphName),
+    /// The operation reads every graph, and the requester may read only some.
+    #[error("{0} reads every graph, and the requester may read only some")]
+    ReadAll(String),
+    /// The operation changes every graph, and the requester may change only some.
+    #[error("{0} changes every graph, and the requester may change only some")]
+    WriteAll(String),
 }
 
 impl StoreError {
@@ -55,8 +71,7 @@ impl StoreError {
     pub fn is_memory_limit(&self) -> bool {
         matches!(
             self,
-            Self::SparqlEvaluation(QueryEvaluationError::Dataset(error))
-                if error.downcast_ref::<nrese_sparql::BudgetExceeded>().is_some()
+            Self::SparqlEvaluation(QueryEvaluationError::MemoryLimit(_))
         )
     }
 
@@ -66,10 +81,8 @@ impl StoreError {
     pub fn is_server_memory_limit(&self) -> bool {
         matches!(
             self,
-            Self::SparqlEvaluation(QueryEvaluationError::Dataset(error))
-                if error
-                    .downcast_ref::<nrese_sparql::BudgetExceeded>()
-                    .is_some_and(|exceeded| exceeded.shared)
+            Self::SparqlEvaluation(QueryEvaluationError::MemoryLimit(exceeded))
+                if exceeded.shared
         )
     }
 
@@ -88,6 +101,7 @@ impl StoreError {
             Self::SparqlEvaluation(error) => !matches!(
                 error,
                 QueryEvaluationError::Dataset(_)
+                    | QueryEvaluationError::MemoryLimit(_)
                     | QueryEvaluationError::Unexpected(_)
                     | QueryEvaluationError::Cancelled
             ),

@@ -49,10 +49,7 @@ impl UpdateOptions {
     fn check_writable(&self, graph: &OxGraphName) -> Result<(), UpdateError> {
         match &self.writable {
             Some(writable) if !writable.allows_graph(graph) => {
-                Err(UpdateError::Forbidden(match graph {
-                    OxGraphName::DefaultGraph => "the default graph".to_owned(),
-                    graph => graph.to_string(),
-                }))
+                Err(UpdateError::Forbidden(graph.clone()))
             }
             _ => Ok(()),
         }
@@ -77,8 +74,19 @@ pub enum UpdateError {
     #[error("update cancelled")]
     Cancelled,
     /// The update would change a graph its user may not write.
-    #[error("the update would change {0}, which the requester may not write")]
-    Forbidden(String),
+    #[error(
+        "the update would change {}, which the requester may not write",
+        graph_label(.0)
+    )]
+    Forbidden(OxGraphName),
+}
+
+/// `graph` in a message: its IRI, or "the default graph".
+pub fn graph_label(graph: &OxGraphName) -> String {
+    match graph {
+        OxGraphName::DefaultGraph => "the default graph".to_owned(),
+        graph => graph.to_string(),
+    }
 }
 
 /// Applies all operations of `update` to `tx`. On error, `tx` may hold part of the request;

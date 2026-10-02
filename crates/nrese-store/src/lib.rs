@@ -45,7 +45,7 @@ pub use config::{
     StoreConfig, StoreMode,
 };
 pub use delta::MutationDeltaPreview;
-pub use error::{StoreError, StoreResult};
+pub use error::{Refusal, StoreError, StoreResult};
 pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
