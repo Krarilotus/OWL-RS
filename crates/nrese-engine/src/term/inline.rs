@@ -31,8 +31,9 @@ const DECIMAL_MANTISSA_LIMIT: i64 = 1 << (DECIMAL_MANTISSA_BITS - 1);
 const DECIMAL_MAX_SCALE: u32 = 15;
 
 /// Returns the inline id for `literal` if its datatype is inlinable and its lexical form is
-/// canonical and in range. O(len(lexical)).
-pub(crate) fn try_inline_literal(literal: LiteralRef<'_>) -> Option<TermId> {
+/// canonical and in range. Integer-derived datatypes only with `derived` (a store that
+/// keeps them in its dictionary passes `false`). O(len(lexical)).
+pub(crate) fn try_inline_literal(literal: LiteralRef<'_>, derived: bool) -> Option<TermId> {
     if literal.language().is_some() {
         return None;
     }
@@ -53,6 +54,8 @@ pub(crate) fn try_inline_literal(literal: LiteralRef<'_>) -> Option<TermId> {
         (TermKind::Date, encode_date(lexical)?)
     } else if datatype == xsd::DATE_TIME {
         (TermKind::DateTime, encode_date_time(lexical)?)
+    } else if derived && let Some(code) = DERIVED.iter().position(|d| d.0 == datatype) {
+        (TermKind::DerivedInteger, encode_derived(lexical, code)?)
     } else {
         return None;
     };
@@ -68,6 +71,10 @@ pub(crate) fn inline_to_literal(id: TermId) -> Option<Literal> {
         TermKind::Decimal => (decode_decimal(payload), xsd::DECIMAL),
         TermKind::Date => (decode_date(payload), xsd::DATE),
         TermKind::DateTime => (decode_date_time(payload), xsd::DATE_TIME),
+        TermKind::DerivedInteger => {
+            let (value, code) = decode_derived(payload);
+            (value.to_string(), DERIVED.get(code)?.0)
+        }
         TermKind::DefaultGraph
         | TermKind::Iri
         | TermKind::BlankNode
@@ -110,6 +117,61 @@ fn is_canonical_integer(lexical: &str) -> bool {
 
 pub(crate) fn decode_integer(payload: u64) -> i64 {
     (payload as i64).wrapping_add(INT_MIN)
+}
+
+// --- datatypes derived from xsd:integer -----------------------------------------------------
+
+/// The integer-derived datatypes, by code, with their value spaces (XSD 1.1 §3.4.14-3.4.26).
+const DERIVED: [(nrese_rdf::NamedNodeRef<'static>, i64, i64); 12] = [
+    (xsd::NON_POSITIVE_INTEGER, i64::MIN, 0),
+    (xsd::NEGATIVE_INTEGER, i64::MIN, -1),
+    (xsd::LONG, i64::MIN, i64::MAX),
+    (xsd::INT, i32::MIN as i64, i32::MAX as i64),
+    (xsd::SHORT, i16::MIN as i64, i16::MAX as i64),
+    (xsd::BYTE, i8::MIN as i64, i8::MAX as i64),
+    (xsd::NON_NEGATIVE_INTEGER, 0, i64::MAX),
+    (xsd::UNSIGNED_LONG, 0, i64::MAX),
+    (xsd::UNSIGNED_INT, 0, u32::MAX as i64),
+    (xsd::UNSIGNED_SHORT, 0, u16::MAX as i64),
+    (xsd::UNSIGNED_BYTE, 0, u8::MAX as i64),
+    (xsd::POSITIVE_INTEGER, 1, i64::MAX),
+];
+/// Bits of the datatype code, below the value.
+const DERIVED_CODE_BITS: u32 = 4;
+/// The inline value range: the payload's bits above the code, offset binary.
+const DERIVED_MIN: i64 = -(1 << (PAYLOAD_BITS - DERIVED_CODE_BITS - 1));
+const DERIVED_MAX: i64 = (1 << (PAYLOAD_BITS - DERIVED_CODE_BITS - 1)) - 1;
+
+/// A canonical literal of the derived datatype `code`, valid for it and in the inline
+/// range: the value (offset binary) above the code. Others stay in the dictionary, as
+/// they are (an ill-typed `"300"^^xsd:byte` included).
+fn encode_derived(lexical: &str, code: usize) -> Option<u64> {
+    let (_, min, max) = DERIVED[code];
+    let value: i64 = lexical.parse().ok()?;
+    ((min..=max).contains(&value)
+        && (DERIVED_MIN..=DERIVED_MAX).contains(&value)
+        && is_canonical_integer(lexical))
+    .then(|| (value.wrapping_sub(DERIVED_MIN) as u64) << DERIVED_CODE_BITS | code as u64)
+}
+
+/// The value and the datatype code of a derived integer's payload.
+pub(crate) fn decode_derived(payload: u64) -> (i64, usize) {
+    let value = ((payload >> DERIVED_CODE_BITS) as i64).wrapping_add(DERIVED_MIN);
+    (value, (payload & ((1 << DERIVED_CODE_BITS) - 1)) as usize)
+}
+
+/// The derived-integer ids with a value in `low..=high` (clamped to the inline range).
+pub(crate) fn derived_range(low: i64, high: i64) -> Option<(TermId, TermId)> {
+    let (low, high) = (low.max(DERIVED_MIN), high.min(DERIVED_MAX));
+    (low <= high).then(|| {
+        let at = |value: i64, code: u64| {
+            TermId::new(
+                TermKind::DerivedInteger,
+                (value.wrapping_sub(DERIVED_MIN) as u64) << DERIVED_CODE_BITS | code,
+            )
+        };
+        (at(low, 0), at(high, (1 << DERIVED_CODE_BITS) - 1))
+    })
 }
 
 fn sign_extend(value: u64, bits: u32) -> i64 {
@@ -392,7 +454,7 @@ mod tests {
     use super::*;
 
     fn inline(lexical: &str, datatype: NamedNodeRef<'_>) -> Option<TermId> {
-        try_inline_literal(LiteralRef::new_typed_literal(lexical, datatype))
+        try_inline_literal(LiteralRef::new_typed_literal(lexical, datatype), true)
     }
 
     fn assert_roundtrips(datatype: NamedNodeRef<'_>, lexicals: &[&str]) {
@@ -600,7 +662,8 @@ mod tests {
             ("0000-01-01T00:00:00", xsd::DATE_TIME, 0),
             ("9999-12-31", xsd::DATE, 9999),
         ] {
-            let id = try_inline_literal(LiteralRef::new_typed_literal(lexical, datatype)).unwrap();
+            let id =
+                try_inline_literal(LiteralRef::new_typed_literal(lexical, datatype), true).unwrap();
             let within = |low, high| {
                 let (first, last) = year_range(id.kind(), low, high).unwrap();
                 first <= id && id <= last
@@ -693,5 +756,49 @@ mod tests {
             inlined > 1_000,
             "the mutations should often stay valid: {inlined}"
         );
+    }
+
+    #[test]
+    fn integer_derived_literals_are_inline_and_sort_by_value() {
+        let id = |lexical: &str, datatype| {
+            try_inline_literal(LiteralRef::new_typed_literal(lexical, datatype), true)
+        };
+        let values = [
+            ("-129", xsd::LONG),
+            ("-5", xsd::INT),
+            ("0", xsd::NON_NEGATIVE_INTEGER),
+            ("0", xsd::UNSIGNED_BYTE),
+            ("7", xsd::BYTE),
+            ("300", xsd::INT),
+            ("70000", xsd::UNSIGNED_INT),
+        ];
+        let ids: Vec<TermId> = values.iter().map(|&(l, d)| id(l, d).unwrap()).collect();
+        assert!(ids.is_sorted(), "ids sort by value: {ids:?}");
+        for (&(lexical, datatype), &id) in values.iter().zip(&ids) {
+            assert_eq!(id.kind(), TermKind::DerivedInteger);
+            assert_eq!(id.as_inline_integer(), Some(lexical.parse().unwrap()));
+            let literal = inline_to_literal(id).unwrap();
+            assert_eq!((literal.value(), literal.datatype()), (lexical, datatype));
+        }
+        // Not canonical, outside the datatype or the inline range: in the dictionary.
+        for (lexical, datatype) in [
+            ("+5", xsd::INT),
+            ("05", xsd::INT),
+            ("-0", xsd::INT),
+            ("300", xsd::BYTE),
+            ("-1", xsd::NON_NEGATIVE_INTEGER),
+            ("0", xsd::POSITIVE_INTEGER),
+            ("1", xsd::NEGATIVE_INTEGER),
+            ("9223372036854775807", xsd::LONG),
+            ("x", xsd::INT),
+        ] {
+            assert_eq!(id(lexical, datatype), None, "{lexical}^^{datatype}");
+        }
+        // A store that keeps them in its dictionary.
+        let literal = LiteralRef::new_typed_literal("5", xsd::INT);
+        assert_eq!(try_inline_literal(literal, false), None);
+        // Ranges by value cover every datatype.
+        let (low, high) = derived_range(-5, 7).unwrap();
+        assert!(ids[1] >= low && ids[4] <= high && ids[0] < low && ids[5] > high);
     }
 }

@@ -3295,12 +3295,19 @@ impl<'a> Context<'a> {
     }
 
     fn order_ranks(&self, column: &[u64]) -> Vec<u64> {
-        let integer = |id: u64| TermId::from_raw(id).kind() == nrese_engine::TermKind::Integer;
-        if column.iter().all(|&id| id == UNDEF || integer(id)) {
-            // UNDEF sorts first in SPARQL; every inline integer id is above 0.
+        let integer = |id: u64| TermId::from_raw(id).as_inline_integer();
+        if column
+            .iter()
+            .all(|&id| id == UNDEF || integer(id).is_some())
+        {
+            // Inline integers (xsd:integer and the datatypes derived from it, 60 bits at
+            // most) by value, above UNDEF, which sorts first in SPARQL.
             return column
                 .iter()
-                .map(|&id| if id == UNDEF { 0 } else { id })
+                .map(|&id| match integer(id) {
+                    Some(value) => (value + (1 << 62)) as u64 + 1,
+                    None => 0,
+                })
                 .collect();
         }
         let mut distinct = column.to_vec();
@@ -3323,6 +3330,34 @@ impl<'a> Context<'a> {
             .collect()
     }
 
+    /// The values of the sort `keys` for `rows` of `solutions`, by position in `rows`. A key
+    /// that is a variable sorts by rank ([`Self::order_ranks`]: inline integers by id, so
+    /// no term is decoded); others are evaluated per row.
+    fn sort_keys(
+        &self,
+        solutions: &Solutions,
+        keys: &[OrderExpression],
+        rows: &[usize],
+    ) -> Vec<SortKey> {
+        keys.iter()
+            .map(|key| {
+                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
+                if let Expression::Variable(v) = e
+                    && let Some(column) = solutions.column(v)
+                {
+                    let column = solutions.table.column(column);
+                    let values: Vec<u64> = rows.iter().map(|&row| column[row]).collect();
+                    return SortKey::Ids(self.order_ranks(&values));
+                }
+                SortKey::Terms(
+                    rows.iter()
+                        .map(|&row| self.evaluator.eval(e, &self.binding(solutions, row)))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     fn order_by(
         &self,
         mut solutions: Solutions,
@@ -3330,29 +3365,12 @@ impl<'a> Context<'a> {
         limit: Option<usize>,
     ) -> NativeResult<Solutions> {
         let n = solutions.table.len();
-        // A key that is a variable holding only inline integers (or UNDEF) sorts by id: inline
-        // integer ids are ordered by value (offset binary), so no term is decoded.
-        let key_values: Vec<SortKey> = keys
-            .iter()
-            .map(|key| {
-                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
-                if let Expression::Variable(v) = e
-                    && let Some(column) = solutions.column(v)
-                {
-                    return SortKey::Ids(self.order_ranks(solutions.table.column(column)));
-                }
-                SortKey::Terms(
-                    (0..n)
-                        .map(|row| self.evaluator.eval(e, &self.binding(&solutions, row)))
-                        .collect(),
-                )
-            })
-            .collect();
-        let compare = |a: &usize, b: &usize| {
-            for (key, values) in keys.iter().zip(&key_values) {
+        // The order of positions `a` and `b` by `values` of `keys` (no tie-break).
+        let by_keys = |keys: &[OrderExpression], values: &[SortKey], a: usize, b: usize| {
+            for (key, values) in keys.iter().zip(values) {
                 let ordering = match values {
-                    SortKey::Ids(ids) => ids[*a].cmp(&ids[*b]),
-                    SortKey::Terms(terms) => value::order(terms[*a].as_ref(), terms[*b].as_ref()),
+                    SortKey::Ids(ids) => ids[a].cmp(&ids[b]),
+                    SortKey::Terms(terms) => value::order(terms[a].as_ref(), terms[b].as_ref()),
                 };
                 let ordering = match key {
                     OrderExpression::Asc(_) => ordering,
@@ -3362,17 +3380,39 @@ impl<'a> Context<'a> {
                     return ordering;
                 }
             }
-            a.cmp(b)
+            std::cmp::Ordering::Equal
         };
-        let mut order: Vec<usize> = (0..n).collect();
+        // ORDER BY with LIMIT k and several keys: the first key alone decides which rows
+        // can be among the first k (those up to the k-th row's value, ties included); the
+        // other keys are computed for those only. Olympics q4 ranked 28 k athletes' IRIs
+        // to break ties among the top 10 medal counts.
+        let mut rows: Vec<usize> = (0..n).collect();
+        if let Some(k) = limit
+            && k > 0
+            && k < n
+            && keys.len() > 1
+        {
+            let first = self.sort_keys(&solutions, &keys[..1], &rows);
+            let cmp = |a: &usize, b: &usize| by_keys(&keys[..1], &first, *a, *b);
+            let mut positions = rows.clone();
+            positions.select_nth_unstable_by(k - 1, cmp);
+            let pivot = positions[k - 1];
+            rows.retain(|row| cmp(row, &pivot).is_le());
+        }
+        let key_values = self.sort_keys(&solutions, keys, &rows);
+        let compare = |a: &usize, b: &usize| {
+            by_keys(keys, &key_values, *a, *b).then_with(|| rows[*a].cmp(&rows[*b]))
+        };
+        let mut order: Vec<usize> = (0..rows.len()).collect();
         match limit {
-            Some(k) if k < n => {
+            Some(k) if k < order.len() => {
                 order.select_nth_unstable_by(k, compare);
                 order.truncate(k);
                 order.sort_unstable_by(compare);
             }
             _ => order.sort_unstable_by(compare),
         }
+        let order: Vec<usize> = order.into_iter().map(|position| rows[position]).collect();
         let columns: Vec<Vec<u64>> = solutions
             .table
             .columns()
@@ -3882,9 +3922,15 @@ impl Aggregator<'_> {
                 } else {
                     values
                 };
+                // By value: xsd:integer and derived ids are of different kinds.
+                let value = |id: &u64| TermId::from_raw(*id).as_inline_integer();
                 Some(match name {
-                    AggregateFunction::Min => Agg::Id(ids.iter().copied().min().unwrap_or(UNDEF)),
-                    AggregateFunction::Max => Agg::Id(ids.iter().copied().max().unwrap_or(UNDEF)),
+                    AggregateFunction::Min => {
+                        Agg::Id(ids.iter().copied().min_by_key(value).unwrap_or(UNDEF))
+                    }
+                    AggregateFunction::Max => {
+                        Agg::Id(ids.iter().copied().max_by_key(value).unwrap_or(UNDEF))
+                    }
                     _ => {
                         let Some(sum) = values.iter().try_fold(0i64, |acc, &v| acc.checked_add(v))
                         else {

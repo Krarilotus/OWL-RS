@@ -19,8 +19,11 @@ use crate::error::{EngineError, EngineResult};
 
 /// Version 2 added the inferred stack to commit records (roadmap E6); version 3 inlines
 /// `xsd:decimal`, `xsd:date` and `xsd:dateTime` (E1), which changes the ids of such terms;
-/// version 4 made integer ids order-preserving and split literal kinds (XC1).
-const SEGMENT_MAGIC: &[u8; 8] = b"NRESEWL4";
+/// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
+/// inlines the integer-derived datatypes. A store created before keeps them in its
+/// dictionary and keeps writing version 4 segments, which are otherwise the same.
+const SEGMENT_MAGIC: &[u8; 8] = b"NRESEWL5";
+const SEGMENT_MAGIC_V4: &[u8; 8] = b"NRESEWL4";
 /// Magic prefix shared by every WAL format version.
 const SEGMENT_FAMILY: &[u8; 7] = b"NRESEWL";
 
@@ -57,6 +60,8 @@ pub(crate) struct SegmentContents {
     pub valid_len: u64,
     /// True if bytes after `valid_len` could not be decoded.
     pub torn: bool,
+    /// A version 4 segment: integer-derived literals are dictionary entries.
+    pub integers_in_dictionary: bool,
 }
 
 pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
@@ -67,9 +72,11 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
             records: Vec::new(),
             valid_len: 0,
             torn: !bytes.is_empty(),
+            integers_in_dictionary: false,
         });
     }
-    if &bytes[..SEGMENT_MAGIC.len()] != SEGMENT_MAGIC {
+    let integers_in_dictionary = &bytes[..SEGMENT_MAGIC.len()] == SEGMENT_MAGIC_V4;
+    if &bytes[..SEGMENT_MAGIC.len()] != SEGMENT_MAGIC && !integers_in_dictionary {
         if bytes.starts_with(SEGMENT_FAMILY) {
             return Err(EngineError::UnsupportedFormat(path.to_path_buf()));
         }
@@ -92,6 +99,7 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
                     records,
                     valid_len: pos as u64,
                     torn: true,
+                    integers_in_dictionary,
                 });
             }
         }
@@ -100,6 +108,7 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
         records,
         valid_len: pos as u64,
         torn: false,
+        integers_in_dictionary,
     })
 }
 
@@ -127,17 +136,25 @@ pub(crate) struct Wal {
     sync: SyncPolicy,
     poisoned: bool,
     buffer: Vec<u8>,
+    /// The magic of new segments (by the store's encoding).
+    magic: &'static [u8; 8],
 }
 
 impl Wal {
     /// Opens the log for appending after recovery. Appends to the newest segment, or starts
-    /// one for `next_revision` if there is none.
+    /// one for `next_revision` if there is none. New segments are of the store's encoding
+    /// (`integers_in_dictionary`: version 4).
     pub(crate) fn open(
         dir: &Path,
         next_revision: u64,
         segment_bytes: u64,
         sync: SyncPolicy,
+        integers_in_dictionary: bool,
     ) -> EngineResult<Self> {
+        let magic = match integers_in_dictionary {
+            true => SEGMENT_MAGIC_V4,
+            false => SEGMENT_MAGIC,
+        };
         fs::create_dir_all(dir)?;
         let (first_revision, active, active_bytes) = match list_segments(dir)?.pop() {
             Some((first_revision, path)) => {
@@ -146,7 +163,7 @@ impl Wal {
                 (first_revision, file, len)
             }
             None => {
-                let file = create_segment(dir, next_revision)?;
+                let file = create_segment(dir, next_revision, magic)?;
                 (next_revision, file, SEGMENT_MAGIC.len() as u64)
             }
         };
@@ -160,6 +177,7 @@ impl Wal {
             sync,
             poisoned: false,
             buffer: Vec::new(),
+            magic,
         })
     }
 
@@ -201,7 +219,7 @@ impl Wal {
             return Ok(());
         }
         self.active.sync_all()?;
-        self.active = create_segment(&self.dir, next_revision)?;
+        self.active = create_segment(&self.dir, next_revision, self.magic)?;
         self.active_first_revision = next_revision;
         self.active_bytes = SEGMENT_MAGIC.len() as u64;
         Ok(())
@@ -222,14 +240,14 @@ impl Wal {
     }
 }
 
-fn create_segment(dir: &Path, first_revision: u64) -> EngineResult<File> {
+fn create_segment(dir: &Path, first_revision: u64, magic: &[u8; 8]) -> EngineResult<File> {
     let path = segment_path(dir, first_revision);
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .open(&path)?;
-    file.write_all(SEGMENT_MAGIC)?;
+    file.write_all(magic)?;
     file.sync_all()?;
     super::sync_dir(dir)?;
     Ok(OpenOptions::new().append(true).open(&path)?)
