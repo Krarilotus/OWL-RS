@@ -133,6 +133,26 @@ HTTP on the main PC, so the comparison is indicative:
 | Olympics (1.8 M quads), sum | 92 ms | 69 ms | the same (q05 6.0 → 0.23 ms, q13 `AVG` of `xsd:int` ages 22 → 13 ms); ORDER BY + LIMIT computes tie-break keys for the candidates only (q04 17.5 → 9 ms) |
 | LUBM-100 after OWL 2 RL, 14 counting queries | 73 ms | 60 ms | WCOJ chunks sized to the threads (q2 18 → 4.8 ms) |
 
+Query sets at the end of 2 October (perf lab, office PC, TSV results; on-disk stores
+loaded fresh, so integer-derived literals are inline):
+
+| Workload | 27 September | Now | Peak during the load / resident after it |
+|---|---:|---:|---|
+| DBpedia core, 67 M quads, 13 queries | 2,279 ms | 128 ms | 5.6 GB / 57 MiB |
+| YAGO tiny, 16.5 M quads, 10 queries | 13,678 ms | 131 ms | 2.4-2.9 GB / 38 MiB |
+| Wikidata lexemes, 60 M quads, 10 queries | (HTTP) | 53 ms | 3.3 GB / 50 MiB |
+| Olympics, 1.8 M quads, 13 queries | – | 56 ms | 0.8 GB |
+| Entities, 10 M quads, 9 queries | – | 10 ms | 1.3 GB |
+| LUBM-100 after OWL 2 RL (8.7 M inferred in 3.2 s), 14 queries with results | – | 120 ms | – |
+| OWL2Bench RL-1 after OWL 2 RL (1.4 M inferred in 0.5 s), q20 (1.3 M rows) | 86 ms | 55 ms | – |
+
+What moved them on 2 October, besides the table above: integer-derived literals inline,
+columnar range scans and date comparisons on ids (entities q04 20 -> 2.4 ms), one-pass
+grouped integer aggregates, DISTINCT over a BGP as a set (Olympics q07 9.7 -> 0.03 ms),
+ORDER BY with LIMIT computing tie-break keys lazily, columnar scans merged across the
+asserted and inferred stacks, EXISTS patterns as sets with sorted merges for semi- and
+anti-joins, results serialised on every core.
+
 Done, with differential tests against the reference evaluator:
 - **A1** CONTAINS / STRSTARTS / STRENDS on a large pattern's object or STR of it, and
   `LANG(?v) = "tag"`, alone or with one of them. Only for patterns that will be scanned:
