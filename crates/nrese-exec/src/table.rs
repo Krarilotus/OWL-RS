@@ -131,12 +131,28 @@ impl IdTable {
         for column in &mut out.columns {
             column.reserve_exact(extra);
         }
+        // Sorted on what every part is sorted on, where each part starts at or after the
+        // row before it (the morsels of a sorted scan, in order).
+        let mut sorted = std::mem::take(&mut out.sorted_by);
         // Each part is freed as soon as it is copied: together with the output they
         // would hold the rows twice.
         for part in rest {
+            let common = sorted
+                .iter()
+                .zip(&part.sorted_by)
+                .take_while(|(a, b)| a == b)
+                .count();
+            sorted.truncate(common);
+            if !sorted.is_empty() && out.len > 0 && part.len > 0 {
+                let before = sorted.iter().map(|&c| out.columns[c][out.len - 1]);
+                let after = sorted.iter().map(|&c| part.columns[c][0]);
+                if before.cmp(after).is_gt() {
+                    sorted.clear();
+                }
+            }
             out.append(&part);
         }
-        out.sorted_by.clear();
+        out.sorted_by = sorted;
         out
     }
 
@@ -356,6 +372,25 @@ mod tests {
 
     fn table(rows: &[&[u64]]) -> IdTable {
         IdTable::from_rows(rows.first().map_or(0, |r| r.len()), rows.iter().copied())
+    }
+
+    /// Concatenated parts keep the sort order they share where each starts at or after the
+    /// row before it, and lose it where one doesn't.
+    #[test]
+    fn concatenation_keeps_a_shared_order_across_ordered_parts() {
+        let a = table(&[&[1, 9], &[2, 8]]).assume_sorted_by(vec![0, 1]);
+        let b = table(&[&[2, 9], &[3, 1]]).assume_sorted_by(vec![0]);
+        let joined = IdTable::concat(2, vec![a.clone(), b.clone()]);
+        assert_eq!(joined.sorted_by(), [0]);
+        assert_eq!(joined.len(), 4);
+        // Out of order at the boundary: no order.
+        let joined = IdTable::concat(2, vec![b, a]);
+        assert!(joined.sorted_by().is_empty());
+        // An empty part in between changes nothing.
+        let c = table(&[&[1, 1]]).assume_sorted_by(vec![0]);
+        let d = table(&[&[5, 0]]).assume_sorted_by(vec![0]);
+        let joined = IdTable::concat(2, vec![c, IdTable::new(2).assume_sorted_by(vec![0]), d]);
+        assert_eq!(joined.sorted_by(), [0]);
     }
 
     #[test]
