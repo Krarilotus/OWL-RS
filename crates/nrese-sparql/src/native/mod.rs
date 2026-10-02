@@ -2503,13 +2503,13 @@ impl<'a> Context<'a> {
             .into_iter()
             .filter(|p| p.iter().any(|x| matches!(x, wcoj::Pos::Var(_))))
             .collect();
-        let query = wcoj::Query {
-            snapshot: self.snapshot,
-            model: self.model,
+        let query = wcoj::Query::new(
+            self.snapshot,
+            self.model,
             patterns,
-            variables: width,
-            max_rows: self.max_rows(width),
-        };
+            width,
+            self.max_rows(width),
+        );
         let token = self.cancellation.clone();
         let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
         let mut stats = wcoj::Stats::default();
