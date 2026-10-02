@@ -232,6 +232,20 @@ the `lubm-materialised` workload, below.
   | Wikidata lexemes | 2,832 → 2,756 MiB (−2.7 %) | 862 → 786 MiB | 54.0 → 47.9 ms | equal |
 
   The query times are within the runs' spread: no cost measured.
+
+  FSST-compressed vocabularies are `store.vocabulary = "fsst"` (format 11, flags bit 1).
+  The same stores as plain and as compressed images, one binary, after a restart (5 runs):
+
+  | Store | Checkpoint plain → fsst | Dictionary mapped | Resident | Queries (sum of medians) |
+  |---|---:|---:|---:|---:|
+  | DBpedia core | 4,852 → 4,068 MiB (−16 %) | 1,994 → 1,209 MiB | 2,386 → 2,015 MiB | 124.1 → 122.0 ms |
+  | Wikidata lexemes | 2,756 → 2,424 MiB (−12 %) | 786 → 454 MiB | 1,176 → 881 MiB | 56.1 → 49.5 ms |
+
+  Rows equal. DBpedia's q08 (`CONTAINS` over English labels: a scan of the dictionary)
+  took 312 ms at first, decoding every key into a fresh buffer; decoded in place, and only
+  keys of the kinds tested, 45.6 ms against 39.9 plain (+14 %). Writing the checkpoint
+  takes longer (DBpedia 7 → 15 s: every key compressed twice). `plain` stays the default
+  until the whole suite has run on `fsst`.
 - **First count after a restart.** On LUBM(100), YAGO tiny and Wikidata the first count
   took 14 to 22 ms in Docker (one sample each), against 1.5 ms elsewhere; on the office
   PC the same store answers it in 0.9 ms over HTTP. To be rechecked with more runs.
