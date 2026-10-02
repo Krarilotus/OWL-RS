@@ -17,6 +17,13 @@ is left, in that order. Status of each capability: the
 - Where a generator rarely produces non-empty answers or never reaches an operator, the
   generator improves (the audit of 30 September found that the old random test had 10 %
   non-empty results and missed four bugs).
+- **Found and fixed so far (2 October):** the `ORDER BY` order was not total over literals
+  of different kinds; a `LIMIT` cut through equal sort keys; compact equality lost the
+  copies of a statement deleted from the default graph but asserted in a named one; a
+  path between two constants answered one solution where its bag has several
+  (alternatives, sequences); explanations of inferences differed between runs. Each has
+  a fixed-seed regression test; the oracle's own mistakes (SAMPLE, CONSTRUCT with LIMIT,
+  NOW, row order) were fixed alongside.
 
 ## G2. One engine API
 
@@ -25,9 +32,11 @@ by the coming frontend; the protocols only translate.
 
 - **Done so far (2 October):** namespaces and client transactions (sessions) in the store;
   every `/dataset/…` capability for every repository under `/api/v1/repositories/{id}`;
-  JSON routes for repositories, namespaces, sessions and explanations of inferences.
+  JSON routes for repositories (create, read, remove), namespaces, sessions, imports,
+  rematerialisation and explanations of inferences; users, workspaces, personal spaces,
+  role rules, their history and local logins in the core (G2b, ADR-0008 accepted).
 - **State in the core.** Done: namespaces and client transactions (sessions) moved from
-  the RDF4J adapter into the store. Next: access policies, users and workspaces (G2b),
+  the RDF4J adapter into the store; access policies, users and workspaces (G2b). Next:
   repository settings, the shapes graph and rulesets as managed store objects.
 - **One management API.** A versioned JSON API over HTTP for what the protocols don't
   cover: repositories, imports and exports, namespaces, sessions, rulesets and reasoning
