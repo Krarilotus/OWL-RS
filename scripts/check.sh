@@ -7,8 +7,9 @@
 # code, and the script fails if any failed.
 #
 # Usage: scripts/check.sh            the whole gate (before a push; what CI runs)
-#        scripts/check.sh --changed  only the crates changed against HEAD (staged or not):
-#                                    fmt, clippy and tests for them, and the lock check
+#        scripts/check.sh --changed  the crates changed against HEAD (staged or not) and
+#                                    every workspace crate depending on them: fmt, clippy
+#                                    and tests for those, and the lock check
 #                                    when a manifest or lock changed (the pre-commit hook)
 set -u
 cd "$(dirname "$0")/.."
@@ -44,6 +45,19 @@ if [ "$mode" = --changed ]; then
       dir=$(dirname "$dir")
     done
   done
+  # And every workspace crate that depends on a changed one (directly or not), so an
+  # engine change runs the store's and the server's tests too.
+  changed=("${!seen[@]}")
+  for name in "${changed[@]}"; do
+    while read -r dependent _; do
+      if [ -n "$dependent" ] && [ -z "${seen[$dependent]:-}" ]; then
+        seen[$dependent]=1
+        packages+=("-p" "$dependent")
+      fi
+    done < <(cargo tree -i "$name" --workspace --prefix none -e normal,build,dev --offline 2>/dev/null \
+               | sed 's/ (\*)//' | sort -u)
+  done
+  echo "=== crates: ${!seen[*]}"
   step fmt cargo fmt --all --check
   if [ ${#packages[@]} -gt 0 ]; then
     step clippy "$guarded" clippy --locked "${packages[@]}" --all-targets -- -D warnings
