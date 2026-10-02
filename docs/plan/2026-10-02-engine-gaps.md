@@ -34,7 +34,8 @@ by the coming frontend; the protocols only translate.
   every `/dataset/…` capability for every repository under `/api/v1/repositories/{id}`;
   JSON routes for repositories (create, read, remove), namespaces, sessions, imports,
   rematerialisation and explanations of inferences; users, workspaces, personal spaces,
-  role rules, their history and local logins in the core (G2b, ADR-0008 accepted).
+  role rules, their history and local logins in the core (G2b, ADR-0008 accepted); the
+  OpenAPI description at `/api/v1/openapi.json`, checked against the router.
 - **State in the core.** Done: namespaces and client transactions (sessions) moved from
   the RDF4J adapter into the store; access policies, users and workspaces (G2b). Next:
   repository settings, the shapes graph and rulesets as managed store objects.

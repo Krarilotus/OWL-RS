@@ -19,11 +19,16 @@ serde_json = "1.0.145"
 sha2 = "0.10.9"
 argon2 = "0.6.0"
 getrandom = "0.4.2"
+utoipa = { version = "6.0.0", optional = true }
 nrese-sparql-results = { path = "../rdf/nrese-sparql-results" }
 nrese-sparql-syntax = { path = "../rdf/nrese-sparql-syntax" }
 thiserror.workspace = true
 tracing.workspace = true
 url = "2.5.7"
+
+[features]
+# Schemas of the types the engine API returns, for its OpenAPI description.
+openapi = ["dep:utoipa"]
 
 [dev-dependencies]
 libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }

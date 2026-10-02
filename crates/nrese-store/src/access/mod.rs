@@ -42,6 +42,7 @@ pub use login::{LoginLimits, SESSION_PREFIX, hash_password, verify_password};
 /// What a role grants a user no rule names, when enforcement is on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum Fallback {
     /// A user no rule names and no workspace has may read and write nothing but its
     /// personal space.
@@ -54,6 +55,7 @@ pub enum Fallback {
 /// Whether users who may not read every graph see the inferred statements.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum Inferred {
     #[default]
     Hidden,
@@ -64,6 +66,7 @@ pub enum Inferred {
 /// A role's right on the store's default graph.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum DefaultGraphRight {
     #[default]
     None,
@@ -76,6 +79,7 @@ pub enum DefaultGraphRight {
 /// A role's graphs: entries are IRIs, or IRI prefixes ending in `*`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RoleRule {
     pub name: String,
     #[serde(default)]
@@ -105,6 +109,7 @@ pub struct AccessPolicy {
 /// A member's level in a workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum Level {
     Viewer,
     Editor,
@@ -130,6 +135,7 @@ impl Level {
 /// The state's settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Settings {
     /// Whether access is restricted at all; off, everyone reads and writes what its
     /// credentials allow.

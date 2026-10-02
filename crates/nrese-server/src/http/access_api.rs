@@ -66,7 +66,7 @@ async fn change(
     Ok(Json(record).into_response())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct WorkspaceView {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,7 +103,7 @@ fn workspace_view(access: &AccessState, name: &str, level: Option<Level>) -> Wor
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct Me {
     user: Option<String>,
     roles: BTreeSet<String>,
@@ -118,6 +118,8 @@ struct Me {
     workspaces: Vec<WorkspaceView>,
 }
 
+#[utoipa::path(get, path = "/api/v1/access/me", tag = "access",
+    responses((status = 200, description = "Who the requester is", body = Me)))]
 /// Who the requester is: its user name, roles, personal space and workspaces.
 pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let identity = guard::enforce_query_read(&state, &headers).await?;
@@ -144,7 +146,7 @@ pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
     .into_response())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct UserView {
     name: String,
     admin: bool,
@@ -153,7 +155,7 @@ struct UserView {
     local_login: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct Overview {
     settings: nrese_store::access::Settings,
     roles: Vec<RoleRule>,
@@ -161,6 +163,8 @@ struct Overview {
     workspaces: Vec<WorkspaceView>,
 }
 
+#[utoipa::path(get, path = "/api/v1/access", tag = "access",
+    responses((status = 200, description = "The whole state", body = Overview), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
 /// The whole state (administrators): settings, roles, users, workspaces.
 pub async fn overview(
     State(state): State<AppState>,
@@ -191,6 +195,8 @@ pub async fn overview(
     .into_response())
 }
 
+#[utoipa::path(get, path = "/api/v1/access/workspaces", tag = "access",
+    responses((status = 200, description = "The requester's workspaces, its personal space first", body = Vec<WorkspaceView>)))]
 /// The workspaces the requester is in (administrators: every one recorded).
 pub async fn workspaces(
     State(state): State<AppState>,
@@ -214,6 +220,8 @@ pub async fn workspaces(
     Ok(Json(views).into_response())
 }
 
+#[utoipa::path(get, path = "/api/v1/access/workspaces/{name}", tag = "access", params(("name" = String, Path)),
+    responses((status = 200, description = "The workspace", body = WorkspaceView), (status = 404, description = "None the requester is in", body = crate::http::openapi::Problem)))]
 /// One workspace, for its members and administrators.
 pub async fn workspace(
     State(state): State<AppState>,
@@ -239,7 +247,7 @@ pub async fn workspace(
     Ok(Json(workspace_view(&access, &name, level)).into_response())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct SettingsBody {
     enforced: Option<bool>,
@@ -250,6 +258,8 @@ struct SettingsBody {
     reason: String,
 }
 
+#[utoipa::path(put, path = "/api/v1/access/settings", tag = "access", request_body = SettingsBody,
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
 /// Changes the settings given (administrators).
 pub async fn settings_put(
     State(state): State<AppState>,
@@ -273,7 +283,7 @@ pub async fn settings_put(
     change(&state, &headers, Change::Settings(settings), request.reason).await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct RoleBody {
     #[serde(default)]
@@ -288,6 +298,8 @@ struct RoleBody {
     reason: String,
 }
 
+#[utoipa::path(put, path = "/api/v1/access/roles/{name}", tag = "access", params(("name" = String, Path)), request_body = RoleBody,
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
 /// Sets role `name`'s rule (administrators).
 pub async fn role_put(
     State(state): State<AppState>,
@@ -306,6 +318,8 @@ pub async fn role_put(
     change(&state, &headers, Change::PutRole(rule), request.reason).await
 }
 
+#[utoipa::path(delete, path = "/api/v1/access/roles/{name}", tag = "access", params(("name" = String, Path), ("reason" = String, Query, description = "Why (required)")),
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem), (status = 404, description = "No such role", body = crate::http::openapi::Problem)))]
 /// Removes role `name`'s rule (administrators).
 pub async fn role_delete(
     State(state): State<AppState>,
@@ -317,7 +331,7 @@ pub async fn role_delete(
     change(&state, &headers, Change::RemoveRole(name), reason).await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct UserBody {
     admin: Option<bool>,
@@ -328,6 +342,8 @@ struct UserBody {
     reason: String,
 }
 
+#[utoipa::path(put, path = "/api/v1/access/users/{name}", tag = "access", params(("name" = String, Path)), request_body = UserBody,
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
 /// Creates or changes user `name` (administrators).
 pub async fn user_put(
     State(state): State<AppState>,
@@ -356,6 +372,8 @@ pub async fn user_put(
     change(&state, &headers, change_user, request.reason).await
 }
 
+#[utoipa::path(delete, path = "/api/v1/access/users/{name}", tag = "access", params(("name" = String, Path), ("reason" = String, Query, description = "Why (required)")),
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem), (status = 404, description = "No such user", body = crate::http::openapi::Problem)))]
 /// Removes user `name` with its memberships (administrators).
 pub async fn user_delete(
     State(state): State<AppState>,
@@ -367,7 +385,7 @@ pub async fn user_delete(
     change(&state, &headers, Change::RemoveUser(name), reason).await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceBody {
     /// Empty: no title.
@@ -380,6 +398,8 @@ struct WorkspaceBody {
     reason: String,
 }
 
+#[utoipa::path(put, path = "/api/v1/access/workspaces/{name}", tag = "access", params(("name" = String, Path)), request_body = WorkspaceBody,
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
 /// Creates workspace `name` (the requester owns it) or changes it (its owners).
 pub async fn workspace_put(
     State(state): State<AppState>,
@@ -402,6 +422,8 @@ pub async fn workspace_put(
     change(&state, &headers, change_workspace, request.reason).await
 }
 
+#[utoipa::path(delete, path = "/api/v1/access/workspaces/{name}", tag = "access", params(("name" = String, Path), ("reason" = String, Query, description = "Why (required)")),
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem), (status = 404, description = "No such workspace", body = crate::http::openapi::Problem)))]
 /// Removes workspace `name` (its owners; for a personal space: who sees it).
 pub async fn workspace_delete(
     State(state): State<AppState>,
@@ -413,7 +435,7 @@ pub async fn workspace_delete(
     change(&state, &headers, Change::RemoveWorkspace(name), reason).await
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct MemberBody {
     level: Level,
@@ -421,6 +443,9 @@ struct MemberBody {
     reason: String,
 }
 
+#[utoipa::path(put, path = "/api/v1/access/workspaces/{name}/members/{user}", tag = "access",
+    params(("name" = String, Path), ("user" = String, Path)), request_body = MemberBody,
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem), (status = 409, description = "The workspace would have no owner", body = crate::http::openapi::Problem)))]
 /// Makes `user` a member of workspace `name` at a level (its owners).
 pub async fn member_put(
     State(state): State<AppState>,
@@ -437,6 +462,9 @@ pub async fn member_put(
     change(&state, &headers, set, request.reason).await
 }
 
+#[utoipa::path(delete, path = "/api/v1/access/workspaces/{name}/members/{user}", tag = "access",
+    params(("name" = String, Path), ("user" = String, Path), ("reason" = String, Query, description = "Why (required)")),
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem), (status = 409, description = "The workspace would have no owner", body = crate::http::openapi::Problem)))]
 /// Removes `user` from workspace `name` (its owners).
 pub async fn member_delete(
     State(state): State<AppState>,
@@ -453,6 +481,9 @@ pub async fn member_delete(
     change(&state, &headers, set, reason).await
 }
 
+#[utoipa::path(get, path = "/api/v1/access/history", tag = "access",
+    params(("limit" = Option<usize>, Query, description = "How many (100)")),
+    responses((status = 200, description = "The changes, the latest first", body = Vec<nrese_store::access::ChangeRecord>), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
 /// The latest changes (`limit`, 100 by default), the latest first (administrators).
 pub async fn history(
     State(state): State<AppState>,
@@ -479,6 +510,9 @@ pub async fn history(
     Ok(Json(records).into_response())
 }
 
+#[utoipa::path(post, path = "/api/v1/access/import", tag = "access", params(("reason" = String, Query, description = "Why (required)")),
+    request_body(content = String, content_type = "application/toml", description = "A policy file"),
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
 /// Replaces the role rules and fallbacks with the policy file in the body (TOML) and
 /// turns enforcement on (administrators); `reason` as a query parameter.
 pub async fn import(
@@ -495,6 +529,8 @@ pub async fn import(
     change(&state, &headers, Change::Import(policy), reason).await
 }
 
+#[utoipa::path(get, path = "/api/v1/access/export", tag = "access",
+    responses((status = 200, description = "The policy file", content_type = "application/toml", body = String), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
 /// The role rules and fallbacks as a policy file (TOML; administrators).
 pub async fn export(
     State(state): State<AppState>,
@@ -512,14 +548,14 @@ pub async fn export(
         .into_response())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct LoginBody {
     user: String,
     password: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct Session {
     user: String,
     /// `Authorization: Bearer {token}` on the following requests.
@@ -527,6 +563,9 @@ struct Session {
     expires_in_seconds: u64,
 }
 
+#[utoipa::path(post, path = "/api/v1/access/login", tag = "access", request_body = LoginBody,
+    responses((status = 200, description = "A session", body = Session), (status = 401, description = "Wrong user name or password", body = crate::http::openapi::Problem),
+        (status = 429, description = "Too many failed logins", body = crate::http::openapi::Problem)))]
 /// Logs a local user in: a session token for the following requests. 401 for a wrong
 /// user name or password, 429 after too many; 404 with local logins off.
 pub async fn login(State(state): State<AppState>, bytes: Bytes) -> Result<Response, ApiError> {
@@ -557,6 +596,8 @@ pub async fn login(State(state): State<AppState>, bytes: Bytes) -> Result<Respon
     }
 }
 
+#[utoipa::path(post, path = "/api/v1/access/logout", tag = "access",
+    responses((status = 204, description = "Ended"), (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
 /// Ends the session whose token the request carries.
 pub async fn logout(
     State(state): State<AppState>,

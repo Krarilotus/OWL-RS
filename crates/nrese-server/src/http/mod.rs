@@ -10,6 +10,7 @@ mod handlers;
 mod media;
 mod metrics;
 mod mutation;
+pub mod openapi;
 mod operator_api;
 mod operator_diagnostics;
 mod operator_ui;
