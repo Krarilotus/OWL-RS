@@ -166,3 +166,42 @@ async fn every_capability_reaches_every_repository() {
     assert_eq!(status, StatusCode::OK);
     assert!(text.contains("Windmill of Sanssouci"), "{text}");
 }
+
+#[tokio::test]
+async fn repositories_and_namespaces_in_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let (status, _) = send(&app, Method::PUT, "/repositories/second", Some("text/turtle"), "").await;
+    assert!(status.is_success());
+    let (status, text) = send(&app, Method::GET, "/api/v1/repositories", None, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let list: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["nrese", "second"]);
+    let base = "/api/v1/repositories/second/namespaces";
+    let (status, _) = send(&app, Method::PUT, &format!("{base}/ex"), None, "http://example.com/").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, text) = send(&app, Method::GET, base, None, "").await;
+    let map: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(map["ex"], "http://example.com/");
+    assert_eq!(map["rdf"], "http://www.w3.org/1999/02/22-rdf-syntax-ns#");
+    // The same prefixes through RDF4J; the default repository's are its own.
+    let (_, text) = send(&app, Method::GET, "/repositories/second/namespaces/ex", None, "").await;
+    assert_eq!(text.trim(), "http://example.com/");
+    let (_, text) = send(&app, Method::GET, "/api/v1/repositories/nrese/namespaces", None, "").await;
+    assert!(!text.contains("example.com"), "{text}");
+    let (status, _) = send(&app, Method::DELETE, &format!("{base}/ex"), None, "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(&app, Method::DELETE, &format!("{base}/ex"), None, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

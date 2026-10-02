@@ -1,6 +1,7 @@
 use axum::Router;
 use axum::routing::{get, post, put};
 
+use crate::http::api_v1;
 use crate::http::handlers;
 use crate::http::rdf4j;
 use crate::state::AppState;
@@ -29,6 +30,11 @@ fn repository_routes() -> Router<AppState> {
         .route("/classification", get(handlers::classification_get))
         .route("/backup", get(handlers::admin_backup_dataset))
         .route("/restore", post(handlers::admin_restore_dataset))
+        .route("/namespaces", get(api_v1::namespaces_get))
+        .route(
+            "/namespaces/{prefix}",
+            put(api_v1::namespace_put).delete(api_v1::namespace_delete),
+        )
 }
 
 pub fn router(state: AppState) -> Router {
@@ -115,6 +121,7 @@ pub fn router(state: AppState) -> Router {
         .route("/console/{*path}", get(handlers::console_file))
         // The engine API (ADR-0007): every capability for every repository, by the same
         // handlers as the default repository's `/dataset/…` routes.
+        .route("/api/v1/repositories", get(api_v1::repositories))
         .nest("/api/v1/repositories/{id}", repository_routes())
         // The RDF4J REST protocol (`rdf4j.rs`).
         .route("/protocol", get(rdf4j::protocol))
