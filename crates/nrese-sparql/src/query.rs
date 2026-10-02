@@ -49,6 +49,9 @@ pub struct QueryOptions {
     /// in chunks of that size); `None`: 4 M. Tests make it small, so that groups are
     /// split across many chunks.
     pub cross_chunk_rows: Option<usize>,
+    /// Evaluate every GROUP BY that can stream in morsels of this many rows of its first
+    /// pattern (`native/stream.rs`), not only when it runs out of memory. Tests set it.
+    pub stream_rows: Option<usize>,
 }
 
 /// Evaluates `query` against `view` over the engine's id tables (`native`); a transaction

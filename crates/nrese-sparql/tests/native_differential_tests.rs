@@ -4822,3 +4822,133 @@ fn equalities_across_patterns_equal_the_reference() {
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
+
+/// GROUP BY over a basic graph pattern in morsels (`native/stream.rs`), forced with morsels
+/// of one to three rows of the first pattern: partial counts, sums, extremes, samples and
+/// averages merged across morsels, with filters (EXISTS too) and without keys. Equal to the
+/// reference evaluator.
+#[test]
+fn streamed_groups_equal_the_reference() {
+    let mut rng = Rng(20_261_006);
+    let (mut checked, mut with_solutions) = (0, 0);
+    for dataset_case in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..40 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+            let mut pattern = format!("?a {} ?b . ?a {} ?c .", p(&mut rng), p(&mut rng));
+            if rng.below(2) == 0 {
+                pattern.push_str(&format!(" ?c {} ?d .", p(&mut rng)));
+            }
+            match rng.below(4) {
+                0 => pattern.push_str(" FILTER(?b != ?c)"),
+                1 => pattern.push_str(&format!(" FILTER NOT EXISTS {{ ?b {} ?a }}", p(&mut rng))),
+                2 => pattern.push_str(" FILTER(isLiteral(?c))"),
+                _ => {}
+            }
+            let keys = *rng.pick(&["", "?a", "?b", "?a ?b"]);
+            let mut aggregates = Vec::new();
+            for (i, aggregate) in [
+                "COUNT(*)",
+                "COUNT(?c)",
+                "SUM(?c)",
+                "AVG(?c)",
+                "MIN(?c)",
+                "MAX(?b)",
+                "SAMPLE(?a)",
+                "AVG(<http://www.w3.org/2001/XMLSchema#double>(?c))",
+            ]
+            .iter()
+            .enumerate()
+            {
+                if rng.below(3) == 0 || (i == 0 && aggregates.is_empty()) {
+                    aggregates.push(format!("({aggregate} AS ?x{i})"));
+                }
+            }
+            let group_by = match keys {
+                "" => String::new(),
+                keys => format!(" GROUP BY {keys}"),
+            };
+            let text = format!(
+                "SELECT {keys} {} WHERE {{ {pattern} }}{group_by}",
+                aggregates.join(" ")
+            );
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "{text}");
+            let context = format!("dataset {dataset_case}, query {query_case}: {text}");
+            let streamed = QueryOptions {
+                stream_rows: Some(1 + rng.below(3) as usize),
+                ..QueryOptions::default()
+            };
+            // SAMPLE may pick any value of its group: compare the rest.
+            let sampled = text.contains("SAMPLE");
+            let open = has_extremes(&text) || sampled;
+            let native = rows_up_to_equal_values(
+                evaluate_query(&snapshot, &query, &streamed).unwrap(),
+                false,
+                open,
+            );
+            let expected = rows_up_to_equal_values(
+                reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+                open,
+            );
+            if sampled {
+                assert_eq!(native.len(), expected.len(), "{context}");
+            } else {
+                assert_same_rows(&native, &expected, &context);
+            }
+            checked += 1;
+            with_solutions += usize::from(!native.is_empty());
+        }
+    }
+    assert!(
+        with_solutions * 2 > checked,
+        "only {with_solutions} of {checked} queries have solutions"
+    );
+}
+
+/// A GROUP BY whose join outgrows the query's memory limit answers in morsels instead of
+/// failing (W6): 400 × 400 rows crossed and counted within 4 MiB.
+#[test]
+fn groups_over_joins_larger_than_memory_answer() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..400 {
+        for (p, o) in [("p0", i), ("p1", i % 7)] {
+            tx.insert(
+                Quad::new(
+                    ex(&format!("s{i}")),
+                    ex(p),
+                    Literal::new_typed_literal(o.to_string(), xsd::INTEGER),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let text = format!(
+        "SELECT ?y (COUNT(*) AS ?n) (SUM(?x) AS ?s) WHERE {{ ?a <{EX}p0> ?x . ?b <{EX}p1> ?y }} GROUP BY ?y"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let limited = QueryOptions {
+        memory_limit: Some(4 << 20),
+        ..QueryOptions::default()
+    };
+    let native = rows(evaluate_query(&snapshot, &query, &limited).unwrap(), false);
+    let expected = rows(
+        reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    assert_eq!(native.len(), 7);
+    assert_same_rows(&native, &expected, &text);
+}
