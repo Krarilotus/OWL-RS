@@ -3750,28 +3750,32 @@ struct FilterMask<'a> {
 }
 
 impl FilterMask<'_> {
-    /// Whether each row of `rows` passes.
+    /// Whether each row of `rows` passes. Compiled filters read the dictionary under one
+    /// read lock for all the rows ([`Snapshot::with_views`]), not one per row.
     fn rows(&self, rows: Range<usize>, term: &dyn Fn(u64) -> Option<Term>) -> Vec<bool> {
         let table = &self.solutions.table;
-        rows.map(|row| {
-            let decided = self.compiled.map(|fast| {
-                let value = |v: &Variable| {
-                    self.solutions
-                        .column(v)
-                        .map_or(UNDEF, |c| table.get(row, c))
-                };
-                fast.eval(&value, self.snapshot)
-            });
-            match decided {
-                Some(fast::Tri::True) => true,
-                Some(fast::Tri::False | fast::Tri::Error) => false,
-                Some(fast::Tri::Unknown) | None => {
-                    let binding = |v: &Variable| term(table.get(row, self.solutions.column(v)?));
-                    self.evaluator.filter(self.expression, &binding)
+        self.snapshot.with_views(|view| {
+            rows.map(|row| {
+                let decided = self.compiled.map(|fast| {
+                    let value = |v: &Variable| {
+                        self.solutions
+                            .column(v)
+                            .map_or(UNDEF, |c| table.get(row, c))
+                    };
+                    fast.eval(&value, view)
+                });
+                match decided {
+                    Some(fast::Tri::True) => true,
+                    Some(fast::Tri::False | fast::Tri::Error) => false,
+                    Some(fast::Tri::Unknown) | None => {
+                        let binding =
+                            |v: &Variable| term(table.get(row, self.solutions.column(v)?));
+                        self.evaluator.filter(self.expression, &binding)
+                    }
                 }
-            }
+            })
+            .collect()
         })
-        .collect()
     }
 }
 
