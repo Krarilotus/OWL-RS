@@ -893,10 +893,9 @@ fn materialisation_by_representatives_equals_replication() {
             .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
             .expect("rematerialise");
         let mut quads: Vec<String> = store
-            .read_statements(
-                &nrese_store::ReadScope::All,
+            .statements(
+                &nrese_store::ReadContext::all(),
                 &nrese_store::StatementPattern::default(),
-                true,
             )
             .expect("statements")
             .iter()
@@ -956,11 +955,12 @@ fn a_retired_pipeline_refuses_writes() {
     ));
     update(&new, "INSERT DATA { <urn:c> <urn:p> 3 }").unwrap();
     assert_eq!(
-        store.count_statements(
-            &nrese_store::ReadScope::All,
-            &nrese_store::StatementPattern::default(),
-            false
-        ),
+        store
+            .count(
+                &nrese_store::ReadContext::all().infer(false),
+                &nrese_store::StatementPattern::default(),
+            )
+            .unwrap(),
         2
     );
 }

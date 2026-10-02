@@ -1,6 +1,7 @@
 //! Every read of the store takes a `ReadScope` (the audit of 2 October, §2.3): a restricted
 //! scope sees its graphs only, whatever the caller forgets, and the operations over the
-//! whole dataset refuse it.
+//! whole dataset refuse it. The rest of a read (inferred statements, a session's pending
+//! changes, cancellation) comes with it in a `ReadContext`.
 
 mod support;
 
@@ -9,8 +10,9 @@ use std::sync::Arc;
 use nrese_rdf::GraphName;
 use nrese_sparql::GraphAccess;
 use nrese_store::{
-    DatasetBackupFormat, GraphReadRequest, GraphResultFormat, GraphTarget, ReadScope,
-    SparqlQueryRequest, SparqlUpdateRequest, StatementPattern, StoreService,
+    DatasetBackupFormat, GraphReadRequest, GraphResultFormat, GraphTarget, ReadContext, ReadScope,
+    SparqlQueryRequest, SparqlUpdateRequest, StatementOp, StatementPattern, StatementsRequest,
+    StoreService,
 };
 use support::in_memory_store_config;
 
@@ -39,17 +41,30 @@ fn a_restricted_scope_reads_its_graphs_only() {
     let store = store();
     let scope = public();
     let quads = store
-        .read_statements(&scope, &StatementPattern::default(), false)
+        .statements(
+            &ReadContext::new(scope.clone()).infer(false),
+            &StatementPattern::default(),
+        )
         .unwrap();
     let graphs: Vec<GraphName> = quads.iter().map(|q| q.graph_name.clone()).collect();
     assert_eq!(quads.len(), 2, "{quads:?}");
     assert!(!graphs.iter().any(|g| g.to_string().contains("secret")));
     assert_eq!(
-        store.count_statements(&scope, &StatementPattern::default(), false),
+        store
+            .count(
+                &ReadContext::new(scope.clone()).infer(false),
+                &StatementPattern::default()
+            )
+            .unwrap(),
         2
     );
     assert_eq!(
-        store.count_statements(&ReadScope::All, &StatementPattern::default(), false),
+        store
+            .count(
+                &ReadContext::all().infer(false),
+                &StatementPattern::default()
+            )
+            .unwrap(),
         3
     );
     let contexts: Vec<String> = store
@@ -72,7 +87,7 @@ fn a_restricted_scope_reads_its_graphs_only() {
     let read = |scope: &ReadScope| {
         store
             .execute_graph_read(
-                scope,
+                &ReadContext::new(scope.clone()),
                 &GraphReadRequest {
                     target: GraphTarget::NamedGraph("urn:g:secret".to_owned()),
                     format: GraphResultFormat::NTriples,
@@ -97,4 +112,113 @@ fn operations_over_the_whole_dataset_refuse_a_restricted_scope() {
     );
     assert!(store.classify(&scope).is_err());
     assert!(store.classify(&ReadScope::All).is_ok());
+}
+
+/// The objects of `<urn:x> <urn:p> ?o` as `read` sees them.
+fn objects(store: &StoreService, read: &ReadContext<'_>) -> Vec<String> {
+    let pattern = StatementPattern {
+        subject: Some(nrese_rdf::NamedNode::new_unchecked("urn:x").into()),
+        ..StatementPattern::default()
+    };
+    let mut objects: Vec<String> = store
+        .statements(read, &pattern)
+        .unwrap()
+        .into_iter()
+        .map(|quad| quad.object.to_string())
+        .collect();
+    objects.sort();
+    objects
+}
+
+#[test]
+fn reads_in_a_session_keep_its_data_until_the_session_or_the_store_changes() {
+    let store = store();
+    let sessions = store.sessions();
+    let id = sessions.begin();
+    // A fresh value on every replay: a kept view shows the same one.
+    let fresh = || {
+        StatementOp::Update(SparqlUpdateRequest::new(
+            "INSERT { <urn:x> <urn:p> ?u } WHERE { BIND(STRUUID() AS ?u) }",
+        ))
+    };
+    assert!(sessions.add(&id, vec![fresh()]));
+    let pending = |session: Option<&str>| StatementsRequest {
+        ops: sessions.pending(&id).unwrap(),
+        session: session.map(str::to_owned),
+        ..StatementsRequest::default()
+    };
+    let in_session = pending(Some(&id));
+    let read = ReadContext::all().on(Some(&in_session));
+    let first = objects(&store, &read);
+    assert_eq!(first.len(), 1);
+    assert_eq!(objects(&store, &read), first, "kept for the next read");
+    // Without a session, every read replays the operations.
+    let outside = pending(None);
+    assert_ne!(
+        objects(&store, &ReadContext::all().on(Some(&outside))),
+        first
+    );
+    // Another reader's view is its own.
+    let scoped = ReadContext::new(public()).on(Some(&in_session));
+    assert_ne!(objects(&store, &scoped), first);
+    // A commit by another client: the operations are replayed on the new data.
+    store
+        .execute_update(&SparqlUpdateRequest::new(
+            "INSERT DATA { <urn:x> <urn:p> 0 }",
+        ))
+        .unwrap();
+    let after_commit = objects(&store, &read);
+    assert_eq!(after_commit.len(), 2, "{after_commit:?}");
+    assert!(!after_commit.contains(&first[0]));
+    // More operations: replayed too.
+    assert!(sessions.add(&id, vec![fresh()]));
+    let longer = pending(Some(&id));
+    assert_eq!(
+        objects(&store, &ReadContext::all().on(Some(&longer))).len(),
+        3
+    );
+}
+
+#[test]
+fn statements_are_written_as_they_are_read() {
+    let store = store();
+    let mut out = Vec::new();
+    let written = store
+        .write_statements(
+            &ReadContext::new(public()).infer(false),
+            &StatementPattern::default(),
+            GraphResultFormat::NQuads,
+            &mut out,
+        )
+        .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(written, 2);
+    assert_eq!(text.lines().count(), 2, "{text}");
+    assert!(text.contains("<urn:g:public>") && !text.contains("secret"));
+    // Triples formats drop the graphs.
+    let mut out = Vec::new();
+    store
+        .write_statements(
+            &ReadContext::all().infer(false),
+            &StatementPattern::default(),
+            GraphResultFormat::NTriples,
+            &mut out,
+        )
+        .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.lines().count(), 3);
+    assert!(!text.contains("urn:g:"), "{text}");
+    // A cancelled read stops.
+    let cancel = nrese_store::CancellationToken::new();
+    cancel.cancel();
+    assert!(
+        store
+            .write_statements(
+                &ReadContext::all().cancelled_by(cancel),
+                &StatementPattern::default(),
+                GraphResultFormat::NQuads,
+                std::io::sink(),
+            )
+            .is_err()
+    );
 }

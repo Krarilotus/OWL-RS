@@ -64,7 +64,7 @@ fn store_graph_roundtrip_accepts_official_vcard_turtle_fixture()
     })?;
 
     let graph = service.execute_graph_read(
-        &nrese_store::ReadScope::All,
+        &nrese_store::ReadContext::all(),
         &GraphReadRequest {
             target,
             format: GraphResultFormat::NTriples,

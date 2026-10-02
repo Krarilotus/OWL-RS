@@ -132,7 +132,10 @@ impl AccessControl {
         limits: LoginLimits,
     ) -> Result<Self, AccessError> {
         let quads = store
-            .read_statements(&crate::ReadScope::All, &graph_pattern(STATE_GRAPH), false)
+            .statements(
+                &crate::ReadContext::all().infer(false),
+                &graph_pattern(STATE_GRAPH),
+            )
             .map_err(|error| AccessError::Store(error.to_string()))?;
         let state = rdf::decode(&quads, base);
         let control = Self {
@@ -279,7 +282,10 @@ impl AccessControl {
     pub fn history(&self, limit: usize) -> Result<Vec<ChangeRecord>, AccessError> {
         let quads = self
             .store
-            .read_statements(&crate::ReadScope::All, &graph_pattern(HISTORY_GRAPH), false)
+            .statements(
+                &crate::ReadContext::all().infer(false),
+                &graph_pattern(HISTORY_GRAPH),
+            )
             .map_err(|error| AccessError::Store(error.to_string()))?;
         let mut changes: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for quad in &quads {

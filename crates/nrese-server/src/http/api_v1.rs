@@ -311,7 +311,10 @@ pub async fn session_query(
         .sessions()
         .pending(&session)
         .ok_or_else(|| no_session(&session))?;
-    let pending = super::rdf4j::scoped(ops, &access);
+    let pending = nrese_store::StatementsRequest {
+        session: Some(session.clone()),
+        ..super::rdf4j::scoped(ops, &access)
+    };
     let mut operation = if body.is_empty() {
         super::requests::query_from_url(raw.0.as_deref())?
     } else {
