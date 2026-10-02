@@ -87,7 +87,7 @@ impl Ends for BlockEnds {
 
     fn start(&self, i: usize) -> usize {
         // The first key of a block starts at the block's start, without a second lookup.
-        if i % BLOCK == 0 {
+        if i.is_multiple_of(BLOCK) {
             return self.blocks[2 * (i / BLOCK)] as usize;
         }
         self.end(i - 1)
