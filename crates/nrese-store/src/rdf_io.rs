@@ -111,3 +111,50 @@ pub(crate) fn file_base_iri(path: &Path) -> StoreResult<String> {
             ))
         })
 }
+
+/// Converts the RDF file `input` into `output`, each format taken from its file's
+/// extension, statement by statement (no store involved, any size): `nrese-server convert`.
+/// Blank node labels are kept; a named graph is an error for a format without graphs. The
+/// output is written to `<output>.tmp` and renamed when complete. Returns the statements.
+pub fn convert_file(input: &Path, output: &Path) -> StoreResult<u64> {
+    let format = |path: &Path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(RdfFormat::from_extension)
+            .ok_or_else(|| {
+                StoreError::Configuration(format!(
+                    "cannot infer the RDF format of {} from its extension",
+                    path.display()
+                ))
+            })
+    };
+    let (from, to) = (format(input)?, format(output)?);
+    let parser = RdfParser::from_format(from)
+        .with_base_iri(file_base_iri(input)?)
+        .map_err(|error| StoreError::Configuration(error.to_string()))?;
+    let reader = std::io::BufReader::new(std::fs::File::open(input)?);
+    let partial = output.with_extension(format!(
+        "{}.tmp",
+        output
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+    ));
+    let mut serializer =
+        RdfSerializer::from_format(to).for_writer(std::fs::File::create(&partial)?);
+    let mut statements = 0;
+    let written = (|| -> StoreResult<()> {
+        for quad in parser.for_reader(reader) {
+            serializer.serialize_quad(&quad?)?;
+            statements += 1;
+        }
+        serializer.finish()?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&partial);
+        return Err(error);
+    }
+    std::fs::rename(&partial, output)?;
+    Ok(statements)
+}

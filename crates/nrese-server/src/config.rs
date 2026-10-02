@@ -23,7 +23,7 @@ mod store_env;
 mod test_support;
 pub mod units;
 
-pub use cli::{CliCommand, CliConfig, LoadCommand};
+pub use cli::{CliCommand, CliConfig, ConvertCommand, LoadCommand, QueryCommand};
 
 use ai_env::parse_ai_config;
 use env_names as names;

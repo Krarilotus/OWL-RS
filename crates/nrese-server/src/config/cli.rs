@@ -6,7 +6,11 @@ use anyhow::{Result, bail};
 /// Command line: `nrese-server [--config PATH]` serves;
 /// `nrese-server load [--config PATH] [--replace] [--graph IRI] FILE...` bulk-loads files
 /// into the configured store and exits (the server must not be running on the same data
-/// directory; the engine's directory lock enforces that).
+/// directory; the engine's directory lock enforces that);
+/// `nrese-server query [--config PATH] [--format F] (QUERY | --file PATH)` answers one query
+/// from the configured store on standard output (the same lock);
+/// `nrese-server convert INPUT OUTPUT` converts an RDF file into another format (by the
+/// extensions), without a store.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliConfig {
     pub config_path: Option<PathBuf>,
@@ -21,6 +25,24 @@ pub enum CliCommand {
     /// `check-config`: load and validate the configuration, print the effective settings
     /// (secrets redacted) and exit.
     CheckConfig,
+    Query(QueryCommand),
+    Convert(ConvertCommand),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueryCommand {
+    /// The query text, or the file holding it.
+    pub query: Option<String>,
+    pub file: Option<PathBuf>,
+    /// A results format (`json`, `xml`, `csv`, `tsv`) or, for CONSTRUCT and DESCRIBE, an
+    /// RDF format by its extension (`nt`, `ttl`, `nq`, `trig`, `rdf`, `jsonld`).
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConvertCommand {
+    pub input: PathBuf,
+    pub output: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,6 +69,12 @@ impl CliConfig {
         {
             args.next();
             config.command = CliCommand::CheckConfig;
+        } else if args.peek().is_some_and(|argument| argument == "query") {
+            args.next();
+            config.command = CliCommand::Query(QueryCommand::default());
+        } else if args.peek().is_some_and(|argument| argument == "convert") {
+            args.next();
+            config.command = CliCommand::Convert(ConvertCommand::default());
         }
 
         while let Some(argument) = args.next() {
@@ -66,6 +94,44 @@ impl CliConfig {
                 continue;
             }
 
+            let text = |argument: OsString, what: &str| {
+                argument
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("non-UTF-8 {what}"))
+            };
+            match &mut config.command {
+                CliCommand::Query(query) => {
+                    if argument == "--format" {
+                        let Some(format) = args.next() else {
+                            bail!("missing value for --format");
+                        };
+                        query.format = Some(text(format, "format")?);
+                    } else if argument == "--file" {
+                        let Some(file) = args.next() else {
+                            bail!("missing value for --file");
+                        };
+                        query.file = Some(PathBuf::from(file));
+                    } else if query.query.is_none() && query.file.is_none() {
+                        query.query = Some(text(argument, "query")?);
+                    } else {
+                        bail!("unsupported argument: {:?}", argument);
+                    }
+                    continue;
+                }
+                CliCommand::Convert(convert) => {
+                    if argument.to_str().is_some_and(|raw| raw.starts_with("--")) {
+                        bail!("unsupported argument: {:?}", argument);
+                    } else if convert.input.as_os_str().is_empty() {
+                        convert.input = PathBuf::from(argument);
+                    } else if convert.output.as_os_str().is_empty() {
+                        convert.output = PathBuf::from(argument);
+                    } else {
+                        bail!("`convert` takes an input and an output file");
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             let CliCommand::Load(load) = &mut config.command else {
                 bail!("unsupported argument: {:?}", argument);
             };
@@ -88,6 +154,16 @@ impl CliConfig {
         {
             bail!("`load` needs at least one RDF file");
         }
+        if let CliCommand::Query(query) = &config.command
+            && query.query.is_some() == query.file.is_some()
+        {
+            bail!("`query` needs a query or --file (one of them)");
+        }
+        if let CliCommand::Convert(convert) = &config.command
+            && convert.output.as_os_str().is_empty()
+        {
+            bail!("`convert` takes an input and an output file");
+        }
         Ok(config)
     }
 }
@@ -97,7 +173,7 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{CliCommand, CliConfig, LoadCommand};
+    use super::{CliCommand, CliConfig, ConvertCommand, LoadCommand, QueryCommand};
 
     fn parse(args: &[&str]) -> anyhow::Result<CliConfig> {
         CliConfig::from_args(
@@ -158,6 +234,33 @@ mod tests {
                 graph: Some("http://example.com/g".to_owned()),
             })
         );
+    }
+
+    #[test]
+    fn query_and_convert_take_their_arguments() {
+        let config = parse(&["query", "--format", "tsv", "SELECT * {}"]).expect("cli config");
+        assert_eq!(
+            config.command,
+            CliCommand::Query(QueryCommand {
+                query: Some("SELECT * {}".to_owned()),
+                file: None,
+                format: Some("tsv".to_owned()),
+            })
+        );
+        let config = parse(&["query", "-c", "n.toml", "--file", "q.rq"]).expect("cli config");
+        assert_eq!(config.config_path, Some(PathBuf::from("n.toml")));
+        assert!(parse(&["query"]).is_err());
+        assert!(parse(&["query", "--file", "q.rq", "SELECT * {}"]).is_err());
+        let config = parse(&["convert", "a.ttl", "b.nt"]).expect("cli config");
+        assert_eq!(
+            config.command,
+            CliCommand::Convert(ConvertCommand {
+                input: PathBuf::from("a.ttl"),
+                output: PathBuf::from("b.nt"),
+            })
+        );
+        assert!(parse(&["convert", "a.ttl"]).is_err());
+        assert!(parse(&["convert", "a.ttl", "b.nt", "c.nq"]).is_err());
     }
 
     #[test]
