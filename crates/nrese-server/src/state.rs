@@ -6,6 +6,7 @@ use nrese_store::{MutationPipeline, ReasoningRunRecord, StoreMode, StoreService}
 
 use crate::ai::AiSuggestionService;
 use crate::error::ApiError;
+use crate::http::request_metrics::RequestMetrics;
 use crate::policy::PolicyAction;
 use crate::policy::PolicyConfig;
 use crate::rate_limit::RateLimiter;
@@ -20,6 +21,7 @@ pub struct AppState {
     ai: Arc<AiSuggestionService>,
     deployment_posture: DeploymentPosture,
     rate_limiter: Arc<RateLimiter>,
+    request_metrics: Arc<RequestMetrics>,
 }
 
 impl AppState {
@@ -37,7 +39,13 @@ impl AppState {
             ai: Arc::new(ai),
             deployment_posture,
             rate_limiter: Arc::new(RateLimiter::default()),
+            request_metrics: Arc::default(),
         }
+    }
+
+    /// Request outcomes and latencies, for `/metrics`.
+    pub fn request_metrics(&self) -> &RequestMetrics {
+        &self.request_metrics
     }
 
     pub fn store(&self) -> Arc<StoreService> {

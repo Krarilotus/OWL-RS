@@ -132,6 +132,37 @@ async fn metrics_endpoint_exposes_prometheus_text() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+/// Requests through the app are counted by kind and status class, with their latency.
+#[tokio::test]
+async fn metrics_count_requests_by_kind_and_outcome() -> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app()?;
+    for query in ["ASK { ?s ?p ?o }", "SELECT nonsense"] {
+        let uri = format!(
+            "/dataset/query?query={}",
+            query
+                .replace(' ', "%20")
+                .replace('?', "%3F")
+                .replace('{', "%7B")
+                .replace('}', "%7D")
+        );
+        app.clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+            .await?;
+    }
+    let response = app
+        .oneshot(Request::builder().uri("/metrics").body(Body::empty())?)
+        .await?;
+    let text = support::body_text(response).await?;
+    assert!(
+        text.contains("nrese_http_responses_total{kind=\"query\",status=\"2xx\"} 1"),
+        "{text}"
+    );
+    assert!(text.contains("nrese_http_responses_total{kind=\"query\",status=\"4xx\"} 1"));
+    assert!(text.contains("nrese_http_request_duration_seconds_count{kind=\"query\"} 2"));
+    assert!(text.contains("nrese_index_runs"));
+    Ok(())
+}
+
 #[tokio::test]
 async fn service_description_endpoint_serves_turtle() -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app()?;

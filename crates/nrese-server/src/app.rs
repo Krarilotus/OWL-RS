@@ -3,6 +3,7 @@ use axum::extract::DefaultBodyLimit;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 
+use crate::http::request_metrics::track;
 use crate::http::router;
 use crate::state::AppState;
 
@@ -17,7 +18,9 @@ pub fn build_app(state: AppState) -> Router {
         .max(limits.max_update_bytes)
         .max(limits.max_rdf_upload_bytes);
     let body_limit = largest.saturating_mul(3).saturating_add(64 * 1024);
+    let metrics = axum::middleware::from_fn_with_state(state.clone(), track);
     router(state)
+        .layer(metrics)
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
