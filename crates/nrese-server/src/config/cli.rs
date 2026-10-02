@@ -13,6 +13,8 @@ use anyhow::{Result, bail};
 /// extensions), without a store;
 /// `nrese-server backup DIR` writes an image backup of the configured store into `DIR`
 /// (the same lock: for a running server, `POST /ops/api/admin/dataset/image`);
+/// `nrese-server prune-archive REVISION` removes the archived WAL segments whose records all
+/// come before `REVISION` (safe while the server runs);
 /// `nrese-server restore DIR [--wal LOGDIR]... [--until-revision N]` restores an image
 /// backup into the configured data directory, which must hold no store, and with `--wal`
 /// replays the WAL segments of those directories after it (up to revision `N`).
@@ -36,6 +38,8 @@ pub enum CliCommand {
     Backup(PathBuf),
     /// `restore DIR`: the image backup in `DIR` into the configured data directory.
     Restore(RestoreCommand),
+    /// `prune-archive REVISION`: archived WAL segments before `REVISION` removed.
+    PruneArchive(Option<u64>),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -100,6 +104,12 @@ impl CliConfig {
         } else if args.peek().is_some_and(|argument| argument == "restore") {
             args.next();
             config.command = CliCommand::Restore(RestoreCommand::default());
+        } else if args
+            .peek()
+            .is_some_and(|argument| argument == "prune-archive")
+        {
+            args.next();
+            config.command = CliCommand::PruneArchive(None);
         }
 
         while let Some(argument) = args.next() {
@@ -150,6 +160,17 @@ impl CliConfig {
                         bail!("unsupported argument: {:?}", argument);
                     }
                     *dir = PathBuf::from(argument);
+                    continue;
+                }
+                CliCommand::PruneArchive(revision) => {
+                    if revision.is_some() {
+                        bail!("unsupported argument: {:?}", argument);
+                    }
+                    let text = text(argument, "revision")?;
+                    *revision = Some(
+                        text.parse()
+                            .map_err(|_| anyhow::anyhow!("`prune-archive` takes a revision"))?,
+                    );
                     continue;
                 }
                 CliCommand::Restore(restore) => {
@@ -223,6 +244,9 @@ impl CliConfig {
             && convert.output.as_os_str().is_empty()
         {
             bail!("`convert` takes an input and an output file");
+        }
+        if config.command == CliCommand::PruneArchive(None) {
+            bail!("`prune-archive` takes a revision");
         }
         if let CliCommand::Backup(dir) | CliCommand::Restore(RestoreCommand { backup: dir, .. }) =
             &config.command
@@ -362,6 +386,10 @@ mod tests {
             })
         );
         assert!(parse(&["restore", "/b", "--until-revision", "x"]).is_err());
+        let config = parse(&["prune-archive", "42"]).expect("cli config");
+        assert_eq!(config.command, CliCommand::PruneArchive(Some(42)));
+        assert!(parse(&["prune-archive"]).is_err());
+        assert!(parse(&["prune-archive", "x"]).is_err());
         assert!(parse(&["backup"]).is_err());
         assert!(parse(&["restore", "a", "b"]).is_err());
     }

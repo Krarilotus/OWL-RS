@@ -113,3 +113,37 @@ fn an_image_and_the_log_restore_a_later_revision() {
     let (_, at) = nrese_store::restore_until(&dir, &target, &logs, None).unwrap();
     assert_eq!(at, *revisions.last().unwrap());
 }
+
+/// Pruning the archive keeps what a restore after a revision needs.
+#[test]
+fn pruning_the_archive_keeps_the_segments_after_a_revision() {
+    let archive = tempdir().unwrap();
+    for first in [1u64, 5, 9, 14] {
+        fs::write(archive.path().join(format!("{first:020}.wal")), b"x").unwrap();
+    }
+    fs::write(archive.path().join("other.txt"), b"x").unwrap();
+    // Revision 9 on: the segment from 9 and the newest stay; 1..=4 and 5..=8 go.
+    assert_eq!(
+        nrese_store::prune_wal_archive(archive.path(), 9).unwrap(),
+        2
+    );
+    let mut left: Vec<String> = fs::read_dir(archive.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        [
+            "00000000000000000009.wal",
+            "00000000000000000014.wal",
+            "other.txt"
+        ]
+    );
+    // The newest segment always stays.
+    assert_eq!(
+        nrese_store::prune_wal_archive(archive.path(), 100).unwrap(),
+        1
+    );
+    assert!(archive.path().join("00000000000000000014.wal").exists());
+}

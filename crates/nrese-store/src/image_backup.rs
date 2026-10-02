@@ -208,3 +208,33 @@ pub fn restore_image(backup: &Path, data_dir: &Path) -> StoreResult<ImageManifes
     fs::rename(&partial, &target).map_err(|e| io(e, &target))?;
     Ok(manifest)
 }
+
+/// Removes from `archive` (a store's `wal-archive/`) the segments whose records all come
+/// before `revision`: what an image backup at `revision - 1` or later makes unneeded. The
+/// newest segment stays. Safe while the store runs (it only adds to the archive). Returns
+/// the number of segments removed.
+pub fn prune_wal_archive(archive: &Path, revision: u64) -> StoreResult<usize> {
+    let mut segments: Vec<(u64, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(archive).map_err(|e| io(e, archive))? {
+        let path = entry.map_err(|e| io(e, archive))?.path();
+        let first = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".wal"))
+            .and_then(|stem| stem.parse::<u64>().ok());
+        if let Some(first) = first {
+            segments.push((first, path));
+        }
+    }
+    segments.sort_unstable_by_key(|(first, _)| *first);
+    let mut removed = 0;
+    for pair in segments.windows(2) {
+        // A segment's records end where the next segment's begin.
+        let ((_, path), (next_first, _)) = (&pair[0], &pair[1]);
+        if *next_first <= revision {
+            fs::remove_file(path).map_err(|e| io(e, path))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
