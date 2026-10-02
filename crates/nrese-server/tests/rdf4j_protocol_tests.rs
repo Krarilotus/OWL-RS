@@ -701,3 +701,71 @@ async fn repository_configurations_set_title_and_reasoning() {
     assert!(results.contains("true"), "{results}");
     assert!(!inferred(app.clone(), "plain").await);
 }
+
+/// User rules in a repository's configuration reason in that repository only.
+#[tokio::test]
+async fn repository_configurations_carry_user_rules() {
+    const CONFIG: &str = "@prefix config: <tag:rdf4j.org,2023:config/> .\n\
+        @prefix nrc: <https://nrese.dev/ns/config#> .\n\
+        [] config:rep.id \"family\" ;\n\
+           nrc:rules \"\"\"@prefix ex: <http://example.com/> .\n\
+             { ?x ex:parent ?y } => { ?y ex:child ?x } .\"\"\" .\n";
+    let app = test_app().unwrap();
+    let (status, text) = send(
+        &app,
+        Method::PUT,
+        "/repositories/family",
+        Some("text/turtle"),
+        None,
+        CONFIG,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+    let data = "<http://example.com/a> <http://example.com/parent> <http://example.com/b> .";
+    for repository in ["family", "nrese"] {
+        let (status, _) = send(
+            &app,
+            Method::POST,
+            &format!("/repositories/{repository}/statements"),
+            Some("text/turtle"),
+            None,
+            data,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let ask = |repository: &'static str| {
+        let app = app.clone();
+        async move {
+            let (_, results) = send(
+                &app,
+                Method::GET,
+                &format!(
+                    "/repositories/{repository}?{}",
+                    encode(&[(
+                        "query",
+                        "ASK { <http://example.com/b> <http://example.com/child> <http://example.com/a> }"
+                    )])
+                ),
+                None,
+                Some("application/sparql-results+json"),
+                "",
+            )
+            .await;
+            results.contains("true")
+        }
+    };
+    assert!(ask("family").await);
+    assert!(!ask("nrese").await);
+    // Broken rules: the repository isn't created.
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        "/repositories/broken",
+        Some("text/turtle"),
+        None,
+        "[] <https://nrese.dev/ns/config#rules> \"{ ?x } =>\" .",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
