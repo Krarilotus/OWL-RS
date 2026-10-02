@@ -92,8 +92,8 @@ pub async fn execute_query_in(
     .await
 }
 
-/// The JSON form of an EXPLAIN: the executor, totals, and one object per operator in
-/// evaluation order (`depth` gives the nesting).
+/// The JSON form of an EXPLAIN: the executor, the rewrites that changed the query, totals,
+/// and one object per operator in evaluation order (`depth` gives the nesting).
 fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value {
     let steps: Vec<serde_json::Value> = explanation
         .steps
@@ -111,6 +111,7 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
         .collect();
     serde_json::json!({
         "executor": explanation.executor,
+        "rewrites": explanation.rewrites,
         "rows": explanation.rows,
         "micros": explanation.micros,
         "steps": steps,

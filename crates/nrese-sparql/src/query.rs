@@ -116,6 +116,9 @@ pub struct PlanStep {
 pub struct Explanation {
     /// `native`: the executor (one; the field stays for the report's format).
     pub executor: &'static str,
+    /// The rewrites that changed the query before it ran, in the order applied:
+    /// `triple-terms`, `join-groups`, `filter-pushdown`, `ask-limit`.
+    pub rewrites: Vec<&'static str>,
     pub steps: Vec<PlanStep>,
     /// Solutions (1 or 0 for ASK); CONSTRUCT and DESCRIBE count triples.
     pub rows: u64,
@@ -131,9 +134,10 @@ pub fn explain_query<V: ReadView>(
 ) -> Result<Explanation, QueryEvaluationError> {
     let start = std::time::Instant::now();
     let snapshot = view.evaluation_snapshot();
-    let (steps, rows) = crate::native::explain(&snapshot, query, options)?;
+    let (rewrites, steps, rows) = crate::native::explain(&snapshot, query, options)?;
     Ok(Explanation {
         executor: "native",
+        rewrites,
         steps,
         rows,
         micros: start.elapsed().as_micros() as u64,

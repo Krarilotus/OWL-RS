@@ -139,7 +139,7 @@ pub(crate) fn evaluate<'a>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
-    let (pattern, form) = native_pattern(query, options)?;
+    let (pattern, form, _) = native_pattern(query, options)?;
     let ctx = Context::new(&snapshot, options, query_dataset(query), query_base(query));
     let pattern = match &options.pre_bound {
         Some(values) => {
@@ -186,14 +186,15 @@ pub(crate) fn evaluate<'a>(
     )))
 }
 
-/// Runs `query`, recording each operator ([`PlanStep`]); returns the steps and the number
-/// of solutions (triples for CONSTRUCT and DESCRIBE).
+/// Runs `query`, recording each operator ([`PlanStep`]); returns the rewrites that changed
+/// the query ([`optimise`]), the steps and the number of solutions (triples for CONSTRUCT
+/// and DESCRIBE).
 pub(crate) fn explain(
     snapshot: &Snapshot,
     query: &Query,
     options: &QueryOptions,
-) -> Result<(Vec<PlanStep>, u64), QueryEvaluationError> {
-    let (pattern, form) = native_pattern(query, options)?;
+) -> Result<(Vec<&'static str>, Vec<PlanStep>, u64), QueryEvaluationError> {
+    let (pattern, form, rewrites) = native_pattern(query, options)?;
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     ctx.trace = Some(RefCell::default());
     let solutions = ctx.eval(&pattern)?;
@@ -206,7 +207,7 @@ pub(crate) fn explain(
             construct(snapshot, ctx.computed.into_inner(), solutions, template).count()
         }
     };
-    Ok((steps, rows as u64))
+    Ok((rewrites, steps, rows as u64))
 }
 
 pub use output::ResultsFormat;
@@ -222,7 +223,7 @@ pub(crate) fn write_results(
     version: Option<&'static str>,
     out: &mut dyn std::io::Write,
 ) -> Option<Result<(), crate::query::WriteResultsError>> {
-    let (pattern, form) = match native_pattern(query, options) {
+    let (pattern, form, _) = match native_pattern(query, options) {
         Ok(native) => native,
         Err(error) => return Some(Err(error.into())),
     };
@@ -299,7 +300,7 @@ pub(crate) fn delete_insert(
     if let Some(what) = unsupported_part(pattern) {
         return Err(QueryEvaluationError::Unsupported(what));
     }
-    let pattern = pushdown::push_filters(pattern.clone());
+    let pattern = optimise(pattern.clone(), &mut Vec::new());
     let ctx = Context::new(snapshot, options, using, base);
     let solutions = ctx.eval(&pattern)?;
     let computed = ctx.computed.into_inner();
@@ -370,12 +371,12 @@ enum Form<'q> {
     Describe,
 }
 
-/// The pattern of a query the native executor runs, as it runs it (filters pushed down,
-/// [`pushdown`]), and the query form.
+/// The pattern of a query the native executor runs, as it runs it ([`optimise`]), the
+/// query form, and the rewrites that changed it.
 fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
-) -> Result<(GraphPattern, Form<'q>), QueryEvaluationError> {
+) -> Result<(GraphPattern, Form<'q>, Vec<&'static str>), QueryEvaluationError> {
     let (pattern, form) = match query {
         Query::Select { pattern, .. } => (pattern, Form::Select),
         Query::Ask { pattern, .. } => (pattern, Form::Ask),
@@ -384,10 +385,12 @@ fn native_pattern<'q>(
         } => (pattern, Form::Construct(template)),
         Query::Describe { pattern, .. } => (pattern, Form::Describe),
     };
+    let mut rewrites = Vec::new();
     // SPARQL 1.2 triple-term patterns with variables, as plain algebra.
     let rewritten;
     let pattern = if triple_terms::has_open(pattern) {
         rewritten = triple_terms::rewrite(pattern);
+        rewrites.push("triple-terms");
         &rewritten
     } else {
         pattern
@@ -404,18 +407,45 @@ fn native_pattern<'q>(
     let pattern = if options.as_written {
         pattern.clone()
     } else {
-        pushdown::push_filters(crate::plan::rewrite(pattern))
+        optimise(pattern.clone(), &mut rewrites)
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
-        Form::Ask if !options.as_written => GraphPattern::Slice {
-            inner: Box::new(pattern),
-            start: 0,
-            length: Some(1),
-        },
+        Form::Ask if !options.as_written => {
+            rewrites.push("ask-limit");
+            GraphPattern::Slice {
+                inner: Box::new(pattern),
+                start: 0,
+                length: Some(1),
+            }
+        }
         _ => pattern,
     };
-    Ok((pattern, form))
+    Ok((pattern, form, rewrites))
+}
+
+/// The rewrites the executor applies to a query's (or an update's) pattern, in order;
+/// `fired` gets the name of each that changed it, for EXPLAIN.
+///
+/// - `join-groups`: groups joined to each other become one basic graph pattern, so their
+///   triple patterns are ordered together ([`crate::plan::Plan::flatten_joins`]).
+/// - `filter-pushdown`: each filter moves to the smallest sub-pattern that binds its
+///   variables ([`pushdown`]).
+fn optimise(pattern: GraphPattern, fired: &mut Vec<&'static str>) -> GraphPattern {
+    type Pass = fn(&GraphPattern) -> GraphPattern;
+    let passes: [(&'static str, Pass); 2] = [
+        ("join-groups", crate::plan::rewrite),
+        ("filter-pushdown", |pattern| {
+            pushdown::push_filters(pattern.clone())
+        }),
+    ];
+    passes.into_iter().fold(pattern, |pattern, (name, pass)| {
+        let rewritten = pass(&pattern);
+        if rewritten != pattern {
+            fired.push(name);
+        }
+        rewritten
+    })
 }
 
 /// A description of the first part of `pattern` the executor doesn't implement.

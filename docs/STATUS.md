@@ -54,7 +54,7 @@ Last updated: 2 October 2026, branch `refactor/engine-v2`.
 | Design | done | [The query plan](plan/2026-10-02-plan-ir.md): a migration in steps |
 | Algebra walker | done | `nrese_sparql_syntax::visit`; the executor's plain searches use it |
 | Step 1: the logical plan | done | `nrese_sparql::plan`: built from the algebra and lowered back, the identity on every random query of the differential tests |
-| Step 2: rewrites on the plan | started | Joins of groups flattened into one basic graph pattern before filter pushdown (a join commutes; inputs with an `ORDER BY` keep their place). Pushdown and the remaining special cases as named rewrites: open |
+| Step 2: rewrites on the plan | started | Named rewrites, in order, for queries and update `WHERE`s alike: `join-groups` (groups joined to each other become one basic graph pattern; inputs with an `ORDER BY` keep their place), `filter-pushdown`; EXPLAIN lists those that changed the query (`rewrites`). Open: pushdown on the plan itself, and the executor's match-guard strategies (paths from their bound end, limit placement, bind joins to `SERVICE`) as rewrites |
 | Steps 3–4: physical plan, executor on the plan | open | |
 | `nrese-sparql` split, numeric promotion once | open | |
 
