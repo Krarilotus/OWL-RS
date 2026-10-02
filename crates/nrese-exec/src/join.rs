@@ -542,8 +542,18 @@ pub fn left_join(
     limit: impl Into<RowLimit>,
 ) -> Result<IdTable, TooManyRows> {
     let width = left.width() + right_payload(right.width(), right_keys).len();
-    let table = (!left_keys.is_empty()).then(|| BuildTable::new(right, right_keys));
     let limit = Limit::new(limit);
+    // One key, both sides sorted on it, no filter: a merge (DBpedia q9 joined 100 k
+    // politicians to 363 k death dates by hashing the dates).
+    if accept.is_none()
+        && let ([lk], [rk]) = (left_keys, right_keys)
+        && left.is_sorted_on(left_keys)
+        && right.is_sorted_on(right_keys)
+    {
+        let out = sorted_left_join(left, right, *lk, *rk, &limit)?;
+        return Ok(out.assume_sorted_by(left_keys.to_vec()));
+    }
+    let table = (!left_keys.is_empty()).then(|| BuildTable::new(right, right_keys));
     let inputs = LeftJoin {
         left,
         right,
@@ -563,6 +573,70 @@ pub fn left_join(
     } else {
         out
     })
+}
+
+/// [`left_join`] of inputs sorted on one key each, without a filter: the pairs of row
+/// numbers (a left row without a match pairs with none), then the output a column at a
+/// time.
+fn sorted_left_join(
+    left: &IdTable,
+    right: &IdTable,
+    lk: usize,
+    rk: usize,
+    limit: &Limit,
+) -> Result<IdTable, TooManyRows> {
+    assert!(
+        left.len() < END as usize && right.len() < END as usize,
+        "join input exceeds u32 rows"
+    );
+    let (a, b) = (left.column(lk), right.column(rk));
+    let (mut lefts, mut rights): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let (mut l, mut r, mut pending) = (0, 0, 0);
+    while l < a.len() {
+        let key = a[l];
+        let l_end = (l + 1..a.len()).find(|&x| a[x] != key).unwrap_or(a.len());
+        while r < b.len() && b[r] < key {
+            r += 1;
+        }
+        let r_end = (r..b.len()).find(|&x| b[x] != key).unwrap_or(b.len());
+        for li in l..l_end {
+            if r == r_end {
+                lefts.push(li as u32);
+                rights.push(END);
+            }
+            for ri in r..r_end {
+                lefts.push(li as u32);
+                rights.push(ri as u32);
+            }
+        }
+        pending += (l_end - l) * (r_end - r).max(1);
+        if pending >= LIMIT_STEP {
+            limit.grow(std::mem::take(&mut pending))?;
+        }
+        l = l_end;
+        r = r_end;
+    }
+    limit.grow(pending)?;
+    let payload = right_payload(right.width(), &[rk]);
+    if left.width() + payload.len() == 0 {
+        return Ok(IdTable::from_rows(
+            0,
+            std::iter::repeat_n(&[][..], lefts.len()),
+        ));
+    }
+    let columns = left
+        .columns()
+        .iter()
+        .map(|column| lefts.iter().map(|&i| column[i as usize]).collect())
+        .chain(payload.iter().map(|&c| {
+            let column = right.column(c);
+            rights
+                .iter()
+                .map(|&i| if i == END { UNDEF } else { column[i as usize] })
+                .collect()
+        }))
+        .collect();
+    Ok(IdTable::from_columns(columns))
 }
 
 /// The inputs of a [`left_join`], shared by its parallel parts.
