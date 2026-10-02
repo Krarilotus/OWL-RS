@@ -5027,3 +5027,45 @@ fn a_limit_cutting_through_equal_values_keeps_the_next_key() {
         );
     }
 }
+
+/// A path with both ends bound has as many solutions as its bag holds the pair: an
+/// alternative both sides of which hold counts twice, a sequence once per middle node
+/// (SPARQL 1.1 §18.4; found by the fuzz campaign, seed 1036).
+#[test]
+fn a_path_between_two_constants_keeps_its_multiplicity() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (s, p, o) in [
+        ("a", "p", "b"),
+        ("a", "q", "b"),
+        ("a", "p", "m1"),
+        ("a", "p", "m2"),
+        ("m1", "q", "b"),
+        ("m2", "q", "b"),
+    ] {
+        tx.insert(Quad::new(ex(s), ex(p), ex(o), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for (path, count) in [
+        (format!("<{EX}p>|<{EX}q>"), 2),
+        (format!("<{EX}p>/<{EX}q>"), 2),
+        (format!("(<{EX}p>|<{EX}q>)+"), 1),
+        (format!("!(<{EX}r>)"), 2),
+        (format!("^(<{EX}p>|<{EX}q>)"), 0),
+    ] {
+        let text = format!("SELECT * WHERE {{ <{EX}a> {path} <{EX}b> }}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        assert!(runs_natively(&query));
+        let native = rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        );
+        let expected = rows(
+            reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        );
+        assert_eq!(native.len(), count, "{text}");
+        assert_same_rows(&native, &expected, &text);
+    }
+}
