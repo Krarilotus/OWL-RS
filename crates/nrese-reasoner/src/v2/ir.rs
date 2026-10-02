@@ -71,7 +71,7 @@ impl Guard {
             },
             Guard::NotIn(term, low, high) => value(*term).is_none_or(|v| v < *low || v > *high),
             Guard::SameList(a, b, index) => match (value(*a), value(*b)) {
-                (Some(a), Some(b)) => a < b && index.0.together(a, b),
+                (Some(a), Some(b)) => a < b && index.together(a, b),
                 _ => true,
             },
         }
@@ -79,7 +79,7 @@ impl Guard {
 }
 
 /// Which lists each term is a member of, for [`Guard::SameList`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct ListIndex {
     /// Each member's list numbers, sorted.
     lists: std::collections::HashMap<u64, Vec<u32>>,
@@ -120,13 +120,38 @@ impl ListIndex {
     }
 }
 
-/// A [`ListIndex`] shared by the rules that ask it; compared by identity.
+/// A [`ListIndex`] shared by the rules that ask it; compared by its contents, so that
+/// the rule instantiated again from the same lists (a commit that touches other list
+/// facts re-instantiates every list rule) is known as the same rule, not added again.
 #[derive(Debug, Clone)]
-pub struct SharedListIndex(pub std::sync::Arc<ListIndex>);
+pub struct SharedListIndex {
+    index: std::sync::Arc<ListIndex>,
+    /// A hash of the contents, computed once.
+    fingerprint: u64,
+}
+
+impl SharedListIndex {
+    pub fn new(index: ListIndex) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut members: Vec<(&u64, &Vec<u32>)> = index.lists.iter().collect();
+        members.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (index.count, members).hash(&mut hasher);
+        Self {
+            fingerprint: hasher.finish(),
+            index: std::sync::Arc::new(index),
+        }
+    }
+
+    pub fn together(&self, a: u64, b: u64) -> bool {
+        self.index.together(a, b)
+    }
+}
 
 impl PartialEq for SharedListIndex {
     fn eq(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.0, &other.0)
+        std::sync::Arc::ptr_eq(&self.index, &other.index)
+            || (self.fingerprint == other.fingerprint && self.index == other.index)
     }
 }
 
@@ -134,7 +159,7 @@ impl Eq for SharedListIndex {}
 
 impl std::hash::Hash for SharedListIndex {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::ptr::hash(std::sync::Arc::as_ptr(&self.0), state);
+        self.fingerprint.hash(state);
     }
 }
 
