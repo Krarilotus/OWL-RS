@@ -9,6 +9,8 @@ use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
 const PREFIXES: &str = "PREFIX bds: <http://www.bigdata.com/rdf/search#> \
+                        PREFIX text: <http://jena.apache.org/text#> \
+                        PREFIX luc: <http://www.ontotext.com/owlim/lucene#> \
                         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
                         PREFIX ex: <http://example.com/> ";
 
@@ -244,4 +246,94 @@ fn search_results_seed_the_joins() {
         "{steps:?}"
     );
     assert_eq!(explanation.rows, 1);
+}
+
+fn sorted(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    rows.sort();
+    rows
+}
+
+fn table(rows: &[&[&str]]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|row| row.iter().map(|v| (*v).to_owned()).collect())
+        .collect()
+}
+
+/// `bds:stem`: words match by their stem in the language given.
+#[test]
+fn stemmed_search() {
+    let engine = engine();
+    let plain = QueryOptions::default();
+    let query = |stem: &str| {
+        sorted(rows(
+            &engine,
+            &format!("SELECT ?o WHERE {{ ?o bds:search \"bridging\" {stem} }}"),
+            &plain,
+        ))
+    };
+    assert!(query("").is_empty());
+    assert_eq!(
+        query("; bds:stem \"en\""),
+        table(&[&["Bridge, bridge and more bridges"], &["Tower Bridge"]])
+    );
+}
+
+/// Jena's `text:query`: subjects by their literals, with the score and the literal, a
+/// property, `AND`, a language, a limit and `NOT`.
+#[test]
+fn jena_text_query() {
+    let engine = engine();
+    let plain = QueryOptions::default();
+    let query = |q: &str| sorted(rows(&engine, q, &plain));
+    // Any property; the literal of another graph and the unused one are not found.
+    assert_eq!(
+        query("SELECT ?s WHERE { ?s text:query \"bridge\" }"),
+        table(&[&["bells"], &["bridge"]])
+    );
+    // A property, every word, the score.
+    assert_eq!(
+        query(
+            "SELECT ?s ?score WHERE { (?s ?score) text:query (rdfs:label \"tower AND bridge\") }"
+        ),
+        table(&[&["bridge", "1"]])
+    );
+    // The literal, in a language; another language finds nothing.
+    assert_eq!(
+        query(
+            "SELECT ?s ?l WHERE { (?s ?score ?l) text:query (rdfs:label \"london\" \"lang:en\") }"
+        ),
+        table(&[&["tower", "Tower of London"]])
+    );
+    assert!(query("SELECT ?s WHERE { ?s text:query (\"tower\" \"lang:de\") }").is_empty());
+    // A limit on the matched literals; a property the labels don't have.
+    assert_eq!(
+        query("SELECT ?s WHERE { ?s text:query (\"bridge\" 1) }").len(),
+        1
+    );
+    assert!(query("SELECT ?s WHERE { ?s text:query (ex:other \"bridge\") }").is_empty());
+    // NOT drops a word; a prefix; joins with the rest of the pattern.
+    assert_eq!(
+        query("SELECT ?s WHERE { ?s text:query \"tower NOT bridge\" }"),
+        table(&[&["bridge"], &["tower"]])
+    );
+    assert_eq!(
+        query("SELECT ?s WHERE { ?s text:query \"brit*\" ; rdfs:label ?l }"),
+        table(&[&["museum"]])
+    );
+}
+
+/// GraphDB's legacy Lucene predicates: resources by their literals, and the score.
+#[test]
+fn graphdb_lucene_predicates() {
+    let engine = engine();
+    let plain = QueryOptions::default();
+    let query = |q: &str| sorted(rows(&engine, q, &plain));
+    assert_eq!(
+        query("SELECT ?x WHERE { ?x luc:labels \"bridge\" }"),
+        table(&[&["bells"], &["bridge"]])
+    );
+    assert_eq!(
+        query("SELECT ?x ?s WHERE { ?x luc:labels \"tower AND bridge\" ; luc:score ?s }"),
+        table(&[&["bridge", "1"]])
+    );
 }
