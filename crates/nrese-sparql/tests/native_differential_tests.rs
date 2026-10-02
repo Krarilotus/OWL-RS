@@ -77,6 +77,16 @@ fn update_engine(
 struct Rng(u64);
 
 impl Rng {
+    /// The generator of a test's base seed, varied by `NRESE_FUZZ_SEED` (a number) for bug
+    /// hunts over many seeds; without it, the same cases on every run.
+    fn seeded(base: u64) -> Self {
+        let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
+            .ok()
+            .and_then(|seed| seed.trim().parse().ok())
+            .unwrap_or(0);
+        Self(base ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+    }
+
     fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
@@ -585,7 +595,7 @@ fn limited(text: &str) -> Option<usize> {
 
 #[test]
 fn native_results_equal_the_reference_on_random_queries() {
-    let mut rng = Rng(20_260_927);
+    let mut rng = Rng::seeded(20_260_927);
     let (mut checked, mut fallbacks) = (0, Vec::new());
     let mut with_solutions = 0;
     let dump = Dump::new("random");
@@ -772,7 +782,7 @@ fn filtered_group(rng: &mut Rng) -> String {
 /// against this test.
 #[test]
 fn pushed_filters_equal_the_reference() {
-    let mut rng = Rng(20_260_930);
+    let mut rng = Rng::seeded(20_260_930);
     let (mut checked, mut with_solutions, mut fallbacks) = (0, 0, 0);
     let oracle = QueryOptions {
         ..QueryOptions::default()
@@ -922,7 +932,7 @@ fn paths_from_bound_values_equal_the_reference() {
         "<P0>/<P1>/^<P0>",
         "(<P2>|<P2>)/<P0>?",
     ];
-    let mut rng = Rng(20_261_001);
+    let mut rng = Rng::seeded(20_261_001);
     let (mut checked, mut with_solutions) = (0, 0);
     for dataset_case in 0..50 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -1360,7 +1370,7 @@ fn year_bounds_equal_the_reference() {
 /// cycles and self-loops, in the default graph, a named graph and the merge of graphs.
 #[test]
 fn open_closures_and_their_counts_equal_the_reference() {
-    let mut rng = Rng(20_261_001);
+    let mut rng = Rng::seeded(20_261_001);
     for round in 0..12 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
@@ -1573,7 +1583,7 @@ fn computed_query(rng: &mut Rng) -> (String, bool) {
 /// Queries over computed values give the reference evaluator's results: see [`computed_query`].
 #[test]
 fn computed_values_equal_the_reference() {
-    let mut rng = Rng(20_261_002);
+    let mut rng = Rng::seeded(20_261_002);
     let (mut checked, mut with_solutions, mut fallbacks) = (0, 0, 0);
     let oracle = QueryOptions {
         ..QueryOptions::default()
@@ -1731,7 +1741,7 @@ fn set_query(rng: &mut Rng) -> (String, bool) {
 /// Mutation-checked.
 #[test]
 fn duplicate_insensitive_queries_equal_both_evaluations() {
-    let mut rng = Rng(20_261_003);
+    let mut rng = Rng::seeded(20_261_003);
     let (mut checked, mut with_solutions) = (0, 0);
     let as_written = QueryOptions {
         as_written: true,
@@ -1796,7 +1806,7 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
 /// kernels have their own test against the definitions.
 #[test]
 fn joins_on_unbound_variables_equal_the_reference() {
-    let mut rng = Rng(20_261_004);
+    let mut rng = Rng::seeded(20_261_004);
     let (mut checked, mut with_solutions) = (0, 0);
     let oracle = QueryOptions {
         ..QueryOptions::default()
@@ -1944,7 +1954,7 @@ fn count_star_of_one_pattern_reads_the_index() {
 /// variable predicate) over dense graphs: the worst-case-optimal join equals the reference evaluator.
 #[test]
 fn cyclic_bgps_equal_the_reference() {
-    let mut rng = Rng(20_260_929);
+    let mut rng = Rng::seeded(20_260_929);
     let oracle = QueryOptions {
         ..QueryOptions::default()
     };
@@ -2368,7 +2378,7 @@ fn construct_equals_the_reference() {
     use nrese_sparql_syntax::term::{BlankNode, NamedNodePattern, TermPattern, TriplePattern};
     use nrese_sparql_syntax::{Query, algebra::GraphPattern};
 
-    let mut rng = Rng(20_260_929);
+    let mut rng = Rng::seeded(20_260_929);
     let var = |name: &str| TermPattern::Variable(nrese_rdf::Variable::new_unchecked(name));
     let template = vec![
         TriplePattern {
@@ -2439,7 +2449,7 @@ fn construct_equals_the_reference() {
 /// graph variable shared across GRAPH blocks and grouped on) equal the reference evaluator.
 #[test]
 fn graph_patterns_equal_the_reference() {
-    let mut rng = Rng(20_260_930);
+    let mut rng = Rng::seeded(20_260_930);
     let (mut checked, mut fallbacks) = (0, 0);
     for _ in 0..80 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -2535,7 +2545,7 @@ fn string_functions_casts_and_group_concat_equal_the_reference() {
         "<http://www.w3.org/2001/XMLSchema#dateTime>(\"2020-01-01T10:00:00Z\")",
         "<http://www.w3.org/2001/XMLSchema#integer>(STR(?b))",
     ];
-    let mut rng = Rng(20_260_931);
+    let mut rng = Rng::seeded(20_260_931);
     let oracle = QueryOptions {
         ..QueryOptions::default()
     };
@@ -2645,7 +2655,7 @@ fn contents(engine: &Engine) -> Vec<String> {
 #[test]
 fn native_updates_equal_the_reference() {
     use nrese_sparql::UpdateOptions;
-    let mut rng = Rng(20_260_932);
+    let mut rng = Rng::seeded(20_260_932);
     let templates = [
         (
             "DELETE { ?a ?p ?b }",
@@ -2775,7 +2785,7 @@ fn direct_results_equal_the_results_serialiser() {
         Literal::new_typed_literal("NaN", xsd::DOUBLE).into(),
         Literal::new_typed_literal("1", xsd::BOOLEAN).into(),
     ];
-    let mut rng = Rng(20_260_933);
+    let mut rng = Rng::seeded(20_260_933);
     let mut checked = 0;
     for _ in 0..60 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -2964,7 +2974,7 @@ fn load_spread_over_graphs(engine: &Engine, rng: &mut Rng) {
 /// statement held by several graphs counts once in both.
 #[test]
 fn the_merged_default_graph_equals_the_reference() {
-    let mut rng = Rng(20_260_933);
+    let mut rng = Rng::seeded(20_260_933);
     let (mut checked, mut fallbacks, mut native_runs, mut native_runs_plain) = (0, 0, 0, 0);
     for dataset_case in 0..120 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -3197,7 +3207,7 @@ fn merged_default_graph_shortcuts_count_statements_once() {
 #[test]
 fn updates_over_the_merged_default_graph_equal_the_reference() {
     use nrese_sparql::UpdateOptions;
-    let mut rng = Rng(20_260_934);
+    let mut rng = Rng::seeded(20_260_934);
     let templates = [
         (
             "DELETE { ?a ?p ?b }",
@@ -3430,7 +3440,7 @@ fn protocol_dataset(rng: &mut Rng) -> Option<nrese_sparql::QueryDatasetSpecifica
 /// with the store's default graph plain or merged.
 #[test]
 fn datasets_and_graph_patterns_equal_the_reference() {
-    let mut rng = Rng(20_260_935);
+    let mut rng = Rng::seeded(20_260_935);
     let (mut checked, mut with_solutions, mut with_dataset, mut fallbacks) = (0, 0, 0, 0);
     for dataset_case in 0..100 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -3726,7 +3736,7 @@ fn a_dataset_is_what_the_query_names() {
 #[test]
 fn updates_with_a_dataset_equal_the_reference() {
     use nrese_sparql::UpdateOptions;
-    let mut rng = Rng(20_260_936);
+    let mut rng = Rng::seeded(20_260_936);
     let (mut checked, mut changed) = (0, 0);
     for _ in 0..60 {
         let engines = [
@@ -3898,7 +3908,7 @@ fn exists_pattern(rng: &mut Rng) -> String {
 /// and on the native executor wherever the correlation allows.
 #[test]
 fn exists_equal_the_reference() {
-    let mut rng = Rng(20_260_937);
+    let mut rng = Rng::seeded(20_260_937);
     let (mut checked, mut native_runs, mut with_solutions) = (0, 0, 0);
     for _ in 0..80 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -3976,7 +3986,7 @@ fn exists_equal_the_reference() {
 #[test]
 fn describe_equals_the_reference() {
     use nrese_rdf::BlankNode;
-    let mut rng = Rng(20_260_938);
+    let mut rng = Rng::seeded(20_260_938);
     let mut checked = 0;
     for _ in 0..40 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -4036,7 +4046,7 @@ fn describe_equals_the_reference() {
 /// properties SPARQL gives them (fresh per call, or one value per query).
 #[test]
 fn the_remaining_functions_run_natively() {
-    let mut rng = Rng(20_260_939);
+    let mut rng = Rng::seeded(20_260_939);
     let engine = Engine::new(EngineConfig::default()).unwrap();
     load_spread_over_graphs(&engine, &mut rng);
     let snapshot = engine.snapshot();
@@ -4173,7 +4183,7 @@ fn skewed_dataset(rng: &mut Rng) -> Vec<Quad> {
 /// index probes into the common patterns.
 #[test]
 fn sideways_joins_equal_the_reference() {
-    let mut rng = Rng(20_260_940);
+    let mut rng = Rng::seeded(20_260_940);
     let (mut checked, mut probed) = (0, 0);
     for _ in 0..4 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -4252,7 +4262,7 @@ fn sideways_joins_equal_the_reference() {
 #[test]
 fn multi_operation_updates_equal_the_reference() {
     use nrese_sparql::UpdateOptions;
-    let mut rng = Rng(20_260_941);
+    let mut rng = Rng::seeded(20_260_941);
     let mut changed = 0;
     for _ in 0..40 {
         let data = random_dataset(&mut rng);
@@ -4318,7 +4328,7 @@ fn multi_operation_updates_equal_the_reference() {
 #[test]
 fn identity_classes_shrink_detached_optionals() {
     let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
-    let mut rng = Rng(20_260_942);
+    let mut rng = Rng::seeded(20_260_942);
     let (mut checked, mut shrunk) = (0, 0);
     for _ in 0..12 {
         // Classes of 1 to 5 identities; facts between classes, replicated.
@@ -4559,7 +4569,7 @@ fn rdf12_pattern(rng: &mut Rng, depth: u32) -> String {
 /// `FILTER`, `BIND` and `ORDER BY`.
 #[test]
 fn triple_terms_and_base_directions_equal_the_reference() {
-    let mut rng = Rng(20_261_001);
+    let mut rng = Rng::seeded(20_261_001);
     let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
     let mut checked = 0;
     let mut with_solutions = 0;
@@ -4673,7 +4683,7 @@ fn triple_terms_and_base_directions_equal_the_reference() {
 /// reference evaluator.
 #[test]
 fn grouped_cross_products_equal_the_reference() {
-    let mut rng = Rng(20_261_002);
+    let mut rng = Rng::seeded(20_261_002);
     let (mut checked, mut with_solutions) = (0, 0);
     for dataset_case in 0..40 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -4767,7 +4777,7 @@ fn grouped_cross_products_equal_the_reference() {
 /// `"01"^^xsd:integer`, `"1"^^xsd:int`). Equal to the reference evaluator.
 #[test]
 fn equalities_across_patterns_equal_the_reference() {
-    let mut rng = Rng(20_261_005);
+    let mut rng = Rng::seeded(20_261_005);
     let (mut checked, mut with_solutions) = (0, 0);
     for dataset_case in 0..40 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -4829,7 +4839,7 @@ fn equalities_across_patterns_equal_the_reference() {
 /// reference evaluator.
 #[test]
 fn streamed_groups_equal_the_reference() {
-    let mut rng = Rng(20_261_006);
+    let mut rng = Rng::seeded(20_261_006);
     let (mut checked, mut with_solutions) = (0, 0);
     for dataset_case in 0..40 {
         let engine = Engine::new(EngineConfig::default()).unwrap();
