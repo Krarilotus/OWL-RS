@@ -281,6 +281,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsst-rs"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03b614a2a7f2efc50d76c1e47d64b57c55acf6e0e718b0cae78236d147c487d0"
+dependencies = [
+ "rustc-hash",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -912,6 +921,7 @@ version = "0.1.0"
 dependencies = [
  "aho-corasick",
  "crc32fast",
+ "fsst-rs",
  "hashbrown 0.16.1",
  "memchr",
  "memmap2",

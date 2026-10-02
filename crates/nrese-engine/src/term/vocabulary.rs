@@ -159,9 +159,11 @@ impl Codec {
                 return None;
             }
             let symbols: Vec<Symbol> = bytes[..255 * 8]
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .take(count)
-                .map(|chunk| Symbol::from_slice(chunk.try_into().expect("8 bytes")))
+                .map(Symbol::from_slice)
                 .collect();
             let lengths = bytes[255 * 8..255 * 8 + count].to_vec();
             if lengths.iter().any(|&n| !(1..=8).contains(&n)) {
