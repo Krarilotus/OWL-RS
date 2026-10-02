@@ -1,7 +1,9 @@
 //! Full-text index over the dictionary's string literals.
 //!
 //! An inverted index from lower-cased words to the literals (simple and language-tagged
-//! strings) that contain them. It is built the first time a query searches, and extended
+//! strings) that contain them, by their entry numbers in the dictionary; postings are
+//! varint deltas, the words in 256 shards by their first byte, so that the build runs on
+//! every core (DBpedia's 40 M terms). It is built the first time a query searches, and extended
 //! with the terms the dictionary gained since before each later search: the dictionary is
 //! append-only, so nothing indexed ever changes. Whether a literal still occurs in the data
 //! is the query's business (it joins the matches with the statements).
@@ -25,6 +27,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
+use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 
 /// What to search for.
@@ -151,28 +154,122 @@ pub fn words(text: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_lowercase)
 }
 
-#[derive(Debug, Default)]
+/// Words go into shards by their first byte, so that a build fills the shards in parallel
+/// and a prefix reads one.
+const SHARDS: usize = 256;
+
+/// Documents tokenised per parallel part of a build.
+const BUILD_PART: usize = 1 << 14;
+
+fn shard_of(word: &str) -> usize {
+    usize::from(word.as_bytes()[0])
+}
+
+fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn get_varint(bytes: &[u8], position: &mut usize) -> u64 {
+    let (mut value, mut shift) = (0u64, 0);
+    loop {
+        let byte = bytes[*position];
+        *position += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte < 0x80 {
+            return value;
+        }
+        shift += 7;
+    }
+}
+
+/// A word's documents and occurrences, document numbers ascending: varint deltas, about
+/// two bytes a document where a pair of numbers took sixteen.
+#[derive(Debug, Default, Clone)]
+struct Postings {
+    bytes: Vec<u8>,
+    last: u64,
+    len: u32,
+}
+
+impl Postings {
+    fn push(&mut self, document: u64, count: u16) {
+        let delta = match self.len {
+            0 => document,
+            _ => document - self.last,
+        };
+        put_varint(&mut self.bytes, delta);
+        put_varint(&mut self.bytes, u64::from(count));
+        self.last = document;
+        self.len += 1;
+    }
+
+    fn decode(&self) -> Vec<(u64, u16)> {
+        let mut out = Vec::with_capacity(self.len as usize);
+        let (mut position, mut document) = (0, 0u64);
+        for _ in 0..self.len {
+            document += get_varint(&self.bytes, &mut position);
+            let count = get_varint(&self.bytes, &mut position) as u16;
+            out.push((document, count));
+        }
+        out
+    }
+}
+
+/// The index. Documents are numbered by the caller (the dictionary's entry numbers), in
+/// ascending order as they are added.
+#[derive(Debug)]
 pub(crate) struct TextIndex {
     /// Dictionary entries looked at so far.
     covered: u64,
-    /// Word → (literal id, occurrences), ids ascending.
-    postings: BTreeMap<Box<str>, Vec<(u64, u16)>>,
-    /// Words per indexed literal.
-    lengths: HashMap<u64, u16>,
+    /// Word → its postings, in the shard of its first byte.
+    shards: Vec<BTreeMap<Box<str>, Postings>>,
+    /// Words per document, by document number (0: not indexed).
+    lengths: Vec<u16>,
+    documents: u64,
     total_words: u64,
-    /// The distinct words in the order they were first indexed: what the stem maps cover.
-    words: Vec<Box<str>>,
+    /// Distinct words so far: when it changed, the stem maps are stale.
+    word_count: usize,
     /// Per stemming language ([`stem_key`]): its stems' words.
     stems: HashMap<String, Stems>,
+}
+
+impl Default for TextIndex {
+    fn default() -> Self {
+        Self {
+            covered: 0,
+            shards: vec![BTreeMap::new(); SHARDS],
+            lengths: Vec::new(),
+            documents: 0,
+            total_words: 0,
+            word_count: 0,
+            stems: HashMap::new(),
+        }
+    }
 }
 
 /// The indexed words by stem, for one language.
 #[derive(Debug, Default)]
 struct Stems {
-    /// Words (of [`TextIndex::words`]) looked at so far.
+    /// [`TextIndex::word_count`] when the map was built.
     covered: usize,
-    /// Stem → the indexes of its words in [`TextIndex::words`].
-    groups: HashMap<Box<str>, Vec<u32>>,
+    /// Stem → its words.
+    groups: HashMap<Box<str>, Vec<Box<str>>>,
+}
+
+/// A document's words with their occurrences, and how many words it has.
+fn tokens(text: &str) -> (HashMap<String, u16>, u16) {
+    let mut counts: HashMap<String, u16> = HashMap::new();
+    let mut length: u16 = 0;
+    for word in words(text) {
+        let count = counts.entry(word).or_default();
+        *count = count.saturating_add(1);
+        length = length.saturating_add(1);
+    }
+    (counts, length)
 }
 
 impl TextIndex {
@@ -180,31 +277,93 @@ impl TextIndex {
         self.covered
     }
 
-    /// Indexes the dictionary entry `index` (id `id`) holding the string `text`.
-    pub(crate) fn add(&mut self, id: u64, text: &str) {
-        let mut counts: HashMap<String, u16> = HashMap::new();
-        let mut length: u16 = 0;
-        for word in words(text) {
-            let count = counts.entry(word).or_default();
-            *count = count.saturating_add(1);
-            length = length.saturating_add(1);
+    fn record_length(&mut self, document: u64, length: u16) {
+        let i = document as usize;
+        if self.lengths.len() <= i {
+            self.lengths.resize(i + 1, 0);
         }
+        self.lengths[i] = length;
+        self.documents += 1;
+        self.total_words += u64::from(length);
+    }
+
+    /// Indexes document `document` (after every one added before) holding `text`.
+    pub(crate) fn add(&mut self, document: u64, text: &str) {
+        let (counts, length) = tokens(text);
         if length == 0 {
             return;
         }
+        self.record_length(document, length);
         for (word, count) in counts {
-            match self.postings.entry(word.into_boxed_str()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    self.words.push(entry.key().clone());
-                    entry.insert(vec![(id, count)]);
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry) => {
-                    entry.get_mut().push((id, count));
+            let shard = &mut self.shards[shard_of(&word)];
+            match shard.get_mut(word.as_str()) {
+                Some(postings) => postings.push(document, count),
+                None => {
+                    let mut postings = Postings::default();
+                    postings.push(document, count);
+                    shard.insert(word.into_boxed_str(), postings);
+                    self.word_count += 1;
                 }
             }
         }
-        self.lengths.insert(id, length);
-        self.total_words += u64::from(length);
+    }
+
+    /// Indexes `documents` (numbers ascending, after every one added before): tokenised in
+    /// parallel parts, then every shard filled in parallel from the parts in order.
+    pub(crate) fn extend(&mut self, documents: &[(u64, &str)]) {
+        if documents.len() < 2 * BUILD_PART {
+            for &(document, text) in documents {
+                self.add(document, text);
+            }
+            return;
+        }
+        type Part = (Vec<(u64, u16)>, Vec<Vec<(Box<str>, u64, u16)>>);
+        let parts: Vec<Part> = documents
+            .par_chunks(BUILD_PART)
+            .map(|part| {
+                let mut lengths = Vec::with_capacity(part.len());
+                let mut by_shard: Vec<Vec<(Box<str>, u64, u16)>> = vec![Vec::new(); SHARDS];
+                for &(document, text) in part {
+                    let (counts, length) = tokens(text);
+                    if length == 0 {
+                        continue;
+                    }
+                    lengths.push((document, length));
+                    for (word, count) in counts {
+                        by_shard[shard_of(&word)].push((word.into_boxed_str(), document, count));
+                    }
+                }
+                (lengths, by_shard)
+            })
+            .collect();
+        for (lengths, _) in &parts {
+            for &(document, length) in lengths {
+                self.record_length(document, length);
+            }
+        }
+        let new_words: usize = self
+            .shards
+            .par_iter_mut()
+            .enumerate()
+            .map(|(s, shard)| {
+                let mut new_words = 0;
+                for (_, by_shard) in &parts {
+                    for (word, document, count) in &by_shard[s] {
+                        match shard.get_mut(word.as_ref()) {
+                            Some(postings) => postings.push(*document, *count),
+                            None => {
+                                let mut postings = Postings::default();
+                                postings.push(*document, *count);
+                                shard.insert(word.clone(), postings);
+                                new_words += 1;
+                            }
+                        }
+                    }
+                }
+                new_words
+            })
+            .sum();
+        self.word_count += new_words;
     }
 
     /// Marks the dictionary entries below `covered` as looked at.
@@ -218,43 +377,50 @@ impl TextIndex {
             || self
                 .stems
                 .get(&stem_key(language))
-                .is_some_and(|stems| stems.covered == self.words.len())
+                .is_some_and(|stems| stems.covered == self.word_count)
     }
 
-    /// Groups the words indexed since the last call by their stem in `language`.
+    /// Groups the indexed words by their stem in `language` (again, where words came since).
     pub(crate) fn prepare_stems(&mut self, language: &str) {
         let Some(stemmer) = stemmer(language) else {
             return;
         };
-        let stems = self.stems.entry(stem_key(language)).or_default();
-        for (i, word) in self.words.iter().enumerate().skip(stems.covered) {
-            stems
-                .groups
-                .entry(stemmer.stem(word).into())
-                .or_default()
-                .push(i as u32);
+        let mut groups: HashMap<Box<str>, Vec<Box<str>>> = HashMap::new();
+        for shard in &self.shards {
+            for word in shard.keys() {
+                groups
+                    .entry(stemmer.stem(word).into())
+                    .or_default()
+                    .push(word.clone());
+            }
         }
-        stems.covered = self.words.len();
+        self.stems.insert(
+            stem_key(language),
+            Stems {
+                covered: self.word_count,
+                groups,
+            },
+        );
     }
 
     /// The postings of `word`: of the words it starts as a prefix, of the words within the
     /// edits of a fuzzy match, of the words with its stem with `stems`, else its own; merged
-    /// by literal (occurrences added up).
+    /// by document (occurrences added up).
     fn postings_of(
         &self,
         word: &str,
         matching: Match,
         stems: Option<(&Stemmer, &Stems)>,
     ) -> Cow<'_, [(u64, u16)]> {
-        let lists: Vec<&Vec<(u64, u16)>> = match (matching, stems) {
+        let lists: Vec<&Postings> = match (matching, stems) {
             (Match::Fuzzy(edits), _) => self
-                .postings
+                .shards
                 .iter()
+                .flat_map(|shard| shard.iter())
                 .filter(|(key, _)| within_edits(key, word, usize::from(edits)))
                 .map(|(_, list)| list)
                 .collect(),
-            (Match::Prefix, _) => self
-                .postings
+            (Match::Prefix, _) => self.shards[shard_of(word)]
                 .range::<str, _>((std::ops::Bound::Included(word), std::ops::Bound::Unbounded))
                 .take_while(|(key, _)| key.starts_with(word))
                 .map(|(_, list)| list)
@@ -264,15 +430,16 @@ impl TextIndex {
                 .get(stemmer.stem(word).as_ref())
                 .into_iter()
                 .flatten()
-                .filter_map(|&i| self.postings.get(&self.words[i as usize]))
+                .filter_map(|word| self.shards[shard_of(word)].get(word))
                 .collect(),
-            (Match::Exact, None) => self.postings.get(word).into_iter().collect(),
+            (Match::Exact, None) => self.shards[shard_of(word)].get(word).into_iter().collect(),
         };
         match lists.as_slice() {
             [] => Cow::Borrowed(&[]),
-            [list] => Cow::Borrowed(list.as_slice()),
+            [list] => Cow::Owned(list.decode()),
             _ => {
-                let mut merged: Vec<(u64, u16)> = lists.into_iter().flatten().copied().collect();
+                let mut merged: Vec<(u64, u16)> =
+                    lists.into_iter().flat_map(Postings::decode).collect();
                 merged.sort_unstable_by_key(|&(id, _)| id);
                 merged.dedup_by(|later, kept| {
                     let same = later.0 == kept.0;
@@ -286,6 +453,14 @@ impl TextIndex {
         }
     }
 
+    /// Words per document (1 where unknown).
+    fn length(&self, document: u64) -> f64 {
+        match self.lengths.get(document as usize) {
+            Some(&length) if length > 0 => f64::from(length),
+            _ => 1.0,
+        }
+    }
+
     /// The literals matching `query`, best first (ties by id); `text_of` gives a literal's
     /// text, to check phrases.
     pub(crate) fn search(
@@ -293,7 +468,7 @@ impl TextIndex {
         query: &TextQuery,
         text_of: &dyn Fn(u64) -> Option<String>,
     ) -> Vec<TextMatch> {
-        let documents = self.lengths.len() as f64;
+        let documents = self.documents as f64;
         if documents == 0.0 {
             return Vec::new();
         }
@@ -355,7 +530,7 @@ impl TextIndex {
             let frequency = list.len() as f64;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(id, count) in list {
-                let length = f64::from(self.lengths.get(&id).copied().unwrap_or(1));
+                let length = self.length(id);
                 let tf = f64::from(count);
                 *out.entry(id).or_default() +=
                     idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * length / average));
@@ -401,7 +576,7 @@ impl TextIndex {
             let frequency = found.len() as f64;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(id, count) in found.iter() {
-                let length = f64::from(self.lengths.get(&id).copied().unwrap_or(1));
+                let length = self.length(id);
                 let tf = f64::from(count);
                 let score = idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * length / average));
                 let entry = scores.entry(id).or_default();
@@ -618,5 +793,52 @@ mod tests {
         assert!(!within_edits("kitten", "sitting", 2));
         assert!(within_edits("über", "uber", 1));
         assert!(within_edits("brigde", "bridge", 1));
+    }
+
+    /// A build in parallel parts gives the same answers as one document at a time.
+    #[test]
+    fn parallel_builds_equal_sequential_ones() {
+        let texts: Vec<String> = (0..70_000u64)
+            .map(|i| {
+                format!(
+                    "word{} common w{} {}",
+                    i % 1000,
+                    i % 7,
+                    if i % 3 == 0 { "third" } else { "" }
+                )
+            })
+            .collect();
+        let documents: Vec<(u64, &str)> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| (i as u64 * 2, text.as_str()))
+            .collect();
+        let mut parallel = TextIndex::default();
+        parallel.extend(&documents);
+        let mut sequential = TextIndex::default();
+        for &(document, text) in &documents {
+            sequential.add(document, text);
+        }
+        let text_of = |id: u64| texts.get(id as usize / 2).cloned();
+        for text in [
+            "word7",
+            "w3 third",
+            "\"common w3\"",
+            "word99*",
+            "commn~1",
+            "third -w2",
+        ] {
+            let query = TextQuery {
+                text: text.to_owned(),
+                all_words: true,
+                prefix: false,
+                stem: None,
+            };
+            let a = parallel.search(&query, &text_of);
+            let b = sequential.search(&query, &text_of);
+            assert!(!a.is_empty(), "{text}");
+            assert_eq!(a, b, "{text}");
+        }
+        assert_eq!(parallel.word_count, sequential.word_count);
     }
 }
