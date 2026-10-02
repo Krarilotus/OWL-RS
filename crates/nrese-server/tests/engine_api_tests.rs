@@ -205,3 +205,74 @@ async fn repositories_and_namespaces_in_json() {
     let (status, _) = send(&app, Method::DELETE, &format!("{base}/ex"), None, "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn sessions_collect_writes_and_commit_them_as_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let base = "/api/v1/repositories/nrese";
+    let (status, text) = send(&app, Method::POST, &format!("{base}/sessions"), None, "").await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let opened: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let session = opened["path"].as_str().unwrap().to_owned();
+    assert!(opened["idle_seconds"].as_u64().unwrap() > 0);
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("{session}/update"),
+        Some("application/sparql-update"),
+        "INSERT DATA { <http://example.com/a> <http://example.com/p> 1 }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("{session}/data?graph=http%3A%2F%2Fexample.com%2Fg"),
+        Some("text/turtle"),
+        "<http://example.com/b> <http://example.com/p> 2 .",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let all = "SELECT (COUNT(*) AS ?n) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } }";
+    let (status, text) = send(
+        &app,
+        Method::POST,
+        &format!("{session}/query"),
+        Some("application/sparql-query"),
+        all,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(count_of(&text), 2, "the session sees its writes");
+    let (_, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/query"),
+        Some("application/sparql-query"),
+        all,
+    )
+    .await;
+    assert_eq!(count_of(&text), 0, "nothing committed yet");
+    let (status, _) = send(&app, Method::POST, &format!("{session}/commit"), None, "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/query"),
+        Some("application/sparql-query"),
+        all,
+    )
+    .await;
+    assert_eq!(count_of(&text), 2, "committed as one");
+    // A committed session is closed.
+    let (status, _) = send(&app, Method::DELETE, &session, None, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&app, Method::POST, &format!("{session}/commit"), None, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
