@@ -30,8 +30,8 @@ use super::delta::Interrupted;
 pub use super::eval::Schema;
 use super::eval::{AllFacts, GroundProgram, Job, NEVER, Seg, Source, guards_hold, run_jobs};
 use super::ir::{Head, Rule};
+use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
-use super::naive::{Triple, Violation};
 
 type Pair = (u64, u64);
 

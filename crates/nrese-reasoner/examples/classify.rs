@@ -14,7 +14,7 @@ use std::io::{BufRead, BufWriter, Write};
 use std::time::Instant;
 
 use nrese_reasoner::v2::classify::classify;
-use nrese_reasoner::v2::testing::LocalVocabulary;
+use nrese_reasoner::v2::vocabulary::LocalVocabulary;
 
 fn split(line: &str) -> Option<[&str; 3]> {
     let line = line.trim();

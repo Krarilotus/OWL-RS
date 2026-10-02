@@ -12,7 +12,7 @@ use std::sync::Arc;
 use super::ir::{ParseError, Rule, Vocabulary};
 use super::n3::{self, N3Program};
 use super::rulesets::{Ruleset, SEMANTICS_VERSION};
-use super::testing::LocalVocabulary;
+use super::vocabulary::LocalVocabulary;
 
 /// User rules: their name (the file's, usually), their text, and its format.
 #[derive(Debug, Clone, PartialEq, Eq)]

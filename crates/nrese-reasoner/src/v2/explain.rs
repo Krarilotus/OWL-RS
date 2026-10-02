@@ -13,7 +13,7 @@ use hashbrown::HashMap;
 
 use super::delta::{Base, Rules};
 use super::eval::{GroundProgram, Seg, Source};
-use super::naive::Triple;
+use super::ir::Triple;
 
 /// One step of an [`Explanation`]: a fact, how it holds, and its premises (indexes of
 /// steps).
