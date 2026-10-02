@@ -87,7 +87,45 @@ impl Skipping {
     }
 }
 
-pub(crate) fn bulk_load(engine: &Engine, request: &BulkLoadRequest) -> StoreResult<BulkLoadReport> {
+/// How far a bulk load is, and a way to stop it: shared with whoever watches it (an import
+/// job). Cancelling stops the load before its next file; nothing of it is committed.
+#[derive(Debug, Default)]
+pub struct LoadProgress {
+    files_done: AtomicU64,
+    files: AtomicU64,
+    parsed: AtomicU64,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl LoadProgress {
+    /// Files loaded, of how many.
+    pub fn files(&self) -> (u64, u64) {
+        (
+            self.files_done.load(Ordering::Relaxed),
+            self.files.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Statements parsed so far (whole files).
+    pub fn parsed(&self) -> u64 {
+        self.parsed.load(Ordering::Relaxed)
+    }
+
+    /// Asks the load to stop before its next file.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn bulk_load(
+    engine: &Engine,
+    request: &BulkLoadRequest,
+    progress: &LoadProgress,
+) -> StoreResult<BulkLoadReport> {
     let started = Instant::now();
     let sources = request
         .files
@@ -105,8 +143,21 @@ pub(crate) fn bulk_load(engine: &Engine, request: &BulkLoadRequest) -> StoreResu
         skipped: AtomicU64::new(0),
     });
     let mut parsed = 0;
+    progress
+        .files
+        .store(sources.len() as u64, Ordering::Relaxed);
     for source in &sources {
-        parsed += source.load_into(&load, &graph, &blank_nodes, skipping.as_ref())?;
+        // Dropping the load unfinished aborts it: nothing is committed.
+        if progress.is_cancelled() {
+            return Err(StoreError::LoadCancelled);
+        }
+        let quads = source.load_into(&load, &graph, &blank_nodes, skipping.as_ref())?;
+        parsed += quads;
+        progress.parsed.fetch_add(quads, Ordering::Relaxed);
+        progress.files_done.fetch_add(1, Ordering::Relaxed);
+    }
+    if progress.is_cancelled() {
+        return Err(StoreError::LoadCancelled);
     }
     let summary = load.finish();
     memory::release_all();

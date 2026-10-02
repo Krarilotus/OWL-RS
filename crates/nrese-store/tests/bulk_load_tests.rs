@@ -252,3 +252,35 @@ mod serde_json_lite {
         }
     }
 }
+
+/// A load reports its progress, and a cancelled one stops before its next file and
+/// commits nothing.
+#[test]
+fn loads_report_progress_and_stop_when_cancelled() {
+    let dir = tempdir().unwrap();
+    let first = dir.path().join("a.nt");
+    let second = dir.path().join("b.nt");
+    fs::write(&first, ntriples(50)).unwrap();
+    fs::write(&second, ntriples(70)).unwrap();
+    let service = service();
+    let progress = nrese_store::LoadProgress::default();
+    let report = service
+        .bulk_load_with(&request(&[&first, &second]), &progress)
+        .unwrap();
+    assert_eq!(progress.files(), (2, 2));
+    assert_eq!(progress.parsed(), report.parsed);
+    let before = count(&service, "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }");
+    // New statements, which a load that went through would add.
+    let third = dir.path().join("c.nt");
+    fs::write(&third, ntriples(80).replace("http://", "urn:other:http://")).unwrap();
+    let cancelled = nrese_store::LoadProgress::default();
+    cancelled.cancel();
+    let error = service
+        .bulk_load_with(&request(&[&third]), &cancelled)
+        .unwrap_err();
+    assert!(matches!(error, StoreError::LoadCancelled), "{error}");
+    assert_eq!(
+        count(&service, "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }"),
+        before
+    );
+}

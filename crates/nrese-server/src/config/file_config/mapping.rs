@@ -14,6 +14,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
         config.server.deployment_posture,
     );
     insert_option(&mut source, names::DATA_DIR, config.store.data_dir);
+    insert_option(
+        &mut source,
+        names::IMPORT_DIR,
+        config.store.import_directory,
+    );
     insert_option(&mut source, names::STORE_MODE, config.store.mode);
     insert_option(
         &mut source,

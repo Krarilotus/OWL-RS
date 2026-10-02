@@ -24,6 +24,9 @@ pub struct PolicyConfig {
     /// credentials, or a session from `POST /api/v1/access/login`), besides the
     /// authentication mode.
     pub local_logins: bool,
+    /// The directory administrators import files from by name
+    /// (`POST /api/v1/repositories/{id}/import/files`); `None`: no server-side imports.
+    pub import_directory: Option<std::path::PathBuf>,
 }
 
 impl Default for PolicyConfig {
@@ -39,6 +42,7 @@ impl Default for PolicyConfig {
             access: None,
             workspace_base: "urn:nrese:".to_owned(),
             local_logins: true,
+            import_directory: None,
         }
     }
 }

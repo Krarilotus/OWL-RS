@@ -39,6 +39,10 @@ pub enum StoreError {
     /// A materialisation was stopped; the previous inferred stack stands.
     #[error("materialisation cancelled")]
     MaterialisationCancelled,
+    /// A bulk load was stopped ([`crate::LoadProgress::cancel`]); nothing of it was
+    /// committed.
+    #[error("the load was cancelled; nothing of it was committed")]
+    LoadCancelled,
     /// The request would change a graph its requester may not write (graph-level access
     /// control); nothing of it is applied.
     #[error("{0}")]
@@ -91,7 +95,8 @@ impl StoreError {
             | Self::Io(_)
             | Self::Engine(_)
             | Self::OntologyFileNotFound { .. }
-            | Self::MaterialisationCancelled => false,
+            | Self::MaterialisationCancelled
+            | Self::LoadCancelled => false,
         }
     }
 }
