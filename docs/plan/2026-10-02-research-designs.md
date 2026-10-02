@@ -152,6 +152,15 @@ alternative derivations. Survey: Kirrane et al., SWJ 2017.
   forbidden target aborts the whole update. `SERVICE` is a separate privilege.
 - Caches keyed by the security context and a policy epoch.
 
+**Status (2 October).** Delivered: the policy as a file per server (roles → graph IRIs
+and prefixes, explicit deny, default graph, deny or allow by default), the dataset
+restriction before evaluation, writes refused as a whole whatever the data holds, query
+cache keyed by the access, SPARQL, Graph Store and RDF4J paths, and the policy granting
+reads and graph-scoped writes to its roles. Inferred statements are all-or-nothing per
+policy (`inferred = "hidden" | "visible"`) until the reasoner records support graph sets
+(§6). Open: policies as transactional metadata importable as RDF, `SERVICE` as a separate
+privilege.
+
 ## 5. Query execution and optimisation
 
 **Evidence.** HyPer, Umbra and DuckDB run morsel-driven, vectorised pipelines with explicit

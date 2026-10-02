@@ -7,12 +7,19 @@
 //! (RDF4J's `null`). Writes with contexts put each statement into each of them, whatever
 //! graph the payload names; without, into the graph the payload names (the default graph
 //! for triples).
+//!
+//! Graph-level access control: a pattern with [`StatementPattern::access`] matches in the
+//! readable graphs only (the others are absent), and a request with
+//! [`StatementsRequest::writable`] fails as a whole if it would add or remove a statement
+//! in a graph outside it, whether the statement is there or not.
+
+use std::sync::Arc;
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId, Transaction};
 use nrese_rdf::{GraphName, NamedNode, Quad, Term, TermRef};
 use nrese_sparql::ReadView;
 
-use crate::error::StoreResult;
+use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
 use crate::rdf_io::parse_payload;
 use crate::update::SparqlUpdateRequest;
@@ -26,6 +33,9 @@ pub struct StatementPattern {
     pub object: Option<Term>,
     /// Empty: every graph. Otherwise these graphs.
     pub contexts: Vec<GraphName>,
+    /// The graphs the requester may read: the pattern matches in them only. `None`: every
+    /// graph.
+    pub access: Option<Arc<nrese_sparql::GraphAccess>>,
 }
 
 impl StatementPattern {
@@ -51,18 +61,25 @@ impl StatementPattern {
             object,
             graph,
         };
-        if self.contexts.is_empty() {
-            return vec![pattern(GraphSelector::Any)];
+        let mut graphs: Vec<TermId> = match (&self.access, self.contexts.is_empty()) {
+            (None, true) => return vec![pattern(GraphSelector::Any)],
+            (Some(_), true) => view
+                .named_graphs()
+                .chain([TermId::DEFAULT_GRAPH])
+                .collect(),
+            (_, false) => self
+                .contexts
+                .iter()
+                .filter_map(|context| match context {
+                    GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
+                    GraphName::NamedNode(n) => view.lookup(n.as_ref().into()),
+                    GraphName::BlankNode(b) => view.lookup(b.as_ref().into()),
+                })
+                .collect(),
+        };
+        if let Some(access) = &self.access {
+            graphs.retain(|&graph| access.allows_id(view, graph));
         }
-        let mut graphs: Vec<TermId> = self
-            .contexts
-            .iter()
-            .filter_map(|context| match context {
-                GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
-                GraphName::NamedNode(n) => view.lookup(n.as_ref().into()),
-                GraphName::BlankNode(b) => view.lookup(b.as_ref().into()),
-            })
-            .collect();
         graphs.sort_unstable();
         graphs.dedup();
         graphs
@@ -128,6 +145,27 @@ pub enum StatementOp {
 #[derive(Debug, Clone, Default)]
 pub struct StatementsRequest {
     pub ops: Vec<StatementOp>,
+    /// The graphs the requester may change; `None`: every graph.
+    pub writable: Option<Arc<nrese_sparql::GraphAccess>>,
+}
+
+impl StatementsRequest {
+    /// Fails unless the request may change `graph`.
+    fn check_writable(&self, graph: &GraphName) -> StoreResult<()> {
+        match &self.writable {
+            Some(writable) if !writable.allows_graph(graph) => Err(forbidden(match graph {
+                GraphName::DefaultGraph => "the default graph".to_owned(),
+                graph => graph.to_string(),
+            })),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn forbidden(graph: String) -> StoreError {
+    StoreError::Forbidden(format!(
+        "the request would change {graph}, which the requester may not write"
+    ))
 }
 
 /// Applies the operations to `tx`, the updates through `update` (the pipeline's SPARQL
@@ -141,16 +179,39 @@ pub(crate) fn apply_statements(
         match op {
             StatementOp::Add { data, contexts } => {
                 for quad in data.quads(contexts)? {
+                    request.check_writable(&quad.graph_name)?;
                     tx.insert(quad.as_ref());
                 }
             }
             StatementOp::RemoveData { data, contexts } => {
                 for quad in data.quads(contexts)? {
+                    request.check_writable(&quad.graph_name)?;
                     tx.remove(quad.as_ref());
                 }
             }
             StatementOp::RemoveMatching(pattern) => {
-                for engine_pattern in pattern.patterns(&*tx) {
+                let patterns = pattern.patterns(&*tx);
+                if let Some(writable) = &request.writable {
+                    // Every graph the removal would change must be writable.
+                    let mut allowed = std::collections::HashSet::new();
+                    for engine_pattern in &patterns {
+                        for quad in tx.quads_for_pattern(engine_pattern) {
+                            if allowed.contains(&quad.graph) {
+                                continue;
+                            }
+                            if !writable.allows_id(&*tx, quad.graph) {
+                                return Err(forbidden(if quad.graph == TermId::DEFAULT_GRAPH {
+                                    "the default graph".to_owned()
+                                } else {
+                                    tx.decode(quad.graph)
+                                        .map_or_else(String::new, |term| term.to_string())
+                                }));
+                            }
+                            allowed.insert(quad.graph);
+                        }
+                    }
+                }
+                for engine_pattern in patterns {
                     tx.remove_matching(&engine_pattern);
                 }
             }

@@ -193,8 +193,9 @@ pub async fn query_get(
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
-    let operation = query_from_url(raw_query.as_deref())?;
+    let access = guard::query_access(&state, &headers).await?;
+    let mut operation = query_from_url(raw_query.as_deref())?;
+    operation.access = access.read;
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
@@ -204,12 +205,13 @@ pub async fn query_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
-    let operation = query_from_post(
+    let access = guard::query_access(&state, &headers).await?;
+    let mut operation = query_from_post(
         raw_query.as_deref(),
         headers.get(header::CONTENT_TYPE),
         &body,
     )?;
+    operation.access = access.read;
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
@@ -219,12 +221,14 @@ pub async fn update_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
-    let operation = update_from_post(
+    let access = guard::update_access(&state, &headers).await?;
+    let mut operation = update_from_post(
         raw_query.as_deref(),
         headers.get(header::CONTENT_TYPE),
         &body,
     )?;
+    operation.access = access.read;
+    operation.writable = access.write;
     sparql::execute_update(state, operation).await
 }
 
@@ -261,12 +265,14 @@ pub async fn sparql_post(
         &body,
     )?;
     match operation {
-        SparqlOperation::Query(operation) => {
-            guard::enforce_query_read(&state, &headers).await?;
+        SparqlOperation::Query(mut operation) => {
+            operation.access = guard::query_access(&state, &headers).await?.read;
             sparql::execute_query(state, operation, accept_header_value(&headers)).await
         }
-        SparqlOperation::Update(operation) => {
-            guard::enforce_update_write(&state, &headers).await?;
+        SparqlOperation::Update(mut operation) => {
+            let access = guard::update_access(&state, &headers).await?;
+            operation.access = access.read;
+            operation.writable = access.write;
             sparql::execute_update(state, operation)
                 .await
                 .map(IntoResponse::into_response)
@@ -281,7 +287,7 @@ pub async fn autocomplete(
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_whole_read(&state, &headers).await?;
     state.ensure_serving()?;
     let pairs: Vec<(String, String)> =
         serde_urlencoded::from_str(raw_query.as_deref().unwrap_or_default())
@@ -321,7 +327,7 @@ pub async fn classification_get(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_whole_read(&state, &headers).await?;
     super::classification::classify(state, &headers).await
 }
 
@@ -331,7 +337,7 @@ pub async fn shacl_get(
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_whole_read(&state, &headers).await?;
     shacl::validate(state, raw_query, headers, None).await
 }
 
@@ -342,7 +348,7 @@ pub async fn shacl_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_whole_read(&state, &headers).await?;
     shacl::validate(state, raw_query, headers, Some(body)).await
 }
 
@@ -352,8 +358,8 @@ pub async fn tell_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_tell_write(&state, &headers).await?;
-    tell::execute_tell(state, raw_query, headers, body).await
+    let access = guard::tell_access(&state, &headers).await?;
+    tell::execute_tell(state, raw_query, headers, body, &access).await
 }
 
 pub async fn graph_get(

@@ -3,7 +3,7 @@ use reqwest::Url;
 use serde::Deserialize;
 
 use crate::auth::grants::{StringOrMany, grants_from_claim_parts};
-use crate::auth::{authorize_grants, extract_bearer_token};
+use crate::auth::{Identity, authorize_grants, extract_bearer_token};
 use crate::error::ApiError;
 use crate::policy::PolicyAction;
 
@@ -69,7 +69,8 @@ pub async fn authorize(
     config: &OidcIntrospectionConfig,
     action: PolicyAction,
     headers: &HeaderMap,
-) -> Result<(), ApiError> {
+    also: &(dyn Fn(&Identity) -> bool + Send + Sync),
+) -> Result<Identity, ApiError> {
     let token = extract_bearer_token(headers)?;
     let response = introspect_token(config, token).await?;
     if !response.active {
@@ -87,8 +88,16 @@ pub async fn authorize(
         response.roles.as_ref(),
     );
 
-    if authorize_grants(action, &grants) {
-        Ok(())
+    let roles = super::grants::role_names_from_claim_parts(
+        response.scope.as_deref(),
+        response.scp.as_ref(),
+        response.role.as_deref(),
+        response.roles.as_ref(),
+    );
+    let identity = Identity::from_grants(&grants, roles);
+    // An active token is authenticated; its roles may get rights from the access policy.
+    if authorize_grants(action, &grants) || also(&identity) {
+        Ok(identity)
     } else {
         Err(ApiError::forbidden(
             "bearer token does not grant access to this endpoint",

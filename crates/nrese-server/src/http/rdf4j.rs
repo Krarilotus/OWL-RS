@@ -36,6 +36,8 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Term};
+
+use crate::access::AccessView;
 use nrese_store::{
     MutationCommand, RdfPayload, SparqlUpdateRequest, StatementOp, StatementPattern,
     StatementsRequest,
@@ -248,6 +250,7 @@ fn pattern(pairs: &[(String, String)]) -> Result<StatementPattern, ApiError> {
         predicate,
         object: optional("obj")?,
         contexts: contexts(pairs)?,
+        access: None,
     })
 }
 
@@ -304,6 +307,7 @@ fn removals(
                 predicate,
                 object: (!wildcard(&quad.object)).then_some(quad.object),
                 contexts,
+                access: None,
             })
         })
         .collect())
@@ -327,13 +331,51 @@ fn update(
         using_graphs: operation.using_graphs,
         using_named_graphs: operation.using_named_graphs,
         access: None,
+        writable: None,
     })
 }
 
-async fn apply(state: &AppState, ops: Vec<StatementOp>) -> Result<(), ApiError> {
+/// `ops` as the requester may apply them (graph-level access control): patterns and
+/// `WHERE` clauses see the graphs it may read, and the request fails if it would change
+/// one it may not write.
+fn scoped(ops: Vec<StatementOp>, access: &AccessView) -> StatementsRequest {
+    let ops = ops
+        .into_iter()
+        .map(|op| match op {
+            StatementOp::RemoveMatching(pattern) => StatementOp::RemoveMatching(StatementPattern {
+                access: access.read.clone(),
+                ..pattern
+            }),
+            StatementOp::Update(request) => StatementOp::Update(SparqlUpdateRequest {
+                access: access.read.clone(),
+                writable: access.write.clone(),
+                ..request
+            }),
+            op => op,
+        })
+        .collect();
+    StatementsRequest {
+        ops,
+        writable: access.write.clone(),
+    }
+}
+
+/// A store error of a read: 403 for a forbidden change in a transaction's operations.
+fn read_error(error: nrese_store::StoreError) -> ApiError {
+    match error {
+        error @ nrese_store::StoreError::Forbidden(_) => ApiError::forbidden(error.to_string()),
+        error => ApiError::internal(error.to_string()),
+    }
+}
+
+async fn apply(
+    state: &AppState,
+    ops: Vec<StatementOp>,
+    access: &AccessView,
+) -> Result<(), ApiError> {
     mutation::run(
         state,
-        MutationCommand::Statements(StatementsRequest { ops }),
+        MutationCommand::Statements(scoped(ops, access)),
         state.policy().timeouts.update,
         "statement operation exceeded policy timeout",
     )
@@ -516,9 +558,10 @@ pub async fn query_get(
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    let access = guard::query_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
-    let operation = query_from_url(raw.0.as_deref())?;
+    let mut operation = query_from_url(raw.0.as_deref())?;
+    operation.access = access.read;
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
@@ -536,13 +579,15 @@ pub async fn query_post(
         && serde_urlencoded::from_bytes::<Vec<(String, String)>>(&body)
             .is_ok_and(|pairs| pairs.iter().any(|(key, _)| key == "update"));
     if form_update || media_type_matches(content_type, "application/sparql-update") {
-        guard::enforce_update_write(&state, &headers).await?;
+        let access = guard::update_access(&state, &headers).await?;
         let request = update(&raw, &headers, &body)?;
-        apply(&state, vec![StatementOp::Update(request)]).await?;
+        apply(&state, vec![StatementOp::Update(request)], &access).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
-    guard::enforce_query_read(&state, &headers).await?;
-    let operation = query_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), &body)?;
+    let access = guard::query_access(&state, &headers).await?;
+    let mut operation =
+        query_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), &body)?;
+    operation.access = access.read;
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
@@ -552,9 +597,9 @@ pub async fn statements_get(
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_graph_read(&state, &headers).await?;
+    let access = guard::graph_read_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
-    statements(state, raw, headers, None).await
+    statements(state, raw, headers, None, &access).await
 }
 
 /// The statements matching the request's pattern, on the committed data or as `pending`
@@ -564,13 +609,17 @@ async fn statements(
     raw: RawQuery,
     headers: HeaderMap,
     pending: Option<StatementsRequest>,
+    access: &AccessView,
 ) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let pairs = pairs(&raw)?;
-    let pattern = pattern(&pairs)?;
+    let pattern = StatementPattern {
+        access: access.read.clone(),
+        ..pattern(&pairs)?
+    };
     let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
-    let infer = infer(&pairs);
+    let infer = infer(&pairs) && access.sees_inferred();
     let body = tokio::task::spawn_blocking(move || {
         let quads = match &pending {
             None => store.read_statements(&pattern, infer)?,
@@ -580,7 +629,7 @@ async fn statements(
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::internal(error.to_string()))?;
+    .map_err(read_error)?;
     let mut response = (StatusCode::OK, body).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -596,7 +645,7 @@ pub async fn statements_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    let access = guard::update_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
     let op = if is_update(&headers) {
         StatementOp::Update(update(&raw, &headers, &body)?)
@@ -607,7 +656,7 @@ pub async fn statements_post(
             contexts: contexts(&pairs(&raw)?)?,
         }
     };
-    apply(&state, vec![op]).await?;
+    apply(&state, vec![op], &access).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -618,7 +667,7 @@ pub async fn statements_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    let access = guard::update_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
     state.policy().enforce_rdf_upload_bytes(body.len())?;
     let contexts = contexts(&pairs(&raw)?)?;
@@ -632,7 +681,7 @@ pub async fn statements_put(
             contexts,
         },
     ];
-    apply(&state, ops).await?;
+    apply(&state, ops, &access).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -642,10 +691,10 @@ pub async fn statements_delete(
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    let access = guard::update_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
     let pattern = pattern(&pairs(&raw)?)?;
-    apply(&state, vec![StatementOp::RemoveMatching(pattern)]).await?;
+    apply(&state, vec![StatementOp::RemoveMatching(pattern)], &access).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -655,9 +704,9 @@ pub async fn size(
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    let access = guard::query_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
-    count(state, raw, None).await
+    count(state, raw, None, &access).await
 }
 
 /// The number of statements (in the request's contexts), on the committed data or as
@@ -666,22 +715,24 @@ async fn count(
     state: AppState,
     raw: RawQuery,
     pending: Option<StatementsRequest>,
+    access: &AccessView,
 ) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let pairs = pairs(&raw)?;
     let pattern = StatementPattern {
         contexts: contexts(&pairs)?,
+        access: access.read.clone(),
         ..StatementPattern::default()
     };
     let store = state.store();
-    let infer = infer(&pairs);
+    let infer = infer(&pairs) && access.sees_inferred();
     let count = tokio::task::spawn_blocking(move || match &pending {
         None => Ok(store.count_statements(&pattern, infer)),
         Some(pending) => store.count_statements_pending(pending, &pattern, infer),
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::internal(error.to_string()))?;
+    .map_err(read_error)?;
     Ok(text(count.to_string()))
 }
 
@@ -690,13 +741,18 @@ pub async fn contexts_get(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    let access = guard::query_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
     state.ensure_serving()?;
+    let readable = |graph: &Term| match graph {
+        Term::NamedNode(node) => access.can_read(&GraphName::NamedNode(node.clone())),
+        _ => access.reads_everything(),
+    };
     let rows = state
         .store()
         .contexts()
         .into_iter()
+        .filter(readable)
         .map(|graph| vec![Some(graph)])
         .collect();
     Ok(table(&headers, &["contextID"], rows))
@@ -874,7 +930,7 @@ pub async fn transaction_action(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    let access = guard::update_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
     let pairs = pairs(&raw)?;
     let action = param(&pairs, "action")
@@ -910,7 +966,7 @@ pub async fn transaction_action(
                 .lock()
                 .remove(&txid)
                 .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
-            apply(&state, pending.ops).await?;
+            apply(&state, pending.ops, &access).await?;
             Ok(StatusCode::OK.into_response())
         }
         "PING" => Ok(text(TRANSACTION_IDLE.as_millis().to_string())),
@@ -921,22 +977,21 @@ pub async fn transaction_action(
                 .transactions
                 .lock()
                 .get(&txid)
-                .map(|pending| StatementsRequest {
-                    ops: pending.ops.clone(),
-                })
+                .map(|pending| scoped(pending.ops.clone(), &access))
                 .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
             match action.as_str() {
                 "QUERY" => {
-                    let operation = if body.is_empty() {
+                    let mut operation = if body.is_empty() {
                         query_from_url(raw.0.as_deref())?
                     } else {
                         query_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), &body)?
                     };
+                    operation.access = access.read.clone();
                     let accept = accept_header_value(&headers);
                     sparql::execute_query_in(state, operation, accept, Some(pending)).await
                 }
-                "GET" => statements(state, raw, headers, Some(pending)).await,
-                _ => count(state, raw, Some(pending)).await,
+                "GET" => statements(state, raw, headers, Some(pending), &access).await,
+                _ => count(state, raw, Some(pending), &access).await,
             }
         }
         other => Err(ApiError::bad_request(format!(

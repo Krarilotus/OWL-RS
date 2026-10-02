@@ -14,9 +14,10 @@ use crate::view::decoded_quads;
 pub fn execute_graph_read(
     view: &impl ReadView,
     request: &GraphReadRequest,
+    model: ReadModel,
 ) -> StoreResult<GraphReadResult> {
     let triples: Vec<nrese_rdf::Triple> = match request.target.pattern_in(view)? {
-        Some(pattern) => decoded_quads(view, ReadModel::Materialised, &pattern)
+        Some(pattern) => decoded_quads(view, model, &pattern)
             .map(|quad| quad.map(Into::into))
             .collect::<StoreResult<Vec<_>>>()?,
         None => Vec::new(),

@@ -164,9 +164,10 @@ impl AppState {
         &self,
         action: PolicyAction,
         headers: &HeaderMap,
-    ) -> Result<(), ApiError> {
-        self.policy.authorize(action, headers).await?;
-        self.rate_limiter.enforce(action, self.policy.rate_limits)
+    ) -> Result<crate::auth::Identity, ApiError> {
+        let identity = self.policy.authorize(action, headers).await?;
+        self.rate_limiter.enforce(action, self.policy.rate_limits)?;
+        Ok(identity)
     }
 
     pub fn last_reasoning_run(&self) -> Option<ReasoningRunRecord> {
