@@ -90,6 +90,13 @@ crafted XML), all fixed by updates; of the ten wildcard arms six covered real va
   `&ReadContext`, none without one. The access fields of `StatementPattern` and the query
   requests go. Sessions keep their speculative state cached by base revision and operation
   count, so repeated reads don't replay (the rest of §2.8).
+
+  Status: B1a (every read takes a `ReadScope`; whole-dataset operations refuse a
+  restricted one) and B1b (`ReadContext { scope, infer, pending, cancel }` with
+  `statements`, `count`, `write_statements` and `execute_graph_read`; RDF4J's statements
+  streamed; a session's view kept by base version, operation count and the reader's access)
+  are done. `StatementPattern::access` stays as the store's internal carrier, set from the
+  scope only. Left: B1c, the same discipline on the write side.
 - **B2.** Error enums: the reasoner's (rule files with line and column), the memory budget
   as a variant, `Forbidden` and `Configuration` typed.
 - **B3.** One typed configuration tree, from defaults, the file, the environment and the

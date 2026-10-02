@@ -51,10 +51,9 @@ fn update(pipeline: &MutationPipeline, text: &str) {
 fn statements(pipeline: &MutationPipeline, infer: bool) -> Vec<String> {
     let mut quads: Vec<String> = pipeline
         .store()
-        .read_statements(
-            &nrese_store::ReadScope::All,
+        .statements(
+            &nrese_store::ReadContext::all().infer(infer),
             &StatementPattern::default(),
-            infer,
         )
         .expect("statements")
         .iter()

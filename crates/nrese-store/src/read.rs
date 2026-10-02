@@ -56,3 +56,60 @@ impl ReadScope {
         }
     }
 }
+
+/// One read: whose it is ([`ReadScope`]), whether inferred statements count, on which data
+/// (the latest, or as a client transaction's pending changes would leave it), and what
+/// stops it. The store's statement reads take one, so a new dimension of a read is a field
+/// here, not another variant of every method.
+#[derive(Clone)]
+pub struct ReadContext<'a> {
+    pub scope: ReadScope,
+    /// Whether inferred statements are read (where the scope sees them).
+    pub infer: bool,
+    /// Pending changes the read sees, if any.
+    pub pending: Option<&'a crate::StatementsRequest>,
+    pub cancel: nrese_sparql::CancellationToken,
+}
+
+impl<'a> ReadContext<'a> {
+    /// A read in `scope` of the latest data, inferred statements included.
+    pub fn new(scope: ReadScope) -> Self {
+        Self {
+            scope,
+            infer: true,
+            pending: None,
+            cancel: nrese_sparql::CancellationToken::new(),
+        }
+    }
+
+    /// A read of every graph (the server's own work, tests).
+    pub fn all() -> Self {
+        Self::new(ReadScope::All)
+    }
+
+    /// With or without the inferred statements.
+    pub fn infer(mut self, infer: bool) -> Self {
+        self.infer = infer;
+        self
+    }
+
+    /// On the data as `pending` would leave it.
+    pub fn on(mut self, pending: Option<&'a crate::StatementsRequest>) -> Self {
+        self.pending = pending;
+        self
+    }
+
+    /// Stopped by `cancel`.
+    pub fn cancelled_by(mut self, cancel: nrese_sparql::CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// The statements read: inferred ones only where both the read and its scope want them.
+    pub fn model(&self) -> nrese_engine::ReadModel {
+        match self.infer && self.scope.sees_inferred() {
+            true => nrese_engine::ReadModel::Materialised,
+            false => nrese_engine::ReadModel::Asserted,
+        }
+    }
+}

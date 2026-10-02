@@ -124,6 +124,11 @@ impl PreparedQuery {
     }
 
     /// Who sent the query, if the caller said.
+    /// The graphs the query may read; `None`: every graph.
+    pub fn access(&self) -> Option<&std::sync::Arc<nrese_sparql::GraphAccess>> {
+        self.access.as_ref()
+    }
+
     pub fn origin(&self) -> Option<&str> {
         self.origin.as_deref()
     }

@@ -1,8 +1,8 @@
 //! Client transactions: writes a client collects over several requests and commits as one
 //! (RDF4J's `/transactions`; the console and other connectors can use the same). A session
 //! holds the statement operations ([`StatementOp`]) in order; reads inside it see the
-//! store as the operations would leave it ([`crate::StoreService::read_statements_pending`]
-//! and the other `*_pending` reads); its commit goes through the mutation pipeline like
+//! store as the operations would leave it ([`crate::ReadContext::on`],
+//! [`crate::StoreService::run_query_pending`]); its commit goes through the mutation pipeline like
 //! any write. Sessions untouched for [`Sessions::idle`] are dropped.
 
 use std::collections::HashMap;
@@ -11,6 +11,12 @@ use std::time::{Duration, Instant};
 
 use std::sync::{Mutex, PoisonError};
 
+use std::sync::Arc;
+
+use nrese_engine::Snapshot;
+use nrese_sparql::GraphAccess;
+
+use crate::ReadScope;
 use crate::statements::{StatementOp, StatementsRequest};
 
 /// How long an untouched session lives.
@@ -19,6 +25,22 @@ pub const SESSION_IDLE: Duration = Duration::from_secs(600);
 struct Session {
     ops: Vec<StatementOp>,
     touched: Instant,
+    /// The data as the operations leave it, kept for the next read
+    /// ([`Sessions::view`]): replaying them for every read of a long transaction would
+    /// take time quadratic in its length.
+    view: Option<View>,
+}
+
+/// The data as a session's operations leave it, and what it was computed from.
+struct View {
+    /// The committed data the operations were applied to.
+    base: Snapshot,
+    /// How many of the session's operations (they are only ever appended).
+    ops: usize,
+    /// Whose: the operations are scoped by the reader's access.
+    scope: ReadScope,
+    writable: Option<Arc<GraphAccess>>,
+    snapshot: Snapshot,
 }
 
 /// The open sessions of one store.
@@ -74,6 +96,7 @@ impl Sessions {
             Session {
                 ops: Vec::new(),
                 touched: Instant::now(),
+                view: None,
             },
         );
         id
@@ -90,6 +113,7 @@ impl Sessions {
             Some(session) => {
                 session.ops.extend(ops);
                 session.touched = Instant::now();
+                session.view = None;
                 true
             }
             None => false,
@@ -128,8 +152,52 @@ impl Sessions {
             .remove(id)
             .map(|session| StatementsRequest {
                 ops: session.ops,
-                writable: None,
+                ..StatementsRequest::default()
             })
+    }
+
+    /// The data as `request` (the session's operations so far, scoped for a reader in
+    /// `scope`) leaves the committed data `latest`, if a read computed it before.
+    pub(crate) fn view(
+        &self,
+        latest: &Snapshot,
+        scope: &ReadScope,
+        request: &StatementsRequest,
+    ) -> Option<Snapshot> {
+        let id = request.session.as_deref()?;
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let view = open.get(id)?.view.as_ref()?;
+        (view.base.same_version(latest)
+            && view.ops == request.ops.len()
+            && view.scope == *scope
+            && view.writable == request.writable)
+            .then(|| view.snapshot.clone())
+    }
+
+    /// Keeps `snapshot`, the data as `request` leaves `base`, for the session's next read.
+    pub(crate) fn keep_view(
+        &self,
+        base: Snapshot,
+        scope: &ReadScope,
+        request: &StatementsRequest,
+        snapshot: Snapshot,
+    ) {
+        let Some(id) = request.session.as_deref() else {
+            return;
+        };
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        // Only for the operations the session still has (none were added meanwhile).
+        if let Some(session) = open.get_mut(id)
+            && session.ops.len() == request.ops.len()
+        {
+            session.view = Some(View {
+                base,
+                ops: request.ops.len(),
+                scope: scope.clone(),
+                writable: request.writable.clone(),
+                snapshot,
+            });
+        }
     }
 
     /// Closes session `id` without committing; whether it was open.

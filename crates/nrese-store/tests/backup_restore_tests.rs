@@ -83,7 +83,7 @@ fn restore_replaces_existing_dataset_and_resets_contents_to_backup()
     assert!(String::from_utf8(source_ask.payload)?.contains("true"));
 
     let named_graph = target.execute_graph_read(
-        &nrese_store::ReadScope::All,
+        &nrese_store::ReadContext::all(),
         &GraphReadRequest {
             target: GraphTarget::NamedGraph("http://example.com/graph/source".to_owned()),
             format: GraphResultFormat::NTriples,

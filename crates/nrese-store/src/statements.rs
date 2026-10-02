@@ -144,6 +144,9 @@ pub struct StatementsRequest {
     pub ops: Vec<StatementOp>,
     /// The graphs the requester may change; `None`: every graph.
     pub writable: Option<Arc<nrese_sparql::GraphAccess>>,
+    /// The session ([`crate::sessions`]) the operations were collected in, if any: reads on
+    /// them keep the data they see there until the session or the store changes.
+    pub session: Option<String>,
 }
 
 impl StatementsRequest {
@@ -233,6 +236,43 @@ pub(crate) fn read_statements(
     Ok(quads)
 }
 
+/// The statements matching `pattern` written to `out` in `format` as they are read: with
+/// their graphs in N-Quads, TriG and Binary RDF, as triples otherwise. Returns how many.
+pub(crate) fn write_statements(
+    view: &impl ReadView,
+    model: ReadModel,
+    pattern: &StatementPattern,
+    format: GraphResultFormat,
+    cancel: &nrese_sparql::CancellationToken,
+    out: impl std::io::Write,
+) -> StoreResult<u64> {
+    let quads_kept = matches!(
+        format,
+        GraphResultFormat::NQuads | GraphResultFormat::TriG | GraphResultFormat::BinaryRdf
+    );
+    let mut writer = nrese_rdf_io::RdfSerializer::from_format(format.rdf_format()).for_writer(out);
+    let mut written = 0;
+    for engine_pattern in pattern.patterns(view) {
+        for quad in decoded_quads(view, model, &engine_pattern) {
+            if cancel.is_cancelled() {
+                return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
+            }
+            let quad = quad?;
+            match quads_kept {
+                true => writer.serialize_quad(&quad)?,
+                false => writer.serialize_triple(&nrese_rdf::Triple::new(
+                    quad.subject,
+                    quad.predicate,
+                    quad.object,
+                ))?,
+            }
+            written += 1;
+        }
+    }
+    writer.finish()?;
+    Ok(written)
+}
+
 /// How many statements match `pattern`.
 pub(crate) fn count_statements(
     view: &impl ReadView,
@@ -251,20 +291,4 @@ pub(crate) fn contexts(view: &impl ReadView) -> Vec<Term> {
     view.named_graphs()
         .filter_map(|graph| view.decode(graph))
         .collect()
-}
-
-/// `quads` in `format`: with their graphs in N-Quads, TriG and Binary RDF, as triples
-/// otherwise.
-pub fn serialize_statements(format: GraphResultFormat, quads: Vec<Quad>) -> StoreResult<Vec<u8>> {
-    match format {
-        GraphResultFormat::NQuads | GraphResultFormat::TriG | GraphResultFormat::BinaryRdf => {
-            crate::rdf_io::serialize_quads(format.rdf_format(), quads)
-        }
-        _ => crate::rdf_io::serialize_triples(
-            format,
-            quads
-                .into_iter()
-                .map(|quad| nrese_rdf::Triple::new(quad.subject, quad.predicate, quad.object)),
-        ),
-    }
 }

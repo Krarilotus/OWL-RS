@@ -351,25 +351,14 @@ impl StoreService {
         self.execute_query(&SparqlQueryRequest::new(query, crate::ReadScope::All))
     }
 
-    /// A graph (Graph Store Protocol `GET`) as `scope` sees it: a graph it may not read
-    /// doesn't exist for it.
+    /// A graph (Graph Store Protocol `GET`) as the read sees it: a graph its scope doesn't
+    /// read doesn't exist for it.
     pub fn execute_graph_read(
         &self,
-        scope: &crate::ReadScope,
+        read: &crate::ReadContext<'_>,
         request: &GraphReadRequest,
     ) -> StoreResult<GraphReadResult> {
-        self.execute_graph_read_as(scope, request, true)
-    }
-
-    /// [`execute_graph_read`](Self::execute_graph_read), asserted statements only unless
-    /// `infer` (and the scope sees inferred statements).
-    pub fn execute_graph_read_as(
-        &self,
-        scope: &crate::ReadScope,
-        request: &GraphReadRequest,
-        infer: bool,
-    ) -> StoreResult<GraphReadResult> {
-        if let Some(access) = scope.access() {
+        if let Some(access) = read.scope.access() {
             let graph = request.target.graph_name()?;
             if !access.allows_graph(&graph) {
                 return Ok(GraphReadResult {
@@ -379,31 +368,24 @@ impl StoreService {
                 });
             }
         }
-        let model = read_model(infer && scope.sees_inferred());
-        execute_graph_read(&self.engine.snapshot(), request, model)
-    }
-
-    /// The statements matching `pattern` (RDF4J's `GET /statements`) in the graphs `scope`
-    /// reads: asserted only, or with the inferred ones.
-    pub fn read_statements(
-        &self,
-        scope: &crate::ReadScope,
-        pattern: &crate::StatementPattern,
-        infer: bool,
-    ) -> StoreResult<Vec<nrese_rdf::Quad>> {
-        let (pattern, model) = scoped_pattern(scope, pattern, infer);
-        crate::statements::read_statements(&self.engine.snapshot(), model, &pattern)
+        execute_graph_read(&self.engine.snapshot(), request, read.model())
     }
 
     /// Runs `read` on the data as it would be after `pending` (an RDF4J transaction's
-    /// operations), which are applied to a transaction that is never committed. The
-    /// writer slot is held meanwhile.
+    /// operations), which are applied to a speculative transaction: never committed, so no
+    /// writer slot is taken.
+    /// In a session, the result is kept for its next read on the same data
+    /// ([`crate::sessions`]); `scope` is the reader's, by which the operations were scoped.
     fn with_pending<T>(
         &self,
         pending: &crate::StatementsRequest,
+        scope: &crate::ReadScope,
         cancellation: &CancellationToken,
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
+        if let Some(view) = self.sessions.view(&self.engine.snapshot(), scope, pending) {
+            return read(&view);
+        }
         // Never committed: no writer slot, so other clients commit meanwhile.
         let mut tx = self.engine.speculative();
         let (union_default_graph, services) = (self.config.union_default_graph, self.services());
@@ -416,7 +398,10 @@ impl StoreService {
                 services.clone(),
             )
         })?;
-        read(&tx.pending_snapshot())
+        let view = tx.pending_snapshot();
+        self.sessions
+            .keep_view(tx.base().clone(), scope, pending, view.clone());
+        read(&view)
     }
 
     /// [`run_query`](Self::run_query) on the data as `pending` would leave it.
@@ -430,7 +415,8 @@ impl StoreService {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
-        self.with_pending(pending, cancellation, |snapshot| {
+        let scope = crate::ReadScope::of(prepared.access().cloned());
+        self.with_pending(pending, &scope, cancellation, |snapshot| {
             run_query(snapshot, prepared, &self.settings, cancellation, out)
         })
     }
@@ -498,50 +484,72 @@ impl StoreService {
         sizes
     }
 
-    /// [`read_statements`](Self::read_statements) on the data as `pending` would leave it.
-    pub fn read_statements_pending(
+    /// The statements matching `pattern` (RDF4J's `GET /statements`) as `read` sees them.
+    pub fn statements(
         &self,
-        scope: &crate::ReadScope,
-        pending: &crate::StatementsRequest,
+        read: &crate::ReadContext<'_>,
         pattern: &crate::StatementPattern,
-        infer: bool,
     ) -> StoreResult<Vec<nrese_rdf::Quad>> {
-        let (pattern, model) = scoped_pattern(scope, pattern, infer);
-        self.with_pending(pending, &CancellationToken::new(), |snapshot| {
-            crate::statements::read_statements(snapshot, model, &pattern)
+        let pattern = scoped_pattern(read, pattern);
+        self.on_data(read, |snapshot| {
+            crate::statements::read_statements(snapshot, read.model(), &pattern)
         })
     }
 
-    /// [`count_statements`](Self::count_statements) on the data as `pending` would leave it.
-    pub fn count_statements_pending(
+    /// [`Self::statements`] written to `out` in `format` as they are read (no list of them
+    /// is kept: a whole repository streams in constant memory). Returns how many.
+    pub fn write_statements(
         &self,
-        scope: &crate::ReadScope,
-        pending: &crate::StatementsRequest,
+        read: &crate::ReadContext<'_>,
         pattern: &crate::StatementPattern,
-        infer: bool,
+        format: crate::GraphResultFormat,
+        out: impl std::io::Write,
     ) -> StoreResult<u64> {
-        let (pattern, model) = scoped_pattern(scope, pattern, infer);
-        self.with_pending(pending, &CancellationToken::new(), |snapshot| {
+        let pattern = scoped_pattern(read, pattern);
+        self.on_data(read, |snapshot| {
+            crate::statements::write_statements(
+                snapshot,
+                read.model(),
+                &pattern,
+                format,
+                &read.cancel,
+                out,
+            )
+        })
+    }
+
+    /// How many statements match `pattern` (RDF4J's `/size`) as `read` sees them.
+    pub fn count(
+        &self,
+        read: &crate::ReadContext<'_>,
+        pattern: &crate::StatementPattern,
+    ) -> StoreResult<u64> {
+        let pattern = scoped_pattern(read, pattern);
+        self.on_data(read, |snapshot| {
             Ok(crate::statements::count_statements(
-                snapshot, model, &pattern,
+                snapshot,
+                read.model(),
+                &pattern,
             ))
         })
+    }
+
+    /// Runs `read` on the latest snapshot, or on the data as the context's pending changes
+    /// would leave it.
+    fn on_data<T>(
+        &self,
+        context: &crate::ReadContext<'_>,
+        read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        match context.pending {
+            None => read(&self.engine.snapshot()),
+            Some(pending) => self.with_pending(pending, &context.scope, &context.cancel, read),
+        }
     }
 
     /// Writes an image backup of the latest snapshot into `dir` ([`crate::image_backup`]).
     pub fn backup_image(&self, dir: &std::path::Path) -> StoreResult<crate::ImageManifest> {
         crate::image_backup::backup_image(&self.engine, dir)
-    }
-
-    /// How many statements match `pattern` (RDF4J's `/size`) in the graphs `scope` reads.
-    pub fn count_statements(
-        &self,
-        scope: &crate::ReadScope,
-        pattern: &crate::StatementPattern,
-        infer: bool,
-    ) -> u64 {
-        let (pattern, model) = scoped_pattern(scope, pattern, infer);
-        crate::statements::count_statements(&self.engine.snapshot(), model, &pattern)
     }
 
     /// At most `limit` resources whose labels' or local names' words begin with the words
@@ -809,16 +817,13 @@ fn read_model(infer: bool) -> crate::ReadModel {
     }
 }
 
-/// `pattern` restricted to the graphs `scope` reads, and the read model: inferred
-/// statements only where both the request and the scope want them.
+/// `pattern` restricted to the graphs the read's scope reads.
 fn scoped_pattern(
-    scope: &crate::ReadScope,
+    read: &crate::ReadContext<'_>,
     pattern: &crate::StatementPattern,
-    infer: bool,
-) -> (crate::StatementPattern, ReadModel) {
-    let pattern = crate::StatementPattern {
-        access: scope.access().cloned(),
+) -> crate::StatementPattern {
+    crate::StatementPattern {
+        access: read.scope.access().cloned(),
         ..pattern.clone()
-    };
-    (pattern, read_model(infer && scope.sees_inferred()))
+    }
 }

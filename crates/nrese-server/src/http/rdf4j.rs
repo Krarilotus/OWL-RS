@@ -281,6 +281,7 @@ pub(crate) fn scoped(ops: Vec<StatementOp>, access: &AccessView) -> StatementsRe
     StatementsRequest {
         ops,
         writable: access.write.clone(),
+        session: None,
     }
 }
 
@@ -546,22 +547,27 @@ async fn statements(
     let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
     let (scope, infer) = (access.read_scope(), infer(&pairs));
-    let body = tokio::task::spawn_blocking(move || {
-        let quads = match &pending {
-            None => store.read_statements(&scope, &pattern, infer)?,
-            Some(pending) => store.read_statements_pending(&scope, pending, &pattern, infer)?,
-        };
-        nrese_store::statements::serialize_statements(format, quads)
-    })
+    // Streamed as read: a whole repository in constant memory.
+    let deadline = tokio::time::Instant::now() + state.policy().timeouts.graph_read;
+    let cancellation = nrese_store::CancellationToken::new();
+    let token = cancellation.clone();
+    super::result_stream::stream_blocking(
+        deadline,
+        cancellation,
+        format.media_type(),
+        "reading the statements exceeded the policy timeout",
+        move |out| {
+            let read = nrese_store::ReadContext::new(scope)
+                .infer(infer)
+                .on(pending.as_ref())
+                .cancelled_by(token);
+            store
+                .write_statements(&read, &pattern, format, out)
+                .map(|_| ())
+                .map_err(read_error)
+        },
+    )
     .await
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(read_error)?;
-    let mut response = (StatusCode::OK, body).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(format.media_type()),
-    );
-    Ok(response)
 }
 
 pub async fn statements_post(
@@ -651,9 +657,11 @@ async fn count(
     };
     let store = state.store();
     let (scope, infer) = (access.read_scope(), infer(&pairs));
-    let count = tokio::task::spawn_blocking(move || match &pending {
-        None => Ok(store.count_statements(&scope, &pattern, infer)),
-        Some(pending) => store.count_statements_pending(&scope, pending, &pattern, infer),
+    let count = tokio::task::spawn_blocking(move || {
+        let read = nrese_store::ReadContext::new(scope)
+            .infer(infer)
+            .on(pending.as_ref());
+        store.count(&read, &pattern)
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
@@ -883,7 +891,10 @@ pub async fn transaction_action(
         "QUERY" | "GET" | "SIZE" => {
             let pending = sessions
                 .pending(&txid)
-                .map(|ops| scoped(ops, &access))
+                .map(|ops| StatementsRequest {
+                    session: Some(txid.clone()),
+                    ..scoped(ops, &access)
+                })
                 .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
             match action.as_str() {
                 "QUERY" => {
