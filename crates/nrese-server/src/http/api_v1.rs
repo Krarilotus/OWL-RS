@@ -43,6 +43,83 @@ pub async fn repositories(
     Ok(Json(entries).into_response())
 }
 
+#[derive(Serialize)]
+struct RepositoryView {
+    id: String,
+    title: String,
+    path: String,
+    default: bool,
+    /// The reasoning mode in effect.
+    reasoning: &'static str,
+    /// The settings it was created with (none for the default repository: the server's).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    settings: Option<crate::repository_config::RepositorySettings>,
+}
+
+/// One repository: its title, reasoning and settings; 404 if there is none.
+pub async fn repository_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_query_read(&state, &headers).await?;
+    let repository = state.for_repository(&id)?;
+    let settings = state.repositories().settings(&id);
+    Ok(Json(RepositoryView {
+        path: format!("/api/v1/repositories/{id}"),
+        title: settings
+            .as_ref()
+            .and_then(|settings| settings.title.clone())
+            .unwrap_or_else(|| format!("NRESE: {id}")),
+        default: id == DEFAULT_REPOSITORY,
+        reasoning: repository.pipeline().reasoner().mode_name(),
+        settings,
+        id,
+    })
+    .into_response())
+}
+
+/// Creates repository `id`, empty, with the settings in the JSON body (`title`,
+/// `reasoning` by mode name, `rules`; an empty body for the server's): 201 with its path,
+/// 409 if it exists.
+pub async fn repository_put(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    let settings: crate::repository_config::RepositorySettings =
+        match body.iter().all(u8::is_ascii_whitespace) {
+            true => Default::default(),
+            false => serde_json::from_slice(&body)
+                .map_err(|error| ApiError::bad_request(format!("repository settings: {error}")))?,
+        };
+    let repositories = state.clone();
+    let created = id.clone();
+    tokio::task::spawn_blocking(move || repositories.repositories().create(&created, settings))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    let path = format!("/api/v1/repositories/{id}");
+    Ok((
+        StatusCode::CREATED,
+        [(axum::http::header::LOCATION, path.clone())],
+        Json(serde_json::json!({ "id": id, "path": path })),
+    )
+        .into_response())
+}
+
+/// Removes repository `id` and its data; the default repository stays.
+pub async fn repository_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    state.repositories().delete(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The repository's namespace prefixes, as a JSON object of prefix to IRI.
 pub async fn namespaces_get(
     Repository(state): Repository,
