@@ -10,7 +10,7 @@ use crate::http::request_metrics::RequestMetrics;
 use crate::policy::PolicyAction;
 use crate::policy::PolicyConfig;
 use crate::rate_limit::RateLimiter;
-use crate::repositories::{DEFAULT_REPOSITORY, Repositories};
+use crate::repositories::{Catalog, DEFAULT_REPOSITORY};
 use crate::runtime_posture::{DeploymentPosture, RuntimePosture};
 use axum::http::HeaderMap;
 
@@ -18,15 +18,13 @@ use axum::http::HeaderMap;
 pub struct AppState {
     /// The repository's write path; a reconfiguration replaces it.
     pipeline: crate::repositories::PipelineSlot,
-    /// The default repository's settings as changed through the engine API.
-    default_settings: Arc<parking_lot::RwLock<crate::repository_config::RepositorySettings>>,
     ready: Arc<AtomicBool>,
     policy: Arc<PolicyConfig>,
     ai: Arc<AiSuggestionService>,
     deployment_posture: DeploymentPosture,
     rate_limiter: Arc<RateLimiter>,
     request_metrics: Arc<RequestMetrics>,
-    repositories: Arc<Repositories>,
+    repositories: Arc<Catalog>,
     /// Users, workspaces and graph policies ([`crate::access`]), server-wide.
     access: Arc<nrese_store::access::AccessControl>,
     /// The repository this state serves.
@@ -57,18 +55,11 @@ impl AppState {
         ai: AiSuggestionService,
         deployment_posture: DeploymentPosture,
     ) -> anyhow::Result<Self> {
-        let repositories = Arc::new(Repositories::open(store.config(), reasoner.clone()));
         let access = Arc::new(open_access(store.config(), &policy)?);
+        let repositories =
+            Arc::new(Catalog::open(store, reasoner).map_err(|error| anyhow::anyhow!(error))?);
         Ok(Self {
-            default_settings: Arc::new(parking_lot::RwLock::new(
-                crate::repositories::stored_default_settings(store.config())
-                    .map_err(|error| anyhow::anyhow!(error))?
-                    .unwrap_or_default(),
-            )),
-            pipeline: Arc::new(parking_lot::RwLock::new(Arc::new(MutationPipeline::new(
-                Arc::new(store),
-                Arc::new(reasoner),
-            )))),
+            pipeline: Arc::clone(&repositories.default_repository().pipeline),
             ready: Arc::new(AtomicBool::new(false)),
             policy: Arc::new(policy),
             ai: Arc::new(ai),
@@ -175,8 +166,8 @@ impl AppState {
         principal
     }
 
-    /// The repositories besides the default one ([`crate::repositories`]).
-    pub fn repositories(&self) -> &Repositories {
+    /// The repositories ([`nrese_store::catalog`]).
+    pub fn repositories(&self) -> &Catalog {
         &self.repositories
     }
 
@@ -214,10 +205,9 @@ impl AppState {
     /// The repository's settings: those it was created with, or for the default
     /// repository those changed through the engine API (empty: the server's).
     pub fn repository_settings(&self) -> crate::repository_config::RepositorySettings {
-        match self.repository_id() {
-            DEFAULT_REPOSITORY => self.default_settings.read().clone(),
-            id => self.repositories.settings(id).unwrap_or_default(),
-        }
+        self.repositories
+            .settings(self.repository_id())
+            .unwrap_or_default()
     }
 
     /// Changes this state's repository's settings: its title, and its reasoning, which
@@ -228,25 +218,7 @@ impl AppState {
         &self,
         settings: crate::repository_config::RepositorySettings,
     ) -> Result<(), ApiError> {
-        if self.repository_id() != DEFAULT_REPOSITORY {
-            return self.repositories.change(self.repository_id(), settings);
-        }
-        crate::repositories::check(&settings)?;
-        let before = self.default_settings.read().clone();
-        if (&before.reasoning, &before.rules) != (&settings.reasoning, &settings.rules) {
-            crate::repositories::reconfigure(
-                &self.pipeline,
-                &settings,
-                self.repositories.server_reasoner(),
-            )?;
-        }
-        if let Some(file) =
-            crate::repositories::default_settings_file(self.pipeline().store().config())
-        {
-            crate::repositories::write_settings(&file, &settings)?;
-        }
-        *self.default_settings.write() = settings;
-        Ok(())
+        Ok(self.repositories.change(self.repository_id(), settings)?)
     }
 
     pub fn mark_ready(&self) {

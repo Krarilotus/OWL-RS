@@ -16,6 +16,7 @@ nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 rayon = "1.10"
+parking_lot = "0.12"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"

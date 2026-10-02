@@ -6,6 +6,7 @@ pub mod access;
 pub mod autocomplete;
 mod backup;
 mod bulk_load;
+pub mod catalog;
 mod classification;
 pub mod config;
 mod datatypes;

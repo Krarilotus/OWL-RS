@@ -131,6 +131,12 @@ crafted XML), all fixed by updates; of the ten wildcard arms six covered real va
   enum with one middleware (authorisation, limits, metrics, tracing, deadlines) that every
   protocol translates to.
 
+  Status: B4a done: `nrese_store::catalog` holds every repository, the default one
+  included (its stored settings, its write path), with `RepositorySettings` and a typed
+  `CatalogError`; the server keeps the RDF4J and GraphDB configuration reading and maps the
+  errors to HTTP. Tested in the store without a server. Left: B4b, the `Operation` enum
+  and its middleware.
+
 ### C. The query engine (with G4)
 
 The algebra visitor, a logical and a physical plan with the optimiser's special cases as
