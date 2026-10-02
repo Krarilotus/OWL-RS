@@ -116,6 +116,17 @@ crafted XML), all fixed by updates; of the ten wildcard arms six covered real va
 - **B3.** One typed configuration tree, from defaults, the file, the environment and the
   command line by one mechanism; its JSON Schema generated for the docs and the frontend;
   the `NRESE_*` names kept.
+
+  Status: done as a registry, not as one serde tree. `config/settings.rs` declares every
+  setting once (file key, older keys, environment name, kind, secrecy, description); the
+  file is read through it (the 770 lines of raw structs and mapping are gone), the
+  command line's `--set key=value` too, and `nrese-server config-schema` prints the JSON
+  Schema generated from it. Tests check that every environment name the parsers read is a
+  setting, that every listed choice loads, and that the operator reference names every
+  key and variable. The typed parse (units, cross-field checks, auth modes) stays in the
+  `*_env.rs` parsers, which already were the one place each value is checked: moving it
+  into serde types would have rewritten tested code for no new behaviour. Left for B4:
+  the schema and the effective settings over the engine API, for the console.
 - **B4.** The engine API for real: the repository catalogue in the store, one `Operation`
   enum with one middleware (authorisation, limits, metrics, tracing, deadlines) that every
   protocol translates to.

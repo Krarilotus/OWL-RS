@@ -139,7 +139,7 @@ result_cache = "256MiB"
         assert_eq!(source.get(key).as_deref(), Some(value), "{key}");
     }
 
-    let config = crate::config::ServerConfig::load(Some(&path)).expect("config");
+    let config = crate::config::ServerConfig::load_isolated(&path, &[]).expect("config");
     assert_eq!(config.policy.limits.max_query_memory_bytes, 8 << 30);
     assert_eq!(config.store.total_query_memory_bytes, 24 << 30);
     assert_eq!(config.policy.timeouts.query.as_secs(), 120);
@@ -159,10 +159,48 @@ result_cache = "256MiB"
     fs::write(&path, "[budgets]\nquery_memory = \"4 parsecs\"\n").expect("write config");
     let error = format!(
         "{:#}",
-        crate::config::ServerConfig::load(Some(&path)).expect_err("unknown unit")
+        crate::config::ServerConfig::load_isolated(&path, &[]).expect_err("unknown unit")
     );
     assert!(
         error.contains("NRESE_MAX_QUERY_MEMORY_BYTES") && error.contains("parsecs"),
         "{error}"
     );
+}
+
+/// A value of the wrong kind names its key; the command line's `--set` goes over the file
+/// and the environment, and its keys are checked like the file's.
+#[test]
+fn values_are_checked_by_kind_and_overrides_win() {
+    let temp_dir = tempdir().expect("temp dir");
+    let path = temp_dir.path().join("config.toml");
+    for text in [
+        "[store]\nverify_on_open = \"yes\"\n",
+        "[federation]\nmax_rows = -1\n",
+        "[auth.mtls]\ntrusted_proxies = [1, 2]\n",
+        "[server]\nbind_address = 8080\n",
+    ] {
+        fs::write(&path, text).expect("write config");
+        let error = format!("{:#}", load_file_source(&path).expect_err(text));
+        let key = text
+            .lines()
+            .nth(1)
+            .and_then(|line| line.split(' ').next())
+            .expect("a key");
+        assert!(error.contains(key), "{key}: {error}");
+    }
+
+    fs::write(&path, "[budgets]\nquery_timeout = \"10s\"\n").expect("write config");
+    let overrides = [("budgets.query_timeout".to_owned(), "45s".to_owned())];
+    let config = crate::config::ServerConfig::load_isolated(&path, &overrides).expect("config");
+    assert_eq!(config.policy.timeouts.query.as_secs(), 45);
+    // An older key works on the command line too.
+    let overrides = [("policy.timeouts.query_ms".to_owned(), "7000".to_owned())];
+    let config = crate::config::ServerConfig::load_isolated(&path, &overrides).expect("config");
+    assert_eq!(config.policy.timeouts.query.as_secs(), 7);
+    let overrides = [("store.mdoe".to_owned(), "on-disk".to_owned())];
+    let error = format!(
+        "{:#}",
+        crate::config::ServerConfig::load_isolated(&path, &overrides).expect_err("unknown")
+    );
+    assert!(error.contains("store.mdoe"), "{error}");
 }

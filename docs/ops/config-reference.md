@@ -15,17 +15,15 @@ Implementation ownership remains in `crates/nrese-server/src/config/`.
 
 ## Precedence
 
-Configuration is resolved in this order:
+Every setting has a key in the configuration file and an environment variable (the lists below; the server's registry of them is `crates/nrese-server/src/config/settings.rs`). A value is taken from the first of:
 
-1. CLI config path via `--config` or `-c`
-2. `NRESE_CONFIG_PATH` for selecting the config file path when no CLI path is given
-3. environment variable overrides for runtime values
-4. `config.toml`
-5. built-in defaults
+1. the command line: `--set KEY=VALUE` with a file key (`--set budgets.query_timeout=2min`), repeatable, for every command
+2. the environment variable
+3. the configuration file: the path from `--config` or `-c`, else `NRESE_CONFIG_PATH`
+4. the built-in default
 
 Notes:
 
-- CLI currently selects the config file path; individual runtime knobs are still configured through file or env.
 - Environment variables always override values loaded from `config.toml`.
 - If no config file path is provided by CLI or `NRESE_CONFIG_PATH`, the server runs from env/defaults only.
 - External reasoner input may still be expressed as `mode`, `preset`, and optional feature overrides, but the server resolves those inputs into one runtime profile/tier contract before diagnostics, capabilities, and frontend surfaces see them.
@@ -33,6 +31,8 @@ Notes:
 ## Validation
 
 - Unknown keys in the TOML file are a startup error that names the key (for example a misspelt `mdoe`). Known aliases such as `server.bind_addr` still work.
+- `nrese-server config-schema` prints the JSON Schema of the configuration file (2020-12): every key with its type, allowed values, description, environment variable (`x-env`), older keys (`x-older-keys`), and `writeOnly` for credentials. Editors and the console can validate and complete `config.toml` with it.
+- A value of the wrong kind (text for a flag, a negative number) is a startup error that names the key.
 - `nrese-server check-config [--config FILE]` loads and validates the configuration (file, then environment overrides), prints the effective settings and exits. Credentials are never printed: authentication and AI show their mode and provider only. `reasoner.semantics` shows the ruleset and its semantic fingerprint (the stored inferences are rebuilt when it changes).
 
 ## Minimal Example
@@ -220,9 +220,9 @@ api_key = "replace-me"
 ## Federation (`SERVICE`)
 
 - file table `[federation]`
-- `allow` (env `NRESE_FEDERATION_ALLOW`, comma-separated): the endpoints `SERVICE` may call, as full IRIs or prefixes (`https://query.wikidata.org/`), or `*` for any. Empty (the default): `SERVICE` is off, an error, and `SERVICE SILENT` one solution without bindings. Allowing `*` lets anyone who may query make the server fetch any URL
-- `timeout` (env `NRESE_FEDERATION_TIMEOUT_MS`, units as in [Budgets](#budgets)): per request to an endpoint; default `30s`
-- `max_rows` (env `NRESE_FEDERATION_MAX_ROWS`): rows one request may return; default 1,000,000
+- `federation.allow` (env `NRESE_FEDERATION_ALLOW`, comma-separated): the endpoints `SERVICE` may call, as full IRIs or prefixes (`https://query.wikidata.org/`), or `*` for any. Empty (the default): `SERVICE` is off, an error, and `SERVICE SILENT` one solution without bindings. Allowing `*` lets anyone who may query make the server fetch any URL
+- `federation.timeout` (env `NRESE_FEDERATION_TIMEOUT_MS`, units as in [Budgets](#budgets)): per request to an endpoint; default `30s`
+- `federation.max_rows` (env `NRESE_FEDERATION_MAX_ROWS`): rows one request may return; default 1,000,000
 - a `SERVICE` joined to a pattern sends the pattern's distinct values as `VALUES`, 200 rows per request (up to 20,000 values; beyond, the block goes once, unbound); redirects are not followed; queries with `SERVICE` are never answered from the result cache
 
 ## Budgets
@@ -390,5 +390,5 @@ default_graph = "read"  # the store's default graph: "none" (default), "read", "
 
 - typed runtime defaults and validation live in owning crates
 - external config parsing and precedence live in `crates/nrese-server/src/config/`
-- env variable names are centralized in `crates/nrese-server/src/config/env_names.rs`
+- every setting (file key, older keys, environment name, kind, description) is declared once in `crates/nrese-server/src/config/settings.rs`; a test checks that this reference names every key and environment variable
 - do not document runtime knobs in multiple operator docs
