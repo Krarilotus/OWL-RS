@@ -385,7 +385,6 @@ fn boundaries(
 
 // One per parser, never in a collection: boxing the large variant would only add an
 // indirection on the hot path.
-#[allow(clippy::large_enum_variant)]
 enum Inner<'a, R: Read> {
     Lines {
         lines: Lines<'a, R>,

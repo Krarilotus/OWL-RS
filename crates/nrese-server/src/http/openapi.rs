@@ -14,7 +14,7 @@ use utoipa::OpenApi;
 /// An error, as every endpoint reports one (RFC 9457 problem details,
 /// `application/problem+json`).
 #[derive(utoipa::ToSchema)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) struct Problem {
     /// The problem's kind, a URI (`https://nrese.dev/problems/…`).
     r#type: String,
@@ -31,7 +31,7 @@ const ID: &str = "The repository's id (`nrese` is the default one)";
 macro_rules! protocol {
     ($name:ident, $($spec:tt)*) => {
         #[utoipa::path($($spec)*)]
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         fn $name() {}
     };
 }

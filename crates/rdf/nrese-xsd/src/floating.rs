@@ -149,7 +149,7 @@ macro_rules! floating {
 
         /// Rounded to nearest.
         impl From<Integer> for $name {
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(clippy::cast_precision_loss)]
             fn from(value: Integer) -> Self {
                 Self(i64::from(value) as $t)
             }
@@ -263,7 +263,7 @@ impl From<Float> for Double {
 
 /// Rounded to nearest.
 impl From<Double> for Float {
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     fn from(value: Double) -> Self {
         Self(value.0 as f32)
     }

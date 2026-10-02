@@ -173,7 +173,6 @@ pub(crate) enum Outcome {
 
 /// Runs `check` for `focus` (with `values`, its value nodes, for an ASK validator) over
 /// `data`, with the pre-bound variables of SHACL-SPARQL.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run<V: ReadView>(
     view: &V,
     data: Selection,

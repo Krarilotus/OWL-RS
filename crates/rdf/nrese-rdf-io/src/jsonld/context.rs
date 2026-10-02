@@ -348,7 +348,7 @@ struct Remote {
 pub(crate) struct Processor {
     pub(crate) options: JsonLdOptions,
     remote: Map<String, Arc<Remote>>,
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     memo: Map<(usize, usize, u8), (Arc<Context>, Arc<Context>, Arc<TermDefinition>)>,
 }
 
@@ -428,7 +428,7 @@ impl Processor {
     }
 
     /// The Context Processing algorithm (§4.1.2).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn process(
         &mut self,
         active: &Context,
@@ -732,7 +732,7 @@ impl Processor {
 
     /// IRI Expansion during context processing: terms of the local context it depends on
     /// are defined first (§5.2 steps 3 and 6.3).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn expand_iri_defining(
         &mut self,
         active: &mut Context,
