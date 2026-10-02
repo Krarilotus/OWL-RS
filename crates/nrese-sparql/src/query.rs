@@ -45,6 +45,10 @@ pub struct QueryOptions {
     /// own projection drops them (the caller knows their values).
     pub pre_bound:
         Option<std::sync::Arc<std::collections::HashMap<nrese_rdf::Variable, nrese_rdf::Term>>>,
+    /// The rows of a cross product made at once below a GROUP BY (the product is grouped
+    /// in chunks of that size); `None`: 4 M. Tests make it small, so that groups are
+    /// split across many chunks.
+    pub cross_chunk_rows: Option<usize>,
 }
 
 /// Evaluates `query` against `view` over the engine's id tables (`native`); a transaction
