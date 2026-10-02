@@ -48,24 +48,93 @@ pub enum Term {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Atom(pub [Term; 3]);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Guard {
     /// The two terms must be bound to different ids.
     NotEqual(Term, Term),
     /// The term's id must lie outside `low..=high` (a kind of term: blank nodes).
     NotIn(Term, u64, u64),
+    /// The two terms must be members of one list of the index, the first's id below the
+    /// second's (each pair once): a long n-ary axiom (`owl:AllDifferent` over thousands of
+    /// individuals) as one rule whose pairs are checked here, instead of a rule per pair
+    /// ([`super::lists`]; its rules are symmetric in the two terms).
+    SameList(Term, Term, SharedListIndex),
 }
 
 impl Guard {
     /// Whether the guard holds for the terms' values (`None`: unbound, decided later).
-    pub fn holds(self, value: impl Fn(Term) -> Option<u64>) -> bool {
+    pub fn holds(&self, value: impl Fn(Term) -> Option<u64>) -> bool {
         match self {
-            Guard::NotEqual(a, b) => match (value(a), value(b)) {
+            Guard::NotEqual(a, b) => match (value(*a), value(*b)) {
                 (Some(a), Some(b)) => a != b,
                 _ => true,
             },
-            Guard::NotIn(term, low, high) => value(term).is_none_or(|v| v < low || v > high),
+            Guard::NotIn(term, low, high) => value(*term).is_none_or(|v| v < *low || v > *high),
+            Guard::SameList(a, b, index) => match (value(*a), value(*b)) {
+                (Some(a), Some(b)) => a < b && index.0.together(a, b),
+                _ => true,
+            },
         }
+    }
+}
+
+/// Which lists each term is a member of, for [`Guard::SameList`].
+#[derive(Debug, Default)]
+pub struct ListIndex {
+    /// Each member's list numbers, sorted.
+    lists: std::collections::HashMap<u64, Vec<u32>>,
+    count: u32,
+}
+
+impl ListIndex {
+    /// Adds a list of `members`.
+    pub fn add(&mut self, members: &[u64]) {
+        let list = self.count;
+        self.count += 1;
+        for &member in members {
+            let lists = self.lists.entry(member).or_default();
+            if lists.last() != Some(&list) {
+                lists.push(list);
+            }
+        }
+    }
+
+    /// Whether `a` and `b` are members of one list.
+    pub fn together(&self, a: u64, b: u64) -> bool {
+        let (Some(x), Some(y)) = (self.lists.get(&a), self.lists.get(&b)) else {
+            return false;
+        };
+        let (mut i, mut j) = (0, 0);
+        while i < x.len() && j < y.len() {
+            match x[i].cmp(&y[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => return true,
+            }
+        }
+        false
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+/// A [`ListIndex`] shared by the rules that ask it; compared by identity.
+#[derive(Debug, Clone)]
+pub struct SharedListIndex(pub std::sync::Arc<ListIndex>);
+
+impl PartialEq for SharedListIndex {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedListIndex {}
+
+impl std::hash::Hash for SharedListIndex {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::ptr::hash(std::sync::Arc::as_ptr(&self.0), state);
     }
 }
 

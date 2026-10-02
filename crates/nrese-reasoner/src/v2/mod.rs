@@ -107,6 +107,92 @@ mod tests {
         assert!(violations.is_empty(), "{violations:?}");
     }
 
+    /// Lists of any length are reasoned with (the audit of 2 October: a cap of 100
+    /// members skipped long `owl:AllDifferent` lists and missed inconsistencies). The
+    /// pairwise axioms over long lists are one rule each, checked through the members'
+    /// index; the rest expand as before.
+    #[test]
+    fn long_lists_are_reasoned_with_not_skipped() {
+        let n = 300;
+        let list = |name: &str, members: &[String]| -> String {
+            let mut lines = String::new();
+            for (i, member) in members.iter().enumerate() {
+                let next = match i + 1 == members.len() {
+                    true => "rdf:nil".to_owned(),
+                    false => format!("_:{name}{}", i + 1),
+                };
+                lines.push_str(&format!(
+                    "_:{name}{i} rdf:first {member}\n_:{name}{i} rdf:rest {next}\n"
+                ));
+            }
+            lines
+        };
+        let people: Vec<String> = (0..n).map(|i| format!("ex:p{i}")).collect();
+        for (property, rule) in [("members", "eq-diff2"), ("distinctMembers", "eq-diff3")] {
+            let axiom = format!(
+                "_:d rdf:type owl:AllDifferent\n_:d owl:{property} _:l0\n{}",
+                list("l", &people)
+            );
+            let (_, _, violations) = closure(&axiom);
+            assert!(violations.is_empty(), "{property}: {violations:?}");
+            // The pair (both ways), and the member sequence equality makes, in which p250
+            // stands twice.
+            let (_, _, violations) = closure(&format!("{axiom}ex:p7 owl:sameAs ex:p250\n"));
+            assert!(
+                !violations.is_empty() && violations.iter().all(|v| v == rule),
+                "{property}: {violations:?}"
+            );
+            // An individual listed twice is inconsistent by itself.
+            let mut twice = people.clone();
+            twice.push("ex:p3".to_owned());
+            let axiom = format!(
+                "_:d rdf:type owl:AllDifferent\n_:d owl:{property} _:l0\n{}",
+                list("l", &twice)
+            );
+            let (_, _, violations) = closure(&axiom);
+            assert!(
+                violations.contains(&rule.to_owned()),
+                "{property}: {violations:?}"
+            );
+        }
+        let classes: Vec<String> = (0..n).map(|i| format!("ex:C{i}")).collect();
+        let disjoint = format!(
+            "_:d rdf:type owl:AllDisjointClasses\n_:d owl:members _:l0\n{}",
+            list("l", &classes)
+        );
+        let (_, _, violations) = closure(&format!("{disjoint}ex:x rdf:type ex:C1\n"));
+        assert!(violations.is_empty(), "{violations:?}");
+        let (_, _, violations) = closure(&format!(
+            "{disjoint}ex:x rdf:type ex:C1\nex:x rdf:type ex:C299\n"
+        ));
+        assert_eq!(violations, vec!["cax-adc".to_owned()]);
+        let properties: Vec<String> = (0..n).map(|i| format!("ex:q{i}")).collect();
+        let disjoint = format!(
+            "_:d rdf:type owl:AllDisjointProperties\n_:d owl:members _:l0\n{}",
+            list("l", &properties)
+        );
+        let (_, _, violations) =
+            closure(&format!("{disjoint}ex:x ex:q5 ex:y\nex:x ex:q200 ex:y\n"));
+        assert_eq!(violations, vec!["prp-adp".to_owned()]);
+        // Linear axioms over long lists: an enumeration and a union.
+        let (vocabulary, derived, _) = closure(&format!(
+            "ex:E owl:oneOf _:l0\n{}ex:U owl:unionOf _:m0\n{}ex:x rdf:type ex:C123\n",
+            list("l", &people),
+            list("m", &classes)
+        ));
+        let mut vocabulary = vocabulary;
+        let ty = vocabulary.iri(&format!("{}type", super::ir::RDF));
+        let id = |v: &mut LocalVocabulary, local: &str| v.iri(&format!("{EX}{local}"));
+        let (p299, e, x, u) = (
+            id(&mut vocabulary, "p299"),
+            id(&mut vocabulary, "E"),
+            id(&mut vocabulary, "x"),
+            id(&mut vocabulary, "U"),
+        );
+        assert!(derived.contains(&[p299, ty, e]), "cls-oo over 300 members");
+        assert!(derived.contains(&[x, ty, u]), "cls-uni over 300 members");
+    }
+
     /// The schema is closed before the instance data (batch), and that pre-closure derives
     /// `ex:a rdf:type ex:C` from the enumeration alone, which the data also asserts: it
     /// must not be reported as derived (`both` checks that, and batch = naive).

@@ -396,6 +396,15 @@ fn instance(
                 Term::Const(_) => {}
                 term => guards.push(Guard::NotIn(term, low, high)),
             },
+            Guard::SameList(a, b, ref index) => {
+                match (substitute(a, substitution), substitute(b, substitution)) {
+                    (Term::Const(a), Term::Const(b)) if a >= b || !index.0.together(a, b) => {
+                        return None;
+                    }
+                    (Term::Const(_), Term::Const(_)) => {}
+                    (a, b) => guards.push(Guard::SameList(a, b, index.clone())),
+                }
+            }
         }
     }
     let head = match &rule.head {
