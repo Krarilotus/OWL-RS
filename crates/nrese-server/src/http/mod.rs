@@ -13,6 +13,7 @@ mod operator_diagnostics;
 mod operator_ui;
 pub(crate) mod rdf4j;
 mod rdf_payload;
+mod repository;
 mod reasoning_view;
 pub(crate) mod request_metrics;
 mod requests;
