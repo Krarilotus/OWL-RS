@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
-/// Command line: `nrese-server [--config PATH]` serves;
+/// Command line: `nrese-server [--config PATH] [--set KEY=VALUE]...` serves (`--set`
+/// overrides a configuration file key, over the file and the environment; every command
+/// takes it); `nrese-server config-schema` prints the JSON Schema of the configuration file;
 /// `nrese-server load [--config PATH] [--replace] [--graph IRI] [--skip-errors] FILE...` bulk-loads files
 /// into the configured store and exits (the server must not be running on the same data
 /// directory; the engine's directory lock enforces that);
@@ -22,6 +24,8 @@ use anyhow::{Result, bail};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliConfig {
     pub config_path: Option<PathBuf>,
+    /// `--set key=value` (a configuration file key): over the file and the environment.
+    pub overrides: Vec<(String, String)>,
     pub command: CliCommand,
 }
 
@@ -33,6 +37,8 @@ pub enum CliCommand {
     /// `check-config`: load and validate the configuration, print the effective settings
     /// (secrets redacted) and exit.
     CheckConfig,
+    /// `config-schema`: print the JSON Schema of the configuration file and exit.
+    ConfigSchema,
     Query(QueryCommand),
     Convert(ConvertCommand),
     /// `backup DIR`: an image backup of the store into `DIR`.
@@ -151,6 +157,12 @@ impl CliConfig {
         {
             args.next();
             config.command = CliCommand::CheckConfig;
+        } else if args
+            .peek()
+            .is_some_and(|argument| argument == "config-schema")
+        {
+            args.next();
+            config.command = CliCommand::ConfigSchema;
         } else if args.peek().is_some_and(|argument| argument == "query") {
             args.next();
             config.command = CliCommand::Query(QueryCommand::default());
@@ -185,6 +197,19 @@ impl CliConfig {
                 .and_then(|raw| raw.strip_prefix("--config="))
             {
                 config.config_path = Some(PathBuf::from(value));
+                continue;
+            }
+
+            if argument == "--set" {
+                let Some(assignment) = args.next().and_then(|a| a.into_string().ok()) else {
+                    bail!("missing or non-UTF-8 value for --set");
+                };
+                let Some((key, value)) = assignment.split_once('=') else {
+                    bail!("--set takes key=value, not '{assignment}'");
+                };
+                config
+                    .overrides
+                    .push((key.trim().to_owned(), value.trim().to_owned()));
                 continue;
             }
 
@@ -335,6 +360,31 @@ mod tests {
                 .chain(args.iter().copied())
                 .map(OsString::from),
         )
+    }
+
+    #[test]
+    fn set_overrides_configuration_keys_for_every_command() {
+        let config = parse(&[
+            "load",
+            "--set",
+            "store.data_dir=/srv/nrese",
+            "--set",
+            "budgets.query_timeout = 2min",
+            "a.nt",
+        ])
+        .expect("cli config");
+        assert_eq!(
+            config.overrides,
+            [
+                ("store.data_dir".to_owned(), "/srv/nrese".to_owned()),
+                ("budgets.query_timeout".to_owned(), "2min".to_owned()),
+            ]
+        );
+        assert!(parse(&["--set", "no-equals-sign"]).is_err());
+        assert_eq!(
+            parse(&["config-schema"]).expect("cli config").command,
+            CliCommand::ConfigSchema
+        );
     }
 
     #[test]

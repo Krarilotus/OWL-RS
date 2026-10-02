@@ -17,10 +17,9 @@ mod env_values;
 mod file_config;
 mod policy_env;
 mod reasoner_env;
+pub mod settings;
 mod source;
 mod store_env;
-#[cfg(test)]
-mod test_support;
 pub mod units;
 
 pub use cli::{CliCommand, CliConfig, ConvertCommand, LoadCommand, QueryCommand};
@@ -173,13 +172,37 @@ impl ServerConfig {
     }
 
     pub fn load(config_path: Option<&Path>) -> Result<Self> {
-        let env_source = ProcessEnv;
-        let file_source = match resolve_config_path(config_path, &env_source) {
+        Self::load_with(config_path, &[])
+    }
+
+    /// The configuration from the file, the environment and `overrides` (the command
+    /// line's `--set key=value`), each over the one before ([`settings`]).
+    pub fn load_with(config_path: Option<&Path>, overrides: &[(String, String)]) -> Result<Self> {
+        Self::load_from(config_path, ProcessEnv, overrides)
+    }
+
+    /// [`Self::load_with`] with `env` as the environment.
+    fn load_from(
+        config_path: Option<&Path>,
+        env: impl ConfigSource,
+        overrides: &[(String, String)],
+    ) -> Result<Self> {
+        let file_source = match resolve_config_path(config_path, &env) {
             Some(path) => load_file_source(&path)?,
             None => KeyValueSource::default(),
         };
-        let source = LayeredSource::new(file_source, env_source);
+        let source = LayeredSource::new(
+            LayeredSource::new(file_source, env),
+            settings::from_overrides(overrides)?,
+        );
         Self::from_source(&source)
+    }
+
+    /// The configuration from the file at `path` and `overrides` alone, whatever the
+    /// process environment holds.
+    #[cfg(test)]
+    fn load_isolated(path: &Path, overrides: &[(String, String)]) -> Result<Self> {
+        Self::load_from(Some(path), KeyValueSource::default(), overrides)
     }
 
     fn from_source(source: &dyn ConfigSource) -> Result<Self> {
@@ -251,13 +274,20 @@ mod tests {
     use nrese_reasoner::ReasoningMode;
     use tempfile::tempdir;
 
-    use super::test_support::{EnvGuard, env_lock};
+    use super::source::KeyValueSource;
     use super::{CliConfig, DeploymentPosture, ServerConfig, env_names as names};
+
+    /// An environment of `values` alone (the process environment untouched).
+    fn env(values: &[(&str, &str)]) -> KeyValueSource {
+        let mut source = KeyValueSource::default();
+        for (key, value) in values {
+            source.insert(*key, *value);
+        }
+        source
+    }
 
     #[test]
     fn server_config_loads_from_file() {
-        let _lock = env_lock().lock().expect("env lock");
-        let _guard = EnvGuard::set(&clean_runtime_env_overrides(&[]));
         let temp_dir = tempdir().expect("temp dir");
         let path = temp_dir.path().join("config.toml");
         fs::write(
@@ -294,7 +324,7 @@ mode = "none"
         )
         .expect("config file");
 
-        let config = ServerConfig::load(Some(&path)).expect("server config");
+        let config = ServerConfig::load_from(Some(&path), env(&[]), &[]).expect("server config");
 
         assert_eq!(config.bind_address.to_string(), "0.0.0.0:9191");
         assert_eq!(config.deployment_posture, DeploymentPosture::OpenWorkbench);
@@ -309,12 +339,10 @@ mode = "none"
 
     #[test]
     fn env_overrides_file_values() {
-        let _lock = env_lock().lock().expect("env lock");
-        let _guard = EnvGuard::set(&clean_runtime_env_overrides(&[
-            (names::BIND_ADDR, Some("127.0.0.1:9898")),
-            (names::REASONING_MODE, Some("disabled")),
-            (names::CONFIG_PATH, None),
-        ]));
+        let environment = env(&[
+            (names::BIND_ADDR, "127.0.0.1:9898"),
+            (names::REASONING_MODE, "disabled"),
+        ]);
         let temp_dir = tempdir().expect("temp dir");
         let path = temp_dir.path().join("config.toml");
         fs::write(
@@ -333,7 +361,7 @@ mode = "none"
         )
         .expect("config file");
 
-        let config = ServerConfig::load(Some(&path)).expect("server config");
+        let config = ServerConfig::load_from(Some(&path), environment, &[]).expect("server config");
 
         assert_eq!(config.bind_address.to_string(), "127.0.0.1:9898");
         assert_eq!(config.reasoner.mode(), ReasoningMode::Disabled);
@@ -341,7 +369,6 @@ mode = "none"
 
     #[test]
     fn config_path_can_be_selected_from_env() {
-        let _lock = env_lock().lock().expect("env lock");
         let temp_dir = tempdir().expect("temp dir");
         let path = temp_dir.path().join("config.toml");
         fs::write(
@@ -356,12 +383,9 @@ mode = "none"
 "#,
         )
         .expect("config file");
-        let _guard = EnvGuard::set(&clean_runtime_env_overrides(&[
-            (names::CONFIG_PATH, Some(path.to_string_lossy().as_ref())),
-            (names::AUTH_MODE, None),
-        ]));
+        let environment = env(&[(names::CONFIG_PATH, path.to_string_lossy().as_ref())]);
 
-        let config = ServerConfig::load(None).expect("server config");
+        let config = ServerConfig::load_from(None, environment, &[]).expect("server config");
 
         assert_eq!(config.bind_address.to_string(), "127.0.0.1:9393");
     }
@@ -373,73 +397,11 @@ mode = "none"
 
     #[test]
     fn deployment_posture_rejects_unauthenticated_internal_mode() {
-        let _lock = env_lock().lock().expect("env lock");
-        let _guard = EnvGuard::set(&clean_runtime_env_overrides(&[
-            (names::DEPLOYMENT_POSTURE, Some("internal-authenticated")),
-            (names::AUTH_MODE, Some("none")),
-        ]));
+        let environment = env(&[
+            (names::DEPLOYMENT_POSTURE, "internal-authenticated"),
+            (names::AUTH_MODE, "none"),
+        ]);
 
-        assert!(ServerConfig::from_env().is_err());
-    }
-
-    fn clean_runtime_env_overrides<'a>(
-        overrides: &'a [(&'static str, Option<&'a str>)],
-    ) -> Vec<(&'static str, Option<&'a str>)> {
-        let mut values = vec![
-            (names::CONFIG_PATH, None),
-            (names::BIND_ADDR, None),
-            (names::DEPLOYMENT_POSTURE, None),
-            (names::DATA_DIR, None),
-            (names::STORE_MODE, None),
-            (names::ONTOLOGY_PATH, None),
-            (names::REASONING_MODE, None),
-            (names::MAX_QUERY_BYTES, None),
-            (names::MAX_UPDATE_BYTES, None),
-            (names::MAX_RDF_UPLOAD_BYTES, None),
-            (names::RATE_LIMIT_WINDOW_SECS, None),
-            (names::READ_REQUESTS_PER_WINDOW, None),
-            (names::WRITE_REQUESTS_PER_WINDOW, None),
-            (names::ADMIN_REQUESTS_PER_WINDOW, None),
-            (names::QUERY_TIMEOUT_MS, None),
-            (names::UPDATE_TIMEOUT_MS, None),
-            (names::GRAPH_READ_TIMEOUT_MS, None),
-            (names::GRAPH_WRITE_TIMEOUT_MS, None),
-            (names::SPARQL_PARSE_ERROR_PROFILE, None),
-            (names::ENABLE_OPERATOR_UI, None),
-            (names::ENABLE_METRICS, None),
-            (names::AI_ENABLED, None),
-            (names::AI_PROVIDER, None),
-            (names::AI_MODEL, None),
-            (names::AI_TIMEOUT_MS, None),
-            (names::AI_MAX_SUGGESTIONS, None),
-            (names::AI_SYSTEM_PROMPT, None),
-            (names::AI_GOOGLE_API_KEY, None),
-            (names::AI_GOOGLE_API_BASE, None),
-            (names::AI_OPENROUTER_API_KEY, None),
-            (names::AI_OPENROUTER_API_BASE, None),
-            (names::AI_OPENROUTER_SITE_URL, None),
-            (names::AI_OPENROUTER_APP_NAME, None),
-            ("GOOGLE_API_KEY", None),
-            (names::AUTH_MODE, None),
-            (names::AUTH_READ_TOKEN, None),
-            (names::AUTH_ADMIN_TOKEN, None),
-            (names::AUTH_JWT_SECRET, None),
-            (names::AUTH_JWT_ISSUER, None),
-            (names::AUTH_JWT_AUDIENCE, None),
-            (names::AUTH_JWT_READ_ROLE, None),
-            (names::AUTH_JWT_ADMIN_ROLE, None),
-            (names::AUTH_JWT_LEEWAY_SECS, None),
-            (names::AUTH_MTLS_SUBJECT_HEADER, None),
-            (names::AUTH_MTLS_READ_SUBJECTS, None),
-            (names::AUTH_MTLS_ADMIN_SUBJECTS, None),
-            (names::AUTH_OIDC_INTROSPECTION_URL, None),
-            (names::AUTH_OIDC_CLIENT_ID, None),
-            (names::AUTH_OIDC_CLIENT_SECRET, None),
-            (names::AUTH_OIDC_READ_ROLE, None),
-            (names::AUTH_OIDC_ADMIN_ROLE, None),
-            (names::AUTH_OIDC_TIMEOUT_MS, None),
-        ];
-        values.extend_from_slice(overrides);
-        values
+        assert!(ServerConfig::from_source(&environment).is_err());
     }
 }
