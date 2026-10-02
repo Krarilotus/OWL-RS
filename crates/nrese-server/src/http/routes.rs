@@ -206,6 +206,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/access/history", get(access_api::history))
         .route("/api/v1/access/import", post(access_api::import))
         .route("/api/v1/access/export", get(access_api::export))
+        .route("/api/v1/queries", get(access_api::saved_queries))
+        .route(
+            "/api/v1/queries/{space}/{name}",
+            get(access_api::saved_query)
+                .put(access_api::saved_query_put)
+                .delete(access_api::saved_query_delete),
+        )
         .route(
             "/api/v1/repositories/{id}",
             get(api_v1::repository_get)

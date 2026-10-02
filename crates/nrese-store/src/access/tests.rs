@@ -464,3 +464,105 @@ fn local_logins_check_passwords_open_sessions_and_throttle_failures() {
         Err(AccessError::Throttled(_))
     ));
 }
+
+/// Saved queries live in spaces: a personal space's owner and those it shares with read
+/// them; editors and owners of a workspace change its queries; they outlive a restart and
+/// are checked to parse (with the repository's prefixes) before they are stored.
+#[test]
+fn saved_queries_belong_to_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        let store = StoreService::new(StoreConfig::on_disk(dir.path())).unwrap();
+        AccessControl::open(store, "urn:nrese:").unwrap()
+    };
+    let draft = |query: &str| QueryDraft {
+        query: query.to_owned(),
+        title: Some("Everything".to_owned()),
+        ..QueryDraft::default()
+    };
+    let namespaces = crate::NamespaceMap::from([("ex".to_owned(), "urn:ex:".to_owned())]);
+    {
+        let control = open();
+        let alice = user("alice");
+        // In her personal space, with a prefix the repository binds.
+        let saved = control
+            .save_query(
+                &alice,
+                "~alice",
+                "all",
+                draft("SELECT * { ?s ex:p ?o }"),
+                &namespaces,
+            )
+            .unwrap();
+        assert_eq!(
+            (saved.author.as_str(), saved.title.as_deref()),
+            ("alice", Some("Everything"))
+        );
+        // Neither a query nor an update; a bad name; someone else's space.
+        assert!(matches!(
+            control.save_query(&alice, "~alice", "bad", draft("SELECT * {"), &namespaces),
+            Err(AccessError::Invalid(_))
+        ));
+        assert!(matches!(
+            control.save_query(&alice, "~alice", "a/b", draft("ASK {}"), &namespaces),
+            Err(AccessError::Invalid(_))
+        ));
+        assert!(matches!(
+            control.save_query(&user("bob"), "~alice", "mine", draft("ASK {}"), &namespaces),
+            Err(AccessError::Forbidden(_))
+        ));
+        // Bob sees nothing of hers until she shares her space with him.
+        assert!(control.saved_queries(&user("bob")).is_empty());
+        assert!(matches!(
+            control.saved_query(&user("bob"), "~alice", "all"),
+            Err(AccessError::NotFound(_))
+        ));
+        control
+            .apply(
+                &alice,
+                Change::SetMember {
+                    workspace: "~alice".to_owned(),
+                    user: "bob".to_owned(),
+                    level: Some(Level::Viewer),
+                },
+                "review",
+            )
+            .unwrap();
+        assert_eq!(control.saved_queries(&user("bob")).len(), 1);
+        // A viewer reads, doesn't remove.
+        assert!(matches!(
+            control.delete_query(&user("bob"), "~alice", "all"),
+            Err(AccessError::Forbidden(_))
+        ));
+        // An update is a query to keep too.
+        control
+            .save_query(
+                &alice,
+                "~alice",
+                "clear",
+                draft("CLEAR DEFAULT"),
+                &namespaces,
+            )
+            .unwrap();
+    }
+    // After a restart.
+    let control = open();
+    let mine = control.saved_queries(&user("alice"));
+    assert_eq!(
+        mine.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(),
+        ["all", "clear"]
+    );
+    assert_eq!(mine[0].query, "SELECT * { ?s ex:p ?o }");
+    control
+        .delete_query(&user("alice"), "~alice", "all")
+        .unwrap();
+    assert!(matches!(
+        control.saved_query(&user("alice"), "~alice", "all"),
+        Err(AccessError::NotFound(_))
+    ));
+    // No such workspace.
+    assert!(matches!(
+        control.save_query(&admin(), "nowhere", "q", draft("ASK {}"), &namespaces),
+        Err(AccessError::NotFound(_))
+    ));
+}
