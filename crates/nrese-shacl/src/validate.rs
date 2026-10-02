@@ -57,6 +57,39 @@ pub(crate) fn validate_raw<V: ReadView + Sync>(
     (results, validator.into_failures())
 }
 
+/// Whether validating `data` against `shapes` checks anything: an active targeted shape
+/// with at least one focus node and at least one constraint, its own or reached through
+/// nested shapes. A conforming report with nothing applicable is a vacuous pass.
+pub(crate) fn applicable<V: ReadView + Sync>(view: &V, shapes: &Shapes, data: Selection) -> bool {
+    let validator = Validator::new(view, shapes, data);
+    shapes.targeted().any(|shape| {
+        constrained(shapes, shape, &mut Vec::new())
+            && !validator.focus_nodes(&shapes.shapes[shape]).is_empty()
+    })
+}
+
+/// Whether `shape` is active and constrains something, directly or through the shapes
+/// its constraints name. `seen` stops cycles.
+fn constrained(shapes: &Shapes, shape: ShapeRef, seen: &mut Vec<ShapeRef>) -> bool {
+    if seen.contains(&shape) || shapes.shapes[shape].deactivated {
+        return false;
+    }
+    seen.push(shape);
+    shapes.shapes[shape]
+        .constraints
+        .iter()
+        .any(|constraint| match constraint {
+            Constraint::Not(nested) | Constraint::Node(nested) | Constraint::Property(nested) => {
+                constrained(shapes, *nested, seen)
+            }
+            Constraint::Qualified { shape: nested, .. } => constrained(shapes, *nested, seen),
+            Constraint::Logical(_, nested) => nested
+                .iter()
+                .any(|nested| constrained(shapes, *nested, seen)),
+            _ => true,
+        })
+}
+
 pub(crate) struct Validator<'a, V: ReadView> {
     graph: GraphView<'a, V>,
     shapes: &'a Shapes,

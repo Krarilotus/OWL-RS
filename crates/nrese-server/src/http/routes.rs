@@ -3,6 +3,7 @@ use axum::routing::{delete, get, post, put};
 
 use crate::http::access_api;
 use crate::http::api_v1;
+use crate::http::draft_check;
 use crate::http::handlers;
 use crate::http::rdf4j;
 use crate::state::AppState;
@@ -99,6 +100,11 @@ pub fn router(state: AppState) -> Router {
     let authenticated = Router::new()
         .route("/console", get(handlers::console_ui))
         .route("/api/ai/status", get(handlers::ai_status))
+        .route(
+            "/api/v1/draft-check/capabilities",
+            get(draft_check::capabilities),
+        )
+        .route("/api/v1/draft-check", post(draft_check::check))
         .route(
             "/api/ai/query-suggestions",
             post(handlers::ai_query_suggestions),
