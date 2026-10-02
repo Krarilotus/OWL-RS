@@ -221,6 +221,17 @@ the `lubm-materialised` workload, below.
   16–22 ns in id order against 5 ns copied plain, and in 166–184 ns at random in a tight
   loop against 53 ns (its decode loop overlaps fewer cache misses); compression runs at
   230–260 MB/s, training on a sample takes 0.02 s.
+
+  Block offsets are in checkpoint format 11. The stores rewritten as images (the
+  `image` example of `nrese-engine`), then queried after a restart in the perf lab (5
+  runs; the format 10 store read by the binary before format 11):
+
+  | Store | Checkpoint 10 → 11 | Dictionary mapped | Queries (sum of medians) | Rows |
+  |---|---:|---:|---:|---|
+  | DBpedia core | 5,075 → 4,852 MiB (−4.4 %) | 2,216 → 1,994 MiB | 129.5 → 118.0 ms | equal |
+  | Wikidata lexemes | 2,832 → 2,756 MiB (−2.7 %) | 862 → 786 MiB | 54.0 → 47.9 ms | equal |
+
+  The query times are within the runs' spread: no cost measured.
 - **First count after a restart.** On LUBM(100), YAGO tiny and Wikidata the first count
   took 14 to 22 ms in Docker (one sample each), against 1.5 ms elsewhere; on the office
   PC the same store answers it in 0.9 ms over HTTP. To be rechecked with more runs.
