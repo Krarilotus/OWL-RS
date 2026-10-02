@@ -53,7 +53,8 @@ Last updated: 2 October 2026, branch `refactor/engine-v2`.
 |---|---|---|
 | Design | done | [The query plan](plan/2026-10-02-plan-ir.md): a migration in steps |
 | Algebra walker | done | `nrese_sparql_syntax::visit`; the executor's plain searches use it |
-| Logical plan, rewrites, physical plan, executor on the plan | open | Steps 1–4 of the design |
+| Step 1: the logical plan | done | `nrese_sparql::plan`: built from the algebra and lowered back, the identity on every random query of the differential tests |
+| Steps 2–4: rewrites, physical plan, executor on the plan | open | |
 | `nrese-sparql` split, numeric promotion once | open | |
 
 ### D. Reasoning (with G3)
