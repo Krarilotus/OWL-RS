@@ -48,6 +48,10 @@ pub struct StoreConfig {
     /// On disk: keep the WAL segments checkpoints cover in `wal-archive/` of the data
     /// directory (point-in-time restore; see `nrese_engine::DurabilityConfig::wal_archive`).
     pub wal_archive: bool,
+    /// How index blocks are encoded when built (`store.index_encoding`): `Fast`, or
+    /// `Compact` (palettes: a smaller store, scans up to a tenth slower). Set for the
+    /// process when the store opens; see `nrese_engine::IndexEncoding`.
+    pub index_encoding: nrese_engine::IndexEncoding,
     /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
@@ -141,6 +145,7 @@ impl StoreConfig {
             map_checkpoints: true,
             bulk_load_memory_bytes: 0,
             wal_archive: false,
+            index_encoding: nrese_engine::IndexEncoding::Fast,
             shacl_gate: ShaclGate::Off,
         }
     }
@@ -160,6 +165,7 @@ impl StoreConfig {
             map_checkpoints: true,
             bulk_load_memory_bytes: 0,
             wal_archive: false,
+            index_encoding: nrese_engine::IndexEncoding::Fast,
             shacl_gate: ShaclGate::Off,
         }
     }

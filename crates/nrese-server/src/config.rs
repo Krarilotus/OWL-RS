@@ -68,6 +68,10 @@ impl ServerConfig {
             ("store.map_checkpoints", store.map_checkpoints.to_string()),
             ("store.wal_archive", store.wal_archive.to_string()),
             (
+                "store.index_encoding",
+                store.index_encoding.as_str().to_owned(),
+            ),
+            (
                 "store.ontology_path",
                 store
                     .ontology_path

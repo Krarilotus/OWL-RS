@@ -31,6 +31,17 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         verify_on_open: parse_bool(source, names::VERIFY_ON_OPEN, defaults.verify_on_open)?,
         map_checkpoints: parse_bool(source, names::MAP_CHECKPOINTS, defaults.map_checkpoints)?,
         wal_archive: parse_bool(source, names::WAL_ARCHIVE, defaults.wal_archive)?,
+        index_encoding: match source.get(names::INDEX_ENCODING) {
+            None => defaults.index_encoding,
+            Some(name) => {
+                nrese_engine::IndexEncoding::from_name(name.trim()).with_context(|| {
+                    format!(
+                        "{} must be 'fast' or 'compact', not '{name}'",
+                        names::INDEX_ENCODING
+                    )
+                })?
+            }
+        },
         bulk_load_memory_bytes: parse_bulk_load_memory(
             source.get(names::BULK_LOAD_MEMORY).as_deref(),
         )?,

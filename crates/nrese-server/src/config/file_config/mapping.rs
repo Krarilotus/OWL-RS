@@ -36,6 +36,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
         config.store.map_checkpoints,
     );
     insert_bool(&mut source, names::WAL_ARCHIVE, config.store.wal_archive);
+    insert_option(
+        &mut source,
+        names::INDEX_ENCODING,
+        config.store.index_encoding,
+    );
 
     insert_option(
         &mut source,

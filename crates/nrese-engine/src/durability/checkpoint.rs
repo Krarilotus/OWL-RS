@@ -39,7 +39,7 @@
 
 use std::borrow::Cow;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use super::codec::{Reader, put_u32, put_u64};
@@ -57,8 +57,11 @@ use crate::term::hash::key_hash;
 /// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
 /// stores the packed permutations (Pf2); version 6 aligns them for mapping; version 7 adds
 /// the dictionary's text order; version 8 the flags (integer-derived literals inline);
-/// version 9 lets the asserted stack have the default-graph layout.
-const MAGIC: &[u8; 8] = b"NRESECK9";
+/// version 9 lets the asserted stack have the default-graph layout; version 10 lets blocks
+/// of the packed permutations store a position as a palette.
+const MAGIC: &[u8; 8] = b"NRESECKA";
+/// Formats 9 and 8 read as 10: their blocks have no palettes (the byte was zero padding).
+const MAGIC_V9: &[u8; 8] = b"NRESECK9";
 const MAGIC_V8: &[u8; 8] = b"NRESECK8";
 /// Earlier formats, still read (their integer-derived literals are in the dictionary):
 /// without the flags, without the text order, unaligned packed permutations, quad lists.
@@ -307,14 +310,18 @@ pub(crate) fn write_parts<'a>(
     packed: &mut dyn FnMut(Stack, Permutation) -> EngineResult<Cow<'a, PackedKeys>>,
 ) -> EngineResult<PathBuf> {
     let tmp = checkpoint_path(dir, revision, "tmp");
-    let file = File::create(&tmp)?;
+    let mut file = File::create(&tmp)?;
+    // The magic is settled at the end: format 10 only where a block has a palette, so that
+    // stores built with the fast encoding stay readable by binaries that know format 9.
+    // It is checksummed apart and the checksums combined.
+    file.write_all(MAGIC)?;
     let mut out = Checksummed {
         inner: BufWriter::with_capacity(1 << 20, file),
         crc: crc32fast::Hasher::new(),
         buffer: Vec::with_capacity(1 << 16),
-        written: 0,
+        written: MAGIC.len() as u64,
     };
-    out.buffer.extend_from_slice(MAGIC);
+    let mut palettes = false;
     put_u64(&mut out.buffer, revision);
     let flags = match dictionary.integers_in_dictionary() {
         true => INTEGERS_IN_DICTIONARY,
@@ -328,15 +335,22 @@ pub(crate) fn write_parts<'a>(
         for &permutation in permutations {
             out.buffer.push(permutation as u8);
             let keys = packed(stack, permutation)?;
+            palettes |= keys.has_palettes();
             let at = out.position();
             keys.write(Some(at), &mut |piece| out.write_bytes(piece))?;
         }
     }
     out.flush_buffer()?;
-    let crc = out.crc.finalize();
+    let magic = if palettes { MAGIC } else { MAGIC_V9 };
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(magic);
+    crc.combine(&out.crc);
+    let crc = crc.finalize();
     let mut inner = out.inner;
     inner.write_all(&crc.to_le_bytes())?;
-    let file = inner.into_inner().map_err(|error| error.into_error())?;
+    let mut file = inner.into_inner().map_err(|error| error.into_error())?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    file.write_all(magic)?;
     file.sync_all()?;
     drop(file);
     let path = checkpoint_path(dir, revision, EXTENSION);
@@ -409,7 +423,9 @@ pub(crate) fn load_latest(
         .ok_or_else(|| corrupt("truncated"))?;
     let mut reader = Reader::new(body);
     let (packed, aligned, with_order, with_flags) = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC || magic == MAGIC_V8 => (true, true, true, true),
+        Some(magic) if magic == MAGIC || magic == MAGIC_V9 || magic == MAGIC_V8 => {
+            (true, true, true, true)
+        }
         Some(magic) if magic == MAGIC_V7 => (true, true, true, false),
         Some(magic) if magic == MAGIC_V6 => (true, true, false, false),
         Some(magic) if magic == MAGIC_V5 => (true, false, false, false),
@@ -540,8 +556,11 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     let bytes: &[u8] = &map;
     let body = &bytes[..bytes.len().saturating_sub(4)];
     let mut reader = Reader::new(body);
-    // Format 8 is format 9 with the quad layout only.
-    if !matches!(reader.bytes(MAGIC.len()), Some(magic) if magic == MAGIC || magic == MAGIC_V8) {
+    // Format 8 is format 9 with the quad layout only; 9 is 10 without palettes.
+    if !matches!(
+        reader.bytes(MAGIC.len()),
+        Some(magic) if magic == MAGIC || magic == MAGIC_V9 || magic == MAGIC_V8
+    ) {
         return Err(corrupt("bad magic"));
     }
     reader.u64().ok_or_else(|| corrupt("truncated header"))?;
