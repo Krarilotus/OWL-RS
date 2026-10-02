@@ -168,6 +168,22 @@ Limits today:
 - A `POST` holds the writer while it validates (its shapes live in a transaction that is never committed), so other writes wait.
 - The shapes graph is an ordinary graph: queries see it, and reasoning reads it like any other.
 
+## Draft checks (`/api/v1/draft-check`)
+
+Isolated checks of pinned inputs, for the Datamodel Workflow and any other client of its store-check protocol (`dmw-store-check/1`, see [the DMW guide](../integration/datamodel-workflow.md#draft-checks)). Each check runs in a throwaway in-memory store: no repository is read or written. The permission asked is the one to query.
+
+| Method and URL | What |
+|---|---|
+| `GET /api/v1/draft-check/capabilities` | The protocol, operations (`shacl`, `query`, `reasoning`), profiles, semantics, this build's id, and the longest time limit a request may ask for |
+| `POST /api/v1/draft-check` | One check: a JSON request with the check's identity, limits and inputs (N-Triples; the query as SPARQL text); the answer is JSON |
+
+Every answer is 200 with a terminal status (`completed`, `failed`, `timeout`, `unsupported`) and echoes the request's identity. A request that isn't a draft-check request is 400; a larger one than the upload limit, 413.
+
+Limits today:
+- One profile, `owl2-rl`: consistency by the OWL 2 RL rules, unsatisfiable classes by the OWL 2 EL classifier. Axioms either skipped are reported as unsupported, and the answer is then not complete.
+- SHACL Core only; SHACL-SPARQL, SHACL-AF and `sh:entailment` are reported as unsupported.
+- A time limit above the server's query timeout is refused, not shortened.
+
 ## Engine API (`/api/v1`)
 
 One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engine-api.md)), the same for every repository; the `/dataset/…` routes are the default repository's (`nrese`) and stay. `GET /api/v1/openapi.json` describes it (OpenAPI 3.1, generated from the server's handlers and types; a test keeps it complete), for generating clients.
