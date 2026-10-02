@@ -486,6 +486,20 @@ impl Snapshot {
         self.columns_of_stacks(model, &plan, permutation, components)
     }
 
+    /// Whether a statement read in `model` has a triple term (RDF 1.2): triple terms are
+    /// objects only and their ids one range, so this is one seek in the object-first index.
+    pub fn holds_triple_terms(&self, model: ReadModel) -> bool {
+        let (low, high) = TermId::kind_range(crate::TermKind::Triple);
+        self.scan_range_in(
+            model,
+            &QuadPattern::all(),
+            crate::quad::Permutation::Ospg,
+            low,
+            high,
+        )
+        .is_some_and(|mut quads| quads.next().is_some())
+    }
+
     /// Exact number of quads [`scan_range_in`](Self::scan_range_in) yields.
     pub fn count_range_in(
         &self,

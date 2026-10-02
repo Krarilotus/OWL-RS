@@ -25,15 +25,20 @@ fn string(out: &mut Vec<u8>, text: &str) {
     escape(text, |piece| out.extend_from_slice(piece.as_bytes()));
 }
 
-pub(crate) fn write_boolean(out: &mut Vec<u8>, value: bool) {
+pub(crate) fn write_boolean(out: &mut Vec<u8>, value: bool, version: Option<&str>) {
+    out.extend_from_slice(b"{\"head\":{");
+    if let Some(version) = version {
+        out.extend_from_slice(b"\"version\":");
+        string(out, version);
+    }
     out.extend_from_slice(if value {
-        b"{\"head\":{},\"boolean\":true}"
+        b"},\"boolean\":true}"
     } else {
-        b"{\"head\":{},\"boolean\":false}"
+        b"},\"boolean\":false}"
     });
 }
 
-pub(crate) fn write_head(out: &mut Vec<u8>, variables: &[Variable]) {
+pub(crate) fn write_head(out: &mut Vec<u8>, variables: &[Variable], version: Option<&str>) {
     out.extend_from_slice(b"{\"head\":{\"vars\":[");
     for (i, variable) in variables.iter().enumerate() {
         if i > 0 {
@@ -41,7 +46,12 @@ pub(crate) fn write_head(out: &mut Vec<u8>, variables: &[Variable]) {
         }
         string(out, variable.as_str());
     }
-    out.extend_from_slice(b"]},\"results\":{\"bindings\":[");
+    out.push(b']');
+    if let Some(version) = version {
+        out.extend_from_slice(b",\"version\":");
+        string(out, version);
+    }
+    out.extend_from_slice(b"},\"results\":{\"bindings\":[");
 }
 
 pub(crate) fn write_row(
