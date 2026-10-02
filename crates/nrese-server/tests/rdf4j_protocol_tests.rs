@@ -574,3 +574,130 @@ async fn repositories_are_created_used_and_removed() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// A repository's configuration sets its title and reasoning: an RDF4J RDFS inferencer
+/// stack reasons, a plain store doesn't; both survive a restart. A configuration for
+/// another repository id is refused.
+#[tokio::test]
+async fn repository_configurations_set_title_and_reasoning() {
+    const RDFS_CONFIG: &str = "@prefix config: <tag:rdf4j.org,2023:config/> .\n\
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+        [] a config:Repository ; config:rep.id \"inferring\" ; rdfs:label \"With RDFS\" ;\n\
+           config:rep.impl [ config:rep.type \"openrdf:SailRepository\" ;\n\
+             config:sail.impl [ config:sail.type \"rdf4j:SchemaCachingRDFSInferencer\" ;\n\
+               config:delegate [ config:sail.type \"openrdf:MemoryStore\" ] ] ] .\n";
+    const PLAIN_CONFIG: &str = "@prefix rep: <http://www.openrdf.org/config/repository#> .\n\
+        @prefix sr: <http://www.openrdf.org/config/repository/sail#> .\n\
+        @prefix sail: <http://www.openrdf.org/config/sail#> .\n\
+        [] a rep:Repository ; rep:repositoryID \"plain\" ;\n\
+           rep:repositoryImpl [ rep:repositoryType \"openrdf:SailRepository\" ;\n\
+             sr:sailImpl [ sail:sailType \"openrdf:NativeStore\" ] ] .\n";
+    const SCHEMA: &str = "@prefix ex: <http://example.com/> .\n\
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+        ex:a a ex:C . ex:C rdfs:subClassOf ex:D .\n";
+    let dir = tempfile::tempdir().unwrap();
+    let app = || {
+        test_app_with_store_config(
+            StoreConfig::on_disk(dir.path()),
+            PolicyConfig::default(),
+            ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
+        )
+        .unwrap()
+    };
+    let inferred = |app: Router, repository: &'static str| async move {
+        let (status, results) = send(
+            &app,
+            Method::GET,
+            &format!(
+                "/repositories/{repository}?{}",
+                encode(&[(
+                    "query",
+                    "ASK { <http://example.com/a> a <http://example.com/D> }"
+                )])
+            ),
+            None,
+            Some("application/sparql-results+json"),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{results}");
+        results.contains("true")
+    };
+    {
+        let app = app();
+        let (status, text) = send(
+            &app,
+            Method::PUT,
+            "/repositories/other",
+            Some("text/turtle"),
+            None,
+            RDFS_CONFIG,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        for (id, config) in [("inferring", RDFS_CONFIG), ("plain", PLAIN_CONFIG)] {
+            let (status, text) = send(
+                &app,
+                Method::PUT,
+                &format!("/repositories/{id}"),
+                Some("text/turtle"),
+                None,
+                config,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+            let (status, text) = send(
+                &app,
+                Method::POST,
+                &format!("/repositories/{id}/statements"),
+                Some("text/turtle"),
+                None,
+                SCHEMA,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+        }
+        assert!(inferred(app.clone(), "inferring").await);
+        assert!(!inferred(app.clone(), "plain").await);
+    }
+    // After a restart: the same titles and reasoning.
+    let app = app();
+    let (_, list) = send(
+        &app,
+        Method::GET,
+        "/repositories",
+        None,
+        Some("application/sparql-results+json"),
+        "",
+    )
+    .await;
+    assert!(list.contains("\"With RDFS\""), "{list}");
+    assert!(list.contains("\"NRESE: plain\""), "{list}");
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/repositories/inferring/statements",
+        Some("text/turtle"),
+        None,
+        "<http://example.com/b> a <http://example.com/C> .",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, results) = send(
+        &app,
+        Method::GET,
+        &format!(
+            "/repositories/inferring?{}",
+            encode(&[(
+                "query",
+                "ASK { <http://example.com/b> a <http://example.com/D> }"
+            )])
+        ),
+        None,
+        Some("application/sparql-results+json"),
+        "",
+    )
+    .await;
+    assert!(results.contains("true"), "{results}");
+    assert!(!inferred(app.clone(), "plain").await);
+}

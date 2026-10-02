@@ -5,7 +5,7 @@
 //! |---|---|
 //! | `GET /protocol` | the protocol version, `12` |
 //! | `GET /repositories` | the repository list |
-//! | `PUT`, `DELETE /repositories/{id}` | a repository created (its configuration in the body is not read: the default's settings apply) or removed with its data |
+//! | `PUT`, `DELETE /repositories/{id}` | a repository created (title and reasoning from the configuration in the body, [`crate::repository_config`]) or removed with its data |
 //! | `GET`/`POST /repositories/{id}` | a SPARQL query (`query`, `infer`, the dataset parameters) |
 //! | `GET /repositories/{id}/statements` | the statements matching `subj`, `pred`, `obj`, `context` (`infer`), as RDF |
 //! | `POST /repositories/{id}/statements` | an RDF payload added (into `context`), or a SPARQL update (`update=`) |
@@ -403,16 +403,14 @@ pub async fn repositories(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
     let writable = state.runtime_posture().sparql_update_enabled;
-    let ids = std::iter::once(DEFAULT_REPOSITORY.to_owned()).chain(state.repositories().ids());
+    let ids = std::iter::once((DEFAULT_REPOSITORY.to_owned(), Some("NRESE".to_owned())))
+        .chain(state.repositories().list());
     let rows = ids
-        .map(|id| {
+        .map(|(id, title)| {
             vec![
                 literal(format!("/repositories/{id}")),
                 literal(id.as_str()),
-                literal(match id == DEFAULT_REPOSITORY {
-                    true => "NRESE".to_owned(),
-                    false => format!("NRESE: {id}"),
-                }),
+                literal(title.unwrap_or_else(|| format!("NRESE: {id}"))),
                 Some(Literal::from(true).into()),
                 Some(Literal::from(writable).into()),
             ]
@@ -425,16 +423,31 @@ pub async fn repositories(
     ))
 }
 
-/// Creates repository `id` (`PUT /repositories/{id}`); the configuration in the body is
-/// not read.
+/// Creates repository `id` (`PUT /repositories/{id}`) with the settings of the
+/// configuration in the body (RDF, Turtle when no type is given).
 pub async fn repository_put(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_admin_write(&state, &headers).await?;
+    let settings = match body.iter().all(u8::is_ascii_whitespace) {
+        true => crate::repository_config::RepositorySettings::default(),
+        false => {
+            let content_type = header_value_str(headers.get(header::CONTENT_TYPE));
+            let format = match content_type {
+                None => nrese_store::GraphResultFormat::Turtle,
+                Some(_) => parse_graph_content_format(content_type)?,
+            };
+            let quads = nrese_store::parse_payload(format, None, &body).map_err(|error| {
+                ApiError::bad_request(format!("repository configuration: {error}"))
+            })?;
+            crate::repository_config::from_config(&id, &quads).map_err(ApiError::bad_request)?
+        }
+    };
     let repositories = state.clone();
-    tokio::task::spawn_blocking(move || repositories.repositories().create(&id))
+    tokio::task::spawn_blocking(move || repositories.repositories().create(&id, settings))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))??;
     Ok(StatusCode::NO_CONTENT)

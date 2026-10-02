@@ -61,7 +61,7 @@ pub use query::{
 };
 pub use query_cache::QueryCacheStats;
 pub use query_executor::PreparedQuery;
-pub use rdf_io::convert_file;
+pub use rdf_io::{convert_file, parse_payload};
 pub use reasoning::{MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
 pub use service::StoreService;
