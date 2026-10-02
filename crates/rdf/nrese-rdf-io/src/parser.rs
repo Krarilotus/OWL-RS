@@ -487,19 +487,28 @@ impl<R: Read> QuadParser<'_, R> {
                 Err(error) => return Some(Err(error)),
             },
             Inner::Lines { lines, parser } => {
-                // Find the next line with a statement without holding a borrow.
-                let range = loop {
-                    match lines.next() {
-                        Ok(Some(range)) => {
-                            if has_statement(lines.slice(range.clone())) {
-                                break range;
-                            }
-                        }
+                // The next line with a statement. A `VERSION` directive (RDF 1.2) has none:
+                // it is checked here and skipped (no statement starts with `VERSION`).
+                let (range, line, offset) = loop {
+                    let range = match lines.next() {
+                        Ok(Some(range)) => range,
                         Ok(None) => return None,
                         Err(error) => return Some(Err(error.into())),
+                    };
+                    let text = lines.slice(range.clone());
+                    if !has_statement(text) {
+                        continue;
                     }
+                    let (line, offset) = lines.position();
+                    if text.trim_ascii_start().starts_with(b"VERSION") {
+                        match parser.parse(text, line, offset) {
+                            Ok(None) => continue,
+                            Ok(Some(_)) => unreachable!("a directive has no statement"),
+                            Err(error) => return Some(Err(error.into())),
+                        }
+                    }
+                    break (range, line, offset);
                 };
-                let (line, offset) = lines.position();
                 match parser.parse(lines.slice(range), line, offset) {
                     Ok(Some(quad)) => (
                         quad,
@@ -509,7 +518,7 @@ impl<R: Read> QuadParser<'_, R> {
                             offset,
                         },
                     ),
-                    Ok(None) => unreachable!("a line with a statement"),
+                    Ok(None) => unreachable!("parsed to a statement above"),
                     Err(error) => return Some(Err(error.into())),
                 }
             }

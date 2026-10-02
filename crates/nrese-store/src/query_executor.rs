@@ -73,6 +73,9 @@ pub struct PreparedQuery {
     /// The repository's namespaces the query was parsed with, if it needed them (it used a
     /// prefix it doesn't declare): part of its cache key.
     implicit_prefixes: Option<crate::NamespaceMap>,
+    /// Whether the results may use RDF 1.2 (triple terms): then they announce
+    /// `version=1.2` ([`Self::announce_rdf12`]).
+    rdf12: bool,
 }
 
 impl PreparedQuery {
@@ -137,7 +140,52 @@ impl PreparedQuery {
             access: request.scope.access().cloned(),
             origin: None,
             implicit_prefixes,
+            rdf12: false,
         })
+    }
+
+    /// Whether the query itself makes or matches RDF 1.2 terms: triple term patterns
+    /// (in its pattern or template), `TRIPLE(…)`, `STRLANGDIR(…)`, or a literal with a base
+    /// direction.
+    pub(crate) fn uses_rdf12(&self) -> bool {
+        use nrese_sparql_syntax::algebra::{Expression, Function, GraphPattern};
+        use nrese_sparql_syntax::term::TermPattern;
+        use nrese_sparql_syntax::visit::Node;
+        let triple = |t: &nrese_sparql_syntax::term::TriplePattern| {
+            matches!(t.subject, TermPattern::Triple(_))
+                || matches!(t.object, TermPattern::Triple(_))
+        };
+        let (pattern, template) = match &self.query {
+            Query::Select { pattern, .. }
+            | Query::Ask { pattern, .. }
+            | Query::Describe { pattern, .. } => (pattern, &[][..]),
+            Query::Construct {
+                pattern, template, ..
+            } => (pattern, template.as_slice()),
+        };
+        template.iter().any(triple)
+            || pattern.find(&mut |node| match node {
+                Node::Pattern(GraphPattern::Bgp { patterns }) => patterns.iter().any(triple),
+                Node::Pattern(GraphPattern::Path {
+                    subject, object, ..
+                }) => {
+                    matches!(subject, TermPattern::Triple(_))
+                        || matches!(object, TermPattern::Triple(_))
+                }
+                Node::Expression(Expression::FunctionCall(
+                    Function::Triple | Function::StrLangDir,
+                    _,
+                )) => true,
+                Node::Expression(Expression::Literal(literal)) => literal.direction().is_some(),
+                _ => false,
+            })
+    }
+
+    /// Announces RDF 1.2 in the results: the media type's `version` parameter, the
+    /// `version` member of JSON results, and `VERSION "1.2"` in Turtle, TriG, N-Triples and
+    /// N-Quads (RDF 1.2 Concepts §2.1; SPARQL 1.2 Query Results JSON §3.1.3).
+    pub fn announce_rdf12(&mut self) {
+        self.rdf12 = true;
     }
 
     /// The query's text, as sent.
@@ -203,11 +251,15 @@ impl PreparedQuery {
     }
 
     pub fn media_type(&self) -> &'static str {
-        match self.kind() {
-            QueryResultKind::Solutions | QueryResultKind::Boolean => {
+        match (self.kind(), self.rdf12) {
+            (QueryResultKind::Solutions | QueryResultKind::Boolean, false) => {
                 self.solutions_format.media_type()
             }
-            QueryResultKind::Graph => self.graph_format.media_type(),
+            (QueryResultKind::Solutions | QueryResultKind::Boolean, true) => {
+                self.solutions_format.media_type_rdf12()
+            }
+            (QueryResultKind::Graph, false) => self.graph_format.media_type(),
+            (QueryResultKind::Graph, true) => self.graph_format.media_type_rdf12(),
         }
     }
 }
@@ -317,6 +369,7 @@ pub(crate) fn run_query(
         false => Ok(()),
     };
     let mut out = out;
+    let version = prepared.rdf12.then_some("1.2");
     let format = match prepared.solutions_format {
         SolutionsResultFormat::Json => Some(ResultsFormat::Json),
         SolutionsResultFormat::Tsv => Some(ResultsFormat::Tsv),
@@ -325,7 +378,8 @@ pub(crate) fn run_query(
     };
     if let Some(format) = format
         && matches!(prepared.query, Query::Select { .. } | Query::Ask { .. })
-        && let Some(written) = write_results(view, &prepared.query, &options, format, &mut out)
+        && let Some(written) =
+            write_results(view, &prepared.query, &options, format, version, &mut out)
     {
         return written.map_err(|error| match error {
             WriteResultsError::Evaluation(error) => StoreError::SparqlEvaluation(error),
@@ -334,13 +388,11 @@ pub(crate) fn run_query(
     }
     match evaluate_query(view, &prepared.query, &options)? {
         QueryResults::Boolean(value) => {
-            QueryResultsSerializer::from_format(prepared.solutions_format.results_format())
-                .serialize_boolean_to_writer(out, value)?;
+            results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;
         }
         QueryResults::Solutions(solutions) => {
-            let mut writer =
-                QueryResultsSerializer::from_format(prepared.solutions_format.results_format())
-                    .serialize_solutions_to_writer(out, solutions.variables().to_vec())?;
+            let mut writer = results_serializer(prepared, version)
+                .serialize_solutions_to_writer(out, solutions.variables().to_vec())?;
             for solution in solutions {
                 alive()?;
                 writer.serialize(&solution?)?;
@@ -348,8 +400,11 @@ pub(crate) fn run_query(
             writer.finish()?;
         }
         QueryResults::Graph(triples) => {
-            let mut writer =
-                RdfSerializer::from_format(prepared.graph_format.rdf_format()).for_writer(out);
+            let mut serializer = RdfSerializer::from_format(prepared.graph_format.rdf_format());
+            if let Some(version) = version {
+                serializer = serializer.with_version(version);
+            }
+            let mut writer = serializer.for_writer(out);
             for triple in triples {
                 alive()?;
                 writer.serialize_triple(&triple?)?;
@@ -358,6 +413,19 @@ pub(crate) fn run_query(
         }
     }
     Ok(())
+}
+
+/// The results serializer of `prepared`'s format, announcing `version`.
+fn results_serializer(
+    prepared: &PreparedQuery,
+    version: Option<&'static str>,
+) -> QueryResultsSerializer {
+    let serializer =
+        QueryResultsSerializer::from_format(prepared.solutions_format.results_format());
+    match version {
+        Some(version) => serializer.with_version(version),
+        None => serializer,
+    }
 }
 
 /// Runs `prepared` on `view` as [`run_query`] would, consuming the results instead of

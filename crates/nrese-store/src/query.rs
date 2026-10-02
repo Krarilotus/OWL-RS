@@ -15,6 +15,15 @@ impl SolutionsResultFormat {
             Self::Tsv => "text/tab-separated-values",
         }
     }
+
+    /// [`Self::media_type`] announcing results that may use RDF 1.2, where the format
+    /// defines how (JSON's `version` parameter; the others have none).
+    pub fn media_type_rdf12(self) -> &'static str {
+        match self {
+            Self::Json => "application/sparql-results+json; version=1.2",
+            other => other.media_type(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +51,18 @@ impl GraphResultFormat {
             Self::TriG => "application/trig",
             Self::JsonLd => "application/ld+json",
             Self::BinaryRdf => "application/x-binary-rdf",
+        }
+    }
+
+    /// [`Self::media_type`] announcing an RDF 1.2 document (`version=1.2`) in the formats of
+    /// the RDF 1.2 specifications.
+    pub fn media_type_rdf12(self) -> &'static str {
+        match self {
+            Self::NTriples => "application/n-triples; version=1.2",
+            Self::Turtle => "text/turtle; version=1.2",
+            Self::NQuads => "application/n-quads; version=1.2",
+            Self::TriG => "application/trig; version=1.2",
+            other => other.media_type(),
         }
     }
 

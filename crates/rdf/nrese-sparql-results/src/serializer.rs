@@ -15,11 +15,23 @@ const FLUSH_AT: usize = 8 * 1024;
 #[derive(Debug, Clone, Copy)]
 pub struct QueryResultsSerializer {
     format: QueryResultsFormat,
+    version: Option<&'static str>,
 }
 
 impl QueryResultsSerializer {
     pub fn from_format(format: QueryResultsFormat) -> Self {
-        Self { format }
+        Self {
+            format,
+            version: None,
+        }
+    }
+
+    /// Announces that the results may use RDF 1.2 (`"1.2"`): JSON's `head` gets a `version`
+    /// member (SPARQL 1.2 Query Results JSON §3.1.3). The other formats have no place for it
+    /// in the document.
+    pub fn with_version(mut self, version: &'static str) -> Self {
+        self.version = Some(version);
+        self
     }
 
     /// The result of an `ASK` query.
@@ -30,7 +42,7 @@ impl QueryResultsSerializer {
     ) -> io::Result<W> {
         let mut out = Vec::with_capacity(128);
         match self.format {
-            QueryResultsFormat::Json => json::write_boolean(&mut out, value),
+            QueryResultsFormat::Json => json::write_boolean(&mut out, value, self.version),
             QueryResultsFormat::Xml => xml::write_boolean(&mut out, value),
             QueryResultsFormat::Csv | QueryResultsFormat::Tsv => {
                 out.extend_from_slice(if value { b"true" } else { b"false" });
@@ -50,7 +62,7 @@ impl QueryResultsSerializer {
     ) -> io::Result<WriterSolutionsSerializer<W>> {
         let mut out = Vec::with_capacity(FLUSH_AT + 4096);
         match self.format {
-            QueryResultsFormat::Json => json::write_head(&mut out, &variables),
+            QueryResultsFormat::Json => json::write_head(&mut out, &variables, self.version),
             QueryResultsFormat::Xml => xml::write_head(&mut out, &variables),
             QueryResultsFormat::Csv => csv::write_head(&mut out, &variables),
             QueryResultsFormat::Tsv => tsv::write_head(&mut out, &variables),

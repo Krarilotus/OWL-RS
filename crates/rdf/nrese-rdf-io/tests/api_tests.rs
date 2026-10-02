@@ -225,3 +225,39 @@ fn borrowed_quads_need_no_allocation_per_term() {
     }
     assert_eq!(count, sample().len());
 }
+
+/// RDF 1.2's `VERSION` directive: written first when asked for, and read back in every
+/// line-based and Turtle-family format (a reader used to take the directive line of
+/// N-Triples for a statement and panic).
+#[test]
+fn version_directives_are_written_and_read() {
+    let quad = Quad::new(
+        NamedNode::new_unchecked("urn:a"),
+        NamedNode::new_unchecked("urn:p"),
+        NamedNode::new_unchecked("urn:b"),
+        GraphName::DefaultGraph,
+    );
+    for format in [
+        RdfFormat::NTriples,
+        RdfFormat::NQuads,
+        RdfFormat::Turtle,
+        RdfFormat::TriG,
+    ] {
+        let mut writer = RdfSerializer::from_format(format)
+            .with_version("1.2")
+            .for_writer(Vec::new());
+        writer.serialize_quad(&quad).unwrap();
+        let document = writer.finish().unwrap();
+        assert!(document.starts_with(b"VERSION \"1.2\"\n"), "{format:?}");
+        let read: Vec<Quad> = RdfParser::from_format(format)
+            .for_slice(&document)
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| panic!("{format:?}: {error}"));
+        assert_eq!(read, std::slice::from_ref(&quad), "{format:?}");
+    }
+    // A malformed directive is an error, not a statement.
+    let bad = RdfParser::from_format(RdfFormat::NTriples)
+        .for_slice(b"VERSION 1.2\n<urn:a> <urn:p> <urn:b> .\n")
+        .collect::<Result<Vec<_>, _>>();
+    assert!(bad.is_err());
+}

@@ -119,6 +119,8 @@ pub(super) struct DirectResults<'a> {
     pub snapshot: &'a Snapshot,
     pub computed: &'a [Term],
     pub format: ResultsFormat,
+    /// Announced in JSON's head: the results may use RDF 1.2.
+    pub version: Option<&'static str>,
 }
 
 impl DirectResults<'_> {
@@ -228,7 +230,12 @@ impl DirectResults<'_> {
                     }
                     escaped(v.as_str(), &mut buffer);
                 }
-                buffer.extend_from_slice(b"]},\"results\":{\"bindings\":[");
+                buffer.push(b']');
+                if let Some(version) = self.version {
+                    buffer.extend_from_slice(b",\"version\":");
+                    escaped(version, &mut buffer);
+                }
+                buffer.extend_from_slice(b"},\"results\":{\"bindings\":[");
             }
             ResultsFormat::Tsv | ResultsFormat::Csv => {
                 for (i, v) in vars.iter().enumerate() {
@@ -297,12 +304,18 @@ impl DirectResults<'_> {
 }
 
 /// The JSON document of a boolean result, as `nrese_sparql_results` writes it.
-pub(super) fn boolean(value: bool) -> &'static [u8] {
-    if value {
-        b"{\"head\":{},\"boolean\":true}"
-    } else {
-        b"{\"head\":{},\"boolean\":false}"
+pub(super) fn boolean(value: bool, version: Option<&str>) -> Vec<u8> {
+    let mut out = b"{\"head\":{".to_vec();
+    if let Some(version) = version {
+        out.extend_from_slice(b"\"version\":");
+        escaped(version, &mut out);
     }
+    out.extend_from_slice(if value {
+        b"},\"boolean\":true}"
+    } else {
+        b"},\"boolean\":false}"
+    });
+    out
 }
 
 #[cfg(test)]

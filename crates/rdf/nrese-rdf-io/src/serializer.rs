@@ -18,6 +18,7 @@ pub struct RdfSerializer {
     format: RdfFormat,
     prefixes: Vec<(String, String)>,
     json_ld_expanded: Option<FromRdfOptions>,
+    version: Option<String>,
 }
 
 impl RdfSerializer {
@@ -26,7 +27,16 @@ impl RdfSerializer {
             format,
             prefixes: Vec::new(),
             json_ld_expanded: None,
+            version: None,
         }
+    }
+
+    /// Announces the document's RDF version (`"1.2"`, `"1.2-basic"`: RDF 1.2 Concepts §2.1)
+    /// in-line, before any statement: `VERSION "…"` in Turtle, TriG, N-Triples and N-Quads.
+    /// Only documents that use RDF 1.2 should announce it.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
     }
 
     /// JSON-LD in expanded form, by the specification's algorithm (Serialize RDF as
@@ -86,10 +96,21 @@ impl RdfSerializer {
             (RdfFormat::JsonLd, None) => Some(JsonLd::Streaming(JsonLdWriter::new(self.prefixes))),
             _ => None,
         };
+        let mut buffer = Vec::with_capacity(BUFFER);
+        if let Some(version) = &self.version
+            && matches!(
+                self.format,
+                RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::NTriples | RdfFormat::NQuads
+            )
+        {
+            buffer.extend_from_slice(b"VERSION \"");
+            buffer.extend_from_slice(version.as_bytes());
+            buffer.extend_from_slice(b"\"\n");
+        }
         QuadSerializer {
             format: self.format,
             writer,
-            buffer: Vec::with_capacity(BUFFER),
+            buffer,
             turtle,
             rdf_xml,
             json_ld,

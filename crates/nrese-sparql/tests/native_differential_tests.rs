@@ -2884,6 +2884,7 @@ fn direct_results_equal_the_results_serialiser() {
                     &query,
                     &QueryOptions::default(),
                     format,
+                    None,
                     &mut direct,
                 ) else {
                     continue;
@@ -2956,6 +2957,7 @@ fn large_direct_results_equal_the_results_serialiser() {
             &query,
             &QueryOptions::default(),
             format,
+            None,
             &mut direct,
         )
         .expect("written directly")

@@ -82,14 +82,16 @@ pub enum WriteResultsError {
 /// [`evaluate_query`]'s results gives, without building terms and solutions per row.
 /// `None` for what isn't written this way (a transaction view, CONSTRUCT, DESCRIBE, ASK in
 /// TSV/CSV): then serialise [`evaluate_query`]'s results. On error the output is partial.
+/// `version` is announced in JSON's head (`"1.2"`: the results may use RDF 1.2).
 pub fn write_results<V: ReadView>(
     view: &V,
     query: &Query,
     options: &QueryOptions,
     format: crate::ResultsFormat,
+    version: Option<&'static str>,
     out: &mut dyn std::io::Write,
 ) -> Option<Result<(), WriteResultsError>> {
-    crate::native::write_results(view.snapshot()?, query, options, format, out)
+    crate::native::write_results(view.snapshot()?, query, options, format, version, out)
 }
 
 /// One operator of a query run, as [`explain_query`] reports it (EXPLAIN ANALYZE).
