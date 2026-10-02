@@ -1,6 +1,8 @@
 //! Which peers may vouch for a client: the proxies that terminate TLS and pass the client
 //! certificate's subject on in a header (the `mtls` mode). A header from any other peer is
-//! a claim anyone could make, so it is dropped before authentication sees it.
+//! a claim anyone could make, so it is dropped before authentication sees it. Likewise
+//! for the client's address ([`client`]): `X-Forwarded-For` counts only from a trusted
+//! proxy.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -89,6 +91,39 @@ pub fn trusted(ranges: &[AddressRange], address: Option<IpAddr>) -> bool {
     address.is_some_and(|address| ranges.iter().any(|range| range.contains(address)))
 }
 
+/// The client's address: the peer's, or, when the peer is a trusted proxy, the last
+/// address of `X-Forwarded-For` that isn't one (each proxy appends the address it was
+/// reached from, so the entries left of the first untrusted one are the client's word).
+/// An entry that isn't an address ends the search at the peer.
+pub fn client(
+    ranges: &[AddressRange],
+    peer: Option<IpAddr>,
+    headers: &axum::http::HeaderMap,
+) -> Option<IpAddr> {
+    if !trusted(ranges, peer) {
+        return peer;
+    }
+    let entries: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .collect();
+    for entry in entries.iter().rev() {
+        let address = entry
+            .parse::<IpAddr>()
+            .ok()
+            .or_else(|| entry.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()));
+        match address {
+            None => return peer,
+            Some(address) if trusted(ranges, Some(address)) => continue,
+            Some(address) => return Some(address),
+        }
+    }
+    peer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +170,38 @@ mod tests {
             !trusted(&loopback, None),
             "an unknown peer is never trusted"
         );
+    }
+
+    #[test]
+    fn the_client_is_named_by_trusted_proxies_only() {
+        let proxies = vec![range("127.0.0.0/8"), range("10.0.0.0/8")];
+        let forwarded = |value: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-forwarded-for", value.parse().unwrap());
+            headers
+        };
+        let none = axum::http::HeaderMap::new();
+        // A direct client is its peer address, whatever it says.
+        let direct = Some(ip("203.0.113.7"));
+        assert_eq!(client(&proxies, direct, &forwarded("1.2.3.4")), direct);
+        // Through proxies: the last address that isn't one; what the client put before
+        // it doesn't count.
+        let proxy = Some(ip("127.0.0.1"));
+        assert_eq!(
+            client(
+                &proxies,
+                proxy,
+                &forwarded("9.9.9.9, 198.51.100.2, 10.1.1.1")
+            ),
+            Some(ip("198.51.100.2"))
+        );
+        assert_eq!(
+            client(&proxies, proxy, &forwarded("198.51.100.2:4711")),
+            Some(ip("198.51.100.2"))
+        );
+        // Nothing forwarded, or an entry that isn't an address: the proxy itself.
+        assert_eq!(client(&proxies, proxy, &none), proxy);
+        assert_eq!(client(&proxies, proxy, &forwarded("unknown")), proxy);
+        assert_eq!(client(&proxies, None, &forwarded("1.2.3.4")), None);
     }
 }

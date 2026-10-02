@@ -246,9 +246,20 @@ impl AccessControl {
         hash_password(password).map(Some)
     }
 
-    /// The principal of a local login with `user` and `password`.
-    pub fn login(&self, user: &str, password: &str) -> Result<Principal, AccessError> {
-        self.logins.login(&self.state(), user, password)
+    /// The principal of a local login with `user` and `password` from `client` (the
+    /// client's address, for throttling failures; `None` if unknown).
+    pub fn login(
+        &self,
+        user: &str,
+        password: &str,
+        client: Option<std::net::IpAddr>,
+    ) -> Result<Principal, AccessError> {
+        self.logins.login(&self.state(), user, password, client)
+    }
+
+    /// The failure counts local logins keep: per name and address, per address.
+    pub fn login_failures_tracked(&self) -> (usize, usize) {
+        self.logins.tracked()
     }
 
     /// Logs in and opens a session: its token and how long it lasts.
@@ -256,8 +267,9 @@ impl AccessControl {
         &self,
         user: &str,
         password: &str,
+        client: Option<std::net::IpAddr>,
     ) -> Result<(String, std::time::Duration), AccessError> {
-        self.login(user, password)?;
+        self.login(user, password, client)?;
         let hours = self.state().settings.session_hours.max(1);
         let lifetime = std::time::Duration::from_secs(u64::from(hours) * 3600);
         Ok((self.logins.open(user, lifetime)?, lifetime))

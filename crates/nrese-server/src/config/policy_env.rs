@@ -78,6 +78,7 @@ pub(super) fn parse_policy_config(source: &dyn ConfigSource) -> Result<PolicyCon
             .filter(|base| !base.is_empty())
             .unwrap_or_else(|| "urn:nrese:".to_owned()),
         local_logins: parse_bool(source, names::LOCAL_LOGINS, true)?,
+        trusted_proxies: super::auth_env::parse_ranges(source, names::AUTH_TRUSTED_PROXIES)?,
         import_directory: source
             .get(names::IMPORT_DIR)
             .map(|dir| dir.trim().to_owned())
