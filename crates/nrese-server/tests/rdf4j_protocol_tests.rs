@@ -492,7 +492,8 @@ async fn repositories_are_created_used_and_removed() {
             "",
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // As RDF4J's server: an existing repository is a conflict.
+        assert_eq!(status, StatusCode::CONFLICT);
         let (status, _) = send(&app, Method::PUT, "/repositories/a%2Fb", None, None, "").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = send(
