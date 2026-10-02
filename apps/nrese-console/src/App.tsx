@@ -7,6 +7,7 @@ import { ConsoleHeader } from "./components/ConsoleHeader";
 import { KnowledgeWorkbench } from "./components/KnowledgeWorkbench";
 import { OutputPanel } from "./components/OutputPanel";
 import { QueryAssistant } from "./components/QueryAssistant";
+import { ResourceSearch } from "./components/ResourceSearch";
 import { RuntimePanel } from "./components/RuntimePanel";
 import { WorkbenchExamples } from "./components/WorkbenchExamples";
 
@@ -89,6 +90,10 @@ export default function App() {
         aiStatus={aiStatusQuery.data}
         loading={state.assistantBusy}
         onUseSuggestion={state.setQuery}
+      />
+      <ResourceSearch
+        strings={strings}
+        onDescribe={(iri) => state.setQuery(`DESCRIBE <${iri}>`)}
       />
       <WorkbenchExamples strings={strings} onApplyExample={applyWorkbenchExample} />
       <KnowledgeWorkbench
