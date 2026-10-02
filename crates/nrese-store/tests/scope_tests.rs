@@ -343,3 +343,45 @@ fn every_write_is_checked_against_its_requesters_scope() {
         "the default and the secret graph's statements stay"
     );
 }
+
+/// `SERVICE` is a privilege of its own: a restricted requester calls other endpoints only
+/// if its access says so, in queries and in updates' `WHERE` clauses alike.
+#[test]
+fn service_is_a_privilege_of_its_own() {
+    let store = store();
+    let restricted = |service: bool| {
+        ReadScope::Graphs(Arc::new(GraphAccess {
+            default_graph: true,
+            service,
+            ..GraphAccess::default()
+        }))
+    };
+    let query = "SELECT * WHERE { SERVICE <http://elsewhere.example/sparql> { ?s ?p ?o } }";
+    let error = |scope: ReadScope| {
+        store
+            .execute_query(&SparqlQueryRequest::new(query, scope))
+            .expect_err("no endpoint is reachable here")
+            .to_string()
+    };
+    let refused = error(restricted(false));
+    assert!(
+        refused.contains("may not call other endpoints"),
+        "{refused}"
+    );
+    // Granted: past the privilege (no federation is set up in this store).
+    let granted = error(restricted(true));
+    assert!(granted.contains("not enabled"), "{granted}");
+    assert!(error(ReadScope::All).contains("not enabled"));
+    let update = MutationCommand::Update(SparqlUpdateRequest::new(
+        "INSERT { ?s ?p ?o } WHERE { SERVICE <http://elsewhere.example/sparql> { ?s ?p ?o } }",
+    ));
+    let requester = Requester::new(restricted(false), WriteScope::All);
+    let refused = store
+        .apply(&update, &requester)
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        refused.contains("may not call other endpoints"),
+        "{refused}"
+    );
+}

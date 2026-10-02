@@ -28,6 +28,9 @@ pub struct GraphAccess {
     pub excluded: Vec<String>,
     /// IRI prefixes excluded the same way.
     pub excluded_prefixes: Vec<String>,
+    /// Whether the requester may call other endpoints with `SERVICE` (a privilege of its
+    /// own: it makes the server fetch URLs). An unrestricted requester may.
+    pub service: bool,
 }
 
 impl GraphAccess {

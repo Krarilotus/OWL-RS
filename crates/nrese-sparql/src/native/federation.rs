@@ -130,6 +130,12 @@ impl Context<'_> {
         inner: &GraphPattern,
         bound: Option<&Solutions>,
     ) -> NativeResult<Solutions> {
+        if self.service_denied {
+            return Err(QueryEvaluationError::Service(
+                format!("SERVICE <{endpoint}>: the requester may not call other endpoints").into(),
+            )
+            .into());
+        }
         let Some(services) = &self.services else {
             return Err(QueryEvaluationError::Service(
                 format!("SERVICE <{endpoint}>: federation is not enabled on this server").into(),

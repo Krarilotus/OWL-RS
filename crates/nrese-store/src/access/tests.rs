@@ -38,6 +38,7 @@ fn rule(name: &str, read: &[&str], write: &[&str], default_graph: DefaultGraphRi
         write: write.iter().map(|s| (*s).to_owned()).collect(),
         deny: Vec::new(),
         default_graph,
+        service: false,
     }
 }
 
@@ -565,4 +566,42 @@ fn saved_queries_belong_to_spaces() {
         control.save_query(&admin(), "nowhere", "q", draft("ASK {}"), &namespaces),
         Err(AccessError::NotFound(_))
     ));
+}
+
+/// A role may grant `SERVICE`; its users' views carry it, and the grant is kept.
+#[test]
+fn roles_grant_service_and_keep_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        let store = StoreService::new(StoreConfig::on_disk(dir.path())).unwrap();
+        AccessControl::open(store, "urn:nrese:").unwrap()
+    };
+    {
+        let control = open();
+        control
+            .apply(
+                &admin(),
+                Change::Import(AccessPolicy {
+                    roles: vec![
+                        RoleRule {
+                            service: true,
+                            ..rule("federator", &["urn:g:*"], &[], DefaultGraphRight::None)
+                        },
+                        rule("reader", &["urn:g:*"], &[], DefaultGraphRight::None),
+                    ],
+                    ..AccessPolicy::default()
+                }),
+                "federation for some",
+            )
+            .unwrap();
+    }
+    let state = open().state();
+    let service = |role: &str| {
+        state
+            .view(&roles(&[role]), "nrese")
+            .read
+            .is_some_and(|read| read.service)
+    };
+    assert!(service("federator"));
+    assert!(!service("reader"));
 }

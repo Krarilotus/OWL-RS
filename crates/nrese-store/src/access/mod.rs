@@ -93,6 +93,10 @@ pub struct RoleRule {
     pub deny: Vec<String>,
     #[serde(default)]
     pub default_graph: DefaultGraphRight,
+    /// Whether the role's users may call other endpoints with `SERVICE` (a privilege of its
+    /// own: it makes the server fetch URLs). Administrators and unrestricted users may.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service: bool,
 }
 
 /// The policy file's form (`auth.access_policy`): role rules and the fallbacks. Imported
@@ -541,6 +545,7 @@ impl AccessState {
             write.default_graph = false;
         }
         read.inferred = read.default_graph && self.settings.inferred == Inferred::Visible;
+        read.service = rules.iter().any(|rule| rule.service);
         AccessView {
             read: Some(Arc::new(read)),
             write: Some(Arc::new(write)),
