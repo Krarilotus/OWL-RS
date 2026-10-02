@@ -78,6 +78,9 @@ pub struct SparqlQueryRequest {
     /// Evaluate the operators where the query puts them (no filter pushdown, no set
     /// evaluation, paths in full): same results, for comparisons and as an escape hatch.
     pub as_written: bool,
+    /// The graphs the requester may read (graph-level access control): the query's
+    /// dataset is restricted to them. `None`: every graph.
+    pub access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
 }
 
 impl SparqlQueryRequest {
@@ -91,6 +94,7 @@ impl SparqlQueryRequest {
             read_model: None,
             memory_limit: None,
             as_written: false,
+            access: None,
         }
     }
 }

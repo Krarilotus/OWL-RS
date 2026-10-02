@@ -67,6 +67,7 @@ pub struct PreparedQuery {
     as_written: bool,
     solutions_format: SolutionsResultFormat,
     graph_format: GraphResultFormat,
+    access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
 }
 
 impl PreparedQuery {
@@ -92,15 +93,24 @@ impl PreparedQuery {
             query,
             text: request.query.clone(),
             dataset: protocol_dataset(&request.default_graphs, &request.named_graphs)?,
-            read_model: request
-                .read_model
-                .or(from_protocol)
-                .or(from_query)
-                .unwrap_or_default(),
+            read_model: match request
+                .access
+                .as_ref()
+                .is_some_and(|access| !access.inferred)
+            {
+                // Without the inferred statements: what was asserted, whatever was asked.
+                true => ReadModel::Asserted,
+                false => request
+                    .read_model
+                    .or(from_protocol)
+                    .or(from_query)
+                    .unwrap_or_default(),
+            },
             memory_limit: request.memory_limit,
             as_written: request.as_written,
             solutions_format: request.solutions_format,
             graph_format: request.graph_format,
+            access: request.access.clone(),
         })
     }
 
@@ -119,9 +129,15 @@ impl PreparedQuery {
     /// Everything the serialised result depends on besides the data: the query text, the
     /// dataset parameters, the read model and the output formats.
     pub(crate) fn cache_request(&self) -> String {
+        // The access too: users who may read different graphs get different answers.
         format!(
-            "{}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
-            self.text, self.dataset, self.read_model, self.solutions_format, self.graph_format
+            "{}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
+            self.text,
+            self.dataset,
+            self.read_model,
+            self.solutions_format,
+            self.graph_format,
+            self.access
         )
     }
 
@@ -244,6 +260,7 @@ pub(crate) fn run_query(
         pre_bound: None,
         cross_chunk_rows: None,
         stream_rows: None,
+        access: prepared.access.clone(),
     };
     let alive = || match cancellation.is_cancelled() {
         true => Err(StoreError::SparqlEvaluation(
@@ -318,6 +335,7 @@ pub(crate) fn explain_prepared(
         pre_bound: None,
         cross_chunk_rows: None,
         stream_rows: None,
+        access: prepared.access.clone(),
     };
     Ok(explain_query(view, &prepared.query, &options)?)
 }

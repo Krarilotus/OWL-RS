@@ -117,6 +117,7 @@ pub(crate) fn apply_sparql_update(
         cancellation: Some(cancellation.clone()),
         union_default_graph,
         services,
+        access: request.access.clone(),
     };
     apply_update(tx, &update, &options)?;
     Ok(())

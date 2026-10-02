@@ -1051,6 +1051,10 @@ impl<'a> Context<'a> {
             options.dataset.as_ref(),
             dataset,
         );
+        let resolved = match &options.access {
+            Some(access) => resolved.restricted(snapshot, access),
+            None => resolved,
+        };
         let (scope, merge_set) = match resolved.default {
             DefaultGraph::Store => (GraphScope::Default, None),
             DefaultGraph::Graph(graph) => (GraphScope::Named(graph), None),

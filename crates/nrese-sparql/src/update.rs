@@ -31,6 +31,8 @@ pub struct UpdateOptions {
     pub cancellation: Option<CancellationToken>,
     /// Who answers `SERVICE` calls in `WHERE` clauses ([`crate::service`]).
     pub services: Option<crate::Services>,
+    /// The graphs `WHERE` clauses may read ([`crate::QueryOptions::access`]).
+    pub access: Option<std::sync::Arc<crate::GraphAccess>>,
 }
 
 #[derive(Debug, Error)]
@@ -100,6 +102,7 @@ fn apply_operation(
                 union_default_graph: options.union_default_graph,
                 dataset: options.using.clone(),
                 services: options.services.clone(),
+                access: options.access.clone(),
                 ..crate::query::QueryOptions::default()
             };
             let (deletes, inserts) = crate::native::delete_insert(

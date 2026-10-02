@@ -6,6 +6,8 @@ pub struct SparqlUpdateRequest {
     pub using_graphs: Vec<String>,
     /// Protocol `using-named-graph-uri` values.
     pub using_named_graphs: Vec<String>,
+    /// The graphs the requester may read in `WHERE` clauses (graph-level access control).
+    pub access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
 }
 
 impl SparqlUpdateRequest {
@@ -14,6 +16,7 @@ impl SparqlUpdateRequest {
             update: update.into(),
             using_graphs: Vec::new(),
             using_named_graphs: Vec::new(),
+            access: None,
         }
     }
 }
