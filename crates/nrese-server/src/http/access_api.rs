@@ -638,3 +638,78 @@ pub async fn logout(
         false => Err(ApiError::not_found("no such session")),
     }
 }
+
+#[utoipa::path(get, path = "/api/v1/queries", tag = "queries",
+    responses((status = 200, description = "The saved queries the requester may read, by space and name", body = Vec<nrese_store::access::SavedQuery>)))]
+/// The saved queries in the spaces the requester reads: its personal space, those shared
+/// with it, its workspaces (administrators: all).
+pub async fn saved_queries(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    Ok(Json(state.access().saved_queries(&by)).into_response())
+}
+
+#[utoipa::path(get, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+    params(("space" = String, Path, description = "A personal space (`~alice`) or a workspace"), ("name" = String, Path)),
+    responses((status = 200, description = "The saved query", body = nrese_store::access::SavedQuery),
+        (status = 404, description = "None the requester may read", body = crate::http::openapi::Problem)))]
+/// One saved query.
+pub async fn saved_query(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((space, name)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    Ok(Json(state.access().saved_query(&by, &space, &name)?).into_response())
+}
+
+#[utoipa::path(put, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+    params(("space" = String, Path, description = "A personal space (`~alice`) or a workspace"), ("name" = String, Path, description = "Letters, digits, `.`, `_`, `-`")),
+    request_body = nrese_store::access::QueryDraft,
+    responses((status = 200, description = "Saved", body = nrese_store::access::SavedQuery),
+        (status = 400, description = "Not a SPARQL query or update, or a bad name", body = crate::http::openapi::Problem),
+        (status = 403, description = "Not an editor or owner of the space", body = crate::http::openapi::Problem),
+        (status = 404, description = "No such space", body = crate::http::openapi::Problem)))]
+/// Saves a query (or update) under `name` in `space` (its editors and owners), replacing
+/// one of that name. It is checked to parse first; a prefix it doesn't declare means what
+/// its repository's namespaces (the default repository's without one) bind it to.
+pub async fn saved_query_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((space, name)): Path<(String, String)>,
+    bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    let draft: nrese_store::access::QueryDraft = body(&bytes)?;
+    let repository = match draft
+        .repository
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        Some(id) => state.for_repository(id)?,
+        None => state.clone(),
+    };
+    let namespaces = repository.store().namespaces().all();
+    let saved = state
+        .access()
+        .save_query(&by, &space, &name, draft, &namespaces)?;
+    Ok(Json(saved).into_response())
+}
+
+#[utoipa::path(delete, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+    params(("space" = String, Path), ("name" = String, Path)),
+    responses((status = 204, description = "Removed"),
+        (status = 403, description = "Not an editor or owner of the space", body = crate::http::openapi::Problem),
+        (status = 404, description = "None the requester may read", body = crate::http::openapi::Problem)))]
+/// Removes a saved query (the space's editors and owners).
+pub async fn saved_query_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((space, name)): Path<(String, String)>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    state.access().delete_query(&by, &space, &name)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}

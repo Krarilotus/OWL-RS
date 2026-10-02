@@ -268,6 +268,10 @@ protocol!(
         super::access_api::history,
         super::access_api::import,
         super::access_api::export,
+        super::access_api::saved_queries,
+        super::access_api::saved_query,
+        super::access_api::saved_query_put,
+        super::access_api::saved_query_delete,
         openapi,
     ),
     tags(
@@ -279,6 +283,7 @@ protocol!(
         (name = "reasoning", description = "Inferences, their explanations, the class hierarchy"),
         (name = "shacl", description = "Validation"),
         (name = "access", description = "Users, workspaces, personal spaces, role rules, logins (ADR-0008)"),
+        (name = "queries", description = "Saved queries, in personal spaces and workspaces"),
     )
 )]
 pub struct ApiDoc;

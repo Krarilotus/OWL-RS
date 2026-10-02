@@ -26,6 +26,7 @@
 
 mod control;
 mod login;
+mod queries;
 mod rdf;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,6 +39,7 @@ use serde::{Deserialize, Serialize};
 
 pub use control::{AccessControl, ChangeRecord, HISTORY_GRAPH, STATE_GRAPH};
 pub use login::{LoginLimits, SESSION_PREFIX, hash_password, verify_password};
+pub use queries::{QUERIES_GRAPH, QueryDraft, SavedQuery};
 
 /// What a role grants a user no rule names, when enforcement is on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

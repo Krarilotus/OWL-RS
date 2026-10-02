@@ -47,8 +47,10 @@ pub struct ChangeRecord {
 
 /// The access state, kept in `store`.
 pub struct AccessControl {
-    store: StoreService,
+    pub(super) store: StoreService,
     state: RwLock<Arc<AccessState>>,
+    /// The saved queries ([`super::queries`]); writes hold its lock.
+    pub(super) queries: RwLock<super::queries::Queries>,
     /// Changes one at a time; holds the next change's number.
     writer: Mutex<u64>,
     logins: Logins,
@@ -68,7 +70,7 @@ fn graph_pattern(graph: &str) -> StatementPattern {
 }
 
 /// The current time, UTC, as `xsd:dateTime` (seconds).
-fn now() -> String {
+pub(super) fn now() -> String {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -101,7 +103,7 @@ fn line(quad: &Quad) -> String {
 }
 
 /// The quads as SPARQL update data, each in its graph.
-fn data(quads: &[Quad]) -> String {
+pub(super) fn data(quads: &[Quad]) -> String {
     let mut by_graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for quad in quads {
         by_graph
@@ -138,9 +140,11 @@ impl AccessControl {
             )
             .map_err(|error| AccessError::Store(error.to_string()))?;
         let state = rdf::decode(&quads, base);
+        let queries = super::queries::load(&store)?;
         let control = Self {
             store,
             state: RwLock::new(Arc::new(state)),
+            queries: RwLock::new(queries),
             writer: Mutex::new(0),
             logins: Logins::new(limits),
         };
