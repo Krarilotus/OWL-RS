@@ -9,6 +9,7 @@ use crate::http::admin_dataset;
 use crate::http::ai;
 use crate::http::console;
 use crate::http::graph_store;
+use crate::http::repository::Repository;
 use crate::http::guard;
 use crate::http::metrics;
 use crate::http::operator_api;
@@ -79,7 +80,7 @@ pub async fn operator_capabilities(
 }
 
 pub async fn operator_dataset_summary(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_operator_read(&state, &headers).await?;
@@ -103,7 +104,7 @@ pub async fn operator_runtime_diagnostics(
 }
 
 pub async fn operator_reasoning_diagnostics(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_operator_read(&state, &headers).await?;
@@ -111,7 +112,7 @@ pub async fn operator_reasoning_diagnostics(
 }
 
 pub async fn admin_backup_dataset(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_admin_write(&state, &headers).await?;
@@ -138,7 +139,7 @@ pub async fn admin_image_backup(
 }
 
 pub async fn admin_restore_dataset(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -155,7 +156,7 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn dataset_info(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_service_description_read(&state, &headers).await?;
@@ -175,7 +176,7 @@ pub async fn metrics(
 }
 
 pub async fn service_description(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_service_description_read(&state, &headers).await?;
@@ -189,7 +190,7 @@ pub async fn service_description(
 }
 
 pub async fn query_get(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -200,7 +201,7 @@ pub async fn query_get(
 }
 
 pub async fn query_post(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
@@ -216,7 +217,7 @@ pub async fn query_post(
 }
 
 pub async fn update_post(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
@@ -235,7 +236,7 @@ pub async fn update_post(
 /// `GET` on the combined SPARQL endpoint: a query, or without one the service description
 /// (SPARQL 1.1 Service Description §2).
 pub async fn sparql_get(
-    state: State<AppState>,
+    state: Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -254,7 +255,7 @@ pub async fn sparql_get(
 /// access rule. Clients that are configured with one endpoint URL use this (RDF4J's
 /// SPARQL repository as ResearchSpace sets it up; Fuseki- and Blazegraph-style setups).
 pub async fn sparql_post(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
@@ -283,7 +284,7 @@ pub async fn sparql_post(
 /// Resources whose labels' or local names' words begin with the words of `q`, best first
 /// (`limit`, default 10; `infer=false` for asserted statements only).
 pub async fn autocomplete(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -324,7 +325,7 @@ pub async fn autocomplete(
 
 /// The OWL 2 EL class hierarchy of the asserted ontology.
 pub async fn classification_get(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_whole_read(&state, &headers).await?;
@@ -333,7 +334,7 @@ pub async fn classification_get(
 
 /// Validates the data against the repository's shapes graph.
 pub async fn shacl_get(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -343,7 +344,7 @@ pub async fn shacl_get(
 
 /// Validates the data against the shapes in the request body.
 pub async fn shacl_post(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
@@ -353,7 +354,7 @@ pub async fn shacl_post(
 }
 
 pub async fn tell_post(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
@@ -363,7 +364,7 @@ pub async fn tell_post(
 }
 
 pub async fn graph_get(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -371,7 +372,7 @@ pub async fn graph_get(
 }
 
 pub async fn graph_head(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -379,7 +380,7 @@ pub async fn graph_head(
 }
 
 pub async fn graph_put(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
@@ -388,7 +389,7 @@ pub async fn graph_put(
 }
 
 pub async fn graph_post(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
@@ -397,7 +398,7 @@ pub async fn graph_post(
 }
 
 pub async fn graph_delete(
-    State(state): State<AppState>,
+    Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {

@@ -5,6 +5,32 @@ use crate::http::handlers;
 use crate::http::rdf4j;
 use crate::state::AppState;
 
+/// A repository's capabilities under `/api/v1/repositories/{id}` ([`super::repository`]).
+fn repository_routes() -> Router<AppState> {
+    Router::new()
+        .route("/info", get(handlers::dataset_info))
+        .route("/summary", get(handlers::operator_dataset_summary))
+        .route("/reasoning", get(handlers::operator_reasoning_diagnostics))
+        .route("/service-description", get(handlers::service_description))
+        .route("/query", get(handlers::query_get).post(handlers::query_post))
+        .route("/update", post(handlers::update_post))
+        .route("/sparql", get(handlers::sparql_get).post(handlers::sparql_post))
+        .route("/tell", post(handlers::tell_post))
+        .route(
+            "/data",
+            get(handlers::graph_get)
+                .head(handlers::graph_head)
+                .put(handlers::graph_put)
+                .post(handlers::graph_post)
+                .delete(handlers::graph_delete),
+        )
+        .route("/shacl", get(handlers::shacl_get).post(handlers::shacl_post))
+        .route("/autocomplete", get(handlers::autocomplete))
+        .route("/classification", get(handlers::classification_get))
+        .route("/backup", get(handlers::admin_backup_dataset))
+        .route("/restore", post(handlers::admin_restore_dataset))
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(handlers::root_redirect))
@@ -87,6 +113,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/dataset/classification", get(handlers::classification_get))
         .route("/console/{*path}", get(handlers::console_file))
+        // The engine API (ADR-0007): every capability for every repository, by the same
+        // handlers as the default repository's `/dataset/…` routes.
+        .nest("/api/v1/repositories/{id}", repository_routes())
         // The RDF4J REST protocol (`rdf4j.rs`).
         .route("/protocol", get(rdf4j::protocol))
         .route("/repositories", get(rdf4j::repositories))
