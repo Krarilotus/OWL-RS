@@ -73,6 +73,9 @@ pub struct ShaclValidation {
     /// The number of shapes, nested ones included; 0 means there was nothing to validate
     /// against.
     pub shapes: usize,
+    /// Whether anything was checked: some active targeted shape had a focus node and a
+    /// constraint ([`nrese_shacl::applicable`]). A conforming report without it is vacuous.
+    pub applicable: bool,
 }
 
 /// One validation result in plain text, for JSON reports: IRIs as they are, other terms
@@ -141,9 +144,9 @@ fn validate_view<V: ReadView + Sync>(
     shapes: Option<TermId>,
     also_excluded: Option<TermId>,
     request: &ShaclValidationRequest,
-) -> StoreResult<(ValidationReport, usize)> {
+) -> StoreResult<(ValidationReport, usize, bool)> {
     let Some(shapes_graph) = shapes else {
-        return Ok((ValidationReport::default(), 0));
+        return Ok((ValidationReport::default(), 0, false));
     };
     let shapes: Shapes = compile(
         view,
@@ -164,7 +167,8 @@ fn validate_view<V: ReadView + Sync>(
         },
     };
     data.model = request.read_model;
-    Ok((validate(view, &shapes, data), shapes.len()))
+    let applicable = nrese_shacl::applicable(view, &shapes, data);
+    Ok((validate(view, &shapes, data), shapes.len(), applicable))
 }
 
 /// Fails if the commit in `tx` changes the graph `shapes_graph` and leaves shapes in it that
@@ -256,7 +260,7 @@ impl StoreService {
                     _ => stored.clone(),
                 };
                 let snapshot = self.engine().snapshot();
-                let (report, shapes) = validate_view(
+                let (report, shapes, applicable) = validate_view(
                     &snapshot,
                     snapshot.lookup(shapes_graph.as_ref().into()),
                     snapshot.lookup(stored.as_ref().into()),
@@ -266,6 +270,7 @@ impl StoreService {
                     report,
                     revision: snapshot.revision(),
                     shapes,
+                    applicable,
                 })
             }
             ShapesSource::Payload {
@@ -289,7 +294,7 @@ impl StoreService {
                 for quad in &quads {
                     tx.insert(quad.as_ref());
                 }
-                let (report, shapes) = validate_view(
+                let (report, shapes, applicable) = validate_view(
                     &tx,
                     tx.lookup(scratch.into()),
                     tx.lookup(stored.as_ref().into()),
@@ -299,6 +304,7 @@ impl StoreService {
                     report,
                     revision,
                     shapes,
+                    applicable,
                 })
             }
         }
