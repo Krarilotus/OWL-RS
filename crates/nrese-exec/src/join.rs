@@ -344,7 +344,9 @@ fn merge_join(
     Ok(out.assume_sorted_by(lk.to_vec()))
 }
 
-/// Merge join of the left rows `rows` with the right rows from `r`.
+/// Merge join of the left rows `rows` with the right rows from `r`: the matching pairs of
+/// row numbers first, then the output a column at a time, gathered by them (no row is
+/// assembled). One key compares two id columns directly.
 fn merge_rows(
     left: &IdTable,
     rows: Range<usize>,
@@ -354,39 +356,77 @@ fn merge_rows(
     rk: &[usize],
     limit: &Limit,
 ) -> Result<IdTable, TooManyRows> {
-    let payload = right_payload(right.width(), rk);
-    let width = left.width() + payload.len();
-    let mut out = Sink::new(width, limit);
-    let mut row = vec![0; width];
+    assert!(
+        left.len() < END as usize && right.len() < END as usize,
+        "join input exceeds u32 rows"
+    );
+    let (mut lefts, mut rights): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut pending = 0;
     let (mut l, end) = (rows.start, rows.end);
-    while l < end && r < right.len() {
-        match compare_keys(left, l, lk, right, r, rk) {
-            Ordering::Less => l = gallop(left, lk, l, right, r, rk, true).min(end),
-            Ordering::Greater => r = gallop(right, rk, r, left, l, lk, false),
-            Ordering::Equal => {
-                let l_end = (l + 1..end)
-                    .find(|&x| !same_key(left, l, x, lk))
-                    .unwrap_or(end);
-                let r_end = (r + 1..right.len())
-                    .find(|&x| !same_key(right, r, x, rk))
-                    .unwrap_or(right.len());
-                for li in l..l_end {
-                    for (i, c) in left.columns().iter().enumerate() {
-                        row[i] = c[li];
-                    }
-                    for ri in r..r_end {
-                        for (i, &c) in payload.iter().enumerate() {
-                            row[left.width() + i] = right.get(ri, c);
-                        }
-                        out.push(&row)?;
-                    }
+    // The pairs of the runs `l..l_end` and `r..r_end` (one key value).
+    let mut pair = |l: usize, l_end: usize, r: usize, r_end: usize| {
+        for li in l..l_end {
+            for ri in r..r_end {
+                lefts.push(li as u32);
+                rights.push(ri as u32);
+            }
+        }
+        pending += (l_end - l) * (r_end - r);
+        if pending >= LIMIT_STEP {
+            limit.grow(std::mem::take(&mut pending))?;
+        }
+        Ok(())
+    };
+    if let ([lk], [rk]) = (lk, rk) {
+        let (a, b) = (left.column(*lk), right.column(*rk));
+        while l < end && r < b.len() {
+            match a[l].cmp(&b[r]) {
+                Ordering::Less => l += 1,
+                Ordering::Greater => r += 1,
+                Ordering::Equal => {
+                    let l_end = (l + 1..end).find(|&x| a[x] != a[l]).unwrap_or(end);
+                    let r_end = (r + 1..b.len()).find(|&x| b[x] != b[r]).unwrap_or(b.len());
+                    pair(l, l_end, r, r_end)?;
+                    l = l_end;
+                    r = r_end;
                 }
-                l = l_end;
-                r = r_end;
+            }
+        }
+    } else {
+        while l < end && r < right.len() {
+            match compare_keys(left, l, lk, right, r, rk) {
+                Ordering::Less => l = gallop(left, lk, l, right, r, rk, true).min(end),
+                Ordering::Greater => r = gallop(right, rk, r, left, l, lk, false),
+                Ordering::Equal => {
+                    let l_end = (l + 1..end)
+                        .find(|&x| !same_key(left, l, x, lk))
+                        .unwrap_or(end);
+                    let r_end = (r + 1..right.len())
+                        .find(|&x| !same_key(right, r, x, rk))
+                        .unwrap_or(right.len());
+                    pair(l, l_end, r, r_end)?;
+                    l = l_end;
+                    r = r_end;
+                }
             }
         }
     }
-    out.finish()
+    limit.grow(pending)?;
+    let payload = right_payload(right.width(), rk);
+    if left.width() + payload.len() == 0 {
+        return Ok(IdTable::from_rows(
+            0,
+            std::iter::repeat_n(&[][..], lefts.len()),
+        ));
+    }
+    let gather = |column: &[u64], at: &[u32]| at.iter().map(|&i| column[i as usize]).collect();
+    let columns = left
+        .columns()
+        .iter()
+        .map(|column| gather(column, &lefts))
+        .chain(payload.iter().map(|&c| gather(right.column(c), &rights)))
+        .collect();
+    Ok(IdTable::from_columns(columns))
 }
 
 /// Hash table from key to the chain of `build` rows with that key: `heads[key]` is the first
