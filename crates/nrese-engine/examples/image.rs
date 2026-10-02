@@ -5,6 +5,9 @@
 //! ```text
 //! cargo run --release -p nrese-engine --example image -- STORE_DIR OUT_DIR
 //! ```
+//!
+//! `NRESE_VOCABULARY=fsst` writes the dictionary's keys compressed, `NRESE_INDEX_ENCODING`
+//! takes `fast` or `compact` for the index blocks, as the server reads them.
 
 use std::time::Instant;
 
@@ -16,6 +19,18 @@ fn main() {
         eprintln!("usage: image STORE_DIR OUT_DIR");
         std::process::exit(2);
     };
+    if let Some(encoding) = std::env::var("NRESE_VOCABULARY")
+        .ok()
+        .and_then(|name| nrese_engine::VocabularyEncoding::from_name(&name))
+    {
+        nrese_engine::set_vocabulary_encoding(encoding);
+    }
+    if let Some(encoding) = std::env::var("NRESE_INDEX_ENCODING")
+        .ok()
+        .and_then(|name| nrese_engine::IndexEncoding::from_name(&name))
+    {
+        nrese_engine::set_index_encoding(encoding);
+    }
     let config = EngineConfig {
         background_maintenance: false,
         ..EngineConfig::default()

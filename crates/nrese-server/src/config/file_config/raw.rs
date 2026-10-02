@@ -122,6 +122,8 @@ pub(super) struct RawStoreConfig {
     pub wal_archive: Option<bool>,
     #[serde(default)]
     pub index_encoding: Option<String>,
+    #[serde(default)]
+    pub vocabulary: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

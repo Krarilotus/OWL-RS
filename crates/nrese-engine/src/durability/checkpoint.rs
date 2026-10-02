@@ -1,7 +1,9 @@
 //! Checkpoints: a full image of one revision (dictionary plus both index stacks).
 //!
 //! Format 11 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* | crc32
-//! u32`. The CRC covers everything before it. Flag bit 0 ([`INTEGERS_IN_DICTIONARY`]):
+//! u32`. The CRC covers everything before it. Flag bit 1 ([`COMPRESSED_KEYS`], format 11):
+//! the dictionary's keys are FSST-compressed ([`crate::term::vocabulary`]); its two symbol
+//! tables follow the dictionary's header. Flag bit 0 ([`INTEGERS_IN_DICTIONARY`]):
 //! integer-derived literals are dictionary entries, not inline (a store created before
 //! [`TermKind::DerivedInteger`](crate::term::TermKind)); formats 4-7 have no flags and
 //! are such stores.
@@ -55,6 +57,7 @@ use crate::quad::{EncodedQuad, EncodedTriple, Permutation};
 use crate::term::Dictionary;
 use crate::term::dictionary::{Base, base_slots};
 use crate::term::offsets::{BlockEnds, Ends, Offsets};
+use crate::term::vocabulary::{Codec, VocabularyEncoding, vocabulary_encoding};
 use crate::term::hash::key_hash;
 
 /// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
@@ -76,6 +79,8 @@ const MAGIC_V7: &[u8; 8] = b"NRESECK7";
 const MAGIC_V6: &[u8; 8] = b"NRESECK6";
 /// Flags bit: integer-derived literals are dictionary entries.
 const INTEGERS_IN_DICTIONARY: u64 = 1;
+/// Flags bit: the dictionary's keys are compressed (format 11).
+const COMPRESSED_KEYS: u64 = 2;
 const MAGIC_V5: &[u8; 8] = b"NRESECK5";
 const MAGIC_V4: &[u8; 8] = b"NRESECK4";
 /// Magic prefix shared by every checkpoint format version.
@@ -170,6 +175,7 @@ fn write_dictionary<W: Write>(
     out: &mut Checksummed<W>,
     dictionary: &Dictionary,
     len: u64,
+    codec: Option<&Codec>,
 ) -> EngineResult<()> {
     if len >= u64::from(u32::MAX) {
         return Err(EngineError::Configuration(
@@ -184,13 +190,23 @@ fn write_dictionary<W: Write>(
     let mask = slot_count - 1;
     let mut slots = vec![0u32; slot_count];
     let mut lengths: Vec<u32> = Vec::with_capacity(len as usize);
+    // A key as stored: plain, or compressed into `stored`.
+    let mut stored = Vec::new();
     for (from, to) in chunks() {
         dictionary.for_each_key(from, to, |key| {
             let mut slot = key_hash(key) as usize & mask;
             while slots[slot] != 0 {
                 slot = (slot + 1) & mask;
             }
-            lengths.push(key.len() as u32);
+            let length = match codec {
+                None => key.len(),
+                Some(codec) => {
+                    stored.clear();
+                    codec.compress(key, &mut stored);
+                    stored.len()
+                }
+            };
+            lengths.push(length as u32);
             slots[slot] = lengths.len() as u32;
         });
     }
@@ -211,13 +227,19 @@ fn write_dictionary<W: Write>(
     put_u64(&mut out.buffer, arena_len);
     put_u64(&mut out.buffer, slot_count as u64);
     put_u64(&mut out.buffer, ends.len() as u64);
+    if let Some(codec) = codec {
+        codec.write(&mut out.buffer);
+    }
     out.pad();
     for block in blocks {
         put_u64(&mut out.buffer, block);
         out.drain()?;
     }
     for (from, to) in chunks() {
-        dictionary.for_each_key(from, to, |key| out.buffer.extend_from_slice(key));
+        dictionary.for_each_key(from, to, |key| match codec {
+            None => out.buffer.extend_from_slice(key),
+            Some(codec) => codec.compress(key, &mut out.buffer),
+        });
         out.drain()?;
     }
     out.write_bytes(&ends)?;
@@ -245,6 +267,7 @@ fn read_dictionary(
     map: &Map,
     with_order: bool,
     blocks: bool,
+    compressed: bool,
 ) -> Result<Base, String> {
     let truncated = || "truncated dictionary".to_owned();
     let len = reader.u64().ok_or_else(truncated)?;
@@ -253,6 +276,17 @@ fn read_dictionary(
     let ends_len = match blocks {
         true => reader.u64().ok_or_else(truncated)?,
         false => 0,
+    };
+    let codec = match compressed {
+        true => Some(
+            Codec::read(
+                reader
+                    .bytes(crate::term::vocabulary::CODEC_BYTES)
+                    .ok_or_else(truncated)?,
+            )
+            .ok_or_else(|| "damaged symbol tables".to_owned())?,
+        ),
+        false => None,
     };
     if len >= u64::from(u32::MAX) || !slot_count.is_power_of_two() || slot_count <= len {
         return Err("damaged dictionary header".into());
@@ -312,6 +346,7 @@ fn read_dictionary(
             Some((at, count)) => Some(Mapped::new(map, at, count).ok_or_else(unmappable)?),
             None => None,
         },
+        codec,
     };
     // The last block's start and the last key's end, checked cheaply; `Base::verify`
     // reads every offset.
@@ -379,12 +414,18 @@ pub(crate) fn write_parts<'a>(
         written: MAGIC.len() as u64,
     };
     put_u64(&mut out.buffer, revision);
+    // Keys compressed with tables trained on a sample of them ([`crate::term::vocabulary`]).
+    let codec = (vocabulary_encoding() == VocabularyEncoding::Fsst)
+        .then(|| Codec::train(&dictionary.sample_keys(dictionary_len)));
     let flags = match dictionary.integers_in_dictionary() {
         true => INTEGERS_IN_DICTIONARY,
         false => 0,
+    } | match codec {
+        Some(_) => COMPRESSED_KEYS,
+        None => 0,
     };
     put_u64(&mut out.buffer, flags);
-    write_dictionary(&mut out, dictionary, dictionary_len)?;
+    write_dictionary(&mut out, dictionary, dictionary_len, codec.as_ref())?;
     for (stack, layout) in Stack::ALL.into_iter().zip(layouts) {
         let permutations = layout.permutations();
         put_u32(&mut out.buffer, permutations.len() as u32);
@@ -504,20 +545,23 @@ pub(crate) fn load_latest(
     }
     lap("crc");
     let revision = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
-    let integers_in_dictionary = match with_flags {
+    let (integers_in_dictionary, compressed) = match with_flags {
         true => {
             let flags = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
-            if flags & !INTEGERS_IN_DICTIONARY != 0 {
+            let known = INTEGERS_IN_DICTIONARY | if blocks { COMPRESSED_KEYS } else { 0 };
+            if flags & !known != 0 {
                 return Err(corrupt("unknown flags"));
             }
-            flags & INTEGERS_IN_DICTIONARY != 0
+            (
+                flags & INTEGERS_IN_DICTIONARY != 0,
+                flags & COMPRESSED_KEYS != 0,
+            )
         }
-        false => true,
+        false => (true, false),
     };
     if aligned {
-        let base =
-            read_dictionary(&mut reader, &map, with_order, blocks)
-                .map_err(|error| corrupt(&error))?;
+        let base = read_dictionary(&mut reader, &map, with_order, blocks, compressed)
+            .map_err(|error| corrupt(&error))?;
         if verify {
             base.verify().map_err(|error| corrupt(&error))?;
         }
@@ -624,9 +668,10 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
         _ => return Err(corrupt("bad magic")),
     };
     reader.u64().ok_or_else(|| corrupt("truncated header"))?;
-    reader.u64().ok_or_else(|| corrupt("truncated header"))?; // flags: this engine's
-    let base =
-        read_dictionary(&mut reader, &map, true, blocks).map_err(|error| corrupt(&error))?;
+    // The flags: this engine's, but whether the keys are compressed.
+    let flags = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
+    let base = read_dictionary(&mut reader, &map, true, blocks, flags & COMPRESSED_KEYS != 0)
+        .map_err(|error| corrupt(&error))?;
     let [asserted, inferred] =
         read_stacks(&mut reader, body, Some(&map), false).map_err(|error| corrupt(&error))?;
     let index = |stack: Stack, packed| stack_index(stack, packed).map_err(|error| corrupt(&error));

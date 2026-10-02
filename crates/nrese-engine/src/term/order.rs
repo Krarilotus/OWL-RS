@@ -14,7 +14,20 @@
 //! ([`super::dictionary::Base`]); the entries interned since are sorted in memory
 //! ([`TextOrder`]), lazily, when a search needs them, and merged as the dictionary grows.
 
+use std::borrow::Cow;
+
 use rayon::prelude::*;
+
+/// A key as the dictionary hands it out: in place, or decoded ([`super::vocabulary`]).
+pub(crate) type Key<'a> = Cow<'a, [u8]>;
+
+/// The text of `key`, empty if it has none; borrowed where the key is.
+pub(crate) fn text_in(key: Key<'_>) -> Key<'_> {
+    match key {
+        Cow::Borrowed(key) => Cow::Borrowed(text_of(key).unwrap_or_default()),
+        Cow::Owned(key) => Cow::Owned(text_of(&key).unwrap_or_default().to_vec()),
+    }
+}
 
 /// The text of a dictionary key, if it has one: an IRI's string or a literal's lexical
 /// form (after its language, direction or datatype).
@@ -39,33 +52,33 @@ pub(crate) fn text_of(key: &[u8]) -> Option<&[u8]> {
 /// rather than (text, index) pairs of 24 bytes (2 GB more at DBpedia's 40 M terms).
 pub(crate) fn sorted<'a, T>(
     range: std::ops::Range<u64>,
-    key: &(dyn Fn(u64) -> &'a [u8] + Sync),
+    key: &(dyn Fn(u64) -> Key<'a> + Sync),
 ) -> Vec<T>
 where
     T: Copy + Ord + Send + Into<u64> + TryFrom<u64>,
 {
     let mut entries: Vec<T> = range
         .into_par_iter()
-        .filter(|&index| text_of(key(index)).is_some())
+        .filter(|&index| text_of(&key(index)).is_some())
         .map(|index| {
             T::try_from(index)
                 .ok()
                 .expect("an index of the order's width")
         })
         .collect();
-    let text = |index: T| text_of(key(index.into())).unwrap_or_default();
-    entries.par_sort_unstable_by(|&a, &b| text(a).cmp(text(b)).then(a.cmp(&b)));
+    let text = |index: T| text_in(key(index.into()));
+    entries.par_sort_unstable_by(|&a, &b| text(a).cmp(&text(b)).then(a.cmp(&b)));
     entries
 }
 
 /// The positions `start..end` of `order` whose text starts with `prefix`.
 pub(crate) fn prefix_range<'a>(
     order: &[impl Copy + Into<u64>],
-    key: &dyn Fn(u64) -> &'a [u8],
+    key: &dyn Fn(u64) -> Key<'a>,
     prefix: &[u8],
 ) -> (usize, usize) {
-    let text = |position: usize| text_of(key(order[position].into())).unwrap_or_default();
-    let start = partition(order.len(), |p| text(p) < prefix);
+    let text = |position: usize| text_in(key(order[position].into()));
+    let start = partition(order.len(), |p| *text(p) < *prefix);
     let end = start + partition(order.len() - start, |p| text(start + p).starts_with(prefix));
     (start, end)
 }
@@ -100,7 +113,7 @@ impl TextOrder {
         &mut self,
         first: u64,
         len: u64,
-        key: &(dyn Fn(u64) -> &'a [u8] + Sync),
+        key: &(dyn Fn(u64) -> Key<'a> + Sync),
     ) {
         if first != self.first {
             *self = Self {
@@ -113,7 +126,7 @@ impl TextOrder {
             return;
         }
         let added: Vec<u64> = sorted(self.covered..len, key);
-        let text = |index: u64| text_of(key(index)).unwrap_or_default();
+        let text = |index: u64| text_in(key(index));
         let old = std::mem::take(&mut self.order);
         let mut merged = Vec::with_capacity(old.len() + added.len());
         let (mut i, mut j) = (0, 0);
@@ -154,9 +167,14 @@ mod tests {
         .iter()
         .map(|k| k.to_vec())
         .collect();
-        let key = |i: u64| keys[i as usize].as_slice();
+        let plain = |i: u64| keys[i as usize].as_slice();
+        // Half the keys as if decoded.
+        let key = |i: u64| match i % 2 {
+            0 => Cow::Borrowed(plain(i)),
+            _ => Cow::Owned(plain(i).to_vec()),
+        };
         let all: Vec<u64> = sorted(0..keys.len() as u64, &key);
-        let texts: Vec<&[u8]> = all.iter().map(|&i| text_of(key(i)).unwrap()).collect();
+        let texts: Vec<&[u8]> = all.iter().map(|&i| text_of(plain(i)).unwrap()).collect();
         assert_eq!(
             texts,
             [
@@ -171,7 +189,7 @@ mod tests {
             ]
         );
         let (start, end) = prefix_range(&all, &key, b"wind");
-        let found: Vec<&[u8]> = all[start..end].iter().map(|&i| key(i)).collect();
+        let found: Vec<&[u8]> = all[start..end].iter().map(|&i| plain(i)).collect();
         assert_eq!(found, [&b"Lde\0wind"[..], b"Swind", b"Den\0rtl\0windsurf"]);
         assert_eq!(prefix_range(&all, &key, b"zzz"), (all.len(), all.len()));
         // Built in two steps, merged: the same order.
