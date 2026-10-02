@@ -1,15 +1,16 @@
-//! SPARQL property paths over ids (SPARQL 1.1 §18.4; the deviations the reference
-//! evaluator's `Deviations` names aside).
+//! SPARQL property paths over ids (SPARQL 1.1 §18.4).
 //!
 //! | Path | Result |
 //! |---|---|
-//! | `p`, `^p`, `a/b`, `!(…)` | bags |
-//! | `a\|b`, `p?` | deduplicated |
+//! | `p`, `^p`, `a/b`, `a\|b`, `!(…)` | bags (an alternative is a UNION: a pair both sides give comes twice) |
+//! | `p?` | deduplicated |
 //! | `p+`, `p*` | sets (each end once per start), via breadth-first reachability |
 //!
-//! Zero-length paths (`*`, `?`) only start from terms that occur as a subject or object in
-//! the graph the path is followed in ([`PathGraph`]); an open `?x p* ?y` pairs every such node with itself. Both ends bound
-//! is an existence test (one solution or none).
+//! Zero-length paths (`*`, `?`) start from the terms that occur as a subject or object in
+//! the graph the path is followed in ([`PathGraph`]), and from the path pattern's constant
+//! end, whether the graph has it or not ([`PathEvaluator::fixed`]); an open `?x p* ?y`
+//! pairs every node with itself. Both ends bound is an existence test (one solution or
+//! none).
 //!
 //! The default graph is the store's, or the merge of all graphs
 //! ([`PathEvaluator::merged`]): then every read takes a graph-last index order, where the
@@ -263,7 +264,7 @@ impl PathEvaluator<'_> {
             Path::Alternative(a, b) => {
                 let mut ends = self.from(a, start);
                 ends.extend(self.from(b, start));
-                dedup_keep_order(ends)
+                ends
             }
             Path::OneOrMore(p) => reachable(start, false, |n, out| out.extend(self.from(p, n))),
             Path::ZeroOrMore(p) => {
@@ -305,7 +306,7 @@ impl PathEvaluator<'_> {
             Path::Alternative(a, b) => {
                 let mut starts = self.to(a, end);
                 starts.extend(self.to(b, end));
-                dedup_keep_order(starts)
+                starts
             }
             Path::OneOrMore(p) => reachable(end, false, |n, out| out.extend(self.to(p, n))),
             Path::ZeroOrMore(p) => {
@@ -436,7 +437,7 @@ impl PathEvaluator<'_> {
             Path::Alternative(a, b) => {
                 let mut pairs = self.open(a);
                 pairs.extend(self.open(b));
-                dedup_pairs(pairs)
+                pairs
             }
             Path::OneOrMore(p) => transitive_closure(&self.open(p)),
             Path::ZeroOrMore(p) => {
