@@ -215,7 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let query = counting(&text);
-        let mut request = SparqlQueryRequest::new(query.clone());
+        let mut request = SparqlQueryRequest::all(query.clone());
         request.memory_limit = memory_limit;
         request.as_written = as_written;
         let prepared = match PreparedQuery::parse(&request) {
@@ -268,7 +268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         eprintln!("{name}: {:.2} ms", best * 1000.0);
         if explain && !failed {
-            let prepared = PreparedQuery::parse(&SparqlQueryRequest::new(query.clone()))?;
+            let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(query.clone()))?;
             let plan = store.explain_query(&prepared, &CancellationToken::new())?;
             eprintln!("  executor {} | {} rows", plan.executor, plan.rows);
             for step in &plan.steps {
@@ -311,7 +311,7 @@ fn commit_latency(
     );
     // Asserted ABox type statements (IRIs, classes outside the W3C vocabularies), spread
     // over the dataset.
-    let mut request = nrese_store::SparqlQueryRequest::new(format!(
+    let mut request = nrese_store::SparqlQueryRequest::all(format!(
         "SELECT ?s ?c WHERE {{ ?s a ?c FILTER(isIRI(?s) && !STRSTARTS(STR(?c), \"http://www.w3.org/\")) }} LIMIT {}",
         n * 50
     ));

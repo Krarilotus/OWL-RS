@@ -154,9 +154,13 @@ pub async fn tell_access(state: &AppState, headers: &HeaderMap) -> Result<Access
 /// [`enforce_query_read`] for endpoints that read the whole dataset (autocomplete,
 /// classification, SHACL validation, query suggestions): only for requesters who may read
 /// every graph.
-pub async fn enforce_whole_read(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    if query_access(state, headers).await?.reads_everything() {
-        Ok(())
+pub async fn enforce_whole_read(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<nrese_store::ReadScope, ApiError> {
+    let access = query_access(state, headers).await?;
+    if access.reads_everything() {
+        Ok(access.read_scope())
     } else {
         Err(ApiError::forbidden(
             "this endpoint reads every graph, and the requester may read only some",

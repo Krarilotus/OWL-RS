@@ -188,7 +188,7 @@ fn run_once(
 }
 
 fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
-    let mut request = SparqlQueryRequest::new(text);
+    let mut request = SparqlQueryRequest::all(text);
     request.solutions_format = args.format;
     let prepared = match PreparedQuery::parse(&request) {
         Ok(prepared) if prepared.kind() != QueryResultKind::Boolean => prepared,
@@ -235,7 +235,7 @@ fn ms(d: Duration) -> f64 {
 /// Prints how `text` runs: each operator, indented by depth, with estimated and actual
 /// rows and its time.
 fn explain(store: &StoreService, text: &str) {
-    let explained = PreparedQuery::parse(&SparqlQueryRequest::new(text))
+    let explained = PreparedQuery::parse(&SparqlQueryRequest::all(text))
         .map_err(|e| e.to_string())
         .and_then(|prepared| {
             store
@@ -382,7 +382,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut results = 0;
         for _ in 0..args.runs {
             let started = Instant::now();
-            let validation = store.validate_shacl(&ShaclValidationRequest::default())?;
+            let validation = store.validate_shacl(
+                &nrese_store::ReadScope::All,
+                &ShaclValidationRequest::default(),
+            )?;
             times.push(started.elapsed());
             results = validation.report.results.len();
         }

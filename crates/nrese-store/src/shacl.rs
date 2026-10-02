@@ -216,9 +216,14 @@ pub(crate) fn introduced(
 }
 
 impl StoreService {
-    /// Validates the repository's data against SHACL shapes. Ill-formed shapes are a
-    /// request error ([`StoreError::ShaclShapes`]).
-    pub fn validate_shacl(&self, request: &ShaclValidationRequest) -> StoreResult<ShaclValidation> {
+    /// Validates the repository's data against SHACL shapes; for a scope that reads every
+    /// graph. Ill-formed shapes are a request error ([`StoreError::ShaclShapes`]).
+    pub fn validate_shacl(
+        &self,
+        scope: &crate::ReadScope,
+        request: &ShaclValidationRequest,
+    ) -> StoreResult<ShaclValidation> {
+        scope.require_all("validation")?;
         let stored = graph_iri(&self.config().shapes_graph)?;
         match &request.shapes {
             ShapesSource::Stored | ShapesSource::Graph(_) => {

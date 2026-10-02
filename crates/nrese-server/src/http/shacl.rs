@@ -86,6 +86,7 @@ pub async fn validate(
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     shapes: Option<Bytes>,
+    scope: nrese_store::ReadScope,
 ) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let format = negotiated(accept_header_value(&headers), REPORTS)?;
@@ -111,7 +112,7 @@ pub async fn validate(
     let store = state.store();
     let validation = tokio::time::timeout(
         state.policy().timeouts.query,
-        tokio::task::spawn_blocking(move || store.validate_shacl(&request)),
+        tokio::task::spawn_blocking(move || store.validate_shacl(&scope, &request)),
     )
     .await
     .map_err(|_| ApiError::timeout("validation exceeded policy timeout"))?

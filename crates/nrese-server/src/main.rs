@@ -213,7 +213,8 @@ fn query_once(store: &StoreService, command: QueryCommand) -> Result<()> {
         }
         (None, None) => anyhow::bail!("`query` needs a query or --file"),
     };
-    let mut request = SparqlQueryRequest::new(text);
+    // The operator on the command line reads every graph.
+    let mut request = SparqlQueryRequest::all(text);
     if let Some(format) = command.format.as_deref() {
         match format.to_ascii_lowercase().as_str() {
             "json" => request.solutions_format = SolutionsResultFormat::Json,

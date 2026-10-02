@@ -288,7 +288,7 @@ pub async fn autocomplete(
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_whole_read(&state, &headers).await?;
+    let scope = guard::enforce_whole_read(&state, &headers).await?;
     state.ensure_serving()?;
     let pairs: Vec<(String, String)> =
         serde_urlencoded::from_str(raw_query.as_deref().unwrap_or_default())
@@ -313,9 +313,11 @@ pub async fn autocomplete(
     };
     let infer = value("infer") != Some("false");
     let store = state.store();
-    let suggestions = tokio::task::spawn_blocking(move || store.autocomplete(&typed, limit, infer))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let suggestions =
+        tokio::task::spawn_blocking(move || store.autocomplete(&scope, &typed, limit, infer))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+            .map_err(|error| ApiError::forbidden(error.to_string()))?;
     let suggestions: Vec<serde_json::Value> = suggestions
         .into_iter()
         .map(|s| serde_json::json!({"iri": s.iri, "label": s.label, "score": s.score}))
@@ -328,8 +330,8 @@ pub async fn classification_get(
     Repository(state): Repository,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_whole_read(&state, &headers).await?;
-    super::classification::classify(state, &headers).await
+    let scope = guard::enforce_whole_read(&state, &headers).await?;
+    super::classification::classify(state, &headers, scope).await
 }
 
 /// Validates the data against the repository's shapes graph.
@@ -338,8 +340,8 @@ pub async fn shacl_get(
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_whole_read(&state, &headers).await?;
-    shacl::validate(state, raw_query, headers, None).await
+    let scope = guard::enforce_whole_read(&state, &headers).await?;
+    shacl::validate(state, raw_query, headers, None, scope).await
 }
 
 /// Validates the data against the shapes in the request body.
@@ -349,8 +351,8 @@ pub async fn shacl_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    guard::enforce_whole_read(&state, &headers).await?;
-    shacl::validate(state, raw_query, headers, Some(body)).await
+    let scope = guard::enforce_whole_read(&state, &headers).await?;
+    shacl::validate(state, raw_query, headers, Some(body), scope).await
 }
 
 pub async fn tell_post(

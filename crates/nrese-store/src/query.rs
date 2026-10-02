@@ -78,13 +78,18 @@ pub struct SparqlQueryRequest {
     /// Evaluate the operators where the query puts them (no filter pushdown, no set
     /// evaluation, paths in full): same results, for comparisons and as an escape hatch.
     pub as_written: bool,
-    /// The graphs the requester may read (graph-level access control): the query's
-    /// dataset is restricted to them. `None`: every graph.
-    pub access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
+    /// Whose read it is (graph-level access control): the query's dataset is restricted
+    /// to the graphs the scope reads.
+    pub scope: crate::ReadScope,
 }
 
 impl SparqlQueryRequest {
-    pub fn new(query: impl Into<String>) -> Self {
+    /// A query over every graph ([`crate::ReadScope::All`]): the server's own work, tests.
+    pub fn all(query: impl Into<String>) -> Self {
+        Self::new(query, crate::ReadScope::All)
+    }
+
+    pub fn new(query: impl Into<String>, scope: crate::ReadScope) -> Self {
         Self {
             query: query.into(),
             solutions_format: SolutionsResultFormat::Json,
@@ -94,7 +99,7 @@ impl SparqlQueryRequest {
             read_model: None,
             memory_limit: None,
             as_written: false,
-            access: None,
+            scope,
         }
     }
 }

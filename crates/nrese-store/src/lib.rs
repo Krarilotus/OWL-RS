@@ -22,6 +22,7 @@ pub mod query;
 mod query_cache;
 mod query_executor;
 mod rdf_io;
+pub mod read;
 pub mod reasoning;
 pub mod reasoning_state;
 pub mod running;
@@ -68,6 +69,7 @@ pub use query::{
 pub use query_cache::QueryCacheStats;
 pub use query_executor::PreparedQuery;
 pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
+pub use read::ReadScope;
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
 pub use running::{RunningQueries, RunningQuery};

@@ -177,10 +177,12 @@ fn negotiate_formats(
 }
 
 fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
-    let mut request = SparqlQueryRequest::new(operation.query);
+    let mut request = SparqlQueryRequest::new(
+        operation.query,
+        nrese_store::ReadScope::of(operation.access),
+    );
     request.default_graphs = operation.default_graphs;
     request.named_graphs = operation.named_graphs;
-    request.access = operation.access;
     // GraphDB's `infer=false`: explicit statements only.
     if operation.infer == Some(false) {
         request.read_model = Some(nrese_store::ReadModel::Asserted);
