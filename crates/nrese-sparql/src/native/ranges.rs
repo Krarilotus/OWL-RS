@@ -205,6 +205,13 @@ fn ranges(bounds: Bounds) -> Option<Vec<(TermId, TermId)>> {
             }
             ranges.push(kind(TermKind::Decimal));
             ranges.push(typed);
+            // Integer-derived literals (xsd:int, ...), inline and ordered by value.
+            if let Some(range) = TermId::derived_integer_range(
+                bounds.low.unwrap_or(i64::MIN),
+                bounds.high.unwrap_or(i64::MAX),
+            ) {
+                ranges.push(range);
+            }
             ranges
         }
         Domain::Date => {

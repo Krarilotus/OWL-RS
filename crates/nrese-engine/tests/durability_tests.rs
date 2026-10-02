@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use nrese_engine::{
     BulkMode, DurabilityConfig, Engine, EngineConfig, EngineError, QuadPattern, SyncPolicy,
+    TermKind,
 };
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
@@ -412,7 +413,65 @@ fn checkpoint_of_many_runs_with_tombstones_recovers() {
     assert_eq!(reopened.stats().runs, 1, "one run per stack after restart");
 }
 
-/// Checkpoints in format 4 (stacks as quad lists) are still read.
+/// An `xsd:int` literal, and a quad with it.
+fn int(n: u64) -> Literal {
+    Literal::new_typed_literal(n.to_string(), xsd::INT)
+}
+
+fn with_int(n: u64) -> Quad {
+    Quad::new(
+        NamedNode::new_unchecked("http://example.com/s"),
+        NamedNode::new_unchecked("http://example.com/age"),
+        int(n),
+        GraphName::DefaultGraph,
+    )
+}
+
+fn commit_one(engine: &Engine, quad: &Quad) {
+    let mut tx = engine.transaction();
+    tx.insert(quad.as_ref());
+    tx.commit().unwrap();
+}
+
+/// How `xsd:int` literals are encoded in `engine`.
+fn int_kind(engine: &Engine, n: u64) -> Option<TermKind> {
+    engine
+        .snapshot()
+        .lookup(int(n).as_ref().into())
+        .map(|id| id.kind())
+}
+
+/// The magic of the newest WAL segment.
+fn newest_segment_magic(dir: &Path) -> Vec<u8> {
+    let newest = segments(dir).pop().unwrap();
+    fs::read(newest).unwrap()[..8].to_vec()
+}
+
+/// A new store inlines integer-derived literals, through the WAL, checkpoints and restarts.
+#[test]
+fn new_stores_inline_integer_derived_literals() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit_one(&engine, &with_int(5));
+        assert_eq!(int_kind(&engine, 5), Some(TermKind::DerivedInteger));
+    }
+    assert_eq!(newest_segment_magic(dir.path()), b"NRESEWL5");
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        assert_eq!(int_kind(&engine, 5), Some(TermKind::DerivedInteger));
+        engine.checkpoint().unwrap();
+        commit_one(&engine, &with_int(6));
+    }
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(int_kind(&engine, 6), Some(TermKind::DerivedInteger));
+    let expected: HashSet<Quad> = [with_int(5), with_int(6)].into_iter().collect();
+    assert_eq!(contents(&engine), expected);
+}
+
+/// Checkpoints in format 4 (stacks as quad lists) are still read. Such a store keeps
+/// integer-derived literals in its dictionary for good: through new checkpoints (format 8
+/// records it), new WAL segments (version 4) and restarts.
 #[test]
 fn format_4_checkpoints_are_read() {
     let dir = tempfile::tempdir().unwrap();
@@ -449,9 +508,22 @@ fn format_4_checkpoints_are_read() {
     file.extend_from_slice(&crc.to_le_bytes());
     fs::write(dir.path().join("checkpoint-00000000000000000007.nck"), file).unwrap();
     let engine = Engine::open(dir.path(), config()).unwrap();
-    let expected: HashSet<Quad> = [quad(0)].into_iter().collect();
+    let mut expected: HashSet<Quad> = [quad(0)].into_iter().collect();
     assert_eq!(contents(&engine), expected);
     assert_eq!(engine.stats().revision, 7);
+    // Integer-derived literals stay dictionary entries in this store.
+    commit_one(&engine, &with_int(5));
+    expected.insert(with_int(5));
+    assert_eq!(int_kind(&engine, 5), Some(TermKind::TypedLiteral));
+    assert_eq!(newest_segment_magic(dir.path()), b"NRESEWL4");
+    engine.checkpoint().unwrap();
+    commit_one(&engine, &with_int(6));
+    expected.insert(with_int(6));
+    drop(engine);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(int_kind(&engine, 5), Some(TermKind::TypedLiteral));
+    assert_eq!(int_kind(&engine, 6), Some(TermKind::TypedLiteral));
+    assert_eq!(contents(&engine), expected);
 }
 
 /// A reopened store uses its checkpoint in place: the index data and the dictionary stay

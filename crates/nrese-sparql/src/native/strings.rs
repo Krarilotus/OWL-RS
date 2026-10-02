@@ -172,6 +172,7 @@ pub(crate) fn ranges(
                 TermKind::Decimal,
                 TermKind::Date,
                 TermKind::DateTime,
+                TermKind::DerivedInteger,
             ]
             .map(TermId::kind_range),
         );

@@ -229,6 +229,9 @@ pub struct Dictionary {
     triples: RwLock<TripleIndex>,
     /// The text order of the entries the mapped base doesn't order ([`super::order`]).
     order: RwLock<super::order::TextOrder>,
+    /// Integer-derived literals (`xsd:int`, ...) are dictionary entries, not inline
+    /// ([`TermKind::DerivedInteger`]): stores created before that kind keep them so.
+    integers_in_dictionary: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Dictionary {
@@ -247,6 +250,30 @@ impl Dictionary {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Whether integer-derived literals are dictionary entries (a store created before
+    /// [`TermKind::DerivedInteger`]); else they are inline.
+    pub fn integers_in_dictionary(&self) -> bool {
+        self.integers_in_dictionary
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Sets how integer-derived literals are encoded: when a store is opened, before any
+    /// term is interned or looked up.
+    pub(crate) fn set_integers_in_dictionary(&self, yes: bool) {
+        self.integers_in_dictionary
+            .store(yes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The inline id of `term`, if it has one in this dictionary's encoding.
+    fn inline_id(&self, term: TermRef<'_>) -> Option<TermId> {
+        match term {
+            TermRef::Literal(literal) => {
+                try_inline_literal(literal, !self.integers_in_dictionary())
+            }
+            _ => None,
+        }
     }
 
     pub fn stats(&self) -> DictionaryStats {
@@ -270,7 +297,7 @@ impl Dictionary {
     /// Snapshots use this so that terms interned after the snapshot was taken are never
     /// observed, which keeps term identity stable for the lifetime of a query.
     pub fn lookup_bounded(&self, term: TermRef<'_>, limit: u64) -> Option<TermId> {
-        if let Some(id) = inline_id(term) {
+        if let Some(id) = self.inline_id(term) {
             return Some(id);
         }
         let mut key = Vec::with_capacity(64);
@@ -296,7 +323,7 @@ impl Dictionary {
 
     /// Returns the id of `term`, adding it to the dictionary if needed. O(len(term)) amortised.
     pub fn intern(&self, term: TermRef<'_>) -> TermId {
-        if let Some(id) = inline_id(term) {
+        if let Some(id) = self.inline_id(term) {
             return id; // no lock needed
         }
         self.intern_locked(&mut self.inner.write(), &mut Vec::with_capacity(64), term)
@@ -314,7 +341,7 @@ impl Dictionary {
 
     /// The one interning path: inline value, or arena entry (reusing `key` as scratch).
     fn intern_locked(&self, inner: &mut Inner, key: &mut Vec<u8>, term: TermRef<'_>) -> TermId {
-        if let Some(id) = inline_id(term) {
+        if let Some(id) = self.inline_id(term) {
             return id;
         }
         if let TermRef::Triple(triple) = term {
@@ -537,7 +564,8 @@ impl Dictionary {
             | TermKind::Boolean
             | TermKind::Decimal
             | TermKind::Date
-            | TermKind::DateTime => inline_to_literal(id).map(Term::from),
+            | TermKind::DateTime
+            | TermKind::DerivedInteger => inline_to_literal(id).map(Term::from),
             TermKind::DefaultGraph => None,
             TermKind::Iri
             | TermKind::BlankNode
@@ -867,7 +895,7 @@ impl KeyBatch {
     }
 
     fn slot(&mut self, dictionary: &Dictionary, term: TermRef<'_>) -> Slot {
-        if let Some(id) = inline_id(term) {
+        if let Some(id) = dictionary.inline_id(term) {
             return Slot::Id(id);
         }
         // Rare, and its key needs its components' ids: interned at once, under the lock.
@@ -903,13 +931,6 @@ fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
         GraphNameRef::NamedNode(node) => Some(node.into()),
         GraphNameRef::BlankNode(node) => Some(node.into()),
         GraphNameRef::DefaultGraph => None,
-    }
-}
-
-fn inline_id(term: TermRef<'_>) -> Option<TermId> {
-    match term {
-        TermRef::Literal(literal) => try_inline_literal(literal),
-        _ => None,
     }
 }
 
