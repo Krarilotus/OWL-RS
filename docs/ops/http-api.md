@@ -166,6 +166,22 @@ Limits today:
 - A `POST` holds the writer while it validates (its shapes live in a transaction that is never committed), so other writes wait.
 - The shapes graph is an ordinary graph: queries see it, and reasoning reads it like any other.
 
+## Engine API (`/api/v1`)
+
+One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engine-api.md)), the same for every repository; the `/dataset/…` routes are the default repository's (`nrese`) and stay.
+
+| URL | What |
+|---|---|
+| `GET /api/v1/repositories` | The repositories (JSON: `id`, `title`, `path`, `default`) |
+| `…/repositories/{id}/query`, `/update`, `/sparql` | SPARQL Protocol, as `/dataset/query`, `/dataset/update`, `/dataset` |
+| `…/repositories/{id}/data` | Graph Store Protocol (`?graph=` or `?default`), as `/dataset/data` |
+| `…/repositories/{id}/tell`, `/shacl`, `/autocomplete`, `/classification` | as their `/dataset/…` counterparts |
+| `…/repositories/{id}/info`, `/summary`, `/reasoning`, `/service-description` | readiness and statistics, reasoning diagnostics, the service description |
+| `…/repositories/{id}/backup`, `/restore` | N-Quads backup and restore |
+| `GET …/repositories/{id}/namespaces`, `PUT`/`DELETE …/namespaces/{prefix}` | The repository's prefixes (JSON object; the IRI as the `PUT` body); RDF4J's `/namespaces` reads the same |
+| `POST …/repositories/{id}/sessions` | Opens a client transaction (JSON: `id`, `path`, `idle_seconds`); then `POST {path}/update` (SPARQL update), `POST`/`DELETE {path}/data` (RDF to add or remove, `?graph=` for its graph), `GET`/`POST {path}/query` (reads the data as the session would leave it), `POST {path}/commit`, `DELETE {path}` (rollback). RDF4J transactions use the same sessions |
+| `GET …/repositories/{id}/explain?subj=&pred=&obj=` | Why a statement holds (terms in N-Triples syntax): `{"steps": [...]}`, the statement first, each step with `subject`, `predicate`, `object`, `origin` (`asserted`, `inferred`), `rule` and `premises` (indexes of steps); a derivation from asserted statements. 404 if it doesn't hold or reasoning is off |
+
 ## Graph-level access control
 
 With an access policy (`auth.access_policy`, [configuration](config-reference.md#graph-level-access-control)) each user has its own dataset: the graphs its roles may read.
