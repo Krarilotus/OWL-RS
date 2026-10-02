@@ -88,7 +88,7 @@ capabilities = [
 [rdf4j]
 name = "Eclipse RDF4J (native store)"
 publish = "free"
-runs = []
+runs = ["docker"]
 capabilities = ["load", "query", "update", "reason-rdfs", "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation"]
 
 [nemo]

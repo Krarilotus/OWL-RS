@@ -64,6 +64,39 @@ repeated runs; cache off unless marked.
 | Oxigraph | 6,966 | 5,419 | 808 | 5,446 | – |
 | Jena (TDB2) | 46,756 | 4,265 | 1,495 | 19,482 | – |
 
+### YAGO tiny (16.5 M statements, 10 queries; batches F and G)
+
+The competitors in batch F; NRESE rerun in batch G at `9a05180`, after the top-k
+`ORDER BY … LIMIT` (q05). Main PC, Docker, cache off, shuffled order, 3 runs.
+
+| System | Load | Load peak | Store | Restart | Queries | Serve peak |
+|---|---:|---:|---:|---:|---:|---:|
+| **NRESE** | **7,409** | **1,878** | 1,147 | **416** | **310** | 828 |
+| QLever | 18,611 | 3,516 | **700** | 700 | 26,926 | **176** |
+| Virtuoso | 89,739 | 8,255 | 2,777 | 6,363 | 37,790 (7 of 10 answered) | 6,179 |
+| Oxigraph | 12,669 | 8,348 | 1,863 | 359 | 79,420 | 9,506 |
+| Jena (TDB2) | 120,692 | 4,605 | 3,442 | 1,486 | 227,934 | 7,023 |
+
+Per query (medians, ms):
+
+| Query | NRESE | QLever | Virtuoso | Oxigraph | Jena |
+|---|---:|---:|---:|---:|---:|
+| q01 label lookup | **0.55** | 44.69 | failed | 0.80 | 4.45 |
+| q02 persons born | **1.62** | 131.17 | 5.94 | 220.51 | 750.00 |
+| q03 taxon path | **5.29** | 115.14 | failed | 120.94 | 344.76 |
+| q04 movie actors | **1.19** | 6.22 | 6.67 | 65.87 | 30.55 |
+| q05 population | **2.03** | 3.98 | 36.08 | 19.23 | 100.04 |
+| q06 alt names | **1.58** | 1,465.95 | 2,163.55 | 2,051.91 | 9,900.73 |
+| q07 class count | **0.92** | 4.97 | 5.69 | 43.03 | 56.00 |
+| q08 subclass path | **24.43** | 23,320.26 | failed | 60,676.96 | 151,486.30 |
+| q09 count all | **0.61** | 147.14 | 95.88 | 3,916.77 | 2,083.79 |
+| q10 labels (en) | **272.15** | 1,686.47 | 35,476.09 | 12,304.28 | 63,177.57 |
+
+With the result cache on, NRESE answers the mix in 212 ms, QLever in 1,887 ms. QLever keeps
+the smaller store (1.6 times) and the smaller serving memory (4.7 times): the gaps the
+[research designs](../plan/2026-10-02-research-designs.md) address (hierarchical blocks,
+a compressed vocabulary). GraphDB Free ran too; its results stay local (licence).
+
 ### Per query, cache off (medians, ms; NRESE now against batch C's competitors)
 
 DBpedia core:
@@ -179,4 +212,9 @@ the `lubm-materialised` workload, below.
 
 ## Next runs
 
-- The competitors on YAGO tiny, and an RDF4J adapter.
+- RDF4J has a suite adapter (`benches/suite/suitekit/adapters.py`, `eclipse/rdf4j-workbench`
+  image, files loaded with SPARQL `LOAD`); its first run on Olympics loaded in 14.1 s and
+  answered 12 of 13 queries (q09 hit the 300 s query timeout). It joins the next batch.
+- BSBM explore and business intelligence (10 M) across the systems; NRESE alone so far:
+  explore 0.1–0.4 ms per query (180 k query mixes per hour, one client), BI q4 6.2 s and
+  q2 2.4 ms after the fixes of 2 October.
