@@ -32,6 +32,16 @@ ex:S5 a sh:NodeShape ; sh:targetNode ex:n0 , ex:n1 ;
   sh:not [ sh:class ex:C1 ] .
 "#;
 
+
+/// `seed` varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds; without
+/// it, the same cases on every run.
+fn fuzz(seed: u64) -> u64 {
+    let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+    seed ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
 struct Rng(u64);
 
 impl Rng {
@@ -80,7 +90,7 @@ fn keys(report: &ValidationReport) -> BTreeSet<String> {
 
 #[test]
 fn incremental_validation_equals_the_difference_of_full_validations() {
-    let mut rng = Rng(20_261_002);
+    let mut rng = Rng(fuzz(20_261_002));
     let mut checked = 0;
     for round in 0..200 {
         let engine = Engine::new(EngineConfig::default()).unwrap();

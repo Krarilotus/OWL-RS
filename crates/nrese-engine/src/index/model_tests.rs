@@ -15,6 +15,16 @@ use super::{IndexVersion, Layout};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
 
+
+/// `seed` varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds; without
+/// it, the same cases on every run.
+fn fuzz(seed: u64) -> u64 {
+    let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+    seed ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
 /// SplitMix64: tiny, deterministic, good enough for test-case generation.
 struct Rng(u64);
 
@@ -216,7 +226,7 @@ fn random_commits_with_policy_compaction_match_the_model() {
     };
     for layout in LAYOUTS {
         for seed in 0..40 {
-            let mut rng = Rng(seed);
+            let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
             let mut version = IndexVersion::empty(layout);
             for step in 0..60 {
@@ -243,7 +253,7 @@ fn random_commits_with_policy_compaction_match_the_model() {
 fn arbitrary_compaction_windows_preserve_contents() {
     for layout in LAYOUTS {
         for seed in 100..140 {
-            let mut rng = Rng(seed);
+            let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
             let mut version = IndexVersion::empty(layout);
             for step in 0..40 {
@@ -264,7 +274,7 @@ fn arbitrary_compaction_windows_preserve_contents() {
 
 #[test]
 fn old_versions_are_unaffected_by_later_writes() {
-    let mut rng = Rng(7);
+    let mut rng = Rng(fuzz(7));
     let mut model = BTreeSet::new();
     let mut version = IndexVersion::default();
     let mut history = Vec::new();
@@ -310,7 +320,7 @@ fn default_graph_versions_turn_into_quad_versions_at_a_named_graph() {
         ..CompactionPolicy::default()
     };
     for seed in 200..230 {
-        let mut rng = Rng(seed);
+        let mut rng = Rng(fuzz(seed));
         let mut model = BTreeSet::new();
         let mut version = IndexVersion::empty(Layout::DefaultGraph);
         let mut named = false;

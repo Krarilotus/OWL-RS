@@ -649,7 +649,12 @@ mod tests {
 
     /// A xorshift generator: `next(n)` is in `0..n`.
     fn rng(seed: u64) -> impl FnMut(usize) -> usize {
-        let mut state = seed;
+        // Varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds.
+        let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        let mut state = (seed ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15)).max(1);
         move |n: usize| {
             state ^= state << 13;
             state ^= state >> 7;
