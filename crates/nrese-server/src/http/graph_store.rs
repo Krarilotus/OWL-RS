@@ -16,10 +16,11 @@ use crate::state::AppState;
 
 pub async fn get_graph(
     state: AppState,
+    authenticated: crate::auth::Authenticated,
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::graph_read_access(&state, &headers).await?;
+    let access = guard::graph_read_access(&state, &authenticated).await?;
     let result = read_graph(state, raw_query, headers, &access).await?;
 
     let mut response = (StatusCode::OK, result.payload).into_response();
@@ -34,10 +35,11 @@ pub async fn get_graph(
 
 pub async fn head_graph(
     state: AppState,
+    authenticated: crate::auth::Authenticated,
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::graph_read_access(&state, &headers).await?;
+    let access = guard::graph_read_access(&state, &authenticated).await?;
     let result = read_graph(state, raw_query, headers, &access).await?;
     let mut response = StatusCode::OK.into_response();
     response.headers_mut().insert(
@@ -84,29 +86,31 @@ async fn read_graph(
 
 pub async fn put_graph(
     state: AppState,
+    authenticated: crate::auth::Authenticated,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    write_graph(state, raw_query, headers, body, true).await
+    write_graph(state, authenticated, raw_query, headers, body, true).await
 }
 
 pub async fn post_graph(
     state: AppState,
+    authenticated: crate::auth::Authenticated,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    write_graph(state, raw_query, headers, body, false).await
+    write_graph(state, authenticated, raw_query, headers, body, false).await
 }
 
 pub async fn delete_graph(
     state: AppState,
+    authenticated: crate::auth::Authenticated,
     raw_query: RawQuery,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     state.ensure_serving()?;
-    let access = guard::graph_write_access(&state, &headers).await?;
+    let access = guard::graph_write_access(&state, &authenticated).await?;
     let target = parse_graph_target(&raw_query)?;
     guard::check_writable(&access, &guard::target_graph(&target)?)?;
     let report = mutation::run(
@@ -131,13 +135,14 @@ pub async fn delete_graph(
 
 async fn write_graph(
     state: AppState,
+    authenticated: crate::auth::Authenticated,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
     replace: bool,
 ) -> Result<StatusCode, ApiError> {
     state.ensure_serving()?;
-    let access = guard::graph_write_access(&state, &headers).await?;
+    let access = guard::graph_write_access(&state, &authenticated).await?;
     state.policy().enforce_rdf_upload_bytes(body.len())?;
     let target = parse_graph_target(&raw_query)?;
     guard::check_writable(&access, &guard::target_graph(&target)?)?;

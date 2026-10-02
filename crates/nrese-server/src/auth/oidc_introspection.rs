@@ -3,9 +3,8 @@ use reqwest::Url;
 use serde::Deserialize;
 
 use crate::auth::grants::{StringOrMany, grants_from_claim_parts};
-use crate::auth::{Identity, authorize_grants, extract_bearer_token};
+use crate::auth::{Authenticated, Identity, extract_bearer_token};
 use crate::error::ApiError;
-use crate::policy::PolicyAction;
 
 #[derive(Debug, Clone)]
 pub struct OidcIntrospectionConfig {
@@ -67,12 +66,10 @@ struct IntrospectionResponse {
     roles: Option<StringOrMany>,
 }
 
-pub async fn authorize(
+pub async fn authenticate(
     config: &OidcIntrospectionConfig,
-    action: PolicyAction,
     headers: &HeaderMap,
-    also: &(dyn Fn(&Identity) -> bool + Send + Sync),
-) -> Result<Identity, ApiError> {
+) -> Result<Authenticated, ApiError> {
     let token = extract_bearer_token(headers)?;
     let response = introspect_token(config, token).await?;
     if !response.active {
@@ -96,16 +93,14 @@ pub async fn authorize(
         response.role.as_deref(),
         response.roles.as_ref(),
     );
-    let identity = Identity::from_grants(&grants, roles)
-        .with_user(response.sub.as_deref().or(response.username.as_deref()));
-    // An active token is authenticated; its roles may get rights from the access policy.
-    if authorize_grants(action, &grants) || also(&identity) {
-        Ok(identity)
-    } else {
-        Err(ApiError::forbidden(
-            "bearer token does not grant access to this endpoint",
-        ))
-    }
+    Ok(Authenticated {
+        identity: Identity::from_grants(&grants, roles)
+            .with_user(response.sub.as_deref().or(response.username.as_deref())),
+        grants,
+        // An active token is authenticated; its roles may get rights from the access policy.
+        known: true,
+        refusal: "bearer token does not grant access to this endpoint",
+    })
 }
 
 async fn introspect_token(

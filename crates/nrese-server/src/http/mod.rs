@@ -2,6 +2,7 @@ mod access_api;
 mod admin_dataset;
 mod ai;
 mod api_v1;
+pub(crate) mod authentication;
 mod classification;
 mod console;
 mod graph_store;

@@ -35,10 +35,10 @@ pub async fn root_redirect() -> Redirect {
 }
 
 pub async fn console_ui(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Html<String>, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_query_read(&state, &authenticated).await?;
     console::index()
 }
 
@@ -49,83 +49,83 @@ pub async fn console_file(axum::extract::Path(path): axum::extract::Path<String>
 }
 
 pub async fn operator_ui(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Html<&'static str>, ApiError> {
-    guard::enforce_operator_read(&state, &headers).await?;
+    guard::enforce_operator_read(&state, &authenticated).await?;
     Ok(operator_ui::page())
 }
 
 pub async fn ai_status(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    ai::status(State(state), headers).await
+    ai::status(authenticated, State(state)).await
 }
 
 pub async fn ai_query_suggestions(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<crate::ai::QuerySuggestionRequest>,
 ) -> Result<Response, ApiError> {
-    ai::query_suggestions(State(state), headers, Json(request)).await
+    ai::query_suggestions(authenticated, State(state), Json(request)).await
 }
 
 pub async fn operator_capabilities(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &headers).await?;
+    guard::enforce_operator_read(&state, &authenticated).await?;
     Ok(operator_api::capabilities(state))
 }
 
 pub async fn operator_dataset_summary(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &headers).await?;
+    guard::enforce_operator_read(&state, &authenticated).await?;
     operator_api::dataset_summary(state)
 }
 
 pub async fn operator_extended_health(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &headers).await?;
+    guard::enforce_operator_read(&state, &authenticated).await?;
     operator_api::extended_health(state)
 }
 
 pub async fn operator_runtime_diagnostics(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &headers).await?;
+    guard::enforce_operator_read(&state, &authenticated).await?;
     operator_diagnostics::runtime(state)
 }
 
 pub async fn operator_reasoning_diagnostics(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &headers).await?;
+    guard::enforce_operator_read(&state, &authenticated).await?;
     Ok(operator_diagnostics::reasoning(state))
 }
 
 pub async fn admin_backup_dataset(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     admin_dataset::backup(state).await
 }
 
 /// An image backup (`?repository=` another repository than the default).
 pub async fn admin_image_backup(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     RawQuery(raw_query): RawQuery,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     let pairs: Vec<(String, String)> =
         serde_urlencoded::from_str(raw_query.as_deref().unwrap_or_default())
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -139,11 +139,12 @@ pub async fn admin_image_backup(
 }
 
 pub async fn admin_restore_dataset(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     admin_dataset::restore(state, headers, body).await
 }
 
@@ -156,10 +157,10 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn dataset_info(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_service_description_read(&state, &headers).await?;
+    guard::enforce_service_description_read(&state, &authenticated).await?;
     Ok((StatusCode::OK, Json(build_ready_response(&state)?)).into_response())
 }
 
@@ -168,18 +169,18 @@ pub async fn version(State(state): State<AppState>) -> Response {
 }
 
 pub async fn metrics(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_metrics_read(&state, &headers).await?;
+    guard::enforce_metrics_read(&state, &authenticated).await?;
     metrics::render(&state)
 }
 
 pub async fn service_description(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_service_description_read(&state, &headers).await?;
+    guard::enforce_service_description_read(&state, &authenticated).await?;
     let ttl = build_service_description(&state);
     Ok((
         StatusCode::OK,
@@ -190,23 +191,25 @@ pub async fn service_description(
 }
 
 pub async fn query_get(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::query_access(&state, &headers).await?;
+    let access = guard::query_access(&state, &authenticated).await?;
     let mut operation = query_from_url(raw_query.as_deref())?;
     operation.restrict(&access);
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
 pub async fn query_post(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let access = guard::query_access(&state, &headers).await?;
+    let access = guard::query_access(&state, &authenticated).await?;
     let mut operation = query_from_post(
         raw_query.as_deref(),
         headers.get(header::CONTENT_TYPE),
@@ -217,12 +220,13 @@ pub async fn query_post(
 }
 
 pub async fn update_post(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    let access = guard::update_access(&state, &authenticated).await?;
     let operation = update_from_post(
         raw_query.as_deref(),
         headers.get(header::CONTENT_TYPE),
@@ -234,6 +238,7 @@ pub async fn update_post(
 /// `GET` on the combined SPARQL endpoint: a query, or without one the service description
 /// (SPARQL 1.1 Service Description §2).
 pub async fn sparql_get(
+    authenticated: crate::auth::Authenticated,
     state: Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
@@ -243,9 +248,9 @@ pub async fn sparql_get(
             .is_ok_and(|pairs| pairs.iter().any(|(key, _)| key == "query"))
     });
     if has_query {
-        query_get(state, RawQuery(raw_query), headers).await
+        query_get(authenticated, state, RawQuery(raw_query), headers).await
     } else {
-        service_description(state, headers).await
+        service_description(authenticated, state).await
     }
 }
 
@@ -253,6 +258,7 @@ pub async fn sparql_get(
 /// access rule. Clients that are configured with one endpoint URL use this (RDF4J's
 /// SPARQL repository as ResearchSpace sets it up; Fuseki- and Blazegraph-style setups).
 pub async fn sparql_post(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
@@ -265,11 +271,11 @@ pub async fn sparql_post(
     )?;
     match operation {
         SparqlOperation::Query(mut operation) => {
-            operation.restrict(&guard::query_access(&state, &headers).await?);
+            operation.restrict(&guard::query_access(&state, &authenticated).await?);
             sparql::execute_query(state, operation, accept_header_value(&headers)).await
         }
         SparqlOperation::Update(operation) => {
-            let access = guard::update_access(&state, &headers).await?;
+            let access = guard::update_access(&state, &authenticated).await?;
             sparql::execute_update(state, operation, access.requester())
                 .await
                 .map(IntoResponse::into_response)
@@ -280,11 +286,11 @@ pub async fn sparql_post(
 /// Resources whose labels' or local names' words begin with the words of `q`, best first
 /// (`limit`, default 10; `infer=false` for asserted statements only).
 pub async fn autocomplete(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     RawQuery(raw_query): RawQuery,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let scope = guard::enforce_whole_read(&state, &headers).await?;
+    let scope = guard::enforce_whole_read(&state, &authenticated).await?;
     state.ensure_serving()?;
     let pairs: Vec<(String, String)> =
         serde_urlencoded::from_str(raw_query.as_deref().unwrap_or_default())
@@ -323,82 +329,90 @@ pub async fn autocomplete(
 
 /// The OWL 2 EL class hierarchy of the asserted ontology.
 pub async fn classification_get(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let scope = guard::enforce_whole_read(&state, &headers).await?;
+    let scope = guard::enforce_whole_read(&state, &authenticated).await?;
     super::classification::classify(state, &headers, scope).await
 }
 
 /// Validates the data against the repository's shapes graph.
 pub async fn shacl_get(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let scope = guard::enforce_whole_read(&state, &headers).await?;
+    let scope = guard::enforce_whole_read(&state, &authenticated).await?;
     shacl::validate(state, raw_query, headers, None, scope).await
 }
 
 /// Validates the data against the shapes in the request body.
 pub async fn shacl_post(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let scope = guard::enforce_whole_read(&state, &headers).await?;
+    let scope = guard::enforce_whole_read(&state, &authenticated).await?;
     shacl::validate(state, raw_query, headers, Some(body), scope).await
 }
 
 pub async fn tell_post(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    let access = guard::tell_access(&state, &headers).await?;
+    let access = guard::tell_access(&state, &authenticated).await?;
     tell::execute_tell(state, raw_query, headers, body, &access).await
 }
 
 pub async fn graph_get(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    graph_store::get_graph(state, raw_query, headers).await
+    graph_store::get_graph(state, authenticated, raw_query, headers).await
 }
 
 pub async fn graph_head(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    graph_store::head_graph(state, raw_query, headers).await
+    graph_store::head_graph(state, authenticated, raw_query, headers).await
 }
 
 pub async fn graph_put(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    graph_store::put_graph(state, raw_query, headers, body).await
+    graph_store::put_graph(state, authenticated, raw_query, headers, body).await
 }
 
 pub async fn graph_post(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     raw_query: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    graph_store::post_graph(state, raw_query, headers, body).await
+    graph_store::post_graph(state, authenticated, raw_query, headers, body).await
 }
 
 pub async fn graph_delete(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     raw_query: RawQuery,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    graph_store::delete_graph(state, raw_query, headers).await
+    graph_store::delete_graph(state, authenticated, raw_query).await
 }

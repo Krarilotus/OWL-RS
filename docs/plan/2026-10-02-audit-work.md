@@ -134,8 +134,18 @@ crafted XML), all fixed by updates; of the ten wildcard arms six covered real va
   Status: B4a done: `nrese_store::catalog` holds every repository, the default one
   included (its stored settings, its write path), with `RepositorySettings` and a typed
   `CatalogError`; the server keeps the RDF4J and GraphDB configuration reading and maps the
-  errors to HTTP. Tested in the store without a server. Left: B4b, the `Operation` enum
-  and its middleware.
+  errors to HTTP. Tested in the store without a server.
+
+  B4b done, differently from the plan's wording: authorisation already was one function
+  over one enum (`PolicyAction`), so a new `Operation` enum would have renamed it. What
+  was wrong was the order: each handler authenticated inside its body, after axum had
+  read the request body, so a client without credentials could make the server buffer
+  uploads up to the body limit, and an unknown repository answered 404 before 401. Now
+  every mode authenticates once (`AuthConfig::authenticate` → `Authenticated`), a
+  middleware on every non-public route does it before the handler, and handlers check
+  their action against it (`AppState::authorize`; no second introspection under OIDC).
+  The public routes are listed in one router. Metrics, tracing, request ids and body
+  limits already were one layer stack; deadlines stay per operation kind.
 
 ### C. The query engine (with G4)
 
