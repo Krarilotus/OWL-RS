@@ -33,8 +33,8 @@ impl Values<'_> {
             Term::NamedNode(n) => Constant::Iri(n.clone()),
             Term::Literal(l) => Constant::Literal(l.clone()),
             Term::BlankNode(b) => Constant::Iri(alias(b.as_str())),
-            #[allow(unreachable_patterns)]
-            _ => return None,
+            // Triple terms aren't substituted into the pattern: it stays a join.
+            Term::Triple(_) => return None,
         })
     }
 
@@ -338,8 +338,6 @@ impl Values<'_> {
                 inner: p(inner),
                 silent: *silent,
             },
-            #[allow(unreachable_patterns)]
-            other => other.clone(),
         }
     }
 }

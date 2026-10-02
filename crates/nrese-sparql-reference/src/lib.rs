@@ -378,8 +378,10 @@ fn in_scope(pattern: &GraphPattern, out: &mut Vec<Variable>) {
                 push(v, out);
             }
         }
-        #[allow(unreachable_patterns)]
-        _ => {}
+        GraphPattern::Lateral { left, right } => {
+            in_scope(left, out);
+            in_scope(right, out);
+        }
     }
 }
 
@@ -781,8 +783,9 @@ impl<'d> Context<'d> {
             GraphPattern::Service { .. } => {
                 return Err(error("SERVICE isn't evaluated by the reference"));
             }
-            #[allow(unreachable_patterns)]
-            _ => return Err(error("a construct the reference doesn't evaluate")),
+            GraphPattern::Lateral { .. } => {
+                return Err(error("LATERAL isn't evaluated by the reference"));
+            }
         })
     }
 
@@ -987,8 +990,8 @@ impl<'d> Context<'d> {
                     AggregateFunction::GroupConcat { separator } => {
                         value::group_concat(&values, separator.as_deref().unwrap_or(" "))
                     }
-                    #[allow(unreachable_patterns)]
-                    _ => None,
+                    // An aggregate the reference doesn't know leaves its variable unbound.
+                    AggregateFunction::Custom(_) => None,
                 })
             }
         }

@@ -705,8 +705,6 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
                     }
                 })
         }
-        #[allow(unreachable_patterns)]
-        _ => false,
     }
 }
 
@@ -1800,8 +1798,8 @@ impl<'a> Context<'a> {
             }
             TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())),
             TermPattern::Literal(l) => Err(self.id(&l.clone().into())),
-            #[allow(unreachable_patterns)]
-            _ => Err(UNDEF),
+            // A triple term at a path's end matches nothing a path reaches.
+            TermPattern::Triple(_) => Err(UNDEF),
         }
     }
 
