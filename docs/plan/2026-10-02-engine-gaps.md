@@ -8,6 +8,7 @@ A to E ([audit work](2026-10-02-audit-work.md)): its security and correctness fi
 bugs (A2), its structural ones go with the gaps they belong to. Status of each capability: the
 [capability matrix](../spec/06-target-capability-matrix.md); designs:
 [research designs](2026-10-02-research-designs.md), [hardware and scaling](2026-10-01-hardware-and-scaling.md).
+What is done is in [STATUS.md](../STATUS.md); this plan holds the order.
 
 ## G1. Bug hunt (running)
 
@@ -19,40 +20,15 @@ bugs (A2), its structural ones go with the gaps they belong to. Status of each c
 - Where a generator rarely produces non-empty answers or never reaches an operator, the
   generator improves (the audit of 30 September found that the old random test had 10 %
   non-empty results and missed four bugs).
-- **Found and fixed so far (2 October):** the `ORDER BY` order was not total over literals
-  of different kinds; a `LIMIT` cut through equal sort keys; compact equality lost the
-  copies of a statement deleted from the default graph but asserted in a named one; a
-  path between two constants answered one solution where its bag has several
-  (alternatives, sequences); explanations of inferences differed between runs. Each has
-  a fixed-seed regression test; the oracle's own mistakes (SAMPLE, CONSTRUCT with LIMIT,
-  NOW, row order) were fixed alongside.
 
 ## G2. One engine API
 
 Every capability an operation of the core, reachable the same way by every connector and
 by the coming frontend; the protocols only translate.
 
-- **Done so far (2 October):** namespaces and client transactions (sessions) in the store;
-  every `/dataset/…` capability for every repository under `/api/v1/repositories/{id}`;
-  JSON routes for repositories (create, read, remove), namespaces, sessions, imports,
-  rematerialisation and explanations of inferences; users, workspaces, personal spaces,
-  role rules, their history and local logins in the core (G2b, ADR-0008 accepted); the
-  OpenAPI description at `/api/v1/openapi.json`, checked against the router; running
-  queries listed and cancelled; graphs with their sizes; a repository's reasoning changed
-  at runtime (`PATCH`); imports as jobs, also from a server-side import directory.
-  ResearchSpace and DMW pass their end-to-end runs on the server image (ResearchSpace:
-  its search templates' Blazegraph check and the knowledge map's query hints needed the
-  hint support; every query in its templates parses and runs).
-- **Done since (2 October, with the audit's B):** every store read and write scoped by its
-  requester; the repository catalogue in the store; one settings registry with a JSON
-  Schema; authentication before handlers and bodies; implicit prefixes from the
-  repository's namespaces (queries and updates; the result cache keyed by them); the
-  shapes graph and user rules as managed objects, checked before they are stored
-  (`/shapes`, `/rules`); saved queries per user and workspace (`/api/v1/queries`).
-- **Still open in G2:** ResearchSpace's pages and forms in a browser (with the frontend).
-- **State in the core.** Done: namespaces and client transactions (sessions) moved from
-  the RDF4J adapter into the store; access policies, users and workspaces (G2b). Next:
-  repository settings, the shapes graph and rulesets as managed store objects.
+- **State in the core.** Namespaces, client transactions (sessions), access policies,
+  users and workspaces, repository settings, the shapes graph and rulesets as managed
+  store objects, saved queries.
 - **One management API.** A versioned JSON API over HTTP for what the protocols don't
   cover: repositories, imports and exports, namespaces, sessions, rulesets and reasoning
   state, shapes and validation, explanations, policies, users and workspaces, backups,

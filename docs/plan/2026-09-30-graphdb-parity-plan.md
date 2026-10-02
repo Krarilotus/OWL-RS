@@ -1,5 +1,8 @@
 # GraphDB parity: status and plan
 
+> A record of its date. Its status columns and lines are not kept up to date: the
+> current status is in [STATUS.md](../STATUS.md).
+
 **Date:** 30 September 2026. **Inputs:**
 - the GraphDB parity list (packages 1–6, "the friend's list");
 - its disposition in [ROADMAP §6](../ROADMAP.md#6-friends-graphdb-parity-list-disposition);
