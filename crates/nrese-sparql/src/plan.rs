@@ -6,6 +6,10 @@
 //! which the executor runs. Until a rewrite changes a plan, lowering is the identity:
 //! `Plan::of(p).lower() == p` for every pattern (a test checks it on the differential
 //! tests' queries).
+//!
+//! The rewrites (step 2), each a method of [`Plan`]; [`rewrite`] applies them all:
+//! - [`Plan::flatten_joins`]: joins inside joins become one join, so the triple patterns
+//!   of groups joined to each other are one basic graph pattern, ordered together.
 
 use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{
@@ -207,18 +211,44 @@ impl Plan {
                 object: object.clone(),
             },
             Self::Join(inputs) => {
-                if inputs.iter().all(|input| matches!(input, Self::Scan(_))) {
-                    return GraphPattern::Bgp {
-                        patterns: inputs
-                            .iter()
-                            .map(|input| match input {
-                                Self::Scan(triple) => triple.clone(),
-                                _ => unreachable!("all scans"),
-                            })
-                            .collect(),
-                    };
+                let scans: Vec<TriplePattern> = inputs
+                    .iter()
+                    .filter_map(|input| match input {
+                        Self::Scan(triple) => Some(triple.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if scans.len() == inputs.len() {
+                    return GraphPattern::Bgp { patterns: scans };
                 }
-                nested(inputs, |left, right| GraphPattern::Join { left, right })
+                let inputs: Vec<Self> = if inputs.iter().any(Self::ordered) {
+                    // An input whose rows an ORDER BY orders keeps its place among the
+                    // others (the executor keeps that order through joins): only runs of
+                    // adjacent scans become one basic graph pattern each.
+                    let mut runs: Vec<Self> = Vec::new();
+                    for input in inputs {
+                        match (input, runs.last_mut()) {
+                            (Self::Scan(triple), Some(Self::Join(run))) => {
+                                run.push(Self::Scan(triple.clone()));
+                            }
+                            (Self::Scan(triple), _) => {
+                                runs.push(Self::Join(vec![Self::Scan(triple.clone())]));
+                            }
+                            (other, _) => runs.push(other.clone()),
+                        }
+                    }
+                    runs
+                } else {
+                    // The scans as one basic graph pattern first, then the other inputs in
+                    // their order (a path after it is followed from the values it binds).
+                    let others = inputs
+                        .iter()
+                        .filter(|input| !matches!(input, Self::Scan(_)));
+                    let first = (!scans.is_empty())
+                        .then(|| Self::Join(scans.into_iter().map(Self::Scan).collect()));
+                    first.into_iter().chain(others.cloned()).collect()
+                };
+                nested(&inputs, |left, right| GraphPattern::Join { left, right })
             }
             Self::LeftJoin {
                 left,
@@ -306,6 +336,133 @@ impl Plan {
     }
 }
 
+/// The rewrites of step 2 applied to `pattern`.
+pub fn rewrite(pattern: &GraphPattern) -> GraphPattern {
+    Plan::of(pattern).flatten_joins().lower()
+}
+
+impl Plan {
+    /// Whether an ORDER BY inside fixes the order of its rows (as the executor's sideways
+    /// join sees it: it keeps that order through joins).
+    fn ordered(&self) -> bool {
+        match self {
+            Self::OrderBy { .. } => true,
+            Self::Join(inputs) | Self::Union(inputs) => inputs.iter().any(Self::ordered),
+            Self::LeftJoin { left, right, .. } | Self::Minus { left, right } => {
+                left.ordered() || right.ordered()
+            }
+            Self::Filter { input, .. }
+            | Self::Extend { input, .. }
+            | Self::Graph { input, .. }
+            | Self::Project { input, .. }
+            | Self::Distinct(input)
+            | Self::Reduced(input)
+            | Self::Slice { input, .. }
+            | Self::Group { input, .. } => input.ordered(),
+            Self::Scan(_)
+            | Self::Path { .. }
+            | Self::Values { .. }
+            | Self::Lateral { .. }
+            | Self::Service { .. } => false,
+        }
+    }
+
+    /// Joins inside joins become one join (joins are associative and commutative, and a
+    /// blank node label never appears in two groups): the triple patterns of groups joined
+    /// to each other are then one basic graph pattern, which the join order covers whole.
+    /// Optionals, filters, unions and the like keep their place: only joins are merged.
+    pub fn flatten_joins(self) -> Self {
+        let flat = |plan: Box<Self>| Box::new(plan.flatten_joins());
+        match self {
+            Self::Join(inputs) => {
+                let mut flattened = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    match input.flatten_joins() {
+                        Self::Join(inner) => flattened.extend(inner),
+                        other => flattened.push(other),
+                    }
+                }
+                Self::Join(flattened)
+            }
+            Self::LeftJoin {
+                left,
+                right,
+                condition,
+            } => Self::LeftJoin {
+                left: flat(left),
+                right: flat(right),
+                condition,
+            },
+            Self::Lateral { left, right } => Self::Lateral {
+                left: flat(left),
+                right: flat(right),
+            },
+            Self::Filter { condition, input } => Self::Filter {
+                condition,
+                input: flat(input),
+            },
+            Self::Union(inputs) => {
+                Self::Union(inputs.into_iter().map(Self::flatten_joins).collect())
+            }
+            Self::Minus { left, right } => Self::Minus {
+                left: flat(left),
+                right: flat(right),
+            },
+            Self::Graph { name, input } => Self::Graph {
+                name,
+                input: flat(input),
+            },
+            Self::Extend {
+                input,
+                variable,
+                expression,
+            } => Self::Extend {
+                input: flat(input),
+                variable,
+                expression,
+            },
+            Self::OrderBy { input, keys } => Self::OrderBy {
+                input: flat(input),
+                keys,
+            },
+            Self::Project { input, variables } => Self::Project {
+                input: flat(input),
+                variables,
+            },
+            Self::Distinct(input) => Self::Distinct(flat(input)),
+            Self::Reduced(input) => Self::Reduced(flat(input)),
+            Self::Slice {
+                input,
+                start,
+                length,
+            } => Self::Slice {
+                input: flat(input),
+                start,
+                length,
+            },
+            Self::Group {
+                input,
+                keys,
+                aggregates,
+            } => Self::Group {
+                input: flat(input),
+                keys,
+                aggregates,
+            },
+            Self::Service {
+                name,
+                input,
+                silent,
+            } => Self::Service {
+                name,
+                input: flat(input),
+                silent,
+            },
+            leaf @ (Self::Scan(_) | Self::Path { .. } | Self::Values { .. }) => leaf,
+        }
+    }
+}
+
 /// `inputs` lowered and combined from the left by `combine`; one input is itself, none an
 /// empty basic graph pattern (the join's identity; an empty union never arises).
 fn nested(
@@ -348,5 +505,36 @@ mod tests {
             };
             assert_eq!(Plan::of(&pattern).lower(), pattern, "{text}");
         }
+    }
+
+    #[test]
+    fn groups_joined_to_each_other_become_one_basic_graph_pattern() {
+        let pattern = |text: &str| match SparqlParser::new().parse_query(text).unwrap() {
+            Query::Select { pattern, .. } => pattern,
+            _ => unreachable!("selects"),
+        };
+        let rewritten = super::rewrite(&pattern(
+            "SELECT * WHERE { { ?a <urn:p> ?b } { ?b <urn:q> ?c } ?c <urn:r>+ ?d }",
+        ));
+        assert_eq!(
+            rewritten,
+            pattern("SELECT * WHERE { ?a <urn:p> ?b . ?b <urn:q> ?c . ?c <urn:r>+ ?d }"),
+            "one pattern, then the path"
+        );
+        // An OPTIONAL keeps its left side; what is joined to it moves into one pattern
+        // before it (a join commutes).
+        let rewritten = super::rewrite(&pattern(
+            "SELECT * WHERE { ?a <urn:p> ?b OPTIONAL { ?b <urn:q> ?c } ?c <urn:r> ?d }",
+        ));
+        assert_eq!(
+            rewritten,
+            pattern(
+                "SELECT * WHERE { ?c <urn:r> ?d { ?a <urn:p> ?b OPTIONAL { ?b <urn:q> ?c } } }"
+            )
+        );
+        // A subquery with an ORDER BY keeps its place (the executor keeps its order through
+        // the join); only adjacent triple patterns merge.
+        let ordered = "SELECT * WHERE { { SELECT ?x WHERE { ?x <urn:k> ?y } ORDER BY ?y LIMIT 2 } ?x <urn:a> ?a }";
+        assert_eq!(super::rewrite(&pattern(ordered)), pattern(ordered));
     }
 }

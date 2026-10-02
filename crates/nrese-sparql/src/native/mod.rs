@@ -404,7 +404,7 @@ fn native_pattern<'q>(
     let pattern = if options.as_written {
         pattern.clone()
     } else {
-        pushdown::push_filters(pattern.clone())
+        pushdown::push_filters(crate::plan::rewrite(pattern))
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
