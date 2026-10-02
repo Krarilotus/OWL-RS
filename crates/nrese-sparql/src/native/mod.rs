@@ -69,6 +69,9 @@ use nrese_sparql_syntax::algebra::{
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_xsd::{Decimal, Double, Float, Integer};
 use rayon::prelude::*;
+
+/// Distinct values of a sort key from which their terms are decoded in parallel.
+const PARALLEL_RANKS: usize = 4096;
 use std::borrow::Cow;
 
 use crate::query::{PlanStep, QueryOptions};
@@ -3361,12 +3364,31 @@ impl<'a> Context<'a> {
                 .collect();
         }
         let mut distinct = column.to_vec();
-        distinct.sort_unstable();
+        distinct.par_sort_unstable();
         distinct.dedup();
-        let terms: Vec<Option<Term>> = distinct.iter().map(|&id| self.term(id)).collect();
+        // Stored terms are decoded and their values parsed on every core where there are
+        // many (YAGO's 18 k populations, `"+4400"^^xsd:decimal`, are dictionary entries).
+        let terms: Vec<value::Sortable> = if distinct.len() >= PARALLEL_RANKS
+            && distinct.iter().all(|&id| computed_index(id).is_none())
+        {
+            let snapshot = self.snapshot;
+            distinct
+                .par_iter()
+                .map(|&id| {
+                    let term = (id != UNDEF)
+                        .then(|| snapshot.decode(TermId::from_raw(id)))
+                        .flatten();
+                    value::Sortable::new(term)
+                })
+                .collect()
+        } else {
+            distinct
+                .iter()
+                .map(|&id| value::Sortable::new(self.term(id)))
+                .collect()
+        };
         let mut by_term: Vec<usize> = (0..distinct.len()).collect();
-        let terms: Vec<value::Sortable> = terms.into_iter().map(value::Sortable::new).collect();
-        by_term.sort_by(|&a, &b| terms[a].order(&terms[b]));
+        by_term.par_sort_by(|&a, &b| terms[a].order(&terms[b]));
         let mut rank_of = vec![0u64; distinct.len()];
         let mut rank = 0;
         for (i, &d) in by_term.iter().enumerate() {
