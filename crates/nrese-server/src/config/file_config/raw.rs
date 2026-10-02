@@ -50,6 +50,8 @@ pub(super) struct RawBudgetsConfig {
     #[serde(default)]
     pub total_query_memory: Option<Amount>,
     #[serde(default)]
+    pub bulk_load_memory: Option<Amount>,
+    #[serde(default)]
     pub query_timeout: Option<Amount>,
     #[serde(default)]
     pub update_timeout: Option<Amount>,

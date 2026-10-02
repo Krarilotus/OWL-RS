@@ -41,6 +41,10 @@ pub struct StoreConfig {
     /// On disk: serve the data from each checkpoint once written, freeing its copies in
     /// memory (see `nrese_engine::DurabilityConfig::map_checkpoints`).
     pub map_checkpoints: bool,
+    /// On disk: memory for a bulk load's quads, in bytes (`0`: no limit); past it they are
+    /// sorted in chunks spilled to the data directory (see
+    /// `nrese_engine::DurabilityConfig::bulk_load_memory`).
+    pub bulk_load_memory_bytes: u64,
     /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
@@ -132,6 +136,7 @@ impl StoreConfig {
             hide_unnamed_classes: false,
             verify_on_open: false,
             map_checkpoints: true,
+            bulk_load_memory_bytes: 0,
             shacl_gate: ShaclGate::Off,
         }
     }
@@ -149,6 +154,7 @@ impl StoreConfig {
             hide_unnamed_classes: false,
             verify_on_open: false,
             map_checkpoints: true,
+            bulk_load_memory_bytes: 0,
             shacl_gate: ShaclGate::Off,
         }
     }
