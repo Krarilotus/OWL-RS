@@ -50,7 +50,7 @@ at the end of a phase, not per package.
 | 4.1 | Custom rules (B2): user rules in the rule IR's syntax, and GraphDB `.pie` import |
 | 4.2 | SHACL-SPARQL (C3) and the SHACL commit gate (C2) |
 | 4.3 | Zero-length paths from a term outside the graph (four W3C tests; done 2 October: a constant end of a path pattern gives itself), `BNODE(label)` per solution |
-| 4.4 | Jena's `text:query`; phrase search and stemming |
+| 4.4 | Jena's `text:query`; phrase search (done 2 October: quoted words in `bds:search`) and stemming |
 | 4.5 | Operations: request outcome and latency metrics, WAL/checkpoint/backup metrics (E2); versioned backups and point-in-time restore (E3); repository isolation and graph-level access control (D1, E1) |
 | 4.6 | The deviations the Jena oracle found, which NRESE shares with spareval: string functions of numbers with non-canonical lexical forms (`STR("07"^^xsd:integer)` is `"07"`), and path alternatives as a UNION with duplicates (done 2 October: the executor and the reference evaluator give the duplicates). The native executor follows the standard; the differential tests learn where spareval doesn't (benches/oracle/README.md) |
 
