@@ -243,6 +243,11 @@ impl AccessView {
     pub fn reads_everything(&self) -> bool {
         self.read.is_none()
     }
+
+    /// The scope of the user's reads, for the store's read methods.
+    pub fn read_scope(&self) -> crate::ReadScope {
+        crate::ReadScope::of(self.read.clone())
+    }
 }
 
 /// A change of the state.

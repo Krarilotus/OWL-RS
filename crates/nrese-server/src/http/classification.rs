@@ -9,7 +9,11 @@ use axum::response::{IntoResponse, Response};
 use crate::error::ApiError;
 use crate::state::AppState;
 
-pub async fn classify(state: AppState, headers: &HeaderMap) -> Result<Response, ApiError> {
+pub async fn classify(
+    state: AppState,
+    headers: &HeaderMap,
+    scope: nrese_store::ReadScope,
+) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let accept = headers
         .get(header::ACCEPT)
@@ -20,7 +24,7 @@ pub async fn classify(state: AppState, headers: &HeaderMap) -> Result<Response, 
     let store = state.store();
     let report = tokio::time::timeout(
         state.policy().timeouts.query,
-        tokio::task::spawn_blocking(move || store.classify()),
+        tokio::task::spawn_blocking(move || store.classify(&scope)),
     )
     .await
     .map_err(|_| ApiError::timeout("classification exceeded policy timeout"))?

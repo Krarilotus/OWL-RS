@@ -67,8 +67,10 @@ impl Vocabulary for Lookup<'_> {
 }
 
 impl StoreService {
-    /// Classifies the asserted statements of every graph under OWL 2 EL.
-    pub fn classify(&self) -> StoreResult<ClassificationReport> {
+    /// Classifies the asserted statements of every graph under OWL 2 EL; for a scope that
+    /// reads every graph.
+    pub fn classify(&self, scope: &crate::ReadScope) -> StoreResult<ClassificationReport> {
+        scope.require_all("classification")?;
         let started = Instant::now();
         let snapshot = self.engine().snapshot();
         let mut triples: Vec<[u64; 3]> = snapshot

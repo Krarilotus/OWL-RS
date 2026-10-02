@@ -542,17 +542,14 @@ async fn statements(
 ) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let pairs = pairs(&raw)?;
-    let pattern = StatementPattern {
-        access: access.read.clone(),
-        ..pattern(&pairs)?
-    };
+    let pattern = pattern(&pairs)?;
     let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
-    let infer = infer(&pairs) && access.sees_inferred();
+    let (scope, infer) = (access.read_scope(), infer(&pairs));
     let body = tokio::task::spawn_blocking(move || {
         let quads = match &pending {
-            None => store.read_statements(&pattern, infer)?,
-            Some(pending) => store.read_statements_pending(pending, &pattern, infer)?,
+            None => store.read_statements(&scope, &pattern, infer)?,
+            Some(pending) => store.read_statements_pending(&scope, pending, &pattern, infer)?,
         };
         nrese_store::statements::serialize_statements(format, quads)
     })
@@ -650,14 +647,13 @@ async fn count(
     let pairs = pairs(&raw)?;
     let pattern = StatementPattern {
         contexts: contexts(&pairs)?,
-        access: access.read.clone(),
         ..StatementPattern::default()
     };
     let store = state.store();
-    let infer = infer(&pairs) && access.sees_inferred();
+    let (scope, infer) = (access.read_scope(), infer(&pairs));
     let count = tokio::task::spawn_blocking(move || match &pending {
-        None => Ok(store.count_statements(&pattern, infer)),
-        Some(pending) => store.count_statements_pending(pending, &pattern, infer),
+        None => Ok(store.count_statements(&scope, &pattern, infer)),
+        Some(pending) => store.count_statements_pending(&scope, pending, &pattern, infer),
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
@@ -673,15 +669,10 @@ pub async fn contexts_get(
     let access = guard::query_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
     state.ensure_serving()?;
-    let readable = |graph: &Term| match graph {
-        Term::NamedNode(node) => access.can_read(&GraphName::NamedNode(node.clone())),
-        _ => access.reads_everything(),
-    };
     let rows = state
         .store()
-        .contexts()
+        .contexts(&access.read_scope())
         .into_iter()
-        .filter(readable)
         .map(|graph| vec![Some(graph)])
         .collect();
     Ok(table(&headers, &["contextID"], rows))

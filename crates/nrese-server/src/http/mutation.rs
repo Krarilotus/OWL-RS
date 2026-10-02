@@ -113,7 +113,7 @@ mod tests {
             MutationKind::Statements,
         ];
         for kind in kinds {
-            let syntax = nrese_store::PreparedQuery::parse(&nrese_store::SparqlQueryRequest::new(
+            let syntax = nrese_store::PreparedQuery::parse(&nrese_store::SparqlQueryRequest::all(
                 "SELECT {",
             ))
             .unwrap_err();
