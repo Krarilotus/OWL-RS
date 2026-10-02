@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             files,
             replace: false,
             graph: GraphTarget::DefaultGraph,
+            skip_errors: false,
         })?;
         println!(
             "loaded {} quads in {:.2} s",

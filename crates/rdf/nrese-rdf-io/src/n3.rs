@@ -167,6 +167,7 @@ impl N3Parser {
             unchecked: self.unchecked,
             max_depth: self.max_nesting,
             n3: true,
+            recover: false,
         }
     }
 

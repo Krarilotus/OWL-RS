@@ -93,7 +93,7 @@ Initial loads and full restores of large files use the offline bulk loader inste
 
 ```powershell
 $env:NRESE_STORE_MODE = "on-disk"; $env:NRESE_DATA_DIR = ".\data"
-nrese-server load [--config .\config.toml] [--replace] [--graph <IRI>] data.nt more.nq ...
+nrese-server load [--config .\config.toml] [--replace] [--graph <IRI>] [--skip-errors] data.nt more.nq ...
 ```
 
 - **Behaviour:**
@@ -101,6 +101,7 @@ nrese-server load [--config .\config.toml] [--replace] [--graph <IRI>] data.nt m
   - `--replace` swaps the dataset instead of adding to it.
   - `--graph` sets the target graph for triple formats; quad formats keep their own graphs.
   - Blank nodes are fresh per load.
+  - A syntax error stops the load and changes nothing. With `--skip-errors` the bad statement is skipped instead (a line of N-Triples or N-Quads, a Turtle or TriG statement up to its `.` or the `}` of its graph block), the first 20 are logged, and the load reports how many it skipped. RDF/XML and JSON-LD still stop at the first error; a read error always stops.
 - **Offline only.** The server must not be running on the same data directory; the directory lock enforces this. Validation gates don't run during a bulk load.
 - **Speed.** N-Triples and N-Quads are parsed on all cores and are the fastest input: about 2.7 M triples/s on the reference machine, with 100 M triples in 37 s (`benches/baselines/README.md`). Convert other formats to N-Triples for the largest loads (`nrese-server convert`, below).
 

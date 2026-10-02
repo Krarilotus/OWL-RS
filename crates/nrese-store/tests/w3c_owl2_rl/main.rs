@@ -212,6 +212,7 @@ fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<(), String> {
             files: vec![file],
             replace: false,
             graph: GraphTarget::DefaultGraph,
+            skip_errors: false,
         })
         .map_err(|e| format!("premise: {e}"))?;
     let report = store

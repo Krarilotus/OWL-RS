@@ -42,6 +42,9 @@ pub(crate) struct TurtleSettings {
     pub(crate) max_depth: usize,
     /// Notation3 rather than Turtle or TriG.
     pub(crate) n3: bool,
+    /// After a syntax error, go on with the next statement ([`crate::RdfParser::recovering`];
+    /// not for Notation3).
+    pub(crate) recover: bool,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -126,26 +129,40 @@ impl<R: Read> Input<'_, R> {
         self.position += n;
     }
 
-    /// The text position of `data()[at]` (at or after the current position).
+    /// The text position of `data()[at]`: at or after the current position, or behind it
+    /// (in a token already consumed, which may span line breaks).
     fn position_at(&self, at: usize) -> TextPosition {
         let data = self.data();
         let at = at.min(data.len());
-        let before = &data[self.position.min(at)..at];
-        let breaks = memchr::memchr_iter(b'\n', before).count() as u64;
         let offset = self.base + at as u64;
-        let line_start = match memchr::memrchr(b'\n', before) {
-            Some(i) => self.base + (self.position + i + 1) as u64,
-            None => self.line_start,
+        let (line, line_start) = if at >= self.position {
+            let before = &data[self.position..at];
+            let breaks = memchr::memchr_iter(b'\n', before).count() as u64;
+            let line_start = match memchr::memrchr(b'\n', before) {
+                Some(i) => self.base + (self.position + i + 1) as u64,
+                None => self.line_start,
+            };
+            (self.line + breaks, line_start)
+        } else {
+            // Back over the line breaks between `at` and the position.
+            let breaks = memchr::memchr_iter(b'\n', &data[at..self.position]).count() as u64;
+            let line_start = if breaks == 0 {
+                self.line_start
+            } else {
+                // The line began before the buffer where no break precedes `at` in it.
+                memchr::memrchr(b'\n', &data[..at]).map_or(self.base, |i| self.base + i as u64 + 1)
+            };
+            (self.line.saturating_sub(breaks), line_start)
         };
         // Characters when the line is still buffered, bytes otherwise.
-        let column = if line_start >= self.base {
+        let column = if line_start >= self.base && line_start <= offset {
             let from = (line_start - self.base) as usize;
             String::from_utf8_lossy(&data[from..at]).chars().count() as u64
         } else {
-            offset - line_start
+            offset.saturating_sub(line_start)
         };
         TextPosition {
-            line: self.line + breaks,
+            line,
             column,
             offset,
         }
@@ -335,10 +352,59 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             self.triple_terms.clear();
             self.handed_out = 0;
             if let Err(error) = self.statement() {
-                self.done = true;
+                let syntax = matches!(error, RdfParseError::Syntax(_));
+                self.done =
+                    !(syntax && self.settings.recover && !self.settings.n3 && self.resync());
                 return Some(Err(error));
             }
             self.own_triple_terms();
+        }
+    }
+
+    /// After a syntax error: skips to the end of the statement, a `.` outside brackets (or
+    /// the `}` closing the TriG block it is in), so that parsing goes on with the next one.
+    /// Bytes the lexer can't read are skipped one by one. `false` at the end of the input,
+    /// or on a read error.
+    fn resync(&mut self) -> bool {
+        self.lookahead = None;
+        self.arena.clear();
+        self.triples.clear();
+        self.triple_terms.clear();
+        let (mut nesting, mut braces) = (0i64, 0i64);
+        loop {
+            match self.fill() {
+                Ok(()) => {}
+                Err(RdfParseError::Io(_)) => return false,
+                Err(_) => {
+                    // Unreadable bytes: drop one and lex again.
+                    self.lookahead = None;
+                    if self.input.position < self.input.data().len() {
+                        self.input.consume(1);
+                    } else if self.input.eof() || self.input.refill().is_err() {
+                        return false;
+                    }
+                    continue;
+                }
+            }
+            let Some(token) = self.lookahead.take() else {
+                return false;
+            };
+            self.input.consume(token.consumed);
+            self.after_string = matches!(token.kind, Kind::String { .. });
+            match token.kind {
+                Kind::Eof => return false,
+                Kind::OpenBracket | Kind::OpenParen => nesting += 1,
+                Kind::CloseBracket | Kind::CloseParen => nesting -= 1,
+                Kind::OpenBrace => braces += 1,
+                Kind::CloseBrace if braces > 0 => braces -= 1,
+                Kind::CloseBrace if self.settings.trig && self.in_block => {
+                    self.in_block = false;
+                    self.graph = None;
+                    return true;
+                }
+                Kind::Dot if nesting <= 0 && braces == 0 => return true,
+                _ => {}
+            }
         }
     }
 
