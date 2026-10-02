@@ -47,7 +47,7 @@ An existing ResearchSpace installation is moved the same way: point `sparqlEndpo
 |---|---|---|
 | Keyword search in the stock templates | Implemented since: Blazegraph's `bds:search` with relevance, rank, prefixes and phrases ([capability matrix](../spec/06-target-capability-matrix.md)); not yet re-run with ResearchSpace's templates | the end-to-end run of the G2 plan |
 | The RDF4J repository type (`openrdf:HTTPRepository`) | Implemented since: the RDF4J REST protocol with repositories, statements, namespaces, contexts and transactions ([HTTP interface](../ops/http-api.md#rdf4j-protocol)); not yet re-run with ResearchSpace | the end-to-end run of the G2 plan |
-| Blazegraph query hints (`hint:`) and other `bd:` extensions | Not implemented | They are triple patterns NRESE doesn't know: a query that uses one finds nothing. Remove them from adapted templates |
+| Blazegraph query hints (`hint:`) and other `bd:` extensions | Query hints are ignored since 2 October (dropped before planning, so a hinted query answers as without them). Other `bd:` extensions (`bd:serviceParam`, `bd:sample`) are not implemented | Remove them from adapted templates |
 | Federation (`SERVICE`) to outside endpoints | Not enabled | ResearchSpace's own Ephedra federation runs inside ResearchSpace and is unaffected |
 
 ## What changed in NRESE for ResearchSpace
