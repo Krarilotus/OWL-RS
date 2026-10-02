@@ -3347,7 +3347,11 @@ impl<'a> Context<'a> {
         Ok(out)
     }
 
-    fn order_ranks(&self, column: &[u64]) -> Vec<u64> {
+    /// Ranks of `column`'s values in SPARQL's order. With `top = (k, descending)` only the
+    /// `k` values that come first in that direction are told apart; the others share the
+    /// rank that comes last (they cover at least `k` rows, so no row of the others is
+    /// among the first `k`): a selection instead of a sort, for ORDER BY … LIMIT k.
+    fn order_ranks(&self, column: &[u64], top: Option<(usize, bool)>) -> Vec<u64> {
         let integer = |id: u64| TermId::from_raw(id).as_inline_integer();
         if column
             .iter()
@@ -3388,6 +3392,41 @@ impl<'a> Context<'a> {
                 .collect()
         };
         let mut by_term: Vec<usize> = (0..distinct.len()).collect();
+        if let Some((k, descending)) = top
+            && k > 0
+            && k < distinct.len()
+        {
+            // The k first distinct values in the direction, in order; the rest last.
+            let first = |a: &usize, b: &usize| match descending {
+                false => terms[*a].order(&terms[*b]),
+                true => terms[*b].order(&terms[*a]),
+            };
+            by_term.select_nth_unstable_by(k - 1, first);
+            by_term.truncate(k);
+            by_term.sort_by(first);
+            let rest = match descending {
+                false => k as u64 + 1,
+                true => 0,
+            };
+            let mut ranks: HashMap<u64, u64> = HashMap::with_capacity(k);
+            let mut rank = 0;
+            for (i, &d) in by_term.iter().enumerate() {
+                if i > 0 && terms[by_term[i - 1]].order(&terms[d]).is_ne() {
+                    rank += 1;
+                }
+                // Ascending ranks follow the values: the first in a descending order are
+                // the largest.
+                let value_rank = match descending {
+                    false => rank + 1,
+                    true => k as u64 - rank,
+                };
+                ranks.insert(distinct[d], value_rank);
+            }
+            return column
+                .iter()
+                .map(|id| ranks.get(id).copied().unwrap_or(rest))
+                .collect();
+        }
         by_term.par_sort_by(|&a, &b| terms[a].order(&terms[b]));
         let mut rank_of = vec![0u64; distinct.len()];
         let mut rank = 0;
@@ -3411,16 +3450,24 @@ impl<'a> Context<'a> {
         solutions: &Solutions,
         keys: &[OrderExpression],
         rows: &[usize],
+        limit: Option<usize>,
     ) -> Vec<SortKey> {
         keys.iter()
-            .map(|key| {
+            .enumerate()
+            .map(|(i, key)| {
                 let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
                 if let Expression::Variable(v) = e
                     && let Some(column) = solutions.column(v)
                 {
                     let column = solutions.table.column(column);
                     let values: Vec<u64> = rows.iter().map(|&row| column[row]).collect();
-                    return SortKey::Ids(self.order_ranks(&values));
+                    // With a limit, the first key needs only its first values told apart
+                    // when it is the only key (later keys break its ties).
+                    let descending = matches!(key, OrderExpression::Desc(_));
+                    let top = limit
+                        .filter(|_| i == 0 && keys.len() == 1)
+                        .map(|k| (k, descending));
+                    return SortKey::Ids(self.order_ranks(&values, top));
                 }
                 SortKey::Terms(
                     rows.iter()
@@ -3465,14 +3512,14 @@ impl<'a> Context<'a> {
             && k < n
             && keys.len() > 1
         {
-            let first = self.sort_keys(&solutions, &keys[..1], &rows);
+            let first = self.sort_keys(&solutions, &keys[..1], &rows, Some(k));
             let cmp = |a: &usize, b: &usize| by_keys(&keys[..1], &first, *a, *b);
             let mut positions = rows.clone();
             positions.select_nth_unstable_by(k - 1, cmp);
             let pivot = positions[k - 1];
             rows.retain(|row| cmp(row, &pivot).is_le());
         }
-        let key_values = self.sort_keys(&solutions, keys, &rows);
+        let key_values = self.sort_keys(&solutions, keys, &rows, limit);
         let compare = |a: &usize, b: &usize| {
             by_keys(keys, &key_values, *a, *b).then_with(|| rows[*a].cmp(&rows[*b]))
         };

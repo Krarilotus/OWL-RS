@@ -426,6 +426,16 @@ fn random_query(rng: &mut Rng) -> (String, bool) {
         1 => {
             // ORDER BY every projected variable: a deterministic sequence even with LIMIT.
             let limit = 1 + rng.below(5);
+            // One key over the only projected variable (the top-k ranking).
+            if rng.below(2) == 0 {
+                let direction = rng.pick(&["ASC", "DESC"]);
+                return (
+                    format!(
+                        "SELECT ?a WHERE {{ {pattern} }} ORDER BY {direction}(?a) LIMIT {limit}"
+                    ),
+                    true,
+                );
+            }
             (
                 format!("SELECT ?a ?b WHERE {{ {pattern} }} ORDER BY DESC(?a) ?b LIMIT {limit}"),
                 true,
