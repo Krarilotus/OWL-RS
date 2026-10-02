@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use nrese_rdf::{BlankNode, Variable};
 use nrese_sparql_syntax::algebra::{Expression, Function, GraphPattern};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
+use nrese_sparql_syntax::visit::Node;
 
 /// The variable a blank node of a pattern stands for in the executor.
 pub(super) fn blank_variable(b: &BlankNode) -> Variable {
@@ -38,79 +39,13 @@ fn open(term: &TermPattern) -> bool {
 /// Whether `pattern` (its expressions' `EXISTS` included) has a triple term pattern with
 /// variables in a basic graph pattern.
 pub(super) fn has_open(pattern: &GraphPattern) -> bool {
-    match pattern {
-        GraphPattern::Bgp { patterns } => {
-            patterns.iter().any(|t| open(&t.subject) || open(&t.object))
-        }
-        GraphPattern::Path { .. } | GraphPattern::Values { .. } => false,
-        GraphPattern::Join { left, right }
-        | GraphPattern::Lateral { left, right }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => has_open(left) || has_open(right),
-        GraphPattern::LeftJoin {
-            left,
-            right,
-            expression,
-        } => has_open(left) || has_open(right) || expression.as_ref().is_some_and(has_open_expr),
-        GraphPattern::Filter { expr, inner } => has_open_expr(expr) || has_open(inner),
-        GraphPattern::Extend {
-            inner, expression, ..
-        } => has_open_expr(expression) || has_open(inner),
-        GraphPattern::Graph { inner, .. }
-        | GraphPattern::Service { inner, .. }
-        | GraphPattern::OrderBy { inner, .. }
-        | GraphPattern::Project { inner, .. }
-        | GraphPattern::Distinct { inner }
-        | GraphPattern::Reduced { inner }
-        | GraphPattern::Slice { inner, .. }
-        | GraphPattern::Group { inner, .. } => has_open(inner),
-    }
+    pattern.find(&mut open_bgp)
 }
 
-fn has_open_expr(expression: &Expression) -> bool {
-    let mut found = false;
-    visit_exists(expression, &mut |p| found |= has_open(p));
-    found
-}
-
-fn visit_exists(expression: &Expression, f: &mut impl FnMut(&GraphPattern)) {
-    match expression {
-        Expression::Exists(p) => f(p),
-        Expression::NamedNode(_)
-        | Expression::Literal(_)
-        | Expression::Variable(_)
-        | Expression::Bound(_) => {}
-        Expression::Or(a, b)
-        | Expression::And(a, b)
-        | Expression::Equal(a, b)
-        | Expression::SameTerm(a, b)
-        | Expression::Greater(a, b)
-        | Expression::GreaterOrEqual(a, b)
-        | Expression::Less(a, b)
-        | Expression::LessOrEqual(a, b)
-        | Expression::Add(a, b)
-        | Expression::Subtract(a, b)
-        | Expression::Multiply(a, b)
-        | Expression::Divide(a, b) => {
-            visit_exists(a, f);
-            visit_exists(b, f);
-        }
-        Expression::UnaryPlus(a) | Expression::UnaryMinus(a) | Expression::Not(a) => {
-            visit_exists(a, f);
-        }
-        Expression::In(a, list) => {
-            visit_exists(a, f);
-            list.iter().for_each(|e| visit_exists(e, f));
-        }
-        Expression::If(a, b, c) => {
-            visit_exists(a, f);
-            visit_exists(b, f);
-            visit_exists(c, f);
-        }
-        Expression::Coalesce(list) | Expression::FunctionCall(_, list) => {
-            list.iter().for_each(|e| visit_exists(e, f));
-        }
-    }
+/// Whether `node` is a basic graph pattern with an open triple term pattern.
+fn open_bgp(node: Node<'_>) -> bool {
+    matches!(node, Node::Pattern(GraphPattern::Bgp { patterns })
+        if patterns.iter().any(|t| open(&t.subject) || open(&t.object)))
 }
 
 /// `pattern` with every open triple term pattern rewritten (see the module's notes).
@@ -222,7 +157,7 @@ impl Rewriter {
 
     /// `EXISTS` patterns inside an expression, rewritten.
     fn expression(&mut self, expression: &Expression) -> Expression {
-        if !has_open_expr(expression) {
+        if !expression.find(&mut open_bgp) {
             return expression.clone();
         }
         let e = |r: &mut Self, x: &Expression| Box::new(r.expression(x));
