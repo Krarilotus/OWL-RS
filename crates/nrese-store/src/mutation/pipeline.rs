@@ -81,11 +81,12 @@ impl MutationPipeline {
         self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Applies `command` unless a gate rejects it or `ticket` is cancelled before the commit
-    /// starts. Blocking; call it from a blocking context.
+    /// Applies `command` for `requester` unless a gate rejects it or `ticket` is cancelled
+    /// before the commit starts. Blocking; call it from a blocking context.
     pub fn apply(
         &self,
         command: MutationCommand,
+        requester: &crate::Requester,
         ticket: &MutationTicket,
     ) -> Result<MutationCommitReport, MutationError> {
         let kind = command.kind();
@@ -126,17 +127,12 @@ impl MutationPipeline {
         let report = command
             .apply(
                 &mut tx,
+                requester,
                 ticket.evaluation_token(),
                 self.store.config().union_default_graph,
                 self.store.services(),
             )
             .map_err(store_error)?;
-        // Graph-level access control: the commands check what they would change; this
-        // checks what they did, so no command can change a graph its requester may not
-        // write.
-        if let Some(writable) = command.writable() {
-            check_writable(&tx, writable).map_err(store_error)?;
-        }
 
         if let Some(rules) = self.reasoner.config().materialised_program() {
             // Reasoner v2: the closure goes into the inferred stack, in this transaction.
@@ -302,28 +298,5 @@ impl MutationPipeline {
         if let Ok(mut slot) = self.last_reasoning_run.write() {
             *slot = Some(run);
         }
-    }
-}
-
-/// Fails if `tx` changes a graph outside `writable`.
-fn check_writable(
-    tx: &nrese_engine::Transaction<'_>,
-    writable: &nrese_sparql::GraphAccess,
-) -> Result<(), StoreError> {
-    let mut graphs: Vec<nrese_engine::TermId> = tx
-        .inserted()
-        .chain(tx.deleted())
-        .map(|quad| quad.graph)
-        .collect();
-    graphs.sort_unstable();
-    graphs.dedup();
-    match graphs
-        .into_iter()
-        .find(|&graph| !writable.allows_id(tx, graph))
-    {
-        None => Ok(()),
-        Some(_) => Err(StoreError::Forbidden(
-            "the request would change a graph the requester may not write".to_owned(),
-        )),
     }
 }

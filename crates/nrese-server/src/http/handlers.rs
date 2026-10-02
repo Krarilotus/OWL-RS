@@ -223,14 +223,12 @@ pub async fn update_post(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let access = guard::update_access(&state, &headers).await?;
-    let mut operation = update_from_post(
+    let operation = update_from_post(
         raw_query.as_deref(),
         headers.get(header::CONTENT_TYPE),
         &body,
     )?;
-    operation.access = access.read;
-    operation.writable = access.write;
-    sparql::execute_update(state, operation).await
+    sparql::execute_update(state, operation, access.requester()).await
 }
 
 /// `GET` on the combined SPARQL endpoint: a query, or without one the service description
@@ -270,11 +268,9 @@ pub async fn sparql_post(
             operation.restrict(&guard::query_access(&state, &headers).await?);
             sparql::execute_query(state, operation, accept_header_value(&headers)).await
         }
-        SparqlOperation::Update(mut operation) => {
+        SparqlOperation::Update(operation) => {
             let access = guard::update_access(&state, &headers).await?;
-            operation.access = access.read;
-            operation.writable = access.write;
-            sparql::execute_update(state, operation)
+            sparql::execute_update(state, operation, access.requester())
                 .await
                 .map(IntoResponse::into_response)
         }

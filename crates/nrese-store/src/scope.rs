@@ -1,7 +1,9 @@
-//! Whose read it is: every read of the store takes a [`ReadScope`], so the store, not each
-//! handler that calls it, decides which graphs a read sees (graph-level access control).
-//! There is no read without one: reading everything is said at the call site
-//! (`ReadScope::All`, for administrators and the server's own work).
+//! Whose read or write it is (graph-level access control). Every read of the store takes a
+//! [`ReadScope`], every write a [`Requester`] (what it may read in its `WHERE` clauses and
+//! patterns, and what it may change), so the store, not each handler that calls it,
+//! decides which graphs a request sees and changes. There is no read or write without one:
+//! everything is said at the call site (`ReadScope::All`, `Requester::all()`, for
+//! administrators and the server's own work).
 
 use std::sync::Arc;
 
@@ -54,6 +56,80 @@ impl ReadScope {
                 "{what} reads every graph, and the requester may read only some"
             ))),
         }
+    }
+}
+
+/// The graphs a write may change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteScope {
+    /// Every graph.
+    All,
+    /// The graphs of the set.
+    Graphs(Arc<GraphAccess>),
+}
+
+impl WriteScope {
+    /// The scope of a graph access set, where there is one (`None`: every graph).
+    pub fn of(access: Option<Arc<GraphAccess>>) -> Self {
+        match access {
+            Some(access) => Self::Graphs(access),
+            None => Self::All,
+        }
+    }
+
+    /// The graph access set the write is restricted to, if any.
+    pub fn access(&self) -> Option<&Arc<GraphAccess>> {
+        match self {
+            Self::All => None,
+            Self::Graphs(access) => Some(access),
+        }
+    }
+
+    /// Fails unless the write may change `graph`.
+    pub(crate) fn check(&self, graph: &nrese_rdf::GraphName) -> StoreResult<()> {
+        match self.access() {
+            Some(access) if !access.allows_graph(graph) => Err(StoreError::Forbidden(format!(
+                "the request would change {}, which the requester may not write",
+                match graph {
+                    nrese_rdf::GraphName::DefaultGraph => "the default graph".to_owned(),
+                    graph => graph.to_string(),
+                }
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Fails unless the write may change every graph: for operations over the whole
+    /// dataset (restores).
+    pub(crate) fn require_all(&self, what: &str) -> StoreResult<()> {
+        match self {
+            Self::All => Ok(()),
+            Self::Graphs(_) => Err(StoreError::Forbidden(format!(
+                "{what} changes every graph, and the requester may change only some"
+            ))),
+        }
+    }
+}
+
+/// Who a write is for: what its `WHERE` clauses and patterns may read, and what it may
+/// change. Every write entry point of the store takes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requester {
+    pub read: ReadScope,
+    pub write: WriteScope,
+}
+
+impl Requester {
+    /// Reads and changes every graph: administrators and the server's own work.
+    pub fn all() -> Self {
+        Self {
+            read: ReadScope::All,
+            write: WriteScope::All,
+        }
+    }
+
+    pub fn new(read: ReadScope, write: WriteScope) -> Self {
+        Self { read, write }
     }
 }
 

@@ -344,7 +344,11 @@ fn commit_latency(
                 "{update} {{ {triple} }}"
             )));
             let started = Instant::now();
-            pipeline.apply(command, &MutationTicket::new())?;
+            pipeline.apply(
+                command,
+                &nrese_store::Requester::all(),
+                &MutationTicket::new(),
+            )?;
             if let Some(times) = timed {
                 times.push(started.elapsed().as_secs_f64() * 1000.0);
             }

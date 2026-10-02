@@ -386,13 +386,17 @@ impl StoreService {
         if let Some(view) = self.sessions.view(&self.engine.snapshot(), scope, pending) {
             return read(&view);
         }
-        // Never committed: no writer slot, so other clients commit meanwhile.
+        // Never committed: no writer slot, so other clients commit meanwhile. The operations
+        // read as the reader may; what they change is checked at the commit (the view is
+        // the reader's own, and shows the graphs it may read only).
         let mut tx = self.engine.speculative();
         let (union_default_graph, services) = (self.config.union_default_graph, self.services());
-        crate::statements::apply_statements(&mut tx, pending, &mut |tx, request| {
+        let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
+        crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {
             crate::mutation::command::apply_sparql_update(
                 tx,
                 request,
+                &requester,
                 cancellation,
                 union_default_graph,
                 services.clone(),
@@ -490,9 +494,8 @@ impl StoreService {
         read: &crate::ReadContext<'_>,
         pattern: &crate::StatementPattern,
     ) -> StoreResult<Vec<nrese_rdf::Quad>> {
-        let pattern = scoped_pattern(read, pattern);
         self.on_data(read, |snapshot| {
-            crate::statements::read_statements(snapshot, read.model(), &pattern)
+            crate::statements::read_statements(snapshot, read.model(), pattern, &read.scope)
         })
     }
 
@@ -505,12 +508,12 @@ impl StoreService {
         format: crate::GraphResultFormat,
         out: impl std::io::Write,
     ) -> StoreResult<u64> {
-        let pattern = scoped_pattern(read, pattern);
         self.on_data(read, |snapshot| {
             crate::statements::write_statements(
                 snapshot,
                 read.model(),
-                &pattern,
+                pattern,
+                &read.scope,
                 format,
                 &read.cancel,
                 out,
@@ -524,12 +527,12 @@ impl StoreService {
         read: &crate::ReadContext<'_>,
         pattern: &crate::StatementPattern,
     ) -> StoreResult<u64> {
-        let pattern = scoped_pattern(read, pattern);
         self.on_data(read, |snapshot| {
             Ok(crate::statements::count_statements(
                 snapshot,
                 read.model(),
-                &pattern,
+                pattern,
+                &read.scope,
             ))
         })
     }
@@ -593,12 +596,17 @@ impl StoreService {
         self.settings.services.get().cloned()
     }
 
-    /// Applies and commits `command` without validation gates.
-    pub fn apply(&self, command: &MutationCommand) -> StoreResult<MutationCommitReport> {
+    /// Applies and commits `command` for `requester` without validation gates.
+    pub fn apply(
+        &self,
+        command: &MutationCommand,
+        requester: &crate::Requester,
+    ) -> StoreResult<MutationCommitReport> {
         self.invalidate_reasoning()?;
         let mut tx = self.engine.transaction();
         let report = command.apply(
             &mut tx,
+            requester,
             &CancellationToken::new(),
             self.config.union_default_graph,
             self.services(),
@@ -607,11 +615,17 @@ impl StoreService {
         Ok(report.committed(summary.revision))
     }
 
+    // The writes below are the server's own and tests': every graph, no gates. Requests go
+    // through the mutation pipeline with their requester.
+
     pub fn execute_update(
         &self,
         request: &SparqlUpdateRequest,
     ) -> StoreResult<UpdateExecutionReport> {
-        match self.apply(&MutationCommand::Update(request.clone()))? {
+        match self.apply(
+            &MutationCommand::Update(request.clone()),
+            &crate::Requester::all(),
+        )? {
             MutationCommitReport::Applied { revision } => Ok(UpdateExecutionReport {
                 applied: true,
                 revision,
@@ -628,14 +642,20 @@ impl StoreService {
         &self,
         request: &GraphWriteRequest,
     ) -> StoreResult<GraphWriteReport> {
-        match self.apply(&MutationCommand::GraphWrite(request.clone()))? {
+        match self.apply(
+            &MutationCommand::GraphWrite(request.clone()),
+            &crate::Requester::all(),
+        )? {
             MutationCommitReport::GraphWrite(report) => Ok(report),
             other => unreachable!("graph write produced {other:?}"),
         }
     }
 
     pub fn execute_graph_delete(&self, target: &GraphTarget) -> StoreResult<GraphDeleteReport> {
-        match self.apply(&MutationCommand::GraphDelete(target.clone()))? {
+        match self.apply(
+            &MutationCommand::GraphDelete(target.clone()),
+            &crate::Requester::all(),
+        )? {
             MutationCommitReport::GraphDelete(report) => Ok(report),
             other => unreachable!("graph delete produced {other:?}"),
         }
@@ -802,7 +822,10 @@ impl StoreService {
         &self,
         request: &DatasetRestoreRequest,
     ) -> StoreResult<DatasetRestoreReport> {
-        match self.apply(&MutationCommand::Restore(request.clone()))? {
+        match self.apply(
+            &MutationCommand::Restore(request.clone()),
+            &crate::Requester::all(),
+        )? {
             MutationCommitReport::Restore(report) => Ok(report),
             other => unreachable!("restore produced {other:?}"),
         }
@@ -814,16 +837,5 @@ fn read_model(infer: bool) -> crate::ReadModel {
     match infer {
         true => crate::ReadModel::Materialised,
         false => crate::ReadModel::Asserted,
-    }
-}
-
-/// `pattern` restricted to the graphs the read's scope reads.
-fn scoped_pattern(
-    read: &crate::ReadContext<'_>,
-    pattern: &crate::StatementPattern,
-) -> crate::StatementPattern {
-    crate::StatementPattern {
-        access: read.scope.access().cloned(),
-        ..pattern.clone()
     }
 }
