@@ -2285,6 +2285,32 @@ fn explain_reports_the_plan() {
     );
     assert_eq!(explanation.executor, "native");
     assert_eq!(explanation.rows, solutions.len() as u64);
+    // A filter over one basic graph pattern is placed inside it by the executor: no
+    // rewrite. Over an OPTIONAL it moves into the left side.
+    assert!(
+        explanation.rewrites.is_empty(),
+        "{:?}",
+        explanation.rewrites
+    );
+    let optional = format!(
+        "SELECT ?x WHERE {{ ?x <{EX}memberOf> <{EX}d0> OPTIONAL {{ ?x <{EX}takes> ?c }} FILTER(?x != <{EX}s1>) }}"
+    );
+    let optional = SparqlParser::new().parse_query(&optional).unwrap();
+    let optional = explain_query(&snapshot, &optional, &QueryOptions::default()).unwrap();
+    assert_eq!(optional.rewrites, ["filter-pushdown"]);
+    // (The parser merges adjacent basic graph patterns itself; a group with an OPTIONAL
+    // stays apart until the rewrite.)
+    let grouped = format!(
+        "SELECT ?x ?c WHERE {{ {{ ?x a <{EX}Grad> OPTIONAL {{ ?x <{EX}takes> ?c }} }} ?x <{EX}memberOf> <{EX}d0> }}"
+    );
+    let grouped = SparqlParser::new().parse_query(&grouped).unwrap();
+    let explained = explain_query(&snapshot, &grouped, &QueryOptions::default()).unwrap();
+    assert_eq!(explained.rewrites, ["join-groups"]);
+    let grouped_rows = rows(
+        evaluate_query(&snapshot, &grouped, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    assert_eq!(explained.rows, grouped_rows.len() as u64);
     let operators: Vec<(usize, &str)> = explanation
         .steps
         .iter()

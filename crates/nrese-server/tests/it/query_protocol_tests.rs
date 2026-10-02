@@ -184,6 +184,7 @@ async fn explain_reports_how_the_query_ran() -> Result<(), Box<dyn std::error::E
     assert_eq!(response.headers()["content-type"], "application/json");
     let explanation: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
     assert_eq!(explanation["executor"], "native");
+    assert_eq!(explanation["rewrites"], serde_json::json!([]));
     assert_eq!(explanation["rows"], 200);
     let steps = explanation["steps"].as_array().expect("steps");
     assert_eq!(steps[0]["operator"], "project");
