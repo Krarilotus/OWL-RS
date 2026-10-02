@@ -209,10 +209,12 @@ pub async fn session_begin(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    let access = guard::update_access(&state, &headers).await?;
     let sessions = state.store();
     let sessions = sessions.sessions();
-    let session = sessions.begin();
+    let session = sessions
+        .begin(access.origin.as_deref())
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     let opened = SessionOpened {
         path: format!("/api/v1/repositories/{id}/sessions/{session}"),
         idle_seconds: sessions.idle().as_secs(),
@@ -225,13 +227,18 @@ fn no_session(session: &str) -> ApiError {
     ApiError::not_found(format!("no session '{session}'"))
 }
 
-/// Adds operations to session `session`; 404 if it isn't open.
+/// Adds operations to `access`'s session `session`; 404 if it isn't open.
 fn add(
     state: &AppState,
     session: &str,
+    access: &nrese_store::access::AccessView,
     ops: Vec<nrese_store::StatementOp>,
 ) -> Result<StatusCode, ApiError> {
-    match state.store().sessions().add(session, ops) {
+    match state
+        .store()
+        .sessions()
+        .add(session, access.origin.as_deref(), ops)
+    {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(no_session(session)),
     }
@@ -249,11 +256,12 @@ pub async fn session_update(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    let access = guard::update_access(&state, &headers).await?;
     let request = super::rdf4j::update(&raw, &headers, &body)?;
     add(
         &state,
         &session,
+        &access,
         vec![nrese_store::StatementOp::Update(request)],
     )
 }
@@ -273,7 +281,7 @@ pub async fn session_data(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    let access = guard::update_access(&state, &headers).await?;
     state.policy().enforce_rdf_upload_bytes(body.len())?;
     let pairs = super::rdf4j::pairs(&raw)?;
     let contexts = pairs
@@ -290,7 +298,7 @@ pub async fn session_data(
         axum::http::Method::DELETE => nrese_store::StatementOp::RemoveData { data, contexts },
         _ => nrese_store::StatementOp::Add { data, contexts },
     };
-    add(&state, &session, vec![op])
+    add(&state, &session, &access, vec![op])
 }
 
 #[utoipa::path(method(get, post), path = "/api/v1/repositories/{id}/sessions/{session}/query", tag = "sessions",
@@ -309,7 +317,7 @@ pub async fn session_query(
     let ops = state
         .store()
         .sessions()
-        .pending(&session)
+        .pending(&session, access.origin.as_deref())
         .ok_or_else(|| no_session(&session))?;
     let pending = nrese_store::StatementsRequest {
         session: Some(session.clone()),
@@ -345,7 +353,7 @@ pub async fn session_commit(
     let request = state
         .store()
         .sessions()
-        .take(&session)
+        .take(&session, access.origin.as_deref())
         .ok_or_else(|| no_session(&session))?;
     super::rdf4j::apply(&state, request.ops, &access).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -360,8 +368,12 @@ pub async fn session_rollback(
     Path((_, session)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
-    match state.store().sessions().rollback(&session) {
+    let access = guard::update_access(&state, &headers).await?;
+    match state
+        .store()
+        .sessions()
+        .rollback(&session, access.origin.as_deref())
+    {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(no_session(&session)),
     }

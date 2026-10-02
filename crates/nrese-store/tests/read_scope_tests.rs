@@ -134,16 +134,16 @@ fn objects(store: &StoreService, read: &ReadContext<'_>) -> Vec<String> {
 fn reads_in_a_session_keep_its_data_until_the_session_or_the_store_changes() {
     let store = store();
     let sessions = store.sessions();
-    let id = sessions.begin();
+    let id = sessions.begin(None).unwrap();
     // A fresh value on every replay: a kept view shows the same one.
     let fresh = || {
         StatementOp::Update(SparqlUpdateRequest::new(
             "INSERT { <urn:x> <urn:p> ?u } WHERE { BIND(STRUUID() AS ?u) }",
         ))
     };
-    assert!(sessions.add(&id, vec![fresh()]));
+    assert!(sessions.add(&id, None, vec![fresh()]));
     let pending = |session: Option<&str>| StatementsRequest {
-        ops: sessions.pending(&id).unwrap(),
+        ops: sessions.pending(&id, None).unwrap(),
         session: session.map(str::to_owned),
         ..StatementsRequest::default()
     };
@@ -171,7 +171,7 @@ fn reads_in_a_session_keep_its_data_until_the_session_or_the_store_changes() {
     assert_eq!(after_commit.len(), 2, "{after_commit:?}");
     assert!(!after_commit.contains(&first[0]));
     // More operations: replayed too.
-    assert!(sessions.add(&id, vec![fresh()]));
+    assert!(sessions.add(&id, None, vec![fresh()]));
     let longer = pending(Some(&id));
     assert_eq!(
         objects(&store, &ReadContext::all().on(Some(&longer))).len(),
