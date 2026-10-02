@@ -444,12 +444,15 @@ fn native_pattern<'q>(
 ///
 /// - `join-groups`: groups joined to each other become one basic graph pattern, so their
 ///   triple patterns are ordered together ([`crate::plan::Plan::flatten_joins`]).
+/// - `eager-aggregation`: a group over a join aggregates the side its aggregates read
+///   before the join ([`crate::plan::Plan::eager_aggregation`]).
 /// - `filter-pushdown`: each filter moves to the smallest sub-pattern that binds its
 ///   variables ([`pushdown`]).
 fn optimise(pattern: GraphPattern, fired: &mut Vec<&'static str>) -> GraphPattern {
     type Pass = fn(&GraphPattern) -> GraphPattern;
-    let passes: [(&'static str, Pass); 2] = [
+    let passes: [(&'static str, Pass); 3] = [
         ("join-groups", crate::plan::rewrite),
+        ("eager-aggregation", crate::plan::eager_aggregation),
         ("filter-pushdown", |pattern| {
             pushdown::push_filters(pattern.clone())
         }),

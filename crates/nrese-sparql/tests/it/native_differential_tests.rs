@@ -5487,3 +5487,73 @@ fn stars_are_estimated_from_characteristic_sets() {
         "{estimate:?} for {found}"
     );
 }
+
+/// Eager aggregation (BSBM BI q4's shape): counts and sums of offers per product
+/// feature are made from per-product partial results, never from a row per feature and
+/// offer; the answers equal the reference evaluator's, also when a sum fails for one
+/// product (a non-numeric price) and for a group the rewrite doesn't apply to (AVG).
+#[test]
+fn groups_over_joins_aggregate_before_joining() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let add = |tx: &mut nrese_engine::Transaction, s: String, p: &str, o: Term| {
+        tx.insert(Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph).as_ref());
+    };
+    for product in 0..40 {
+        add(&mut tx, format!("product{product}"), "type", ex("T").into());
+        for feature in 0..(product % 5 + 1) {
+            add(
+                &mut tx,
+                format!("product{product}"),
+                "feature",
+                ex(&format!("f{}", (product + feature) % 7)).into(),
+            );
+        }
+        for offer in 0..(product % 4 + 2) {
+            let price: Term = if product == 13 && offer == 0 {
+                Literal::new_simple_literal("n/a").into()
+            } else {
+                Literal::new_typed_literal(format!("{}", product * 10 + offer), xsd::INTEGER).into()
+            };
+            add(
+                &mut tx,
+                format!("offer{product}_{offer}"),
+                "product",
+                ex(&format!("product{product}")).into(),
+            );
+            add(&mut tx, format!("offer{product}_{offer}"), "price", price);
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let oracle = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    for (aggregates, rewritten) in [
+        (
+            "(COUNT(?price) AS ?n) (SUM(?price) AS ?total) (COUNT(*) AS ?rows)",
+            true,
+        ),
+        ("(AVG(?price) AS ?mean)", false),
+    ] {
+        let text = format!(
+            "PREFIX : <{EX}> SELECT ?feature {aggregates} WHERE {{ ?product :type :T ; :feature ?feature . ?offer :product ?product ; :price ?price }} GROUP BY ?feature"
+        );
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+        assert_eq!(
+            explained.rewrites.contains(&"eager-aggregation"),
+            rewritten,
+            "{aggregates}: {:?}",
+            explained.rewrites
+        );
+        let native = rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        );
+        let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
+        assert_eq!(native, expected, "{aggregates}");
+        assert_eq!(native.len(), 7);
+    }
+}
