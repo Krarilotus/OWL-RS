@@ -869,6 +869,21 @@ fn store_over_representatives(
         .map(|&t| rewrite(t))
         .filter(|&t| storable(t))
         .collect();
+    // A statement deleted from the default graph but still asserted in another stays a
+    // fact (the delta executor never sees it), and its copies for other identities stay
+    // inferred: their representative form must stay stored, which the deleted statement
+    // may have been.
+    let still_asserted: Vec<Triple> = tx
+        .deleted()
+        .filter(|quad| quad.graph.is_default_graph())
+        .map(triple)
+        .collect();
+    for fact in still_asserted {
+        let representative = rewrite(fact);
+        if touches(&representative) && storable(representative) && asserted_somewhere(tx, fact) {
+            additions.push(representative);
+        }
+    }
     additions.sort_unstable();
     additions.dedup();
     for fact in additions {
