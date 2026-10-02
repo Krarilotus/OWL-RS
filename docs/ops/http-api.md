@@ -41,7 +41,7 @@ SELECT ?s ?o ?score WHERE {
 
 | Predicate | Object |
 |---|---|
-| `bds:search` | the words (a literal); a word ending in `*` matches as a prefix; case doesn't matter |
+| `bds:search` | the words (a literal); a word ending in `*` matches as a prefix; words in double quotes are a phrase, matching the literals that hold them in sequence (`"\"quick brown\" fox"`); case doesn't matter |
 | `bds:relevance` | a variable: an `xsd:double` in (0, 1], the best match 1 (BM25, normalised) |
 | `bds:rank` | a variable: the rank by relevance, from 1 |
 | `bds:matchAllTerms "true"` | every word must occur (else any) |
