@@ -1,6 +1,11 @@
 # ADR-0009: OWL 2 DL reasoning
 
-Status: proposed (2 October 2026), for the owner's review. The owner's direction (2 October):
+Status: accepted (2 October 2026). The owner gave the direction ("a complete engine first,
+then the fast layers in front of it"; [the roadmap to the papers](../plan/2026-10-02-roadmap-to-papers.md))
+and left the way to it to the project. Revised the same day after seven research reports
+and their check (outside the repository: `output/dl-research-A…G.md`,
+`output/OWL-RS-dl-research-review-2026-10-02.md`); the revisions are marked below. The
+owner's direction (2 October):
 OWL 2 DL is in scope and is where NRESE means to lead: "the core feature catalogue to be
 exceptional at reasoning, and the widest research field to draw from for improvements and
 clever design techniques".
@@ -53,28 +58,45 @@ own and each measured against the systems above:
    with DL-clauses, anywhere blocking and individual reuse (HermiT's design), written for
    NRESE's ids and memory layout. It is the correctness anchor: every faster path is
    checked against it, and it answers what nothing faster can.
-3. **Classification that scales.** A consequence-based calculus (Horn first, then
-   disjunctions and number restrictions after Bate et al., then nominals after Sequoia),
-   with the EL saturation as its fast path and the hypertableau engine for the classes it
-   leaves open (MORe's split, decided per module). Incremental on TBox commits (the
-   approach of Kazakov and Klinov, ISWC 2013, for EL, generalised), parallel across
-   contexts.
-4. **Certain answers in the store (PAGOdA's scheme).** A reasoning mode `owl2-dl`: the
-   OWL 2 RL closure as the lower bound (as today); an upper bound from a datalog
-   relaxation of the ontology (disjunctions read as conjunctions, existentials as fresh
-   constants), materialised in a stack of its own; answers in the upper but not the lower
-   bound checked by the hypertableau engine on the fragment of the ABox they depend on.
-   Queries in `owl2-dl` give certain answers; the explain endpoint says which were
-   settled how. Consistency of commits is checked the same way (the upper bound first).
-5. **Explanations.** Proofs from the consequence-based derivations and the hypertableau
-   traces (as the RL explanations are today), and justifications: minimal axiom sets,
-   found by pinpointing over the recorded derivations and minimised with the engine
-   (Kalyanpur et al., ISWC 2007, for the black-box part).
-6. **Evidence.** Classification and consistency of the ORE 2015 corpus against HermiT,
-   Konclude and ELK (correctness against HermiT's results, run through ROBOT in Docker);
-   instance queries on LUBM and UOBM against PAGOdA; OWL2Bench DL. Each layer lands with
-   its corpus green and its numbers published (other systems' numbers only where their
-   licences allow).
+3. **Classification that scales.** *(Revised.)*
+   - **One context-saturation core** (Bate et al., JAIR 2018; Sequoia, Tena Cucala et al.), not separate Horn, SRIQ and SROIQ engines. Its rule families switch on step by step: Horn, then disjunction, cardinality and equality, then nominals.
+   - **The EL saturation stays a separate fast path.** Sequoia needed about 131 s on SNOMED, ELK 2 s.
+   - **The hypertableau handles what the core leaves open.** The handover is decided *dynamically*, by the measured growth of clauses and equalities, not only by syntax; the telemetry for it (contexts created, equality literals, the widest clause head, …) is there from the first day.
+   - **Commits:** additions are incremental. Deletions are incremental while their dependency cone is bounded; otherwise the affected module is saturated again. Incremental TBox deletion beyond EL is an open research problem, so no generalisation of Kazakov and Klinov (ISWC 2013) is claimed. Every path is checked against a clean rebuild.
+   - Parallel across contexts.
+4. **Certain answers in the store (PAGOdA's scheme).** *(Revised.)* A reasoning mode `owl2-dl`.
+   - **Bounds:**
+     - the OWL 2 RL closure is the persistent lower bound L, as today;
+     - a candidate upper bound U1 comes from a datalog relaxation of the ontology (disjunctions read as conjunctions, existentials as fresh constants);
+     - U1 is materialised in a stack of its own and is **never visible as inferred data**;
+     - tighter bounds (PAGOdA's U2/U3, RSA approximation, summarisation) are computed per query, where a query needs them.
+   - **Completeness status:** every answer carries `sound`, `complete`, the lower and upper counts, and `unresolved`. A hypertableau is a complete oracle for consistency, entailment and atomic instance queries. It is **not** one for arbitrary conjunctive queries (cyclic ones, or ones whose non-projected variables are witnessed by anonymous individuals). So:
+     - an exact query service names the class of queries it is complete for, as part of its public contract;
+     - answers in the gap outside that class stay `unresolved`;
+     - non-monotone operators (`MINUS`, `NOT EXISTS`, aggregates) get exact answers only when the gap is closed.
+   - **Consistency of commits** is checked the same way, the upper bound first.
+5. **Explanations.** *(Revised.)*
+   - **One proof format** for RL, EL and DL steps, whose every step maps back through the normalisation to the *source OWL axioms*, not to clauses or bare triples.
+   - **Justifications** through one API: `one`, `top-k`, `core`, `union` and lazy `all`.
+   - **Methods:**
+     - PULi-style enumeration (Kazakov and Skočovský) over the derivations NRESE already records, for RL and EL now, before any DL code;
+     - pinpointing over consequence-based derivations;
+     - black-box minimisation (Kalyanpur et al., ISWC 2007) as the anchor for the hypertableau.
+   - **Internals:** the backjumping dependency sets are kept apart from the proof ids.
+6. **Evidence.** *(Revised.)*
+   - **The protocol comes before the first number:**
+     - **Reference runners:** KoncludeCLI, not through OWLLink (the out-of-memory failures in Lam et al. 2023 came from that adapter); HermiT, Openllet and ELK through an OWL API runner of our own for timing, not ROBOT.
+     - **Correctness:** checked through a canonical taxonomy and realisation format; disagreements recorded as `DISPUTED` and settled, never by a majority vote.
+     - **Runs:** cold and warm reported apart, single-thread and whole-host tables; timeouts and out-of-memory failures counted as censored runs.
+     - **Corpora:** fetched by hash and never committed.
+   - **Gates, staged:**
+     1. the W3C OWL 2 conformance suite (direct semantics);
+     2. parity with HermiT on ORE 2015 (1,751 classifications, 1,881 consistency checks in Lam et al. 2023);
+     3. Konclude's 1,862 of 1,920 classifications, as the final bar.
+   - **Query answering:** instance queries on LUBM and UOBM against PAGOdA; OWL2Bench DL.
+   - **The full corpus** runs on the Draco cluster.
+   - **Testing the engine:** grammar-based SROIQ(D) fuzzing, with metamorphic tests.
+   - Other systems' numbers are published only where their licences allow.
 
 The order is the list's: the model, then the complete engine (correctness first), then
 classification speed, then certain answers in the store, then justifications. Each step
@@ -97,6 +119,5 @@ ships behind its own reasoning mode or endpoint (`/classification` gains `profil
 
 ## Open for the owner
 
-- Whether `owl2-dl` query answering should be certain answers by default once it exists,
-  or opt-in per query (it can be slower on queries whose bounds differ).
-- Whether SWRL (DL-safe rules) belongs with step 2 or later.
+- Whether `owl2-dl` answers are certain answers by default. The research's recommendation: always report completeness, and give certain answers by default only where the plan has a complete path.
+- Whether SWRL (DL-safe rules) belongs with step 2 or later. The plan's default: later.
