@@ -400,6 +400,9 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 Arc::clone(&shared.statistics),
             );
             let path = checkpoint::write(durable.root(), &image)?;
+            shared
+                .checkpoints
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             drop(image);
             let mut base = None;
             let next = match durable
@@ -495,6 +498,9 @@ fn publish_streamed(
     );
     drop(source);
     let path = path?;
+    shared
+        .checkpoints
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (base, [asserted, inferred]) = match checkpoint::map_written(&path) {
         Ok(mapped) => mapped,
         Err(error) => {

@@ -26,7 +26,7 @@ mod statistics;
 mod transaction;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
@@ -81,6 +81,12 @@ pub struct EngineStats {
     /// Index data of both stacks used in place from a mapped checkpoint.
     pub index_mapped_bytes: u64,
     pub dictionary: DictionaryStats,
+    /// Bytes logged since the last checkpoint (0 in memory): what a restart replays.
+    pub wal_bytes_since_checkpoint: u64,
+    /// Merges of runs published since the engine started.
+    pub compactions: u64,
+    /// Checkpoints written since the engine started (bulk loads write one each).
+    pub checkpoints: u64,
 }
 
 /// Which statements a read sees. GraphDB calls them explicit and implicit statements.
@@ -217,6 +223,8 @@ struct Versions {
     current: RwLock<Arc<Version>>,
     compaction_slot: Mutex<()>,
     policy: CompactionPolicy,
+    /// Merges published.
+    compactions: AtomicU64,
 }
 
 impl Versions {
@@ -278,7 +286,10 @@ impl Versions {
                             .is_some_and(|run| Arc::ptr_eq(run, &runs[i]))
                     });
                 match unchanged {
-                    true => current.with_stack(stack, index.with_compacted(plan.window, merged)),
+                    true => {
+                        self.compactions.fetch_add(1, Ordering::Relaxed);
+                        current.with_stack(stack, index.with_compacted(plan.window, merged))
+                    }
                     false => current.with_stack(stack, index.clone()),
                 }
             });
@@ -295,6 +306,8 @@ struct Shared {
     durable: Option<Durable>,
     wants_compaction: AtomicBool,
     wants_checkpoint: AtomicBool,
+    /// Checkpoints written.
+    checkpoints: AtomicU64,
 }
 
 impl Shared {
@@ -326,6 +339,7 @@ impl Shared {
                 snapshot
             };
             let path = checkpoint::write(durable.root(), &snapshot)?;
+            self.checkpoints.fetch_add(1, Ordering::Relaxed);
             durable.wal.lock().release_through(snapshot.revision())?;
             (snapshot, path)
         };
@@ -523,10 +537,12 @@ impl Engine {
                 current: RwLock::new(Arc::new(version)),
                 compaction_slot: Mutex::new(()),
                 policy: config.compaction,
+                compactions: AtomicU64::new(0),
             },
             durable,
             wants_compaction: AtomicBool::new(false),
             wants_checkpoint: AtomicBool::new(false),
+            checkpoints: AtomicU64::new(0),
         });
         let worker = config
             .background_maintenance
@@ -592,6 +608,19 @@ impl Engine {
             index_bytes: version.runs().map(|run| run.memory_bytes()).sum(),
             index_mapped_bytes: version.runs().map(|run| run.mapped_bytes()).sum(),
             dictionary: self.inner.shared.dictionary.stats(),
+            wal_bytes_since_checkpoint: self
+                .inner
+                .shared
+                .durable
+                .as_ref()
+                .map_or(0, |durable| durable.wal.lock().bytes_since_checkpoint()),
+            compactions: self
+                .inner
+                .shared
+                .versions
+                .compactions
+                .load(Ordering::Relaxed),
+            checkpoints: self.inner.shared.checkpoints.load(Ordering::Relaxed),
         }
     }
 }
