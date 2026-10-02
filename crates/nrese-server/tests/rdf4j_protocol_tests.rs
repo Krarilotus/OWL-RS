@@ -8,7 +8,10 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use tower::util::ServiceExt;
 
-use support::{body_text, test_app};
+use nrese_reasoner::ReasonerConfig;
+use nrese_server::policy::PolicyConfig;
+use nrese_store::StoreConfig;
+use support::{body_text, test_app, test_app_with_store_config};
 
 const REPO: &str = "/repositories/repo";
 
@@ -344,4 +347,58 @@ async fn autocomplete_finds_labels_and_local_names() {
     assert_eq!(suggest("haspa").await, ["hasPart"]);
     let (status, _) = send(&app, Method::GET, "/dataset/autocomplete", None, None, "").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An on-disk store keeps its namespaces across a restart.
+#[tokio::test]
+async fn namespaces_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = || {
+        test_app_with_store_config(
+            StoreConfig::on_disk(dir.path()),
+            PolicyConfig::default(),
+            ReasonerConfig::default(),
+        )
+        .unwrap()
+    };
+    let uri = format!("{REPO}/namespaces/ex");
+    {
+        let app = app();
+        let (status, _) = send(
+            &app,
+            Method::PUT,
+            &uri,
+            Some("text/plain"),
+            None,
+            "http://example.com/",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = send(
+            &app,
+            Method::DELETE,
+            &format!("{REPO}/namespaces/owl"),
+            None,
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let app = app();
+    let (status, iri) = send(&app, Method::GET, &uri, None, None, "").await;
+    assert_eq!(
+        (status, iri.as_str()),
+        (StatusCode::OK, "http://example.com/")
+    );
+    let (status, _) = send(
+        &app,
+        Method::GET,
+        &format!("{REPO}/namespaces/owl"),
+        None,
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
