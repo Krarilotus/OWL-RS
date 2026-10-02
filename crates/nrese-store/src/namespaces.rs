@@ -44,11 +44,18 @@ impl Namespaces {
 
     /// All of them.
     pub fn all(&self) -> NamespaceMap {
-        self.map.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.map
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn get(&self, prefix: &str) -> Option<String> {
-        self.map.lock().unwrap_or_else(PoisonError::into_inner).get(prefix).cloned()
+        self.map
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(prefix)
+            .cloned()
     }
 
     /// Binds `prefix` to `iri`, replacing an earlier binding.
@@ -109,14 +116,12 @@ mod tests {
     #[test]
     fn namespaces_are_kept_and_taken_over_from_the_rdf4j_file() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(BEFORE),
-            r#"{"ex": "http://example.com/"}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join(BEFORE), r#"{"ex": "http://example.com/"}"#).unwrap();
         let namespaces = Namespaces::open(Some(dir.path().to_path_buf()));
         assert_eq!(namespaces.get("ex").as_deref(), Some("http://example.com/"));
-        namespaces.set("foaf", "http://xmlns.com/foaf/0.1/").unwrap();
+        namespaces
+            .set("foaf", "http://xmlns.com/foaf/0.1/")
+            .unwrap();
         assert!(namespaces.remove("ex").unwrap());
         assert!(!namespaces.remove("ex").unwrap());
         let reopened = Namespaces::open(Some(dir.path().to_path_buf()));
