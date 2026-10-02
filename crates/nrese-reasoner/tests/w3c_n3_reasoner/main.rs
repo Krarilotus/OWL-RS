@@ -21,7 +21,7 @@ use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_reasoner::v2::ir::Vocabulary;
 use nrese_reasoner::v2::n3::compile_quads;
 use nrese_reasoner::v2::naive::materialise;
-use nrese_reasoner::v2::testing::LocalVocabulary;
+use nrese_reasoner::v2::vocabulary::LocalVocabulary;
 
 const BASE: &str = "https://w3c.github.io/N3/tests/N3Tests/";
 const MF: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#";

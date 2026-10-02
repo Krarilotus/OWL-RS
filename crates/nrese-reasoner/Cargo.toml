@@ -16,5 +16,13 @@ hashbrown = { version = "0.16", default-features = false, features = ["default-h
 rayon = "1.10"
 thiserror.workspace = true
 
+[features]
+# The naive reference evaluator (v2::naive), the oracle the executors are tested against.
+oracle = []
+
+[dev-dependencies]
+# Its own tests and examples use the oracle.
+nrese-reasoner = { path = ".", features = ["oracle"] }
+
 [lints]
 workspace = true

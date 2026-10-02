@@ -11,11 +11,11 @@ use std::time::Instant;
 
 use nrese_reasoner::v2::batch::{self, Schema};
 use nrese_reasoner::v2::delta::{MemoryBase, Rules, program, update};
+use nrese_reasoner::v2::ir::Triple;
 use nrese_reasoner::v2::ir::Vocabulary;
 use nrese_reasoner::v2::lists::ListVocabulary;
-use nrese_reasoner::v2::naive::Triple;
 use nrese_reasoner::v2::rulesets::Ruleset;
-use nrese_reasoner::v2::testing::LocalVocabulary;
+use nrese_reasoner::v2::vocabulary::LocalVocabulary;
 
 fn split(line: &str) -> Option<[&str; 3]> {
     let line = line.trim();

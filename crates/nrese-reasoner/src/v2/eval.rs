@@ -14,9 +14,9 @@ use std::collections::HashMap;
 use hashbrown::HashSet;
 use rayon::prelude::*;
 
+use super::ir::Triple;
 use super::ir::{Atom, Guard, Head, OWL, RDF, RDFS, Rule, Term, Vocabulary};
 use super::lists::Facts;
-use super::naive::Triple;
 
 /// Driver matches per parallel work unit.
 const MORSEL: usize = 4096;

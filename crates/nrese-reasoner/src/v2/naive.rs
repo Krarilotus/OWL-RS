@@ -12,14 +12,7 @@ use std::collections::{HashMap, HashSet};
 use super::ir::{Atom, Head, Rule, Term};
 use super::lists::{Facts, ListVocabulary, instantiate};
 
-pub type Triple = [u64; 3];
-
-/// A consistency rule that fired: its name and the bindings of its variables.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Violation {
-    pub rule: String,
-    pub bindings: Vec<u64>,
-}
+pub use super::ir::{Triple, Violation};
 
 #[derive(Debug, Default)]
 pub struct Closure {

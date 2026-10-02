@@ -18,8 +18,8 @@
 
 use std::collections::HashMap;
 
+use super::ir::Triple;
 use super::ir::{OWL, RDF, RDFS, Vocabulary};
-use super::naive::Triple;
 
 /// The vocabulary the analysis reads.
 pub struct UnnamedVocabulary {

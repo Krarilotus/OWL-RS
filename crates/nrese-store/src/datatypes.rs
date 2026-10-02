@@ -16,7 +16,7 @@
 
 use nrese_engine::{TermId, TermKind};
 use nrese_rdf::{Literal, Term};
-use nrese_reasoner::v2::naive::{Triple, Violation};
+use nrese_reasoner::v2::ir::{Triple, Violation};
 use nrese_xsd::{DateTime, Decimal, Double, Float, Integer};
 use std::str::FromStr;
 

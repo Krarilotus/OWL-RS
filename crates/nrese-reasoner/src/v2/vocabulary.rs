@@ -1,4 +1,5 @@
-//! A local [`Vocabulary`] and N-Triples-lite helpers for tests and tools.
+//! A local [`Vocabulary`]: terms interned into dense ids by their N-Triples form, where
+//! there is no store (checking user rules, tools, tests).
 
 use std::collections::HashMap;
 

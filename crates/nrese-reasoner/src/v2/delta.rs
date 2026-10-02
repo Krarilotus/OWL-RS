@@ -44,8 +44,8 @@ use super::eval::{
     rule_key, run_jobs, run_jobs_acyclic, transitive_predicate,
 };
 use super::ir::{Head, Rule};
+use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
-use super::naive::{Triple, Violation};
 
 /// The materialised state: asserted facts after the change, and inferred facts before it.
 pub trait Base: Sync {

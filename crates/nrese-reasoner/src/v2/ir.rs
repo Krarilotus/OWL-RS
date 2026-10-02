@@ -174,6 +174,16 @@ impl Rule {
     }
 }
 
+/// A fact: subject, predicate and object ids.
+pub type Triple = [u64; 3];
+
+/// A consistency rule that fired: its name and the bindings of its variables.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Violation {
+    pub rule: String,
+    pub bindings: Vec<u64>,
+}
+
 /// A rule text that doesn't compile: which rule, what is wrong, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -422,7 +432,7 @@ fn term(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::testing::LocalVocabulary;
+    use crate::v2::vocabulary::LocalVocabulary;
 
     #[test]
     fn errors_name_the_line_of_their_rule() {

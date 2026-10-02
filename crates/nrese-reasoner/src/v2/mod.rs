@@ -4,7 +4,8 @@
 //! - [`ir`]: the rule IR and its text syntax; rules are data
 //! - [`rulesets`]: the built-in rulesets (`rdfs`, `owl2-rl`), with the W3C rule names
 //! - [`lists`]: list axioms (chains, keys, intersections, …) compiled to fixed-arity rules
-//! - [`naive`]: the naive reference evaluator, the oracle for the fast executors
+//! - [`naive`]: the naive reference evaluator, the oracle for the fast executors (tests
+//!   and the `oracle` feature only)
 //! - [`eval`]: rule evaluation over any [`eval::Source`]: grounding, planning, joins
 //! - [`batch`]: the batch executor: schema grounding and parallel semi-naive evaluation
 //! - [`delta`]: the delta executor: maintenance under inserts and deletes (DRed)
@@ -19,15 +20,16 @@ pub mod explain;
 pub mod ir;
 pub mod lists;
 pub mod n3;
+#[cfg(any(test, feature = "oracle"))]
 pub mod naive;
 pub mod pie;
 pub mod program;
 pub mod representatives;
 pub mod rulesets;
-pub mod testing;
 pub mod unnamed;
 #[cfg(test)]
 mod v1_scenarios;
+pub mod vocabulary;
 
 #[cfg(test)]
 mod tests {
@@ -38,7 +40,7 @@ mod tests {
     use super::lists::ListVocabulary;
     use super::naive::{Triple, Violation, materialise};
     use super::rulesets::Ruleset;
-    use super::testing::LocalVocabulary;
+    use super::vocabulary::LocalVocabulary;
 
     const EX: &str = "http://example.com/";
 
