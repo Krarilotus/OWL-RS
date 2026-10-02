@@ -832,9 +832,13 @@ pub async fn transaction_begin(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    let access = guard::update_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
-    let txid = state.store().sessions().begin();
+    let txid = state
+        .store()
+        .sessions()
+        .begin(access.origin.as_deref())
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     let location = absolute(&headers, &format!("/repositories/{id}/transactions/{txid}"));
     let mut response = StatusCode::CREATED.into_response();
     response.headers_mut().insert(
@@ -859,7 +863,8 @@ pub async fn transaction_action(
         .to_ascii_uppercase();
     let store = state.store();
     let sessions = store.sessions();
-    if !sessions.ping(&txid) {
+    let owner = access.origin.as_deref();
+    if !sessions.ping(&txid, owner) {
         return Err(ApiError::not_found(format!("no transaction '{txid}'")));
     }
     let ops = match action.as_str() {
@@ -873,7 +878,7 @@ pub async fn transaction_action(
     };
     if let Some(ops) = ops {
         state.policy().enforce_rdf_upload_bytes(body.len())?;
-        return match sessions.add(&txid, ops) {
+        return match sessions.add(&txid, owner, ops) {
             true => Ok(StatusCode::OK.into_response()),
             false => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
         };
@@ -881,7 +886,7 @@ pub async fn transaction_action(
     match action.as_str() {
         "COMMIT" => {
             let pending = sessions
-                .take(&txid)
+                .take(&txid, owner)
                 .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
             apply(&state, pending.ops, &access).await?;
             Ok(StatusCode::OK.into_response())
@@ -890,7 +895,7 @@ pub async fn transaction_action(
         // Reads see the transaction's changes (module docs).
         "QUERY" | "GET" | "SIZE" => {
             let pending = sessions
-                .pending(&txid)
+                .pending(&txid, owner)
                 .map(|ops| StatementsRequest {
                     session: Some(txid.clone()),
                     ..scoped(ops, &access)
@@ -922,9 +927,13 @@ pub async fn transaction_rollback(
     Path((id, txid)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    let access = guard::update_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
-    match state.store().sessions().rollback(&txid) {
+    match state
+        .store()
+        .sessions()
+        .rollback(&txid, access.origin.as_deref())
+    {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
     }
