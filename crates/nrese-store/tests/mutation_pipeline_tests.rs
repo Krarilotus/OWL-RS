@@ -910,4 +910,21 @@ fn materialisation_by_representatives_equals_replication() {
         "the equalities reach the data"
     );
     assert_eq!(by_representatives, replicated);
+    // Without asserted sameAs: equalities only from the functional and inverse-functional
+    // properties (the first pass finds them, then the representative closure).
+    let derived_only = format!(
+        "@prefix ex: <{EX}> . @prefix owl: <{owl}> .
+         ex:hasMother a owl:FunctionalProperty . ex:email a owl:InverseFunctionalProperty .
+         ex:kim ex:hasMother ex:m1 , ex:m2 . ex:p1 ex:email \"x@y\" . ex:p2 ex:email \"x@y\" .
+         ex:m1 ex:knows ex:p1 . ex:p2 ex:age 30 . ex:m2 a ex:Person ."
+    );
+    std::fs::write(&file, &derived_only).unwrap();
+    let replicated = everything(false);
+    assert!(
+        replicated
+            .iter()
+            .any(|q| q.contains("m2") && q.contains("knows") && q.contains("p2")),
+        "the derived equalities reach the data"
+    );
+    assert_eq!(everything(true), replicated);
 }

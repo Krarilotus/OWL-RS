@@ -335,24 +335,17 @@ pub fn materialise_until(
     snapshot: &Snapshot,
     stop: nrese_reasoner::v2::eval::Stop<'_>,
 ) -> Result<Closure, delta::Interrupted> {
-    let mut input = asserted_by_predicate(snapshot);
-    // Axioms nothing asserts are inferred statements, and premises of the rules.
-    let mut axioms: Vec<Triple> = Vec::new();
-    for &axiom in &program.axioms {
-        let [s, p, o] = axiom;
-        let at = input.partition_point(|(predicate, _)| *predicate < p);
-        match input.get_mut(at) {
-            Some((predicate, pairs)) if *predicate == p => match pairs.binary_search(&(o, s)) {
-                Ok(_) => continue,
-                Err(position) => pairs.insert(position, (o, s)),
-            },
-            _ => input.insert(at, (p, vec![(o, s)])),
-        }
-        axioms.push(axiom);
-    }
+    let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
     let result = match program.same_as.filter(|_| program.by_representatives) {
-        Some(_) => by_representatives(program, input, &schema, stop)?,
+        Some(same_as) => by_representatives(
+            program,
+            input,
+            &|| input_of(program, snapshot).0,
+            same_as,
+            &schema,
+            stop,
+        )?,
         None => batch::materialise_grouped_until(
             input,
             &program.rules,
@@ -383,28 +376,90 @@ pub fn materialise_until(
     })
 }
 
+/// The input of a full materialisation of `snapshot`: its asserted statements (any graph)
+/// grouped by predicate, with the ruleset's axioms; and the axioms nothing asserts (they
+/// are inferred statements, and premises of the rules).
+fn input_of(program: &Program, snapshot: &Snapshot) -> (Vec<(u64, Vec<(u64, u64)>)>, Vec<Triple>) {
+    let mut input = asserted_by_predicate(snapshot);
+    let mut axioms: Vec<Triple> = Vec::new();
+    for &axiom in &program.axioms {
+        let [s, p, o] = axiom;
+        let at = input.partition_point(|(predicate, _)| *predicate < p);
+        match input.get_mut(at) {
+            Some((predicate, pairs)) if *predicate == p => match pairs.binary_search(&(o, s)) {
+                Ok(_) => continue,
+                Err(position) => pairs.insert(position, (o, s)),
+            },
+            _ => input.insert(at, (p, vec![(o, s)])),
+        }
+        axioms.push(axiom);
+    }
+    (input, axioms)
+}
+
 /// The closure of `input` (grouped by predicate) over representatives of the `owl:sameAs`
 /// classes, expanded to every identity: what the replacement rules derive, as a batch
 /// materialisation reports it (the derived facts beyond the input). Violations are over
 /// representatives.
+///
+/// Where no equality appears, nothing needs representatives: without asserted `sameAs`,
+/// the closure is computed first on the compact grouped input without the replacement
+/// rules, and if it derives no `sameAs` between two terms either, that is the closure
+/// (LUBM: the replicated time and memory, the replacement rules saved). Otherwise the
+/// representative closure starts from the input (`rebuild` reads it again) and what that
+/// first pass derived.
 fn by_representatives(
     program: &Program,
     input: Vec<(u64, Vec<(u64, u64)>)>,
+    rebuild: &dyn Fn() -> Vec<(u64, Vec<(u64, u64)>)>,
+    same_as: u64,
     schema: &Schema,
     stop: nrese_reasoner::v2::eval::Stop<'_>,
 ) -> Result<batch::Materialisation, delta::Interrupted> {
+    let equal = |pairs: &[(u64, u64)]| pairs.iter().any(|&(o, s)| o != s);
+    let asserts_equality = input
+        .binary_search_by_key(&same_as, |(p, _)| *p)
+        .is_ok_and(|at| equal(&input[at].1));
+    let mut seeds: Vec<Triple> = Vec::new();
+    let input = if asserts_equality {
+        input
+    } else {
+        let rules = nrese_reasoner::v2::representatives::without_replacement(&program.rules);
+        let first =
+            batch::materialise_grouped_until(input, &rules, program.lists.as_ref(), schema, stop)?;
+        if !first
+            .derived
+            .iter()
+            .any(|t| t[1] == same_as && t[0] != t[2])
+        {
+            return Ok(first);
+        }
+        seeds = first.derived;
+        rebuild()
+    };
     let mut asserted: Vec<Triple> = input
         .into_iter()
         .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
         .collect();
     asserted.par_sort_unstable();
+    let start: Vec<Triple> = match seeds.is_empty() {
+        true => asserted.clone(),
+        false => {
+            let mut all = asserted.clone();
+            all.extend(seeds);
+            all.par_sort_unstable();
+            all.dedup();
+            all
+        }
+    };
     let closure = nrese_reasoner::v2::representatives::materialise_until(
-        &asserted,
+        &start,
         &program.rules,
         program.lists.as_ref(),
         schema,
         stop,
     )?;
+    drop(start);
     let classes = &closure.classes;
     let mut derived: Vec<Triple> = closure
         .facts
