@@ -86,6 +86,16 @@ export type QuerySuggestionResponse = {
   suggestions: QuerySuggestion[];
 };
 
+export type ResourceSuggestion = {
+  iri: string;
+  label?: string | null;
+  score: number;
+};
+
+export type AutocompleteResponse = {
+  suggestions: ResourceSuggestion[];
+};
+
 export type OutputState = {
   title: string;
   status: "idle" | "success" | "error";

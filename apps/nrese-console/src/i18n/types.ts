@@ -69,6 +69,12 @@ export type AppStrings = {
   queryAcceptLabel: string;
   namedGraphLabel: string;
   noOutput: string;
+  searchTitle: string;
+  searchHint: string;
+  searchPlaceholder: string;
+  searchNoResults: string;
+  searchUnavailable: string;
+  describeResource: string;
   exampleLabels: Record<
     "overview-query" | "class-count-query" | "insert-update" | "tell-ingest" | "named-graph",
     {
