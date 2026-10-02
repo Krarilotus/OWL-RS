@@ -109,6 +109,10 @@ impl Rules<'_> {
     }
 }
 
+/// Whether commits without support counts keep candidates that a non-recursive rule still
+/// derives in one step, before the proof search.
+const NON_RECURSIVE_CHECK: bool = true;
+
 /// What [`update`] computed.
 #[derive(Default)]
 pub struct Update {
@@ -270,8 +274,11 @@ pub fn update_counted<B: Base + ?Sized>(
     let same_as = super::batch::same_as_of(rules.rules);
     // Support counting: which ground rules are non-recursive, the instances lost and
     // gained. Off (the counts stale) once the program itself changes.
-    let non_recursive: Vec<bool> = match supports {
-        Some(_) => {
+    // Without counts, a candidate is still kept when a non-recursive rule derives it in
+    // one step from what is left (its premises are below it: if one goes later, its loss
+    // brings the candidate back).
+    let non_recursive: Vec<bool> = match supports.is_some() || NON_RECURSIVE_CHECK {
+        true => {
             let before = Overlay {
                 base,
                 hidden: &inserted_set,
@@ -281,7 +288,7 @@ pub fn update_counted<B: Base + ?Sized>(
                 super::supports::same_as_partners(&before, same_as, term)
             })
         }
-        None => Vec::new(),
+        false => Vec::new(),
     };
     let mut counting = supports.is_some();
     // The lost instances counted so far (rule and bindings): overdeletion may find one
@@ -496,6 +503,20 @@ pub fn update_counted<B: Base + ?Sized>(
             candidates.extend(component.into_iter().filter(|&f| overdeletable(f)));
             drop(jobs);
             drop(counted_jobs);
+            if !counting && backward && !non_recursive.is_empty() {
+                let mut gone: HashSet<Triple> = inserted_set.clone();
+                gone.extend(overdeleted.iter().copied());
+                let left = Overlay {
+                    base,
+                    hidden: &gone,
+                    extra: &empty,
+                };
+                candidates.sort_unstable();
+                candidates.dedup();
+                candidates
+                    .retain(|&f| stop() || !old_program.derivable_by(&left, f, &non_recursive));
+                check_stop()?;
+            }
             if counting && let Some(supports) = supports {
                 // A candidate with a non-recursive derivation left keeps it: no proof
                 // search. If that derivation's premises go later in this commit, its loss

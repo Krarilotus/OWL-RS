@@ -1239,6 +1239,35 @@ impl GroundProgram {
     }
 }
 
+impl GroundProgram {
+    /// Whether one of the rules `only` marks derives `fact` from `source` in one step.
+    pub fn derivable_by<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        only: &[bool],
+    ) -> bool {
+        let mut producers = Vec::new();
+        self.heads.matching_fact(fact, &mut producers);
+        producers.sort_unstable();
+        producers.dedup_by_key(|(r, _)| *r);
+        let mut found = false;
+        for (r, _) in producers {
+            if !only.get(r).copied().unwrap_or(false) {
+                continue;
+            }
+            derivations(source, &self.rules[r], fact, Seg::All, &mut |_| {
+                found = true;
+                true
+            });
+            if found {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// The transitivity rule over `p`, for evaluation where the module doesn't apply
 /// (overdeletion, rederivation).
 pub fn transitivity(p: u64) -> Rule {
