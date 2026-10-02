@@ -15,7 +15,6 @@ use super::{IndexVersion, Layout};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
 
-
 /// `seed` varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds; without
 /// it, the same cases on every run.
 fn fuzz(seed: u64) -> u64 {

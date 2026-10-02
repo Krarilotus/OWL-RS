@@ -1005,7 +1005,11 @@ const EXPLANATION_BUDGET: usize = 4096;
 /// Why the fact `[s, p, o]` holds in `snapshot` under `program`: a derivation of it from
 /// asserted facts ([`nrese_reasoner::v2::explain`]), the fact first. `None` if it doesn't
 /// hold, or no derivation is found within the budget.
-pub fn explain_fact(program: &Program, snapshot: &Snapshot, fact: Triple) -> Option<Vec<InferenceStep>> {
+pub fn explain_fact(
+    program: &Program,
+    snapshot: &Snapshot,
+    fact: Triple,
+) -> Option<Vec<InferenceStep>> {
     let base = SnapshotBase {
         snapshot,
         axioms: &program.axioms,
@@ -1023,7 +1027,11 @@ pub fn explain_fact(program: &Program, snapshot: &Snapshot, fact: Triple) -> Opt
                     subject: decode(s),
                     predicate: decode(p),
                     object: decode(o),
-                    origin: if step.rule.is_some() { "inferred" } else { "asserted" },
+                    origin: if step.rule.is_some() {
+                        "inferred"
+                    } else {
+                        "asserted"
+                    },
                     rule: step.rule,
                     premises: step.premises,
                 }

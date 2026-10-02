@@ -190,7 +190,6 @@ fn compact_equality_survives_a_restart() {
     );
 }
 
-
 /// `seed` varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds; without
 /// it, the same cases on every run.
 fn fuzz(seed: u64) -> u64 {

@@ -32,7 +32,6 @@ ex:S5 a sh:NodeShape ; sh:targetNode ex:n0 , ex:n1 ;
   sh:not [ sh:class ex:C1 ] .
 "#;
 
-
 /// `seed` varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds; without
 /// it, the same cases on every run.
 fn fuzz(seed: u64) -> u64 {
