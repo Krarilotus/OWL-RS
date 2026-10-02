@@ -11,13 +11,13 @@
 pub(crate) mod dictionary;
 pub(crate) mod hash;
 mod inline;
-pub(crate) mod order;
 pub(crate) mod offsets;
-pub(crate) mod vocabulary;
+pub(crate) mod order;
 mod strings;
+pub mod text;
+pub(crate) mod vocabulary;
 #[cfg(test)]
 mod vocabulary_study;
-pub mod text;
 
 pub use dictionary::{Dictionary, DictionaryStats, TermView};
 pub use strings::{Placement, StringTest};

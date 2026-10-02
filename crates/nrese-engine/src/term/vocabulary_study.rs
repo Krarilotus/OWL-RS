@@ -109,8 +109,7 @@ fn vocabulary_study() {
     }
     let compressed_key = |i: usize| &arena[if i == 0 { 0 } else { ends[i - 1] }..ends[i]];
     let decompressor = one.decompressor();
-    let mut buffer: Vec<std::mem::MaybeUninit<u8>> =
-        vec![std::mem::MaybeUninit::uninit(); 1 << 20];
+    let mut buffer: Vec<std::mem::MaybeUninit<u8>> = vec![std::mem::MaybeUninit::uninit(); 1 << 20];
     let mut sink = 0usize;
     let started = Instant::now();
     for i in 0..all.keys.len() {

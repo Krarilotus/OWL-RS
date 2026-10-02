@@ -109,7 +109,11 @@ impl BlockEnds {
         for i in 0..self.count {
             let block = i / BLOCK;
             let at = (self.blocks[2 * block + 1] >> 1) as usize;
-            let width = if self.blocks[2 * block + 1] & 1 == 1 { 4 } else { 2 };
+            let width = if self.blocks[2 * block + 1] & 1 == 1 {
+                4
+            } else {
+                2
+            };
             if at + width * (i % BLOCK + 1) > self.ends.len() {
                 return Err("dictionary block offsets point past their ends".into());
             }

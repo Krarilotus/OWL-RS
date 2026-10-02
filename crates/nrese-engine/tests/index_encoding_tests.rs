@@ -98,7 +98,9 @@ fn checkpoints_before_format_11_open() {
             );
             for quad in quads() {
                 assert!(
-                    snapshot.lookup_quad(quad.as_ref()).is_some_and(|q| snapshot.contains(&q)),
+                    snapshot
+                        .lookup_quad(quad.as_ref())
+                        .is_some_and(|q| snapshot.contains(&q)),
                     "{name}: {quad}"
                 );
             }
@@ -124,7 +126,10 @@ fn checkpoints_before_format_11_open() {
         assert_eq!(&fs::read(newest).unwrap()[..8], b"NRESECKB", "{name}");
         let engine = Engine::open(dir.path(), config()).unwrap();
         assert_eq!(
-            engine.snapshot().quads_for_pattern(&QuadPattern::all()).count(),
+            engine
+                .snapshot()
+                .quads_for_pattern(&QuadPattern::all())
+                .count(),
             2_001,
             "{name}"
         );
