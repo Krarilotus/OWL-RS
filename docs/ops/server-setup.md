@@ -102,7 +102,18 @@ nrese-server load [--config .\config.toml] [--replace] [--graph <IRI>] data.nt m
   - `--graph` sets the target graph for triple formats; quad formats keep their own graphs.
   - Blank nodes are fresh per load.
 - **Offline only.** The server must not be running on the same data directory; the directory lock enforces this. Validation gates don't run during a bulk load.
-- **Speed.** N-Triples and N-Quads are parsed on all cores and are the fastest input: about 2.7 M triples/s on the reference machine, with 100 M triples in 37 s (`benches/baselines/README.md`). Convert other formats to N-Triples for the largest loads.
+- **Speed.** N-Triples and N-Quads are parsed on all cores and are the fastest input: about 2.7 M triples/s on the reference machine, with 100 M triples in 37 s (`benches/baselines/README.md`). Convert other formats to N-Triples for the largest loads (`nrese-server convert`, below).
+
+### 5.4.1 One-off Queries and Conversions
+
+```powershell
+nrese-server query [--config .\config.toml] [--format json|xml|csv|tsv|nt|ttl|nq|trig|rdf|jsonld] "SELECT ..."
+nrese-server query [--config .\config.toml] --file query.rq
+nrese-server convert data.ttl data.nt
+```
+
+- `query` answers one query from the configured store as it is (no reasoning first; the inferred stack is what the last load or start materialised) and writes the results to standard output: SELECT and ASK in the results format (default JSON), CONSTRUCT and DESCRIBE in the RDF format (default N-Triples). Offline, like `load`.
+- `convert` reads one RDF file and writes it in another format, both taken from the extensions, statement by statement and without a store, so the file can be larger than memory. Blank node labels are kept; a named graph is an error for a format without graphs. The output appears only when complete.
 
 ## 5.5 Local Test-Server Startup Example (PowerShell)
 

@@ -1,12 +1,17 @@
 use anyhow::{Context, Result};
 use axum::serve::ListenerExt;
 use nrese_reasoner::ReasonerService;
-use nrese_store::{BulkLoadRequest, GraphTarget, StoreService};
+use nrese_store::{
+    BulkLoadRequest, CancellationToken, GraphResultFormat, GraphTarget, PreparedQuery,
+    SolutionsResultFormat, SparqlQueryRequest, StoreService,
+};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 use nrese_server::ai::AiSuggestionService;
-use nrese_server::{AppState, CliCommand, CliConfig, LoadCommand, ServerConfig, build_app};
+use nrese_server::{
+    AppState, CliCommand, CliConfig, LoadCommand, QueryCommand, ServerConfig, build_app,
+};
 
 /// mimalloc (Pf7a): 7-20% faster query sets and 30% faster bulk loads than the system
 /// allocator in the perf lab (benches/baselines/perf-lab/2026-09-27-r198-*).
@@ -32,6 +37,12 @@ async fn run() -> Result<()> {
     init_tracing();
 
     let cli = CliConfig::from_args(std::env::args_os())?;
+    if let CliCommand::Convert(convert) = &cli.command {
+        let statements = nrese_store::convert_file(&convert.input, &convert.output)
+            .with_context(|| format!("converting {}", convert.input.display()))?;
+        tracing::info!(statements, output = %convert.output.display(), "converted");
+        return Ok(());
+    }
     let config = ServerConfig::load(cli.config_path.as_deref())?;
     if cli.command == CliCommand::CheckConfig {
         // Loading validated everything; show what takes effect.
@@ -41,6 +52,9 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     let store = StoreService::new(config.store.clone())?;
+    if let CliCommand::Query(query) = cli.command {
+        return query_once(&store, query);
+    }
     let program = config.reasoner.materialised_program();
     if let CliCommand::Load(load) = cli.command {
         bulk_load(&store, load)?;
@@ -130,6 +144,40 @@ async fn run() -> Result<()> {
     axum::serve(listener, app)
         .await
         .context("nrese-server terminated unexpectedly")
+}
+
+/// `nrese-server query`: one query on the configured store as it is (no reasoning first),
+/// its results on standard output.
+fn query_once(store: &StoreService, command: QueryCommand) -> Result<()> {
+    use std::io::Write as _;
+    let text = match (command.query, command.file) {
+        (Some(text), _) => text,
+        (None, Some(file)) => {
+            std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?
+        }
+        (None, None) => anyhow::bail!("`query` needs a query or --file"),
+    };
+    let mut request = SparqlQueryRequest::new(text);
+    if let Some(format) = command.format.as_deref() {
+        match format.to_ascii_lowercase().as_str() {
+            "json" => request.solutions_format = SolutionsResultFormat::Json,
+            "xml" => request.solutions_format = SolutionsResultFormat::Xml,
+            "csv" => request.solutions_format = SolutionsResultFormat::Csv,
+            "tsv" => request.solutions_format = SolutionsResultFormat::Tsv,
+            other => {
+                request.graph_format = GraphResultFormat::from_extension(other)
+                    .with_context(|| format!("unknown result format {other}"))?;
+            }
+        }
+    }
+    let prepared = PreparedQuery::parse(&request).context("parsing the query failed")?;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    store
+        .run_query(&prepared, &CancellationToken::new(), &mut out)
+        .context("the query failed")?;
+    out.flush()?;
+    Ok(())
 }
 
 /// `nrese-server load`: bulk-loads files into the configured store and exits.
