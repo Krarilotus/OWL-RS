@@ -118,6 +118,21 @@ the `lubm-materialised` workload (batch E, running).
   618 MB), where our dictionary is mapped uncompressed (862 MB). Delta-encoding the sorted
   columns within blocks and a compressed vocabulary would close it; both change the
   checkpoint format and the point-lookup path, so they are planned, not started.
+
+  Measured on the office PC's checkpoints (`index/compression_study.rs`, an ignored test):
+  choosing per block and key position the cheapest of the current frame of reference, a
+  palette of the block's distinct values, and deltas for the first position that varies,
+  the four permutations of a default-graph store would take, in bytes per quad:
+
+  | Store | SPOG | POSG | OSPG | PSOG | Together | With the choice |
+  |---|---:|---:|---:|---:|---:|---:|
+  | Wikidata lexemes | 9.16 → 6.37 | 2.92 → 2.49 | 3.39 → 2.69 | 3.52 → 2.89 | 19.0 | 14.4 (−24 %) |
+  | DBpedia core | 10.07 → 8.62 | 4.36 → 3.89 | 5.56 → 4.36 | 4.73 → 4.17 | 24.7 | 21.0 (−15 %) |
+
+  Block headers and first keys add 0.81 bytes per key in every permutation; the first keys
+  can be derived from the blocks (−0.25), and blocks of 256 keys would halve the rest. The
+  objects in SPOG (identifiers in insertion order, random within a subject) are what
+  stays expensive: QLever's identifiers follow its sorted vocabulary.
 - **First count after a restart.** On LUBM(100), YAGO tiny and Wikidata the first count
   took 14 to 22 ms in Docker (one sample each), against 1.5 ms elsewhere; on the office
   PC the same store answers it in 0.9 ms over HTTP. To be rechecked with more runs.
