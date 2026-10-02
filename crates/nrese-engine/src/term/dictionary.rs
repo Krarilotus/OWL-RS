@@ -574,7 +574,9 @@ impl Dictionary {
             | TermKind::TypedLiteral
             | TermKind::Triple => {
                 let ids = {
-                    let inner = self.inner.read();
+                    // Recursive: callers may hold a read lock already (`with_views`), and a
+                    // plain read would queue behind a waiting writer, which waits for them.
+                    let inner = self.inner.read_recursive();
                     if id.payload() >= inner.len() {
                         return None;
                     }
@@ -615,7 +617,8 @@ impl Dictionary {
     }
 
     /// Calls `f` with a lookup of entry views below `limit`, all under one read lock: for
-    /// writing many terms (result serialisation) without a lock per term.
+    /// writing many terms (result serialisation) without a lock per term. `f` may decode
+    /// ([`Self::decode`] reads recursively) but not intern.
     pub fn with_views<R>(
         &self,
         limit: u64,
