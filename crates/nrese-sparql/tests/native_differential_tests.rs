@@ -171,7 +171,8 @@ fn ex(local: &str) -> NamedNode {
 fn random_object(rng: &mut Rng) -> Term {
     match rng.below(12) {
         // Range pruning edge cases: dates with timezones next to the FILTER bounds, a
-        // non-canonical integer and an xsd:int (both dictionary typed literals).
+        // non-canonical integer (a dictionary typed literal), and integer-derived literals
+        // (inline, by value) next to an ill-typed one (in the dictionary).
         9 => Literal::new_typed_literal(
             *rng.pick(&[
                 "2001-01-01Z",
@@ -183,7 +184,19 @@ fn random_object(rng: &mut Rng) -> Term {
         )
         .into(),
         10 => Literal::new_typed_literal(format!("0{}", rng.below(8)), xsd::INTEGER).into(),
-        11 => Literal::new_typed_literal(rng.below(8).to_string(), xsd::INT).into(),
+        // One draw, as for the other cases, so the rest of the generated data stays put.
+        11 => {
+            let n = rng.below(40);
+            let value = n / 5;
+            match n % 5 {
+                0 => Literal::new_typed_literal(value.to_string(), xsd::INT),
+                1 => Literal::new_typed_literal(format!("-{}", 1 + value % 3), xsd::LONG),
+                2 => Literal::new_typed_literal(value.to_string(), xsd::NON_NEGATIVE_INTEGER),
+                3 => Literal::new_typed_literal(value.to_string(), xsd::UNSIGNED_BYTE),
+                _ => Literal::new_typed_literal("300", xsd::BYTE),
+            }
+            .into()
+        }
         0..=2 => ex(&format!("e{}", rng.below(6))).into(),
         3 => Literal::new_typed_literal(rng.below(8).to_string(), xsd::INTEGER).into(),
         4 => Literal::new_typed_literal(format!("{}.5", rng.below(5)), xsd::DECIMAL).into(),
@@ -506,13 +519,23 @@ fn rows_with(results: QueryResults<'_>, ordered: bool, by_values: bool) -> Vec<S
     out
 }
 
-/// An integer literal (of `xsd:integer`, `int` or `long`) as its value's canonical
-/// `xsd:integer`; other terms unchanged.
+/// An integer literal (of `xsd:integer` or a datatype derived from it) as its value's
+/// canonical `xsd:integer`; other terms unchanged.
 fn by_value(term: &Term) -> Term {
-    const INTEGERS: [&str; 3] = [
+    const INTEGERS: [&str; 13] = [
         "http://www.w3.org/2001/XMLSchema#integer",
         "http://www.w3.org/2001/XMLSchema#int",
         "http://www.w3.org/2001/XMLSchema#long",
+        "http://www.w3.org/2001/XMLSchema#short",
+        "http://www.w3.org/2001/XMLSchema#byte",
+        "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+        "http://www.w3.org/2001/XMLSchema#nonPositiveInteger",
+        "http://www.w3.org/2001/XMLSchema#negativeInteger",
+        "http://www.w3.org/2001/XMLSchema#positiveInteger",
+        "http://www.w3.org/2001/XMLSchema#unsignedLong",
+        "http://www.w3.org/2001/XMLSchema#unsignedInt",
+        "http://www.w3.org/2001/XMLSchema#unsignedShort",
+        "http://www.w3.org/2001/XMLSchema#unsignedByte",
     ];
     match term {
         Term::Literal(l) if INTEGERS.contains(&l.datatype().as_str()) => {
@@ -2972,9 +2995,11 @@ fn the_merged_default_graph_equals_the_reference() {
                 read_model: model,
                 ..QueryOptions::default()
             }));
-            let native = rows(
+            // Equal values may come out in either order under ORDER BY.
+            let native = rows_up_to_equal_values(
                 evaluate_query(&snapshot, &query, &native_options).unwrap(),
                 ordered,
+                false,
             );
             let context = format!("dataset {dataset_case}, query {query_case}, {model:?}: {text}");
             if let Some(limit) = limited(&text) {
@@ -2988,7 +3013,11 @@ fn the_merged_default_graph_equals_the_reference() {
                     all.remove(position.unwrap());
                 }
             } else {
-                let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), ordered);
+                let expected = rows_up_to_equal_values(
+                    reference(&snapshot, &query, &oracle).unwrap(),
+                    ordered,
+                    false,
+                );
                 assert_eq!(native, expected, "{context}");
             }
             checked += 1;

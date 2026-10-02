@@ -1,14 +1,18 @@
 //! Checkpoints: a full image of one revision (dictionary plus both index stacks).
 //!
-//! Format 6 (little-endian): `magic | revision u64 | dictionary | stack* | crc32 u32`. The
-//! CRC covers everything before it.
+//! Format 8 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* | crc32
+//! u32`. The CRC covers everything before it. Flag bit 0 ([`INTEGERS_IN_DICTIONARY`]):
+//! integer-derived literals are dictionary entries, not inline (a store created before
+//! [`TermKind::DerivedInteger`](crate::term::TermKind)); formats 4-7 have no flags and
+//! are such stores.
 //! - The dictionary is `len u64 | arena_len u64 | slot_count u64 | padding | ends: len ×
 //!   u64 | arena: arena_len bytes | padding | slots: slot_count × u32`: the keys one after
 //!   another, their end offsets, and an open-addressing hash table of them (linear probing
 //!   by the fixed [`key_hash`], entry index + 1 per slot, 0 empty), then `padding |
 //!   order_len u64 | order: order_len × u32`, the entries with a text sorted by it
 //!   ([`crate::term::order`]: prefix searches). Padding is zero bytes up to an 8-byte
-//!   boundary of the file. Format 6 is format 7 without the order.
+//!   boundary of the file. Format 7 is format 8 without the flags, format 6 format 7
+//!   without the order.
 //! - Each stack (asserted, then inferred) is `count u32 | (permutation u8, packed keys)*`:
 //!   every permutation of the stack's layout, compressed as in memory
 //!   ([`PackedKeys::write`]), its packed bits padded to an 8-byte boundary.
@@ -49,11 +53,14 @@ use crate::term::hash::key_hash;
 /// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
 /// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
 /// stores the packed permutations (Pf2); version 6 aligns them for mapping; version 7 adds
-/// the dictionary's text order.
-const MAGIC: &[u8; 8] = b"NRESECK7";
-/// Earlier formats, still read (same terms): without the text order, unaligned packed
-/// permutations, quad lists.
+/// the dictionary's text order; version 8 the flags (integer-derived literals inline).
+const MAGIC: &[u8; 8] = b"NRESECK8";
+/// Earlier formats, still read (their integer-derived literals are in the dictionary):
+/// without the flags, without the text order, unaligned packed permutations, quad lists.
+const MAGIC_V7: &[u8; 8] = b"NRESECK7";
 const MAGIC_V6: &[u8; 8] = b"NRESECK6";
+/// Flags bit: integer-derived literals are dictionary entries.
+const INTEGERS_IN_DICTIONARY: u64 = 1;
 const MAGIC_V5: &[u8; 8] = b"NRESECK5";
 const MAGIC_V4: &[u8; 8] = b"NRESECK4";
 /// Magic prefix shared by every checkpoint format version.
@@ -301,6 +308,11 @@ pub(crate) fn write_parts<'a>(
     };
     out.buffer.extend_from_slice(MAGIC);
     put_u64(&mut out.buffer, revision);
+    let flags = match dictionary.integers_in_dictionary() {
+        true => INTEGERS_IN_DICTIONARY,
+        false => 0,
+    };
+    put_u64(&mut out.buffer, flags);
     write_dictionary(&mut out, dictionary, dictionary_len)?;
     for stack in Stack::ALL {
         let permutations = stack.layout().permutations();
@@ -329,6 +341,8 @@ pub(crate) fn write_parts<'a>(
 pub(crate) struct Loaded {
     pub revision: u64,
     pub stacks: Stacks,
+    /// The store keeps integer-derived literals in its dictionary.
+    pub integers_in_dictionary: bool,
 }
 
 /// The index stacks of a checkpoint.
@@ -373,11 +387,12 @@ pub(crate) fn load_latest(
         .split_at_checked(bytes.len().saturating_sub(4))
         .ok_or_else(|| corrupt("truncated"))?;
     let mut reader = Reader::new(body);
-    let (packed, aligned, with_order) = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC => (true, true, true),
-        Some(magic) if magic == MAGIC_V6 => (true, true, false),
-        Some(magic) if magic == MAGIC_V5 => (true, false, false),
-        Some(magic) if magic == MAGIC_V4 => (false, false, false),
+    let (packed, aligned, with_order, with_flags) = match reader.bytes(MAGIC.len()) {
+        Some(magic) if magic == MAGIC => (true, true, true, true),
+        Some(magic) if magic == MAGIC_V7 => (true, true, true, false),
+        Some(magic) if magic == MAGIC_V6 => (true, true, false, false),
+        Some(magic) if magic == MAGIC_V5 => (true, false, false, false),
+        Some(magic) if magic == MAGIC_V4 => (false, false, false, false),
         Some(magic) if magic.starts_with(FAMILY) => {
             return Err(EngineError::UnsupportedFormat(path));
         }
@@ -392,6 +407,16 @@ pub(crate) fn load_latest(
     }
     lap("crc");
     let revision = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
+    let integers_in_dictionary = match with_flags {
+        true => {
+            let flags = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
+            if flags & !INTEGERS_IN_DICTIONARY != 0 {
+                return Err(corrupt("unknown flags"));
+            }
+            flags & INTEGERS_IN_DICTIONARY != 0
+        }
+        false => true,
+    };
     if aligned {
         let base =
             read_dictionary(&mut reader, &map, with_order).map_err(|error| corrupt(&error))?;
@@ -425,6 +450,7 @@ pub(crate) fn load_latest(
         return Ok(Some(Loaded {
             revision,
             stacks: Stacks::Packed(stacks),
+            integers_in_dictionary,
         }));
     }
     let count = reader.u64().ok_or_else(|| corrupt("truncated quads"))?;
@@ -446,6 +472,7 @@ pub(crate) fn load_latest(
     Ok(Some(Loaded {
         revision,
         stacks: Stacks::Quads { quads, inferred },
+        integers_in_dictionary,
     }))
 }
 
@@ -496,6 +523,7 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
         return Err(corrupt("bad magic"));
     }
     reader.u64().ok_or_else(|| corrupt("truncated header"))?;
+    reader.u64().ok_or_else(|| corrupt("truncated header"))?; // flags: this engine's
     let base = read_dictionary(&mut reader, &map, true).map_err(|error| corrupt(&error))?;
     let [asserted, inferred] =
         read_stacks(&mut reader, body, Some(&map), false).map_err(|error| corrupt(&error))?;

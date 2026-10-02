@@ -54,6 +54,13 @@ pub enum TermKind {
     TypedLiteral = 10,
     /// A triple term (RDF 1.2); after the literals, as SPARQL 1.2 orders terms.
     Triple = 11,
+    /// Inline canonical literals of the datatypes derived from `xsd:integer` (`xsd:int`,
+    /// `xsd:long`, `xsd:nonNegativeInteger`, ...): the value (56-bit, offset binary) and a
+    /// datatype code below it, so ids sort by value. A store created before this kind
+    /// keeps such literals in the dictionary ([`TypedLiteral`](Self::TypedLiteral)) for
+    /// its whole life (`Dictionary::integers_in_dictionary`). The tag comes after the
+    /// others, which older stores already use.
+    DerivedInteger = 12,
 }
 
 impl TermKind {
@@ -71,6 +78,7 @@ impl TermKind {
             9 => Self::LangString,
             10 => Self::TypedLiteral,
             11 => Self::Triple,
+            12 => Self::DerivedInteger,
             _ => return None,
         })
     }
@@ -97,7 +105,12 @@ impl TermKind {
     pub const fn is_inline(self) -> bool {
         matches!(
             self,
-            Self::Integer | Self::Boolean | Self::Decimal | Self::Date | Self::DateTime
+            Self::Integer
+                | Self::Boolean
+                | Self::Decimal
+                | Self::Date
+                | Self::DateTime
+                | Self::DerivedInteger
         )
     }
 }
@@ -138,9 +151,21 @@ impl TermId {
         self.0 == 0
     }
 
-    /// Value of an inline integer term, if this is one.
+    /// Value of an inline integer term (`xsd:integer` or a datatype derived from it), if
+    /// this is one.
     pub fn as_inline_integer(self) -> Option<i64> {
-        (self.kind() == TermKind::Integer).then(|| inline::decode_integer(self.payload()))
+        match self.kind() {
+            TermKind::Integer => Some(inline::decode_integer(self.payload())),
+            TermKind::DerivedInteger => Some(inline::decode_derived(self.payload()).0),
+            _ => None,
+        }
+    }
+
+    /// The ids of inline integer-derived literals ([`TermKind::DerivedInteger`]) with a
+    /// value in `low..=high`, as one range (the value leads the payload); values beyond
+    /// the inline range are clamped to it.
+    pub fn derived_integer_range(low: i64, high: i64) -> Option<(Self, Self)> {
+        inline::derived_range(low, high)
     }
 
     /// The inline id of the canonical integer `value`, if it is in the inline range. Inline

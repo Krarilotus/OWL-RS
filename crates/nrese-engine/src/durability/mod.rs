@@ -116,6 +116,9 @@ impl Durable {
             );
         }
         let clock = std::time::Instant::now();
+        // The store's encoding of integer-derived literals: its checkpoint's, else its
+        // first WAL segment's, else (a new store) inline.
+        let mut integers_in_dictionary = loaded.as_ref().map(|l| l.integers_in_dictionary);
         let mut version = match loaded {
             Some(loaded) => {
                 let (asserted, inferred) = match loaded.stacks {
@@ -163,6 +166,19 @@ impl Durable {
         let last = segments.len().checked_sub(1);
         for (position, (_, path)) in segments.iter().enumerate() {
             let contents = wal::read_segment(path)?;
+            if contents.valid_len > 0 {
+                match integers_in_dictionary {
+                    None => integers_in_dictionary = Some(contents.integers_in_dictionary),
+                    Some(store) if store != contents.integers_in_dictionary => {
+                        return Err(EngineError::Corruption(format!(
+                            "{} encodes integer-derived literals unlike the rest of the store",
+                            path.display()
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            }
+            dictionary.set_integers_in_dictionary(integers_in_dictionary.unwrap_or(false));
             for record in contents.records {
                 if record.revision <= version.revision {
                     continue; // covered by the checkpoint
@@ -189,11 +205,14 @@ impl Durable {
             }
         }
 
+        let integers_in_dictionary = integers_in_dictionary.unwrap_or(false);
+        dictionary.set_integers_in_dictionary(integers_in_dictionary);
         let wal = Wal::open(
             &wal_dir,
             version.revision + 1,
             config.wal_segment_bytes,
             config.sync,
+            integers_in_dictionary,
         )?;
         Ok(Recovered {
             durable: Self {

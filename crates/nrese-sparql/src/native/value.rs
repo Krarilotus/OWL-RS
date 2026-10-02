@@ -43,7 +43,7 @@ pub enum Value {
 }
 
 /// Datatypes derived from `xsd:integer` that SPARQL treats as integers.
-const INTEGER_TYPES: [&str; 12] = [
+const INTEGER_TYPES: [&str; 13] = [
     "http://www.w3.org/2001/XMLSchema#integer",
     "http://www.w3.org/2001/XMLSchema#long",
     "http://www.w3.org/2001/XMLSchema#int",
@@ -56,6 +56,7 @@ const INTEGER_TYPES: [&str; 12] = [
     "http://www.w3.org/2001/XMLSchema#unsignedLong",
     "http://www.w3.org/2001/XMLSchema#unsignedInt",
     "http://www.w3.org/2001/XMLSchema#unsignedShort",
+    "http://www.w3.org/2001/XMLSchema#unsignedByte",
 ];
 
 impl Value {
