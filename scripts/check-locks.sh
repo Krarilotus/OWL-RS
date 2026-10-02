@@ -12,7 +12,9 @@
 #   scripts/check-locks.sh --fix    update the stale ones (only what changed)
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# A native Windows path under Git Bash (`pwd -W`): cargo can't read `/c/...` paths when
+# path conversion is off (MSYS_NO_PATHCONV=1, inherited by the git hooks).
+ROOT="$(cd "$(dirname "$0")/.." && { pwd -W 2>/dev/null || pwd; })"
 failed=0
 for manifest in "$ROOT/Cargo.toml" "$ROOT"/benches/*/Cargo.toml "$ROOT/fuzz/Cargo.toml"; do
   grep -q '^\[workspace\]' "$manifest" 2>/dev/null || [ "$manifest" = "$ROOT/Cargo.toml" ] || continue
