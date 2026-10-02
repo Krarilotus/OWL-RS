@@ -64,7 +64,7 @@ impl SparqlParser {
 
     /// The IRI relative IRIs resolve against, unless the text declares its own `BASE`.
     pub fn with_base_iri(mut self, base_iri: impl Into<String>) -> Result<Self, IriParseError> {
-        self.base_iri = Some(Iri::parse(base_iri.into())?);
+        self.base_iri = Some(query::absolute(Iri::parse(base_iri.into())?));
         Ok(self)
     }
 

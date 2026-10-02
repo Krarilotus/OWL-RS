@@ -325,9 +325,19 @@ impl<R: BufRead> RdfXmlParser<R> {
             return Err(self.error(format!("rdf:nodeID {label:?} is not an XML name")));
         }
         let mut out = String::new();
-        Ok(BlankNode::new_unchecked(
-            self.settings.blank_nodes.name(label, &mut out),
-        ))
+        let name = self.settings.blank_nodes.name(label, &mut out);
+        if BlankNode::new(name).is_ok() {
+            return Ok(BlankNode::new_unchecked(name));
+        }
+        // An XML name that isn't a blank node label (`object.`: N-Triples labels can't end
+        // with a dot): named from the document's key and the name, in hex, so that every
+        // writer can write it and the same name stays the same node (found by fuzzing,
+        // `nrese-fuzz`).
+        let hex: String = label.bytes().map(|b| format!("{b:02x}")).collect();
+        Ok(BlankNode::new_unchecked(format!(
+            "r{:016x}n{hex}",
+            self.generated_key
+        )))
     }
 
     /// The IRI `rdf:ID` makes: the base with the fragment `id`, once per document.
@@ -657,8 +667,18 @@ impl<R: BufRead> RdfXmlParser<R> {
                     ));
                 }
                 (XML, "lang") => {
-                    inherited.language = (!attribute.value.is_empty())
-                        .then(|| Arc::from(attribute.value.to_ascii_lowercase()));
+                    // XML allows any text here; RDF only BCP 47 tags (as the other readers).
+                    let tag = attribute.value.to_ascii_lowercase();
+                    if !tag.is_empty()
+                        && !self.settings.unchecked
+                        && !nrese_rdf::language::is_well_formed(&tag)
+                    {
+                        return Err(self.error(format!(
+                            "xml:lang {:?} is not a BCP 47 language tag",
+                            attribute.value
+                        )));
+                    }
+                    inherited.language = (!tag.is_empty()).then(|| Arc::from(tag));
                 }
                 (RDF, "version") => inherited.version = Some(Arc::from(attribute.value.as_str())),
                 _ => {}

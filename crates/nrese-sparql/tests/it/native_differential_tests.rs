@@ -5395,3 +5395,47 @@ fn a_path_bound_at_both_ends_is_followed_from_the_smaller_end() {
         path.detail
     );
 }
+
+/// Long operator chains (found by fuzzing, `nrese-fuzz`): a chain is a tree as deep as it
+/// is long, and evaluating, printing and dropping it recurse on its depth, so 1,500 `1 +`
+/// overflowed a 2 MiB thread and took the process down. `||` and `&&` chains are balanced
+/// (log n deep) and any length works; arithmetic chains count against the nesting limit.
+/// Each chain prints as text that reads back the same (`!!x`, not `!(!(x))`).
+#[test]
+fn long_operator_chains_neither_overflow_nor_print_unreadably() {
+    let stack = if cfg!(debug_assertions) {
+        16 << 20
+    } else {
+        2 << 20
+    };
+    std::thread::Builder::new()
+        .stack_size(stack)
+        .spawn(|| {
+            let engine = Engine::new(EngineConfig::default()).unwrap();
+            let snapshot = engine.snapshot();
+            let parser = SparqlParser::new();
+            let alternatives = (0..10_000)
+                .map(|i| format!("?x = {i}"))
+                .collect::<Vec<_>>()
+                .join(" || ");
+            let text = format!("SELECT * {{ VALUES ?x {{ 9999 10000 }} FILTER({alternatives}) }}");
+            let query = parser.parse_query(&text).unwrap();
+            let answers = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            assert_eq!(answers.len(), 1);
+            let printed = query.to_string();
+            assert_eq!(parser.parse_query(&printed).unwrap().to_string(), printed);
+            let arithmetic = format!("SELECT ({} AS ?y) {{}}", vec!["1"; 200].join(" + "));
+            let error = parser.parse_query(&arithmetic).unwrap_err();
+            assert!(error.message().contains("nested deeper"), "{error}");
+            let negations = format!("SELECT ({}true AS ?y) {{}}", "!".repeat(100));
+            let printed = parser.parse_query(&negations).unwrap().to_string();
+            assert!(printed.contains(&"!".repeat(100)), "{printed}");
+            assert_eq!(parser.parse_query(&printed).unwrap().to_string(), printed);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
