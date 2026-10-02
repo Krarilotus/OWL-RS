@@ -27,7 +27,6 @@
 //! are kept in `rdf4j-namespaces.json` in an on-disk store's directory (in memory
 //! otherwise), written whole at every change.
 
-
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};

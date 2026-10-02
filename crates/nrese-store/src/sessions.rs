@@ -31,7 +31,14 @@ pub struct Sessions {
 impl std::fmt::Debug for Sessions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sessions")
-            .field("open", &self.open.lock().unwrap_or_else(PoisonError::into_inner).len())
+            .field(
+                "open",
+                &self
+                    .open
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len(),
+            )
             .finish()
     }
 }
@@ -74,7 +81,12 @@ impl Sessions {
 
     /// Appends `ops` to session `id`; `false` if there is no such session.
     pub fn add(&self, id: &str, ops: Vec<StatementOp>) -> bool {
-        match self.open.lock().unwrap_or_else(PoisonError::into_inner).get_mut(id) {
+        match self
+            .open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(id)
+        {
             Some(session) => {
                 session.ops.extend(ops);
                 session.touched = Instant::now();
@@ -86,7 +98,12 @@ impl Sessions {
 
     /// Keeps session `id` alive; `false` if there is no such session.
     pub fn ping(&self, id: &str) -> bool {
-        match self.open.lock().unwrap_or_else(PoisonError::into_inner).get_mut(id) {
+        match self
+            .open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(id)
+        {
             Some(session) => {
                 session.touched = Instant::now();
                 true
@@ -105,20 +122,31 @@ impl Sessions {
 
     /// Closes session `id` and returns its operations to commit, if it was open.
     pub fn take(&self, id: &str) -> Option<StatementsRequest> {
-        self.open.lock().unwrap_or_else(PoisonError::into_inner).remove(id).map(|session| StatementsRequest {
-            ops: session.ops,
-            writable: None,
-        })
+        self.open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
+            .map(|session| StatementsRequest {
+                ops: session.ops,
+                writable: None,
+            })
     }
 
     /// Closes session `id` without committing; whether it was open.
     pub fn rollback(&self, id: &str) -> bool {
-        self.open.lock().unwrap_or_else(PoisonError::into_inner).remove(id).is_some()
+        self.open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
+            .is_some()
     }
 
     /// The number of open sessions (idle ones included until the next `begin`).
     pub fn len(&self) -> usize {
-        self.open.lock().unwrap_or_else(PoisonError::into_inner).len()
+        self.open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -135,7 +163,10 @@ mod tests {
     fn sessions_collect_operations_until_commit_or_rollback() {
         let sessions = Sessions::default();
         let id = sessions.begin();
-        assert!(sessions.add(&id, vec![StatementOp::RemoveMatching(StatementPattern::default())]));
+        assert!(sessions.add(
+            &id,
+            vec![StatementOp::RemoveMatching(StatementPattern::default())]
+        ));
         assert_eq!(sessions.pending(&id).map(|ops| ops.len()), Some(1));
         let other = sessions.begin();
         assert_ne!(id, other);
