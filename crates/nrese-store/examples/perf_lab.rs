@@ -4,7 +4,7 @@
 //! cargo run --release -p nrese-store --example perf_lab -- \
 //!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
-//!     [--explain] [--format tsv|json|xml|csv] [--shapes FILE]
+//!     [--explain] [--format tsv|json|xml|csv] [--shapes FILE] [--reason RULESET]
 //! ```
 //!
 //! - **Data:** `--load` bulk-loads files, into memory or, with `--store`, into an on-disk
@@ -19,6 +19,8 @@
 //!   data against it (`--runs` times), before the queries.
 //!   `--format` serialises SELECT results in another format than TSV (JSON is what most
 //!   clients ask for).
+//!   `--reason` materialises a ruleset (`owl2-rl`, `rdfs`, ...) after the load, timed, and
+//!   the queries read the materialised data (the default read model).
 //!   `--explain` prints each query's plan after its measurement: every operator with its
 //!   estimated and actual rows and its time (inputs included), where the time goes when a
 //!   profiler isn't at hand.
@@ -56,6 +58,7 @@ struct Args {
     explain: bool,
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
+    reason: Option<nrese_reasoner::v2::rulesets::Ruleset>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -73,6 +76,7 @@ fn parse_args() -> Result<Args, String> {
         explain: false,
         format: SolutionsResultFormat::Tsv,
         shapes: None,
+        reason: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -93,6 +97,13 @@ fn parse_args() -> Result<Args, String> {
             "--baseline" => args.baseline = Some(value()?.into()),
             "--explain" => args.explain = true,
             "--shapes" => args.shapes = Some(value()?.into()),
+            "--reason" => {
+                let name = value()?;
+                args.reason = Some(
+                    nrese_reasoner::v2::rulesets::Ruleset::from_name(&name)
+                        .ok_or(format!("--reason: unknown ruleset {name}"))?,
+                );
+            }
             "--format" => {
                 args.format = match value()?.as_str() {
                     "tsv" => SolutionsResultFormat::Tsv,
@@ -323,6 +334,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         load_s = started.elapsed().as_secs_f64();
         eprintln!("loaded {} quads in {load_s:.2} s", report.inserted);
+    }
+    if let Some(ruleset) = args.reason {
+        let started = Instant::now();
+        let report = store.rematerialise(ruleset)?;
+        eprintln!(
+            "reasoned ({}): {} inferred in {:.2} s",
+            ruleset.name(),
+            report.inferred,
+            started.elapsed().as_secs_f64()
+        );
     }
     if let Some(shapes) = &args.shapes {
         store.bulk_load(&BulkLoadRequest {
