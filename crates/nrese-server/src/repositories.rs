@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService};
+use nrese_reasoner::ReasonerService;
 use nrese_store::{MutationPipeline, StoreConfig, StoreMode, StoreService};
 use parking_lot::RwLock;
 
@@ -103,8 +103,8 @@ impl Repositories {
     /// Opens (or creates) repository `id`'s store and brings its inferences in line with
     /// its reasoning, as the server does for the default store at start.
     fn start(&self, id: &str, settings: RepositorySettings) -> Result<Repository, String> {
-        let reasoner = match settings.reasoning_mode() {
-            Some(mode) => ReasonerService::new(ReasonerConfig::for_mode(mode)),
+        let reasoner = match settings.reasoner_config()? {
+            Some(config) => ReasonerService::new(config),
             None => self.reasoner.clone(),
         };
         let config = StoreConfig {
