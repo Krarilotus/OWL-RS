@@ -67,6 +67,7 @@ fn map_error(policy: &PolicyConfig, error: MutationError, timeout_message: &str)
             ApiError::reasoner_reject(reject.detail, reject.explanation, reject.attribution)
         }
         MutationError::Cancelled => ApiError::timeout(timeout_message.to_owned()),
+        error @ MutationError::Retired => ApiError::unavailable(error.to_string()),
         error @ (MutationError::Gate(_) | MutationError::Poisoned) => {
             ApiError::internal(error.to_string())
         }

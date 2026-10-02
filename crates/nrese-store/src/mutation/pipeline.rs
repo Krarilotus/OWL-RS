@@ -36,6 +36,9 @@ pub struct MutationPipeline {
     /// outside the pipeline (bulk loads, rematerialisation) change the revision, which
     /// invalidates it.
     ground: std::sync::Mutex<Option<(u64, nrese_reasoner::v2::eval::GroundProgram)>>,
+    /// Set when another pipeline (other rules) took over the store: writes are refused
+    /// from then on, so none applies this pipeline's rules to a stack made for others.
+    retired: std::sync::atomic::AtomicBool,
 }
 
 impl MutationPipeline {
@@ -46,6 +49,7 @@ impl MutationPipeline {
             last_reasoning_run: RwLock::new(None),
             program: std::sync::OnceLock::new(),
             ground: std::sync::Mutex::new(None),
+            retired: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -63,6 +67,18 @@ impl MutationPipeline {
             .read()
             .ok()
             .and_then(|slot| slot.clone())
+    }
+
+    /// Retires this pipeline: another one with other rules takes over its store, and this
+    /// one's writes are refused ([`MutationError::Retired`]) from now on.
+    pub fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether [`Self::retire`] was called.
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Applies `command` unless a gate rejects it or `ticket` is cancelled before the commit
@@ -98,6 +114,12 @@ impl MutationPipeline {
             }
         }
         let mut tx = self.store.engine().transaction();
+        // Checked with the writer slot held: a pipeline that took over the store
+        // rematerialises after retiring this one, so a write that got the slot before
+        // commits first and is recomputed, and one after is refused here.
+        if self.is_retired() {
+            return Err(MutationError::Retired);
+        }
         if ticket.is_cancelled() {
             return Err(MutationError::Cancelled);
         }

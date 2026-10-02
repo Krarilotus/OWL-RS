@@ -43,7 +43,21 @@ async fn run() -> Result<()> {
         tracing::info!(statements, output = %convert.output.display(), "converted");
         return Ok(());
     }
-    let config = ServerConfig::load(cli.config_path.as_deref())?;
+    let mut config = ServerConfig::load(cli.config_path.as_deref())?;
+    // The default repository's reasoning as changed through the engine API overrides the
+    // configuration's (it is kept in the data directory).
+    if let Some(settings) = nrese_server::repositories::stored_default_settings(&config.store)
+        .map_err(|error| anyhow::anyhow!(error))?
+        && let Some(reasoner) = settings
+            .reasoner_config()
+            .map_err(|error| anyhow::anyhow!(error))?
+    {
+        tracing::info!(
+            reasoning = ?reasoner.mode(),
+            "the default repository's stored settings choose its reasoning"
+        );
+        config.reasoner = reasoner;
+    }
     if cli.command == CliCommand::CheckConfig {
         // Loading validated everything; show what takes effect.
         print!("{}", config.summary());
