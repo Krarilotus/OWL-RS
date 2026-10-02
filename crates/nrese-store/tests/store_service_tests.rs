@@ -141,7 +141,7 @@ fn graph_store_named_graph_roundtrip() -> Result<(), Box<dyn std::error::Error>>
     assert_eq!(write_report.revision, 1);
 
     let read = service.execute_graph_read(
-        &nrese_store::ReadScope::All,
+        &nrese_store::ReadContext::all(),
         &GraphReadRequest {
             target: named_graph.clone(),
             format: nrese_store::GraphResultFormat::NTriples,
@@ -154,7 +154,7 @@ fn graph_store_named_graph_roundtrip() -> Result<(), Box<dyn std::error::Error>>
     assert!(delete_report.modified);
     assert_eq!(delete_report.revision, 2);
     let read_after_delete = service.execute_graph_read(
-        &nrese_store::ReadScope::All,
+        &nrese_store::ReadContext::all(),
         &GraphReadRequest {
             target: named_graph,
             format: nrese_store::GraphResultFormat::NTriples,
@@ -225,7 +225,7 @@ fn graph_write_replace_true_replaces_only_target_graph() -> Result<(), Box<dyn s
     })?;
 
     let named_read = service.execute_graph_read(
-        &nrese_store::ReadScope::All,
+        &nrese_store::ReadContext::all(),
         &GraphReadRequest {
             target: named_graph,
             format: nrese_store::GraphResultFormat::NTriples,
@@ -312,7 +312,7 @@ fn graph_write_replace_false_appends_to_existing_graph() -> Result<(), Box<dyn s
     })?;
 
     let read = service.execute_graph_read(
-        &nrese_store::ReadScope::All,
+        &nrese_store::ReadContext::all(),
         &GraphReadRequest {
             target: named_graph,
             format: nrese_store::GraphResultFormat::NTriples,
@@ -349,14 +349,14 @@ fn graph_delete_only_affects_target_named_graph() -> Result<(), Box<dyn std::err
     service.execute_graph_delete(&graph_one)?;
 
     let one_after = service.execute_graph_read(
-        &nrese_store::ReadScope::All,
+        &nrese_store::ReadContext::all(),
         &GraphReadRequest {
             target: graph_one,
             format: nrese_store::GraphResultFormat::NTriples,
         },
     )?;
     let two_after = service.execute_graph_read(
-        &nrese_store::ReadScope::All,
+        &nrese_store::ReadContext::all(),
         &GraphReadRequest {
             target: graph_two,
             format: nrese_store::GraphResultFormat::NTriples,

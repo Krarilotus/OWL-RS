@@ -65,10 +65,10 @@ async fn read_graph(
     let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let request = GraphReadRequest { target, format };
     let store = state.store();
-    let scope = access.read_scope();
+    let read = nrese_store::ReadContext::new(access.read_scope());
     let result = tokio::time::timeout(
         state.policy().timeouts.graph_read,
-        tokio::task::spawn_blocking(move || store.execute_graph_read(&scope, &request)),
+        tokio::task::spawn_blocking(move || store.execute_graph_read(&read, &request)),
     )
     .await
     .map_err(|_| ApiError::timeout("graph read exceeded policy timeout"))?
