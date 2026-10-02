@@ -61,9 +61,14 @@ pub(crate) fn autocomplete(
             entry.1 = label;
         }
     };
+    // Both indexes at once (each built at its first use, on every core).
+    let (label_hits, name_hits) = rayon::join(
+        || snapshot.text_search(&query),
+        || snapshot.iri_search(&query),
+    );
     // Matches come best first: the first `limit` resources of each kind are its best.
     let mut from_labels = 0;
-    for hit in snapshot.text_search(&query) {
+    for hit in label_hits {
         let literal = TermId::from_raw(hit.id);
         for &property in &labels {
             let pattern = QuadPattern {
@@ -84,7 +89,7 @@ pub(crate) fn autocomplete(
         }
     }
     let mut from_names = 0;
-    for hit in snapshot.iri_search(&query) {
+    for hit in name_hits {
         let iri = TermId::from_raw(hit.id);
         let described = QuadPattern {
             subject: Some(iri),

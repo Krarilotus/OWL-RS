@@ -468,6 +468,7 @@ impl Dictionary {
     /// The IRIs whose local name's words match `query`, best first; the index first takes
     /// in the IRIs interned since the last search.
     pub fn iri_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+        use rayon::prelude::*;
         if self.iri_text.read().covered() < self.len() {
             let mut text = self.iri_text.write();
             let inner = self.inner.read();
@@ -475,8 +476,11 @@ impl Dictionary {
             let mut start = text.covered();
             while start < end {
                 let stop = (start + TEXT_BATCH).min(end);
+                // The local names on every core: string work per IRI (25 M in DBpedia).
+                let inner_ref: &Inner = &inner;
                 let names: Vec<(u64, String)> = (start..stop)
-                    .filter_map(|index| match view_key(inner.key(index)) {
+                    .into_par_iter()
+                    .filter_map(|index| match view_key(inner_ref.key(index)) {
                         TermView::Iri(iri) => Some((index, super::text::local_name_text(iri)?)),
                         _ => None,
                     })
