@@ -1194,6 +1194,12 @@ fn dictionary_first_string_tests_equal_the_reference() {
         Literal::new_simple_literal("Saint Petersburg").into(),
         Literal::new_simple_literal("windsurf").into(),
         Literal::new_language_tagged_literal_unchecked("windsurf", "en").into(),
+        // For LCASE: other ASCII cases, and characters whose lower case holds an ASCII
+        // letter without being one (İ to i and a combining dot, the Kelvin sign to k).
+        Literal::new_simple_literal("SEMANTIC TOOLS").into(),
+        Literal::new_language_tagged_literal_unchecked("SemAnTiC web", "en").into(),
+        Literal::new_simple_literal("MİCHAEL").into(),
+        Literal::new_simple_literal("300 \u{212A}").into(),
     ];
     // Filler: the pattern is large against the few terms that pass, so the dictionary
     // pass runs (checked below by EXPLAIN).
@@ -1234,6 +1240,12 @@ fn dictionary_first_string_tests_equal_the_reference() {
         "\"de\" = LANG(?l)",
         "LANG(?l) = \"en\" && STRSTARTS(?l, \"filler 1\")",
         "LANG(?l) = \"fr\" && CONTAINS(STR(?l), \"Web\")",
+        "CONTAINS(LCASE(?l), \"semantic\")",
+        "STRSTARTS(LCASE(STR(?l)), \"semantic\")",
+        "STRENDS(LCASE(?l), \"web\")",
+        "CONTAINS(LCASE(?l), \"mi\")",
+        "CONTAINS(LCASE(?l), \"k\")",
+        "CONTAINS(LCASE(STR(?l)), \"semanticthing\")",
     ] {
         for pattern in [
             format!("?s <{EX}label> ?l"),
