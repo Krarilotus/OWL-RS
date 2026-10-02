@@ -98,6 +98,11 @@ pub(crate) struct PathEvaluator<'a> {
     pub(crate) snapshot: &'a Snapshot,
     pub(crate) model: ReadModel,
     pub(crate) graph: PathGraph<'a>,
+    /// A constant end of the path pattern: a zero-length step from it gives it, whether
+    /// the graph has it or not (§18.4: `:x p* ?y` binds `?y` to `:x`). A value bound by
+    /// other patterns has the zero-length step only as a node of the graph: the path is a
+    /// pattern of its own, which the join meets.
+    pub(crate) fixed: Option<u64>,
 }
 
 impl PathEvaluator<'_> {
@@ -146,9 +151,11 @@ impl PathEvaluator<'_> {
             .map(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()))
     }
 
-    /// True if `node` is a subject or object in the default graph.
+    /// True if `node` is a subject or object in the default graph (or the path pattern's
+    /// constant end, [`Self::fixed`]).
     fn is_node(&self, node: u64) -> bool {
-        self.quads(Some(node), None, None).next().is_some()
+        self.fixed == Some(node)
+            || self.quads(Some(node), None, None).next().is_some()
             || self.quads(None, None, Some(node)).next().is_some()
     }
 
