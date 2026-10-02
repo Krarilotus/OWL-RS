@@ -61,6 +61,12 @@ fn repository_routes() -> Router<AppState> {
             get(api_v1::server_files).post(api_v1::import_server_files),
         )
         .route("/reasoning/rematerialise", post(api_v1::rematerialise))
+        .route(
+            "/rules",
+            get(api_v1::rules_get)
+                .put(api_v1::rules_put)
+                .delete(api_v1::rules_delete),
+        )
         .route("/sessions", post(api_v1::session_begin))
         .route("/sessions/{session}", delete(api_v1::session_rollback))
         .route("/sessions/{session}/update", post(api_v1::session_update))

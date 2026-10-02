@@ -1035,3 +1035,100 @@ pub async fn shapes_delete(
     let target = shapes_target(&state)?;
     super::graph_store::delete_graph(state, authenticated, target).await
 }
+
+#[utoipa::path(get, path = "/api/v1/repositories/{id}/rules", tag = "reasoning",
+    params(("id" = String, Path, description = "The repository's id")),
+    responses((status = 200, description = "The repository's user rules", body = crate::repository_config::RepositoryRules),
+        (status = 404, description = "No user rules", body = crate::http::openapi::Problem)))]
+/// The repository's user rules (Notation3 or a GraphDB ruleset), as they were stored.
+pub async fn rules_get(
+    authenticated: crate::auth::Authenticated,
+    Repository(state): Repository,
+) -> Result<Response, ApiError> {
+    guard::enforce_query_read(&state, &authenticated).await?;
+    match state.repository_settings().rules {
+        Some(rules) => Ok(Json(rules).into_response()),
+        None => Err(ApiError::not_found("the repository has no user rules")),
+    }
+}
+
+#[utoipa::path(put, path = "/api/v1/repositories/{id}/rules", tag = "reasoning",
+    params(("id" = String, Path, description = "The repository's id"),
+        ("format" = Option<String>, Query, description = "`n3` or `pie`; else from `name`'s extension, else `n3`"),
+        ("name" = Option<String>, Query, description = "Shown in errors and diagnostics (default `rules`)")),
+    request_body(content = String, description = "The rules: a Notation3 document or a GraphDB ruleset (`.pie`)"),
+    responses((status = 200, description = "Stored; the inferences recomputed", body = RepositoryView),
+        (status = 400, description = "Rules that don't compile: the first problem, with its line and column; nothing changed", body = crate::http::openapi::Problem)))]
+/// Replaces the repository's user rules (administrators). They are compiled before they are
+/// stored, and take effect at once (the inferences recomputed). A GraphDB ruleset is the
+/// whole program; Notation3 rules add to the repository's ruleset. A repository without
+/// reasoning of its own gets what the rules need: `custom` for a ruleset, else the
+/// reasoning it has now.
+pub async fn rules_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: axum::extract::RawQuery,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    guard::enforce_admin_write(&state, &authenticated).await?;
+    let repository = state.for_repository(&id)?;
+    let pairs = super::rdf4j::pairs(&raw)?;
+    let param = |key: &str| {
+        pairs
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
+    let name = param("name").unwrap_or_else(|| "rules".to_owned());
+    let format = match param("format").as_deref() {
+        Some(format @ ("n3" | "pie")) => format.to_owned(),
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "rules are 'n3' or 'pie', not '{other}'"
+            )));
+        }
+        None if name.ends_with(".pie") => "pie".to_owned(),
+        None => "n3".to_owned(),
+    };
+    let text = String::from_utf8(body.to_vec())
+        .map_err(|_| ApiError::bad_request("the rules are not UTF-8"))?;
+    let mut settings = repository.repository_settings();
+    if settings.reasoning.is_none() {
+        settings.reasoning = Some(match (format.as_str(), repository.reasoner_mode_name()) {
+            ("pie", _) | (_, "disabled") => "custom".to_owned(),
+            (_, mode) => mode.to_owned(),
+        });
+    }
+    settings.rules = Some(crate::repository_config::RepositoryRules { name, format, text });
+    let changing = repository.clone();
+    tokio::task::spawn_blocking(move || changing.change_repository_settings(settings))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    repository_get(authenticated, State(state), Path(id)).await
+}
+
+#[utoipa::path(delete, path = "/api/v1/repositories/{id}/rules", tag = "reasoning",
+    params(("id" = String, Path, description = "The repository's id")),
+    responses((status = 204, description = "Removed; the inferences recomputed"),
+        (status = 404, description = "No user rules", body = crate::http::openapi::Problem)))]
+/// Removes the repository's user rules (administrators); its reasoning stays, but a
+/// `custom` repository (the rules alone) returns to the server's.
+pub async fn rules_delete(
+    authenticated: crate::auth::Authenticated,
+    Repository(state): Repository,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_admin_write(&state, &authenticated).await?;
+    let mut settings = state.repository_settings();
+    if settings.rules.take().is_none() {
+        return Err(ApiError::not_found("the repository has no user rules"));
+    }
+    // `custom` is the rules alone: without them, the server's reasoning.
+    if settings.reasoning.as_deref() == Some("custom") {
+        settings.reasoning = None;
+    }
+    tokio::task::spawn_blocking(move || state.change_repository_settings(settings))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(StatusCode::NO_CONTENT)
+}
