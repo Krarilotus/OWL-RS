@@ -15,6 +15,7 @@ pub mod batch;
 pub mod classify;
 pub mod delta;
 pub mod eval;
+pub mod explain;
 pub mod ir;
 pub mod lists;
 pub mod n3;

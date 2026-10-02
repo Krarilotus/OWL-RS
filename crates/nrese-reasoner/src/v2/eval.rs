@@ -1093,6 +1093,20 @@ impl GroundProgram {
         fact: Triple,
         limit: usize,
     ) -> Vec<Vec<Triple>> {
+        self.named_derivations(source, fact, limit)
+            .into_iter()
+            .map(|(_, body)| body)
+            .collect()
+    }
+
+    /// [`Self::derivation_bodies`], each with the name of the rule it instantiates
+    /// (`prp-trp` for transitivity): what explanations show.
+    pub fn named_derivations<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        limit: usize,
+    ) -> Vec<(String, Vec<Triple>)> {
         let mut producers = Vec::new();
         self.heads.matching_fact(fact, &mut producers);
         producers.sort_unstable();
@@ -1119,7 +1133,7 @@ impl GroundProgram {
                     .map(|atom| instantiate_head(atom, bindings))
                     .collect();
                 body.extend_from_slice(premises);
-                bodies.push(body);
+                bodies.push((rule.name.clone(), body));
                 bodies.len() >= limit
             });
             if bodies.len() >= limit {
