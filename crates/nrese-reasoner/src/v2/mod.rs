@@ -1279,6 +1279,131 @@ mod tests {
         assert!(rules.len() >= 8, "{violations} violations of {rules:?}");
     }
 
+    /// List axioms edited under the delta executor (the milestone review's R1): its list
+    /// rules follow the list's current members, as a rematerialisation's do, and commits
+    /// that touch list facts don't pile up copies of the list-derived consistency rules.
+    /// Both for short lists (a rule per pair) and long ones (one rule asking the members'
+    /// index).
+    #[test]
+    fn list_rules_follow_list_edits_under_the_delta_executor() {
+        use super::delta::{MemoryBase, Rules, program, update};
+
+        for n in [3, super::lists::PAIRWISE_MEMBERS + 50] {
+            let mut vocabulary = LocalVocabulary::default();
+            let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+            let lists = ListVocabulary::new(&mut vocabulary);
+            let schema = Schema::owl(&mut vocabulary);
+            let compiled = Rules {
+                rules: &rules,
+                lists: Some(&lists),
+                schema: &schema,
+            };
+            let closure =
+                |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema);
+            // AllDifferent(p0 … p(n-1)); the last member is `c` of the review's example.
+            let mut text = "_:d rdf:type owl:AllDifferent\n_:d owl:members _:l0\n".to_owned();
+            for i in 0..n {
+                let next = match i + 1 == n {
+                    true => "rdf:nil".to_owned(),
+                    false => format!("_:l{}", i + 1),
+                };
+                text.push_str(&format!(
+                    "_:l{i} rdf:first ex:p{i}\n_:l{i} rdf:rest {next}\n"
+                ));
+            }
+            let mut asserted = load(&mut vocabulary, &text);
+            asserted.sort_unstable();
+            let mut inferred = closure(&asserted).derived;
+            let mut cache = program(&MemoryBase::new(&asserted, &inferred), compiled);
+            // One commit through the cached program; checked against a rematerialisation.
+            // Returns the violations the commit reported and the number of consistency
+            // rules of the program after it.
+            let mut commit = |insert: &str, delete: &str, step: &str| -> (Vec<String>, usize) {
+                let insert = load(&mut vocabulary, insert);
+                let delete = load(&mut vocabulary, delete);
+                let mut after: Vec<Triple> = asserted
+                    .iter()
+                    .copied()
+                    .filter(|f| !delete.contains(f))
+                    .chain(insert.iter().copied())
+                    .collect();
+                after.sort_unstable();
+                after.dedup();
+                let new: Vec<Triple> = insert
+                    .iter()
+                    .copied()
+                    .filter(|f| inferred.binary_search(f).is_err())
+                    .collect();
+                let stack: Vec<Triple> = inferred
+                    .iter()
+                    .copied()
+                    .filter(|f| after.binary_search(f).is_err())
+                    .collect();
+                let result = update(
+                    &MemoryBase::new(&after, &stack),
+                    &new,
+                    &delete,
+                    compiled,
+                    Some(&cache),
+                );
+                let expected = closure(&after);
+                let removal: HashSet<Triple> = result.remove.iter().copied().collect();
+                let mut maintained: Vec<Triple> = stack
+                    .iter()
+                    .copied()
+                    .filter(|f| !removal.contains(f))
+                    .chain(result.insert.iter().copied())
+                    .collect();
+                maintained.sort_unstable();
+                maintained.dedup();
+                assert_eq!(maintained, expected.derived, "n = {n}, {step}");
+                let reported: HashSet<&Violation> = result.violations.iter().collect();
+                let holds: HashSet<&Violation> = expected.violations.iter().collect();
+                assert!(reported.is_subset(&holds), "n = {n}, {step}: {reported:?}");
+                if let Some(program) = result.program {
+                    cache = program;
+                }
+                asserted = after;
+                inferred = expected.derived;
+                let rules = result.violations.iter().map(|v| v.rule.clone()).collect();
+                (rules, cache.consistency.len())
+            };
+            // c leaves the list; then `p0 sameAs c` is consistent.
+            let (last, before) = (n - 1, n - 2);
+            let (reported, _) = commit(
+                &format!("_:l{before} rdf:rest rdf:nil"),
+                &format!(
+                    "_:l{before} rdf:rest _:l{last}\n_:l{last} rdf:first ex:p{last}\n_:l{last} rdf:rest rdf:nil"
+                ),
+                "c removed",
+            );
+            assert!(reported.is_empty(), "n = {n}: {reported:?}");
+            let (reported, _) = commit(&format!("ex:p0 owl:sameAs ex:p{last}"), "", "p0 sameAs c");
+            assert!(reported.is_empty(), "n = {n}, c is no member: {reported:?}");
+            // Commits touching other lists leave the consistency rules as they are.
+            let (_, settled) = commit("ex:x ex:p ex:y", "", "no list");
+            for i in 0..5 {
+                let (_, now) = commit(
+                    &format!(
+                        "ex:U{i} owl:unionOf _:u{i}\n_:u{i} rdf:first ex:A{i}\n_:u{i} rdf:rest rdf:nil"
+                    ),
+                    "",
+                    "another list",
+                );
+                assert_eq!(
+                    now, settled,
+                    "n = {n}: list commit {i} added consistency rules"
+                );
+            }
+            // A pair still in the list is inconsistent.
+            let (reported, _) = commit("ex:p0 owl:sameAs ex:p1", "", "p0 sameAs p1");
+            assert!(
+                reported.iter().any(|rule| rule == "eq-diff2"),
+                "n = {n}: {reported:?}"
+            );
+        }
+    }
+
     /// Random ontologies under random insert/delete sequences: after every change, the
     /// inferred facts the delta executor maintains equal a rematerialisation, and the
     /// violations it reports are exactly the new ones.
