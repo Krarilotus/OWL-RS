@@ -18,7 +18,7 @@ use crate::quad::{EncodedQuad, Key, Permutation};
 /// Deltas at least this large are sorted with all of the layout's permutations in parallel.
 const PARALLEL_BUILD_THRESHOLD: usize = 16 * 1024;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct PermutationRun {
     pub(crate) keys: PackedKeys,
     /// Bitset over `keys` positions; empty when the run has no tombstones.
@@ -177,6 +177,43 @@ impl Run {
     /// Number of entries (inserts + tombstones); the size used by the compaction policy.
     pub(crate) fn entries(&self) -> u64 {
         self.inserts + self.deletes
+    }
+
+    /// This run (of the default-graph layout) in the quad layout: SPOG, POSG and OSPG
+    /// shared or copied, the graph-first permutations from the graph-last ones with each
+    /// key's graph moved to the front, the same order since every graph is the default
+    /// one. Tombstones stay where they are.
+    pub(crate) fn with_quads_layout(&self) -> Self {
+        debug_assert_eq!(self.layout, Layout::DefaultGraph);
+        let built: Vec<(Permutation, PermutationRun)> = Layout::Quads
+            .permutations()
+            .par_iter()
+            .map(|&permutation| {
+                let run = match permutation.graph_last() {
+                    None => self.perms[permutation as usize].clone(),
+                    Some(last) => {
+                        let source = &self.perms[last as usize];
+                        PermutationRun {
+                            keys: PackedKeys::from_sorted_iter(
+                                source.keys.iter().map(|[a, b, c, g]| [g, a, b, c]),
+                            ),
+                            tombstones: source.tombstones.clone(),
+                        }
+                    }
+                };
+                (permutation, run)
+            })
+            .collect();
+        let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
+        for (permutation, run) in built {
+            perms[permutation as usize] = run;
+        }
+        Self {
+            layout: Layout::Quads,
+            perms,
+            inserts: self.inserts,
+            deletes: self.deletes,
+        }
     }
 
     /// Net contribution to the visible quad count.

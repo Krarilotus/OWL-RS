@@ -28,7 +28,7 @@ use parking_lot::Mutex;
 use crate::engine::{Stack, Version};
 use crate::error::{EngineError, EngineResult};
 use crate::index::compaction::merge_runs;
-use crate::index::{CompactionPolicy, IndexVersion};
+use crate::index::{CompactionPolicy, IndexVersion, Layout};
 use crate::term::Dictionary;
 use codec::CommitRecord;
 use wal::Wal;
@@ -134,7 +134,7 @@ impl Durable {
                 let (asserted, inferred) = match loaded.stacks {
                     checkpoint::Stacks::Packed([asserted, inferred]) => {
                         let index = |stack: Stack, packed| {
-                            IndexVersion::from_packed(stack.layout(), packed).map_err(|error| {
+                            checkpoint::stack_index(stack, packed).map_err(|error| {
                                 EngineError::Corruption(format!("checkpoint: {error}"))
                             })
                         };
@@ -144,9 +144,9 @@ impl Durable {
                         )
                     }
                     checkpoint::Stacks::Quads { quads, inferred } => (
-                        IndexVersion::from_quads(Stack::Asserted.layout(), quads),
+                        IndexVersion::from_quads(Layout::holding(&quads), quads),
                         IndexVersion::from_quads(
-                            Stack::Inferred.layout(),
+                            Layout::DefaultGraph,
                             inferred
                                 .into_iter()
                                 .map(|triple| triple.in_default_graph())
@@ -252,7 +252,13 @@ fn replay(
     for (offset, key) in record.keys.iter().enumerate() {
         dictionary.restore_key(record.dictionary_start + offset as u64, key)?;
     }
-    for (stack, run) in Stack::ALL.into_iter().zip(record.runs()) {
+    let asserted = match record.names_a_graph() {
+        true => version.asserted.with_quads_layout(),
+        false => version.asserted.clone(),
+    };
+    let runs = record.runs(asserted.layout());
+    version.asserted = asserted;
+    for (stack, run) in Stack::ALL.into_iter().zip(runs) {
         let mut index = version.stack(stack).with_run(run);
         while let Some(plan) = policy.plan(index.runs()) {
             let merged = merge_runs(&index.runs()[plan.window.clone()]);

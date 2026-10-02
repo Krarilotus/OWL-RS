@@ -2,9 +2,12 @@
 //!
 //! A bulk load whose quads outgrow its budget ([`DurabilityConfig::bulk_load_memory`]
 //! (crate::DurabilityConfig)) hands them over in chunks to a spilling thread. That thread
-//! sorts each chunk in every permutation of the layout and writes each permutation packed
-//! ([`PackedKeys`], 6 to 12 bytes per key) to its own file. At the end, each permutation
-//! is the merge of its chunk files, read through memory maps, with duplicates dropped.
+//! sorts each chunk in every permutation of the smallest layout that holds it and writes
+//! each permutation packed ([`PackedKeys`], 6 to 12 bytes per key) to its own file. At the
+//! end, each permutation is the merge of its chunk files, read through memory maps, with
+//! duplicates dropped. A chunk without named graphs gives the graph-first permutations of
+//! the quad layout (if another chunk needs that layout) from its graph-last ones, the
+//! graph moved to the front of each key: they sort alike when every graph is the default.
 //! The merged permutation is packed on the fly and goes into the checkpoint before the
 //! next is merged. So the load's quads take the budget plus one packed permutation,
 //! whatever the data's size, at the cost of writing and reading each key once more.
@@ -40,16 +43,16 @@ fn concat(batches: Vec<Vec<EncodedQuad>>) -> Vec<EncodedQuad> {
     quads
 }
 
-/// Chunks spilled to disk: per chunk, one packed file per permutation of the layout.
+/// Chunks spilled to disk: per chunk, one packed file per permutation of its layout.
 pub(crate) struct Spill {
     dir: PathBuf,
-    layout: Layout,
-    chunks: usize,
+    /// The layout of each chunk.
+    chunks: Vec<Layout>,
 }
 
 impl Spill {
     /// A new, empty spill directory under `root` (an old one is removed first).
-    fn create(root: &Path, layout: Layout) -> std::io::Result<Self> {
+    fn create(root: &Path) -> std::io::Result<Self> {
         let dir = root.join(SPILL_DIR);
         if dir.exists() {
             fs::remove_dir_all(&dir)?;
@@ -57,9 +60,16 @@ impl Spill {
         fs::create_dir_all(&dir)?;
         Ok(Self {
             dir,
-            layout,
-            chunks: 0,
+            chunks: Vec::new(),
         })
+    }
+
+    /// The layout of the merged quads: the quad layout if a chunk has a named graph.
+    pub(crate) fn layout(&self) -> Layout {
+        match self.chunks.contains(&Layout::Quads) {
+            true => Layout::Quads,
+            false => Layout::DefaultGraph,
+        }
     }
 
     fn path(&self, chunk: usize, permutation: Permutation) -> PathBuf {
@@ -67,43 +77,49 @@ impl Spill {
             .join(format!("chunk-{chunk:05}-{}.keys", permutation as usize))
     }
 
-    /// Sorts `quads` in every permutation and writes each, packed.
+    /// Sorts `quads` in every permutation of the smallest layout that holds them and writes
+    /// each, packed.
     fn write_chunk(&mut self, quads: Vec<EncodedQuad>) -> std::io::Result<()> {
+        let layout = Layout::holding(&quads);
+        let chunk = self.chunks.len();
         let mut builder = PermutationBuilder::new(quads);
-        for &permutation in self.layout.permutations() {
+        for &permutation in layout.permutations() {
             let packed = builder.packed(permutation);
-            let mut out = BufWriter::with_capacity(
-                1 << 20,
-                File::create(self.path(self.chunks, permutation))?,
-            );
+            let file = File::create(self.path(chunk, permutation))?;
+            let mut out = BufWriter::with_capacity(1 << 20, file);
             packed.write(Some(0), &mut |bytes| out.write_all(bytes))?;
             out.into_inner()
                 .map_err(|error| error.into_error())?
                 .sync_all()?;
         }
-        self.chunks += 1;
+        self.chunks.push(layout);
         Ok(())
     }
 
-    /// The keys of `permutation` over all chunks, in order, duplicates dropped, packed.
-    /// The permutation's chunk files go afterwards.
+    /// The keys of `permutation` (of [`layout`](Self::layout)) over all chunks, in order,
+    /// duplicates dropped, packed. The files stay until the spill is dropped: a graph-last
+    /// permutation's also answers its graph-first one.
     pub(crate) fn merged(&self, permutation: Permutation) -> std::io::Result<PackedKeys> {
-        let paths: Vec<PathBuf> = (0..self.chunks)
-            .map(|chunk| self.path(chunk, permutation))
-            .collect();
-        let mut cursors = Vec::with_capacity(paths.len());
-        for path in &paths {
-            let map = mapped::map(path)?;
+        let mut cursors = Vec::with_capacity(self.chunks.len());
+        for (chunk, layout) in self.chunks.iter().enumerate() {
+            let (file, rotate) = match layout.permutations().contains(&permutation) {
+                true => (permutation, false),
+                false => match permutation.graph_last() {
+                    Some(last) => (last, true),
+                    None => {
+                        return Err(std::io::Error::other(format!(
+                            "chunk {chunk} has no permutation {permutation:?}"
+                        )));
+                    }
+                },
+            };
+            let path = self.path(chunk, file);
+            let map = mapped::map(&path)?;
             let (keys, _) = PackedKeys::read(&map, Some(0), Some(&map), false)
                 .map_err(|error| std::io::Error::other(format!("{}: {error}", path.display())))?;
-            cursors.push(Cursor::new(keys));
+            cursors.push(Cursor::new(keys, rotate));
         }
-        let packed = PackedKeys::from_sorted_iter(Merge::new(cursors));
-        // The maps are gone with the cursors: the files can go (on Windows too).
-        for path in &paths {
-            fs::remove_file(path)?;
-        }
-        Ok(packed)
+        Ok(PackedKeys::from_sorted_iter(Merge::new(cursors)))
     }
 }
 
@@ -113,18 +129,21 @@ impl Drop for Spill {
     }
 }
 
-/// Keys of one chunk file in order, a block decoded at a time.
+/// Keys of one chunk file in order, a block decoded at a time; with `rotate`, each key's
+/// last component (the graph) moved to the front.
 struct Cursor {
     keys: PackedKeys,
+    rotate: bool,
     next: usize,
     block: Vec<Key>,
     at: usize,
 }
 
 impl Cursor {
-    fn new(keys: PackedKeys) -> Self {
+    fn new(keys: PackedKeys, rotate: bool) -> Self {
         Self {
             keys,
+            rotate,
             next: 0,
             block: Vec::with_capacity(crate::index::keys::BLOCK),
             at: 0,
@@ -140,6 +159,11 @@ impl Cursor {
             let end = end.min(self.keys.len());
             self.block.clear();
             self.keys.decode_range(self.next, end, &mut self.block);
+            if self.rotate {
+                for key in &mut self.block {
+                    key.rotate_right(1);
+                }
+            }
             self.next = end;
             self.at = 0;
         }
@@ -194,8 +218,8 @@ pub(super) struct Spiller {
 }
 
 impl Spiller {
-    pub(super) fn start(root: &Path, layout: Layout) -> std::io::Result<Self> {
-        let mut spill = Spill::create(root, layout)?;
+    pub(super) fn start(root: &Path) -> std::io::Result<Self> {
+        let mut spill = Spill::create(root)?;
         let threads = std::thread::available_parallelism().map_or(4, usize::from);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -247,9 +271,9 @@ mod tests {
     use super::*;
     use crate::TermId;
 
-    fn quad(s: u64, p: u64, o: u64) -> EncodedQuad {
+    fn quad(g: u64, s: u64, p: u64, o: u64) -> EncodedQuad {
         EncodedQuad {
-            graph: TermId::DEFAULT_GRAPH,
+            graph: TermId::from_raw(g),
             subject: TermId::from_raw(s),
             predicate: TermId::from_raw(p),
             object: TermId::from_raw(o),
@@ -257,32 +281,45 @@ mod tests {
     }
 
     /// Overlapping chunks merge into each permutation sorted and without duplicates, the
-    /// same as sorting everything at once.
+    /// same as sorting everything at once: in the default-graph layout while every chunk
+    /// is in the default graph, in the quad layout once one has a named graph (the others'
+    /// graph-first permutations then come from their graph-last ones).
     #[test]
     fn merged_chunks_equal_one_sort() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = Layout::Quads;
-        let mut spill = Spill::create(dir.path(), layout).unwrap();
-        let all: Vec<EncodedQuad> = (0..5000u64)
-            .map(|i| quad(1 + i % 97, 1 + i % 7, 1 + (i * 31) % 1009))
-            .collect();
-        for chunk in all.chunks(1700) {
-            let mut chunk = chunk.to_vec();
-            // Duplicates across chunks.
-            chunk.extend_from_slice(&all[..50]);
-            spill.write_chunk(chunk).unwrap();
+        for named in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut spill = Spill::create(dir.path()).unwrap();
+            let mut all: Vec<EncodedQuad> = (0..5000u64)
+                .map(|i| quad(0, 1 + i % 97, 1 + i % 7, 1 + (i * 31) % 1009))
+                .collect();
+            for chunk in all.chunks(1700) {
+                let mut chunk = chunk.to_vec();
+                // Duplicates across chunks.
+                chunk.extend_from_slice(&all[..50]);
+                spill.write_chunk(chunk).unwrap();
+            }
+            if named {
+                let graphs: Vec<EncodedQuad> = (0..300u64)
+                    .map(|i| quad(2000 + i % 3, 1 + i % 97, 1 + i % 7, 5 + i))
+                    .chain(all[..20].iter().copied())
+                    .collect();
+                spill.write_chunk(graphs.clone()).unwrap();
+                all.extend(graphs);
+            }
+            let layout = spill.layout();
+            assert_eq!(layout == Layout::Quads, named);
+            let mut builder = PermutationBuilder::new(all);
+            for &permutation in layout.permutations() {
+                let merged = spill.merged(permutation).unwrap();
+                let expected = builder.packed(permutation);
+                assert_eq!(merged.len(), expected.len(), "{permutation:?}");
+                assert!(
+                    (0..merged.len()).all(|i| merged.get(i) == expected.get(i)),
+                    "{permutation:?}"
+                );
+            }
+            drop(spill);
+            assert!(!dir.path().join(SPILL_DIR).exists());
         }
-        let mut builder = PermutationBuilder::new(all);
-        for &permutation in layout.permutations() {
-            let merged = spill.merged(permutation).unwrap();
-            let expected = builder.packed(permutation);
-            assert_eq!(merged.len(), expected.len(), "{permutation:?}");
-            assert!(
-                (0..merged.len()).all(|i| merged.get(i) == expected.get(i)),
-                "{permutation:?}"
-            );
-        }
-        drop(spill);
-        assert!(!dir.path().join(SPILL_DIR).exists());
     }
 }

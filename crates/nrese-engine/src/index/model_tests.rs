@@ -64,6 +64,16 @@ fn random_quad(layout: Layout, rng: &mut Rng) -> EncodedQuad {
 
 /// Applies a random batch as an exact delta, the way the transaction layer does.
 fn random_commit(layout: Layout, rng: &mut Rng, model: &mut BTreeSet<EncodedQuad>) -> Run {
+    let (inserts, deletes) = random_delta(layout, rng, model);
+    Run::from_delta(layout, &inserts, &deletes)
+}
+
+/// A random exact delta of quads `layout` can hold, applied to `model`: inserts, deletes.
+fn random_delta(
+    layout: Layout,
+    rng: &mut Rng,
+    model: &mut BTreeSet<EncodedQuad>,
+) -> (Vec<EncodedQuad>, Vec<EncodedQuad>) {
     let mut inserts = BTreeSet::new();
     let mut deletes = BTreeSet::new();
     for _ in 0..=rng.below(12) {
@@ -85,9 +95,7 @@ fn random_commit(layout: Layout, rng: &mut Rng, model: &mut BTreeSet<EncodedQuad
     for quad in &deletes {
         model.remove(quad);
     }
-    let inserts: Vec<_> = inserts.into_iter().collect();
-    let deletes: Vec<_> = deletes.into_iter().collect();
-    Run::from_delta(layout, &inserts, &deletes)
+    (inserts.into_iter().collect(), deletes.into_iter().collect())
 }
 
 fn all_patterns() -> Vec<QuadPattern> {
@@ -290,4 +298,43 @@ fn default_graph_layout_stores_four_of_seven_permutations() {
         IndexVersion::from_quads(Layout::Quads, quads.clone()).runs()[0].memory_bytes();
     let triples = IndexVersion::from_quads(Layout::DefaultGraph, quads);
     assert_eq!(triples.runs()[0].memory_bytes() * 7, quads_bytes * 4);
+}
+
+/// A default-graph version turns into a quad version at its first quad in a named graph:
+/// the same answers before and after in every permutation, tombstones and all, and its
+/// runs (converted and new) still compact.
+#[test]
+fn default_graph_versions_turn_into_quad_versions_at_a_named_graph() {
+    let policy = CompactionPolicy {
+        fanout: 2,
+        ..CompactionPolicy::default()
+    };
+    for seed in 200..230 {
+        let mut rng = Rng(seed);
+        let mut model = BTreeSet::new();
+        let mut version = IndexVersion::empty(Layout::DefaultGraph);
+        let mut named = false;
+        for step in 0..50 {
+            // Default-graph quads first, then any.
+            let layout = match step < 20 {
+                true => Layout::DefaultGraph,
+                false => Layout::Quads,
+            };
+            let (inserts, deletes) = random_delta(layout, &mut rng, &mut model);
+            named |= Layout::holding(&inserts) == Layout::Quads;
+            version = version.with_delta(&inserts, &deletes);
+            let expected = match named {
+                true => Layout::Quads,
+                false => Layout::DefaultGraph,
+            };
+            assert_eq!(version.layout(), expected, "seed {seed} step {step}");
+            if step % 3 == 0
+                && let Some(plan) = policy.plan(version.runs())
+            {
+                let merged = merge_runs(&version.runs()[plan.window.clone()]);
+                version = version.with_compacted(plan.window, merged);
+            }
+            assert_matches_model(&version, &model, &format!("seed {seed} step {step}"));
+        }
+    }
 }

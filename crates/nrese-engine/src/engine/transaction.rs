@@ -7,6 +7,7 @@ use parking_lot::MutexGuard;
 use super::{Inner, ReadModel, Snapshot, Stack, Version};
 use crate::durability::codec::CommitRecord;
 use crate::error::EngineResult;
+use crate::index::Layout;
 use crate::quad::{EncodedQuad, EncodedTriple, QuadPattern};
 use crate::term::TermId;
 
@@ -163,20 +164,13 @@ impl<'e> Transaction<'e> {
                 && self.base.stack_contains(Stack::Inferred, quad)
         }));
         let base = self.base.version();
-        let run = |stack: Stack, inserts: &[EncodedQuad], deletes: &[EncodedQuad]| {
-            crate::index::run::Run::from_delta(stack.layout(), inserts, deletes)
-        };
         let version = Version {
-            asserted: base.asserted.with_run(run(
-                Stack::Asserted,
-                &asserted_inserts,
-                &asserted_deletes,
-            )),
-            inferred: base.inferred.with_run(run(
-                Stack::Inferred,
-                &inferred_inserts,
-                &inferred_deletes,
-            )),
+            asserted: base
+                .asserted
+                .with_delta(&asserted_inserts, &asserted_deletes),
+            inferred: base
+                .inferred
+                .with_delta(&inferred_inserts, &inferred_deletes),
             revision: base.revision,
             dictionary_len: self.engine.shared.dictionary.len(),
         };
@@ -457,12 +451,24 @@ impl<'e> Transaction<'e> {
             inferred_inserts: triples(inferred.inserts),
             inferred_deletes: triples(inferred.deletes),
         };
-        let [asserted_run, inferred_run] = record.runs();
+        // The first quad in a named graph turns a default-graph asserted stack into a quad
+        // stack. No compaction or checkpoint may replace its runs meanwhile: the writer slot
+        // excludes other commits, the compaction slot both of those.
+        let latest = shared.versions.load();
+        let converting = latest.asserted.layout() == Layout::DefaultGraph && record.names_a_graph();
+        let _compaction = converting.then(|| shared.versions.compaction_slot.lock());
+        let converted = converting.then(|| shared.versions.load().asserted.with_quads_layout());
+        let asserted_layout = converted
+            .as_ref()
+            .map_or(latest.asserted.layout(), |index| index.layout());
+        drop(latest);
+        let [asserted_run, inferred_run] = record.runs(asserted_layout);
         let revision = record.revision;
         let publish = move |current: &Version| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
+            let asserted = converted.as_ref().unwrap_or(&current.asserted);
             Version {
-                asserted: current.asserted.with_run(asserted_run),
+                asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
                 dictionary_len,
@@ -480,6 +486,8 @@ impl<'e> Transaction<'e> {
                 0
             }
         };
+        // After the commit's own compaction slot (a conversion's): compacting takes it.
+        drop(_compaction);
         engine.after_commit(wal_bytes);
         Ok(summary)
     }

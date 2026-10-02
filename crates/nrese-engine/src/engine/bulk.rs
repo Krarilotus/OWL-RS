@@ -27,9 +27,9 @@ use super::spill::{Spill, Spiller};
 use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version};
 use crate::durability::checkpoint;
 use crate::error::{EngineError, EngineResult};
-use crate::index::IndexVersion;
 use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
+use crate::index::{IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
 
 /// Batches copied between releases of their memory ([`crate::memory`]): about 256 MiB at
@@ -126,7 +126,7 @@ impl<'e> BulkLoad<'e> {
             return;
         }
         if spiller.is_none() {
-            match Spiller::start(durable.root(), Stack::Asserted.layout()) {
+            match Spiller::start(durable.root()) {
                 Ok(started) => *spiller = Some(started),
                 Err(error) => {
                     *self.spill_failed.lock() = Some(error);
@@ -208,6 +208,7 @@ impl<'e> BulkLoad<'e> {
                     inferred_deleted: current.inferred.len(),
                 };
                 let next = Next::Streamed {
+                    layout: Layout::holding(&quads),
                     builder: PermutationBuilder::new(quads),
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
@@ -223,8 +224,8 @@ impl<'e> BulkLoad<'e> {
                     inferred_deleted: current.inferred.len(),
                 };
                 let next = Version {
-                    asserted: IndexVersion::from_quads(Stack::Asserted.layout(), quads),
-                    inferred: IndexVersion::empty(Stack::Inferred.layout()),
+                    asserted: IndexVersion::from_quads(Layout::holding(&quads), quads),
+                    inferred: IndexVersion::empty(Layout::DefaultGraph),
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                 };
@@ -250,11 +251,16 @@ impl<'e> BulkLoad<'e> {
                     inferred_inserted: 0,
                     inferred_deleted: explicit.len() as u64,
                 };
-                let asserted = Run::from_quads(Stack::Asserted.layout(), inserts);
-                let inferred = Run::from_delta(Stack::Inferred.layout(), &[], &explicit);
+                // The first quad in a named graph turns a default-graph stack into a quad
+                // stack.
+                let asserted = match Layout::holding(&inserts) {
+                    Layout::Quads => current.asserted.with_quads_layout(),
+                    Layout::DefaultGraph => current.asserted.clone(),
+                };
+                let run = Run::from_quads(asserted.layout(), inserts);
                 let next = Version {
-                    asserted: current.asserted.with_run(asserted),
-                    inferred: current.inferred.with_run(inferred),
+                    asserted: asserted.with_run(run),
+                    inferred: current.inferred.with_delta(&[], &explicit),
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                 };
@@ -306,7 +312,14 @@ fn publish_spilled(
 ) -> EngineResult<CommitSummary> {
     let revision = current.revision + 1;
     let dictionary_len = engine.shared.dictionary.len();
-    let inserted = publish_streamed(engine, Source::Spilled(spill), revision, dictionary_len)?;
+    let layout = spill.layout();
+    let inserted = publish_streamed(
+        engine,
+        Source::Spilled(spill),
+        layout,
+        revision,
+        dictionary_len,
+    )?;
     drop(compaction);
     let summary = CommitSummary {
         revision,
@@ -350,6 +363,8 @@ enum Next {
     /// written to the checkpoint and dropped before the next (durable, `map_checkpoints`).
     /// The load's peak then holds one packed permutation instead of all of them.
     Streamed {
+        /// The asserted stack's: the default-graph one unless a quad is in a named graph.
+        layout: Layout,
         builder: PermutationBuilder,
         revision: u64,
         dictionary_len: u64,
@@ -365,12 +380,13 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     let next = match next {
         Next::Built(version) => version,
         Next::Streamed {
+            layout,
             builder,
             revision,
             dictionary_len,
         } => {
-            return publish_streamed(engine, Source::Memory(builder), revision, dictionary_len)
-                .map(|_| ());
+            let source = Source::Memory(builder);
+            return publish_streamed(engine, source, layout, revision, dictionary_len).map(|_| ());
         }
     };
     let next = Arc::new(next);
@@ -425,28 +441,28 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     Ok(())
 }
 
-/// [`publish`] of [`Next::Streamed`]: the checkpoint written from `source`, then installed
-/// mapped. In memory (no checkpoint), the permutations are built into a version. Returns
-/// the number of quads.
+/// [`publish`] of [`Next::Streamed`]: the checkpoint written from `source`, the asserted
+/// stack in `layout`, then installed mapped. In memory (no checkpoint), the permutations
+/// are built into a version. Returns the number of quads.
 fn publish_streamed(
     engine: &Inner,
     mut source: Source,
+    layout: Layout,
     revision: u64,
     dictionary_len: u64,
 ) -> EngineResult<u64> {
     let shared = &engine.shared;
     let Some(durable) = &shared.durable else {
-        let layout = Stack::Asserted.layout();
         let packed = layout
             .permutations()
             .iter()
             .map(|&permutation| Ok((permutation, source.packed(permutation)?)))
             .collect::<EngineResult<Vec<_>>>()?;
-        let asserted = IndexVersion::from_packed(layout, packed)
-            .map_err(crate::error::EngineError::Corruption)?;
+        let asserted =
+            IndexVersion::from_packed(packed).map_err(crate::error::EngineError::Corruption)?;
         let next = Version {
             asserted,
-            inferred: IndexVersion::empty(Stack::Inferred.layout()),
+            inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision,
             dictionary_len,
         };
@@ -463,6 +479,7 @@ fn publish_streamed(
         revision,
         &shared.dictionary,
         dictionary_len,
+        [layout, Layout::DefaultGraph],
         &mut |stack, permutation| {
             Ok(match stack {
                 Stack::Asserted => {
@@ -588,7 +605,7 @@ impl<'e> Rematerialisation<'e> {
         }
         let next = Version {
             asserted: current.asserted.clone(),
-            inferred: IndexVersion::from_quads(Stack::Inferred.layout(), quads),
+            inferred: IndexVersion::from_quads(Layout::DefaultGraph, quads),
             revision: summary.revision,
             dictionary_len: shared.dictionary.len(),
         };

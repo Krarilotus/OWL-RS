@@ -188,9 +188,9 @@ impl Snapshot {
         permutation: Permutation,
     ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
         let plan = AccessPlan::in_permutation(pattern, permutation)?;
-        let supported = Stack::ALL
-            .into_iter()
-            .all(|stack| !model.includes(stack) || stack.layout().supports(permutation));
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+        });
         if !supported {
             return None;
         }
@@ -283,9 +283,9 @@ impl Snapshot {
             .zip(&plan.high)
             .take_while(|(l, h)| l == h)
             .count();
-        let supported = Stack::ALL
-            .into_iter()
-            .all(|stack| !model.includes(stack) || stack.layout().supports(permutation));
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+        });
         if bound >= 4 || plan.exclude_default_graph || !supported {
             return None;
         }
@@ -319,9 +319,9 @@ impl Snapshot {
         if bound >= 4 {
             return None;
         }
-        let supported = Stack::ALL
-            .into_iter()
-            .all(|stack| !model.includes(stack) || stack.layout().supports(permutation));
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+        });
         if !supported {
             return None;
         }
@@ -373,10 +373,9 @@ impl Snapshot {
         if plan.exclude_default_graph {
             return None;
         }
-        if Stack::ALL
-            .into_iter()
-            .any(|stack| model.includes(stack) && !stack.layout().supports(permutation))
-        {
+        if Stack::ALL.into_iter().any(|stack| {
+            model.includes(stack) && !self.version.stack(stack).layout().supports(permutation)
+        }) {
             return None;
         }
         self.columns_of_stacks(model, &plan, permutation, components)
@@ -481,9 +480,9 @@ impl Snapshot {
             .zip(&plan.high)
             .take_while(|(l, h)| l == h)
             .count();
-        let supported = Stack::ALL
-            .into_iter()
-            .all(|stack| !model.includes(stack) || stack.layout().supports(permutation));
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+        });
         if bound >= 4 || !supported {
             return None;
         }
