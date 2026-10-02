@@ -179,11 +179,21 @@ Still open:
   default: what a checkpoint holds is served from the file once written). Compaction
   into the base still writes a heap run until the next checkpoint; merged base runs
   written to files (LSM) would avoid that.
-- Bulk loads with bounded memory: the peak (6.0 GB for DBpedia) is now the heap
-  dictionary (2.3 GB, needed for interning) plus one array of the loaded quads (2.2 GB,
-  sorted once per permutation) plus one packed permutation. Below that takes an external
-  sort, as QLever's index builder does: sorted runs of quads spilled to disk and merged
-  into each permutation, and the dictionary built from sorted, spilled term runs (ids
-  assigned after the sort). That would bound the load by a configurable budget at the
-  cost of disk passes; worth it for datasets beyond the machine's memory.
+- Bulk loads with bounded memory, first part done (2 October): the loaded quads.
+  `budgets.bulk_load_memory` (default 25 % of the machine) bounds them: past it they are
+  sorted in chunks of a third of it on a spilling thread with its own pool, each
+  permutation packed into its own file, and merged into each permutation while the
+  checkpoint is written (`engine/spill.rs`). DBpedia core (67 M) on the office PC:
+
+  | Budget | Load | Peak RSS |
+  |---|---:|---:|
+  | none | 38.8 s | 5.46 GB |
+  | 2 GiB | 43.9 s | 4.43 GB |
+  | 1 GiB | 43.5 s | 4.11 GB |
+  | 512 MiB | 44.6 s | 4.21 GB |
+
+  The floor left is the heap dictionary (2.3 GB, needed for interning) plus one merged
+  packed permutation. Bounding the dictionary takes ids assigned after an external sort
+  of the terms, as QLever's vocabulary merge does (per-batch vocabularies, merged, ids
+  rewritten), or an arena in a file the OS can page.
 - The remeasurement of every gap in the suite, with cache on and off, after batch A.

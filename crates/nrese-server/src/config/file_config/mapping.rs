@@ -301,6 +301,7 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
             budgets.total_query_memory,
             "",
         ),
+        (names::BULK_LOAD_MEMORY, budgets.bulk_load_memory, ""),
         (
             names::QUERY_TIMEOUT_MS,
             budgets.query_timeout,

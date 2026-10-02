@@ -62,6 +62,14 @@ pub struct DurabilityConfig {
     /// are freed once no snapshot holds them. Memory then grows with what queries touch,
     /// and the OS can page the rest out. Off: the data stays in memory too.
     pub map_checkpoints: bool,
+    /// Memory for a bulk load's quads, in bytes (`None`: no limit). A load into an empty
+    /// store, or one replacing its data, whose quads outgrow it sorts them in chunks of a
+    /// third of it (one filling, one being sorted, and its sorted copy) spilled to the
+    /// store's directory, and merges them into each permutation
+    /// ([`crate::engine::bulk`]): slower by a pass over the disk, but its quads then take
+    /// this much plus one packed permutation, however large the data. The dictionary is
+    /// apart: it grows with the distinct terms. Needs `map_checkpoints`.
+    pub bulk_load_memory: Option<u64>,
 }
 
 impl Default for DurabilityConfig {
@@ -72,6 +80,7 @@ impl Default for DurabilityConfig {
             checkpoint_after_wal_bytes: 256 << 20,
             verify_on_open: false,
             map_checkpoints: true,
+            bulk_load_memory: None,
         }
     }
 }
@@ -106,6 +115,7 @@ impl Durable {
             return Err(EngineError::Locked(root.to_path_buf()));
         }
         checkpoint::remove_temporaries(root)?;
+        crate::engine::spill::remove_leftovers(root)?;
         let timing = std::env::var_os("NRESE_RECOVERY_TIMING").is_some();
         let clock = std::time::Instant::now();
         let loaded = checkpoint::load_latest(root, dictionary, config.verify_on_open)?;

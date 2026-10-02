@@ -30,6 +30,9 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         )?,
         verify_on_open: parse_bool(source, names::VERIFY_ON_OPEN, defaults.verify_on_open)?,
         map_checkpoints: parse_bool(source, names::MAP_CHECKPOINTS, defaults.map_checkpoints)?,
+        bulk_load_memory_bytes: parse_bulk_load_memory(
+            source.get(names::BULK_LOAD_MEMORY).as_deref(),
+        )?,
         shacl_gate: parse_shacl_gate(
             source.get(names::SHACL_GATE).as_deref(),
             source.get(names::SHACL_GATE_SEVERITY).as_deref(),
@@ -132,6 +135,17 @@ pub const DEFAULT_TOTAL_QUERY_MEMORY: &str = "50%";
 
 /// Bytes or a share of the machine's memory; `0` is unlimited, and so is a share where
 /// the machine's memory isn't known.
+/// What a bulk load's quads may take before they are spilled to disk: a size or a share of
+/// the memory the server may use, `0` for no limit.
+pub const DEFAULT_BULK_LOAD_MEMORY: &str = "25%";
+
+fn parse_bulk_load_memory(input: Option<&str>) -> Result<u64> {
+    let text = input.unwrap_or(DEFAULT_BULK_LOAD_MEMORY);
+    let bytes = super::units::parse_memory(text)
+        .with_context(|| format!("failed to parse {}", names::BULK_LOAD_MEMORY))?;
+    Ok(bytes.unwrap_or(0))
+}
+
 fn parse_total_query_memory(input: Option<&str>) -> Result<usize> {
     let text = input.unwrap_or(DEFAULT_TOTAL_QUERY_MEMORY);
     let bytes = super::units::parse_memory(text)

@@ -21,6 +21,7 @@
 
 mod bulk;
 mod snapshot;
+pub(crate) mod spill;
 mod statistics;
 mod transaction;
 
