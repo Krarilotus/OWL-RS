@@ -194,6 +194,13 @@ impl TermId {
         (Self::new(kind, 0), Self::new(kind, PAYLOAD_MASK))
     }
 
+    /// The timezone code of an inline date or dateTime (its lowest payload bits): two such
+    /// ids of one kind with the same code compare by id as by value.
+    pub fn date_timezone(self) -> Option<u64> {
+        matches!(self.kind(), TermKind::Date | TermKind::DateTime)
+            .then(|| inline::timezone_code(self.payload()))
+    }
+
     /// Value of an inline boolean term, if this is one.
     pub fn as_inline_boolean(self) -> Option<bool> {
         (self.kind() == TermKind::Boolean).then(|| self.payload() != 0)
