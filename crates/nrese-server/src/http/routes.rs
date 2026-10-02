@@ -1,5 +1,5 @@
 use axum::Router;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 
 use crate::http::api_v1;
 use crate::http::handlers;
@@ -35,6 +35,18 @@ fn repository_routes() -> Router<AppState> {
             "/namespaces/{prefix}",
             put(api_v1::namespace_put).delete(api_v1::namespace_delete),
         )
+        .route("/sessions", post(api_v1::session_begin))
+        .route("/sessions/{session}", delete(api_v1::session_rollback))
+        .route("/sessions/{session}/update", post(api_v1::session_update))
+        .route(
+            "/sessions/{session}/data",
+            post(api_v1::session_data).delete(api_v1::session_data),
+        )
+        .route(
+            "/sessions/{session}/query",
+            get(api_v1::session_query).post(api_v1::session_query),
+        )
+        .route("/sessions/{session}/commit", post(api_v1::session_commit))
 }
 
 pub fn router(state: AppState) -> Router {

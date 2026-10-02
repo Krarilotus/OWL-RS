@@ -91,3 +91,145 @@ pub async fn namespace_delete(
         false => Err(ApiError::not_found(format!("no namespace '{prefix}'"))),
     }
 }
+
+#[derive(Serialize)]
+struct SessionOpened {
+    id: String,
+    /// Where its operations go.
+    path: String,
+    /// How long it lives untouched.
+    idle_seconds: u64,
+}
+
+/// Opens a client transaction ([`nrese_store::Sessions`]): writes collected over requests
+/// and committed as one.
+pub async fn session_begin(
+    Repository(state): Repository,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_update_write(&state, &headers).await?;
+    let sessions = state.store();
+    let sessions = sessions.sessions();
+    let session = sessions.begin();
+    let opened = SessionOpened {
+        path: format!("/api/v1/repositories/{id}/sessions/{session}"),
+        idle_seconds: sessions.idle().as_secs(),
+        id: session,
+    };
+    Ok((StatusCode::CREATED, Json(opened)).into_response())
+}
+
+fn no_session(session: &str) -> ApiError {
+    ApiError::not_found(format!("no session '{session}'"))
+}
+
+/// Adds operations to session `session`; 404 if it isn't open.
+fn add(state: &AppState, session: &str, ops: Vec<nrese_store::StatementOp>) -> Result<StatusCode, ApiError> {
+    match state.store().sessions().add(session, ops) {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(no_session(session)),
+    }
+}
+
+/// A SPARQL update (as the update endpoint takes it), applied at the commit.
+pub async fn session_update(
+    Repository(state): Repository,
+    Path((_, session)): Path<(String, String)>,
+    raw: axum::extract::RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_update_write(&state, &headers).await?;
+    let request = super::rdf4j::update(&raw, &headers, &body)?;
+    add(&state, &session, vec![nrese_store::StatementOp::Update(request)])
+}
+
+/// RDF data to add (`POST`) or remove (`DELETE`) at the commit: into the graph `graph`
+/// if given (an IRI), else into the graphs the data names.
+pub async fn session_data(
+    Repository(state): Repository,
+    Path((_, session)): Path<(String, String)>,
+    method: axum::http::Method,
+    raw: axum::extract::RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_update_write(&state, &headers).await?;
+    state.policy().enforce_rdf_upload_bytes(body.len())?;
+    let pairs = super::rdf4j::pairs(&raw)?;
+    let contexts = pairs
+        .iter()
+        .filter(|(key, _)| key == "graph")
+        .map(|(_, iri)| {
+            nrese_rdf::NamedNode::new(iri.as_str())
+                .map(nrese_rdf::GraphName::from)
+                .map_err(|error| ApiError::bad_request(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let data = super::rdf4j::payload(&headers, &body)?;
+    let op = match method {
+        axum::http::Method::DELETE => nrese_store::StatementOp::RemoveData { data, contexts },
+        _ => nrese_store::StatementOp::Add { data, contexts },
+    };
+    add(&state, &session, vec![op])
+}
+
+/// A query on the data as the session's operations would leave it.
+pub async fn session_query(
+    Repository(state): Repository,
+    Path((_, session)): Path<(String, String)>,
+    raw: axum::extract::RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let access = guard::update_access(&state, &headers).await?;
+    let ops = state
+        .store()
+        .sessions()
+        .pending(&session)
+        .ok_or_else(|| no_session(&session))?;
+    let pending = super::rdf4j::scoped(ops, &access);
+    let mut operation = if body.is_empty() {
+        super::requests::query_from_url(raw.0.as_deref())?
+    } else {
+        super::requests::query_from_post(
+            raw.0.as_deref(),
+            headers.get(axum::http::header::CONTENT_TYPE),
+            &body,
+        )?
+    };
+    operation.access = access.read.clone();
+    let accept = super::requests::accept_header_value(&headers);
+    super::sparql::execute_query_in(state, operation, accept, Some(pending)).await
+}
+
+/// Commits the session's operations as one transaction, through the same gates as any
+/// write.
+pub async fn session_commit(
+    Repository(state): Repository,
+    Path((_, session)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let access = guard::update_access(&state, &headers).await?;
+    let request = state
+        .store()
+        .sessions()
+        .take(&session)
+        .ok_or_else(|| no_session(&session))?;
+    super::rdf4j::apply(&state, request.ops, &access).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Closes the session without committing.
+pub async fn session_rollback(
+    Repository(state): Repository,
+    Path((_, session)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_update_write(&state, &headers).await?;
+    match state.store().sessions().rollback(&session) {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(no_session(&session)),
+    }
+}
