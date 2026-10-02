@@ -215,4 +215,17 @@ Still open:
   packed permutation. Bounding the dictionary takes ids assigned after an external sort
   of the terms, as QLever's vocabulary merge does (per-batch vocabularies, merged, ids
   rewritten), or an arena in a file the OS can page.
-- The remeasurement of every gap in the suite, with cache on and off, after batch A.
+- The remeasurement of every gap in the suite, with cache on and off: done on 2 October
+  ([suite results](../reviews/2026-10-02-suite-results.md)). Against QLever, Virtuoso,
+  Oxigraph and Jena, NRESE is the fastest on every query of DBpedia core, Wikidata
+  lexemes, Olympics and the synthetic entities, cache off and on, and loads fastest with
+  the lowest load peak. What remains behind is the store's size:
+- **Store size** (the gap left to QLever: 1.4 times on DBpedia, 2 times on Wikidata).
+  Measured options (`index/compression_study.rs`): the cheapest per block and key
+  position of frame of reference, palette and deltas saves 24 % (Wikidata) and 15 %
+  (DBpedia) of the four permutations; first keys derived from the blocks and larger blocks
+  save part of the 0.81 bytes per key of headers; a compressed vocabulary (QLever: 28 % of
+  the strings) is the larger part. Each changes the checkpoint format: to be decided.
+- DBpedia q13 (`FILTER NOT EXISTS` count) 5.0 → 3.1 ms (2 October): semi- and anti-joins
+  filter in place, branch-free and in parallel parts; group walks over large ranges in
+  parallel.
