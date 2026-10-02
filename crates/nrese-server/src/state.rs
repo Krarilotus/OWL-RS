@@ -6,6 +6,7 @@ use nrese_store::{MutationPipeline, ReasoningRunRecord, StoreMode, StoreService}
 
 use crate::ai::AiSuggestionService;
 use crate::error::ApiError;
+use crate::http::rdf4j::Rdf4jState;
 use crate::http::request_metrics::RequestMetrics;
 use crate::policy::PolicyAction;
 use crate::policy::PolicyConfig;
@@ -22,6 +23,7 @@ pub struct AppState {
     deployment_posture: DeploymentPosture,
     rate_limiter: Arc<RateLimiter>,
     request_metrics: Arc<RequestMetrics>,
+    rdf4j: Arc<Rdf4jState>,
 }
 
 impl AppState {
@@ -40,7 +42,13 @@ impl AppState {
             deployment_posture,
             rate_limiter: Arc::new(RateLimiter::default()),
             request_metrics: Arc::default(),
+            rdf4j: Arc::default(),
         }
+    }
+
+    /// The RDF4J protocol's open transactions and namespaces.
+    pub fn rdf4j(&self) -> &Rdf4jState {
+        &self.rdf4j
     }
 
     /// Request outcomes and latencies, for `/metrics`.

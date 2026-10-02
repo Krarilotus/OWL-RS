@@ -78,6 +78,7 @@ fn kind_name(kind: MutationKind) -> &'static str {
         MutationKind::GraphWrite => "graph write",
         MutationKind::GraphDelete => "graph delete",
         MutationKind::Restore => "restore",
+        MutationKind::Statements => "statements",
     }
 }
 
@@ -106,6 +107,7 @@ mod tests {
             MutationKind::GraphWrite,
             MutationKind::GraphDelete,
             MutationKind::Restore,
+            MutationKind::Statements,
         ];
         for kind in kinds {
             let syntax = nrese_store::PreparedQuery::parse(&nrese_store::SparqlQueryRequest::new(

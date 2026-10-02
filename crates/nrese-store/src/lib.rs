@@ -21,6 +21,7 @@ pub mod reasoning;
 pub mod reasoning_state;
 pub mod service;
 pub mod shacl;
+pub mod statements;
 mod stats;
 mod tell;
 pub mod update;
@@ -62,6 +63,7 @@ pub use service::StoreService;
 pub use shacl::{
     ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource, ValidatedGraphs,
 };
+pub use statements::{RdfPayload, StatementOp, StatementPattern, StatementsRequest};
 pub use stats::StoreStats;
 pub use tell::TellRequest;
 pub use update::{SparqlUpdateRequest, UpdateExecutionReport};

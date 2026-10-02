@@ -307,6 +307,26 @@ impl StoreService {
         execute_graph_read(&self.engine.snapshot(), request)
     }
 
+    /// The statements matching `pattern` (RDF4J's `GET /statements`): asserted only, or
+    /// with the inferred ones.
+    pub fn read_statements(
+        &self,
+        pattern: &crate::StatementPattern,
+        infer: bool,
+    ) -> StoreResult<Vec<nrese_rdf::Quad>> {
+        crate::statements::read_statements(&self.engine.snapshot(), read_model(infer), pattern)
+    }
+
+    /// How many statements match `pattern` (RDF4J's `/size`).
+    pub fn count_statements(&self, pattern: &crate::StatementPattern, infer: bool) -> u64 {
+        crate::statements::count_statements(&self.engine.snapshot(), read_model(infer), pattern)
+    }
+
+    /// The named graphs (RDF4J's `/contexts`).
+    pub fn contexts(&self) -> Vec<nrese_rdf::Term> {
+        crate::statements::contexts(&self.engine.snapshot())
+    }
+
     /// Installs who answers `SERVICE` calls (for every clone of this store); the first
     /// client installed stays. Without one, `SERVICE` is an error.
     pub fn set_service_client(&self, client: std::sync::Arc<dyn nrese_sparql::ServiceClient>) {
@@ -488,5 +508,13 @@ impl StoreService {
             MutationCommitReport::Restore(report) => Ok(report),
             other => unreachable!("restore produced {other:?}"),
         }
+    }
+}
+
+/// The read model of RDF4J's `infer` parameter.
+fn read_model(infer: bool) -> crate::ReadModel {
+    match infer {
+        true => crate::ReadModel::Materialised,
+        false => crate::ReadModel::Asserted,
     }
 }

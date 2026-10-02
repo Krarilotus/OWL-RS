@@ -34,6 +34,16 @@ impl Kind {
     ];
 
     fn of(path: &str) -> Self {
+        // The RDF4J protocol: queries at the repository, statements and graphs below it.
+        if let Some(rest) = path.strip_prefix("/repositories/") {
+            return match rest.split_once('/') {
+                None => Self::Sparql,
+                Some((_, "statements")) => Self::GraphStore,
+                Some((_, below)) if below.starts_with("rdf-graphs") => Self::GraphStore,
+                Some((_, below)) if below.starts_with("transactions") => Self::Update,
+                Some(_) => Self::Other,
+            };
+        }
         match path {
             "/dataset/query" => Self::Query,
             "/dataset/update" => Self::Update,
@@ -188,5 +198,7 @@ mod tests {
         );
         assert_eq!(Kind::of("/dataset/query"), Kind::Query);
         assert_eq!(Kind::of("/healthz"), Kind::Other);
+        assert_eq!(Kind::of("/repositories/repo"), Kind::Sparql);
+        assert_eq!(Kind::of("/repositories/repo/statements"), Kind::GraphStore);
     }
 }
