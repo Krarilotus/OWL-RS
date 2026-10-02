@@ -9,7 +9,6 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
-use nrese_server::access::AccessPolicy;
 use nrese_server::auth::{AuthConfig, JwtBearerConfig};
 use nrese_server::policy::PolicyConfig;
 use serde::Serialize;
@@ -65,7 +64,7 @@ fn app() -> Result<axum::Router, Box<dyn std::error::Error>> {
             admin_role: "nrese.admin".to_owned(),
             leeway_seconds: 0,
         }),
-        access: Some(Arc::new(AccessPolicy::load(&path)?)),
+        access: Some(Arc::new(nrese_server::access::load(&path)?)),
         ..PolicyConfig::default()
     };
     test_app_with_settings(policy, ReasonerConfig::for_mode(ReasoningMode::Rdfs))

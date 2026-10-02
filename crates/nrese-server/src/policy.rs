@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use axum::http::HeaderMap;
-
 use crate::auth::AuthConfig;
 pub use crate::auth::{JwtBearerConfig, MtlsConfig, OidcIntrospectionConfig, StaticBearerConfig};
 use crate::error::ApiError;
@@ -15,9 +13,13 @@ pub struct PolicyConfig {
     pub sparql_parse_error_profile: SparqlParseErrorProfile,
     pub expose_operator_ui: bool,
     pub expose_metrics: bool,
-    /// Graph-level access control ([`crate::access`]); `None`: every user reads and writes
-    /// every graph its grants allow.
+    /// A policy file to import into the access state at the first start
+    /// ([`crate::access`]); without one, enforcement stays off until the engine API turns
+    /// it on.
     pub access: Option<std::sync::Arc<crate::access::AccessPolicy>>,
+    /// What workspace graph prefixes start with (`urn:nrese:` by default): a personal
+    /// space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`.
+    pub workspace_base: String,
 }
 
 impl Default for PolicyConfig {
@@ -31,32 +33,12 @@ impl Default for PolicyConfig {
             expose_operator_ui: true,
             expose_metrics: true,
             access: None,
+            workspace_base: "urn:nrese:".to_owned(),
         }
     }
 }
 
 impl PolicyConfig {
-    pub async fn authorize(
-        &self,
-        action: PolicyAction,
-        headers: &HeaderMap,
-    ) -> Result<crate::auth::Identity, ApiError> {
-        let also = |identity: &crate::auth::Identity| {
-            self.access
-                .as_ref()
-                .is_some_and(|access| access.allows(identity, action))
-        };
-        self.auth.authorize(action, headers, &also).await
-    }
-
-    /// What `identity` may read and write.
-    pub fn access_view(&self, identity: &crate::auth::Identity) -> crate::access::AccessView {
-        match &self.access {
-            None => crate::access::AccessView::unrestricted(),
-            Some(policy) => policy.view(identity),
-        }
-    }
-
     pub fn enforce_query_bytes(&self, size: usize) -> Result<(), ApiError> {
         enforce_size_limit("query", size, self.limits.max_query_bytes)
     }

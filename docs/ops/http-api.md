@@ -173,6 +173,7 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 | URL | What |
 |---|---|
 | `GET /api/v1/repositories` | The repositories (JSON: `id`, `title`, `path`, `default`) |
+| `GET`/`PUT`/`DELETE /api/v1/repositories/{id}` | One repository (`title`, `reasoning` in effect, `settings`); `PUT` creates it with JSON settings (`title`, `reasoning` by mode name, `rules`), 201, 409 if it exists; `DELETE` removes it and its data (administrators) |
 | `…/repositories/{id}/query`, `/update`, `/sparql` | SPARQL Protocol, as `/dataset/query`, `/dataset/update`, `/dataset` |
 | `…/repositories/{id}/data` | Graph Store Protocol (`?graph=` or `?default`), as `/dataset/data` |
 | `…/repositories/{id}/tell`, `/shacl`, `/autocomplete`, `/classification` | as their `/dataset/…` counterparts |
@@ -180,11 +181,32 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 | `…/repositories/{id}/backup`, `/restore` | N-Quads backup and restore |
 | `GET …/repositories/{id}/namespaces`, `PUT`/`DELETE …/namespaces/{prefix}` | The repository's prefixes (JSON object; the IRI as the `PUT` body); RDF4J's `/namespaces` reads the same |
 | `POST …/repositories/{id}/sessions` | Opens a client transaction (JSON: `id`, `path`, `idle_seconds`); then `POST {path}/update` (SPARQL update), `POST`/`DELETE {path}/data` (RDF to add or remove, `?graph=` for its graph), `GET`/`POST {path}/query` (reads the data as the session would leave it), `POST {path}/commit`, `DELETE {path}` (rollback). RDF4J transactions use the same sessions |
-| `GET …/repositories/{id}/explain?subj=&pred=&obj=` | Why a statement holds (terms in N-Triples syntax): `{"steps": [...]}`, the statement first, each step with `subject`, `predicate`, `object`, `origin` (`asserted`, `inferred`), `rule` and `premises` (indexes of steps); a derivation from asserted statements. 404 if it doesn't hold or reasoning is off |
+| `GET …/repositories/{id}/explain?subj=&pred=&obj=` | Why a statement holds (terms in N-Triples syntax): `{"steps": [...]}`, the statement first, each step with `subject`, `predicate`, `object`, `origin` (`asserted`, `inferred`), `rule` and `premises` (indexes of steps); the shallowest, smallest derivation from asserted statements, the same on every call. 404 if it doesn't hold or reasoning is off |
+| `POST …/repositories/{id}/import` | Bulk-loads the RDF document in the body (`?graph=`, `?replace=true`, `?skip_errors=true`), then recomputes the inferences (administrators) |
+| `POST …/repositories/{id}/reasoning/rematerialise` | Recomputes the inferences (administrators) |
+
+### Users, workspaces and policies (`/api/v1/access`)
+
+[ADR-0008](../adr/0008-users-workspaces-policies.md). Server-wide; every change takes a `reason` (in the JSON body, or `?reason=` for `DELETE` and the import), answers with its history record (`number`, `author`, `time`, `reason`, `summary`, `added`, `removed`), and applies to the next request.
+
+| URL | What | Who |
+|---|---|---|
+| `GET /api/v1/access/me` | The requester: `user`, `roles`, `admin`, `enforced`, `reads_everything`, `personal_space`, `workspaces` (each with `prefix`, `level`, `members`) | anyone who may read |
+| `GET /api/v1/access` | The whole state: `settings`, `roles`, `users` (`local_login`, never a hash), `workspaces` | administrators |
+| `PUT /api/v1/access/settings` | `enforced`, `fallback` (`deny`, `allow`), `inferred` (`hidden`, `visible`), `users_create_workspaces` | administrators |
+| `PUT`/`DELETE /api/v1/access/roles/{name}` | A role's rule: `read`, `write`, `deny` (IRIs or prefixes ending in `*`), `default_graph` (`none`, `read`, `write`, `deny`) | administrators |
+| `PUT`/`DELETE /api/v1/access/users/{name}` | A user record: `admin`, `roles` (added to its credentials'); removal takes its memberships along | administrators |
+| `GET /api/v1/access/workspaces` | The requester's workspaces, its personal space first (administrators: all) | anyone who may read |
+| `GET`/`PUT`/`DELETE /api/v1/access/workspaces/{name}` | A workspace: `title`, `repository` (empty: every one), `graphs` taken in besides its prefix (administrators only). Whoever creates one owns it; `~user` is that user's personal space | owners, administrators |
+| `PUT`/`DELETE /api/v1/access/workspaces/{name}/members/{user}` | A member's `level`: `owner`, `editor`, `viewer`; a personal space has viewers only; a workspace keeps an owner (409) | owners, administrators |
+| `GET /api/v1/access/history?limit=` | The changes, the latest first (100 by default) | administrators |
+| `POST /api/v1/access/import?reason=`, `GET /api/v1/access/export` | The role rules and fallbacks as a policy file (TOML); importing turns enforcement on | administrators |
+
+Graph prefixes: a personal space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`, with `base` from `auth.workspace_base` (`NRESE_WORKSPACE_BASE`, default `urn:nrese:`). User names come from a token's `sub` (or an introspection's `username`) or a client certificate's subject, where they are letters, digits and `. _ @ + | : -`.
 
 ## Graph-level access control
 
-With an access policy (`auth.access_policy`, [configuration](config-reference.md#graph-level-access-control)) each user has its own dataset: the graphs its roles may read.
+With access enforced (the access state's `enforced` setting, on once a policy file is imported or an administrator turns it on) each user has its own dataset: the graphs its roles, its workspaces and its personal space let it read. The policy file (`auth.access_policy`, [configuration](config-reference.md#graph-level-access-control)) is imported at the first start; afterwards the state changes through `/api/v1/access` (a changed file is reported at start and applies only when imported).
 
 - **Queries** evaluate over that dataset, restricted before anything is evaluated: the other graphs are absent, not forbidden. `GRAPH ?g` never binds them, `FROM` and `GRAPH` with their names match nothing, counts don't see them, and a union default graph merges the readable graphs only. The same holds for the `WHERE` clauses of updates, RDF4J's `/statements`, `/size` and `/contexts`, and reads inside RDF4J transactions.
 - **Inferred statements** come from statements in any graph; users who may not read every graph see the asserted statements only, unless the policy sets `inferred = "visible"`.
@@ -198,6 +220,7 @@ With an access policy (`auth.access_policy`, [configuration](config-reference.md
 |---|---|
 | 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) |
 | 401, 403 | Authentication or authorisation failed; 403 also for a write to a graph the access policy doesn't let the user write |
+| 409 | The resource exists already (a repository), or the change would leave a workspace without an owner |
 | 404 | The surface is disabled, or the named graph doesn't exist |
 | 406 | The client accepts no format the result has |
 | 408 | The policy timeout passed; a timed-out write was not committed |

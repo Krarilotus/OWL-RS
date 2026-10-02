@@ -319,7 +319,10 @@ Use `fuseki-plain-text` when you want local or live parity runs to match Fuseki-
 
 ### Graph-Level Access Control
 
-- `auth.access_policy` -> `NRESE_ACCESS_POLICY`: the path of an access policy file. Without one, every user reads and writes what its authentication grants allow.
+The rules are the server's access state (users, workspaces, personal spaces, role rules; [ADR-0008](../adr/0008-users-workspaces-policies.md)), kept in `system/` of the data directory and changed through `/api/v1/access` ([HTTP API](http-api.md#users-workspaces-and-policies-apiv1access)). Until access is enforced, every user reads and writes what its authentication grants allow.
+
+- `auth.access_policy` -> `NRESE_ACCESS_POLICY`: the path of an access policy file, imported into the access state at the first start (it turns enforcement on). Later changes of the file are reported at start and apply once imported (`POST /api/v1/access/import`); `GET /api/v1/access/export` writes the state's rules in this form.
+- `auth.workspace_base` -> `NRESE_WORKSPACE_BASE`: what workspace graph prefixes start with (default `urn:nrese:`): a personal space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`.
 - the file (TOML), per role:
 
 ```toml
@@ -336,7 +339,8 @@ default_graph = "read"  # the store's default graph: "none" (default), "read", "
 
 - graphs by IRI, or by IRI prefix (an entry ending in `*`): ontologies and data sets usually differ by prefix, so one entry covers a family of graphs.
 - role names: a token's `scope`, `scp`, `role` and `roles` claims (`bearer-jwt`, `oidc-introspection`); `reader` for the static read token; the subject and `reader` for a listed client certificate; `anonymous` without authentication.
-- a user's rights are the union of its roles' rules, and what it may write it may read; an explicit deny (`deny`, `default_graph = "deny"`) in any of its roles wins. Administrators are unrestricted.
+- user names: a token's `sub` (an introspection's `username` without one), a client certificate's subject, where they are letters, digits and `. _ @ + | : -`; a named user always has its personal space, and a user record can add roles or the administrator's right.
+- a user's rights are the union of its roles' rules and its workspaces', and what it may write it may read; an explicit deny (`deny`, `default_graph = "deny"`) in any of its roles wins. Administrators are unrestricted.
 - the policy grants as well as restricts: a role with a rule may query and read graphs even without the read role, and a role that may write a graph may update. So a role can edit some graphs without being an administrator.
 - what it means for requests: [HTTP API, access control](http-api.md#graph-level-access-control).
 
