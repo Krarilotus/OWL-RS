@@ -3437,7 +3437,19 @@ impl<'a> Context<'a> {
                 true => terms[*b].order(&terms[*a]),
             };
             by_term.select_nth_unstable_by(k - 1, first);
-            by_term.truncate(k);
+            // Values equal to the k-th (other terms of the same value, `"0"` and `"00"`)
+            // are among the first too: they tie in this key, so the next key decides
+            // between their rows, as the full sort would.
+            let kth = by_term[k - 1];
+            let tail = &mut by_term[k..];
+            let mut tied = 0;
+            for i in 0..tail.len() {
+                if terms[tail[i]].order(&terms[kth]).is_eq() {
+                    tail.swap(tied, i);
+                    tied += 1;
+                }
+            }
+            by_term.truncate(k + tied);
             by_term.sort_by(first);
             let rest = match descending {
                 false => k as u64 + 1,
