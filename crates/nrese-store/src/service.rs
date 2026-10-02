@@ -306,7 +306,17 @@ impl StoreService {
     }
 
     pub fn execute_graph_read(&self, request: &GraphReadRequest) -> StoreResult<GraphReadResult> {
-        execute_graph_read(&self.engine.snapshot(), request)
+        execute_graph_read(&self.engine.snapshot(), request, ReadModel::Materialised)
+    }
+
+    /// [`execute_graph_read`](Self::execute_graph_read), asserted statements only unless
+    /// `infer`.
+    pub fn execute_graph_read_as(
+        &self,
+        request: &GraphReadRequest,
+        infer: bool,
+    ) -> StoreResult<GraphReadResult> {
+        execute_graph_read(&self.engine.snapshot(), request, read_model(infer))
     }
 
     /// The statements matching `pattern` (RDF4J's `GET /statements`): asserted only, or

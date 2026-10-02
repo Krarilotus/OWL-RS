@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::policy::{
     DEFAULT_QUERY_MEMORY_BYTES, PolicyConfig, RateLimitConfig, RequestLimits, RequestTimeouts,
@@ -62,6 +62,16 @@ pub(super) fn parse_policy_config(source: &dyn ConfigSource) -> Result<PolicyCon
         )?,
         expose_operator_ui: parse_bool(source, names::ENABLE_OPERATOR_UI, true)?,
         expose_metrics: parse_bool(source, names::ENABLE_METRICS, true)?,
+        access: match source
+            .get(names::ACCESS_POLICY)
+            .filter(|p| !p.trim().is_empty())
+        {
+            None => None,
+            Some(path) => Some(std::sync::Arc::new(
+                crate::access::AccessPolicy::load(std::path::Path::new(path.trim()))
+                    .with_context(|| names::ACCESS_POLICY)?,
+            )),
+        },
     })
 }
 

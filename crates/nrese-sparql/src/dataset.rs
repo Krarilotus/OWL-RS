@@ -24,15 +24,33 @@ pub struct GraphAccess {
     /// The inferred statements (they live in the default graph; whether a user who may not
     /// read every graph sees them is the configuration's choice).
     pub inferred: bool,
+    /// Graph IRIs excluded whatever `graphs` and `prefixes` say (an explicit deny).
+    pub excluded: Vec<String>,
+    /// IRI prefixes excluded the same way.
+    pub excluded_prefixes: Vec<String>,
 }
 
 impl GraphAccess {
     /// Whether the named graph `iri` is readable.
     pub fn allows(&self, iri: &str) -> bool {
-        self.graphs.iter().any(|g| g == iri) || self.prefixes.iter().any(|p| iri.starts_with(p))
+        let matches = |graphs: &[String], prefixes: &[String]| {
+            graphs.iter().any(|g| g == iri) || prefixes.iter().any(|p| iri.starts_with(p))
+        };
+        matches(&self.graphs, &self.prefixes) && !matches(&self.excluded, &self.excluded_prefixes)
     }
 
-    fn allows_id<V: ReadView>(&self, view: &V, id: TermId) -> bool {
+    /// Whether `graph` is in the set: the default graph, or a named graph by IRI (graphs
+    /// named by blank nodes never).
+    pub fn allows_graph(&self, graph: &GraphName) -> bool {
+        match graph {
+            GraphName::DefaultGraph => self.default_graph,
+            GraphName::NamedNode(node) => self.allows(node.as_str()),
+            GraphName::BlankNode(_) => false,
+        }
+    }
+
+    /// Whether the graph `id` of `view` is in the set.
+    pub fn allows_id<V: ReadView>(&self, view: &V, id: TermId) -> bool {
         if id == TermId::DEFAULT_GRAPH {
             return self.default_graph;
         }

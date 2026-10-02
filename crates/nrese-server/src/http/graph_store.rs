@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use nrese_store::{GraphReadRequest, GraphWriteRequest, MutationCommand, MutationCommitReport};
 
+use crate::access::AccessView;
 use crate::error::ApiError;
 use crate::http::guard;
 use crate::http::media::{GRAPHS, header_value_str, negotiated};
@@ -18,8 +19,8 @@ pub async fn get_graph(
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_graph_read(&state, &headers).await?;
-    let result = read_graph(state, raw_query, headers).await?;
+    let access = guard::graph_read_access(&state, &headers).await?;
+    let result = read_graph(state, raw_query, headers, &access).await?;
 
     let mut response = (StatusCode::OK, result.payload).into_response();
     response.headers_mut().insert(
@@ -36,8 +37,8 @@ pub async fn head_graph(
     raw_query: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_graph_read(&state, &headers).await?;
-    let result = read_graph(state, raw_query, headers).await?;
+    let access = guard::graph_read_access(&state, &headers).await?;
+    let result = read_graph(state, raw_query, headers, &access).await?;
     let mut response = StatusCode::OK.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -52,16 +53,22 @@ async fn read_graph(
     state: AppState,
     raw_query: RawQuery,
     headers: HeaderMap,
+    access: &AccessView,
 ) -> Result<nrese_store::GraphReadResult, ApiError> {
     state.ensure_serving()?;
 
     let target = parse_graph_target(&raw_query)?;
+    // A graph the requester may not read is absent.
+    if !access.can_read(&guard::target_graph(&target)?) {
+        return Err(ApiError::not_found("the graph does not exist"));
+    }
     let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let request = GraphReadRequest { target, format };
     let store = state.store();
+    let infer = access.sees_inferred();
     let result = tokio::time::timeout(
         state.policy().timeouts.graph_read,
-        tokio::task::spawn_blocking(move || store.execute_graph_read(&request)),
+        tokio::task::spawn_blocking(move || store.execute_graph_read_as(&request, infer)),
     )
     .await
     .map_err(|_| ApiError::timeout("graph read exceeded policy timeout"))?
@@ -99,8 +106,9 @@ pub async fn delete_graph(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     state.ensure_serving()?;
-    guard::enforce_graph_write(&state, &headers).await?;
+    let access = guard::graph_write_access(&state, &headers).await?;
     let target = parse_graph_target(&raw_query)?;
+    guard::check_writable(&access, &guard::target_graph(&target)?)?;
     let report = mutation::run(
         &state,
         MutationCommand::GraphDelete(target),
@@ -128,9 +136,10 @@ async fn write_graph(
     replace: bool,
 ) -> Result<StatusCode, ApiError> {
     state.ensure_serving()?;
-    guard::enforce_graph_write(&state, &headers).await?;
+    let access = guard::graph_write_access(&state, &headers).await?;
     state.policy().enforce_rdf_upload_bytes(body.len())?;
     let target = parse_graph_target(&raw_query)?;
+    guard::check_writable(&access, &guard::target_graph(&target)?)?;
     let format = parse_graph_content_format(header_value_str(headers.get(header::CONTENT_TYPE)))?;
 
     let request = GraphWriteRequest {

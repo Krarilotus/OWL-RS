@@ -160,3 +160,41 @@ fn update_where_clauses_read_only_the_graphs_they_may() {
         3
     );
 }
+
+#[test]
+fn clear_all_clears_the_graphs_the_user_sees() {
+    let engine = engine();
+    let public = Arc::new(GraphAccess {
+        prefixes: vec![format!("{EX}g/pub/")],
+        ..GraphAccess::default()
+    });
+    let options = UpdateOptions {
+        access: Some(public.clone()),
+        writable: Some(public),
+        ..UpdateOptions::default()
+    };
+    let mut tx = engine.transaction();
+    let update = SparqlParser::new().parse_update("CLEAR ALL").unwrap();
+    apply_update(&mut tx, &update, &options).unwrap();
+    tx.commit().unwrap();
+    // The public graphs are gone; the default graph and the secret graph stay.
+    let named = "SELECT * WHERE { GRAPH ?g { ?s ?p ?o } }";
+    assert_eq!(count(&engine, named, &QueryOptions::default()), 1);
+    let all = "SELECT * WHERE { ?s ?p ?o }";
+    assert_eq!(count(&engine, all, &QueryOptions::default()), 2);
+    // A writer of nothing may not clear what it sees.
+    let engine = self::engine();
+    let options = UpdateOptions {
+        access: Some(Arc::new(GraphAccess {
+            prefixes: vec![format!("{EX}g/pub/")],
+            ..GraphAccess::default()
+        })),
+        writable: Some(Arc::new(GraphAccess::default())),
+        ..UpdateOptions::default()
+    };
+    let mut tx = engine.transaction();
+    assert!(matches!(
+        apply_update(&mut tx, &update, &options),
+        Err(nrese_sparql::UpdateError::Forbidden(_))
+    ));
+}

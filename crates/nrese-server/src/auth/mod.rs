@@ -38,19 +38,52 @@ impl AuthConfig {
         }
     }
 
+    /// Checks that the request's credentials allow `action`; returns who it is.
+    ///
+    /// `also` may allow what the credentials' grants don't (the access policy's roles,
+    /// [`crate::access::AccessPolicy::allows`]).
     pub async fn authorize(
         &self,
         action: PolicyAction,
         headers: &HeaderMap,
-    ) -> Result<(), ApiError> {
+        also: &(dyn Fn(&Identity) -> bool + Send + Sync),
+    ) -> Result<Identity, ApiError> {
         match self {
-            Self::None => Ok(()),
-            Self::BearerStatic(config) => bearer_static::authorize(config, action, headers),
-            Self::BearerJwt(config) => bearer_jwt::authorize(config, action, headers),
-            Self::Mtls(config) => mtls::authorize(config, action, headers),
+            Self::None => Ok(Identity::anonymous()),
+            Self::BearerStatic(config) => bearer_static::authorize(config, action, headers, also),
+            Self::BearerJwt(config) => bearer_jwt::authorize(config, action, headers, also),
+            Self::Mtls(config) => mtls::authorize(config, action, headers, also),
             Self::OidcIntrospection(config) => {
-                oidc_introspection::authorize(config, action, headers).await
+                oidc_introspection::authorize(config, action, headers, also).await
             }
+        }
+    }
+}
+
+/// Who a request is, as its credentials say: an administrator, and its role names
+/// (claims of a token, `reader` for a static read token, the subject of a client
+/// certificate; `anonymous` without authentication). Graph access ([`crate::access`]) is
+/// decided by the role names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Identity {
+    pub admin: bool,
+    pub roles: BTreeSet<String>,
+}
+
+impl Identity {
+    /// A request without authentication.
+    pub fn anonymous() -> Self {
+        Self {
+            admin: false,
+            roles: BTreeSet::from(["anonymous".to_owned()]),
+        }
+    }
+
+    /// An identity with `grants` and role names `roles`.
+    pub fn from_grants(grants: &BTreeSet<AccessGrant>, roles: BTreeSet<String>) -> Self {
+        Self {
+            admin: grants.contains(&AccessGrant::Admin),
+            roles,
         }
     }
 }

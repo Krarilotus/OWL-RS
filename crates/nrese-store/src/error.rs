@@ -39,6 +39,10 @@ pub enum StoreError {
     /// A materialisation was stopped; the previous inferred stack stands.
     #[error("materialisation cancelled")]
     MaterialisationCancelled,
+    /// The request would change a graph its requester may not write (graph-level access
+    /// control); nothing of it is applied.
+    #[error("{0}")]
+    Forbidden(String),
 }
 
 impl StoreError {
@@ -75,6 +79,7 @@ impl StoreError {
             | Self::InvalidGraphIri(_)
             | Self::RdfParse(_)
             | Self::ShaclShapes(_)
+            | Self::Forbidden(_)
             | Self::FileParse { .. } => true,
             Self::SparqlEvaluation(error) => !matches!(
                 error,

@@ -15,6 +15,9 @@ pub struct PolicyConfig {
     pub sparql_parse_error_profile: SparqlParseErrorProfile,
     pub expose_operator_ui: bool,
     pub expose_metrics: bool,
+    /// Graph-level access control ([`crate::access`]); `None`: every user reads and writes
+    /// every graph its grants allow.
+    pub access: Option<std::sync::Arc<crate::access::AccessPolicy>>,
 }
 
 impl Default for PolicyConfig {
@@ -27,6 +30,7 @@ impl Default for PolicyConfig {
             sparql_parse_error_profile: SparqlParseErrorProfile::default(),
             expose_operator_ui: true,
             expose_metrics: true,
+            access: None,
         }
     }
 }
@@ -36,8 +40,21 @@ impl PolicyConfig {
         &self,
         action: PolicyAction,
         headers: &HeaderMap,
-    ) -> Result<(), ApiError> {
-        self.auth.authorize(action, headers).await
+    ) -> Result<crate::auth::Identity, ApiError> {
+        let also = |identity: &crate::auth::Identity| {
+            self.access
+                .as_ref()
+                .is_some_and(|access| access.allows(identity, action))
+        };
+        self.auth.authorize(action, headers, &also).await
+    }
+
+    /// What `identity` may read and write.
+    pub fn access_view(&self, identity: &crate::auth::Identity) -> crate::access::AccessView {
+        match &self.access {
+            None => crate::access::AccessView::unrestricted(),
+            Some(policy) => policy.view(identity),
+        }
     }
 
     pub fn enforce_query_bytes(&self, size: usize) -> Result<(), ApiError> {

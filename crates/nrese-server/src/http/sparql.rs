@@ -142,6 +142,8 @@ pub async fn execute_update(
     let mut request = SparqlUpdateRequest::new(operation.update);
     request.using_graphs = operation.using_graphs;
     request.using_named_graphs = operation.using_named_graphs;
+    request.access = operation.access;
+    request.writable = operation.writable;
     mutation::run(
         &state,
         MutationCommand::Update(request),
@@ -170,6 +172,7 @@ fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
     let mut request = SparqlQueryRequest::new(operation.query);
     request.default_graphs = operation.default_graphs;
     request.named_graphs = operation.named_graphs;
+    request.access = operation.access;
     // GraphDB's `infer=false`: explicit statements only.
     if operation.infer == Some(false) {
         request.read_model = Some(nrese_store::ReadModel::Asserted);
