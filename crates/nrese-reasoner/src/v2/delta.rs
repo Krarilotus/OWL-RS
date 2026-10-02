@@ -513,8 +513,11 @@ pub fn update_counted<B: Base + ?Sized>(
                 };
                 candidates.sort_unstable();
                 candidates.dedup();
-                candidates
-                    .retain(|&f| stop() || !old_program.derivable_by(&left, f, &non_recursive));
+                // Independent per candidate: in parallel.
+                candidates = candidates
+                    .into_par_iter()
+                    .filter(|&f| stop() || !old_program.derivable_by(&left, f, &non_recursive))
+                    .collect();
                 check_stop()?;
             }
             if counting && let Some(supports) = supports {
