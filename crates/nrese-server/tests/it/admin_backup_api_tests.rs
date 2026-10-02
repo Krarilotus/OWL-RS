@@ -1,0 +1,290 @@
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+use nrese_server::auth::{AuthConfig, StaticBearerConfig};
+use nrese_server::policy::{PolicyConfig, RateLimitConfig};
+use nrese_store::StoreConfig;
+use tower::util::ServiceExt;
+
+use crate::support::{
+    body_text, ready_revision, readyz_text, test_app_with_policy, test_app_with_store_config,
+};
+
+fn admin_policy() -> PolicyConfig {
+    PolicyConfig {
+        auth: AuthConfig::BearerStatic(StaticBearerConfig {
+            read_token: Some("reader".to_owned()),
+            admin_token: "admin".to_owned(),
+        }),
+        ..PolicyConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn backup_endpoint_requires_admin_policy() -> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_policy(admin_policy())?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/ops/api/admin/dataset/backup")
+                .method(Method::GET)
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn backup_endpoint_returns_dataset_payload_with_expected_headers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory().with_ontology(crate::support::minimal_fixture_path()),
+        admin_policy(),
+        ReasonerConfig::default(),
+    )?;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/ops/api/admin/dataset/backup")
+                .method(Method::GET)
+                .header("authorization", "Bearer admin")
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/n-quads")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-nrese-backup-format")
+            .and_then(|value| value.to_str().ok()),
+        Some("n-quads")
+    );
+    let text = body_text(response).await?;
+    assert!(text.contains("http://example.com/alice"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_endpoint_replaces_dataset_and_updates_ready_surface()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_policy(admin_policy())?;
+
+    let backup_payload = b"<http://example.com/restored-s> <http://example.com/p> <http://example.com/restored-o> .\n".to_vec();
+    let restore = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ops/api/admin/dataset/restore")
+                .method(Method::POST)
+                .header("authorization", "Bearer admin")
+                .header("content-type", "application/n-quads")
+                .body(Body::from(backup_payload))?,
+        )
+        .await?;
+
+    assert_eq!(restore.status(), StatusCode::OK);
+    let restore_text = body_text(restore).await?;
+    assert!(restore_text.contains("\"status\":\"restored\""));
+    assert!(restore_text.contains("\"revision\":1"));
+
+    let ask = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query?query=ASK%20WHERE%20%7B%20%3Chttp%3A%2F%2Fexample.com%2Frestored-s%3E%20%3Chttp%3A%2F%2Fexample.com%2Fp%3E%20%3Chttp%3A%2F%2Fexample.com%2Frestored-o%3E%20%7D")
+                .method(Method::GET)
+                .header("authorization", "Bearer reader")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert!(body_text(ask).await?.contains("true"));
+
+    assert!(readyz_text(app).await?.contains("\"revision\":1"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_endpoint_rejects_invalid_payload_with_problem_json()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_policy(admin_policy())?;
+
+    let seed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/update")
+                .method(Method::POST)
+                .header("authorization", "Bearer admin")
+                .header("content-type", "application/sparql-update")
+                .body(Body::from(
+                    "INSERT DATA { <http://example.com/live-s> <http://example.com/p> <http://example.com/live-o> }",
+                ))?,
+        )
+        .await?;
+    assert_eq!(seed.status(), StatusCode::NO_CONTENT);
+
+    let restore = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ops/api/admin/dataset/restore")
+                .method(Method::POST)
+                .header("authorization", "Bearer admin")
+                .header("content-type", "application/n-quads")
+                .body(Body::from("not valid n-quads"))?,
+        )
+        .await?;
+
+    assert_eq!(restore.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        restore
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/problem+json")
+    );
+
+    let ask = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query?query=ASK%20WHERE%20%7B%20%3Chttp%3A%2F%2Fexample.com%2Flive-s%3E%20%3Chttp%3A%2F%2Fexample.com%2Fp%3E%20%3Chttp%3A%2F%2Fexample.com%2Flive-o%3E%20%7D")
+                .method(Method::GET)
+                .header("authorization", "Bearer reader")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert!(body_text(ask).await?.contains("true"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_endpoint_uses_reasoner_gate_and_rejects_without_publish()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_store_config(
+        StoreConfig::default(),
+        admin_policy(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+    )?;
+    let revision_before = ready_revision(app.clone()).await?;
+
+    let restore = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ops/api/admin/dataset/restore")
+                .method(Method::POST)
+                .header("authorization", "Bearer admin")
+                .header("content-type", "application/n-quads")
+                .body(Body::from(
+                    "<http://example.com/Parent> <http://www.w3.org/2002/07/owl#disjointWith> <http://example.com/Other> .\n\
+                     <http://example.com/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Parent> .\n\
+                     <http://example.com/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Other> .\n",
+                ))?,
+        )
+        .await?;
+
+    assert_eq!(restore.status(), StatusCode::BAD_REQUEST);
+    let restore_text = body_text(restore).await?;
+    assert!(restore_text.contains("reasoner_reject"));
+    assert!(restore_text.contains("cax-dw"));
+
+    let ask = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query?query=ASK%20WHERE%20%7B%20%3Chttp%3A%2F%2Fexample.com%2Falice%3E%20a%20%3Chttp%3A%2F%2Fexample.com%2FOther%3E%20%7D")
+                .method(Method::GET)
+                .header("authorization", "Bearer reader")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert!(body_text(ask).await?.contains("false"));
+    assert_eq!(ready_revision(app).await?, revision_before);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_backup_endpoint_is_rate_limited_when_enabled()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_policy(PolicyConfig {
+        rate_limits: RateLimitConfig {
+            admin_requests_per_window: 1,
+            ..RateLimitConfig::default()
+        },
+        ..admin_policy()
+    })?;
+
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ops/api/admin/dataset/backup")
+                .method(Method::GET)
+                .header("authorization", "Bearer admin")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .uri("/ops/api/admin/dataset/backup")
+                .method(Method::GET)
+                .header("authorization", "Bearer admin")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    Ok(())
+}
+
+/// An image backup of a running on-disk store: into `backups/` of its data directory,
+/// answered with the manifest; admins only.
+#[tokio::test]
+async fn image_backup_writes_a_manifest_into_the_data_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()).with_ontology(crate::support::minimal_fixture_path()),
+        admin_policy(),
+        ReasonerConfig::default(),
+    )?;
+    let request = |token: &str| {
+        Request::builder()
+            .uri("/ops/api/admin/dataset/image")
+            .method(Method::POST)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+    };
+    let denied = app.clone().oneshot(request("reader")?).await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let response = app.oneshot(request("admin")?).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    let directory = std::path::PathBuf::from(json["directory"].as_str().unwrap());
+    assert!(directory.starts_with(dir.path().join("backups")));
+    assert_eq!(json["manifest"]["format"], "nrese-checkpoint");
+    assert!(json["manifest"]["quads"].as_u64().unwrap() > 0);
+    assert_eq!(
+        nrese_store::read_manifest(&directory)?.sha256,
+        json["manifest"]["sha256"]
+    );
+    Ok(())
+}

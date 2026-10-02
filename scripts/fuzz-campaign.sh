@@ -20,7 +20,7 @@ deadline=$(( $(date +%s) + ${hours%.*} * 3600 ))
 # The test binaries (crate:target) and the tests in them that draw random cases.
 targets=(
   "nrese-sparql:native_differential_tests:"
-  "nrese-store:equality_compact_tests:"
+  "nrese-store:it:equality_compact_tests::"
   "nrese-shacl:incremental_tests:"
   "nrese-engine:inferred_stack_tests:"
   "nrese-engine:lib:index::model_tests"
