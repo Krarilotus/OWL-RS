@@ -56,9 +56,9 @@ use crate::mapped::{Map, Mapped};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation};
 use crate::term::Dictionary;
 use crate::term::dictionary::{Base, base_slots};
+use crate::term::hash::key_hash;
 use crate::term::offsets::{BlockEnds, Ends, Offsets};
 use crate::term::vocabulary::{Codec, VocabularyEncoding, vocabulary_encoding};
-use crate::term::hash::key_hash;
 
 /// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
 /// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
@@ -312,8 +312,7 @@ fn read_dictionary(
         section(padding(ends_at + ends_len as usize), 1)?;
         let offsets = Offsets::Blocks(BlockEnds {
             count: len as usize,
-            blocks: Mapped::new(map, blocks_at, 2 * block_count as usize)
-                .ok_or_else(unmappable)?,
+            blocks: Mapped::new(map, blocks_at, 2 * block_count as usize).ok_or_else(unmappable)?,
             ends: Mapped::new(map, ends_at, ends_len as usize).ok_or_else(unmappable)?,
         });
         (offsets, arena_at)
@@ -357,8 +356,8 @@ fn read_dictionary(
             let block = (len as usize - 1) / crate::term::offsets::BLOCK;
             let at = blocks.blocks[2 * block + 1];
             let width = if at & 1 == 1 { 4 } else { 2 };
-            let needed = (at >> 1) as usize
-                + width * ((len as usize - 1) % crate::term::offsets::BLOCK + 1);
+            let needed =
+                (at >> 1) as usize + width * ((len as usize - 1) % crate::term::offsets::BLOCK + 1);
             if needed > blocks.ends.len() {
                 return Err("dictionary block offsets point past their ends".into());
             }
@@ -670,8 +669,14 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     reader.u64().ok_or_else(|| corrupt("truncated header"))?;
     // The flags: this engine's, but whether the keys are compressed.
     let flags = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
-    let base = read_dictionary(&mut reader, &map, true, blocks, flags & COMPRESSED_KEYS != 0)
-        .map_err(|error| corrupt(&error))?;
+    let base = read_dictionary(
+        &mut reader,
+        &map,
+        true,
+        blocks,
+        flags & COMPRESSED_KEYS != 0,
+    )
+    .map_err(|error| corrupt(&error))?;
     let [asserted, inferred] =
         read_stacks(&mut reader, body, Some(&map), false).map_err(|error| corrupt(&error))?;
     let index = |stack: Stack, packed| stack_index(stack, packed).map_err(|error| corrupt(&error));

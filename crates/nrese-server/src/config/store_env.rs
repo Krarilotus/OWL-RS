@@ -47,13 +47,14 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         },
         vocabulary: match source.get(names::VOCABULARY) {
             None => defaults.vocabulary,
-            Some(name) => nrese_engine::VocabularyEncoding::from_name(name.trim())
-                .with_context(|| {
+            Some(name) => {
+                nrese_engine::VocabularyEncoding::from_name(name.trim()).with_context(|| {
                     format!(
                         "{} must be 'plain' or 'fsst', not '{name}'",
                         names::VOCABULARY
                     )
-                })?,
+                })?
+            }
         },
         bulk_load_memory_bytes: parse_bulk_load_memory(
             source.get(names::BULK_LOAD_MEMORY).as_deref(),

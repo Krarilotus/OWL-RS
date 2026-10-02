@@ -138,7 +138,10 @@ impl Base {
 
     fn bytes(&self) -> u64 {
         let order = self.order.as_ref().map_or(0, |order| order.len() * 4);
-        let codec = self.codec.as_ref().map_or(0, |_| super::vocabulary::CODEC_BYTES);
+        let codec = self
+            .codec
+            .as_ref()
+            .map_or(0, |_| super::vocabulary::CODEC_BYTES);
         (self.arena.len() + self.offsets.bytes() + self.slots.len() * 4 + order + codec) as u64
     }
 
@@ -214,7 +217,11 @@ impl Inner {
                 .expect("an index below the base")
                 .plain(index);
         }
-        Key::Borrowed(heap_key(&self.bytes, &self.ends, (index - base_len) as usize))
+        Key::Borrowed(heap_key(
+            &self.bytes,
+            &self.ends,
+            (index - base_len) as usize,
+        ))
     }
 
     /// The index of `key`, whose hash is `hash`, if it is an entry.
@@ -525,8 +532,9 @@ impl Dictionary {
             let mut start = text.covered();
             while start < end {
                 let stop = (start + TEXT_BATCH).min(end);
-                let keys: Vec<(u64, Key<'_>)> =
-                    (start..stop).map(|index| (index, inner.key(index))).collect();
+                let keys: Vec<(u64, Key<'_>)> = (start..stop)
+                    .map(|index| (index, inner.key(index)))
+                    .collect();
                 let documents: Vec<(u64, &str)> = keys
                     .iter()
                     .filter_map(|(index, key)| match view_key(key) {

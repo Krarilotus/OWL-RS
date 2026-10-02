@@ -30,7 +30,8 @@ fn quads(round: u64) -> Vec<Quad> {
             let n = n + round * 10_000;
             let object: Term = match n % 7 {
                 0 => iri(format!("http://www.wikidata.org/entity/Q{n}")).into(),
-                1 => Literal::new_simple_literal(format!("a label of item {n}, \u{e9}t\u{e9}")).into(),
+                1 => Literal::new_simple_literal(format!("a label of item {n}, \u{e9}t\u{e9}"))
+                    .into(),
                 2 => Literal::new_language_tagged_literal(format!("Windm\u{fc}hle {n}"), "de")
                     .unwrap()
                     .into(),
@@ -134,7 +135,10 @@ fn compressed_vocabularies_read_as_plain_ones() {
             prefix: false,
             stem: None,
         });
-        assert_eq!(found.len(), first.len() / 7 + usize::from(first.len() % 7 > 2));
+        assert_eq!(
+            found.len(),
+            first.len() / 7 + usize::from(first.len() % 7 > 2)
+        );
         // Views of decoded keys, many under one lock.
         let ids: Vec<_> = first
             .iter()
@@ -157,7 +161,10 @@ fn compressed_vocabularies_read_as_plain_ones() {
     check(&engine, &first);
     check(&engine, &second);
     assert_eq!(
-        engine.snapshot().quads_for_pattern(&QuadPattern::all()).count(),
+        engine
+            .snapshot()
+            .quads_for_pattern(&QuadPattern::all())
+            .count(),
         first.len() + second.len()
     );
     let checkpoint = std::fs::read_dir(dir.path())
@@ -169,5 +176,8 @@ fn compressed_vocabularies_read_as_plain_ones() {
     // The flags' bit 1: the keys are compressed.
     let header = std::fs::read(checkpoint).unwrap();
     assert_eq!(&header[..8], b"NRESECKB");
-    assert_eq!(u64::from_le_bytes(header[16..24].try_into().unwrap()) & 2, 2);
+    assert_eq!(
+        u64::from_le_bytes(header[16..24].try_into().unwrap()) & 2,
+        2
+    );
 }
