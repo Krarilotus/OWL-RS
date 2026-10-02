@@ -58,9 +58,23 @@ async fn every_capability_reaches_every_repository() {
     )
     .unwrap();
     // Unknown repositories are absent on every route.
-    let (status, _) = send(&app, Method::GET, "/api/v1/repositories/second/info", None, "").await;
+    let (status, _) = send(
+        &app,
+        Method::GET,
+        "/api/v1/repositories/second/info",
+        None,
+        "",
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = send(&app, Method::PUT, "/repositories/second", Some("text/turtle"), "").await;
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        "/repositories/second",
+        Some("text/turtle"),
+        "",
+    )
+    .await;
     assert!(status.is_success(), "{status}");
 
     let base = "/api/v1/repositories/second";
@@ -156,8 +170,17 @@ async fn every_capability_reaches_every_repository() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    assert!(text.contains("false") || text.contains("Violation"), "{text}");
-    for path in ["classification", "info", "summary", "reasoning", "service-description"] {
+    assert!(
+        text.contains("false") || text.contains("Violation"),
+        "{text}"
+    );
+    for path in [
+        "classification",
+        "info",
+        "summary",
+        "reasoning",
+        "service-description",
+    ] {
         let (status, text) = send(&app, Method::GET, &format!("{base}/{path}"), None, "").await;
         assert_eq!(status, StatusCode::OK, "{path}: {text}");
     }
@@ -176,7 +199,14 @@ async fn repositories_and_namespaces_in_json() {
         ReasonerConfig::default(),
     )
     .unwrap();
-    let (status, _) = send(&app, Method::PUT, "/repositories/second", Some("text/turtle"), "").await;
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        "/repositories/second",
+        Some("text/turtle"),
+        "",
+    )
+    .await;
     assert!(status.is_success());
     let (status, text) = send(&app, Method::GET, "/api/v1/repositories", None, "").await;
     assert_eq!(status, StatusCode::OK);
@@ -189,16 +219,37 @@ async fn repositories_and_namespaces_in_json() {
         .collect();
     assert_eq!(ids, ["nrese", "second"]);
     let base = "/api/v1/repositories/second/namespaces";
-    let (status, _) = send(&app, Method::PUT, &format!("{base}/ex"), None, "http://example.com/").await;
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        &format!("{base}/ex"),
+        None,
+        "http://example.com/",
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (_, text) = send(&app, Method::GET, base, None, "").await;
     let map: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(map["ex"], "http://example.com/");
     assert_eq!(map["rdf"], "http://www.w3.org/1999/02/22-rdf-syntax-ns#");
     // The same prefixes through RDF4J; the default repository's are its own.
-    let (_, text) = send(&app, Method::GET, "/repositories/second/namespaces/ex", None, "").await;
+    let (_, text) = send(
+        &app,
+        Method::GET,
+        "/repositories/second/namespaces/ex",
+        None,
+        "",
+    )
+    .await;
     assert_eq!(text.trim(), "http://example.com/");
-    let (_, text) = send(&app, Method::GET, "/api/v1/repositories/nrese/namespaces", None, "").await;
+    let (_, text) = send(
+        &app,
+        Method::GET,
+        "/api/v1/repositories/nrese/namespaces",
+        None,
+        "",
+    )
+    .await;
     assert!(!text.contains("example.com"), "{text}");
     let (status, _) = send(&app, Method::DELETE, &format!("{base}/ex"), None, "").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -306,7 +357,10 @@ async fn explanations_through_the_engine_api() {
     let body: serde_json::Value = serde_json::from_str(&text).unwrap();
     let steps = body["steps"].as_array().unwrap();
     assert_eq!(steps[0]["origin"], "inferred");
-    assert_eq!(steps[0]["rule"], "rdfs9", "the RDFS name of the subclass rule");
+    assert_eq!(
+        steps[0]["rule"], "rdfs9",
+        "the RDFS name of the subclass rule"
+    );
     assert_eq!(steps[0]["premises"].as_array().unwrap().len(), 2);
     let (status, _) = send(&app, Method::GET, &explain("X"), None, "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);

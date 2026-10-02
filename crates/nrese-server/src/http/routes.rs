@@ -13,9 +13,15 @@ fn repository_routes() -> Router<AppState> {
         .route("/summary", get(handlers::operator_dataset_summary))
         .route("/reasoning", get(handlers::operator_reasoning_diagnostics))
         .route("/service-description", get(handlers::service_description))
-        .route("/query", get(handlers::query_get).post(handlers::query_post))
+        .route(
+            "/query",
+            get(handlers::query_get).post(handlers::query_post),
+        )
         .route("/update", post(handlers::update_post))
-        .route("/sparql", get(handlers::sparql_get).post(handlers::sparql_post))
+        .route(
+            "/sparql",
+            get(handlers::sparql_get).post(handlers::sparql_post),
+        )
         .route("/tell", post(handlers::tell_post))
         .route(
             "/data",
@@ -25,7 +31,10 @@ fn repository_routes() -> Router<AppState> {
                 .post(handlers::graph_post)
                 .delete(handlers::graph_delete),
         )
-        .route("/shacl", get(handlers::shacl_get).post(handlers::shacl_post))
+        .route(
+            "/shacl",
+            get(handlers::shacl_get).post(handlers::shacl_post),
+        )
         .route("/autocomplete", get(handlers::autocomplete))
         .route("/classification", get(handlers::classification_get))
         .route("/backup", get(handlers::admin_backup_dataset))

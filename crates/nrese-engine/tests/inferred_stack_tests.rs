@@ -217,7 +217,6 @@ fn remove_matching_retracts_asserted_statements_only() {
 
 // --- Differential test against a two-set model ------------------------------------------
 
-
 /// `seed` varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds; without
 /// it, the same cases on every run.
 fn fuzz(seed: u64) -> u64 {

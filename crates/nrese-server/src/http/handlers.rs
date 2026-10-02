@@ -9,12 +9,12 @@ use crate::http::admin_dataset;
 use crate::http::ai;
 use crate::http::console;
 use crate::http::graph_store;
-use crate::http::repository::Repository;
 use crate::http::guard;
 use crate::http::metrics;
 use crate::http::operator_api;
 use crate::http::operator_diagnostics;
 use crate::http::operator_ui;
+use crate::http::repository::Repository;
 use crate::http::requests::{
     SparqlOperation, accept_header_value, operation_from_post, query_from_post, query_from_url,
     update_from_post,

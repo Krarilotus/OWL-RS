@@ -1,6 +1,6 @@
 mod admin_dataset;
-mod api_v1;
 mod ai;
+mod api_v1;
 mod classification;
 mod console;
 mod graph_store;
@@ -14,8 +14,8 @@ mod operator_diagnostics;
 mod operator_ui;
 pub(crate) mod rdf4j;
 mod rdf_payload;
-mod repository;
 mod reasoning_view;
+mod repository;
 pub(crate) mod request_metrics;
 mod requests;
 mod responses;
