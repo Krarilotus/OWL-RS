@@ -12,6 +12,8 @@
 //! The first variable's candidates are split across threads (rayon); each thread extends
 //! its share depth-first and collects rows. The output is unordered.
 
+use std::borrow::Cow;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nrese_engine::quad::Permutation;
@@ -33,6 +35,9 @@ pub(super) struct Query<'a> {
     pub variables: usize,
     /// Solutions allowed (the query's memory budget).
     pub max_rows: usize,
+    /// The value lists of patterns with a single variable, read once: the same under any
+    /// bindings (LUBM q2 intersected the 2007 departments for each of 1000 universities).
+    lists: Vec<OnceLock<Option<Vec<u64>>>>,
 }
 
 /// Why a join stopped early.
@@ -44,6 +49,9 @@ pub(super) enum Stop {
 /// A pattern at most this many times larger than the smallest one is intersected as a
 /// sorted list rather than checked by one lookup per candidate.
 const LIST_FACTOR: u64 = 32;
+
+/// Chunks of the first variable's candidates per thread, for balance.
+const CHUNKS_PER_THREAD: usize = 4;
 
 /// Solutions a thread produces between two checks of the shared row count.
 const ROW_STEP: usize = 4096;
@@ -105,7 +113,25 @@ pub(super) fn cyclic(patterns: &[[Pos; 3]], variables: usize) -> bool {
     false
 }
 
-impl Query<'_> {
+impl<'a> Query<'a> {
+    pub(super) fn new(
+        snapshot: &'a Snapshot,
+        model: ReadModel,
+        patterns: Vec<[Pos; 3]>,
+        variables: usize,
+        max_rows: usize,
+    ) -> Self {
+        let lists = patterns.iter().map(|_| OnceLock::new()).collect();
+        Self {
+            snapshot,
+            model,
+            patterns,
+            variables,
+            max_rows,
+            lists,
+        }
+    }
+
     fn quad_pattern(&self, pattern: &[Pos; 3], bindings: &[Option<u64>]) -> QuadPattern {
         let value = |p: Pos| match p {
             Pos::Const(id) => Some(TermId::from_raw(id)),
@@ -184,7 +210,7 @@ impl Query<'_> {
         let mut enforced = vec![false; self.patterns.len()];
         enforced[driver] = true;
         let mut values = match self.sorted_values(driver, var, bindings) {
-            Some(values) => values,
+            Some(values) => values.into_owned(),
             None => {
                 let pattern = &self.patterns[driver];
                 let positions: Vec<usize> =
@@ -226,13 +252,29 @@ impl Query<'_> {
     }
 
     /// The values of `var` in pattern `index`'s matches, in id order, if `var` is its only
-    /// unbound position (then an index range lists them sorted and distinct).
+    /// unbound position (then an index range lists them sorted and distinct). A pattern
+    /// with no other variable gives the same list under any bindings: read once.
     fn sorted_values(
         &self,
         index: usize,
         var: usize,
         bindings: &[Option<u64>],
-    ) -> Option<Vec<u64>> {
+    ) -> Option<Cow<'_, [u64]>> {
+        let pattern = &self.patterns[index];
+        let only_var = pattern
+            .iter()
+            .all(|&p| matches!(p, Pos::Const(_)) || p == Pos::Var(var));
+        if only_var {
+            return self.lists[index]
+                .get_or_init(|| self.read_values(index, var, bindings))
+                .as_deref()
+                .map(Cow::Borrowed);
+        }
+        self.read_values(index, var, bindings).map(Cow::Owned)
+    }
+
+    /// [`Self::sorted_values`], read from the index.
+    fn read_values(&self, index: usize, var: usize, bindings: &[Option<u64>]) -> Option<Vec<u64>> {
         let pattern = &self.patterns[index];
         let mut free = (0..3).filter(|&c| match pattern[c] {
             Pos::Var(v) => bindings[v].is_none(),
@@ -341,8 +383,14 @@ impl Query<'_> {
             rows: AtomicUsize::new(0),
             token,
         };
+        // A few chunks per thread, at most 256 values each: 1000 universities (LUBM q2) in
+        // chunks of 256 kept 4 of 32 threads busy.
+        let chunk = first
+            .len()
+            .div_ceil(rayon::current_num_threads() * CHUNKS_PER_THREAD)
+            .clamp(1, 256);
         let chunks: Vec<Result<Vec<u64>, Stop>> = first
-            .par_chunks(256)
+            .par_chunks(chunk)
             .map(|chunk| {
                 let mut bindings = vec![None; self.variables];
                 let mut rows = Vec::new();
