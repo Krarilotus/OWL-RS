@@ -67,7 +67,11 @@ pub(crate) fn fingerprint(
         } else {
             0
         }
-        ^ if compact_equality { COMPACT_EQUALITY } else { 0 }
+        ^ if compact_equality {
+            COMPACT_EQUALITY
+        } else {
+            0
+        }
 }
 
 impl ReasoningState {

@@ -83,7 +83,8 @@ impl Snapshot {
         if model == ReadModel::Asserted || !default_graph {
             return None;
         }
-        self.equality_classes().filter(|classes| !classes.is_empty())
+        self.equality_classes()
+            .filter(|classes| !classes.is_empty())
     }
 
     /// The expanded matches of `pattern` in `model`, sorted by `permutation` (module docs

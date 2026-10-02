@@ -2037,7 +2037,8 @@ impl<'a> Context<'a> {
                             }),
                         _ => None,
                     };
-                    hinted.unwrap_or_else(|| self.snapshot.estimate_in(self.model, &s.quad_pattern()))
+                    hinted
+                        .unwrap_or_else(|| self.snapshot.estimate_in(self.model, &s.quad_pattern()))
                 })
                 .min()
                 .unwrap_or(0);
