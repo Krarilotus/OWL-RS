@@ -18,6 +18,8 @@
 //! about terms, transactions or durability.
 
 pub(crate) mod compaction;
+#[cfg(test)]
+mod compression_study;
 pub(crate) mod keys;
 mod merge;
 pub(crate) mod run;
