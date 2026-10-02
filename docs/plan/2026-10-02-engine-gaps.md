@@ -43,10 +43,13 @@ by the coming frontend; the protocols only translate.
   ResearchSpace and DMW pass their end-to-end runs on the server image (ResearchSpace:
   its search templates' Blazegraph check and the knowledge map's query hints needed the
   hint support; every query in its templates parses and runs).
-- **Still open in G2:** shapes and rulesets as managed objects (checked before they are
-  stored), saved queries per user and workspace, implicit prefixes from the repository's
-  namespaces (GraphDB-style; needs the query cache keyed by them), ResearchSpace's pages
-  and forms in a browser.
+- **Done since (2 October, with the audit's B):** every store read and write scoped by its
+  requester; the repository catalogue in the store; one settings registry with a JSON
+  Schema; authentication before handlers and bodies; implicit prefixes from the
+  repository's namespaces (queries and updates; the result cache keyed by them); the
+  shapes graph and user rules as managed objects, checked before they are stored
+  (`/shapes`, `/rules`); saved queries per user and workspace (`/api/v1/queries`).
+- **Still open in G2:** ResearchSpace's pages and forms in a browser (with the frontend).
 - **State in the core.** Done: namespaces and client transactions (sessions) moved from
   the RDF4J adapter into the store; access policies, users and workspaces (G2b). Next:
   repository settings, the shapes graph and rulesets as managed store objects.
