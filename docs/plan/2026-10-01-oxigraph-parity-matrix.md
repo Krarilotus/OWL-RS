@@ -22,9 +22,9 @@ do), **decide** (the owner decides whether the use case needs it).
 | In-memory backend | The same engine in memory (writes 0.22 ms at 10 M) | **have** |
 | WebAssembly build (memory-backed) | None; the bundle crates (`nrese-rdf`, `-xsd`, `-json`, `-rdf-io`) are pure Rust without threads or files in their core and could build for WASM | **decide** (see §8) |
 | Permutation indexes: SPO, POS, OSP, GSPO, GPOS, GOSP, SPOG | Seven permutations: SPOG, POSG, OSPG, GSPO, GPOS, GOSP, and GPSO for star joins | **have** |
-| Key encoding: prefix compression, varints | 64-bit term ids, bit-packed runs (peak memory on LUBM(100) 5.5 → 2.5 GB); memory-mapped runs for data larger than RAM missing (Pf2) | **partial** |
+| Key encoding: prefix compression, varints | 64-bit term ids, bit-packed runs (peak memory on LUBM(100) 5.5 → 2.5 GB); checkpoints are memory-mapped and used in place, at restart and once written (a restart opens DBpedia's 67 M quads in milliseconds at 13 MiB resident) | **have** |
 | Term dictionary, two-way | Dictionary encoding to 64-bit `TermId`s | **have** |
-| Inlined values (numbers, booleans, dates) | Canonical `xsd:integer` and `xsd:boolean` inlined, and only canonical forms, so `"01"` and `"1"` stay distinct terms (RDF-correct); decimals, doubles and dates not inlined | **partial**: inline more types, measured in the perf lab |
+| Inlined values (numbers, booleans, dates) | Canonical `xsd:integer`, `xsd:boolean`, `xsd:decimal`, `xsd:date`, `xsd:dateTime` and the integer-derived types (`xsd:int`, `long`, ..., 2 October) inlined, only canonical forms, so `"01"` and `"1"` stay distinct terms (RDF-correct); ids sort by value, so ranges, ORDER BY and aggregates read ids; doubles and floats not inlined | **have** (doubles: open) |
 | 128-bit hashes for interned strings | A dictionary with exact lookup; no hash-identity risk | **have** (different design) |
 | Snapshot isolation, non-blocking readers | MVCC: a snapshot is an `Arc` of the run list; readers never block | **have** |
 | Single writer, atomic batches | Single writer slot; mutation pipeline plan → validate (reasoning, SHACL) → commit, delta-proportional | **have** (see §7 for write concurrency) |
@@ -105,7 +105,7 @@ version bump of the crates it changes (minor while they are 0.x).
 | `sparopt`, `spareval` | `nrese-sparql` (planner, native executor), `nrese-exec` | **have** |
 | `spargeo` | GeoSPARQL in `nrese-sparql` with an R-tree | **have** |
 | `oxigraph` (`Store`, transactions, bulk load) | `nrese-engine` and `nrese-store` | **have** |
-| CLI: load, convert, validate, dump, batch queries | `nrese-server load` (100 M triples in 37 s), configuration check, backup and restore through the API; no format conversion or batch query subcommands | **partial**: add `convert` and `query` subcommands (small; reuse `nrese-rdf-io` and the store) |
+| CLI: load, convert, validate, dump, batch queries | `nrese-server load` (100 M triples in 37 s), `query` (one query on the store, results to standard output), `convert` (one RDF file into another format, streamed), configuration check, backup and restore through the API | **have** |
 | HTTP server with SPARQL and Graph Store Protocols | `nrese-server` | **have** |
 | Web UI (YASGUI) | `nrese-console` (browser UI and CLI) | **have** |
 | Docker images, multi-arch | A `Dockerfile`; multi-arch builds not set up | **partial** (packaging, E5) |
