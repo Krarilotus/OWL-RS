@@ -9,6 +9,8 @@
 #   6. remove what it created
 #
 # Usage: scripts/smoke-dmw-export.sh [server URL]   (default http://127.0.0.1:8080)
+#        DMW_GATE=enforce scripts/smoke-dmw-export.sh …   for a server with
+#        `shacl.gate = "enforce"`: the breaking export is then refused at its commit.
 # Needs a server with writes enabled, `store.default_graph = "union"` (the exports go into
 # named graphs and the questions are asked without naming them), and an empty or
 # disposable dataset. Exits non-zero on the first difference and says what differed.
@@ -110,6 +112,23 @@ put_graph "$SHAPES_GRAPH" shapes.ttl 201
 request 200 -H 'Accept: application/json' "$SERVER/dataset/shacl"
 body_has '"conforms":true'
 body_has '"shapes":4'
+
+if [ "${DMW_GATE:-off}" = enforce ]; then
+  say "data that breaks the shapes is refused at the commit (shacl.gate = enforce), with what is wrong"
+  put_graph "$INVALID_GRAPH" invalid.ttl 400
+  body_has 'petition-3'
+  body_has 'MinCountConstraintComponent'
+  request 404 "$(graph_url "$INVALID_GRAPH")"
+  request 200 -H 'Accept: application/json' "$SERVER/dataset/shacl"
+  body_has '"conforms":true'
+  say "remove what was created"
+  for graph in "$MODULE_GRAPH" "$DATA_GRAPH" "$SHAPES_GRAPH"; do
+    request 204 -X DELETE "$(graph_url "$graph")"
+    request 404 "$(graph_url "$graph")"
+  done
+  printf 'ok: %d steps against %s (gate enforced)\n' "$step" "$SERVER"
+  exit 0
+fi
 
 say "data that breaks the shapes is reported, with what is wrong"
 put_graph "$INVALID_GRAPH" invalid.ttl 201
