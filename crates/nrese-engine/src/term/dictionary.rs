@@ -252,17 +252,30 @@ impl Inner {
 
 /// Keys decoded while views of them are lent out ([`Dictionary::with_views`]): each stays
 /// where it is until the arena is dropped, after the views.
+///
+/// The keys are kept as raw allocations, not as `Box`es: moving a `Box` (into the list, or
+/// when the list grows) asserts unique ownership again and would invalidate the views
+/// already lent out (Stacked Borrows); a raw pointer from `Box::into_raw` stays valid until
+/// the allocation is freed in `drop`.
 #[derive(Default)]
-struct Decoded(std::cell::RefCell<Vec<Box<[u8]>>>);
+struct Decoded(std::cell::RefCell<Vec<*mut [u8]>>);
 
 impl Decoded {
     fn keep(&self, key: Vec<u8>) -> &[u8] {
-        let key = key.into_boxed_slice();
-        let kept: *const [u8] = &*key;
-        self.0.borrow_mut().push(key);
-        // SAFETY: the box's contents never move and are freed only when `self` is dropped;
-        // the reference borrows `self`.
+        let kept: *mut [u8] = Box::into_raw(key.into_boxed_slice());
+        self.0.borrow_mut().push(kept);
+        // SAFETY: the allocation belongs to the arena, is never written or moved, and is
+        // freed only in `drop`, after every borrow of `self` (and so every view) has ended.
         unsafe { &*kept }
+    }
+}
+
+impl Drop for Decoded {
+    fn drop(&mut self) {
+        for kept in self.0.get_mut().drain(..) {
+            // SAFETY: each pointer came from `Box::into_raw` in `keep` and is freed once.
+            drop(unsafe { Box::from_raw(kept) });
+        }
     }
 }
 
@@ -1345,6 +1358,21 @@ mod tests {
     use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
 
     use super::*;
+
+    /// Views of decoded keys stay valid while the arena keeps more (its list grows and
+    /// moves): the case Miri's Stacked Borrows checks (the audit of 2 October).
+    #[test]
+    fn decoded_keys_stay_put_while_the_arena_grows() {
+        let arena = Decoded::default();
+        let first = arena.keep(b"first key".to_vec());
+        let views: Vec<&[u8]> = (0..1000u32)
+            .map(|i| arena.keep(i.to_le_bytes().repeat(3)))
+            .collect();
+        assert_eq!(first, b"first key");
+        for (i, view) in views.iter().enumerate() {
+            assert_eq!(*view, (i as u32).to_le_bytes().repeat(3).as_slice());
+        }
+    }
 
     #[test]
     fn bulk_restore_matches_interning() {
