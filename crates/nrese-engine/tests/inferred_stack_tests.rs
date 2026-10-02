@@ -217,6 +217,16 @@ fn remove_matching_retracts_asserted_statements_only() {
 
 // --- Differential test against a two-set model ------------------------------------------
 
+
+/// `seed` varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds; without
+/// it, the same cases on every run.
+fn fuzz(seed: u64) -> u64 {
+    let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+    seed ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
 /// SplitMix64: tiny, deterministic, good enough for test-case generation.
 struct Rng(u64);
 
@@ -350,7 +360,7 @@ fn assert_view(
                 .collect();
             assert_eq!(got, want, "{context}: {read_model:?} {pattern:?}");
         }
-        let mut rng = Rng(expected.len() as u64);
+        let mut rng = Rng(fuzz(expected.len() as u64));
         for _ in 0..8 {
             let probe = random_quad(&mut rng);
             assert_eq!(
@@ -479,7 +489,7 @@ fn run_random_transactions(engine: &Engine, rng: &mut Rng, committed: &mut Model
 fn both_stacks_match_the_model_with_compaction() {
     for seed in 0..25 {
         let engine = engine(); // inline compaction after every commit
-        let mut rng = Rng(seed);
+        let mut rng = Rng(fuzz(seed));
         let mut committed = Model::default();
         run_random_transactions(&engine, &mut rng, &mut committed, 40);
     }
@@ -492,7 +502,7 @@ fn both_stacks_survive_checkpoints_and_reopening() {
         background_maintenance: false,
         ..EngineConfig::default()
     };
-    let mut rng = Rng(99);
+    let mut rng = Rng(fuzz(99));
     let mut committed = Model::default();
     for round in 0..6 {
         let engine = Engine::open(dir.path(), config).expect("open");

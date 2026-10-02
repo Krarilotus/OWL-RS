@@ -190,6 +190,16 @@ fn compact_equality_survives_a_restart() {
     );
 }
 
+
+/// `seed` varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds; without
+/// it, the same cases on every run.
+fn fuzz(seed: u64) -> u64 {
+    let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+    seed ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
 /// A small deterministic generator (the tests need no randomness crate).
 struct Lcg(u64);
 
@@ -209,7 +219,7 @@ impl Lcg {
 #[test]
 fn compact_equality_answers_as_replication_on_random_data() {
     for seed in 1..=12u64 {
-        let mut random = Lcg(seed);
+        let mut random = Lcg(fuzz(seed));
         let entity = |i: usize| format!("ex:e{i}");
         let predicates = ["ex:p", "ex:q", "ex:r", "ex:f", "ex:i"];
         let fact = |random: &mut Lcg| {
