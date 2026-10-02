@@ -183,16 +183,29 @@ pub struct Catalog {
     others: RwLock<BTreeMap<String, Repository>>,
 }
 
-/// Whether `id` can name a repository: letters, digits, `-`, `_` and `.`, at most 64.
+/// Whether `id` can name a repository: letters, digits, `-`, `_` and `.`, at most 64, not
+/// starting with `.` (the catalogue's own directories do) nor ending with one (Windows
+/// drops it: `a.` is `a`), and no Windows device name (`CON`, `NUL`, `COM1`, ... with or
+/// without an extension), on every system, so that a data directory moves between them.
 fn valid(id: &str) -> bool {
+    const DEVICES: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    let stem = id.split('.').next().unwrap_or(id).to_ascii_uppercase();
+    let device = DEVICES.contains(&stem.as_str())
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit());
     !id.is_empty()
         && id.len() <= 64
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        && id != "."
-        && id != ".."
+        && !id.starts_with('.')
+        && !id.ends_with('.')
+        && !device
 }
+
+/// What a repository's directory is renamed to while it is removed.
+const TRASH: &str = ".trash-";
 
 impl Catalog {
     /// The repositories of a server whose default store is `store`, reasoning with
@@ -228,6 +241,13 @@ impl Catalog {
                 let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
                     continue;
                 };
+                // A removal that didn't finish (files still held when it ran): finished now.
+                if id.starts_with(TRASH) {
+                    if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                        tracing::warn!(dir = %entry.path().display(), %error, "removed repository's files not deleted");
+                    }
+                    continue;
+                }
                 if !valid(&id) || !entry.path().is_dir() {
                     continue;
                 }
@@ -376,12 +396,18 @@ impl Catalog {
     pub fn create(&self, id: &str, settings: RepositorySettings) -> Result<(), CatalogError> {
         if !valid(id) {
             return Err(CatalogError::Invalid(format!(
-                "'{id}' can't name a repository (letters, digits, '-', '_', '.')"
+                "'{id}' can't name a repository (letters, digits, '-', '_', '.', not starting or ending with '.', no device name such as 'CON')"
             )));
         }
-        if id == DEFAULT_REPOSITORY || self.others.read().contains_key(id) {
+        // Ids differing only in case are one directory on Windows and macOS.
+        let taken = |other: &str| other.eq_ignore_ascii_case(id);
+        if let Some(other) = std::iter::once(DEFAULT_REPOSITORY)
+            .chain(self.others.read().keys().map(String::as_str))
+            .find(|other| taken(other))
+            .map(str::to_owned)
+        {
             return Err(CatalogError::Conflict(format!(
-                "repository '{id}' exists already"
+                "repository '{other}' exists already"
             )));
         }
         check(&settings)?;
@@ -409,12 +435,26 @@ impl Catalog {
         let Some(repository) = self.others.write().remove(id) else {
             return Err(CatalogError::NotFound(format!("no repository '{id}'")));
         };
-        // The store goes with the last request that holds it; its files after that.
+        // The store goes with the last request that holds it; its files after that. The
+        // directory is renamed first (at once), so that files still held (mapped
+        // checkpoints of a request in flight, on Windows) leave a `.trash-` directory the
+        // next start deletes, not a broken repository.
         drop(repository);
         if let Some(root) = &self.root {
             let dir = root.join(id);
-            if let Err(error) = std::fs::remove_dir_all(&dir) {
-                tracing::warn!(dir = %dir.display(), %error, "repository files not removed");
+            let trash = (0..)
+                .map(|n| root.join(format!("{TRASH}{id}-{n}")))
+                .find(|path| !path.exists())
+                .expect("a free name");
+            let doomed = match std::fs::rename(&dir, &trash) {
+                Ok(()) => trash,
+                Err(error) => {
+                    tracing::warn!(dir = %dir.display(), %error, "repository directory not renamed");
+                    dir
+                }
+            };
+            if let Err(error) = std::fs::remove_dir_all(&doomed) {
+                tracing::warn!(dir = %doomed.display(), %error, "repository files not removed yet; deleted at the next start");
             }
         }
         Ok(())
@@ -433,5 +473,12 @@ mod tests {
         assert!(!valid(".."));
         assert!(!valid("a/b"));
         assert!(!valid(&"x".repeat(65)));
+        // Hidden, trailing dots, device names (any case, with an extension).
+        assert!(!valid(".trash-a-0"));
+        assert!(!valid("repo."));
+        for device in ["CON", "nul", "Aux.db", "com1", "LPT9.x"] {
+            assert!(!valid(device), "{device}");
+        }
+        assert!(valid("console") && valid("com10") && valid("nullable"));
     }
 }

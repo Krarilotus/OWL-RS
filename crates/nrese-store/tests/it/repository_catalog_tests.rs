@@ -77,6 +77,21 @@ fn repositories_outlive_the_catalogue_that_made_them() {
     catalog.delete("bench").expect("removed");
     assert!(catalog.get("bench").is_none());
     assert!(catalog.list().is_empty());
+    drop(store);
+    drop(catalog);
+    // Nothing left under the root, and a removal a start didn't see finish (a renamed
+    // directory whose files were still held) is swept at the next one.
+    let root = dir.path().join("repositories");
+    let left = |root: &std::path::Path| {
+        std::fs::read_dir(root)
+            .map(|entries| entries.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    std::fs::create_dir_all(root.join(".trash-old-0")).unwrap();
+    std::fs::write(root.join(".trash-old-0").join("file"), b"x").unwrap();
+    let catalog = open(dir.path());
+    assert!(catalog.list().is_empty());
+    assert!(left(&root).is_empty(), "{:?}", left(&root));
 }
 
 #[test]
@@ -99,6 +114,24 @@ fn the_catalogue_refuses_what_it_cant_do() {
     assert!(matches!(
         catalog.create(DEFAULT_REPOSITORY, RepositorySettings::default()),
         Err(CatalogError::Conflict(_))
+    ));
+    // Ids differing only in case are one directory on Windows and macOS.
+    assert!(matches!(
+        catalog.create(
+            &DEFAULT_REPOSITORY.to_uppercase(),
+            RepositorySettings::default()
+        ),
+        Err(CatalogError::Conflict(_))
+    ));
+    catalog
+        .create("bench", RepositorySettings::default())
+        .expect("created");
+    assert!(matches!(
+        catalog.create("Bench", RepositorySettings::default()),
+        Err(CatalogError::Conflict(_))
+    ));
+    assert!(invalid(
+        catalog.create("con", RepositorySettings::default())
     ));
     assert!(matches!(
         catalog.change("nowhere", RepositorySettings::default()),
