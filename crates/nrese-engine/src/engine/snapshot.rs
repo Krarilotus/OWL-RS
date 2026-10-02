@@ -234,6 +234,36 @@ impl Snapshot {
         })
     }
 
+    /// [`Self::scan_range_in`] as columns of `components`, decoded a block and a column at
+    /// a time ([`Self::scan_columns_in`]); `None` where that can't answer.
+    pub fn scan_range_columns_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        low: TermId,
+        high: TermId,
+        components: &[usize],
+    ) -> Option<Vec<Vec<u64>>> {
+        let plan = self.range_plan(model, pattern, permutation, low, high)?;
+        let mut out = vec![Vec::new(); components.len()];
+        let mut answered = false;
+        for stack in Stack::ALL {
+            if !model.includes(stack) {
+                continue;
+            }
+            let index = self.version.stack(stack);
+            if !index.any_plan(&plan) {
+                continue;
+            }
+            if answered || !index.scan_columns(&plan, components, &mut out) {
+                return None;
+            }
+            answered = true;
+        }
+        Some(out)
+    }
+
     /// Exact number of quads [`scan_range_in`](Self::scan_range_in) yields.
     pub fn count_range_in(
         &self,

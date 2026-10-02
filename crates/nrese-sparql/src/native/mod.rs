@@ -2767,9 +2767,23 @@ impl<'a> Context<'a> {
                 .par_retain(|table, row| set.contains(table.get(row, column)));
             return self.produced(solutions);
         }
-        let mut table = IdTable::new(vars.len());
-        let mut row = vec![0u64; vars.len()];
+        // Each range a block and a column at a time where the index can, else quad by quad.
+        let mut out: Vec<Vec<u64>> = vec![Vec::new(); vars.len()];
         for &(low, high) in ranges {
+            self.check()?;
+            if let Some(decoded) = self.snapshot.scan_range_columns_in(
+                self.model,
+                &pattern,
+                permutation,
+                low,
+                high,
+                &columns,
+            ) {
+                for (column, values) in out.iter_mut().zip(decoded) {
+                    column.extend(values);
+                }
+                continue;
+            }
             let Some(quads) =
                 self.snapshot
                     .scan_range_in(self.model, &pattern, permutation, low, high)
@@ -2781,17 +2795,16 @@ impl<'a> Context<'a> {
                     self.check()?;
                 }
                 let components = quad.components();
-                for (slot, &c) in row.iter_mut().zip(&columns) {
-                    *slot = components[c];
+                for (column, &c) in out.iter_mut().zip(&columns) {
+                    column.push(components[c]);
                 }
-                table.push_row(&row);
             }
         }
         let object = vars
             .iter()
             .position(|v| scan.slots[2].is_var(v))
             .expect("ranged object");
-        let table = table.assume_sorted_by(vec![object]);
+        let table = IdTable::from_columns(out).assume_sorted_by(vec![object]);
         self.produced(Solutions {
             vars,
             table,
