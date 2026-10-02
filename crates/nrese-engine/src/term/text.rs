@@ -81,6 +81,27 @@ pub struct TextMatch {
     pub relevance: f64,
 }
 
+/// The text an IRI is found by in autocompletion: its local name (after the last `#`,
+/// `/` or `:`) with camel case split into words, and the local name whole
+/// (`AlbertEinstein` → `Albert Einstein AlbertEinstein`).
+pub(crate) fn local_name_text(iri: &str) -> Option<String> {
+    let local = iri.rsplit(['#', '/', ':']).next()?;
+    if local.is_empty() {
+        return None;
+    }
+    let mut spaced = String::with_capacity(local.len() * 2);
+    let mut previous: Option<char> = None;
+    for c in local.chars() {
+        if previous.is_some_and(|p| p.is_lowercase() && c.is_uppercase()) {
+            spaced.push(' ');
+        }
+        spaced.push(c);
+        previous = Some(c);
+    }
+    let whole: String = local.chars().filter(|c| c.is_alphanumeric()).collect();
+    Some(format!("{spaced} {whole}"))
+}
+
 /// The words of `text`: maximal runs of letters and digits, lower-cased.
 pub fn words(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !c.is_alphanumeric())
@@ -474,5 +495,19 @@ mod tests {
         index.prepare_stems("fr");
         assert_eq!(query(&index, "connecté", None), Vec::<u64>::new());
         assert_eq!(query(&index, "connecté", Some("fr")), [1, 3]);
+    }
+
+    #[test]
+    fn local_names_split_for_autocompletion() {
+        assert_eq!(
+            local_name_text("http://dbpedia.org/resource/Albert_Einstein").as_deref(),
+            Some("Albert_Einstein AlbertEinstein")
+        );
+        assert_eq!(
+            local_name_text("http://example.com/onto#hasPart").as_deref(),
+            Some("has Part hasPart")
+        );
+        assert_eq!(local_name_text("urn:isbn:123").as_deref(), Some("123 123"));
+        assert_eq!(local_name_text("http://example.com/"), None);
     }
 }
