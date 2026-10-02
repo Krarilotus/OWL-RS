@@ -146,6 +146,7 @@ pub fn router(state: AppState) -> Router {
         .route("/console/{*path}", get(handlers::console_file))
         // The engine API (ADR-0007): every capability for every repository, by the same
         // handlers as the default repository's `/dataset/…` routes.
+        .route("/api/v1/openapi.json", get(crate::http::openapi::openapi))
         .route("/api/v1/repositories", get(api_v1::repositories))
         // Users, workspaces and graph policies (ADR-0008).
         .route("/api/v1/access", get(access_api::overview))

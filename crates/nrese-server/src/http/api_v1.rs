@@ -16,7 +16,7 @@ use crate::http::repository::Repository;
 use crate::repositories::DEFAULT_REPOSITORY;
 use crate::state::AppState;
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct RepositoryEntry {
     id: String,
     title: String,
@@ -25,6 +25,8 @@ struct RepositoryEntry {
     default: bool,
 }
 
+#[utoipa::path(get, path = "/api/v1/repositories", tag = "repositories",
+    responses((status = 200, description = "The repositories, the default one first", body = Vec<RepositoryEntry>)))]
 /// The repositories: the default one first, then the others.
 pub async fn repositories(
     State(state): State<AppState>,
@@ -43,7 +45,7 @@ pub async fn repositories(
     Ok(Json(entries).into_response())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct RepositoryView {
     id: String,
     title: String,
@@ -56,6 +58,9 @@ struct RepositoryView {
     settings: Option<crate::repository_config::RepositorySettings>,
 }
 
+#[utoipa::path(get, path = "/api/v1/repositories/{id}", tag = "repositories", params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)")),
+    responses((status = 200, description = "The repository", body = RepositoryView),
+        (status = 404, description = "No such repository", body = crate::http::openapi::Problem)))]
 /// One repository: its title, reasoning and settings; 404 if there is none.
 pub async fn repository_get(
     State(state): State<AppState>,
@@ -79,6 +84,10 @@ pub async fn repository_get(
     .into_response())
 }
 
+#[utoipa::path(put, path = "/api/v1/repositories/{id}", tag = "repositories", params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)")),
+    request_body(content = Option<crate::repository_config::RepositorySettings>, description = "Its settings; none for the server's"),
+    responses((status = 201, description = "Created; `Location` is its path"),
+        (status = 400, description = "Invalid id or settings", body = crate::http::openapi::Problem), (status = 409, description = "It exists already", body = crate::http::openapi::Problem)))]
 /// Creates repository `id`, empty, with the settings in the JSON body (`title`,
 /// `reasoning` by mode name, `rules`; an empty body for the server's): 201 with its path,
 /// 409 if it exists.
@@ -109,6 +118,9 @@ pub async fn repository_put(
         .into_response())
 }
 
+#[utoipa::path(delete, path = "/api/v1/repositories/{id}", tag = "repositories", params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)")),
+    responses((status = 204, description = "Removed with its data"),
+        (status = 400, description = "The default repository stays", body = crate::http::openapi::Problem), (status = 404, description = "No such repository", body = crate::http::openapi::Problem)))]
 /// Removes repository `id` and its data; the default repository stays.
 pub async fn repository_delete(
     State(state): State<AppState>,
@@ -120,6 +132,8 @@ pub async fn repository_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(get, path = "/api/v1/repositories/{id}/namespaces", tag = "namespaces", params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)")),
+    responses((status = 200, description = "Prefix to IRI", body = std::collections::BTreeMap<String, String>)))]
 /// The repository's namespace prefixes, as a JSON object of prefix to IRI.
 pub async fn namespaces_get(
     Repository(state): Repository,
@@ -129,6 +143,10 @@ pub async fn namespaces_get(
     Ok(Json(state.store().namespaces().all()).into_response())
 }
 
+#[utoipa::path(put, path = "/api/v1/repositories/{id}/namespaces/{prefix}", tag = "namespaces",
+    params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("prefix" = String, Path)),
+    request_body(content = String, content_type = "text/plain", description = "The namespace IRI"),
+    responses((status = 204, description = "Bound")))]
 /// Binds the prefix to the IRI in the body (plain text).
 pub async fn namespace_put(
     Repository(state): Repository,
@@ -151,6 +169,9 @@ pub async fn namespace_put(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(delete, path = "/api/v1/repositories/{id}/namespaces/{prefix}", tag = "namespaces",
+    params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("prefix" = String, Path)),
+    responses((status = 204, description = "Unbound"), (status = 404, description = "Not bound", body = crate::http::openapi::Problem)))]
 /// Removes the prefix; 404 if it isn't bound.
 pub async fn namespace_delete(
     Repository(state): Repository,
@@ -169,7 +190,7 @@ pub async fn namespace_delete(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct SessionOpened {
     id: String,
     /// Where its operations go.
@@ -178,6 +199,8 @@ struct SessionOpened {
     idle_seconds: u64,
 }
 
+#[utoipa::path(post, path = "/api/v1/repositories/{id}/sessions", tag = "sessions", params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)")),
+    responses((status = 201, description = "Opened", body = SessionOpened)))]
 /// Opens a client transaction ([`nrese_store::Sessions`]): writes collected over requests
 /// and committed as one.
 pub async fn session_begin(
@@ -213,6 +236,10 @@ fn add(
     }
 }
 
+#[utoipa::path(post, path = "/api/v1/repositories/{id}/sessions/{session}/update", tag = "sessions",
+    params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("session" = String, Path, description = "The session's id")),
+    request_body(content = String, content_type = "application/sparql-update"),
+    responses((status = 204, description = "Collected for the commit"), (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
 /// A SPARQL update (as the update endpoint takes it), applied at the commit.
 pub async fn session_update(
     Repository(state): Repository,
@@ -230,6 +257,11 @@ pub async fn session_update(
     )
 }
 
+#[utoipa::path(method(post, delete), path = "/api/v1/repositories/{id}/sessions/{session}/data", tag = "sessions",
+    params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("session" = String, Path, description = "The session's id"), ("graph" = Option<String>, Query, description = "The graph (an IRI); else the graphs the data names")),
+    request_body(content = String, description = "RDF in any format NRESE reads (`Content-Type`)"),
+    responses((status = 204, description = "Collected: added (`POST`) or removed (`DELETE`) at the commit"),
+        (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
 /// RDF data to add (`POST`) or remove (`DELETE`) at the commit: into the graph `graph`
 /// if given (an IRI), else into the graphs the data names.
 pub async fn session_data(
@@ -260,6 +292,10 @@ pub async fn session_data(
     add(&state, &session, vec![op])
 }
 
+#[utoipa::path(method(get, post), path = "/api/v1/repositories/{id}/sessions/{session}/query", tag = "sessions",
+    params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("session" = String, Path, description = "The session's id")),
+    responses((status = 200, description = "The results on the data as the session would leave it"),
+        (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
 /// A query on the data as the session's operations would leave it.
 pub async fn session_query(
     Repository(state): Repository,
@@ -289,6 +325,11 @@ pub async fn session_query(
     super::sparql::execute_query_in(state, operation, accept, Some(pending)).await
 }
 
+#[utoipa::path(post, path = "/api/v1/repositories/{id}/sessions/{session}/commit", tag = "sessions",
+    params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("session" = String, Path, description = "The session's id")),
+    responses((status = 204, description = "Committed as one transaction"),
+        (status = 400, description = "Rejected (a consistency or SHACL gate), with an explanation", body = crate::http::openapi::Problem),
+        (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
 /// Commits the session's operations as one transaction, through the same gates as any
 /// write.
 pub async fn session_commit(
@@ -306,6 +347,9 @@ pub async fn session_commit(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(delete, path = "/api/v1/repositories/{id}/sessions/{session}", tag = "sessions",
+    params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("session" = String, Path, description = "The session's id")),
+    responses((status = 204, description = "Closed without committing"), (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
 /// Closes the session without committing.
 pub async fn session_rollback(
     Repository(state): Repository,
@@ -319,7 +363,14 @@ pub async fn session_rollback(
     }
 }
 
-#[derive(Serialize)]
+/// Why a statement holds.
+#[derive(Serialize, utoipa::ToSchema)]
+struct Explanation {
+    /// The statement first; each premise after the steps that use it.
+    steps: Vec<ExplanationStep>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
 struct ExplanationStep {
     subject: String,
     predicate: String,
@@ -333,6 +384,12 @@ struct ExplanationStep {
     premises: Vec<usize>,
 }
 
+#[utoipa::path(get, path = "/api/v1/repositories/{id}/explain", tag = "reasoning",
+    params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("subj" = String, Query, description = "N-Triples term"),
+        ("pred" = String, Query, description = "N-Triples term"), ("obj" = String, Query, description = "N-Triples term")),
+    responses((status = 200, description = "`{\"steps\": [...]}`: the statement first, each step with its premises", body = Explanation),
+        (status = 403, description = "The requester doesn't see inferred statements", body = crate::http::openapi::Problem),
+        (status = 404, description = "The statement doesn't hold, or reasoning is off", body = crate::http::openapi::Problem)))]
 /// Why the statement `subj pred obj` (N-Triples terms, as RDF4J's parameters) holds: a
 /// derivation from asserted statements, the statement first. 404 if it doesn't hold or
 /// reasoning is off; 403 for users who don't see inferred statements.
@@ -383,10 +440,10 @@ pub async fn explain(
             premises: step.premises,
         })
         .collect();
-    Ok(Json(serde_json::json!({ "steps": steps })).into_response())
+    Ok(Json(Explanation { steps }).into_response())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct ReasoningRun {
     ruleset: String,
     revision: u64,
@@ -409,6 +466,8 @@ impl From<&nrese_store::MaterialisationReport> for ReasoningRun {
     }
 }
 
+#[utoipa::path(post, path = "/api/v1/repositories/{id}/reasoning/rematerialise", tag = "reasoning", params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)")),
+    responses((status = 200, description = "The run", body = ReasoningRun), (status = 404, description = "Reasoning is off", body = crate::http::openapi::Problem)))]
 /// Recomputes the repository's inferences from its asserted statements under its
 /// ruleset (after a change of ontology files or rules outside the store, or to leave
 /// quarantine after a repair). 404 without reasoning.
@@ -438,7 +497,7 @@ async fn rematerialised(
         .map_err(|error| ApiError::internal(error.to_string()))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, utoipa::ToSchema)]
 struct ImportReport {
     revision: u64,
     /// Statements parsed, duplicates included.
@@ -453,6 +512,13 @@ struct ImportReport {
     reasoning: Option<ReasoningRun>,
 }
 
+#[utoipa::path(post, path = "/api/v1/repositories/{id}/import", tag = "data",
+    params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("graph" = Option<String>, Query, description = "The graph for triple formats"),
+        ("replace" = Option<bool>, Query, description = "Replace the repository's statements"),
+        ("skip_errors" = Option<bool>, Query, description = "Skip statements with syntax errors")),
+    request_body(content = String, description = "An RDF document (`Content-Type` names its format)"),
+    responses((status = 200, description = "Loaded, inferences recomputed", body = ImportReport),
+        (status = 400, description = "Unreadable data", body = crate::http::openapi::Problem)))]
 /// Bulk-loads the RDF document in the body (its format from `Content-Type`): into the
 /// graph `graph` for triple formats (the default graph without), replacing the
 /// repository's statements with `replace=true`, skipping statements with syntax errors

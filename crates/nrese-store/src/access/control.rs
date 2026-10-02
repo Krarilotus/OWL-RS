@@ -32,6 +32,7 @@ const XSD_DATE_TIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
 
 /// One change of the state, as its history keeps it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ChangeRecord {
     pub number: u64,
     pub author: String,
