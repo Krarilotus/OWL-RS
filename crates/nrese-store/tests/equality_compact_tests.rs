@@ -237,10 +237,18 @@ fn compact_equality_answers_as_replication_on_random_data() {
         if random.below(3) == 0 {
             data.push_str("ex:r owl:sameAs ex:p .");
         }
-        let named = format!("GRAPH ex:g {{ {} {} }}", fact(&mut random), fact(&mut random));
+        let named = format!(
+            "GRAPH ex:g {{ {} {} }}",
+            fact(&mut random),
+            fact(&mut random)
+        );
         let commits = [
             format!("INSERT DATA {{ {data} {named} }}"),
-            format!("INSERT DATA {{ {} {} }}", fact(&mut random), fact(&mut random)),
+            format!(
+                "INSERT DATA {{ {} {} }}",
+                fact(&mut random),
+                fact(&mut random)
+            ),
             format!(
                 "INSERT DATA {{ {} owl:sameAs {} }}",
                 entity(random.below(12)),
@@ -267,7 +275,10 @@ fn compact_equality_answers_as_replication_on_random_data() {
                 results[0].is_ok(),
                 results[1].is_ok(),
                 "seed {seed}: {commit}: {:?}",
-                results.iter().map(|r| r.as_ref().err().map(ToString::to_string)).collect::<Vec<_>>()
+                results
+                    .iter()
+                    .map(|r| r.as_ref().err().map(ToString::to_string))
+                    .collect::<Vec<_>>()
             );
             let (a, b) = (entity(random.below(12)), entity(random.below(12)));
             let p = predicates[random.below(predicates.len())];
@@ -279,9 +290,7 @@ fn compact_equality_answers_as_replication_on_random_data() {
                 format!("ASK {{ {a} {p} {b} }}"),
                 format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?s {p} ?o }}"),
                 format!("SELECT (COUNT(*) AS ?n) WHERE {{ {a} ?p ?o }}"),
-                format!(
-                    "SELECT ?x ?z WHERE {{ ?x {p} ?y . ?y ex:q ?z }} ORDER BY ?x ?z"
-                ),
+                format!("SELECT ?x ?z WHERE {{ ?x {p} ?y . ?y ex:q ?z }} ORDER BY ?x ?z"),
                 "SELECT ?x ?y WHERE { ?x ex:p ?y . ?y ex:p ?x } ORDER BY ?x ?y".to_owned(),
                 "SELECT ?x WHERE { ?x ?p ?x } ORDER BY ?x".to_owned(),
                 format!("SELECT ?x WHERE {{ ?x owl:sameAs {a} }} ORDER BY ?x"),
@@ -289,9 +298,7 @@ fn compact_equality_answers_as_replication_on_random_data() {
                     .to_owned(),
                 "SELECT DISTINCT ?x WHERE { ?x a ex:D } ORDER BY ?x".to_owned(),
                 format!("SELECT ?g ?o WHERE {{ GRAPH ?g {{ {a} ?p ?o }} }} ORDER BY ?g ?o"),
-                format!(
-                    "SELECT ?s ?o WHERE {{ ?s {p} ?o FILTER(?s != {a}) }} ORDER BY ?s ?o"
-                ),
+                format!("SELECT ?s ?o WHERE {{ ?s {p} ?o FILTER(?s != {a}) }} ORDER BY ?s ?o"),
                 format!(
                     "SELECT ?s ?o WHERE {{ ?s ex:p ?o MINUS {{ ?s ex:q ?o }} }} ORDER BY ?s ?o"
                 ),

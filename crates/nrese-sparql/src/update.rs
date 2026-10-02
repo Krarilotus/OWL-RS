@@ -231,7 +231,10 @@ fn clear(
         .collect();
     for &id in &graphs {
         let empty = tx
-            .quads_for_pattern_in(nrese_engine::ReadModel::Asserted, &QuadPattern::in_graph(id))
+            .quads_for_pattern_in(
+                nrese_engine::ReadModel::Asserted,
+                &QuadPattern::in_graph(id),
+            )
             .next()
             .is_none();
         // Clearing an empty graph changes nothing.

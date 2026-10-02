@@ -125,10 +125,8 @@ impl StoreService {
         let same_as = (closed && state.compact_equality)
             .then(|| {
                 self.engine.snapshot().lookup(
-                    nrese_rdf::NamedNodeRef::new_unchecked(
-                        "http://www.w3.org/2002/07/owl#sameAs",
-                    )
-                    .into(),
+                    nrese_rdf::NamedNodeRef::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
+                        .into(),
                 )
             })
             .flatten();
@@ -504,14 +502,13 @@ impl StoreService {
     /// Whether the inferred stack is `program`'s closure as this store computes it.
     pub fn reasoning_is_current(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> bool {
         let program = program.into();
-        self.reasoning_state()
-            .is_some_and(|state| {
-                state.is_current_with(
-                    &program,
-                    self.config.hide_unnamed_classes,
-                    self.config.equality_compact,
-                )
-            })
+        self.reasoning_state().is_some_and(|state| {
+            state.is_current_with(
+                &program,
+                self.config.hide_unnamed_classes,
+                self.config.equality_compact,
+            )
+        })
     }
 
     /// The closure's size with equality replicated and over representatives, for
