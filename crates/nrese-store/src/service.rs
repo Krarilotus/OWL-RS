@@ -45,6 +45,10 @@ pub struct StoreService {
     /// What every query gets from the store: the default graph's meaning and the budget
     /// all running queries share.
     settings: crate::query_executor::StoreSettings,
+    /// Namespace prefixes for clients ([`crate::namespaces`]).
+    namespaces: std::sync::Arc<crate::namespaces::Namespaces>,
+    /// Client transactions ([`crate::sessions`]).
+    sessions: std::sync::Arc<crate::sessions::Sessions>,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -94,9 +98,14 @@ impl StoreService {
             services: std::sync::Arc::default(),
             equality_closed: std::sync::Arc::default(),
         };
+        let namespaces = crate::namespaces::Namespaces::open(
+            (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
+        );
         let service = Self {
             query_cache,
             settings,
+            namespaces: std::sync::Arc::new(namespaces),
+            sessions: std::sync::Arc::default(),
             config,
             engine,
             preloaded_ontology,
@@ -132,6 +141,16 @@ impl StoreService {
             })
             .flatten();
         self.engine.set_equality(same_as);
+    }
+
+    /// The store's namespace prefixes ([`crate::namespaces`]).
+    pub fn namespaces(&self) -> &crate::namespaces::Namespaces {
+        &self.namespaces
+    }
+
+    /// The store's client transactions ([`crate::sessions`]).
+    pub fn sessions(&self) -> &crate::sessions::Sessions {
+        &self.sessions
     }
 
     fn marker_path(&self) -> Option<PathBuf> {

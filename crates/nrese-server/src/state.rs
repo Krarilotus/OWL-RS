@@ -6,7 +6,6 @@ use nrese_store::{MutationPipeline, ReasoningRunRecord, StoreMode, StoreService}
 
 use crate::ai::AiSuggestionService;
 use crate::error::ApiError;
-use crate::http::rdf4j::Rdf4jState;
 use crate::http::request_metrics::RequestMetrics;
 use crate::policy::PolicyAction;
 use crate::policy::PolicyConfig;
@@ -24,7 +23,6 @@ pub struct AppState {
     deployment_posture: DeploymentPosture,
     rate_limiter: Arc<RateLimiter>,
     request_metrics: Arc<RequestMetrics>,
-    rdf4j: Arc<Rdf4jState>,
     repositories: Arc<Repositories>,
 }
 
@@ -36,8 +34,6 @@ impl AppState {
         ai: AiSuggestionService,
         deployment_posture: DeploymentPosture,
     ) -> Self {
-        let namespaces_file = matches!(store.config().mode, StoreMode::OnDisk)
-            .then(|| store.config().data_dir.join("rdf4j-namespaces.json"));
         let repositories = Arc::new(Repositories::open(store.config(), reasoner.clone()));
         Self {
             pipeline: Arc::new(MutationPipeline::new(Arc::new(store), Arc::new(reasoner))),
@@ -47,7 +43,6 @@ impl AppState {
             deployment_posture,
             rate_limiter: Arc::new(RateLimiter::default()),
             request_metrics: Arc::default(),
-            rdf4j: Arc::new(Rdf4jState::with_file(namespaces_file)),
             repositories,
         }
     }
@@ -69,14 +64,8 @@ impl AppState {
             .ok_or_else(|| ApiError::not_found(format!("no repository '{id}'")))?;
         Ok(Self {
             pipeline: repository.pipeline,
-            rdf4j: repository.rdf4j,
             ..self.clone()
         })
-    }
-
-    /// The RDF4J protocol's open transactions and namespaces.
-    pub fn rdf4j(&self) -> &Rdf4jState {
-        &self.rdf4j
     }
 
     /// Request outcomes and latencies, for `/metrics`.
