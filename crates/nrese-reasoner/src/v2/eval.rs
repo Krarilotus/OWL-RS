@@ -398,7 +398,7 @@ fn instance(
             },
             Guard::SameList(a, b, ref index) => {
                 match (substitute(a, substitution), substitute(b, substitution)) {
-                    (Term::Const(a), Term::Const(b)) if a >= b || !index.0.together(a, b) => {
+                    (Term::Const(a), Term::Const(b)) if a >= b || !index.together(a, b) => {
                         return None;
                     }
                     (Term::Const(_), Term::Const(_)) => {}
