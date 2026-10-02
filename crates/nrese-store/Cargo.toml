@@ -15,14 +15,14 @@ nrese-sparql = { path = "../nrese-sparql" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
-rayon = "1.10"
-parking_lot = "0.12"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
-sha2 = "0.10.9"
+rayon = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 argon2 = "0.6.0"
 getrandom = "0.4.2"
-utoipa = { version = "6.0.0", optional = true }
+utoipa = { workspace = true, optional = true }
 nrese-sparql-results = { path = "../rdf/nrese-sparql-results" }
 nrese-sparql-syntax = { path = "../rdf/nrese-sparql-syntax" }
 thiserror.workspace = true
@@ -34,9 +34,9 @@ url = "2.5.7"
 openapi = ["dep:utoipa"]
 
 [dev-dependencies]
-libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
-mimalloc = { version = "0.1", default-features = false }
-tempfile = "3.23.0"
+libmimalloc-sys = { workspace = true }
+mimalloc = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

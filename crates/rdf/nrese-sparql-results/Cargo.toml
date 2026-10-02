@@ -8,10 +8,10 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-memchr = "2.8"
+memchr = { workspace = true }
 nrese-json = { path = "../nrese-json" }
 nrese-rdf = { path = "../nrese-rdf", default-features = false }
-quick-xml = "0.42"
+quick-xml = { workspace = true }
 thiserror.workspace = true
 
 [lints]

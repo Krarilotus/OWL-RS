@@ -8,9 +8,9 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-foldhash = "0.2"
-hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
-rayon = "1.10"
+foldhash = { workspace = true }
+hashbrown = { workspace = true }
+rayon = { workspace = true }
 
 [lints]
 workspace = true

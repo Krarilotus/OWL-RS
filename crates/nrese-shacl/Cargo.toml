@@ -13,8 +13,8 @@ nrese-sparql = { path = "../nrese-sparql" }
 nrese-sparql-syntax = { path = "../rdf/nrese-sparql-syntax" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
-rayon = "1.10"
-regex = "1.12"
+rayon = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 # W3C suite runner: manifests, data and shapes files.

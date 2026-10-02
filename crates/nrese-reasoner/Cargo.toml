@@ -12,8 +12,8 @@ nrese-exec = { path = "../nrese-exec" }
 # User rules in Notation3 (v2::n3).
 nrese-rdf = { path = "../rdf/nrese-rdf", default-features = false }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
-hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
-rayon = "1.10"
+hashbrown = { workspace = true }
+rayon = { workspace = true }
 thiserror.workspace = true
 
 [features]

@@ -1203,6 +1203,7 @@ dependencies = [
  "nrese-exec",
  "nrese-rdf",
  "nrese-rdf-io",
+ "nrese-reasoner",
  "rayon",
  "thiserror 2.0.21",
 ]
