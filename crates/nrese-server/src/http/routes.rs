@@ -69,9 +69,22 @@ fn repository_routes() -> Router<AppState> {
         .route("/sessions/{session}/commit", post(api_v1::session_commit))
 }
 
+/// Every route. The public ones (health, version, the console's files, the API
+/// description, logging in and out, RDF4J's protocol version) answer anyone; every other
+/// request is authenticated first ([`super::authentication`]), before its handler and its
+/// body are read, and its handler checks its action ([`super::guard`]).
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let public = Router::new()
         .route("/", get(handlers::root_redirect))
+        .route("/healthz", get(handlers::healthz))
+        .route("/readyz", get(handlers::readyz))
+        .route("/version", get(handlers::version))
+        .route("/console/{*path}", get(handlers::console_file))
+        .route("/api/v1/openapi.json", get(crate::http::openapi::openapi))
+        .route("/api/v1/access/login", post(access_api::login))
+        .route("/api/v1/access/logout", post(access_api::logout))
+        .route("/protocol", get(rdf4j::protocol));
+    let authenticated = Router::new()
         .route("/console", get(handlers::console_ui))
         .route("/api/ai/status", get(handlers::ai_status))
         .route(
@@ -112,9 +125,6 @@ pub fn router(state: AppState) -> Router {
             "/ops/api/admin/dataset/image",
             post(handlers::admin_image_backup),
         )
-        .route("/healthz", get(handlers::healthz))
-        .route("/readyz", get(handlers::readyz))
-        .route("/version", get(handlers::version))
         .route("/metrics", get(handlers::metrics))
         .route(
             "/dataset/service-description",
@@ -150,10 +160,8 @@ pub fn router(state: AppState) -> Router {
             get(handlers::shacl_get).post(handlers::shacl_post),
         )
         .route("/dataset/classification", get(handlers::classification_get))
-        .route("/console/{*path}", get(handlers::console_file))
         // The engine API (ADR-0007): every capability for every repository, by the same
         // handlers as the default repository's `/dataset/…` routes.
-        .route("/api/v1/openapi.json", get(crate::http::openapi::openapi))
         .route("/api/v1/repositories", get(api_v1::repositories))
         .route("/api/v1/jobs", get(api_v1::jobs))
         .route(
@@ -163,8 +171,6 @@ pub fn router(state: AppState) -> Router {
         // Users, workspaces and graph policies (ADR-0008).
         .route("/api/v1/access", get(access_api::overview))
         .route("/api/v1/access/me", get(access_api::me))
-        .route("/api/v1/access/login", post(access_api::login))
-        .route("/api/v1/access/logout", post(access_api::logout))
         .route("/api/v1/access/settings", put(access_api::settings_put))
         .route(
             "/api/v1/access/roles/{name}",
@@ -197,7 +203,6 @@ pub fn router(state: AppState) -> Router {
         )
         .nest("/api/v1/repositories/{id}", repository_routes())
         // The RDF4J REST protocol (`rdf4j.rs`).
-        .route("/protocol", get(rdf4j::protocol))
         .route("/repositories", get(rdf4j::repositories))
         .route(
             "/repositories/{id}",
@@ -242,5 +247,9 @@ pub fn router(state: AppState) -> Router {
                 .post(rdf4j::transaction_action)
                 .delete(rdf4j::transaction_rollback),
         )
-        .with_state(state)
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            super::authentication::authenticate,
+        ));
+    public.merge(authenticated).with_state(state)
 }

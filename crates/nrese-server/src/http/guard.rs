@@ -1,7 +1,9 @@
-use axum::http::HeaderMap;
+//! What a request may do. Who it is was established before the handler ran (the
+//! authentication middleware, [`crate::app`]); each handler checks its action here, with
+//! the deployment posture's switches, and gets the requester's graph access.
 
 use crate::access::AccessView;
-use crate::auth::Identity;
+use crate::auth::{Authenticated, Identity};
 use crate::error::ApiError;
 use crate::policy::PolicyAction;
 use crate::state::AppState;
@@ -9,105 +11,105 @@ use crate::state::AppState;
 pub async fn enforce(
     state: &AppState,
     action: PolicyAction,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<Identity, ApiError> {
-    state.enforce_policy_action(action, headers).await
+    state.authorize(action, authenticated)
 }
 
 pub async fn enforce_operator_read(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<Identity, ApiError> {
     if !state.runtime_posture().operator_surface_enabled {
         return Err(ApiError::not_found("operator UI is disabled by policy"));
     }
-    enforce(state, PolicyAction::OperatorRead, headers).await
+    enforce(state, PolicyAction::OperatorRead, authenticated).await
 }
 
 pub async fn enforce_query_read(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<Identity, ApiError> {
-    enforce(state, PolicyAction::QueryRead, headers).await
+    enforce(state, PolicyAction::QueryRead, authenticated).await
 }
 
 pub async fn enforce_update_write(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<Identity, ApiError> {
     if !state.runtime_posture().sparql_update_enabled {
         return Err(ApiError::not_found(
             "SPARQL update endpoint is disabled by deployment posture",
         ));
     }
-    enforce(state, PolicyAction::UpdateWrite, headers).await
+    enforce(state, PolicyAction::UpdateWrite, authenticated).await
 }
 
 pub async fn enforce_tell_write(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<Identity, ApiError> {
     if !state.runtime_posture().tell_enabled {
         return Err(ApiError::not_found(
             "tell endpoint is disabled by deployment posture",
         ));
     }
-    enforce(state, PolicyAction::TellWrite, headers).await
+    enforce(state, PolicyAction::TellWrite, authenticated).await
 }
 
 pub async fn enforce_admin_write(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<Identity, ApiError> {
     if !state.runtime_posture().admin_surface_enabled {
         return Err(ApiError::not_found(
             "admin mutation endpoints are disabled by deployment posture",
         ));
     }
-    enforce(state, PolicyAction::AdminWrite, headers).await
+    enforce(state, PolicyAction::AdminWrite, authenticated).await
 }
 
 pub async fn enforce_graph_read(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<Identity, ApiError> {
     if !state.runtime_posture().graph_store_enabled {
         return Err(ApiError::not_found(
             "graph store read surface is disabled by deployment posture",
         ));
     }
-    enforce(state, PolicyAction::GraphRead, headers).await
+    enforce(state, PolicyAction::GraphRead, authenticated).await
 }
 
 pub async fn enforce_graph_write(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<Identity, ApiError> {
     if !state.runtime_posture().graph_write_enabled {
         return Err(ApiError::not_found(
             "graph store write surface is disabled by deployment posture",
         ));
     }
-    enforce(state, PolicyAction::GraphWrite, headers).await
+    enforce(state, PolicyAction::GraphWrite, authenticated).await
 }
 
 pub async fn enforce_service_description_read(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<Identity, ApiError> {
-    enforce(state, PolicyAction::ServiceDescriptionRead, headers).await
+    enforce(state, PolicyAction::ServiceDescriptionRead, authenticated).await
 }
 
 pub async fn enforce_metrics_read(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<Identity, ApiError> {
     if !state.runtime_posture().metrics_enabled {
         return Err(ApiError::not_found(
             "metrics endpoint is disabled by policy",
         ));
     }
-    enforce(state, PolicyAction::MetricsRead, headers).await
+    enforce(state, PolicyAction::MetricsRead, authenticated).await
 }
 
 /// What `identity` may read and write (graph-level access control, [`crate::access`]).
@@ -116,38 +118,47 @@ pub fn view(state: &AppState, identity: &Identity) -> AccessView {
 }
 
 /// [`enforce_query_read`], and what the requester may read.
-pub async fn query_access(state: &AppState, headers: &HeaderMap) -> Result<AccessView, ApiError> {
-    let identity = enforce_query_read(state, headers).await?;
+pub async fn query_access(
+    state: &AppState,
+    authenticated: &Authenticated,
+) -> Result<AccessView, ApiError> {
+    let identity = enforce_query_read(state, authenticated).await?;
     Ok(view(state, &identity))
 }
 
 /// [`enforce_update_write`], and what the requester may read and write.
-pub async fn update_access(state: &AppState, headers: &HeaderMap) -> Result<AccessView, ApiError> {
-    let identity = enforce_update_write(state, headers).await?;
+pub async fn update_access(
+    state: &AppState,
+    authenticated: &Authenticated,
+) -> Result<AccessView, ApiError> {
+    let identity = enforce_update_write(state, authenticated).await?;
     Ok(view(state, &identity))
 }
 
 /// [`enforce_graph_read`], and what the requester may read.
 pub async fn graph_read_access(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<AccessView, ApiError> {
-    let identity = enforce_graph_read(state, headers).await?;
+    let identity = enforce_graph_read(state, authenticated).await?;
     Ok(view(state, &identity))
 }
 
 /// [`enforce_graph_write`], and what the requester may write.
 pub async fn graph_write_access(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<AccessView, ApiError> {
-    let identity = enforce_graph_write(state, headers).await?;
+    let identity = enforce_graph_write(state, authenticated).await?;
     Ok(view(state, &identity))
 }
 
 /// [`enforce_tell_write`], and what the requester may write.
-pub async fn tell_access(state: &AppState, headers: &HeaderMap) -> Result<AccessView, ApiError> {
-    let identity = enforce_tell_write(state, headers).await?;
+pub async fn tell_access(
+    state: &AppState,
+    authenticated: &Authenticated,
+) -> Result<AccessView, ApiError> {
+    let identity = enforce_tell_write(state, authenticated).await?;
     Ok(view(state, &identity))
 }
 
@@ -156,9 +167,9 @@ pub async fn tell_access(state: &AppState, headers: &HeaderMap) -> Result<Access
 /// every graph.
 pub async fn enforce_whole_read(
     state: &AppState,
-    headers: &HeaderMap,
+    authenticated: &Authenticated,
 ) -> Result<nrese_store::ReadScope, ApiError> {
-    let access = query_access(state, headers).await?;
+    let access = query_access(state, authenticated).await?;
     if access.reads_everything() {
         Ok(access.read_scope())
     } else {

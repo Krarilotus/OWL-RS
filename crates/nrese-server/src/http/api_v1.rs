@@ -29,10 +29,10 @@ struct RepositoryEntry {
     responses((status = 200, description = "The repositories, the default one first", body = Vec<RepositoryEntry>)))]
 /// The repositories: the default one first, then the others.
 pub async fn repositories(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_query_read(&state, &authenticated).await?;
     let entries: Vec<RepositoryEntry> = std::iter::once((DEFAULT_REPOSITORY.to_owned(), None))
         .chain(state.repositories().list())
         .map(|(id, title)| RepositoryEntry {
@@ -63,11 +63,11 @@ struct RepositoryView {
         (status = 404, description = "No such repository", body = crate::http::openapi::Problem)))]
 /// One repository: its title, reasoning and settings; 404 if there is none.
 pub async fn repository_get(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_query_read(&state, &authenticated).await?;
     let repository = state.for_repository(&id)?;
     let settings = Some(repository.repository_settings())
         .filter(|settings| *settings != crate::repository_config::RepositorySettings::default());
@@ -93,12 +93,12 @@ pub async fn repository_get(
 /// `reasoning` by mode name, `rules`; an empty body for the server's): 201 with its path,
 /// 409 if it exists.
 pub async fn repository_put(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     let settings: crate::repository_config::RepositorySettings =
         match body.iter().all(u8::is_ascii_whitespace) {
             true => Default::default(),
@@ -124,11 +124,11 @@ pub async fn repository_put(
         (status = 400, description = "The default repository stays", body = crate::http::openapi::Problem), (status = 404, description = "No such repository", body = crate::http::openapi::Problem)))]
 /// Removes repository `id` and its data; the default repository stays.
 pub async fn repository_delete(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     state.repositories().delete(&id)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -137,10 +137,10 @@ pub async fn repository_delete(
     responses((status = 200, description = "Prefix to IRI", body = std::collections::BTreeMap<String, String>)))]
 /// The repository's namespace prefixes, as a JSON object of prefix to IRI.
 pub async fn namespaces_get(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_query_read(&state, &headers).await?;
+    guard::enforce_query_read(&state, &authenticated).await?;
     Ok(Json(state.store().namespaces().all()).into_response())
 }
 
@@ -150,12 +150,12 @@ pub async fn namespaces_get(
     responses((status = 204, description = "Bound")))]
 /// Binds the prefix to the IRI in the body (plain text).
 pub async fn namespace_put(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     Path((_, prefix)): Path<(String, String)>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    guard::enforce_update_write(&state, &authenticated).await?;
     let iri = std::str::from_utf8(&body)
         .map_err(|_| ApiError::bad_request("the namespace must be UTF-8"))?
         .trim();
@@ -175,11 +175,11 @@ pub async fn namespace_put(
     responses((status = 204, description = "Unbound"), (status = 404, description = "Not bound", body = crate::http::openapi::Problem)))]
 /// Removes the prefix; 404 if it isn't bound.
 pub async fn namespace_delete(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     Path((_, prefix)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_update_write(&state, &headers).await?;
+    guard::enforce_update_write(&state, &authenticated).await?;
     match state
         .store()
         .namespaces()
@@ -205,11 +205,11 @@ struct SessionOpened {
 /// Opens a client transaction ([`nrese_store::Sessions`]): writes collected over requests
 /// and committed as one.
 pub async fn session_begin(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     Path(id): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    let access = guard::update_access(&state, &authenticated).await?;
     let sessions = state.store();
     let sessions = sessions.sessions();
     let session = sessions
@@ -250,13 +250,14 @@ fn add(
     responses((status = 204, description = "Collected for the commit"), (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
 /// A SPARQL update (as the update endpoint takes it), applied at the commit.
 pub async fn session_update(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     Path((_, session)): Path<(String, String)>,
     raw: axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    let access = guard::update_access(&state, &authenticated).await?;
     let request = super::rdf4j::update(&raw, &headers, &body)?;
     add(
         &state,
@@ -274,6 +275,7 @@ pub async fn session_update(
 /// RDF data to add (`POST`) or remove (`DELETE`) at the commit: into the graph `graph`
 /// if given (an IRI), else into the graphs the data names.
 pub async fn session_data(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     Path((_, session)): Path<(String, String)>,
     method: axum::http::Method,
@@ -281,7 +283,7 @@ pub async fn session_data(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    let access = guard::update_access(&state, &authenticated).await?;
     state.policy().enforce_rdf_upload_bytes(body.len())?;
     let pairs = super::rdf4j::pairs(&raw)?;
     let contexts = pairs
@@ -307,13 +309,14 @@ pub async fn session_data(
         (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
 /// A query on the data as the session's operations would leave it.
 pub async fn session_query(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     Path((_, session)): Path<(String, String)>,
     raw: axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    let access = guard::update_access(&state, &authenticated).await?;
     let ops = state
         .store()
         .sessions()
@@ -345,11 +348,11 @@ pub async fn session_query(
 /// Commits the session's operations as one transaction, through the same gates as any
 /// write.
 pub async fn session_commit(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     Path((_, session)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    let access = guard::update_access(&state, &authenticated).await?;
     let request = state
         .store()
         .sessions()
@@ -364,11 +367,11 @@ pub async fn session_commit(
     responses((status = 204, description = "Closed without committing"), (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
 /// Closes the session without committing.
 pub async fn session_rollback(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     Path((_, session)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    let access = guard::update_access(&state, &authenticated).await?;
     match state
         .store()
         .sessions()
@@ -410,11 +413,11 @@ struct ExplanationStep {
 /// derivation from asserted statements, the statement first. 404 if it doesn't hold or
 /// reasoning is off; 403 for users who don't see inferred statements.
 pub async fn explain(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     raw: axum::extract::RawQuery,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::query_access(&state, &headers).await?;
+    let access = guard::query_access(&state, &authenticated).await?;
     if !access.sees_inferred() {
         return Err(ApiError::forbidden(
             "explanations show inferred statements, which the requester doesn't see",
@@ -488,10 +491,10 @@ impl From<&nrese_store::MaterialisationReport> for ReasoningRun {
 /// ruleset (after a change of ontology files or rules outside the store, or to leave
 /// quarantine after a repair). 404 without reasoning.
 pub async fn rematerialise(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     let report = rematerialised(&state)
         .await?
         .ok_or_else(|| ApiError::not_found("reasoning is off: nothing to materialise"))?;
@@ -542,12 +545,13 @@ struct ImportReport {
 /// loader's parallel path, not one commit's; administrators only, since a bulk load
 /// replaces whole indexes and passes no commit gate.
 pub async fn import(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     raw: axum::extract::RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     state.ensure_serving()?;
     state.policy().enforce_rdf_upload_bytes(body.len())?;
     let pairs = super::rdf4j::pairs(&raw)?;
@@ -709,10 +713,10 @@ fn import_directory(state: &AppState) -> Result<std::path::PathBuf, ApiError> {
     responses((status = 200, description = "The files", body = Vec<ServerFile>),
         (status = 404, description = "No import directory", body = crate::http::openapi::Problem)))]
 pub async fn server_files(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     let dir = import_directory(&state)?;
     let files = tokio::task::spawn_blocking(move || {
         let mut files = Vec::new();
@@ -773,11 +777,11 @@ struct ServerImport {
         (status = 400, description = "A file outside the directory, or none", body = crate::http::openapi::Problem),
         (status = 404, description = "No import directory, or no such file", body = crate::http::openapi::Problem)))]
 pub async fn import_server_files(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     state.ensure_serving()?;
     let request: ServerImport =
         serde_json::from_slice(&body).map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -828,8 +832,11 @@ pub async fn import_server_files(
 /// The jobs (imports) running and the latest finished, the latest first (operators).
 #[utoipa::path(get, path = "/api/v1/jobs", tag = "data",
     responses((status = 200, description = "The jobs", body = Vec<nrese_store::jobs::JobView>)))]
-pub async fn jobs(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &headers).await?;
+pub async fn jobs(
+    State(state): State<AppState>,
+    authenticated: crate::auth::Authenticated,
+) -> Result<Response, ApiError> {
+    guard::enforce_operator_read(&state, &authenticated).await?;
     Ok(Json(state.jobs().list()).into_response())
 }
 
@@ -838,11 +845,11 @@ pub async fn jobs(State(state): State<AppState>, headers: HeaderMap) -> Result<R
     responses((status = 200, description = "The job", body = nrese_store::jobs::JobView),
         (status = 404, description = "No such job", body = crate::http::openapi::Problem)))]
 pub async fn job(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(job): Path<u64>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &headers).await?;
+    guard::enforce_operator_read(&state, &authenticated).await?;
     let view = state
         .jobs()
         .get(job)
@@ -856,11 +863,11 @@ pub async fn job(
     responses((status = 204, description = "Cancelling"),
         (status = 404, description = "No such job running", body = crate::http::openapi::Problem)))]
 pub async fn job_cancel(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(job): Path<u64>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     match state.jobs().cancel(job) {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::not_found(format!("no job {job} is running"))),
@@ -872,10 +879,10 @@ pub async fn job_cancel(
     params(("id" = String, Path, description = "The repository's id")),
     responses((status = 200, description = "The running queries", body = Vec<nrese_store::RunningQuery>)))]
 pub async fn running_queries(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &headers).await?;
+    guard::enforce_operator_read(&state, &authenticated).await?;
     Ok(Json(state.store().running_queries().list()).into_response())
 }
 
@@ -886,11 +893,11 @@ pub async fn running_queries(
     responses((status = 204, description = "Cancelled"),
         (status = 404, description = "Not running", body = crate::http::openapi::Problem)))]
 pub async fn cancel_query(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
     Path((_, query)): Path<(String, u64)>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     match state.store().running_queries().cancel(query) {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::not_found(format!("no query {query} is running"))),
@@ -912,10 +919,10 @@ struct GraphSize {
     params(("id" = String, Path, description = "The repository's id")),
     responses((status = 200, description = "The graphs", body = Vec<GraphSize>)))]
 pub async fn graphs(
+    authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::graph_read_access(&state, &headers).await?;
+    let access = guard::graph_read_access(&state, &authenticated).await?;
     let store = state.store();
     let scope = access.read_scope();
     let sizes = tokio::task::spawn_blocking(move || store.graph_sizes(&scope))
@@ -945,12 +952,12 @@ pub async fn graphs(
         (status = 400, description = "Invalid settings", body = crate::http::openapi::Problem),
         (status = 404, description = "No such repository", body = crate::http::openapi::Problem)))]
 pub async fn repository_patch(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    guard::enforce_admin_write(&state, &headers).await?;
+    guard::enforce_admin_write(&state, &authenticated).await?;
     let repository = state.for_repository(&id)?;
     let changes: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&body)
         .map_err(|error| ApiError::bad_request(format!("repository settings: {error}")))?;
@@ -973,5 +980,5 @@ pub async fn repository_patch(
     tokio::task::spawn_blocking(move || changing.change_repository_settings(settings))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))??;
-    repository_get(State(state), Path(id), headers).await
+    repository_get(authenticated, State(state), Path(id)).await
 }

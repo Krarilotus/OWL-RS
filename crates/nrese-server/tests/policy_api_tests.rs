@@ -774,3 +774,70 @@ async fn mtls_ignores_the_subject_header_from_untrusted_peers()
     );
     Ok(())
 }
+
+/// A request is authenticated before anything reads its body: without credentials an
+/// oversized upload is refused as unauthenticated, not buffered first; and an unknown
+/// repository doesn't answer anyone who isn't authenticated.
+#[tokio::test]
+async fn requests_are_authenticated_before_their_bodies_are_read() {
+    let policy = PolicyConfig {
+        limits: RequestLimits {
+            max_query_bytes: 1024,
+            max_update_bytes: 1024,
+            max_rdf_upload_bytes: 1024,
+            ..RequestLimits::default()
+        },
+        ..static_policy()
+    };
+    let app = test_app_with_policy(policy).expect("app");
+    let oversized = "x".repeat(512 * 1024);
+    let send = |token: Option<&'static str>, method: Method, uri: &'static str, body: String| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/sparql-update");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            app.oneshot(request.body(Body::from(body)).expect("request"))
+                .await
+                .expect("response")
+                .status()
+        }
+    };
+    assert_eq!(
+        send(None, Method::POST, "/dataset/update", oversized.clone()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(Some("admin"), Method::POST, "/dataset/update", oversized).await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        send(
+            None,
+            Method::GET,
+            "/repositories/nowhere/size",
+            String::new()
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        send(
+            Some("reader"),
+            Method::GET,
+            "/repositories/nowhere/size",
+            String::new()
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    // The public routes answer anyone.
+    assert_eq!(
+        send(None, Method::GET, "/healthz", String::new()).await,
+        StatusCode::OK
+    );
+}

@@ -2,9 +2,8 @@ use std::collections::BTreeSet;
 
 use axum::http::HeaderMap;
 
-use crate::auth::{AccessGrant, Identity, authorize_grants, extract_bearer_token};
+use crate::auth::{AccessGrant, Authenticated, Identity, extract_bearer_token};
 use crate::error::ApiError;
-use crate::policy::PolicyAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticBearerConfig {
@@ -12,27 +11,23 @@ pub struct StaticBearerConfig {
     pub admin_token: String,
 }
 
-pub fn authorize(
+pub fn authenticate(
     config: &StaticBearerConfig,
-    action: PolicyAction,
     headers: &HeaderMap,
-    also: &(dyn Fn(&Identity) -> bool + Send + Sync),
-) -> Result<Identity, ApiError> {
+) -> Result<Authenticated, ApiError> {
     let token = extract_bearer_token(headers)?;
     let grants = grants_for_token(config, token);
     let mut roles = BTreeSet::new();
     if grants.contains(&AccessGrant::Read) {
         roles.insert("reader".to_owned());
     }
-    let identity = Identity::from_grants(&grants, roles);
-
-    if authorize_grants(action, &grants) || (!grants.is_empty() && also(&identity)) {
-        Ok(identity)
-    } else {
-        Err(ApiError::forbidden(
-            "bearer token does not grant access to this endpoint",
-        ))
-    }
+    Ok(Authenticated {
+        identity: Identity::from_grants(&grants, roles),
+        // A token the configuration doesn't list is unknown, whatever a policy names.
+        known: !grants.is_empty(),
+        grants,
+        refusal: "bearer token does not grant access to this endpoint",
+    })
 }
 
 fn grants_for_token(config: &StaticBearerConfig, token: &str) -> BTreeSet<AccessGrant> {

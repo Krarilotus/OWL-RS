@@ -288,10 +288,39 @@ impl AppState {
         RuntimePosture::from_state(self)
     }
 
-    pub async fn enforce_policy_action(
+    /// Who the request is ([`crate::auth::Authenticated`]): a local login (`Basic`
+    /// credentials of a user with a password, or a session token), else the
+    /// authentication mode's credentials. 401 for missing or wrong ones.
+    pub async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<crate::auth::Authenticated, ApiError> {
+        match self.local_identity(headers).await? {
+            Some(mut identity) => {
+                let principal = crate::access::principal(&identity);
+                identity.admin = self.access.state().is_admin(&principal);
+                let mut grants = std::collections::BTreeSet::from([crate::auth::AccessGrant::Read]);
+                if identity.admin {
+                    grants.insert(crate::auth::AccessGrant::Admin);
+                }
+                Ok(crate::auth::Authenticated {
+                    identity,
+                    grants,
+                    known: true,
+                    refusal: "the local login does not grant access to this endpoint",
+                })
+            }
+            None => self.policy.auth.authenticate(headers).await,
+        }
+    }
+
+    /// Whether `authenticated` may do `action`: what its credentials grant, or the access
+    /// state's rules (a role with a rule may read; one that may write a graph may update);
+    /// then the rate limit. Returns who it is.
+    pub fn authorize(
         &self,
         action: PolicyAction,
-        headers: &HeaderMap,
+        authenticated: &crate::auth::Authenticated,
     ) -> Result<crate::auth::Identity, ApiError> {
         let state = self.access.state();
         let also = |identity: &crate::auth::Identity| {
@@ -308,23 +337,7 @@ impl AppState {
                 | PolicyAction::MetricsRead => state.is_admin(&principal),
             }
         };
-        let identity = match self.local_identity(headers).await? {
-            Some(mut identity) => {
-                let principal = crate::access::principal(&identity);
-                identity.admin = state.is_admin(&principal);
-                let mut grants = std::collections::BTreeSet::from([crate::auth::AccessGrant::Read]);
-                if identity.admin {
-                    grants.insert(crate::auth::AccessGrant::Admin);
-                }
-                if !(crate::auth::authorize_grants(action, &grants) || also(&identity)) {
-                    return Err(ApiError::forbidden(
-                        "the local login does not grant access to this endpoint",
-                    ));
-                }
-                identity
-            }
-            None => self.policy.auth.authorize(action, headers, &also).await?,
-        };
+        let identity = authenticated.check(action, &also)?;
         self.rate_limiter.enforce(action, self.policy.rate_limits)?;
         Ok(identity)
     }

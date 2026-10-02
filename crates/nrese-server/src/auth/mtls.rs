@@ -2,9 +2,8 @@ use std::collections::BTreeSet;
 
 use axum::http::HeaderMap;
 
-use crate::auth::{AccessGrant, Identity, authorize_grants};
+use crate::auth::{AccessGrant, Authenticated, Identity};
 use crate::error::ApiError;
-use crate::policy::PolicyAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MtlsConfig {
@@ -18,12 +17,7 @@ pub struct MtlsConfig {
     pub admin_subjects: BTreeSet<String>,
 }
 
-pub fn authorize(
-    config: &MtlsConfig,
-    action: PolicyAction,
-    headers: &HeaderMap,
-    also: &(dyn Fn(&Identity) -> bool + Send + Sync),
-) -> Result<Identity, ApiError> {
+pub fn authenticate(config: &MtlsConfig, headers: &HeaderMap) -> Result<Authenticated, ApiError> {
     let subject = extract_subject(headers, &config.subject_header)?;
     let grants = grants_for_subject(config, subject);
     // The subject is a role name of its own, so a policy can name one certificate.
@@ -31,16 +25,13 @@ pub fn authorize(
     if grants.contains(&AccessGrant::Read) {
         roles.insert("reader".to_owned());
     }
-    let identity = Identity::from_grants(&grants, roles).with_user(Some(subject));
-
-    // A subject the configuration doesn't list is unknown, whatever a policy names.
-    if authorize_grants(action, &grants) || (!grants.is_empty() && also(&identity)) {
-        Ok(identity)
-    } else {
-        Err(ApiError::forbidden(
-            "client certificate subject does not grant access to this endpoint",
-        ))
-    }
+    Ok(Authenticated {
+        identity: Identity::from_grants(&grants, roles).with_user(Some(subject)),
+        // A subject the configuration doesn't list is unknown, whatever a policy names.
+        known: !grants.is_empty(),
+        grants,
+        refusal: "client certificate subject does not grant access to this endpoint",
+    })
 }
 
 fn extract_subject<'a>(headers: &'a HeaderMap, subject_header: &str) -> Result<&'a str, ApiError> {
