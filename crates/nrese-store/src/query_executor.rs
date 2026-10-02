@@ -15,9 +15,9 @@ use nrese_engine::ReadModel;
 use nrese_rdf::{GraphName, NamedNode, NamedOrBlankNode};
 use nrese_rdf_io::RdfSerializer;
 use nrese_sparql::{
-    CancellationToken, Explanation, QueryDatasetSpecification, QueryEvaluationError, QueryOptions,
-    QueryResults, ReadView, ResultsFormat, WriteResultsError, evaluate_query, explain_query,
-    write_results,
+    CancellationToken, Explanation, PlannedQuery, QueryDatasetSpecification, QueryEvaluationError,
+    QueryOptions, QueryResults, ReadView, ResultsFormat, WriteResultsError, evaluate_query,
+    explain_query, plan_query, write_results,
 };
 use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 use nrese_sparql_syntax::Query;
@@ -436,7 +436,28 @@ pub(crate) fn explain_prepared(
     store: &StoreSettings,
     cancellation: &CancellationToken,
 ) -> StoreResult<Explanation> {
-    let options = QueryOptions {
+    let options = explain_options(prepared, store, cancellation);
+    Ok(explain_query(view, &prepared.query, &options)?)
+}
+
+/// The plan `prepared` would run as on `view`, with estimated rows, without running it
+/// (EXPLAIN).
+pub(crate) fn plan_prepared(
+    view: &impl ReadView,
+    prepared: &PreparedQuery,
+    store: &StoreSettings,
+) -> StoreResult<PlannedQuery> {
+    let options = explain_options(prepared, store, &CancellationToken::new());
+    Ok(plan_query(view, &prepared.query, &options)?)
+}
+
+/// The options `prepared` runs with, for an explanation.
+fn explain_options(
+    prepared: &PreparedQuery,
+    store: &StoreSettings,
+    cancellation: &CancellationToken,
+) -> QueryOptions {
+    QueryOptions {
         dataset: prepared.dataset.clone(),
         cancellation: Some(cancellation.clone()),
         read_model: prepared.read_model,
@@ -452,6 +473,5 @@ pub(crate) fn explain_prepared(
         cross_chunk_rows: None,
         stream_rows: None,
         access: prepared.access.clone(),
-    };
-    Ok(explain_query(view, &prepared.query, &options)?)
+    }
 }

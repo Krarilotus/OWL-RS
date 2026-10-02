@@ -22,7 +22,9 @@ use std::path::PathBuf;
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, ReadModel};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
-use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query, runs_natively};
+use nrese_sparql::{
+    QueryOptions, QueryResults, evaluate_query, explain_query, plan_query, runs_natively,
+};
 use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
@@ -731,6 +733,9 @@ fn native_results_equal_the_reference_on_random_queries() {
                 continue;
             }
             plan_round_trips(&query);
+            // Every query that runs has a plan with estimates.
+            plan_query(&snapshot, &query, &native_options)
+                .unwrap_or_else(|e| panic!("plan of {text}: {e}"));
             let native = rows_up_to_equal_values(
                 evaluate_query(&snapshot, &query, &native_options).unwrap(),
                 ordered,
@@ -911,6 +916,8 @@ fn pushed_filters_equal_the_reference() {
                 continue;
             }
             plan_round_trips(&query);
+            plan_query(&snapshot, &query, &QueryOptions::default())
+                .unwrap_or_else(|e| panic!("plan of {text}: {e}"));
             let native = rows(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
@@ -2311,6 +2318,31 @@ fn explain_reports_the_plan() {
         false,
     );
     assert_eq!(explained.rows, grouped_rows.len() as u64);
+    // The plan before running: the same rewrites, the nodes from the top down, each
+    // triple pattern with its exact count, the join with the orderer's estimate.
+    let planned = plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    assert_eq!(planned.rewrites, explanation.rewrites);
+    assert_eq!(planned.steps[0].operator, "project");
+    let member_of = planned
+        .steps
+        .iter()
+        .find(|s| s.operator == "scan" && s.detail.contains("memberOf"))
+        .unwrap();
+    assert_eq!(member_of.estimated_rows, Some(20), "{:#?}", planned.steps);
+    let bgp = planned.steps.iter().find(|s| s.operator == "bgp").unwrap();
+    assert!(bgp.estimated_rows.is_some_and(|rows| rows <= 20), "{bgp:?}");
+    // What a remote endpoint returns is unknown, and so is what contains it.
+    let remote = SparqlParser::new()
+        .parse_query("SELECT * WHERE { SERVICE <http://example.com/sparql> { ?s ?p ?o } }")
+        .unwrap();
+    let planned = plan_query(&snapshot, &remote, &QueryOptions::default()).unwrap();
+    let service = planned
+        .steps
+        .iter()
+        .find(|s| s.operator == "service")
+        .unwrap();
+    assert_eq!(service.estimated_rows, None);
+    assert_eq!(planned.steps[0].estimated_rows, None);
     let operators: Vec<(usize, &str)> = explanation
         .steps
         .iter()

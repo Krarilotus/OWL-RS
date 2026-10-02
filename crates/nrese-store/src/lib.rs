@@ -62,7 +62,9 @@ pub use mutation::{
 pub use namespaces::{NamespaceMap, Namespaces};
 pub use nrese_engine::{EngineError, ReadModel};
 pub use nrese_shacl::{ValidationReport, ValidationResult};
-pub use nrese_sparql::{CancellationToken, Explanation, PlanStep, QueryEvaluationError};
+pub use nrese_sparql::{
+    CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
+};
 pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
     SparqlQueryRequest,

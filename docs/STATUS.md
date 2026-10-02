@@ -55,7 +55,8 @@ Last updated: 2 October 2026, branch `refactor/engine-v2`.
 | Algebra walker | done | `nrese_sparql_syntax::visit`; the executor's plain searches use it |
 | Step 1: the logical plan | done | `nrese_sparql::plan`: built from the algebra and lowered back, the identity on every random query of the differential tests |
 | Step 2: rewrites on the plan | started | Named rewrites, in order, for queries and update `WHERE`s alike: `join-groups` (groups joined to each other become one basic graph pattern; inputs with an `ORDER BY` keep their place), `filter-pushdown`; EXPLAIN lists those that changed the query (`rewrites`). Open: pushdown on the plan itself, and the executor's match-guard strategies (paths from their bound end, limit placement, bind joins to `SERVICE`) as rewrites |
-| Steps 3–4: physical plan, executor on the plan | open | |
+| Step 3: estimates on the plan, EXPLAIN before running | started | `plan_query` and `explain=plan`: the rewritten plan, each node with estimated rows from the store's statistics (triple patterns exact, basic graph patterns by the join orderer, the rest by documented rules in `native/estimate.rs`), without running; every random query of the differential tests is planned. Open: characteristic sets, the physical operator choices, estimates checked against actual rows |
+| Step 4: executor on the plan | open | |
 | `nrese-sparql` split, numeric promotion once | open | |
 
 ### D. Reasoning (with G3)
