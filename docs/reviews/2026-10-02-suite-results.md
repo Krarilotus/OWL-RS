@@ -102,12 +102,35 @@ entities likewise; `suite.py report` on both result files has them all).
 | OWL2Bench RL(1) | **NRESE (now)** | **991** | 105 | 1,454,463 | **686** |
 | | Nemo | 1,794,271 | 25,620 | 1,454,431 | – |
 
+### LUBM with the closure precomputed (batch E)
+
+The SPARQL engines without a reasoner on their own turf: LUBM(N) closed under OWL 2 RL
+beforehand (by NRESE, checked against the published LUBM(1) answers and across systems:
+every system answers all 14 queries correctly), loaded without inference.
+
+| Tier | System | Load | Load peak | Store | Queries | Queries, cache on |
+|---|---|---:|---:|---:|---:|---:|
+| LUBM(1), 168 k | **NRESE** | **646** | – | 4.1 | **22** | **17** |
+| | QLever | 727 | – | **2.0** | 354 | 332 |
+| | Virtuoso | 1,169 | 5,908 | 114 | 242 | – |
+| | Oxigraph | 795 | – | 12.6 | 295 | – |
+| LUBM(10), 2.1 M | **NRESE** | **750** | – | 50.5 | **84** | **66** |
+| | QLever | 2,001 | 265 | **24.1** | 643 | 576 |
+| | Virtuoso | 6,522 | 6,220 | 180 | 1,486 | – |
+| | Oxigraph | 1,867 | 1,088 | 148 | 3,517 | – |
+| LUBM(100), 22 M | **NRESE** | **3,908** | **1,347** | 549 | **655** | **582** |
+| | QLever | 13,613 | 2,288 | **251** | 4,288 | 3,992 |
+| | Virtuoso | 62,615 | 6,804 | 611 | 15,563 | – |
+| | Oxigraph | 13,775 | 7,925 | 1,558 | 40,828 | – |
+
+Jena (TDB2) runs after these; GraphDB's results stay local.
+
 Nemo and owlrl compute closures without a query interface. NRESE's closures have 32
 statements more than Nemo's on every tier (not yet broken down; owlrl's reference closure
 of LUBM(1) is larger still, it adds OWL's axiomatic triples). Jena's OWL Horst
 rule reasoner answered LUBM(1) (25.7 s for the queries) and ran out of time on LUBM(10).
 The SPARQL engines without a reasoner (QLever, Oxigraph, Virtuoso) are compared on LUBM by
-the `lubm-materialised` workload (batch E, running).
+the `lubm-materialised` workload, below.
 
 ## Where NRESE is behind
 
@@ -139,6 +162,5 @@ the `lubm-materialised` workload (batch E, running).
 
 ## Next runs
 
-- Batch E: NRESE, QLever, Oxigraph, Virtuoso and GraphDB (local) on `lubm-materialised`
-  1, 10 and 100, then Jena; results in `benches/suite/results/2026-10-02-lubm-materialised`.
+- Jena on `lubm-materialised` (the rest of batch E).
 - The competitors on YAGO tiny, and an RDF4J adapter.
