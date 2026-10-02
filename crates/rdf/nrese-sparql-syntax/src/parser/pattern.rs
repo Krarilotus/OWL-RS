@@ -81,7 +81,8 @@ impl<'a> Parser<'a> {
         } else {
             GraphPattern::default()
         };
-        let mut filter: Option<Expression> = None;
+        // A group's filters, joined by `&&` as a balanced tree (as a chain of `&&` is).
+        let mut filters: Vec<Expression> = Vec::new();
         while !matches!(self.peek(), Some(b'}') | None) {
             match self.graph_pattern_not_triples()? {
                 Element::Optional(p, expression) => {
@@ -126,19 +127,22 @@ impl<'a> Parser<'a> {
                         expression,
                     };
                 }
-                Element::Filter(expr) => {
-                    filter = Some(match filter {
-                        Some(f) => Expression::And(Box::new(f), Box::new(expr)),
-                        None => expr,
-                    });
-                }
+                Element::Filter(expr) => filters.push(expr),
                 Element::Other(p) => g = new_join(g, p),
             }
             self.eat(".");
             if self.at_triples_start() {
-                g = new_join(g, build_bgp(self.triples_block()?));
+                // Element by element: a block's triples continue the basic graph pattern
+                // before it (a FILTER between them doesn't end it, and a blank node label
+                // may span it), also when the block holds paths (found by fuzzing,
+                // `nrese-fuzz`: printed, `Join(g, Join(bgp, path))` became a group of its own,
+                // across which the label was refused).
+                for element in bgp_elements(self.triples_block()?) {
+                    g = new_join(g, element);
+                }
             }
         }
+        let filter = (!filters.is_empty()).then(|| super::expr::balanced(filters, Expression::And));
         Ok(match filter {
             Some(expr) => GraphPattern::Filter {
                 expr,
@@ -982,6 +986,14 @@ fn add_triple(
 
 /// The triples of a block as a basic graph pattern, paths joined in between.
 pub(super) fn build_bgp(patterns: Vec<TripleOrPath>) -> GraphPattern {
+    bgp_elements(patterns)
+        .into_iter()
+        .reduce(new_join)
+        .unwrap_or_default()
+}
+
+/// A triples block's basic graph patterns and paths, in order.
+fn bgp_elements(patterns: Vec<TripleOrPath>) -> Vec<GraphPattern> {
     let mut bgp = Vec::new();
     let mut elements = Vec::new();
     for pattern in patterns {
@@ -1008,7 +1020,7 @@ pub(super) fn build_bgp(patterns: Vec<TripleOrPath>) -> GraphPattern {
     if !bgp.is_empty() {
         elements.push(GraphPattern::Bgp { patterns: bgp });
     }
-    elements.into_iter().reduce(new_join).unwrap_or_default()
+    elements
 }
 
 /// `Join`, dropping empty basic graph patterns and merging adjacent ones.

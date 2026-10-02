@@ -106,23 +106,45 @@ fn is_special_builtin(word: &str) -> bool {
     )
 }
 
+/// `operands` joined by an associative operator (`||`, `&&`: associative in SPARQL's
+/// logic of true, false and error) as a balanced tree: a chain of n operands is log n deep,
+/// not n, since evaluating, printing and dropping an expression recurse on its depth. Two
+/// and three operands give the left-deep tree of the grammar.
+pub(super) fn balanced(
+    mut operands: Vec<Expression>,
+    join: fn(Box<Expression>, Box<Expression>) -> Expression,
+) -> Expression {
+    while operands.len() > 1 {
+        let mut next = Vec::with_capacity(operands.len().div_ceil(2));
+        let mut pairs = operands.into_iter();
+        while let Some(a) = pairs.next() {
+            next.push(match pairs.next() {
+                Some(b) => join(Box::new(a), Box::new(b)),
+                None => a,
+            });
+        }
+        operands = next;
+    }
+    operands.pop().expect("an expression has an operand")
+}
+
 impl<'a> Parser<'a> {
     pub(super) fn expression(&mut self) -> ParseResult<Expression> {
         self.enter()?;
-        let mut e = self.and_expression()?;
+        let mut operands = vec![self.and_expression()?];
         while self.eat("||") {
-            e = Expression::Or(Box::new(e), Box::new(self.and_expression()?));
+            operands.push(self.and_expression()?);
         }
         self.leave();
-        Ok(e)
+        Ok(balanced(operands, Expression::Or))
     }
 
     fn and_expression(&mut self) -> ParseResult<Expression> {
-        let mut e = self.relational_expression()?;
+        let mut operands = vec![self.relational_expression()?];
         while self.eat("&&") {
-            e = Expression::And(Box::new(e), Box::new(self.relational_expression()?));
+            operands.push(self.relational_expression()?);
         }
-        Ok(e)
+        Ok(balanced(operands, Expression::And))
     }
 
     fn relational_expression(&mut self) -> ParseResult<Expression> {
@@ -172,9 +194,25 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// A chain of `+` and `-` (left-associative, so a tree as deep as it is long): each
+    /// operand after the first counts as a nesting level, so that evaluating, printing and
+    /// dropping it can't run out of stack (fuzzing found 1,500 `1 +` overflowing 2 MiB).
     fn additive_expression(&mut self) -> ParseResult<Expression> {
+        let mut levels = 0;
+        let result = self.additive_chain(&mut levels);
+        for _ in 0..levels {
+            self.leave();
+        }
+        result
+    }
+
+    fn additive_chain(&mut self, levels: &mut usize) -> ParseResult<Expression> {
         let mut e = self.multiplicative_expression()?;
         loop {
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.enter()?;
+                *levels += 1;
+            }
             // `?x -1`: the sign belongs to the number token, and the grammar makes it an
             // operator; the literal starts the next operand's products.
             if self.at_number(true) && matches!(self.peek(), Some(b'+' | b'-')) {
@@ -182,6 +220,10 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let mut right = Expression::Literal(self.numeric_literal(false)?);
                 loop {
+                    if matches!(self.peek(), Some(b'*' | b'/')) {
+                        self.enter()?;
+                        *levels += 1;
+                    }
                     if self.eat("*") {
                         right = Expression::Multiply(
                             Box::new(right),
@@ -209,9 +251,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A chain of `*` and `/`, its operands counted as [`Self::additive_expression`]'s.
     fn multiplicative_expression(&mut self) -> ParseResult<Expression> {
+        let mut levels = 0;
+        let result = self.multiplicative_chain(&mut levels);
+        for _ in 0..levels {
+            self.leave();
+        }
+        result
+    }
+
+    fn multiplicative_chain(&mut self, levels: &mut usize) -> ParseResult<Expression> {
         let mut e = self.unary_expression()?;
         loop {
+            if matches!(self.peek(), Some(b'*' | b'/')) {
+                self.enter()?;
+                *levels += 1;
+            }
             if self.eat("*") {
                 e = Expression::Multiply(Box::new(e), Box::new(self.unary_expression()?));
             } else if self.eat("/") {

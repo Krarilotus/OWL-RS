@@ -1,0 +1,106 @@
+# Coverage-guided fuzzing of the parsers with cargo-fuzz (libFuzzer), on nightly:
+#   cargo +nightly fuzz run turtle
+# The targets are nrese-fuzz's (crates/nrese-fuzz), which also run on stable from corpora;
+# see README.md here. A workspace of its own: it isn't built by the main one.
+[package]
+name = "nrese-fuzz-targets"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nrese-fuzz = { path = "../crates/nrese-fuzz" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "ntriples"
+path = "fuzz_targets/ntriples.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nquads"
+path = "fuzz_targets/nquads.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "turtle"
+path = "fuzz_targets/turtle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trig"
+path = "fuzz_targets/trig.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "n3"
+path = "fuzz_targets/n3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdfxml"
+path = "fuzz_targets/rdfxml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jsonld"
+path = "fuzz_targets/jsonld.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sparql_query"
+path = "fuzz_targets/sparql_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sparql_update"
+path = "fuzz_targets/sparql_update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "results_json"
+path = "fuzz_targets/results_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "results_xml"
+path = "fuzz_targets/results_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "results_tsv"
+path = "fuzz_targets/results_tsv.rs"
+test = false
+doc = false
+bench = false
