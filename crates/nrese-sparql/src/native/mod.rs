@@ -14,6 +14,7 @@
 mod calendar;
 mod equality;
 mod equijoin;
+mod estimate;
 mod exists;
 pub(crate) mod expr;
 mod fast;
@@ -208,6 +209,20 @@ pub(crate) fn explain(
         }
     };
     Ok((rewrites, steps, rows as u64))
+}
+
+/// The plan `query` would run as, after the rewrites, with estimated rows per node
+/// ([`estimate`]), without running it; and the rewrites that changed it.
+pub(crate) fn plan(
+    snapshot: &Snapshot,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<(Vec<&'static str>, Vec<crate::query::PlannedStep>), QueryEvaluationError> {
+    let (pattern, _, rewrites) = native_pattern(query, options)?;
+    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let mut steps = Vec::new();
+    ctx.estimate_plan(&crate::plan::Plan::of(&pattern), 0, &mut steps);
+    Ok((rewrites, steps))
 }
 
 pub use output::ResultsFormat;

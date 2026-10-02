@@ -144,6 +144,39 @@ pub fn explain_query<V: ReadView>(
     })
 }
 
+/// One node of a query's plan before it runs ([`plan_query`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedStep {
+    /// Nesting depth: a node's inputs follow it one level deeper.
+    pub depth: usize,
+    /// `scan`, `bgp`, `join`, `optional`, `filter`, `union`, `path`, `group`, ...
+    pub operator: String,
+    /// The triple pattern, expression or variables the node works on.
+    pub detail: String,
+    /// Rows estimated from the store's statistics; `None` where unknown (`SERVICE`).
+    pub estimated_rows: Option<u64>,
+}
+
+/// The plan a query would run as ([`plan_query`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedQuery {
+    /// The rewrites that changed the query, in the order applied (as in [`Explanation`]).
+    pub rewrites: Vec<&'static str>,
+    pub steps: Vec<PlannedStep>,
+}
+
+/// The plan `query` would run as on `view`, after the rewrites, each node with an estimate
+/// of its rows, without running it (EXPLAIN without ANALYZE).
+pub fn plan_query<V: ReadView>(
+    view: &V,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<PlannedQuery, QueryEvaluationError> {
+    let snapshot = view.evaluation_snapshot();
+    let (rewrites, steps) = crate::native::plan(&snapshot, query, options)?;
+    Ok(PlannedQuery { rewrites, steps })
+}
+
 /// True if `query` would run on the native executor over a snapshot with default options.
 /// For coverage reports and tests; the decision itself is made per call.
 pub fn runs_natively(query: &Query) -> bool {
