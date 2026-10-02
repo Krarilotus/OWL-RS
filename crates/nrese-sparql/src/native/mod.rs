@@ -1769,6 +1769,7 @@ impl<'a> Context<'a> {
             snapshot: self.snapshot,
             model: self.model,
             graph,
+            fixed: None,
         })
     }
 
@@ -1853,8 +1854,9 @@ impl<'a> Context<'a> {
         object: &TermPattern,
     ) -> NativeResult<Solutions> {
         let resolved = paths::Path::resolve(path, self.snapshot);
-        let evaluator = self.path_evaluator()?;
         let end = |term: &TermPattern| self.path_end(term);
+        let mut evaluator = self.path_evaluator()?;
+        evaluator.fixed = end(subject).err().or_else(|| end(object).err());
         let column = |values: Vec<u64>| IdTable::from_columns(vec![values]);
         let (vars, table) = match (end(subject), end(object)) {
             (Err(start), Err(finish)) => {
