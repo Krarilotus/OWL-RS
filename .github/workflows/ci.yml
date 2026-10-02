@@ -1,0 +1,75 @@
+# Merge gate (ROADMAP F5). Every job must pass; warnings are errors.
+# The bench harness is a separate Cargo workspace, so it is checked via --manifest-path.
+name: CI
+
+# Run at milestones, not on every push (the local gate is scripts/check.sh):
+#   gh workflow run ci.yml --ref refactor/engine-v2
+# and on merges to main.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.target.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: workspace
+            manifest: Cargo.toml
+          - name: bench-harness
+            manifest: benches/nrese-bench-harness/Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain version from rust-toolchain.toml
+        run: echo "RUST_TOOLCHAIN=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target.name }}
+          # Both workspaces build into the repository's `target` (.cargo/config.toml).
+          workspaces: ${{ matrix.target.name == 'workspace' && '.' || 'benches/nrese-bench-harness -> ../../target' }}
+      - name: fmt
+        run: cargo fmt --manifest-path ${{ matrix.target.manifest }} --all --check
+      - name: clippy
+        run: cargo clippy --manifest-path ${{ matrix.target.manifest }} --all-targets --locked -- -D warnings
+      - name: fetch W3C test suites (pinned)
+        if: matrix.target.name == 'workspace'
+        run: bash scripts/fetch-w3c-tests.sh
+      - name: test
+        run: cargo test --manifest-path ${{ matrix.target.manifest }} --all-targets --locked
+        env:
+          # The W3C suite runners fail instead of skipping when the suite is missing.
+          NRESE_W3C_REQUIRED: ${{ matrix.target.name == 'workspace' && '1' || '' }}
+
+  console:
+    name: Console (apps/nrese-console)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/nrese-console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/nrese-console/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npx vitest run
+      - run: npm run build
