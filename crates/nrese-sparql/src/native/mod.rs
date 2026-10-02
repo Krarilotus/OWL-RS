@@ -3357,11 +3357,12 @@ impl<'a> Context<'a> {
         distinct.dedup();
         let terms: Vec<Option<Term>> = distinct.iter().map(|&id| self.term(id)).collect();
         let mut by_term: Vec<usize> = (0..distinct.len()).collect();
-        by_term.sort_by(|&a, &b| value::order(terms[a].as_ref(), terms[b].as_ref()));
+        let terms: Vec<value::Sortable> = terms.into_iter().map(value::Sortable::new).collect();
+        by_term.sort_by(|&a, &b| terms[a].order(&terms[b]));
         let mut rank_of = vec![0u64; distinct.len()];
         let mut rank = 0;
         for (i, &d) in by_term.iter().enumerate() {
-            if i > 0 && value::order(terms[by_term[i - 1]].as_ref(), terms[d].as_ref()).is_ne() {
+            if i > 0 && terms[by_term[i - 1]].order(&terms[d]).is_ne() {
                 rank += 1;
             }
             rank_of[d] = rank;
