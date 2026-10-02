@@ -42,6 +42,22 @@ capabilities = [
 # 2026-10-01; builtins and .pie import are B2's rest.)
 missing = {}
 
+# The same server with FSST-compressed vocabularies (`store.vocabulary = "fsst"`): next to
+# `nrese` (plain, the default) it shows the trade-off of a smaller store and less memory
+# against decoding the terms a query reads (office PC: stores 12–16 % smaller, memory 16–25 %
+# lower, query totals even, a scan of the dictionary 14 % slower).
+[nrese-fsst]
+name = "NRESE (FSST vocabulary)"
+publish = "free"
+runs = ["docker", "apptainer", "native"]
+capabilities = [
+  "load", "query", "update",
+  "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
+  "reason-custom-rules", "reason-incremental", "consistency", "explain",
+  "shacl-core", "shacl-sparql", "fulltext", "federation", "geosparql", "classify",
+]
+missing = {}
+
 # The same server on the Oxigraph libraries: the branch baseline/pre-oxigraph-migration,
 # checked out beside the repository (NRESE_OXIGRAPH_SRC elsewhere). Next to `nrese` it
 # shows what the migration to the own RDF libraries changed.

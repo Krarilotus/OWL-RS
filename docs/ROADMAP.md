@@ -7,7 +7,7 @@ Architecture: [ARCHITECTURE.md](ARCHITECTURE.md) · decisions: [adr/](adr/) · c
 
 ## 1. Goal and how we'll know we're there
 
-NRESE becomes a single-node RDF database that **reads like QLever and governs data like GraphDB**, and serves as the store behind ResearchSpace and the datamodel workflow (DMW).
+NRESE becomes an RDF database and ontology platform that **reads like QLever and governs data like GraphDB**, leads in reasoning (OWL 2 RL materialised, OWL 2 DL as the goal), uses the hardware it runs on and scales out to clusters where a use case needs it, and serves as the store behind ResearchSpace and the datamodel workflow (DMW), which must work end to end.
 
 "Done" is defined by evidence, not by features:
 
