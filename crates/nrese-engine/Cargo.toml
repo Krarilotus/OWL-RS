@@ -15,6 +15,7 @@ nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 parking_lot = "0.12"
 rayon = "1.10"
+rust-stemmers = "1.2"
 thiserror.workspace = true
 tracing.workspace = true
 
