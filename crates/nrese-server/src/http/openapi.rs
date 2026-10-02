@@ -208,6 +208,7 @@ protocol!(
         super::api_v1::repositories,
         super::api_v1::repository_get,
         super::api_v1::repository_put,
+        super::api_v1::repository_patch,
         super::api_v1::repository_delete,
         info,
         summary,

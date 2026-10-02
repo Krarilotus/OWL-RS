@@ -183,6 +183,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/repositories/{id}",
             get(api_v1::repository_get)
                 .put(api_v1::repository_put)
+                .patch(api_v1::repository_patch)
                 .delete(api_v1::repository_delete),
         )
         .nest("/api/v1/repositories/{id}", repository_routes())

@@ -16,7 +16,10 @@ use axum::http::HeaderMap;
 
 #[derive(Clone)]
 pub struct AppState {
-    pipeline: Arc<MutationPipeline>,
+    /// The repository's write path; a reconfiguration replaces it.
+    pipeline: crate::repositories::PipelineSlot,
+    /// The default repository's settings as changed through the engine API.
+    default_settings: Arc<parking_lot::RwLock<crate::repository_config::RepositorySettings>>,
     ready: Arc<AtomicBool>,
     policy: Arc<PolicyConfig>,
     ai: Arc<AiSuggestionService>,
@@ -55,7 +58,15 @@ impl AppState {
         let repositories = Arc::new(Repositories::open(store.config(), reasoner.clone()));
         let access = Arc::new(open_access(store.config(), &policy)?);
         Ok(Self {
-            pipeline: Arc::new(MutationPipeline::new(Arc::new(store), Arc::new(reasoner))),
+            default_settings: Arc::new(parking_lot::RwLock::new(
+                crate::repositories::stored_default_settings(store.config())
+                    .map_err(|error| anyhow::anyhow!(error))?
+                    .unwrap_or_default(),
+            )),
+            pipeline: Arc::new(parking_lot::RwLock::new(Arc::new(MutationPipeline::new(
+                Arc::new(store),
+                Arc::new(reasoner),
+            )))),
             ready: Arc::new(AtomicBool::new(false)),
             policy: Arc::new(policy),
             ai: Arc::new(ai),
@@ -184,12 +195,50 @@ impl AppState {
     }
 
     pub fn store(&self) -> Arc<StoreService> {
-        Arc::clone(self.pipeline.store())
+        Arc::clone(self.pipeline.read().store())
     }
 
     /// The store-owned write path; every mutation goes through it.
     pub fn pipeline(&self) -> Arc<MutationPipeline> {
-        Arc::clone(&self.pipeline)
+        Arc::clone(&self.pipeline.read())
+    }
+
+    /// The repository's settings: those it was created with, or for the default
+    /// repository those changed through the engine API (empty: the server's).
+    pub fn repository_settings(&self) -> crate::repository_config::RepositorySettings {
+        match self.repository_id() {
+            DEFAULT_REPOSITORY => self.default_settings.read().clone(),
+            id => self.repositories.settings(id).unwrap_or_default(),
+        }
+    }
+
+    /// Changes this state's repository's settings: its title, and its reasoning, which
+    /// takes effect at once (the inferences are recomputed). The default repository's are
+    /// kept in the data directory (on disk) and override the configuration's reasoning
+    /// at the next start.
+    pub fn change_repository_settings(
+        &self,
+        settings: crate::repository_config::RepositorySettings,
+    ) -> Result<(), ApiError> {
+        if self.repository_id() != DEFAULT_REPOSITORY {
+            return self.repositories.change(self.repository_id(), settings);
+        }
+        crate::repositories::check(&settings)?;
+        let before = self.default_settings.read().clone();
+        if (&before.reasoning, &before.rules) != (&settings.reasoning, &settings.rules) {
+            crate::repositories::reconfigure(
+                &self.pipeline,
+                &settings,
+                self.repositories.server_reasoner(),
+            )?;
+        }
+        if let Some(file) =
+            crate::repositories::default_settings_file(self.pipeline().store().config())
+        {
+            crate::repositories::write_settings(&file, &settings)?;
+        }
+        *self.default_settings.write() = settings;
+        Ok(())
     }
 
     pub fn mark_ready(&self) {
@@ -228,19 +277,19 @@ impl AppState {
     }
 
     pub fn reasoner_profile_name(&self) -> &'static str {
-        self.pipeline.reasoner().profile_name()
+        self.pipeline().reasoner().profile_name()
     }
 
     pub fn reasoner_mode_name(&self) -> &'static str {
-        self.pipeline.reasoner().mode_name()
+        self.pipeline().reasoner().mode_name()
     }
 
     pub fn reasoner_read_model_name(&self) -> &'static str {
-        self.pipeline.reasoner().read_model_name()
+        self.pipeline().reasoner().read_model_name()
     }
 
     pub fn reasoner(&self) -> Arc<ReasonerService> {
-        Arc::clone(self.pipeline.reasoner())
+        Arc::clone(self.pipeline().reasoner())
     }
 
     pub fn policy(&self) -> Arc<PolicyConfig> {
@@ -301,11 +350,11 @@ impl AppState {
     }
 
     pub fn last_reasoning_run(&self) -> Option<ReasoningRunRecord> {
-        self.pipeline.last_reasoning_run()
+        self.pipeline().last_reasoning_run()
     }
 
     pub fn store_mode(&self) -> StoreMode {
-        self.pipeline.store().config().mode
+        self.pipeline().store().config().mode
     }
 
     pub fn store_mode_name(&self) -> &'static str {

@@ -33,7 +33,7 @@ fn routes_in(from: &str, to: &str, prefix: &str) -> BTreeSet<(String, String)> {
         if !path.starts_with("/api/v1") {
             continue;
         }
-        for method in ["get", "post", "put", "delete", "head"] {
+        for method in ["get", "post", "put", "patch", "delete", "head"] {
             let call = format!("{method}(");
             let called = chunk.match_indices(&call).any(|(at, _)| {
                 // `get(` as a call of its own, not the end of another name.
