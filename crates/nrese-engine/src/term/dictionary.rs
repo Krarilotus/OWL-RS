@@ -30,6 +30,9 @@ use crate::error::{EngineError, EngineResult};
 use crate::mapped::Mapped;
 use crate::quad::EncodedQuad;
 
+/// Dictionary entries handed to the full-text index per batch while it is built.
+const TEXT_BATCH: u64 = 1 << 20;
+
 const TAG_IRI: u8 = b'I';
 const TAG_BNODE: u8 = b'B';
 const TAG_STRING: u8 = b'S';
@@ -421,16 +424,20 @@ impl Dictionary {
             let mut text = self.text.write();
             let inner = self.inner.read();
             let end = inner.len();
-            for index in text.covered()..end {
-                match view_key(inner.key(index)) {
-                    TermView::String(value) => {
-                        text.add(TermId::new(TermKind::String, index).raw(), value);
-                    }
-                    TermView::LangString { value, .. } => {
-                        text.add(TermId::new(TermKind::LangString, index).raw(), value);
-                    }
-                    _ => {}
-                }
+            // In batches, each tokenised on every core (TextIndex::extend).
+            let mut start = text.covered();
+            while start < end {
+                let stop = (start + TEXT_BATCH).min(end);
+                let documents: Vec<(u64, &str)> = (start..stop)
+                    .filter_map(|index| match view_key(inner.key(index)) {
+                        TermView::String(value) | TermView::LangString { value, .. } => {
+                            Some((index, value))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                text.extend(&documents);
+                start = stop;
             }
             text.cover(end);
         }
@@ -442,11 +449,20 @@ impl Dictionary {
             }
         }
         let inner = self.inner.read();
-        let text_of = |id: u64| match view_key(inner.key(TermId::from_raw(id).payload())) {
+        let text_of = |index: u64| match view_key(inner.key(index)) {
             TermView::String(value) | TermView::LangString { value, .. } => Some(value.to_owned()),
             _ => None,
         };
-        self.text.read().search(query, &text_of)
+        // Matches are entry numbers: as ids, by the entry's kind.
+        let mut matches = self.text.read().search(query, &text_of);
+        for found in &mut matches {
+            let kind = match view_key(inner.key(found.id)) {
+                TermView::LangString { .. } => TermKind::LangString,
+                _ => TermKind::String,
+            };
+            found.id = TermId::new(kind, found.id).raw();
+        }
+        matches
     }
 
     /// The IRIs whose local name's words match `query`, best first; the index first takes
@@ -456,12 +472,21 @@ impl Dictionary {
             let mut text = self.iri_text.write();
             let inner = self.inner.read();
             let end = inner.len();
-            for index in text.covered()..end {
-                if let TermView::Iri(iri) = view_key(inner.key(index))
-                    && let Some(words) = super::text::local_name_text(iri)
-                {
-                    text.add(TermId::new(TermKind::Iri, index).raw(), &words);
-                }
+            let mut start = text.covered();
+            while start < end {
+                let stop = (start + TEXT_BATCH).min(end);
+                let names: Vec<(u64, String)> = (start..stop)
+                    .filter_map(|index| match view_key(inner.key(index)) {
+                        TermView::Iri(iri) => Some((index, super::text::local_name_text(iri)?)),
+                        _ => None,
+                    })
+                    .collect();
+                let documents: Vec<(u64, &str)> = names
+                    .iter()
+                    .map(|(index, words)| (*index, words.as_str()))
+                    .collect();
+                text.extend(&documents);
+                start = stop;
             }
             text.cover(end);
         }
@@ -472,11 +497,15 @@ impl Dictionary {
             }
         }
         let inner = self.inner.read();
-        let text_of = |id: u64| match view_key(inner.key(TermId::from_raw(id).payload())) {
+        let text_of = |index: u64| match view_key(inner.key(index)) {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
-        self.iri_text.read().search(query, &text_of)
+        let mut matches = self.iri_text.read().search(query, &text_of);
+        for found in &mut matches {
+            found.id = TermId::new(TermKind::Iri, found.id).raw();
+        }
+        matches
     }
 
     /// The ids of the entries `0..limit` whose text passes `test`, sorted: one parallel
