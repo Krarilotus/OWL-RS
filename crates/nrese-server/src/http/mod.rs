@@ -1,4 +1,5 @@
 mod admin_dataset;
+mod api_v1;
 mod ai;
 mod classification;
 mod console;
