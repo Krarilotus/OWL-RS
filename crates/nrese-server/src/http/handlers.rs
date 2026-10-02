@@ -255,6 +255,48 @@ pub async fn sparql_post(
     }
 }
 
+/// Resources whose labels' or local names' words begin with the words of `q`, best first
+/// (`limit`, default 10; `infer=false` for asserted statements only).
+pub async fn autocomplete(
+    State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_query_read(&state, &headers).await?;
+    state.ensure_serving()?;
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_str(raw_query.as_deref().unwrap_or_default())
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let value = |name: &str| {
+        pairs
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let typed = value("q").unwrap_or_default().trim().to_owned();
+    if typed.is_empty() {
+        return Err(ApiError::bad_request("autocomplete needs a non-empty q"));
+    }
+    let limit = match value("limit") {
+        None => 10,
+        Some(text) => text
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| (1..=1000).contains(&n))
+            .ok_or_else(|| ApiError::bad_request("limit must be between 1 and 1000"))?,
+    };
+    let infer = value("infer") != Some("false");
+    let store = state.store();
+    let suggestions = tokio::task::spawn_blocking(move || store.autocomplete(&typed, limit, infer))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let suggestions: Vec<serde_json::Value> = suggestions
+        .into_iter()
+        .map(|s| serde_json::json!({"iri": s.iri, "label": s.label, "score": s.score}))
+        .collect();
+    Ok(Json(serde_json::json!({ "suggestions": suggestions })).into_response())
+}
+
 /// The OWL 2 EL class hierarchy of the asserted ontology.
 pub async fn classification_get(
     State(state): State<AppState>,

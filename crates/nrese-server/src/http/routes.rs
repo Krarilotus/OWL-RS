@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
             get(handlers::service_description),
         )
         .route("/dataset/info", get(handlers::dataset_info))
+        .route("/dataset/autocomplete", get(handlers::autocomplete))
         .route(
             "/dataset/query",
             get(handlers::query_get).post(handlers::query_post),
