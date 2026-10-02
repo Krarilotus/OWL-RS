@@ -148,9 +148,7 @@ pub(crate) fn apply_sparql_update(
         writable: requester.write.access().cloned(),
     };
     apply_update(tx, &update, &options).map_err(|error| match error {
-        nrese_sparql::UpdateError::Forbidden(graph) => StoreError::Forbidden(format!(
-            "the update would change {graph}, which the requester may not write"
-        )),
+        nrese_sparql::UpdateError::Forbidden(graph) => crate::Refusal::Write(graph).into(),
         error => error.into(),
     })
 }
@@ -186,8 +184,19 @@ fn check_writable(
         .find(|&graph| !writable.allows_id(tx, graph))
     {
         None => Ok(()),
-        Some(_) => Err(StoreError::Forbidden(
-            "the request would change a graph the requester may not write".to_owned(),
-        )),
+        Some(graph) => Err(crate::Refusal::Write(graph_name(tx, graph)).into()),
+    }
+}
+
+/// The graph `id` of `tx` as a name.
+pub(crate) fn graph_name(
+    tx: &nrese_engine::Transaction<'_>,
+    id: nrese_engine::TermId,
+) -> nrese_rdf::GraphName {
+    match tx.decode(id) {
+        _ if id == nrese_engine::TermId::DEFAULT_GRAPH => nrese_rdf::GraphName::DefaultGraph,
+        Some(nrese_rdf::Term::NamedNode(node)) => nrese_rdf::GraphName::NamedNode(node),
+        Some(nrese_rdf::Term::BlankNode(node)) => nrese_rdf::GraphName::BlankNode(node),
+        _ => nrese_rdf::GraphName::DefaultGraph,
     }
 }

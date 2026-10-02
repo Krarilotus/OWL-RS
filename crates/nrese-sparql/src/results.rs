@@ -19,9 +19,13 @@ pub enum QueryEvaluationError {
     /// The request's [`CancellationToken`] fired: a deadline or a client gone.
     #[error("the query was cancelled")]
     Cancelled,
-    /// The data couldn't be read, or a budget ran out.
+    /// The data couldn't be read.
     #[error(transparent)]
     Dataset(Box<dyn Error + Send + Sync>),
+    /// The query needed more memory than its budget, or than the server's budget for all
+    /// queries had left ([`BudgetExceeded::shared`](nrese_exec::BudgetExceeded)).
+    #[error(transparent)]
+    MemoryLimit(#[from] nrese_exec::BudgetExceeded),
     /// A `SERVICE` call failed.
     #[error("SERVICE call failed: {0}")]
     Service(Box<dyn Error + Send + Sync>),

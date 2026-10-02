@@ -53,45 +53,58 @@ pub fn compile(
     text: &str,
     vocabulary: &mut impl Vocabulary,
 ) -> Result<N3Program, ParseError> {
-    let error = |rule: &str, message: String| ParseError {
-        rule: if rule.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{name}#{rule}")
-        },
-        message,
+    // Errors name the line they are on (comments are stripped line for line, so the
+    // numbers are the document's); 0 for the document as a whole.
+    let error = |rule: &str, line: usize, message: String| {
+        let error = ParseError::new(
+            if rule.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name}#{rule}")
+            },
+            message,
+        );
+        match line {
+            0 => error,
+            line => error.at(line, 1),
+        }
     };
     let text = strip_comments(text);
     let mut prefixes: HashMap<String, String> = HashMap::new();
-    let mut axioms_text = String::new();
-    let mut rules_text = String::new();
-    for (section, body) in sections(&text).map_err(|m| error("", m))? {
+    let mut axioms_text = (String::new(), 0);
+    let mut rules_text = (String::new(), 0);
+    for (section, body, first) in sections(&text).map_err(|m| error("", 0, m))? {
         match section.as_str() {
             "Prefices" | "Prefixes" => {
-                for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                    let (prefix, iri) = line
-                        .split_once(':')
-                        .ok_or_else(|| error("", format!("a prefix line without ':': {line}")))?;
+                for (line, number) in lines(&body, first) {
+                    let (prefix, iri) = line.split_once(':').ok_or_else(|| {
+                        error("", number, format!("a prefix line without ':': {line}"))
+                    })?;
                     prefixes.insert(prefix.trim().to_owned(), iri.trim().to_owned());
                 }
             }
-            "Axioms" => axioms_text = body,
-            "Rules" => rules_text = body,
-            other => return Err(error("", format!("unknown section {other}"))),
+            "Axioms" => axioms_text = (body, first),
+            "Rules" => rules_text = (body, first),
+            other => return Err(error("", first, format!("unknown section {other}"))),
         }
     }
     let mut facts = Vec::new();
-    for line in axioms_text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        let (terms, _) = tokens(line).map_err(|m| error("axioms", m))?;
+    for (line, number) in lines(&axioms_text.0, axioms_text.1) {
+        let (terms, _) = tokens(line).map_err(|m| error("axioms", number, m))?;
         let [s, p, o] = terms.as_slice() else {
             return Err(error(
                 "axioms",
+                number,
                 format!("an axiom isn't three terms: {line}"),
             ));
         };
         let constant = |token: &Token, vocabulary: &mut _| match token {
-            Token::Var(v) => Err(error("axioms", format!("a variable in an axiom: {v}"))),
-            other => constant(other, &prefixes, vocabulary).map_err(|m| error("axioms", m)),
+            Token::Var(v) => Err(error(
+                "axioms",
+                number,
+                format!("a variable in an axiom: {v}"),
+            )),
+            other => constant(other, &prefixes, vocabulary).map_err(|m| error("axioms", number, m)),
         };
         facts.push([
             constant(s, vocabulary)?,
@@ -100,12 +113,23 @@ pub fn compile(
         ]);
     }
     let mut rules = Vec::new();
-    for (kind, rule_name, body) in rule_blocks(&rules_text).map_err(|m| error("", m))? {
+    for (kind, rule_name, body, number) in
+        rule_blocks(&rules_text.0, rules_text.1).map_err(|m| error("", 0, m))?
+    {
         let rule = compile_rule(&kind, &rule_name, &body, &prefixes, vocabulary)
-            .map_err(|m| error(&rule_name, m))?;
+            .map_err(|m| error(&rule_name, number, m))?;
         rules.push(rule);
     }
     Ok(N3Program { rules, facts })
+}
+
+/// The non-empty lines of `text`, trimmed, with their line numbers in the document
+/// (`text`'s first line is line `first`).
+fn lines(text: &str, first: usize) -> impl Iterator<Item = (&str, usize)> {
+    text.lines()
+        .enumerate()
+        .map(move |(i, line)| (line.trim(), first + i))
+        .filter(|(line, _)| !line.is_empty())
 }
 
 /// `text` without `//` and `/* */` comments (outside `<…>` and quotes; `//` starts a
@@ -165,8 +189,9 @@ fn strip_comments(text: &str) -> String {
     out
 }
 
-/// The top-level sections: a name, then a body in braces.
-fn sections(text: &str) -> Result<Vec<(String, String)>, String> {
+/// The top-level sections: a name, then a body in braces, and the line number of the
+/// body's first line.
+fn sections(text: &str) -> Result<Vec<(String, String, usize)>, String> {
     let mut out = Vec::new();
     let mut rest = text;
     loop {
@@ -174,6 +199,7 @@ fn sections(text: &str) -> Result<Vec<(String, String)>, String> {
         if trimmed.is_empty() {
             return Ok(out);
         }
+        let line_of = |at: &str| text[..text.len() - at.len()].matches('\n').count() + 1;
         let open = trimmed
             .find('{')
             .ok_or_else(|| format!("a section without '{{': {}", head(trimmed)))?;
@@ -196,7 +222,8 @@ fn sections(text: &str) -> Result<Vec<(String, String)>, String> {
             }
         }
         let end = end.ok_or_else(|| format!("section {name} isn't closed"))?;
-        out.push((name, trimmed[body_start..end].to_owned()));
+        let first = line_of(&trimmed[body_start..]);
+        out.push((name, trimmed[body_start..end].to_owned(), first));
         rest = &trimmed[end + 1..];
     }
 }
@@ -206,14 +233,15 @@ fn head(text: &str) -> &str {
     &text[..end]
 }
 
-/// The rules of the `Rules` section: kind (`Id` or `Consistency`), name, and body lines.
-fn rule_blocks(text: &str) -> Result<Vec<(String, String, Vec<String>)>, String> {
-    let mut out: Vec<(String, String, Vec<String>)> = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+/// The rules of the `Rules` section: kind (`Id` or `Consistency`), name, body lines, and
+/// the line number of its `Id:` (`text`'s first line is line `first`).
+#[allow(clippy::type_complexity)]
+fn rule_blocks(
+    text: &str,
+    first: usize,
+) -> Result<Vec<(String, String, Vec<String>, usize)>, String> {
+    let mut out: Vec<(String, String, Vec<String>, usize)> = Vec::new();
+    for (line, number) in lines(text, first) {
         let start = ["Id:", "Consistency:"]
             .into_iter()
             .find(|keyword| line.starts_with(keyword));
@@ -222,10 +250,15 @@ fn rule_blocks(text: &str) -> Result<Vec<(String, String, Vec<String>)>, String>
                 keyword.trim_end_matches(':').to_owned(),
                 line[keyword.len()..].trim().to_owned(),
                 Vec::new(),
+                number,
             )),
             None => match out.last_mut() {
-                Some((_, _, lines)) => lines.push(line.to_owned()),
-                None => return Err(format!("a rule line before any 'Id:': {line}")),
+                Some((_, _, lines, _)) => lines.push(line.to_owned()),
+                None => {
+                    return Err(format!(
+                        "line {number}: a rule line before any 'Id:': {line}"
+                    ));
+                }
             },
         }
     }
@@ -543,6 +576,36 @@ fn compile_rule(
 mod tests {
     use super::*;
     use crate::v2::testing::LocalVocabulary;
+
+    #[test]
+    fn errors_name_the_line_of_their_rule_or_axiom() {
+        let line = |text: &str, start: &str| {
+            text.lines()
+                .position(|line| line.starts_with(start))
+                .unwrap()
+                + 1
+        };
+        let mut vocabulary = LocalVocabulary::default();
+        // A conclusion variable no premise binds: the line of its rule's `Id:`.
+        let broken = RULES.replace("  x  <rdf:type>  z\n", "  w  <rdf:type>  z\n");
+        let error = compile("test", &broken, &mut vocabulary).unwrap_err();
+        assert_eq!(error.rule, "test#rdfs2");
+        assert_eq!(
+            error.position.map(|p| p.line),
+            Some(line(&broken, "Id: rdfs2")),
+            "{error}"
+        );
+        // An axiom of two terms: its own line, after a multi-line comment.
+        let broken = RULES
+            .replace("// A test ruleset.", "/* A test\n   ruleset. */")
+            .replace("<ex:a> <rdfs:label> \"A label\"@en", "<ex:a> <rdfs:label>");
+        let error = compile("test", &broken, &mut vocabulary).unwrap_err();
+        assert_eq!(
+            error.position.map(|p| p.line),
+            Some(line(&broken, "  <ex:a> <rdfs:label>")),
+            "{error}"
+        );
+    }
 
     /// A ruleset in GraphDB's syntax, written for this test.
     const RULES: &str = r#"

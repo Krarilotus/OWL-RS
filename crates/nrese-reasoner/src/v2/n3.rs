@@ -41,14 +41,23 @@ pub fn compile(
     text: &str,
     vocabulary: &mut impl Vocabulary,
 ) -> Result<N3Program, ParseError> {
-    let error = |message: String| ParseError {
-        rule: name.to_owned(),
-        message,
-    };
     let quads: Vec<N3Quad> = N3Parser::new()
         .for_slice(text.as_bytes())
         .collect::<Result<_, _>>()
-        .map_err(|e| error(format!("not valid N3: {e}")))?;
+        .map_err(|e| match e {
+            nrese_rdf_io::RdfParseError::Syntax(syntax) => {
+                let start = syntax.location().start;
+                ParseError::new(name, format!("not valid N3: {}", syntax.message())).at(
+                    usize::try_from(start.line)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(1),
+                    usize::try_from(start.column)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(1),
+                )
+            }
+            e => ParseError::new(name, format!("not valid N3: {e}")),
+        })?;
     compile_quads(name, &quads, vocabulary)
 }
 
@@ -58,10 +67,7 @@ pub fn compile_quads(
     quads: &[N3Quad],
     vocabulary: &mut impl Vocabulary,
 ) -> Result<N3Program, ParseError> {
-    let error = |message: String| ParseError {
-        rule: name.to_owned(),
-        message,
-    };
+    let error = |message: String| ParseError::new(name, message);
     // The statements of each formula, by its blank node.
     let mut formulas: HashMap<&BlankNode, Vec<&N3Quad>> = HashMap::new();
     for quad in quads {
@@ -87,10 +93,7 @@ pub fn compile_quads(
         };
         let rule = Compiler::default()
             .rule(&rule_name, body, head, &formulas, vocabulary)
-            .map_err(|message| ParseError {
-                rule: rule_name.clone(),
-                message,
-            })?;
+            .map_err(|message| ParseError::new(rule_name.clone(), message))?;
         program.rules.extend(rule);
     }
     Ok(program)
@@ -348,6 +351,16 @@ mod tests {
         let mut vocabulary = LocalVocabulary::default();
         let program = compile("test", text, &mut vocabulary)?;
         Ok((program, vocabulary))
+    }
+
+    #[test]
+    fn syntax_errors_name_their_line_and_column() {
+        let error = compiled("@prefix : <http://e/> .\n{ ?x :p ?y } => { ?y :p ?x \n:a :p .\n")
+            .unwrap_err();
+        let position = error.position.expect("a position");
+        assert_eq!(position.line, 3, "{error}");
+        assert!(position.column >= 1);
+        assert!(error.to_string().starts_with("line 3, column "), "{error}");
     }
 
     #[test]
