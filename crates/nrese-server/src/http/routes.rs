@@ -35,6 +35,7 @@ fn repository_routes() -> Router<AppState> {
             "/namespaces/{prefix}",
             put(api_v1::namespace_put).delete(api_v1::namespace_delete),
         )
+        .route("/explain", get(api_v1::explain))
         .route("/sessions", post(api_v1::session_begin))
         .route("/sessions/{session}", delete(api_v1::session_rollback))
         .route("/sessions/{session}/update", post(api_v1::session_update))

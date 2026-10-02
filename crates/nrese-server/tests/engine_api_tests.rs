@@ -276,3 +276,38 @@ async fn sessions_collect_writes_and_commit_them_as_one() {
     let (status, _) = send(&app, Method::POST, &format!("{session}/commit"), None, "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn explanations_through_the_engine_api() {
+    let app = support::test_app_with_settings(
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Rdfs),
+    )
+    .unwrap();
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/dataset/update",
+        Some("application/sparql-update"),
+        "PREFIX ex: <http://example.com/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         INSERT DATA { ex:a a ex:C . ex:C rdfs:subClassOf ex:D }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let explain = |object: &str| {
+        format!(
+            "/api/v1/repositories/nrese/explain?subj=%3Chttp%3A%2F%2Fexample.com%2Fa%3E\
+             &pred=%3Chttp%3A%2F%2Fwww.w3.org%2F1999%2F02%2F22-rdf-syntax-ns%23type%3E\
+             &obj=%3Chttp%3A%2F%2Fexample.com%2F{object}%3E"
+        )
+    };
+    let (status, text) = send(&app, Method::GET, &explain("D"), None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let steps = body["steps"].as_array().unwrap();
+    assert_eq!(steps[0]["origin"], "inferred");
+    assert_eq!(steps[0]["rule"], "rdfs9", "the RDFS name of the subclass rule");
+    assert_eq!(steps[0]["premises"].as_array().unwrap().len(), 2);
+    let (status, _) = send(&app, Method::GET, &explain("X"), None, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

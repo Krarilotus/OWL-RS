@@ -68,7 +68,7 @@ fn param<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
 }
 
 /// A term written as in N-Triples.
-fn term(text: &str) -> Result<Term, ApiError> {
+pub(crate) fn term(text: &str) -> Result<Term, ApiError> {
     let bad = || ApiError::bad_request(format!("'{text}' is not an N-Triples term"));
     let text = text.trim();
     if let Some(iri) = text.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
