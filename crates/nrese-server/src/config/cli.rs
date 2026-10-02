@@ -15,9 +15,10 @@ use anyhow::{Result, bail};
 /// (the same lock: for a running server, `POST /ops/api/admin/dataset/image`);
 /// `nrese-server prune-archive REVISION` removes the archived WAL segments whose records all
 /// come before `REVISION` (safe while the server runs);
-/// `nrese-server restore DIR [--wal LOGDIR]... [--until-revision N]` restores an image
-/// backup into the configured data directory, which must hold no store, and with `--wal`
-/// replays the WAL segments of those directories after it (up to revision `N`).
+/// `nrese-server restore DIR [--wal LOGDIR]... [--until-revision N] [--until-time T]`
+/// restores an image backup into the configured data directory, which must hold no store,
+/// and with `--wal` replays the WAL segments of those directories after it (up to revision
+/// `N`, and the commits made up to time `T`, RFC 3339: `2026-10-02T14:05:00Z`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliConfig {
     pub config_path: Option<PathBuf>,
@@ -48,6 +49,64 @@ pub struct RestoreCommand {
     /// Directories of WAL segments to replay after the image (an archive, a live `wal/`).
     pub wal: Vec<PathBuf>,
     pub until_revision: Option<u64>,
+    /// Microseconds since 1970.
+    pub until_time: Option<u64>,
+}
+
+/// An RFC 3339 time (`2026-10-02T14:05:00Z`, `…T16:05:00.5+02:00`) as microseconds since
+/// 1970.
+pub fn parse_time(text: &str) -> Result<u64> {
+    let bad = || anyhow::anyhow!("'{text}' is not an RFC 3339 time (2026-10-02T14:05:00Z)");
+    let number = |part: &str| part.parse::<i64>().map_err(|_| bad());
+    let (date, rest) = text.split_once(['T', 't', ' ']).ok_or_else(bad)?;
+    let mut date = date.splitn(3, '-');
+    let (year, month, day) = (
+        number(date.next().ok_or_else(bad)?)?,
+        number(date.next().ok_or_else(bad)?)?,
+        number(date.next().ok_or_else(bad)?)?,
+    );
+    // The zone: Z, or an offset from UTC.
+    let (time, offset_minutes) = if let Some(time) = rest.strip_suffix(['Z', 'z']) {
+        (time, 0)
+    } else {
+        let at = rest.rfind(['+', '-']).ok_or_else(bad)?;
+        let (time, zone) = rest.split_at(at);
+        let sign = if zone.starts_with('-') { -1 } else { 1 };
+        let (hours, minutes) = zone[1..].split_once(':').ok_or_else(bad)?;
+        (time, sign * (number(hours)? * 60 + number(minutes)?))
+    };
+    let mut clock = time.splitn(3, ':');
+    let (hour, minute, second) = (
+        number(clock.next().ok_or_else(bad)?)?,
+        number(clock.next().ok_or_else(bad)?)?,
+        clock.next().ok_or_else(bad)?,
+    );
+    let (whole, fraction) = second.split_once('.').unwrap_or((second, ""));
+    let second = number(whole)?;
+    let micros: i64 = match fraction {
+        "" => 0,
+        digits if digits.len() <= 9 && digits.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{digits:0<6}")[..6].parse().map_err(|_| bad())?
+        }
+        _ => return Err(bad()),
+    };
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return Err(bad());
+    }
+    // Days since 1970 of the civil date (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let year_of_era = y - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_minutes * 60;
+    u64::try_from(seconds * 1_000_000 + micros).map_err(|_| bad())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -188,6 +247,11 @@ impl CliConfig {
                                 .parse()
                                 .map_err(|_| anyhow::anyhow!("--until-revision takes a number"))?,
                         );
+                    } else if argument == "--until-time" {
+                        let Some(time) = args.next().and_then(|t| t.into_string().ok()) else {
+                            bail!("missing value for --until-time");
+                        };
+                        restore.until_time = Some(parse_time(&time)?);
                     } else if argument.to_str().is_some_and(|raw| raw.starts_with("--"))
                         || !restore.backup.as_os_str().is_empty()
                     {
@@ -383,8 +447,15 @@ mod tests {
                 backup: PathBuf::from("/b"),
                 wal: vec![PathBuf::from("/a"), PathBuf::from("/w")],
                 until_revision: Some(42),
+                until_time: None,
             })
         );
+        let config =
+            parse(&["restore", "/b", "--until-time", "2026-10-02T14:05:00Z"]).expect("cli config");
+        let CliCommand::Restore(restore) = config.command else {
+            panic!("restore")
+        };
+        assert_eq!(restore.until_time, Some(1_790_949_900_000_000));
         assert!(parse(&["restore", "/b", "--until-revision", "x"]).is_err());
         let config = parse(&["prune-archive", "42"]).expect("cli config");
         assert_eq!(config.command, CliCommand::PruneArchive(Some(42)));
@@ -400,5 +471,30 @@ mod tests {
         assert!(parse(&["data.nt"]).is_err());
         assert!(parse(&["load"]).is_err());
         assert!(parse(&["load", "--bogus", "a.nt"]).is_err());
+    }
+
+    #[test]
+    fn rfc3339_times() {
+        use super::parse_time;
+        assert_eq!(parse_time("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(
+            parse_time("2026-10-02T14:05:00Z").unwrap(),
+            1_790_949_900_000_000
+        );
+        assert_eq!(
+            parse_time("2026-10-02T16:05:00.25+02:00").unwrap(),
+            1_790_949_900_250_000
+        );
+        assert_eq!(
+            parse_time("2026-10-02T09:05:00-05:00").unwrap(),
+            1_790_949_900_000_000
+        );
+        assert_eq!(
+            parse_time("2000-02-29T00:00:00Z").unwrap(),
+            951_782_400_000_000
+        );
+        assert!(parse_time("2026-13-02T14:05:00Z").is_err());
+        assert!(parse_time("yesterday").is_err());
+        assert!(parse_time("2026-10-02T14:05:00").is_err());
     }
 }

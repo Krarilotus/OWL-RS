@@ -107,14 +107,16 @@ pub fn read_manifest(dir: &Path) -> StoreResult<ImageManifest> {
 
 /// Restores the backup in `backup` and the WAL segments in `logs` after it (an archive,
 /// `wal-archive/` of a store with `wal_archive`, and the store's live `wal/` where it is
-/// still there) into `data_dir`, which must hold no store, up to revision `until` (else
-/// as far as the log goes): [`restore_image`], the segments copied, then the store opened
-/// once to replay and cut the log. Returns the manifest and the revision restored.
+/// still there) into `data_dir`, which must hold no store, up to revision `until` and the
+/// commits made up to `until_micros` (microseconds since 1970; else as far as the log
+/// goes): [`restore_image`], the segments copied, then the store opened once to replay and
+/// cut the log. Returns the manifest and the revision restored.
 pub fn restore_until(
     backup: &Path,
     data_dir: &Path,
     logs: &[PathBuf],
     until: Option<u64>,
+    until_micros: Option<u64>,
 ) -> StoreResult<(ImageManifest, u64)> {
     let manifest = restore_image(backup, data_dir)?;
     let wal = data_dir.join("wal");
@@ -155,6 +157,7 @@ pub fn restore_until(
         background_maintenance: false,
         durability: nrese_engine::DurabilityConfig {
             recover_until: until,
+            recover_until_micros: until_micros,
             ..nrese_engine::DurabilityConfig::default()
         },
         ..nrese_engine::EngineConfig::default()
