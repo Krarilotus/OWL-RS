@@ -198,6 +198,11 @@ def main(argv):
     for rule, places in explained.items():
         if places:
             print(f"  {rule}: {len(places)}")
+    # No cases compared is a failure too: the dump step found no tests (a renamed test
+    # once made the workflow pass on nothing).
+    if counts["queries"] == 0 or counts["agree"] + counts["explained"] == 0:
+        print("no queries were compared", file=sys.stderr)
+        return 1
     return 1 if counts["unexplained"] or counts["jena errors"] else 0
 
 
