@@ -103,6 +103,34 @@ impl Header {
     }
 }
 
+/// [`PackedKeys::iter`].
+pub(crate) struct Iter<'a> {
+    keys: &'a PackedKeys,
+    /// The first key not decoded yet.
+    next: usize,
+    block: Vec<Key>,
+    at: usize,
+}
+
+impl Iterator for Iter<'_> {
+    type Item = Key;
+
+    fn next(&mut self) -> Option<Key> {
+        if self.at == self.block.len() {
+            if self.next == self.keys.len {
+                return None;
+            }
+            let end = ((self.next / BLOCK + 1) * BLOCK).min(self.keys.len);
+            self.block.clear();
+            self.keys.decode_range(self.next, end, &mut self.block);
+            self.next = end;
+            self.at = 0;
+        }
+        self.at += 1;
+        Some(self.block[self.at - 1])
+    }
+}
+
 /// A sorted array of keys, compressed per block.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PackedKeys {
@@ -501,6 +529,16 @@ impl PackedKeys {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// The keys in order, a block decoded at a time.
+    pub(crate) fn iter(&self) -> Iter<'_> {
+        Iter {
+            keys: self,
+            next: 0,
+            block: Vec::with_capacity(BLOCK),
+            at: 0,
+        }
     }
 
     /// The key at `index`. O(1).

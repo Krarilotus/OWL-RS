@@ -42,13 +42,34 @@ pub(crate) enum Layout {
     /// Any quads, in the six pattern permutations plus GPSO.
     #[default]
     Quads,
-    /// Default-graph quads only (the inferred stack), in SPOG, POSG, OSPG and PSOG. A graph-first
-    /// order over one constant graph sorts exactly like the matching graph-last order, so
-    /// the graph-first permutations would be redundant copies.
+    /// Default-graph quads only (the inferred stack, and the asserted one until it holds a
+    /// quad in a named graph), in SPOG, POSG, OSPG and PSOG. A graph-first order over one
+    /// constant graph sorts exactly like the matching graph-last order, so the graph-first
+    /// permutations would be redundant copies.
     DefaultGraph,
 }
 
 impl Layout {
+    /// The layout that maintains exactly `permutations`, if one does.
+    pub(crate) fn of(permutations: &[Permutation]) -> Option<Self> {
+        [Self::Quads, Self::DefaultGraph]
+            .into_iter()
+            .find(|layout| {
+                let wanted = layout.permutations();
+                wanted.len() == permutations.len()
+                    && wanted.iter().all(|p| permutations.contains(p))
+            })
+    }
+
+    /// The smaller layout that can hold `quads`: the default-graph one unless one of them is
+    /// in a named graph.
+    pub(crate) fn holding(quads: &[EncodedQuad]) -> Self {
+        match quads.iter().any(|quad| !quad.graph.is_default_graph()) {
+            true => Self::Quads,
+            false => Self::DefaultGraph,
+        }
+    }
+
     pub(crate) const fn permutations(self) -> &'static [Permutation] {
         match self {
             Self::Quads => &[
@@ -130,19 +151,12 @@ impl IndexVersion {
     }
 
     /// A version holding one base run built from packed permutations (a checkpoint): every
-    /// permutation of the layout exactly once, all with the same number of keys.
-    pub(crate) fn from_packed(
-        layout: Layout,
-        packed: Vec<(Permutation, PackedKeys)>,
-    ) -> Result<Self, String> {
-        let wanted = layout.permutations();
-        let complete = packed.len() == wanted.len()
-            && wanted
-                .iter()
-                .all(|p| packed.iter().filter(|(q, _)| q == p).count() == 1);
-        if !complete {
-            return Err("the checkpoint doesn't hold every permutation once".into());
-        }
+    /// permutation of a layout exactly once, all with the same number of keys. The layout
+    /// is the one they make up.
+    pub(crate) fn from_packed(packed: Vec<(Permutation, PackedKeys)>) -> Result<Self, String> {
+        let permutations: Vec<Permutation> = packed.iter().map(|(p, _)| *p).collect();
+        let layout = Layout::of(&permutations)
+            .ok_or("the checkpoint doesn't hold every permutation of a layout once")?;
         let len = packed[0].1.len();
         if packed.iter().any(|(_, keys)| keys.len() != len) {
             return Err("checkpoint permutations differ in size".into());
@@ -185,6 +199,42 @@ impl IndexVersion {
     /// Number of visible quads. O(1).
     pub(crate) fn len(&self) -> u64 {
         self.len
+    }
+
+    pub(crate) fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// `self` with the exact delta `inserts` and `deletes` appended as a run. A default-graph
+    /// stack that receives a quad in a named graph turns into a quad stack first
+    /// ([`with_quads_layout`](Self::with_quads_layout)).
+    pub(crate) fn with_delta(&self, inserts: &[EncodedQuad], deletes: &[EncodedQuad]) -> Self {
+        let named = |quads: &[EncodedQuad]| Layout::holding(quads) == Layout::Quads;
+        let base = match self.layout == Layout::DefaultGraph && (named(inserts) || named(deletes)) {
+            true => self.with_quads_layout(),
+            false => self.clone(),
+        };
+        let run = Run::from_delta(base.layout, inserts, deletes);
+        base.with_run(run)
+    }
+
+    /// The same quads in the quad layout: each run's graph-first permutations are its
+    /// graph-last ones with the graph moved to the front (all its quads are in the default
+    /// graph, so both sort alike). O(n) for n entries, once per store: at its first quad in
+    /// a named graph.
+    pub(crate) fn with_quads_layout(&self) -> Self {
+        if self.layout == Layout::Quads {
+            return self.clone();
+        }
+        Self {
+            layout: Layout::Quads,
+            runs: self
+                .runs
+                .iter()
+                .map(|run| Arc::new(run.with_quads_layout()))
+                .collect(),
+            len: self.len,
+        }
     }
 
     pub(crate) fn runs(&self) -> &[Arc<Run>] {

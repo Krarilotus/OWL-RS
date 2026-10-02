@@ -133,6 +133,22 @@ HTTP on the main PC, so the comparison is indicative:
 | Olympics (1.8 M quads), sum | 92 ms | 69 ms | the same (q05 6.0 → 0.23 ms, q13 `AVG` of `xsd:int` ages 22 → 13 ms); ORDER BY + LIMIT computes tie-break keys for the candidates only (q04 17.5 → 9 ms) |
 | LUBM-100 after OWL 2 RL, 14 counting queries | 73 ms | 60 ms | WCOJ chunks sized to the threads (q2 18 → 4.8 ms) |
 
+Store size and load, 2 October (DBpedia core, office PC). The asserted stack now starts in
+the default-graph layout (SPOG, POSG, OSPG, PSOG) and turns into the quad layout, once, at
+its first quad in a named graph: the graph-first permutations of default-graph data are
+the graph-last ones rotated, so they were copies (checkpoint format 9).
+
+| | 7 permutations | 4 permutations |
+|---|---:|---:|
+| Bulk load | 38.8 s | 29.6 s |
+| Index (packed permutations) | 2,858 MiB | 1,581 MiB |
+| Store on disk | 5.0 GB | 3.8 GB (57 B per quad; QLever 42 B) |
+| Query sum (13 queries) | 113–125 ms | 113.9 ms |
+
+The dictionary (2.2 GB mapped: 1.5 GB of text, end offsets, hash table, text order) is now
+the larger part of the store: compressing its text (front coding by the text order, as
+QLever's vocabulary does) is the next lever on size.
+
 Query sets at the end of 2 October (perf lab, office PC, TSV results; on-disk stores
 loaded fresh, so integer-derived literals are inline):
 
@@ -191,6 +207,9 @@ Still open:
   | 2 GiB | 43.9 s | 4.43 GB |
   | 1 GiB | 43.5 s | 4.11 GB |
   | 512 MiB | 44.6 s | 4.21 GB |
+
+  With the asserted stack in the default-graph layout (section 5): no budget 29.6 s /
+  5.47 GB, 1 GiB 34.9 s / 4.02 GB.
 
   The floor left is the heap dictionary (2.3 GB, needed for interning) plus one merged
   packed permutation. Bounding the dictionary takes ids assigned after an external sort
