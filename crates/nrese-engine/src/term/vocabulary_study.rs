@@ -114,7 +114,7 @@ fn vocabulary_study() {
     let mut sink = 0usize;
     let started = Instant::now();
     for i in 0..all.keys.len() {
-        sink += decompressor.decompress_into(compressed_key(i), &mut buffer);
+        sink += std::hint::black_box(decompressor.decompress_into(compressed_key(i), &mut buffer));
     }
     let sequential = started.elapsed().as_nanos() as f64 / all.keys.len() as f64;
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
@@ -128,20 +128,28 @@ fn vocabulary_study() {
         .collect();
     let started = Instant::now();
     for &i in &picks {
-        sink += decompressor.decompress_into(compressed_key(i), &mut buffer);
+        sink += std::hint::black_box(decompressor.decompress_into(compressed_key(i), &mut buffer));
     }
     let random = started.elapsed().as_nanos() as f64 / picks.len() as f64;
+    // The plain keys as the dictionary reads them: through the end offsets into the arena.
     let mut plain: Vec<u8> = Vec::with_capacity(1 << 20);
+    let started = Instant::now();
+    for i in 0..base.len {
+        plain.clear();
+        plain.extend_from_slice(base.key(i));
+        sink += std::hint::black_box(&plain).len();
+    }
+    let copy_sequential = started.elapsed().as_nanos() as f64 / base.len as f64;
     let started = Instant::now();
     for &i in &picks {
         plain.clear();
-        plain.extend_from_slice(keys[i]);
-        sink += plain.len();
+        plain.extend_from_slice(base.key(i as u64));
+        sink += std::hint::black_box(&plain).len();
     }
     let copy = started.elapsed().as_nanos() as f64 / picks.len() as f64;
     println!(
-        "decode a key: {sequential:.0} ns in id order, {random:.0} ns at random; copying a \
-         plain key at random: {copy:.0} ns ({sink} bytes)"
+        "decode a key: {sequential:.0} ns in id order, {random:.0} ns at random; a plain key: \
+         {copy_sequential:.0} ns in id order, {copy:.0} ns at random ({sink} bytes)"
     );
     let dictionary_now = text + keys.len() * 8;
     let dictionary_then = all.bytes + block_offsets(&lengths) + 255 * 9;
