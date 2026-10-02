@@ -787,6 +787,16 @@ impl Snapshot {
         self.statistics.distinct(self, model, pattern, permutation)
     }
 
+    /// The characteristic sets of the default graph in `model`, for estimates of star
+    /// joins ([`super::characteristic`]); `None` while they are being built for a large
+    /// graph, or where the graph's subjects have too many.
+    pub fn characteristic_sets_in(
+        &self,
+        model: ReadModel,
+    ) -> Option<Arc<super::characteristic::CharacteristicSets>> {
+        self.statistics.characteristic_sets(self, model)
+    }
+
     pub(crate) fn stack_quads<'a>(
         &'a self,
         stack: Stack,
