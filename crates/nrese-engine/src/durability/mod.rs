@@ -132,15 +132,12 @@ impl Durable {
         }
         checkpoint::remove_temporaries(root)?;
         crate::engine::spill::remove_leftovers(root)?;
-        let timing = std::env::var_os("NRESE_RECOVERY_TIMING").is_some();
         let clock = std::time::Instant::now();
         let loaded = checkpoint::load_latest(root, dictionary, config.verify_on_open)?;
-        if timing {
-            eprintln!(
-                "recovery: checkpoint read {:.3} s",
-                clock.elapsed().as_secs_f64()
-            );
-        }
+        tracing::debug!(
+            seconds = clock.elapsed().as_secs_f64(),
+            "recovery: checkpoint read"
+        );
         let clock = std::time::Instant::now();
         // The store's encoding of integer-derived literals: its checkpoint's, else its
         // first WAL segment's, else (a new store) inline.
@@ -180,12 +177,10 @@ impl Durable {
             }
             None => Version::empty(),
         };
-        if timing {
-            eprintln!(
-                "recovery: indexes built {:.3} s",
-                clock.elapsed().as_secs_f64()
-            );
-        }
+        tracing::debug!(
+            seconds = clock.elapsed().as_secs_f64(),
+            "recovery: indexes built"
+        );
 
         let wal_dir = wal::wal_dir(root);
         fs::create_dir_all(&wal_dir)?;

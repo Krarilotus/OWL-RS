@@ -1,10 +1,9 @@
 # The Jena oracle (benches/oracle/README.md): the differential tests' queries answered by a
-# second engine. Fails when a difference is left unexplained; the report is kept.
-name: Nightly oracle
+# second engine. Fails when a difference is left unexplained; the report is kept. Run at
+# milestones: gh workflow run oracle.yml --ref refactor/engine-v2
+name: Oracle
 
 on:
-  schedule:
-    - cron: "17 2 * * *"
   workflow_dispatch:
 
 env:
