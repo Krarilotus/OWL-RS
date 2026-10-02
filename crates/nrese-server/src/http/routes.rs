@@ -50,6 +50,10 @@ fn repository_routes() -> Router<AppState> {
         .route("/queries/{query}", delete(api_v1::cancel_query))
         .route("/graphs", get(api_v1::graphs))
         .route("/import", post(api_v1::import))
+        .route(
+            "/import/files",
+            get(api_v1::server_files).post(api_v1::import_server_files),
+        )
         .route("/reasoning/rematerialise", post(api_v1::rematerialise))
         .route("/sessions", post(api_v1::session_begin))
         .route("/sessions/{session}", delete(api_v1::session_rollback))
@@ -151,6 +155,11 @@ pub fn router(state: AppState) -> Router {
         // handlers as the default repository's `/dataset/…` routes.
         .route("/api/v1/openapi.json", get(crate::http::openapi::openapi))
         .route("/api/v1/repositories", get(api_v1::repositories))
+        .route("/api/v1/jobs", get(api_v1::jobs))
+        .route(
+            "/api/v1/jobs/{job}",
+            get(api_v1::job).delete(api_v1::job_cancel),
+        )
         // Users, workspaces and graph policies (ADR-0008).
         .route("/api/v1/access", get(access_api::overview))
         .route("/api/v1/access/me", get(access_api::me))

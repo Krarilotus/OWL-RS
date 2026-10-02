@@ -574,9 +574,24 @@ pub async fn import(
         graph,
         skip_errors: flag("skip_errors"),
     };
+    {
+        let (file, body) = (file.clone(), body.clone());
+        tokio::task::spawn_blocking(move || std::fs::write(&file, &body))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+    if flag("async") {
+        let job = start_import(
+            &state,
+            request,
+            "an uploaded document".to_owned(),
+            Some(file),
+        );
+        return Ok(job.into_response());
+    }
     let store = state.store();
     let loaded = tokio::task::spawn_blocking(move || {
-        std::fs::write(&file, &body)?;
         let report = store.bulk_load(&request);
         let _ = std::fs::remove_file(&file);
         report.map_err(|error| std::io::Error::other(error.to_string()))
@@ -585,16 +600,256 @@ pub async fn import(
     .map_err(|error| ApiError::internal(error.to_string()))?
     .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let reasoning = rematerialised(&state).await?;
-    Ok(Json(ImportReport {
-        revision: reasoning.as_ref().map_or(loaded.revision, |r| r.revision),
+    Ok(Json(import_report(&loaded, reasoning.as_ref())).into_response())
+}
+
+fn import_report(
+    loaded: &nrese_store::BulkLoadReport,
+    reasoning: Option<&nrese_store::MaterialisationReport>,
+) -> ImportReport {
+    ImportReport {
+        revision: reasoning.map_or(loaded.revision, |r| r.revision),
         parsed: loaded.parsed,
         inserted: loaded.inserted,
         deleted: loaded.deleted,
         skipped: loaded.skipped,
         elapsed_ms: loaded.elapsed.as_millis(),
-        reasoning: reasoning.as_ref().map(ReasoningRun::from),
+        reasoning: reasoning.map(ReasoningRun::from),
+    }
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct JobStarted {
+    job: u64,
+    /// Where its state is.
+    path: String,
+}
+
+/// Starts an import job: the load, then the inferences recomputed; `remove` is a file to
+/// delete afterwards (an upload). 202 with where the job is.
+fn start_import(
+    state: &AppState,
+    request: nrese_store::BulkLoadRequest,
+    description: String,
+    remove: Option<std::path::PathBuf>,
+) -> (
+    StatusCode,
+    [(axum::http::HeaderName, String); 1],
+    Json<JobStarted>,
+) {
+    let job = state
+        .jobs()
+        .start("import", state.repository_id(), &description);
+    let id = job.id();
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        job.phase("loading");
+        let store = state.store();
+        let loaded = store.bulk_load_with(&request, job.progress());
+        if let Some(file) = remove {
+            let _ = std::fs::remove_file(file);
+        }
+        let outcome = loaded
+            .map_err(|error| error.to_string())
+            .and_then(|loaded| {
+                job.phase("reasoning");
+                let reasoning = match state.pipeline().reasoner().config().materialised_program() {
+                    Some(program) => Some(store.rematerialise(program).map_err(|e| e.to_string())?),
+                    None => None,
+                };
+                serde_json::to_value(import_report(&loaded, reasoning.as_ref()))
+                    .map_err(|error| error.to_string())
+            });
+        job.finish(outcome);
+    });
+    let path = format!("/api/v1/jobs/{id}");
+    (
+        StatusCode::ACCEPTED,
+        [(axum::http::header::LOCATION, path.clone())],
+        Json(JobStarted { job: id, path }),
+    )
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct ServerFile {
+    /// Its path in the import directory, with `/`.
+    name: String,
+    bytes: u64,
+}
+
+/// The import directory, or 404 if none is configured.
+fn import_directory(state: &AppState) -> Result<std::path::PathBuf, ApiError> {
+    let dir = state.policy().import_directory.clone().ok_or_else(|| {
+        ApiError::not_found(
+            "no import directory is configured (store.import_directory, NRESE_IMPORT_DIR)",
+        )
+    })?;
+    dir.canonicalize()
+        .map_err(|error| ApiError::internal(format!("{}: {error}", dir.display())))
+}
+
+/// The files administrators may import from the server's import directory.
+#[utoipa::path(get, path = "/api/v1/repositories/{id}/import/files", tag = "data",
+    params(("id" = String, Path, description = "The repository's id")),
+    responses((status = 200, description = "The files", body = Vec<ServerFile>),
+        (status = 404, description = "No import directory", body = crate::http::openapi::Problem)))]
+pub async fn server_files(
+    Repository(state): Repository,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    let dir = import_directory(&state)?;
+    let files = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        let mut pending = vec![dir.clone()];
+        while let Some(next) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&next) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    pending.push(path);
+                } else if meta.is_file()
+                    && let Ok(relative) = path.strip_prefix(&dir)
+                {
+                    let name = relative
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    files.push(ServerFile {
+                        name,
+                        bytes: meta.len(),
+                    });
+                }
+            }
+        }
+        files.sort_by(|a, b| a.name.cmp(&b.name));
+        files
     })
-    .into_response())
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(Json(files).into_response())
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ServerImport {
+    /// Paths in the import directory (as listed).
+    files: Vec<String>,
+    /// The graph for triple formats; the default graph without.
+    graph: Option<String>,
+    #[serde(default)]
+    replace: bool,
+    #[serde(default)]
+    skip_errors: bool,
+}
+
+/// Imports files from the server's import directory as a job (administrators): no upload,
+/// no size limit; formats from the files' extensions.
+#[utoipa::path(post, path = "/api/v1/repositories/{id}/import/files", tag = "data",
+    params(("id" = String, Path, description = "The repository's id")),
+    request_body = ServerImport,
+    responses((status = 202, description = "Started; `Location` is the job", body = JobStarted),
+        (status = 400, description = "A file outside the directory, or none", body = crate::http::openapi::Problem),
+        (status = 404, description = "No import directory, or no such file", body = crate::http::openapi::Problem)))]
+pub async fn import_server_files(
+    Repository(state): Repository,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    state.ensure_serving()?;
+    let request: ServerImport =
+        serde_json::from_slice(&body).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if request.files.is_empty() {
+        return Err(ApiError::bad_request("no files to import"));
+    }
+    let dir = import_directory(&state)?;
+    let mut files = Vec::new();
+    for name in &request.files {
+        let path = std::path::Path::new(name);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(ApiError::bad_request(format!(
+                "'{name}' is not a path inside the import directory"
+            )));
+        }
+        let full = dir.join(path).canonicalize().map_err(|_| {
+            ApiError::not_found(format!("no file '{name}' in the import directory"))
+        })?;
+        if !full.starts_with(&dir) || !full.is_file() {
+            return Err(ApiError::bad_request(format!(
+                "'{name}' is not a file inside the import directory"
+            )));
+        }
+        files.push(full);
+    }
+    let graph = match request.graph {
+        Some(iri) => {
+            nrese_rdf::NamedNode::new(iri.as_str())
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            nrese_store::GraphTarget::NamedGraph(iri)
+        }
+        None => nrese_store::GraphTarget::DefaultGraph,
+    };
+    let description = request.files.join(", ");
+    let load = nrese_store::BulkLoadRequest {
+        files,
+        replace: request.replace,
+        graph,
+        skip_errors: request.skip_errors,
+    };
+    Ok(start_import(&state, load, description, None).into_response())
+}
+
+/// The jobs (imports) running and the latest finished, the latest first (operators).
+#[utoipa::path(get, path = "/api/v1/jobs", tag = "data",
+    responses((status = 200, description = "The jobs", body = Vec<nrese_store::jobs::JobView>)))]
+pub async fn jobs(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    guard::enforce_operator_read(&state, &headers).await?;
+    Ok(Json(state.jobs().list()).into_response())
+}
+
+/// One job: its state, progress and, when done, its report (operators).
+#[utoipa::path(get, path = "/api/v1/jobs/{job}", tag = "data", params(("job" = u64, Path)),
+    responses((status = 200, description = "The job", body = nrese_store::jobs::JobView),
+        (status = 404, description = "No such job", body = crate::http::openapi::Problem)))]
+pub async fn job(
+    State(state): State<AppState>,
+    Path(job): Path<u64>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_operator_read(&state, &headers).await?;
+    let view = state
+        .jobs()
+        .get(job)
+        .ok_or_else(|| ApiError::not_found(format!("no job {job}")))?;
+    Ok(Json(view).into_response())
+}
+
+/// Cancels a running job (administrators): an import stops before its next file and
+/// commits nothing.
+#[utoipa::path(delete, path = "/api/v1/jobs/{job}", tag = "data", params(("job" = u64, Path)),
+    responses((status = 204, description = "Cancelling"),
+        (status = 404, description = "No such job running", body = crate::http::openapi::Problem)))]
+pub async fn job_cancel(
+    State(state): State<AppState>,
+    Path(job): Path<u64>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    match state.jobs().cancel(job) {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::not_found(format!("no job {job} is running"))),
+    }
 }
 
 /// The queries running on the repository now, the longest-running first (operators).

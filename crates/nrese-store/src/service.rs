@@ -589,8 +589,17 @@ impl StoreService {
     /// sort, one revision, no validation gates. For initial loads and full restores; use
     /// the mutation pipeline for regular writes.
     pub fn bulk_load(&self, request: &BulkLoadRequest) -> StoreResult<BulkLoadReport> {
+        self.bulk_load_with(request, &crate::LoadProgress::default())
+    }
+
+    /// [`Self::bulk_load`], reporting to `progress` and stopping when it is cancelled.
+    pub fn bulk_load_with(
+        &self,
+        request: &BulkLoadRequest,
+        progress: &crate::LoadProgress,
+    ) -> StoreResult<BulkLoadReport> {
         self.invalidate_reasoning()?;
-        bulk_load(&self.engine, request)
+        bulk_load(&self.engine, request, progress)
     }
 
     /// Whether the inferred stack is `program`'s closure as this store computes it.

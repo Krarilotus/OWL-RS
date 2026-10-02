@@ -150,6 +150,11 @@ api_key = "replace-me"
 - default: `off`; severity `violation`
 - SHACL as a commit gate: `report` validates every commit against the shapes graph (`shacl.shapes_graph`) and logs what it introduces; `enforce` also rejects a commit that introduces a result at or above `gate_severity` (`violation`, `warning` or `info`), or a validation failure, and the commit changes nothing. Only what a commit introduces counts: data that was invalid before doesn't block writes (validation at `/dataset/shacl` reports it). The check validates the focus nodes the commit can affect, after reasoning; a commit that changes the shapes graph is validated in full
 
+- file key: `store.import_directory`
+- env override: `NRESE_IMPORT_DIR`
+- default: none
+- the directory administrators import files from by name (`POST /api/v1/repositories/{id}/import/files`): large loads without uploading them, as jobs. Paths can't leave it. Without it, server-side imports don't exist
+
 - file key: `store.verify_on_open`
 - env override: `NRESE_VERIFY_ON_OPEN`
 - default: `false`
