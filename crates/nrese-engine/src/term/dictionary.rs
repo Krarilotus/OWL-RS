@@ -26,6 +26,8 @@ use parking_lot::RwLock;
 
 use super::hash::key_hash;
 use super::offsets::{Ends, Offsets};
+use super::order::Key;
+use super::vocabulary::Codec;
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
 use crate::mapped::Mapped;
@@ -77,10 +79,13 @@ pub(crate) struct Base {
     /// The entries with a text, sorted by it ([`super::order`]); `None` in checkpoints
     /// written before format 7.
     pub(crate) order: Option<Mapped<u32>>,
+    /// The symbol tables of keys stored compressed ([`super::vocabulary`]); `None`: plain.
+    pub(crate) codec: Option<Codec>,
 }
 
 impl Base {
-    /// Entry `index`'s key; empty where a damaged file's offsets point nowhere.
+    /// Entry `index`'s key as stored (compressed with a codec); empty where a damaged
+    /// file's offsets point nowhere.
     pub(crate) fn key(&self, index: u64) -> &[u8] {
         let i = index as usize;
         self.arena
@@ -88,7 +93,33 @@ impl Base {
             .unwrap_or_default()
     }
 
+    /// Entry `index`'s plain key: in place, or decoded.
+    pub(crate) fn plain(&self, index: u64) -> Key<'_> {
+        let stored = self.key(index);
+        match &self.codec {
+            None => Key::Borrowed(stored),
+            Some(codec) => {
+                let mut key = Vec::with_capacity(stored.len() * 3);
+                codec.decompress(stored, &mut key);
+                Key::Owned(key)
+            }
+        }
+    }
+
+    /// The index of the plain `key`, whose hash is `hash`, if it is an entry.
     fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
+        match &self.codec {
+            None => self.find_stored(hash, key),
+            Some(codec) => {
+                let mut stored = Vec::with_capacity(key.len());
+                codec.compress(key, &mut stored);
+                self.find_stored(hash, &stored)
+            }
+        }
+    }
+
+    /// [`Self::find`] for `key` as stored.
+    fn find_stored(&self, hash: u64, key: &[u8]) -> Option<u64> {
         let mask = self.slots.len() - 1;
         let mut slot = hash as usize & mask;
         // At most one round (a damaged, full table must not loop forever).
@@ -107,7 +138,8 @@ impl Base {
 
     fn bytes(&self) -> u64 {
         let order = self.order.as_ref().map_or(0, |order| order.len() * 4);
-        (self.arena.len() + self.offsets.bytes() + self.slots.len() * 4 + order) as u64
+        let codec = self.codec.as_ref().map_or(0, |_| super::vocabulary::CODEC_BYTES);
+        (self.arena.len() + self.offsets.bytes() + self.slots.len() * 4 + order + codec) as u64
     }
 
     /// Checks every key and that the hash table finds each entry: reads all of the base.
@@ -120,21 +152,23 @@ impl Base {
             Offsets::Blocks(blocks) => blocks.verify(self.arena.len())?,
         }
         for index in 0..self.len {
-            let key = self.key(index);
-            validate_key(key).map_err(|error| format!("dictionary entry {index}: {error}"))?;
-            if self.find(key_hash(key), key) != Some(index) {
+            let key = self.plain(index);
+            validate_key(&key).map_err(|error| format!("dictionary entry {index}: {error}"))?;
+            if self.find(key_hash(&key), &key) != Some(index) {
                 return Err(format!("the dictionary's hash table misses entry {index}"));
             }
         }
         if let Some(order) = &self.order {
             let text = |index: u32| {
                 (u64::from(index) < self.len)
-                    .then(|| super::order::text_of(self.key(u64::from(index))))
+                    .then(|| {
+                        super::order::text_of(&self.plain(u64::from(index))).map(<[u8]>::to_vec)
+                    })
                     .flatten()
             };
             for pair in order.windows(2) {
                 match (text(pair[0]), text(pair[1])) {
-                    (Some(a), Some(b)) if (a, pair[0]) < (b, pair[1]) => {}
+                    (Some(a), Some(b)) if (&a, pair[0]) < (&b, pair[1]) => {}
                     _ => return Err("the dictionary's text order is out of order".into()),
                 }
             }
@@ -170,16 +204,17 @@ impl Inner {
         self.base_len() + self.ends.len() as u64
     }
 
-    fn key(&self, index: u64) -> &[u8] {
+    /// Entry `index`'s plain key: in place, or decoded from a compressed base.
+    fn key(&self, index: u64) -> Key<'_> {
         let base_len = self.base_len();
         if index < base_len {
             return self
                 .base
                 .as_ref()
                 .expect("an index below the base")
-                .key(index);
+                .plain(index);
         }
-        heap_key(&self.bytes, &self.ends, (index - base_len) as usize)
+        Key::Borrowed(heap_key(&self.bytes, &self.ends, (index - base_len) as usize))
     }
 
     /// The index of `key`, whose hash is `hash`, if it is an entry.
@@ -188,7 +223,7 @@ impl Inner {
             return Some(index);
         }
         self.table
-            .find(hash, |&index| self.key(index) == key)
+            .find(hash, |&index| *self.key(index) == *key)
             .copied()
     }
 
@@ -206,6 +241,45 @@ impl Inner {
         });
         index
     }
+}
+
+/// Keys decoded while views of them are lent out ([`Dictionary::with_views`]): each stays
+/// where it is until the arena is dropped, after the views.
+#[derive(Default)]
+struct Decoded(std::cell::RefCell<Vec<Box<[u8]>>>);
+
+impl Decoded {
+    fn keep(&self, key: Vec<u8>) -> &[u8] {
+        let key = key.into_boxed_slice();
+        let kept: *const [u8] = &*key;
+        self.0.borrow_mut().push(key);
+        // SAFETY: the box's contents never move and are freed only when `self` is dropped;
+        // the reference borrows `self`.
+        unsafe { &*kept }
+    }
+}
+
+/// The ids of the first `limit` entries of a compressed base whose text passes `test`,
+/// sorted: decoded a slice of entries at a time, each slice searched as a plain arena.
+fn decoded_matching(base: &Base, limit: u64, test: &super::StringTest<'_>) -> Vec<TermId> {
+    use rayon::prelude::*;
+    const SLICE: u64 = 1 << 16;
+    let entries = base.len.min(limit);
+    let mut ids: Vec<TermId> = (0..entries.div_ceil(SLICE))
+        .into_par_iter()
+        .flat_map_iter(|slice| {
+            let (first, last) = (slice * SLICE, ((slice + 1) * SLICE).min(entries));
+            let mut bytes = Vec::new();
+            let mut ends = Vec::with_capacity((last - first) as usize);
+            for index in first..last {
+                bytes.extend_from_slice(&base.plain(index));
+                ends.push(bytes.len() as u64);
+            }
+            super::strings::matching(&bytes, &ends[..], first, u64::MAX, test)
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// Heap entry `local` (counted from the end of the base).
@@ -386,7 +460,7 @@ impl Dictionary {
             let inner = self.inner.read();
             let end = inner.len();
             for entry in index.covered..end {
-                if let Some(ids) = triple_ids(inner.key(entry)) {
+                if let Some(ids) = triple_ids(&inner.key(entry)) {
                     let [s, p, o] = ids;
                     index
                         .rows
@@ -433,10 +507,13 @@ impl Dictionary {
             let mut start = text.covered();
             while start < end {
                 let stop = (start + TEXT_BATCH).min(end);
-                let documents: Vec<(u64, &str)> = (start..stop)
-                    .filter_map(|index| match view_key(inner.key(index)) {
+                let keys: Vec<(u64, Key<'_>)> =
+                    (start..stop).map(|index| (index, inner.key(index))).collect();
+                let documents: Vec<(u64, &str)> = keys
+                    .iter()
+                    .filter_map(|(index, key)| match view_key(key) {
                         TermView::String(value) | TermView::LangString { value, .. } => {
-                            Some((index, value))
+                            Some((*index, value))
                         }
                         _ => None,
                     })
@@ -454,14 +531,14 @@ impl Dictionary {
             }
         }
         let inner = self.inner.read();
-        let text_of = |index: u64| match view_key(inner.key(index)) {
+        let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::String(value) | TermView::LangString { value, .. } => Some(value.to_owned()),
             _ => None,
         };
         // Matches are entry numbers: as ids, by the entry's kind.
         let mut matches = self.text.read().search(query, &text_of);
         for found in &mut matches {
-            let kind = match view_key(inner.key(found.id)) {
+            let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
                 _ => TermKind::String,
             };
@@ -485,7 +562,7 @@ impl Dictionary {
                 let inner_ref: &Inner = &inner;
                 let names: Vec<(u64, String)> = (start..stop)
                     .into_par_iter()
-                    .filter_map(|index| match view_key(inner_ref.key(index)) {
+                    .filter_map(|index| match view_key(&inner_ref.key(index)) {
                         TermView::Iri(iri) => Some((index, super::text::local_name_text(iri)?)),
                         _ => None,
                     })
@@ -506,7 +583,7 @@ impl Dictionary {
             }
         }
         let inner = self.inner.read();
-        let text_of = |index: u64| match view_key(inner.key(index)) {
+        let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
@@ -533,6 +610,7 @@ impl Dictionary {
         let inner = self.inner.read();
         let base_len = inner.base_len();
         let mut ids = match &inner.base {
+            Some(base) if base.codec.is_some() => decoded_matching(base, limit, test),
             Some(base) => super::strings::matching(&base.arena, &base.offsets, 0, limit, test),
             None => Vec::new(),
         };
@@ -591,7 +669,7 @@ impl Dictionary {
         let mut ids: Vec<TermId> = candidates
             .into_iter()
             .filter(|&index| index < limit)
-            .filter_map(|index| super::strings::passes(key(index), index, 0, test))
+            .filter_map(|index| super::strings::passes(&key(index), index, 0, test))
             .collect();
         ids.sort_unstable();
         ids
@@ -603,7 +681,7 @@ impl Dictionary {
     pub(crate) fn text_order(&self, len: u64) -> Vec<u32> {
         let inner = self.inner.read();
         let key = |index: u64| inner.key(index);
-        let text = |index: u64| super::order::text_of(key(index)).unwrap_or_default();
+        let text = |index: u64| super::order::text_in(key(index));
         let (base, first): (&[u32], u64) =
             match inner.base.as_ref().and_then(|base| base.order.as_ref()) {
                 Some(order) => (order, inner.base_len()),
@@ -665,9 +743,9 @@ impl Dictionary {
                         return None;
                     }
                     let key = inner.key(id.payload());
-                    match triple_ids(key) {
+                    match triple_ids(&key) {
                         Some(ids) => ids,
-                        None => return Some(decode_key(key)),
+                        None => return Some(decode_key(&key)),
                     }
                 };
                 let [s, p, o] = ids;
@@ -697,7 +775,7 @@ impl Dictionary {
         if id.payload() >= inner.len() {
             return None;
         }
-        Some(f(view_key(inner.key(id.payload()))))
+        Some(f(view_key(&inner.key(id.payload()))))
     }
 
     /// Calls `f` with a lookup of entry views below `limit`, all under one read lock: for
@@ -710,9 +788,15 @@ impl Dictionary {
     ) -> R {
         let inner = self.inner.read();
         let len = inner.len().min(limit);
+        // Keys decoded from a compressed base stay here while their views are out.
+        let decoded = Decoded::default();
         let view = |id: TermId| {
-            (id.kind().is_dictionary() && id.payload() < len)
-                .then(|| view_key(inner.key(id.payload())))
+            (id.kind().is_dictionary() && id.payload() < len).then(|| {
+                view_key(match inner.key(id.payload()) {
+                    Key::Borrowed(key) => key,
+                    Key::Owned(key) => decoded.keep(key),
+                })
+            })
         };
         f(&view)
     }
@@ -817,11 +901,20 @@ impl Dictionary {
         ))
     }
 
+    /// The plain keys of a sample of the entries `0..len`, spread over them: what a
+    /// checkpoint's symbol tables are trained on ([`super::vocabulary`]).
+    pub(crate) fn sample_keys(&self, len: u64) -> Vec<Vec<u8>> {
+        let inner = self.inner.read();
+        Codec::sample_indexes(len.min(inner.len()))
+            .map(|index| inner.key(index).into_owned())
+            .collect()
+    }
+
     /// Raw key bytes of entries `[from, to)`, in id order. Used by the WAL and checkpoints.
     pub(crate) fn export_keys(&self, from: u64, to: u64) -> Vec<Vec<u8>> {
         let inner = self.inner.read();
         (from..to.min(inner.len()))
-            .map(|index| inner.key(index).to_vec())
+            .map(|index| inner.key(index).into_owned())
             .collect()
     }
 
@@ -830,7 +923,7 @@ impl Dictionary {
     pub(crate) fn for_each_key(&self, from: u64, to: u64, mut f: impl FnMut(&[u8])) {
         let inner = self.inner.read();
         for index in from..to.min(inner.len()) {
-            f(inner.key(index));
+            f(&inner.key(index));
         }
     }
 
@@ -855,7 +948,7 @@ impl Dictionary {
         if len <= inner.base_len() {
             return Ok(false);
         }
-        if len > inner.len() || base.key(len - 1) != inner.key(len - 1) {
+        if len > inner.len() || *base.plain(len - 1) != *inner.key(len - 1) {
             return Err(EngineError::Corruption(
                 "a checkpoint's dictionary doesn't match the dictionary".to_owned(),
             ));
@@ -866,7 +959,7 @@ impl Dictionary {
         };
         for index in len..inner.len() {
             let key = inner.key(index);
-            next.push(key, key_hash(key));
+            next.push(&key, key_hash(&key));
         }
         *inner = next;
         // The in-memory text order covered entries the base orders now.
