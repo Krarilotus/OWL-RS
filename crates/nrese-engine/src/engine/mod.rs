@@ -116,13 +116,6 @@ pub(crate) enum Stack {
 impl Stack {
     pub(crate) const ALL: [Self; 2] = [Self::Asserted, Self::Inferred];
 
-    pub(crate) const fn layout(self) -> Layout {
-        match self {
-            Self::Asserted => Layout::Quads,
-            Self::Inferred => Layout::DefaultGraph,
-        }
-    }
-
     /// The read model that sees exactly this stack.
     pub(crate) const fn model(self) -> ReadModel {
         match self {
@@ -133,20 +126,27 @@ impl Stack {
 }
 
 impl CommitRecord {
-    /// The runs this record adds to the asserted and inferred stacks. Shared by commit and
-    /// WAL replay, so both build identical versions.
-    pub(crate) fn runs(&self) -> [Run; 2] {
+    /// The runs this record adds to the asserted stack, of `asserted` layout, and to the
+    /// inferred stack. Shared by commit and WAL replay, so both build identical versions.
+    pub(crate) fn runs(&self, asserted: Layout) -> [Run; 2] {
         let in_default_graph = |triples: &[EncodedTriple]| -> Vec<EncodedQuad> {
             triples.iter().map(|t| t.in_default_graph()).collect()
         };
         [
-            Run::from_delta(Stack::Asserted.layout(), &self.inserts, &self.deletes),
+            Run::from_delta(asserted, &self.inserts, &self.deletes),
             Run::from_delta(
-                Stack::Inferred.layout(),
+                Layout::DefaultGraph,
                 &in_default_graph(&self.inferred_inserts),
                 &in_default_graph(&self.inferred_deletes),
             ),
         ]
+    }
+
+    /// Whether the record puts a quad in a named graph: then a default-graph asserted stack
+    /// turns into a quad stack ([`IndexVersion::with_quads_layout`]).
+    pub(crate) fn names_a_graph(&self) -> bool {
+        Layout::holding(&self.inserts) == Layout::Quads
+            || Layout::holding(&self.deletes) == Layout::Quads
     }
 }
 
@@ -166,8 +166,8 @@ impl Version {
     /// The empty revision 0.
     pub(crate) fn empty() -> Self {
         Self {
-            asserted: IndexVersion::empty(Stack::Asserted.layout()),
-            inferred: IndexVersion::empty(Stack::Inferred.layout()),
+            asserted: IndexVersion::empty(Layout::DefaultGraph),
+            inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision: 0,
             dictionary_len: 0,
         }
@@ -268,13 +268,19 @@ impl Versions {
             let merged = merge_runs(&runs[plan.window.clone()]);
             self.publish(|current| {
                 let index = current.stack(stack);
-                debug_assert!(
-                    plan.window
-                        .clone()
-                        .all(|i| Arc::ptr_eq(&index.runs()[i], &runs[i])),
-                    "compaction window changed while merging"
-                );
-                current.with_stack(stack, index.with_compacted(plan.window, merged))
+                // A commit that turned the stack into the quad layout replaced its runs
+                // meanwhile: the merge is of runs that are gone.
+                let unchanged = index.layout() == merged.layout()
+                    && plan.window.clone().all(|i| {
+                        index
+                            .runs()
+                            .get(i)
+                            .is_some_and(|run| Arc::ptr_eq(run, &runs[i]))
+                    });
+                match unchanged {
+                    true => current.with_stack(stack, index.with_compacted(plan.window, merged)),
+                    false => current.with_stack(stack, index.clone()),
+                }
             });
         }
     }

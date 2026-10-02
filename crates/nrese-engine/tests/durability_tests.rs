@@ -723,6 +723,38 @@ fn bulk_loads_past_their_budget_spill_and_merge() {
     assert_eq!(contents(&engine), expected);
 }
 
+/// A store of default-graph quads (bulk-loaded, then committed to, with deletes) turns into
+/// a quad store at its first quad in a named graph: its mapped checkpoint and its runs
+/// alike, the same contents before and after, and after restarts on either side of a
+/// checkpoint.
+#[test]
+fn default_graph_stores_take_named_graphs_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let data: Vec<Quad> = (0..300).map(label).collect();
+    let load = engine.bulk_load(BulkMode::Append);
+    load.add(&data);
+    load.finish().unwrap();
+    let defaults: Vec<(Vec<Quad>, Vec<Quad>)> = (300..320)
+        .map(|n| (vec![label(n)], vec![label(n - 300)]))
+        .collect();
+    let states = commit_all(&engine, &defaults);
+    // A quad in a named graph (odd), and more deletes of mapped and committed quads.
+    let named = vec![(vec![quad(1), quad(3)], vec![label(50), label(301)])];
+    let mut states = [states, commit_all(&engine, &named)].concat();
+    assert_eq!(contents(&engine), *states.last().unwrap());
+    // Through the WAL alone.
+    drop(engine);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), *states.last().unwrap());
+    // Through a checkpoint of the quad layout, with a named quad deleted after it.
+    engine.checkpoint().unwrap();
+    states.extend(commit_all(&engine, &[(vec![label(999)], vec![quad(1)])]));
+    drop(engine);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), *states.last().unwrap());
+}
+
 /// A spill directory left by a crashed load goes when the store opens.
 #[test]
 fn opening_removes_a_crashed_loads_spill() {

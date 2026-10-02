@@ -1,6 +1,6 @@
 //! Checkpoints: a full image of one revision (dictionary plus both index stacks).
 //!
-//! Format 8 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* | crc32
+//! Format 9 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* | crc32
 //! u32`. The CRC covers everything before it. Flag bit 0 ([`INTEGERS_IN_DICTIONARY`]):
 //! integer-derived literals are dictionary entries, not inline (a store created before
 //! [`TermKind::DerivedInteger`](crate::term::TermKind)); formats 4-7 have no flags and
@@ -15,7 +15,10 @@
 //!   without the order.
 //! - Each stack (asserted, then inferred) is `count u32 | (permutation u8, packed keys)*`:
 //!   every permutation of the stack's layout, compressed as in memory
-//!   ([`PackedKeys::write`]), its packed bits padded to an 8-byte boundary.
+//!   ([`PackedKeys::write`]), its packed bits padded to an 8-byte boundary. The layout is
+//!   the one the permutations make up: since format 9 the asserted stack may have the
+//!   default-graph layout too (four permutations; format 8 is format 9 with the quad
+//!   layout's seven always).
 //!
 //! Restart maps the file and uses all of that in place ([`crate::mapped`]): the dictionary
 //! as the dictionary's base, the packed bits as the index runs' data. That is most of a
@@ -42,8 +45,8 @@ use std::path::{Path, PathBuf};
 use super::codec::{Reader, put_u32, put_u64};
 use crate::engine::{Snapshot, Stack};
 use crate::error::{EngineError, EngineResult};
-use crate::index::IndexVersion;
 use crate::index::keys::PackedKeys;
+use crate::index::{IndexVersion, Layout};
 use crate::mapped::{Map, Mapped};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation};
 use crate::term::Dictionary;
@@ -53,8 +56,10 @@ use crate::term::hash::key_hash;
 /// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
 /// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
 /// stores the packed permutations (Pf2); version 6 aligns them for mapping; version 7 adds
-/// the dictionary's text order; version 8 the flags (integer-derived literals inline).
-const MAGIC: &[u8; 8] = b"NRESECK8";
+/// the dictionary's text order; version 8 the flags (integer-derived literals inline);
+/// version 9 lets the asserted stack have the default-graph layout.
+const MAGIC: &[u8; 8] = b"NRESECK9";
+const MAGIC_V8: &[u8; 8] = b"NRESECK8";
 /// Earlier formats, still read (their integer-derived literals are in the dictionary):
 /// without the flags, without the text order, unaligned packed permutations, quad lists.
 const MAGIC_V7: &[u8; 8] = b"NRESECK7";
@@ -278,24 +283,27 @@ pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
 
 /// Writes a checkpoint of `snapshot` and returns its path.
 pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
+    let version = snapshot.version();
     write_parts(
         dir,
         snapshot.revision(),
         snapshot.dictionary(),
         snapshot.dictionary_len(),
+        [version.asserted.layout(), version.inferred.layout()],
         &mut |stack, permutation| Ok(snapshot.version().stack(stack).packed(permutation)),
     )
 }
 
 /// Writes a checkpoint of `revision` from its parts and returns its path: the dictionary's
 /// entries `0..dictionary_len`, and each stack's permutations as `packed` gives them, in
-/// the order of the stack's layout. Each is written before the next is asked for, so a
+/// the order of the stack's layout (`layouts`: asserted, inferred). Each is written before the next is asked for, so a
 /// caller can build one at a time and drop it (bulk loads).
 pub(crate) fn write_parts<'a>(
     dir: &Path,
     revision: u64,
     dictionary: &Dictionary,
     dictionary_len: u64,
+    layouts: [Layout; 2],
     packed: &mut dyn FnMut(Stack, Permutation) -> EngineResult<Cow<'a, PackedKeys>>,
 ) -> EngineResult<PathBuf> {
     let tmp = checkpoint_path(dir, revision, "tmp");
@@ -314,8 +322,8 @@ pub(crate) fn write_parts<'a>(
     };
     put_u64(&mut out.buffer, flags);
     write_dictionary(&mut out, dictionary, dictionary_len)?;
-    for stack in Stack::ALL {
-        let permutations = stack.layout().permutations();
+    for (stack, layout) in Stack::ALL.into_iter().zip(layouts) {
+        let permutations = layout.permutations();
         put_u32(&mut out.buffer, permutations.len() as u32);
         for &permutation in permutations {
             out.buffer.push(permutation as u8);
@@ -335,6 +343,19 @@ pub(crate) fn write_parts<'a>(
     fs::rename(&tmp, &path)?;
     super::sync_dir(dir)?;
     Ok(path)
+}
+
+/// The index of `stack` from a checkpoint's packed permutations: the inferred stack in the
+/// default-graph layout, the asserted one in either.
+pub(crate) fn stack_index(
+    stack: Stack,
+    packed: Vec<(Permutation, PackedKeys)>,
+) -> Result<IndexVersion, String> {
+    let index = IndexVersion::from_packed(packed)?;
+    match (stack, index.layout()) {
+        (Stack::Inferred, Layout::Quads) => Err("the inferred stack holds named graphs".into()),
+        _ => Ok(index),
+    }
 }
 
 /// A loaded checkpoint: its revision and both stacks; the dictionary is restored in place.
@@ -388,7 +409,7 @@ pub(crate) fn load_latest(
         .ok_or_else(|| corrupt("truncated"))?;
     let mut reader = Reader::new(body);
     let (packed, aligned, with_order, with_flags) = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC => (true, true, true, true),
+        Some(magic) if magic == MAGIC || magic == MAGIC_V8 => (true, true, true, true),
         Some(magic) if magic == MAGIC_V7 => (true, true, true, false),
         Some(magic) if magic == MAGIC_V6 => (true, true, false, false),
         Some(magic) if magic == MAGIC_V5 => (true, false, false, false),
@@ -527,9 +548,7 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     let base = read_dictionary(&mut reader, &map, true).map_err(|error| corrupt(&error))?;
     let [asserted, inferred] =
         read_stacks(&mut reader, body, Some(&map), false).map_err(|error| corrupt(&error))?;
-    let index = |stack: Stack, packed| {
-        IndexVersion::from_packed(stack.layout(), packed).map_err(|error| corrupt(&error))
-    };
+    let index = |stack: Stack, packed| stack_index(stack, packed).map_err(|error| corrupt(&error));
     Ok((
         base,
         [
