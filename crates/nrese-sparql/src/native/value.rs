@@ -277,6 +277,33 @@ pub(crate) fn effective_boolean(value: &Value) -> Option<bool> {
 
 /// `ORDER BY` order (SPARQL §15.1): unbound < blank nodes < IRIs < literals; literals by
 /// value where comparable, then by lexical form and datatype so the order is total.
+/// A term with its literal value parsed once: for sorting many terms, where [`order`]
+/// would parse both literals at every comparison.
+pub struct Sortable {
+    term: Option<Term>,
+    value: Option<Value>,
+}
+
+impl Sortable {
+    pub fn new(term: Option<Term>) -> Self {
+        let value = match &term {
+            Some(Term::Literal(literal)) => Some(Value::of_literal(literal)),
+            _ => None,
+        };
+        Self { term, value }
+    }
+
+    /// [`order`] of the two terms.
+    pub fn order(&self, other: &Self) -> Ordering {
+        if let (Some(a), Some(b)) = (&self.value, &other.value)
+            && let Some(ordering) = compare(a, b)
+        {
+            return ordering;
+        }
+        order(self.term.as_ref(), other.term.as_ref())
+    }
+}
+
 pub fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
     fn rank(term: Option<&Term>) -> u8 {
         match term {
