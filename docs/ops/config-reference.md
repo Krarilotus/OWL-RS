@@ -17,7 +17,7 @@ Implementation ownership remains in `crates/nrese-server/src/config/`.
 
 Every setting has a key in the configuration file and an environment variable (the lists below; the server's registry of them is `crates/nrese-server/src/config/settings.rs`). A value is taken from the first of:
 
-1. the command line: `--set KEY=VALUE` with a file key (`--set budgets.query_timeout=2min`), repeatable, for every command
+1. the command line: `--set KEY=VALUE` with a file key (`--set budgets.query_timeout=2min`), repeatable, for every command; secrets (tokens, keys, passwords) are refused there, since a command line shows in the process list
 2. the environment variable
 3. the configuration file: the path from `--config` or `-c`, else `NRESE_CONFIG_PATH`
 4. the built-in default
