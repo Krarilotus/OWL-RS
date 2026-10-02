@@ -79,6 +79,10 @@ pub struct DurabilityConfig {
     /// continue from it. For point-in-time restore on a copy of a store; opening fails if
     /// the checkpoint is newer or the log ends before it.
     pub recover_until: Option<u64>,
+    /// Recover the commits made up to this time only (microseconds since 1970), cut as
+    /// with `recover_until`; commits logged without a time (before WAL version 6) count as
+    /// earlier.
+    pub recover_until_micros: Option<u64>,
 }
 
 impl Default for DurabilityConfig {
@@ -92,6 +96,7 @@ impl Default for DurabilityConfig {
             bulk_load_memory: None,
             wal_archive: false,
             recover_until: None,
+            recover_until_micros: None,
         }
     }
 }
@@ -218,10 +223,14 @@ impl Durable {
                 if record.revision <= version.revision {
                     continue; // covered by the checkpoint
                 }
-                if config
+                let after = config
                     .recover_until
                     .is_some_and(|until| record.revision > until)
-                {
+                    || config
+                        .recover_until_micros
+                        .zip(record.committed_micros)
+                        .is_some_and(|(until, committed)| committed > until);
+                if after {
                     // Point-in-time restore: the log ends before this record.
                     match index {
                         0 => fs::remove_file(path)?,

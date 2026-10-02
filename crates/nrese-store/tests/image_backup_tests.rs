@@ -104,13 +104,13 @@ fn an_image_and_the_log_restore_a_later_revision() {
     for (i, &revision) in revisions.iter().enumerate() {
         let target = backups.path().join(format!("at-{revision}"));
         let (restored, at) =
-            nrese_store::restore_until(&dir, &target, &logs, Some(revision)).unwrap();
+            nrese_store::restore_until(&dir, &target, &logs, Some(revision), None).unwrap();
         assert_eq!((restored, at), (manifest.clone(), revision));
         let store = StoreService::new(StoreConfig::on_disk(&target)).unwrap();
         assert_eq!(count(&store), 2 + i as u64);
     }
     let target = backups.path().join("all");
-    let (_, at) = nrese_store::restore_until(&dir, &target, &logs, None).unwrap();
+    let (_, at) = nrese_store::restore_until(&dir, &target, &logs, None, None).unwrap();
     assert_eq!(at, *revisions.last().unwrap());
 }
 

@@ -348,6 +348,7 @@ fn background_checkpoints_bound_the_wal() {
             bulk_load_memory: None,
             wal_archive: false,
             recover_until: None,
+            recover_until_micros: None,
         },
         ..EngineConfig::default()
     };
@@ -459,16 +460,32 @@ fn new_stores_inline_integer_derived_literals() {
         commit_one(&engine, &with_int(5));
         assert_eq!(int_kind(&engine, 5), Some(TermKind::DerivedInteger));
     }
-    assert_eq!(newest_segment_magic(dir.path()), b"NRESEWL5");
+    assert_eq!(newest_segment_magic(dir.path()), b"NRESEWL6");
+    // A store whose newest segment is of version 5 starts a version 6 one at the next
+    // commit, not appending timed records to the old format.
+    let newest = segments(dir.path()).pop().unwrap();
+    let mut bytes = fs::read(&newest).unwrap();
+    bytes[..8].copy_from_slice(b"NRESEWL5");
+    fs::write(&newest, bytes).unwrap();
     {
         let engine = Engine::open(dir.path(), config()).unwrap();
         assert_eq!(int_kind(&engine, 5), Some(TermKind::DerivedInteger));
+        commit_one(&engine, &with_int(7));
+    }
+    assert_eq!(segments(dir.path()).len(), 2);
+    assert_eq!(newest_segment_magic(dir.path()), b"NRESEWL6");
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        assert_eq!(int_kind(&engine, 5), Some(TermKind::DerivedInteger));
+        assert_eq!(int_kind(&engine, 7), Some(TermKind::DerivedInteger));
         engine.checkpoint().unwrap();
         commit_one(&engine, &with_int(6));
     }
     let engine = Engine::open(dir.path(), config()).unwrap();
     assert_eq!(int_kind(&engine, 6), Some(TermKind::DerivedInteger));
-    let expected: HashSet<Quad> = [with_int(5), with_int(6)].into_iter().collect();
+    let expected: HashSet<Quad> = [with_int(5), with_int(6), with_int(7)]
+        .into_iter()
+        .collect();
     assert_eq!(contents(&engine), expected);
 }
 
@@ -840,6 +857,43 @@ fn an_image_and_the_archived_log_restore_any_later_revision() {
     // Before the image, after the end of the log.
     assert!(restore(Some(9)).0.is_err());
     assert!(restore(Some(36)).0.is_err());
+}
+
+/// Point-in-time restore by time: the commits made up to a time, from the log's commit
+/// times.
+#[test]
+fn the_log_restores_the_state_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    };
+    let mut states = commit_all(&engine, &batches(0..5));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let middle = now();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    states.extend(commit_all(&engine, &batches(5..9)));
+    drop(engine);
+    let copy = tempfile::tempdir().unwrap();
+    let wal = copy.path().join("wal");
+    fs::create_dir_all(&wal).unwrap();
+    for entry in fs::read_dir(dir.path().join("wal")).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), wal.join(entry.file_name())).unwrap();
+    }
+    let config = EngineConfig {
+        durability: DurabilityConfig {
+            recover_until_micros: Some(middle),
+            ..config().durability
+        },
+        ..config()
+    };
+    let engine = Engine::open(copy.path(), config).unwrap();
+    assert_eq!(engine.snapshot().revision(), 5);
+    assert_eq!(contents(&engine), states[4]);
 }
 
 /// A spill directory left by a crashed load goes when the store opens.
