@@ -28,6 +28,10 @@ pub enum MutationError {
     Gate(String),
     #[error("the write slot is poisoned by an earlier panic")]
     Poisoned,
+    /// The repository was reconfigured (other rules) while the write waited: it may be
+    /// sent again.
+    #[error("the repository was reconfigured while the write waited; send it again")]
+    Retired,
 }
 
 /// Details of a gate rejection, shared by HTTP problem responses and operator diagnostics.

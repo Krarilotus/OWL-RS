@@ -685,3 +685,98 @@ async fn running_queries_are_listed_and_cancelled() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// A repository's reasoning changes at once through `PATCH`: the inferences are
+/// recomputed under the new rules, writes go on, and the default repository's change is
+/// kept in the data directory.
+#[tokio::test]
+async fn repository_settings_change_at_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let json = Some("application/json");
+    for base in ["/api/v1/repositories/r2", "/api/v1/repositories/nrese"] {
+        if base.ends_with("r2") {
+            let (status, text) = send(
+                &app,
+                Method::PUT,
+                base,
+                json,
+                r#"{"reasoning": "disabled"}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{text}");
+        } else {
+            let (status, text) = send(
+                &app,
+                Method::PATCH,
+                base,
+                json,
+                r#"{"reasoning": "disabled"}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+        }
+        let (status, _) = send(
+            &app,
+            Method::POST,
+            &format!("{base}/update"),
+            Some("application/sparql-update"),
+            "INSERT DATA { <urn:C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:D> . \
+             <urn:x> a <urn:C> }",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let ask = format!(
+            "{base}/query?query={}",
+            urlencoding("ASK { <urn:x> a <urn:D> }")
+        );
+        let (_, text) = send(&app, Method::GET, &ask, None, "").await;
+        assert!(text.contains("false"), "{base}: {text}");
+        let (status, text) = send(
+            &app,
+            Method::PATCH,
+            base,
+            json,
+            r#"{"reasoning": "rdfs", "title": "With RDFS"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let view: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(view["reasoning"], "rdfs", "{text}");
+        assert_eq!(view["title"], "With RDFS");
+        let (_, text) = send(&app, Method::GET, &ask, None, "").await;
+        assert!(text.contains("true"), "{base}: {text}");
+        // Writes go on under the new rules.
+        let (status, _) = send(
+            &app,
+            Method::POST,
+            &format!("{base}/update"),
+            Some("application/sparql-update"),
+            "INSERT DATA { <urn:y> a <urn:C> }",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, text) = send(
+            &app,
+            Method::GET,
+            &format!(
+                "{base}/query?query={}",
+                urlencoding("ASK { <urn:y> a <urn:D> }")
+            ),
+            None,
+            "",
+        )
+        .await;
+        assert!(text.contains("true"), "{base}: {text}");
+        let (status, _) = send(&app, Method::PATCH, base, json, r#"{"reasoning": "bogus"}"#).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    // The default repository's settings are kept in the data directory.
+    let stored = std::fs::read_to_string(dir.path().join("repository.json")).unwrap();
+    assert!(stored.contains("rdfs"), "{stored}");
+}

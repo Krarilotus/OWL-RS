@@ -928,3 +928,31 @@ fn materialisation_by_representatives_equals_replication() {
     );
     assert_eq!(everything(true), replicated);
 }
+
+/// A pipeline another one took over (a repository's reasoning changed) refuses writes, so
+/// none applies its rules to an inferred stack made for others; the new one writes on.
+#[test]
+fn a_retired_pipeline_refuses_writes() {
+    let store = Arc::new(StoreService::new(in_memory_store_config()).unwrap());
+    let reasoner = |mode| Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode)));
+    let old = MutationPipeline::new(Arc::clone(&store), reasoner(ReasoningMode::Rdfs));
+    let update = |pipeline: &MutationPipeline, text: &str| {
+        pipeline.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(text)),
+            &MutationTicket::new(),
+        )
+    };
+    update(&old, "INSERT DATA { <urn:a> <urn:p> 1 }").unwrap();
+    let new = MutationPipeline::new(Arc::clone(&store), reasoner(ReasoningMode::Owl2Rl));
+    old.retire();
+    assert!(old.is_retired());
+    assert!(matches!(
+        update(&old, "INSERT DATA { <urn:b> <urn:p> 2 }"),
+        Err(nrese_store::MutationError::Retired)
+    ));
+    update(&new, "INSERT DATA { <urn:c> <urn:p> 3 }").unwrap();
+    assert_eq!(
+        store.count_statements(&nrese_store::StatementPattern::default(), false),
+        2
+    );
+}

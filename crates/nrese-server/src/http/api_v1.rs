@@ -69,7 +69,8 @@ pub async fn repository_get(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
     let repository = state.for_repository(&id)?;
-    let settings = state.repositories().settings(&id);
+    let settings = Some(repository.repository_settings())
+        .filter(|settings| *settings != crate::repository_config::RepositorySettings::default());
     Ok(Json(RepositoryView {
         path: format!("/api/v1/repositories/{id}"),
         title: settings
@@ -660,4 +661,46 @@ pub async fn graphs(
         })
         .collect();
     Ok(Json(graphs).into_response())
+}
+
+/// Changes repository `id`'s settings (administrators): the fields given replace the
+/// current ones (`null` removes one); a change of `reasoning` or `rules` takes effect at
+/// once, the inferences recomputed. The repository as it is then.
+#[utoipa::path(patch, path = "/api/v1/repositories/{id}", tag = "repositories",
+    params(("id" = String, Path, description = "The repository's id")),
+    request_body(content = crate::repository_config::RepositorySettings,
+        description = "The settings to change; absent fields stay"),
+    responses((status = 200, description = "Changed", body = RepositoryView),
+        (status = 400, description = "Invalid settings", body = crate::http::openapi::Problem),
+        (status = 404, description = "No such repository", body = crate::http::openapi::Problem)))]
+pub async fn repository_patch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    let repository = state.for_repository(&id)?;
+    let changes: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&body)
+        .map_err(|error| ApiError::bad_request(format!("repository settings: {error}")))?;
+    let mut merged = serde_json::to_value(repository.repository_settings())
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let fields = merged.as_object_mut().expect("settings are an object");
+    for (key, value) in changes {
+        match value {
+            serde_json::Value::Null => {
+                fields.remove(&key);
+            }
+            value => {
+                fields.insert(key, value);
+            }
+        }
+    }
+    let settings: crate::repository_config::RepositorySettings = serde_json::from_value(merged)
+        .map_err(|error| ApiError::bad_request(format!("repository settings: {error}")))?;
+    let changing = repository.clone();
+    tokio::task::spawn_blocking(move || changing.change_repository_settings(settings))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    repository_get(State(state), Path(id), headers).await
 }

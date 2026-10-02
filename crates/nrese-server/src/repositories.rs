@@ -25,11 +25,71 @@ const SETTINGS_FILE: &str = "repository.json";
 /// The default repository's id.
 pub const DEFAULT_REPOSITORY: &str = "nrese";
 
-/// One repository: its write path (and store) and its RDF4J state.
+/// A repository's write path, which a reconfiguration replaces ([`reconfigure`]).
+pub type PipelineSlot = Arc<RwLock<Arc<MutationPipeline>>>;
+
+/// One repository: its write path (and store) and its settings.
 #[derive(Clone)]
 pub struct Repository {
-    pub pipeline: Arc<MutationPipeline>,
-    pub settings: RepositorySettings,
+    pub pipeline: PipelineSlot,
+    pub settings: Arc<RwLock<RepositorySettings>>,
+}
+
+/// The default repository's settings file in the data directory, if the server is on
+/// disk and its settings were changed through the engine API.
+pub fn default_settings_file(template: &StoreConfig) -> Option<PathBuf> {
+    matches!(template.mode, StoreMode::OnDisk).then(|| template.data_dir.join(SETTINGS_FILE))
+}
+
+/// The default repository's stored settings (`None` if they were never changed).
+pub fn stored_default_settings(
+    template: &StoreConfig,
+) -> Result<Option<RepositorySettings>, String> {
+    let Some(file) = default_settings_file(template) else {
+        return Ok(None);
+    };
+    match std::fs::read(&file) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("{}: {error}", file.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", file.display())),
+    }
+}
+
+/// Gives the repository whose write path is `slot` the reasoning of `settings` (`fallback`
+/// where they name none): a new write path over the same store takes over, the old one is
+/// retired (its waiting writes are refused, retryable), and the inferences are recomputed
+/// under the new rules (or cleared without reasoning). Returns the new reasoning's name.
+pub fn reconfigure(
+    slot: &PipelineSlot,
+    settings: &RepositorySettings,
+    fallback: &ReasonerService,
+) -> Result<&'static str, ApiError> {
+    let reasoner = match settings.reasoner_config().map_err(ApiError::bad_request)? {
+        Some(config) => ReasonerService::new(config),
+        None => fallback.clone(),
+    };
+    let store = Arc::clone(slot.read().store());
+    let next = Arc::new(MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(reasoner),
+    ));
+    let previous = std::mem::replace(&mut *slot.write(), Arc::clone(&next));
+    previous.retire();
+    match next.reasoner().config().materialised_program() {
+        Some(program) => {
+            store
+                .rematerialise(&program)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+        None => {
+            store
+                .clear_inferred()
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+    }
+    Ok(next.reasoner().mode_name())
 }
 
 /// The repositories besides the default one.
@@ -126,8 +186,11 @@ impl Repositories {
             }
         }
         Ok(Repository {
-            pipeline: Arc::new(MutationPipeline::new(Arc::new(store), Arc::new(reasoner))),
-            settings,
+            pipeline: Arc::new(RwLock::new(Arc::new(MutationPipeline::new(
+                Arc::new(store),
+                Arc::new(reasoner),
+            )))),
+            settings: Arc::new(RwLock::new(settings)),
         })
     }
 
@@ -138,15 +201,65 @@ impl Repositories {
 
     /// Repository `id`'s settings, if there is one besides the default.
     pub fn settings(&self, id: &str) -> Option<RepositorySettings> {
-        self.others.read().get(id).map(|r| r.settings.clone())
+        self.others
+            .read()
+            .get(id)
+            .map(|r| r.settings.read().clone())
     }
 
+    /// Changes repository `id`'s settings (not the default's): its title, and its
+    /// reasoning, which takes effect at once ([`reconfigure`]); kept in its directory.
+    pub fn change(&self, id: &str, settings: RepositorySettings) -> Result<(), ApiError> {
+        let repository = self
+            .get(id)
+            .ok_or_else(|| ApiError::not_found(format!("no repository '{id}'")))?;
+        check(&settings)?;
+        let before = repository.settings.read().clone();
+        if (&before.reasoning, &before.rules) != (&settings.reasoning, &settings.rules) {
+            reconfigure(&repository.pipeline, &settings, &self.reasoner)?;
+        }
+        if let Some(root) = &self.root {
+            write_settings(&root.join(id).join(SETTINGS_FILE), &settings)?;
+        }
+        *repository.settings.write() = settings;
+        Ok(())
+    }
+
+    /// The server's reasoning, for repositories whose settings name none.
+    pub fn server_reasoner(&self) -> &ReasonerService {
+        &self.reasoner
+    }
+}
+
+/// Refuses settings that name no reasoning mode or whose rules don't compile.
+pub fn check(settings: &RepositorySettings) -> Result<(), ApiError> {
+    if let Some(name) = &settings.reasoning
+        && settings.reasoning_mode().is_none()
+    {
+        return Err(ApiError::bad_request(format!("no reasoning mode '{name}'")));
+    }
+    settings.reasoner_config().map_err(ApiError::bad_request)?;
+    Ok(())
+}
+
+/// Writes `settings` to `file`.
+pub fn write_settings(
+    file: &std::path::Path,
+    settings: &RepositorySettings,
+) -> Result<(), ApiError> {
+    let json = serde_json::to_vec_pretty(settings)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    std::fs::write(file, json)
+        .map_err(|error| ApiError::internal(format!("{}: {error}", file.display())))
+}
+
+impl Repositories {
     /// The ids of the repositories besides the default, sorted, with their titles.
     pub fn list(&self) -> Vec<(String, Option<String>)> {
         self.others
             .read()
             .iter()
-            .map(|(id, repository)| (id.clone(), repository.settings.title.clone()))
+            .map(|(id, repository)| (id.clone(), repository.settings.read().title.clone()))
             .collect()
     }
 
@@ -162,12 +275,7 @@ impl Repositories {
                 "repository '{id}' exists already"
             )));
         }
-        if let Some(name) = &settings.reasoning
-            && settings.reasoning_mode().is_none()
-        {
-            return Err(ApiError::bad_request(format!("no reasoning mode '{name}'")));
-        }
-        settings.reasoner_config().map_err(ApiError::bad_request)?;
+        check(&settings)?;
         let repository = self
             .start(id, settings.clone())
             .map_err(ApiError::internal)?;
