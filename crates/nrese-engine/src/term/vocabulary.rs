@@ -81,9 +81,8 @@ impl Codec {
             .iter()
             .map(|key| key.as_slice())
             .partition(|key| key.first() == Some(&TAG_IRI));
-        let rest = |keys: &[&[u8]]| -> Vec<Vec<u8>> {
-            keys.iter().map(|key| key[1..].to_vec()).collect()
-        };
+        let rest =
+            |keys: &[&[u8]]| -> Vec<Vec<u8>> { keys.iter().map(|key| key[1..].to_vec()).collect() };
         let train = |keys: Vec<Vec<u8>>| {
             let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
             Compressor::train(&refs)
@@ -104,7 +103,11 @@ impl Codec {
     }
 
     fn table(&self, tag: u8) -> &Compressor {
-        if tag == TAG_IRI { &self.iri } else { &self.other }
+        if tag == TAG_IRI {
+            &self.iri
+        } else {
+            &self.other
+        }
     }
 
     /// Appends `key` (plain) as stored: its tag, then the rest compressed.

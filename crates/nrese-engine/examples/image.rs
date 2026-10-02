@@ -38,7 +38,9 @@ fn main() {
     let engine = Engine::open(&store, config).expect("open the store");
     std::fs::create_dir_all(&out).expect("create the output directory");
     let started = Instant::now();
-    let image = engine.write_image(std::path::Path::new(&out)).expect("write the image");
+    let image = engine
+        .write_image(std::path::Path::new(&out))
+        .expect("write the image");
     let size = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |m| m.len());
     let before: u64 = std::fs::read_dir(&store)
         .expect("read the store")
