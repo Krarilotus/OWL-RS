@@ -412,7 +412,9 @@ mod tests {
             for &alias in &group[1..] {
                 classes.aliases.insert(alias, group[0]);
             }
-            classes.members.insert(group[0], group.to_vec().into_boxed_slice());
+            classes
+                .members
+                .insert(group[0], group.to_vec().into_boxed_slice());
         }
         classes
     }
@@ -421,7 +423,12 @@ mod tests {
     fn expansion_keeps_the_scan_order() {
         let classes = Arc::new(classes(&[&[10, 30], &[20, 25, 40]]));
         // Stored over representatives, in SPOG order; `30 p 1` is an alias's fact.
-        let stored = vec![quad(10, 5, 20), quad(10, 6, 1), quad(20, 5, 10), quad(30, 5, 1)];
+        let stored = vec![
+            quad(10, 5, 20),
+            quad(10, 6, 1),
+            quad(20, 5, 10),
+            quad(30, 5, 1),
+        ];
         let version = Version::empty();
         let expanded: Vec<EncodedQuad> = Expand::new(
             stored.into_iter(),
@@ -433,7 +440,10 @@ mod tests {
             &version,
         )
         .collect();
-        let keys: Vec<Key> = expanded.iter().map(|q| Permutation::Spog.to_key(q)).collect();
+        let keys: Vec<Key> = expanded
+            .iter()
+            .map(|q| Permutation::Spog.to_key(q))
+            .collect();
         assert!(keys.is_sorted(), "{keys:?}");
         // 10 5 20: 2 × 3 copies; 10 6 1: 2; 20 5 10: 3 × 2; the alias fact: none.
         assert_eq!(expanded.len(), 6 + 2 + 6);
