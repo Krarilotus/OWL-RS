@@ -416,6 +416,12 @@ pub const SETTINGS: &[Setting] = &[
         Bool,
         "Whether users of the access state log in with passwords (default true).",
     ),
+    setting(
+        "auth.trusted_proxies",
+        names::AUTH_TRUSTED_PROXIES,
+        List { delimiter: "," },
+        "The proxies (addresses or ranges) whose X-Forwarded-For names the client, for login throttling (default loopback).",
+    ),
     secret(setting(
         "auth.bearer_static.read_token",
         names::AUTH_READ_TOKEN,

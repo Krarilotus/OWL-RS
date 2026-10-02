@@ -596,7 +596,11 @@ struct Session {
         (status = 429, description = "Too many failed logins", body = crate::http::openapi::Problem)))]
 /// Logs a local user in: a session token for the following requests. 401 for a wrong
 /// user name or password, 429 after too many; 404 with local logins off.
-pub async fn login(State(state): State<AppState>, bytes: Bytes) -> Result<Response, ApiError> {
+pub async fn login(
+    State(state): State<AppState>,
+    crate::http::authentication::ClientAddress(client): crate::http::authentication::ClientAddress,
+    bytes: Bytes,
+) -> Result<Response, ApiError> {
     if !state.policy().local_logins {
         return Err(ApiError::not_found("local logins are off"));
     }
@@ -606,7 +610,7 @@ pub async fn login(State(state): State<AppState>, bytes: Bytes) -> Result<Respon
     let opened = tokio::task::spawn_blocking(move || {
         access
             .access()
-            .open_session(&request.user, &request.password)
+            .open_session(&request.user, &request.password, client)
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?;

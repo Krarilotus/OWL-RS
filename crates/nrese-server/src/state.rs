@@ -79,6 +79,7 @@ impl AppState {
     async fn local_identity(
         &self,
         headers: &HeaderMap,
+        client: Option<std::net::IpAddr>,
     ) -> Result<Option<crate::auth::Identity>, ApiError> {
         use base64::Engine;
         if !self.policy.local_logins {
@@ -120,7 +121,7 @@ impl AppState {
             .ok_or_else(|| ApiError::unauthorized("malformed Basic credentials"))?;
         let (user, password) = (user.to_owned(), password.to_owned());
         let access = Arc::clone(&self.access);
-        let principal = tokio::task::spawn_blocking(move || access.login(&user, &password))
+        let principal = tokio::task::spawn_blocking(move || access.login(&user, &password, client))
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?;
         match principal {
@@ -290,12 +291,15 @@ impl AppState {
 
     /// Who the request is ([`crate::auth::Authenticated`]): a local login (`Basic`
     /// credentials of a user with a password, or a session token), else the
-    /// authentication mode's credentials. 401 for missing or wrong ones.
+    /// authentication mode's credentials. 401 for missing or wrong ones. `client` is the
+    /// client's address ([`crate::http::authentication::client_address`]), which failed
+    /// logins are counted by.
     pub async fn authenticate(
         &self,
         headers: &HeaderMap,
+        client: Option<std::net::IpAddr>,
     ) -> Result<crate::auth::Authenticated, ApiError> {
-        match self.local_identity(headers).await? {
+        match self.local_identity(headers, client).await? {
             Some(mut identity) => {
                 let principal = crate::access::principal(&identity);
                 identity.admin = self.access.state().is_admin(&principal);
