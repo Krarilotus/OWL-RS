@@ -45,6 +45,7 @@ pub const GRAPHS: Offers<GraphResultFormat> = &[
     ("application/ld+json", GraphResultFormat::JsonLd),
     ("application/n-quads", GraphResultFormat::NQuads),
     ("application/trig", GraphResultFormat::TriG),
+    ("application/x-binary-rdf", GraphResultFormat::BinaryRdf),
     ("application/x-turtle", GraphResultFormat::Turtle),
     ("text/plain", GraphResultFormat::NTriples),
 ];

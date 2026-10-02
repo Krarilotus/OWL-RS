@@ -769,3 +769,117 @@ async fn repository_configurations_carry_user_rules() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// A new transaction's `Location` is absolute, as the request reached the server (RDF4J's
+/// client follows it as given), behind a proxy too.
+#[tokio::test]
+async fn transaction_locations_are_absolute() {
+    let app = test_app().unwrap();
+    for (headers, expected) in [
+        (
+            vec![("host", "store.example:7878")],
+            "http://store.example:7878/repositories/nrese/transactions/",
+        ),
+        (
+            vec![
+                ("host", "internal:7878"),
+                ("x-forwarded-host", "kg.example"),
+                ("x-forwarded-proto", "https"),
+            ],
+            "https://kg.example/repositories/nrese/transactions/",
+        ),
+    ] {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{REPO}/transactions"));
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let location = response.headers()[header::LOCATION].to_str().unwrap();
+        assert!(location.starts_with(expected), "{location}");
+    }
+}
+
+/// A transaction's DELETE takes statements as patterns, as RDF4J's client sends them
+/// (`clear()` too): `sesame:wildcard` matches any value, no graph means every graph,
+/// `rdf4j:nil` the default graph.
+#[tokio::test]
+async fn transaction_deletes_take_wildcards() {
+    let app = test_app().unwrap();
+    let graph = "<http://example.com/g>";
+    let uri = format!("{REPO}/statements?{}", encode(&[("context", graph)]));
+    let (status, _) = send(&app, Method::POST, &uri, Some("text/turtle"), None, DATA).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("{REPO}/statements"),
+        Some("text/turtle"),
+        None,
+        DATA,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(size(&app, None).await, 6);
+    let delete = |body: &'static str, content_type: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("{REPO}/transactions"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let tx = response.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (status, text) = send(
+                &app,
+                Method::PUT,
+                &format!("{tx}?preserveNodeId=true&action=DELETE"),
+                Some(content_type),
+                None,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            let (status, _) = send(
+                &app,
+                Method::PUT,
+                &format!("{tx}?action=COMMIT"),
+                None,
+                None,
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    };
+    // ex:p everywhere, of any subject and object: two statements in each graph.
+    delete(
+        "<http://www.openrdf.org/schema/sesame#wildcard> <http://example.com/p> <http://www.openrdf.org/schema/sesame#wildcard> .",
+        "text/turtle",
+    )
+    .await;
+    assert_eq!(size(&app, None).await, 2);
+    // Everything in the default graph only.
+    delete(
+        "<http://rdf4j.org/schema/rdf4j#nil> { <http://www.openrdf.org/schema/sesame#wildcard> <http://www.openrdf.org/schema/sesame#wildcard> <http://www.openrdf.org/schema/sesame#wildcard> . }",
+        "application/trig",
+    )
+    .await;
+    assert_eq!(size(&app, None).await, 1);
+    assert_eq!(size(&app, Some(graph)).await, 1);
+}

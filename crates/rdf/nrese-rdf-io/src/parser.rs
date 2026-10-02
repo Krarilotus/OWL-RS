@@ -9,6 +9,7 @@ use std::path::Path;
 use memchr::memchr2;
 use nrese_rdf::{GraphName, Iri, IriParseError, Quad, QuadRef};
 
+use crate::binary::BinaryParser;
 use crate::blank::BlankNodes;
 use crate::error::{RdfParseError, RdfSyntaxError, TextPosition};
 use crate::format::RdfFormat;
@@ -135,6 +136,10 @@ impl RdfParser {
                 let settings = self.rdf_xml_settings();
                 self.wrap(Inner::RdfXmlSlice(RdfXmlParser::new(bytes, settings)))
             }
+            RdfFormat::BinaryRdf => {
+                let parser = BinaryParser::new(bytes, self.blank_nodes.clone(), self.unchecked);
+                self.wrap(Inner::BinarySlice(parser))
+            }
             _ => self.parser(Lines::from_slice(bytes, 0)),
         }
     }
@@ -160,6 +165,14 @@ impl RdfParser {
                     BufReader::new(reader),
                     settings,
                 )))
+            }
+            RdfFormat::BinaryRdf => {
+                let parser = BinaryParser::new(
+                    BufReader::new(reader),
+                    self.blank_nodes.clone(),
+                    self.unchecked,
+                );
+                self.wrap(Inner::BinaryReader(parser))
             }
             _ => self.parser(Lines::from_reader(reader, 0)),
         }
@@ -383,6 +396,8 @@ enum Inner<'a, R: Read> {
     N3(TurtleParser<'a, R>, Option<Quad>),
     RdfXmlSlice(RdfXmlParser<&'a [u8]>),
     RdfXmlReader(RdfXmlParser<BufReader<R>>),
+    BinarySlice(BinaryParser<&'a [u8]>),
+    BinaryReader(BinaryParser<BufReader<R>>),
     JsonLd(Box<JsonLdParser<'a>>),
     /// JSON-LD from a reader: read whole at the first call (see [`crate::jsonld`]).
     JsonLdReader(
@@ -424,6 +439,16 @@ impl<R: Read> QuadParser<'_, R> {
                 Err(error) => return Some(Err(error)),
             },
             Inner::RdfXmlReader(parser) => match parser.advance() {
+                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+                Ok(false) => return None,
+                Err(error) => return Some(Err(error)),
+            },
+            Inner::BinarySlice(parser) => match parser.advance() {
+                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+                Ok(false) => return None,
+                Err(error) => return Some(Err(error)),
+            },
+            Inner::BinaryReader(parser) => match parser.advance() {
                 Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
                 Ok(false) => return None,
                 Err(error) => return Some(Err(error)),

@@ -21,10 +21,13 @@ pub enum RdfFormat {
     /// format it reads documents RDF can hold and writes Turtle, which is N3; formulas,
     /// variables and rules go through [`crate::n3`].
     N3,
+    /// RDF4J's [Binary RDF](https://rdf4j.org/documentation/reference/rdf4j-binary/)
+    /// (`application/x-binary-rdf`): what RDF4J's HTTP client sends and asks for.
+    BinaryRdf,
 }
 
 impl RdfFormat {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::NTriples,
         Self::NQuads,
         Self::Turtle,
@@ -32,6 +35,7 @@ impl RdfFormat {
         Self::RdfXml,
         Self::JsonLd,
         Self::N3,
+        Self::BinaryRdf,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -43,6 +47,7 @@ impl RdfFormat {
             Self::RdfXml => "RDF/XML",
             Self::JsonLd => "JSON-LD",
             Self::N3 => "N3",
+            Self::BinaryRdf => "Binary RDF",
         }
     }
 
@@ -56,6 +61,7 @@ impl RdfFormat {
             Self::RdfXml => "application/rdf+xml",
             Self::JsonLd => "application/ld+json",
             Self::N3 => "text/n3",
+            Self::BinaryRdf => "application/x-binary-rdf",
         }
     }
 
@@ -69,12 +75,16 @@ impl RdfFormat {
             Self::RdfXml => "rdf",
             Self::JsonLd => "jsonld",
             Self::N3 => "n3",
+            Self::BinaryRdf => "brf",
         }
     }
 
     /// Whether the format can hold named graphs.
     pub const fn supports_datasets(self) -> bool {
-        matches!(self, Self::NQuads | Self::TriG | Self::JsonLd)
+        matches!(
+            self,
+            Self::NQuads | Self::TriG | Self::JsonLd | Self::BinaryRdf
+        )
     }
 
     /// The format of a file extension (any letter case; `owl` is RDF/XML, `json` JSON-LD).
@@ -87,6 +97,7 @@ impl RdfFormat {
             "rdf" | "xml" | "owl" | "rdfxml" => Self::RdfXml,
             "jsonld" | "json" => Self::JsonLd,
             "n3" => Self::N3,
+            "brf" => Self::BinaryRdf,
             _ => return None,
         })
     }
@@ -108,6 +119,7 @@ impl RdfFormat {
             "application/rdf+xml" | "application/xml" | "text/xml" => Self::RdfXml,
             "application/ld+json" | "application/json" => Self::JsonLd,
             "text/n3" | "text/rdf+n3" | "application/n3" => Self::N3,
+            "application/x-binary-rdf" => Self::BinaryRdf,
             _ => return None,
         })
     }
