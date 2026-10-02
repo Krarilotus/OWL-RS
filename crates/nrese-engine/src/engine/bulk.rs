@@ -6,6 +6,11 @@
 //! sorts once in parallel, builds the base run directly (no transaction hash sets, no
 //! per-quad existence checks against an empty base) and publishes one revision.
 //!
+//! Memory: in a durable store with `map_checkpoints`, a load into an empty store or one
+//! replacing its data is bounded by `bulk_load_memory`: past it, quads are sorted in chunks
+//! spilled to disk and merged into each permutation as it goes into the checkpoint
+//! ([`super::spill`]).
+//!
 //! Durability: a bulk load is not written to the WAL, whose records are capped at 4 GiB.
 //! Instead, a checkpoint of the new revision is written *before* the revision is published,
 //! so nothing is ever visible that a crash could lose. Its cost is O(dataset), which is why
@@ -18,13 +23,14 @@ use nrese_rdf::Quad;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
 
+use super::spill::{Spill, Spiller};
 use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version};
 use crate::durability::checkpoint;
-use crate::error::EngineResult;
+use crate::error::{EngineError, EngineResult};
 use crate::index::IndexVersion;
 use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
-use crate::quad::{EncodedQuad, EncodedTriple, QuadPattern};
+use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
 
 /// Batches copied between releases of their memory ([`crate::memory`]): about 256 MiB at
 /// the stores' batch size.
@@ -47,34 +53,118 @@ pub struct BulkLoad<'e> {
     engine: &'e Inner,
     _slot: MutexGuard<'e, ()>,
     mode: BulkMode,
-    batches: Mutex<Vec<Vec<EncodedQuad>>>,
+    batches: Mutex<Batches>,
+    /// Quads per spilled chunk, if the load spills past its memory budget.
+    chunk: Option<usize>,
+    /// Started with the first spilled chunk; held while one is handed over.
+    spiller: Mutex<Option<Spiller>>,
+    /// Spilling failed (setting it up, or the thread): the load fails at `finish`.
+    spill_failed: Mutex<Option<std::io::Error>>,
+}
+
+/// Interned quads not yet spilled.
+#[derive(Default)]
+struct Batches {
+    batches: Vec<Vec<EncodedQuad>>,
+    quads: usize,
 }
 
 impl<'e> BulkLoad<'e> {
     pub(super) fn new(engine: &'e Inner, slot: MutexGuard<'e, ()>, mode: BulkMode) -> Self {
+        // The writer slot is held from here on: whether the load can be streamed into the
+        // checkpoint (and so spilled) stays as decided now.
+        let chunk = engine
+            .shared
+            .durable
+            .as_ref()
+            .filter(|_| streamable(engine, mode))
+            .and_then(|durable| durable.config.bulk_load_memory)
+            // In flight at once: a chunk filling, one being spilled and its sorted copy.
+            .map(|budget| (budget as usize / 3 / size_of::<EncodedQuad>()).max(1));
         Self {
             engine,
             _slot: slot,
             mode,
             batches: Mutex::default(),
+            chunk,
+            spiller: Mutex::new(None),
+            spill_failed: Mutex::new(None),
         }
     }
 
     /// Adds a batch of quads. Callable from several threads at once; batches of 10⁴–10⁵
-    /// quads amortise the dictionary lock well.
+    /// quads amortise the dictionary lock well. Past the memory budget, it waits while the
+    /// last chunk is spilled.
     pub fn add(&self, quads: &[Quad]) {
         let encoded = self.engine.shared.dictionary.intern_quads(quads);
-        self.batches.lock().push(encoded);
+        let full = {
+            let mut batches = self.batches.lock();
+            batches.quads += encoded.len();
+            batches.batches.push(encoded);
+            self.chunk.is_some_and(|chunk| batches.quads >= chunk)
+        };
+        if full {
+            self.spill(false);
+        }
+    }
+
+    /// Hands the batches over to the spilling thread, starting it if needed: all of them
+    /// with `rest`, else only once a chunk is full (another thread may have taken it).
+    fn spill(&self, rest: bool) {
+        let (Some(chunk), Some(durable)) = (self.chunk, &self.engine.shared.durable) else {
+            return;
+        };
+        let mut spiller = self.spiller.lock();
+        let batches = {
+            let mut batches = self.batches.lock();
+            if batches.quads == 0 || (!rest && batches.quads < chunk) {
+                return;
+            }
+            std::mem::take(&mut *batches).batches
+        };
+        if self.spill_failed.lock().is_some() {
+            return;
+        }
+        if spiller.is_none() {
+            match Spiller::start(durable.root(), Stack::Asserted.layout()) {
+                Ok(started) => *spiller = Some(started),
+                Err(error) => {
+                    *self.spill_failed.lock() = Some(error);
+                    return;
+                }
+            }
+        }
+        let sent = spiller
+            .as_ref()
+            .is_some_and(|spiller| spiller.send(batches));
+        if !sent {
+            // The thread stopped on an error, which `finish` reports.
+            let failed = self.spill_failed.lock().is_some();
+            if !failed && let Some(stopped) = spiller.take() {
+                let error = match stopped.finish() {
+                    Err(error) => error,
+                    Ok(_) => std::io::Error::other("the spilling thread stopped"),
+                };
+                *self.spill_failed.lock() = Some(error);
+            }
+        }
     }
 
     /// Publishes the loaded quads as one new revision (see the module docs for durability).
     /// Returns the revision and the asserted and inferred quads added and removed.
     pub fn finish(self) -> EngineResult<CommitSummary> {
+        // A load that spilled sends what is left as its last chunk.
+        if self.spiller.lock().is_some() {
+            self.spill(true);
+        }
         let Self {
             engine,
             _slot,
             mode,
             batches,
+            spiller,
+            spill_failed,
+            ..
         } = self;
         let shared = &engine.shared;
         // No commit can run (writer slot) and no compaction can replace runs while the new
@@ -82,8 +172,17 @@ impl<'e> BulkLoad<'e> {
         let _compaction = shared.versions.compaction_slot.lock();
         let base = shared.snapshot();
         let started = Instant::now();
+        let spilled = match (spill_failed.into_inner(), spiller.into_inner()) {
+            (Some(error), _) => return Err(EngineError::Io(error)),
+            (None, Some(spiller)) => Some(spiller.finish()?),
+            (None, None) => None,
+        };
+        let current = base.version();
+        if let Some(spill) = spilled {
+            return publish_spilled(engine, spill, current, started, _compaction);
+        }
         // The batches into one array, each freed once copied (not all held twice).
-        let batches = batches.into_inner();
+        let batches = batches.into_inner().batches;
         let mut quads: Vec<EncodedQuad> = Vec::with_capacity(batches.iter().map(Vec::len).sum());
         // What the copied batches held stays with the threads that interned them until
         // released: without, the batches would count twice at the peak.
@@ -97,13 +196,8 @@ impl<'e> BulkLoad<'e> {
         quads.par_sort_unstable();
         quads.dedup();
 
-        let current = base.version();
         // Nothing else in the new version: its permutations go straight into the checkpoint.
-        let streamed = shared
-            .durable
-            .as_ref()
-            .is_some_and(|durable| durable.config.map_checkpoints)
-            && (mode == BulkMode::Replace || current.asserted.len() + current.inferred.len() == 0);
+        let streamed = streamable(engine, mode);
         let (next, summary) = match mode {
             _ if streamed => {
                 let summary = CommitSummary {
@@ -189,6 +283,65 @@ impl<'e> BulkLoad<'e> {
     }
 }
 
+/// Whether a load in `mode` publishes a version holding nothing but the loaded quads,
+/// written into the checkpoint permutation by permutation ([`Next::Streamed`]).
+fn streamable(engine: &Inner, mode: BulkMode) -> bool {
+    let current = engine.shared.snapshot();
+    let current = current.version();
+    engine
+        .shared
+        .durable
+        .as_ref()
+        .is_some_and(|durable| durable.config.map_checkpoints)
+        && (mode == BulkMode::Replace || current.asserted.len() + current.inferred.len() == 0)
+}
+
+/// [`BulkLoad::finish`] of a load that spilled: its chunks merged into the checkpoint.
+fn publish_spilled(
+    engine: &Inner,
+    spill: Spill,
+    current: &Version,
+    started: Instant,
+    compaction: MutexGuard<'_, ()>,
+) -> EngineResult<CommitSummary> {
+    let revision = current.revision + 1;
+    let dictionary_len = engine.shared.dictionary.len();
+    let inserted = publish_streamed(engine, Source::Spilled(spill), revision, dictionary_len)?;
+    drop(compaction);
+    let summary = CommitSummary {
+        revision,
+        inserted,
+        deleted: current.asserted.len(),
+        inferred_inserted: 0,
+        inferred_deleted: current.inferred.len(),
+    };
+    tracing::info!(
+        revision,
+        inserted,
+        ms = started.elapsed().as_millis() as u64,
+        "bulk load published from spilled chunks"
+    );
+    engine.after_commit(0);
+    Ok(summary)
+}
+
+/// The packed permutations of a streamed load.
+enum Source {
+    /// Sorted in memory.
+    Memory(PermutationBuilder),
+    /// Merged from chunks on disk.
+    Spilled(Spill),
+}
+
+impl Source {
+    fn packed(&mut self, permutation: Permutation) -> EngineResult<PackedKeys> {
+        match self {
+            Self::Memory(builder) => Ok(builder.packed(permutation)),
+            Self::Spilled(spill) => Ok(spill.merged(permutation)?),
+        }
+    }
+}
+
 /// The version a bulk load publishes.
 enum Next {
     /// Built in memory.
@@ -215,7 +368,10 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             builder,
             revision,
             dictionary_len,
-        } => return publish_streamed(engine, builder, revision, dictionary_len),
+        } => {
+            return publish_streamed(engine, Source::Memory(builder), revision, dictionary_len)
+                .map(|_| ());
+        }
     };
     let next = Arc::new(next);
     match &shared.durable {
@@ -269,22 +425,23 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     Ok(())
 }
 
-/// [`publish`] of [`Next::Streamed`]: the checkpoint written from `builder`, then installed
-/// mapped. In memory (no checkpoint), the permutations are built into a version.
+/// [`publish`] of [`Next::Streamed`]: the checkpoint written from `source`, then installed
+/// mapped. In memory (no checkpoint), the permutations are built into a version. Returns
+/// the number of quads.
 fn publish_streamed(
     engine: &Inner,
-    mut builder: PermutationBuilder,
+    mut source: Source,
     revision: u64,
     dictionary_len: u64,
-) -> EngineResult<()> {
+) -> EngineResult<u64> {
     let shared = &engine.shared;
     let Some(durable) = &shared.durable else {
         let layout = Stack::Asserted.layout();
         let packed = layout
             .permutations()
             .iter()
-            .map(|&permutation| (permutation, builder.packed(permutation)))
-            .collect();
+            .map(|&permutation| Ok((permutation, source.packed(permutation)?)))
+            .collect::<EngineResult<Vec<_>>>()?;
         let asserted = IndexVersion::from_packed(layout, packed)
             .map_err(crate::error::EngineError::Corruption)?;
         let next = Version {
@@ -293,10 +450,14 @@ fn publish_streamed(
             revision,
             dictionary_len,
         };
-        return publish(engine, Next::Built(next));
+        let len = next.asserted.len();
+        publish(engine, Next::Built(next))?;
+        return Ok(len);
     };
     let _checkpoint = durable.checkpoint_slot.lock();
     let empty = PackedKeys::from_sorted(&[]);
+    // Every layout has SPOG: its length is the number of quads.
+    let mut len = 0;
     let path = checkpoint::write_parts(
         durable.root(),
         revision,
@@ -304,12 +465,19 @@ fn publish_streamed(
         dictionary_len,
         &mut |stack, permutation| {
             Ok(match stack {
-                Stack::Asserted => std::borrow::Cow::Owned(builder.packed(permutation)),
+                Stack::Asserted => {
+                    let packed = source.packed(permutation)?;
+                    if permutation == Permutation::Spog {
+                        len = packed.len() as u64;
+                    }
+                    std::borrow::Cow::Owned(packed)
+                }
                 Stack::Inferred => std::borrow::Cow::Borrowed(&empty),
             })
         },
-    )?;
-    drop(builder);
+    );
+    drop(source);
+    let path = path?;
     let (base, [asserted, inferred]) = match checkpoint::map_written(&path) {
         Ok(mapped) => mapped,
         Err(error) => {
@@ -334,7 +502,7 @@ fn publish_streamed(
         tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }
     checkpoint::remove_older_than(durable.root(), revision)?;
-    Ok(())
+    Ok(len)
 }
 
 /// A rematerialisation in progress: the reasoner reads [`base`](Self::base), computes the

@@ -70,6 +70,8 @@ impl StoreService {
                     durability: nrese_engine::DurabilityConfig {
                         verify_on_open: config.verify_on_open,
                         map_checkpoints: config.map_checkpoints,
+                        bulk_load_memory: (config.bulk_load_memory_bytes > 0)
+                            .then_some(config.bulk_load_memory_bytes),
                         ..defaults.durability
                     },
                     ..defaults

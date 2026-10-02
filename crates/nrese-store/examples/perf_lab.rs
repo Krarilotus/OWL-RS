@@ -316,9 +316,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(dir) => StoreConfig::on_disk(dir),
         None => StoreConfig::in_memory(),
     };
-    // No result cache: repeated runs measure evaluation.
+    // No result cache: repeated runs measure evaluation. NRESE_BULK_LOAD_MEMORY (bytes)
+    // bounds the load's quads (spilled past it).
+    let bulk_load_memory_bytes = std::env::var("NRESE_BULK_LOAD_MEMORY")
+        .ok()
+        .and_then(|bytes| bytes.parse().ok())
+        .unwrap_or(0);
     let config = StoreConfig {
         query_cache_bytes: 0,
+        bulk_load_memory_bytes,
         ..config
     };
     let started = Instant::now();

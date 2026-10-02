@@ -121,6 +121,10 @@ impl ServerConfig {
                 "budgets.total_query_memory",
                 size(store.total_query_memory_bytes),
             ),
+            (
+                "budgets.bulk_load_memory",
+                size(store.bulk_load_memory_bytes as usize),
+            ),
             ("budgets.query_timeout", format!("{:?}", timeouts.query)),
             ("budgets.update_timeout", format!("{:?}", timeouts.update)),
             (

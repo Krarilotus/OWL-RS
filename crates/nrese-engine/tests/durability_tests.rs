@@ -345,6 +345,7 @@ fn background_checkpoints_bound_the_wal() {
             sync: SyncPolicy::OsBuffered,
             verify_on_open: false,
             map_checkpoints: true,
+            bulk_load_memory: None,
         },
         ..EngineConfig::default()
     };
@@ -667,6 +668,71 @@ fn bulk_loads_are_served_from_their_checkpoint() {
         let engine = Engine::open(dir.path(), config).unwrap();
         assert_eq!(contents(&engine), states[9]);
     }
+}
+
+/// A bulk load past its memory budget spills sorted chunks and merges them: the same
+/// contents and counts as one in memory, from several threads with duplicates across
+/// batches, nothing left in the directory, and the same after a restart. Appending to a
+/// store that has data doesn't spill (its version isn't streamed) and stays correct.
+#[test]
+fn bulk_loads_past_their_budget_spill_and_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        durability: DurabilityConfig {
+            // 21 quads per chunk.
+            bulk_load_memory: Some(2048),
+            ..config().durability
+        },
+        ..config()
+    };
+    let engine = Engine::open(dir.path(), config).unwrap();
+    commit_all(&engine, &batches(0..5));
+    let data: Vec<Quad> = (0..900).flat_map(|n| [quad(n), label(n)]).collect();
+    let load = engine.bulk_load(BulkMode::Replace);
+    std::thread::scope(|scope| {
+        for part in data.chunks(250) {
+            let load = &load;
+            scope.spawn(move || {
+                for batch in part.chunks(20) {
+                    load.add(batch);
+                    // Every quad twice, in other batches.
+                    load.add(&batch[..batch.len() / 2]);
+                    load.add(&batch[batch.len() / 2..]);
+                }
+            });
+        }
+    });
+    let summary = load.finish().unwrap();
+    let mut expected: HashSet<Quad> = data.iter().cloned().collect();
+    assert_eq!(summary.inserted, expected.len() as u64);
+    assert_eq!(contents(&engine), expected);
+    assert_eq!(engine.stats().index_bytes, 0);
+    assert!(!dir.path().join("bulk-spill").exists());
+    // Appending to data: in memory.
+    let more: Vec<Quad> = (2000..2100).map(label).collect();
+    let load = engine.bulk_load(BulkMode::Append);
+    for batch in more.chunks(10) {
+        load.add(batch);
+    }
+    let summary = load.finish().unwrap();
+    assert_eq!(summary.inserted, 100);
+    expected.extend(more);
+    assert_eq!(contents(&engine), expected);
+    drop(engine);
+    let engine = Engine::open(dir.path(), config).unwrap();
+    assert_eq!(contents(&engine), expected);
+}
+
+/// A spill directory left by a crashed load goes when the store opens.
+#[test]
+fn opening_removes_a_crashed_loads_spill() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Engine::open(dir.path(), config()).unwrap());
+    let spill = dir.path().join("bulk-spill");
+    std::fs::create_dir_all(&spill).unwrap();
+    std::fs::write(spill.join("chunk-00000-0.keys"), b"partial").unwrap();
+    drop(Engine::open(dir.path(), config()).unwrap());
+    assert!(!spill.exists());
 }
 
 /// A bulk replacement of a durable store with commits in its WAL: the loaded quads only,
