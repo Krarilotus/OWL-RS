@@ -54,7 +54,7 @@ impl RepositoryRules {
             "pie" => UserRules::pie(self.name.clone(), self.text.clone()),
             _ => UserRules::n3(self.name.clone(), self.text.clone()),
         };
-        rules.map_err(|error| format!("rules {}: {error}", self.name))
+        rules.map_err(|error| error.to_string())
     }
 }
 

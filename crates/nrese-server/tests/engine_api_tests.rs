@@ -916,3 +916,78 @@ async fn imports_run_as_jobs() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// User rules are a managed object: uploaded as a file, compiled before they are stored
+/// (a mistake is refused with its line), in effect at once, and removed again.
+#[tokio::test]
+async fn rules_are_uploaded_checked_and_removed() {
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let base = "/api/v1/repositories/nrese";
+    let n3 = Some("text/n3");
+    let (status, text) = send(
+        &app,
+        Method::PUT,
+        &format!("{base}/rules?name=broken.n3"),
+        n3,
+        "@prefix : <http://e/> .\n\n{ ?x :parent ?y } => { ?y :child ?x  .\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("line 4, column 1"), "{text}");
+    let (status, _) = send(&app, Method::GET, &format!("{base}/rules"), None, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing stored");
+
+    let rules = "@prefix : <http://e/> .\n{ ?x :parent ?y } => { ?y :child ?x } .\n";
+    let (status, text) = send(
+        &app,
+        Method::PUT,
+        &format!("{base}/rules?name=family.n3"),
+        n3,
+        rules,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let (status, text) = send(&app, Method::GET, &format!("{base}/rules"), None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let stored: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(stored["name"], "family.n3");
+    assert_eq!(stored["format"], "n3");
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/update"),
+        Some("application/sparql-update"),
+        "INSERT DATA { <http://e/ann> <http://e/parent> <http://e/bob> }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let ask = "ASK { <http://e/bob> <http://e/child> <http://e/ann> }";
+    let (_, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/query"),
+        Some("application/sparql-query"),
+        ask,
+    )
+    .await;
+    assert!(text.contains("true"), "the rule derives: {text}");
+
+    let (status, _) = send(&app, Method::DELETE, &format!("{base}/rules"), None, "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(&app, Method::GET, &format!("{base}/rules"), None, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/query"),
+        Some("application/sparql-query"),
+        ask,
+    )
+    .await;
+    assert!(text.contains("false"), "the inference is gone: {text}");
+}
