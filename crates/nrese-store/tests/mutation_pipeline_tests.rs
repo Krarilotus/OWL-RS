@@ -854,3 +854,60 @@ fn datatype_consistency() {
         )
         .unwrap();
 }
+
+/// A full OWL 2 RL materialisation by representatives of the `owl:sameAs` classes
+/// (`reasoner.equality = "representatives"`, the default) stores the same statements as
+/// one with the replacement rules: on data whose equalities come from `sameAs` chains, a
+/// functional and an inverse-functional property, and reach subjects, objects and a
+/// predicate.
+#[test]
+fn materialisation_by_representatives_equals_replication() {
+    let owl = "http://www.w3.org/2002/07/owl#";
+    let data = format!(
+        "@prefix ex: <{EX}> . @prefix owl: <{owl}> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:a owl:sameAs ex:b . ex:b owl:sameAs ex:c . ex:d owl:sameAs ex:a .
+         ex:hasMother a owl:FunctionalProperty . ex:email a owl:InverseFunctionalProperty .
+         ex:kim ex:hasMother ex:m1 , ex:m2 . ex:p1 ex:email \"x@y\" . ex:p2 ex:email \"x@y\" .
+         ex:a ex:knows ex:kim . ex:p1 ex:age 30 . ex:c a ex:Person . ex:Person rdfs:subClassOf ex:Agent .
+         ex:knows owl:sameAs ex:meets . ex:meets a owl:SymmetricProperty .
+         ex:m2 ex:livesIn ex:berlin . ex:berlin owl:sameAs ex:berlinCity ."
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("equality.ttl");
+    std::fs::write(&file, &data).unwrap();
+    let everything = |representatives: bool| {
+        let config = nrese_store::StoreConfig {
+            equality_by_representatives: representatives,
+            ..in_memory_store_config()
+        };
+        let store = StoreService::new(config).expect("store");
+        store
+            .bulk_load(&nrese_store::BulkLoadRequest {
+                files: vec![file.clone()],
+                replace: false,
+                graph: nrese_store::GraphTarget::DefaultGraph,
+                skip_errors: false,
+            })
+            .expect("load");
+        store
+            .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .expect("rematerialise");
+        let mut quads: Vec<String> = store
+            .read_statements(&nrese_store::StatementPattern::default(), true)
+            .expect("statements")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        quads.sort();
+        quads
+    };
+    let replicated = everything(false);
+    let by_representatives = everything(true);
+    assert!(
+        replicated
+            .iter()
+            .any(|q| q.contains("meets") && q.contains("kim")),
+        "the equalities reach the data"
+    );
+    assert_eq!(by_representatives, replicated);
+}

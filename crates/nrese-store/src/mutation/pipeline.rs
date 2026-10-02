@@ -116,6 +116,7 @@ impl MutationPipeline {
                 let tx = &tx;
                 crate::reasoning::Program::new(&rules, &|term| tx.intern(term))
                     .hiding_unnamed_classes(self.store.config().hide_unnamed_classes)
+                    .by_representatives(self.store.config().equality_by_representatives)
             });
             let revision = tx.base().revision();
             // Writers are serialised by the transaction, so the cache can't change meanwhile.

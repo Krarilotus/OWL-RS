@@ -135,6 +135,8 @@ pub(super) struct RawReasonerConfig {
     pub rules: Option<String>,
     #[serde(default)]
     pub unnamed_classes: Option<String>,
+    #[serde(default)]
+    pub equality: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
