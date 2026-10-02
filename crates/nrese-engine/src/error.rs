@@ -22,4 +22,7 @@ pub enum EngineError {
     Locked(std::path::PathBuf),
     #[error("{0} uses an unsupported storage format; reload the data into a new directory")]
     UnsupportedFormat(std::path::PathBuf),
+    /// A speculative transaction ([`crate::Engine::speculative`]) was asked to commit.
+    #[error("a speculative transaction can't commit")]
+    Speculative,
 }
