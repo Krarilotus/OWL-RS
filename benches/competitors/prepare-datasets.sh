@@ -42,7 +42,7 @@ download() { # url file
 # (nt-filter.py), so that strict and lenient loaders get identical input.
 # The Oxigraph image has no shell, so it converts file by file; alpine concatenates.
 convert() { # name glob [filter]
-  local name=$1 glob=$2 filter=${3:-} file source
+  local name=$1 glob=$2 filter=${3:-} file source format
   in_volume "rm -rf '$name.parts' && mkdir '$name.parts'"
   for file in $(in_volume "ls $glob"); do
     source=$file
@@ -51,7 +51,13 @@ convert() { # name glob [filter]
       docker run --rm -v nrese-bench-data:/data -v "$HERE:/scripts:ro" "$PYTHON_IMAGE" \
         sh -c "python /scripts/nt-filter.py < '/data/real/$file' > '/data/real/$source'"
     fi
-    docker run --rm -v nrese-bench-data:/data "$OXIGRAPH_IMAGE" convert --from-format nt \
+    # The source's syntax by its extension (YAGO ships Turtle).
+    case $file in
+      *.ttl) format=ttl ;;
+      *.nq) format=nq ;;
+      *) format=nt ;;
+    esac
+    docker run --rm -v nrese-bench-data:/data "$OXIGRAPH_IMAGE" convert --from-format "$format" \
       --from-file "/data/real/$source" --to-file "/data/real/$name.parts/$(basename "$file").nt"
     [ -z "$filter" ] || in_volume "rm -f '$source'"
   done
