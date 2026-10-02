@@ -214,12 +214,22 @@ async fn updates_change_only_writable_graphs() -> Result<(), Box<dyn std::error:
     let app = seeded().await?;
     let analyst = &["analyst"];
     // Its own graphs: allowed, from the policy alone.
-    let insert = |graph: &str| format!("INSERT DATA {{ GRAPH <{EX}g/{graph}> {{ <{EX}x> <{EX}p> 9 }} }}");
-    assert_eq!(update(&app, analyst, &insert("analyst/new")).await?, StatusCode::NO_CONTENT);
+    let insert =
+        |graph: &str| format!("INSERT DATA {{ GRAPH <{EX}g/{graph}> {{ <{EX}x> <{EX}p> 9 }} }}");
+    assert_eq!(
+        update(&app, analyst, &insert("analyst/new")).await?,
+        StatusCode::NO_CONTENT
+    );
     // Readable but not writable, unreadable, the default graph: refused, whether the
     // statement is there or not.
-    assert_eq!(update(&app, analyst, &insert("pub/1")).await?, StatusCode::FORBIDDEN);
-    assert_eq!(update(&app, analyst, &insert("secret")).await?, StatusCode::FORBIDDEN);
+    assert_eq!(
+        update(&app, analyst, &insert("pub/1")).await?,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        update(&app, analyst, &insert("secret")).await?,
+        StatusCode::FORBIDDEN
+    );
     // Re-inserting a statement that is there changes nothing, and is still refused: the
     // answer doesn't tell whether a graph the role can't read holds it.
     assert_eq!(
@@ -232,7 +242,12 @@ async fn updates_change_only_writable_graphs() -> Result<(), Box<dyn std::error:
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        update(&app, analyst, &format!("INSERT DATA {{ <{EX}x> <{EX}p> 9 }}")).await?,
+        update(
+            &app,
+            analyst,
+            &format!("INSERT DATA {{ <{EX}x> <{EX}p> 9 }}")
+        )
+        .await?,
         StatusCode::FORBIDDEN
     );
     // A WHERE clause sees the readable graphs: copying them into a writable graph copies
@@ -251,18 +266,17 @@ async fn updates_change_only_writable_graphs() -> Result<(), Box<dyn std::error:
     let copied = format!("SELECT ?x WHERE {{ GRAPH <{EX}g/analyst/copy> {{ ?x ?p ?o }} }}");
     assert_eq!(
         select(&app, &["nrese.admin"], &copied).await?,
-        vec![
-            format!("{EX}n1"),
-            format!("{EX}p1"),
-            format!("{EX}x")
-        ]
+        vec![format!("{EX}n1"), format!("{EX}p1"), format!("{EX}x")]
     );
     // Deleting everything it sees would change a public graph: refused as a whole.
     assert_eq!(
         update(&app, analyst, "DELETE WHERE { GRAPH ?g { ?s ?p ?o } }").await?,
         StatusCode::FORBIDDEN
     );
-    assert_eq!(update(&app, analyst, "CLEAR ALL").await?, StatusCode::FORBIDDEN);
+    assert_eq!(
+        update(&app, analyst, "CLEAR ALL").await?,
+        StatusCode::FORBIDDEN
+    );
     // An unreadable graph is absent: dropping it does nothing.
     assert_eq!(
         update(&app, analyst, &format!("DROP SILENT GRAPH <{EX}g/secret>")).await?,
@@ -294,11 +308,22 @@ async fn graph_store_and_rdf4j_follow_the_policy() -> Result<(), Box<dyn std::er
     let (status, _) = send(&app, analyst, Method::GET, &graph("pub/1"), None, "").await?;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = send(&app, analyst, Method::GET, &graph("secret"), None, "").await?;
-    assert_eq!(status, StatusCode::NOT_FOUND, "an unreadable graph is absent");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unreadable graph is absent"
+    );
     let turtle = Some("text/turtle");
     let triple = format!("<{EX}y> <{EX}p> 1 .");
-    let (status, _) =
-        send(&app, analyst, Method::PUT, &graph("analyst/gsp"), turtle, &triple).await?;
+    let (status, _) = send(
+        &app,
+        analyst,
+        Method::PUT,
+        &graph("analyst/gsp"),
+        turtle,
+        &triple,
+    )
+    .await?;
     assert_eq!(status, StatusCode::CREATED);
     let (status, _) = send(&app, analyst, Method::PUT, &graph("pub/1"), turtle, &triple).await?;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -306,11 +331,29 @@ async fn graph_store_and_rdf4j_follow_the_policy() -> Result<(), Box<dyn std::er
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // RDF4J: contexts, size and statements count what the role may read.
-    let (status, body) =
-        send(&app, analyst, Method::GET, "/repositories/nrese/contexts", None, "").await?;
+    let (status, body) = send(
+        &app,
+        analyst,
+        Method::GET,
+        "/repositories/nrese/contexts",
+        None,
+        "",
+    )
+    .await?;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("g/pub/1") && !body.contains("g/secret"), "{body}");
-    let (_, size) = send(&app, analyst, Method::GET, "/repositories/nrese/size", None, "").await?;
+    assert!(
+        body.contains("g/pub/1") && !body.contains("g/secret"),
+        "{body}"
+    );
+    let (_, size) = send(
+        &app,
+        analyst,
+        Method::GET,
+        "/repositories/nrese/size",
+        None,
+        "",
+    )
+    .await?;
     // Two asserted statements in the default graph, one each in pub/1, analyst/notes and
     // analyst/gsp; the secret one and the inferred ones don't count.
     assert_eq!(size.trim(), "5");

@@ -63,10 +63,7 @@ impl StatementPattern {
         };
         let mut graphs: Vec<TermId> = match (&self.access, self.contexts.is_empty()) {
             (None, true) => return vec![pattern(GraphSelector::Any)],
-            (Some(_), true) => view
-                .named_graphs()
-                .chain([TermId::DEFAULT_GRAPH])
-                .collect(),
+            (Some(_), true) => view.named_graphs().chain([TermId::DEFAULT_GRAPH]).collect(),
             (_, false) => self
                 .contexts
                 .iter()
