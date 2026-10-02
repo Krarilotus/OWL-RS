@@ -431,7 +431,12 @@ impl Dictionary {
             }
             text.cover(end);
         }
-        self.text.read().search(query)
+        let inner = self.inner.read();
+        let text_of = |id: u64| match view_key(inner.key(TermId::from_raw(id).payload())) {
+            TermView::String(value) | TermView::LangString { value, .. } => Some(value.to_owned()),
+            _ => None,
+        };
+        self.text.read().search(query, &text_of)
     }
 
     /// The ids of the entries `0..limit` whose text passes `test`, sorted: one parallel
