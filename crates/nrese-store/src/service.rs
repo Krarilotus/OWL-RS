@@ -114,11 +114,25 @@ impl StoreService {
 
     /// Whether the recorded reasoning closes the data under `owl:sameAs` (a ruleset with
     /// the equality rules): queries may then rely on it.
+    ///
+    /// A stack kept over representatives (`reasoner.equality = "compact"`) is read
+    /// expanded: the engine learns `owl:sameAs` ([`nrese_engine::Engine::set_equality`]).
     fn note_equality(&self, state: &crate::ReasoningState) {
         let closed = nrese_reasoner::RuleProgram::closes_equality(&state.ruleset);
         self.settings
             .equality_closed
             .store(closed, std::sync::atomic::Ordering::Release);
+        let same_as = (closed && state.compact_equality)
+            .then(|| {
+                self.engine.snapshot().lookup(
+                    nrese_rdf::NamedNodeRef::new_unchecked(
+                        "http://www.w3.org/2002/07/owl#sameAs",
+                    )
+                    .into(),
+                )
+            })
+            .flatten();
+        self.engine.set_equality(same_as);
     }
 
     fn marker_path(&self) -> Option<PathBuf> {
@@ -183,6 +197,7 @@ impl StoreService {
     /// Empties the inferred stack (reasoning switched off), forgetting the marker.
     pub fn clear_inferred(&self) -> StoreResult<u64> {
         self.invalidate_reasoning()?;
+        self.engine.set_equality(None);
         let rematerialisation = self.engine.rematerialisation();
         if rematerialisation.base().len_in(ReadModel::Inferred) == 0 {
             return Ok(0);
@@ -490,7 +505,13 @@ impl StoreService {
     pub fn reasoning_is_current(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> bool {
         let program = program.into();
         self.reasoning_state()
-            .is_some_and(|state| state.is_current_with(&program, self.config.hide_unnamed_classes))
+            .is_some_and(|state| {
+                state.is_current_with(
+                    &program,
+                    self.config.hide_unnamed_classes,
+                    self.config.equality_compact,
+                )
+            })
     }
 
     /// The closure's size with equality replicated and over representatives, for
@@ -526,7 +547,8 @@ impl StoreService {
             .len_in(nrese_engine::ReadModel::Asserted);
         let program = crate::reasoning::Program::new(rules, &|term| rematerialisation.intern(term))
             .hiding_unnamed_classes(self.config.hide_unnamed_classes)
-            .by_representatives(self.config.equality_by_representatives);
+            .by_representatives(self.config.equality_by_representatives)
+            .storing_representatives(self.config.equality_compact);
         let closure = crate::reasoning::materialise_until(&program, rematerialisation.base(), stop)
             .map_err(|_| crate::StoreError::MaterialisationCancelled)?;
         let inferred = closure.inferred.len() as u64;
@@ -545,6 +567,7 @@ impl StoreService {
         self.record_reasoning(crate::ReasoningState::of_with(
             rules,
             self.config.hide_unnamed_classes,
+            self.config.equality_compact,
             closure.violations.len(),
         ))?;
         if !closure.violations.is_empty() {

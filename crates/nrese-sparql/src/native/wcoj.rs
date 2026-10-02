@@ -147,7 +147,7 @@ impl<'a> Query<'a> {
 
     fn count(&self, pattern: &[Pos; 3], bindings: &[Option<u64>]) -> u64 {
         self.snapshot
-            .count_in(self.model, &self.quad_pattern(pattern, bindings))
+            .estimate_in(self.model, &self.quad_pattern(pattern, bindings))
     }
 
     /// A variable order: start with the variable whose most selective pattern is smallest,

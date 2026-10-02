@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 
+use super::equality::{Classes as EqualityClasses, Expand, Visibility as CopyVisibility};
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
@@ -18,11 +19,17 @@ use crate::term::{Dictionary, TermId};
 /// Term lookups are bounded by the dictionary size at the snapshot's revision, so terms
 /// interned later (even by an open transaction) are reported as unknown, which keeps term
 /// identity stable for the lifetime of a query.
+///
+/// With equality by representatives on ([`crate::Engine::set_equality`]), reads of the
+/// default graph with inferred statements expand the stored closure to every identity of
+/// its terms ([`super::equality`]); [`Self::stored`] reads the statements as stored.
 #[derive(Clone)]
 pub struct Snapshot {
     version: Arc<Version>,
     dictionary: Arc<Dictionary>,
     statistics: Arc<Statistics>,
+    /// `owl:sameAs`, when reads expand equality classes.
+    equality: Option<TermId>,
 }
 
 impl std::fmt::Debug for Snapshot {
@@ -40,12 +47,205 @@ impl Snapshot {
         version: Arc<Version>,
         dictionary: Arc<Dictionary>,
         statistics: Arc<Statistics>,
+        equality: Option<TermId>,
     ) -> Self {
         Self {
             version,
             dictionary,
             statistics,
+            equality,
         }
+    }
+
+    /// This snapshot reading the statements as stored: no equality expansion.
+    pub fn stored(&self) -> Snapshot {
+        Snapshot {
+            equality: None,
+            ..self.clone()
+        }
+    }
+
+    /// The `owl:sameAs` classes reads expand, if equality by representatives is on.
+    pub fn equality_classes(&self) -> Option<Arc<EqualityClasses>> {
+        let same_as = self.equality?;
+        Some(self.version.equality.classes(&self.version, same_as))
+    }
+
+    /// The classes a read of `pattern` in `model` expands: equality is on, some class
+    /// exists, the model has inferred statements and the pattern can match the default
+    /// graph.
+    fn expanding(&self, model: ReadModel, pattern: &QuadPattern) -> Option<Arc<EqualityClasses>> {
+        let default_graph = match pattern.graph {
+            GraphSelector::Any => true,
+            GraphSelector::AnyNamed => false,
+            GraphSelector::Exact(graph) => graph.is_default_graph(),
+        };
+        if model == ReadModel::Asserted || !default_graph {
+            return None;
+        }
+        self.equality_classes().filter(|classes| !classes.is_empty())
+    }
+
+    /// The expanded matches of `pattern` in `model`, sorted by `permutation` (module docs
+    /// of [`super::equality`]). `None` if `permutation` can't answer the pattern or a stack
+    /// doesn't keep it.
+    fn expanded_sorted<'a>(
+        &'a self,
+        classes: Arc<EqualityClasses>,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
+        let normalised = classes.normalised(pattern);
+        let plan = AccessPlan::in_permutation(&normalised, permutation)?;
+        let supported = Stack::ALL
+            .into_iter()
+            .all(|stack| self.version.stack(stack).layout().supports(permutation));
+        if !supported {
+            return None;
+        }
+        // Named graphs are read as stored, with the pattern's own constants: from this
+        // scan when the representatives are those constants, else from one of their own.
+        let named = model == ReadModel::Materialised && pattern.graph == GraphSelector::Any;
+        let renamed = normalised != *pattern;
+        let named_plan = match named && renamed {
+            true => Some(AccessPlan::in_permutation(pattern, permutation)?),
+            false => None,
+        };
+        let stored = SortedMerge {
+            left: self.version.asserted.scan_plan(&plan).peekable(),
+            right: self.version.inferred.scan_plan(&plan).peekable(),
+            permutation,
+        };
+        let expanded = Expand::new(
+            stored,
+            classes,
+            *pattern,
+            permutation,
+            named && !renamed,
+            model,
+            &self.version,
+        );
+        let named = named_plan
+            .into_iter()
+            .flat_map(move |plan| self.version.asserted.scan_plan(&plan))
+            .filter(|quad| !quad.graph.is_default_graph());
+        Some(SortedMerge {
+            left: expanded.peekable(),
+            right: named.peekable(),
+            permutation,
+        })
+    }
+
+    /// The expanded matches of `pattern` in `model`, in the order of its access plan.
+    fn expanded<'a>(
+        &'a self,
+        classes: Arc<EqualityClasses>,
+        model: ReadModel,
+        pattern: &QuadPattern,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        let permutation = AccessPlan::for_pattern(&classes.normalised(pattern)).permutation;
+        match self.expanded_sorted(Arc::clone(&classes), model, pattern, permutation) {
+            Some(sorted) => Either::Left(sorted),
+            None => {
+                // A layout without the permutation: every match, then sorted.
+                let mut all: Vec<EncodedQuad> = Vec::new();
+                let normalised = classes.normalised(pattern);
+                for stack in Stack::ALL {
+                    for quad in self.stack_quads(stack, &normalised) {
+                        if !quad.graph.is_default_graph() {
+                            if model == ReadModel::Materialised && normalised == *pattern {
+                                all.push(quad);
+                            }
+                            continue;
+                        }
+                        if !classes.is_canonical(&quad) {
+                            continue;
+                        }
+                        let touching = classes.touches(&quad);
+                        let visibility = CopyVisibility::new(&self.version, model);
+                        classes.expand(&quad, pattern, &mut |copy| {
+                            if visibility.shows(&copy, touching) {
+                                all.push(copy);
+                            }
+                        });
+                    }
+                }
+                if model == ReadModel::Materialised
+                    && pattern.graph == GraphSelector::Any
+                    && normalised != *pattern
+                {
+                    all.extend(
+                        self.stack_quads(Stack::Asserted, pattern)
+                            .filter(|quad| !quad.graph.is_default_graph()),
+                    );
+                }
+                all.sort_unstable_by_key(|quad| permutation.to_key(quad));
+                Either::Right(all.into_iter())
+            }
+        }
+    }
+
+    /// The number of quads matching `pattern` in `model`, expanded: the stored matches over
+    /// representatives weighted by how many quads each stands for.
+    fn expanded_count(
+        &self,
+        classes: &EqualityClasses,
+        model: ReadModel,
+        pattern: &QuadPattern,
+    ) -> u64 {
+        let normalised = classes.normalised(pattern);
+        let visibility = CopyVisibility::new(&self.version, model);
+        let mut count = 0;
+        for stack in Stack::ALL {
+            for quad in self.stack_quads(stack, &normalised) {
+                if !quad.graph.is_default_graph() {
+                    count += u64::from(model == ReadModel::Materialised && normalised == *pattern);
+                    continue;
+                }
+                if !classes.is_canonical(&quad) {
+                    continue;
+                }
+                let touching = classes.touches(&quad);
+                count += match visibility.shows_all(touching) {
+                    true => classes.multiplicity(&quad, pattern),
+                    false => {
+                        let mut copies = 0;
+                        classes.expand(&quad, pattern, &mut |copy| {
+                            copies += u64::from(visibility.shows(&copy, touching));
+                        });
+                        copies
+                    }
+                };
+            }
+        }
+        if model == ReadModel::Materialised
+            && pattern.graph == GraphSelector::Any
+            && normalised != *pattern
+        {
+            count += self
+                .stack_quads(Stack::Asserted, pattern)
+                .filter(|quad| !quad.graph.is_default_graph())
+                .count() as u64;
+        }
+        count
+    }
+
+    /// An estimate of [`count_in`](Self::count_in) for planning, O(r log n): with
+    /// equality classes, the stored matches without weighing the classes. Zero only if
+    /// nothing matches.
+    pub fn estimate_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+        let Some(classes) = self.expanding(model, pattern) else {
+            return self.count_in(model, pattern);
+        };
+        let stored = self.stored();
+        let normalised = classes.normalised(pattern);
+        let mut estimate = stored.count_in(ReadModel::Materialised, &normalised);
+        // Named graphs are read with the pattern's own constants.
+        if normalised != *pattern && pattern.graph == GraphSelector::Any {
+            estimate += stored.count_in(ReadModel::Asserted, pattern);
+        }
+        estimate
     }
 
     /// Whether `other` shows the same version of the same engine (a cache key).
@@ -59,6 +259,7 @@ impl Snapshot {
             version: Arc::new(version),
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::clone(&self.statistics),
+            equality: self.equality,
         }
     }
 
@@ -103,6 +304,25 @@ impl Snapshot {
 
     /// O(r log n) per included stack.
     pub fn contains_in(&self, model: ReadModel, quad: &EncodedQuad) -> bool {
+        if quad.graph.is_default_graph()
+            && let Some(classes) =
+                self.expanding(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH))
+        {
+            // Held iff its copy over representatives is stored (and, for the inferred
+            // model, it isn't asserted).
+            let canonical = EncodedQuad::new(
+                classes.representative(quad.subject),
+                classes.representative(quad.predicate),
+                classes.representative(quad.object),
+                quad.graph,
+            );
+            let stored = Stack::ALL
+                .into_iter()
+                .any(|stack| self.stack_contains(stack, &canonical));
+            return stored
+                && CopyVisibility::new(&self.version, model)
+                    .shows(quad, classes.touches(&canonical));
+        }
         Stack::ALL
             .into_iter()
             .any(|stack| model.includes(stack) && self.stack_contains(stack, quad))
@@ -128,11 +348,16 @@ impl Snapshot {
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        if let Some(classes) = self.expanding(model, pattern) {
+            return Either::Left(self.expanded(classes, model, pattern));
+        }
         let pattern = *pattern;
-        Stack::ALL
-            .into_iter()
-            .filter(move |&stack| model.includes(stack))
-            .flat_map(move |stack| self.stack_quads(stack, &pattern))
+        Either::Right(
+            Stack::ALL
+                .into_iter()
+                .filter(move |&stack| model.includes(stack))
+                .flat_map(move |stack| self.stack_quads(stack, &pattern)),
+        )
     }
 
     /// Exact number of quads matching `pattern`, asserted and inferred.
@@ -144,6 +369,9 @@ impl Snapshot {
     /// per stack when the matching runs hold no tombstones in range (see
     /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up.
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+        if let Some(classes) = self.expanding(model, pattern) {
+            return self.expanded_count(&classes, model, pattern);
+        }
         if pattern.graph == GraphSelector::AnyNamed {
             // Every graph minus the default graph: two range counts instead of a scan.
             let every = QuadPattern {
@@ -167,6 +395,9 @@ impl Snapshot {
     /// True if some quad matches `pattern` in `model`; cheaper than
     /// [`count_in`](Self::count_in)` > 0`.
     pub fn exists_in(&self, model: ReadModel, pattern: &QuadPattern) -> bool {
+        if let Some(classes) = self.expanding(model, pattern) {
+            return self.expanded(classes, model, pattern).next().is_some();
+        }
         if pattern.graph == GraphSelector::AnyNamed {
             return self.count_in(model, pattern) > 0;
         }
@@ -187,6 +418,11 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
+        if let Some(classes) = self.expanding(model, pattern) {
+            return self
+                .expanded_sorted(classes, model, pattern, permutation)
+                .map(Either::Left);
+        }
         let plan = AccessPlan::in_permutation(pattern, permutation)?;
         let supported = Stack::ALL.into_iter().all(|stack| {
             !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
@@ -201,11 +437,11 @@ impl Snapshot {
                 .into_iter()
                 .flatten()
         };
-        Some(SortedMerge {
+        Some(Either::Right(SortedMerge {
             left: scan(Stack::Asserted).peekable(),
             right: scan(Stack::Inferred).peekable(),
             permutation,
-        })
+        }))
     }
 
     /// Like [`scan_sorted_in`](Self::scan_sorted_in), with the first unbound component of the
@@ -276,6 +512,9 @@ impl Snapshot {
         low: TermId,
         high: TermId,
     ) -> Option<AccessPlan> {
+        if self.expanding(model, pattern).is_some() {
+            return None;
+        }
         let mut plan = AccessPlan::in_permutation(pattern, permutation)?;
         let bound = plan
             .low
@@ -306,6 +545,9 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<Vec<(TermId, u64)>> {
+        if self.expanding(model, pattern).is_some() {
+            return None;
+        }
         let plan = AccessPlan::in_permutation(pattern, permutation)?;
         if plan.exclude_default_graph {
             return None;
@@ -369,6 +611,9 @@ impl Snapshot {
         permutation: Permutation,
         components: &[usize],
     ) -> Option<Vec<Vec<u64>>> {
+        if self.expanding(model, pattern).is_some() {
+            return None;
+        }
         let plan = AccessPlan::in_permutation(pattern, permutation)?;
         if plan.exclude_default_graph {
             return None;
@@ -424,6 +669,13 @@ impl Snapshot {
     /// for this version once computed. The two walks (subjects, objects) run in parallel.
     /// `None` where [`Self::group_counts_in`] can't walk the graphs.
     pub fn node_count_in(&self, model: ReadModel, graphs: GraphSelector) -> Option<u64> {
+        let pattern = QuadPattern {
+            graph: graphs,
+            ..QuadPattern::all()
+        };
+        if self.expanding(model, &pattern).is_some() {
+            return None;
+        }
         self.statistics
             .node_count(&self.version, model, graphs, || {
                 let (pattern, by_subject, by_object) = match graphs {
@@ -470,6 +722,9 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<u64> {
+        if self.expanding(model, pattern).is_some() {
+            return None;
+        }
         let plan = AccessPlan::in_permutation(pattern, permutation)?;
         if plan.exclude_default_graph {
             return None;
@@ -687,4 +942,26 @@ fn merge_columns(
         }
     }
     out
+}
+
+/// One of two iterators.
+enum Either<L, R> {
+    Left(L),
+    Right(R),
+}
+
+impl<L, R> Iterator for Either<L, R>
+where
+    L: Iterator<Item = EncodedQuad>,
+    R: Iterator<Item = EncodedQuad>,
+{
+    type Item = EncodedQuad;
+
+    #[inline]
+    fn next(&mut self) -> Option<EncodedQuad> {
+        match self {
+            Either::Left(left) => left.next(),
+            Either::Right(right) => right.next(),
+        }
+    }
 }

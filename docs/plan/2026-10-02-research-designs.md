@@ -56,6 +56,17 @@ such giants.
 - Configuration: `reasoner.equality = off | axiomatic | rewrite`, `equality.answers =
   strict | canonical`, `equality.scope = dataset | named-graph`, representative policy;
   memory budgets with spilling, an error (never a silently partial closure) past them.
+- **Status (2 October), stage B:** `reasoner.equality = "compact"` keeps the closure over
+  representatives (the class's smallest id) in the inferred stack, each other identity as
+  `identity owl:sameAs representative`; the engine reads the default graph expanded
+  (constants looked up by representative, scans kept in index order by a heap, exact
+  counts weighted by class sizes, cheap estimates for the planner; the columnar, range
+  and group-count fast paths step aside while a class exists). Commits without class
+  changes are rewritten to representatives incrementally; a merge or split recomputes the
+  closure after the commit. Differential tests against replication: fixed and random
+  data, commits, named graphs, restart. Not yet: stable class ids apart from the
+  smallest id, incremental merges and splits (B/F), late expansion in the executor
+  (stage C), `strict`/`canonical` answer modes, bulk class building by sorting.
 - Benchmarks: UOBM and Claros-like data (RDFox's), LDBC SPB, a sameAs.cc-shaped identity
   graph, and our own torture test (class-size distributions up to 10^6 members, chain /
   star / mesh topologies with the same closure, merges, redundant deletes, bridge

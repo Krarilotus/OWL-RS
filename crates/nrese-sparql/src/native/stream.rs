@@ -183,7 +183,7 @@ impl Context<'_> {
         }
         // The smallest pattern starts every morsel.
         let first = (0..scans.len())
-            .min_by_key(|&i| self.snapshot.count_in(self.model, &scans[i].quad_pattern()))
+            .min_by_key(|&i| self.snapshot.estimate_in(self.model, &scans[i].quad_pattern()))
             .expect("two patterns or more");
         let rest: Vec<TriplePattern> = plan
             .patterns

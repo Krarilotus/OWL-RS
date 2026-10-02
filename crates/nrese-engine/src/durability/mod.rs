@@ -175,6 +175,7 @@ impl Durable {
                     inferred,
                     revision: loaded.revision,
                     dictionary_len: 0,
+                    equality: Default::default(),
                 }
             }
             None => Version::empty(),

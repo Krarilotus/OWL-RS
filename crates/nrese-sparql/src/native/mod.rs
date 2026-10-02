@@ -2037,7 +2037,7 @@ impl<'a> Context<'a> {
                             }),
                         _ => None,
                     };
-                    hinted.unwrap_or_else(|| self.snapshot.count_in(self.model, &s.quad_pattern()))
+                    hinted.unwrap_or_else(|| self.snapshot.estimate_in(self.model, &s.quad_pattern()))
                 })
                 .min()
                 .unwrap_or(0);
@@ -2058,7 +2058,7 @@ impl<'a> Context<'a> {
                 ) else {
                     continue;
                 };
-                let rows = self.snapshot.count_in(self.model, &s.quad_pattern());
+                let rows = self.snapshot.estimate_in(self.model, &s.quad_pattern());
                 // A prefix found by binary search in the text order costs nothing worth
                 // weighing; otherwise the dictionary pass must be worth its size.
                 let cheap = condition.is_prefix() && self.snapshot.text_order_ready();
@@ -2108,10 +2108,10 @@ impl<'a> Context<'a> {
             .map(|(s, ranged)| match ranged {
                 // One pattern: nothing to order, and the ranges are read once anyway.
                 Some(_) if scans.len() == 1 => {
-                    self.snapshot.count_in(self.model, &s.quad_pattern())
+                    self.snapshot.estimate_in(self.model, &s.quad_pattern())
                 }
                 Some((permutation, ranges)) => self.count_ranges(s, *permutation, ranges),
-                None => self.snapshot.count_in(self.model, &s.quad_pattern()),
+                None => self.snapshot.estimate_in(self.model, &s.quad_pattern()),
             })
             .collect();
         let start = Instant::now();
@@ -2347,7 +2347,7 @@ impl<'a> Context<'a> {
         }
         let counts: Vec<u64> = scans
             .iter()
-            .map(|s| self.snapshot.count_in(self.model, &s.quad_pattern()))
+            .map(|s| self.snapshot.estimate_in(self.model, &s.quad_pattern()))
             .collect();
         // A conjunct runs once its variables are bound: by a scan, or by the seed where no
         // row leaves them unbound (a column alone isn't enough: an OPTIONAL may have left
@@ -2432,7 +2432,7 @@ impl<'a> Context<'a> {
             .step_by(step)
             .fold((0u64, 0u64), |(n, sum), range| (n + 1, sum + count(range)));
         let estimate = exact + (sum as f64 * rest.len() as f64 / sampled as f64).round() as u64;
-        estimate.min(self.snapshot.count_in(self.model, &pattern))
+        estimate.min(self.snapshot.estimate_in(self.model, &pattern))
     }
 
     /// Applies, and removes from `filters`, the conjuncts whose variables `solutions` binds.

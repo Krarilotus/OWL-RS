@@ -28,6 +28,16 @@ static CACHE: Mutex<Option<(Snapshot, Arc<Representatives>)>> = Mutex::new(None)
 
 fn build(snapshot: &Snapshot) -> Representatives {
     let mut out = HashMap::new();
+    // A store kept over representatives knows its classes; its `sameAs` relation, read
+    // expanded, would list every pair of each class.
+    if let Some(classes) = snapshot.equality_classes() {
+        for (representative, members) in classes.iter() {
+            for &member in members {
+                out.insert(member, representative);
+            }
+        }
+        return out;
+    }
     let Some(same_as) = snapshot.lookup(NamedNodeRef::new_unchecked(SAME_AS).into()) else {
         return out;
     };

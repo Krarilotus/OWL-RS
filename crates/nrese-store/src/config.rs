@@ -39,6 +39,11 @@ pub struct StoreConfig {
     /// the default) instead of copying every fact to every identity while computing it
     /// (`"replicate"`). The same closure either way.
     pub equality_by_representatives: bool,
+    /// With [`Self::equality_by_representatives`]: the inferred stack keeps the closure
+    /// over representatives, and reads expand it to every identity
+    /// (`reasoner.equality = "compact"`; W4 stage B): storage and commits shrink by the
+    /// replication factor, reads of facts about identities pay the expansion.
+    pub equality_compact: bool,
     /// On disk: check the whole checkpoint when opening (see
     /// `nrese_engine::DurabilityConfig::verify_on_open`). Off: the checkpoint is used in
     /// place and opening reads only its structure.
@@ -147,6 +152,7 @@ impl StoreConfig {
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             equality_by_representatives: true,
+            equality_compact: false,
             verify_on_open: false,
             map_checkpoints: true,
             bulk_load_memory_bytes: 0,
@@ -168,6 +174,7 @@ impl StoreConfig {
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             equality_by_representatives: true,
+            equality_compact: false,
             verify_on_open: false,
             map_checkpoints: true,
             bulk_load_memory_bytes: 0,
@@ -184,6 +191,13 @@ impl StoreConfig {
     }
 
     pub fn validate(&self) -> StoreResult<()> {
+        if self.equality_compact && !self.equality_by_representatives {
+            return Err(crate::StoreError::Configuration(
+                "compact equality storage computes over representatives; it needs \
+                 equality_by_representatives"
+                    .to_owned(),
+            ));
+        }
         if matches!(self.mode, StoreMode::OnDisk) && self.data_dir.as_os_str().is_empty() {
             return Err(StoreError::Configuration(
                 "data_dir must not be empty in on-disk mode".to_owned(),
