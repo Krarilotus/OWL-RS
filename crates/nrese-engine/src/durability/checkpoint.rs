@@ -1,17 +1,20 @@
 //! Checkpoints: a full image of one revision (dictionary plus both index stacks).
 //!
-//! Format 9 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* | crc32
+//! Format 11 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* | crc32
 //! u32`. The CRC covers everything before it. Flag bit 0 ([`INTEGERS_IN_DICTIONARY`]):
 //! integer-derived literals are dictionary entries, not inline (a store created before
 //! [`TermKind::DerivedInteger`](crate::term::TermKind)); formats 4-7 have no flags and
 //! are such stores.
-//! - The dictionary is `len u64 | arena_len u64 | slot_count u64 | padding | ends: len ×
-//!   u64 | arena: arena_len bytes | padding | slots: slot_count × u32`: the keys one after
-//!   another, their end offsets, and an open-addressing hash table of them (linear probing
-//!   by the fixed [`key_hash`], entry index + 1 per slot, 0 empty), then `padding |
-//!   order_len u64 | order: order_len × u32`, the entries with a text sorted by it
-//!   ([`crate::term::order`]: prefix searches). Padding is zero bytes up to an 8-byte
-//!   boundary of the file. Format 7 is format 8 without the flags, format 6 format 7
+//! - The dictionary is `len u64 | arena_len u64 | slot_count u64 | ends_len u64 | padding |
+//!   blocks: 2·⌈len/64⌉ × u64 | arena: arena_len bytes | ends: ends_len bytes | padding |
+//!   slots: slot_count × u32`: block offsets ([`crate::term::offsets`]), the keys one after
+//!   another, their ends relative to their block, and an open-addressing hash table of the
+//!   keys (linear probing by the fixed [`key_hash`], entry index + 1 per slot, 0 empty),
+//!   then `padding | order_len u64 | order: order_len × u32`, the entries with a text
+//!   sorted by it ([`crate::term::order`]: prefix searches). Padding is zero bytes up to an
+//!   8-byte boundary of the file. Formats 8 to 10 have `len u64 | arena_len u64 |
+//!   slot_count u64 | padding | ends: len × u64 | arena | padding | slots …` instead: an
+//!   8-byte end offset per key. Format 7 is format 8 without the flags, format 6 format 7
 //!   without the order.
 //! - Each stack (asserted, then inferred) is `count u32 | (permutation u8, packed keys)*`:
 //!   every permutation of the stack's layout, compressed as in memory
@@ -51,6 +54,7 @@ use crate::mapped::{Map, Mapped};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation};
 use crate::term::Dictionary;
 use crate::term::dictionary::{Base, base_slots};
+use crate::term::offsets::{BlockEnds, Ends, Offsets};
 use crate::term::hash::key_hash;
 
 /// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
@@ -58,8 +62,11 @@ use crate::term::hash::key_hash;
 /// stores the packed permutations (Pf2); version 6 aligns them for mapping; version 7 adds
 /// the dictionary's text order; version 8 the flags (integer-derived literals inline);
 /// version 9 lets the asserted stack have the default-graph layout; version 10 lets blocks
-/// of the packed permutations store a position as a palette.
-const MAGIC: &[u8; 8] = b"NRESECKA";
+/// of the packed permutations store a position as a palette; version 11 stores the
+/// dictionary's offsets in blocks.
+const MAGIC: &[u8; 8] = b"NRESECKB";
+/// Format 10: 8-byte dictionary end offsets.
+const MAGIC_V10: &[u8; 8] = b"NRESECKA";
 /// Formats 9 and 8 read as 10: their blocks have no palettes (the byte was zero padding).
 const MAGIC_V9: &[u8; 8] = b"NRESECK9";
 const MAGIC_V8: &[u8; 8] = b"NRESECK8";
@@ -193,21 +200,28 @@ fn write_dictionary<W: Write>(
         ));
     }
     let arena_len: u64 = lengths.iter().map(|&n| u64::from(n)).sum();
+    let (blocks, ends) = crate::term::offsets::encode(&lengths).ok_or_else(|| {
+        EngineError::Configuration(
+            "64 consecutive dictionary keys take 4 GiB or more; a checkpoint can't hold them"
+                .to_owned(),
+        )
+    })?;
+    drop(lengths);
     put_u64(&mut out.buffer, len);
     put_u64(&mut out.buffer, arena_len);
     put_u64(&mut out.buffer, slot_count as u64);
+    put_u64(&mut out.buffer, ends.len() as u64);
     out.pad();
-    let mut end = 0u64;
-    for &n in &lengths {
-        end += u64::from(n);
-        put_u64(&mut out.buffer, end);
+    for block in blocks {
+        put_u64(&mut out.buffer, block);
         out.drain()?;
     }
-    drop(lengths);
     for (from, to) in chunks() {
         dictionary.for_each_key(from, to, |key| out.buffer.extend_from_slice(key));
         out.drain()?;
     }
+    out.write_bytes(&ends)?;
+    drop(ends);
     out.pad();
     for slot in slots {
         put_u32(&mut out.buffer, slot);
@@ -224,12 +238,22 @@ fn write_dictionary<W: Write>(
 }
 
 /// Reads the dictionary section (module docs) from `reader`, positioned after the
-/// revision, as a [`Base`] of `map`; `with_order` from format 7 on.
-fn read_dictionary(reader: &mut Reader<'_>, map: &Map, with_order: bool) -> Result<Base, String> {
+/// revision, as a [`Base`] of `map`; `with_order` from format 7 on, `blocks` (block
+/// offsets) from format 11 on.
+fn read_dictionary(
+    reader: &mut Reader<'_>,
+    map: &Map,
+    with_order: bool,
+    blocks: bool,
+) -> Result<Base, String> {
     let truncated = || "truncated dictionary".to_owned();
     let len = reader.u64().ok_or_else(truncated)?;
     let arena_len = reader.u64().ok_or_else(truncated)?;
     let slot_count = reader.u64().ok_or_else(truncated)?;
+    let ends_len = match blocks {
+        true => reader.u64().ok_or_else(truncated)?,
+        false => 0,
+    };
     if len >= u64::from(u32::MAX) || !slot_count.is_power_of_two() || slot_count <= len {
         return Err("damaged dictionary header".into());
     }
@@ -245,9 +269,27 @@ fn read_dictionary(reader: &mut Reader<'_>, map: &Map, with_order: bool) -> Resu
     let padding = |at: usize| ((8 - at % 8) % 8) as u64;
     let at = section(0, 1)?;
     section(padding(at), 1)?;
-    let ends_at = section(len, 8)?;
-    let arena_at = section(arena_len, 1)?;
-    section(padding(arena_at + arena_len as usize), 1)?;
+    let unmappable = || "the dictionary can't be mapped on this machine".to_owned();
+    let (offsets, arena_at) = if blocks {
+        let block_count = len.div_ceil(crate::term::offsets::BLOCK as u64);
+        let blocks_at = section(2 * block_count, 8)?;
+        let arena_at = section(arena_len, 1)?;
+        let ends_at = section(ends_len, 1)?;
+        section(padding(ends_at + ends_len as usize), 1)?;
+        let offsets = Offsets::Blocks(BlockEnds {
+            count: len as usize,
+            blocks: Mapped::new(map, blocks_at, 2 * block_count as usize)
+                .ok_or_else(unmappable)?,
+            ends: Mapped::new(map, ends_at, ends_len as usize).ok_or_else(unmappable)?,
+        });
+        (offsets, arena_at)
+    } else {
+        let ends_at = section(len, 8)?;
+        let arena_at = section(arena_len, 1)?;
+        section(padding(arena_at + arena_len as usize), 1)?;
+        let ends = Mapped::new(map, ends_at, len as usize).ok_or_else(unmappable)?;
+        (Offsets::Ends(ends), arena_at)
+    };
     let slots_at = section(slot_count, 4)?;
     let order = if with_order {
         let at = section(0, 1)?;
@@ -261,18 +303,34 @@ fn read_dictionary(reader: &mut Reader<'_>, map: &Map, with_order: bool) -> Resu
     } else {
         None
     };
-    let unmappable = || "the dictionary can't be mapped on this machine".to_owned();
     let base = Base {
         len,
         arena: Mapped::new(map, arena_at, arena_len as usize).ok_or_else(unmappable)?,
-        ends: Mapped::new(map, ends_at, len as usize).ok_or_else(unmappable)?,
+        offsets,
         slots: Mapped::new(map, slots_at, slot_count as usize).ok_or_else(unmappable)?,
         order: match order {
             Some((at, count)) => Some(Mapped::new(map, at, count).ok_or_else(unmappable)?),
             None => None,
         },
     };
-    if base.ends.last().copied().unwrap_or(0) != arena_len {
+    // The last block's start and the last key's end, checked cheaply; `Base::verify`
+    // reads every offset.
+    let last_end = match (&base.offsets, len) {
+        (_, 0) => 0,
+        (Offsets::Ends(ends), _) => ends.last().copied().unwrap_or(0) as usize,
+        (Offsets::Blocks(blocks), _) => {
+            let block = (len as usize - 1) / crate::term::offsets::BLOCK;
+            let at = blocks.blocks[2 * block + 1];
+            let width = if at & 1 == 1 { 4 } else { 2 };
+            let needed = (at >> 1) as usize
+                + width * ((len as usize - 1) % crate::term::offsets::BLOCK + 1);
+            if needed > blocks.ends.len() {
+                return Err("dictionary block offsets point past their ends".into());
+            }
+            blocks.end(len as usize - 1)
+        }
+    };
+    if last_end as u64 != arena_len {
         return Err("dictionary end offsets don't match its keys".into());
     }
     Ok(base)
@@ -311,9 +369,8 @@ pub(crate) fn write_parts<'a>(
 ) -> EngineResult<PathBuf> {
     let tmp = checkpoint_path(dir, revision, "tmp");
     let mut file = File::create(&tmp)?;
-    // The magic is settled at the end: format 10 only where a block has a palette, so that
-    // stores built with the fast encoding stay readable by binaries that know format 9.
-    // It is checksummed apart and the checksums combined.
+    // The magic is written last, once everything else is on file; it is checksummed apart
+    // and the checksums combined.
     file.write_all(MAGIC)?;
     let mut out = Checksummed {
         inner: BufWriter::with_capacity(1 << 20, file),
@@ -321,7 +378,6 @@ pub(crate) fn write_parts<'a>(
         buffer: Vec::with_capacity(1 << 16),
         written: MAGIC.len() as u64,
     };
-    let mut palettes = false;
     put_u64(&mut out.buffer, revision);
     let flags = match dictionary.integers_in_dictionary() {
         true => INTEGERS_IN_DICTIONARY,
@@ -335,13 +391,12 @@ pub(crate) fn write_parts<'a>(
         for &permutation in permutations {
             out.buffer.push(permutation as u8);
             let keys = packed(stack, permutation)?;
-            palettes |= keys.has_palettes();
             let at = out.position();
             keys.write(Some(at), &mut |piece| out.write_bytes(piece))?;
         }
     }
     out.flush_buffer()?;
-    let magic = if palettes { MAGIC } else { MAGIC_V9 };
+    let magic = MAGIC;
     let mut crc = crc32fast::Hasher::new();
     crc.update(magic);
     crc.combine(&out.crc);
@@ -422,8 +477,13 @@ pub(crate) fn load_latest(
         .split_at_checked(bytes.len().saturating_sub(4))
         .ok_or_else(|| corrupt("truncated"))?;
     let mut reader = Reader::new(body);
+    let mut blocks = false;
     let (packed, aligned, with_order, with_flags) = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC || magic == MAGIC_V9 || magic == MAGIC_V8 => {
+        Some(magic) if magic == MAGIC => {
+            blocks = true;
+            (true, true, true, true)
+        }
+        Some(magic) if magic == MAGIC_V10 || magic == MAGIC_V9 || magic == MAGIC_V8 => {
             (true, true, true, true)
         }
         Some(magic) if magic == MAGIC_V7 => (true, true, true, false),
@@ -456,7 +516,8 @@ pub(crate) fn load_latest(
     };
     if aligned {
         let base =
-            read_dictionary(&mut reader, &map, with_order).map_err(|error| corrupt(&error))?;
+            read_dictionary(&mut reader, &map, with_order, blocks)
+                .map_err(|error| corrupt(&error))?;
         if verify {
             base.verify().map_err(|error| corrupt(&error))?;
         }
@@ -557,15 +618,15 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     let body = &bytes[..bytes.len().saturating_sub(4)];
     let mut reader = Reader::new(body);
     // Format 8 is format 9 with the quad layout only; 9 is 10 without palettes.
-    if !matches!(
-        reader.bytes(MAGIC.len()),
-        Some(magic) if magic == MAGIC || magic == MAGIC_V9 || magic == MAGIC_V8
-    ) {
-        return Err(corrupt("bad magic"));
-    }
+    let blocks = match reader.bytes(MAGIC.len()) {
+        Some(magic) if magic == MAGIC => true,
+        Some(magic) if magic == MAGIC_V10 || magic == MAGIC_V9 || magic == MAGIC_V8 => false,
+        _ => return Err(corrupt("bad magic")),
+    };
     reader.u64().ok_or_else(|| corrupt("truncated header"))?;
     reader.u64().ok_or_else(|| corrupt("truncated header"))?; // flags: this engine's
-    let base = read_dictionary(&mut reader, &map, true).map_err(|error| corrupt(&error))?;
+    let base =
+        read_dictionary(&mut reader, &map, true, blocks).map_err(|error| corrupt(&error))?;
     let [asserted, inferred] =
         read_stacks(&mut reader, body, Some(&map), false).map_err(|error| corrupt(&error))?;
     let index = |stack: Stack, packed| stack_index(stack, packed).map_err(|error| corrupt(&error));
