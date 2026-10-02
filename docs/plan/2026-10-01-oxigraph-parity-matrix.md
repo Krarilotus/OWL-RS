@@ -1,5 +1,8 @@
 # Oxigraph parity matrix
 
+> A record of its date. Its status columns and lines are not kept up to date: the
+> current status is in [STATUS.md](../STATUS.md).
+
 The owner's yardstick for the Oxigraph replacement (1 October 2026): reach parity with
 everything Oxigraph offers that our use cases need, where parity means the **intended
 behaviour of the standards**, not a copy of Oxigraph's bugs or departures; do it with our

@@ -56,17 +56,6 @@ such giants.
 - Configuration: `reasoner.equality = off | axiomatic | rewrite`, `equality.answers =
   strict | canonical`, `equality.scope = dataset | named-graph`, representative policy;
   memory budgets with spilling, an error (never a silently partial closure) past them.
-- **Status (2 October), stage B:** `reasoner.equality = "compact"` keeps the closure over
-  representatives (the class's smallest id) in the inferred stack, each other identity as
-  `identity owl:sameAs representative`; the engine reads the default graph expanded
-  (constants looked up by representative, scans kept in index order by a heap, exact
-  counts weighted by class sizes, cheap estimates for the planner; the columnar, range
-  and group-count fast paths step aside while a class exists). Commits without class
-  changes are rewritten to representatives incrementally; a merge or split recomputes the
-  closure after the commit. Differential tests against replication: fixed and random
-  data, commits, named graphs, restart. Not yet: stable class ids apart from the
-  smallest id, incremental merges and splits (B/F), late expansion in the executor
-  (stage C), `strict`/`canonical` answer modes, bulk class building by sorting.
 - Benchmarks: UOBM and Claros-like data (RDFox's), LDBC SPB, a sameAs.cc-shaped identity
   graph, and our own torture test (class-size distributions up to 10^6 members, chain /
   star / mesh topologies with the same closure, merges, redundant deletes, bridge
@@ -162,16 +151,6 @@ alternative derivations. Survey: Kirrane et al., SWJ 2017.
 - Updates: the WHERE part reads with read rights; every target needs write rights; a
   forbidden target aborts the whole update. `SERVICE` is a separate privilege.
 - Caches keyed by the security context and a policy epoch.
-
-**Status (2 October).** Delivered: the policy as a file per server (roles → graph IRIs
-and prefixes, explicit deny, default graph, deny or allow by default), the dataset
-restriction before evaluation, writes refused as a whole whatever the data holds, query
-cache keyed by the access, SPARQL, Graph Store and RDF4J paths, and the policy granting
-reads and graph-scoped writes to its roles. Inferred statements are all-or-nothing per
-policy (`inferred = "hidden" | "visible"`) until the reasoner records support graph sets
-(§6). Since then (ADR-0008, 2 October): policies as transactional metadata in the system
-store, kept as RDF with their history; `SERVICE` a privilege of its own (a role's
-`service = true`).
 
 ## 5. Query execution and optimisation
 
