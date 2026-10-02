@@ -8,7 +8,12 @@ use crate::policy::PolicyAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MtlsConfig {
+    /// The header a TLS-terminating proxy passes the client certificate's subject in. It
+    /// counts only from `trusted_proxies` ([`super::peers`]): from any other peer it is
+    /// dropped before authentication.
     pub subject_header: String,
+    /// The peers that may send `subject_header` (loopback by default).
+    pub trusted_proxies: Vec<super::peers::AddressRange>,
     pub read_subjects: BTreeSet<String>,
     pub admin_subjects: BTreeSet<String>,
 }
@@ -73,6 +78,7 @@ mod tests {
     fn admin_subject_maps_to_admin_grant() {
         let config = MtlsConfig {
             subject_header: "x-client-cert-subject".to_owned(),
+            trusted_proxies: crate::auth::peers::AddressRange::loopback(),
             read_subjects: BTreeSet::new(),
             admin_subjects: BTreeSet::from(["CN=admin".to_owned()]),
         };

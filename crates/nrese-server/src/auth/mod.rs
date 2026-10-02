@@ -3,6 +3,7 @@ mod bearer_static;
 mod grants;
 mod mtls;
 mod oidc_introspection;
+pub mod peers;
 
 use std::collections::BTreeSet;
 
