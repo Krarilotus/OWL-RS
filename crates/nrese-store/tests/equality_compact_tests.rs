@@ -299,9 +299,7 @@ fn compact_equality_answers_as_replication_on_random_data() {
                 "SELECT DISTINCT ?x WHERE { ?x a ex:D } ORDER BY ?x".to_owned(),
                 format!("SELECT ?g ?o WHERE {{ GRAPH ?g {{ {a} ?p ?o }} }} ORDER BY ?g ?o"),
                 format!("SELECT ?s ?o WHERE {{ ?s {p} ?o FILTER(?s != {a}) }} ORDER BY ?s ?o"),
-                format!(
-                    "SELECT ?s ?o WHERE {{ ?s ex:p ?o MINUS {{ ?s ex:q ?o }} }} ORDER BY ?s ?o"
-                ),
+                "SELECT ?s ?o WHERE { ?s ex:p ?o MINUS { ?s ex:q ?o } } ORDER BY ?s ?o".to_owned(),
             ];
             for query in &queries {
                 let want = answer(&pipelines[0], query);
