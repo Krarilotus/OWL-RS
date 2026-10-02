@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod binary;
 mod blank;
 mod error;
 mod format;

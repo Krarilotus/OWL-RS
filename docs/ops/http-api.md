@@ -85,7 +85,7 @@ On the combined URL a form is a query or an update by its field, and a body by i
 |---|---|
 | `SELECT` | `application/sparql-results+json`, `application/sparql-results+xml`, `text/csv`, `text/tab-separated-values` |
 | `ASK` | `application/sparql-results+json`, `application/sparql-results+xml` |
-| `CONSTRUCT`, `DESCRIBE` | `application/n-triples`, `text/turtle`, `application/rdf+xml`, `application/ld+json`, `application/n-quads`, `application/trig` |
+| `CONSTRUCT`, `DESCRIBE` | `application/n-triples`, `text/turtle`, `application/rdf+xml`, `application/ld+json`, `application/n-quads`, `application/trig`, `application/x-binary-rdf` (RDF4J's Binary RDF, also accepted as a payload) |
 
 `application/json` and `application/xml` are taken as the SPARQL results formats, `application/x-turtle` as Turtle, and `text/plain` as N-Triples.
 

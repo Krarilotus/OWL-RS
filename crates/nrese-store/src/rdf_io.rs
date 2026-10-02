@@ -25,6 +25,7 @@ impl GraphResultFormat {
             Self::NQuads => RdfFormat::NQuads,
             Self::TriG => RdfFormat::TriG,
             Self::JsonLd => RdfFormat::JsonLd,
+            Self::BinaryRdf => RdfFormat::BinaryRdf,
         }
     }
 }
@@ -78,6 +79,19 @@ pub fn parse_payload(
     payload: &[u8],
 ) -> StoreResult<Vec<Quad>> {
     parser(format.rdf_format(), base_iri, BlankNodes::Fresh)?
+        .for_slice(payload)
+        .map(|quad| quad.map_err(StoreError::from))
+        .collect()
+}
+
+/// [`parse_payload`], with the blank nodes as labelled in the payload: they refer to the
+/// store's (RDF4J's `preserveNodeId`).
+pub fn parse_payload_preserving_blank_nodes(
+    format: GraphResultFormat,
+    base_iri: Option<&str>,
+    payload: &[u8],
+) -> StoreResult<Vec<Quad>> {
+    parser(format.rdf_format(), base_iri, BlankNodes::AsWritten)?
         .for_slice(payload)
         .map(|quad| quad.map_err(StoreError::from))
         .collect()

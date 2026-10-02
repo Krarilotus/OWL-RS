@@ -264,6 +264,51 @@ fn payload(headers: &HeaderMap, body: &Bytes) -> Result<RdfPayload, ApiError> {
     })
 }
 
+/// `sesame:wildcard`: in a transaction's `DELETE` payload, any value at that position.
+const WILDCARD: &str = "http://www.openrdf.org/schema/sesame#wildcard";
+/// `rdf4j:nil`: in a `DELETE` payload's graph position, the default graph.
+const NIL: &str = "http://rdf4j.org/schema/rdf4j#nil";
+
+/// A transaction's `DELETE`: each statement of the payload a pattern, as RDF4J's server
+/// reads it (its client removes this way, `clear()` too): `sesame:wildcard` matches any
+/// value, a statement without a graph removes from every graph (or from the `context`
+/// parameters), one in `rdf4j:nil` from the default graph. With `preserveNodeId=true`,
+/// blank nodes refer to the store's.
+fn removals(
+    pairs: &[(String, String)],
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<Vec<StatementOp>, ApiError> {
+    let data = payload(headers, body)?;
+    let preserve = param(pairs, "preserveNodeId").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let parse = match preserve {
+        true => nrese_store::parse_payload_preserving_blank_nodes,
+        false => nrese_store::parse_payload,
+    };
+    let quads = parse(data.format, data.base_iri.as_deref(), &data.payload)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let given = contexts(pairs)?;
+    let wildcard = |term: &Term| matches!(term, Term::NamedNode(node) if node.as_str() == WILDCARD);
+    Ok(quads
+        .into_iter()
+        .map(|quad| {
+            let subject: Term = quad.subject.into();
+            let predicate = (quad.predicate.as_str() != WILDCARD).then_some(quad.predicate);
+            let contexts = match quad.graph_name {
+                GraphName::DefaultGraph => given.clone(),
+                GraphName::NamedNode(node) if node.as_str() == NIL => vec![GraphName::DefaultGraph],
+                graph => vec![graph],
+            };
+            StatementOp::RemoveMatching(StatementPattern {
+                subject: (!wildcard(&subject)).then_some(subject),
+                predicate,
+                object: (!wildcard(&quad.object)).then_some(quad.object),
+                contexts,
+            })
+        })
+        .collect())
+}
+
 /// Whether the body is a SPARQL update (a form with `update`, or `sparql-update`).
 fn is_update(headers: &HeaderMap) -> bool {
     let content_type = header_value_str(headers.get(header::CONTENT_TYPE));
@@ -773,6 +818,26 @@ pub async fn graph_store_delete(
     graph_store::delete_graph(state, raw, headers).await
 }
 
+/// `path` as an absolute URL of this server as the request reached it (the `Host` header,
+/// or a proxy's `X-Forwarded-Host` and `X-Forwarded-Proto`): RDF4J's client follows a new
+/// transaction's `Location` as given and fails on a relative one ("Target host is not
+/// specified"). Without a host, the path alone.
+fn absolute(headers: &HeaderMap, path: &str) -> String {
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let Some(host) = value("x-forwarded-host").or_else(|| value("host")) else {
+        return path.to_owned();
+    };
+    let scheme = value("x-forwarded-proto").unwrap_or("http");
+    format!("{scheme}://{host}{path}")
+}
+
 pub async fn transaction_begin(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -792,7 +857,7 @@ pub async fn transaction_begin(
             touched: Instant::now(),
         },
     );
-    let location = format!("/repositories/{id}/transactions/{txid}");
+    let location = absolute(&headers, &format!("/repositories/{id}/transactions/{txid}"));
     let mut response = StatusCode::CREATED.into_response();
     response.headers_mut().insert(
         header::LOCATION,
@@ -821,21 +886,18 @@ pub async fn transaction_action(
             .get_mut(&txid)
             .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
         pending.touched = Instant::now();
-        let op = match action.as_str() {
-            "ADD" => Some(StatementOp::Add {
+        let ops = match action.as_str() {
+            "ADD" => Some(vec![StatementOp::Add {
                 data: payload(&headers, &body)?,
                 contexts: contexts(&pairs)?,
-            }),
-            "DELETE" => Some(StatementOp::RemoveData {
-                data: payload(&headers, &body)?,
-                contexts: contexts(&pairs)?,
-            }),
-            "UPDATE" => Some(StatementOp::Update(update(&raw, &headers, &body)?)),
+            }]),
+            "DELETE" => Some(removals(&pairs, &headers, &body)?),
+            "UPDATE" => Some(vec![StatementOp::Update(update(&raw, &headers, &body)?)]),
             _ => None,
         };
-        if let Some(op) = op {
+        if let Some(ops) = ops {
             state.policy().enforce_rdf_upload_bytes(body.len())?;
-            pending.ops.push(op);
+            pending.ops.extend(ops);
             return Ok(StatusCode::OK.into_response());
         }
     }
