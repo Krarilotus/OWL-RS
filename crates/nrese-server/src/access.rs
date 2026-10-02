@@ -140,7 +140,9 @@ impl AccessView {
 
     /// Whether `graph` may be written.
     pub fn can_write(&self, graph: &GraphName) -> bool {
-        self.write.as_ref().is_none_or(|set| set.allows_graph(graph))
+        self.write
+            .as_ref()
+            .is_none_or(|set| set.allows_graph(graph))
     }
 
     /// Whether the requester sees the inferred statements.
@@ -185,11 +187,10 @@ impl AccessPolicy {
             PolicyAction::QueryRead
             | PolicyAction::GraphRead
             | PolicyAction::ServiceDescriptionRead => rules.next().is_some(),
-            PolicyAction::UpdateWrite | PolicyAction::GraphWrite | PolicyAction::TellWrite => {
-                rules.any(|rule| {
+            PolicyAction::UpdateWrite | PolicyAction::GraphWrite | PolicyAction::TellWrite => rules
+                .any(|rule| {
                     !rule.write.is_empty() || rule.default_graph == DefaultGraphRight::Write
-                })
-            }
+                }),
             PolicyAction::OperatorRead | PolicyAction::AdminWrite | PolicyAction::MetricsRead => {
                 false
             }
