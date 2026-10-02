@@ -123,7 +123,9 @@ every system answers all 14 queries correctly), loaded without inference.
 | | Virtuoso | 62,615 | 6,804 | 611 | 15,563 | – |
 | | Oxigraph | 13,775 | 7,925 | 1,558 | 40,828 | – |
 
-Jena (TDB2) runs after these; GraphDB's results stay local.
+Jena (TDB2), the same tiers: loads in 2,168, 4,995 and 34,669 ms (stores of 194, 467 and
+3,266 MiB) and answers the queries in 236, 1,150 and 11,749 ms. GraphDB's results stay
+local.
 
 Nemo and owlrl compute closures without a query interface. NRESE's closures have 32
 statements more than Nemo's on every tier (not yet broken down; owlrl's reference closure
@@ -162,5 +164,4 @@ the `lubm-materialised` workload, below.
 
 ## Next runs
 
-- Jena on `lubm-materialised` (the rest of batch E).
 - The competitors on YAGO tiny, and an RDF4J adapter.
