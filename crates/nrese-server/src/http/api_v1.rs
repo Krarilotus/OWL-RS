@@ -233,3 +233,65 @@ pub async fn session_rollback(
         false => Err(no_session(&session)),
     }
 }
+
+#[derive(Serialize)]
+struct ExplanationStep {
+    subject: String,
+    predicate: String,
+    object: String,
+    /// `asserted` or `inferred`.
+    origin: &'static str,
+    /// The rule that derives it, for an inferred step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<String>,
+    /// The steps (indexes) it is derived from.
+    premises: Vec<usize>,
+}
+
+/// Why the statement `subj pred obj` (N-Triples terms, as RDF4J's parameters) holds: a
+/// derivation from asserted statements, the statement first. 404 if it doesn't hold or
+/// reasoning is off; 403 for users who don't see inferred statements.
+pub async fn explain(
+    Repository(state): Repository,
+    raw: axum::extract::RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let access = guard::query_access(&state, &headers).await?;
+    if !access.sees_inferred() {
+        return Err(ApiError::forbidden(
+            "explanations show inferred statements, which the requester doesn't see",
+        ));
+    }
+    let pairs = super::rdf4j::pairs(&raw)?;
+    let get = |name: &str| -> Result<nrese_rdf::Term, ApiError> {
+        let text = pairs
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .ok_or_else(|| ApiError::bad_request(format!("explain needs {name}")))?;
+        super::rdf4j::term(text)
+    };
+    let (subject, predicate, object) = (get("subj")?, get("pred")?, get("obj")?);
+    let Some(program) = state.pipeline().reasoner().config().materialised_program() else {
+        return Err(ApiError::not_found("reasoning is off: nothing is inferred"));
+    };
+    let store = state.store();
+    let steps = tokio::task::spawn_blocking(move || {
+        store.explain_statement(program, subject.as_ref(), predicate.as_ref(), object.as_ref())
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
+    let steps: Vec<ExplanationStep> = steps
+        .into_iter()
+        .map(|step| ExplanationStep {
+            subject: step.subject,
+            predicate: step.predicate,
+            object: step.object,
+            origin: step.origin,
+            rule: step.rule,
+            premises: step.premises,
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "steps": steps })).into_response())
+}
