@@ -368,6 +368,10 @@ fn order_literals(xv: &Value, x: &Literal, yv: &Value, y: &Literal) -> Ordering 
                     y.direction().map(|d| d.as_str()),
                 ))
         })
+        // Literals of one canonical form ("1" and "01") by their own lexical form and
+        // datatype: the order is total over distinct terms, so every evaluation (and
+        // every `LIMIT` cutting through equal values) takes the same one first.
+        .then_with(|| (x.value(), x.datatype()).cmp(&(y.value(), y.datatype())))
 }
 
 /// The kinds of literal value `ORDER BY` ranks apart ([`order`]).
@@ -534,6 +538,8 @@ mod tests {
     fn pool() -> Vec<Term> {
         let mut terms = vec![
             typed("2", "integer"),
+            typed("02", "integer"),
+            typed("+2", "integer"),
             typed("10", "integer"),
             typed("02", "int"),
             typed("1", "unsignedByte"),
@@ -580,6 +586,9 @@ mod tests {
             for (j, &b) in all.iter().enumerate() {
                 let ab = order(a, b);
                 assert_eq!(ab, order(b, a).reverse(), "antisymmetric: {a:?} {b:?}");
+                // Total over distinct terms: only a term ties with itself, so a `LIMIT`
+                // cutting through equal values takes the same one everywhere.
+                assert_eq!(ab.is_eq(), a == b, "total: {a:?} {b:?}");
                 assert_eq!(ab, sortable[i].order(&sortable[j]), "cached: {a:?} {b:?}");
                 // Where `<` orders two literals, `ORDER BY` agrees.
                 if let (Some(Term::Literal(x)), Some(Term::Literal(y))) = (a, b)
