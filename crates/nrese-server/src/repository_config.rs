@@ -9,17 +9,50 @@
 //!   `owl2-ql`, `owl2-rl`, each also `-optimized`; or an NRESE reasoning mode's name), else
 //!   from the sail stack: an RDFS inferencer (`…RDFSInferencer`) reasons with RDFS, a stack
 //!   without one doesn't reason. A configuration that names neither (or no configuration)
-//!   keeps the server's reasoning.
+//!   keeps the server's reasoning;
+//! - user rules: a `ruleset` that is the path of a GraphDB ruleset file (`….pie`, read on
+//!   the server: GraphDB's custom rulesets), or rules in the configuration itself
+//!   (`nrc:rules`, Notation3 unless `nrc:rulesFormat "pie"`, with `nrc:` =
+//!   `https://nrese.dev/ns/config#`). A `.pie` file is the whole program (mode `custom`);
+//!   inline rules add to the ruleset named beside them, or are the whole program without
+//!   one. They are checked when the repository is created and kept with its settings.
 //!
 //! The repository id it names (`rep.id`, `repositoryID`) must be the one in the path.
 //! Everything else (the store type, its persistence and indexes) is NRESE's own: a
 //! repository is stored as the server stores its default one.
 
+use std::sync::Arc;
+
 use nrese_rdf::{Quad, Term};
-use nrese_reasoner::ReasoningMode;
+use nrese_reasoner::{ReasonerConfig, ReasoningMode, UserRules};
 use serde::{Deserialize, Serialize};
 
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
+/// User rules in a repository's configuration (NRESE's own vocabulary).
+const CONFIG_RULES: &str = "https://nrese.dev/ns/config#rules";
+const CONFIG_RULES_FORMAT: &str = "https://nrese.dev/ns/config#rulesFormat";
+
+/// A repository's user rules: their text, kept with the settings so that a restart needs
+/// no file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryRules {
+    /// Shown in errors and diagnostics: the file name, or `configuration`.
+    pub name: String,
+    /// `n3` or `pie`.
+    pub format: String,
+    pub text: String,
+}
+
+impl RepositoryRules {
+    /// The rules, compiled to check them.
+    fn compile(&self) -> Result<UserRules, String> {
+        let rules = match self.format.as_str() {
+            "pie" => UserRules::pie(self.name.clone(), self.text.clone()),
+            _ => UserRules::n3(self.name.clone(), self.text.clone()),
+        };
+        rules.map_err(|error| format!("rules {}: {error}", self.name))
+    }
+}
 
 /// What a repository is created with besides the server's settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,12 +63,32 @@ pub struct RepositorySettings {
     /// The repository's reasoning, by mode name; the server's when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// The repository's user rules, if it has any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<RepositoryRules>,
 }
 
 impl RepositorySettings {
     /// The reasoning mode, if the settings choose one.
     pub fn reasoning_mode(&self) -> Option<ReasoningMode> {
         self.reasoning.as_deref().and_then(ReasoningMode::from_name)
+    }
+
+    /// The repository's reasoner configuration, if the settings choose one (else the
+    /// server's applies).
+    pub fn reasoner_config(&self) -> Result<Option<ReasonerConfig>, String> {
+        let Some(mode) = self.reasoning_mode() else {
+            return Ok(None);
+        };
+        let rules = self
+            .rules
+            .as_ref()
+            .map(|rules| rules.compile().map(Arc::new))
+            .transpose()?;
+        ReasonerConfig::for_mode(mode)
+            .with_rules(rules)
+            .map(Some)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -63,7 +116,7 @@ fn ruleset_mode(name: &str) -> Option<ReasoningMode> {
         "owl-horst" => Some(ReasoningMode::OwlHorst),
         "owl2-ql" => Some(ReasoningMode::Owl2Ql),
         "owl2-rl" => Some(ReasoningMode::Owl2Rl),
-        // User rules come with the server's configuration only.
+        // `custom` needs rules: a `.pie` file or rules in the configuration.
         _ => ReasoningMode::from_name(name).filter(|mode| *mode != ReasoningMode::Custom),
     }
 }
@@ -74,10 +127,16 @@ pub fn from_config(id: &str, quads: &[Quad]) -> Result<RepositorySettings, Strin
     let mut repository = None;
     let mut sail_types = Vec::new();
     let mut ruleset = None;
+    let (mut inline_rules, mut rules_format) = (None, None);
     for quad in quads {
         let Some(value) = text(&quad.object) else {
             continue;
         };
+        match quad.predicate.as_str() {
+            CONFIG_RULES => inline_rules = Some(value),
+            CONFIG_RULES_FORMAT => rules_format = Some(value),
+            _ => {}
+        }
         match local_name(quad.predicate.as_str()) {
             "rep.id" | "repositoryID" => {
                 if value != id {
@@ -104,6 +163,36 @@ pub fn from_config(id: &str, quads: &[Quad]) -> Result<RepositorySettings, Strin
             Term::Literal(literal) => Some(literal.value().to_owned()),
             _ => None,
         });
+    // A GraphDB ruleset file: the whole program.
+    if let Some(path) = ruleset.filter(|name| name.trim().to_ascii_lowercase().ends_with(".pie")) {
+        let path = std::path::Path::new(path.trim());
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("ruleset {}: {error}", path.display()))?;
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        settings.rules = Some(RepositoryRules {
+            name,
+            format: "pie".to_owned(),
+            text,
+        });
+        settings.reasoning = Some(ReasoningMode::Custom.as_str().to_owned());
+        settings.reasoner_config()?;
+        return Ok(settings);
+    }
+    if let Some(text) = inline_rules {
+        let format = match rules_format.map(str::trim) {
+            None | Some("n3") => "n3",
+            Some("pie") => "pie",
+            Some(other) => return Err(format!("rules format '{other}' isn't n3 or pie")),
+        };
+        settings.rules = Some(RepositoryRules {
+            name: "configuration".to_owned(),
+            format: format.to_owned(),
+            text: text.to_owned(),
+        });
+    }
     let mode = match ruleset {
         Some(name) => Some(ruleset_mode(name).ok_or_else(|| {
             format!(
@@ -119,7 +208,17 @@ pub fn from_config(id: &str, quads: &[Quad]) -> Result<RepositorySettings, Strin
         }
         None => Some(ReasoningMode::Disabled),
     };
+    // Rules alone are the whole program; rules with a disabled ruleset make no sense.
+    let mode = match (mode, &settings.rules) {
+        (None, Some(_)) => Some(ReasoningMode::Custom),
+        (Some(ReasoningMode::Disabled), Some(_)) if ruleset.is_none() => {
+            Some(ReasoningMode::Custom)
+        }
+        (mode, _) => mode,
+    };
     settings.reasoning = mode.map(|mode| mode.as_str().to_owned());
+    // Checked now: a mistake in the rules fails the creation, with the rule it is in.
+    settings.reasoner_config()?;
     Ok(settings)
 }
 
@@ -198,5 +297,56 @@ mod tests {
             from_config("x", &[]).unwrap(),
             RepositorySettings::default()
         );
+    }
+
+    #[test]
+    fn rules_in_the_configuration_and_from_a_ruleset_file() {
+        let rule =
+            "@prefix ex: <http://example.com/> .\n{ ?x ex:parent ?y } => { ?y ex:child ?x } .";
+        let inline = vec![quad("r", CONFIG_RULES, literal(rule))];
+        let settings = from_config("x", &inline).unwrap();
+        assert_eq!(settings.reasoning_mode(), Some(ReasoningMode::Custom));
+        assert!(settings.reasoner_config().unwrap().unwrap().rules.is_some());
+        let with_ruleset = vec![
+            quad("r", CONFIG_RULES, literal(rule)),
+            quad(
+                "s",
+                "http://www.ontotext.com/config/graphdb#ruleset",
+                literal("rdfs"),
+            ),
+        ];
+        assert_eq!(
+            from_config("x", &with_ruleset).unwrap().reasoning_mode(),
+            Some(ReasoningMode::Rdfs)
+        );
+        let broken = vec![quad("r", CONFIG_RULES, literal("{ ?x } => "))];
+        assert!(from_config("x", &broken).is_err());
+        let wrong_format = vec![
+            quad("r", CONFIG_RULES, literal(rule)),
+            quad("r", CONFIG_RULES_FORMAT, literal("swrl")),
+        ];
+        assert!(from_config("x", &wrong_format).is_err());
+        // A .pie file is the whole program, its text kept with the settings.
+        let dir = tempfile::tempdir().unwrap();
+        let pie = dir.path().join("family.pie");
+        std::fs::write(
+            &pie,
+            "Prefices\n{\n  ex : http://example.com/\n}\nAxioms\n{\n}\nRules\n{\nId: child\n  x <ex:parent> y\n  ------------------------------------\n  y <ex:child> x\n}\n",
+        )
+        .unwrap();
+        let file = vec![quad(
+            "s",
+            "http://www.ontotext.com/config/graphdb#ruleset",
+            literal(pie.to_str().unwrap()),
+        )];
+        let settings = from_config("x", &file).unwrap();
+        assert_eq!(settings.reasoning_mode(), Some(ReasoningMode::Custom));
+        assert_eq!(settings.rules.as_ref().unwrap().format, "pie");
+        let missing = vec![quad(
+            "s",
+            "http://www.ontotext.com/config/graphdb#ruleset",
+            literal("/no/such/file.pie"),
+        )];
+        assert!(from_config("x", &missing).is_err());
     }
 }
