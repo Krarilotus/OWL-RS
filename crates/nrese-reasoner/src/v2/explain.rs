@@ -81,38 +81,47 @@ pub fn explain_with<B: Base + ?Sized>(
         }
         derivations.insert(next, found);
     }
-    // Forwards: prove from the asserted facts until nothing more is proved.
-    let mut proved: HashMap<Triple, Option<(String, Vec<Triple>)>> = HashMap::new();
-    let is_proved = |fact: Triple, proved: &mut HashMap<Triple, Option<(String, Vec<Triple>)>>| {
-        if proved.contains_key(&fact) {
-            return true;
+    // Forwards, in rounds: a fact is proved in the first round where a derivation of it
+    // has every premise proved in an earlier one, so its proof is as shallow as can be;
+    // of the derivations usable then, the smallest proof wins (then the rule's name and
+    // the premises), so the explanation is the same on every run.
+    let mut proved: HashMap<Triple, Proved> = HashMap::new();
+    let size = |fact: Triple, proved: &HashMap<Triple, Proved>| -> Option<usize> {
+        match proved.get(&fact) {
+            Some(entry) => Some(entry.size),
+            None => base.is_asserted(fact).then_some(1),
         }
-        if base.is_asserted(fact) {
-            proved.insert(fact, None);
-            return true;
-        }
-        false
     };
-    loop {
-        let mut progress = false;
-        for (&fact, found) in &derivations {
-            if proved.contains_key(&fact) {
-                continue;
-            }
-            let usable = found.iter().find(|(_, body)| {
-                body.iter()
-                    .all(|&premise| premise != fact && is_proved(premise, &mut proved))
-            });
-            if let Some((rule, body)) = usable {
-                proved.insert(fact, Some((rule.clone(), body.clone())));
-                progress = true;
+    let mut pending: Vec<Triple> = derivations.keys().copied().collect();
+    pending.sort_unstable();
+    while !proved.contains_key(&fact) {
+        let mut round: Vec<(Triple, Proved)> = Vec::new();
+        for &next in &pending {
+            let best = derivations[&next]
+                .iter()
+                .filter_map(|(rule, body)| {
+                    let sizes = body
+                        .iter()
+                        .map(|&premise| match premise == next {
+                            true => None,
+                            false => size(premise, &proved),
+                        })
+                        .collect::<Option<Vec<usize>>>()?;
+                    Some((1 + sizes.iter().sum::<usize>(), rule, body))
+                })
+                .min();
+            if let Some((size, rule, body)) = best {
+                let derivation = Some((rule.clone(), body.clone()));
+                round.push((next, Proved { size, derivation }));
             }
         }
-        if !progress || proved.contains_key(&fact) {
+        if round.is_empty() {
             break;
         }
+        pending.retain(|next| !round.iter().any(|(fact, _)| fact == next));
+        proved.extend(round);
     }
-    if !is_proved(fact, &mut proved) {
+    if !proved.contains_key(&fact) && !base.is_asserted(fact) {
         return None;
     }
     // The proof of `fact`, each fact once.
@@ -120,7 +129,7 @@ pub fn explain_with<B: Base + ?Sized>(
     let mut index: HashMap<Triple, usize> = HashMap::new();
     fn add(
         fact: Triple,
-        proved: &HashMap<Triple, Option<(String, Vec<Triple>)>>,
+        proved: &HashMap<Triple, Proved>,
         steps: &mut Vec<Step>,
         index: &mut HashMap<Triple, usize>,
     ) -> usize {
@@ -134,7 +143,11 @@ pub fn explain_with<B: Base + ?Sized>(
             rule: None,
             premises: Vec::new(),
         });
-        if let Some(Some((rule, body))) = proved.get(&fact) {
+        if let Some(Proved {
+            derivation: Some((rule, body)),
+            ..
+        }) = proved.get(&fact)
+        {
             let premises: Vec<usize> = body
                 .iter()
                 .map(|&premise| add(premise, proved, steps, index))
@@ -146,6 +159,12 @@ pub fn explain_with<B: Base + ?Sized>(
     }
     add(fact, &proved, &mut steps, &mut index);
     Some(Explanation { steps })
+}
+
+/// A fact proved: the size of its proof (steps, shared ones counted per use) and how.
+struct Proved {
+    size: usize,
+    derivation: Option<(String, Vec<Triple>)>,
 }
 
 /// A [`Base`] as a [`Source`] whose every fact is old.

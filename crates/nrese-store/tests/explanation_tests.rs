@@ -41,29 +41,35 @@ fn inferences_are_explained_by_their_derivations() {
         )
     };
 
-    // Two subclass steps down to the asserted statements.
+    // Two subclass steps down to the asserted statements: `a` is a D, and D is a subclass
+    // of E; or `a` is a C, and C a subclass of E (both proofs are as shallow and as
+    // small).
     let steps = explain("a", TYPE, "E").expect("a is an E");
     assert_eq!(steps[0].object, format!("{EX}E"));
     assert_eq!(steps[0].origin, "inferred");
     assert_eq!(steps[0].rule.as_deref(), Some("cax-sco"));
-    let premises: Vec<String> = steps[0]
+    let mut premises: Vec<String> = steps[0]
         .premises
         .iter()
         .map(|&i| format!("{} {}", steps[i].object, steps[i].origin))
         .collect();
+    premises.sort();
+    let through_d = [format!("{EX}D inferred"), format!("{EX}E asserted")];
+    let through_c = [format!("{EX}C asserted"), format!("{EX}E inferred")];
     assert!(
-        premises.contains(&format!("{EX}D inferred")),
+        premises == through_d || premises == through_c,
         "{premises:?}"
     );
+    let rules: Vec<&str> = steps.iter().filter_map(|s| s.rule.as_deref()).collect();
+    assert_eq!(rules.len(), 2, "{steps:?}");
     assert!(
-        premises.contains(&format!("{EX}E asserted")),
-        "{premises:?}"
+        rules
+            .iter()
+            .all(|r| matches!(*r, "cax-sco" | "scm-sco" | "prp-trp")),
+        "{rules:?}"
     );
-    let d = steps
-        .iter()
-        .position(|s| s.object == format!("{EX}D") && s.predicate == TYPE)
-        .unwrap();
-    assert_eq!(steps[d].rule.as_deref(), Some("cax-sco"));
+    // The same explanation every time.
+    assert_eq!(explain("a", TYPE, "E").unwrap(), steps);
     // Every inferred step has premises; every asserted one has none; no step is its own
     // premise, and the premises come later (the proof is well-founded).
     for (i, step) in steps.iter().enumerate() {
