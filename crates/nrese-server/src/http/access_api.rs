@@ -306,6 +306,9 @@ struct RoleBody {
     deny: Vec<String>,
     #[serde(default)]
     default_graph: DefaultGraphRight,
+    /// Whether the role's users may call other endpoints with `SERVICE`.
+    #[serde(default)]
+    service: bool,
     #[serde(default)]
     reason: String,
 }
@@ -326,6 +329,7 @@ pub async fn role_put(
         write: request.write,
         deny: request.deny,
         default_graph: request.default_graph,
+        service: request.service,
     };
     change(
         &state,

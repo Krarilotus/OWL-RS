@@ -993,6 +993,8 @@ struct Context<'a> {
     synthetic: Cell<usize>,
     /// [`QueryOptions::services`].
     services: Option<crate::Services>,
+    /// Whether `SERVICE` is refused to the requester ([`crate::GraphAccess::service`]).
+    service_denied: bool,
     /// [`QueryOptions::equality_closed`].
     equality_closed: bool,
 }
@@ -1061,6 +1063,10 @@ impl<'a> Context<'a> {
             graph: RefCell::new(scope),
             synthetic: Cell::new(0),
             services: options.services.clone(),
+            service_denied: options
+                .access
+                .as_ref()
+                .is_some_and(|access| !access.service),
             equality_closed: options.equality_closed,
         }
     }

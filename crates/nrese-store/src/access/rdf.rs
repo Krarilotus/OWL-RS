@@ -138,6 +138,9 @@ pub(super) fn encode(state: &AccessState, graph: &NamedNode) -> Vec<Quad> {
             "defaultGraph",
             text(default_graph_name(rule.default_graph)),
         );
+        if rule.service {
+            push(&subject, "service", boolean(true));
+        }
     }
     for (name, user) in &state.users {
         let subject = user_iri(name);
@@ -253,6 +256,7 @@ pub(super) fn decode(quads: &[Quad], base: &str) -> AccessState {
                     write: all("write"),
                     deny: all("deny"),
                     default_graph,
+                    service: flag("service"),
                 },
             );
         } else if subject.starts_with(USER) {
