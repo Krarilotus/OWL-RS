@@ -83,19 +83,20 @@ pub async fn restore(
     Ok((StatusCode::OK, Json(build_admin_restore_response(&report))).into_response())
 }
 
-/// An image backup of the latest snapshot into `backups/<seconds since 1970>` of the data
-/// directory, while writers go on; answers its manifest and directory.
-pub async fn image_backup(state: AppState) -> Result<Response, ApiError> {
+/// An image backup of repository `repository`'s latest snapshot into `backups/` of the
+/// default repository's data directory (`<seconds since 1970>`, or `<id>-<seconds>` for
+/// another repository), while writers go on; answers its manifest and directory.
+pub async fn image_backup(state: AppState, repository: &str) -> Result<Response, ApiError> {
     state.ensure_serving()?;
-    let store = state.store();
+    let backups = state.store().config().data_dir.join("backups");
+    let store = state.for_repository(repository)?.store();
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    let dir = store
-        .config()
-        .data_dir
-        .join("backups")
-        .join(seconds.to_string());
+    let dir = backups.join(match repository {
+        crate::repositories::DEFAULT_REPOSITORY => seconds.to_string(),
+        other => format!("{other}-{seconds}"),
+    });
     let target = dir.clone();
     let manifest = tokio::task::spawn_blocking(move || store.backup_image(&target))
         .await
