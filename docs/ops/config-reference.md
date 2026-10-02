@@ -163,7 +163,7 @@ api_key = "replace-me"
 - file key: `store.wal_archive`
 - env override: `NRESE_WAL_ARCHIVE`
 - default: `false`
-- on disk, keep the WAL segments that checkpoints cover in `wal-archive/` of the data directory instead of deleting them. With an image backup they restore the store to any later revision (`nrese-server restore DIR --wal ARCHIVE --wal DATA/wal --until-revision N`). The archive grows until pruned: segments older than the oldest image backup kept can go. Sync it to another machine for recovery from a lost disk
+- on disk, keep the WAL segments that checkpoints cover in `wal-archive/` of the data directory instead of deleting them. With an image backup they restore the store to any later revision (`nrese-server restore DIR --wal ARCHIVE --wal DATA/wal --until-revision N`). The archive grows until pruned (`nrese-server prune-archive R`, with `R` the oldest image backup's revision plus one). Sync it to another machine for recovery from a lost disk
 
 - file key: `store.ontology_path`
 - env override: `NRESE_ONTOLOGY_PATH`
