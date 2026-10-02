@@ -12,8 +12,16 @@
 //! A part of the query in double quotes is a phrase (`"quick brown" fox`): it matches the
 //! literals whose words hold it as a sequence, and counts as one of the query's terms.
 //! Its words find the candidates in the index; each is checked against its text.
+//!
+//! With a stemming language ([`TextQuery::stem`]), words match by their Snowball stem
+//! (`connected` finds `connection` and `connecting`), phrases too. The index keeps the
+//! words as written; per language, a map from stems to the indexed words with that stem
+//! is built at the first stemmed search and extended at later ones.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+
+use rust_stemmers::{Algorithm, Stemmer};
 
 /// What to search for.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +33,45 @@ pub struct TextQuery {
     pub all_words: bool,
     /// Every word matches as a prefix.
     pub prefix: bool,
+    /// Match words by their stem in this language (ISO 639-1: `en`, `de`, `fr`, ...;
+    /// [`stemmer`] lists them). `None`, or a language without a stemmer: as written.
+    pub stem: Option<String>,
+}
+
+/// The Snowball stemmer for `language` (an ISO 639-1 code, a region after `-` ignored).
+pub fn stemmer(language: &str) -> Option<Stemmer> {
+    let code = language.split('-').next()?.to_ascii_lowercase();
+    let algorithm = match code.as_str() {
+        "ar" => Algorithm::Arabic,
+        "da" => Algorithm::Danish,
+        "nl" => Algorithm::Dutch,
+        "en" => Algorithm::English,
+        "fi" => Algorithm::Finnish,
+        "fr" => Algorithm::French,
+        "de" => Algorithm::German,
+        "el" => Algorithm::Greek,
+        "hu" => Algorithm::Hungarian,
+        "it" => Algorithm::Italian,
+        "no" | "nb" | "nn" => Algorithm::Norwegian,
+        "pt" => Algorithm::Portuguese,
+        "ro" => Algorithm::Romanian,
+        "ru" => Algorithm::Russian,
+        "es" => Algorithm::Spanish,
+        "sv" => Algorithm::Swedish,
+        "ta" => Algorithm::Tamil,
+        "tr" => Algorithm::Turkish,
+        _ => return None,
+    };
+    Some(Stemmer::create(algorithm))
+}
+
+/// The key of a stemming language: its code, lower case, without a region.
+fn stem_key(language: &str) -> String {
+    language
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 /// A literal that matched, with its relevance (the best match has 1).
@@ -50,6 +97,19 @@ pub(crate) struct TextIndex {
     /// Words per indexed literal.
     lengths: HashMap<u64, u16>,
     total_words: u64,
+    /// The distinct words in the order they were first indexed: what the stem maps cover.
+    words: Vec<Box<str>>,
+    /// Per stemming language ([`stem_key`]): its stems' words.
+    stems: HashMap<String, Stems>,
+}
+
+/// The indexed words by stem, for one language.
+#[derive(Debug, Default)]
+struct Stems {
+    /// Words (of [`TextIndex::words`]) looked at so far.
+    covered: usize,
+    /// Stem → the indexes of its words in [`TextIndex::words`].
+    groups: HashMap<Box<str>, Vec<u32>>,
 }
 
 impl TextIndex {
@@ -70,10 +130,15 @@ impl TextIndex {
             return;
         }
         for (word, count) in counts {
-            self.postings
-                .entry(word.into_boxed_str())
-                .or_default()
-                .push((id, count));
+            match self.postings.entry(word.into_boxed_str()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    self.words.push(entry.key().clone());
+                    entry.insert(vec![(id, count)]);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().push((id, count));
+                }
+            }
         }
         self.lengths.insert(id, length);
         self.total_words += u64::from(length);
@@ -82,6 +147,73 @@ impl TextIndex {
     /// Marks the dictionary entries below `covered` as looked at.
     pub(crate) fn cover(&mut self, covered: u64) {
         self.covered = covered;
+    }
+
+    /// Whether the stems of `language` cover every indexed word (or it has no stemmer).
+    pub(crate) fn stems_ready(&self, language: &str) -> bool {
+        stemmer(language).is_none()
+            || self
+                .stems
+                .get(&stem_key(language))
+                .is_some_and(|stems| stems.covered == self.words.len())
+    }
+
+    /// Groups the words indexed since the last call by their stem in `language`.
+    pub(crate) fn prepare_stems(&mut self, language: &str) {
+        let Some(stemmer) = stemmer(language) else {
+            return;
+        };
+        let stems = self.stems.entry(stem_key(language)).or_default();
+        for (i, word) in self.words.iter().enumerate().skip(stems.covered) {
+            stems
+                .groups
+                .entry(stemmer.stem(word).into())
+                .or_default()
+                .push(i as u32);
+        }
+        stems.covered = self.words.len();
+    }
+
+    /// The postings of `word`: of the words it starts with `prefix`, of the words with its
+    /// stem with `stems`, else its own; merged by literal (occurrences added up).
+    fn postings_of(
+        &self,
+        word: &str,
+        prefix: bool,
+        stems: Option<(&Stemmer, &Stems)>,
+    ) -> Cow<'_, [(u64, u16)]> {
+        let lists: Vec<&Vec<(u64, u16)>> = match (prefix, stems) {
+            (true, _) => self
+                .postings
+                .range::<str, _>((std::ops::Bound::Included(word), std::ops::Bound::Unbounded))
+                .take_while(|(key, _)| key.starts_with(word))
+                .map(|(_, list)| list)
+                .collect(),
+            (false, Some((stemmer, stems))) => stems
+                .groups
+                .get(stemmer.stem(word).as_ref())
+                .into_iter()
+                .flatten()
+                .filter_map(|&i| self.postings.get(&self.words[i as usize]))
+                .collect(),
+            (false, None) => self.postings.get(word).into_iter().collect(),
+        };
+        match lists.as_slice() {
+            [] => Cow::Borrowed(&[]),
+            [list] => Cow::Borrowed(list.as_slice()),
+            _ => {
+                let mut merged: Vec<(u64, u16)> = lists.into_iter().flatten().copied().collect();
+                merged.sort_unstable_by_key(|&(id, _)| id);
+                merged.dedup_by(|later, kept| {
+                    let same = later.0 == kept.0;
+                    if same {
+                        kept.1 = kept.1.saturating_add(later.1);
+                    }
+                    same
+                });
+                Cow::Owned(merged)
+            }
+        }
     }
 
     /// The literals matching `query`, best first (ties by id); `text_of` gives a literal's
@@ -97,6 +229,19 @@ impl TextIndex {
         }
         let average = self.total_words as f64 / documents;
         let (k1, b) = (1.2, 0.75);
+        // Stemming, where the language has a stemmer and its stems are prepared.
+        let stemming = query
+            .stem
+            .as_deref()
+            .and_then(|language| Some((stemmer(language)?, self.stems.get(&stem_key(language))?)));
+        let stems = stemming.as_ref().map(|(stemmer, stems)| (stemmer, *stems));
+        // Words compared in phrases: their stems when stemming.
+        let normal = |word: &str| -> String {
+            match &stemming {
+                Some((stemmer, _)) => stemmer.stem(word).into_owned(),
+                None => word.to_owned(),
+            }
+        };
         // Quoted parts are phrases; the rest are words.
         let mut terms: Vec<(String, bool)> = Vec::new();
         let mut phrases: Vec<Vec<String>> = Vec::new();
@@ -135,17 +280,18 @@ impl TextIndex {
             }
         };
         for phrase in &phrases {
-            let lists: Option<Vec<&Vec<(u64, u16)>>> = phrase
+            let lists: Vec<Cow<'_, [(u64, u16)]>> = phrase
                 .iter()
-                .map(|word| self.postings.get(word.as_str()))
+                .map(|word| self.postings_of(word, false, stems))
                 .collect();
-            let Some(lists) = lists else {
+            if lists.iter().any(|list| list.is_empty()) {
                 continue;
-            };
+            }
             let mut phrase_scores: HashMap<u64, f64> = HashMap::new();
             for list in &lists {
                 bm25(list, &mut phrase_scores);
             }
+            let phrase: Vec<String> = phrase.iter().map(|word| normal(word)).collect();
             // The literals with every word of the phrase, then with them in sequence.
             let rarest = lists
                 .iter()
@@ -157,7 +303,7 @@ impl TextIndex {
                     .all(|list| list.binary_search_by_key(&id, |&(i, _)| i).is_ok());
                 let in_sequence = in_all
                     && text_of(id).is_some_and(|text| {
-                        let text: Vec<String> = words(&text).collect();
+                        let text: Vec<String> = words(&text).map(|word| normal(&word)).collect();
                         text.windows(phrase.len())
                             .any(|window| window == phrase.as_slice())
                     });
@@ -169,28 +315,10 @@ impl TextIndex {
             }
         }
         for (word, prefix) in &terms {
-            let mut found: HashMap<u64, u16> = HashMap::new();
-            let lists: Vec<&Vec<(u64, u16)>> = if *prefix {
-                self.postings
-                    .range::<str, _>((
-                        std::ops::Bound::Included(word.as_str()),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .take_while(|(key, _)| key.starts_with(word.as_str()))
-                    .map(|(_, list)| list)
-                    .collect()
-            } else {
-                self.postings.get(word.as_str()).into_iter().collect()
-            };
-            for list in lists {
-                for &(id, count) in list {
-                    let entry = found.entry(id).or_default();
-                    *entry = entry.saturating_add(count);
-                }
-            }
+            let found = self.postings_of(word, *prefix, stems);
             let frequency = found.len() as f64;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
-            for (id, count) in found {
+            for &(id, count) in found.iter() {
                 let length = f64::from(self.lengths.get(&id).copied().unwrap_or(1));
                 let tf = f64::from(count);
                 let score = idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * length / average));
@@ -262,6 +390,7 @@ mod tests {
                     text: text.to_owned(),
                     all_words,
                     prefix,
+                    stem: None,
                 },
                 &text_of,
             )
@@ -294,5 +423,56 @@ mod tests {
         assert_eq!(ids(&query("füchs*", false, false)), [3]);
         assert!(query("", false, false).is_empty());
         assert!(query("cat", false, false).is_empty());
+    }
+
+    /// With a stemming language, a word finds the words with its stem, in phrases too;
+    /// prefixes stay prefixes, and a language without a stemmer searches as written.
+    #[test]
+    fn stemmed_words_and_phrases() {
+        let texts = [
+            "Connected systems",
+            "The connection of systems",
+            "connecting a system",
+            "Les chevaux sont connectés",
+            "unrelated",
+        ];
+        let mut index = index(&texts);
+        let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
+        assert!(!index.stems_ready("en"));
+        index.prepare_stems("en");
+        assert!(index.stems_ready("en-GB"));
+        assert!(index.stems_ready("xx"));
+        let query = |index: &TextIndex, text: &str, stem: Option<&str>| {
+            let mut found = ids(&index.search(
+                &TextQuery {
+                    text: text.to_owned(),
+                    all_words: false,
+                    prefix: false,
+                    stem: stem.map(str::to_owned),
+                },
+                &text_of,
+            ));
+            found.sort_unstable();
+            found
+        };
+        assert_eq!(query(&index, "connect", None), Vec::<u64>::new());
+        assert_eq!(query(&index, "connect", Some("en")), [0, 1, 2]);
+        assert_eq!(query(&index, "connections", Some("en")), [0, 1, 2]);
+        assert_eq!(query(&index, "\"connected system\"", Some("en")), [0]);
+        assert_eq!(query(&index, "\"connecting systems\"", Some("en")), [0]);
+        assert_eq!(
+            query(&index, "\"connected system\"", None),
+            Vec::<u64>::new()
+        );
+        assert_eq!(query(&index, "connect", Some("xx")), Vec::<u64>::new());
+        // Words indexed later are stemmed at the next preparation.
+        index.add(9, "reconnecting systems");
+        assert!(!index.stems_ready("en"));
+        index.prepare_stems("en");
+        assert_eq!(query(&index, "system", Some("en")), [0, 1, 2, 9]);
+        // French has its own stemmer: `connectés` and `connection` stem to `connect`.
+        index.prepare_stems("fr");
+        assert_eq!(query(&index, "connecté", None), Vec::<u64>::new());
+        assert_eq!(query(&index, "connecté", Some("fr")), [1, 3]);
     }
 }

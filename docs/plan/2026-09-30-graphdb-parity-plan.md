@@ -39,7 +39,7 @@ Legend: ✅ done · 🟡 partial · ❌ missing · ➖ deliberately different.
 | 4.1 | Graph Store Protocol | 🟡 | Works; status codes for missing graphs differ from the spec (review) |
 | 4.2 | RDF4J protocol, repositories, transactions | ❌ | X1; server state is single-repository today |
 | 4.2 | Formats | 🟡 | N-Triples, N-Quads, Turtle, TriG, RDF/XML; JSON-LD and Binary RDF missing |
-| 5.1 | Full-text search, `luc:` predicates | 🟡 | Full-text search with Blazegraph's `bds:` vocabulary (BM25); GraphDB's `luc:` predicates missing |
+| 5.1 | Full-text search, `luc:` predicates | 🟡 | Full-text search with Blazegraph's `bds:` vocabulary (BM25, phrases, Snowball stemming), Jena's `text:query` and GraphDB's legacy `luc:` predicates on one index (2 October 2026); GraphDB's connectors (configured indexes) missing |
 | 5.2 | GeoSPARQL, R-tree | ✅ | GeoSPARQL functions and relations with an R-tree (benchmarked with the GeoSPARQL compliance kit) |
 | 5.3 | Vector similarity | ❌ | V1 |
 | 6.1 | Online backup/restore | 🟡 | Snapshot-consistent export and restore through the pipeline; no manifest/versioning or point-in-time restore |

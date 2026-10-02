@@ -431,6 +431,13 @@ impl Dictionary {
             }
             text.cover(end);
         }
+        if let Some(language) = query.stem.as_deref() {
+            // The read lock goes before the write lock is taken.
+            let ready = self.text.read().stems_ready(language);
+            if !ready {
+                self.text.write().prepare_stems(language);
+            }
+        }
         let inner = self.inner.read();
         let text_of = |id: u64| match view_key(inner.key(TermId::from_raw(id).payload())) {
             TermView::String(value) | TermView::LangString { value, .. } => Some(value.to_owned()),
