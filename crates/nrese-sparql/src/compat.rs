@@ -7,11 +7,18 @@
 //! unbound there and no group passes. Jena and QLever read the alias as its expression,
 //! and queries in the wild rely on it. [`parse_query`] replaces such a
 //! variable in `HAVING` by the expression it names.
+//!
+//! **Blazegraph's query hints.** `hint:Query hint:optimizer "None" .` and the like
+//! (namespace `http://www.bigdata.com/queryHints#`) are triple patterns that tell
+//! Blazegraph's planner what to do; ResearchSpace's and other Blazegraph clients' queries
+//! carry them. Read as data they match nothing, and the query with them. They are dropped:
+//! NRESE plans on its own.
 
 use std::collections::HashMap;
 
 use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern, OrderExpression};
+use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_sparql_syntax::{Query, SparqlParser, SparqlSyntaxError};
 
 /// Parses a query and applies the compatibility rewrites.
@@ -23,6 +30,17 @@ pub fn parse_query(text: &str) -> Result<Query, SparqlSyntaxError> {
     | Query::Ask { pattern, .. }) = &mut query;
     having_aliases(pattern);
     Ok(query)
+}
+
+/// Blazegraph's query hints' namespace.
+const QUERY_HINTS: &str = "http://www.bigdata.com/queryHints#";
+
+/// Whether `triple` is a Blazegraph query hint (its subject or predicate in the hints'
+/// namespace).
+fn is_hint(triple: &TriplePattern) -> bool {
+    let in_hints = |iri: &str| iri.starts_with(QUERY_HINTS);
+    matches!(&triple.predicate, NamedNodePattern::NamedNode(p) if in_hints(p.as_str()))
+        || matches!(&triple.subject, TermPattern::NamedNode(s) if in_hints(s.as_str()))
 }
 
 /// The `HAVING` expression under a chain of `SELECT` expressions, which are collected
@@ -50,7 +68,8 @@ fn having_under<'a>(
     }
 }
 
-/// Rewrites every `HAVING` in `pattern` (subqueries included) that names `SELECT` aliases.
+/// Rewrites every `HAVING` in `pattern` (subqueries included) that names `SELECT` aliases,
+/// and drops query hints from its basic graph patterns.
 fn having_aliases(pattern: &mut GraphPattern) {
     if matches!(pattern, GraphPattern::Extend { .. }) {
         let mut aliases = Vec::new();
@@ -66,7 +85,8 @@ fn having_aliases(pattern: &mut GraphPattern) {
         }
     }
     match pattern {
-        GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+        GraphPattern::Bgp { patterns } => patterns.retain(|triple| !is_hint(triple)),
+        GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
         GraphPattern::Join { left, right }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
@@ -238,6 +258,25 @@ mod tests {
     }
 
     const WHERE: &str = "WHERE { ?x <http://example.com/in> ?g ; <http://example.com/v> ?v }";
+
+    /// Blazegraph's query hints are dropped, wherever they are; the rest stays.
+    #[test]
+    fn query_hints_are_dropped() {
+        let with_hints = "PREFIX hint: <http://www.bigdata.com/queryHints#>
+            SELECT ?x WHERE {
+              hint:Query hint:optimizer \"None\" .
+              ?x <http://example.com/p> ?y .
+              hint:Prior hint:runFirst true .
+              OPTIONAL { ?y <http://example.com/q> ?z . hint:Group hint:optimizer \"None\" }
+              FILTER EXISTS { ?x <http://example.com/r> ?w . hint:SubQuery hint:runOnce true }
+            }";
+        let without = "SELECT ?x WHERE {
+              ?x <http://example.com/p> ?y .
+              OPTIONAL { ?y <http://example.com/q> ?z }
+              FILTER EXISTS { ?x <http://example.com/r> ?w }
+            }";
+        assert_eq!(rewritten(with_hints), standard(without));
+    }
 
     /// An alias in `HAVING` means its expression. `BOUND(?g)` and the group variable keep
     /// their meaning.

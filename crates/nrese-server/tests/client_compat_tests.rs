@@ -590,3 +590,33 @@ async fn request_size_limits_are_the_policys() -> TestResult {
     assert_eq!(content_type(&response), "application/problem+json");
     Ok(())
 }
+
+/// Blazegraph's query hints, which ResearchSpace's and other Blazegraph clients' queries
+/// carry, don't change the answer: they are dropped, not read as triple patterns.
+#[tokio::test]
+async fn blazegraph_query_hints_are_ignored() -> TestResult {
+    let app = test_app()?;
+    update(
+        &app,
+        "INSERT DATA { <http://example.com/a> <http://www.w3.org/2000/01/rdf-schema#label> \"A\" }",
+    )
+    .await?;
+    let query = "PREFIX hint: <http://www.bigdata.com/queryHints#>
+        SELECT ?l WHERE { hint:Query hint:optimizer \"None\" .
+          ?s <http://www.w3.org/2000/01/rdf-schema#label> ?l . hint:Prior hint:runFirst true }";
+    let response = send(
+        &app,
+        Method::POST,
+        "/dataset/query",
+        &[
+            ("content-type", "application/sparql-query"),
+            ("accept", "application/sparql-results+json"),
+        ],
+        query.to_owned(),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await?;
+    assert!(body.contains("\"A\""), "{body}");
+    Ok(())
+}
