@@ -44,6 +44,10 @@ pub fn router(state: AppState) -> Router {
             "/ops/api/admin/dataset/restore",
             post(handlers::admin_restore_dataset),
         )
+        .route(
+            "/ops/api/admin/dataset/image",
+            post(handlers::admin_image_backup),
+        )
         .route("/healthz", get(handlers::healthz))
         .route("/readyz", get(handlers::readyz))
         .route("/version", get(handlers::version))

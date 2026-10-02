@@ -381,6 +381,11 @@ impl StoreService {
         })
     }
 
+    /// Writes an image backup of the latest snapshot into `dir` ([`crate::image_backup`]).
+    pub fn backup_image(&self, dir: &std::path::Path) -> StoreResult<crate::ImageManifest> {
+        crate::image_backup::backup_image(&self.engine, dir)
+    }
+
     /// How many statements match `pattern` (RDF4J's `/size`).
     pub fn count_statements(&self, pattern: &crate::StatementPattern, infer: bool) -> u64 {
         crate::statements::count_statements(&self.engine.snapshot(), read_model(infer), pattern)

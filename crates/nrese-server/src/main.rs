@@ -51,7 +51,32 @@ async fn run() -> Result<()> {
         println!("configuration is valid");
         return Ok(());
     }
+    if let CliCommand::Restore(dir) = &cli.command {
+        let manifest = nrese_store::restore_image(dir, &config.store.data_dir)
+            .with_context(|| format!("restoring {}", dir.display()))?;
+        tracing::info!(
+            revision = manifest.revision,
+            quads = manifest.quads,
+            inferred = manifest.inferred,
+            data_dir = %config.store.data_dir.display(),
+            "restored"
+        );
+        return Ok(());
+    }
     let store = StoreService::new(config.store.clone())?;
+    if let CliCommand::Backup(dir) = &cli.command {
+        let manifest = store
+            .backup_image(dir)
+            .with_context(|| format!("backing up into {}", dir.display()))?;
+        tracing::info!(
+            revision = manifest.revision,
+            quads = manifest.quads,
+            bytes = manifest.bytes,
+            dir = %dir.display(),
+            "backed up"
+        );
+        return Ok(());
+    }
     if let CliCommand::Query(query) = cli.command {
         return query_once(&store, query);
     }
