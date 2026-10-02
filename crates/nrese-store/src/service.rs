@@ -531,6 +531,32 @@ impl StoreService {
         })
     }
 
+    /// Why the statement `subject predicate object` holds under `program`: a derivation of
+    /// it from asserted statements, the statement first ([`crate::reasoning::explain_fact`]).
+    /// `None` if it doesn't hold (or no derivation was found within the budget).
+    pub fn explain_statement(
+        &self,
+        program: impl Into<nrese_reasoner::RuleProgram>,
+        subject: nrese_rdf::TermRef<'_>,
+        predicate: nrese_rdf::TermRef<'_>,
+        object: nrese_rdf::TermRef<'_>,
+    ) -> Option<Vec<crate::reasoning::InferenceStep>> {
+        // The program's constants interned under a brief transaction; the explanation
+        // reads a snapshot, without the writer.
+        let program = {
+            let tx = self.engine.transaction();
+            crate::reasoning::Program::new(&program.into(), &|term| tx.intern(term))
+                .hiding_unnamed_classes(self.config.hide_unnamed_classes)
+        };
+        let snapshot = self.engine.snapshot();
+        let fact = [
+            snapshot.lookup(subject)?.raw(),
+            snapshot.lookup(predicate)?.raw(),
+            snapshot.lookup(object)?.raw(),
+        ];
+        crate::reasoning::explain_fact(&program, &snapshot, fact)
+    }
+
     /// The closure's size with equality replicated and over representatives, for
     /// `program` on the asserted data ([`crate::reasoning::equality_report`]).
     pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
