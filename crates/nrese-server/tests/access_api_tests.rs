@@ -589,3 +589,86 @@ async fn local_users_log_in_with_passwords_besides_tokens() {
     let (status, _) = send_with(&app, &bearer, Method::GET, "/api/v1/access/me", "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// A client transaction (an `/api/v1` session or an RDF4J transaction) exists for the user
+/// who opened it only: nobody else adds to it, reads in it, commits or closes it.
+#[tokio::test]
+async fn sessions_belong_to_whoever_opened_them() {
+    let app = app();
+    // Administrators both (updates need the role): a session is still its opener's.
+    const ALICE: As<'static> = As(Some("alice"), &["nrese.admin"]);
+    const BOB: As<'static> = As(Some("bob"), &["nrese.admin"]);
+    let base = "/api/v1/repositories/nrese";
+    let (status, text) = send(
+        &app,
+        ALICE,
+        Method::POST,
+        &format!("{base}/sessions"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let opened: Value = serde_json::from_str(&text).unwrap();
+    let session = opened["path"].as_str().unwrap().to_owned();
+    let write = "INSERT DATA { GRAPH <urn:nrese:space/alice/x> { <urn:a> <urn:p> 1 } }";
+    let sparql_update = Some("application/sparql-update");
+    let sparql_query = Some("application/sparql-query");
+    let ask = "ASK { GRAPH ?g { <urn:a> <urn:p> 1 } }";
+    for (method, path, content_type, body) in [
+        (Method::POST, "/update", sparql_update, write),
+        (Method::POST, "/query", sparql_query, ask),
+        (Method::POST, "/commit", None, ""),
+        (Method::DELETE, "", None, ""),
+    ] {
+        let uri = format!("{session}{path}");
+        let (status, text) = send(&app, BOB, method, &uri, content_type, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {text}");
+    }
+    let (status, text) = send(
+        &app,
+        ALICE,
+        Method::POST,
+        &format!("{session}/update"),
+        sparql_update,
+        write,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+    let (status, text) = send(
+        &app,
+        ALICE,
+        Method::POST,
+        &format!("{session}/commit"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    // RDF4J: the same for its transactions.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/repositories/nrese/transactions")
+                .method(Method::POST)
+                .header("authorization", format!("Bearer {}", token(ALICE)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location = response.headers()["location"].to_str().unwrap().to_owned();
+    let transaction = location[location.find("/repositories/").unwrap()..].to_owned();
+    for action in ["UPDATE", "SIZE", "COMMIT"] {
+        let uri = format!("{transaction}?action={action}");
+        let (status, text) = send(&app, BOB, Method::PUT, &uri, sparql_update, write).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {text}");
+    }
+    let (status, text) = send(&app, BOB, Method::DELETE, &transaction, None, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    let (status, text) = send(&app, ALICE, Method::DELETE, &transaction, None, "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+}
