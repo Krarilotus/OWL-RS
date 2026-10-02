@@ -311,10 +311,14 @@ fn jena_text_query() {
         1
     );
     assert!(query("SELECT ?s WHERE { ?s text:query (ex:other \"bridge\") }").is_empty());
-    // NOT drops a word; a prefix; joins with the rest of the pattern.
+    // NOT excludes a word; fuzzy words; a prefix; joins with the rest of the pattern.
     assert_eq!(
         query("SELECT ?s WHERE { ?s text:query \"tower NOT bridge\" }"),
-        table(&[&["bridge"], &["tower"]])
+        table(&[&["tower"]])
+    );
+    assert_eq!(
+        query("SELECT ?s WHERE { ?s text:query \"brigde~1\" }"),
+        table(&[&["bells"], &["bridge"]])
     );
     assert_eq!(
         query("SELECT ?s WHERE { ?s text:query \"brit*\" ; rdfs:label ?l }"),

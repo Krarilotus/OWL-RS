@@ -39,9 +39,10 @@
 //! optional property, the query string, an optional limit on the matched literals, and
 //! `"lang:xx"` for the literals' language (other `name:value` options are ignored). The
 //! query string is read as Lucene's syntax as far as the index goes: words, phrases in
-//! double quotes and `word*` prefixes; `AND` between words makes every word needed (else
-//! any); `OR`, `+`, field names, fuzzy (`~`) and boosts (`^`) are dropped; words after
-//! `NOT` or `-` are dropped too, not excluded. Without a property, a literal matches as the
+//! double quotes, `word*` prefixes and fuzzy `word~` (two edits) or `word~1`; `AND` between
+//! words makes every word needed (else any); words after `NOT` or `-` are excluded (a phrase
+//! after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Without a
+//! property, a literal matches as the
 //! object of any property (Jena uses the index's default field). The score is the
 //! relevance as for `bds:` (the best match has 1), not Lucene's.
 //!
@@ -232,11 +233,12 @@ fn list(head: &TermPattern, triples: &[TriplePattern]) -> Option<(Vec<TermPatter
 /// Jena's query string as this index's query (module docs), and whether every word is
 /// needed.
 fn lucene(text: &str) -> (String, bool) {
-    let (mut out, mut all_words, mut drop_next) = (Vec::new(), false, false);
+    let (mut out, mut all_words, mut negate_next) = (Vec::new(), false, false);
     // Phrases stay whole: split outside double quotes only.
     for (i, part) in text.split('"').enumerate() {
         if i % 2 == 1 {
-            if !std::mem::take(&mut drop_next) {
+            // A phrase after `-` or `NOT` is dropped: the index excludes words only.
+            if !std::mem::take(&mut negate_next) {
                 out.push(format!("\"{part}\""));
             }
             continue;
@@ -245,23 +247,25 @@ fn lucene(text: &str) -> (String, bool) {
             match token {
                 "AND" | "&&" => all_words = true,
                 "OR" | "||" => {}
-                "NOT" | "!" => drop_next = true,
-                _ if token.starts_with('-') => {}
-                _ if std::mem::take(&mut drop_next) => {}
+                "NOT" | "!" | "-" => negate_next = true,
                 _ => {
-                    let token = token.trim_start_matches('+');
-                    // A field name, fuzziness and boosts.
+                    let negated = std::mem::take(&mut negate_next) || token.starts_with('-');
+                    let token = token.trim_start_matches(['+', '-']);
+                    // A field name and boosts go; fuzziness stays.
                     let token = token.rsplit_once(':').map_or(token, |(_, word)| word);
-                    let token = token.split(['~', '^']).next().unwrap_or_default();
+                    let token = token.split('^').next().unwrap_or_default();
                     if !token.is_empty() {
-                        out.push(token.to_owned());
+                        out.push(match negated {
+                            true => format!("-{token}"),
+                            false => token.to_owned(),
+                        });
                     }
                 }
             }
         }
-        // A `-` or `NOT` right before a phrase drops the phrase.
-        if part.trim_end().ends_with('-') {
-            drop_next = true;
+        // A `-` right before a phrase.
+        if part.ends_with('-') {
+            negate_next = true;
         }
     }
     (out.join(" "), all_words)
