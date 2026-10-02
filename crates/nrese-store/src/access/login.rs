@@ -3,7 +3,9 @@
 //! `Basic` credentials or at a login that opens a session.
 //!
 //! Argon2 is slow by design (tens of milliseconds): a credential verified once is
-//! remembered by its SHA-256 for as long as the user's hash stays the same, so a client
+//! remembered for as long as the user's hash stays the same, by its HMAC-SHA-256 under a
+//! key drawn at start and never stored (so a memory dump doesn't let anyone test guesses
+//! at SHA-256 speed, past Argon2), so a client
 //! that sends `Basic` credentials with every request pays it once. A user name without a
 //! login is checked against a fixed hash all the same, so the time a refusal takes doesn't
 //! tell which names exist.
@@ -165,12 +167,31 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     })
 }
 
+/// HMAC-SHA-256 (RFC 2104) of the concatenated `parts` under `key` (at most one block).
+fn hmac_sha256(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut padded = [0u8; BLOCK];
+    padded[..key.len()].copy_from_slice(key);
+    let pad = |byte: u8| padded.map(|k| k ^ byte);
+    let mut inner = Sha256::new().chain_update(pad(0x36));
+    for part in parts {
+        inner.update(part);
+    }
+    Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner.finalize())
+        .finalize()
+        .into()
+}
+
 /// The open sessions and what logins remember.
 #[derive(Default)]
 pub(super) struct Logins {
     limits: LoginLimits,
-    /// Verified credentials (by SHA-256 of `user`, NUL, `password`): the user and the
-    /// hash they were verified against.
+    /// The key of [`Self::verified`]'s HMACs: random, per process.
+    secret: [u8; 32],
+    /// Verified credentials (by HMAC of `user`, NUL, `password`): the user and the hash
+    /// they were verified against.
     verified: Mutex<HashMap<[u8; 32], (String, String)>>,
     /// Failed attempts ([`Throttle`]).
     failures: Mutex<Throttle>,
@@ -183,8 +204,12 @@ pub const SESSION_PREFIX: &str = "nrese-session.";
 
 impl Logins {
     pub(super) fn new(limits: LoginLimits) -> Self {
+        let mut secret = [0u8; 32];
+        // Without randomness, the cache key is a plain hash again, which is what it was.
+        let _ = getrandom::fill(&mut secret);
         Self {
             limits,
+            secret,
             ..Self::default()
         }
     }
@@ -222,12 +247,7 @@ impl Logins {
             self.failed(&pair);
             return Err(refused());
         };
-        let key: [u8; 32] = Sha256::new()
-            .chain_update(user.as_bytes())
-            .chain_update([0])
-            .chain_update(password.as_bytes())
-            .finalize()
-            .into();
+        let key = hmac_sha256(&self.secret, &[user.as_bytes(), &[0], password.as_bytes()]);
         let known = self
             .verified
             .lock()
@@ -303,5 +323,23 @@ impl Logins {
             .lock()
             .expect("sessions")
             .retain(|_, (owner, _)| owner != user);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// RFC 4231, test case 1.
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        // RFC 4231 test case 1 uses a 20-byte key 0x0b..; padded to 32 bytes with zeros it
+        // is the same HMAC key (keys shorter than a block are zero-padded).
+        let mut key = [0u8; 32];
+        key[..20].fill(0x0b);
+        let mac = super::hmac_sha256(&key, &[b"Hi ", b"There"]);
+        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
     }
 }
