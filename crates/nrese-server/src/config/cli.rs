@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 
 /// Command line: `nrese-server [--config PATH]` serves;
-/// `nrese-server load [--config PATH] [--replace] [--graph IRI] FILE...` bulk-loads files
+/// `nrese-server load [--config PATH] [--replace] [--graph IRI] [--skip-errors] FILE...` bulk-loads files
 /// into the configured store and exits (the server must not be running on the same data
 /// directory; the engine's directory lock enforces that);
 /// `nrese-server query [--config PATH] [--format F] (QUERY | --file PATH)` answers one query
@@ -51,6 +51,8 @@ pub struct LoadCommand {
     pub replace: bool,
     /// Target graph IRI for triple formats; `None` = the default graph.
     pub graph: Option<String>,
+    /// Skip statements with syntax errors (logged and counted) instead of stopping.
+    pub skip_errors: bool,
 }
 
 impl CliConfig {
@@ -137,6 +139,8 @@ impl CliConfig {
             };
             if argument == "--replace" {
                 load.replace = true;
+            } else if argument == "--skip-errors" {
+                load.skip_errors = true;
             } else if argument == "--graph" {
                 let Some(graph) = args.next().and_then(|graph| graph.into_string().ok()) else {
                     bail!("missing or non-UTF-8 value for --graph");
@@ -232,6 +236,7 @@ mod tests {
                 files: vec![PathBuf::from("a.nt"), PathBuf::from("b.ttl")],
                 replace: true,
                 graph: Some("http://example.com/g".to_owned()),
+                skip_errors: false,
             })
         );
     }

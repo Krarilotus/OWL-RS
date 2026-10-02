@@ -188,6 +188,7 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
         graph: load
             .graph
             .map_or(GraphTarget::DefaultGraph, GraphTarget::NamedGraph),
+        skip_errors: load.skip_errors,
     };
     let report = store.bulk_load(&request).context("bulk load failed")?;
     let seconds = report.elapsed.as_secs_f64();
@@ -198,6 +199,7 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
         deleted = report.deleted,
         seconds,
         quads_per_second = (report.parsed as f64 / seconds) as u64,
+        skipped = report.skipped,
         "bulk load complete"
     );
     Ok(())

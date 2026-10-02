@@ -171,6 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         files,
         replace: false,
         graph: GraphTarget::DefaultGraph,
+        skip_errors: false,
     })?;
     let load_time = started.elapsed();
     if equality_report {

@@ -31,6 +31,7 @@ pub struct RdfParser {
     unchecked: bool,
     max_nesting: usize,
     json_ld: JsonLdOptions,
+    recover: bool,
 }
 
 /// How deep `[ … ]` and `( … )` may nest in Turtle and TriG by default: far beyond real
@@ -48,6 +49,7 @@ impl RdfParser {
             unchecked: false,
             max_nesting: MAX_NESTING,
             json_ld: JsonLdOptions::default(),
+            recover: false,
         }
     }
 
@@ -84,6 +86,15 @@ impl RdfParser {
     /// input known to be valid.
     pub fn unchecked(mut self) -> Self {
         self.unchecked = true;
+        self
+    }
+
+    /// Goes on after a syntax error in Turtle or TriG: the error is returned, the rest of
+    /// its statement (up to the `.` ending it, or the `}` ending its graph block) skipped,
+    /// and the statements after it follow. N-Triples and N-Quads go on after a bad line
+    /// anyway; other formats stop at the first error. A read error always stops.
+    pub fn recovering(mut self) -> Self {
+        self.recover = true;
         self
     }
 
@@ -162,6 +173,7 @@ impl RdfParser {
             unchecked: self.unchecked,
             max_depth: self.max_nesting,
             n3: self.format == RdfFormat::N3,
+            recover: self.recover,
         }
     }
 
