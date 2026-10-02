@@ -715,50 +715,78 @@ pub fn anti_join(
     right_keys: &[usize],
 ) -> IdTable {
     let mut out = left.clone();
-    if right.is_empty() {
-        return out;
-    }
-    if left_keys.is_empty() {
-        out.slice(0, Some(0));
-        return out;
-    }
-    if let Some(found) = sorted_membership(left, right, left_keys, right_keys) {
-        out.retain_mask(&found.iter().map(|f| !f).collect::<Vec<_>>());
-        return out;
-    }
-    let table = BuildTable::new(right, right_keys);
-    out.par_retain(|t, row| table.first(t, row, left_keys) == END);
+    anti_join_in_place(&mut out, right, left_keys, right_keys);
     out
 }
 
-/// Per left row, whether its key occurs in `right`, where both are sorted on their keys:
-/// one merge, galloping over runs, instead of a hash table of `right` (`None` otherwise).
-/// Wikidata lexemes: 432 k entries against the 246 k senses' entries.
+/// [`anti_join`] of a table the caller owns, filtered where it is: no copy of it.
+pub fn anti_join_in_place(
+    left: &mut IdTable,
+    right: &IdTable,
+    left_keys: &[usize],
+    right_keys: &[usize],
+) {
+    if right.is_empty() {
+        return;
+    }
+    if left_keys.is_empty() {
+        left.slice(0, Some(0));
+        return;
+    }
+    if let Some(keep) = sorted_membership(left, right, left_keys, right_keys, false) {
+        left.retain_mask(&keep);
+        return;
+    }
+    let table = BuildTable::new(right, right_keys);
+    left.par_retain(|t, row| table.first(t, row, left_keys) == END);
+}
+
+/// Per left row, whether its key occurring in `right` is `wanted`, where both are sorted
+/// on their keys: one merge, galloping over runs, instead of a hash table of `right`
+/// (`None` otherwise). Wikidata lexemes: 432 k entries against the 246 k senses' entries.
 fn sorted_membership(
     left: &IdTable,
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
+    wanted: bool,
 ) -> Option<Vec<bool>> {
     if !left.is_sorted_on(left_keys) || !right.is_sorted_on(right_keys) {
         return None;
     }
-    // One key: two columns of ids, merged in one linear pass.
+    // One key: two columns of ids, merged in one linear pass without branches to
+    // mispredict. Each step advances the smaller side; a left key equal to the right one
+    // is found, and the right one stays for the next left key. A left row is written
+    // again until its key is passed, so the last write is its answer. DBpedia q13: 298 k
+    // people against 363 k death dates' subjects.
+    // Each step waits for the last one's comparison, so large inputs are cut into parts
+    // merged in parallel, each from its first key's place in `right`.
     if let ([lk], [rk]) = (left_keys, right_keys) {
+        const PART: usize = 1 << 15;
         let (keys, against) = (left.column(*lk), right.column(*rk));
-        let mut r = 0;
-        return Some(
-            keys.iter()
-                .map(|&key| {
-                    while r < against.len() && against[r] < key {
-                        r += 1;
-                    }
-                    r < against.len() && against[r] == key
-                })
-                .collect(),
-        );
+        let mut keep = vec![!wanted; keys.len()];
+        let merge = |keys: &[u64], keep: &mut [bool]| {
+            let Some(&first) = keys.first() else {
+                return;
+            };
+            let (mut l, mut r) = (0, against.partition_point(|&b| b < first));
+            while l < keys.len() && r < against.len() {
+                let (a, b) = (keys[l], against[r]);
+                keep[l] = (a == b) == wanted;
+                l += usize::from(a <= b);
+                r += usize::from(b < a);
+            }
+        };
+        if keys.len() < 2 * PART {
+            merge(keys, &mut keep);
+        } else {
+            keep.par_chunks_mut(PART)
+                .zip(keys.par_chunks(PART))
+                .for_each(|(keep, keys)| merge(keys, keep));
+        }
+        return Some(keep);
     }
-    let mut found = vec![false; left.len()];
+    let mut keep = vec![!wanted; left.len()];
     let (mut l, mut r) = (0, 0);
     while l < left.len() && r < right.len() {
         match compare_keys(left, l, left_keys, right, r, right_keys) {
@@ -766,12 +794,12 @@ fn sorted_membership(
             Ordering::Greater => r = gallop(right, right_keys, r, left, l, left_keys, false),
             Ordering::Equal => {
                 // The next left rows may have the same key: `r` stays.
-                found[l] = true;
+                keep[l] = wanted;
                 l += 1;
             }
         }
     }
-    Some(found)
+    Some(keep)
 }
 
 /// Left rows whose key occurs in `right` (FILTER EXISTS). Order and sortedness of `left` are
@@ -783,19 +811,29 @@ pub fn semi_join(
     right_keys: &[usize],
 ) -> IdTable {
     let mut out = left.clone();
+    semi_join_in_place(&mut out, right, left_keys, right_keys);
+    out
+}
+
+/// [`semi_join`] of a table the caller owns, filtered where it is: no copy of it.
+pub fn semi_join_in_place(
+    left: &mut IdTable,
+    right: &IdTable,
+    left_keys: &[usize],
+    right_keys: &[usize],
+) {
     if left_keys.is_empty() {
         if right.is_empty() {
-            out.slice(0, Some(0));
+            left.slice(0, Some(0));
         }
-        return out;
+        return;
     }
-    if let Some(found) = sorted_membership(left, right, left_keys, right_keys) {
-        out.retain_mask(&found);
-        return out;
+    if let Some(keep) = sorted_membership(left, right, left_keys, right_keys, true) {
+        left.retain_mask(&keep);
+        return;
     }
     let table = BuildTable::new(right, right_keys);
-    out.par_retain(|t, row| table.first(t, row, left_keys) != END);
-    out
+    left.par_retain(|t, row| table.first(t, row, left_keys) != END);
 }
 
 /// Inner join where key columns may hold UNDEF (SPARQL compatibility: UNDEF matches any

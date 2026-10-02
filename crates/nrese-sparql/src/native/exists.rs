@@ -27,7 +27,9 @@ use nrese_sparql_syntax::algebra::{
 };
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
 
-use nrese_exec::join::{anti_join, compatible_mask, outer_join_with_undef, semi_join};
+use nrese_exec::join::{
+    anti_join_in_place, compatible_mask, outer_join_with_undef, semi_join_in_place,
+};
 use nrese_exec::{IdTable, UNDEF};
 
 use super::{
@@ -409,11 +411,10 @@ impl Context<'_> {
             };
             let (lk, rk) = shared_columns(&solutions, &found);
             if !has_undef(&solutions.table, &lk) && !has_undef(&found.table, &rk) {
-                solutions.table = if keep_matching {
-                    semi_join(&solutions.table, &found.table, &lk, &rk)
-                } else {
-                    anti_join(&solutions.table, &found.table, &lk, &rk)
-                };
+                match keep_matching {
+                    true => semi_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
+                    false => anti_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
+                }
                 self.consumed(&found);
                 return Ok(solutions);
             }

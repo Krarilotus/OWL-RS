@@ -54,7 +54,7 @@ use crate::results::{
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
-    anti_join, compatible_mask, join, join_keeping_left_order, join_with_undef, left_join,
+    anti_join_in_place, compatible_mask, join, join_keeping_left_order, join_with_undef, left_join,
     outer_join_with_undef,
 };
 use nrese_exec::{
@@ -1496,15 +1496,14 @@ impl<'a> Context<'a> {
                 if lk.is_empty() {
                     return Ok(left);
                 }
-                let table = if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
+                let mut table = left.table;
+                if has_undef(&table, &lk) || has_undef(&right.table, &rk) {
                     // A row goes if a compatible row shares a variable both bind.
-                    let removed = compatible_mask(&left.table, &right.table, &lk, &rk, true);
-                    let mut table = left.table.clone();
+                    let removed = compatible_mask(&table, &right.table, &lk, &rk, true);
                     table.retain_mask(&removed.iter().map(|r| !r).collect::<Vec<_>>());
-                    table
                 } else {
-                    anti_join(&left.table, &right.table, &lk, &rk)
-                };
+                    anti_join_in_place(&mut table, &right.table, &lk, &rk);
+                }
                 self.consumed(&right);
                 self.produced(Solutions {
                     vars: left.vars,

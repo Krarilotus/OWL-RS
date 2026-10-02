@@ -280,10 +280,10 @@ impl Context<'_> {
                 let detail = format!("distinct {kept} of {triple}");
                 self.note("group walk", detail, None, groups.len(), start);
             }
-            let mut table = IdTable::new(1);
-            for (id, _) in groups {
-                table.push_row(&[id.raw()]);
-            }
+            // The column at once: a row at a time cost as much as the walk (DBpedia q13,
+            // 363 k subjects).
+            let table =
+                IdTable::from_columns(vec![groups.iter().map(|(id, _)| id.raw()).collect()]);
             let values = self.produced(Solutions {
                 vars: vec![(*kept).clone()],
                 table: table.assume_sorted_by(vec![0]),
