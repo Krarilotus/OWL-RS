@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+aho-corasick = "1.1"
 crc32fast = "1.5"
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
 memchr = "2.8"

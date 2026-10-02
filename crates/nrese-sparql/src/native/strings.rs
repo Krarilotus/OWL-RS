@@ -13,6 +13,7 @@
 //! | `CONTAINS/STRSTARTS/STRENDS(?v, "text")` | simple and language-tagged literals with the text (others are errors) |
 //! | the same on `STR(?v)` | IRIs and literals of every kind with the text, plus every inline literal (numbers and dates: their text isn't in the dictionary) |
 //! | `LANG(?v) = "tag"` | language-tagged strings with that tag; with one of the above on `?v`, those of them with the text |
+//! | the same on `LCASE(?v)` or `LCASE(STR(?v))`, with a lower-case ASCII needle | those with the text in any ASCII case, and those holding a character whose lower case is ASCII without being so (`İ`, the Kelvin sign): a superset |
 //!
 //! The pass costs the dictionary's size, so it runs only for patterns with at least one
 //! row per [`DICTIONARY_BYTES_PER_ROW`] bytes of dictionary text; for smaller ones the
@@ -40,13 +41,17 @@ pub(crate) struct Condition<'e> {
     of_str: bool,
     /// `LANG(?v) = "tag"`.
     language: Option<&'e str>,
+    /// The test is on `LCASE(…)` of the term: its text in any ASCII case passes.
+    fold_case: bool,
 }
 
 impl Condition<'_> {
     /// A prefix test: answered by binary search where the dictionary's text order is at
     /// hand ([`Snapshot::text_order_ready`]), whatever the pattern's size.
     pub(crate) fn is_prefix(&self) -> bool {
-        matches!(self.placement, Placement::Start | Placement::Whole) && !self.needle.is_empty()
+        matches!(self.placement, Placement::Start | Placement::Whole)
+            && !self.needle.is_empty()
+            && !self.fold_case
     }
 }
 
@@ -68,6 +73,7 @@ pub(crate) fn combined<'e>(
                     found.needle = condition.needle;
                     found.placement = condition.placement;
                     found.of_str = condition.of_str;
+                    found.fold_case = condition.fold_case;
                 }
                 found.language = found.language.or(condition.language);
                 found
@@ -101,6 +107,7 @@ pub(crate) fn condition(conjunct: &Expression) -> Option<Condition<'_>> {
             placement: Placement::Anywhere,
             of_str: false,
             language: Some(tag.value()),
+            fold_case: false,
         });
     }
     let Expression::FunctionCall(function, args) = conjunct else {
@@ -119,13 +126,27 @@ pub(crate) fn condition(conjunct: &Expression) -> Option<Condition<'_>> {
     if needle.datatype() != xsd::STRING || needle.value().is_empty() {
         return None;
     }
-    let (variable, of_str) = match subject {
-        Expression::Variable(v) => (v, false),
-        Expression::FunctionCall(Function::Str, inner) => match inner.as_slice() {
-            [Expression::Variable(v)] => (v, true),
-            _ => return None,
-        },
-        _ => return None,
+    // The term itself, its STR, or LCASE of either (then only a lower-case ASCII needle:
+    // its matches in any ASCII case are a superset, see the module docs).
+    let (variable, of_str, fold_case) = match subject {
+        Expression::FunctionCall(Function::LCase, inner) => {
+            let [inner] = inner.as_slice() else {
+                return None;
+            };
+            let lower_ascii = needle
+                .value()
+                .bytes()
+                .all(|b| b.is_ascii() && !b.is_ascii_uppercase());
+            if !lower_ascii {
+                return None;
+            }
+            let (variable, of_str) = operand(inner)?;
+            (variable, of_str, true)
+        }
+        other => {
+            let (variable, of_str) = operand(other)?;
+            (variable, of_str, false)
+        }
     };
     Some(Condition {
         variable,
@@ -133,7 +154,20 @@ pub(crate) fn condition(conjunct: &Expression) -> Option<Condition<'_>> {
         placement,
         of_str,
         language: None,
+        fold_case,
     })
+}
+
+/// The variable a string test reads, and whether through `STR`.
+fn operand(expression: &Expression) -> Option<(&Variable, bool)> {
+    match expression {
+        Expression::Variable(v) => Some((v, false)),
+        Expression::FunctionCall(Function::Str, inner) => match inner.as_slice() {
+            [Expression::Variable(v)] => Some((v, true)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The id ranges of the terms that can pass `condition`, sorted, for a pattern of `rows`
@@ -151,6 +185,7 @@ pub(crate) fn ranges(
         lang_strings: true,
         typed: condition.of_str,
         language: condition.language,
+        ascii_case_insensitive: condition.fold_case,
     };
     let ids = snapshot.matching_strings(&test);
     if ids.len() as u64 > rows {
