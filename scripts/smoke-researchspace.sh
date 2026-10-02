@@ -7,6 +7,8 @@
 #   3. write through it: a SPARQL update, then a resource created, read and deleted with
 #      its LDP container API
 #   4. a keyword search as its stock templates ask it (Blazegraph's bds:search)
+#   5. Blazegraph's query hints as its templates send them (its search templates check
+#      for Blazegraph with one; the knowledge map puts one before its filters)
 #
 # Usage: scripts/smoke-researchspace.sh [ResearchSpace URL] [user] [password]
 #        (defaults: http://127.0.0.1:10214 admin admin)
@@ -101,6 +103,14 @@ has false "the deleted resource is still there"
 say "a keyword search as the stock templates ask it (bds:search)"
 query "PREFIX bds: <http://www.bigdata.com/rdf/search#> SELECT ?s WHERE { ?s <$RDFS_LABEL> ?l . ?l bds:search \"Anna*\" }"
 has "$TEST_GRAPH/a" "the keyword search doesn't find the label"
+
+say "Blazegraph's query hints, as ResearchSpace's templates send them"
+# SimpleSearchInclude decides with this ASK whether the store is Blazegraph (and then
+# searches with bds:search); the knowledge map puts the hint before its filters.
+query "ASK { <http://www.bigdata.com/queryHints#Query> <http://www.bigdata.com/queryHints#optimizer> 'None' . ?x ?y ?z . }"
+has true "the Blazegraph check is false: the search templates fall back"
+query "SELECT ?s WHERE { <http://www.bigdata.com/queryHints#Query> <http://www.bigdata.com/queryHints#optimizer> \"None\" . ?s <$RDFS_LABEL> \"Anna Amalia Bibliothek\" }"
+has "$TEST_GRAPH/a" "a query with the knowledge map's hint prelude finds nothing"
 
 say "remove what was created"
 update "DROP GRAPH <$TEST_GRAPH>"

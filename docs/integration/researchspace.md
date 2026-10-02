@@ -2,7 +2,7 @@
 
 How to run the ResearchSpace platform with NRESE as its triple store, what was tested, and what doesn't work yet.
 
-Status on 30 September 2026: tested with the image `researchspace/platform-ci:latest` on Linux, through ResearchSpace's HTTP interfaces (`scripts/smoke-researchspace.sh`). Its pages and forms were not tested in a browser.
+Status on 2 October 2026: tested with the image `researchspace/platform-ci:latest` on Linux, through ResearchSpace's HTTP interfaces (`scripts/smoke-researchspace.sh`, 8 steps, all pass: startup data, queries, updates, the LDP API, keyword search with `bds:search`, Blazegraph's query hints). Every SPARQL query in ResearchSpace's shipped templates (291) was also sent to NRESE: all that ResearchSpace sends as written parse and run; the others use ResearchSpace's own placeholders (`??`, its namespace prefixes), which it resolves before sending, or its own `SERVICE`s, which run inside it. Its pages and forms were not tested in a browser.
 
 ## Running both
 
@@ -34,7 +34,8 @@ An existing ResearchSpace installation is moved the same way: point `sparqlEndpo
 
 | What | How it was checked |
 |---|---|
-| Startup: ResearchSpace connects to its repositories and loads its 645 system resources | 73,751 statements in 1,435 named graphs, written in about 1,400 updates; no warning or error in ResearchSpace's log |
+| Startup: ResearchSpace connects to its repositories and loads its system resources | 54,745 statements in 647 named graphs with the image of 2 October (73,751 in 1,435 with that of 30 September); no warning or error in ResearchSpace's log |
+| Its search templates' Blazegraph check (an `ASK` with a query hint) and the knowledge map's hint prelude | true, and the hinted queries answer as without the hint (before 2 October both matched nothing, so the search fell back and the knowledge map's filters found nothing) |
 | Queries through ResearchSpace's SPARQL endpoint | `SELECT` over all graphs, `GRAPH ?g`, `ASK`, `CONSTRUCT` as Turtle, property paths |
 | Updates through ResearchSpace's SPARQL endpoint | `INSERT DATA` into a named graph, `DROP GRAPH` |
 | Resources through ResearchSpace's LDP container API | create (201), found in its container, read as Turtle with ResearchSpace's provenance, delete |

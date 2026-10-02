@@ -2,7 +2,7 @@
 
 How the Datamodel Workflow (DMW) uses NRESE through the standard protocols its exporter already speaks (its plan: WP15 export, D18 validation in the store). Nothing here is specific to DMW on the server side: any exporter that uses SPARQL Update, the Graph Store Protocol and SHACL can follow it.
 
-Status on 30 September 2026: the protocol below is replayed end to end by `scripts/smoke-dmw-export.sh`, which passes with reasoning off and with `owl2-rl`. DMW's own exporter doesn't exist yet, so nothing has been run from DMW itself.
+Status on 2 October 2026: the protocol below is replayed end to end by `scripts/smoke-dmw-export.sh` against the server's Docker image, and passes with reasoning off, with `owl2-rl`, and with the SHACL commit gate enforced (`DMW_GATE=enforce`). DMW's own exporter doesn't exist yet, so nothing has been run from DMW itself.
 
 ## Server settings
 
@@ -37,8 +37,8 @@ A suggested graph naming, which the smoke test uses: one graph per module versio
 
 ## What to know
 
-- **Validation runs on request, not on commit.** A `PUT` of data that breaks the shapes succeeds; the exporter asks `/dataset/shacl` afterwards (or before, with the posted-shapes form on a draft graph). Validation on commit is a later step ([plan](../plan/2026-09-30-graphdb-parity-plan.md), U7).
-- **SHACL Core only.** `sh:sparql` constraints aren't evaluated yet.
+- **Validation on request or on commit.** By default a `PUT` of data that breaks the shapes succeeds, and the exporter asks `/dataset/shacl` afterwards (or before, with the posted-shapes form on a draft graph). With `shacl.gate = "enforce"` ([configuration](../ops/config-reference.md)) an export that introduces a violation is refused whole (400, with the validation results), so the store holds only data that keeps the ABox contract; `report` logs instead.
+- **SHACL Core and SHACL-SPARQL** (`sh:sparql` constraints and components) are evaluated.
 - **Updates without `GRAPH`** write to, and delete from, the default graph only, also with `store.default_graph = "union"`. The exporter should name the graph in updates.
 - **The shapes graph is an ordinary graph:** a query over all graphs sees the shapes too. Validation leaves it out of the data by itself.
 - **Inferred statements** live in the default graph. `GET /dataset/data?graph=…` returns what was exported, not what was inferred from it; queries see both unless they say `infer=false`.
