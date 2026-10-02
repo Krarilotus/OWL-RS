@@ -19,6 +19,7 @@ mod fast;
 mod federation;
 mod geo;
 mod geo_formats;
+mod lateral;
 
 /// The reference system (an IRI) and geometry of a GeoSPARQL literal: WKT, GeoJSON or
 /// GML; `None` for other terms. EPSG:4326 is read as CRS84 (longitude first).
@@ -662,6 +663,7 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
         | GraphPattern::Distinct { inner }
         | GraphPattern::Reduced { inner }
         | GraphPattern::Slice { inner, .. } => supported(inner),
+        GraphPattern::Lateral { left, right } => supported(left) && supported(right),
         GraphPattern::Group {
             inner, aggregates, ..
         } => {
@@ -1619,9 +1621,10 @@ impl<'a> Context<'a> {
                 variables,
                 aggregates,
             } => self.group(inner, variables, aggregates, None),
-            // LATERAL, where a feature of nrese_sparql_syntax enables it.
-            #[allow(unreachable_patterns)]
-            _ => unsupported("LATERAL"),
+            GraphPattern::Lateral { left, right } => {
+                let left = self.eval(left)?;
+                self.lateral(left, right)
+            }
         }
     }
 
