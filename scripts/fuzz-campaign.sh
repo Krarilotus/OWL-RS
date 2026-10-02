@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A bug hunt over many seeds: the random differential and property tests (SPARQL against
 # the reference evaluator, reasoner closures, index models, the inferred stack, compact
-# equality, incremental SHACL) run again and again, each run with another
+# equality, incremental SHACL, the parsers of untrusted input) run again and again, each run with another
 # NRESE_FUZZ_SEED, until the time budget is spent. A failing run's output is kept with
 # its seed, which replays it:
 #
@@ -25,6 +25,7 @@ targets=(
   "nrese-engine:it:inferred_stack_tests::"
   "nrese-engine:lib:index::model_tests"
   "nrese-reasoner:lib:v2::"
+  "nrese-fuzz:it:parsers_hold"
 )
 
 declare -A binary

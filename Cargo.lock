@@ -1164,6 +1164,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-fuzz"
+version = "0.1.0"
+dependencies = [
+ "nrese-rdf",
+ "nrese-rdf-io",
+ "nrese-sparql-results",
+ "nrese-sparql-syntax",
+]
+
+[[package]]
 name = "nrese-json"
 version = "0.1.0"
 dependencies = [
