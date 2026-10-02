@@ -12,6 +12,7 @@ mod delta;
 pub mod error;
 pub mod graph_store;
 mod graph_store_executor;
+pub mod image_backup;
 mod loader;
 pub mod mutation;
 pub mod query;
@@ -43,6 +44,7 @@ pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
 };
+pub use image_backup::{ImageManifest, read_manifest, restore_image};
 pub use mutation::{
     MutationCommand, MutationCommitReport, MutationError, MutationKind, MutationPipeline,
     MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
