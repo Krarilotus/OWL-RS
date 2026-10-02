@@ -9,6 +9,11 @@
 //! its result is joined further. `?p :date ?d BIND(YEAR(?d) AS ?y)` with 300 dates in 10
 //! years hands 10 rows to the next join, not 300.
 //!
+//! In a basic graph pattern, a triple pattern whose other variables nothing else reads
+//! (`?x :games ?games` when only `?games` is needed) stands for the distinct values of the
+//! one it shares, which a group walk over the index lists without reading its matches
+//! ([`Context::bgp_set`]): the 51 games of 270 k participations, not the participations.
+//!
 //! **Aggregates per OPTIONAL branch** ([`Context::group_detached`]). In
 //!
 //! ```sparql
@@ -41,9 +46,11 @@ use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern,
 };
+use nrese_sparql_syntax::term::TriplePattern;
 
 use super::{
-    Agg, Context, NativeResult, Solutions, as_path, bound_variables, expression_variables, pushdown,
+    Agg, Context, NativeResult, Solutions, as_path, bound_variables, expression_variables,
+    pushdown, triple_variables,
 };
 
 /// The variables each aggregate reads, if none of the aggregates counts duplicate rows.
@@ -215,9 +222,80 @@ impl Context<'_> {
                 let solutions = self.eval_set(inner, &keep)?;
                 self.filter(solutions, expr)?
             }
+            GraphPattern::Bgp { patterns } if !self.as_written => {
+                match self.bgp_set(patterns, needed)? {
+                    Some(solutions) => solutions,
+                    None => self.eval(pattern)?,
+                }
+            }
             other => self.eval(other)?,
         };
         self.distinct_on(solutions, needed)
+    }
+
+    /// A BGP as a set over `needed`, from one triple pattern that has exactly one variable
+    /// something else reads, in the place its index lists next: that pattern gives the
+    /// distinct values of the variable by a group walk, and the other patterns join to
+    /// them (as matches or as probes). `None` where no pattern qualifies.
+    pub(super) fn bgp_set(
+        &self,
+        patterns: &[TriplePattern],
+        needed: &[Variable],
+    ) -> NativeResult<Option<Solutions>> {
+        // Readers of a variable: the patterns that hold it, and the consumer if it needs it.
+        let readers = |v: &Variable| {
+            patterns
+                .iter()
+                .filter(|p| triple_variables(p).contains(v))
+                .count()
+                + usize::from(needed.contains(v))
+        };
+        for (i, triple) in patterns.iter().enumerate() {
+            let Some(scan) = self.scan_pattern(triple) else {
+                continue;
+            };
+            if scan.merged() || !scan.in_default_graph() || scan.repeats_variable() {
+                continue;
+            }
+            let vars = scan.vars();
+            let shared: Vec<&Variable> = vars.iter().filter(|v| readers(v) > 1).collect();
+            let ([kept], true) = (shared.as_slice(), vars.len() > 1) else {
+                continue;
+            };
+            let Some(position) = (0..3).find(|&c| scan.slots[c].is_var(kept)) else {
+                continue;
+            };
+            let permutation = scan.permutation_for(Some(kept));
+            if scan.first_free(permutation) != Some(position) {
+                continue;
+            }
+            let Some(groups) =
+                self.snapshot
+                    .group_counts_in(self.model, &scan.quad_pattern(), permutation)
+            else {
+                continue;
+            };
+            let mut table = IdTable::new(1);
+            for (id, _) in groups {
+                table.push_row(&[id.raw()]);
+            }
+            let values = self.produced(Solutions {
+                vars: vec![(*kept).clone()],
+                table: table.assume_sorted_by(vec![0]),
+                ordered: false,
+            })?;
+            let rest: Vec<TriplePattern> = patterns
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, p)| p.clone())
+                .collect();
+            if rest.is_empty() {
+                return Ok(Some(values));
+            }
+            return Ok(Some(self.bgp_from(values, &rest, &mut Vec::new())?));
+        }
+        Ok(None)
     }
 
     /// A group whose aggregates ignore duplicates (`arguments`: the variables each reads),

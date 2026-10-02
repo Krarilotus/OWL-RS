@@ -1533,7 +1533,16 @@ impl<'a> Context<'a> {
                         matches!(e, Expression::Variable(v) if variables.contains(v))
                     })
                 {
-                    let solutions = self.eval(sorted)?;
+                    // A BGP as a set over the projection (`sets`): what only feeds
+                    // duplicates isn't read.
+                    let solutions = match &**sorted {
+                        GraphPattern::Bgp { patterns }
+                            if patterns.len() > 1 && !self.as_written =>
+                        {
+                            self.eval_set(sorted, variables)?
+                        }
+                        _ => self.eval(sorted)?,
+                    };
                     let mut solutions = self.project(solutions, variables);
                     solutions.table.dedup_preserving_order();
                     return self.order_by(solutions, expression, None);
@@ -1543,7 +1552,8 @@ impl<'a> Context<'a> {
                     inner: projected,
                     variables,
                 } = &**inner
-                    && sets::joins(projected)
+                    && (sets::joins(projected)
+                        || matches!(&**projected, GraphPattern::Bgp { patterns } if patterns.len() > 1))
                     && !self.as_written
                 {
                     let solutions = self.eval_set(projected, variables)?;
