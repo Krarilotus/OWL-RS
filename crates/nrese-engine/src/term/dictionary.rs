@@ -265,14 +265,32 @@ fn decoded_matching(base: &Base, limit: u64, test: &super::StringTest<'_>) -> Ve
     use rayon::prelude::*;
     const SLICE: u64 = 1 << 16;
     let entries = base.len.min(limit);
+    let codec = base.codec.as_ref().expect("a compressed base");
+    // The tag byte is stored plain: keys of kinds the test doesn't read aren't decoded
+    // (their tag alone stays, which the test rejects).
+    let wanted = |tag: u8| match test.language {
+        Some(_) => matches!(tag, b'L' | b'D'),
+        None => match tag {
+            b'I' => test.iris,
+            b'S' => test.strings,
+            b'L' | b'D' => test.lang_strings,
+            b'T' => test.typed,
+            _ => false,
+        },
+    };
     let mut ids: Vec<TermId> = (0..entries.div_ceil(SLICE))
         .into_par_iter()
         .flat_map_iter(|slice| {
             let (first, last) = (slice * SLICE, ((slice + 1) * SLICE).min(entries));
-            let mut bytes = Vec::new();
+            let mut bytes = Vec::with_capacity(64 * (last - first) as usize);
             let mut ends = Vec::with_capacity((last - first) as usize);
             for index in first..last {
-                bytes.extend_from_slice(&base.plain(index));
+                let stored = base.key(index);
+                match stored.first() {
+                    Some(&tag) if wanted(tag) => codec.decompress(stored, &mut bytes),
+                    Some(&tag) => bytes.push(tag),
+                    None => {}
+                }
                 ends.push(bytes.len() as u64);
             }
             super::strings::matching(&bytes, &ends[..], first, u64::MAX, test)
