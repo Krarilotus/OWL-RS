@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use axum::serve::ListenerExt;
 use nrese_reasoner::ReasonerService;
 use nrese_store::{
-    BulkLoadRequest, CancellationToken, GraphResultFormat, GraphTarget, PreparedQuery,
-    SolutionsResultFormat, SparqlQueryRequest, StoreService,
+    BulkLoadRequest, CancellationToken, GraphResultFormat, GraphTarget, SolutionsResultFormat,
+    SparqlQueryRequest, StoreService,
 };
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -234,7 +234,9 @@ fn query_once(store: &StoreService, command: QueryCommand) -> Result<()> {
             }
         }
     }
-    let prepared = PreparedQuery::parse(&request).context("parsing the query failed")?;
+    let prepared = store
+        .prepare_query(&request)
+        .context("parsing the query failed")?;
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     store

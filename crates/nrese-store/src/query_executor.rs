@@ -70,11 +70,37 @@ pub struct PreparedQuery {
     access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
     /// Who sent it, for the list of running queries.
     origin: Option<String>,
+    /// The repository's namespaces the query was parsed with, if it needed them (it used a
+    /// prefix it doesn't declare): part of its cache key.
+    implicit_prefixes: Option<crate::NamespaceMap>,
 }
 
 impl PreparedQuery {
     pub fn parse(request: &SparqlQueryRequest) -> StoreResult<Self> {
-        let mut query = nrese_sparql::compat::parse_query(&request.query)?;
+        Self::parse_with(request, None)
+    }
+
+    /// [`Self::parse`], where a prefix the query uses without declaring it means what
+    /// `namespaces` bind it to (GraphDB's and RDF4J's repository namespaces; the query's own
+    /// declarations win). A query that parses without them doesn't depend on them.
+    pub fn parse_with(
+        request: &SparqlQueryRequest,
+        namespaces: Option<&crate::NamespaceMap>,
+    ) -> StoreResult<Self> {
+        let (mut query, implicit_prefixes) =
+            match nrese_sparql::compat::parse_query(&request.query, None) {
+                Ok(query) => (query, None),
+                Err(error) => match namespaces.filter(|namespaces| !namespaces.is_empty()) {
+                    None => return Err(error.into()),
+                    Some(namespaces) => {
+                        match nrese_sparql::compat::parse_query(&request.query, Some(namespaces)) {
+                            Ok(query) => (query, Some(namespaces.clone())),
+                            // A mistake of its own: the error without the namespaces.
+                            Err(_) => return Err(error.into()),
+                        }
+                    }
+                },
+            };
         let mut default_graphs = request.default_graphs.clone();
         let from_protocol = pseudo_graph_strings(&mut default_graphs);
         let from_query = query_dataset(&mut query)
@@ -110,6 +136,7 @@ impl PreparedQuery {
             graph_format: request.graph_format,
             access: request.scope.access().cloned(),
             origin: None,
+            implicit_prefixes,
         })
     }
 
@@ -123,12 +150,12 @@ impl PreparedQuery {
         self.origin = Some(origin.into());
     }
 
-    /// Who sent the query, if the caller said.
     /// The graphs the query may read; `None`: every graph.
     pub fn access(&self) -> Option<&std::sync::Arc<nrese_sparql::GraphAccess>> {
         self.access.as_ref()
     }
 
+    /// Who sent the query, if the caller said.
     pub fn origin(&self) -> Option<&str> {
         self.origin.as_deref()
     }
@@ -148,15 +175,17 @@ impl PreparedQuery {
     /// Everything the serialised result depends on besides the data: the query text, the
     /// dataset parameters, the read model and the output formats.
     pub(crate) fn cache_request(&self) -> String {
-        // The access too: users who may read different graphs get different answers.
+        // The access too: users who may read different graphs get different answers; and
+        // the namespaces a query needed: the same text means another query under others.
         format!(
-            "{}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
+            "{}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
             self.text,
             self.dataset,
             self.read_model,
             self.solutions_format,
             self.graph_format,
-            self.access
+            self.access,
+            self.implicit_prefixes
         )
     }
 
