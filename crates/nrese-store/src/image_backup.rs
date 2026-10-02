@@ -105,6 +105,65 @@ pub fn read_manifest(dir: &Path) -> StoreResult<ImageManifest> {
         .map_err(|error| StoreError::Configuration(format!("{}: {error}", path.display())))
 }
 
+/// Restores the backup in `backup` and the WAL segments in `logs` after it (an archive,
+/// `wal-archive/` of a store with `wal_archive`, and the store's live `wal/` where it is
+/// still there) into `data_dir`, which must hold no store, up to revision `until` (else
+/// as far as the log goes): [`restore_image`], the segments copied, then the store opened
+/// once to replay and cut the log. Returns the manifest and the revision restored.
+pub fn restore_until(
+    backup: &Path,
+    data_dir: &Path,
+    logs: &[PathBuf],
+    until: Option<u64>,
+) -> StoreResult<(ImageManifest, u64)> {
+    let manifest = restore_image(backup, data_dir)?;
+    let wal = data_dir.join("wal");
+    fs::create_dir_all(&wal).map_err(|e| io(e, &wal))?;
+    // Segments are named by their first revision; one ends where the next begins. Those
+    // that can hold a revision after the image go along.
+    let mut segments: Vec<(u64, PathBuf)> = Vec::new();
+    for dir in logs {
+        for entry in fs::read_dir(dir).map_err(|e| io(e, dir))? {
+            let path = entry.map_err(|e| io(e, dir))?.path();
+            let first = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".wal"))
+                .and_then(|stem| stem.parse::<u64>().ok());
+            if let Some(first) = first {
+                // The same segment in two places: the larger copy (a live one grew).
+                let size = |path: &Path| fs::metadata(path).map_or(0, |m| m.len());
+                match segments.iter_mut().find(|(f, _)| *f == first) {
+                    Some(existing) if size(&path) > size(&existing.1) => existing.1 = path,
+                    Some(_) => {}
+                    None => segments.push((first, path)),
+                }
+            }
+        }
+    }
+    segments.sort_unstable_by_key(|(first, _)| *first);
+    for (i, (_, path)) in segments.iter().enumerate() {
+        let after_image = segments
+            .get(i + 1)
+            .is_none_or(|(next, _)| *next > manifest.revision + 1);
+        if after_image {
+            let target = wal.join(path.file_name().expect("segment name"));
+            fs::copy(path, &target).map_err(|e| io(e, path))?;
+        }
+    }
+    let config = nrese_engine::EngineConfig {
+        background_maintenance: false,
+        durability: nrese_engine::DurabilityConfig {
+            recover_until: until,
+            ..nrese_engine::DurabilityConfig::default()
+        },
+        ..nrese_engine::EngineConfig::default()
+    };
+    let engine = nrese_engine::Engine::open(data_dir, config)?;
+    let revision = engine.snapshot().revision();
+    Ok((manifest, revision))
+}
+
 /// Restores the backup in `backup` into `data_dir`, which must hold no store (no
 /// checkpoint, no log): the image is checked against its manifest, then copied there.
 /// The store opens from it as from any checkpoint.

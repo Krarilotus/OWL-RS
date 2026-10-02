@@ -45,6 +45,9 @@ pub struct StoreConfig {
     /// sorted in chunks spilled to the data directory (see
     /// `nrese_engine::DurabilityConfig::bulk_load_memory`).
     pub bulk_load_memory_bytes: u64,
+    /// On disk: keep the WAL segments checkpoints cover in `wal-archive/` of the data
+    /// directory (point-in-time restore; see `nrese_engine::DurabilityConfig::wal_archive`).
+    pub wal_archive: bool,
     /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
@@ -137,6 +140,7 @@ impl StoreConfig {
             verify_on_open: false,
             map_checkpoints: true,
             bulk_load_memory_bytes: 0,
+            wal_archive: false,
             shacl_gate: ShaclGate::Off,
         }
     }
@@ -155,6 +159,7 @@ impl StoreConfig {
             verify_on_open: false,
             map_checkpoints: true,
             bulk_load_memory_bytes: 0,
+            wal_archive: false,
             shacl_gate: ShaclGate::Off,
         }
     }

@@ -13,8 +13,9 @@ use anyhow::{Result, bail};
 /// extensions), without a store;
 /// `nrese-server backup DIR` writes an image backup of the configured store into `DIR`
 /// (the same lock: for a running server, `POST /ops/api/admin/dataset/image`);
-/// `nrese-server restore DIR` restores an image backup into the configured data directory,
-/// which must hold no store.
+/// `nrese-server restore DIR [--wal LOGDIR]... [--until-revision N]` restores an image
+/// backup into the configured data directory, which must hold no store, and with `--wal`
+/// replays the WAL segments of those directories after it (up to revision `N`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliConfig {
     pub config_path: Option<PathBuf>,
@@ -34,7 +35,15 @@ pub enum CliCommand {
     /// `backup DIR`: an image backup of the store into `DIR`.
     Backup(PathBuf),
     /// `restore DIR`: the image backup in `DIR` into the configured data directory.
-    Restore(PathBuf),
+    Restore(RestoreCommand),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreCommand {
+    pub backup: PathBuf,
+    /// Directories of WAL segments to replay after the image (an archive, a live `wal/`).
+    pub wal: Vec<PathBuf>,
+    pub until_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -90,7 +99,7 @@ impl CliConfig {
             config.command = CliCommand::Backup(PathBuf::new());
         } else if args.peek().is_some_and(|argument| argument == "restore") {
             args.next();
-            config.command = CliCommand::Restore(PathBuf::new());
+            config.command = CliCommand::Restore(RestoreCommand::default());
         }
 
         while let Some(argument) = args.next() {
@@ -134,13 +143,37 @@ impl CliConfig {
                     }
                     continue;
                 }
-                CliCommand::Backup(dir) | CliCommand::Restore(dir) => {
+                CliCommand::Backup(dir) => {
                     if argument.to_str().is_some_and(|raw| raw.starts_with("--"))
                         || !dir.as_os_str().is_empty()
                     {
                         bail!("unsupported argument: {:?}", argument);
                     }
                     *dir = PathBuf::from(argument);
+                    continue;
+                }
+                CliCommand::Restore(restore) => {
+                    if argument == "--wal" {
+                        let Some(dir) = args.next() else {
+                            bail!("missing value for --wal");
+                        };
+                        restore.wal.push(PathBuf::from(dir));
+                    } else if argument == "--until-revision" {
+                        let Some(revision) = args.next().and_then(|r| r.into_string().ok()) else {
+                            bail!("missing value for --until-revision");
+                        };
+                        restore.until_revision = Some(
+                            revision
+                                .parse()
+                                .map_err(|_| anyhow::anyhow!("--until-revision takes a number"))?,
+                        );
+                    } else if argument.to_str().is_some_and(|raw| raw.starts_with("--"))
+                        || !restore.backup.as_os_str().is_empty()
+                    {
+                        bail!("unsupported argument: {:?}", argument);
+                    } else {
+                        restore.backup = PathBuf::from(argument);
+                    }
                     continue;
                 }
                 CliCommand::Convert(convert) => {
@@ -191,7 +224,8 @@ impl CliConfig {
         {
             bail!("`convert` takes an input and an output file");
         }
-        if let CliCommand::Backup(dir) | CliCommand::Restore(dir) = &config.command
+        if let CliCommand::Backup(dir) | CliCommand::Restore(RestoreCommand { backup: dir, .. }) =
+            &config.command
             && dir.as_os_str().is_empty()
         {
             bail!("`backup` and `restore` take a backup directory");
@@ -205,7 +239,7 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{CliCommand, CliConfig, ConvertCommand, LoadCommand, QueryCommand};
+    use super::{CliCommand, CliConfig, ConvertCommand, LoadCommand, QueryCommand, RestoreCommand};
 
     fn parse(args: &[&str]) -> anyhow::Result<CliConfig> {
         CliConfig::from_args(
@@ -303,8 +337,31 @@ mod tests {
         let config = parse(&["restore", "/backups/one"]).expect("cli config");
         assert_eq!(
             config.command,
-            CliCommand::Restore(PathBuf::from("/backups/one"))
+            CliCommand::Restore(RestoreCommand {
+                backup: PathBuf::from("/backups/one"),
+                ..RestoreCommand::default()
+            })
         );
+        let config = parse(&[
+            "restore",
+            "/b",
+            "--wal",
+            "/a",
+            "--wal",
+            "/w",
+            "--until-revision",
+            "42",
+        ])
+        .expect("cli config");
+        assert_eq!(
+            config.command,
+            CliCommand::Restore(RestoreCommand {
+                backup: PathBuf::from("/b"),
+                wal: vec![PathBuf::from("/a"), PathBuf::from("/w")],
+                until_revision: Some(42),
+            })
+        );
+        assert!(parse(&["restore", "/b", "--until-revision", "x"]).is_err());
         assert!(parse(&["backup"]).is_err());
         assert!(parse(&["restore", "a", "b"]).is_err());
     }

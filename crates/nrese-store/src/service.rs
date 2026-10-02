@@ -72,6 +72,7 @@ impl StoreService {
                         map_checkpoints: config.map_checkpoints,
                         bulk_load_memory: (config.bulk_load_memory_bytes > 0)
                             .then_some(config.bulk_load_memory_bytes),
+                        wal_archive: config.wal_archive,
                         ..defaults.durability
                     },
                     ..defaults
