@@ -71,7 +71,10 @@ pub fn explain_with<B: Base + ?Sized>(
         }
         let mut found = program.named_derivations(&source, next, BRANCHES);
         if program.bodiless.contains(&next) {
-            found.insert(0, ("axiom".to_owned(), program.bodiless_premises(next).to_vec()));
+            found.insert(
+                0,
+                ("axiom".to_owned(), program.bodiless_premises(next).to_vec()),
+            );
         }
         for (_, body) in &found {
             queue.extend(body.iter().copied().filter(|premise| *premise != next));

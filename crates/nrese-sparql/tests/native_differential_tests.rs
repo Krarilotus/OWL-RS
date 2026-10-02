@@ -1782,10 +1782,14 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
             );
             // SAMPLE may pick any value of its group, and two plans may visit the rows in
             // another order: its column is left out of the comparison.
-            let (native_rows, plain_rows) = match sample_column(&text, &variables(&snapshot, &query)) {
-                Some(column) => (without_column(&native, column), without_column(&plain, column)),
-                None => (native.clone(), plain.clone()),
-            };
+            let (native_rows, plain_rows) =
+                match sample_column(&text, &variables(&snapshot, &query)) {
+                    Some(column) => (
+                        without_column(&native, column),
+                        without_column(&plain, column),
+                    ),
+                    None => (native.clone(), plain.clone()),
+                };
             assert_same_rows(
                 &native_rows,
                 &plain_rows,
@@ -5017,6 +5021,9 @@ fn a_limit_cutting_through_equal_values_keeps_the_next_key() {
             true,
         );
         assert_eq!(native, expected, "{text}");
-        assert!(native.last().unwrap().ends_with("p2>"), "{text}: {native:?}");
+        assert!(
+            native.last().unwrap().ends_with("p2>"),
+            "{text}: {native:?}"
+        );
     }
 }

@@ -51,8 +51,14 @@ fn inferences_are_explained_by_their_derivations() {
         .iter()
         .map(|&i| format!("{} {}", steps[i].object, steps[i].origin))
         .collect();
-    assert!(premises.contains(&format!("{EX}D inferred")), "{premises:?}");
-    assert!(premises.contains(&format!("{EX}E asserted")), "{premises:?}");
+    assert!(
+        premises.contains(&format!("{EX}D inferred")),
+        "{premises:?}"
+    );
+    assert!(
+        premises.contains(&format!("{EX}E asserted")),
+        "{premises:?}"
+    );
     let d = steps
         .iter()
         .position(|s| s.object == format!("{EX}D") && s.predicate == TYPE)
@@ -61,7 +67,11 @@ fn inferences_are_explained_by_their_derivations() {
     // Every inferred step has premises; every asserted one has none; no step is its own
     // premise, and the premises come later (the proof is well-founded).
     for (i, step) in steps.iter().enumerate() {
-        assert_eq!(step.origin == "inferred", !step.premises.is_empty(), "{step:?}");
+        assert_eq!(
+            step.origin == "inferred",
+            !step.premises.is_empty(),
+            "{step:?}"
+        );
         assert!(step.premises.iter().all(|&p| p > i), "{step:?}");
     }
 

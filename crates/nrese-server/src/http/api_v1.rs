@@ -125,7 +125,11 @@ fn no_session(session: &str) -> ApiError {
 }
 
 /// Adds operations to session `session`; 404 if it isn't open.
-fn add(state: &AppState, session: &str, ops: Vec<nrese_store::StatementOp>) -> Result<StatusCode, ApiError> {
+fn add(
+    state: &AppState,
+    session: &str,
+    ops: Vec<nrese_store::StatementOp>,
+) -> Result<StatusCode, ApiError> {
     match state.store().sessions().add(session, ops) {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(no_session(session)),
@@ -142,7 +146,11 @@ pub async fn session_update(
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
     let request = super::rdf4j::update(&raw, &headers, &body)?;
-    add(&state, &session, vec![nrese_store::StatementOp::Update(request)])
+    add(
+        &state,
+        &session,
+        vec![nrese_store::StatementOp::Update(request)],
+    )
 }
 
 /// RDF data to add (`POST`) or remove (`DELETE`) at the commit: into the graph `graph`
@@ -277,7 +285,12 @@ pub async fn explain(
     };
     let store = state.store();
     let steps = tokio::task::spawn_blocking(move || {
-        store.explain_statement(program, subject.as_ref(), predicate.as_ref(), object.as_ref())
+        store.explain_statement(
+            program,
+            subject.as_ref(),
+            predicate.as_ref(),
+            object.as_ref(),
+        )
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
