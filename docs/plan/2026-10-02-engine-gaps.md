@@ -23,6 +23,9 @@ is left, in that order. Status of each capability: the
 Every capability an operation of the core, reachable the same way by every connector and
 by the coming frontend; the protocols only translate.
 
+- **Done so far (2 October):** namespaces and client transactions (sessions) in the store;
+  every `/dataset/…` capability for every repository under `/api/v1/repositories/{id}`;
+  JSON routes for repositories, namespaces, sessions and explanations of inferences.
 - **State in the core.** Done: namespaces and client transactions (sessions) moved from
   the RDF4J adapter into the store. Next: access policies, users and workspaces (G2b),
   repository settings, the shapes graph and rulesets as managed store objects.
