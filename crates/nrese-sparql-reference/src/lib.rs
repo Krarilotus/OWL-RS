@@ -49,16 +49,12 @@ pub struct Deviations {
     /// A path alternative `(p|q)` gives each pair once (the specification: a UNION, with
     /// duplicates).
     pub alternative_paths_distinct: bool,
-    /// A zero-length path (`*`, `?`) from a term the graph doesn't have gives nothing (the
-    /// specification: the term itself).
-    pub no_zero_length_outside_the_graph: bool,
 }
 
 impl Default for Deviations {
     fn default() -> Self {
         Self {
             alternative_paths_distinct: true,
-            no_zero_length_outside_the_graph: true,
         }
     }
 }
@@ -1116,23 +1112,16 @@ impl<'d> Context<'d> {
     }
 
     /// The pairs of the zero-length path: each node of the graph with itself, and a fixed
-    /// end with itself (§18.4, "ALP"; also a term the graph doesn't have, unless the
-    /// executor's deviation is followed).
+    /// end with itself (§18.4, "ALP"; also a term the graph doesn't have).
     fn zero_length(
         &self,
         graph: &Graph,
         start: Option<&Term>,
         end: Option<&Term>,
     ) -> Vec<(Term, Term)> {
-        let nodes = graph.nodes();
-        let outside_allowed = !self.dataset.deviations.no_zero_length_outside_the_graph;
-        let fixed = start.or(end);
-        match fixed {
-            Some(term) if outside_allowed || nodes.contains(term) => {
-                vec![(term.clone(), term.clone())]
-            }
-            Some(_) => Vec::new(),
-            None => nodes.into_iter().map(|n| (n.clone(), n)).collect(),
+        match start.or(end) {
+            Some(term) => vec![(term.clone(), term.clone())],
+            None => graph.nodes().into_iter().map(|n| (n.clone(), n)).collect(),
         }
     }
 
@@ -1147,10 +1136,6 @@ impl<'d> Context<'d> {
     ) -> Vec<(Term, Term)> {
         let step = self.pairs(path, graph, None, None);
         let nodes = graph.nodes();
-        let known: HashSet<&Term> = nodes.iter().collect();
-        let zero_length_allowed = |t: &Term| {
-            known.contains(t) || !self.dataset.deviations.no_zero_length_outside_the_graph
-        };
         // Everything `from` reaches in one or more steps along `edges`.
         let reach = |from: &Term, edges: &HashMap<&Term, Vec<&Term>>| -> Vec<Term> {
             let mut reached: HashSet<&Term> = HashSet::new();
@@ -1173,7 +1158,7 @@ impl<'d> Context<'d> {
             for (a, b) in &step {
                 backwards.entry(b).or_default().push(a);
             }
-            if reflexive && zero_length_allowed(e) {
+            if reflexive {
                 out.push((e.clone(), e.clone()));
             }
             for s in reach(e, &backwards) {
@@ -1190,7 +1175,7 @@ impl<'d> Context<'d> {
             None => nodes.clone(),
         };
         for s in starts {
-            if reflexive && zero_length_allowed(&s) {
+            if reflexive {
                 out.push((s.clone(), s.clone()));
             }
             for r in reach(&s, &forwards) {
