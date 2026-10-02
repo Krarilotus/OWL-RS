@@ -38,7 +38,7 @@ do), **decide** (the owner decides whether the use case needs it).
 | RDF 1.1 Semantics, literal value spaces | `nrese-xsd` (strict XSD lexical forms, XPath operations) | **have** |
 | RDF 1.2 (`rdf-12` feature): triple terms | Part of the model, not a feature: terms and every syntax (3e, all W3C `rdf12` syntax suites pass); SPARQL (4), engine (6) | **have** (model, syntaxes); SPARQL and engine **planned** |
 | RDF Dataset Canonicalization (RDFC-1.0) | `nrese_rdf::rdfc` (feature `rdfc`, on by default): SHA-256 and SHA-384, the issued-label map, a work limit against poison graphs that grows with the input; W3C `rdf-canon` 86/86. Faster than `oxrdf`'s RDFC-1.0: 0.70 of its time with distinct blank nodes, 0.38 on symmetric cycles, 0.03 on a long chain of ties (0.2 s against 6.9 s), and it needs no large caller stack where oxrdf's overflows | **have** (beyond `oxrdf`) |
-| SPARQL 1.1 query, patterns, paths, aggregates, modifiers, functions (hashes included) | Native executor: W3C 491/495 (one known deviation, zero-length paths from a term outside the graph) | **have** |
+| SPARQL 1.1 query, patterns, paths, aggregates, modifiers, functions (hashes included) | Native executor: W3C 505/505 (2 October 2026: query, update, syntax, result formats and federation) | **have** |
 | SPARQL 1.1 Update (all operations) | W3C update 94/94 | **have** |
 | SPARQL 1.1 Federated Query | `SERVICE` to allow-listed endpoints (off by default), bind joins, `SILENT` | **have** |
 | SPARQL 1.2 / SPARQL-star | Results formats (4a), grammar (4b) and evaluation (6): all 269 W3C `sparql12` tests pass on the native executor and on the reference | **have** |

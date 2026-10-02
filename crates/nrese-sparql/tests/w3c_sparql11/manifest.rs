@@ -53,6 +53,8 @@ pub struct Test {
     pub expected_data: Vec<GraphFile>,
     /// Tests that need a remote `SERVICE` endpoint.
     pub needs_service: bool,
+    /// The endpoints such a test calls and their data (`qt:serviceData`).
+    pub service_data: Vec<(NamedNode, Vec<GraphFile>)>,
 }
 
 pub struct Suite {
@@ -237,6 +239,7 @@ fn read_test(graph: &Graph, entry: &Term) -> Option<Test> {
         result: None,
         expected_data: Vec::new(),
         needs_service: false,
+        service_data: Vec::new(),
     };
     match kind {
         Kind::PositiveSyntax
@@ -259,7 +262,27 @@ fn read_test(graph: &Graph, entry: &Term) -> Option<Test> {
                         file,
                     })
                 }));
-            test.needs_service = object(graph, action, &iri(QT, "serviceData")).is_some();
+            for service in objects(graph, action, &iri(QT, "serviceData")) {
+                let Some(service) = as_subject(service) else {
+                    continue;
+                };
+                let Some(endpoint) = named(object(graph, service, &iri(QT, "endpoint"))) else {
+                    continue;
+                };
+                let mut files: Vec<GraphFile> = named(object(graph, service, &iri(QT, "data")))
+                    .map(|file| GraphFile { name: None, file })
+                    .into_iter()
+                    .collect();
+                files.extend(objects(graph, service, &graph_data).filter_map(|term| {
+                    let file = named(Some(term))?;
+                    Some(GraphFile {
+                        name: Some(file.clone()),
+                        file,
+                    })
+                }));
+                test.service_data.push((endpoint, files));
+            }
+            test.needs_service = !test.service_data.is_empty();
             test.result = named(result);
         }
         Kind::UpdateEvaluation => {

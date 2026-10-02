@@ -34,7 +34,7 @@ Legend: ✅ done · 🟡 partial · ❌ missing · ➖ deliberately different.
 | 2.2 | Semi-naive fixpoint, consistency rules | ✅ | Batch = naive on 400 random ontologies |
 | 2.3 | TMS, retraction, atomic rollback | ✅ | DRed + B/F; incremental = rematerialisation on 84 k random changes |
 | 3.1–3.2 | SHACL Core, SHACL-SPARQL, commit gate, incremental validation | ✅ | `nrese-shacl`: W3C Core 98 of 98, SHACL-SPARQL 22 of 22; served at `/dataset/shacl`; commit gate (off, report, enforce) with incremental validation of the affected focus nodes (2 October 2026). Not yet: parallel, set-at-a-time evaluation (C1c). Design: [shacl.md](../design/shacl.md) |
-| 4.1 | SPARQL 1.1 Query, Update | ✅ | W3C suite 485/495; native executor covers almost all queries |
+| 4.1 | SPARQL 1.1 Query, Update | ✅ | W3C suite 505/505 with federation (2 October 2026); the native executor answers every query |
 | 4.1 | Federated `SERVICE` | ✅ | Allowlist, timeouts and row limits (`store.federation`) |
 | 4.1 | Graph Store Protocol | 🟡 | Works; status codes for missing graphs differ from the spec (review) |
 | 4.2 | RDF4J protocol, repositories, transactions | 🟡 | X1: the RDF4J REST protocol with transactions over the one dataset (2 October 2026); several repositories, reads inside a transaction and persisted namespaces missing |

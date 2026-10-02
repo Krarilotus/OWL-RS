@@ -8,8 +8,11 @@
 //!   (`nrese-sparql-reference`: the specification's algebra, evaluated plainly), which
 //!   shares the executor's function semantics. A failure on both is a function's or the
 //!   test format's; a failure only on ours is the executor's.
-//! - **Not covered here.** Protocol, Graph Store Protocol, service description and
-//!   federation tests are HTTP-level and belong to the server's suites.
+//! - **Federation.** The `SERVICE` tests run against endpoints that are engines in this
+//!   process, each loaded with the test's `qt:serviceData`; the reference evaluator has no
+//!   `SERVICE` and skips them.
+//! - **Not covered here.** Protocol, Graph Store Protocol and service description tests are
+//!   HTTP-level and belong to the server's suites.
 //! - **Expected failures.** Every known failure of ours is listed with its reason in
 //!   `expected-failures.txt`. The run fails on any failure not in the list, and on any listed
 //!   test that now passes, so the list never goes stale. The full report is written to
@@ -25,7 +28,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use manifest::{GraphFile, Kind, Suite, Test};
 use nrese_engine::{Engine, EngineConfig, QuadPattern};
 use nrese_rdf::{BlankNode, Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Variable};
-use nrese_sparql::{QueryOptions, QueryResults, UpdateOptions, apply_update, evaluate_query};
+use nrese_sparql::{
+    CancellationToken, QueryOptions, QueryResults, ServiceClient, ServiceResults, Services,
+    UpdateOptions, apply_update, evaluate_query,
+};
 use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 use nrese_sparql_syntax::{Query, SparqlParser, Update};
 use results::{Results, canonical, parse_expected};
@@ -70,6 +76,7 @@ fn w3c_sparql11() {
             "manifest-sparql11-query.ttl",
             "manifest-sparql11-update.ttl",
             "manifest-sparql11-results.ttl",
+            "manifest-sparql11-fed.ttl",
         ],
         EXPECTED_FAILURES,
         "w3c-sparql11-report.txt",
@@ -149,13 +156,80 @@ fn check_suite(
 }
 
 fn outcome(suite: &Suite, test: &Test, backend: fn() -> Backend) -> Outcome {
+    let backend = backend();
     if test.needs_service {
-        return Outcome::Skipped("needs a remote SERVICE endpoint");
+        if matches!(backend, Backend::Oracle(_)) {
+            return Outcome::Skipped("the reference evaluator has no SERVICE");
+        }
+        match Endpoints::load(suite, test) {
+            Ok(endpoints) => {
+                SERVICES.with(|services| *services.borrow_mut() = Some(endpoints));
+            }
+            Err(message) => return Outcome::Failed(message),
+        }
     }
-    match catch_unwind(AssertUnwindSafe(|| run(suite, test, backend()))) {
+    let result = catch_unwind(AssertUnwindSafe(|| run(suite, test, backend)));
+    SERVICES.with(|services| *services.borrow_mut() = None);
+    match result {
         Ok(Ok(())) => Outcome::Passed,
         Ok(Err(message)) => Outcome::Failed(message),
         Err(_) => Outcome::Failed("panicked".to_owned()),
+    }
+}
+
+thread_local! {
+    /// The endpoints of the `SERVICE` test running on this thread.
+    static SERVICES: RefCell<Option<Services>> = const { RefCell::new(None) };
+}
+
+/// A test's `SERVICE` endpoints: engines in this process, by endpoint IRI. An endpoint the
+/// test doesn't list fails, as an unreachable one would.
+struct Endpoints(BTreeMap<String, Engine>);
+
+impl Endpoints {
+    fn load(suite: &Suite, test: &Test) -> Result<Services, String> {
+        let mut engines = BTreeMap::new();
+        for (endpoint, files) in &test.service_data {
+            let backend = Backend::ours();
+            backend.insert(&quads(suite, files)?)?;
+            let Backend::Ours(engine) = backend else {
+                unreachable!("ours")
+            };
+            engines.insert(endpoint.as_str().to_owned(), engine);
+        }
+        Ok(Services(std::sync::Arc::new(Self(engines))))
+    }
+}
+
+impl ServiceClient for Endpoints {
+    fn select(
+        &self,
+        endpoint: &str,
+        query: &str,
+        _cancellation: Option<&CancellationToken>,
+    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
+        let engine = self
+            .0
+            .get(endpoint)
+            .ok_or_else(|| format!("no endpoint {endpoint}"))?;
+        let parsed = SparqlParser::new().parse_query(query)?;
+        let snapshot = engine.snapshot();
+        // The endpoints reach each other too (a SERVICE nested in a SERVICE).
+        let options = QueryOptions {
+            services: Some(Services(std::sync::Arc::new(Self(self.0.clone())))),
+            ..QueryOptions::default()
+        };
+        let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, &parsed, &options)?
+        else {
+            return Err("not a SELECT".into());
+        };
+        let variables = solutions.variables().to_vec();
+        let mut rows = Vec::new();
+        for solution in solutions {
+            let solution = solution?;
+            rows.push(variables.iter().map(|v| solution.get(v).cloned()).collect());
+        }
+        Ok(ServiceResults { variables, rows })
     }
 }
 
@@ -271,7 +345,11 @@ impl Backend {
         match self {
             Self::Ours(engine) => {
                 let snapshot = engine.snapshot();
-                consume(evaluate_query(&snapshot, query, &QueryOptions::default()).map_err(failed)?)
+                let options = QueryOptions {
+                    services: SERVICES.with(|services| services.borrow().clone()),
+                    ..QueryOptions::default()
+                };
+                consume(evaluate_query(&snapshot, query, &options).map_err(failed)?)
             }
             Self::Oracle(dataset) => consume(
                 dataset
