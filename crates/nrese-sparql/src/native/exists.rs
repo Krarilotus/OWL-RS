@@ -174,6 +174,7 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Vec<Variable>) {
             walk_pattern(inner, out);
         }
         GraphPattern::Join { left, right }
+        | GraphPattern::Lateral { left, right }
         | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
             walk_pattern(left, out);
