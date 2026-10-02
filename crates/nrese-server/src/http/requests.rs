@@ -16,9 +16,17 @@ pub struct QueryOperation {
     pub explain: bool,
     /// The graphs the requester may read (graph-level access control); `None`: every graph.
     pub access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
+    /// Who sent it (shown in the running queries).
+    pub origin: Option<String>,
 }
 
 impl QueryOperation {
+    /// Restricts the query to what `view` lets its requester read, and names the requester.
+    pub fn restrict(&mut self, view: &crate::access::AccessView) {
+        self.access = view.read.clone();
+        self.origin = view.origin.clone();
+    }
+
     /// Collects `query`, `default-graph-uri`, `named-graph-uri` and `infer` from
     /// URL-encoded pairs. The dataset parameters may repeat; other parameters are ignored.
     fn parse_pairs(&mut self, encoded: &[u8]) -> Result<(), ApiError> {
@@ -250,6 +258,7 @@ mod tests {
                 infer: None,
                 explain: false,
                 access: None,
+                origin: None,
             }
         );
     }

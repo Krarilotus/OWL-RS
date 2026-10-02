@@ -490,7 +490,7 @@ pub async fn query_get(
     let access = guard::query_access(&state, &headers).await?;
     let state = state.for_repository(&id)?;
     let mut operation = query_from_url(raw.0.as_deref())?;
-    operation.access = access.read;
+    operation.restrict(&access);
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
@@ -516,7 +516,7 @@ pub async fn query_post(
     let access = guard::query_access(&state, &headers).await?;
     let mut operation =
         query_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), &body)?;
-    operation.access = access.read;
+    operation.restrict(&access);
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
@@ -901,7 +901,7 @@ pub async fn transaction_action(
                     } else {
                         query_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), &body)?
                     };
-                    operation.access = access.read.clone();
+                    operation.restrict(&access);
                     let accept = accept_header_value(&headers);
                     sparql::execute_query_in(state, operation, accept, Some(pending)).await
                 }
