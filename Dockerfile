@@ -28,11 +28,12 @@ COPY crates crates
 COPY --from=console /src/apps/nrese-console/dist apps/nrese-console/dist
 # `--build-arg CARGO_BUILD_JOBS=8` keeps the build from taking every core.
 ARG CARGO_BUILD_JOBS=default
-# Code for the CPU the image is built on, which is where it runs unless it is pushed
-# elsewhere. For an image that ships: `--build-arg NRESE_TARGET_CPU=portable`, or a level
-# the building machine has too, such as x86-64-v3 (scripts/lib/target-cpu.sh). The server
-# refuses, with a message, to start on a CPU that lacks what it was built for.
-ARG NRESE_TARGET_CPU=native
+# Code for x86-64-v3 (AVX2: server CPUs of the last decade), so the image runs wherever it
+# is pushed. For the building machine's own CPU (benchmark and local images):
+# `--build-arg NRESE_TARGET_CPU=native`; for any x86-64: `portable`
+# (scripts/lib/target-cpu.sh). The server refuses, with a message, to start on a CPU that
+# lacks what it was built for.
+ARG NRESE_TARGET_CPU=x86-64-v3
 RUN if [ "$NRESE_TARGET_CPU" != portable ]; then export RUSTFLAGS="-C target-cpu=$NRESE_TARGET_CPU"; fi \
     && cargo build --release --locked -p nrese-server
 

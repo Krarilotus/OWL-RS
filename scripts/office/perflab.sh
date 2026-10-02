@@ -24,7 +24,7 @@ rm -rf "$store"
 echo "=== load + queries ($label)"
 "$lab" --store "$store" --load "$data" --queries "$queries" --runs 3 --label "$label" "$@"
 echo "=== restart ($label)"
-NRESE_RECOVERY_TIMING=1 "$lab" --store "$store" --queries "$queries" --runs 3 --label "$label-restart" "$@"
+RUST_LOG=nrese_engine=debug "$lab" --store "$store" --queries "$queries" --runs 3 --label "$label-restart" "$@"
 du -sh "$store"
 rm -rf "$store"
 echo ALL-DONE

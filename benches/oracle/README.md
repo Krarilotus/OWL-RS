@@ -12,7 +12,7 @@ benches/oracle/run.sh                     # dump, answer, compare; the report in
 | answer | `jena/Oracle.java` (Jena 6.2.0, in `nrese-bench/jena-oracle`) answers every query on both copies of its dataset: `q<M>.jena`, `q<M>.jena-canonical` |
 | compare | `compare.py`: rows as multisets (in order where the query orders every column), numbers by value, columns aligned by name; a query agrees if it matches Jena on either copy |
 
-The nightly workflow (`.github/workflows/nightly-oracle.yml`) runs the same steps and keeps the report. It fails when a difference is left unexplained.
+The oracle workflow (`.github/workflows/oracle.yml`, run at milestones with `gh workflow run oracle.yml --ref <branch>`) runs the same steps and keeps the report. It fails when a difference is left unexplained.
 
 ## How Jena is run
 

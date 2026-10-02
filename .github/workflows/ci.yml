@@ -2,10 +2,13 @@
 # The bench harness is a separate Cargo workspace, so it is checked via --manifest-path.
 name: CI
 
+# Run at milestones, not on every push (the local gate is scripts/check.sh):
+#   gh workflow run ci.yml --ref refactor/engine-v2
+# and on merges to main.
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-  pull_request:
 
 concurrency:
   group: ci-${{ github.ref }}

@@ -497,15 +497,13 @@ pub(crate) fn load_latest(
     let Some((_, path)) = list(dir)?.pop() else {
         return Ok(None);
     };
-    let timing = std::env::var_os("NRESE_RECOVERY_TIMING").is_some();
     let clock = std::time::Instant::now();
     let lap = |what: &str| {
-        if timing {
-            eprintln!(
-                "  checkpoint {what}: {:.3} s",
-                clock.elapsed().as_secs_f64()
-            );
-        }
+        tracing::debug!(
+            part = what,
+            seconds = clock.elapsed().as_secs_f64(),
+            "recovery: checkpoint part"
+        );
     };
     // Mapped: the packed permutations are used in place (format 6).
     let map = crate::mapped::map(&path)?;

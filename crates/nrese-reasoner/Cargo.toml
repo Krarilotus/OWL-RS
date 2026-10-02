@@ -2,6 +2,8 @@
 name = "nrese-reasoner"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -14,3 +16,5 @@ hashbrown = { version = "0.16", default-features = false, features = ["default-h
 rayon = "1.10"
 thiserror.workspace = true
 
+[lints]
+workspace = true

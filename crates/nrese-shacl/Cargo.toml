@@ -3,6 +3,8 @@ name = "nrese-shacl"
 description = "NRESE SHACL: shapes compiled to an id-level program, validated over engine snapshots and transactions"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -21,3 +23,6 @@ nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 [[test]]
 name = "w3c_shacl"
 path = "tests/w3c_shacl/main.rs"
+
+[lints]
+workspace = true

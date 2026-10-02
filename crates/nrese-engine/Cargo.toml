@@ -3,6 +3,8 @@ name = "nrese-engine"
 description = "NRESE storage engine: term dictionary, quad permutation indexes, MVCC snapshots, transactions, durability"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -23,3 +25,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3.23.0"
+
+[lints]
+workspace = true
