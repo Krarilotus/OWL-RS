@@ -129,6 +129,114 @@ impl fmt::Display for Expr<'_> {
     }
 }
 
+/// `FILTER` with its constraint: an expression that prints in brackets of its own, or a
+/// call, stands as it is (the grammar's `Constraint`); anything else gets brackets. Each
+/// bracket is a nesting level the parser counts, so none is added that isn't needed.
+fn fmt_filter(e: &Expression, f: &mut Formatter<'_>) -> fmt::Result {
+    let own = level(e) > 0
+        || matches!(
+            e,
+            Expression::In(..)
+                | Expression::FunctionCall(..)
+                | Expression::Bound(_)
+                | Expression::If(..)
+                | Expression::Coalesce(_)
+                | Expression::SameTerm(..)
+                | Expression::Exists(_)
+        )
+        || matches!(e, Expression::Not(inner) if matches!(**inner, Expression::In(..) | Expression::Exists(_)));
+    if own {
+        write!(f, "FILTER {e}")
+    } else {
+        write!(f, "FILTER({e})")
+    }
+}
+
+/// How tightly a binary expression binds in SPARQL's grammar: `||` 1, `&&` 2, comparisons
+/// 3, `+ -` 4, `* /` 5; 0 for what prints as a primary expression (or a unary one).
+fn level(e: &Expression) -> u8 {
+    match e {
+        Expression::Or(..) => 1,
+        Expression::And(..) => 2,
+        Expression::Equal(..)
+        | Expression::Greater(..)
+        | Expression::GreaterOrEqual(..)
+        | Expression::Less(..)
+        | Expression::LessOrEqual(..) => 3,
+        Expression::Not(inner) if matches!(**inner, Expression::Equal(..)) => 3,
+        Expression::Add(..) | Expression::Subtract(..) => 4,
+        Expression::Multiply(..) | Expression::Divide(..) => 5,
+        _ => 0,
+    }
+}
+
+/// A binary expression's operands and operator.
+fn operands(e: &Expression) -> Option<(&Expression, &'static str, &Expression)> {
+    Some(match e {
+        Expression::Or(a, b) => (a, "||", b),
+        Expression::And(a, b) => (a, "&&", b),
+        Expression::Equal(a, b) => (a, "=", b),
+        Expression::Greater(a, b) => (a, ">", b),
+        Expression::GreaterOrEqual(a, b) => (a, ">=", b),
+        Expression::Less(a, b) => (a, "<", b),
+        Expression::LessOrEqual(a, b) => (a, "<=", b),
+        Expression::Not(inner) => match &**inner {
+            Expression::Equal(a, b) => (a, "!=", b),
+            _ => return None,
+        },
+        Expression::Add(a, b) => (a, "+", b),
+        Expression::Subtract(a, b) => (a, "-", b),
+        Expression::Multiply(a, b) => (a, "*", b),
+        Expression::Divide(a, b) => (a, "/", b),
+        _ => return None,
+    })
+}
+
+/// A binary expression without its brackets: its left operand flat too when it continues
+/// the same chain (the same left-associative level; comparisons don't chain). Iterative
+/// down the chain, so a long chain doesn't recurse.
+fn fmt_flat(e: &Expression, aggregates: Aggregates<'_>, f: &mut Formatter<'_>) -> fmt::Result {
+    // `||` and `&&` are associative (the parser builds their chains balanced): every
+    // operand of the chain, in order, on both sides.
+    if matches!(level(e), 1 | 2) {
+        let (_, op, _) = operands(e).expect("a binary expression");
+        let mut stack = vec![e];
+        let mut first = true;
+        while let Some(x) = stack.pop() {
+            if level(x) == level(e) {
+                let (a, _, b) = operands(x).expect("a binary expression");
+                stack.push(b);
+                stack.push(a);
+                continue;
+            }
+            if !first {
+                write!(f, " {op} ")?;
+            }
+            first = false;
+            fmt_expression(x, aggregates, f)?;
+        }
+        return Ok(());
+    }
+    let chained = |x: &Expression| level(x) == level(e) && level(e) != 3;
+    // The chain's start, then each operator with its right operand, left to right.
+    let mut rights = Vec::new();
+    let mut start = e;
+    while let Some((a, op, b)) = operands(start) {
+        rights.push((op, b));
+        if !chained(a) {
+            start = a;
+            break;
+        }
+        start = a;
+    }
+    fmt_expression(start, aggregates, f)?;
+    for (op, b) in rights.into_iter().rev() {
+        write!(f, " {op} ")?;
+        fmt_expression(b, aggregates, f)?;
+    }
+    Ok(())
+}
+
 fn fmt_expression(
     e: &Expression,
     aggregates: Aggregates<'_>,
@@ -138,7 +246,13 @@ fn fmt_expression(
         expression: e,
         aggregates,
     };
-    let binary = |f: &mut Formatter<'_>, a, op: &str, b| write!(f, "({} {op} {})", sub(a), sub(b));
+    // A binary expression in brackets; a chain of one left-associative operator flat inside
+    // them (`(a + b + c)`), since every bracket is a nesting level the parser counts.
+    let binary = |f: &mut Formatter<'_>, _, _, _| {
+        f.write_str("(")?;
+        fmt_flat(e, aggregates, f)?;
+        f.write_str(")")
+    };
     match e {
         Expression::NamedNode(n) => n.fmt(f),
         Expression::Literal(l) => fmt_literal(l, f),
@@ -175,6 +289,14 @@ fn fmt_expression(
             Expression::Exists(p) => {
                 f.write_str("NOT EXISTS ")?;
                 fmt_braced(p, f)
+            }
+            // `!` before a primary expression or another `!` (SPARQL 1.2's `!!x`) needs no
+            // brackets of its own.
+            other
+                if level(other) == 0
+                    && !matches!(other, Expression::UnaryPlus(_) | Expression::UnaryMinus(_)) =>
+            {
+                write!(f, "!{}", sub(other))
             }
             other => write!(f, "!({})", sub(other)),
         },
@@ -352,7 +474,7 @@ fn fmt_sequence(p: &GraphPattern, f: &mut Formatter<'_>) -> Result<Tail, fmt::Er
             match expression {
                 Some(e) => {
                     space(fmt_prefix(right, f)?, f)?;
-                    write!(f, "FILTER({e})")?;
+                    fmt_filter(e, f)?;
                 }
                 // A group that is a filter would become the optional's condition: keep
                 // it a filter with a subquery around.
@@ -388,7 +510,7 @@ fn fmt_sequence(p: &GraphPattern, f: &mut Formatter<'_>) -> Result<Tail, fmt::Er
         }
         GraphPattern::Filter { expr, inner } => {
             space(fmt_prefix(inner, f)?, f)?;
-            write!(f, "FILTER({expr})")?;
+            fmt_filter(expr, f)?;
             Ok(Tail::Other)
         }
         other => fmt_element(other, Tail::Nothing, f),
