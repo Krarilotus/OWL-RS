@@ -5,6 +5,7 @@ mod api_v1;
 pub(crate) mod authentication;
 mod classification;
 mod console;
+mod draft_check;
 mod graph_store;
 mod guard;
 mod handlers;

@@ -40,6 +40,13 @@ use nrese_sparql::ReadView;
 ///
 /// `shapes` must have been compiled from the same view (or one of the same repository):
 /// it holds that dictionary's term ids.
+/// Whether validating `data` against `shapes` checks anything: some active targeted shape
+/// has a focus node and a constraint. A report that conforms while nothing applies is a
+/// vacuous pass, which callers may need to tell apart from a real one.
+pub fn applicable<V: ReadView + Sync>(view: &V, shapes: &Shapes, data: Selection) -> bool {
+    validate::applicable(view, shapes, data)
+}
+
 pub fn validate<V: ReadView + Sync>(
     view: &V,
     shapes: &Shapes,
