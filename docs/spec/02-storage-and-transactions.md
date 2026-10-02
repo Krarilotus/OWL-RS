@@ -86,9 +86,9 @@ Initial loads and full restores bypass the per-commit path (`Engine::bulk_load`;
 |---|---|
 | Visibility rule, all pattern shapes, compaction | `crates/nrese-engine/src/index/model_tests.rs` |
 | Snapshot isolation, overlay reads, concurrent readers | `crates/nrese-engine/tests/engine_tests.rs` |
-| Bulk loads equal transactional loads (parallel, append/replace, durable) | `crates/nrese-engine/tests/bulk_load_tests.rs`, `crates/nrese-store/tests/bulk_load_tests.rs` |
+| Bulk loads equal transactional loads (parallel, append/replace, durable) | `crates/nrese-engine/tests/bulk_load_tests.rs`, `crates/nrese-store/tests/it/bulk_load_tests.rs` |
 | Inferred stack: read models, disjointness, both stacks against a model across compaction, checkpoints and reopening | `crates/nrese-engine/tests/inferred_stack_tests.rs` |
 | Crash recovery, torn tails, corruption, checkpoints | `crates/nrese-engine/tests/durability_tests.rs` |
 | SPARQL semantics against an oracle | `crates/nrese-sparql/tests/differential_tests.rs` |
-| Pipeline: cancel vs. commit, gate rejection | `crates/nrese-store/tests/mutation_pipeline_tests.rs` |
+| Pipeline: cancel vs. commit, gate rejection | `crates/nrese-store/tests/it/mutation_pipeline_tests.rs` |
 | Write cost independent of size (HTTP, end to end) | `benches/baselines/v2-write-scaling-*.json` |
