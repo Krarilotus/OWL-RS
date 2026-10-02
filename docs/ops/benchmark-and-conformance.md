@@ -175,8 +175,6 @@ The secured templates intentionally reuse the existing compat suites:
   - `benches/nrese-bench-harness/fixtures/catalog/ontologies.toml`
 - Seed dataset:
   - `benches/nrese-bench-harness/fixtures/datasets/comparison_seed.ttl`
-- Optional local Fuseki stack:
-  - `ops/fuseki/docker-compose.yml`
 
 ## Prerequisites
 
@@ -282,11 +280,9 @@ That requirement is validated by the harness for catalog-driven pack execution.
 
 ## 0. Reproducible Dataset Parity
 
-Start Fuseki if you want a local side-by-side comparison stack:
-
-```powershell
-docker compose -f ops/fuseki/docker-compose.yml up -d
-```
+The local Fuseki stack (`ops/fuseki/`) was removed on 2 October 2026: Fuseki is no longer a
+parity target ([ADR-0004](../adr/0004-parity-targets-qlever-graphdb.md)). Run a reference
+engine yourself if you need one, or use the benchmark suite (`benches/suite`).
 
 Then seed the same dataset into NRESE and optionally the reference engine:
 
@@ -600,43 +596,7 @@ These numbers are informative, not release gates. Replacement-grade evidence sti
 - add preflight report gating in CI before authenticated live parity runs are allowed to publish benchmark/compat evidence
 - add ontology-specific workload packs on top of the staged real-world ontology catalog
 
-## Isolated Side-by-Side Stack
+## Side-by-side stacks with Fuseki
 
-If local ports `8080` or `3030` are already in use, run an isolated compare stack:
-
-```powershell
-$env:FUSEKI_PORT = "3031"
-$env:FUSEKI_DATASET = "/ds"
-docker compose -f ops/fuseki/docker-compose.yml up -d
-```
-
-Run NRESE on a separate bind address:
-
-```powershell
-$env:NRESE_BIND_ADDR = "127.0.0.1:18080"
-$env:NRESE_STORE_MODE = "in-memory"
-$env:NRESE_REASONING_MODE = "rules-mvp"
-cargo run -p nrese-server
-```
-
-Then use:
-
-- NRESE: `http://127.0.0.1:18080`
-- Fuseki: `http://127.0.0.1:3031/ds`
-
-## Local External Fuseki Helper
-
-If you keep a local Apache Fuseki install one directory above the repo at `../Apache_Fuseki/apache-jena-fuseki-6.0.0`, you can use:
-
-- `ops/fuseki/run-local-pack-matrix.ps1`
-
-Example:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\ops\fuseki\run-local-pack-matrix.ps1 `
-  -Tier medium `
-  -ExecutionMode full `
-  -ReportDir artifacts\local-fuseki-medium
-```
-
-The helper keeps the external Fuseki process outside the git repo, starts NRESE on an isolated local port, defaults `-ServiceCoverage compat`, and writes logs plus harness reports into the chosen artifact directory.
+Removed with `ops/fuseki/` on 2 October 2026 (see above); the benchmark suite
+(`benches/suite`) compares NRESE with the engines that are targets.

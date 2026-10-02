@@ -3,7 +3,9 @@
 The owner's order of 2 October: first the bug hunt, then the remaining engine and feature
 gaps, until a full, industry-leading engine API stands; the one consolidated frontend
 comes after, on that API ([vision](../spec/00-vision-and-scope.md)). This plan lists what
-is left, in that order. Status of each capability: the
+is left, in that order. The outside audit of 2 October is merged into it as work packages
+A to E ([audit work](2026-10-02-audit-work.md)): its security and correctness findings are
+bugs (A2), its structural ones go with the gaps they belong to. Status of each capability: the
 [capability matrix](../spec/06-target-capability-matrix.md); designs:
 [research designs](2026-10-02-research-designs.md), [hardware and scaling](2026-10-01-hardware-and-scaling.md).
 
