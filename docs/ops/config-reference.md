@@ -322,6 +322,7 @@ Use `fuseki-plain-text` when you want local or live parity runs to match Fuseki-
 The rules are the server's access state (users, workspaces, personal spaces, role rules; [ADR-0008](../adr/0008-users-workspaces-policies.md)), kept in `system/` of the data directory and changed through `/api/v1/access` ([HTTP API](http-api.md#users-workspaces-and-policies-apiv1access)). Until access is enforced, every user reads and writes what its authentication grants allow.
 
 - `auth.access_policy` -> `NRESE_ACCESS_POLICY`: the path of an access policy file, imported into the access state at the first start (it turns enforcement on). Later changes of the file are reported at start and apply once imported (`POST /api/v1/access/import`); `GET /api/v1/access/export` writes the state's rules in this form.
+- `auth.local_logins` -> `NRESE_AUTH_LOCAL_LOGINS` (default `true`): whether users of the access state with a password log in (`Basic` credentials, or a session from `POST /api/v1/access/login`) besides the authentication mode; for standalone and desktop installations without an identity provider.
 - `auth.workspace_base` -> `NRESE_WORKSPACE_BASE`: what workspace graph prefixes start with (default `urn:nrese:`): a personal space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`.
 - the file (TOML), per role:
 

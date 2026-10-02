@@ -77,6 +77,7 @@ pub(super) fn parse_policy_config(source: &dyn ConfigSource) -> Result<PolicyCon
             .map(|base| base.trim().to_owned())
             .filter(|base| !base.is_empty())
             .unwrap_or_else(|| "urn:nrese:".to_owned()),
+        local_logins: parse_bool(source, names::LOCAL_LOGINS, true)?,
     })
 }
 

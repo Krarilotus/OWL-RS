@@ -88,6 +88,7 @@ impl From<AccessError> for ApiError {
             AccessError::Invalid(message) => ApiError::bad_request(message),
             AccessError::NotFound(message) => ApiError::not_found(message),
             AccessError::Conflict(message) => ApiError::conflict(message),
+            AccessError::Throttled(message) => ApiError::too_many_requests(message),
             AccessError::Store(message) => ApiError::internal(message),
         }
     }

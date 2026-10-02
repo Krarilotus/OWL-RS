@@ -322,6 +322,8 @@ pub async fn role_delete(
 struct UserBody {
     admin: Option<bool>,
     roles: Option<BTreeSet<String>>,
+    /// A local login's password; empty removes it. Users set their own.
+    password: Option<String>,
     #[serde(default)]
     reason: String,
 }
@@ -334,11 +336,22 @@ pub async fn user_put(
     bytes: Bytes,
 ) -> Result<Response, ApiError> {
     let request: UserBody = body(&bytes)?;
+    let password_hash = match request.password {
+        None => None,
+        Some(password) => {
+            let access = state.clone();
+            Some(
+                tokio::task::spawn_blocking(move || access.access().password_hash(&password))
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))??,
+            )
+        }
+    };
     let change_user = Change::PutUser {
         name,
         admin: request.admin,
         roles: request.roles,
-        password_hash: None,
+        password_hash,
     };
     change(&state, &headers, change_user, request.reason).await
 }
@@ -497,4 +510,66 @@ pub async fn export(
         text,
     )
         .into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginBody {
+    user: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct Session {
+    user: String,
+    /// `Authorization: Bearer {token}` on the following requests.
+    token: String,
+    expires_in_seconds: u64,
+}
+
+/// Logs a local user in: a session token for the following requests. 401 for a wrong
+/// user name or password, 429 after too many; 404 with local logins off.
+pub async fn login(State(state): State<AppState>, bytes: Bytes) -> Result<Response, ApiError> {
+    if !state.policy().local_logins {
+        return Err(ApiError::not_found("local logins are off"));
+    }
+    let request: LoginBody = body(&bytes)?;
+    let access = state.clone();
+    let user = request.user.clone();
+    let opened = tokio::task::spawn_blocking(move || {
+        access
+            .access()
+            .open_session(&request.user, &request.password)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    match opened {
+        Ok((token, lifetime)) => Ok(Json(Session {
+            user,
+            token,
+            expires_in_seconds: lifetime.as_secs(),
+        })
+        .into_response()),
+        Err(nrese_store::access::AccessError::Throttled(message)) => {
+            Err(ApiError::too_many_requests(message))
+        }
+        Err(_) => Err(ApiError::unauthorized("wrong user name or password")),
+    }
+}
+
+/// Ends the session whose token the request carries.
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .ok_or_else(|| ApiError::unauthorized("no session token"))?;
+    match state.access().close_session(token) {
+        true => Ok(axum::http::StatusCode::NO_CONTENT),
+        false => Err(ApiError::not_found("no such session")),
+    }
 }
