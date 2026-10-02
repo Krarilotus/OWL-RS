@@ -555,3 +555,133 @@ async fn imports_load_documents_and_reason_over_them() {
         "rdfs"
     );
 }
+
+#[tokio::test]
+async fn graphs_are_listed_with_their_sizes() {
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/update",
+        Some("application/sparql-update"),
+        "INSERT DATA { <urn:a> <urn:p> 1 . GRAPH <urn:g:2> { <urn:a> <urn:p> 1 , 2 } \
+         GRAPH <urn:g:1> { <urn:b> <urn:p> 3 } }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, text) = send(
+        &app,
+        Method::GET,
+        "/api/v1/repositories/nrese/graphs",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let graphs: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        graphs,
+        serde_json::json!([
+            { "statements": 1 },
+            { "graph": "urn:g:1", "statements": 1 },
+            { "graph": "urn:g:2", "statements": 2 },
+        ])
+    );
+}
+
+/// A query in flight is listed with its text; cancelling it stops it, and its client gets
+/// an error instead of results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn running_queries_are_listed_and_cancelled() {
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let data: String = (0..300)
+        .map(|i| format!("<urn:s{i}> <urn:p> {i} . "))
+        .collect();
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/update",
+        Some("application/sparql-update"),
+        &format!("INSERT DATA {{ {data} }}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // 300³ rows, each compared: minutes, unless cancelled.
+    let slow = "SELECT (COUNT(*) AS ?n) WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y . ?c <urn:p> ?z \
+                FILTER(?x + ?y != ?z * 1000) }";
+    let running = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            send(
+                &app,
+                Method::POST,
+                "/api/v1/repositories/nrese/query",
+                Some("application/sparql-query"),
+                slow,
+            )
+            .await
+        })
+    };
+    let mut id = None;
+    for _ in 0..200 {
+        let (_, text) = send(
+            &app,
+            Method::GET,
+            "/api/v1/repositories/nrese/queries",
+            None,
+            "",
+        )
+        .await;
+        let list: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if let Some(query) = list.as_array().unwrap().first() {
+            assert!(query["query"].as_str().unwrap().contains("COUNT(*)"));
+            assert_eq!(query["origin"], "roles: anonymous");
+            id = query["id"].as_u64();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let id = id.expect("the query was listed while it ran");
+    let (status, _) = send(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/repositories/nrese/queries/{id}"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(30), running)
+        .await
+        .expect("the cancelled query stops")
+        .unwrap();
+    assert!(!status.is_success(), "{status}");
+    let (_, text) = send(
+        &app,
+        Method::GET,
+        "/api/v1/repositories/nrese/queries",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(text.trim(), "[]");
+    let (status, _) = send(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/repositories/nrese/queries/{id}"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

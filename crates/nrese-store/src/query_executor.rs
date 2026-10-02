@@ -68,6 +68,8 @@ pub struct PreparedQuery {
     solutions_format: SolutionsResultFormat,
     graph_format: GraphResultFormat,
     access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
+    /// Who sent it, for the list of running queries.
+    origin: Option<String>,
 }
 
 impl PreparedQuery {
@@ -111,7 +113,23 @@ impl PreparedQuery {
             solutions_format: request.solutions_format,
             graph_format: request.graph_format,
             access: request.access.clone(),
+            origin: None,
         })
+    }
+
+    /// The query's text, as sent.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Names who sent the query (shown in the list of running queries).
+    pub fn set_origin(&mut self, origin: impl Into<String>) {
+        self.origin = Some(origin.into());
+    }
+
+    /// Who sent the query, if the caller said.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
     }
 
     /// Sets the output formats. A transport negotiates them once it knows the query form

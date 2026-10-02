@@ -46,6 +46,9 @@ fn repository_routes() -> Router<AppState> {
             put(api_v1::namespace_put).delete(api_v1::namespace_delete),
         )
         .route("/explain", get(api_v1::explain))
+        .route("/queries", get(api_v1::running_queries))
+        .route("/queries/{query}", delete(api_v1::cancel_query))
+        .route("/graphs", get(api_v1::graphs))
         .route("/import", post(api_v1::import))
         .route("/reasoning/rematerialise", post(api_v1::rematerialise))
         .route("/sessions", post(api_v1::session_begin))

@@ -23,6 +23,7 @@ mod query_executor;
 mod rdf_io;
 pub mod reasoning;
 pub mod reasoning_state;
+pub mod running;
 pub mod service;
 pub mod sessions;
 pub mod shacl;
@@ -68,6 +69,7 @@ pub use query_executor::PreparedQuery;
 pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
+pub use running::{RunningQueries, RunningQuery};
 pub use service::StoreService;
 pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{

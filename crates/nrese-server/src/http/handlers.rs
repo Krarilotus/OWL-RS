@@ -196,7 +196,7 @@ pub async fn query_get(
 ) -> Result<Response, ApiError> {
     let access = guard::query_access(&state, &headers).await?;
     let mut operation = query_from_url(raw_query.as_deref())?;
-    operation.access = access.read;
+    operation.restrict(&access);
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
@@ -212,7 +212,7 @@ pub async fn query_post(
         headers.get(header::CONTENT_TYPE),
         &body,
     )?;
-    operation.access = access.read;
+    operation.restrict(&access);
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
@@ -267,7 +267,7 @@ pub async fn sparql_post(
     )?;
     match operation {
         SparqlOperation::Query(mut operation) => {
-            operation.access = guard::query_access(&state, &headers).await?.read;
+            operation.restrict(&guard::query_access(&state, &headers).await?);
             sparql::execute_query(state, operation, accept_header_value(&headers)).await
         }
         SparqlOperation::Update(mut operation) => {

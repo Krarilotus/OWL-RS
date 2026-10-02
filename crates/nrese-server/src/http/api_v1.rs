@@ -320,7 +320,7 @@ pub async fn session_query(
             &body,
         )?
     };
-    operation.access = access.read.clone();
+    operation.restrict(&access);
     let accept = super::requests::accept_header_value(&headers);
     super::sparql::execute_query_in(state, operation, accept, Some(pending)).await
 }
@@ -594,4 +594,70 @@ pub async fn import(
         reasoning: reasoning.as_ref().map(ReasoningRun::from),
     })
     .into_response())
+}
+
+/// The queries running on the repository now, the longest-running first (operators).
+#[utoipa::path(get, path = "/api/v1/repositories/{id}/queries", tag = "sparql",
+    params(("id" = String, Path, description = "The repository's id")),
+    responses((status = 200, description = "The running queries", body = Vec<nrese_store::RunningQuery>)))]
+pub async fn running_queries(
+    Repository(state): Repository,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_operator_read(&state, &headers).await?;
+    Ok(Json(state.store().running_queries().list()).into_response())
+}
+
+/// Cancels running query `query` (administrators): it stops at its next check and answers
+/// its client with an error.
+#[utoipa::path(delete, path = "/api/v1/repositories/{id}/queries/{query}", tag = "sparql",
+    params(("id" = String, Path, description = "The repository's id"), ("query" = u64, Path)),
+    responses((status = 204, description = "Cancelled"),
+        (status = 404, description = "Not running", body = crate::http::openapi::Problem)))]
+pub async fn cancel_query(
+    Repository(state): Repository,
+    Path((_, query)): Path<(String, u64)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    match state.store().running_queries().cancel(query) {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::not_found(format!("no query {query} is running"))),
+    }
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct GraphSize {
+    /// The graph's IRI (a blank node in N-Triples form); absent for the default graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    graph: Option<String>,
+    /// Its asserted statements.
+    statements: u64,
+}
+
+/// The graphs with statements the requester may read, each with its number of asserted
+/// statements: the default graph first, then the named graphs in IRI order.
+#[utoipa::path(get, path = "/api/v1/repositories/{id}/graphs", tag = "data",
+    params(("id" = String, Path, description = "The repository's id")),
+    responses((status = 200, description = "The graphs", body = Vec<GraphSize>)))]
+pub async fn graphs(
+    Repository(state): Repository,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let access = guard::graph_read_access(&state, &headers).await?;
+    let store = state.store();
+    let sizes = tokio::task::spawn_blocking(move || store.graph_sizes(access.read.as_deref()))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let graphs: Vec<GraphSize> = sizes
+        .into_iter()
+        .map(|(graph, statements)| GraphSize {
+            graph: graph.map(|graph| match graph {
+                nrese_rdf::NamedOrBlankNode::NamedNode(node) => node.as_str().to_owned(),
+                other => other.to_string(),
+            }),
+            statements,
+        })
+        .collect();
+    Ok(Json(graphs).into_response())
 }

@@ -184,6 +184,8 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 | `GET …/repositories/{id}/explain?subj=&pred=&obj=` | Why a statement holds (terms in N-Triples syntax): `{"steps": [...]}`, the statement first, each step with `subject`, `predicate`, `object`, `origin` (`asserted`, `inferred`), `rule` and `premises` (indexes of steps); the shallowest, smallest derivation from asserted statements, the same on every call. 404 if it doesn't hold or reasoning is off |
 | `POST …/repositories/{id}/import` | Bulk-loads the RDF document in the body (`?graph=`, `?replace=true`, `?skip_errors=true`), then recomputes the inferences (administrators) |
 | `POST …/repositories/{id}/reasoning/rematerialise` | Recomputes the inferences (administrators) |
+| `GET …/repositories/{id}/graphs` | The graphs with statements the requester may read, each with its number of asserted statements (`graph` absent for the default graph) |
+| `GET …/repositories/{id}/queries`, `DELETE …/queries/{query}` | The queries running now (`id`, `query`, `origin`, `started`, `elapsed_ms`; operators), and cancelling one (administrators): it stops at its next check and its client gets a 408 |
 
 ### Users, workspaces and policies (`/api/v1/access`)
 
