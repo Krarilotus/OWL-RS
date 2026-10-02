@@ -515,7 +515,8 @@ impl StoreService {
             .base()
             .len_in(nrese_engine::ReadModel::Asserted);
         let program = crate::reasoning::Program::new(rules, &|term| rematerialisation.intern(term))
-            .hiding_unnamed_classes(self.config.hide_unnamed_classes);
+            .hiding_unnamed_classes(self.config.hide_unnamed_classes)
+            .by_representatives(self.config.equality_by_representatives);
         let closure = crate::reasoning::materialise_until(&program, rematerialisation.base(), stop)
             .map_err(|_| crate::StoreError::MaterialisationCancelled)?;
         let inferred = closure.inferred.len() as u64;

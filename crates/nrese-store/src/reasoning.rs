@@ -35,6 +35,7 @@ use nrese_reasoner::v2::lists::ListDiagnostic;
 use nrese_reasoner::v2::lists::ListVocabulary;
 use nrese_reasoner::v2::naive::{Triple, Violation};
 use nrese_reasoner::v2::unnamed::UnnamedVocabulary;
+use rayon::prelude::*;
 use std::collections::HashSet;
 
 /// A rule program compiled against the engine dictionary: its rules, list vocabulary and
@@ -52,6 +53,10 @@ pub struct Program {
     /// For the datatype checks ([`crate::datatypes`]).
     rdf_type: u64,
     same_as: Option<u64>,
+    /// Full materialisations compute the closure over representatives of the `owl:sameAs`
+    /// classes and expand it (W4 stage A): the same closure, without rules copying every
+    /// fact to every identity while it is computed (`reasoner.equality`).
+    by_representatives: bool,
     /// The ruleset's axiomatic triples, sorted: they seed every closure, and a commit
     /// never retracts them.
     axioms: Vec<Triple>,
@@ -104,8 +109,17 @@ impl Program {
             things,
             rdf_type,
             same_as,
+            by_representatives: true,
             axioms,
         }
+    }
+
+    /// This program computing full closures over representatives of `owl:sameAs` classes
+    /// (the default), or with the replacement rules.
+    #[must_use]
+    pub fn by_representatives(mut self, representatives: bool) -> Self {
+        self.by_representatives = representatives;
+        self
     }
 
     /// This program leaving out memberships in unnamed classes nothing consumes, or not.
@@ -337,13 +351,16 @@ pub fn materialise_until(
         axioms.push(axiom);
     }
     let schema = program.schema_for(snapshot);
-    let result = batch::materialise_grouped_until(
-        input,
-        &program.rules,
-        program.lists.as_ref(),
-        &schema,
-        stop,
-    )?;
+    let result = match program.same_as.filter(|_| program.by_representatives) {
+        Some(_) => by_representatives(program, input, &schema, stop)?,
+        None => batch::materialise_grouped_until(
+            input,
+            &program.rules,
+            program.lists.as_ref(),
+            &schema,
+            stop,
+        )?,
+    };
     let mut violations = result.violations;
     violations.extend(crate::datatypes::violations(
         &result.derived,
@@ -363,6 +380,55 @@ pub fn materialise_until(
         diagnostics: result.diagnostics,
         rounds: result.rounds,
         phases: result.phases,
+    })
+}
+
+/// The closure of `input` (grouped by predicate) over representatives of the `owl:sameAs`
+/// classes, expanded to every identity: what the replacement rules derive, as a batch
+/// materialisation reports it (the derived facts beyond the input). Violations are over
+/// representatives.
+fn by_representatives(
+    program: &Program,
+    input: Vec<(u64, Vec<(u64, u64)>)>,
+    schema: &Schema,
+    stop: nrese_reasoner::v2::eval::Stop<'_>,
+) -> Result<batch::Materialisation, delta::Interrupted> {
+    let mut asserted: Vec<Triple> = input
+        .into_iter()
+        .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
+        .collect();
+    asserted.par_sort_unstable();
+    let closure = nrese_reasoner::v2::representatives::materialise_until(
+        &asserted,
+        &program.rules,
+        program.lists.as_ref(),
+        schema,
+        stop,
+    )?;
+    let classes = &closure.classes;
+    let mut derived: Vec<Triple> = closure
+        .facts
+        .par_iter()
+        .flat_map_iter(|&fact| {
+            let [s, p, o] = fact;
+            match classes.class_of(s).is_none()
+                && classes.class_of(p).is_none()
+                && classes.class_of(o).is_none()
+            {
+                true => vec![fact],
+                false => classes.expand(fact),
+            }
+        })
+        .filter(|fact| asserted.binary_search(fact).is_err())
+        .collect();
+    derived.par_sort_unstable();
+    derived.dedup();
+    Ok(batch::Materialisation {
+        derived,
+        violations: closure.violations,
+        diagnostics: closure.diagnostics,
+        rounds: closure.rounds,
+        ..batch::Materialisation::default()
     })
 }
 

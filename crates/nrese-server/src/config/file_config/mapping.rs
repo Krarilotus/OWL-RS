@@ -66,6 +66,11 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
         names::REASONING_UNNAMED_CLASSES,
         config.reasoner.unnamed_classes,
     );
+    insert_option(
+        &mut source,
+        names::REASONING_EQUALITY,
+        config.reasoner.equality,
+    );
 
     insert_joined(
         &mut source,

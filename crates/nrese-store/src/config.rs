@@ -34,6 +34,11 @@ pub struct StoreConfig {
     /// Reasoning leaves out memberships in unnamed union classes that nothing consumes
     /// (`reasoner.unnamed_classes = "skip"`; work package W7).
     pub hide_unnamed_classes: bool,
+    /// Full materialisations with equality rules compute the closure over representatives
+    /// of the `owl:sameAs` classes and expand it (`reasoner.equality = "representatives"`,
+    /// the default) instead of copying every fact to every identity while computing it
+    /// (`"replicate"`). The same closure either way.
+    pub equality_by_representatives: bool,
     /// On disk: check the whole checkpoint when opening (see
     /// `nrese_engine::DurabilityConfig::verify_on_open`). Off: the checkpoint is used in
     /// place and opening reads only its structure.
@@ -141,6 +146,7 @@ impl StoreConfig {
             total_query_memory_bytes: 0,
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            equality_by_representatives: true,
             verify_on_open: false,
             map_checkpoints: true,
             bulk_load_memory_bytes: 0,
@@ -161,6 +167,7 @@ impl StoreConfig {
             total_query_memory_bytes: 0,
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            equality_by_representatives: true,
             verify_on_open: false,
             map_checkpoints: true,
             bulk_load_memory_bytes: 0,
