@@ -168,7 +168,7 @@ Limits today:
 
 ## Engine API (`/api/v1`)
 
-One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engine-api.md)), the same for every repository; the `/dataset/…` routes are the default repository's (`nrese`) and stay.
+One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engine-api.md)), the same for every repository; the `/dataset/…` routes are the default repository's (`nrese`) and stay. `GET /api/v1/openapi.json` describes it (OpenAPI 3.1, generated from the server's handlers and types; a test keeps it complete), for generating clients.
 
 | URL | What |
 |---|---|

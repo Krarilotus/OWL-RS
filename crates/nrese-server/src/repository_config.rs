@@ -34,7 +34,7 @@ const CONFIG_RULES_FORMAT: &str = "https://nrese.dev/ns/config#rulesFormat";
 
 /// A repository's user rules: their text, kept with the settings so that a restart needs
 /// no file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RepositoryRules {
     /// Shown in errors and diagnostics: the file name, or `configuration`.
     pub name: String,
@@ -55,7 +55,7 @@ impl RepositoryRules {
 }
 
 /// What a repository is created with besides the server's settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RepositorySettings {
     /// Shown in the repository list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
