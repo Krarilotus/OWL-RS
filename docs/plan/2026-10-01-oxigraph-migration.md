@@ -1,5 +1,8 @@
 # Migration away from Oxigraph
 
+> A record of its date. Its status columns and lines are not kept up to date: the
+> current status is in [STATUS.md](../STATUS.md).
+
 As of 1 October 2026 (owner's request: lose the dependency altogether, make what depends on
 it independent and more efficient, and keep the replacement modular, so that any piece of
 it stays easy to replace).

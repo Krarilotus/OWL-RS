@@ -1,5 +1,8 @@
 # Completion plan: from here to the benchmark runs
 
+> A record of its date. Its status columns and lines are not kept up to date: the
+> current status is in [STATUS.md](../STATUS.md).
+
 As of 30 September 2026, branch `refactor/engine-v2`. NRESE has every capability the
 benchmark suite asks for (audit §4), and the native executor answers every standard
 query. What remains is listed here, in the order it is done: first what decides the

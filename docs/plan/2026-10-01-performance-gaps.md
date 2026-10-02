@@ -1,5 +1,8 @@
 # Where NRESE is behind, and why: top-down analysis (1 October 2026)
 
+> A record of its date. Its status columns and lines are not kept up to date: the
+> current status is in [STATUS.md](../STATUS.md).
+
 The owner's direction:
 1. Where NRESE is behind, find out where the performance actually goes.
 2. Fix the approach first: how a query is evaluated and how data is laid out.
