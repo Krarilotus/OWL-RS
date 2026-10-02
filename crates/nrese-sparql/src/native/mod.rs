@@ -3385,13 +3385,22 @@ impl<'a> Context<'a> {
     /// rank that comes last (they cover at least `k` rows, so no row of the others is
     /// among the first `k`): a selection instead of a sort, for ORDER BY … LIMIT k.
     fn order_ranks(&self, column: &[u64], top: Option<(usize, bool)>) -> Vec<u64> {
-        let integer = |id: u64| TermId::from_raw(id).as_inline_integer();
+        // Plain inline xsd:integers only: their lexical forms are canonical, so their value
+        // is their place in the total order. Integers of derived datatypes of one value
+        // (`"6"^^xsd:nonNegativeInteger` and `"6"^^xsd:integer`) differ there by datatype,
+        // which the general path below takes into account (fuzz campaign, seed 2458).
+        let integer = |id: u64| {
+            let id = TermId::from_raw(id);
+            match id.kind() {
+                nrese_engine::TermKind::Integer => id.as_inline_integer(),
+                _ => None,
+            }
+        };
         if column
             .iter()
             .all(|&id| id == UNDEF || integer(id).is_some())
         {
-            // Inline integers (xsd:integer and the datatypes derived from it, 60 bits at
-            // most) by value, above UNDEF, which sorts first in SPARQL.
+            // By value, above UNDEF, which sorts first in SPARQL.
             return column
                 .iter()
                 .map(|&id| match integer(id) {
