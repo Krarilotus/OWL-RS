@@ -26,6 +26,9 @@ pub use budget::{Budget, BudgetExceeded, SharedBudget};
 pub use join::RowLimit;
 pub use table::IdTable;
 
+/// A hash map keyed by term ids, with the fast hasher the operators use.
+pub type IdMap<V> = hashbrown::HashMap<u64, V, foldhash::fast::FixedState>;
+
 /// An unbound value (SPARQL `UNDEF`, from OPTIONAL or VALUES). Tag 15, which the engine never
 /// assigns; it sorts after every stored id.
 pub const UNDEF: u64 = u64::MAX;

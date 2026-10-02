@@ -70,6 +70,12 @@ use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_xsd::{Decimal, Double, Float, Integer};
 use rayon::prelude::*;
 
+/// The most numbers kept per aggregate argument between groupings ([`Context::numeric_pass`]).
+const NUMBER_MEMO_ENTRIES: usize = 1 << 22;
+
+/// The rows of a cross product made at once below a GROUP BY ([`Context::group_crossed`]).
+const CROSS_CHUNK_ROWS: usize = 1 << 22;
+
 /// Distinct values of a sort key from which their terms are decoded in parallel.
 const PARALLEL_RANKS: usize = 4096;
 use std::borrow::Cow;
@@ -979,6 +985,11 @@ struct Context<'a> {
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
     decoded: RefCell<HashMap<u64, Option<Term>>>,
+    /// Per aggregate argument, the variable it reads and id: its number for SUM and AVG
+    /// ([`Context::numeric_pass`]), kept for the whole evaluation. Keyed by the expression
+    /// itself, not its address: patterns made during the evaluation (substituted
+    /// subqueries) come and go, and a freed address may hold another expression next.
+    numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
     cancellation: Option<CancellationToken>,
     budget: Budget,
     /// The operators run so far, for EXPLAIN; `None` when not explaining.
@@ -992,6 +1003,8 @@ struct Context<'a> {
     graph: RefCell<GraphScope>,
     /// [`QueryOptions::as_written`].
     as_written: bool,
+    /// [`QueryOptions::cross_chunk_rows`].
+    cross_chunk_rows: usize,
     /// With a dataset of several default graphs (`FROM <a> FROM <b>`), the graphs whose
     /// merge the default graph is; the scope is then [`GraphScope::Union`].
     merge_set: Option<Vec<TermId>>,
@@ -1044,6 +1057,7 @@ impl<'a> Context<'a> {
             merge_set,
             named: resolved.named,
             as_written: options.as_written,
+            cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
             snapshot,
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
@@ -1051,6 +1065,7 @@ impl<'a> Context<'a> {
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
             decoded: RefCell::default(),
+            numbers: RefCell::default(),
             cancellation: options.cancellation.clone(),
             budget: options
                 .memory_limit
@@ -3293,6 +3308,7 @@ impl<'a> Context<'a> {
                 evaluator: &self.evaluator,
                 term: &term,
                 memo: RefCell::default(),
+                numbers: RefCell::default(),
             };
             return Ok(members
                 .iter()
@@ -3328,6 +3344,7 @@ impl<'a> Context<'a> {
                     evaluator,
                     term: &term,
                     memo: RefCell::default(),
+                    numbers: RefCell::default(),
                 };
                 Some(
                     members[window[0]..window[1]]
@@ -3654,6 +3671,12 @@ impl<'a> Context<'a> {
                 });
             }
         }
+        if !self.as_written
+            && !variables.is_empty()
+            && let Some(solutions) = self.group_crossed(inner, variables, aggregates)?
+        {
+            return Ok(solutions);
+        }
         // Aggregates that ignore duplicates let the pattern be evaluated as a set, and
         // OPTIONALs that only feed them be aggregated apart from the rest (`sets`).
         let solutions = match sets::insensitive_arguments(aggregates) {
@@ -3674,6 +3697,371 @@ impl<'a> Context<'a> {
             }
             _ => self.eval(inner)?,
         };
+        self.group_solutions(solutions, variables, aggregates)
+    }
+
+    /// GROUP BY over a cross product: (filters over) a join of two patterns that share no
+    /// variable, with every key bound by one side. The product is made in chunks of that
+    /// side's rows, all rows of a key in the same chunk, and each chunk is filtered and
+    /// grouped on its own: its groups are complete, and memory holds one chunk instead of
+    /// the product. BSBM BI q4 crossed 2.5 k features with 63 k offers (155 M rows, 10 GB).
+    /// `None` for other patterns.
+    fn group_crossed(
+        &self,
+        inner: &GraphPattern,
+        variables: &[Variable],
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Option<Solutions>> {
+        let mut filters = Vec::new();
+        let mut pattern = inner;
+        while let GraphPattern::Filter { expr, inner } = pattern {
+            filters.push(expr);
+            pattern = inner;
+        }
+        let GraphPattern::Join { left, right } = pattern else {
+            return Ok(None);
+        };
+        let (left_vars, right_vars) = (sets::in_scope(left), sets::in_scope(right));
+        if sets::shares(&left_vars, &right_vars)
+            || as_path(left).is_some()
+            || as_path(right).is_some()
+            || matches!(**left, GraphPattern::Service { .. })
+            || matches!(**right, GraphPattern::Service { .. })
+        {
+            return Ok(None);
+        }
+        let (keyed, other) = if variables.iter().all(|v| left_vars.contains(v)) {
+            (left, right)
+        } else if variables.iter().all(|v| right_vars.contains(v)) {
+            (right, left)
+        } else {
+            return Ok(None);
+        };
+        let keyed = self.eval(keyed)?;
+        let other = self.eval(other)?;
+        // Rows of the keyed side per chunk, so that a chunk's product has about
+        // CROSS_CHUNK_ROWS rows.
+        let per_chunk = (self.cross_chunk_rows / other.table.len().max(1)).max(1);
+        // A key in scope but never bound has no column: unbound in every row, it splits no
+        // group.
+        let key_columns: Vec<usize> = variables.iter().filter_map(|v| keyed.column(v)).collect();
+        let mut order: Vec<usize> = (0..keyed.table.len()).collect();
+        if keyed.table.len() > per_chunk {
+            let key_of = |row: usize| -> Vec<u64> {
+                key_columns
+                    .iter()
+                    .map(|&c| keyed.table.get(row, c))
+                    .collect()
+            };
+            order.sort_by_cached_key(|&row| key_of(row));
+        }
+        let same_key = |a: usize, b: usize| {
+            key_columns
+                .iter()
+                .all(|&c| keyed.table.get(a, c) == keyed.table.get(b, c))
+        };
+        let mut parts = Vec::new();
+        let mut start = 0;
+        while start < order.len() {
+            let mut end = (start + per_chunk).min(order.len());
+            // A key's rows stay together.
+            while end < order.len() && same_key(order[end - 1], order[end]) {
+                end += 1;
+            }
+            let rows = &order[start..end];
+            let columns: Vec<Vec<u64>> = keyed
+                .table
+                .columns()
+                .iter()
+                .map(|column| rows.iter().map(|&row| column[row]).collect())
+                .collect();
+            let chunk = self.produced(Solutions {
+                vars: keyed.vars.clone(),
+                table: if columns.is_empty() {
+                    IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows.len()))
+                } else {
+                    IdTable::from_columns(columns)
+                },
+                ordered: false,
+            })?;
+            let copy = self.produced(Solutions {
+                vars: other.vars.clone(),
+                table: other.table.clone(),
+                ordered: false,
+            })?;
+            let mut crossed = self.join(chunk, copy)?;
+            for filter in filters.iter().rev() {
+                crossed = self.filter(crossed, filter)?;
+            }
+            parts.push(self.group_solutions(crossed, variables, aggregates)?);
+            start = end;
+        }
+        self.consumed(&keyed);
+        self.consumed(&other);
+        let Some(first) = parts.first() else {
+            // No keyed rows: no groups (with GROUP BY, an empty input has none).
+            let mut vars = variables.to_vec();
+            vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
+            return Ok(Some(Solutions {
+                table: IdTable::new(vars.len()),
+                vars,
+                ordered: false,
+            }));
+        };
+        let vars = first.vars.clone();
+        let width = first.table.width();
+        let tables = parts
+            .into_iter()
+            .map(|part| {
+                self.consumed(&part);
+                part.table
+            })
+            .collect();
+        Ok(Some(self.produced(Solutions {
+            vars,
+            table: IdTable::concat(width, tables),
+            ordered: false,
+        })?))
+    }
+
+    /// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
+    /// `COUNT` of a variable, or `SUM` or `AVG` of an expression of one variable whose
+    /// values are numbers (none DISTINCT): each id's number is found once, and the rows
+    /// are read in order instead of per group. `None` otherwise (and where a value isn't a
+    /// number: the general path decides, durations included). BSBM BI q4: 154 M rows of
+    /// `AVG(xsd:float(xsd:string(?price)))` at 80 ns a row per group, now a pass.
+    fn numeric_pass(
+        &self,
+        solutions: &Solutions,
+        group_of: &[u32],
+        groups: usize,
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> Option<Vec<Vec<Agg>>> {
+        enum Plan<'e> {
+            Rows,
+            Bound(usize),
+            Total {
+                column: usize,
+                expr: &'e Expression,
+                average: bool,
+            },
+        }
+        let mut plans = Vec::with_capacity(aggregates.len());
+        let mut totals = 0;
+        for (_, aggregate) in aggregates {
+            plans.push(match aggregate {
+                AggregateExpression::CountSolutions { distinct: false } => Plan::Rows,
+                AggregateExpression::FunctionCall {
+                    name: AggregateFunction::Count,
+                    expr: Expression::Variable(variable),
+                    distinct: false,
+                } => Plan::Bound(solutions.column(variable)?),
+                AggregateExpression::FunctionCall {
+                    name: name @ (AggregateFunction::Sum | AggregateFunction::Avg),
+                    expr,
+                    distinct: false,
+                } if !pushdown::per_solution(expr) => {
+                    let mut columns: Vec<usize> = expression_variables(expr)
+                        .iter()
+                        .filter_map(|v| solutions.column(v))
+                        .collect();
+                    columns.sort_unstable();
+                    columns.dedup();
+                    let [column] = columns[..] else {
+                        return None;
+                    };
+                    totals += 1;
+                    Plan::Total {
+                        column,
+                        expr,
+                        average: *name == AggregateFunction::Avg,
+                    }
+                }
+                _ => return None,
+            });
+        }
+        // Only worth it where a total is computed; counts alone take the other paths.
+        if totals == 0 {
+            return None;
+        }
+        #[derive(Clone, Copy)]
+        struct State {
+            count: u64,
+            total: Option<Numeric>,
+            error: bool,
+        }
+        let width = plans.len();
+        let table = &solutions.table;
+        // Every id's number, found once per query: the chunks of a cross product
+        // ([`Self::group_crossed`]) share their values.
+        for plan in &plans {
+            let Plan::Total { column, expr, .. } = plan else {
+                continue;
+            };
+            // The expression and the variable it reads here: with another one bound, the
+            // same id may give another value.
+            let key = ((*expr).clone(), solutions.vars[*column].clone());
+            let mut missing: nrese_exec::IdMap<usize> = nrese_exec::IdMap::default();
+            {
+                let numbers = self.numbers.borrow();
+                let known = numbers.get(&key);
+                for (row, &id) in table.column(*column).iter().enumerate() {
+                    if !known.is_some_and(|known| known.contains_key(&id)) {
+                        missing.entry(id).or_insert(row);
+                    }
+                }
+            }
+            let missing: Vec<(u64, usize)> = missing.into_iter().collect();
+            let number = |aggregator: &Aggregator<'_>, row: usize| {
+                let binding = aggregator.binding(solutions, row);
+                match aggregator.evaluator.eval(expr, &binding) {
+                    None => Number::Error,
+                    Some(term) => match Numeric::of(&term) {
+                        Some(number) => Number::Value(number),
+                        None => Number::Other,
+                    },
+                }
+            };
+            let found: Vec<(u64, Number)> = if missing.len() < 2 * PARALLEL_EXPRESSION_ROWS {
+                let term = |id: u64| self.term(id);
+                let aggregator = Aggregator {
+                    evaluator: &self.evaluator,
+                    term: &term,
+                    memo: RefCell::default(),
+                    numbers: RefCell::default(),
+                };
+                missing
+                    .iter()
+                    .map(|&(id, row)| (id, number(&aggregator, row)))
+                    .collect()
+            } else {
+                let computed = self.computed.borrow();
+                let computed: &[Term] = &computed;
+                let (snapshot, evaluator) = (self.snapshot, &self.evaluator);
+                missing
+                    .par_chunks(PARALLEL_EXPRESSION_ROWS)
+                    .flat_map_iter(|part| {
+                        let decoder = Decoder::new(snapshot, computed);
+                        let term = |id: u64| decoder.term(id);
+                        let aggregator = Aggregator {
+                            evaluator,
+                            term: &term,
+                            memo: RefCell::default(),
+                            numbers: RefCell::default(),
+                        };
+                        part.iter()
+                            .map(|&(id, row)| (id, number(&aggregator, row)))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            };
+            self.numbers
+                .borrow_mut()
+                .entry(key)
+                .or_default()
+                .extend(found);
+        }
+        let numbers = self.numbers.borrow();
+        let known: Vec<Option<&nrese_exec::IdMap<Number>>> = plans
+            .iter()
+            .map(|plan| match plan {
+                Plan::Total { expr, column, .. } => {
+                    numbers.get(&((*expr).clone(), solutions.vars[*column].clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        // The states of groups `range`, from every row in order; `None` once a value isn't
+        // a number.
+        let pass = |range: std::ops::Range<usize>| {
+            let start = State {
+                count: 0,
+                total: Some(Numeric::Integer(Integer::from(0))),
+                error: false,
+            };
+            let mut states = vec![start; range.len() * width];
+            for (row, &group) in group_of.iter().enumerate() {
+                let group = group as usize;
+                if !range.contains(&group) {
+                    continue;
+                }
+                let at = (group - range.start) * width;
+                for (a, plan) in plans.iter().enumerate() {
+                    let state = &mut states[at + a];
+                    match plan {
+                        Plan::Rows => state.count += 1,
+                        Plan::Bound(column) => {
+                            if table.get(row, *column) != UNDEF {
+                                state.count += 1;
+                            }
+                        }
+                        Plan::Total { column, .. } => {
+                            let id = table.get(row, *column);
+                            state.count += 1;
+                            match known[a].and_then(|known| known.get(&id)) {
+                                Some(Number::Value(number)) => {
+                                    state.total = state.total.and_then(|total| total.add(*number));
+                                }
+                                Some(Number::Error) => state.error = true,
+                                Some(Number::Other) | None => return None,
+                            }
+                        }
+                    }
+                }
+            }
+            Some(states)
+        };
+        // Parts of the groups on every core where there are many rows: each part reads the
+        // rows in order, so every group adds its values in the order the general path does.
+        let parts = rayon::current_num_threads().min(groups).max(1);
+        let states: Vec<State> = if group_of.len() < 2 * PARALLEL_EXPRESSION_ROWS || parts < 2 {
+            pass(0..groups)?
+        } else {
+            let done: Vec<Option<Vec<State>>> = (0..parts)
+                .into_par_iter()
+                .map(|part| pass(part * groups / parts..(part + 1) * groups / parts))
+                .collect();
+            let mut states = Vec::with_capacity(groups * width);
+            for part in done {
+                states.extend(part?);
+            }
+            states
+        };
+        // Kept for the next chunk only while small: a GROUP BY over many distinct values
+        // would hold all their numbers to the end of the query.
+        drop(known);
+        drop(numbers);
+        self.numbers
+            .borrow_mut()
+            .retain(|_, known| known.len() <= NUMBER_MEMO_ENTRIES);
+        Some(
+            (0..groups)
+                .map(|group| {
+                    plans
+                        .iter()
+                        .enumerate()
+                        .map(|(a, plan)| {
+                            let state = states[group * width + a];
+                            match plan {
+                                Plan::Rows | Plan::Bound(_) => integer_agg(state.count as i64),
+                                Plan::Total { average, .. } => {
+                                    finish_total(state.total, state.error, state.count, *average)
+                                }
+                            }
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
+    /// GROUP BY over evaluated `solutions`.
+    fn group_solutions(
+        &self,
+        solutions: Solutions,
+        variables: &[Variable],
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Solutions> {
         let key_table = if variables.is_empty() {
             IdTable::from_rows(0, std::iter::repeat_n(&[][..], solutions.table.len()))
         } else {
@@ -3699,17 +4087,18 @@ impl<'a> Context<'a> {
         let groups = group_rows(&key_table, &keys);
         // Without GROUP BY, an empty input still yields one (empty) group.
         let group_count = groups.len();
-        let values =
-            match aggregate_in_one_pass(&solutions, &groups.group_of, group_count, aggregates) {
-                Some(values) => values,
-                None => {
-                    let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
-                    for (row, &group) in groups.group_of.iter().enumerate() {
-                        members[group as usize].push(row);
-                    }
-                    self.aggregate_groups(&solutions, &members, aggregates)?
+        let one_pass = aggregate_in_one_pass(&solutions, &groups.group_of, group_count, aggregates)
+            .or_else(|| self.numeric_pass(&solutions, &groups.group_of, group_count, aggregates));
+        let values = match one_pass {
+            Some(values) => values,
+            None => {
+                let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
+                for (row, &group) in groups.group_of.iter().enumerate() {
+                    members[group as usize].push(row);
                 }
-            };
+                self.aggregate_groups(&solutions, &members, aggregates)?
+            }
+        };
         let mut columns: Vec<Vec<u64>> = groups.keys.clone().into_columns();
         let mut vars: Vec<Variable> = variables.to_vec();
         for (index, (target, _)) in aggregates.iter().enumerate() {
@@ -4002,9 +4391,71 @@ struct Aggregator<'a> {
     /// The value of an expression over one variable, per (expression, id): groups share
     /// most of their values, and `STR(?x)` of an id is the same in each of them.
     memo: RefCell<HashMap<(usize, u64), Option<Term>>>,
+    /// The same for SUM and AVG: the value as a number ([`Aggregator::numeric_total`]).
+    numbers: RefCell<HashMap<(usize, u64), Number>>,
+}
+
+/// An expression's value for SUM and AVG.
+#[derive(Clone, Copy)]
+enum Number {
+    Value(Numeric),
+    /// An error: SUM and AVG are unbound.
+    Error,
+    /// Not a number (a duration, or no sum): the general path decides.
+    Other,
 }
 
 impl Aggregator<'_> {
+    /// SUM (or AVG with `average`) of `expr`, an expression of one variable, over `rows`:
+    /// each id's number found once, then added up without a term per row. `None` where the
+    /// general path must decide (a value that isn't a number, a value drawn per row). BSBM
+    /// BI q4 averaged `xsd:float(xsd:string(?price))` over 154 M rows.
+    fn numeric_total(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        expr: &Expression,
+        average: bool,
+    ) -> Option<Agg> {
+        if pushdown::per_solution(expr) {
+            return None;
+        }
+        let mut columns: Vec<usize> = expression_variables(expr)
+            .iter()
+            .filter_map(|v| solutions.column(v))
+            .collect();
+        columns.sort_unstable();
+        columns.dedup();
+        let [column] = columns[..] else {
+            return None;
+        };
+        let key = expr as *const Expression as usize;
+        let table = &solutions.table;
+        let mut numbers = self.numbers.borrow_mut();
+        let mut total = Some(Numeric::Integer(Integer::from(0)));
+        let mut error = false;
+        for &row in rows {
+            let number =
+                *numbers
+                    .entry((key, table.get(row, column)))
+                    .or_insert_with(|| {
+                        match self.evaluator.eval(expr, &self.binding(solutions, row)) {
+                            None => Number::Error,
+                            Some(term) => match Numeric::of(&term) {
+                                Some(number) => Number::Value(number),
+                                None => Number::Other,
+                            },
+                        }
+                    });
+            match number {
+                Number::Value(number) => total = total.and_then(|total| total.add(number)),
+                Number::Error => error = true,
+                Number::Other => return None,
+            }
+        }
+        Some(finish_total(total, error, rows.len() as u64, average))
+    }
+
     fn binding<'s>(
         &'s self,
         solutions: &'s Solutions,
@@ -4178,6 +4629,13 @@ impl Aggregator<'_> {
                         return result;
                     }
                 }
+                if !*distinct
+                    && matches!(name, AggregateFunction::Sum | AggregateFunction::Avg)
+                    && let Some(result) =
+                        self.numeric_total(solutions, rows, expr, *name == AggregateFunction::Avg)
+                {
+                    return result;
+                }
                 let evaluated = self.evaluated(solutions, rows, expr, *distinct);
                 // COUNT skips errors and SAMPLE takes the first value, but one error makes
                 // SUM, AVG, MIN and MAX unbound.
@@ -4223,6 +4681,30 @@ impl Aggregator<'_> {
             }
         }
     }
+}
+
+/// SUM (or AVG with `average`) of `count` values adding up to `total`, as `sum` and
+/// `average` give it: unbound after an error or an overflow, AVG of none 0, of integers
+/// and decimals a decimal.
+fn finish_total(total: Option<Numeric>, error: bool, count: u64, average: bool) -> Agg {
+    let Some(total) = total.filter(|_| !error) else {
+        return Agg::Id(UNDEF);
+    };
+    if !average {
+        return Agg::Term(total.term());
+    }
+    if count == 0 {
+        return Agg::Term(integer(0));
+    }
+    let mean = match total {
+        Numeric::Integer(_) | Numeric::Decimal(_) => total
+            .decimal()
+            .and_then(|sum| sum.checked_div(Decimal::from(count as i64)))
+            .map(|mean| Numeric::Decimal(mean).term()),
+        Numeric::Float(f) => Some(Numeric::Float(f / Float::from(count as f32)).term()),
+        Numeric::Double(d) => Some(Numeric::Double(d / Double::from(count as f64)).term()),
+    };
+    mean.map_or(Agg::Id(UNDEF), Agg::Term)
 }
 
 fn counts_rows(aggregate: &AggregateExpression, scan: &ScanPattern) -> bool {

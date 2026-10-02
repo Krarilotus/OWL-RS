@@ -4665,3 +4665,98 @@ fn triple_terms_and_base_directions_equal_the_reference() {
         "{with_solutions} of {checked} with solutions"
     );
 }
+
+/// GROUP BY over a cross product (`Context::group_crossed`), grouped in chunks of one row
+/// of the keyed side: keys from a subquery or a pattern (repeated keys stay in one chunk),
+/// NOT EXISTS and comparisons across the sides, an OPTIONAL on the other side, and the
+/// aggregates of the one-pass totals (`numeric_pass`) and of the general path. Equal to the
+/// reference evaluator.
+#[test]
+fn grouped_cross_products_equal_the_reference() {
+    let mut rng = Rng(20_261_002);
+    let (mut checked, mut with_solutions) = (0, 0);
+    for dataset_case in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..40 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+            let keyed = match rng.below(3) {
+                0 => format!("{{ SELECT DISTINCT ?k {{ ?k {} ?x }} }}", p(&mut rng)),
+                1 => format!("?k {} ?x .", p(&mut rng)),
+                _ => format!("{{ SELECT ?k ?x {{ ?k {} ?x }} }}", p(&mut rng)),
+            };
+            let keys = if keyed.contains("DISTINCT") || rng.below(2) == 0 {
+                "?k"
+            } else {
+                "?k ?x"
+            };
+            // In a group of its own: a join of the two sides.
+            let optional = match rng.below(2) {
+                0 => format!(" OPTIONAL {{ ?y {} ?w }}", p(&mut rng)),
+                _ => String::new(),
+            };
+            let other = format!("{{ ?y {} ?v .{optional} }}", p(&mut rng));
+            let mut filters = String::new();
+            if rng.below(2) == 0 {
+                filters.push_str(&format!(" FILTER NOT EXISTS {{ ?y {} ?k }}", p(&mut rng)));
+            }
+            if rng.below(3) == 0 {
+                filters.push_str(" FILTER(?v != ?k)");
+            }
+            let mut aggregates = Vec::new();
+            for (i, aggregate) in [
+                "COUNT(*)",
+                "COUNT(?w)",
+                "SUM(?v)",
+                "AVG(?v)",
+                "AVG(<http://www.w3.org/2001/XMLSchema#double>(?v))",
+                "SUM(STRLEN(STR(?v)))",
+                "MIN(?v)",
+                "COUNT(DISTINCT ?v)",
+            ]
+            .iter()
+            .enumerate()
+            {
+                if rng.below(3) == 0 || (i == 3 && aggregates.is_empty()) {
+                    aggregates.push(format!("({aggregate} AS ?a{i})"));
+                }
+            }
+            let text = format!(
+                "SELECT {keys} {} WHERE {{ {keyed} {other}{filters} }} GROUP BY {keys}",
+                aggregates.join(" ")
+            );
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "{text}");
+            let context = format!("dataset {dataset_case}, query {query_case}: {text}");
+            let open = has_extremes(&text);
+            let chunked = QueryOptions {
+                cross_chunk_rows: Some(1 + rng.below(3) as usize),
+                ..QueryOptions::default()
+            };
+            let native = rows_up_to_equal_values(
+                evaluate_query(&snapshot, &query, &chunked).unwrap(),
+                false,
+                open,
+            );
+            let expected = rows_up_to_equal_values(
+                reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+                open,
+            );
+            assert_same_rows(&native, &expected, &context);
+            checked += 1;
+            with_solutions += usize::from(!native.is_empty());
+        }
+    }
+    assert!(
+        with_solutions * 2 > checked,
+        "only {with_solutions} of {checked} queries have solutions"
+    );
+}
