@@ -21,6 +21,7 @@ use super::{AccessState, DefaultGraphRight, Fallback, Inferred, Level, RoleRule,
 pub(super) const NS: &str = "https://nrese.dev/ns/access#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
+const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 const SETTINGS: &str = "urn:nrese:access:settings";
 const ROLE: &str = "urn:nrese:role:";
 const USER: &str = "urn:nrese:user:";
@@ -110,6 +111,15 @@ pub(super) fn encode(state: &AccessState, graph: &NamedNode) -> Vec<Quad> {
         "usersCreateWorkspaces",
         boolean(s.users_create_workspaces),
     );
+    let integer = |value: u32| -> Term {
+        Literal::new_typed_literal(value.to_string(), iri(XSD_INTEGER)).into()
+    };
+    push(
+        &settings,
+        "minPasswordLength",
+        integer(s.min_password_length),
+    );
+    push(&settings, "sessionHours", integer(s.session_hours));
     for rule in state.roles.values() {
         let subject = iri(&format!("{ROLE}{}", encode_name(&rule.name)));
         push(&subject, "a", term("Role").into());
@@ -216,6 +226,13 @@ pub(super) fn decode(quads: &[Quad], base: &str) -> AccessState {
             };
             settings.users_create_workspaces =
                 get("usersCreateWorkspaces").is_none_or(|v| v == "true" || v == "1");
+            let defaults = super::Settings::default();
+            settings.min_password_length = get("minPasswordLength")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.min_password_length);
+            settings.session_hours = get("sessionHours")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(defaults.session_hours);
             continue;
         }
         let Some(name) = get("name") else {

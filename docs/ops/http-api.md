@@ -193,16 +193,18 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 |---|---|---|
 | `GET /api/v1/access/me` | The requester: `user`, `roles`, `admin`, `enforced`, `reads_everything`, `personal_space`, `workspaces` (each with `prefix`, `level`, `members`) | anyone who may read |
 | `GET /api/v1/access` | The whole state: `settings`, `roles`, `users` (`local_login`, never a hash), `workspaces` | administrators |
-| `PUT /api/v1/access/settings` | `enforced`, `fallback` (`deny`, `allow`), `inferred` (`hidden`, `visible`), `users_create_workspaces` | administrators |
+| `PUT /api/v1/access/settings` | `enforced`, `fallback` (`deny`, `allow`), `inferred` (`hidden`, `visible`), `users_create_workspaces`, `min_password_length` (10), `session_hours` (12) | administrators |
 | `PUT`/`DELETE /api/v1/access/roles/{name}` | A role's rule: `read`, `write`, `deny` (IRIs or prefixes ending in `*`), `default_graph` (`none`, `read`, `write`, `deny`) | administrators |
-| `PUT`/`DELETE /api/v1/access/users/{name}` | A user record: `admin`, `roles` (added to its credentials'); removal takes its memberships along | administrators |
+| `PUT`/`DELETE /api/v1/access/users/{name}` | A user record: `admin`, `roles` (added to its credentials'), `password` for a local login (empty removes it; at least `min_password_length` characters); removal takes its memberships along | administrators; a user its own `password` |
+| `POST /api/v1/access/login` | `{"user", "password"}` of a local login: `{"user", "token", "expires_in_seconds"}`; send `Authorization: Bearer {token}` afterwards. 401 for wrong credentials, 429 after too many failures | anyone |
+| `POST /api/v1/access/logout` | Ends the session of the bearer token sent | the session |
 | `GET /api/v1/access/workspaces` | The requester's workspaces, its personal space first (administrators: all) | anyone who may read |
 | `GET`/`PUT`/`DELETE /api/v1/access/workspaces/{name}` | A workspace: `title`, `repository` (empty: every one), `graphs` taken in besides its prefix (administrators only). Whoever creates one owns it; `~user` is that user's personal space | owners, administrators |
 | `PUT`/`DELETE /api/v1/access/workspaces/{name}/members/{user}` | A member's `level`: `owner`, `editor`, `viewer`; a personal space has viewers only; a workspace keeps an owner (409) | owners, administrators |
 | `GET /api/v1/access/history?limit=` | The changes, the latest first (100 by default) | administrators |
 | `POST /api/v1/access/import?reason=`, `GET /api/v1/access/export` | The role rules and fallbacks as a policy file (TOML); importing turns enforcement on | administrators |
 
-Graph prefixes: a personal space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`, with `base` from `auth.workspace_base` (`NRESE_WORKSPACE_BASE`, default `urn:nrese:`). User names come from a token's `sub` (or an introspection's `username`) or a client certificate's subject, where they are letters, digits and `. _ @ + | : -`.
+Graph prefixes: a personal space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`, with `base` from `auth.workspace_base` (`NRESE_WORKSPACE_BASE`, default `urn:nrese:`). User names come from a token's `sub` (or an introspection's `username`) or a client certificate's subject, where they are letters, digits and `. _ @ + | : -`, or from a local login: `Authorization: Basic` with a user's password (Argon2id; a credential verified once is remembered while the password stays), or a session token from `/login`. Local logins work besides any authentication mode (`auth.local_logins`, on by default); a user's sessions end when its password changes or it is removed.
 
 ## Graph-level access control
 

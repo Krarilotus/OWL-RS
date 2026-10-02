@@ -400,3 +400,67 @@ fn changes_are_kept_with_their_history_and_survive_a_restart() {
     assert_eq!(record.number, 4);
     assert!(record.removed.iter().any(|l| l.contains("editor")));
 }
+
+#[test]
+fn local_logins_check_passwords_open_sessions_and_throttle_failures() {
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    let limits = LoginLimits {
+        failures: 3,
+        ..LoginLimits::default()
+    };
+    let control = AccessControl::open_with(store, "urn:nrese:", limits).unwrap();
+    assert!(matches!(
+        control.password_hash("short"),
+        Err(AccessError::Invalid(_))
+    ));
+    let hash = control.password_hash("correct horse battery").unwrap();
+    assert!(hash.as_deref().unwrap().starts_with("$argon2id$"));
+    assert!(verify_password(
+        "correct horse battery",
+        hash.as_deref().unwrap()
+    ));
+    let set_password = |hash: Option<String>| Change::PutUser {
+        name: "alice".to_owned(),
+        admin: None,
+        roles: None,
+        password_hash: Some(hash),
+    };
+    control
+        .apply(&admin(), set_password(hash), "a local login")
+        .unwrap();
+    let principal = control.login("alice", "correct horse battery").unwrap();
+    assert_eq!(principal.user.as_deref(), Some("alice"));
+    // Verified once, remembered: the same answer again.
+    assert!(control.login("alice", "correct horse battery").is_ok());
+    assert!(matches!(
+        control.login("alice", "wrong"),
+        Err(AccessError::Forbidden(_))
+    ));
+    assert!(control.login("nobody", "correct horse battery").is_err());
+    let (token, lifetime) = control
+        .open_session("alice", "correct horse battery")
+        .unwrap();
+    assert!(token.starts_with(SESSION_PREFIX));
+    assert_eq!(lifetime.as_secs(), 12 * 3600);
+    assert_eq!(
+        control.session(&token).and_then(|p| p.user).as_deref(),
+        Some("alice")
+    );
+    assert!(control.session("nrese-session.forged").is_none());
+    // A new password ends the sessions and the old password.
+    let new = control.password_hash("another long secret").unwrap();
+    control
+        .apply(&user("alice"), set_password(new), "rotated")
+        .unwrap();
+    assert!(control.session(&token).is_none());
+    assert!(control.login("alice", "correct horse battery").is_err());
+    // A success clears the count; three failures within the window, and the right
+    // password is refused too, until the window has passed.
+    for _ in 0..2 {
+        assert!(control.login("alice", "guess").is_err());
+    }
+    assert!(matches!(
+        control.login("alice", "another long secret"),
+        Err(AccessError::Throttled(_))
+    ));
+}

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use nrese_rdf::{Literal, NamedNode, Quad, Term};
 
+use super::login::{LoginLimits, Logins, hash_password};
 use super::rdf::{self, iri, term};
 use super::{AccessError, AccessState, AccessView, Change, Principal};
 use crate::{SparqlUpdateRequest, StatementPattern, StoreService};
@@ -49,6 +50,7 @@ pub struct AccessControl {
     state: RwLock<Arc<AccessState>>,
     /// Changes one at a time; holds the next change's number.
     writer: Mutex<u64>,
+    logins: Logins,
 }
 
 impl std::fmt::Debug for AccessControl {
@@ -119,6 +121,15 @@ fn data(quads: &[Quad]) -> String {
 impl AccessControl {
     /// The access state kept in `store`; workspace prefixes under `base`.
     pub fn open(store: StoreService, base: &str) -> Result<Self, AccessError> {
+        Self::open_with(store, base, LoginLimits::default())
+    }
+
+    /// [`Self::open`] with local logins bounded by `limits`.
+    pub fn open_with(
+        store: StoreService,
+        base: &str,
+        limits: LoginLimits,
+    ) -> Result<Self, AccessError> {
         let quads = store
             .read_statements(&graph_pattern(STATE_GRAPH), false)
             .map_err(|error| AccessError::Store(error.to_string()))?;
@@ -127,6 +138,7 @@ impl AccessControl {
             store,
             state: RwLock::new(Arc::new(state)),
             writer: Mutex::new(0),
+            logins: Logins::new(limits),
         };
         let next = control
             .history(usize::MAX)?
@@ -165,6 +177,16 @@ impl AccessControl {
                 "a change of the access state needs a reason".to_owned(),
             ));
         }
+        // A user's sessions end when its password changes or it is removed.
+        let ends_sessions = match &change {
+            Change::PutUser {
+                name,
+                password_hash: Some(_),
+                ..
+            }
+            | Change::RemoveUser(name) => Some(name.clone()),
+            _ => None,
+        };
         let mut next = self.writer.lock().expect("writer");
         let before = self.state();
         let mut after = (*before).clone();
@@ -195,7 +217,61 @@ impl AccessControl {
             .map_err(|error| AccessError::Store(error.to_string()))?;
         *self.state.write().expect("state") = Arc::new(after);
         *next += 1;
+        if let Some(user) = ends_sessions {
+            self.logins.close_all(&user);
+        }
         Ok(record)
+    }
+
+    /// The password hash a change of `password` stores: `None` for an empty one (the
+    /// local login removed); refused if shorter than the settings allow.
+    pub fn password_hash(&self, password: &str) -> Result<Option<String>, AccessError> {
+        if password.is_empty() {
+            return Ok(None);
+        }
+        let shortest = self.state().settings.min_password_length;
+        if password.chars().count() < shortest as usize {
+            return Err(AccessError::Invalid(format!(
+                "a password needs {shortest} characters at least"
+            )));
+        }
+        hash_password(password).map(Some)
+    }
+
+    /// The principal of a local login with `user` and `password`.
+    pub fn login(&self, user: &str, password: &str) -> Result<Principal, AccessError> {
+        self.logins.login(&self.state(), user, password)
+    }
+
+    /// Logs in and opens a session: its token and how long it lasts.
+    pub fn open_session(
+        &self,
+        user: &str,
+        password: &str,
+    ) -> Result<(String, std::time::Duration), AccessError> {
+        self.login(user, password)?;
+        let hours = self.state().settings.session_hours.max(1);
+        let lifetime = std::time::Duration::from_secs(u64::from(hours) * 3600);
+        Ok((self.logins.open(user, lifetime)?, lifetime))
+    }
+
+    /// The principal of session `token`, while it lasts and its user has a local login.
+    pub fn session(&self, token: &str) -> Option<Principal> {
+        let user = self.logins.session(token)?;
+        let state = self.state();
+        state
+            .users
+            .get(&user)
+            .is_some_and(|record| record.password_hash.is_some())
+            .then(|| Principal {
+                user: Some(user),
+                ..Principal::default()
+            })
+    }
+
+    /// Closes session `token`; whether it was open.
+    pub fn close_session(&self, token: &str) -> bool {
+        self.logins.close(token)
     }
 
     /// The latest `limit` changes, the latest first.

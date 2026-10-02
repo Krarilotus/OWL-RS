@@ -218,6 +218,7 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
         names::WORKSPACE_BASE,
         config.auth.workspace_base,
     );
+    insert_bool(&mut source, names::LOCAL_LOGINS, config.auth.local_logins);
     insert_option(
         &mut source,
         names::AUTH_READ_TOKEN,
