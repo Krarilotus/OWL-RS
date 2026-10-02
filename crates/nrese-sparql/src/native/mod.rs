@@ -1912,7 +1912,7 @@ impl<'a> Context<'a> {
         let column = |values: Vec<u64>| IdTable::from_columns(vec![values]);
         let (vars, table) = match (end(subject), end(object)) {
             (Err(start), Err(finish)) => {
-                let rows = usize::from(evaluator.connects(&resolved, start, finish));
+                let rows = evaluator.multiplicity(&resolved, start, finish);
                 (
                     Vec::new(),
                     IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),

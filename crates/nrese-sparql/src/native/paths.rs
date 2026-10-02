@@ -9,8 +9,8 @@
 //! Zero-length paths (`*`, `?`) start from the terms that occur as a subject or object in
 //! the graph the path is followed in ([`PathGraph`]), and from the path pattern's constant
 //! end, whether the graph has it or not ([`PathEvaluator::fixed`]); an open `?x p* ?y`
-//! pairs every node with itself. Both ends bound is an existence test (one solution or
-//! none).
+//! pairs every node with itself. With both ends bound, a path has as many solutions as
+//! its bag would hold the pair ([`PathEvaluator::multiplicity`]).
 //!
 //! The default graph is the store's, or the merge of all graphs
 //! ([`PathEvaluator::merged`]): then every read takes a graph-last index order, where the
@@ -328,6 +328,33 @@ impl PathEvaluator<'_> {
                 .filter(|(_, p, _)| !excluded.contains(p))
                 .map(|(s, _, _)| s)
                 .collect(),
+        }
+    }
+
+    /// How many solutions `start path end` has: as many as `end` occurs in
+    /// [`Self::from`]`(path, start)`, without building that bag. An alternative is a UNION
+    /// (a pair both sides give counts twice) and a sequence a join (one per middle node);
+    /// closures and `p?` are sets (at most one).
+    pub(crate) fn multiplicity(&self, path: &Path, start: u64, end: u64) -> usize {
+        match path {
+            Path::Link(None) => 0,
+            Path::Link(Some(p)) => self.quads(Some(start), Some(*p), Some(end)).count(),
+            Path::Reverse(p) => self.multiplicity(p, end, start),
+            Path::Sequence(a, b) => self
+                .from(a, start)
+                .into_iter()
+                .map(|m| self.multiplicity(b, m, end))
+                .sum(),
+            Path::Alternative(a, b) => {
+                self.multiplicity(a, start, end) + self.multiplicity(b, start, end)
+            }
+            Path::ZeroOrMore(_) | Path::OneOrMore(_) | Path::ZeroOrOne(_) => {
+                usize::from(self.connects(path, start, end))
+            }
+            Path::Negated(excluded) => self
+                .quads(Some(start), None, Some(end))
+                .filter(|(_, p, _)| !excluded.contains(p))
+                .count(),
         }
     }
 
