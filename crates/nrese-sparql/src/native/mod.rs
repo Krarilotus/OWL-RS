@@ -821,35 +821,12 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
 
 /// True if `expression` holds an `EXISTS` at any depth.
 fn contains_any_exists(expression: &Expression) -> bool {
-    match expression {
-        Expression::Exists(_) => true,
-        Expression::NamedNode(_)
-        | Expression::Literal(_)
-        | Expression::Variable(_)
-        | Expression::Bound(_) => false,
-        Expression::Or(a, b)
-        | Expression::And(a, b)
-        | Expression::Equal(a, b)
-        | Expression::SameTerm(a, b)
-        | Expression::Greater(a, b)
-        | Expression::GreaterOrEqual(a, b)
-        | Expression::Less(a, b)
-        | Expression::LessOrEqual(a, b)
-        | Expression::Add(a, b)
-        | Expression::Subtract(a, b)
-        | Expression::Multiply(a, b)
-        | Expression::Divide(a, b) => contains_any_exists(a) || contains_any_exists(b),
-        Expression::In(a, list) => contains_any_exists(a) || list.iter().any(contains_any_exists),
-        Expression::UnaryPlus(a) | Expression::UnaryMinus(a) | Expression::Not(a) => {
-            contains_any_exists(a)
-        }
-        Expression::If(a, b, c) => {
-            contains_any_exists(a) || contains_any_exists(b) || contains_any_exists(c)
-        }
-        Expression::Coalesce(list) | Expression::FunctionCall(_, list) => {
-            list.iter().any(contains_any_exists)
-        }
-    }
+    expression.find(&mut |node| {
+        matches!(
+            node,
+            nrese_sparql_syntax::visit::Node::Expression(Expression::Exists(_))
+        )
+    })
 }
 
 fn supported_term(term: &TermPattern) -> bool {
