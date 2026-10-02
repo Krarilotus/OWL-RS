@@ -106,6 +106,13 @@ crafted XML), all fixed by updates; of the ten wildcard arms six covered real va
   `tx-1`, `tx-2`, … and anyone's).
 - **B2.** Error enums: the reasoner's (rule files with line and column), the memory budget
   as a variant, `Forbidden` and `Configuration` typed.
+
+  Status: done, but for `Configuration`. Rule errors carry a `Position` (native rules and
+  `.pie`: the line of the rule or axiom; N3: the parser's line and column) and print it.
+  `QueryEvaluationError::MemoryLimit(BudgetExceeded)` replaces the downcast from `Dataset`.
+  `StoreError::Forbidden(Refusal)`: `Write(GraphName)`, `ReadAll`, `WriteAll`; the
+  pipeline's final check names the graph too. `Configuration(String)` stays: nothing
+  branches on it, and B3's typed configuration tree reports its mistakes where they are.
 - **B3.** One typed configuration tree, from defaults, the file, the environment and the
   command line by one mechanism; its JSON Schema generated for the docs and the frontend;
   the `NRESE_*` names kept.

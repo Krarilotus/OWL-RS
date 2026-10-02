@@ -174,15 +174,47 @@ impl Rule {
     }
 }
 
+/// A rule text that doesn't compile: which rule, what is wrong, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     pub rule: String,
     pub message: String,
+    /// Where in the text, where known: the mistake's, else the start of its rule.
+    pub position: Option<Position>,
+}
+
+/// A place in a text: line and column, both from 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    pub line: usize,
+    pub column: usize,
+}
+
+impl ParseError {
+    pub fn new(rule: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            rule: rule.into(),
+            message: message.into(),
+            position: None,
+        }
+    }
+
+    /// At line `line` (from 1), column `column` (from 1).
+    pub fn at(mut self, line: usize, column: usize) -> Self {
+        self.position = Some(Position { line, column });
+        self
+    }
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "rule {}: {}", self.rule, self.message)
+        if let Some(Position { line, column }) = self.position {
+            write!(f, "line {line}, column {column}: ")?;
+        }
+        match self.rule.is_empty() {
+            true => write!(f, "{}", self.message),
+            false => write!(f, "rule {}: {}", self.rule, self.message),
+        }
     }
 }
 
@@ -191,8 +223,9 @@ impl std::error::Error for ParseError {}
 /// Parses rules in the syntax above, interning constants through `vocabulary`.
 pub fn parse_rules(text: &str, vocabulary: &mut impl Vocabulary) -> Result<Vec<Rule>, ParseError> {
     // Join continuation lines: a rule starts with `name:` at the beginning of a line.
-    let mut sources: Vec<(String, String)> = Vec::new();
-    for line in text.lines() {
+    // Each rule keeps the line it starts on, for its errors.
+    let mut sources: Vec<(String, String, usize)> = Vec::new();
+    for (number, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or_default();
         if line.trim().is_empty() {
             continue;
@@ -203,24 +236,24 @@ pub fn parse_rules(text: &str, vocabulary: &mut impl Vocabulary) -> Result<Vec<R
                 .is_some_and(|(name, _)| !name.contains(' ') && !name.contains('('));
         if starts_rule {
             let (name, rest) = line.split_once(':').expect("checked above");
-            sources.push((name.trim().to_owned(), rest.to_owned()));
-        } else if let Some((_, body)) = sources.last_mut() {
+            sources.push((name.trim().to_owned(), rest.to_owned(), number + 1));
+        } else if let Some((_, body, _)) = sources.last_mut() {
             body.push(' ');
             body.push_str(line.trim());
         } else {
-            return Err(ParseError {
-                rule: String::new(),
-                message: format!("text before the first rule: {line}"),
-            });
+            let column = line.len() - line.trim_start().len() + 1;
+            return Err(ParseError::new(
+                "",
+                format!("text before the first rule: {}", line.trim()),
+            )
+            .at(number + 1, column));
         }
     }
     sources
         .into_iter()
-        .map(|(name, source)| {
-            parse_rule(&name, &source, vocabulary).map_err(|message| ParseError {
-                rule: name,
-                message,
-            })
+        .map(|(name, source, line)| {
+            parse_rule(&name, &source, vocabulary)
+                .map_err(|message| ParseError::new(name, message).at(line, 1))
         })
         .collect()
 }
@@ -390,6 +423,30 @@ fn term(
 mod tests {
     use super::*;
     use crate::v2::testing::LocalVocabulary;
+
+    #[test]
+    fn errors_name_the_line_of_their_rule() {
+        let mut vocabulary = LocalVocabulary::default();
+        let error = parse_rules(
+            "# rules\n\
+             ok: (?x rdf:type ?y) -> (?y rdf:type ?x)\n\
+             \n\
+             broken: (?x rdf:type ?y)\n\
+             \x20   (?y rdf:type ?x)\n",
+            &mut vocabulary,
+        )
+        .unwrap_err();
+        assert_eq!(error.rule, "broken");
+        assert_eq!(error.position, Some(Position { line: 4, column: 1 }));
+        assert!(
+            error
+                .to_string()
+                .starts_with("line 4, column 1: rule broken: "),
+            "{error}"
+        );
+        let error = parse_rules("\n   stray text\n", &mut vocabulary).unwrap_err();
+        assert_eq!(error.position, Some(Position { line: 2, column: 4 }));
+    }
 
     #[test]
     fn parses_rules_with_guards_continuations_and_false_heads() {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use nrese_sparql::GraphAccess;
 
-use crate::error::{StoreError, StoreResult};
+use crate::error::{Refusal, StoreResult};
 
 /// The graphs a read may see.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,9 +52,7 @@ impl ReadScope {
     pub(crate) fn require_all(&self, what: &str) -> StoreResult<()> {
         match self {
             Self::All => Ok(()),
-            Self::Graphs(_) => Err(StoreError::Forbidden(format!(
-                "{what} reads every graph, and the requester may read only some"
-            ))),
+            Self::Graphs(_) => Err(Refusal::ReadAll(what.to_owned()).into()),
         }
     }
 }
@@ -88,13 +86,9 @@ impl WriteScope {
     /// Fails unless the write may change `graph`.
     pub(crate) fn check(&self, graph: &nrese_rdf::GraphName) -> StoreResult<()> {
         match self.access() {
-            Some(access) if !access.allows_graph(graph) => Err(StoreError::Forbidden(format!(
-                "the request would change {}, which the requester may not write",
-                match graph {
-                    nrese_rdf::GraphName::DefaultGraph => "the default graph".to_owned(),
-                    graph => graph.to_string(),
-                }
-            ))),
+            Some(access) if !access.allows_graph(graph) => {
+                Err(Refusal::Write(graph.clone()).into())
+            }
             _ => Ok(()),
         }
     }
@@ -104,9 +98,7 @@ impl WriteScope {
     pub(crate) fn require_all(&self, what: &str) -> StoreResult<()> {
         match self {
             Self::All => Ok(()),
-            Self::Graphs(_) => Err(StoreError::Forbidden(format!(
-                "{what} changes every graph, and the requester may change only some"
-            ))),
+            Self::Graphs(_) => Err(Refusal::WriteAll(what.to_owned()).into()),
         }
     }
 }

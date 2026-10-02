@@ -184,14 +184,7 @@ pub(crate) fn apply_statements(
                                 continue;
                             }
                             if !writable.allows_id(&*tx, quad.graph) {
-                                let graph = match tx.decode(quad.graph) {
-                                    _ if quad.graph == TermId::DEFAULT_GRAPH => {
-                                        GraphName::DefaultGraph
-                                    }
-                                    Some(Term::NamedNode(node)) => GraphName::NamedNode(node),
-                                    Some(Term::BlankNode(node)) => GraphName::BlankNode(node),
-                                    _ => GraphName::DefaultGraph,
-                                };
+                                let graph = crate::mutation::command::graph_name(tx, quad.graph);
                                 return requester.write.check(&graph);
                             }
                             allowed.insert(quad.graph);

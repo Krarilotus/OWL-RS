@@ -156,10 +156,8 @@ impl Ruleset {
             .filter(|l| !l.is_empty())
         {
             out.push(
-                super::ir::parse_triple(line, vocabulary).map_err(|message| ParseError {
-                    rule: line.to_owned(),
-                    message,
-                })?,
+                super::ir::parse_triple(line, vocabulary)
+                    .map_err(|message| ParseError::new(line, message))?,
             );
         }
         Ok(out)
