@@ -263,3 +263,55 @@ fn a_bare_pattern_is_written_as_select_star() {
     let text = query.to_string();
     assert_eq!(text, "SELECT * WHERE { ?s <http://e/p> ?o . }");
 }
+
+/// A base IRI is used in absolute form, without dot segments (RFC 3986 §5.2.1), so that a
+/// printed query reads back the same. Found by fuzzing (`nrese-fuzz`): with
+/// `BASE <http:./example.org/>`, `<#>` kept the base's `./` and printed as an IRI that read
+/// back without it.
+#[test]
+fn a_base_with_dot_segments_is_used_in_absolute_form() {
+    let text = "BASE <http:./example.org/>\nPREFIX : <#>\nSELECT * WHERE { :x :p <a/../b> }";
+    let query = SparqlParser::new().parse_query(text).unwrap();
+    let printed = query.to_string();
+    assert!(printed.contains("<http:example.org/#x>"), "{printed}");
+    let again = SparqlParser::new().parse_query(&printed).unwrap();
+    assert_eq!(again.to_string(), printed);
+    let given = SparqlParser::new()
+        .with_base_iri("http://a/b/./c/../d")
+        .unwrap()
+        .parse_query("SELECT * WHERE { <#x> ?p ?o }")
+        .unwrap();
+    assert!(given.to_string().contains("<http://a/b/d#x>"), "{given}");
+}
+
+/// A `GROUP BY (expression AS ?v)` binds `?v` as a BIND does, so `?v` must not be bound
+/// already (found by fuzzing, `nrese-fuzz`: two conditions binding `?i` printed as two BINDs
+/// that read back as an error).
+#[test]
+fn group_by_binds_a_variable_once() {
+    let parser = SparqlParser::new();
+    for text in [
+        "SELECT ?i { ?s ?p ?o } GROUP BY (STR(?o) AS ?i) (STR(?s) AS ?i)",
+        "SELECT ?o { ?s ?p ?o } GROUP BY (STR(?s) AS ?o)",
+    ] {
+        let error = parser.parse_query(text).unwrap_err();
+        assert!(error.message().contains("bound already"), "{text}: {error}");
+    }
+    let query = parser
+        .parse_query("SELECT ?i { ?s ?p ?o } GROUP BY (STR(?o) AS ?i) ?s")
+        .unwrap();
+    let printed = query.to_string();
+    assert_eq!(parser.parse_query(&printed).unwrap().to_string(), printed);
+}
+
+/// A blank node label may span a FILTER inside one group (W3C `syn-blabel-cross-filter`),
+/// also when the triples after it hold a path: the printed query reads back (found by
+/// fuzzing, `nrese-fuzz`).
+#[test]
+fn a_blank_node_spans_a_filter_before_a_path() {
+    let parser = SparqlParser::new();
+    let text = "SELECT ?c { ?c <http://e/sub> _:b FILTER(?c != <http://e/n>) _:b <http://e/on> <http://e/h> ; !<http://e/svf> <http://e/t> }";
+    let printed = parser.parse_query(text).unwrap().to_string();
+    let again = parser.parse_query(&printed).unwrap().to_string();
+    assert_eq!(again, printed);
+}

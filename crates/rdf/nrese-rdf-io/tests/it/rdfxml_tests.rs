@@ -72,3 +72,35 @@ fn what_rdf_xml_cant_hold_is_an_error() {
     assert!(write(&parse("<http://e/s> <http://e/p> \"\\u0001\" .")[0]).is_err());
     assert!(write(&parse("<http://e/s> <http://e/p> \"fine\" .")[0]).is_ok());
 }
+
+/// `xml:lang` takes any text in XML, but a literal's language must be a BCP 47 tag: found by
+/// fuzzing (`nrese-fuzz`), the RDF/XML reader took `"bar"@es/wn` and wrote N-Quads that
+/// didn't read back. Now it refuses the document, as the other readers do; unchecked, it
+/// still takes it.
+#[test]
+fn xml_lang_must_be_a_language_tag() {
+    let document = |lang: &str| {
+        format!(
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" xmlns:e=\"http://example.org/\">\
+             <rdf:Description rdf:about=\"http://example.org/joe\" xml:lang=\"{lang}\"><e:name>bar</e:name></rdf:Description></rdf:RDF>"
+        )
+    };
+    let read = |parser: RdfParser, lang: &str| {
+        parser
+            .for_slice(document(lang).as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+    };
+    for lang in ["es/wn", "f@r", "e all rights", "-en", "en-"] {
+        assert!(
+            read(RdfParser::from_format(RdfFormat::RdfXml), lang).is_err(),
+            "{lang}"
+        );
+        assert!(read(RdfParser::from_format(RdfFormat::RdfXml).unchecked(), lang).is_ok());
+    }
+    for lang in ["en", "EN-gb", "zh-Hant-TW", ""] {
+        assert!(
+            read(RdfParser::from_format(RdfFormat::RdfXml), lang).is_ok(),
+            "{lang}"
+        );
+    }
+}
