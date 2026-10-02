@@ -8,25 +8,25 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-rayon = "1.10"
+rayon = { workspace = true }
 nrese-engine = { path = "../nrese-engine" }
 nrese-exec = { path = "../nrese-exec" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
-regex = "1.12"
+regex = { workspace = true }
 # RDF terms and their XSD values.
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 # SPARQL functions (RAND, UUID, the hashes, IRI against BASE).
 # GeoSPARQL: geometries and their relations; WKT, GeoJSON and GML literals.
 geo = "0.33"
-quick-xml = "0.42"
+quick-xml = { workspace = true }
 rstar = "0.12"
-serde_json = "1.0.145"
+serde_json = { workspace = true }
 wkt = "0.14"
 hex = "0.4"
 md-5 = "0.10"
-rand = "0.9"
+rand = { workspace = true }
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = { workspace = true }
 nrese-sparql-syntax = { path = "../rdf/nrese-sparql-syntax" }
 # Results terms written exactly as the results serialiser writes them.
 nrese-sparql-results = { path = "../rdf/nrese-sparql-results" }
