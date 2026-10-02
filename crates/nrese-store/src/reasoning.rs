@@ -376,10 +376,13 @@ pub fn materialise_until(
     })
 }
 
+/// Facts grouped by predicate: each predicate once, its `(object, subject)` pairs sorted.
+type Grouped = Vec<(u64, Vec<(u64, u64)>)>;
+
 /// The input of a full materialisation of `snapshot`: its asserted statements (any graph)
 /// grouped by predicate, with the ruleset's axioms; and the axioms nothing asserts (they
 /// are inferred statements, and premises of the rules).
-fn input_of(program: &Program, snapshot: &Snapshot) -> (Vec<(u64, Vec<(u64, u64)>)>, Vec<Triple>) {
+fn input_of(program: &Program, snapshot: &Snapshot) -> (Grouped, Vec<Triple>) {
     let mut input = asserted_by_predicate(snapshot);
     let mut axioms: Vec<Triple> = Vec::new();
     for &axiom in &program.axioms {
@@ -410,8 +413,8 @@ fn input_of(program: &Program, snapshot: &Snapshot) -> (Vec<(u64, Vec<(u64, u64)
 /// first pass derived.
 fn by_representatives(
     program: &Program,
-    input: Vec<(u64, Vec<(u64, u64)>)>,
-    rebuild: &dyn Fn() -> Vec<(u64, Vec<(u64, u64)>)>,
+    input: Grouped,
+    rebuild: &dyn Fn() -> Grouped,
     same_as: u64,
     schema: &Schema,
     stop: nrese_reasoner::v2::eval::Stop<'_>,
