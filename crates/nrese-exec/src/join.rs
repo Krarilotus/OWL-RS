@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | [`join`] | merge join with galloping if both inputs are sorted on the keys, else a hash join building on the smaller input | inner joins without UNDEF keys |
 //! | [`left_join`] | hash join, probing with every left row | OPTIONAL; a filter over the combined row decides which matches count |
-//! | [`anti_join`] | hash set of right keys | MINUS and FILTER NOT EXISTS with shared variables |
+//! | [`anti_join`], [`semi_join`] | a merge if both inputs are sorted on the keys, else a hash set of right keys | MINUS and FILTER NOT EXISTS, FILTER EXISTS, with shared variables |
 //! | [`join_with_undef`] | the fast join for rows with bound keys, nested loops for rows with UNDEF | inner joins where a key may be unbound (after OPTIONAL) |
 //! | [`outer_join_with_undef`] | a hash table for rows with bound keys, scans for rows with UNDEF; left order kept | OPTIONAL, and joins that keep the left order, where a key may be unbound |
 //! | [`compatible_mask`] | the same | MINUS and (NOT) EXISTS where a key may be unbound |
@@ -608,9 +608,56 @@ pub fn anti_join(
         out.slice(0, Some(0));
         return out;
     }
+    if let Some(found) = sorted_membership(left, right, left_keys, right_keys) {
+        out.retain_mask(&found.iter().map(|f| !f).collect::<Vec<_>>());
+        return out;
+    }
     let table = BuildTable::new(right, right_keys);
     out.par_retain(|t, row| table.first(t, row, left_keys) == END);
     out
+}
+
+/// Per left row, whether its key occurs in `right`, where both are sorted on their keys:
+/// one merge, galloping over runs, instead of a hash table of `right` (`None` otherwise).
+/// Wikidata lexemes: 432 k entries against the 246 k senses' entries.
+fn sorted_membership(
+    left: &IdTable,
+    right: &IdTable,
+    left_keys: &[usize],
+    right_keys: &[usize],
+) -> Option<Vec<bool>> {
+    if !left.is_sorted_on(left_keys) || !right.is_sorted_on(right_keys) {
+        return None;
+    }
+    // One key: two columns of ids, merged in one linear pass.
+    if let ([lk], [rk]) = (left_keys, right_keys) {
+        let (keys, against) = (left.column(*lk), right.column(*rk));
+        let mut r = 0;
+        return Some(
+            keys.iter()
+                .map(|&key| {
+                    while r < against.len() && against[r] < key {
+                        r += 1;
+                    }
+                    r < against.len() && against[r] == key
+                })
+                .collect(),
+        );
+    }
+    let mut found = vec![false; left.len()];
+    let (mut l, mut r) = (0, 0);
+    while l < left.len() && r < right.len() {
+        match compare_keys(left, l, left_keys, right, r, right_keys) {
+            Ordering::Less => l = gallop(left, left_keys, l, right, r, right_keys, true),
+            Ordering::Greater => r = gallop(right, right_keys, r, left, l, left_keys, false),
+            Ordering::Equal => {
+                // The next left rows may have the same key: `r` stays.
+                found[l] = true;
+                l += 1;
+            }
+        }
+    }
+    Some(found)
 }
 
 /// Left rows whose key occurs in `right` (FILTER EXISTS). Order and sortedness of `left` are
@@ -626,6 +673,10 @@ pub fn semi_join(
         if right.is_empty() {
             out.slice(0, Some(0));
         }
+        return out;
+    }
+    if let Some(found) = sorted_membership(left, right, left_keys, right_keys) {
+        out.retain_mask(&found);
         return out;
     }
     let table = BuildTable::new(right, right_keys);

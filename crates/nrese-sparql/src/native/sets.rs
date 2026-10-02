@@ -269,12 +269,17 @@ impl Context<'_> {
             if scan.first_free(permutation) != Some(position) {
                 continue;
             }
+            let start = std::time::Instant::now();
             let Some(groups) =
                 self.snapshot
                     .group_counts_in(self.model, &scan.quad_pattern(), permutation)
             else {
                 continue;
             };
+            if self.trace.is_some() {
+                let detail = format!("distinct {kept} of {triple}");
+                self.note("group walk", detail, None, groups.len(), start);
+            }
             let mut table = IdTable::new(1);
             for (id, _) in groups {
                 table.push_row(&[id.raw()]);
