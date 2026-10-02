@@ -317,6 +317,70 @@ impl StoreService {
         crate::statements::read_statements(&self.engine.snapshot(), read_model(infer), pattern)
     }
 
+    /// Runs `read` on the data as it would be after `pending` (an RDF4J transaction's
+    /// operations), which are applied to a transaction that is never committed. The
+    /// writer slot is held meanwhile.
+    fn with_pending<T>(
+        &self,
+        pending: &crate::StatementsRequest,
+        cancellation: &CancellationToken,
+        read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        let mut tx = self.engine.transaction();
+        let (union_default_graph, services) = (self.config.union_default_graph, self.services());
+        crate::statements::apply_statements(&mut tx, pending, &mut |tx, request| {
+            crate::mutation::command::apply_sparql_update(
+                tx,
+                request,
+                cancellation,
+                union_default_graph,
+                services.clone(),
+            )
+        })?;
+        read(&tx.pending_snapshot())
+    }
+
+    /// [`run_query`](Self::run_query) on the data as `pending` would leave it.
+    pub fn run_query_pending(
+        &self,
+        pending: &crate::StatementsRequest,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+    ) -> StoreResult<()> {
+        self.with_pending(pending, cancellation, |snapshot| {
+            run_query(snapshot, prepared, &self.settings, cancellation, out)
+        })
+    }
+
+    /// [`read_statements`](Self::read_statements) on the data as `pending` would leave it.
+    pub fn read_statements_pending(
+        &self,
+        pending: &crate::StatementsRequest,
+        pattern: &crate::StatementPattern,
+        infer: bool,
+    ) -> StoreResult<Vec<nrese_rdf::Quad>> {
+        self.with_pending(pending, &CancellationToken::new(), |snapshot| {
+            crate::statements::read_statements(snapshot, read_model(infer), pattern)
+        })
+    }
+
+    /// [`count_statements`](Self::count_statements) on the data as `pending` would leave it.
+    pub fn count_statements_pending(
+        &self,
+        pending: &crate::StatementsRequest,
+        pattern: &crate::StatementPattern,
+        infer: bool,
+    ) -> StoreResult<u64> {
+        self.with_pending(pending, &CancellationToken::new(), |snapshot| {
+            Ok(crate::statements::count_statements(
+                snapshot,
+                read_model(infer),
+                pattern,
+            ))
+        })
+    }
+
     /// How many statements match `pattern` (RDF4J's `/size`).
     pub fn count_statements(&self, pattern: &crate::StatementPattern, infer: bool) -> u64 {
         crate::statements::count_statements(&self.engine.snapshot(), read_model(infer), pattern)

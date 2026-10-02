@@ -20,7 +20,8 @@
 //! `subj`, `pred`, `obj` and `context` are written as in N-Triples (`<iri>`, `_:b`,
 //! `"text"@en`, `"1"^^<…#int>`); `context=null` is the default graph. A transaction's
 //! operations are kept on the server and applied in one commit; reads inside one
-//! (`action=QUERY`, `GET`, `SIZE`) see the committed state, not its own changes. Namespaces
+//! (`action=QUERY`, `GET`, `SIZE`) see its changes: its operations are applied to an engine
+//! transaction that is never committed, holding the writer slot while they read. Namespaces
 //! are kept in `rdf4j-namespaces.json` in an on-disk store's directory (in memory
 //! otherwise), written whole at every change.
 
@@ -455,6 +456,17 @@ pub async fn statements_get(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_graph_read(&state, &headers).await?;
+    statements(state, raw, headers, None).await
+}
+
+/// The statements matching the request's pattern, on the committed data or as `pending`
+/// would leave it.
+async fn statements(
+    state: AppState,
+    raw: RawQuery,
+    headers: HeaderMap,
+    pending: Option<StatementsRequest>,
+) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let pairs = pairs(&raw)?;
     let pattern = pattern(&pairs)?;
@@ -462,7 +474,10 @@ pub async fn statements_get(
     let store = state.store();
     let infer = infer(&pairs);
     let body = tokio::task::spawn_blocking(move || {
-        let quads = store.read_statements(&pattern, infer)?;
+        let quads = match &pending {
+            None => store.read_statements(&pattern, infer)?,
+            Some(pending) => store.read_statements_pending(pending, &pattern, infer)?,
+        };
         nrese_store::statements::serialize_statements(format, quads)
     })
     .await
@@ -540,6 +555,16 @@ pub async fn size(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
+    count(state, raw, None).await
+}
+
+/// The number of statements (in the request's contexts), on the committed data or as
+/// `pending` would leave it.
+async fn count(
+    state: AppState,
+    raw: RawQuery,
+    pending: Option<StatementsRequest>,
+) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let pairs = pairs(&raw)?;
     let pattern = StatementPattern {
@@ -548,9 +573,13 @@ pub async fn size(
     };
     let store = state.store();
     let infer = infer(&pairs);
-    let count = tokio::task::spawn_blocking(move || store.count_statements(&pattern, infer))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let count = tokio::task::spawn_blocking(move || match &pending {
+        None => Ok(store.count_statements(&pattern, infer)),
+        Some(pending) => store.count_statements_pending(pending, &pattern, infer),
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(text(count.to_string()))
 }
 
@@ -707,7 +736,7 @@ pub async fn transaction_begin(
 
 pub async fn transaction_action(
     State(state): State<AppState>,
-    Path((id, txid)): Path<(String, String)>,
+    Path((_id, txid)): Path<(String, String)>,
     raw: RawQuery,
     headers: HeaderMap,
     body: Bytes,
@@ -754,17 +783,31 @@ pub async fn transaction_action(
             Ok(StatusCode::OK.into_response())
         }
         "PING" => Ok(text(TRANSACTION_IDLE.as_millis().to_string())),
-        // Reads see the committed state (module docs).
-        "QUERY" => {
-            let operation = if body.is_empty() {
-                query_from_url(raw.0.as_deref())?
-            } else {
-                query_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), &body)?
-            };
-            sparql::execute_query(state, operation, accept_header_value(&headers)).await
+        // Reads see the transaction's changes (module docs).
+        "QUERY" | "GET" | "SIZE" => {
+            let pending = state
+                .rdf4j()
+                .transactions
+                .lock()
+                .get(&txid)
+                .map(|pending| StatementsRequest {
+                    ops: pending.ops.clone(),
+                })
+                .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
+            match action.as_str() {
+                "QUERY" => {
+                    let operation = if body.is_empty() {
+                        query_from_url(raw.0.as_deref())?
+                    } else {
+                        query_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), &body)?
+                    };
+                    let accept = accept_header_value(&headers);
+                    sparql::execute_query_in(state, operation, accept, Some(pending)).await
+                }
+                "GET" => statements(state, raw, headers, Some(pending)).await,
+                _ => count(state, raw, Some(pending)).await,
+            }
         }
-        "GET" => statements_get(State(state), Path(id), RawQuery(raw.0), headers).await,
-        "SIZE" => size(State(state), Path(id), RawQuery(raw.0), headers).await,
         other => Err(ApiError::bad_request(format!(
             "unknown transaction action '{other}'"
         ))),
