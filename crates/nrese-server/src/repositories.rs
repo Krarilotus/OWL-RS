@@ -17,7 +17,6 @@ use nrese_store::{MutationPipeline, StoreConfig, StoreMode, StoreService};
 use parking_lot::RwLock;
 
 use crate::error::ApiError;
-use crate::http::rdf4j::Rdf4jState;
 use crate::repository_config::RepositorySettings;
 
 /// A repository's settings, in its directory.
@@ -30,7 +29,6 @@ pub const DEFAULT_REPOSITORY: &str = "nrese";
 #[derive(Clone)]
 pub struct Repository {
     pub pipeline: Arc<MutationPipeline>,
-    pub rdf4j: Arc<Rdf4jState>,
     pub settings: RepositorySettings,
 }
 
@@ -127,14 +125,8 @@ impl Repositories {
                 store.clear_inferred().map_err(|error| error.to_string())?;
             }
         }
-        let rdf4j = Rdf4jState::with_file(
-            self.root
-                .as_ref()
-                .map(|root| root.join(id).join("rdf4j-namespaces.json")),
-        );
         Ok(Repository {
             pipeline: Arc::new(MutationPipeline::new(Arc::new(store), Arc::new(reasoner))),
-            rdf4j: Arc::new(rdf4j),
             settings,
         })
     }

@@ -27,9 +27,6 @@
 //! are kept in `rdf4j-namespaces.json` in an on-disk store's directory (in memory
 //! otherwise), written whole at every change.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
@@ -42,7 +39,6 @@ use nrese_store::{
     MutationCommand, RdfPayload, SparqlUpdateRequest, StatementOp, StatementPattern,
     StatementsRequest,
 };
-use parking_lot::Mutex;
 
 use crate::error::ApiError;
 use crate::http::graph_store;
@@ -59,77 +55,6 @@ use crate::state::AppState;
 
 /// The RDF4J protocol version answered at `/protocol`.
 const PROTOCOL: &str = "12";
-/// Transactions untouched this long are dropped.
-const TRANSACTION_IDLE: Duration = Duration::from_secs(600);
-
-/// Open transactions and namespace prefixes.
-pub struct Rdf4jState {
-    next_transaction: AtomicU64,
-    transactions: Mutex<HashMap<String, Pending>>,
-    namespaces: Mutex<BTreeMap<String, String>>,
-    /// Where the namespaces are kept (on-disk stores).
-    namespaces_file: Option<std::path::PathBuf>,
-}
-
-impl Default for Rdf4jState {
-    fn default() -> Self {
-        Self::with_file(None)
-    }
-}
-
-impl Rdf4jState {
-    /// The state of a store whose namespaces are kept in `file`, if given: read from it
-    /// when it exists, else the four standard prefixes.
-    pub fn with_file(file: Option<std::path::PathBuf>) -> Self {
-        let standard = || {
-            [
-                ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
-                ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
-                ("owl", "http://www.w3.org/2002/07/owl#"),
-                ("xsd", "http://www.w3.org/2001/XMLSchema#"),
-            ]
-            .into_iter()
-            .map(|(prefix, iri)| (prefix.to_owned(), iri.to_owned()))
-            .collect()
-        };
-        let namespaces = file
-            .as_deref()
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_else(standard);
-        Self {
-            next_transaction: AtomicU64::new(1),
-            transactions: Mutex::default(),
-            namespaces: Mutex::new(namespaces),
-            namespaces_file: file,
-        }
-    }
-
-    /// Changes the namespaces and keeps them (a temporary file renamed over the old one).
-    fn change_namespaces(
-        &self,
-        change: impl FnOnce(&mut BTreeMap<String, String>),
-    ) -> Result<(), ApiError> {
-        let mut namespaces = self.namespaces.lock();
-        change(&mut namespaces);
-        let Some(path) = &self.namespaces_file else {
-            return Ok(());
-        };
-        let json = serde_json::to_vec_pretty(&*namespaces)
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, json)
-            .and_then(|()| std::fs::rename(&temporary, path))
-            .map_err(|error| ApiError::internal(format!("keeping the namespaces: {error}")))
-    }
-}
-
-/// A transaction's operations, applied at its commit.
-struct Pending {
-    ops: Vec<StatementOp>,
-    touched: Instant,
-}
-
 /// URL parameters, repeated ones in order.
 fn pairs(raw: &RawQuery) -> Result<Vec<(String, String)>, ApiError> {
     serde_urlencoded::from_str(raw.0.as_deref().unwrap_or_default())
@@ -358,6 +283,11 @@ fn scoped(ops: Vec<StatementOp>, access: &AccessView) -> StatementsRequest {
         ops,
         writable: access.write.clone(),
     }
+}
+
+/// A store error of a namespace change: the store's fault.
+fn store_error(error: nrese_store::StoreError) -> ApiError {
+    ApiError::internal(error.to_string())
 }
 
 /// A store error of a read: 403 for a forbidden change in a transaction's operations.
@@ -766,9 +696,9 @@ pub async fn namespaces_get(
     guard::enforce_query_read(&state, &headers).await?;
     let state = state.for_repository(&id)?;
     let rows = state
-        .rdf4j()
-        .namespaces
-        .lock()
+        .store()
+        .namespaces()
+        .all()
         .iter()
         .map(|(prefix, iri)| vec![literal(prefix.as_str()), literal(iri.as_str())])
         .collect();
@@ -782,7 +712,7 @@ pub async fn namespaces_delete(
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
     let state = state.for_repository(&id)?;
-    state.rdf4j().change_namespaces(BTreeMap::clear)?;
+    state.store().namespaces().clear().map_err(store_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -793,8 +723,8 @@ pub async fn namespace_get(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
     let state = state.for_repository(&id)?;
-    match state.rdf4j().namespaces.lock().get(&prefix) {
-        Some(iri) => Ok(text(iri.clone())),
+    match state.store().namespaces().get(&prefix) {
+        Some(iri) => Ok(text(iri)),
         None => Err(ApiError::not_found(format!("no namespace '{prefix}'"))),
     }
 }
@@ -814,9 +744,11 @@ pub async fn namespace_put(
     if iri.is_empty() {
         return Err(ApiError::bad_request("the namespace is empty"));
     }
-    state.rdf4j().change_namespaces(|namespaces| {
-        namespaces.insert(prefix, iri);
-    })?;
+    state
+        .store()
+        .namespaces()
+        .set(&prefix, &iri)
+        .map_err(store_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -827,9 +759,11 @@ pub async fn namespace_delete(
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
     let state = state.for_repository(&id)?;
-    state.rdf4j().change_namespaces(|namespaces| {
-        namespaces.remove(&prefix);
-    })?;
+    state
+        .store()
+        .namespaces()
+        .remove(&prefix)
+        .map_err(store_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -902,18 +836,7 @@ pub async fn transaction_begin(
 ) -> Result<Response, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
     let state = state.for_repository(&id)?;
-    let rdf4j = state.rdf4j();
-    let number = rdf4j.next_transaction.fetch_add(1, Ordering::Relaxed);
-    let txid = format!("tx-{number}");
-    let mut open = rdf4j.transactions.lock();
-    open.retain(|_, pending| pending.touched.elapsed() < TRANSACTION_IDLE);
-    open.insert(
-        txid.clone(),
-        Pending {
-            ops: Vec::new(),
-            touched: Instant::now(),
-        },
-    );
+    let txid = state.store().sessions().begin();
     let location = absolute(&headers, &format!("/repositories/{id}/transactions/{txid}"));
     let mut response = StatusCode::CREATED.into_response();
     response.headers_mut().insert(
@@ -936,48 +859,41 @@ pub async fn transaction_action(
     let action = param(&pairs, "action")
         .unwrap_or_default()
         .to_ascii_uppercase();
-    {
-        let rdf4j = state.rdf4j();
-        let mut open = rdf4j.transactions.lock();
-        let pending = open
-            .get_mut(&txid)
-            .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
-        pending.touched = Instant::now();
-        let ops = match action.as_str() {
-            "ADD" => Some(vec![StatementOp::Add {
-                data: payload(&headers, &body)?,
-                contexts: contexts(&pairs)?,
-            }]),
-            "DELETE" => Some(removals(&pairs, &headers, &body)?),
-            "UPDATE" => Some(vec![StatementOp::Update(update(&raw, &headers, &body)?)]),
-            _ => None,
+    let store = state.store();
+    let sessions = store.sessions();
+    if !sessions.ping(&txid) {
+        return Err(ApiError::not_found(format!("no transaction '{txid}'")));
+    }
+    let ops = match action.as_str() {
+        "ADD" => Some(vec![StatementOp::Add {
+            data: payload(&headers, &body)?,
+            contexts: contexts(&pairs)?,
+        }]),
+        "DELETE" => Some(removals(&pairs, &headers, &body)?),
+        "UPDATE" => Some(vec![StatementOp::Update(update(&raw, &headers, &body)?)]),
+        _ => None,
+    };
+    if let Some(ops) = ops {
+        state.policy().enforce_rdf_upload_bytes(body.len())?;
+        return match sessions.add(&txid, ops) {
+            true => Ok(StatusCode::OK.into_response()),
+            false => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
         };
-        if let Some(ops) = ops {
-            state.policy().enforce_rdf_upload_bytes(body.len())?;
-            pending.ops.extend(ops);
-            return Ok(StatusCode::OK.into_response());
-        }
     }
     match action.as_str() {
         "COMMIT" => {
-            let pending = state
-                .rdf4j()
-                .transactions
-                .lock()
-                .remove(&txid)
+            let pending = sessions
+                .take(&txid)
                 .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
             apply(&state, pending.ops, &access).await?;
             Ok(StatusCode::OK.into_response())
         }
-        "PING" => Ok(text(TRANSACTION_IDLE.as_millis().to_string())),
+        "PING" => Ok(text(sessions.idle().as_millis().to_string())),
         // Reads see the transaction's changes (module docs).
         "QUERY" | "GET" | "SIZE" => {
-            let pending = state
-                .rdf4j()
-                .transactions
-                .lock()
-                .get(&txid)
-                .map(|pending| scoped(pending.ops.clone(), &access))
+            let pending = sessions
+                .pending(&txid)
+                .map(|ops| scoped(ops, &access))
                 .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
             match action.as_str() {
                 "QUERY" => {
@@ -1007,9 +923,9 @@ pub async fn transaction_rollback(
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
     let state = state.for_repository(&id)?;
-    match state.rdf4j().transactions.lock().remove(&txid) {
-        Some(_) => Ok(StatusCode::NO_CONTENT),
-        None => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
+    match state.store().sessions().rollback(&txid) {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
     }
 }
 

@@ -15,6 +15,7 @@ mod graph_store_executor;
 pub mod image_backup;
 mod loader;
 pub mod mutation;
+pub mod namespaces;
 pub mod query;
 mod query_cache;
 mod query_executor;
@@ -22,6 +23,7 @@ mod rdf_io;
 pub mod reasoning;
 pub mod reasoning_state;
 pub mod service;
+pub mod sessions;
 pub mod shacl;
 pub mod statements;
 mod stats;
@@ -64,7 +66,9 @@ pub use query_executor::PreparedQuery;
 pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
 pub use reasoning::{MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
+pub use namespaces::{NamespaceMap, Namespaces};
 pub use service::StoreService;
+pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{
     ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource, ValidatedGraphs,
 };
