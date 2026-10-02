@@ -1824,8 +1824,9 @@ impl<'a> Context<'a> {
     }
 
     /// The solutions of `path` that can join `bound`: if `bound` binds one of the path's
-    /// variable ends in every row, the path is followed from those values (the subject's,
-    /// if both are bound). Otherwise all of the path's solutions.
+    /// variable ends in every row, the path is followed from those values (from the end
+    /// with fewer distinct values, if both are bound). Otherwise all of the path's
+    /// solutions.
     fn path_from(&self, bound: &Solutions, path: &PathPattern<'_>) -> NativeResult<Solutions> {
         let start = Instant::now();
         // The distinct values of a variable, if every row of `bound` has one.
@@ -1844,9 +1845,15 @@ impl<'a> Context<'a> {
         };
         let resolved = paths::Path::resolve(path.path, self.snapshot);
         let evaluator = self.path_evaluator()?;
-        let (pairs, from) = if let Some(starts) = values(&s) {
+        // Bound at both ends: followed from the end with fewer values (the join with
+        // `bound` keeps the rows whose other end matches).
+        let (starts, ends) = match (values(&s), values(&o)) {
+            (Some(starts), Some(ends)) if ends.len() < starts.len() => (None, Some(ends)),
+            (starts, ends) => (starts, ends),
+        };
+        let (pairs, from) = if let Some(starts) = starts {
             (evaluator.reached_from(&resolved, &starts), starts.len())
-        } else if let Some(ends) = values(&o) {
+        } else if let Some(ends) = ends {
             (evaluator.reaching(&resolved, &ends), ends.len())
         } else {
             return self.filtered_path(path, None, start);
