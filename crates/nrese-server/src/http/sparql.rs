@@ -22,6 +22,17 @@ pub async fn execute_query(
     operation: QueryOperation,
     accept: Option<&str>,
 ) -> Result<Response, ApiError> {
+    execute_query_in(state, operation, accept, None).await
+}
+
+/// [`execute_query`] on the data as `pending` would leave it (a read inside an RDF4J
+/// transaction); with `None`, on the committed data.
+pub async fn execute_query_in(
+    state: AppState,
+    operation: QueryOperation,
+    accept: Option<&str>,
+    pending: Option<nrese_store::StatementsRequest>,
+) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let policy = state.policy().clone();
     policy.enforce_query_bytes(operation.query.len())?;
@@ -64,9 +75,11 @@ pub async fn execute_query(
         media_type,
         QUERY_TIMEOUT_MESSAGE,
         move |out| {
-            store
-                .run_query(&prepared, &token, out)
-                .map_err(|error| map_query_error(&policy, error))
+            match &pending {
+                None => store.run_query(&prepared, &token, out),
+                Some(pending) => store.run_query_pending(pending, &prepared, &token, out),
+            }
+            .map_err(|error| map_query_error(&policy, error))
         },
     )
     .await
