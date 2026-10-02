@@ -22,8 +22,22 @@ use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_sparql_syntax::{Query, SparqlParser, SparqlSyntaxError};
 
 /// Parses a query and applies the compatibility rewrites.
-pub fn parse_query(text: &str) -> Result<Query, SparqlSyntaxError> {
-    let mut query = SparqlParser::new().parse_query(text)?;
+pub fn parse_query(
+    text: &str,
+    prefixes: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<Query, SparqlSyntaxError> {
+    let mut parser = SparqlParser::new();
+    for (prefix, namespace) in prefixes.into_iter().flatten() {
+        // A namespace that isn't an IRI can't be a prefix; the query fails as without it.
+        parser = match parser
+            .clone()
+            .with_prefix(prefix.clone(), namespace.clone())
+        {
+            Ok(with) => with,
+            Err(_) => parser,
+        };
+    }
+    let mut query = parser.parse_query(text)?;
     let (Query::Select { pattern, .. }
     | Query::Construct { pattern, .. }
     | Query::Describe { pattern, .. }
@@ -250,7 +264,7 @@ mod tests {
     }
 
     fn rewritten(text: &str) -> String {
-        shape(&parse_query(text).unwrap())
+        shape(&parse_query(text, None).unwrap())
     }
 
     fn standard(text: &str) -> String {

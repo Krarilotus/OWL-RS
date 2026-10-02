@@ -124,14 +124,14 @@ impl MutationPipeline {
         if ticket.is_cancelled() {
             return Err(MutationError::Cancelled);
         }
+        let context = crate::mutation::command::UpdateContext {
+            cancellation: ticket.evaluation_token(),
+            union_default_graph: self.store.config().union_default_graph,
+            services: self.store.services(),
+            namespaces: self.store.namespaces().all(),
+        };
         let report = command
-            .apply(
-                &mut tx,
-                requester,
-                ticket.evaluation_token(),
-                self.store.config().union_default_graph,
-                self.store.services(),
-            )
+            .apply(&mut tx, requester, &context)
             .map_err(store_error)?;
 
         if let Some(rules) = self.reasoner.config().materialised_program() {
