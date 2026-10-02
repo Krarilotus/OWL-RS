@@ -2,6 +2,8 @@
 name = "nrese-store"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -35,6 +37,5 @@ libmimalloc-sys = { version = "0.1", default-features = false, features = ["exte
 mimalloc = { version = "0.1", default-features = false }
 tempfile = "3.23.0"
 
-[lints.rust]
-# `--cfg system_alloc` switches the perf lab to the system allocator (benches/perf-lab.sh).
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_alloc)"] }
+[lints]
+workspace = true

@@ -3,6 +3,8 @@ name = "nrese-sparql"
 description = "NRESE SPARQL layer: query and update execution over nrese-engine snapshots and transactions"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -16,7 +18,7 @@ nrese-rdf = { path = "../rdf/nrese-rdf" }
 # SPARQL functions (RAND, UUID, the hashes, IRI against BASE).
 # GeoSPARQL: geometries and their relations; WKT, GeoJSON and GML literals.
 geo = "0.33"
-quick-xml = "0.37"
+quick-xml = "0.42"
 rstar = "0.12"
 serde_json = "1.0.145"
 wkt = "0.14"
@@ -37,3 +39,6 @@ nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-sparql-reference = { path = "../nrese-sparql-reference" }
 # W3C suite runner: manifests, data files and expected results.
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+
+[lints]
+workspace = true

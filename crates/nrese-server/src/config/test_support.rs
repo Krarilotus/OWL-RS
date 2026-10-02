@@ -15,8 +15,13 @@ impl EnvGuard {
             .iter()
             .map(|(key, value)| {
                 let old = std::env::var(key).ok();
+                // Only the config tests change the environment, one at a time under the
+                // guard's lock; the other tests of this binary don't read these variables.
+                // (B3 of the audit work replaces this with an injected source.)
                 match value {
+                    // SAFETY: see above.
                     Some(value) => unsafe { std::env::set_var(key, value) },
+                    // SAFETY: see above.
                     None => unsafe { std::env::remove_var(key) },
                 }
                 (*key, old)
@@ -31,7 +36,9 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         for (key, value) in self.previous.drain(..) {
             match value {
+                // SAFETY: as in `set`: the guard's lock is still held.
                 Some(value) => unsafe { std::env::set_var(key, value) },
+                // SAFETY: as in `set`.
                 None => unsafe { std::env::remove_var(key) },
             }
         }

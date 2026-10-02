@@ -3,9 +3,14 @@ name = "nrese-exec"
 description = "NRESE execution core: id tables, joins, sorting and aggregation shared by SPARQL and reasoning (D11)"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
 
 [dependencies]
 foldhash = "0.2"
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
 rayon = "1.10"
+
+[lints]
+workspace = true

@@ -24,6 +24,7 @@ fn main() -> Result<()> {
     // this), not on an illegal instruction later.
     nrese_engine::cpu::exit_if_missing();
     // What threads freed goes back to the system after bulk loads and reasoning.
+    // SAFETY: mimalloc's `mi_collect` may be called at any time, from any thread.
     nrese_engine::memory::set_release(|force| unsafe { libmimalloc_sys::mi_collect(force) });
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

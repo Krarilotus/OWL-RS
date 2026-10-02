@@ -16,3 +16,9 @@ NRESE is licensed under the Apache License, Version 2.0 ([LICENSE-APACHE](LICENS
 ## Working rules
 
 Layer ownership, where to fix what, and the evidence a change needs are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/dev/code-structure-guidelines.md](docs/dev/code-structure-guidelines.md).
+
+## Checks
+
+- `scripts/check.sh` is the gate every change passes before it is pushed: rustfmt, clippy on all targets with warnings as errors, the tests of both Cargo workspaces, the lock check, `cargo-deny` (licences, advisories, bans, sources; `deny.toml`) and the console's typecheck and tests. `scripts/check.sh --changed` runs fmt, clippy and the tests of the crates you changed.
+- Git hooks run them for you: `git config core.hooksPath .githooks` (`pre-commit`: the changed crates; `pre-push`: the whole gate).
+- CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on merges to `main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise (`oracle.yml`).

@@ -45,6 +45,13 @@ Deferred, with reasons:
 
 ### A. Hygiene and trust (now)
 
+Status (2 October): A1 and A2 done; A3 done but the first CI run. Found on the way: the
+`ORDER BY` order wasn't total over terms of one canonical form (fuzz seed 2329, fixed);
+cargo-deny's first run found seven advisories in the dependency tree (`h2`, `rustls`,
+`rustls-webpki`, `anyhow`, `rand`, and `quick-xml` 0.37 in `nrese-sparql`, quadratic on
+crafted XML), all fixed by updates; of the ten wildcard arms six covered real variants
+(`LATERAL`, triple terms, custom aggregates) and now name them.
+
 - **A1. `tmp/` and the legacy tree.** The reusable runners and probes committed with usage
   lines (`scripts/office/`, `benches/probes/`, `benches/suite/batch.sh` and `summarise.py`,
   `scripts/researchspace-template-queries.py`); spent edit scripts, backups, bundles, logs and
@@ -75,7 +82,14 @@ Deferred, with reasons:
 
 - **B1.** A mandatory `ReadScope` on every store read and write (administrators pass
   `ReadScope::all()` explicitly), one `ReadContext` instead of the `_pending`/`_as`/`_str`
-  variants, and statements streamed instead of collected.
+  variants, and statements streamed instead of collected. The shape: `ReadScope` is
+  `All` or `Graphs(Arc<GraphAccess>)` (built from the requester's `AccessView`, so the
+  inferred-statements rule travels with it); `ReadContext { scope, model, source: Latest |
+  Pending(&StatementsRequest) | Session(id), cancel }`; one store method per operation
+  (`query`, `statements`, `count`, `contexts`, `graphs`, `autocomplete`, `export`) taking a
+  `&ReadContext`, none without one. The access fields of `StatementPattern` and the query
+  requests go. Sessions keep their speculative state cached by base revision and operation
+  count, so repeated reads don't replay (the rest of §2.8).
 - **B2.** Error enums: the reasoner's (rule files with line and column), the memory budget
   as a variant, `Forbidden` and `Configuration` typed.
 - **B3.** One typed configuration tree, from defaults, the file, the environment and the

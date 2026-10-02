@@ -310,6 +310,7 @@ fn read_baseline(path: &PathBuf) -> BTreeMap<String, f64> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(system_alloc))]
+    // SAFETY: mimalloc's `mi_collect` may be called at any time, from any thread.
     nrese_engine::memory::set_release(|force| unsafe { libmimalloc_sys::mi_collect(force) });
     let args = parse_args().map_err(|e| format!("{e}\nsee the usage at the top of perf_lab.rs"))?;
     let config = match &args.store {

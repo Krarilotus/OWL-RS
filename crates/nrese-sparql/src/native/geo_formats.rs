@@ -227,15 +227,17 @@ struct Element {
 impl Element {
     fn open(start: &BytesStart<'_>) -> Option<Self> {
         let mut element = Self {
-            name: String::from_utf8(start.local_name().as_ref().to_vec()).ok()?,
+            name: start.local_name().as_ref().to_owned(),
             ..Self::default()
         };
         for attribute in start.attributes() {
             let attribute = attribute.ok()?;
-            let value = attribute.unescape_value().ok()?;
+            let value = attribute
+                .normalized_value(quick_xml::XmlVersion::default())
+                .ok()?;
             match attribute.key.local_name().as_ref() {
-                b"srsName" => element.srs = Some(value.into_owned()),
-                b"srsDimension" => element.dimension = value.trim().parse().ok(),
+                "srsName" => element.srs = Some(value.into_owned()),
+                "srsDimension" => element.dimension = value.trim().parse().ok(),
                 _ => {}
             }
         }
@@ -262,7 +264,25 @@ fn parse_xml(text: &str) -> Option<Element> {
             }
             Event::Text(text) => {
                 if let Some(element) = stack.last_mut() {
-                    element.text.push_str(&text.unescape().ok()?);
+                    element.text.push_str(&text.xml10_content());
+                }
+            }
+            // Entity and character references come apart from the text around them.
+            Event::GeneralRef(reference) => {
+                if let Some(element) = stack.last_mut() {
+                    match reference.resolve_char_ref().ok()? {
+                        Some(c) => element.text.push(c),
+                        None => element
+                            .text
+                            .push_str(match reference.xml10_content().as_ref() {
+                                "lt" => "<",
+                                "gt" => ">",
+                                "amp" => "&",
+                                "apos" => "'",
+                                "quot" => "\"",
+                                _ => return None,
+                            }),
+                    }
                 }
             }
             Event::End(_) => {
