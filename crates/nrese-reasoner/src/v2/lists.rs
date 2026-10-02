@@ -540,8 +540,7 @@ pub fn instantiate_with_premises(
     // One rule per kind of long axiom, its pairs checked by the index.
     let long = long.into_inner();
     let [classes, different, properties, distinct] = long.indexes;
-    let shared =
-        |index: super::ir::ListIndex| super::ir::SharedListIndex(std::sync::Arc::new(index));
+    let shared = super::ir::SharedListIndex::new;
     let mut native = |name: &str, body: Vec<Atom>, x: Term, y: Term, index, used: Vec<[u64; 3]>| {
         rules.push(rule(
             name,
