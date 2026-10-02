@@ -9,7 +9,7 @@ use nrese_rdf::vocab::{rdf, xsd};
 use nrese_rdf::{Literal, Term};
 use nrese_xsd::{
     Boolean, Date, DateTime, DayTimeDuration, Decimal, Double, Duration, Float, GDay, GMonth,
-    GMonthDay, GYear, GYearMonth, Integer, Time, YearMonthDuration,
+    GMonthDay, GYear, GYearMonth, Integer, Time, TimezoneOffset, YearMonthDuration,
 };
 
 /// A term's value, as far as operators distinguish them.
@@ -275,8 +275,6 @@ pub(crate) fn effective_boolean(value: &Value) -> Option<bool> {
     }
 }
 
-/// `ORDER BY` order (SPARQL §15.1): unbound < blank nodes < IRIs < literals; literals by
-/// value where comparable, then by lexical form and datatype so the order is total.
 /// A term with its literal value parsed once: for sorting many terms, where [`order`]
 /// would parse both literals at every comparison.
 pub struct Sortable {
@@ -295,15 +293,26 @@ impl Sortable {
 
     /// [`order`] of the two terms.
     pub fn order(&self, other: &Self) -> Ordering {
-        if let (Some(a), Some(b)) = (&self.value, &other.value)
-            && let Some(ordering) = compare(a, b)
-        {
-            return ordering;
+        match (&self.term, &self.value, &other.term, &other.value) {
+            (Some(Term::Literal(x)), Some(xv), Some(Term::Literal(y)), Some(yv)) => {
+                order_literals(xv, x, yv, y)
+            }
+            _ => order(self.term.as_ref(), other.term.as_ref()),
         }
-        order(self.term.as_ref(), other.term.as_ref())
     }
 }
 
+/// `ORDER BY` order (SPARQL §15.1): unbound < blank nodes < IRIs < literals < triple
+/// terms. It is a total order, as sorting needs (a comparison that isn't one makes a sort
+/// panic or return a wrong order): literals first by their kind of value (numbers,
+/// booleans, strings, language-tagged strings by language, each date and time type,
+/// durations, the rest), then by value within it, then by lexical form, datatype, language
+/// and direction. Where SPARQL's `<` orders two values, this order agrees; where `<` leaves
+/// them unordered (a number and a string, dates with and without a timezone close to each
+/// other, durations of months and of days, NaN), the order is this implementation's
+/// choice (§15.1 leaves it to the implementation), made per value, never per pair: a
+/// choice per pair (by value where comparable, else by text) is not transitive (2 < 10 by
+/// value, "10" < "15" < "2" by text).
 pub fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
     fn rank(term: Option<&Term>) -> u8 {
         match term {
@@ -326,35 +335,139 @@ pub fn order(a: Option<&Term>, b: Option<&Term>) -> Ordering {
         (Some(Term::BlankNode(x)), Some(Term::BlankNode(y))) => x.as_str().cmp(y.as_str()),
         (Some(Term::NamedNode(x)), Some(Term::NamedNode(y))) => x.as_str().cmp(y.as_str()),
         (Some(Term::Literal(x)), Some(Term::Literal(y))) => {
-            // By value where comparable (equal values tie, e.g. 1 and 1.0),
-            // otherwise by (lexical form, datatype, language).
-            match compare(&Value::of_literal(x), &Value::of_literal(y)) {
-                Some(order) => order,
-                // Otherwise the canonical forms of the values ("03" as "3", an xsd:int as
-                // an xsd:integer): §15.1 leaves this order to the implementation.
-                None => {
-                    let (Term::Literal(x), Term::Literal(y)) =
-                        (canonical(x.clone().into()), canonical(y.clone().into()))
-                    else {
-                        unreachable!("canonical keeps literals literals")
-                    };
-                    // The base direction last, so strings differing only in it don't tie.
-                    (
-                        x.value(),
-                        x.datatype(),
-                        x.language(),
-                        x.direction().map(|d| d.as_str()),
-                    )
-                        .cmp(&(
-                            y.value(),
-                            y.datatype(),
-                            y.language(),
-                            y.direction().map(|d| d.as_str()),
-                        ))
-                }
-            }
+            order_literals(&Value::of_literal(x), x, &Value::of_literal(y), y)
         }
         _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+/// [`order`] of two literals, given their values.
+fn order_literals(xv: &Value, x: &Literal, yv: &Value, y: &Literal) -> Ordering {
+    kind(xv)
+        .cmp(&kind(yv))
+        .then_with(|| within_kind(xv, yv))
+        .then_with(|| {
+            // The canonical forms ("03" as "3", an xsd:int as an xsd:integer), then the
+            // datatype, the language and the base direction (last, so strings differing
+            // only in it don't tie).
+            let (Term::Literal(x), Term::Literal(y)) =
+                (canonical(x.clone().into()), canonical(y.clone().into()))
+            else {
+                unreachable!("canonical keeps literals literals")
+            };
+            (
+                x.value(),
+                x.datatype(),
+                x.language(),
+                x.direction().map(|d| d.as_str()),
+            )
+                .cmp(&(
+                    y.value(),
+                    y.datatype(),
+                    y.language(),
+                    y.direction().map(|d| d.as_str()),
+                ))
+        })
+}
+
+/// The kinds of literal value `ORDER BY` ranks apart ([`order`]).
+fn kind(value: &Value) -> u8 {
+    match value {
+        Value::Integer(_) | Value::Decimal(_) | Value::Float(_) | Value::Double(_) => 0,
+        Value::Boolean(_) => 1,
+        Value::String(_) => 2,
+        Value::LangString(..) => 3,
+        Value::Date(_) => 4,
+        Value::DateTime(_) => 5,
+        Value::Time(_) => 6,
+        Value::GYear(_) => 7,
+        Value::GYearMonth(_) => 8,
+        Value::GMonth(_) => 9,
+        Value::GMonthDay(_) => 10,
+        Value::GDay(_) => 11,
+        Value::Duration(_) | Value::YearMonthDuration(_) | Value::DayTimeDuration(_) => 12,
+        Value::Other(_) | Value::Iri(_) | Value::Blank(_) | Value::Triple(_) => 13,
+    }
+}
+
+/// Two values of one [`kind`] by a key of each (so the result is transitive), equal where
+/// the key is: numbers as doubles (NaN first; an integer or decimal before a float or
+/// double of the same double value, integers and decimals among themselves exactly), dates
+/// and times without a timezone as if in UTC (where `<` orders them, the same order),
+/// durations by their average length (months of 30.436875 days), then months and seconds.
+fn within_kind(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::LangString(x, lx), Value::LangString(y, ly)) => (lx, x).cmp(&(ly, y)),
+        (Value::Date(x), Value::Date(y)) => utc(*x, *y, Date::or_timezone),
+        (Value::DateTime(x), Value::DateTime(y)) => utc(*x, *y, DateTime::or_timezone),
+        (Value::Time(x), Value::Time(y)) => utc(*x, *y, Time::or_timezone),
+        (Value::GYear(x), Value::GYear(y)) => utc(*x, *y, GYear::or_timezone),
+        (Value::GYearMonth(x), Value::GYearMonth(y)) => utc(*x, *y, GYearMonth::or_timezone),
+        (Value::GMonth(x), Value::GMonth(y)) => utc(*x, *y, GMonth::or_timezone),
+        (Value::GMonthDay(x), Value::GMonthDay(y)) => utc(*x, *y, GMonthDay::or_timezone),
+        (Value::GDay(x), Value::GDay(y)) => utc(*x, *y, GDay::or_timezone),
+        _ if a.is_numeric() && b.is_numeric() => numeric_key(a).cmp(&numeric_key(b)),
+        _ => match (a.duration(), b.duration()) {
+            (Some(x), Some(y)) => duration_key(x).cmp(&duration_key(y)),
+            _ => Ordering::Equal,
+        },
+    }
+}
+
+/// Two dates or times of one type, each without a timezone taken as in UTC: then both have
+/// one, and their instants are totally ordered.
+fn utc<T: PartialOrd + Copy>(x: T, y: T, or_timezone: fn(T, TimezoneOffset) -> T) -> Ordering {
+    or_timezone(x, TimezoneOffset::UTC)
+        .partial_cmp(&or_timezone(y, TimezoneOffset::UTC))
+        .unwrap_or(Ordering::Equal)
+}
+
+/// A number's key for [`within_kind`]: whether it is a number at all (NaN isn't), its
+/// double value (-0 as 0), whether it is binary floating point, and the exact value of an
+/// integer or decimal.
+fn numeric_key(value: &Value) -> (bool, OrderedDouble, bool, Option<Decimal>) {
+    let double = to_double(value).map_or(f64::NAN, f64::from);
+    let exact = to_decimal(value);
+    (
+        !double.is_nan(),
+        OrderedDouble(if double == 0. { 0. } else { double }),
+        exact.is_none(),
+        exact,
+    )
+}
+
+/// A duration's key for [`within_kind`]: its average length in seconds, then its months
+/// and seconds.
+fn duration_key(duration: Duration) -> (OrderedDouble, i64, Decimal) {
+    const MONTH_SECONDS: f64 = 30.436_875 * 86_400.;
+    let seconds = f64::from(Double::from(duration.as_seconds()));
+    (
+        OrderedDouble(duration.all_months() as f64 * MONTH_SECONDS + seconds),
+        duration.all_months(),
+        duration.as_seconds(),
+    )
+}
+
+/// A double ordered by [`f64::total_cmp`] (keys hold no NaN, see [`numeric_key`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OrderedDouble(f64);
+
+impl Eq for OrderedDouble {}
+
+impl PartialOrd for OrderedDouble {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedDouble {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.0.is_nan() && other.0.is_nan() {
+            return Ordering::Equal;
+        }
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -398,4 +511,99 @@ pub(crate) fn boolean_term(value: bool) -> Term {
 /// True for `rdf:langString`-typed literals; used by `DATATYPE` and `LANG`.
 pub(crate) fn is_lang_string(literal: &Literal) -> bool {
     literal.datatype() == rdf::LANG_STRING
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_rdf::NamedNode;
+
+    use super::*;
+
+    fn typed(lexical: &str, datatype: &str) -> Term {
+        Literal::new_typed_literal(
+            lexical,
+            NamedNode::new_unchecked(format!("http://www.w3.org/2001/XMLSchema#{datatype}")),
+        )
+        .into()
+    }
+
+    /// Literals whose values `<` orders only partly: numbers of every type (NaN, -0, an
+    /// integer and a float of nearly the same value), strings, language strings, dates
+    /// with and without timezones close to each other, durations of months and of days,
+    /// unknown datatypes.
+    fn pool() -> Vec<Term> {
+        let mut terms = vec![
+            typed("2", "integer"),
+            typed("10", "integer"),
+            typed("02", "int"),
+            typed("1", "unsignedByte"),
+            typed("1.0", "decimal"),
+            typed("0.1", "decimal"),
+            typed("0.10000000149011612", "decimal"),
+            typed("0.1", "float"),
+            typed("0.1", "double"),
+            typed("NaN", "double"),
+            typed("-0", "double"),
+            typed("0", "integer"),
+            typed("INF", "float"),
+            typed("1e300", "double"),
+            typed("9007199254740993", "integer"),
+            typed("9007199254740992", "double"),
+            typed("true", "boolean"),
+            typed("2000-01-01T00:00:00", "dateTime"),
+            typed("2000-01-01T10:00:00Z", "dateTime"),
+            typed("2000-01-01T20:00:00", "dateTime"),
+            typed("2000-01-02T00:00:00+14:00", "dateTime"),
+            typed("2000-01-01", "date"),
+            typed("2000-01-01Z", "date"),
+            typed("P1M", "duration"),
+            typed("P30D", "duration"),
+            typed("P31D", "dayTimeDuration"),
+            typed("P1Y", "yearMonthDuration"),
+            typed("abc", "unknownType"),
+            Literal::new_simple_literal("15").into(),
+            Literal::new_simple_literal("2").into(),
+            Literal::new_simple_literal("10").into(),
+            Literal::new_language_tagged_literal_unchecked("b", "en").into(),
+            Literal::new_language_tagged_literal_unchecked("a", "de").into(),
+        ];
+        terms.push(NamedNode::new_unchecked("http://example.com/x").into());
+        terms
+    }
+
+    #[test]
+    fn the_order_by_order_is_total_and_agrees_with_less_than() {
+        let terms = pool();
+        let all: Vec<Option<&Term>> = terms.iter().map(Some).chain([None]).collect();
+        let sortable: Vec<Sortable> = all.iter().map(|t| Sortable::new(t.cloned())).collect();
+        for (i, &a) in all.iter().enumerate() {
+            for (j, &b) in all.iter().enumerate() {
+                let ab = order(a, b);
+                assert_eq!(ab, order(b, a).reverse(), "antisymmetric: {a:?} {b:?}");
+                assert_eq!(ab, sortable[i].order(&sortable[j]), "cached: {a:?} {b:?}");
+                // Where `<` orders two literals, `ORDER BY` agrees.
+                if let (Some(Term::Literal(x)), Some(Term::Literal(y))) = (a, b)
+                    && let Some(less) = compare(&Value::of_literal(x), &Value::of_literal(y))
+                    && less.is_ne()
+                {
+                    assert_eq!(ab, less, "agrees with <: {x} {y}");
+                }
+                for &c in &all {
+                    let (bc, ac) = (order(b, c), order(a, c));
+                    if ab.is_le() && bc.is_le() {
+                        assert!(ac.is_le(), "transitive: {a:?} <= {b:?} <= {c:?}");
+                    }
+                }
+            }
+        }
+        // And sorting doesn't panic, whatever the input order.
+        let mut shuffled = all.clone();
+        for round in 0..50 {
+            shuffled.rotate_left(round % 7 + 1);
+            let n = shuffled.len();
+            shuffled.swap(round % n, (round * 13) % n);
+            let mut sorted = shuffled.clone();
+            sorted.sort_by(|a, b| order(*a, *b));
+        }
+    }
 }
