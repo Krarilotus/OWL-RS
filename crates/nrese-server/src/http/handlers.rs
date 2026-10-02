@@ -118,12 +118,23 @@ pub async fn admin_backup_dataset(
     admin_dataset::backup(state).await
 }
 
+/// An image backup (`?repository=` another repository than the default).
 pub async fn admin_image_backup(
     State(state): State<AppState>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_admin_write(&state, &headers).await?;
-    admin_dataset::image_backup(state).await
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_str(raw_query.as_deref().unwrap_or_default())
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let repository = pairs
+        .iter()
+        .find(|(key, _)| key == "repository")
+        .map_or(crate::repositories::DEFAULT_REPOSITORY, |(_, value)| {
+            value.as_str()
+        });
+    admin_dataset::image_backup(state, repository).await
 }
 
 pub async fn admin_restore_dataset(

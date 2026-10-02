@@ -542,6 +542,23 @@ async fn repositories_are_created_used_and_removed() {
         assert_eq!(status, StatusCode::OK);
         assert!(results.contains("true"), "{results}");
     }
+    // An image backup of the repository, into the default's backups.
+    {
+        let app = app();
+        let (status, body) = send(
+            &app,
+            Method::POST,
+            "/ops/api/admin/dataset/image?repository=second",
+            None,
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["manifest"]["quads"], 3);
+        assert!(json["directory"].as_str().unwrap().contains("second-"));
+    }
     // After a restart the repository and its data are back; then it goes.
     let app = app();
     assert_eq!(
