@@ -246,22 +246,7 @@ impl Snapshot {
         components: &[usize],
     ) -> Option<Vec<Vec<u64>>> {
         let plan = self.range_plan(model, pattern, permutation, low, high)?;
-        let mut out = vec![Vec::new(); components.len()];
-        let mut answered = false;
-        for stack in Stack::ALL {
-            if !model.includes(stack) {
-                continue;
-            }
-            let index = self.version.stack(stack);
-            if !index.any_plan(&plan) {
-                continue;
-            }
-            if answered || !index.scan_columns(&plan, components, &mut out) {
-                return None;
-            }
-            answered = true;
-        }
-        Some(out)
+        self.columns_of_stacks(model, &plan, permutation, components)
     }
 
     /// Exact number of quads [`scan_range_in`](Self::scan_range_in) yields.
@@ -388,25 +373,51 @@ impl Snapshot {
         if plan.exclude_default_graph {
             return None;
         }
-        let mut out = vec![Vec::new(); components.len()];
-        let mut answered = false;
+        if Stack::ALL
+            .into_iter()
+            .any(|stack| model.includes(stack) && !stack.layout().supports(permutation))
+        {
+            return None;
+        }
+        self.columns_of_stacks(model, &plan, permutation, components)
+    }
+
+    /// The columns `components` of the quads matching `plan` in each stack of `model`, each
+    /// decoded a block and a column at a time, and merged in `permutation`'s order where
+    /// both stacks have matches (they hold no quad twice): asserted and inferred
+    /// statements of one pattern, as reasoning gives them. `None` where a stack can't be
+    /// decoded so (several runs, deletions).
+    fn columns_of_stacks(
+        &self,
+        model: ReadModel,
+        plan: &AccessPlan,
+        permutation: Permutation,
+        components: &[usize],
+    ) -> Option<Vec<Vec<u64>>> {
+        let mut parts: Vec<Vec<Vec<u64>>> = Vec::new();
         for stack in Stack::ALL {
             if !model.includes(stack) {
                 continue;
             }
-            if !stack.layout().supports(permutation) {
-                return None;
-            }
             let index = self.version.stack(stack);
-            if !index.any_plan(&plan) {
+            if !index.any_plan(plan) {
                 continue;
             }
-            if answered || !index.scan_columns(&plan, components, &mut out) {
+            let mut out = vec![Vec::new(); components.len()];
+            if !index.scan_columns(plan, components, &mut out) {
                 return None;
             }
-            answered = true;
+            parts.push(out);
         }
-        Some(out)
+        match parts.len() {
+            0 => Some(vec![Vec::new(); components.len()]),
+            1 => parts.pop(),
+            _ => {
+                let right = parts.pop().expect("two parts");
+                let left = parts.pop().expect("two parts");
+                Some(merge_columns(left, right, permutation, components))
+            }
+        }
     }
 
     /// The number of distinct terms used as subject or object in `graphs` (one graph, or
@@ -631,4 +642,41 @@ where
             (None, _) => self.right.next(),
         }
     }
+}
+
+/// Two column sets (`components` of quads), each sorted in `permutation`'s order, merged
+/// into one in that order: rows compared on the components by their place in the order.
+fn merge_columns(
+    left: Vec<Vec<u64>>,
+    right: Vec<Vec<u64>>,
+    permutation: Permutation,
+    components: &[usize],
+) -> Vec<Vec<u64>> {
+    let order = permutation.order();
+    let mut keys: Vec<usize> = (0..components.len()).collect();
+    keys.sort_by_key(|&c| order.iter().position(|&o| o == components[c]));
+    let rows = |columns: &[Vec<u64>]| columns.first().map_or(0, Vec::len);
+    let (n, m) = (rows(&left), rows(&right));
+    let mut out: Vec<Vec<u64>> = (0..components.len())
+        .map(|_| Vec::with_capacity(n + m))
+        .collect();
+    let less = |a: usize, b: usize| {
+        keys.iter()
+            .map(|&k| left[k][a].cmp(&right[k][b]))
+            .find(|ordering| ordering.is_ne())
+            .is_some_and(|ordering| ordering.is_le())
+    };
+    let (mut i, mut j) = (0, 0);
+    while i < n || j < m {
+        let from_left = j == m || (i < n && less(i, j));
+        for (c, column) in out.iter_mut().enumerate() {
+            column.push(if from_left { left[c][i] } else { right[c][j] });
+        }
+        if from_left {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
 }
