@@ -2,6 +2,7 @@
 //! store, tell, backup/restore, stats - and the mutation pipeline that owns commit semantics.
 //! No HTTP concerns live here. See `docs/ARCHITECTURE.md`.
 
+pub mod autocomplete;
 mod backup;
 mod bulk_load;
 mod classification;

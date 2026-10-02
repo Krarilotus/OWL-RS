@@ -291,3 +291,57 @@ async fn namespaces_are_listed_set_and_removed() {
     let (status, _) = send(&app, Method::GET, &uri, None, None, "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// Autocompletion: resources by the beginning of their labels' words or local names.
+#[tokio::test]
+async fn autocomplete_finds_labels_and_local_names() {
+    let app = test_app().unwrap();
+    let data = "@prefix ex: <http://example.com/> .\n\
+                @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+                @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+                ex:q1 rdfs:label \"Albert Einstein\"@en .\n\
+                ex:q2 rdfs:label \"Albertina\" .\n\
+                ex:hasPart a owl:ObjectProperty .\n\
+                ex:q3 ex:note \"Albert Schweitzer\" .\n";
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("{REPO}/statements"),
+        Some("text/turtle"),
+        None,
+        data,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let suggest = |q: &str| {
+        let app = app.clone();
+        let uri = format!("/dataset/autocomplete?{}", encode(&[("q", q)]));
+        async move {
+            let (status, body) = send(&app, Method::GET, &uri, None, None, "").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            json["suggestions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| {
+                    s["iri"]
+                        .as_str()
+                        .unwrap()
+                        .trim_start_matches("http://example.com/")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    // Every word begins a word; a note is not a label.
+    assert_eq!(suggest("alb ein").await, ["q1"]);
+    let mut albert = suggest("alb").await;
+    albert.sort();
+    assert_eq!(albert, ["q1", "q2"]);
+    // Local names, split at camel case.
+    assert_eq!(suggest("part").await, ["hasPart"]);
+    assert_eq!(suggest("haspa").await, ["hasPart"]);
+    let (status, _) = send(&app, Method::GET, "/dataset/autocomplete", None, None, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

@@ -225,6 +225,9 @@ pub struct Dictionary {
     inner: RwLock<Inner>,
     /// Built at the first search, extended at later ones ([`super::text`]).
     text: RwLock<super::text::TextIndex>,
+    /// IRIs by the words of their local names ([`super::text::local_name_text`]), built at
+    /// the first autocompletion and extended at later ones.
+    iri_text: RwLock<super::text::TextIndex>,
     /// Built at the first triple-term match, extended at later ones.
     triples: RwLock<TripleIndex>,
     /// The text order of the entries the mapped base doesn't order ([`super::order`]).
@@ -444,6 +447,36 @@ impl Dictionary {
             _ => None,
         };
         self.text.read().search(query, &text_of)
+    }
+
+    /// The IRIs whose local name's words match `query`, best first; the index first takes
+    /// in the IRIs interned since the last search.
+    pub fn iri_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+        if self.iri_text.read().covered() < self.len() {
+            let mut text = self.iri_text.write();
+            let inner = self.inner.read();
+            let end = inner.len();
+            for index in text.covered()..end {
+                if let TermView::Iri(iri) = view_key(inner.key(index))
+                    && let Some(words) = super::text::local_name_text(iri)
+                {
+                    text.add(TermId::new(TermKind::Iri, index).raw(), &words);
+                }
+            }
+            text.cover(end);
+        }
+        if let Some(language) = query.stem.as_deref() {
+            let ready = self.iri_text.read().stems_ready(language);
+            if !ready {
+                self.iri_text.write().prepare_stems(language);
+            }
+        }
+        let inner = self.inner.read();
+        let text_of = |id: u64| match view_key(inner.key(TermId::from_raw(id).payload())) {
+            TermView::Iri(iri) => super::text::local_name_text(iri),
+            _ => None,
+        };
+        self.iri_text.read().search(query, &text_of)
     }
 
     /// The ids of the entries `0..limit` whose text passes `test`, sorted: one parallel

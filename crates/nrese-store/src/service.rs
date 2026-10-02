@@ -322,6 +322,17 @@ impl StoreService {
         crate::statements::count_statements(&self.engine.snapshot(), read_model(infer), pattern)
     }
 
+    /// At most `limit` resources whose labels' or local names' words begin with the words
+    /// of `typed`, best first ([`crate::autocomplete`]).
+    pub fn autocomplete(
+        &self,
+        typed: &str,
+        limit: usize,
+        infer: bool,
+    ) -> Vec<crate::autocomplete::Suggestion> {
+        crate::autocomplete::autocomplete(&self.engine.snapshot(), read_model(infer), typed, limit)
+    }
+
     /// The named graphs (RDF4J's `/contexts`).
     pub fn contexts(&self) -> Vec<nrese_rdf::Term> {
         crate::statements::contexts(&self.engine.snapshot())
