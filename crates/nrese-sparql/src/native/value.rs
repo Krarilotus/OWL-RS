@@ -42,21 +42,76 @@ pub enum Value {
     Triple(Box<nrese_rdf::Triple>),
 }
 
-/// Datatypes derived from `xsd:integer` that SPARQL treats as integers.
-const INTEGER_TYPES: [&str; 13] = [
-    "http://www.w3.org/2001/XMLSchema#integer",
-    "http://www.w3.org/2001/XMLSchema#long",
-    "http://www.w3.org/2001/XMLSchema#int",
-    "http://www.w3.org/2001/XMLSchema#short",
-    "http://www.w3.org/2001/XMLSchema#byte",
-    "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-    "http://www.w3.org/2001/XMLSchema#nonPositiveInteger",
-    "http://www.w3.org/2001/XMLSchema#negativeInteger",
-    "http://www.w3.org/2001/XMLSchema#positiveInteger",
-    "http://www.w3.org/2001/XMLSchema#unsignedLong",
-    "http://www.w3.org/2001/XMLSchema#unsignedInt",
-    "http://www.w3.org/2001/XMLSchema#unsignedShort",
-    "http://www.w3.org/2001/XMLSchema#unsignedByte",
+/// Datatypes derived from `xsd:integer` that SPARQL treats as integers, with their value
+/// ranges (XSD 1.1 Datatypes §3.4). A lexical form outside its datatype's range is
+/// ill-typed: not a number, but a literal compared by identity, and an error in
+/// arithmetic (`"300"^^xsd:byte * 2`), as the standard and Jena have it.
+const INTEGER_TYPES: [(&str, i128, i128); 13] = [
+    (
+        "http://www.w3.org/2001/XMLSchema#integer",
+        i128::MIN,
+        i128::MAX,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#long",
+        i64::MIN as i128,
+        i64::MAX as i128,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#int",
+        i32::MIN as i128,
+        i32::MAX as i128,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#short",
+        i16::MIN as i128,
+        i16::MAX as i128,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#byte",
+        i8::MIN as i128,
+        i8::MAX as i128,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
+        0,
+        i128::MAX,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#nonPositiveInteger",
+        i128::MIN,
+        0,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#negativeInteger",
+        i128::MIN,
+        -1,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#positiveInteger",
+        1,
+        i128::MAX,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#unsignedLong",
+        0,
+        u64::MAX as i128,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#unsignedInt",
+        0,
+        u32::MAX as i128,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#unsignedShort",
+        0,
+        u16::MAX as i128,
+    ),
+    (
+        "http://www.w3.org/2001/XMLSchema#unsignedByte",
+        0,
+        u8::MAX as i128,
+    ),
 ];
 
 impl Value {
@@ -117,8 +172,14 @@ impl Value {
             GMonthDay::from_str(value).ok().map(Self::GMonthDay)
         } else if datatype == xsd::G_DAY {
             GDay::from_str(value).ok().map(Self::GDay)
-        } else if INTEGER_TYPES.contains(&datatype.as_str()) {
-            Integer::from_str(value).ok().map(Self::Integer)
+        } else if let Some(&(_, min, max)) = INTEGER_TYPES
+            .iter()
+            .find(|(iri, ..)| *iri == datatype.as_str())
+        {
+            Integer::from_str(value)
+                .ok()
+                .filter(|integer| (min..=max).contains(&i128::from(i64::from(*integer))))
+                .map(Self::Integer)
         } else {
             None
         };
@@ -529,6 +590,35 @@ mod tests {
             NamedNode::new_unchecked(format!("http://www.w3.org/2001/XMLSchema#{datatype}")),
         )
         .into()
+    }
+
+    /// An integer-derived literal outside its datatype's range is ill-typed: not a number
+    /// (so arithmetic on it is an error), but a literal of its own (found by the Jena oracle:
+    /// `"300"^^xsd:byte * 1.5` was 450).
+    #[test]
+    fn integers_outside_their_derived_range_are_not_numbers() {
+        for (lexical, datatype, number) in [
+            ("127", "byte", true),
+            ("128", "byte", false),
+            ("300", "byte", false),
+            ("-129", "byte", false),
+            ("255", "unsignedByte", true),
+            ("256", "unsignedByte", false),
+            ("-1", "unsignedInt", false),
+            ("0", "positiveInteger", false),
+            ("0", "nonNegativeInteger", true),
+            ("1", "negativeInteger", false),
+            ("2147483648", "int", false),
+            ("2147483647", "int", true),
+            ("123456789012", "integer", true),
+        ] {
+            let value = Value::of(&typed(lexical, datatype));
+            assert_eq!(
+                matches!(value, Value::Integer(_)),
+                number,
+                "{lexical}^^xsd:{datatype}"
+            );
+        }
     }
 
     /// Literals whose values `<` orders only partly: numbers of every type (NaN, -0, an

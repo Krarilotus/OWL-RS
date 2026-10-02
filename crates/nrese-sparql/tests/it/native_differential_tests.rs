@@ -107,16 +107,25 @@ impl Rng {
 /// Cases for a second oracle (benches/oracle/README.md): with `NRESE_ORACLE_DUMP=<dir>`, a
 /// test writes `<dir>/<test>/d<N>/data.nq` per dataset and `q<M>.rq` with `q<M>.nrese` (a
 /// line of the variables, then the native rows, one per line, terms separated by tabs;
-/// `q<M>.ordered` if their order counts) per compared query.
-struct Dump(Option<PathBuf>);
+/// `q<M>.ordered` if their order counts) per compared query, and `q<M>.nrese-canonical`, the
+/// native rows on the dataset's canonical copy (so the oracle can tell a lexical form's
+/// difference from another).
+struct Dump {
+    dir: Option<PathBuf>,
+    /// The current dataset's canonical copy, loaded (only when dumping).
+    canonical: std::cell::RefCell<Option<Engine>>,
+}
 
 impl Dump {
     fn new(test: &str) -> Self {
-        Self(std::env::var_os("NRESE_ORACLE_DUMP").map(|dir| PathBuf::from(dir).join(test)))
+        Self {
+            dir: std::env::var_os("NRESE_ORACLE_DUMP").map(|dir| PathBuf::from(dir).join(test)),
+            canonical: std::cell::RefCell::default(),
+        }
     }
 
     fn dir(&self, dataset: usize) -> Option<PathBuf> {
-        let dir = self.0.as_ref()?.join(format!("d{dataset}"));
+        let dir = self.dir.as_ref()?.join(format!("d{dataset}"));
         std::fs::create_dir_all(&dir).unwrap();
         Some(dir)
     }
@@ -129,27 +138,36 @@ impl Dump {
         if let Some(dir) = self.dir(dataset) {
             let text: String = quads.iter().map(|q| format!("{q} .\n")).collect();
             std::fs::write(dir.join("data.nq"), text).unwrap();
-            let canonical: String = quads
+            let canonical: Vec<Quad> = quads
                 .iter()
                 .map(|q| {
                     let object = match &q.object {
                         Term::Literal(l) => Term::Literal(canonical_number(l)),
                         other => other.clone(),
                     };
-                    let quad = Quad::new(
+                    Quad::new(
                         q.subject.clone(),
                         q.predicate.clone(),
                         object,
                         q.graph_name.clone(),
-                    );
-                    format!("{quad} .\n")
+                    )
                 })
                 .collect();
-            std::fs::write(dir.join("data.canonical.nq"), canonical).unwrap();
+            let text: String = canonical.iter().map(|q| format!("{q} .\n")).collect();
+            std::fs::write(dir.join("data.canonical.nq"), text).unwrap();
+            let engine = Engine::new(EngineConfig::default()).unwrap();
+            let mut tx = engine.transaction();
+            for quad in &canonical {
+                tx.insert(quad.as_ref());
+            }
+            tx.commit().unwrap();
+            *self.canonical.borrow_mut() = Some(engine);
         }
     }
 
-    /// `variables` gives the result's variables (evaluated only when dumping).
+    /// `variables` gives the result's variables, `canonical` the native rows on a snapshot
+    /// (of the canonical copy); both are evaluated only when dumping.
+    #[expect(clippy::too_many_arguments)]
     fn query(
         &self,
         dataset: usize,
@@ -158,6 +176,7 @@ impl Dump {
         ordered: bool,
         rows: &[String],
         variables: impl FnOnce() -> Vec<String>,
+        canonical: impl FnOnce(&nrese_engine::Snapshot) -> Vec<String>,
     ) {
         if let Some(dir) = self.dir(dataset) {
             std::fs::write(dir.join(format!("q{query}.rq")), text).unwrap();
@@ -167,6 +186,14 @@ impl Dump {
                 .map(|r| format!("{r}\n"))
                 .collect();
             std::fs::write(dir.join(format!("q{query}.nrese")), lines).unwrap();
+            if let Some(engine) = &*self.canonical.borrow() {
+                let canonical_rows = canonical(&engine.snapshot());
+                let lines: String = std::iter::once(&header)
+                    .chain(&canonical_rows)
+                    .map(|r| format!("{r}\n"))
+                    .collect();
+                std::fs::write(dir.join(format!("q{query}.nrese-canonical")), lines).unwrap();
+            }
             if ordered {
                 std::fs::write(dir.join(format!("q{query}.ordered")), "").unwrap();
             }
@@ -726,9 +753,21 @@ fn native_results_equal_the_reference_on_random_queries() {
                 "dataset {dataset_case}, query {query_case}, {model:?}: {text}"
             );
             if model == ReadModel::Materialised {
-                dump.query(dataset_case, query_case, &text, ordered, &native, || {
-                    variables(&snapshot, &query)
-                });
+                dump.query(
+                    dataset_case,
+                    query_case,
+                    &text,
+                    ordered,
+                    &native,
+                    || variables(&snapshot, &query),
+                    |canonical| {
+                        rows_up_to_equal_values(
+                            evaluate_query(canonical, &query, &native_options).unwrap(),
+                            ordered,
+                            has_extremes(&text),
+                        )
+                    },
+                );
             }
             checked += 1;
             with_solutions += usize::from(!expected.is_empty());
@@ -871,9 +910,20 @@ fn pushed_filters_equal_the_reference() {
                 &expected,
                 &format!("dataset {dataset_case}, query {query_case}: {text}"),
             );
-            dump.query(dataset_case, query_case, &text, false, &native, || {
-                variables(&snapshot, &query)
-            });
+            dump.query(
+                dataset_case,
+                query_case,
+                &text,
+                false,
+                &native,
+                || variables(&snapshot, &query),
+                |canonical| {
+                    rows(
+                        evaluate_query(canonical, &query, &QueryOptions::default()).unwrap(),
+                        false,
+                    )
+                },
+            );
             checked += 1;
             with_solutions += usize::from(!expected.is_empty());
         }
@@ -1657,9 +1707,21 @@ fn computed_values_equal_the_reference() {
                 &expected,
                 &format!("dataset {dataset_case}, query {query_case}: {text}"),
             );
-            dump.query(dataset_case, query_case, &text, ordered, &native, || {
-                variables(&snapshot, &query)
-            });
+            dump.query(
+                dataset_case,
+                query_case,
+                &text,
+                ordered,
+                &native,
+                || variables(&snapshot, &query),
+                |canonical| {
+                    rows_up_to_equal_values(
+                        evaluate_query(canonical, &query, &QueryOptions::default()).unwrap(),
+                        ordered,
+                        open,
+                    )
+                },
+            );
             checked += 1;
             with_solutions += usize::from(!expected.is_empty());
         }
