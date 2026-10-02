@@ -281,6 +281,12 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
         config.auth.mtls.admin_subjects,
         ";",
     );
+    insert_joined(
+        &mut source,
+        names::AUTH_MTLS_TRUSTED_PROXIES,
+        config.auth.mtls.trusted_proxies,
+        ",",
+    );
     insert_option(
         &mut source,
         names::AUTH_OIDC_INTROSPECTION_URL,

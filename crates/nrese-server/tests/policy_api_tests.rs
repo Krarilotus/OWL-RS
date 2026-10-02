@@ -427,6 +427,7 @@ async fn mtls_allows_read_subject_on_query_endpoint() -> Result<(), Box<dyn std:
                 .uri("/dataset/query?query=ASK%20WHERE%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D")
                 .method(Method::GET)
                 .header("x-client-cert-subject", "CN=reader-1,O=Test")
+                .extension(from_proxy())
                 .body(Body::empty())?,
         )
         .await?;
@@ -445,6 +446,7 @@ async fn mtls_rejects_read_subject_on_write_endpoint() -> Result<(), Box<dyn std
                 .uri("/dataset/update")
                 .method(Method::POST)
                 .header("x-client-cert-subject", "CN=reader-1,O=Test")
+                .extension(from_proxy())
                 .header("content-type", "application/sparql-update")
                 .body(Body::from(
                     "INSERT DATA { <http://example.com/s> <http://example.com/p> <http://example.com/o> }",
@@ -466,6 +468,7 @@ async fn mtls_allows_admin_subject_on_admin_endpoint() -> Result<(), Box<dyn std
                 .uri("/ops/api/diagnostics/runtime")
                 .method(Method::GET)
                 .header("x-client-cert-subject", "CN=admin-1,O=Test")
+                .extension(from_proxy())
                 .body(Body::empty())?,
         )
         .await?;
@@ -501,6 +504,7 @@ async fn mtls_rejects_unknown_subject() -> Result<(), Box<dyn std::error::Error>
                 .uri("/dataset/query?query=ASK%20WHERE%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D")
                 .method(Method::GET)
                 .header("x-client-cert-subject", "CN=unknown,O=Test")
+                .extension(from_proxy())
                 .body(Body::empty())?,
         )
         .await?;
@@ -650,6 +654,7 @@ fn mtls_policy() -> PolicyConfig {
             subject_header: "x-client-cert-subject".to_owned(),
             read_subjects: BTreeSet::from(["CN=reader-1,O=Test".to_owned()]),
             admin_subjects: BTreeSet::from(["CN=admin-1,O=Test".to_owned()]),
+            trusted_proxies: nrese_server::auth::peers::AddressRange::loopback(),
         }),
         ..PolicyConfig::default()
     }
@@ -721,4 +726,51 @@ impl Drop for MockIntrospectionServer {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// A request as the TLS-terminating proxy on this host passes it on.
+fn from_proxy() -> axum::extract::ConnectInfo<std::net::SocketAddr> {
+    axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50_000)))
+}
+
+/// The subject header counts only from the trusted proxies: from any other peer (or an
+/// unknown one) it is dropped, so a client that reaches the port directly can't claim a
+/// subject.
+#[tokio::test]
+async fn mtls_ignores_the_subject_header_from_untrusted_peers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ask = |peer: Option<[u8; 4]>| {
+        let mut request = Request::builder()
+            .uri("/ops/api/diagnostics/runtime")
+            .method(Method::GET)
+            .header("x-client-cert-subject", "CN=admin-1,O=Test");
+        if let Some(peer) = peer {
+            request = request.extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                peer, 50_000,
+            ))));
+        }
+        request.body(Body::empty())
+    };
+    let app = test_app_with_policy(mtls_policy())?;
+    let direct = app.clone().oneshot(ask(Some([10, 1, 2, 3]))?).await?;
+    assert_eq!(direct.status(), StatusCode::UNAUTHORIZED);
+    let unknown = app.clone().oneshot(ask(None)?).await?;
+    assert_eq!(unknown.status(), StatusCode::UNAUTHORIZED);
+    let proxied = app.oneshot(ask(Some([127, 0, 0, 1]))?).await?;
+    assert_eq!(proxied.status(), StatusCode::OK);
+    // A proxy elsewhere, once its range is trusted.
+    let mut policy = mtls_policy();
+    if let AuthConfig::Mtls(config) = &mut policy.auth {
+        config.trusted_proxies = vec!["10.0.0.0/8".parse()?];
+    }
+    let app = test_app_with_policy(policy)?;
+    let proxied = app.clone().oneshot(ask(Some([10, 1, 2, 3]))?).await?;
+    assert_eq!(proxied.status(), StatusCode::OK);
+    let local = app.oneshot(ask(Some([127, 0, 0, 1]))?).await?;
+    assert_eq!(
+        local.status(),
+        StatusCode::UNAUTHORIZED,
+        "loopback isn't trusted then"
+    );
+    Ok(())
 }

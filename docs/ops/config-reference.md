@@ -309,6 +309,7 @@ Use `fuseki-plain-text` when you want local or live parity runs to match Fuseki-
 - `auth.mtls.subject_header` -> `NRESE_AUTH_MTLS_SUBJECT_HEADER`
 - `auth.mtls.read_subjects` -> `NRESE_AUTH_MTLS_READ_SUBJECTS`
 - `auth.mtls.admin_subjects` -> `NRESE_AUTH_MTLS_ADMIN_SUBJECTS`
+- `auth.mtls.trusted_proxies` -> `NRESE_AUTH_MTLS_TRUSTED_PROXIES` (addresses or ranges such as `10.0.0.0/8`, comma-separated; default loopback): the peers that terminate TLS and may pass the subject header on. From any other peer the header is dropped before authentication, so a client that reaches the server's port directly can't claim a subject. With the proxy in another container or host, list its address or network here
 - file format:
   - string: `admin_subjects = "CN=admin,O=Example"`
   - list: `admin_subjects = ["CN=admin-1,O=Example", "CN=admin-2,O=Example"]`
