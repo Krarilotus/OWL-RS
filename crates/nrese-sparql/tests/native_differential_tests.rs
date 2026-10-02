@@ -5145,3 +5145,50 @@ fn a_limit_between_terms_of_one_canonical_form_keeps_the_same_one() {
         }
     }
 }
+
+/// Integers of one value and different datatypes (`"6"^^xsd:nonNegativeInteger`,
+/// `"6"^^xsd:integer`) are ordered by datatype in the total order: the fast path for inline
+/// integers, which ranks by value, must not decide between them (found by the fuzz
+/// campaign, seed 2458).
+#[test]
+fn integers_of_one_value_and_two_datatypes_sort_as_the_full_order() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let typed = |lexical: &str, datatype| Literal::new_typed_literal(lexical, datatype);
+    for (s, o) in [
+        ("e1", typed("6", xsd::INTEGER)),
+        ("e3", typed("6", xsd::NON_NEGATIVE_INTEGER)),
+        ("e0", typed("7", xsd::INTEGER)),
+        ("e2", typed("3", xsd::INTEGER)),
+    ] {
+        tx.insert(Quad::new(ex(s), ex("p"), o, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for direction in ["ASC", "DESC"] {
+        let full = format!("SELECT ?a ?b WHERE {{ ?a <{EX}p> ?b }} ORDER BY {direction}(?b) ?a");
+        let all = rows(
+            evaluate_query(
+                &snapshot,
+                &SparqlParser::new().parse_query(&full).unwrap(),
+                &QueryOptions::default(),
+            )
+            .unwrap(),
+            true,
+        );
+        for limit in 1..=4 {
+            let text = format!("{full} LIMIT {limit}");
+            let query = SparqlParser::new().parse_query(&text).unwrap();
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                true,
+            );
+            let expected = rows(
+                reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                true,
+            );
+            assert_eq!(native, expected, "{text}");
+            assert_eq!(native, all[..limit], "{text}");
+        }
+    }
+}
