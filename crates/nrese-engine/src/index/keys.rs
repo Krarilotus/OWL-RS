@@ -686,11 +686,6 @@ impl PackedKeys {
         self.len
     }
 
-    /// Whether a block stores a position as a palette (format 10).
-    pub(crate) fn has_palettes(&self) -> bool {
-        self.headers.iter().any(|h| (0..4).any(|c| h.palette(c)))
-    }
-
     /// The keys in order, a block decoded at a time.
     pub(crate) fn iter(&self) -> Iter<'_> {
         Iter {

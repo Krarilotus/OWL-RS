@@ -10,6 +10,7 @@
 //! the entry's kind and the part of the key that holds the text. The result is the
 //! matching ids, sorted: the executor scans the index for those values only.
 
+use super::offsets::Ends;
 use rayon::prelude::*;
 
 use super::{TermId, TermKind};
@@ -75,7 +76,7 @@ const SLICE: usize = 1 << 16;
 /// `ends[i]`, its id index `first_index + i`) that pass `test`, sorted.
 pub(crate) fn matching(
     bytes: &[u8],
-    ends: &[u64],
+    ends: &(impl Ends + ?Sized),
     first_index: u64,
     limit: u64,
     test: &StringTest<'_>,
@@ -107,17 +108,17 @@ pub(crate) fn matching(
 /// [`matching`] with `find` giving the first hit in a haystack.
 fn matching_with(
     bytes: &[u8],
-    ends: &[u64],
+    ends: &(impl Ends + ?Sized),
     first_index: u64,
     limit: u64,
     test: &StringTest<'_>,
     find: &(dyn Fn(&[u8]) -> Option<usize> + Sync),
 ) -> Vec<TermId> {
-    let entries = ends.len().min(limit as usize);
+    let entries = ends.count().min(limit as usize);
     if entries == 0 {
         return Vec::new();
     }
-    let start_of = |i: usize| if i == 0 { 0 } else { ends[i - 1] as usize };
+    let start_of = |i: usize| ends.start(i);
     let mut ids: Vec<TermId> = (0..entries.div_ceil(SLICE))
         .into_par_iter()
         .flat_map_iter(|slice| {
@@ -126,19 +127,19 @@ fn matching_with(
             if test.needle.is_empty() {
                 return (first..last)
                     .filter_map(|entry| {
-                        let key = &bytes[start_of(entry)..ends[entry] as usize];
+                        let key = &bytes[start_of(entry)..ends.end(entry)];
                         passes(key, first_index + entry as u64, 0, test)
                     })
                     .collect::<Vec<_>>();
             }
-            let (from, to) = (start_of(first), ends[last - 1] as usize);
+            let (from, to) = (start_of(first), ends.end(last - 1));
             let mut found = Vec::new();
             let mut entry = first;
             let mut at = from;
             // Each hit's entry, then on past that entry: one test per matching entry.
             while let Some(hit) = find(&bytes[at..to]).map(|offset| at + offset) {
-                entry += ends[entry..last].partition_point(|&end| end as usize <= hit);
-                let (start, end) = (start_of(entry), ends[entry] as usize);
+                entry = ends.holding(entry, last, hit);
+                let (start, end) = (start_of(entry), ends.end(entry));
                 if let Some(id) = passes(
                     &bytes[start..end],
                     first_index + entry as u64,

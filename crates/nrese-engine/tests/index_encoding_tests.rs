@@ -1,7 +1,7 @@
-//! `store.index_encoding` (`nrese_engine::IndexEncoding`): checkpoints of blocks without
-//! palettes are written as format 9, which binaries before palettes read; with palettes as
-//! format 10. Both reopen with the same statements. A process of its own: the encoding is
-//! set for the process.
+//! `store.index_encoding` (`nrese_engine::IndexEncoding`): checkpoints are written as format
+//! 11 with either encoding and reopen with the same statements; checkpoints of formats 9
+//! (no palettes) and 10 (palettes), written by the engine before format 11, still open. A
+//! process of its own: the encoding is set for the process.
 
 use std::fs;
 use std::path::Path;
@@ -49,10 +49,10 @@ fn magic(dir: &Path) -> Vec<u8> {
 }
 
 #[test]
-fn checkpoints_say_format_10_only_with_palettes() {
+fn checkpoints_of_either_encoding_are_format_11() {
     for (encoding, expected) in [
-        (IndexEncoding::Fast, b"NRESECK9"),
-        (IndexEncoding::Compact, b"NRESECKA"),
+        (IndexEncoding::Fast, b"NRESECKB"),
+        (IndexEncoding::Compact, b"NRESECKB"),
     ] {
         set_index_encoding(encoding);
         let dir = tempfile::tempdir().unwrap();
@@ -72,5 +72,61 @@ fn checkpoints_say_format_10_only_with_palettes() {
             .quads_for_pattern(&QuadPattern::all())
             .count();
         assert_eq!(count, 2_000, "{encoding:?}");
+    }
+}
+
+/// Checkpoints the engine wrote before format 11 (the statements of [`quads`]; format 9
+/// without palettes, format 10 with) open, and their next checkpoint is format 11.
+#[test]
+fn checkpoints_before_format_11_open() {
+    for name in ["checkpoint-format-9.nck", "checkpoint-format-10.nck"] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name),
+            dir.path().join("checkpoint-00000000000000000001.nck"),
+        )
+        .unwrap();
+        {
+            let engine = Engine::open(dir.path(), config()).unwrap();
+            let snapshot = engine.snapshot();
+            assert_eq!(
+                snapshot.quads_for_pattern(&QuadPattern::all()).count(),
+                2_000,
+                "{name}"
+            );
+            for quad in quads() {
+                assert!(
+                    snapshot.lookup_quad(quad.as_ref()).is_some_and(|q| snapshot.contains(&q)),
+                    "{name}: {quad}"
+                );
+            }
+            let mut tx = engine.transaction();
+            tx.insert(
+                Quad::new(
+                    NamedNode::new_unchecked("http://example.com/new"),
+                    NamedNode::new_unchecked("http://example.com/p0"),
+                    NamedNode::new_unchecked("http://example.com/o"),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+            tx.commit().unwrap();
+            engine.checkpoint().unwrap();
+        }
+        let checkpoints: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "nck"))
+            .collect();
+        let newest = checkpoints.iter().max().unwrap();
+        assert_eq!(&fs::read(newest).unwrap()[..8], b"NRESECKB", "{name}");
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        assert_eq!(
+            engine.snapshot().quads_for_pattern(&QuadPattern::all()).count(),
+            2_001,
+            "{name}"
+        );
     }
 }
