@@ -30,7 +30,7 @@ The last run (30 September 2026): 9,403 queries, 8,070 agree, 765 agree on the c
 | `limit` | 81 | ORDER BY with LIMIT or OFFSET over incomparable values picks different rows |
 | `relative-iri` | 138 | `IRI()` of a relative string: Jena resolves it against a `file:///` base; without a BASE, NRESE makes it an error |
 | `date-functions` | 1 | `YEAR`, `MONTH`, … take `xsd:dateTime` in SPARQL; Jena also takes `xsd:date` |
-| `path-duplicates` | 39 | **NRESE deviates:** path alternatives `(p\|q)` are a UNION in the standard, with duplicates; NRESE (and spareval) give each solution once |
+| `path-duplicates` | 39 | **Fixed 2 October 2026:** path alternatives `(p\|q)` are a UNION in the standard, with duplicates; NRESE gave each solution once (as spareval does) and now follows the standard |
 | `lexical-forms` | 27 (and the 765 that agree only on the canonical copy) | **NRESE deviates:** `STR` of `"07"^^xsd:integer` is `"07"` in the standard, `"7"` in NRESE (and spareval), which compute string functions from the value |
 | `zero-length` | 5 | **NRESE deviates:** zero-length paths from a term outside the graph (completion plan 4.3) |
 | `jena-path-values` | 2 | **Jena deviates:** its property paths find `"1"^^xsd:int` for a bound `"01"^^xsd:integer`. `SELECT * { ?s <p> ?d . ?s (<q>\|<r>) ?d }` over `<s> <p> "01"^^xsd:integer . <s> <q> "1"^^xsd:int` gives one row; the plain join gives none |

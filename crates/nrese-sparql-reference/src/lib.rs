@@ -15,9 +15,9 @@
 //! triples a resource is the subject of, following blank nodes). Function semantics are
 //! checked against the W3C suite and against Jena (benches/oracle), not here.
 //!
-//! **Known deviations of the executor** that the reference reproduces, so that the
-//! differential tests check everything else, each named in [`Deviations`] and meant to be
-//! turned off as the executor is fixed (completion plan 4.3, 4.6).
+//! The executor's earlier deviations, which the reference reproduced for a while (zero-length
+//! paths from a constant the graph lacks, path alternatives without duplicates), are fixed:
+//! the reference follows the specification throughout.
 //!
 //! Slow on purpose: for test datasets of a few hundred statements.
 
@@ -43,22 +43,6 @@ use nrese_sparql_syntax::term::{
 };
 use nrese_sparql_syntax::{GraphUpdateOperation, Query, Update};
 
-/// The executor's known deviations from the specification that the reference follows too.
-#[derive(Debug, Clone, Copy)]
-pub struct Deviations {
-    /// A path alternative `(p|q)` gives each pair once (the specification: a UNION, with
-    /// duplicates).
-    pub alternative_paths_distinct: bool,
-}
-
-impl Default for Deviations {
-    fn default() -> Self {
-        Self {
-            alternative_paths_distinct: true,
-        }
-    }
-}
-
 /// A dataset: quads, the default graph's with [`GraphName::DefaultGraph`].
 #[derive(Debug, Clone, Default)]
 pub struct Dataset {
@@ -66,7 +50,6 @@ pub struct Dataset {
     /// Named graphs the store has beyond those of `quads`: a read model filters
     /// statements, not graphs, so a graph with no statement of the model still exists.
     graphs: HashSet<NamedOrBlankNode>,
-    pub deviations: Deviations,
 }
 
 type Solution = HashMap<Variable, Term>;
@@ -81,7 +64,6 @@ impl Dataset {
         Self {
             quads: quads.into_iter().collect(),
             graphs: HashSet::new(),
-            deviations: Deviations::default(),
         }
     }
 
@@ -1083,13 +1065,10 @@ impl<'d> Context<'d> {
                 out
             }
             PropertyPathExpression::Alternative(a, b) => {
+                // A UNION: a pair both sides give comes twice.
                 let mut out = self.pairs(a, graph, start, end);
                 out.extend(self.pairs(b, graph, start, end));
-                if self.dataset.deviations.alternative_paths_distinct {
-                    distinct(out)
-                } else {
-                    out
-                }
+                out
             }
             PropertyPathExpression::NegatedPropertySet(excluded) => graph
                 .triples
