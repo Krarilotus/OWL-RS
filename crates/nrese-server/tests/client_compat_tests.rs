@@ -126,11 +126,15 @@ async fn one_endpoint_serves_queries_and_updates_as_rdf4j_sends_them() -> TestRe
             construct,
         )
         .await?;
-        assert_eq!(content_type(&response), "application/n-triples");
+        // RDF4J asks for its Binary RDF first, and gets it.
+        assert_eq!(content_type(&response), "application/x-binary-rdf");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let quads =
+            nrese_store::parse_payload(nrese_store::GraphResultFormat::BinaryRdf, None, &bytes)?;
         assert!(
-            body_text(response)
-                .await?
-                .contains("<http://example.com/s>")
+            quads
+                .iter()
+                .any(|quad| quad.subject.to_string() == "<http://example.com/s>")
         );
 
         // The media types of the protocol's direct POSTs work on the same URL.

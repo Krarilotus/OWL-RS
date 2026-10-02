@@ -259,9 +259,10 @@ mod tests {
         let rdf4j_graph = "application/x-binary-rdf, application/n-triples;q=0.8, \
              text/turtle;q=0.8, application/rdf+xml;q=0.5, application/trig;q=0.8, \
              application/n-quads;q=0.8, application/ld+json;q=0.5";
+        // RDF4J asks for its Binary RDF first.
         assert_eq!(
             negotiate(Some(rdf4j_graph), GRAPHS),
-            Some(GraphResultFormat::NTriples)
+            Some(GraphResultFormat::BinaryRdf)
         );
         let rdf4j_boolean = "text/boolean, application/sparql-results+json;q=0.8, \
              application/sparql-results+xml;q=0.8";

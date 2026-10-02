@@ -170,8 +170,10 @@ impl<R: Read> BinaryParser<R> {
                     return Err(self.error("a UTF-16 string of an odd number of bytes"));
                 }
                 let units: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_be_bytes(*pair))
                     .collect();
                 String::from_utf16(&units).map_err(|_| self.error("a string that isn't UTF-16"))
             }
@@ -275,11 +277,11 @@ impl<R: Read> BinaryParser<R> {
         if self.done {
             return Ok(false);
         }
-        if self.version.is_none() {
-            if let Err(error) = self.header() {
-                self.done = true;
-                return Err(error);
-            }
+        if self.version.is_none()
+            && let Err(error) = self.header()
+        {
+            self.done = true;
+            return Err(error);
         }
         let result = self.record();
         if !matches!(result, Ok(true)) {
