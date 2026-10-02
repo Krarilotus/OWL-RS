@@ -1293,6 +1293,20 @@ impl<'a> Context<'a> {
         variable: &Variable,
         expression: &Expression,
     ) -> NativeResult<Solutions> {
+        // BIND(?x AS ?y) copies the column: the same terms, nothing to evaluate (the
+        // aggregates of a SELECT come out this way).
+        if let Expression::Variable(source) = expression {
+            let values = match solutions.column(source) {
+                Some(column) => solutions.table.column(column).to_vec(),
+                None => vec![UNDEF; solutions.table.len()],
+            };
+            let mut solutions = solutions;
+            let mut columns = std::mem::take(&mut solutions.table).into_columns();
+            columns.push(values);
+            solutions.vars.push(variable.clone());
+            solutions.table = IdTable::from_columns(columns);
+            return self.produced(solutions);
+        }
         let (solutions, plain, added) = if contains_any_exists(expression) {
             self.with_exists(solutions, expression)?
         } else {
@@ -3542,7 +3556,13 @@ impl<'a> Context<'a> {
                         .map(|(value, _)| value.raw())
                         .collect::<Vec<_>>(),
                 ];
-                let counts: Vec<u64> = groups.iter().map(|&(_, n)| self.id(&integer(n))).collect();
+                let counts: Vec<u64> = groups
+                    .iter()
+                    .map(|&(_, n)| match TermId::inline_integer(n as i64) {
+                        Some(id) => id.raw(),
+                        None => self.id(&integer(n)),
+                    })
+                    .collect();
                 let mut vars = vec![key.clone()];
                 for (target, _) in aggregates {
                     columns.push(counts.clone());
