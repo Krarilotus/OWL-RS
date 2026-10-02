@@ -70,6 +70,19 @@ pub(crate) fn parse_graph(
         .collect()
 }
 
+/// Parses a request payload into quads, in the graphs it names (the default graph for
+/// triples), with fresh blank nodes.
+pub(crate) fn parse_payload(
+    format: GraphResultFormat,
+    base_iri: Option<&str>,
+    payload: &[u8],
+) -> StoreResult<Vec<Quad>> {
+    parser(format.rdf_format(), base_iri, BlankNodes::Fresh)?
+        .for_slice(payload)
+        .map(|quad| quad.map_err(StoreError::from))
+        .collect()
+}
+
 /// Parses a dataset payload (N-Quads) into quads.
 pub(crate) fn parse_dataset(format: RdfFormat, payload: &[u8]) -> StoreResult<Vec<Quad>> {
     parser(format, None, BlankNodes::Fresh)?

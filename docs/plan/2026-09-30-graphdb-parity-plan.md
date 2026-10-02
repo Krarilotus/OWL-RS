@@ -37,7 +37,7 @@ Legend: ✅ done · 🟡 partial · ❌ missing · ➖ deliberately different.
 | 4.1 | SPARQL 1.1 Query, Update | ✅ | W3C suite 485/495; native executor covers almost all queries |
 | 4.1 | Federated `SERVICE` | ✅ | Allowlist, timeouts and row limits (`store.federation`) |
 | 4.1 | Graph Store Protocol | 🟡 | Works; status codes for missing graphs differ from the spec (review) |
-| 4.2 | RDF4J protocol, repositories, transactions | ❌ | X1; server state is single-repository today |
+| 4.2 | RDF4J protocol, repositories, transactions | 🟡 | X1: the RDF4J REST protocol with transactions over the one dataset (2 October 2026); several repositories, reads inside a transaction and persisted namespaces missing |
 | 4.2 | Formats | 🟡 | N-Triples, N-Quads, Turtle, TriG, RDF/XML; JSON-LD and Binary RDF missing |
 | 5.1 | Full-text search, `luc:` predicates | 🟡 | Full-text search with Blazegraph's `bds:` vocabulary (BM25, phrases, Snowball stemming), Jena's `text:query` and GraphDB's legacy `luc:` predicates on one index (2 October 2026); GraphDB's connectors (configured indexes) missing |
 | 5.2 | GeoSPARQL, R-tree | ✅ | GeoSPARQL functions and relations with an R-tree (benchmarked with the GeoSPARQL compliance kit) |

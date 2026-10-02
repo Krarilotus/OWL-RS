@@ -6,6 +6,7 @@ use crate::backup::{DatasetRestoreReport, DatasetRestoreRequest, apply_restore};
 use crate::error::StoreError;
 use crate::graph_store::{GraphDeleteReport, GraphTarget, GraphWriteReport, GraphWriteRequest};
 use crate::graph_store_executor::{apply_graph_delete, apply_graph_write};
+use crate::statements::{StatementsRequest, apply_statements};
 use crate::tell::TellRequest;
 use crate::update::SparqlUpdateRequest;
 
@@ -18,6 +19,8 @@ pub enum MutationCommand {
     GraphWrite(GraphWriteRequest),
     GraphDelete(GraphTarget),
     Restore(DatasetRestoreRequest),
+    /// RDF4J's statement operations, in order ([`crate::statements`]).
+    Statements(StatementsRequest),
 }
 
 /// The entry point a mutation came from; transport layers use it to map errors.
@@ -28,6 +31,7 @@ pub enum MutationKind {
     GraphWrite,
     GraphDelete,
     Restore,
+    Statements,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +53,7 @@ impl MutationCommand {
             Self::GraphWrite(_) => MutationKind::GraphWrite,
             Self::GraphDelete(_) => MutationKind::GraphDelete,
             Self::Restore(_) => MutationKind::Restore,
+            Self::Statements(_) => MutationKind::Statements,
         }
     }
 
@@ -62,19 +67,27 @@ impl MutationCommand {
         union_default_graph: bool,
         services: Option<nrese_sparql::Services>,
     ) -> Result<MutationCommitReport, StoreError> {
+        let mut update = |tx: &mut Transaction<'_>, request: &SparqlUpdateRequest| {
+            let update = SparqlParser::new().parse_update(&request.update)?;
+            let options = UpdateOptions {
+                using: crate::query_executor::protocol_dataset(
+                    &request.using_graphs,
+                    &request.using_named_graphs,
+                )?,
+                cancellation: Some(cancellation.clone()),
+                union_default_graph,
+                services: services.clone(),
+            };
+            apply_update(tx, &update, &options)?;
+            Ok::<(), StoreError>(())
+        };
         match self {
             Self::Update(request) => {
-                let update = SparqlParser::new().parse_update(&request.update)?;
-                let options = UpdateOptions {
-                    using: crate::query_executor::protocol_dataset(
-                        &request.using_graphs,
-                        &request.using_named_graphs,
-                    )?,
-                    cancellation: Some(cancellation.clone()),
-                    union_default_graph,
-                    services,
-                };
-                apply_update(tx, &update, &options)?;
+                update(tx, request)?;
+                Ok(MutationCommitReport::Applied { revision: 0 })
+            }
+            Self::Statements(request) => {
+                apply_statements(tx, request, &mut update)?;
                 Ok(MutationCommitReport::Applied { revision: 0 })
             }
             Self::Tell(request) => {
