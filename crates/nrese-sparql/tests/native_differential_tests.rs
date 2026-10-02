@@ -497,6 +497,32 @@ fn sample_column(text: &str, variables: &[String]) -> Option<usize> {
     variables.iter().position(|v| v == alias)
 }
 
+/// Rows with the parts of every simple literal that holds `separator` sorted (as
+/// `GROUP_CONCAT` gives them in an open order), the rows sorted.
+fn concatenations_sorted(rows: &[String], separator: char) -> Vec<String> {
+    let mut out: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            row.split('\t')
+                .map(
+                    |cell| match cell.strip_prefix('"').and_then(|t| t.split_once('"')) {
+                        Some((value, rest)) if value.contains(separator) => {
+                            let mut parts: Vec<&str> = value.split(separator).collect();
+                            parts.sort_unstable();
+                            let joined = parts.join(&separator.to_string());
+                            format!("\"{joined}\"{rest}")
+                        }
+                        _ => cell.to_owned(),
+                    },
+                )
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// Rows of tab-separated cells without cell `column`, sorted.
 fn without_column(rows: &[String], column: usize) -> Vec<String> {
     let mut out: Vec<String> = rows
@@ -1743,9 +1769,10 @@ fn set_query(rng: &mut Rng) -> (String, bool) {
 
 /// Set evaluation (`native/sets.rs`): queries whose consumers ignore duplicates give the
 /// results of the same queries evaluated as written, and the reference evaluator's. Order-dependent
-/// results (`GROUP_CONCAT`, `SAMPLE`) are compared with the as-written evaluation only,
-/// where they must be identical: the set evaluation keeps first occurrences in order.
-/// Mutation-checked.
+/// results (`GROUP_CONCAT`, `SAMPLE`) are compared with the as-written evaluation only:
+/// `SAMPLE`'s column left out, `GROUP_CONCAT`'s parts sorted (the planner may join in
+/// another order than as written, and SPARQL leaves the order of concatenation open; seed
+/// 2051 of the fuzz campaign). Mutation-checked.
 #[test]
 fn duplicate_insensitive_queries_equal_both_evaluations() {
     let mut rng = Rng::seeded(20_261_003);
@@ -1790,6 +1817,13 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
                     ),
                     None => (native.clone(), plain.clone()),
                 };
+            let (native_rows, plain_rows) = match text.contains("GROUP_CONCAT") {
+                true => (
+                    concatenations_sorted(&native_rows, '|'),
+                    concatenations_sorted(&plain_rows, '|'),
+                ),
+                false => (native_rows, plain_rows),
+            };
             assert_same_rows(
                 &native_rows,
                 &plain_rows,
