@@ -11,6 +11,7 @@
 //! delete_count u32 | (s p o g: 4 x u64)*
 //! inferred_insert_count u32 | (s p o: 3 x u64)*       inferred stack (default graph)
 //! inferred_delete_count u32 | (s p o: 3 x u64)*
+//! [committed u64]                                     microseconds since 1970 (segments v6)
 //! ```
 
 use crate::error::{EngineError, EngineResult};
@@ -33,6 +34,8 @@ pub(crate) struct CommitRecord {
     pub deletes: Vec<EncodedQuad>,
     pub inferred_inserts: Vec<EncodedTriple>,
     pub inferred_deletes: Vec<EncodedTriple>,
+    /// When it was committed, microseconds since 1970; written to segments of version 6.
+    pub committed_micros: Option<u64>,
 }
 
 /// Exact payload size of `record` in bytes.
@@ -41,7 +44,17 @@ fn payload_len(record: &CommitRecord) -> u64 {
     let quads = (record.inserts.len() + record.deletes.len()) as u64 * QUAD_BYTES as u64;
     let triples = (record.inferred_inserts.len() + record.inferred_deletes.len()) as u64
         * TRIPLE_BYTES as u64;
-    8 + 8 + 4 + keys + 4 * 4 + quads + triples
+    8 + 8
+        + 4
+        + keys
+        + 4 * 4
+        + quads
+        + triples
+        + if record.committed_micros.is_some() {
+            8
+        } else {
+            0
+        }
 }
 
 /// Appends one framed record to `out`. Fails without writing anything if the payload does
@@ -66,6 +79,9 @@ pub(crate) fn encode_record(record: &CommitRecord, out: &mut Vec<u8>) -> EngineR
     put_quads(out, &record.deletes);
     put_triples(out, &record.inferred_inserts);
     put_triples(out, &record.inferred_deletes);
+    if let Some(micros) = record.committed_micros {
+        put_u64(out, micros);
+    }
     debug_assert_eq!((out.len() - payload_start) as u64, len);
     let crc = crc32fast::hash(&out[payload_start..]);
     out[frame_start..frame_start + 4].copy_from_slice(&payload_len.to_le_bytes());
@@ -120,6 +136,10 @@ fn decode_payload(payload: &[u8]) -> Option<CommitRecord> {
     let deletes = reader.quads()?;
     let inferred_inserts = reader.triples()?;
     let inferred_deletes = reader.triples()?;
+    let committed_micros = match reader.remaining() {
+        0 => None,
+        _ => Some(reader.u64()?),
+    };
     reader.is_done().then_some(CommitRecord {
         revision,
         dictionary_start,
@@ -128,6 +148,7 @@ fn decode_payload(payload: &[u8]) -> Option<CommitRecord> {
         deletes,
         inferred_inserts,
         inferred_deletes,
+        committed_micros,
     })
 }
 
@@ -251,6 +272,7 @@ mod tests {
             deletes: vec![EncodedQuad::new(id(0), id(1), id(2), id(9))],
             inferred_inserts: vec![EncodedTriple::new(id(5), id(6), id(7))],
             inferred_deletes: vec![EncodedTriple::new(id(8), id(6), id(7))],
+            committed_micros: Some(1_759_400_000_123_456),
         }
     }
 

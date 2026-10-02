@@ -26,7 +26,9 @@ use crate::error::{EngineError, EngineResult};
 /// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
 /// inlines the integer-derived datatypes. A store created before keeps them in its
 /// dictionary and keeps writing version 4 segments, which are otherwise the same.
-const SEGMENT_MAGIC: &[u8; 8] = b"NRESEWL5";
+/// Version 6 adds the commit time to every record.
+const SEGMENT_MAGIC: &[u8; 8] = b"NRESEWL6";
+const SEGMENT_MAGIC_V5: &[u8; 8] = b"NRESEWL5";
 const SEGMENT_MAGIC_V4: &[u8; 8] = b"NRESEWL4";
 /// Magic prefix shared by every WAL format version.
 const SEGMENT_FAMILY: &[u8; 7] = b"NRESEWL";
@@ -87,8 +89,9 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
             integers_in_dictionary: false,
         });
     }
-    let integers_in_dictionary = &bytes[..SEGMENT_MAGIC.len()] == SEGMENT_MAGIC_V4;
-    if &bytes[..SEGMENT_MAGIC.len()] != SEGMENT_MAGIC && !integers_in_dictionary {
+    let magic = &bytes[..SEGMENT_MAGIC.len()];
+    let integers_in_dictionary = magic == SEGMENT_MAGIC_V4;
+    if magic != SEGMENT_MAGIC && magic != SEGMENT_MAGIC_V5 && !integers_in_dictionary {
         if bytes.starts_with(SEGMENT_FAMILY) {
             return Err(EngineError::UnsupportedFormat(path.to_path_buf()));
         }
@@ -178,7 +181,15 @@ impl Wal {
         if let Some(archive) = &archive {
             fs::create_dir_all(archive)?;
         }
-        let (first_revision, active, active_bytes) = match list_segments(dir)?.pop() {
+        // The newest segment is appended to if it is of the format written now; otherwise
+        // (a store from before version 6) a new segment starts.
+        let newest = list_segments(dir)?.pop().filter(|(_, path)| {
+            let mut head = [0u8; 8];
+            File::open(path)
+                .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut head))
+                .is_ok_and(|()| &head == magic)
+        });
+        let (first_revision, active, active_bytes) = match newest {
             Some((first_revision, path)) => {
                 let mut file = OpenOptions::new().append(true).open(&path)?;
                 let len = file.seek(SeekFrom::End(0))?;
@@ -218,6 +229,18 @@ impl Wal {
             self.rotate(record.revision)?;
         }
         self.buffer.clear();
+        // Version 4 segments (stores that keep integers in their dictionary) have no times.
+        let timed;
+        let record = match self.magic == SEGMENT_MAGIC {
+            true => record,
+            false => {
+                timed = CommitRecord {
+                    committed_micros: None,
+                    ..record.clone()
+                };
+                &timed
+            }
+        };
         encode_record(record, &mut self.buffer)?; // nothing written yet on error
         let result = self
             .active

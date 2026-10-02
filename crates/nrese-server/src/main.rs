@@ -64,6 +64,7 @@ async fn run() -> Result<()> {
             &config.store.data_dir,
             &restore.wal,
             restore.until_revision,
+            restore.until_time,
         )
         .with_context(|| format!("restoring {}", restore.backup.display()))?;
         tracing::info!(
