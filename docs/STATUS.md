@@ -6,7 +6,7 @@ in the branch), **deferred** (not done, with the reason and where it went), or *
 
 - What the product can do, capability by capability: the
   [capability matrix](spec/06-target-capability-matrix.md).
-- Why and in which order: [the roadmap to the papers](plan/2026-10-02-roadmap-to-papers.md) (the order from 2 October on), and the plans it builds on ([audit work](plan/2026-10-02-audit-work.md),
+- Why and in which order: [the roadmap](plan/2026-10-02-roadmap.md) (the order from 2 October on), and the plans it builds on ([audit work](plan/2026-10-02-audit-work.md),
   [engine gaps](plan/2026-10-02-engine-gaps.md), [research designs](plan/2026-10-02-research-designs.md),
   [query plan](plan/2026-10-02-plan-ir.md)). They hold design and order, no status. Older plans
   (30 September, 1 October) are records of their date; their status columns are not kept
@@ -63,9 +63,9 @@ Last updated: 2 October 2026, branch `refactor/engine-v2`.
 
 | Item | State | Notes |
 |---|---|---|
-| Inferences and graph access | open, needs a decision | Two designs on record: support graph sets (research designs §4/§6) and reasoning scopes (the audit plan); both change the engine's inferred stack |
+| Inferences and graph access | open, decided | Support graph sets (research designs §4/§6), decided on 2 October; in phase 1 of [the roadmap](plan/2026-10-02-roadmap.md), reasoner provenance first. The audit plan's reasoning scopes are not pursued |
 | `v2` flattened, `nrese-core` folded in | open | |
-| OWL 2 DL | open | [ADR-0009](adr/0009-owl2-dl-reasoning.md) accepted on 2 October and revised after seven research reports; the order is [the roadmap to the papers](plan/2026-10-02-roadmap-to-papers.md), phases 2–4 |
+| OWL 2 DL | open | [ADR-0009](adr/0009-owl2-dl-reasoning.md) accepted on 2 October and revised after seven research reports; the order is [the roadmap](plan/2026-10-02-roadmap.md), phases 2–4; `owl2-dl` always reports completeness, certain answers by default only where a complete path exists (decided 2 October) |
 
 ### E. Benchmarks
 
