@@ -169,8 +169,9 @@ restriction before evaluation, writes refused as a whole whatever the data holds
 cache keyed by the access, SPARQL, Graph Store and RDF4J paths, and the policy granting
 reads and graph-scoped writes to its roles. Inferred statements are all-or-nothing per
 policy (`inferred = "hidden" | "visible"`) until the reasoner records support graph sets
-(§6). Open: policies as transactional metadata importable as RDF, `SERVICE` as a separate
-privilege.
+(§6). Since then (ADR-0008, 2 October): policies as transactional metadata in the system
+store, kept as RDF with their history; `SERVICE` a privilege of its own (a role's
+`service = true`).
 
 ## 5. Query execution and optimisation
 

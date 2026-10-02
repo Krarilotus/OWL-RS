@@ -200,7 +200,7 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 | `GET /api/v1/access/me` | The requester: `user`, `roles`, `admin`, `enforced`, `reads_everything`, `personal_space`, `workspaces` (each with `prefix`, `level`, `members`) | anyone who may read |
 | `GET /api/v1/access` | The whole state: `settings`, `roles`, `users` (`local_login`, never a hash), `workspaces` | administrators |
 | `PUT /api/v1/access/settings` | `enforced`, `fallback` (`deny`, `allow`), `inferred` (`hidden`, `visible`), `users_create_workspaces`, `min_password_length` (10), `session_hours` (12) | administrators |
-| `PUT`/`DELETE /api/v1/access/roles/{name}` | A role's rule: `read`, `write`, `deny` (IRIs or prefixes ending in `*`), `default_graph` (`none`, `read`, `write`, `deny`) | administrators |
+| `PUT`/`DELETE /api/v1/access/roles/{name}` | A role's rule: `read`, `write`, `deny` (IRIs or prefixes ending in `*`), `default_graph` (`none`, `read`, `write`, `deny`), `service` (whether its users may call other endpoints with `SERVICE`) | administrators |
 | `PUT`/`DELETE /api/v1/access/users/{name}` | A user record: `admin`, `roles` (added to its credentials'), `password` for a local login (empty removes it; at least `min_password_length` characters); removal takes its memberships along | administrators; a user its own `password` |
 | `POST /api/v1/access/login` | `{"user", "password"}` of a local login: `{"user", "token", "expires_in_seconds"}`; send `Authorization: Bearer {token}` afterwards. 401 for wrong credentials, 429 after too many failures | anyone |
 | `POST /api/v1/access/logout` | Ends the session of the bearer token sent | the session |

@@ -342,8 +342,10 @@ read = ["https://kg.example/graphs/public/*", "https://kg.example/graphs/sales"]
 write = ["https://kg.example/graphs/analyst/*"]
 deny = ["https://kg.example/graphs/public/hr/*"]
 default_graph = "read"  # the store's default graph: "none" (default), "read", "write" or "deny"
+service = true          # may call other endpoints with SERVICE (default false)
 ```
 
+- `SERVICE` is a privilege of its own (it makes the server fetch URLs): with access enforced, a user calls the endpoints `federation.allow` lists only if one of its roles says `service = true` (administrators always). Without the privilege a `SERVICE` is an error, `SERVICE SILENT` one solution without bindings.
 - graphs by IRI, or by IRI prefix (an entry ending in `*`): ontologies and data sets usually differ by prefix, so one entry covers a family of graphs.
 - role names: a token's `scope`, `scp`, `role` and `roles` claims (`bearer-jwt`, `oidc-introspection`); `reader` for the static read token; the subject and `reader` for a listed client certificate; `anonymous` without authentication.
 - user names: a token's `sub` (an introspection's `username` without one), a client certificate's subject, where they are letters, digits and `. _ @ + | : -`; a named user always has its personal space, and a user record can add roles or the administrator's right.
