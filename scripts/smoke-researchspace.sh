@@ -100,11 +100,7 @@ has false "the deleted resource is still there"
 
 say "a keyword search as the stock templates ask it (bds:search)"
 query "PREFIX bds: <http://www.bigdata.com/rdf/search#> SELECT ?s WHERE { ?s <$RDFS_LABEL> ?l . ?l bds:search \"Anna*\" }"
-if grep -q "$TEST_GRAPH/a" "$WORK/body"; then
-  printf '    keyword search finds the label\n'
-else
-  printf '    NOT YET: the search runs without an error but finds nothing (full-text search is plan step U5)\n'
-fi
+has "$TEST_GRAPH/a" "the keyword search doesn't find the label"
 
 say "remove what was created"
 update "DROP GRAPH <$TEST_GRAPH>"

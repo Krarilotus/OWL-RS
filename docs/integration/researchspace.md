@@ -45,8 +45,8 @@ An existing ResearchSpace installation is moved the same way: point `sparqlEndpo
 
 | What | Why | Until then |
 |---|---|---|
-| Keyword search in the stock templates | They use Blazegraph's `bds:search`, which NRESE doesn't implement yet. The query runs without an error and finds nothing | Templates can search with `FILTER(CONTAINS(LCASE(?label), "…"))` or `REGEX`, which is slow on large data. Full-text search with a `bds:search` shim is the next step ([plan](../plan/2026-09-30-graphdb-parity-plan.md), U5) |
-| The RDF4J repository type (`openrdf:HTTPRepository`) | NRESE has no RDF4J protocol yet | Use the SPARQL repository, as above (plan: U6) |
+| Keyword search in the stock templates | Implemented since: Blazegraph's `bds:search` with relevance, rank, prefixes and phrases ([capability matrix](../spec/06-target-capability-matrix.md)); not yet re-run with ResearchSpace's templates | the end-to-end run of the G2 plan |
+| The RDF4J repository type (`openrdf:HTTPRepository`) | Implemented since: the RDF4J REST protocol with repositories, statements, namespaces, contexts and transactions ([HTTP interface](../ops/http-api.md#rdf4j-protocol)); not yet re-run with ResearchSpace | the end-to-end run of the G2 plan |
 | Blazegraph query hints (`hint:`) and other `bd:` extensions | Not implemented | They are triple patterns NRESE doesn't know: a query that uses one finds nothing. Remove them from adapted templates |
 | Federation (`SERVICE`) to outside endpoints | Not enabled | ResearchSpace's own Ephedra federation runs inside ResearchSpace and is unaffected |
 
