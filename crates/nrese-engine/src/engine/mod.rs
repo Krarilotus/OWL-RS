@@ -602,7 +602,15 @@ impl Engine {
     /// [`commit`](Transaction::commit) aborts it.
     pub fn transaction(&self) -> Transaction<'_> {
         let slot = self.inner.writer.lock();
-        Transaction::new(&self.inner, slot)
+        Transaction::new(&self.inner, Some(slot))
+    }
+
+    /// A transaction over the latest snapshot that never commits and doesn't take the
+    /// writer slot: for reading what pending changes would make (a client transaction's
+    /// reads) while other writers go on. Its changes stay in it; terms it interns are kept
+    /// (as an aborted transaction's are). [`Transaction::commit`] fails on it.
+    pub fn speculative(&self) -> Transaction<'_> {
+        Transaction::new(&self.inner, None)
     }
 
     /// Starts a bulk load, waiting for the writer slot. See [`BulkLoad`].

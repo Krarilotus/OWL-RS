@@ -380,7 +380,8 @@ impl StoreService {
         cancellation: &CancellationToken,
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
-        let mut tx = self.engine.transaction();
+        // Never committed: no writer slot, so other clients commit meanwhile.
+        let mut tx = self.engine.speculative();
         let (union_default_graph, services) = (self.config.union_default_graph, self.services());
         crate::statements::apply_statements(&mut tx, pending, &mut |tx, request| {
             crate::mutation::command::apply_sparql_update(

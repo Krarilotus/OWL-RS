@@ -83,14 +83,16 @@ impl Delta {
 /// [`ReadModel::Materialised`]. Dropping the transaction aborts it.
 pub struct Transaction<'e> {
     engine: &'e Inner,
-    _slot: MutexGuard<'e, ()>,
+    /// The writer slot; `None` for a speculative transaction ([`crate::Engine::speculative`]),
+    /// which never commits.
+    _slot: Option<MutexGuard<'e, ()>>,
     base: Snapshot,
     asserted: Delta,
     inferred: Delta,
 }
 
 impl<'e> Transaction<'e> {
-    pub(super) fn new(engine: &'e Inner, slot: MutexGuard<'e, ()>) -> Self {
+    pub(super) fn new(engine: &'e Inner, slot: Option<MutexGuard<'e, ()>>) -> Self {
         Self {
             base: engine.shared.snapshot(),
             engine,
@@ -431,6 +433,9 @@ impl<'e> Transaction<'e> {
     ///
     /// On error nothing is published and the transaction is discarded.
     pub fn commit(mut self) -> EngineResult<CommitSummary> {
+        if self._slot.is_none() {
+            return Err(crate::EngineError::Speculative);
+        }
         self.take_over_inferred();
         let changes_equality = self.changes_equality();
         let Self {

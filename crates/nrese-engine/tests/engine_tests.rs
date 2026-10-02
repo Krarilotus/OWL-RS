@@ -473,3 +473,39 @@ fn a_pending_snapshot_is_what_the_commit_publishes() {
         assert_eq!(counts, committed_counts);
     }
 }
+
+/// A speculative transaction reads its own pending changes without the writer slot: a
+/// writer commits while it is open (with the slot held this would wait for ever), it
+/// never sees that commit's data in its own base, and it can't commit (the audit of
+/// 2 October: client-transaction reads stalled every writer).
+#[test]
+fn speculative_transactions_leave_the_writer_slot_free() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut speculative = engine.speculative();
+    speculative.insert(quad(1, 2, 3).as_ref());
+    let pending = speculative.pending_snapshot();
+    let mut writer = engine.transaction();
+    writer.insert(quad(4, 5, 6).as_ref());
+    writer
+        .commit()
+        .expect("a writer commits while a speculative transaction is open");
+    let latest = all_quads(&engine);
+    assert!(latest.contains(&quad(4, 5, 6)));
+    assert!(
+        !latest.contains(&quad(1, 2, 3)),
+        "speculative changes stay in it"
+    );
+    let seen: HashSet<Quad> = pending
+        .quads_for_pattern(&QuadPattern::all())
+        .map(|q| pending.decode_quad(q).unwrap())
+        .collect();
+    assert!(seen.contains(&quad(1, 2, 3)));
+    assert!(
+        !seen.contains(&quad(4, 5, 6)),
+        "its base is the snapshot it started from"
+    );
+    assert!(matches!(
+        speculative.commit(),
+        Err(nrese_engine::EngineError::Speculative)
+    ));
+}
