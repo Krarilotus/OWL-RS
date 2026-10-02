@@ -308,3 +308,147 @@ pub async fn explain(
         .collect();
     Ok(Json(serde_json::json!({ "steps": steps })).into_response())
 }
+
+#[derive(Serialize)]
+struct ReasoningRun {
+    ruleset: String,
+    revision: u64,
+    asserted: u64,
+    inferred: u64,
+    violations: usize,
+    elapsed_ms: u128,
+}
+
+impl From<&nrese_store::MaterialisationReport> for ReasoningRun {
+    fn from(report: &nrese_store::MaterialisationReport) -> Self {
+        Self {
+            ruleset: report.ruleset.clone(),
+            revision: report.revision,
+            asserted: report.asserted,
+            inferred: report.inferred,
+            violations: report.violations,
+            elapsed_ms: report.elapsed.as_millis(),
+        }
+    }
+}
+
+/// Recomputes the repository's inferences from its asserted statements under its
+/// ruleset (after a change of ontology files or rules outside the store, or to leave
+/// quarantine after a repair). 404 without reasoning.
+pub async fn rematerialise(
+    Repository(state): Repository,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    let report = rematerialised(&state)
+        .await?
+        .ok_or_else(|| ApiError::not_found("reasoning is off: nothing to materialise"))?;
+    Ok(Json(ReasoningRun::from(&report)).into_response())
+}
+
+/// The repository's inferences recomputed, if it reasons.
+async fn rematerialised(
+    state: &AppState,
+) -> Result<Option<nrese_store::MaterialisationReport>, ApiError> {
+    let Some(program) = state.pipeline().reasoner().config().materialised_program() else {
+        return Ok(None);
+    };
+    let store = state.store();
+    tokio::task::spawn_blocking(move || store.rematerialise(program))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map(Some)
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+#[derive(Serialize)]
+struct ImportReport {
+    revision: u64,
+    /// Statements parsed, duplicates included.
+    parsed: u64,
+    inserted: u64,
+    deleted: u64,
+    /// Statements skipped for syntax errors (`skip_errors=true`).
+    skipped: u64,
+    elapsed_ms: u128,
+    /// The inferences recomputed after the load, where the repository reasons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningRun>,
+}
+
+/// Bulk-loads the RDF document in the body (its format from `Content-Type`): into the
+/// graph `graph` for triple formats (the default graph without), replacing the
+/// repository's statements with `replace=true`, skipping statements with syntax errors
+/// with `skip_errors=true`. Then the inferences are recomputed. For large loads: the
+/// loader's parallel path, not one commit's; administrators only, since a bulk load
+/// replaces whole indexes and passes no commit gate.
+pub async fn import(
+    Repository(state): Repository,
+    raw: axum::extract::RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    state.ensure_serving()?;
+    state.policy().enforce_rdf_upload_bytes(body.len())?;
+    let pairs = super::rdf4j::pairs(&raw)?;
+    let flag = |name: &str| {
+        pairs
+            .iter()
+            .any(|(key, value)| key == name && value.eq_ignore_ascii_case("true"))
+    };
+    let graph = match pairs.iter().find(|(key, _)| key == "graph") {
+        Some((_, iri)) => {
+            nrese_rdf::NamedNode::new(iri.as_str())
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            nrese_store::GraphTarget::NamedGraph(iri.clone())
+        }
+        None => nrese_store::GraphTarget::DefaultGraph,
+    };
+    let format = super::rdf_payload::parse_graph_content_format(super::media::header_value_str(
+        headers.get(axum::http::header::CONTENT_TYPE),
+    ))?;
+    let extension = match format {
+        nrese_store::GraphResultFormat::NTriples => "nt",
+        nrese_store::GraphResultFormat::Turtle => "ttl",
+        nrese_store::GraphResultFormat::RdfXml => "rdf",
+        nrese_store::GraphResultFormat::NQuads => "nq",
+        nrese_store::GraphResultFormat::TriG => "trig",
+        nrese_store::GraphResultFormat::JsonLd => "jsonld",
+        nrese_store::GraphResultFormat::BinaryRdf => "brf",
+    };
+    // The loader reads files: the body is one, for the load's duration.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let file = std::env::temp_dir().join(format!(
+        "nrese-import-{}-{}.{extension}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let request = nrese_store::BulkLoadRequest {
+        files: vec![file.clone()],
+        replace: flag("replace"),
+        graph,
+        skip_errors: flag("skip_errors"),
+    };
+    let store = state.store();
+    let loaded = tokio::task::spawn_blocking(move || {
+        std::fs::write(&file, &body)?;
+        let report = store.bulk_load(&request);
+        let _ = std::fs::remove_file(&file);
+        report.map_err(|error| std::io::Error::other(error.to_string()))
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let reasoning = rematerialised(&state).await?;
+    Ok(Json(ImportReport {
+        revision: reasoning.as_ref().map_or(loaded.revision, |r| r.revision),
+        parsed: loaded.parsed,
+        inserted: loaded.inserted,
+        deleted: loaded.deleted,
+        skipped: loaded.skipped,
+        elapsed_ms: loaded.elapsed.as_millis(),
+        reasoning: reasoning.as_ref().map(ReasoningRun::from),
+    })
+    .into_response())
+}

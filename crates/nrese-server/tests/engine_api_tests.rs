@@ -365,3 +365,118 @@ async fn explanations_through_the_engine_api() {
     let (status, _) = send(&app, Method::GET, &explain("X"), None, "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn imports_load_documents_and_reason_over_them() {
+    let app = support::test_app_with_settings(
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Rdfs),
+    )
+    .unwrap();
+    let base = "/api/v1/repositories/nrese";
+    let turtle = "@prefix ex: <http://example.com/> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        ex:a a ex:C . ex:b a ex:C . ex:C rdfs:subClassOf ex:D .";
+    let (status, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/import"),
+        Some("text/turtle"),
+        turtle,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(report["inserted"], 3);
+    assert!(
+        report["reasoning"]["inferred"].as_u64().unwrap() >= 2,
+        "{text}"
+    );
+    let ds = "SELECT (COUNT(*) AS ?n) WHERE { ?x a <http://example.com/D> }";
+    let (_, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/query"),
+        Some("application/sparql-query"),
+        ds,
+    )
+    .await;
+    assert_eq!(count_of(&text), 2, "the import was reasoned over");
+    // Into a named graph; then replacing everything; a broken document with skip_errors.
+    let (status, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/import?graph=http%3A%2F%2Fexample.com%2Fg"),
+        Some("application/n-triples"),
+        "<http://example.com/x> <http://example.com/p> \"1\" .\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let named = "SELECT (COUNT(*) AS ?n) WHERE { GRAPH <http://example.com/g> { ?s ?p ?o } }";
+    let (_, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/query"),
+        Some("application/sparql-query"),
+        named,
+    )
+    .await;
+    assert_eq!(count_of(&text), 1);
+    let (status, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/import?replace=true&skip_errors=true"),
+        Some("application/n-triples"),
+        "<http://example.com/y> <http://example.com/p> \"2\" .\nthis is not a statement\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(report["skipped"], 1, "{text}");
+    let all = "SELECT (COUNT(*) AS ?n) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } FILTER(?p != <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>) }";
+    let (_, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/query"),
+        Some("application/sparql-query"),
+        all,
+    )
+    .await;
+    assert!(count_of(&text) >= 1);
+    let (_, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/query"),
+        Some("application/sparql-query"),
+        ds,
+    )
+    .await;
+    assert_eq!(
+        count_of(&text),
+        0,
+        "replaced: the old statements and their inferences are gone"
+    );
+    // Without skipping, a broken document is refused.
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/import"),
+        Some("application/n-triples"),
+        "not rdf\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Rematerialising on demand.
+    let (status, text) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/reasoning/rematerialise"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()["ruleset"],
+        "rdfs"
+    );
+}
