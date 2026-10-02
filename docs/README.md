@@ -19,7 +19,7 @@ target ([ADR-0004](adr/0004-parity-targets-qlever-graphdb.md)).
 | Who owns what, in which layer is a fix made? | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Why was something decided so? | [adr/](adr/) |
 | What is done, deferred, open? | [STATUS.md](STATUS.md), the one place for status |
-| What is built in which order? | [The roadmap to the papers](plan/2026-10-02-roadmap-to-papers.md) (the current order), [ROADMAP.md](ROADMAP.md) and the plans in [plan/](plan/) (design and order, no status) |
+| What is built in which order? | [The roadmap](plan/2026-10-02-roadmap.md) (the current order), [ROADMAP.md](ROADMAP.md) and the plans in [plan/](plan/) (design and order, no status) |
 | Where do we stand against QLever and GraphDB? | [spec/06-target-capability-matrix.md](spec/06-target-capability-matrix.md) |
 | What reasoning computes (rules, omissions, graph scope, consistency) | [spec/reasoning-semantics.md](spec/reasoning-semantics.md) |
 | Behaviour of the v1 implementation (historical) | [spec/02](spec/02-storage-and-transactions.md), [03](spec/03-reasoner-and-owl-profile.md), [04](spec/04-api-and-protocols.md) |
