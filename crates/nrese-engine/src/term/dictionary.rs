@@ -25,6 +25,7 @@ use nrese_rdf::{
 use parking_lot::RwLock;
 
 use super::hash::key_hash;
+use super::offsets::{Ends, Offsets};
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
 use crate::mapped::Mapped;
@@ -68,7 +69,8 @@ pub struct DictionaryStats {
 pub(crate) struct Base {
     pub(crate) len: u64,
     pub(crate) arena: Mapped<u8>,
-    pub(crate) ends: Mapped<u64>,
+    /// Where each key ends ([`super::offsets`]).
+    pub(crate) offsets: Offsets,
     /// Open addressing with linear probing by [`key_hash`]: entry index + 1, or 0 for an
     /// empty slot; a power of two long, with at least one empty slot.
     pub(crate) slots: Mapped<u32>,
@@ -81,9 +83,8 @@ impl Base {
     /// Entry `index`'s key; empty where a damaged file's offsets point nowhere.
     pub(crate) fn key(&self, index: u64) -> &[u8] {
         let i = index as usize;
-        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
         self.arena
-            .get(start..self.ends[i] as usize)
+            .get(self.offsets.start(i)..self.offsets.end(i))
             .unwrap_or_default()
     }
 
@@ -106,13 +107,17 @@ impl Base {
 
     fn bytes(&self) -> u64 {
         let order = self.order.as_ref().map_or(0, |order| order.len() * 4);
-        (self.arena.len() + self.ends.len() * 8 + self.slots.len() * 4 + order) as u64
+        (self.arena.len() + self.offsets.bytes() + self.slots.len() * 4 + order) as u64
     }
 
     /// Checks every key and that the hash table finds each entry: reads all of the base.
     pub(crate) fn verify(&self) -> Result<(), String> {
-        if !self.ends.is_sorted() {
-            return Err("dictionary end offsets are out of order".into());
+        match &self.offsets {
+            Offsets::Ends(ends) if !ends.is_sorted() => {
+                return Err("dictionary end offsets are out of order".into());
+            }
+            Offsets::Ends(_) => {}
+            Offsets::Blocks(blocks) => blocks.verify(self.arena.len())?,
         }
         for index in 0..self.len {
             let key = self.key(index);
@@ -528,13 +533,13 @@ impl Dictionary {
         let inner = self.inner.read();
         let base_len = inner.base_len();
         let mut ids = match &inner.base {
-            Some(base) => super::strings::matching(&base.arena, &base.ends, 0, limit, test),
+            Some(base) => super::strings::matching(&base.arena, &base.offsets, 0, limit, test),
             None => Vec::new(),
         };
         if limit > base_len {
             ids.extend(super::strings::matching(
                 &inner.bytes,
-                &inner.ends,
+                &inner.ends[..],
                 base_len,
                 limit - base_len,
                 test,

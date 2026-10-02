@@ -12,6 +12,7 @@ pub(crate) mod dictionary;
 pub(crate) mod hash;
 mod inline;
 pub(crate) mod order;
+pub(crate) mod offsets;
 mod strings;
 #[cfg(test)]
 mod vocabulary_study;
