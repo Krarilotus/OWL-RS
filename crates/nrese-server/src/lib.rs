@@ -8,6 +8,7 @@ pub mod http;
 pub mod policy;
 mod rate_limit;
 mod reject_view;
+pub mod repositories;
 mod runtime_posture;
 pub mod state;
 

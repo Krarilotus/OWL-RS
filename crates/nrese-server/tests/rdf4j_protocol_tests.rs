@@ -13,7 +13,7 @@ use nrese_server::policy::PolicyConfig;
 use nrese_store::StoreConfig;
 use support::{body_text, test_app, test_app_with_store_config};
 
-const REPO: &str = "/repositories/repo";
+const REPO: &str = "/repositories/nrese";
 
 fn encode(pairs: &[(&str, &str)]) -> String {
     serde_urlencoded::to_string(pairs).unwrap()
@@ -434,4 +434,126 @@ async fn namespaces_survive_a_restart() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Several repositories: created and removed through the protocol, each its own dataset,
+/// kept on disk across a restart; an unknown repository is 404.
+#[tokio::test]
+async fn repositories_are_created_used_and_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = || {
+        test_app_with_store_config(
+            StoreConfig::on_disk(dir.path()),
+            PolicyConfig::default(),
+            ReasonerConfig::default(),
+        )
+        .unwrap()
+    };
+    let size_of = |app: Router, repository: &'static str| async move {
+        let (status, text) = send(
+            &app,
+            Method::GET,
+            &format!("/repositories/{repository}/size"),
+            None,
+            None,
+            "",
+        )
+        .await;
+        (status, text.trim().to_owned())
+    };
+    {
+        let app = app();
+        let (status, _) = send(
+            &app,
+            Method::GET,
+            "/repositories/second/size",
+            None,
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send(
+            &app,
+            Method::PUT,
+            "/repositories/second",
+            Some("text/turtle"),
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = send(
+            &app,
+            Method::PUT,
+            "/repositories/second",
+            Some("text/turtle"),
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send(&app, Method::PUT, "/repositories/a%2Fb", None, None, "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send(
+            &app,
+            Method::POST,
+            "/repositories/second/statements",
+            Some("text/turtle"),
+            None,
+            DATA,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            size_of(app.clone(), "second").await,
+            (StatusCode::OK, "3".to_owned())
+        );
+        assert_eq!(
+            size_of(app.clone(), "nrese").await,
+            (StatusCode::OK, "0".to_owned())
+        );
+        let (_, list) = send(
+            &app,
+            Method::GET,
+            "/repositories",
+            None,
+            Some("application/sparql-results+json"),
+            "",
+        )
+        .await;
+        assert!(
+            list.contains("\"second\"") && list.contains("\"nrese\""),
+            "{list}"
+        );
+        // Queries at the repository read its data.
+        let (status, results) = send(
+            &app,
+            Method::GET,
+            &format!(
+                "/repositories/second?{}",
+                encode(&[("query", "ASK { <http://example.com/b> ?p ?o }")])
+            ),
+            None,
+            Some("application/sparql-results+json"),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(results.contains("true"), "{results}");
+    }
+    // After a restart the repository and its data are back; then it goes.
+    let app = app();
+    assert_eq!(
+        size_of(app.clone(), "second").await,
+        (StatusCode::OK, "3".to_owned())
+    );
+    let (status, _) = send(&app, Method::DELETE, "/repositories/nrese", None, None, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send(&app, Method::DELETE, "/repositories/second", None, None, "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        size_of(app.clone(), "second").await.0,
+        StatusCode::NOT_FOUND
+    );
 }

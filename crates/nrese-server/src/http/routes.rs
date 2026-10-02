@@ -92,7 +92,10 @@ pub fn router(state: AppState) -> Router {
         .route("/repositories", get(rdf4j::repositories))
         .route(
             "/repositories/{id}",
-            get(rdf4j::query_get).post(rdf4j::query_post),
+            get(rdf4j::query_get)
+                .post(rdf4j::query_post)
+                .put(rdf4j::repository_put)
+                .delete(rdf4j::repository_delete),
         )
         .route(
             "/repositories/{id}/statements",
