@@ -26,6 +26,19 @@ kit = "benches/reasoning"
 check = "inferred set against owlrl or Nemo; the published answers for LUBM(1)"
 note = "The standard materialisation benchmark; GraphDB and RDFox publish numbers on it"
 
+[lubm-materialised]
+title = "LUBM with the closure precomputed: the 14 queries on every SPARQL engine"
+kind = "performance"
+tasks = ["RT5"]
+needs = ["load", "query"]
+scales = "1, 10, 100 universities (closure of 0.1 to 13.9 M statements)"
+source = "the lubm workload's data, closed under OWL 2 RL by NRESE (benches/reasoning/prepare-lubm-materialised.sh)"
+licence = "GPL-2.0 (generator); data is generated"
+state = "ready"
+kit = "benches/reasoning"
+check = "row counts across systems; the published answers for LUBM(1)"
+note = "Query engines without a reasoner compete on their own turf: no inference cost, same closed data"
+
 [owl2bench]
 title = "OWL2Bench: one TBox per OWL 2 profile, 22 queries"
 kind = "performance"
