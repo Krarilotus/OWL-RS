@@ -66,6 +66,7 @@ impl ServerConfig {
             ("store.data_dir", store.data_dir.display().to_string()),
             ("store.verify_on_open", store.verify_on_open.to_string()),
             ("store.map_checkpoints", store.map_checkpoints.to_string()),
+            ("store.wal_archive", store.wal_archive.to_string()),
             (
                 "store.ontology_path",
                 store

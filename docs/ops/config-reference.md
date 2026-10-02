@@ -160,6 +160,11 @@ api_key = "replace-me"
 - default: `true`
 - on disk, once a checkpoint is written (after a bulk load, and by background or explicit checkpoints) the data it holds is served from the file, mapped, as after a restart, and its copies in memory are freed: memory then grows with what queries touch, and the OS can page out the rest. `false` keeps everything in memory as well (the file is still written)
 
+- file key: `store.wal_archive`
+- env override: `NRESE_WAL_ARCHIVE`
+- default: `false`
+- on disk, keep the WAL segments that checkpoints cover in `wal-archive/` of the data directory instead of deleting them. With an image backup they restore the store to any later revision (`nrese-server restore DIR --wal ARCHIVE --wal DATA/wal --until-revision N`). The archive grows until pruned: segments older than the oldest image backup kept can go. Sync it to another machine for recovery from a lost disk
+
 - file key: `store.ontology_path`
 - env override: `NRESE_ONTOLOGY_PATH`
 - optional; when set, the file is loaded at startup and a missing file is a startup error

@@ -51,13 +51,17 @@ async fn run() -> Result<()> {
         println!("configuration is valid");
         return Ok(());
     }
-    if let CliCommand::Restore(dir) = &cli.command {
-        let manifest = nrese_store::restore_image(dir, &config.store.data_dir)
-            .with_context(|| format!("restoring {}", dir.display()))?;
+    if let CliCommand::Restore(restore) = &cli.command {
+        let (manifest, revision) = nrese_store::restore_until(
+            &restore.backup,
+            &config.store.data_dir,
+            &restore.wal,
+            restore.until_revision,
+        )
+        .with_context(|| format!("restoring {}", restore.backup.display()))?;
         tracing::info!(
-            revision = manifest.revision,
-            quads = manifest.quads,
-            inferred = manifest.inferred,
+            image_revision = manifest.revision,
+            revision,
             data_dir = %config.store.data_dir.display(),
             "restored"
         );

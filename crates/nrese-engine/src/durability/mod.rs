@@ -70,6 +70,15 @@ pub struct DurabilityConfig {
     /// this much plus one packed permutation, however large the data. The dictionary is
     /// apart: it grows with the distinct terms. Needs `map_checkpoints`.
     pub bulk_load_memory: Option<u64>,
+    /// Keep the WAL segments checkpoints cover in `<root>/wal-archive/` instead of deleting
+    /// them: with an image backup they replay the store to any later revision
+    /// (point-in-time restore). The archive grows until it is pruned outside the engine.
+    pub wal_archive: bool,
+    /// Recover up to this revision only: the log after it is cut off (the segment holding
+    /// the next record truncated before it, later segments removed), and new commits
+    /// continue from it. For point-in-time restore on a copy of a store; opening fails if
+    /// the checkpoint is newer or the log ends before it.
+    pub recover_until: Option<u64>,
 }
 
 impl Default for DurabilityConfig {
@@ -81,6 +90,8 @@ impl Default for DurabilityConfig {
             verify_on_open: false,
             map_checkpoints: true,
             bulk_load_memory: None,
+            wal_archive: false,
+            recover_until: None,
         }
     }
 }
@@ -174,7 +185,21 @@ impl Durable {
         fs::create_dir_all(&wal_dir)?;
         let segments = wal::list_segments(&wal_dir)?;
         let last = segments.len().checked_sub(1);
+        if let Some(until) = config.recover_until
+            && until < version.revision
+        {
+            return Err(EngineError::Configuration(format!(
+                "the checkpoint is at revision {}, after the requested revision {until}",
+                version.revision
+            )));
+        }
+        // Set once the log has been cut at `recover_until`: later segments go.
+        let mut cut = false;
         for (position, (_, path)) in segments.iter().enumerate() {
+            if cut {
+                fs::remove_file(path)?;
+                continue;
+            }
             let contents = wal::read_segment(path)?;
             if contents.valid_len > 0 {
                 match integers_in_dictionary {
@@ -189,9 +214,21 @@ impl Durable {
                 }
             }
             dictionary.set_integers_in_dictionary(integers_in_dictionary.unwrap_or(false));
-            for record in contents.records {
+            for (index, record) in contents.records.iter().enumerate() {
                 if record.revision <= version.revision {
                     continue; // covered by the checkpoint
+                }
+                if config
+                    .recover_until
+                    .is_some_and(|until| record.revision > until)
+                {
+                    // Point-in-time restore: the log ends before this record.
+                    match index {
+                        0 => fs::remove_file(path)?,
+                        _ => wal::truncate_segment(path, contents.ends[index - 1])?,
+                    }
+                    cut = true;
+                    break;
                 }
                 if record.revision != version.revision + 1 {
                     return Err(EngineError::Corruption(format!(
@@ -201,9 +238,9 @@ impl Durable {
                         path.display()
                     )));
                 }
-                replay(&mut version, dictionary, policy, &record)?;
+                replay(&mut version, dictionary, policy, record)?;
             }
-            if contents.torn {
+            if contents.torn && !cut {
                 if Some(position) != last {
                     return Err(EngineError::Corruption(format!(
                         "invalid record in {} (not the last segment)",
@@ -215,6 +252,14 @@ impl Durable {
             }
         }
 
+        if let Some(until) = config.recover_until
+            && version.revision < until
+        {
+            return Err(EngineError::Configuration(format!(
+                "the log ends at revision {}, before the requested revision {until}",
+                version.revision
+            )));
+        }
         let integers_in_dictionary = integers_in_dictionary.unwrap_or(false);
         dictionary.set_integers_in_dictionary(integers_in_dictionary);
         let wal = Wal::open(
@@ -223,6 +268,7 @@ impl Durable {
             config.wal_segment_bytes,
             config.sync,
             integers_in_dictionary,
+            config.wal_archive.then(|| wal::archive_dir(root)),
         )?;
         Ok(Recovered {
             durable: Self {
