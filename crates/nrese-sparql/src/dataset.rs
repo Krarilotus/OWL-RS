@@ -3,11 +3,42 @@
 //! RDF merge (SPARQL 1.1 §13.2): a statement two of them hold counts once.
 
 use nrese_engine::TermId;
-use nrese_rdf::{GraphName, NamedOrBlankNodeRef};
+use nrese_rdf::{GraphName, NamedOrBlankNodeRef, Term};
 use nrese_sparql_syntax::algebra::QueryDataset;
 
 use crate::results::QueryDatasetSpecification;
 use crate::view::ReadView;
+
+/// The graphs a user may read (graph-level access control): named graphs by IRI or IRI
+/// prefix, and whether the store's default graph. A query of such a user evaluates over
+/// its dataset restricted to them: the others are absent, not forbidden (`GRAPH ?g` never
+/// binds them, counts don't see them). Graphs named by blank nodes are never readable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphAccess {
+    /// Graph IRIs readable as they are.
+    pub graphs: Vec<String>,
+    /// IRI prefixes: every graph whose IRI starts with one is readable.
+    pub prefixes: Vec<String>,
+    /// The store's default graph.
+    pub default_graph: bool,
+    /// The inferred statements (they live in the default graph; whether a user who may not
+    /// read every graph sees them is the configuration's choice).
+    pub inferred: bool,
+}
+
+impl GraphAccess {
+    /// Whether the named graph `iri` is readable.
+    pub fn allows(&self, iri: &str) -> bool {
+        self.graphs.iter().any(|g| g == iri) || self.prefixes.iter().any(|p| iri.starts_with(p))
+    }
+
+    fn allows_id<V: ReadView>(&self, view: &V, id: TermId) -> bool {
+        if id == TermId::DEFAULT_GRAPH {
+            return self.default_graph;
+        }
+        matches!(view.decode(id), Some(Term::NamedNode(node)) if self.allows(node.as_str()))
+    }
+}
 
 /// The default graph of a query's dataset.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +122,52 @@ impl ResolvedDataset {
                 .iter()
                 .filter_map(|name| graph(name.as_ref()))
                 .collect()
+        });
+        Self { default, named }
+    }
+
+    /// This dataset restricted to what `access` lets its user read: the default graph
+    /// merged from the readable graphs among its own, the readable named graphs.
+    pub(crate) fn restricted<V: ReadView>(self, view: &V, access: &GraphAccess) -> Self {
+        let readable_named = || -> Vec<TermId> {
+            view.named_graphs()
+                .filter(|&g| access.allows_id(view, g))
+                .collect()
+        };
+        let merge = |mut ids: Vec<TermId>| {
+            ids.sort_unstable();
+            ids.dedup();
+            match ids[..] {
+                [] => DefaultGraph::Empty,
+                [id] if id == TermId::DEFAULT_GRAPH => DefaultGraph::Store,
+                [id] => DefaultGraph::Graph(id),
+                _ => DefaultGraph::Merge(Some(ids)),
+            }
+        };
+        let default = match self.default {
+            DefaultGraph::Store if access.default_graph => DefaultGraph::Store,
+            DefaultGraph::Store | DefaultGraph::Empty => DefaultGraph::Empty,
+            DefaultGraph::Graph(g) if access.allows_id(view, g) => DefaultGraph::Graph(g),
+            DefaultGraph::Graph(_) => DefaultGraph::Empty,
+            DefaultGraph::Merge(None) => {
+                let mut ids = readable_named();
+                if access.default_graph {
+                    ids.push(TermId::DEFAULT_GRAPH);
+                }
+                merge(ids)
+            }
+            DefaultGraph::Merge(Some(ids)) => merge(
+                ids.into_iter()
+                    .filter(|&g| access.allows_id(view, g))
+                    .collect(),
+            ),
+        };
+        let named = Some(match self.named {
+            None => readable_named(),
+            Some(graphs) => graphs
+                .into_iter()
+                .filter(|&g| access.allows_id(view, g))
+                .collect(),
         });
         Self { default, named }
     }

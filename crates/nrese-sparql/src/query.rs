@@ -52,6 +52,9 @@ pub struct QueryOptions {
     /// Evaluate every GROUP BY that can stream in morsels of this many rows of its first
     /// pattern (`native/stream.rs`), not only when it runs out of memory. Tests set it.
     pub stream_rows: Option<usize>,
+    /// The graphs the query's user may read (graph-level access control): its dataset is
+    /// restricted to them. `None`: every graph.
+    pub access: Option<std::sync::Arc<crate::GraphAccess>>,
 }
 
 /// Evaluates `query` against `view` over the engine's id tables (`native`); a transaction
