@@ -120,6 +120,8 @@ pub(super) struct RawStoreConfig {
     pub map_checkpoints: Option<bool>,
     #[serde(default)]
     pub wal_archive: Option<bool>,
+    #[serde(default)]
+    pub index_encoding: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

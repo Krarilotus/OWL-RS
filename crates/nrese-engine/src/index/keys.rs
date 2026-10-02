@@ -1,20 +1,78 @@
 //! Compressed sorted key arrays (Pf1): the storage of one permutation of a run.
 //!
-//! Keys are cut into blocks of [`BLOCK`]. Within a block each key position is stored as
-//! two bit-packed sub-columns, relative to the block's minimum (frame of reference): the
-//! 4-bit term kind tag and the 60-bit payload (see [`TermId`](crate::TermId)). A position
-//! that is constant in the block (the graph, usually the first component) takes no bits; a
-//! position mixing kinds (IRIs and literals as objects) costs a few tag bits plus the
-//! payload range instead of 64 bits. Every key stays randomly accessible in O(1), so binary
-//! searches run on the compressed data: first over the blocks' first keys, then inside one
-//! block.
+//! Keys are cut into blocks of [`BLOCK`]. Within a block each key position is stored in
+//! the cheaper of two encodings:
+//!
+//! - frame of reference: two bit-packed sub-columns relative to the block's minimum, the
+//!   4-bit term kind tag and the 60-bit payload (see [`TermId`](crate::TermId)). A position
+//!   that is constant in the block (the graph, usually the first component) takes no bits;
+//!   a position mixing kinds (IRIs and literals as objects) costs a few tag bits plus the
+//!   payload range instead of 64 bits;
+//! - a palette (format 10): the block's distinct values at that position, word-aligned at
+//!   the start of the block's data, and per key the bit-packed index of its value. It wins
+//!   where few values spread far apart: a subject's objects, identifiers in insertion
+//!   order (DBpedia's 1.9, Wikidata's 3.1 bytes per quad).
+//!
+//! Every key stays randomly accessible in O(1) (a palette costs one more word read), so
+//! binary searches run on the compressed data: first over the blocks' first keys, then
+//! inside one block.
+//!
+//! Palettes are a trade-off ([`IndexEncoding`]): on the office PC, DBpedia core's store is
+//! 3.3 % smaller (the index 8 %) and its queries 7 % slower (a dependent load per value in
+//! scans); Wikidata lexemes' store 8.6 % smaller, queries even. Off by default.
 //!
 //! Typical cost on LUBM: 6 to 12 bytes per key instead of 32.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rayon::prelude::*;
 
 use crate::mapped::{Map, Mapped, Plain};
 use crate::quad::Key;
+
+/// How index blocks are encoded when they are built (`store.index_encoding`). Reading
+/// takes either, so a store can switch: blocks built after the switch take the new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexEncoding {
+    /// Frame of reference only: the fastest scans.
+    #[default]
+    Fast,
+    /// Palettes where smaller: a smaller store, scans up to a tenth slower.
+    Compact,
+}
+
+impl IndexEncoding {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Compact => "compact",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "fast" => Some(Self::Fast),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
+}
+
+/// The encoding blocks are built with, for the process: the stores of one server share
+/// their settings.
+static COMPACT: AtomicBool = AtomicBool::new(false);
+
+/// Sets the encoding of the index blocks built from now on, in every store of the process.
+pub fn set_index_encoding(encoding: IndexEncoding) {
+    COMPACT.store(encoding == IndexEncoding::Compact, Ordering::Relaxed);
+}
+
+fn current_encoding() -> IndexEncoding {
+    match COMPACT.load(Ordering::Relaxed) {
+        true => IndexEncoding::Compact,
+        false => IndexEncoding::Fast,
+    }
+}
 
 /// Keys per block.
 pub(crate) const BLOCK: usize = 128;
@@ -22,29 +80,57 @@ pub(crate) const BLOCK: usize = 128;
 const TAG_SHIFT: u32 = 60;
 const PAYLOAD_MASK: u64 = (1 << TAG_SHIFT) - 1;
 
-/// Frame of reference of one block: per key position, the minimum tag and payload, the bit
-/// widths of the packed offsets from them, and where each sub-column starts.
+/// The tag width that marks a position stored as a palette (tags take at most 4 bits). In
+/// a byte every access reads anyway: a flag elsewhere in the header cost random access a
+/// cache line (12.6 -> 22 ns per key with `keys_bench`).
+const PALETTE: u8 = 0x80;
+
+/// Bits per key of a sub-column of width `w` (a palette marker has none).
+#[inline]
+fn bits_of(w: u8) -> usize {
+    if w == PALETTE { 0 } else { w as usize }
+}
+
+/// The encoding of one block: per key position, the minimum tag and payload, the bit
+/// widths of the packed offsets from them, and where each sub-column starts; or, where the
+/// tag width is [`PALETTE`], a palette.
 ///
 /// `repr(C)` with explicit padding: its memory image is what checkpoints store, so a
-/// mapped checkpoint's headers are used in place.
+/// mapped checkpoint's headers are used in place. Formats before 10 have no palettes.
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 struct Header {
-    /// Word offset of the block's bits in `data`.
+    /// Word offset of the block's data in `data`.
     offset: u64,
+    /// Per position: the minimum payload; for a palette, the word of its first value
+    /// within the block's data.
     payload_min: [u64; 4],
+    /// Per position: the minimum tag; for a palette, its number of values less one.
     tag_min: [u8; 4],
-    /// Bit widths of the sub-columns: tag then payload, per key position.
+    /// Bit widths of the sub-columns: tag then payload, per key position (a palette: the
+    /// marker [`PALETTE`], and the index width).
     widths: [u8; 8],
-    /// Bit offsets of the sub-columns within the block (at most 128 keys × 256 bits).
+    /// Bit offsets of the sub-columns within the block's data, after the palettes (at most
+    /// 4 positions × 128 keys × 64 bits, each at most what the frame of reference takes).
     starts: [u16; 8],
     _padding: [u8; 4],
 }
 
+/// The distinct values of position `c` in `block`, ascending.
+fn distinct(block: &[Key], c: usize) -> Vec<u64> {
+    let mut values: Vec<u64> = block.iter().map(|k| k[c]).collect();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
 impl Header {
-    /// The frame of reference of `block` (at most [`BLOCK`] sorted keys).
-    fn of(block: &[Key]) -> Self {
+    /// The encoding of `block` (at most [`BLOCK`] sorted keys): per position, the frame of
+    /// reference, or (`Compact`) a palette where that takes fewer bits.
+    fn of(block: &[Key], encoding: IndexEncoding) -> Self {
         let mut header = Header::default();
+        let n = block.len();
+        let mut palette_words = 0;
         for c in 0..4 {
             let (tag_min, tag_max) = block.iter().fold((u8::MAX, 0), |(lo, hi), k| {
                 let t = (k[c] >> TAG_SHIFT) as u8;
@@ -54,32 +140,71 @@ impl Header {
                 let p = k[c] & PAYLOAD_MASK;
                 (lo.min(p), hi.max(p))
             });
+            let (tw, pw) = (
+                width(u64::from(tag_max - tag_min)),
+                width(payload_max - payload_min),
+            );
+            let frame_bits = n * (tw as usize + pw as usize);
+            // A palette only where the values vary, and only if it is smaller.
+            if encoding == IndexEncoding::Compact && frame_bits > 0 {
+                let values = distinct(block, c).len();
+                let index = width(values as u64 - 1);
+                if 64 * values + n * (index as usize) < frame_bits {
+                    header.widths[2 * c] = PALETTE;
+                    header.payload_min[c] = palette_words as u64;
+                    header.tag_min[c] = (values - 1) as u8;
+                    header.widths[2 * c + 1] = index;
+                    palette_words += values;
+                    continue;
+                }
+            }
             header.tag_min[c] = tag_min;
             header.payload_min[c] = payload_min;
-            header.widths[2 * c] = width(u64::from(tag_max - tag_min));
-            header.widths[2 * c + 1] = width(payload_max - payload_min);
+            header.widths[2 * c] = tw;
+            header.widths[2 * c + 1] = pw;
         }
-        let mut bit = 0;
+        let mut bit = 64 * palette_words;
         for (start, &w) in header.starts.iter_mut().zip(&header.widths) {
             *start = bit as u16;
-            bit += block.len() * w as usize;
+            bit += n * bits_of(w);
         }
         header
     }
 
-    /// Words of packed bits for a block of `n` keys.
+    /// Whether position `c` is stored as a palette.
+    #[inline]
+    fn palette(&self, c: usize) -> bool {
+        self.widths[2 * c] == PALETTE
+    }
+
+    /// Words of data (palettes, then packed bits) for a block of `n` keys.
     fn words(&self, n: usize) -> usize {
-        let bits: usize = self.widths.iter().map(|&w| w as usize).sum();
-        (n * bits).div_ceil(64)
+        (self.starts[7] as usize + n * self.widths[7] as usize).div_ceil(64)
     }
 
     /// Packs `block` into `bits` (zeroed, [`words`](Self::words) long).
     fn pack(&self, block: &[Key], bits: &mut [u64]) {
-        for (j, key) in block.iter().enumerate() {
-            for (c, &value) in key.iter().enumerate() {
+        for c in 0..4 {
+            let (tw, pw) = (self.widths[2 * c], self.widths[2 * c + 1]);
+            if self.palette(c) {
+                let values = distinct(block, c);
+                let first = self.payload_min[c] as usize;
+                bits[first..first + values.len()].copy_from_slice(&values);
+                for (j, key) in block.iter().enumerate() {
+                    let index = values.binary_search(&key[c]).expect("in the palette") as u64;
+                    write(
+                        bits,
+                        self.starts[2 * c + 1] as usize + j * pw as usize,
+                        pw,
+                        index,
+                    );
+                }
+                continue;
+            }
+            for (j, key) in block.iter().enumerate() {
+                let value = key[c];
                 let tag = u64::from((value >> TAG_SHIFT) as u8 - self.tag_min[c]);
                 let payload = (value & PAYLOAD_MASK) - self.payload_min[c];
-                let (tw, pw) = (self.widths[2 * c], self.widths[2 * c + 1]);
                 write(bits, self.starts[2 * c] as usize + j * tw as usize, tw, tag);
                 write(
                     bits,
@@ -91,10 +216,14 @@ impl Header {
         }
     }
 
-    /// Component `c` of key `j` of the block whose bits start at `data`.
+    /// Component `c` of key `j` of the block whose data starts at `data`.
     #[inline]
     fn component(&self, data: &[u64], c: usize, j: usize) -> u64 {
         let (tw, pw) = (self.widths[2 * c], self.widths[2 * c + 1]);
+        if tw == PALETTE {
+            let index = read(data, self.starts[2 * c + 1] as usize + j * pw as usize, pw);
+            return data[self.payload_min[c] as usize + index as usize];
+        }
         let tag = u64::from(self.tag_min[c])
             + read(data, self.starts[2 * c] as usize + j * tw as usize, tw);
         let payload =
@@ -243,14 +372,24 @@ fn write(data: &mut [u64], bit: usize, width: u8, value: u64) {
 }
 
 impl PackedKeys {
-    /// Packs `keys`, which must be sorted. Large arrays are packed in parallel.
+    /// Packs `keys`, which must be sorted, in the process's encoding. Large arrays are
+    /// packed in parallel.
     pub(crate) fn from_sorted(keys: &[Key]) -> Self {
+        Self::from_sorted_as(keys, current_encoding())
+    }
+
+    /// Packs `keys`, which must be sorted, in `encoding`.
+    pub(crate) fn from_sorted_as(keys: &[Key], encoding: IndexEncoding) -> Self {
         debug_assert!(keys.is_sorted(), "keys must be sorted");
         let parallel = keys.len() >= PARALLEL_PACK;
         let mut headers: Vec<Header> = if parallel {
-            keys.par_chunks(BLOCK).map(Header::of).collect()
+            keys.par_chunks(BLOCK)
+                .map(|block| Header::of(block, encoding))
+                .collect()
         } else {
-            keys.chunks(BLOCK).map(Header::of).collect()
+            keys.chunks(BLOCK)
+                .map(|block| Header::of(block, encoding))
+                .collect()
         };
         let mut words = 0;
         for (header, block) in headers.iter_mut().zip(keys.chunks(BLOCK)) {
@@ -292,8 +431,9 @@ impl PackedKeys {
         let mut data: Vec<u64> = Vec::new();
         let (mut headers, mut firsts) = (Vec::new(), Vec::new());
         let mut block: Vec<Key> = Vec::with_capacity(BLOCK);
+        let encoding = current_encoding();
         let mut flush = |block: &mut Vec<Key>, data: &mut Vec<u64>| {
-            let mut header = Header::of(block);
+            let mut header = Header::of(block, encoding);
             header.offset = data.len() as u64;
             let start = data.len();
             data.resize(start + header.words(block.len()), 0);
@@ -501,18 +641,33 @@ impl PackedKeys {
         let mut expected_offset = 0u64;
         for (b, header) in self.headers.iter().enumerate() {
             let n = BLOCK.min(self.len - b * BLOCK);
-            let valid_widths = header.widths.chunks(2).all(|w| w[0] <= 4 && w[1] <= 60);
-            let mut bit = 0;
+            let valid_widths = header
+                .widths
+                .chunks(2)
+                .all(|w| (w[0] <= 4 || w[0] == PALETTE) && w[1] <= 60);
+            // Palettes: indices within them, laid out one after the other.
+            let mut palette_words = 0;
+            let mut valid_palettes = true;
+            for c in (0..4).filter(|&c| header.palette(c)) {
+                let values = header.tag_min[c] as usize + 1;
+                valid_palettes &= header.payload_min[c] == palette_words as u64
+                    && values <= n
+                    && header.widths[2 * c + 1] <= 7
+                    && (1usize << header.widths[2 * c + 1]) >= values;
+                palette_words += values;
+            }
+            let mut bit = 64 * palette_words;
             let valid_starts = header
                 .starts
                 .iter()
                 .zip(&header.widths)
                 .all(|(&start, &w)| {
                     let ok = start as usize == bit;
-                    bit += n * w as usize;
+                    bit += n * bits_of(w);
                     ok
                 });
-            if header.offset != expected_offset || !valid_widths || !valid_starts {
+            if header.offset != expected_offset || !valid_widths || !valid_palettes || !valid_starts
+            {
                 return Err(format!("damaged header of block {b}"));
             }
             expected_offset += header.words(n) as u64;
@@ -529,6 +684,11 @@ impl PackedKeys {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// Whether a block stores a position as a palette (format 10).
+    pub(crate) fn has_palettes(&self) -> bool {
+        self.headers.iter().any(|h| (0..4).any(|c| h.palette(c)))
     }
 
     /// The keys in order, a block decoded at a time.
@@ -569,6 +729,15 @@ impl PackedKeys {
         let j0 = start - block * BLOCK;
         for c in 0..4 {
             let (tw, pw) = (header.widths[2 * c], header.widths[2 * c + 1]);
+            if header.palette(c) {
+                let palette = &data[header.payload_min[c] as usize..];
+                let mut bit = header.starts[2 * c + 1] as usize + j0 * pw as usize;
+                for key in keys.iter_mut() {
+                    key[c] = palette[read(data, bit, pw) as usize];
+                    bit += pw as usize;
+                }
+                continue;
+            }
             if tw == 0 && pw == 0 {
                 let constant = (u64::from(header.tag_min[c]) << TAG_SHIFT) | header.payload_min[c];
                 keys.iter_mut().for_each(|key| key[c] = constant);
@@ -644,7 +813,7 @@ impl PackedKeys {
             let block_end = ((block + 1) * BLOCK).min(end);
             let header = &self.headers[block];
             let (tw, pw) = (header.widths[2 * position], header.widths[2 * position + 1]);
-            if tw == 0 && pw == 0 {
+            if tw == 0 && pw == 0 && !header.palette(position) {
                 let constant = (u64::from(header.tag_min[position]) << TAG_SHIFT)
                     | header.payload_min[position];
                 if constant != value {
@@ -701,6 +870,16 @@ impl PackedKeys {
         let header = &self.headers[block];
         let data = &self.data[header.offset as usize..];
         let (tw, pw) = (header.widths[2 * c], header.widths[2 * c + 1]);
+        if header.palette(c) {
+            let palette = &data[header.payload_min[c] as usize..];
+            let mut bit = header.starts[2 * c + 1] as usize + j0 * pw as usize;
+            out.extend((j0..j1).map(|_| {
+                let value = palette[read(data, bit, pw) as usize];
+                bit += pw as usize;
+                value
+            }));
+            return;
+        }
         let tag_min = u64::from(header.tag_min[c]);
         let payload_min = header.payload_min[c];
         let (mut tag_bit, mut payload_bit) = (
@@ -915,21 +1094,21 @@ mod tests {
             let streamed = PackedKeys::from_sorted_iter(keys.iter().copied());
             let mut bytes = Vec::new();
             packed
-                .write(None, &mut |piece| {
+                .write(Some(0), &mut |piece| {
                     bytes.extend_from_slice(piece);
                     Ok(())
                 })
                 .unwrap();
             let mut streamed_bytes = Vec::new();
             streamed
-                .write(None, &mut |piece| {
+                .write(Some(0), &mut |piece| {
                     streamed_bytes.extend_from_slice(piece);
                     Ok(())
                 })
                 .unwrap();
             assert_eq!(bytes, streamed_bytes, "streaming packs identically, n {n}");
             bytes.extend_from_slice(b"trailing");
-            let (read, used) = PackedKeys::read(&bytes, None, None, true).unwrap();
+            let (read, used) = PackedKeys::read(&bytes, Some(0), None, true).unwrap();
             assert_eq!(used, bytes.len() - 8);
             assert_eq!(
                 (0..read.len()).map(|i| read.get(i)).collect::<Vec<_>>(),
@@ -938,8 +1117,8 @@ mod tests {
             if n > 0 {
                 let mut damaged = bytes.clone();
                 damaged[24 + 44] = 61; // a tag width no header can have
-                assert!(PackedKeys::read(&damaged, None, None, true).is_err());
-                assert!(PackedKeys::read(&bytes[..bytes.len() - 16], None, None, true).is_err());
+                assert!(PackedKeys::read(&damaged, Some(0), None, true).is_err());
+                assert!(PackedKeys::read(&bytes[..bytes.len() - 16], Some(0), None, true).is_err());
             }
         }
     }
@@ -979,6 +1158,92 @@ mod tests {
             assert_eq!(copied.mapped_bytes(), 0);
             assert_eq!(copied.len(), keys.len());
         }
+    }
+
+    /// Blocks where few values spread far apart (a subject's objects among millions of
+    /// ids) take palettes; they read, decode, group and search like the keys.
+    #[test]
+    fn palettes_are_chosen_where_smaller_and_read_back() {
+        let mut state = 31;
+        let mut keys: Vec<Key> = (0..20_000u64)
+            .map(|i| {
+                // Per subject, objects from a handful of far-apart identifiers.
+                let object = (1 << TAG_SHIFT) | ((rng(&mut state) % 6) * 40_000_000_000);
+                [
+                    (1 << TAG_SHIFT) | (i / 50),
+                    (1 << TAG_SHIFT) | (i % 3),
+                    object,
+                    i % 2,
+                ]
+            })
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let packed = PackedKeys::from_sorted_as(&keys, IndexEncoding::Compact);
+        assert!(
+            PackedKeys::from_sorted_as(&keys, IndexEncoding::Fast)
+                .headers
+                .iter()
+                .all(|h| (0..4).all(|c| !h.palette(c))),
+            "fast takes no palettes"
+        );
+        assert!(
+            packed.headers.iter().any(|h| (0..4).any(|c| h.palette(c))),
+            "no palette chosen"
+        );
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(packed.get(i), *key, "index {i}");
+        }
+        let mut decoded = Vec::new();
+        for start in (0..keys.len()).step_by(BLOCK) {
+            packed.decode_range(start, (start + BLOCK).min(keys.len()), &mut decoded);
+        }
+        assert_eq!(decoded, keys);
+        let mut columns = vec![Vec::new(), Vec::new()];
+        packed.decode_columns(5, keys.len() - 3, &[2, 3], &mut columns);
+        assert_eq!(
+            columns[0],
+            keys[5..keys.len() - 3]
+                .iter()
+                .map(|k| k[2])
+                .collect::<Vec<_>>()
+        );
+        for probe in keys.iter().step_by(97) {
+            let expected = keys.partition_point(|k| k < probe);
+            assert_eq!(packed.bound_in(0, keys.len(), probe, false), expected);
+        }
+        packed.verify().unwrap();
+        let mut bytes = Vec::new();
+        packed
+            .write(Some(0), &mut |piece| {
+                bytes.extend_from_slice(piece);
+                Ok(())
+            })
+            .unwrap();
+        let (read, _) = PackedKeys::read(&bytes, Some(0), None, true).unwrap();
+        assert_eq!(
+            (0..read.len()).map(|i| read.get(i)).collect::<Vec<_>>(),
+            keys
+        );
+        // Smaller than the frame of reference alone.
+        let frame_only: usize = keys
+            .chunks(BLOCK)
+            .map(|block| {
+                (0..4)
+                    .map(|c| {
+                        let min = block.iter().map(|k| k[c] & PAYLOAD_MASK).min().unwrap();
+                        let max = block.iter().map(|k| k[c] & PAYLOAD_MASK).max().unwrap();
+                        block.len() * width(max - min) as usize
+                    })
+                    .sum::<usize>()
+                    .div_ceil(64)
+            })
+            .sum();
+        assert!(
+            packed.data.len() < frame_only,
+            "{} >= {frame_only}",
+            packed.data.len()
+        );
     }
 
     #[test]
