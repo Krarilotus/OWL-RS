@@ -72,7 +72,7 @@ pub(crate) fn parse_graph(
 
 /// Parses a request payload into quads, in the graphs it names (the default graph for
 /// triples), with fresh blank nodes.
-pub(crate) fn parse_payload(
+pub fn parse_payload(
     format: GraphResultFormat,
     base_iri: Option<&str>,
     payload: &[u8],

@@ -116,7 +116,7 @@ The hierarchy isn't stored; the reasoning modes materialise instance-level infer
 
 ## RDF4J protocol
 
-The RDF4J REST protocol, as RDF4J's `HTTPRepository`, GraphDB's clients and the tools built on them speak it. The configured store is repository `nrese` (what `/dataset/…` serves); `PUT /repositories/{id}` creates another (admins; the configuration in the body is not read: the default's settings and reasoning apply, on disk under `repositories/<id>/` of the data directory, opened again at start) and `DELETE /repositories/{id}` removes one with its data. A repository besides the default has no `SERVICE` client and no preloaded ontology.
+The RDF4J REST protocol, as RDF4J's `HTTPRepository`, GraphDB's clients and the tools built on them speak it. The configured store is repository `nrese` (what `/dataset/…` serves); `PUT /repositories/{id}` creates another (admins; on disk under `repositories/<id>/` of the data directory, opened again at start, with the default's store settings). The repository configuration in the body (RDF4J's, Turtle unless `Content-Type` says otherwise) sets its title (`rdfs:label`) and reasoning: GraphDB's `ruleset` (`empty`, `rdfs`, `rdfsplus`, `owl-horst`, `owl2-ql`, `owl2-rl`, also `-optimized`, or an NRESE reasoning mode), else an RDFS inferencer sail (`…RDFSInferencer`) for RDFS and a sail stack without one for none; a configuration naming neither keeps the server's reasoning, and one naming another repository id is refused (400) and `DELETE /repositories/{id}` removes one with its data. A repository besides the default has no `SERVICE` client and no preloaded ontology.
 
 | Path | What |
 |---|---|
