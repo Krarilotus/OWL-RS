@@ -24,6 +24,9 @@ pub struct ReasoningState {
     pub fingerprint: u64,
     /// Consistency violations in the materialised closure.
     pub violations: usize,
+    /// The inferred stack holds the closure over representatives of the `owl:sameAs`
+    /// classes, which reads expand (`reasoner.equality = "compact"`).
+    pub compact_equality: bool,
 }
 
 /// Whether the stored data is consistent under the configured ruleset.
@@ -50,43 +53,59 @@ impl ConsistencyStatus {
 
 /// The fingerprint of `program` as the store runs it: leaving out unnamed classes'
 /// memberships is another closure.
-pub(crate) fn fingerprint(program: &RuleProgram, hide_unnamed_classes: bool) -> u64 {
+pub(crate) fn fingerprint(
+    program: &RuleProgram,
+    hide_unnamed_classes: bool,
+    compact_equality: bool,
+) -> u64 {
     const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0007;
+    // Another form of the stack, not another closure; still not interchangeable.
+    const COMPACT_EQUALITY: u64 = 0x0e9a_11c0_3a5c_0b02;
     program.fingerprint()
         ^ if hide_unnamed_classes {
             HIDDEN_UNNAMED_CLASSES
         } else {
             0
         }
+        ^ if compact_equality { COMPACT_EQUALITY } else { 0 }
 }
 
 impl ReasoningState {
     #[cfg(test)]
     pub(crate) fn of(program: &RuleProgram, violations: usize) -> Self {
-        Self::of_with(program, false, violations)
+        Self::of_with(program, false, false, violations)
     }
 
     pub(crate) fn of_with(
         program: &RuleProgram,
         hide_unnamed_classes: bool,
+        compact_equality: bool,
         violations: usize,
     ) -> Self {
         Self {
             ruleset: program.name(),
-            fingerprint: fingerprint(program, hide_unnamed_classes),
+            fingerprint: fingerprint(program, hide_unnamed_classes, compact_equality),
             violations,
+            compact_equality,
         }
     }
 
     /// Whether the inferred stack is exactly `program`'s closure of the asserted data.
     pub fn is_current_for(&self, program: impl Into<RuleProgram>) -> bool {
-        self.is_current_with(&program.into(), false)
+        self.is_current_with(&program.into(), false, false)
     }
 
-    /// [`Self::is_current_for`] with unnamed classes' memberships left out or not.
-    pub fn is_current_with(&self, program: &RuleProgram, hide_unnamed_classes: bool) -> bool {
+    /// [`Self::is_current_for`] with unnamed classes' memberships left out or not, and
+    /// equality stored compactly or not.
+    pub fn is_current_with(
+        &self,
+        program: &RuleProgram,
+        hide_unnamed_classes: bool,
+        compact_equality: bool,
+    ) -> bool {
         self.ruleset == program.name()
-            && self.fingerprint == fingerprint(program, hide_unnamed_classes)
+            && self.fingerprint == fingerprint(program, hide_unnamed_classes, compact_equality)
+            && self.compact_equality == compact_equality
     }
 
     pub fn consistency(&self) -> ConsistencyStatus {
@@ -98,22 +117,28 @@ impl ReasoningState {
 
     /// The file form: `key value` lines.
     pub(crate) fn to_text(&self) -> String {
-        format!(
+        let mut text = format!(
             "ruleset {}\nfingerprint {:016x}\nviolations {}\n",
             self.ruleset, self.fingerprint, self.violations
-        )
+        );
+        if self.compact_equality {
+            text.push_str("equality compact\n");
+        }
+        text
     }
 
     /// Parses [`to_text`](Self::to_text); `None` for anything else, including the older
     /// marker that held only the ruleset name (the store then rematerialises once).
     pub(crate) fn from_text(text: &str) -> Option<Self> {
         let (mut ruleset, mut fingerprint, mut violations) = (None, None, None);
+        let mut compact_equality = false;
         for line in text.lines() {
             let (key, value) = line.split_once(' ')?;
             match key {
                 "ruleset" => ruleset = Some(value.to_owned()),
                 "fingerprint" => fingerprint = u64::from_str_radix(value, 16).ok(),
                 "violations" => violations = value.parse().ok(),
+                "equality" => compact_equality = value == "compact",
                 _ => {}
             }
         }
@@ -121,6 +146,7 @@ impl ReasoningState {
             ruleset: ruleset?,
             fingerprint: fingerprint?,
             violations: violations?,
+            compact_equality,
         })
     }
 }

@@ -228,6 +228,7 @@ impl<'e> BulkLoad<'e> {
                     inferred: IndexVersion::empty(Layout::DefaultGraph),
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
+                    equality: Default::default(),
                 };
                 (Next::Built(next), summary)
             }
@@ -263,6 +264,7 @@ impl<'e> BulkLoad<'e> {
                     inferred: current.inferred.with_delta(&[], &explicit),
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
+                    equality: Default::default(),
                 };
                 (Next::Built(next), summary)
             }
@@ -398,6 +400,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 Arc::clone(&next),
                 Arc::clone(&shared.dictionary),
                 Arc::clone(&shared.statistics),
+                None,
             );
             let path = checkpoint::write(durable.root(), &image)?;
             shared
@@ -415,6 +418,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                     Arc::new(Version {
                         asserted,
                         inferred,
+                        equality: Arc::clone(&next.equality),
                         revision,
                         dictionary_len: next.dictionary_len,
                     })
@@ -468,6 +472,7 @@ fn publish_streamed(
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision,
             dictionary_len,
+            equality: Default::default(),
         };
         let len = next.asserted.len();
         publish(engine, Next::Built(next))?;
@@ -515,6 +520,7 @@ fn publish_streamed(
         inferred,
         revision,
         dictionary_len,
+        equality: Default::default(),
     });
     let mut wal = durable.wal.lock();
     wal.rotate(revision + 1)?;
@@ -614,6 +620,7 @@ impl<'e> Rematerialisation<'e> {
             inferred: IndexVersion::from_quads(Layout::DefaultGraph, quads),
             revision: summary.revision,
             dictionary_len: shared.dictionary.len(),
+            equality: Default::default(),
         };
         publish(engine, Next::Built(next))?;
         drop(_compaction);

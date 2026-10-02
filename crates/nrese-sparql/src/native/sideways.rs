@@ -68,7 +68,7 @@ impl Context<'_> {
                     .iter()
                     .map(|triple| match self.scan_pattern(triple) {
                         Some(scan) => {
-                            self.snapshot.count_in(self.model, &scan.quad_pattern()) as f64
+                            self.snapshot.estimate_in(self.model, &scan.quad_pattern()) as f64
                         }
                         None => 0.0,
                     })
@@ -228,7 +228,7 @@ impl Context<'_> {
                 .any(|v| seed.column(v).is_some())
                 && self.scan_pattern(triple).is_some_and(|scan| {
                     (seed.table.len() as u64).saturating_mul(PROBE_FACTOR)
-                        < self.snapshot.count_in(self.model, &scan.quad_pattern())
+                        < self.snapshot.estimate_in(self.model, &scan.quad_pattern())
                 })
         })
     }

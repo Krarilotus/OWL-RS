@@ -173,8 +173,28 @@ impl<'e> Transaction<'e> {
                 .with_delta(&inferred_inserts, &inferred_deletes),
             revision: base.revision,
             dictionary_len: self.engine.shared.dictionary.len(),
+            equality: match self.changes_equality() {
+                true => Default::default(),
+                false => std::sync::Arc::clone(&base.equality),
+            },
         };
         self.base.with_version(version)
+    }
+
+    /// Whether the pending changes touch an `owl:sameAs` statement while reads expand
+    /// equality classes: then the next version computes its classes anew.
+    fn changes_equality(&self) -> bool {
+        let Some(same_as) = *self.engine.shared.equality.read() else {
+            return false;
+        };
+        [
+            &self.asserted.inserts,
+            &self.asserted.deletes,
+            &self.inferred.inserts,
+            &self.inferred.deletes,
+        ]
+        .into_iter()
+        .any(|set| set.iter().any(|quad| quad.predicate == same_as))
     }
 
     /// Number of asserted and inferred quads, including pending changes.
@@ -412,6 +432,7 @@ impl<'e> Transaction<'e> {
     /// On error nothing is published and the transaction is discarded.
     pub fn commit(mut self) -> EngineResult<CommitSummary> {
         self.take_over_inferred();
+        let changes_equality = self.changes_equality();
         let Self {
             engine,
             _slot,
@@ -477,6 +498,10 @@ impl<'e> Transaction<'e> {
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
                 dictionary_len,
+                equality: match changes_equality {
+                    true => Default::default(),
+                    false => std::sync::Arc::clone(&current.equality),
+                },
             }
         };
         let wal_bytes = match &shared.durable {

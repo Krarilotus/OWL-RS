@@ -57,6 +57,10 @@ pub struct Program {
     /// classes and expand it (W4 stage A): the same closure, without rules copying every
     /// fact to every identity while it is computed (`reasoner.equality`).
     by_representatives: bool,
+    /// With `by_representatives`: the inferred stack keeps the closure over
+    /// representatives, each other identity stored as `identity sameAs representative`,
+    /// and reads expand it (W4 stage B; `reasoner.equality = "compact"`).
+    store_representatives: bool,
     /// The ruleset's axiomatic triples, sorted: they seed every closure, and a commit
     /// never retracts them.
     axioms: Vec<Triple>,
@@ -110,6 +114,7 @@ impl Program {
             rdf_type,
             same_as,
             by_representatives: true,
+            store_representatives: false,
             axioms,
         }
     }
@@ -120,6 +125,19 @@ impl Program {
     pub fn by_representatives(mut self, representatives: bool) -> Self {
         self.by_representatives = representatives;
         self
+    }
+
+    /// This program keeping the closure over representatives in the store (with
+    /// [`Self::by_representatives`]), or every copy.
+    #[must_use]
+    pub fn storing_representatives(mut self, store: bool) -> Self {
+        self.store_representatives = store;
+        self
+    }
+
+    /// Whether the inferred stack holds the closure over representatives.
+    pub(crate) fn stores_representatives(&self) -> bool {
+        self.by_representatives && self.store_representatives && self.same_as.is_some()
     }
 
     /// This program leaving out memberships in unnamed classes nothing consumes, or not.
@@ -464,6 +482,33 @@ fn by_representatives(
     )?;
     drop(start);
     let classes = &closure.classes;
+    if program.store_representatives {
+        // The closure as it is, and each identity's place in its class. A fact asserted
+        // in some graph needs no inferred copy unless its terms have identities (the
+        // default graph's reads expand only what it holds).
+        let touches = |fact: &Triple| fact.iter().any(|&term| classes.class_of(term).is_some());
+        let mut derived: Vec<Triple> = closure
+            .facts
+            .par_iter()
+            .copied()
+            .filter(|fact| touches(fact) || asserted.binary_search(fact).is_err())
+            .collect();
+        derived.extend(classes.classes().flat_map(|(representative, members)| {
+            members
+                .iter()
+                .filter(move |&&member| member != representative)
+                .map(move |&member| [member, same_as, representative])
+        }));
+        derived.par_sort_unstable();
+        derived.dedup();
+        return Ok(batch::Materialisation {
+            derived,
+            violations: closure.violations,
+            diagnostics: closure.diagnostics,
+            rounds: closure.rounds,
+            ..batch::Materialisation::default()
+        });
+    }
     let mut derived: Vec<Triple> = closure
         .facts
         .par_iter()
@@ -714,22 +759,30 @@ pub fn apply_delta(
         &|id| tx.decode(TermId::from_raw(id)),
     ));
     let (mut inserted, mut removed) = (0, 0);
-    // A statement asserted in any graph is explicit, never also inferred (the engine
-    // enforces that for the default graph only).
-    let asserted_now: Vec<EncodedTriple> = tx.inserted().map(EncodedTriple::from).collect();
-    for fact in update.remove.iter().map(|&t| encode(t)).chain(asserted_now) {
-        if tx.remove_inferred(fact) {
-            removed += 1;
+    let mut recompute = false;
+    if program.stores_representatives() {
+        match store_over_representatives(program, &update, &missing_axioms, tx) {
+            Some((added, dropped)) => (inserted, removed) = (added, dropped),
+            None => recompute = true,
         }
-    }
-    for &fact in update
-        .insert
-        .iter()
-        .chain(&missing_axioms)
-        .filter(|&&t| storable(t))
-    {
-        if tx.insert_inferred(encode(fact)) {
-            inserted += 1;
+    } else {
+        // A statement asserted in any graph is explicit, never also inferred (the engine
+        // enforces that for the default graph only).
+        let asserted_now: Vec<EncodedTriple> = tx.inserted().map(EncodedTriple::from).collect();
+        for fact in update.remove.iter().map(|&t| encode(t)).chain(asserted_now) {
+            if tx.remove_inferred(fact) {
+                removed += 1;
+            }
+        }
+        for &fact in update
+            .insert
+            .iter()
+            .chain(&missing_axioms)
+            .filter(|&&t| storable(t))
+        {
+            if tx.insert_inferred(encode(fact)) {
+                inserted += 1;
+            }
         }
     }
     let report = MaterialisationReport {
@@ -742,13 +795,91 @@ pub fn apply_delta(
         violations: update.violations.len(),
         rounds: update.rounds,
         elapsed: started.elapsed(),
-        needs_rematerialisation: revived,
+        needs_rematerialisation: revived || recompute,
         ..MaterialisationReport::default()
     }
     .with_diagnostics(&update.diagnostics, &|id| {
         decoded(tx.decode(TermId::from_raw(id)), id)
     });
     Ok((update.violations, report, update.program))
+}
+
+/// Applies `update` (over every identity, as the delta executor reads the expanded stack)
+/// to an inferred stack kept over representatives (W4 stage B): each fact rewritten to
+/// its representatives. Returns the inferred statements added and removed; `None` if the
+/// change merges or splits `owl:sameAs` classes, which rewrites every fact about them: the
+/// caller recomputes the stack after the commit, and nothing is applied.
+fn store_over_representatives(
+    program: &Program,
+    update: &delta::Update,
+    missing_axioms: &[Triple],
+    tx: &mut Transaction<'_>,
+) -> Option<(u64, u64)> {
+    let same_as = program.same_as?;
+    let equates = |t: &Triple| t[1] == same_as && t[0] != t[2];
+    let asserted_change = tx
+        .inserted()
+        .chain(tx.deleted())
+        .map(triple)
+        .any(|t| equates(&t));
+    if asserted_change || update.insert.iter().chain(&update.remove).any(equates) {
+        return None;
+    }
+    let classes = tx.base().equality_classes();
+    let rewrite = |t: Triple| -> Triple {
+        match &classes {
+            Some(classes) => t.map(|term| classes.representative(TermId::from_raw(term)).raw()),
+            None => t,
+        }
+    };
+    let touches = |t: &Triple| {
+        classes.as_ref().is_some_and(|classes| {
+            t.iter()
+                .any(|&term| classes.class_of(TermId::from_raw(term)).is_some())
+        })
+    };
+    let asserted_somewhere = |tx: &Transaction<'_>, t: Triple| {
+        tx.quads_for_pattern_in(
+            ReadModel::Asserted,
+            &pattern(t.map(Some), GraphSelector::Any),
+        )
+        .next()
+        .is_some()
+    };
+    let (mut inserted, mut removed) = (0, 0);
+    let mut removals: Vec<Triple> = update.remove.iter().map(|&t| rewrite(t)).collect();
+    // A statement asserted now needs no inferred copy, unless its terms have identities.
+    for quad in tx.inserted().collect::<Vec<_>>() {
+        let fact = rewrite(triple(quad));
+        if !touches(&fact) {
+            removals.push(fact);
+        }
+    }
+    removals.sort_unstable();
+    removals.dedup();
+    for fact in removals {
+        if tx.remove_inferred(encode(fact)) {
+            removed += 1;
+        }
+    }
+    let mut additions: Vec<Triple> = update
+        .insert
+        .iter()
+        .chain(missing_axioms)
+        .map(|&t| rewrite(t))
+        .filter(|&t| storable(t))
+        .collect();
+    additions.sort_unstable();
+    additions.dedup();
+    for fact in additions {
+        if !touches(&fact) && asserted_somewhere(tx, fact) {
+            continue;
+        }
+        if tx.insert_inferred(encode(fact)) {
+            inserted += 1;
+        }
+    }
+    Some((inserted, removed))
 }
 
 /// What an OWL 2 RL consistency rule's violation means, for reject reports.
