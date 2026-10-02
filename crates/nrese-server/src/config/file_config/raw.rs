@@ -118,6 +118,8 @@ pub(super) struct RawStoreConfig {
     pub verify_on_open: Option<bool>,
     #[serde(default)]
     pub map_checkpoints: Option<bool>,
+    #[serde(default)]
+    pub wal_archive: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]

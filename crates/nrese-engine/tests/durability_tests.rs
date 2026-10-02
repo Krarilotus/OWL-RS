@@ -346,6 +346,8 @@ fn background_checkpoints_bound_the_wal() {
             verify_on_open: false,
             map_checkpoints: true,
             bulk_load_memory: None,
+            wal_archive: false,
+            recover_until: None,
         },
         ..EngineConfig::default()
     };
@@ -753,6 +755,91 @@ fn default_graph_stores_take_named_graphs_later() {
     drop(engine);
     let engine = Engine::open(dir.path(), config()).unwrap();
     assert_eq!(contents(&engine), *states.last().unwrap());
+}
+
+/// Point-in-time restore: an image at one revision plus the archived and the live WAL
+/// segments recover any later revision; the log is cut there, new commits continue from it,
+/// and a restart sees the same. Revisions before the image, or after the log's end, are
+/// refused.
+#[test]
+fn an_image_and_the_archived_log_restore_any_later_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let archiving = EngineConfig {
+        durability: DurabilityConfig {
+            wal_archive: true,
+            wal_segment_bytes: 256,
+            ..config().durability
+        },
+        ..config()
+    };
+    let engine = Engine::open(dir.path(), archiving).unwrap();
+    let mut states = commit_all(&engine, &batches(0..10));
+    let images = tempfile::tempdir().unwrap();
+    let image = engine.write_image(images.path()).unwrap();
+    assert_eq!(image.revision, 10);
+    engine.checkpoint().unwrap();
+    states.extend(commit_all(&engine, &batches(10..30)));
+    engine.checkpoint().unwrap();
+    states.extend(commit_all(&engine, &batches(30..35)));
+    drop(engine);
+    let archive = dir.path().join("wal-archive");
+    assert!(
+        fs::read_dir(&archive).unwrap().count() > 0,
+        "segments archived"
+    );
+
+    // A copy: the image, then the archived segments and the live ones.
+    let restore = |until: Option<u64>| {
+        let target = tempfile::tempdir().unwrap();
+        fs::copy(
+            &image.path,
+            target.path().join(image.path.file_name().unwrap()),
+        )
+        .unwrap();
+        let wal = target.path().join("wal");
+        fs::create_dir_all(&wal).unwrap();
+        for source in [archive.clone(), dir.path().join("wal")] {
+            for entry in fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                fs::copy(entry.path(), wal.join(entry.file_name())).unwrap();
+            }
+        }
+        let config = EngineConfig {
+            durability: DurabilityConfig {
+                recover_until: until,
+                ..config().durability
+            },
+            ..config()
+        };
+        (Engine::open(target.path(), config), target)
+    };
+    for until in [10u64, 11, 17, 29, 35] {
+        let (engine, target) = restore(Some(until));
+        let engine = engine.unwrap();
+        assert_eq!(engine.snapshot().revision(), until);
+        assert_eq!(
+            contents(&engine),
+            states[until as usize - 1],
+            "revision {until}"
+        );
+        // New commits continue from there, and a restart sees them.
+        let mut next = states[until as usize - 1].clone();
+        next.extend(
+            commit_all(&engine, &[(vec![label(9000)], vec![])])
+                .pop()
+                .unwrap(),
+        );
+        assert_eq!(engine.snapshot().revision(), until + 1);
+        drop(engine);
+        let engine = Engine::open(target.path(), config()).unwrap();
+        assert_eq!(contents(&engine), next, "revision {until}, reopened");
+    }
+    // Everything: no cut.
+    let (engine, _target) = restore(None);
+    assert_eq!(contents(&engine.unwrap()), states[34]);
+    // Before the image, after the end of the log.
+    assert!(restore(Some(9)).0.is_err());
+    assert!(restore(Some(36)).0.is_err());
 }
 
 /// A spill directory left by a crashed load goes when the store opens.

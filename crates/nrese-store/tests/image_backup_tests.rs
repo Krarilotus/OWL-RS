@@ -72,3 +72,44 @@ fn an_in_memory_store_backs_up_too() {
     assert_eq!(count(&store), 1);
     assert_eq!(store.current_revision(), manifest.revision);
 }
+
+/// Point-in-time restore: the image, then the log after it up to a revision; without a
+/// revision, as far as the log goes.
+#[test]
+fn an_image_and_the_log_restore_a_later_revision() {
+    let data = tempdir().unwrap();
+    let backups = tempdir().unwrap();
+    let config = StoreConfig {
+        wal_archive: true,
+        ..StoreConfig::on_disk(data.path())
+    };
+    let store = StoreService::new(config).unwrap();
+    let insert = |n: u32| {
+        store
+            .execute_update_str(&format!(
+                "INSERT DATA {{ <http://example.com/s{n}> <http://example.com/p> {n} }}"
+            ))
+            .unwrap()
+    };
+    insert(1);
+    let dir = backups.path().join("image");
+    let manifest = store.backup_image(&dir).unwrap();
+    let mut revisions = Vec::new();
+    for n in 2..6 {
+        insert(n);
+        revisions.push(store.current_revision());
+    }
+    drop(store);
+    let logs = [data.path().join("wal-archive"), data.path().join("wal")];
+    for (i, &revision) in revisions.iter().enumerate() {
+        let target = backups.path().join(format!("at-{revision}"));
+        let (restored, at) =
+            nrese_store::restore_until(&dir, &target, &logs, Some(revision)).unwrap();
+        assert_eq!((restored, at), (manifest.clone(), revision));
+        let store = StoreService::new(StoreConfig::on_disk(&target)).unwrap();
+        assert_eq!(count(&store), 2 + i as u64);
+    }
+    let target = backups.path().join("all");
+    let (_, at) = nrese_store::restore_until(&dir, &target, &logs, None).unwrap();
+    assert_eq!(at, *revisions.last().unwrap());
+}

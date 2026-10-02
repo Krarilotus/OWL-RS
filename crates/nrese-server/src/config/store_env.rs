@@ -30,6 +30,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         )?,
         verify_on_open: parse_bool(source, names::VERIFY_ON_OPEN, defaults.verify_on_open)?,
         map_checkpoints: parse_bool(source, names::MAP_CHECKPOINTS, defaults.map_checkpoints)?,
+        wal_archive: parse_bool(source, names::WAL_ARCHIVE, defaults.wal_archive)?,
         bulk_load_memory_bytes: parse_bulk_load_memory(
             source.get(names::BULK_LOAD_MEMORY).as_deref(),
         )?,

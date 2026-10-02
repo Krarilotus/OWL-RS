@@ -35,6 +35,7 @@ pub(super) fn into_key_value_source(config: RawFileConfig) -> Result<KeyValueSou
         names::MAP_CHECKPOINTS,
         config.store.map_checkpoints,
     );
+    insert_bool(&mut source, names::WAL_ARCHIVE, config.store.wal_archive);
 
     insert_option(
         &mut source,

@@ -4,6 +4,10 @@
 //! (`00000000000000000042.wal`), so a segment's revision range ends where the next one
 //! starts. Only the newest segment is appended to.
 //!
+//! With archiving, the segments a checkpoint covers move to `<dir>/wal-archive/` instead of
+//! being deleted: with an image backup they replay a store to any later revision
+//! (point-in-time restore).
+//!
 //! Failure model: if an append fails midway, the file may end in a partial frame. The log
 //! is then *poisoned*: every later append fails until the engine is reopened, and recovery
 //! truncates the torn tail. Appending after a partial frame would turn a recoverable torn
@@ -31,6 +35,11 @@ pub(crate) fn wal_dir(root: &Path) -> PathBuf {
     root.join("wal")
 }
 
+/// Where archived segments go.
+pub(crate) fn archive_dir(root: &Path) -> PathBuf {
+    root.join("wal-archive")
+}
+
 fn segment_path(dir: &Path, first_revision: u64) -> PathBuf {
     dir.join(format!("{first_revision:020}.wal"))
 }
@@ -56,6 +65,8 @@ pub(crate) fn list_segments(dir: &Path) -> EngineResult<Vec<(u64, PathBuf)>> {
 /// Decoded contents of one segment.
 pub(crate) struct SegmentContents {
     pub records: Vec<CommitRecord>,
+    /// Where each record ends in the file.
+    pub ends: Vec<u64>,
     /// Length of the valid prefix (header plus complete records).
     pub valid_len: u64,
     /// True if bytes after `valid_len` could not be decoded.
@@ -70,6 +81,7 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
         // Crash while creating the segment: treat it as empty and torn.
         return Ok(SegmentContents {
             records: Vec::new(),
+            ends: Vec::new(),
             valid_len: 0,
             torn: !bytes.is_empty(),
             integers_in_dictionary: false,
@@ -87,16 +99,19 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
     }
     let mut pos = SEGMENT_MAGIC.len();
     let mut records = Vec::new();
+    let mut ends = Vec::new();
     loop {
         match decode_frame(&bytes[pos..]) {
             Frame::Record(record, used) => {
                 records.push(record);
                 pos += used;
+                ends.push(pos as u64);
             }
             Frame::End => break,
             Frame::Invalid => {
                 return Ok(SegmentContents {
                     records,
+                    ends,
                     valid_len: pos as u64,
                     torn: true,
                     integers_in_dictionary,
@@ -106,6 +121,7 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
     }
     Ok(SegmentContents {
         records,
+        ends,
         valid_len: pos as u64,
         torn: false,
         integers_in_dictionary,
@@ -138,6 +154,8 @@ pub(crate) struct Wal {
     buffer: Vec<u8>,
     /// The magic of new segments (by the store's encoding).
     magic: &'static [u8; 8],
+    /// Where released segments go instead of being deleted.
+    archive: Option<PathBuf>,
 }
 
 impl Wal {
@@ -150,12 +168,16 @@ impl Wal {
         segment_bytes: u64,
         sync: SyncPolicy,
         integers_in_dictionary: bool,
+        archive: Option<PathBuf>,
     ) -> EngineResult<Self> {
         let magic = match integers_in_dictionary {
             true => SEGMENT_MAGIC_V4,
             false => SEGMENT_MAGIC,
         };
         fs::create_dir_all(dir)?;
+        if let Some(archive) = &archive {
+            fs::create_dir_all(archive)?;
+        }
         let (first_revision, active, active_bytes) = match list_segments(dir)?.pop() {
             Some((first_revision, path)) => {
                 let mut file = OpenOptions::new().append(true).open(&path)?;
@@ -178,6 +200,7 @@ impl Wal {
             poisoned: false,
             buffer: Vec::new(),
             magic,
+            archive,
         })
     }
 
@@ -225,20 +248,38 @@ impl Wal {
         Ok(())
     }
 
-    /// Called after a checkpoint at `revision`: restarts the byte counter and deletes every
-    /// segment whose records are all covered by the checkpoint. The active segment stays.
+    /// Called after a checkpoint at `revision`: restarts the byte counter and deletes (or
+    /// archives) every segment whose records are all covered by the checkpoint. The active
+    /// segment stays.
     pub(crate) fn release_through(&mut self, revision: u64) -> EngineResult<()> {
         self.bytes_since_checkpoint = 0;
         let segments = list_segments(&self.dir)?;
         for pair in segments.windows(2) {
             let ((_, path), (next_first, _)) = (&pair[0], &pair[1]);
             if *next_first <= revision + 1 && *next_first <= self.active_first_revision {
-                fs::remove_file(path)?;
+                match &self.archive {
+                    None => fs::remove_file(path)?,
+                    Some(archive) => archive_segment(path, archive)?,
+                }
             }
         }
         Ok(())
     }
 }
+
+/// Moves a segment into `archive` (a copy where a rename can't cross file systems).
+fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
+    let target = archive.join(path.file_name().expect("segment file name"));
+    if fs::rename(path, &target).is_err() {
+        fs::copy(path, &target)?;
+        File::open(&target)?.sync_all()?;
+        fs::remove_file(path)?;
+    }
+    super::sync_dir(archive)?;
+    Ok(())
+}
+
+impl Wal {}
 
 fn create_segment(dir: &Path, first_revision: u64, magic: &[u8; 8]) -> EngineResult<File> {
     let path = segment_path(dir, first_revision);
