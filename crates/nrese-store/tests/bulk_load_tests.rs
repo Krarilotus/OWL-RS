@@ -17,6 +17,7 @@ fn request(files: &[&Path]) -> BulkLoadRequest {
         files: files.iter().map(|path| path.to_path_buf()).collect(),
         replace: false,
         graph: GraphTarget::DefaultGraph,
+        skip_errors: false,
     }
 }
 
@@ -172,6 +173,36 @@ fn a_parse_error_names_the_file_and_changes_nothing() {
         .bulk_load(&request(&[&dir.path().join("data.unknown")]))
         .unwrap_err();
     assert!(matches!(error, StoreError::Configuration(_)), "{error}");
+}
+
+/// With `skip_errors`, bad statements are counted and skipped and the rest loads: lines of
+/// N-Triples, statements of Turtle.
+#[test]
+fn skip_errors_loads_the_good_statements() {
+    let dir = tempdir().unwrap();
+    let lines = dir.path().join("lines.nt");
+    let mut text = ntriples(10);
+    text.push_str("<http://example.com/x> <broken\n");
+    text.push_str("<http://example.com/y> <http://example.com/p> \"ok\" .\n");
+    fs::write(&lines, text).unwrap();
+    let turtle = dir.path().join("doc.ttl");
+    fs::write(
+        &turtle,
+        "@prefix ex: <http://example.com/> .\nex:t1 ex:p 1 .\nex:t2 ex:p ex:q ex:r .\nex:t3 ex:p 3 .\n",
+    )
+    .unwrap();
+    let service = service();
+    let report = service
+        .bulk_load(&BulkLoadRequest {
+            skip_errors: true,
+            ..request(&[&lines, &turtle])
+        })
+        .unwrap();
+    assert_eq!(report.skipped, 2);
+    assert_eq!(report.inserted, 13);
+    // Without: the first bad statement stops the load.
+    let service = self::service();
+    assert!(service.bulk_load(&request(&[&lines])).is_err());
 }
 
 #[test]

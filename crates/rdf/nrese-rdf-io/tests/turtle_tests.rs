@@ -312,3 +312,76 @@ fn parallel_parsing_is_exact() {
         std::fs::remove_file(&path).unwrap();
     }
 }
+
+/// Recovering: a statement with a syntax error is reported and skipped up to its `.` (or
+/// the `}` ending its TriG block), and parsing goes on; without, it stops there.
+#[test]
+fn recovering_parsers_skip_bad_statements_and_go_on() {
+    let turtle = "@prefix ex: <http://example.com/> .\n\
+                  ex:a ex:p 1 .\n\
+                  ex:b ex:p [ ex:q \"open ; ex:r ( 1 2 ] .\n\
+                  ex:c ex:p 3 .\n\
+                  ex:d ex:p ex:e ex:f .\n\
+                  ex:g ex:p 7 .\n";
+    let results: Vec<_> = RdfParser::from_format(RdfFormat::Turtle)
+        .recovering()
+        .for_slice(turtle.as_bytes())
+        .collect();
+    let subjects: Vec<String> = results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|q| q.subject.to_string())
+        .collect();
+    assert_eq!(
+        subjects,
+        [
+            "<http://example.com/a>",
+            "<http://example.com/c>",
+            "<http://example.com/g>"
+        ]
+    );
+    assert_eq!(
+        results.iter().filter(|r| r.is_err()).count(),
+        2,
+        "{results:?}"
+    );
+    // Without recovery: nothing after the first error.
+    let strict: Vec<_> = RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(turtle.as_bytes())
+        .collect();
+    assert_eq!(strict.iter().filter(|r| r.is_err()).count(), 1);
+    assert!(
+        strict
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .all(|q| !q.subject.to_string().contains("example.com/c")),
+        "{strict:?}"
+    );
+
+    // One term too many in a block: the statement goes, the block still ends at its `}`.
+    let trig = "<http://example.com/g> { <http://example.com/a> <http://example.com/p> 1 . \
+                <http://example.com/b> <http://example.com/p> <http://example.com/x> \
+                <http://example.com/y> . }\n\
+                <http://example.com/c> <http://example.com/p> 3 .\n";
+    let results: Vec<_> = RdfParser::from_format(RdfFormat::TriG)
+        .recovering()
+        .for_slice(trig.as_bytes())
+        .collect();
+    let good: Vec<&Quad> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert_eq!(good.len(), 2, "{results:?}");
+    assert!(
+        good[1].graph_name.is_default_graph(),
+        "the block ended: {:?}",
+        good[1]
+    );
+}
+
+/// An error inside a token that spans lines (an IRI with a space and a line break) gets a
+/// position, not a panic.
+#[test]
+fn an_error_inside_a_multi_line_token_has_a_position() {
+    let text =
+        "<http://example.com/a> <http://example.com/p> <oops . }\n<http://example.com/c> .\n";
+    let error = parse(RdfFormat::Turtle, text).unwrap_err();
+    assert!(error.to_string().contains("line"), "{error}");
+}

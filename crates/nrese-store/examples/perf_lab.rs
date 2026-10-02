@@ -331,6 +331,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             files: args.load.clone(),
             replace: false,
             graph: GraphTarget::DefaultGraph,
+            skip_errors: false,
         })?;
         load_s = started.elapsed().as_secs_f64();
         eprintln!("loaded {} quads in {load_s:.2} s", report.inserted);
@@ -350,6 +351,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             files: vec![shapes.clone()],
             replace: false,
             graph: GraphTarget::NamedGraph(nrese_store::DEFAULT_SHAPES_GRAPH.to_owned()),
+            skip_errors: false,
         })?;
         let mut times = Vec::new();
         let mut results = 0;

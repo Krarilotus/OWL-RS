@@ -106,6 +106,7 @@ fn data_that_was_invalid_before_does_not_block_other_commits() {
             files: vec![file.path().to_path_buf()],
             replace: false,
             graph: GraphTarget::DefaultGraph,
+            skip_errors: false,
         })
         .expect("load");
     update(
