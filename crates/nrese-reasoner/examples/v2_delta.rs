@@ -283,9 +283,17 @@ fn batches(
             )
             .expect("never stopped");
             let ms = started.elapsed().as_secs_f64() * 1000.0;
-            if deleting {
-                deletes.push((ms, result.phases, result.remove.len(), result.rounds));
-            }
+            deletes.push((
+                if deleting { "delete" } else { "insert" },
+                ms,
+                result.phases,
+                if deleting {
+                    result.remove.len()
+                } else {
+                    result.insert.len()
+                },
+                result.rounds,
+            ));
             if let Some(program) = result.program {
                 cache = Some(program);
             }
@@ -313,10 +321,10 @@ fn batches(
             asserted = after;
         }
     }
-    for (ms, phases, removed, rounds) in &deletes {
+    for (what, ms, phases, changed, rounds) in &deletes {
         let phase = |i: usize| phases[i].as_secs_f64() * 1000.0;
         println!(
-            "delete {size}: {ms:.1} ms (program {:.1}, overdelete {:.1}, rederive {:.1}, insert {:.1}, consistency {:.1}); {removed} inferred removed, {rounds} rounds",
+            "{what} {size}: {ms:.1} ms (program {:.1}, overdelete {:.1}, rederive {:.1}, insert {:.1}, consistency {:.1}); {changed} inferred changed, {rounds} rounds",
             phase(0),
             phase(1),
             phase(2),
