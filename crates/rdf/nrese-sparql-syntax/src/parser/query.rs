@@ -45,6 +45,15 @@ struct SolutionModifiers {
     values: Option<GraphPattern>,
 }
 
+/// A base IRI in absolute form (RFC 3986 §5.2.1), its dot segments removed: a reference
+/// with an empty path takes the base's path as it is (§5.2.2), so a base with dot segments
+/// would make IRIs that read differently once printed. Found by fuzzing (`nrese-fuzz`):
+/// `BASE <http:./example.org/> PREFIX : <#>` gave `:x` as `http:./example.org/#x`, which
+/// reads back as `http:example.org/#x`.
+pub(super) fn absolute(base: Iri<String>) -> Iri<String> {
+    base.resolve_unchecked(base.as_str())
+}
+
 impl<'a> Parser<'a> {
     // --- Prologue ---------------------------------------------------------------------
 
@@ -54,7 +63,7 @@ impl<'a> Parser<'a> {
                 let at = self.peek_offset();
                 let text = self.iriref_text()?;
                 let iri = self.resolve(&text, at)?;
-                self.base = Some(Iri::parse_unchecked(iri.into_string()));
+                self.base = Some(absolute(Iri::parse_unchecked(iri.into_string())));
             } else if self.keyword("PREFIX") {
                 let prefix = self.pname_ns()?.to_owned();
                 let iri = self.iriref()?;
@@ -331,23 +340,20 @@ impl<'a> Parser<'a> {
         }
         if self.keyword("HAVING") {
             let allowed = std::mem::replace(&mut self.aggregates_allowed, true);
-            let mut having: Option<Expression> = None;
+            let mut conditions: Vec<Expression> = Vec::new();
             let result = loop {
                 if !self.at_constraint() {
                     break Ok(());
                 }
                 match self.constraint() {
-                    Ok(c) => {
-                        having = Some(match having {
-                            Some(h) => Expression::And(Box::new(h), Box::new(c)),
-                            None => c,
-                        });
-                    }
+                    Ok(c) => conditions.push(c),
                     Err(e) => break Err(e),
                 }
             };
             self.aggregates_allowed = allowed;
             result?;
+            let having = (!conditions.is_empty())
+                .then(|| super::expr::balanced(conditions, Expression::And));
             if having.is_none() {
                 return Err(self.expected("a HAVING condition"));
             }
@@ -444,6 +450,17 @@ impl<'a> Parser<'a> {
         let grouped = group.is_some();
         if let Some((variables, bindings)) = group {
             for (expression, variable) in bindings {
+                // As for BIND (§18.2.1): the variable must not be in scope already, from the
+                // pattern or an earlier condition; the query would print as a BIND that
+                // reads back as an error (found by fuzzing, `nrese-fuzz`).
+                let mut bound = false;
+                p.on_in_scope_variable(|v| bound |= *v == variable);
+                if bound {
+                    return Err(self.error_at(
+                        at,
+                        format!("GROUP BY binds {variable}, which is bound already"),
+                    ));
+                }
                 p = GraphPattern::Extend {
                     inner: Box::new(p),
                     variable,
