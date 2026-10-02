@@ -129,6 +129,18 @@ def post(url: str, data: dict, accept: str = "application/sparql-results+json", 
         return 0, ""
 
 
+def put(url: str, body: str, content_type: str, timeout: float = 60) -> int:
+    request = urllib.request.Request(url, data=body.encode(), method="PUT",
+                                     headers={"Content-Type": content_type})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
+        return 0
+
+
 def get(url: str, timeout: float = 10) -> int:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -567,6 +579,67 @@ def server_log(ctx: Context, server: Server) -> str:
     return read_text(server.log) if server.log else ""
 
 
+# A native store with the indexes RDF4J recommends for mixed queries.
+RDF4J_REPOSITORY = """\
+@prefix rep: <http://www.openrdf.org/config/repository#> .
+@prefix sr: <http://www.openrdf.org/config/repository/sail#> .
+@prefix sail: <http://www.openrdf.org/config/sail#> .
+@prefix ns: <http://www.openrdf.org/config/sail/native#> .
+[] a rep:Repository ; rep:repositoryID "bench" ;
+   rep:repositoryImpl [ rep:repositoryType "openrdf:SailRepository" ;
+     sr:sailImpl [ sail:sailType "openrdf:NativeStore" ; ns:tripleIndexes "spoc,posc,opsc" ] ] .
+"""
+
+
+class Rdf4j(Adapter):
+    """Eclipse RDF4J server with a native store. Loads through the running server: the
+    repository created over the REST API, each file read by SPARQL `LOAD <file:///data/…>`
+    from the mounted data (server start-up excluded)."""
+
+    key = "rdf4j"
+
+    def images(self, ctx):
+        return [ctx.setting("RDF4J_IMAGE", "eclipse/rdf4j-workbench:6.1.0-tomcat")]
+
+    def spec(self, ctx, name, store, port):
+        env = {"JAVA_OPTS": f"-Xmx{ctx.heap} -Dorg.eclipse.rdf4j.appdata.basedir=/var/rdf4j"}
+        return Spec(name, self.images(ctx)[0], [], env,
+                    ctx.mounts(Mount(store, "/var/rdf4j", readonly=False)), port=port,
+                    entrypoint=True, memory=ctx.memory)
+
+    def endpoint(self, ctx, spec) -> Endpoint:
+        base = ctx.runtime.url(spec) + "/rdf4j-server"
+        return Endpoint(f"{base}/repositories/bench", f"{base}/repositories/bench/statements",
+                        ready=f"{base}/protocol")
+
+    def load(self, ctx, store, inputs, regime):
+        spec = self.spec(ctx, ctx.name("load"), store, ctx.listen(8080))
+        endpoint = self.start(ctx, spec, self.endpoint(ctx, spec))
+        if ctx.dry:
+            self.stop(ctx)
+            return Step(Measured(0.0, None, 0))
+        started = time.monotonic()
+        log = []
+        created = put(endpoint.query, RDF4J_REPOSITORY, "text/turtle")
+        rc = 0 if created in (200, 201, 204) else 1
+        log.append(f"create repository: HTTP {created}")
+        for path in inputs:
+            if rc != 0:
+                break
+            status, text = post(endpoint.update, {"update": f"LOAD <file://{path}>"},
+                                timeout=ctx.timeout_s)
+            log.append(f"LOAD {path}: HTTP {status} {text[:500]}")
+            rc = 0 if status in (200, 204) else 1
+        ms = (time.monotonic() - started) * 1000
+        (ctx.logs / "load.log").write_text("\n".join(log), encoding="utf-8")
+        peak = self.stop(ctx)
+        return Step(Measured(ms, peak, rc), note="server start-up excluded; SPARQL LOAD per file")
+
+    def serve(self, ctx, store, regime):
+        spec = self.spec(ctx, ctx.name("serve"), store, ctx.listen(8080))
+        return self.start(ctx, spec, self.endpoint(ctx, spec))
+
+
 GRAPHDB_RULESETS = {"none": "empty", "rdfs": "rdfs", "owl-horst": "owl-horst",
                     "owl2-rl": "owl2-rl", "owl2-ql": "owl2-ql"}
 
@@ -795,7 +868,8 @@ class Owlrl(ClosureAdapter):
                     reason_ms=float(seconds[-1]) * 1000 if seconds else None)
 
 
-ADAPTERS = {a.key: a for a in (Nrese, NreseOxigraph, Qlever, Oxigraph, Jena, Virtuoso, Graphdb, Rdfox, Anzograph, Nemo, Owlrl)}
+ADAPTERS = {a.key: a for a in (Nrese, NreseOxigraph, Qlever, Oxigraph, Jena, Virtuoso, Rdf4j, Graphdb, Rdfox, Anzograph,
+                                 Nemo, Owlrl)}
 
 
 def adapter(key: str) -> Adapter | None:
