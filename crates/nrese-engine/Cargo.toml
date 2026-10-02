@@ -20,4 +20,6 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# FSST for the vocabulary study (src/term/vocabulary_study.rs); Apache-2.0.
+fsst = { package = "fsst-rs", version = "0.6" }
 tempfile = "3.23.0"
