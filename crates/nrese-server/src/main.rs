@@ -51,6 +51,13 @@ async fn run() -> Result<()> {
         println!("configuration is valid");
         return Ok(());
     }
+    if let CliCommand::PruneArchive(Some(revision)) = cli.command {
+        let archive = config.store.data_dir.join("wal-archive");
+        let removed = nrese_store::prune_wal_archive(&archive, revision)
+            .with_context(|| format!("pruning {}", archive.display()))?;
+        tracing::info!(removed, revision, archive = %archive.display(), "archive pruned");
+        return Ok(());
+    }
     if let CliCommand::Restore(restore) = &cli.command {
         let (manifest, revision) = nrese_store::restore_until(
             &restore.backup,

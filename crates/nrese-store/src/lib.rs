@@ -44,7 +44,9 @@ pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
 };
-pub use image_backup::{ImageManifest, read_manifest, restore_image, restore_until};
+pub use image_backup::{
+    ImageManifest, prune_wal_archive, read_manifest, restore_image, restore_until,
+};
 pub use mutation::{
     MutationCommand, MutationCommitReport, MutationError, MutationKind, MutationPipeline,
     MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
