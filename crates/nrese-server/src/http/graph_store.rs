@@ -112,6 +112,7 @@ pub async fn delete_graph(
     let report = mutation::run(
         &state,
         MutationCommand::GraphDelete(target),
+        access.requester(),
         state.policy().timeouts.graph_write,
         "graph delete exceeded policy timeout",
     )
@@ -152,6 +153,7 @@ async fn write_graph(
     let report = match mutation::run(
         &state,
         MutationCommand::GraphWrite(request),
+        access.requester(),
         state.policy().timeouts.graph_write,
         "graph write exceeded policy timeout",
     )

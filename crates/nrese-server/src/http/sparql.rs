@@ -143,6 +143,7 @@ fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
 pub async fn execute_update(
     state: AppState,
     operation: UpdateOperation,
+    requester: nrese_store::Requester,
 ) -> Result<StatusCode, ApiError> {
     state
         .policy()
@@ -150,11 +151,10 @@ pub async fn execute_update(
     let mut request = SparqlUpdateRequest::new(operation.update);
     request.using_graphs = operation.using_graphs;
     request.using_named_graphs = operation.using_named_graphs;
-    request.access = operation.access;
-    request.writable = operation.writable;
     mutation::run(
         &state,
         MutationCommand::Update(request),
+        requester,
         state.policy().timeouts.update,
         "update execution exceeded policy timeout",
     )

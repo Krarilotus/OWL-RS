@@ -11,11 +11,10 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use nrese_engine::Snapshot;
-use nrese_sparql::GraphAccess;
 
 use crate::ReadScope;
 use crate::statements::{StatementOp, StatementsRequest};
@@ -40,9 +39,8 @@ struct View {
     base: Snapshot,
     /// How many of the session's operations (they are only ever appended).
     ops: usize,
-    /// Whose: the operations are scoped by the reader's access.
+    /// Whose: the operations read as the reader may.
     scope: ReadScope,
-    writable: Option<Arc<GraphAccess>>,
     snapshot: Snapshot,
 }
 
@@ -171,10 +169,7 @@ impl Sessions {
         let id = request.session.as_deref()?;
         let open = self.lock();
         let view = open.get(id)?.view.as_ref()?;
-        (view.base.same_version(latest)
-            && view.ops == request.ops.len()
-            && view.scope == *scope
-            && view.writable == request.writable)
+        (view.base.same_version(latest) && view.ops == request.ops.len() && view.scope == *scope)
             .then(|| view.snapshot.clone())
     }
 
@@ -198,7 +193,6 @@ impl Sessions {
                 base,
                 ops: request.ops.len(),
                 scope: scope.clone(),
-                writable: request.writable.clone(),
                 snapshot,
             });
         }

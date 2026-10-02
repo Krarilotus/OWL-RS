@@ -71,6 +71,7 @@ fn user_rules_follow_commits() {
                 "<{EX}anna> <{EX}parent> <{EX}ben> . <{EX}ben> <{EX}parent> <{EX}carl> .
                  <{EX}dora> <{EX}parent> <{EX}ben> ."
             )),
+            &nrese_store::Requester::all(),
             &ticket(),
         )
         .expect("facts");
@@ -92,6 +93,7 @@ fn user_rules_follow_commits() {
     pipeline
         .apply(
             delete(&format!("<{EX}ben> <{EX}parent> <{EX}carl>")),
+            &nrese_store::Requester::all(),
             &ticket(),
         )
         .expect("delete");
@@ -101,7 +103,11 @@ fn user_rules_follow_commits() {
     ));
     // `=> false` rejects the commit that makes it hold.
     let own_parent = format!("<{EX}eve> <{EX}parent> <{EX}eve>");
-    let result = pipeline.apply(insert(&own_parent), &ticket());
+    let result = pipeline.apply(
+        insert(&own_parent),
+        &nrese_store::Requester::all(),
+        &ticket(),
+    );
     let Err(MutationError::Rejected(reject)) = result else {
         panic!("expected a rejection, got {result:?}");
     };
@@ -119,6 +125,7 @@ fn user_rules_add_to_a_ruleset() {
                  <{EX}anna> a <{EX}Person> .
                  <{EX}anna> <{EX}parent> <{EX}ben> . <{EX}ben> <{EX}parent> <{EX}carl> ."
             )),
+            &nrese_store::Requester::all(),
             &MutationTicket::new(),
         )
         .expect("facts");
@@ -202,6 +209,7 @@ fn graphdb_rulesets_are_read_as_user_rules() {
                 "<{EX}anna> <{EX}parent> <{EX}ben> . <{EX}ben> <{EX}parent> <{EX}carl> .
                  <{EX}dora> <{EX}parent> <{EX}ben> ."
             )),
+            &nrese_store::Requester::all(),
             &MutationTicket::new(),
         )
         .expect("facts");
@@ -219,6 +227,7 @@ fn graphdb_rulesets_are_read_as_user_rules() {
     ));
     let rejected = pipeline.apply(
         insert(&format!("<{EX}eve> <{EX}parent> <{EX}eve>")),
+        &nrese_store::Requester::all(),
         &MutationTicket::new(),
     );
     assert!(

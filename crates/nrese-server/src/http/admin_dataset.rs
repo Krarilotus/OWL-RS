@@ -82,6 +82,8 @@ pub async fn restore(
     let result = mutation::run(
         &state,
         MutationCommand::Restore(request),
+        // Administrators only (the caller's guard): every graph.
+        nrese_store::Requester::all(),
         state.policy().timeouts.update,
         "dataset restore exceeded policy timeout",
     )

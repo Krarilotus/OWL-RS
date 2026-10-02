@@ -8,18 +8,16 @@
 //! graph the payload names; without, into the graph the payload names (the default graph
 //! for triples).
 //!
-//! Graph-level access control: a pattern with [`StatementPattern::access`] matches in the
-//! readable graphs only (the others are absent), and a request with
-//! [`StatementsRequest::writable`] fails as a whole if it would add or remove a statement
-//! in a graph outside it, whether the statement is there or not.
-
-use std::sync::Arc;
+//! Graph-level access control comes with the read ([`crate::ReadContext`]) or the write
+//! ([`crate::Requester`]): a pattern matches in the readable graphs only (the others are
+//! absent), and a write fails as a whole if it would add or remove a statement in a graph
+//! its requester may not write, whether the statement is there or not.
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId, Transaction};
 use nrese_rdf::{GraphName, NamedNode, Quad, Term, TermRef};
 use nrese_sparql::ReadView;
 
-use crate::error::{StoreError, StoreResult};
+use crate::error::StoreResult;
 use crate::query::GraphResultFormat;
 use crate::rdf_io::parse_payload;
 use crate::update::SparqlUpdateRequest;
@@ -33,15 +31,14 @@ pub struct StatementPattern {
     pub object: Option<Term>,
     /// Empty: every graph. Otherwise these graphs.
     pub contexts: Vec<GraphName>,
-    /// The graphs the requester may read: the pattern matches in them only. `None`: every
-    /// graph.
-    pub access: Option<Arc<nrese_sparql::GraphAccess>>,
 }
 
 impl StatementPattern {
-    /// The engine's patterns for this one in `view`: one per context (or one for every
-    /// graph); a pattern with a term the view doesn't know matches nothing and is left out.
-    fn patterns(&self, view: &impl ReadView) -> Vec<QuadPattern> {
+    /// The engine's patterns for this one in `view`, in the graphs `scope` reads: one per
+    /// context (or one for every graph); a pattern with a term the view doesn't know
+    /// matches nothing and is left out.
+    fn patterns(&self, view: &impl ReadView, scope: &crate::ReadScope) -> Vec<QuadPattern> {
+        let access = scope.access();
         let id = |term: Option<TermRef<'_>>| -> Option<Option<TermId>> {
             match term {
                 None => Some(None),
@@ -61,7 +58,7 @@ impl StatementPattern {
             object,
             graph,
         };
-        let mut graphs: Vec<TermId> = match (&self.access, self.contexts.is_empty()) {
+        let mut graphs: Vec<TermId> = match (access, self.contexts.is_empty()) {
             (None, true) => return vec![pattern(GraphSelector::Any)],
             (Some(_), true) => view.named_graphs().chain([TermId::DEFAULT_GRAPH]).collect(),
             (_, false) => self
@@ -74,7 +71,7 @@ impl StatementPattern {
                 })
                 .collect(),
         };
-        if let Some(access) = &self.access {
+        if let Some(access) = access {
             graphs.retain(|&graph| access.allows_id(view, graph));
         }
         graphs.sort_unstable();
@@ -142,56 +139,43 @@ pub enum StatementOp {
 #[derive(Debug, Clone, Default)]
 pub struct StatementsRequest {
     pub ops: Vec<StatementOp>,
-    /// The graphs the requester may change; `None`: every graph.
-    pub writable: Option<Arc<nrese_sparql::GraphAccess>>,
     /// The session ([`crate::sessions`]) the operations were collected in, if any: reads on
     /// them keep the data they see there until the session or the store changes.
     pub session: Option<String>,
 }
 
 impl StatementsRequest {
-    /// Fails unless the request may change `graph`.
-    fn check_writable(&self, graph: &GraphName) -> StoreResult<()> {
-        match &self.writable {
-            Some(writable) if !writable.allows_graph(graph) => Err(forbidden(match graph {
-                GraphName::DefaultGraph => "the default graph".to_owned(),
-                graph => graph.to_string(),
-            })),
-            _ => Ok(()),
-        }
+    pub fn new(ops: Vec<StatementOp>) -> Self {
+        Self { ops, session: None }
     }
 }
 
-fn forbidden(graph: String) -> StoreError {
-    StoreError::Forbidden(format!(
-        "the request would change {graph}, which the requester may not write"
-    ))
-}
-
-/// Applies the operations to `tx`, the updates through `update` (the pipeline's SPARQL
-/// update path, with its dataset and cancellation).
+/// Applies the operations to `tx` for `requester`, the updates through `update` (the
+/// pipeline's SPARQL update path, with its dataset and cancellation).
 pub(crate) fn apply_statements(
     tx: &mut Transaction<'_>,
     request: &StatementsRequest,
+    requester: &crate::Requester,
     update: &mut dyn FnMut(&mut Transaction<'_>, &SparqlUpdateRequest) -> StoreResult<()>,
 ) -> StoreResult<()> {
     for op in &request.ops {
         match op {
             StatementOp::Add { data, contexts } => {
                 for quad in data.quads(contexts)? {
-                    request.check_writable(&quad.graph_name)?;
+                    requester.write.check(&quad.graph_name)?;
                     tx.insert(quad.as_ref());
                 }
             }
             StatementOp::RemoveData { data, contexts } => {
                 for quad in data.quads(contexts)? {
-                    request.check_writable(&quad.graph_name)?;
+                    requester.write.check(&quad.graph_name)?;
                     tx.remove(quad.as_ref());
                 }
             }
             StatementOp::RemoveMatching(pattern) => {
-                let patterns = pattern.patterns(&*tx);
-                if let Some(writable) = &request.writable {
+                // The removal matches in the graphs the requester reads.
+                let patterns = pattern.patterns(&*tx, &requester.read);
+                if let Some(writable) = requester.write.access() {
                     // Every graph the removal would change must be writable.
                     let mut allowed = std::collections::HashSet::new();
                     for engine_pattern in &patterns {
@@ -200,12 +184,15 @@ pub(crate) fn apply_statements(
                                 continue;
                             }
                             if !writable.allows_id(&*tx, quad.graph) {
-                                return Err(forbidden(if quad.graph == TermId::DEFAULT_GRAPH {
-                                    "the default graph".to_owned()
-                                } else {
-                                    tx.decode(quad.graph)
-                                        .map_or_else(String::new, |term| term.to_string())
-                                }));
+                                let graph = match tx.decode(quad.graph) {
+                                    _ if quad.graph == TermId::DEFAULT_GRAPH => {
+                                        GraphName::DefaultGraph
+                                    }
+                                    Some(Term::NamedNode(node)) => GraphName::NamedNode(node),
+                                    Some(Term::BlankNode(node)) => GraphName::BlankNode(node),
+                                    _ => GraphName::DefaultGraph,
+                                };
+                                return requester.write.check(&graph);
                             }
                             allowed.insert(quad.graph);
                         }
@@ -221,14 +208,16 @@ pub(crate) fn apply_statements(
     Ok(())
 }
 
-/// The statements matching `pattern` in `view` under `model`, decoded.
+/// The statements matching `pattern` in `view` under `model` in the graphs `scope`
+/// reads, decoded.
 pub(crate) fn read_statements(
     view: &impl ReadView,
     model: ReadModel,
     pattern: &StatementPattern,
+    scope: &crate::ReadScope,
 ) -> StoreResult<Vec<Quad>> {
     let mut quads = Vec::new();
-    for engine_pattern in pattern.patterns(view) {
+    for engine_pattern in pattern.patterns(view, scope) {
         for quad in decoded_quads(view, model, &engine_pattern) {
             quads.push(quad?);
         }
@@ -242,6 +231,7 @@ pub(crate) fn write_statements(
     view: &impl ReadView,
     model: ReadModel,
     pattern: &StatementPattern,
+    scope: &crate::ReadScope,
     format: GraphResultFormat,
     cancel: &nrese_sparql::CancellationToken,
     out: impl std::io::Write,
@@ -252,7 +242,7 @@ pub(crate) fn write_statements(
     );
     let mut writer = nrese_rdf_io::RdfSerializer::from_format(format.rdf_format()).for_writer(out);
     let mut written = 0;
-    for engine_pattern in pattern.patterns(view) {
+    for engine_pattern in pattern.patterns(view, scope) {
         for quad in decoded_quads(view, model, &engine_pattern) {
             if cancel.is_cancelled() {
                 return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
@@ -278,9 +268,10 @@ pub(crate) fn count_statements(
     view: &impl ReadView,
     model: ReadModel,
     pattern: &StatementPattern,
+    scope: &crate::ReadScope,
 ) -> u64 {
     pattern
-        .patterns(view)
+        .patterns(view, scope)
         .iter()
         .map(|p| view.quads_for_pattern_in(model, p).count() as u64)
         .sum()

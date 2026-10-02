@@ -57,10 +57,6 @@ pub struct UpdateOperation {
     pub update: String,
     pub using_graphs: Vec<String>,
     pub using_named_graphs: Vec<String>,
-    /// The graphs the requester may read and write (graph-level access control); `None`:
-    /// every graph.
-    pub access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
-    pub writable: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
 }
 
 impl UpdateOperation {

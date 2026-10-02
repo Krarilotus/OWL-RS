@@ -17,6 +17,7 @@ use crate::state::AppState;
 pub async fn run(
     state: &AppState,
     command: MutationCommand,
+    requester: nrese_store::Requester,
     timeout: Duration,
     timeout_message: &'static str,
 ) -> Result<MutationCommitReport, ApiError> {
@@ -25,7 +26,8 @@ pub async fn run(
     let policy = state.policy();
     let ticket = MutationTicket::new();
     let worker_ticket = ticket.clone();
-    let mut task = tokio::task::spawn_blocking(move || pipeline.apply(command, &worker_ticket));
+    let mut task =
+        tokio::task::spawn_blocking(move || pipeline.apply(command, &requester, &worker_ticket));
 
     let joined = match tokio::time::timeout(timeout, &mut task).await {
         Ok(joined) => joined,

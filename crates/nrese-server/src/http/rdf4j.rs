@@ -174,7 +174,6 @@ fn pattern(pairs: &[(String, String)]) -> Result<StatementPattern, ApiError> {
         predicate,
         object: optional("obj")?,
         contexts: contexts(pairs)?,
-        access: None,
     })
 }
 
@@ -231,7 +230,6 @@ fn removals(
                 predicate,
                 object: (!wildcard(&quad.object)).then_some(quad.object),
                 contexts,
-                access: None,
             })
         })
         .collect())
@@ -254,35 +252,7 @@ pub(crate) fn update(
         update: operation.update,
         using_graphs: operation.using_graphs,
         using_named_graphs: operation.using_named_graphs,
-        access: None,
-        writable: None,
     })
-}
-
-/// `ops` as the requester may apply them (graph-level access control): patterns and
-/// `WHERE` clauses see the graphs it may read, and the request fails if it would change
-/// one it may not write.
-pub(crate) fn scoped(ops: Vec<StatementOp>, access: &AccessView) -> StatementsRequest {
-    let ops = ops
-        .into_iter()
-        .map(|op| match op {
-            StatementOp::RemoveMatching(pattern) => StatementOp::RemoveMatching(StatementPattern {
-                access: access.read.clone(),
-                ..pattern
-            }),
-            StatementOp::Update(request) => StatementOp::Update(SparqlUpdateRequest {
-                access: access.read.clone(),
-                writable: access.write.clone(),
-                ..request
-            }),
-            op => op,
-        })
-        .collect();
-    StatementsRequest {
-        ops,
-        writable: access.write.clone(),
-        session: None,
-    }
 }
 
 /// A store error of a namespace change: the store's fault.
@@ -290,7 +260,7 @@ fn store_error(error: nrese_store::StoreError) -> ApiError {
     ApiError::internal(error.to_string())
 }
 
-/// A store error of a read: 403 for a forbidden change in a transaction's operations.
+/// A store error of a read: 403 for a forbidden one.
 fn read_error(error: nrese_store::StoreError) -> ApiError {
     match error {
         error @ nrese_store::StoreError::Forbidden(_) => ApiError::forbidden(error.to_string()),
@@ -305,7 +275,8 @@ pub(crate) async fn apply(
 ) -> Result<(), ApiError> {
     mutation::run(
         state,
-        MutationCommand::Statements(scoped(ops, access)),
+        MutationCommand::Statements(StatementsRequest::new(ops)),
+        access.requester(),
         state.policy().timeouts.update,
         "statement operation exceeded policy timeout",
     )
@@ -898,7 +869,7 @@ pub async fn transaction_action(
                 .pending(&txid, owner)
                 .map(|ops| StatementsRequest {
                     session: Some(txid.clone()),
-                    ..scoped(ops, &access)
+                    ..StatementsRequest::new(ops)
                 })
                 .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
             match action.as_str() {

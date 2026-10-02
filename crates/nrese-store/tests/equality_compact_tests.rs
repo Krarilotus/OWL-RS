@@ -43,6 +43,7 @@ fn update(pipeline: &MutationPipeline, text: &str) {
     pipeline
         .apply(
             MutationCommand::Update(SparqlUpdateRequest::new(format!("{PREFIXES}{text}"))),
+            &nrese_store::Requester::all(),
             &MutationTicket::new(),
         )
         .unwrap_or_else(|error| panic!("{text}: {error}"));
@@ -304,6 +305,7 @@ fn compact_equality_answers_as_replication_on_random_data() {
                         MutationCommand::Update(SparqlUpdateRequest::new(format!(
                             "{PREFIXES}{commit}"
                         ))),
+                        &nrese_store::Requester::all(),
                         &MutationTicket::new(),
                     )
                 })

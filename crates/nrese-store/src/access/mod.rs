@@ -248,6 +248,11 @@ impl AccessView {
     pub fn read_scope(&self) -> crate::ReadScope {
         crate::ReadScope::of(self.read.clone())
     }
+
+    /// The user as a requester of writes, for the store's write methods.
+    pub fn requester(&self) -> crate::Requester {
+        crate::Requester::new(self.read_scope(), crate::WriteScope::of(self.write.clone()))
+    }
 }
 
 /// A change of the state.
