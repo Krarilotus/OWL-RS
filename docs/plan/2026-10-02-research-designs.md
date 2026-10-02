@@ -1,6 +1,6 @@
-# Designs from the October 2026 research: equality, vectors, compression, graph access
+# Designs from the October 2026 research: equality, vectors, compression, graph access, execution, reasoning, transactions
 
-Four questions were researched in depth on 2 October 2026 (deep-research reports by the
+Seven questions were researched in depth on 2 October 2026 (deep-research reports by the
 project owner, plus our own reading of the primary papers). This page records what NRESE
 takes from them, the decisions, and the order of work. Each design keeps the project's
 rule: tuned defaults, every use-case-dependent trade-off configurable, no hard-coded
@@ -152,11 +152,100 @@ alternative derivations. Survey: Kirrane et al., SWJ 2017.
   forbidden target aborts the whole update. `SERVICE` is a separate privilege.
 - Caches keyed by the security context and a policy epoch.
 
+## 5. Query execution and optimisation
+
+**Evidence.** HyPer, Umbra and DuckDB run morsel-driven, vectorised pipelines with explicit
+pipeline breakers; Free Join (2023) shows binary joins win on most acyclic queries and
+worst-case-optimal joins on cyclic ones, a hybrid matching or beating both. Characteristic
+sets and pairs (RDF-3X lineage) estimate star and chain cardinalities far better than
+independence; sampling covers the rest. Factorised representations keep `A × B` as its two
+inputs, and aggregates over them need no enumeration (`COUNT(A × B) = |A|·|B|`, sums
+scaled by multiplicities). EXISTS and subqueries decorrelate into semi- and anti-joins.
+Sparqloscope (ISWC 2025, Wikidata truthy, 8 B triples): QLever 2.3 s geometric mean over
+105 queries, Virtuoso 10.1 s, MillenniumDB 23.3 s; most systems struggle below 10 B.
+MillenniumDB plans property paths with the rest of the query; reachability indexes and
+path-cardinality statistics help `P31/P279*`.
+
+**Design:**
+
+- Executor: columnar id batches through morsel-driven pipelines; materialisation where a
+  breaker needs it (sort, hash build), not per operator. A first step is in: GROUP BY
+  over a basic graph pattern streams in morsels when it outgrows memory, GROUP BY over a
+  cross product groups in chunks.
+- Optimiser over whole algebra regions (groups, OPTIONAL, subqueries, paths, EXISTS as
+  semi- and anti-joins), choosing per node the join family (merge, hash, index probe,
+  leapfrog, semi-join reduction, factorised) and the representation (flat, stream,
+  factorised).
+- Characteristic sets and pairs, with sampling where they don't apply; plans re-optimised
+  at pipeline breakers when the observed cardinality is far off.
+- An aggregate algebra over products and joins (decomposable aggregates, multiplicities),
+  checked against SPARQL's bag semantics, errors and unbound values: BSBM BI q4's 155 M
+  rows need not exist.
+- Paths planned with the rest of the query, from their bound end; reachability labels for
+  hierarchies.
+- Benchmarks: Sparqloscope, WatDiv, BSBM BI, the Wikidata query logs.
+
+## 6. Parallel incremental reasoning
+
+**Evidence.** Hu, Motik and Horrocks (2018/2019): counting is nearly always worth it;
+which recursive repair wins depends on the workload (1,000 deletes: B/F with counting 1.2 s
+against DRed with counting 179 s on UOBM, but 247 s against 10.5 s on SSPE), and
+rematerialising wins from a few percent of deletes where they invalidate much of a
+recursive closure. Modular materialisation avoids generic rule firings. RDFox reached
+6.1 M derived triples/s and 87× speed-up on 128 cores at 36.9 bytes per triple. RDFox 7.0's
+removal of equality rewriting has no published reason; the likely one is the cost of a
+special global rewrite path against MVCC reads, explanations and stratification.
+
+**Design:**
+
+- Maintenance chosen per rule module and commit by estimated impact: B/F or DRed with
+  counting for small commits, rematerialisation of the affected modules for large ones;
+  `maintenance = auto | bf-count | dred-count | remat` to pin it.
+- Support counts always; derivation records (witnesses, support graph sets) as the
+  provenance level chosen (`count | witness | acl | full`): the ACL design (§4) needs
+  `acl`.
+- Equality (§1) keeps logical identity apart from physical canonicalisation: stable term
+  ids in storage and provenance, a per-epoch canonical map as an accelerator that old
+  snapshots keep until no reader needs them.
+- One serialised closure per commit with many workers inside it; leapfrog joins for cyclic
+  rule bodies, binary joins otherwise.
+- An incremental benchmark of our own: the same commits as 1 to 1 M inserts and deletes,
+  plus pathological ones (a bridge in a transitive closure, a sameAs class split, a fact
+  with many supports, a schema change).
+
+## 7. Transactions, loading and scale-out
+
+**Evidence.** QLever builds Wikidata (21 B triples) in about 5 h with about 20 GB RAM into
+about 500 GB, with a vocabulary merged from per-batch vocabularies. RDFox needs 45–85 bytes
+per fact in memory. RocksDB groups commits for one fsync; Virtuoso updates in place;
+QLever's delta triples suit small deltas.
+
+**Design** (NRESE's run structure is already a delta-main LSM):
+
+- Commit sequence numbers for snapshots; group commit (`durability = sync-low-latency |
+  sync-grouped | async | bulk-build`, a 0.5–5 ms window) for many small transactions;
+  `write_isolation = snapshot | serial-update`.
+- Bounded deltas: compaction debt as a metric that throttles writers; long-lived snapshots
+  reported and optionally capped.
+- Bulk load: per-batch sorted vocabularies merged into dense ids (bounded memory, the
+  measured gap: the dictionary during loads), ids stable afterwards (new terms from a
+  delta dictionary), permutations built by external sort.
+- Targets: full Wikidata in 4–8 h within 24–32 GB RAM into 500–750 GB; at least 10,000
+  small durable commits per second with group commit; reads under an update stream at
+  most 10–20 % slower (p95).
+- Scale-out after standalone and replicated modes: subject-owned shards with all
+  permutations locally, a coordinator for atomic updates, an entity-stream mode for
+  Wikidata-style replays.
+
 ## Order of work
 
 1. Equality stage B with class ids, strict and canonical answers (the reasoning
    pipelines' largest lever), with the torture benchmark.
-2. Store layout: measurement, hierarchical blocks, FSST vocabulary.
-3. Graph access control (needs the reasoner's support sets, shared with equality's
-   support tracking).
-4. Vector search, from the algebra and filter model outward.
+2. Optimiser regions and decorrelated EXISTS, then characteristic sets, then the
+   aggregate algebra over products (§5).
+3. Store layout: measurement, hierarchical blocks, FSST vocabulary; the vocabulary merge
+   for bounded loads (§3, §7).
+4. Support counts and provenance levels in the reasoner (§6), then graph access control
+   on them (§4).
+5. Group commit and commit sequence numbers (§7).
+6. Vector search, from the algebra and filter model outward (§2).
