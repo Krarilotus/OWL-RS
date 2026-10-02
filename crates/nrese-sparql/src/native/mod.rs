@@ -393,6 +393,15 @@ fn native_pattern<'q>(
     } else {
         pushdown::push_filters(pattern.clone())
     };
+    // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
+    let pattern = match form {
+        Form::Ask if !options.as_written => GraphPattern::Slice {
+            inner: Box::new(pattern),
+            start: 0,
+            length: Some(1),
+        },
+        _ => pattern,
+    };
     Ok((pattern, form))
 }
 
