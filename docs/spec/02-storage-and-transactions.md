@@ -1,93 +1,94 @@
 # Storage and Transaction Model
 
-## Objective
+This is the contract the storage engine (`nrese-engine`, layer L1) and the mutation pipeline (`nrese-store`, L3) give to everything above them. The design rationale is in [ADR-0002](../adr/0002-engine-storage-lsm-permutations.md); implementation status is in the [capability matrix](06-target-capability-matrix.md).
 
-Provide a high-throughput, low-latency RDF storage layer with explicit transaction semantics and reasoner-friendly snapshot boundaries.
+## Data model
 
-## Target Storage Capabilities
+- **Dataset:** a set of quads `(subject, predicate, object, graph)`. The default graph is a graph like any other, with a reserved id.
+- **Term identity is RDF term identity.**
+  - Literals keep their lexical form exactly as written: `"030"^^xsd:integer` and `"30"^^xsd:integer` are different terms.
+  - Graph patterns match terms. `FILTER` comparisons compare values.
+- **Named graphs exist iff they contain at least one quad.**
+  - `CREATE GRAPH` stores nothing.
+  - `CLEAR`/`DROP` of an empty named graph fails unless `SILENT` is given.
+- **Asserted and inferred statements are stored separately** (ADR-0003, roadmap E6).
+  - The *asserted* stack holds what clients wrote, in any graph.
+  - The *inferred* stack holds what the reasoner derived, always in the default graph.
+  - The two are **disjoint**: a statement that is both asserted and derivable counts as asserted, as in GraphDB.
+  - Backups contain asserted statements only.
+- **Blank nodes are scoped to one payload.** Every write request (update, Graph Store write, `TELL`, restore) gets fresh blank nodes. Within one payload, labels stay consistent. The startup ontology preload keeps the file's labels, so re-preloading is idempotent.
 
-- Typed query and update execution APIs
-- Default graph + named graph lifecycle operations
-- Snapshot-aware read consistency
-- Atomic commit boundaries for mutation batches
-- Reasoner overlay compatibility
-- Operational controls for backup, restore, and retention
+## Reads
 
-## Storage Capability Tiers
+- **Snapshot reads.** Every query, Graph Store read and export runs on one snapshot, a consistent committed revision.
+  - A snapshot never observes a partial commit.
+  - Readers never wait for writers, compaction or checkpoints.
+- **Read models.** Every read takes one:
+  - `Materialised` (the default): asserted plus inferred statements
+  - `Asserted`: explicit statements only
+  - `Inferred`: implicit statements only
 
-### Tier S1: Baseline
+  A request-level switch and GraphDB's `onto:explicit`/`onto:implicit` pseudo-graphs come with R4.
+- **Pattern cost.** Every triple pattern is a contiguous range in one of six index permutations: O(r·log n + k) for k results over r runs, with r = O(log n). The inferred stack keeps three permutations, because a graph-first order over its single graph is the same as the matching graph-last one.
 
-- In-memory and local durable mode abstraction
-- SPARQL query and update execution
-- Ontology preload and data import primitives
+## Writes
 
-### Tier S2: Protocol-Complete Dataset Behavior
+Every write goes through the mutation pipeline:
 
-- Graph Store operations (GET/PUT/POST/DELETE/HEAD)
-- Dataset-level metadata and graph enumeration
-- Media-type aware RDF parse/serialize flows
+1. **Plan.** The command is applied to an engine transaction. Nothing is visible yet.
+   - Later operations of one request see earlier ones.
+   - The pending delta is exact: inserts are absent from the base, and deletes are present in it.
+2. **Validate.** The gates run on the transaction's state. Today this is the v1 reasoner gate, which reads the whole dataset when enabled; SHACL comes in M2.
+3. **Claim.** The request's ticket decides the race against a timeout. A timed-out request is guaranteed not to be committed, and cancelling it also stops SPARQL evaluation.
+4. **Commit.** The delta is appended to the WAL and synced, then published atomically as the next revision.
 
-### Tier S3: Transaction and Snapshot Hardening
+**Guarantees:**
+- **Atomic inferences.** Asserted and inferred changes commit together, under one revision.
+- **Disjointness is enforced by the engine.**
+  - The reasoner can't infer an asserted statement.
+  - Asserting an inferred statement makes it explicit.
+  - Retracting an asserted statement leaves the inferred stack alone. Re-deriving a statement that is still supported is the reasoner's job.
+  - These rules apply to the transaction's final state, so asserting and retracting a statement within one request changes nothing.
+- **Request paths write asserted statements only.** SPARQL Update, the Graph Store Protocol and restore can't reach the inferred stack. `DELETE`, `CLEAR` and `DROP` retract asserted statements, never inferred ones.
+- **Single writer.** Writes are serialised by the engine's writer slot. Commit cost is O(d log d) for a delta of d quads, independent of the dataset size.
+- **Revisions** increase by one per commit with a net change. They are persistent in on-disk mode and don't change for no-op writes.
+- **Aborts.** Any error before the commit discards the whole request. There are no partial writes.
 
-- Explicit revision IDs
-- Atomic publish after validation gates
-- Read isolation for concurrent query traffic
-- Observable commit latency + queue pressure
+## Bulk loads
 
-### Tier S4: Enterprise Durability
+Initial loads and full restores bypass the per-commit path (`Engine::bulk_load`; `nrese-server load`):
 
-- Backup/restore workflows bound to committed revisions
-- Store-owned export/import primitives with a stable dataset artifact format
-- Recovery validation and corruption detection flows
-- Compaction/vacuum hooks and storage health metrics
+- **One revision.** A bulk load holds the writer slot and publishes one revision. `Append` adds to the asserted data; `Replace` swaps it and clears the inferred stack.
+- **Durable before visible.** The load isn't written to the WAL. A checkpoint of the new revision is written before the revision is published, so a crash either loses the whole unacknowledged load or none of it. Its cost is O(dataset), which is why regular writes use transactions.
+- **Parallel.** Batches are parsed and interned from many threads. The dictionary encodes, hashes and deduplicates a batch before taking its lock.
+- **Blank nodes** are fresh per load, and consistent across the chunks of one load.
+- **No gates.** Bulk loads are operator actions and don't run validation gates.
 
-### Tier S5: Scale and Distribution Readiness
+## Durability (on-disk mode)
 
-- Abstractions for remote/object-backed snapshots
-- Replication and partition strategy integration points
-- Bounded consistency contracts for multi-node modes
+- **Acknowledgement.** A commit is acknowledged only after its WAL record is synced (`SyncPolicy::EveryCommit`, the default).
+- **Checkpoints** run in the background once the WAL grows past a threshold. Writers keep committing while a checkpoint is written, and covered WAL segments are deleted afterwards.
+- **Recovery** loads the newest checkpoint and then replays later WAL records.
+  - A torn record at the end of the log (a crash mid-write) is truncated; it was never acknowledged.
+  - Invalid data anywhere else is a startup error, never silently skipped.
+- **Directory lock.** The data directory is locked against a second process.
+- **Format versions.** WAL segments and checkpoints carry a format version in their magic bytes; format 2 added the inferred stack. A directory written by another version is rejected at startup with `UnsupportedFormat` instead of being reported as corrupt.
 
-## Transaction Lifecycle (Target)
+## Limits (current milestone)
 
-1. Parse and validate mutation payload.
-2. Normalize the request into one canonical mutation command.
-3. Build a candidate revision through a side-effect-free preview path.
-4. Trigger reasoner planning/execution on the preview snapshot if enabled.
-5. Validate post-reasoning constraints.
-6. Apply the canonical mutation to the live store and publish the new revision atomically.
-7. Emit metrics + audit event.
+- **Memory.** Indexes are held in memory, at about 190 bytes per quad uncompressed. Compressed and larger-than-RAM indexes are Pf1/Pf2.
+- **Commit size.** One commit holds at most 4 GiB of WAL payload, about 130 M quads. Larger loads go through the bulk loader.
+- **v1 reasoner cost.** With the v1 reasoner enabled (`rules-mvp`), every write costs O(dataset) until the M3 reasoner replaces it.
 
-## Query Visibility Model
+## Evidence
 
-- Queries read the latest committed revision.
-- The current read model is `asserted-only`.
-- Query and graph-read APIs expose committed asserted dataset state.
-- Reasoning currently affects commit acceptance and diagnostics, not the default query result set.
-- The current reasoner snapshot used for mutation-time reasoning is narrower than full dataset semantics: it reasons over asserted triples, skips triples with blank-node subjects, blank-node objects, or literal objects, and currently flattens named-graph quads so graph names do not participate in indexing yet.
-- Future inferred/materialized read surfaces are an explicit extension point, not an implied current behavior.
-
-## Operational Requirements
-
-- Backups must represent committed canonical state.
-- Restore validation must complete before the live dataset is replaced.
-- Recovery must reject partial revisions.
-- Metrics must include:
-- Query latency
-- Update latency
-- Commit duration
-- Active revision age
-- Reasoning overlay freshness
-
-## Conformance and Reliability Requirements
-
-- SPARQL behavior aligned to supported W3C semantics
-- Deterministic error classes for parser/evaluation/storage failures
-- Load/regression test suite for mixed read/write pressure
-
-## Acceptance Criteria
-
-- Failed mutation or reasoning stage cannot leak partial state.
-- Graph-level operations preserve default vs named graph semantics for store and HTTP behavior; the current mutation-time reasoner snapshot still flattens named-graph quads and does not index graph names.
-- Restore path yields a consistent queryable dataset and shares the same atomic publish gate as the other write paths.
-- Backup artifacts and restore reports expose revision and checksum metadata.
-- Revision publication and rollback paths are test-covered.
+| Guarantee | Test |
+|---|---|
+| Visibility rule, all pattern shapes, compaction | `crates/nrese-engine/src/index/model_tests.rs` |
+| Snapshot isolation, overlay reads, concurrent readers | `crates/nrese-engine/tests/engine_tests.rs` |
+| Bulk loads equal transactional loads (parallel, append/replace, durable) | `crates/nrese-engine/tests/bulk_load_tests.rs`, `crates/nrese-store/tests/it/bulk_load_tests.rs` |
+| Inferred stack: read models, disjointness, both stacks against a model across compaction, checkpoints and reopening | `crates/nrese-engine/tests/inferred_stack_tests.rs` |
+| Crash recovery, torn tails, corruption, checkpoints | `crates/nrese-engine/tests/durability_tests.rs` |
+| SPARQL semantics against an oracle | `crates/nrese-sparql/tests/differential_tests.rs` |
+| Pipeline: cancel vs. commit, gate rejection | `crates/nrese-store/tests/it/mutation_pipeline_tests.rs` |
+| Write cost independent of size (HTTP, end to end) | `benches/baselines/v2-write-scaling-*.json` |

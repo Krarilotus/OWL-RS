@@ -5,8 +5,8 @@ use nrese_reasoner::RejectExplanation;
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::reject_attribution::RejectAttribution;
 use crate::reject_view::RejectExplanationView;
+use nrese_store::RejectAttribution;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -25,6 +25,12 @@ pub enum ApiError {
     Forbidden(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
+    #[error("not acceptable: {0}")]
+    NotAcceptable(String),
+    #[error("unsupported media type: {0}")]
+    UnsupportedMediaType(String),
     #[error("payload too large: {0}")]
     PayloadTooLarge(String),
     #[error("too many requests: {0}")]
@@ -71,6 +77,21 @@ impl ApiError {
         Self::NotFound(message.into())
     }
 
+    /// The request conflicts with the resource's state (it exists already, say).
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
+    }
+
+    /// The client accepts no media type the endpoint can produce.
+    pub fn not_acceptable(message: impl Into<String>) -> Self {
+        Self::NotAcceptable(message.into())
+    }
+
+    /// The request body's media type isn't one the endpoint reads.
+    pub fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self::UnsupportedMediaType(message.into())
+    }
+
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         Self::PayloadTooLarge(message.into())
     }
@@ -94,6 +115,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Server faults are logged once, here; the request span carries the request id,
+        // which the response returns in `x-request-id`.
+        if let Self::Internal(detail) = &self {
+            tracing::error!(%detail, "request failed on the server side");
+        }
         let (status, problem_type, title, detail, reasoner_reject) = match self {
             Self::BadRequest(detail) => (
                 StatusCode::BAD_REQUEST,
@@ -134,6 +160,27 @@ impl IntoResponse for ApiError {
                 StatusCode::NOT_FOUND,
                 "https://nrese.dev/problems/not-found",
                 "Not Found",
+                detail,
+                None,
+            ),
+            Self::Conflict(detail) => (
+                StatusCode::CONFLICT,
+                "https://nrese.dev/problems/conflict",
+                "Conflict",
+                detail,
+                None,
+            ),
+            Self::NotAcceptable(detail) => (
+                StatusCode::NOT_ACCEPTABLE,
+                "https://nrese.dev/problems/not-acceptable",
+                "Not Acceptable",
+                detail,
+                None,
+            ),
+            Self::UnsupportedMediaType(detail) => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "https://nrese.dev/problems/unsupported-media-type",
+                "Unsupported Media Type",
                 detail,
                 None,
             ),

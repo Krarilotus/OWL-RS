@@ -6,8 +6,9 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::interpolation::{expand_env_placeholders, expand_headers_env_placeholders};
 use crate::model::{
-    BasicAuthConfig, ConnectionProfilesRegistry, LiveConnectionProfile, ServiceConnectionConfig,
-    ServiceConnectionProfile, ServiceInvocationProfiles, ServiceRequestProfile,
+    BasicAuthConfig, ConnectionProfilesRegistry, LiveConnectionProfile, ReferenceConnection,
+    ReferenceKind, ServiceConnectionConfig, ServiceConnectionProfile, ServiceInvocationProfiles,
+    ServiceRequestProfile,
 };
 
 pub fn read_connection_profiles_registry(path: &Path) -> Result<ConnectionProfilesRegistry> {
@@ -27,7 +28,9 @@ pub fn resolve_live_connection_profile<'a>(
     profile_name: &str,
 ) -> Result<&'a LiveConnectionProfile> {
     registry.profiles.get(profile_name).ok_or_else(|| {
-        anyhow!("connection profile '{profile_name}' is not defined in the connection profile registry")
+        anyhow!(
+            "connection profile '{profile_name}' is not defined in the connection profile registry"
+        )
     })
 }
 
@@ -63,16 +66,44 @@ pub fn resolve_optional_service_connection(
         .map(|profile| profile.headers.clone())
         .unwrap_or_default();
     let timeout_ms = profile.and_then(|profile| profile.timeout_ms);
-    let basic_auth = cli_basic_auth
-        .cloned()
-        .or_else(|| profile.and_then(|profile| profile.basic_auth.as_ref()).map(to_runtime_basic_auth));
+    let basic_auth = cli_basic_auth.cloned().or_else(|| {
+        profile
+            .and_then(|profile| profile.basic_auth.as_ref())
+            .map(to_runtime_basic_auth)
+    });
 
     Ok(Some(ServiceConnectionConfig {
         base_url,
         headers,
         timeout_ms,
         basic_auth,
+        endpoints: profile
+            .map(|profile| profile.endpoints.clone())
+            .unwrap_or_default(),
     }))
+}
+
+/// Resolves the reference side. The engine kind comes from the CLI or the profile; a
+/// reference URL without a kind is an error instead of a guessed layout.
+pub fn resolve_reference_connection(
+    profile: Option<&ServiceConnectionProfile>,
+    cli_kind: Option<ReferenceKind>,
+    cli_base_url: Option<&str>,
+    cli_basic_auth: Option<&BasicAuthConfig>,
+) -> Result<Option<ReferenceConnection>> {
+    let Some(connection) =
+        resolve_optional_service_connection("Reference", profile, cli_base_url, cli_basic_auth)?
+    else {
+        return Ok(None);
+    };
+    let kind = cli_kind
+        .or_else(|| profile.and_then(|profile| profile.kind))
+        .ok_or_else(|| {
+            anyhow!(
+                "reference connection needs an engine kind: pass --reference-kind or set `kind` in the connection profile"
+            )
+        })?;
+    Ok(Some(ReferenceConnection { kind, connection }))
 }
 
 pub fn merge_invocation_profiles(
@@ -81,7 +112,7 @@ pub fn merge_invocation_profiles(
 ) -> Result<ServiceInvocationProfiles> {
     Ok(ServiceInvocationProfiles {
         nrese: merge_profile_map("NRESE", &base.nrese, &overlay.nrese)?,
-        fuseki: merge_profile_map("Fuseki", &base.fuseki, &overlay.fuseki)?,
+        reference: merge_profile_map("Reference", &base.reference, &overlay.reference)?,
     })
 }
 
@@ -109,13 +140,13 @@ fn merge_profile_map(
 
 fn normalize_live_connection_profile(profile: &mut LiveConnectionProfile) -> Result<()> {
     normalize_service_profile(&mut profile.nrese)?;
-    if let Some(fuseki) = profile.fuseki.as_mut() {
-        normalize_service_profile(fuseki)?;
+    if let Some(reference) = profile.reference.as_mut() {
+        normalize_service_profile(reference)?;
     }
     for request_profile in profile.invocation_profiles.nrese.values_mut() {
         expand_headers_env_placeholders(&mut request_profile.headers)?;
     }
-    for request_profile in profile.invocation_profiles.fuseki.values_mut() {
+    for request_profile in profile.invocation_profiles.reference.values_mut() {
         expand_headers_env_placeholders(&mut request_profile.headers)?;
     }
     Ok(())
@@ -147,8 +178,9 @@ mod tests {
     use crate::model::{BasicAuthConfig, ServiceInvocationProfiles, ServiceRequestProfile};
 
     use super::{
-        merge_invocation_profiles, read_connection_profiles_registry, resolve_live_connection_profile,
-        resolve_optional_service_connection, resolve_required_service_connection,
+        merge_invocation_profiles, read_connection_profiles_registry,
+        resolve_live_connection_profile, resolve_optional_service_connection,
+        resolve_reference_connection, resolve_required_service_connection,
     };
 
     #[test]
@@ -165,12 +197,12 @@ timeout_ms = 15000
 [profiles.secured-live.nrese.headers]
 authorization = "Bearer ${NRESE_TOKEN}"
 
-[profiles.secured-live.fuseki]
-base_url = "${FUSEKI_BASE_URL}"
+[profiles.secured-live.reference]
+base_url = "${REFERENCE_BASE_URL}"
 
-[profiles.secured-live.fuseki.basic_auth]
-username = "${FUSEKI_USER}"
-password = "${FUSEKI_PASS}"
+[profiles.secured-live.reference.basic_auth]
+username = "${REFERENCE_USER}"
+password = "${REFERENCE_PASS}"
 
 [profiles.secured-live.invocation_profiles.nrese.invalid.headers]
 authorization = "Bearer invalid-token"
@@ -181,16 +213,19 @@ authorization = "Bearer invalid-token"
         let previous = [
             ("NRESE_BASE_URL", std::env::var("NRESE_BASE_URL").ok()),
             ("NRESE_TOKEN", std::env::var("NRESE_TOKEN").ok()),
-            ("FUSEKI_BASE_URL", std::env::var("FUSEKI_BASE_URL").ok()),
-            ("FUSEKI_USER", std::env::var("FUSEKI_USER").ok()),
-            ("FUSEKI_PASS", std::env::var("FUSEKI_PASS").ok()),
+            (
+                "REFERENCE_BASE_URL",
+                std::env::var("REFERENCE_BASE_URL").ok(),
+            ),
+            ("REFERENCE_USER", std::env::var("REFERENCE_USER").ok()),
+            ("REFERENCE_PASS", std::env::var("REFERENCE_PASS").ok()),
         ];
         unsafe {
             std::env::set_var("NRESE_BASE_URL", "http://127.0.0.1:8080");
             std::env::set_var("NRESE_TOKEN", "secret");
-            std::env::set_var("FUSEKI_BASE_URL", "http://127.0.0.1:3030/ds");
-            std::env::set_var("FUSEKI_USER", "admin");
-            std::env::set_var("FUSEKI_PASS", "fuseki-admin");
+            std::env::set_var("REFERENCE_BASE_URL", "http://127.0.0.1:3030/ds");
+            std::env::set_var("REFERENCE_USER", "admin");
+            std::env::set_var("REFERENCE_PASS", "reference-admin");
         }
         let registry = read_connection_profiles_registry(&path).expect("registry");
         for (name, value) in previous {
@@ -204,7 +239,11 @@ authorization = "Bearer invalid-token"
             resolve_live_connection_profile(&registry, "secured-live").expect("selected profile");
         assert_eq!(profile.nrese.base_url, "http://127.0.0.1:8080");
         assert_eq!(
-            profile.nrese.headers.get("authorization").map(String::as_str),
+            profile
+                .nrese
+                .headers
+                .get("authorization")
+                .map(String::as_str),
             Some("Bearer secret")
         );
         assert_eq!(
@@ -218,7 +257,7 @@ authorization = "Bearer invalid-token"
         );
         assert_eq!(
             profile
-                .fuseki
+                .reference
                 .as_ref()
                 .and_then(|profile| profile.basic_auth.as_ref())
                 .map(|auth| auth.username.as_str()),
@@ -236,10 +275,10 @@ authorization = "Bearer invalid-token"
 [profiles.secured-live.nrese]
 base_url = "http://127.0.0.1:8080"
 
-[profiles.secured-live.fuseki]
+[profiles.secured-live.reference]
 base_url = "http://127.0.0.1:3030/ds"
 
-[profiles.secured-live.fuseki.basic_auth]
+[profiles.secured-live.reference.basic_auth]
 username = "profile-user"
 password = "profile-pass"
 "#,
@@ -250,8 +289,8 @@ password = "profile-pass"
         let profile =
             resolve_live_connection_profile(&registry, "secured-live").expect("selected profile");
         let config = resolve_optional_service_connection(
-            "Fuseki",
-            profile.fuseki.as_ref(),
+            "Reference",
+            profile.reference.as_ref(),
             Some("http://127.0.0.1:3030/ds"),
             Some(&BasicAuthConfig {
                 username: "override".to_owned(),
@@ -259,10 +298,13 @@ password = "profile-pass"
             }),
         )
         .expect("connection")
-        .expect("fuseki");
+        .expect("reference");
 
         assert_eq!(
-            config.basic_auth.as_ref().map(|auth| auth.username.as_str()),
+            config
+                .basic_auth
+                .as_ref()
+                .map(|auth| auth.username.as_str()),
             Some("override")
         );
     }
@@ -300,5 +342,40 @@ password = "profile-pass"
 
         let error = merge_invocation_profiles(&base, &overlay).expect_err("collision");
         assert!(error.to_string().contains("collide"));
+    }
+
+    #[test]
+    fn reference_kind_comes_from_cli_or_profile_and_is_required() {
+        let profile: crate::model::ServiceConnectionProfile = toml::from_str(
+            r#"
+kind = "graphdb"
+base_url = "http://h:7200/repositories/r"
+update_url = "http://h:7200/custom"
+"#,
+        )
+        .expect("profile");
+
+        let from_profile = resolve_reference_connection(Some(&profile), None, None, None)
+            .expect("resolve")
+            .expect("reference");
+        assert_eq!(from_profile.kind, crate::model::ReferenceKind::Graphdb);
+        assert_eq!(
+            from_profile.connection.endpoints.update_url.as_deref(),
+            Some("http://h:7200/custom")
+        );
+
+        let from_cli = resolve_reference_connection(
+            Some(&profile),
+            Some(crate::model::ReferenceKind::Qlever),
+            None,
+            None,
+        )
+        .expect("resolve")
+        .expect("reference");
+        assert_eq!(from_cli.kind, crate::model::ReferenceKind::Qlever);
+
+        let error = resolve_reference_connection(None, None, Some("http://h:3030/ds"), None)
+            .expect_err("kind required");
+        assert!(error.to_string().contains("engine kind"));
     }
 }

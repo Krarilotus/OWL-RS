@@ -1,27 +1,21 @@
-use oxigraph::store::Store;
-
-use crate::error::StoreResult;
+use nrese_engine::{ReadModel, Snapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoreStats {
+    /// Asserted quads.
     pub quad_count: usize,
+    /// Inferred quads (default graph; disjoint from the asserted ones).
+    pub inferred_count: usize,
     pub named_graph_count: usize,
     pub is_empty: bool,
 }
 
-pub fn collect_stats(store: &Store) -> StoreResult<StoreStats> {
-    let quad_count = store.len()?;
-    let is_empty = store.is_empty()?;
-    let mut named_graph_count = 0usize;
-
-    for graph in store.named_graphs() {
-        graph?;
-        named_graph_count += 1;
+/// O(1) for the counts plus O(g log n) for listing g named graphs.
+pub fn collect_stats(snapshot: &Snapshot) -> StoreStats {
+    StoreStats {
+        quad_count: snapshot.len_in(ReadModel::Asserted) as usize,
+        inferred_count: snapshot.len_in(ReadModel::Inferred) as usize,
+        named_graph_count: snapshot.named_graphs().count(),
+        is_empty: snapshot.is_empty(),
     }
-
-    Ok(StoreStats {
-        quad_count,
-        named_graph_count,
-        is_empty,
-    })
 }

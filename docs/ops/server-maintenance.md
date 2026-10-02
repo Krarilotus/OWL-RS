@@ -11,7 +11,7 @@
 - Confirm active ontology path matches expected environment configuration
 - Keep migration and rollback documents current:
 - `migration-fuseki-to-nrese.md`
-- `rollback-runbook.md`
+- `docs/archive/fuseki-rollback-runbook.md` (archived)
 - `backup-restore-drills.md`
 - `operational-readiness-handbook.md`
 
@@ -42,7 +42,7 @@
 - Run `cargo check` and repository tests before deployment
 - Roll out configuration changes with explicit change logs
 - Prefer reversible deployment steps and data-compatible releases
-- Validate fallback path discovery behavior in staging before production rollout
+- Validate that `NRESE_ONTOLOGY_PATH` points to the intended ontology in staging before production rollout
 
 ## Incident Response Pattern
 

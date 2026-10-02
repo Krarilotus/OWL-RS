@@ -1,0 +1,15 @@
+[package]
+name = "nrese-json"
+description = "NRESE's JSON: a strict pull parser over text or a reader, a borrowing DOM, a writer, and the JSON Canonicalization Scheme"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+memchr = { workspace = true }
+thiserror.workspace = true
+
+[lints]
+workspace = true

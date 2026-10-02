@@ -1,209 +1,66 @@
-use std::time::Instant;
+use nrese_core::ReasonerCapability;
 
-use nrese_core::{
-    DatasetSnapshot, ReasonerCapability, ReasonerEngine, ReasonerExecutionPlan, ReasonerRunMetrics,
-    ReasonerRunReport, ReasonerRunStatus, ReasoningOutput,
-};
-
-use crate::config::{ReasonerConfig, ReasonerProfileConfig, ReasoningMode, ReasoningReadModel};
-use crate::output::{InferenceDelta, ReasoningCacheStats};
+use crate::config::{ReasonerConfig, ReasoningMode};
 use crate::profile::{ReasonerProfile, profile_for_config};
-use crate::rules::execute_rules_mvp_with_cache;
-use crate::rules_mvp_cache::RulesMvpExecutionCache;
 
+/// The configured reasoner: its mode and profile. The reasoning itself runs in the store
+/// (`nrese_store::reasoning`): the batch executor after loads, the delta executor on
+/// every commit.
 #[derive(Debug, Clone)]
 pub struct ReasonerService {
     config: ReasonerConfig,
-    resolved_profile: ReasonerProfile,
-    rules_mvp_cache: std::sync::Arc<RulesMvpExecutionCache>,
+    profile: ReasonerProfile,
 }
 
 impl ReasonerService {
     pub fn new(config: ReasonerConfig) -> Self {
-        let resolved_profile = profile_for_config(&config);
-        Self {
-            config,
-            resolved_profile,
-            rules_mvp_cache: std::sync::Arc::new(RulesMvpExecutionCache::default()),
-        }
+        let profile = profile_for_config(&config);
+        Self { config, profile }
     }
 
     pub fn config(&self) -> &ReasonerConfig {
         &self.config
     }
 
+    pub fn mode(&self) -> ReasoningMode {
+        self.config.mode()
+    }
+
     pub fn profile_name(&self) -> &'static str {
-        self.resolved_profile.name
+        self.profile.name
     }
 
     pub fn mode_name(&self) -> &'static str {
-        self.resolved_profile.mode
-    }
-
-    pub const fn read_model(&self) -> ReasoningReadModel {
-        self.config.read_model
+        self.profile.mode
     }
 
     pub fn read_model_name(&self) -> &'static str {
-        self.read_model().as_str()
+        self.config.read_model_name()
     }
 
     pub fn semantic_tier(&self) -> &'static str {
-        self.resolved_profile.semantic_tier
+        self.profile.semantic_tier
     }
 
-    pub fn rules_mvp_preset(&self) -> crate::RulesMvpPreset {
-        self.config
-            .rules_mvp_preset()
-            .unwrap_or(crate::RulesMvpPreset::Custom)
-    }
-
-    pub fn rules_mvp_feature_policy(&self) -> Option<crate::RulesMvpFeaturePolicy> {
-        self.config.rules_mvp_feature_policy()
-    }
-
-    pub fn available_rules_mvp_presets(&self) -> &'static [crate::RulesMvpPresetDescriptor] {
-        crate::RulesMvpPreset::available_descriptors()
+    /// The program's name, semantics version and fingerprint (`owl2-rl v2 1f…`): what the
+    /// materialised closure means. It changes exactly when a build or the user's rules
+    /// derive something different for the same data. `None` without reasoning.
+    pub fn semantics(&self) -> Option<String> {
+        self.config.materialised_program().map(|program| {
+            format!(
+                "{} v{} {:016x}",
+                program.name(),
+                crate::v2::rulesets::SEMANTICS_VERSION,
+                program.fingerprint()
+            )
+        })
     }
 
     pub fn capabilities(&self) -> &[ReasonerCapability] {
-        &self.resolved_profile.capabilities
-    }
-
-    pub fn rules_mvp_cache_stats(&self) -> ReasoningCacheStats {
-        self.rules_mvp_cache.snapshot()
+        &self.profile.capabilities
     }
 
     pub fn resolved_profile(&self) -> &ReasonerProfile {
-        &self.resolved_profile
+        &self.profile
     }
 }
-
-impl<'a, S> ReasonerEngine<'a, S> for ReasonerService
-where
-    S: DatasetSnapshot<'a>,
-{
-    type Inferred = InferenceDelta;
-
-    fn profile_name(&self) -> &'static str {
-        ReasonerService::profile_name(self)
-    }
-
-    fn mode_name(&self) -> &'static str {
-        ReasonerService::mode_name(self)
-    }
-
-    fn capabilities(&self) -> &[ReasonerCapability] {
-        ReasonerService::capabilities(self)
-    }
-
-    fn plan(&self, snapshot: &'a S) -> nrese_core::NreseResult<ReasonerExecutionPlan> {
-        let revision = snapshot.revision();
-        let plan = match self.config.mode() {
-            ReasoningMode::Disabled => ReasonerExecutionPlan::validation_only(revision),
-            ReasoningMode::RulesMvp | ReasoningMode::OwlDlTarget => {
-                ReasonerExecutionPlan::full_materialization(revision)
-            }
-        };
-
-        Ok(plan)
-    }
-
-    fn run(
-        &self,
-        snapshot: &'a S,
-        plan: &ReasonerExecutionPlan,
-    ) -> nrese_core::NreseResult<ReasoningOutput<Self::Inferred>> {
-        let started = Instant::now();
-        let asserted_triples = snapshot.asserted_triple_count();
-
-        let (status, notes, inferred) = match &self.config.profile {
-            ReasonerProfileConfig::Disabled => (
-                ReasonerRunStatus::Skipped,
-                vec!["reasoner mode disabled"],
-                InferenceDelta::default(),
-            ),
-            ReasonerProfileConfig::RulesMvp(rules_mvp) => {
-                let cached =
-                    execute_rules_mvp_with_cache(snapshot, &self.rules_mvp_cache, &self.config);
-                let inferred = cached.inferred;
-                let mut notes =
-                    vec!["rules-mvp executed bounded RDFS/OWL closure and consistency checks"];
-                if inferred.cache.execution_cache_hit {
-                    notes.push("rules-mvp reused memoized preparation and inference artifacts");
-                } else if inferred.cache.schema_cache_hit {
-                    notes.push("rules-mvp reused memoized schema preparation artifacts");
-                } else if snapshot.cache_key().is_some() {
-                    notes.push("rules-mvp refreshed memoized preparation and inference artifacts");
-                }
-                let status = if inferred.consistency_violations > 0 {
-                    notes.push("rules-mvp rejected update due to consistency violations");
-                    ReasonerRunStatus::Rejected
-                } else {
-                    ReasonerRunStatus::Completed
-                };
-                if inferred
-                    .diagnostics
-                    .iter()
-                    .any(|message| message.contains("not implemented in rules-mvp"))
-                {
-                    notes
-                        .push("rules-mvp reported deterministic unsupported-construct diagnostics");
-                }
-                if snapshot.unsupported_triple_count() > 0 {
-                    notes.push("rules-mvp skipped unsupported asserted triples");
-                }
-                if inferred.stats.equality_assertion_count > 0 {
-                    notes.push("rules-mvp applied canonical owl:sameAs equality handling");
-                }
-                if inferred.stats.inferred_equality_link_count > 0 {
-                    notes.push(
-                        "rules-mvp derived bounded owl:sameAs links from functional or inverse-functional property semantics",
-                    );
-                }
-                if !rules_mvp.feature_policy.owl_consistency_check_enabled() {
-                    notes.push(
-                        "rules-mvp consistency gates were disabled by external configuration",
-                    );
-                }
-                if !rules_mvp
-                    .feature_policy
-                    .unsupported_construct_diagnostics_enabled()
-                {
-                    notes.push(
-                        "rules-mvp unsupported-construct diagnostics were disabled by external configuration",
-                    );
-                }
-                (status, notes, inferred)
-            }
-            ReasonerProfileConfig::OwlDlTarget => (
-                ReasonerRunStatus::Skipped,
-                vec!["owl-dl target mode scaffolded but not implemented"],
-                InferenceDelta::default(),
-            ),
-        };
-        let metrics = ReasonerRunMetrics {
-            asserted_triples_seen: asserted_triples,
-            inferred_triples_produced: inferred.inferred_triples,
-            consistency_violations: inferred.consistency_violations,
-            elapsed_millis: started.elapsed().as_millis() as u64,
-        };
-        let profile = self.resolved_profile();
-
-        Ok(ReasoningOutput {
-            inferred,
-            report: ReasonerRunReport {
-                profile: profile.name,
-                mode: profile.mode,
-                revision: plan.revision,
-                status,
-                metrics,
-                notes,
-            },
-        })
-    }
-}
-
-#[cfg(test)]
-#[path = "tests/service_tests.rs"]
-mod tests;

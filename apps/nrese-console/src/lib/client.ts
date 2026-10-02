@@ -2,6 +2,7 @@ import { NRESE_ENDPOINTS, buildGraphQuery, type GraphMode } from "./endpoints";
 import { fetchJson, fetchText, type FetchLike } from "./http";
 import type {
   AiStatus,
+  AutocompleteResponse,
   Capabilities,
   QuerySuggestionResponse,
   ReasoningDiagnostics,
@@ -41,8 +42,9 @@ export class NreseClient {
     );
   }
 
+  /** The server advertises the diagnostics path at runtime, so any path is accepted. */
   async getReasoningDiagnostics(
-    endpoint = NRESE_ENDPOINTS.reasoningDiagnostics,
+    endpoint: string = NRESE_ENDPOINTS.reasoningDiagnostics,
   ): Promise<ReasoningDiagnostics> {
     return fetchJson<ReasoningDiagnostics>(this.fetchImpl, this.baseUrl, endpoint);
   }
@@ -71,6 +73,17 @@ export class NreseClient {
         }),
         body: JSON.stringify(payload),
       },
+    );
+  }
+
+  /** Resources whose labels' or local names' words begin with the words of `text`. */
+  async autocomplete(text: string, limit = 10): Promise<AutocompleteResponse> {
+    const params = new URLSearchParams({ q: text, limit: String(limit) });
+    return fetchJson<AutocompleteResponse>(
+      this.fetchImpl,
+      this.baseUrl,
+      `${NRESE_ENDPOINTS.autocomplete}?${params.toString()}`,
+      { headers: this.mergeHeaders() },
     );
   }
 

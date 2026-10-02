@@ -1,5 +1,9 @@
 # Reasoner and OWL Profile
 
+> **Historical.** The v1 reasoner is gone; the current contract is [reasoning-semantics.md](reasoning-semantics.md).
+>
+> **Scope:** describes the **v1** `rules-mvp` reasoner. The v2 reasoner (materialised, incremental, queryable) is [ADR-0003](../adr/0003-materialised-reasoning.md), designed and planned in [design/reasoner-v2.md](../design/reasoner-v2.md) (roadmap Milestone 3).
+
 ## Objective
 
 Build a Rust-native reasoning subsystem that scales from practical enterprise closure to advanced OWL capabilities with explicit profile and support boundaries.
@@ -135,6 +139,8 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 - OWL 2 EL-oriented classification path for large terminology workloads
 
 ### Tier R4: OWL 2 DL Target
+
+In scope (owner, 2026-10-02): reasoning is the feature NRESE means to lead in. The tiers below are the v1 sketch; the engine v2 design is [ADR-0009](../adr/0009-owl2-dl-reasoning.md) (proposed).
 
 - Wider class expression handling
 - Property characteristics and cardinality-centric reasoning

@@ -1,0 +1,723 @@
+//! The engine API for users, workspaces and graph policies (ADR-0008): who the requester
+//! is and what it may do, the state for administrators, and its changes, each with a
+//! reason (`reason` in the JSON body, or as a query parameter of a `DELETE`), kept in the
+//! history. Who may change what is the engine's decision ([`nrese_store::access`]):
+//! administrators everything; owners their workspace and its members; every user its own
+//! password and who sees its personal space.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::{Path, RawQuery, State};
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+use nrese_store::access::{
+    AccessState, Change, ChangeRecord, DefaultGraphRight, Fallback, Inferred, Level, Principal,
+    RoleRule,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::error::ApiError;
+use crate::http::guard;
+use crate::state::AppState;
+
+/// The requester, as the access state's changes see it.
+async fn requester(
+    state: &AppState,
+    authenticated: &crate::auth::Authenticated,
+) -> Result<Principal, ApiError> {
+    let identity = guard::enforce_query_read(state, authenticated).await?;
+    Ok(state.access_principal(&identity))
+}
+
+/// Fails unless `principal` administers.
+fn administrator(access: &AccessState, principal: &Principal) -> Result<(), ApiError> {
+    match access.is_admin(principal) {
+        true => Ok(()),
+        false => Err(ApiError::forbidden(
+            "only administrators see the whole access state",
+        )),
+    }
+}
+
+fn body<T: for<'de> Deserialize<'de>>(bytes: &Bytes) -> Result<T, ApiError> {
+    serde_json::from_slice(bytes).map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
+/// The `reason` query parameter (for `DELETE`s, which have no body).
+fn reason_parameter(raw: &RawQuery) -> Result<String, ApiError> {
+    Ok(super::rdf4j::pairs(raw)?
+        .into_iter()
+        .find(|(key, _)| key == "reason")
+        .map(|(_, value)| value)
+        .unwrap_or_default())
+}
+
+/// Applies `change` by the requester; the change's record.
+async fn change(
+    state: &AppState,
+    authenticated: &crate::auth::Authenticated,
+    change: Change,
+    reason: String,
+) -> Result<Response, ApiError> {
+    let by = requester(state, authenticated).await?;
+    let access = state.clone();
+    let record = tokio::task::spawn_blocking(move || access.access().apply(&by, change, &reason))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(record).into_response())
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct WorkspaceView {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Its graphs' IRI prefix.
+    prefix: String,
+    /// The repository it is in; absent: every repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
+    /// Graphs it takes in besides its prefix.
+    graphs: Vec<String>,
+    personal: bool,
+    /// The requester's level, where it is a member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<Level>,
+    members: BTreeMap<String, Level>,
+}
+
+fn workspace_view(access: &AccessState, name: &str, level: Option<Level>) -> WorkspaceView {
+    let workspace = access.workspaces.get(name).cloned().unwrap_or_default();
+    let mut members = workspace.members;
+    if let Some(owner) = name.strip_prefix('~') {
+        members.insert(owner.to_owned(), Level::Owner);
+    }
+    WorkspaceView {
+        name: name.to_owned(),
+        title: workspace.title,
+        prefix: access.prefix(name),
+        repository: workspace.repository,
+        graphs: workspace.graphs,
+        personal: name.starts_with('~'),
+        level,
+        members,
+    }
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct Me {
+    user: Option<String>,
+    roles: BTreeSet<String>,
+    admin: bool,
+    /// Whether access is restricted at all.
+    enforced: bool,
+    /// Whether the requester reads every graph (in the repository asked about).
+    reads_everything: bool,
+    /// Its personal space, where it has a user name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    personal_space: Option<WorkspaceView>,
+    workspaces: Vec<WorkspaceView>,
+}
+
+#[utoipa::path(get, path = "/api/v1/access/me", tag = "access",
+    responses((status = 200, description = "Who the requester is", body = Me)))]
+/// Who the requester is: its user name, roles, personal space and workspaces.
+pub async fn me(
+    State(state): State<AppState>,
+    authenticated: crate::auth::Authenticated,
+) -> Result<Response, ApiError> {
+    let identity = guard::enforce_query_read(&state, &authenticated).await?;
+    let principal = crate::access::principal(&identity);
+    let access = state.access().state();
+    let memberships = principal
+        .user
+        .as_deref()
+        .map(|user| access.memberships(user, None))
+        .unwrap_or_default();
+    let mut workspaces = memberships
+        .iter()
+        .map(|(name, level)| workspace_view(&access, name, Some(*level)));
+    let personal_space = principal.user.as_ref().and_then(|_| workspaces.next());
+    Ok(Json(Me {
+        roles: access.roles_of(&principal),
+        admin: access.is_admin(&principal),
+        enforced: access.settings.enforced,
+        reads_everything: state.access_view(&identity).reads_everything(),
+        workspaces: workspaces.collect(),
+        personal_space,
+        user: principal.user,
+    })
+    .into_response())
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct UserView {
+    name: String,
+    admin: bool,
+    roles: BTreeSet<String>,
+    /// Whether it has a password for local logins.
+    local_login: bool,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct Overview {
+    settings: nrese_store::access::Settings,
+    roles: Vec<RoleRule>,
+    users: Vec<UserView>,
+    workspaces: Vec<WorkspaceView>,
+}
+
+#[utoipa::path(get, path = "/api/v1/access", tag = "access",
+    responses((status = 200, description = "The whole state", body = Overview), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
+/// The whole state (administrators): settings, roles, users, workspaces.
+pub async fn overview(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    let access = state.access().state();
+    administrator(&access, &by)?;
+    Ok(Json(Overview {
+        settings: access.settings.clone(),
+        roles: access.roles.values().cloned().collect(),
+        users: access
+            .users
+            .iter()
+            .map(|(name, user)| UserView {
+                name: name.clone(),
+                admin: user.admin,
+                roles: user.roles.clone(),
+                local_login: user.password_hash.is_some(),
+            })
+            .collect(),
+        workspaces: access
+            .workspaces
+            .keys()
+            .map(|name| workspace_view(&access, name, None))
+            .collect(),
+    })
+    .into_response())
+}
+
+#[utoipa::path(get, path = "/api/v1/access/workspaces", tag = "access",
+    responses((status = 200, description = "The requester's workspaces, its personal space first", body = Vec<WorkspaceView>)))]
+/// The workspaces the requester is in (administrators: every one recorded).
+pub async fn workspaces(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    let access = state.access().state();
+    let views: Vec<WorkspaceView> = match (access.is_admin(&by), by.user.as_deref()) {
+        (true, _) => access
+            .workspaces
+            .keys()
+            .map(|name| workspace_view(&access, name, None))
+            .collect(),
+        (false, Some(user)) => access
+            .memberships(user, None)
+            .iter()
+            .map(|(name, level)| workspace_view(&access, name, Some(*level)))
+            .collect(),
+        (false, None) => Vec::new(),
+    };
+    Ok(Json(views).into_response())
+}
+
+#[utoipa::path(get, path = "/api/v1/access/workspaces/{name}", tag = "access", params(("name" = String, Path)),
+    responses((status = 200, description = "The workspace", body = WorkspaceView), (status = 404, description = "None the requester is in", body = crate::http::openapi::Problem)))]
+/// One workspace, for its members and administrators.
+pub async fn workspace(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    let access = state.access().state();
+    let level = by
+        .user
+        .as_deref()
+        .and_then(|user| match name.strip_prefix('~') {
+            Some(owner) if owner == user => Some(Level::Owner),
+            _ => access
+                .workspaces
+                .get(&name)
+                .and_then(|w| w.members.get(user).copied()),
+        });
+    let known = name.starts_with('~') || access.workspaces.contains_key(&name);
+    if !known || (level.is_none() && !access.is_admin(&by)) {
+        return Err(ApiError::not_found(format!("no workspace '{name}'")));
+    }
+    Ok(Json(workspace_view(&access, &name, level)).into_response())
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct SettingsBody {
+    enforced: Option<bool>,
+    fallback: Option<Fallback>,
+    inferred: Option<Inferred>,
+    users_create_workspaces: Option<bool>,
+    #[serde(default)]
+    reason: String,
+}
+
+#[utoipa::path(put, path = "/api/v1/access/settings", tag = "access", request_body = SettingsBody,
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
+/// Changes the settings given (administrators).
+pub async fn settings_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let request: SettingsBody = body(&bytes)?;
+    let mut settings = state.access().state().settings.clone();
+    if let Some(enforced) = request.enforced {
+        settings.enforced = enforced;
+    }
+    if let Some(fallback) = request.fallback {
+        settings.fallback = fallback;
+    }
+    if let Some(inferred) = request.inferred {
+        settings.inferred = inferred;
+    }
+    if let Some(create) = request.users_create_workspaces {
+        settings.users_create_workspaces = create;
+    }
+    change(
+        &state,
+        &authenticated,
+        Change::Settings(settings),
+        request.reason,
+    )
+    .await
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct RoleBody {
+    #[serde(default)]
+    read: Vec<String>,
+    #[serde(default)]
+    write: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    default_graph: DefaultGraphRight,
+    /// Whether the role's users may call other endpoints with `SERVICE`.
+    #[serde(default)]
+    service: bool,
+    #[serde(default)]
+    reason: String,
+}
+
+#[utoipa::path(put, path = "/api/v1/access/roles/{name}", tag = "access", params(("name" = String, Path)), request_body = RoleBody,
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
+/// Sets role `name`'s rule (administrators).
+pub async fn role_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let request: RoleBody = body(&bytes)?;
+    let rule = RoleRule {
+        name,
+        read: request.read,
+        write: request.write,
+        deny: request.deny,
+        default_graph: request.default_graph,
+        service: request.service,
+    };
+    change(
+        &state,
+        &authenticated,
+        Change::PutRole(rule),
+        request.reason,
+    )
+    .await
+}
+
+#[utoipa::path(delete, path = "/api/v1/access/roles/{name}", tag = "access", params(("name" = String, Path), ("reason" = String, Query, description = "Why (required)")),
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem), (status = 404, description = "No such role", body = crate::http::openapi::Problem)))]
+/// Removes role `name`'s rule (administrators).
+pub async fn role_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    raw: RawQuery,
+) -> Result<Response, ApiError> {
+    let reason = reason_parameter(&raw)?;
+    change(&state, &authenticated, Change::RemoveRole(name), reason).await
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct UserBody {
+    admin: Option<bool>,
+    roles: Option<BTreeSet<String>>,
+    /// A local login's password; empty removes it. Users set their own.
+    password: Option<String>,
+    #[serde(default)]
+    reason: String,
+}
+
+#[utoipa::path(put, path = "/api/v1/access/users/{name}", tag = "access", params(("name" = String, Path)), request_body = UserBody,
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
+/// Creates or changes user `name` (administrators).
+pub async fn user_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let request: UserBody = body(&bytes)?;
+    let password_hash = match request.password {
+        None => None,
+        Some(password) => {
+            let access = state.clone();
+            Some(
+                tokio::task::spawn_blocking(move || access.access().password_hash(&password))
+                    .await
+                    .map_err(|error| ApiError::internal(error.to_string()))??,
+            )
+        }
+    };
+    let change_user = Change::PutUser {
+        name,
+        admin: request.admin,
+        roles: request.roles,
+        password_hash,
+    };
+    change(&state, &authenticated, change_user, request.reason).await
+}
+
+#[utoipa::path(delete, path = "/api/v1/access/users/{name}", tag = "access", params(("name" = String, Path), ("reason" = String, Query, description = "Why (required)")),
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem), (status = 404, description = "No such user", body = crate::http::openapi::Problem)))]
+/// Removes user `name` with its memberships (administrators).
+pub async fn user_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    raw: RawQuery,
+) -> Result<Response, ApiError> {
+    let reason = reason_parameter(&raw)?;
+    change(&state, &authenticated, Change::RemoveUser(name), reason).await
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceBody {
+    /// Empty: no title.
+    title: Option<String>,
+    /// Empty or `*`: every repository.
+    repository: Option<String>,
+    /// Graphs it takes in besides its prefix (administrators only).
+    graphs: Option<Vec<String>>,
+    #[serde(default)]
+    reason: String,
+}
+
+#[utoipa::path(put, path = "/api/v1/access/workspaces/{name}", tag = "access", params(("name" = String, Path)), request_body = WorkspaceBody,
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
+/// Creates workspace `name` (the requester owns it) or changes it (its owners).
+pub async fn workspace_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let request: WorkspaceBody = body(&bytes)?;
+    let none_if = |value: String, empty: &[&str]| -> Option<String> {
+        (!empty.contains(&value.trim())).then_some(value)
+    };
+    let change_workspace = Change::PutWorkspace {
+        name,
+        title: request.title.map(|title| none_if(title, &[""])),
+        repository: request
+            .repository
+            .map(|repository| none_if(repository, &["", "*"])),
+        graphs: request.graphs,
+    };
+    change(&state, &authenticated, change_workspace, request.reason).await
+}
+
+#[utoipa::path(delete, path = "/api/v1/access/workspaces/{name}", tag = "access", params(("name" = String, Path), ("reason" = String, Query, description = "Why (required)")),
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem), (status = 404, description = "No such workspace", body = crate::http::openapi::Problem)))]
+/// Removes workspace `name` (its owners; for a personal space: who sees it).
+pub async fn workspace_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    raw: RawQuery,
+) -> Result<Response, ApiError> {
+    let reason = reason_parameter(&raw)?;
+    change(
+        &state,
+        &authenticated,
+        Change::RemoveWorkspace(name),
+        reason,
+    )
+    .await
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct MemberBody {
+    level: Level,
+    #[serde(default)]
+    reason: String,
+}
+
+#[utoipa::path(put, path = "/api/v1/access/workspaces/{name}/members/{user}", tag = "access",
+    params(("name" = String, Path), ("user" = String, Path)), request_body = MemberBody,
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem), (status = 409, description = "The workspace would have no owner", body = crate::http::openapi::Problem)))]
+/// Makes `user` a member of workspace `name` at a level (its owners).
+pub async fn member_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((name, user)): Path<(String, String)>,
+    bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let request: MemberBody = body(&bytes)?;
+    let set = Change::SetMember {
+        workspace: name,
+        user,
+        level: Some(request.level),
+    };
+    change(&state, &authenticated, set, request.reason).await
+}
+
+#[utoipa::path(delete, path = "/api/v1/access/workspaces/{name}/members/{user}", tag = "access",
+    params(("name" = String, Path), ("user" = String, Path), ("reason" = String, Query, description = "Why (required)")),
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem), (status = 409, description = "The workspace would have no owner", body = crate::http::openapi::Problem)))]
+/// Removes `user` from workspace `name` (its owners).
+pub async fn member_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((name, user)): Path<(String, String)>,
+    raw: RawQuery,
+) -> Result<Response, ApiError> {
+    let reason = reason_parameter(&raw)?;
+    let set = Change::SetMember {
+        workspace: name,
+        user,
+        level: None,
+    };
+    change(&state, &authenticated, set, reason).await
+}
+
+#[utoipa::path(get, path = "/api/v1/access/history", tag = "access",
+    params(("limit" = Option<usize>, Query, description = "How many (100)")),
+    responses((status = 200, description = "The changes, the latest first", body = Vec<nrese_store::access::ChangeRecord>), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
+/// The latest changes (`limit`, 100 by default), the latest first (administrators).
+pub async fn history(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    raw: RawQuery,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    administrator(&state.access().state(), &by)?;
+    let limit = super::rdf4j::pairs(&raw)?
+        .into_iter()
+        .find(|(key, _)| key == "limit")
+        .map(|(_, value)| {
+            value
+                .parse::<usize>()
+                .map_err(|_| ApiError::bad_request("limit must be a number"))
+        })
+        .transpose()?
+        .unwrap_or(100);
+    let access = state.clone();
+    let records: Vec<ChangeRecord> =
+        tokio::task::spawn_blocking(move || access.access().history(limit))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(Json(records).into_response())
+}
+
+#[utoipa::path(post, path = "/api/v1/access/import", tag = "access", params(("reason" = String, Query, description = "Why (required)")),
+    request_body(content = String, content_type = "application/toml", description = "A policy file"),
+    responses((status = 200, description = "Applied; its history record", body = nrese_store::access::ChangeRecord), (status = 400, description = "Invalid, or no reason", body = crate::http::openapi::Problem), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
+/// Replaces the role rules and fallbacks with the policy file in the body (TOML) and
+/// turns enforcement on (administrators); `reason` as a query parameter.
+pub async fn import(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    raw: RawQuery,
+    bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let reason = reason_parameter(&raw)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| ApiError::bad_request("the policy must be UTF-8"))?;
+    let policy: crate::access::AccessPolicy =
+        toml::from_str(text).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    change(&state, &authenticated, Change::Import(policy), reason).await
+}
+
+#[utoipa::path(get, path = "/api/v1/access/export", tag = "access",
+    responses((status = 200, description = "The policy file", content_type = "application/toml", body = String), (status = 403, description = "The requester may not make this change", body = crate::http::openapi::Problem)))]
+/// The role rules and fallbacks as a policy file (TOML; administrators).
+pub async fn export(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    let access = state.access().state();
+    administrator(&access, &by)?;
+    let text =
+        toml::to_string(&access.export()).map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/toml")],
+        text,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+struct LoginBody {
+    user: String,
+    password: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct Session {
+    user: String,
+    /// `Authorization: Bearer {token}` on the following requests.
+    token: String,
+    expires_in_seconds: u64,
+}
+
+#[utoipa::path(post, path = "/api/v1/access/login", tag = "access", request_body = LoginBody,
+    responses((status = 200, description = "A session", body = Session), (status = 401, description = "Wrong user name or password", body = crate::http::openapi::Problem),
+        (status = 429, description = "Too many failed logins", body = crate::http::openapi::Problem)))]
+/// Logs a local user in: a session token for the following requests. 401 for a wrong
+/// user name or password, 429 after too many; 404 with local logins off.
+pub async fn login(
+    State(state): State<AppState>,
+    crate::http::authentication::ClientAddress(client): crate::http::authentication::ClientAddress,
+    bytes: Bytes,
+) -> Result<Response, ApiError> {
+    if !state.policy().local_logins {
+        return Err(ApiError::not_found("local logins are off"));
+    }
+    let request: LoginBody = body(&bytes)?;
+    let access = state.clone();
+    let user = request.user.clone();
+    let opened = tokio::task::spawn_blocking(move || {
+        access
+            .access()
+            .open_session(&request.user, &request.password, client)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    match opened {
+        Ok((token, lifetime)) => Ok(Json(Session {
+            user,
+            token,
+            expires_in_seconds: lifetime.as_secs(),
+        })
+        .into_response()),
+        Err(nrese_store::access::AccessError::Throttled(message)) => {
+            Err(ApiError::too_many_requests(message))
+        }
+        Err(_) => Err(ApiError::unauthorized("wrong user name or password")),
+    }
+}
+
+#[utoipa::path(post, path = "/api/v1/access/logout", tag = "access",
+    responses((status = 204, description = "Ended"), (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
+/// Ends the session whose token the request carries.
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .ok_or_else(|| ApiError::unauthorized("no session token"))?;
+    match state.access().close_session(token) {
+        true => Ok(axum::http::StatusCode::NO_CONTENT),
+        false => Err(ApiError::not_found("no such session")),
+    }
+}
+
+#[utoipa::path(get, path = "/api/v1/queries", tag = "queries",
+    responses((status = 200, description = "The saved queries the requester may read, by space and name", body = Vec<nrese_store::access::SavedQuery>)))]
+/// The saved queries in the spaces the requester reads: its personal space, those shared
+/// with it, its workspaces (administrators: all).
+pub async fn saved_queries(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    Ok(Json(state.access().saved_queries(&by)).into_response())
+}
+
+#[utoipa::path(get, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+    params(("space" = String, Path, description = "A personal space (`~alice`) or a workspace"), ("name" = String, Path)),
+    responses((status = 200, description = "The saved query", body = nrese_store::access::SavedQuery),
+        (status = 404, description = "None the requester may read", body = crate::http::openapi::Problem)))]
+/// One saved query.
+pub async fn saved_query(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((space, name)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    Ok(Json(state.access().saved_query(&by, &space, &name)?).into_response())
+}
+
+#[utoipa::path(put, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+    params(("space" = String, Path, description = "A personal space (`~alice`) or a workspace"), ("name" = String, Path, description = "Letters, digits, `.`, `_`, `-`")),
+    request_body = nrese_store::access::QueryDraft,
+    responses((status = 200, description = "Saved", body = nrese_store::access::SavedQuery),
+        (status = 400, description = "Not a SPARQL query or update, or a bad name", body = crate::http::openapi::Problem),
+        (status = 403, description = "Not an editor or owner of the space", body = crate::http::openapi::Problem),
+        (status = 404, description = "No such space", body = crate::http::openapi::Problem)))]
+/// Saves a query (or update) under `name` in `space` (its editors and owners), replacing
+/// one of that name. It is checked to parse first; a prefix it doesn't declare means what
+/// its repository's namespaces (the default repository's without one) bind it to.
+pub async fn saved_query_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((space, name)): Path<(String, String)>,
+    bytes: Bytes,
+) -> Result<Response, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    let draft: nrese_store::access::QueryDraft = body(&bytes)?;
+    let repository = match draft
+        .repository
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        Some(id) => state.for_repository(id)?,
+        None => state.clone(),
+    };
+    let namespaces = repository.store().namespaces().all();
+    let saved = state
+        .access()
+        .save_query(&by, &space, &name, draft, &namespaces)?;
+    Ok(Json(saved).into_response())
+}
+
+#[utoipa::path(delete, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+    params(("space" = String, Path), ("name" = String, Path)),
+    responses((status = 204, description = "Removed"),
+        (status = 403, description = "Not an editor or owner of the space", body = crate::http::openapi::Problem),
+        (status = 404, description = "None the requester may read", body = crate::http::openapi::Problem)))]
+/// Removes a saved query (the space's editors and owners).
+pub async fn saved_query_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((space, name)): Path<(String, String)>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let by = requester(&state, &authenticated).await?;
+    state.access().delete_query(&by, &space, &name)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}

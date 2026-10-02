@@ -1,0 +1,100 @@
+{
+  "label": "r191-sys",
+  "open_s": 0.000,
+  "load_s": 29.882,
+  "peak_mib": 16965,
+  "sum_p50_ms": 24629.393,
+  "queries": [
+    {
+      "name": "q01-point-lookup",
+      "rows": 31,
+      "p50_ms": 0.186,
+      "min_ms": 0.186,
+      "max_ms": 0.592
+    },
+    {
+      "name": "q02-born-in-berlin",
+      "rows": 2126,
+      "p50_ms": 735.628,
+      "min_ms": 733.803,
+      "max_ms": 799.355
+    },
+    {
+      "name": "q03-top-birthplaces",
+      "rows": 20,
+      "p50_ms": 402.451,
+      "min_ms": 397.979,
+      "max_ms": 413.143
+    },
+    {
+      "name": "q04-date-range",
+      "rows": 1,
+      "p50_ms": 510.732,
+      "min_ms": 482.802,
+      "max_ms": 514.648
+    },
+    {
+      "name": "q05-population",
+      "rows": 50,
+      "p50_ms": 177.439,
+      "min_ms": 174.456,
+      "max_ms": 181.136
+    },
+    {
+      "name": "q06-film-cast",
+      "rows": 1587,
+      "p50_ms": 556.910,
+      "min_ms": 555.136,
+      "max_ms": 562.141
+    },
+    {
+      "name": "q07-subdivision-path",
+      "rows": 21,
+      "p50_ms": 0.035,
+      "min_ms": 0.031,
+      "max_ms": 0.051
+    },
+    {
+      "name": "q08-label-text",
+      "rows": 445,
+      "p50_ms": 5951.418,
+      "min_ms": 5923.210,
+      "max_ms": 6006.816
+    },
+    {
+      "name": "q09-optional-death",
+      "rows": 100000,
+      "p50_ms": 476.615,
+      "min_ms": 474.674,
+      "max_ms": 490.394
+    },
+    {
+      "name": "q10-types-count",
+      "rows": 25,
+      "p50_ms": 1270.754,
+      "min_ms": 1261.737,
+      "max_ms": 1280.558
+    },
+    {
+      "name": "q11-count-all",
+      "rows": 1,
+      "p50_ms": 10669.197,
+      "min_ms": 10644.124,
+      "max_ms": 10702.063
+    },
+    {
+      "name": "q12-goals-per-team",
+      "rows": 20,
+      "p50_ms": 3645.945,
+      "min_ms": 3623.683,
+      "max_ms": 3745.973
+    },
+    {
+      "name": "q13-no-death",
+      "rows": 1,
+      "p50_ms": 232.084,
+      "min_ms": 228.442,
+      "max_ms": 233.803
+    }
+  ]
+}

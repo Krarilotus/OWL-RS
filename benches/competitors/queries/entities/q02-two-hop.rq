@@ -1,0 +1,5 @@
+# Two-hop join from one entity
+PREFIX e: <http://example.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?b ?c ?label WHERE { <http://example.org/person/4242> e:knows ?b . ?b e:knows ?c . ?c rdfs:label ?label }

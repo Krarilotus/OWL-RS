@@ -1,0 +1,9 @@
+# Star join: all attributes of one team's athletes
+PREFIX o: <http://wallscope.co.uk/ontology/olympics/>
+PREFIX r: <http://wallscope.co.uk/resource/olympics/>
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbp: <http://dbpedia.org/property/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?a ?name ?age ?height ?weight WHERE { ?a dbo:team <http://wallscope.co.uk/resource/olympics/team/Germany> ; rdfs:label ?name . OPTIONAL { ?a foaf:age ?age } OPTIONAL { ?a dbo:height ?height } OPTIONAL { ?a dbo:weight ?weight } }

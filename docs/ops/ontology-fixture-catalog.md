@@ -33,7 +33,7 @@ The current source set is intentionally staged from small to broader:
   - source: `https://www.w3.org/2009/08/skos-reference/skos.rdf`
   - tier: `medium`
 - `sosa`
-  - source: `https://www.w3.org/ns/ssn/sosa.ttl`
+  - source: `https://www.w3.org/ns/sosa/` (content negotiation; the older `/ns/ssn/sosa.ttl` path serves SSN, which made earlier "SOSA" evidence actually test SSN)
   - tier: `medium`
 - `ssn`
   - source: `https://www.w3.org/ns/ssn/ssn.ttl`
@@ -177,7 +177,7 @@ Example:
 ```powershell
 cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
   --nrese-base-url http://127.0.0.1:8080 `
-  --fuseki-base-url http://127.0.0.1:3030/ds `
+  --reference-kind fuseki --reference-base-url http://127.0.0.1:3030/ds `
   --workload-pack benches/nrese-bench-harness/fixtures/packs/foaf-baseline/pack.toml `
   --report-dir artifacts/foaf-baseline
 ```

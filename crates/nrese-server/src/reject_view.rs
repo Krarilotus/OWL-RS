@@ -1,5 +1,5 @@
-use crate::reject_attribution::{RejectAttribution, RejectAttributionCandidate};
 use nrese_reasoner::RejectExplanation;
+use nrese_store::{RejectAttribution, RejectAttributionCandidate};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -7,15 +7,8 @@ pub struct RejectExplanationView {
     pub summary: String,
     pub violated_constraint: String,
     pub focus_resource: String,
-    pub primary_conflicting_term: String,
-    pub secondary_conflicting_term: String,
     pub likely_commit_trigger: Option<(String, String, String)>,
     pub commit_attribution: Option<RejectAttributionView>,
-    pub heuristic: &'static str,
-    pub principal_contributor: String,
-    pub principal_origin: String,
-    pub contextual_contributor: String,
-    pub contextual_origin: String,
     pub evidence: Vec<RejectEvidenceView>,
 }
 
@@ -52,15 +45,8 @@ pub fn reject_view(
         summary: reject.summary.clone(),
         violated_constraint: reject.violated_constraint.clone(),
         focus_resource: reject.focus_resource.clone(),
-        primary_conflicting_term: reject.primary_conflicting_term.clone(),
-        secondary_conflicting_term: reject.secondary_conflicting_term.clone(),
         likely_commit_trigger: attribution.and_then(RejectAttribution::likely_commit_trigger),
         commit_attribution: attribution.map(attribution_view),
-        heuristic: reject.blame.heuristic,
-        principal_contributor: reject.blame.principal_contributor.clone(),
-        principal_origin: reject.blame.principal_origin.clone(),
-        contextual_contributor: reject.blame.contextual_contributor.clone(),
-        contextual_origin: reject.blame.contextual_origin.clone(),
         evidence: reject
             .evidence
             .iter()

@@ -1,0 +1,6 @@
+# OWL2Bench Q4. Find the age of all the Person instances.
+# Construct: hasAge is a Functional Data Property. Domain(Person), Range(xsd:nonNegativeInteger).
+# Profiles: EL, RL, DL
+PREFIX : <https://kracr.iiitd.edu.in/OWL2Bench#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?x ?y WHERE { ?x :hasAge ?y }

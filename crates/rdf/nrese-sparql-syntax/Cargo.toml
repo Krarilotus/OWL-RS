@@ -1,0 +1,18 @@
+[package]
+name = "nrese-sparql-syntax"
+description = "NRESE's SPARQL 1.1 and 1.2 parser, algebra and writer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+nrese-rdf = { path = "../nrese-rdf", default-features = false }
+thiserror.workspace = true
+
+[dev-dependencies]
+nrese-rdf-io = { path = "../nrese-rdf-io" }
+
+[lints]
+workspace = true

@@ -1,0 +1,6 @@
+# OWL2Bench Q5. Find all the instances of class T20CricketFan. T20CricketFan is a Person who is crazy about T20Cricket. {T20Cricket} is an instance of Class Cricket.
+# Construct: ObjectHasValue.
+# Profiles: EL, RL, DL
+PREFIX : <https://kracr.iiitd.edu.in/OWL2Bench#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?x WHERE { ?x rdf:type :T20CricketFan }

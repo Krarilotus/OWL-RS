@@ -1,7 +1,9 @@
 import { NreseClient } from "./client";
+import { NRESE_ENDPOINTS } from "./endpoints";
 import { resolveBrowserApiBaseUrl } from "./runtimeConfig";
 import type {
   AiStatus,
+  AutocompleteResponse,
   Capabilities,
   QuerySuggestionResponse,
   ReasoningDiagnostics,
@@ -26,7 +28,7 @@ export async function getCapabilities(): Promise<Capabilities> {
 }
 
 export async function getReasoningDiagnostics(
-  endpoint = "/ops/api/diagnostics/reasoning",
+  endpoint: string = NRESE_ENDPOINTS.reasoningDiagnostics,
 ): Promise<ReasoningDiagnostics> {
   return getBrowserClient().getReasoningDiagnostics(endpoint);
 }
@@ -41,6 +43,10 @@ export async function getQuerySuggestions(payload: {
   current_query?: string;
 }): Promise<QuerySuggestionResponse> {
   return getBrowserClient().getQuerySuggestions(payload);
+}
+
+export async function autocomplete(text: string): Promise<AutocompleteResponse> {
+  return getBrowserClient().autocomplete(text);
 }
 
 export async function runQuery(query: string, accept: string) {

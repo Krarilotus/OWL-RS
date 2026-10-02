@@ -1,0 +1,9 @@
+# ASK with a selective join
+PREFIX o: <http://wallscope.co.uk/ontology/olympics/>
+PREFIX r: <http://wallscope.co.uk/resource/olympics/>
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbp: <http://dbpedia.org/property/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+ASK { ?x o:athlete ?a ; o:medal <http://wallscope.co.uk/resource/olympics/medal/Gold> . ?a dbo:team <http://wallscope.co.uk/resource/olympics/team/Kenya> }

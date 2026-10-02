@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use axum::http::HeaderMap;
-
 use crate::auth::AuthConfig;
 pub use crate::auth::{JwtBearerConfig, MtlsConfig, OidcIntrospectionConfig, StaticBearerConfig};
 use crate::error::ApiError;
@@ -15,6 +13,23 @@ pub struct PolicyConfig {
     pub sparql_parse_error_profile: SparqlParseErrorProfile,
     pub expose_operator_ui: bool,
     pub expose_metrics: bool,
+    /// A policy file to import into the access state at the first start
+    /// ([`crate::access`]); without one, enforcement stays off until the engine API turns
+    /// it on.
+    pub access: Option<std::sync::Arc<crate::access::AccessPolicy>>,
+    /// What workspace graph prefixes start with (`urn:nrese:` by default): a personal
+    /// space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`.
+    pub workspace_base: String,
+    /// Whether users of the access state log in with their passwords (`Basic`
+    /// credentials, or a session from `POST /api/v1/access/login`), besides the
+    /// authentication mode.
+    pub local_logins: bool,
+    /// The reverse proxies whose `X-Forwarded-For` names the client
+    /// ([`crate::auth::peers::client`]); failed local logins are counted per client.
+    pub trusted_proxies: Vec<crate::auth::peers::AddressRange>,
+    /// The directory administrators import files from by name
+    /// (`POST /api/v1/repositories/{id}/import/files`); `None`: no server-side imports.
+    pub import_directory: Option<std::path::PathBuf>,
 }
 
 impl Default for PolicyConfig {
@@ -27,19 +42,16 @@ impl Default for PolicyConfig {
             sparql_parse_error_profile: SparqlParseErrorProfile::default(),
             expose_operator_ui: true,
             expose_metrics: true,
+            access: None,
+            workspace_base: "urn:nrese:".to_owned(),
+            local_logins: true,
+            trusted_proxies: crate::auth::peers::AddressRange::loopback(),
+            import_directory: None,
         }
     }
 }
 
 impl PolicyConfig {
-    pub async fn authorize(
-        &self,
-        action: PolicyAction,
-        headers: &HeaderMap,
-    ) -> Result<(), ApiError> {
-        self.auth.authorize(action, headers).await
-    }
-
     pub fn enforce_query_bytes(&self, size: usize) -> Result<(), ApiError> {
         enforce_size_limit("query", size, self.limits.max_query_bytes)
     }
@@ -70,16 +82,30 @@ pub enum SparqlParseErrorProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestLimits {
     pub max_query_bytes: usize,
+    /// Bytes of intermediate results one query may hold; 0 is unlimited.
+    pub max_query_memory_bytes: usize,
     pub max_update_bytes: usize,
     pub max_rdf_upload_bytes: usize,
 }
 
+/// Default per-query memory: 4 GiB.
+pub const DEFAULT_QUERY_MEMORY_BYTES: usize = 4 << 30;
+/// Default longest query text: 1 MiB.
+pub const DEFAULT_MAX_QUERY_BYTES: usize = 1 << 20;
+/// Default largest SPARQL update: 16 MiB. Clients that write a whole graph in one update
+/// (RDF4J's, and so ResearchSpace) send several megabytes.
+pub const DEFAULT_MAX_UPDATE_BYTES: usize = 16 << 20;
+/// Default largest RDF payload (Graph Store, TELL, SHACL shapes): 128 MiB, enough for an
+/// exported graph of about a million statements. Larger data goes through `load`.
+pub const DEFAULT_MAX_RDF_UPLOAD_BYTES: usize = 128 << 20;
+
 impl Default for RequestLimits {
     fn default() -> Self {
         Self {
-            max_query_bytes: 1_048_576,
-            max_update_bytes: 1_048_576,
-            max_rdf_upload_bytes: 10_485_760,
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+            max_query_memory_bytes: DEFAULT_QUERY_MEMORY_BYTES,
+            max_update_bytes: DEFAULT_MAX_UPDATE_BYTES,
+            max_rdf_upload_bytes: DEFAULT_MAX_RDF_UPLOAD_BYTES,
         }
     }
 }

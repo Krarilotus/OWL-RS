@@ -1,0 +1,7 @@
+# Date range filter: people born in 1900
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (COUNT(*) AS ?n) WHERE { ?p dbo:birthDate ?d FILTER(?d >= "1900-01-01"^^xsd:date && ?d < "1901-01-01"^^xsd:date) }

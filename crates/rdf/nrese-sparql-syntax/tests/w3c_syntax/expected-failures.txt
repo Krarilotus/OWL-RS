@@ -1,0 +1,2 @@
+# W3C SPARQL syntax tests nrese-sparql-syntax knowingly fails: one test IRI per line, with
+# the reason in a comment.

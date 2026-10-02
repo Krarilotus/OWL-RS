@@ -1,0 +1,18 @@
+[package]
+name = "nrese-sparql-results"
+description = "NRESE's SPARQL 1.2 query results formats: JSON, XML, CSV and TSV, readers and writers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+memchr = { workspace = true }
+nrese-json = { path = "../nrese-json" }
+nrese-rdf = { path = "../nrese-rdf", default-features = false }
+quick-xml = { workspace = true }
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,31 +1,26 @@
 use axum::Json;
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 
 use crate::ai::{AiStatusResponse, QuerySuggestionRequest, SuggestionContext};
 use crate::error::ApiError;
-use crate::policy::PolicyAction;
 use crate::state::AppState;
 
 pub async fn status(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state
-        .enforce_policy_action(PolicyAction::QueryRead, &headers)
-        .await?;
+    crate::http::guard::enforce_query_read(&state, &authenticated).await?;
     Ok(Json(ai_status(&state)).into_response())
 }
 
 pub async fn query_suggestions(
+    authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<QuerySuggestionRequest>,
 ) -> Result<Response, ApiError> {
-    state
-        .enforce_policy_action(PolicyAction::QueryRead, &headers)
-        .await?;
+    // The suggestions describe the whole dataset.
+    crate::http::guard::enforce_whole_read(&state, &authenticated).await?;
     let stats = state
         .store()
         .stats()

@@ -1,0 +1,23 @@
+# Build settings for everything in this repository (the workspace and the benchmark
+# harness, which is a workspace of its own).
+#
+# They keep the build directory small. Without them it grew past 140 GB in a few weeks:
+# full debug information in some fifty test binaries, an incremental cache per target,
+# a second build directory for the harness, and cargo never removes what it no longer
+# uses. `scripts/cargo-guarded.sh` enforces a budget on top of this.
+
+[build]
+# One build directory for both workspaces: dependencies are compiled once.
+target-dir = "target"
+
+[profile.dev]
+# File and line in backtraces, no variable information: the debugger isn't how this
+# code base is debugged, and full debug info is most of a test binary's size.
+debug = "line-tables-only"
+# The incremental cache was 33 GB. Our crates rebuild in well under a minute without it.
+# For a long edit-compile session on one crate: CARGO_INCREMENTAL=1.
+incremental = false
+
+[profile.dev.package."*"]
+# Dependencies: no debug information at all.
+debug = false

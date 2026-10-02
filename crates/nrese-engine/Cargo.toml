@@ -1,0 +1,30 @@
+[package]
+name = "nrese-engine"
+description = "NRESE storage engine: term dictionary, quad permutation indexes, MVCC snapshots, transactions, durability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+aho-corasick = "1.1"
+crc32fast = "1.5"
+# FSST-compressed vocabularies (src/term/vocabulary.rs); Apache-2.0.
+fsst = { package = "fsst-rs", version = "0.6" }
+hashbrown = { workspace = true }
+memchr = { workspace = true }
+memmap2 = "0.9"
+nrese-rdf = { path = "../rdf/nrese-rdf" }
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+parking_lot = { workspace = true }
+rayon = { workspace = true }
+rust-stemmers = "1.2"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

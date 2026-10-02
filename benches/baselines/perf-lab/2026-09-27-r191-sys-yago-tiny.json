@@ -1,0 +1,79 @@
+{
+  "label": "r191-sys",
+  "open_s": 0.000,
+  "load_s": 6.795,
+  "peak_mib": 15915,
+  "sum_p50_ms": 27526.244,
+  "queries": [
+    {
+      "name": "q01-label-lookup",
+      "rows": 0,
+      "p50_ms": 0.013,
+      "min_ms": 0.012,
+      "max_ms": 0.022
+    },
+    {
+      "name": "q02-persons-born",
+      "rows": 21,
+      "p50_ms": 1859.811,
+      "min_ms": 1835.114,
+      "max_ms": 1896.717
+    },
+    {
+      "name": "q03-taxon-path",
+      "rows": 1,
+      "p50_ms": 23.849,
+      "min_ms": 23.348,
+      "max_ms": 24.580
+    },
+    {
+      "name": "q04-movie-actors",
+      "rows": 203,
+      "p50_ms": 4.501,
+      "min_ms": 4.478,
+      "max_ms": 4.613
+    },
+    {
+      "name": "q05-population",
+      "rows": 20,
+      "p50_ms": 59.963,
+      "min_ms": 57.153,
+      "max_ms": 60.833
+    },
+    {
+      "name": "q06-alt-names",
+      "rows": 564,
+      "p50_ms": 324.445,
+      "min_ms": 321.587,
+      "max_ms": 326.000
+    },
+    {
+      "name": "q07-class-count",
+      "rows": 20,
+      "p50_ms": 31.085,
+      "min_ms": 30.834,
+      "max_ms": 33.120
+    },
+    {
+      "name": "q08-subclass-path",
+      "rows": 1,
+      "p50_ms": 20542.978,
+      "min_ms": 20370.132,
+      "max_ms": 20806.098
+    },
+    {
+      "name": "q09-count-all",
+      "rows": 1,
+      "p50_ms": 2746.086,
+      "min_ms": 2717.423,
+      "max_ms": 2748.393
+    },
+    {
+      "name": "q10-labels-en",
+      "rows": 407456,
+      "p50_ms": 1933.512,
+      "min_ms": 1925.326,
+      "max_ms": 1947.205
+    }
+  ]
+}

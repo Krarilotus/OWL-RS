@@ -1,38 +1,85 @@
-mod backend;
+//! `nrese-store` (layer L3): the operations the product offers - query, update, graph
+//! store, tell, backup/restore, stats - and the mutation pipeline that owns commit semantics.
+//! No HTTP concerns live here. See `docs/ARCHITECTURE.md`.
+
+pub mod access;
+pub mod autocomplete;
 mod backup;
+mod bulk_load;
+pub mod catalog;
+mod classification;
 pub mod config;
+mod datatypes;
+mod delta;
 pub mod error;
 pub mod graph_store;
 mod graph_store_executor;
+pub mod image_backup;
+pub mod jobs;
 mod loader;
-mod on_disk;
+pub mod mutation;
+pub mod namespaces;
 pub mod query;
+mod query_cache;
 mod query_executor;
 mod rdf_io;
+pub mod reasoning;
+pub mod reasoning_state;
+pub mod running;
+pub mod scope;
 pub mod service;
-mod snapshot;
-mod staging;
+pub mod sessions;
+pub mod shacl;
+pub mod statements;
 mod stats;
 mod tell;
 pub mod update;
-mod update_executor;
+mod view;
 
 pub use backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
 };
-pub use config::{StoreConfig, StoreMode};
-pub use error::{StoreError, StoreResult};
+pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
+pub use classification::ClassificationReport;
+pub use config::{
+    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity, ShaclGate,
+    StoreConfig, StoreMode,
+};
+pub use delta::MutationDeltaPreview;
+pub use error::{Refusal, StoreError, StoreResult};
 pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
 };
+pub use image_backup::{
+    ImageManifest, prune_wal_archive, read_manifest, restore_image, restore_until,
+};
+pub use mutation::{
+    MutationCommand, MutationCommitReport, MutationError, MutationKind, MutationPipeline,
+    MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
+    RejectAttributionCandidate,
+};
+pub use namespaces::{NamespaceMap, Namespaces};
+pub use nrese_engine::{EngineError, ReadModel};
+pub use nrese_shacl::{ValidationReport, ValidationResult};
+pub use nrese_sparql::{CancellationToken, Explanation, PlanStep, QueryEvaluationError};
 pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
     SparqlQueryRequest,
 };
+pub use query_cache::QueryCacheStats;
+pub use query_executor::PreparedQuery;
+pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
+pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
+pub use reasoning_state::{ConsistencyStatus, ReasoningState};
+pub use running::{RunningQueries, RunningQuery};
+pub use scope::{ReadContext, ReadScope, Requester, WriteScope};
 pub use service::StoreService;
-pub use snapshot::StoreDatasetSnapshot;
-pub use staging::{MutationDeltaPreview, StagedMutationPreview};
+pub use sessions::{SESSION_IDLE, Sessions};
+pub use shacl::{
+    ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource, ValidatedGraphs,
+};
+pub use statements::{RdfPayload, StatementOp, StatementPattern, StatementsRequest};
 pub use stats::StoreStats;
-pub use tell::{TellRequest, compile_tell_update};
+pub use tell::TellRequest;
 pub use update::{SparqlUpdateRequest, UpdateExecutionReport};
