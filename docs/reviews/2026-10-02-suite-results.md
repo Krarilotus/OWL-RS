@@ -206,6 +206,21 @@ the `lubm-materialised` workload, below.
   can be derived from the blocks (−0.25), and blocks of 256 keys would halve the rest. The
   objects in SPOG (identifiers in insertion order, random within a subject) are what
   stays expensive: QLever's identifiers follow its sorted vocabulary.
+
+  The dictionary, measured the same way (`term/vocabulary_study.rs`, office PC): the keys
+  are two thirds of it, the rest is 8-byte end offsets, the hash table and the text order.
+
+  | Store | Terms | Keys | FSST, one table | FSST, IRIs apart | End offsets → block offsets |
+  |---|---:|---:|---:|---:|---:|
+  | Wikidata lexemes | 13.8 M | 576 MiB | 258 MiB (45 %) | 224 MiB (39 %) | 105 → 28 MiB |
+  | YAGO | 12.4 M | 530 MiB | 295 MiB (56 %) | 281 MiB (53 %) | 95 → 25 MiB |
+  | DBpedia core | 40.5 M | 1,497 MiB | 690 MiB (46 %) | 668 MiB (45 %) | 309 → 82 MiB |
+
+  Block offsets (an 8-byte start per 64 keys, 2 bytes a key) read with the same cache
+  misses as end offsets: a saving without a cost. FSST is a trade-off: a key decodes in
+  16–22 ns in id order against 5 ns copied plain, and in 166–184 ns at random in a tight
+  loop against 53 ns (its decode loop overlaps fewer cache misses); compression runs at
+  230–260 MB/s, training on a sample takes 0.02 s.
 - **First count after a restart.** On LUBM(100), YAGO tiny and Wikidata the first count
   took 14 to 22 ms in Docker (one sample each), against 1.5 ms elsewhere; on the office
   PC the same store answers it in 0.9 ms over HTTP. To be rechecked with more runs.
