@@ -718,27 +718,69 @@ impl StoreService {
     /// Why the statement `subject predicate object` holds under `program`: a derivation of
     /// it from asserted statements, the statement first ([`crate::reasoning::explain_fact`]).
     /// `None` if it doesn't hold (or no derivation was found within the budget).
+    ///
+    /// Within `scope`: the statement must be one the requester sees (an inferred statement
+    /// where the scope shows inferences, an asserted one in a readable graph), else the
+    /// answer is `None` as for a statement that doesn't hold (no existence oracle for
+    /// hidden statements); asserted premises in no readable graph are `hidden` steps.
     pub fn explain_statement(
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,
+        scope: &crate::ReadScope,
         subject: nrese_rdf::TermRef<'_>,
         predicate: nrese_rdf::TermRef<'_>,
         object: nrese_rdf::TermRef<'_>,
     ) -> Option<Vec<crate::reasoning::InferenceStep>> {
-        // The program's constants interned under a brief transaction; the explanation
-        // reads a snapshot, without the writer.
-        let program = {
-            let tx = self.engine.transaction();
-            crate::reasoning::Program::new(&program.into(), &|term| tx.intern(term))
-                .hiding_unnamed_classes(self.config.hide_unnamed_classes)
-        };
         let snapshot = self.engine.snapshot();
+        // The program's constants by the snapshot's ids, without the writer: a constant
+        // the store doesn't hold gets an id no statement uses (its rules can't fire).
+        let unknown = std::cell::Cell::new(u64::MAX >> 1);
+        let program = crate::reasoning::Program::new(&program.into(), &|term| {
+            snapshot.lookup(term).unwrap_or_else(|| {
+                unknown.set(unknown.get() - 1);
+                nrese_engine::TermId::from_raw(unknown.get())
+            })
+        })
+        .hiding_unnamed_classes(self.config.hide_unnamed_classes);
         let fact = [
             snapshot.lookup(subject)?.raw(),
             snapshot.lookup(predicate)?.raw(),
             snapshot.lookup(object)?.raw(),
         ];
-        crate::reasoning::explain_fact(&program, &snapshot, fact)
+        let crate::ReadScope::Graphs(access) = scope else {
+            return crate::reasoning::explain_fact(&program, &snapshot, fact, None);
+        };
+        let readable = |[s, p, o]: [u64; 3]| {
+            let id = nrese_engine::TermId::from_raw;
+            let pattern = nrese_engine::QuadPattern {
+                subject: Some(id(s)),
+                predicate: Some(id(p)),
+                object: Some(id(o)),
+                graph: nrese_engine::GraphSelector::Any,
+            };
+            snapshot
+                .quads_for_pattern_in(nrese_engine::ReadModel::Asserted, &pattern)
+                .any(|quad| {
+                    let graph = if quad.graph.is_default_graph() {
+                        nrese_rdf::GraphName::DefaultGraph
+                    } else {
+                        match snapshot.decode(quad.graph) {
+                            Some(nrese_rdf::Term::NamedNode(n)) => {
+                                nrese_rdf::GraphName::NamedNode(n)
+                            }
+                            _ => return false,
+                        }
+                    };
+                    access.allows_graph(&graph)
+                })
+        };
+        let steps = crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))?;
+        let visible = match steps.first().map(|step| step.origin) {
+            Some("inferred") => access.inferred,
+            Some("asserted") => true,
+            _ => false,
+        };
+        visible.then_some(steps)
     }
 
     /// The closure's size with equality replicated and over representatives, for
