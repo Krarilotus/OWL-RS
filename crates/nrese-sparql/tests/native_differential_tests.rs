@@ -5021,8 +5021,9 @@ fn groups_over_joins_larger_than_memory_answer() {
 }
 
 /// `ORDER BY ?a ?b LIMIT k` where the k-th and the next value of `?a` are different terms
-/// of one value (`"0"` and `"00"`): both are among the first, so `?b` decides between
-/// their rows, as the full sort would (found by the fuzz campaign, seed 19).
+/// of one value (`"0"` and `"00"`): the cut keeps what the full sort puts first (found by
+/// the fuzz campaign, seed 19). The order is total over terms (seed 2329), so `"0"` comes
+/// before `"00"` whatever `?b` says.
 #[test]
 fn a_limit_cutting_through_equal_values_keeps_the_next_key() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -5055,9 +5056,16 @@ fn a_limit_cutting_through_equal_values_keeps_the_next_key() {
             true,
         );
         assert_eq!(native, expected, "{text}");
-        assert!(
-            native.last().unwrap().ends_with("p2>"),
-            "{text}: {native:?}"
+        let full = text.replace(&format!(" LIMIT {limit}"), "");
+        let full = SparqlParser::new().parse_query(&full).unwrap();
+        let sorted = rows(
+            evaluate_query(&snapshot, &full, &QueryOptions::default()).unwrap(),
+            true,
+        );
+        assert_eq!(
+            native,
+            sorted[..limit],
+            "{text}: the full sort's first rows"
         );
     }
 }
@@ -5101,5 +5109,39 @@ fn a_path_between_two_constants_keeps_its_multiplicity() {
         );
         assert_eq!(native.len(), count, "{text}");
         assert_same_rows(&native, &expected, &text);
+    }
+}
+
+/// `ORDER BY ?d LIMIT k` cutting between two literals of one value and one canonical
+/// form ("1" and "01"): every evaluation takes the same one first, with and without
+/// `DISTINCT`, so what joins on the kept term downstream agrees (found by the fuzz
+/// campaign, seed 2329).
+#[test]
+fn a_limit_between_terms_of_one_canonical_form_keeps_the_same_one() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let integer = |lexical: &str| Literal::new_typed_literal(lexical, xsd::INTEGER);
+    for (s, d) in [("e4", "1"), ("e4", "01"), ("e3", "5"), ("e2", "7")] {
+        tx.insert(Quad::new(ex(s), ex("p2"), integer(d), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for form in ["DISTINCT", ""] {
+        for limit in [1, 2, 3] {
+            let text = format!(
+                "SELECT {form} ?a ?d WHERE {{ ?a <{EX}p2> ?d }} ORDER BY DESC(?a) ?d LIMIT {limit}"
+            );
+            let query = SparqlParser::new().parse_query(&text).unwrap();
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                true,
+            );
+            let expected = rows(
+                reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                true,
+            );
+            assert_eq!(native, expected, "{text}");
+            assert!(native[0].contains("\"01\""), "{text}: {native:?}");
+        }
     }
 }
