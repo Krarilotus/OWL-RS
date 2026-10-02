@@ -57,21 +57,37 @@ impl MutationCommand {
         }
     }
 
-    /// Applies the command to `tx` without committing it; reports carry revision 0 until
-    /// [`MutationCommitReport::committed`]. The evaluation token lets the caller stop a
-    /// long-running `WHERE` clause.
-    /// The graphs the command may change, if its requester is restricted.
-    pub(crate) fn writable(&self) -> Option<&nrese_sparql::GraphAccess> {
-        match self {
-            Self::Update(request) => request.writable.as_deref(),
-            Self::Statements(request) => request.writable.as_deref(),
-            Self::Tell(_) | Self::GraphWrite(_) | Self::GraphDelete(_) | Self::Restore(_) => None,
-        }
-    }
-
+    /// Applies the command to `tx` for `requester` without committing it; reports carry
+    /// revision 0 until [`MutationCommitReport::committed`]. The evaluation token lets the
+    /// caller stop a long-running `WHERE` clause.
+    ///
+    /// Graph-level access control: the commands check what they would change as they go
+    /// (for the clearest error); then every graph `tx` changes is checked against the
+    /// requester's write scope, so no command, present or future, changes a graph its
+    /// requester may not write.
     pub(crate) fn apply(
         &self,
         tx: &mut Transaction<'_>,
+        requester: &crate::Requester,
+        cancellation: &CancellationToken,
+        union_default_graph: bool,
+        services: Option<nrese_sparql::Services>,
+    ) -> Result<MutationCommitReport, StoreError> {
+        if let Self::Restore(_) = self {
+            requester.write.require_all("a restore")?;
+        }
+        let report =
+            self.apply_unchecked(tx, requester, cancellation, union_default_graph, services)?;
+        if let Some(writable) = requester.write.access() {
+            check_writable(tx, writable)?;
+        }
+        Ok(report)
+    }
+
+    fn apply_unchecked(
+        &self,
+        tx: &mut Transaction<'_>,
+        requester: &crate::Requester,
         cancellation: &CancellationToken,
         union_default_graph: bool,
         services: Option<nrese_sparql::Services>,
@@ -80,6 +96,7 @@ impl MutationCommand {
             apply_sparql_update(
                 tx,
                 request,
+                requester,
                 cancellation,
                 union_default_graph,
                 services.clone(),
@@ -91,7 +108,7 @@ impl MutationCommand {
                 Ok(MutationCommitReport::Applied { revision: 0 })
             }
             Self::Statements(request) => {
-                apply_statements(tx, request, &mut update)?;
+                apply_statements(tx, request, requester, &mut update)?;
                 Ok(MutationCommitReport::Applied { revision: 0 })
             }
             Self::Tell(request) => {
@@ -109,10 +126,11 @@ impl MutationCommand {
     }
 }
 
-/// Applies a SPARQL update request to `tx`.
+/// Applies a SPARQL update request to `tx` for `requester`.
 pub(crate) fn apply_sparql_update(
     tx: &mut Transaction<'_>,
     request: &SparqlUpdateRequest,
+    requester: &crate::Requester,
     cancellation: &CancellationToken,
     union_default_graph: bool,
     services: Option<nrese_sparql::Services>,
@@ -126,8 +144,8 @@ pub(crate) fn apply_sparql_update(
         cancellation: Some(cancellation.clone()),
         union_default_graph,
         services,
-        access: request.access.clone(),
-        writable: request.writable.clone(),
+        access: requester.read.access().cloned(),
+        writable: requester.write.access().cloned(),
     };
     apply_update(tx, &update, &options).map_err(|error| match error {
         nrese_sparql::UpdateError::Forbidden(graph) => StoreError::Forbidden(format!(
@@ -148,5 +166,28 @@ impl MutationCommitReport {
             }
             Self::Restore(report) => Self::Restore(DatasetRestoreReport { revision, ..report }),
         }
+    }
+}
+
+/// Fails if `tx` changes a graph outside `writable`.
+fn check_writable(
+    tx: &nrese_engine::Transaction<'_>,
+    writable: &nrese_sparql::GraphAccess,
+) -> Result<(), StoreError> {
+    let mut graphs: Vec<nrese_engine::TermId> = tx
+        .inserted()
+        .chain(tx.deleted())
+        .map(|quad| quad.graph)
+        .collect();
+    graphs.sort_unstable();
+    graphs.dedup();
+    match graphs
+        .into_iter()
+        .find(|&graph| !writable.allows_id(tx, graph))
+    {
+        None => Ok(()),
+        Some(_) => Err(StoreError::Forbidden(
+            "the request would change a graph the requester may not write".to_owned(),
+        )),
     }
 }

@@ -41,7 +41,7 @@ fn cancelled_ticket_prevents_commit() {
     let ticket = MutationTicket::new();
     assert!(ticket.cancel());
 
-    let result = pipeline.apply(insert(triple), &ticket);
+    let result = pipeline.apply(insert(triple), &nrese_store::Requester::all(), &ticket);
 
     assert!(matches!(result, Err(MutationError::Cancelled)));
     assert!(!contains(&pipeline, triple));
@@ -53,7 +53,9 @@ fn committed_mutation_cannot_be_cancelled_afterwards() {
     let triple = "<http://example.com/a> <http://example.com/p> <http://example.com/b>";
     let ticket = MutationTicket::new();
 
-    pipeline.apply(insert(triple), &ticket).expect("commit");
+    pipeline
+        .apply(insert(triple), &nrese_store::Requester::all(), &ticket)
+        .expect("commit");
 
     assert!(
         !ticket.cancel(),
@@ -68,11 +70,19 @@ fn gate_rejection_is_recorded_and_not_committed() {
     let setup = "<http://example.com/A> <http://www.w3.org/2002/07/owl#disjointWith> <http://example.com/B> .
                  <http://example.com/x> a <http://example.com/A> .";
     pipeline
-        .apply(insert(setup), &MutationTicket::new())
+        .apply(
+            insert(setup),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
         .expect("consistent setup");
 
     let conflicting = "<http://example.com/x> a <http://example.com/B>";
-    let result = pipeline.apply(insert(conflicting), &MutationTicket::new());
+    let result = pipeline.apply(
+        insert(conflicting),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    );
 
     let Err(MutationError::Rejected(reject)) = result else {
         panic!("expected a rejection, got {result:?}");
@@ -112,12 +122,16 @@ fn owl2_rl_inferences_follow_commits() {
          <{EX}knows> a <http://www.w3.org/2002/07/owl#SymmetricProperty> .
          <{EX}ancestor> a <http://www.w3.org/2002/07/owl#TransitiveProperty> ."
     );
-    pipeline.apply(insert(&schema), &ticket()).expect("schema");
+    pipeline
+        .apply(insert(&schema), &nrese_store::Requester::all(), &ticket())
+        .expect("schema");
     let facts = format!(
         "<{EX}tom> a <{EX}Cat> . <{EX}a> <{EX}knows> <{EX}b> .
          <{EX}x> <{EX}ancestor> <{EX}y> . <{EX}y> <{EX}ancestor> <{EX}z> ."
     );
-    pipeline.apply(insert(&facts), &ticket()).expect("facts");
+    pipeline
+        .apply(insert(&facts), &nrese_store::Requester::all(), &ticket())
+        .expect("facts");
     for inferred in [
         format!("<{EX}tom> a <{EX}Animal>"),
         format!("<{EX}b> <{EX}knows> <{EX}a>"),
@@ -129,6 +143,7 @@ fn owl2_rl_inferences_follow_commits() {
     pipeline
         .apply(
             delete(&format!("<{EX}y> <{EX}ancestor> <{EX}z>")),
+            &nrese_store::Requester::all(),
             &ticket(),
         )
         .expect("delete");
@@ -139,11 +154,19 @@ fn owl2_rl_inferences_follow_commits() {
     assert!(contains(&pipeline, &format!("<{EX}tom> a <{EX}Animal>")));
     // An asserted statement that is also derivable counts as asserted only.
     pipeline
-        .apply(insert(&format!("<{EX}tom> a <{EX}Animal>")), &ticket())
+        .apply(
+            insert(&format!("<{EX}tom> a <{EX}Animal>")),
+            &nrese_store::Requester::all(),
+            &ticket(),
+        )
         .expect("explicit");
     let inferred_before = pipeline.store().stats().expect("stats").inferred_count;
     pipeline
-        .apply(delete(&format!("<{EX}tom> a <{EX}Animal>")), &ticket())
+        .apply(
+            delete(&format!("<{EX}tom> a <{EX}Animal>")),
+            &nrese_store::Requester::all(),
+            &ticket(),
+        )
         .expect("delete explicit");
     // Still derivable, so still visible: it moved back to the inferred stack.
     assert!(contains(&pipeline, &format!("<{EX}tom> a <{EX}Animal>")));
@@ -159,10 +182,18 @@ fn owl2_rl_rejects_inconsistent_commits() {
          <{EX}x> a <{EX}A> ."
     );
     pipeline
-        .apply(insert(&setup), &MutationTicket::new())
+        .apply(
+            insert(&setup),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
         .expect("consistent setup");
     let conflicting = format!("<{EX}x> a <{EX}B>");
-    let result = pipeline.apply(insert(&conflicting), &MutationTicket::new());
+    let result = pipeline.apply(
+        insert(&conflicting),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    );
     let Err(MutationError::Rejected(reject)) = result else {
         panic!("expected a rejection, got {result:?}");
     };
@@ -179,7 +210,11 @@ fn rematerialise_installs_the_closure_of_existing_data() {
          <{EX}tom> a <{EX}Cat> ."
     );
     plain
-        .apply(insert(&data), &MutationTicket::new())
+        .apply(
+            insert(&data),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
         .expect("data");
     let inferred = format!("<{EX}tom> a <{EX}Animal>");
     assert!(!contains(&plain, &inferred));
@@ -253,7 +288,14 @@ fn owl2_rl_commits_keep_the_inferred_stack_exact() {
         } else {
             insert(&data)
         };
-        if pipeline.apply(command, &MutationTicket::new()).is_ok() {
+        if pipeline
+            .apply(
+                command,
+                &nrese_store::Requester::all(),
+                &MutationTicket::new(),
+            )
+            .is_ok()
+        {
             commits += 1;
             if !deleting {
                 asserted.push((triple, graph));
@@ -290,7 +332,11 @@ fn queries_choose_asserted_inferred_or_both() {
          <{EX}tom> a <{EX}Cat> ."
     );
     pipeline
-        .apply(insert(&data), &MutationTicket::new())
+        .apply(
+            insert(&data),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
         .expect("data");
     let ask = |query: String, model: Option<nrese_store::ReadModel>, default_graphs: &[&str]| {
         let mut request = nrese_store::SparqlQueryRequest::all(query);
@@ -365,7 +411,11 @@ fn reasoning_state_tracks_whether_inferences_are_current() {
             ))),
         );
         pipeline
-            .apply(insert(&data), &MutationTicket::new())
+            .apply(
+                insert(&data),
+                &nrese_store::Requester::all(),
+                &MutationTicket::new(),
+            )
             .expect("commit");
         assert!(current(&store));
         // An ungated write drops it; rematerialisation restores it.
@@ -429,6 +479,7 @@ fn inconsistent_baselines_are_quarantined_until_repaired() {
     pipeline
         .apply(
             insert(&format!("<{EX}y> a <{EX}A>")),
+            &nrese_store::Requester::all(),
             &MutationTicket::new(),
         )
         .expect("unrelated commit");
@@ -441,6 +492,7 @@ fn inconsistent_baselines_are_quarantined_until_repaired() {
         pipeline
             .apply(
                 insert(&format!("<{EX}y> a <{EX}B>")),
+                &nrese_store::Requester::all(),
                 &MutationTicket::new()
             )
             .is_err()
@@ -451,6 +503,7 @@ fn inconsistent_baselines_are_quarantined_until_repaired() {
             MutationCommand::Update(SparqlUpdateRequest::new(format!(
                 "DELETE DATA {{ <{EX}x> a <{EX}B> }}"
             ))),
+            &nrese_store::Requester::all(),
             &MutationTicket::new(),
         )
         .expect("repair");
@@ -475,6 +528,7 @@ fn self_difference_is_rejected_on_commit() {
         insert(&format!(
             "<{EX}x> <http://www.w3.org/2002/07/owl#differentFrom> <{EX}x>"
         )),
+        &nrese_store::Requester::all(),
         &MutationTicket::new(),
     );
     assert!(result.is_err(), "{result:?}");
@@ -498,7 +552,11 @@ fn unusable_list_axioms_are_reported() {
         "<{EX}D> <{OWL}unionOf> <{EX}c> . <{EX}c> <{RDF}first> <{EX}A> . <{EX}c> <{RDF}rest> <{EX}c> ."
     );
     plain
-        .apply(insert(&cyclic), &MutationTicket::new())
+        .apply(
+            insert(&cyclic),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
         .expect("data");
     let report = store
         .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
@@ -531,8 +589,12 @@ fn unusable_list_axioms_are_reported() {
         ))),
     );
     let run = |data: &str| {
-        owl.apply(insert(data), &MutationTicket::new())
-            .expect("commit");
+        owl.apply(
+            insert(data),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .expect("commit");
         owl.last_reasoning_run().expect("run")
     };
     let unrelated = run(&format!("<{EX}x> <{EX}p> <{EX}y> ."));
@@ -571,7 +633,11 @@ fn cancelled_reasoning_commits_stop_promptly_and_change_nothing() {
         .collect();
     data.extend((0..10_000).map(|j| format!("<{EX}x{j}> a <{EX}D> .")));
     plain
-        .apply(insert(&data.join("\n")), &MutationTicket::new())
+        .apply(
+            insert(&data.join("\n")),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
         .expect("data");
     store
         .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
@@ -599,7 +665,11 @@ fn cancelled_reasoning_commits_stop_promptly_and_change_nothing() {
             std::time::Instant::now()
         })
     };
-    let result = owl.apply(insert(&format!("<{EX}D> <{RDFS_SUB}> <{EX}C0> .")), &ticket);
+    let result = owl.apply(
+        insert(&format!("<{EX}D> <{RDFS_SUB}> <{EX}C0> .")),
+        &nrese_store::Requester::all(),
+        &ticket,
+    );
     let returned = std::time::Instant::now();
     let cancelled = canceller.join().expect("canceller");
     assert!(
@@ -614,6 +684,7 @@ fn cancelled_reasoning_commits_stop_promptly_and_change_nothing() {
 
     owl.apply(
         insert(&format!("<{EX}y> a <{EX}C0> .")),
+        &nrese_store::Requester::all(),
         &MutationTicket::new(),
     )
     .expect("the writer is free");
@@ -630,7 +701,11 @@ fn full_rdfs_keeps_its_axioms() {
     let axiom = format!("<{rdf}type> <{rdf}type> <{rdf}Property>");
     let fact = format!("<http://example.com/tom> <{rdf}type> <http://example.com/Cat>");
     pipeline
-        .apply(insert(&fact), &MutationTicket::new())
+        .apply(
+            insert(&fact),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
         .expect("commit");
     assert!(contains(&pipeline, &axiom));
     // rdfs4a, rdf:type's axiomatic domain, and rdfs1 for xsd:string.
@@ -647,6 +722,7 @@ fn full_rdfs_keeps_its_axioms() {
             MutationCommand::Update(SparqlUpdateRequest::new(format!(
                 "DELETE DATA {{ {fact} }}"
             ))),
+            &nrese_store::Requester::all(),
             &MutationTicket::new(),
         )
         .expect("delete");
@@ -702,6 +778,7 @@ fn unnamed_union_memberships_are_left_out_on_request() {
         pipeline
             .apply(
                 insert(&format!("<{ex}bob> <{ex}livesIn> <{ex}weimar>")),
+                &nrese_store::Requester::all(),
                 &MutationTicket::new(),
             )
             .unwrap();
@@ -747,7 +824,7 @@ fn unnamed_union_memberships_are_left_out_on_request() {
             MutationCommand::Update(SparqlUpdateRequest::new(format!(
                 "INSERT {{ ?u <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{ex}Place> }} WHERE {{ ?u <http://www.w3.org/2002/07/owl#unionOf> ?l }}"
             ))),
-            &MutationTicket::new(),
+            &nrese_store::Requester::all(), &MutationTicket::new(),
         )
         .unwrap();
     let after = support::inferred_statements(lean_pipeline.store()).unwrap();
@@ -837,12 +914,13 @@ fn datatype_consistency() {
             MutationCommand::Update(SparqlUpdateRequest::new(format!(
                 "INSERT DATA {{ <{ex}age> <http://www.w3.org/2000/01/rdf-schema#range> <{xsd}nonNegativeInteger> }}"
             ))),
-            &MutationTicket::new(),
+            &nrese_store::Requester::all(), &MutationTicket::new(),
         )
         .unwrap();
     let error = pipeline
         .apply(
             insert(&format!("<{ex}b> <{ex}age> \"-5\"^^<{xsd}integer>")),
+            &nrese_store::Requester::all(),
             &MutationTicket::new(),
         )
         .unwrap_err();
@@ -850,6 +928,7 @@ fn datatype_consistency() {
     pipeline
         .apply(
             insert(&format!("<{ex}b> <{ex}age> \"5\"^^<{xsd}integer>")),
+            &nrese_store::Requester::all(),
             &MutationTicket::new(),
         )
         .unwrap();
@@ -942,6 +1021,7 @@ fn a_retired_pipeline_refuses_writes() {
     let update = |pipeline: &MutationPipeline, text: &str| {
         pipeline.apply(
             MutationCommand::Update(SparqlUpdateRequest::new(text)),
+            &nrese_store::Requester::all(),
             &MutationTicket::new(),
         )
     };

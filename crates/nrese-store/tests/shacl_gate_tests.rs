@@ -28,7 +28,13 @@ fn pipeline(gate: ShaclGate) -> MutationPipeline {
 
 fn update(pipeline: &MutationPipeline, body: &str) -> Result<(), MutationError> {
     let command = MutationCommand::Update(SparqlUpdateRequest::new(format!("{PREFIXES}{body}")));
-    pipeline.apply(command, &MutationTicket::new()).map(drop)
+    pipeline
+        .apply(
+            command,
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .map(drop)
 }
 
 fn holds(pipeline: &MutationPipeline, pattern: &str) -> bool {

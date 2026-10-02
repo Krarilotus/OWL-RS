@@ -95,8 +95,15 @@ crafted XML), all fixed by updates; of the ten wildcard arms six covered real va
   restricted one) and B1b (`ReadContext { scope, infer, pending, cancel }` with
   `statements`, `count`, `write_statements` and `execute_graph_read`; RDF4J's statements
   streamed; a session's view kept by base version, operation count and the reader's access)
-  are done. `StatementPattern::access` stays as the store's internal carrier, set from the
-  scope only. Left: B1c, the same discipline on the write side.
+  and B1c are done. B1c: every write takes a `Requester { read: ReadScope, write:
+  WriteScope }` (the pipeline's `apply`, `StoreService::apply`, the server's
+  `mutation::run`); the access fields of `SparqlUpdateRequest`, `StatementsRequest` and
+  `StatementPattern` are gone, so requests are data only. After any command, every graph
+  the transaction changes is checked against the write scope (Graph Store writes, TELL and
+  deletes included, which only the handlers checked before), and a restore needs `All`.
+  Reads inside a session replay its operations with the reader's read scope; what they
+  change is checked at the commit. Sessions also got random ids and an owner (they were
+  `tx-1`, `tx-2`, … and anyone's).
 - **B2.** Error enums: the reasoner's (rule files with line and column), the memory budget
   as a variant, `Forbidden` and `Configuration` typed.
 - **B3.** One typed configuration tree, from defaults, the file, the environment and the

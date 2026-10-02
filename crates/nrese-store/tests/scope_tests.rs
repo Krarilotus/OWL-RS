@@ -1,7 +1,8 @@
-//! Every read of the store takes a `ReadScope` (the audit of 2 October, §2.3): a restricted
-//! scope sees its graphs only, whatever the caller forgets, and the operations over the
-//! whole dataset refuse it. The rest of a read (inferred statements, a session's pending
-//! changes, cancellation) comes with it in a `ReadContext`.
+//! Every read of the store takes a `ReadScope`, every write a `Requester` (the audit of
+//! 2 October, §2.3): a restricted scope sees and changes its graphs only, whatever the
+//! caller forgets, and the operations over the whole dataset refuse it. The rest of a read
+//! (inferred statements, a session's pending changes, cancellation) comes with it in a
+//! `ReadContext`.
 
 mod support;
 
@@ -10,9 +11,10 @@ use std::sync::Arc;
 use nrese_rdf::GraphName;
 use nrese_sparql::GraphAccess;
 use nrese_store::{
-    DatasetBackupFormat, GraphReadRequest, GraphResultFormat, GraphTarget, ReadContext, ReadScope,
-    SparqlQueryRequest, SparqlUpdateRequest, StatementOp, StatementPattern, StatementsRequest,
-    StoreService,
+    DatasetBackupFormat, DatasetRestoreRequest, GraphReadRequest, GraphResultFormat, GraphTarget,
+    GraphWriteRequest, MutationCommand, ReadContext, ReadScope, Requester, SparqlQueryRequest,
+    SparqlUpdateRequest, StatementOp, StatementPattern, StatementsRequest, StoreService,
+    TellRequest, WriteScope,
 };
 use support::in_memory_store_config;
 
@@ -145,7 +147,6 @@ fn reads_in_a_session_keep_its_data_until_the_session_or_the_store_changes() {
     let pending = |session: Option<&str>| StatementsRequest {
         ops: sessions.pending(&id, None).unwrap(),
         session: session.map(str::to_owned),
-        ..StatementsRequest::default()
     };
     let in_session = pending(Some(&id));
     let read = ReadContext::all().on(Some(&in_session));
@@ -220,5 +221,109 @@ fn statements_are_written_as_they_are_read() {
                 std::io::sink(),
             )
             .is_err()
+    );
+}
+
+/// Reads the public graphs, writes `urn:g:public` only.
+fn public_writer() -> Requester {
+    Requester::new(
+        public(),
+        WriteScope::Graphs(Arc::new(GraphAccess {
+            prefixes: vec!["urn:g:public".to_owned()],
+            ..GraphAccess::default()
+        })),
+    )
+}
+
+fn forbidden(result: nrese_store::StoreResult<nrese_store::MutationCommitReport>) -> bool {
+    matches!(result, Err(nrese_store::StoreError::Forbidden(_)))
+}
+
+#[test]
+fn every_write_is_checked_against_its_requesters_scope() {
+    let store = store();
+    let writer = public_writer();
+    let graph_write = |graph: &str| {
+        MutationCommand::GraphWrite(GraphWriteRequest {
+            target: GraphTarget::NamedGraph(graph.to_owned()),
+            format: GraphResultFormat::NTriples,
+            base_iri: None,
+            payload: b"<urn:n> <urn:p> \"4\" .".to_vec(),
+            replace: true,
+        })
+    };
+    // Graph Store writes, deletes and TELL: the store checks them, whatever the handler did.
+    assert!(forbidden(
+        store.apply(&graph_write("urn:g:secret"), &writer)
+    ));
+    assert!(store.apply(&graph_write("urn:g:public"), &writer).is_ok());
+    let delete = MutationCommand::GraphDelete(GraphTarget::DefaultGraph);
+    assert!(forbidden(store.apply(&delete, &writer)));
+    let tell = MutationCommand::Tell(TellRequest {
+        target: GraphTarget::NamedGraph("urn:g:secret".to_owned()),
+        format: GraphResultFormat::NTriples,
+        base_iri: None,
+        payload: b"<urn:n> <urn:p> \"5\" .".to_vec(),
+    });
+    assert!(forbidden(store.apply(&tell, &writer)));
+    // A restore changes every graph.
+    let restore = MutationCommand::Restore(DatasetRestoreRequest {
+        format: DatasetBackupFormat::NQuads,
+        payload: Vec::new(),
+    });
+    assert!(forbidden(store.apply(&restore, &writer)));
+    // Updates: the WHERE clause reads the readable graphs; changes elsewhere are refused.
+    let update = |text: &str| MutationCommand::Update(SparqlUpdateRequest::new(text));
+    assert!(forbidden(store.apply(
+        &update("INSERT DATA { GRAPH <urn:g:secret> { <urn:x> <urn:p> 6 } }"),
+        &writer
+    )));
+    store
+        .apply(
+            &update(
+                "INSERT { GRAPH <urn:g:public> { ?s <urn:copied> ?o } }
+                 WHERE { GRAPH ?g { ?s <urn:p> ?o } }",
+            ),
+            &writer,
+        )
+        .unwrap();
+    let copied = store
+        .statements(
+            &ReadContext::all().infer(false),
+            &StatementPattern {
+                predicate: Some(nrese_rdf::NamedNode::new_unchecked("urn:copied")),
+                ..StatementPattern::default()
+            },
+        )
+        .unwrap();
+    // The public graph holds one statement since the graph write replaced it; the secret
+    // graph's isn't read.
+    assert_eq!(copied.len(), 1, "{copied:?}");
+    // Statement operations: a removal matches in the readable graphs only, so removing
+    // everything leaves the secret graph, and the default graph isn't writable.
+    let remove_all =
+        MutationCommand::Statements(StatementsRequest::new(vec![StatementOp::RemoveMatching(
+            StatementPattern::default(),
+        )]));
+    assert!(forbidden(store.apply(&remove_all, &writer)));
+    let remove_public =
+        MutationCommand::Statements(StatementsRequest::new(vec![StatementOp::RemoveMatching(
+            StatementPattern {
+                contexts: vec![GraphName::NamedNode(nrese_rdf::NamedNode::new_unchecked(
+                    "urn:g:public",
+                ))],
+                ..StatementPattern::default()
+            },
+        )]));
+    store.apply(&remove_public, &writer).unwrap();
+    assert_eq!(
+        store
+            .count(
+                &ReadContext::all().infer(false),
+                &StatementPattern::default()
+            )
+            .unwrap(),
+        2,
+        "the default and the secret graph's statements stay"
     );
 }

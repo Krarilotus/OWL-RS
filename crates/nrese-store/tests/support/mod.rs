@@ -69,6 +69,7 @@ pub fn run_owl2_rl_catalog_fixture(
     );
     pipeline.apply(
         MutationCommand::Update(SparqlUpdateRequest::new(update)),
+        &nrese_store::Requester::all(),
         &MutationTicket::new(),
     )?;
     inferred_statements(&store)
