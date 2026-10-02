@@ -19,8 +19,8 @@ use rayon::prelude::*;
 
 use super::batch::{self, Materialisation, Schema};
 use super::ir::Rule;
+use super::ir::{Triple, Violation};
 use super::lists::ListVocabulary;
-use super::naive::{Triple, Violation};
 
 /// The `owl:sameAs` classes of a closure: each term's representative, and each
 /// representative's members (only for classes of two or more).
