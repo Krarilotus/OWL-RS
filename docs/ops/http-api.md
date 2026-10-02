@@ -169,6 +169,21 @@ Errors are `application/problem+json` documents. Every response carries `x-reque
 | `/dataset/service-description` | SPARQL service description (Turtle); it names every endpoint above |
 | `/dataset/info` | Statement and graph counts |
 | `/dataset/tell` | Adds an RDF payload to a graph (`POST`) |
-| `/metrics` | Prometheus metrics |
+| `/metrics` | Prometheus metrics (below) |
 | `/console`, `/ops` | User console, operator UI |
 | `/ops/api/…` | Operator API: capabilities, diagnostics, backup and restore |
+
+`/metrics`, in Prometheus' text format:
+
+| Metric | What |
+|---|---|
+| `nrese_ready`, `nrese_dataset_revision`, `nrese_store_quads`, `nrese_store_inferred`, `nrese_store_named_graphs` | Readiness and the dataset |
+| `nrese_reasoner_mode_info`, `nrese_store_mode_info` | Modes, as labels |
+| `nrese_query_cache_hits_total`, `nrese_query_cache_misses_total`, `nrese_query_cache_bytes` | The result cache |
+| `nrese_query_memory_bytes`, `nrese_query_memory_peak_bytes`, `nrese_query_memory_limit_bytes` | Intermediate results of running queries, against `budgets.total_query_memory` |
+| `nrese_http_responses_total{kind, status}` | Responses by kind of request (`query`, `update`, `sparql` for the single endpoint, `graph_store`, `shacl`, `other`) and status class (`2xx` … `5xx`) |
+| `nrese_http_request_duration_seconds{kind}` | Histogram of the time to the response's start, by kind |
+| `nrese_index_runs`, `nrese_index_bytes{place}` | Index runs; index data on the heap and mapped from the checkpoint |
+| `nrese_dictionary_terms`, `nrese_dictionary_bytes{part}` | Dictionary terms; their text, the heap's index, and what is mapped |
+| `nrese_wal_bytes_since_checkpoint`, `nrese_compactions_total`, `nrese_checkpoints_total` | What a restart would replay; run merges and checkpoints since start |
+| `nrese_process_resident_bytes` | Resident memory (Linux; mapped file pages included, which the OS can drop) |

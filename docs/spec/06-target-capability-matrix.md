@@ -42,7 +42,7 @@ The **Evidence** column names the test or benchmark that moves a row to `done`.
 | Vector similarity | no | yes (similarity/connectors) | missing | V1 | recall@k |
 | RDF-star / RDF 1.2 triple terms | partial | yes | **done**: triple terms, reifiers and annotations in every RDF format, base directions, SPARQL 1.2 functions and patterns; the W3C RDF 1.2 syntax suites and the SPARQL 1.2 suite pass (`nrese-rdf-io/tests/w3c_rdf`, `nrese-sparql/tests/w3c_sparql11`) | R7 | RDF 1.2 tests |
 | Graph-level access control | no | yes (Enterprise) | missing | O1 | security matrix |
-| Metrics and tracing | partial | yes | delivered: readiness, revision, counts, modes, query-cache metrics; request ids and `tracing` spans. Missing: request outcomes and latencies, WAL/compaction/backup metrics (O3, parity plan E2) | O3 | dashboards |
+| Metrics and tracing | partial | yes | delivered: readiness, revision, counts, modes, query-cache and query-memory metrics; request outcomes by kind and status class and latency histograms; index and dictionary bytes (heap and mapped) and resident memory; WAL bytes since the last checkpoint, compactions and checkpoints; request ids and `tracing` spans. Missing: backup metrics (O3, parity plan E2) | O3 | dashboards |
 
 **Evidence notes (2026-09-25; the v1 notes are historical):**
 - v1 reasoning fixtures now run against vendored copies of the published vocabularies (`benches/nrese-bench-harness/fixtures/catalog-cache/`). Earlier SOSA evidence was invalid: the catalog URL served the SSN document, so the "SOSA" test asserted an SSN axiom. It now asserts SOSA's own `sosa:observes owl:inverseOf sosa:isObservedBy`.
