@@ -123,6 +123,16 @@ HTTP on the main PC, so the comparison is indicative:
 | q06 `STRSTARTS` on 452 k lemmas | 148 ms | 0.06 ms | the dictionary's text order (checkpoint format 7): a prefix is two binary searches |
 | Sum of query medians | – | 80 ms | |
 
+2 October, in the same perf lab (DBpedia and YAGO sums above include them):
+
+| | Before | Now | What changed |
+|---|---:|---:|---|
+| YAGO q10, 407 k rows (TSV) | 269 ms | 90 ms | planning without a seek per passing term (estimated counts); results serialised on every core |
+| DBpedia q09, 100 k rows | 58 ms | 31 ms | results serialised on every core |
+| DBpedia q05 populations (`xsd:nonNegativeInteger`) | 19 ms | 1.3 ms | integer-derived literals inline (kind 12), so the range hint narrows them |
+| Olympics (1.8 M quads), sum | 92 ms | 69 ms | the same (q05 6.0 → 0.23 ms, q13 `AVG` of `xsd:int` ages 22 → 13 ms); ORDER BY + LIMIT computes tie-break keys for the candidates only (q04 17.5 → 9 ms) |
+| LUBM-100 after OWL 2 RL, 14 counting queries | 73 ms | 60 ms | WCOJ chunks sized to the threads (q2 18 → 4.8 ms) |
+
 Done, with differential tests against the reference evaluator:
 - **A1** CONTAINS / STRSTARTS / STRENDS on a large pattern's object or STR of it, and
   `LANG(?v) = "tag"`, alone or with one of them. Only for patterns that will be scanned:
@@ -145,10 +155,6 @@ Still open:
   inferred) or several runs still go quad by quad: merge them column-wise next.
 - The text order could also answer string ranges (`?s >= "M"`) and ORDER BY on strings
   (a rank per entry instead of decoding and comparing terms).
-- DBpedia q05 (21 ms): populations are `xsd:nonNegativeInteger`, dictionary literals, so
-  the numeric range hint can't narrow them. An inline kind for the integer-derived
-  datatypes (value first, datatype code last, so ids still sort by value) would; it is a
-  term-encoding change.
 - A6, second part: done for checkpoints and bulk loads (`store.map_checkpoints`, on by
   default: what a checkpoint holds is served from the file once written). Compaction
   into the base still writes a heap run until the next checkpoint; merged base runs
