@@ -20,6 +20,7 @@
 //!   background worker.
 
 mod bulk;
+mod equality;
 mod snapshot;
 pub(crate) mod spill;
 mod statistics;
@@ -39,9 +40,10 @@ use crate::index::compaction::merge_runs;
 use crate::index::run::Run;
 use crate::index::{CompactionPolicy, IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple};
-use crate::term::{Dictionary, DictionaryStats};
+use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
+pub use equality::Classes as EqualityClasses;
 pub use snapshot::Snapshot;
 pub use transaction::{CommitSummary, Transaction};
 
@@ -175,6 +177,8 @@ pub(crate) struct Version {
     pub(crate) revision: u64,
     /// Dictionary entries visible to this version; newer terms are hidden from lookups.
     pub(crate) dictionary_len: u64,
+    /// Its `owl:sameAs` classes, once a read needs them ([`equality`]).
+    pub(crate) equality: Arc<equality::EqualityCell>,
 }
 
 impl Version {
@@ -185,6 +189,7 @@ impl Version {
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision: 0,
             dictionary_len: 0,
+            equality: Default::default(),
         }
     }
 
@@ -208,6 +213,7 @@ impl Version {
             inferred: self.inferred.clone(),
             revision: self.revision,
             dictionary_len: self.dictionary_len,
+            equality: Arc::clone(&self.equality),
         };
         *next.stack_mut(stack) = index;
         next
@@ -317,6 +323,9 @@ struct Shared {
     wants_checkpoint: AtomicBool,
     /// Checkpoints written.
     checkpoints: AtomicU64,
+    /// `owl:sameAs`, when the inferred stack holds the closure over representatives
+    /// ([`Engine::set_equality`]).
+    equality: RwLock<Option<TermId>>,
 }
 
 impl Shared {
@@ -325,6 +334,7 @@ impl Shared {
             self.versions.load(),
             Arc::clone(&self.dictionary),
             Arc::clone(&self.statistics),
+            *self.equality.read(),
         )
     }
 
@@ -394,6 +404,7 @@ impl Shared {
                     inferred: index(Stack::Inferred, &inferred),
                     revision: current.revision,
                     dictionary_len: current.dictionary_len,
+                    equality: Arc::clone(&current.equality),
                 }
             });
         }
@@ -552,6 +563,7 @@ impl Engine {
             wants_compaction: AtomicBool::new(false),
             wants_checkpoint: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
+            equality: RwLock::new(None),
         });
         let worker = config
             .background_maintenance
@@ -569,6 +581,21 @@ impl Engine {
     /// The latest committed state. Never blocks on writers.
     pub fn snapshot(&self) -> Snapshot {
         self.inner.shared.snapshot()
+    }
+
+    /// Equality by representatives (work package W4, stage B): with `Some(sameAs)`, the
+    /// inferred stack holds the closure over one representative per `owl:sameAs` class,
+    /// each other identity stored as `identity sameAs representative`, and snapshots taken
+    /// from now on read the default graph expanded to every identity
+    /// ([`equality`](self::equality)). The reasoner that fills the stack decides; `None`
+    /// reads the stacks as stored.
+    pub fn set_equality(&self, same_as: Option<TermId>) {
+        *self.inner.shared.equality.write() = same_as;
+    }
+
+    /// `owl:sameAs` if reads expand equality classes ([`Self::set_equality`]).
+    pub fn equality(&self) -> Option<TermId> {
+        *self.inner.shared.equality.read()
     }
 
     /// Starts a transaction, waiting for the writer slot. Dropping it without

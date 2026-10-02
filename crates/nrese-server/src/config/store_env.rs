@@ -9,6 +9,7 @@ use super::source::ConfigSource;
 
 pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfig> {
     let defaults = StoreConfig::default();
+    let equality = parse_equality(source.get(names::REASONING_EQUALITY).as_deref())?;
     Ok(StoreConfig {
         mode: parse_store_mode(source.get(names::STORE_MODE).as_deref())?,
         data_dir: source
@@ -28,18 +29,8 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         hide_unnamed_classes: parse_unnamed_classes(
             source.get(names::REASONING_UNNAMED_CLASSES).as_deref(),
         )?,
-        equality_by_representatives: match source
-            .get(names::REASONING_EQUALITY)
-            .map(|v| v.to_ascii_lowercase())
-            .as_deref()
-        {
-            None | Some("representatives") => true,
-            Some("replicate") => false,
-            Some(unknown) => bail!(
-                "unsupported value '{unknown}' in {} (expected 'representatives' or 'replicate')",
-                names::REASONING_EQUALITY
-            ),
-        },
+        equality_by_representatives: equality.0,
+        equality_compact: equality.1,
         verify_on_open: parse_bool(source, names::VERIFY_ON_OPEN, defaults.verify_on_open)?,
         map_checkpoints: parse_bool(source, names::MAP_CHECKPOINTS, defaults.map_checkpoints)?,
         wal_archive: parse_bool(source, names::WAL_ARCHIVE, defaults.wal_archive)?,
@@ -105,6 +96,21 @@ fn parse_shacl_gate(gate: Option<&str>, severity: Option<&str>) -> Result<ShaclG
 
 /// Memberships in unnamed union classes that nothing consumes: `derive` them (OWL 2 RL
 /// as written, the default) or `skip` them.
+/// `reasoner.equality`: whether full materialisations compute over representatives, and
+/// whether the store keeps the closure over them.
+fn parse_equality(input: Option<&str>) -> Result<(bool, bool)> {
+    Ok(match input.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("representatives") => (true, false),
+        Some("compact") => (true, true),
+        Some("replicate") => (false, false),
+        Some(unknown) => bail!(
+            "unsupported value '{unknown}' in {} (expected 'representatives', 'compact' or \
+             'replicate')",
+            names::REASONING_EQUALITY
+        ),
+    })
+}
+
 fn parse_unnamed_classes(input: Option<&str>) -> Result<bool> {
     match input.map(str::to_ascii_lowercase).as_deref() {
         None | Some("derive") => Ok(false),
@@ -240,6 +246,15 @@ mod tests {
         assert!(!parse_default_graph(Some("default")).unwrap());
         assert!(parse_default_graph(Some("Union")).unwrap());
         assert!(parse_default_graph(Some("all")).is_err());
+    }
+
+    #[test]
+    fn equality_parser_knows_three_modes() {
+        use super::parse_equality;
+        assert_eq!(parse_equality(None).unwrap(), (true, false));
+        assert_eq!(parse_equality(Some("Compact")).unwrap(), (true, true));
+        assert_eq!(parse_equality(Some("replicate")).unwrap(), (false, false));
+        assert!(parse_equality(Some("rewrite")).is_err());
     }
 
     #[test]
