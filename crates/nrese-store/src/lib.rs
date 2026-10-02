@@ -54,6 +54,7 @@ pub use mutation::{
     MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
     RejectAttributionCandidate,
 };
+pub use namespaces::{NamespaceMap, Namespaces};
 pub use nrese_engine::{EngineError, ReadModel};
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{CancellationToken, Explanation, PlanStep, QueryEvaluationError};
@@ -66,7 +67,6 @@ pub use query_executor::PreparedQuery;
 pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
 pub use reasoning::{MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
-pub use namespaces::{NamespaceMap, Namespaces};
 pub use service::StoreService;
 pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{
