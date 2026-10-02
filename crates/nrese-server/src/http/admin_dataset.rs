@@ -9,6 +9,7 @@ use nrese_store::{
 use crate::error::ApiError;
 use crate::http::media::{header_value_str, media_type_matches};
 use crate::http::mutation;
+use crate::http::request_metrics::BackupKind;
 use crate::http::responses::build_admin_restore_response;
 use crate::state::AppState;
 
@@ -21,11 +22,21 @@ pub async fn backup(state: AppState) -> Result<Response, ApiError> {
     state.ensure_serving()?;
 
     let store = state.store();
+    let started = std::time::Instant::now();
     let artifact =
         tokio::task::spawn_blocking(move || store.export_dataset(DatasetBackupFormat::NQuads))
             .await
-            .map_err(|error| ApiError::internal(error.to_string()))?
-            .map_err(map_backup_error)?;
+            .map_err(|error| ApiError::internal(error.to_string()))
+            .and_then(|result| result.map_err(map_backup_error));
+    state.request_metrics().record_backup(
+        BackupKind::Dump,
+        artifact
+            .as_ref()
+            .ok()
+            .map(|artifact| artifact.payload.len() as u64),
+        started.elapsed(),
+    );
+    let artifact = artifact?;
 
     let mut response = (StatusCode::OK, artifact.payload).into_response();
     response.headers_mut().insert(
@@ -64,14 +75,20 @@ pub async fn restore(
         payload: body.to_vec(),
     };
 
-    let report = match mutation::run(
+    let started = std::time::Instant::now();
+    let result = mutation::run(
         &state,
         MutationCommand::Restore(request),
         state.policy().timeouts.update,
         "dataset restore exceeded policy timeout",
     )
-    .await?
-    {
+    .await;
+    state.request_metrics().record_backup(
+        BackupKind::Restore,
+        result.as_ref().ok().map(|_| body.len() as u64),
+        started.elapsed(),
+    );
+    let report = match result? {
         MutationCommitReport::Restore(report) => report,
         other => {
             return Err(ApiError::internal(format!(
@@ -98,10 +115,17 @@ pub async fn image_backup(state: AppState, repository: &str) -> Result<Response,
         other => format!("{other}-{seconds}"),
     });
     let target = dir.clone();
+    let started = std::time::Instant::now();
     let manifest = tokio::task::spawn_blocking(move || store.backup_image(&target))
         .await
-        .map_err(|error| ApiError::internal(error.to_string()))?
-        .map_err(map_backup_error)?;
+        .map_err(|error| ApiError::internal(error.to_string()))
+        .and_then(|result| result.map_err(map_backup_error));
+    state.request_metrics().record_backup(
+        BackupKind::Image,
+        manifest.as_ref().ok().map(|manifest| manifest.bytes),
+        started.elapsed(),
+    );
+    let manifest = manifest?;
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({

@@ -1,6 +1,7 @@
 //! Request outcomes and latencies for `/metrics` (O3): per kind of request, how many ended
 //! in each status class, and a histogram of the time to the response's start (the head;
-//! a streamed body may still be on its way).
+//! a streamed body may still be on its way). Also backups and restores: how many succeeded
+//! and failed, and the last success's time, duration and size.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -80,12 +81,48 @@ struct PerKind {
     buckets: [AtomicU64; BUCKETS.len()],
     count: AtomicU64,
     sum_micros: AtomicU64,
+    /// Requests begun and not yet answered.
+    in_flight: AtomicU64,
+}
+
+/// The kinds of backup operation the metrics tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupKind {
+    /// An N-Quads export (`/ops/api/admin/dataset/backup`).
+    Dump,
+    /// An image of the store's snapshot (`…/backup/image`).
+    Image,
+    /// An N-Quads restore.
+    Restore,
+}
+
+impl BackupKind {
+    const ALL: [Self; 3] = [Self::Dump, Self::Image, Self::Restore];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dump => "dump",
+            Self::Image => "image",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+#[derive(Default)]
+struct PerBackupKind {
+    ok: AtomicU64,
+    failed: AtomicU64,
+    /// The last success: when it ended (seconds since 1970), how long it took and its size.
+    last_unix: AtomicU64,
+    last_micros: AtomicU64,
+    last_bytes: AtomicU64,
 }
 
 /// Counters shared by every request; lock-free.
 #[derive(Default)]
 pub struct RequestMetrics {
     kinds: [PerKind; Kind::ALL.len()],
+    backups: [PerBackupKind; BackupKind::ALL.len()],
 }
 
 impl RequestMetrics {
@@ -103,9 +140,85 @@ impl RequestMetrics {
             .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
     }
 
+    /// A backup or restore that ended: its size in bytes if it succeeded.
+    pub fn record_backup(&self, kind: BackupKind, bytes: Option<u64>, elapsed: Duration) {
+        let metrics = &self.backups[kind as usize];
+        let Some(bytes) = bytes else {
+            metrics.failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        metrics.last_unix.store(now, Ordering::Relaxed);
+        metrics
+            .last_micros
+            .store(elapsed.as_micros() as u64, Ordering::Relaxed);
+        metrics.last_bytes.store(bytes, Ordering::Relaxed);
+        metrics.ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a request of `kind` as in flight until the guard drops (also when the
+    /// client goes away and the request's future is dropped).
+    pub fn begin(&self, kind: Kind) -> InFlight<'_> {
+        let counter = &self.kinds[kind as usize].in_flight;
+        counter.fetch_add(1, Ordering::Relaxed);
+        InFlight(counter)
+    }
+
     /// The metrics in Prometheus' text format.
     pub fn render(&self, out: &mut String) {
         use std::fmt::Write as _;
+        out.push_str(
+            "# HELP nrese_http_requests_in_flight Requests begun and not yet answered, by kind.\n\
+             # TYPE nrese_http_requests_in_flight gauge\n",
+        );
+        for kind in Kind::ALL {
+            let _ = writeln!(
+                out,
+                "nrese_http_requests_in_flight{{kind=\"{}\"}} {}",
+                kind.label(),
+                self.kinds[kind as usize].in_flight.load(Ordering::Relaxed)
+            );
+        }
+        out.push_str(
+            "# HELP nrese_backups_total Backups and restores by kind and outcome.\n\
+             # TYPE nrese_backups_total counter\n",
+        );
+        for kind in BackupKind::ALL {
+            let metrics = &self.backups[kind as usize];
+            let label = kind.label();
+            let _ = writeln!(
+                out,
+                "nrese_backups_total{{kind=\"{label}\",outcome=\"ok\"}} {}\n\
+                 nrese_backups_total{{kind=\"{label}\",outcome=\"failed\"}} {}",
+                metrics.ok.load(Ordering::Relaxed),
+                metrics.failed.load(Ordering::Relaxed),
+            );
+        }
+        let last = [
+            (
+                "nrese_backup_last_success_timestamp_seconds",
+                "When the last success ended, seconds since 1970 (0: none yet).",
+            ),
+            (
+                "nrese_backup_last_duration_seconds",
+                "How long the last success took.",
+            ),
+            ("nrese_backup_last_bytes", "The last success's size."),
+        ];
+        for (index, (name, help)) in last.into_iter().enumerate() {
+            let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} gauge");
+            for kind in BackupKind::ALL {
+                let metrics = &self.backups[kind as usize];
+                let value = match index {
+                    0 => metrics.last_unix.load(Ordering::Relaxed) as f64,
+                    1 => metrics.last_micros.load(Ordering::Relaxed) as f64 / 1e6,
+                    _ => metrics.last_bytes.load(Ordering::Relaxed) as f64,
+                };
+                let _ = writeln!(out, "{name}{{kind=\"{}\"}} {value}", kind.label());
+            }
+        }
         out.push_str(
             "# HELP nrese_http_responses_total Responses by kind of request and status class.\n\
              # TYPE nrese_http_responses_total counter\n",
@@ -149,11 +262,22 @@ impl RequestMetrics {
     }
 }
 
+/// A request in flight; see [`RequestMetrics::begin`].
+pub struct InFlight<'a>(&'a AtomicU64);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// The middleware that records every request.
 pub async fn track(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let kind = Kind::of(request.uri().path());
     let start = Instant::now();
+    let in_flight = state.request_metrics().begin(kind);
     let response = next.run(request).await;
+    drop(in_flight);
     state
         .request_metrics()
         .record(kind, response.status().as_u16(), start.elapsed());
@@ -196,9 +320,37 @@ mod tests {
                 "nrese_http_request_duration_seconds_bucket{kind=\"update\",le=\"+Inf\"} 1"
             )
         );
+        assert!(text.contains("nrese_backups_total{kind=\"image\",outcome=\"ok\"} 0"));
+        {
+            let _first = metrics.begin(Kind::Update);
+            let _second = metrics.begin(Kind::Update);
+            let mut text = String::new();
+            metrics.render(&mut text);
+            assert!(text.contains("nrese_http_requests_in_flight{kind=\"update\"} 2"));
+        }
+        let mut text = String::new();
+        metrics.render(&mut text);
+        assert!(text.contains("nrese_http_requests_in_flight{kind=\"update\"} 0"));
         assert_eq!(Kind::of("/dataset/query"), Kind::Query);
         assert_eq!(Kind::of("/healthz"), Kind::Other);
         assert_eq!(Kind::of("/repositories/repo"), Kind::Sparql);
         assert_eq!(Kind::of("/repositories/repo/statements"), Kind::GraphStore);
+    }
+
+    #[test]
+    fn records_backups() {
+        let metrics = RequestMetrics::default();
+        metrics.record_backup(BackupKind::Image, Some(4096), Duration::from_millis(1500));
+        metrics.record_backup(BackupKind::Image, None, Duration::from_millis(3));
+        metrics.record_backup(BackupKind::Dump, None, Duration::from_millis(3));
+        let mut text = String::new();
+        metrics.render(&mut text);
+        assert!(text.contains("nrese_backups_total{kind=\"image\",outcome=\"ok\"} 1"));
+        assert!(text.contains("nrese_backups_total{kind=\"image\",outcome=\"failed\"} 1"));
+        assert!(text.contains("nrese_backups_total{kind=\"dump\",outcome=\"failed\"} 1"));
+        assert!(text.contains("nrese_backup_last_duration_seconds{kind=\"image\"} 1.5"));
+        assert!(text.contains("nrese_backup_last_bytes{kind=\"image\"} 4096"));
+        assert!(text.contains("nrese_backup_last_success_timestamp_seconds{kind=\"dump\"} 0"));
+        assert!(!text.contains("nrese_backup_last_success_timestamp_seconds{kind=\"image\"} 0\n"));
     }
 }
