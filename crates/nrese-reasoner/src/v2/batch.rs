@@ -624,6 +624,19 @@ pub fn materialise_owned(
     run(store, clock.elapsed(), rules, lists, schema, NEVER).expect("never stopped")
 }
 
+/// [`materialise_owned`], polling `stop` as [`materialise_grouped_until`] does.
+pub fn materialise_owned_until(
+    input: Vec<Triple>,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    stop: super::eval::Stop<'_>,
+) -> Result<Materialisation, Interrupted> {
+    let clock = std::time::Instant::now();
+    let store = Store::new(input);
+    run(store, clock.elapsed(), rules, lists, schema, stop)
+}
+
 /// [`materialise`] over input already grouped the way the working set stores it: per
 /// predicate (each once), its `(object, subject)` pairs, sorted and distinct. A store can
 /// stream this from a predicate-object-subject index without an intermediate triple list or

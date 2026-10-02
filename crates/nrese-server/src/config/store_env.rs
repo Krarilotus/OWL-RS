@@ -28,6 +28,18 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         hide_unnamed_classes: parse_unnamed_classes(
             source.get(names::REASONING_UNNAMED_CLASSES).as_deref(),
         )?,
+        equality_by_representatives: match source
+            .get(names::REASONING_EQUALITY)
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("representatives") => true,
+            Some("replicate") => false,
+            Some(unknown) => bail!(
+                "unsupported value '{unknown}' in {} (expected 'representatives' or 'replicate')",
+                names::REASONING_EQUALITY
+            ),
+        },
         verify_on_open: parse_bool(source, names::VERIFY_ON_OPEN, defaults.verify_on_open)?,
         map_checkpoints: parse_bool(source, names::MAP_CHECKPOINTS, defaults.map_checkpoints)?,
         wal_archive: parse_bool(source, names::WAL_ARCHIVE, defaults.wal_archive)?,

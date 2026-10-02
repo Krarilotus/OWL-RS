@@ -193,18 +193,29 @@ pub fn materialise(
     lists: Option<&ListVocabulary>,
     schema: &Schema,
 ) -> RepresentativeClosure {
+    materialise_until(input, rules, lists, schema, super::eval::NEVER).expect("never stopped")
+}
+
+/// [`materialise`], polling `stop` in every round of every closure.
+pub fn materialise_until(
+    input: &[Triple],
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    stop: super::eval::Stop<'_>,
+) -> Result<RepresentativeClosure, super::delta::Interrupted> {
     let Some(same_as) = same_as(rules) else {
-        let result = batch::materialise(input, rules, lists, schema);
+        let result = batch::materialise_owned_until(input.to_vec(), rules, lists, schema, stop)?;
         let mut facts: Vec<Triple> = input.iter().copied().chain(result.derived).collect();
         facts.par_sort_unstable();
         facts.dedup();
-        return RepresentativeClosure {
+        return Ok(RepresentativeClosure {
             facts,
             violations: result.violations,
             diagnostics: result.diagnostics,
             rounds: result.rounds,
             ..RepresentativeClosure::default()
-        };
+        });
     };
     let rules = without_replacement(rules);
     let mut classes = EqualityClasses::default();
@@ -231,21 +242,21 @@ pub fn materialise(
             diagnostics,
             rounds,
             ..
-        } = batch::materialise_owned(rewritten.clone(), &rules, lists, schema);
+        } = batch::materialise_owned_until(rewritten.clone(), &rules, lists, schema, stop)?;
         let mut closure = rewritten;
         closure.extend(derived);
         closure.par_sort_unstable();
         closure.dedup();
         let new_equalities = closure.iter().any(|t| t[1] == same_as && t[0] != t[2]);
         if !new_equalities {
-            return RepresentativeClosure {
+            return Ok(RepresentativeClosure {
                 facts: closure,
                 classes,
                 violations,
                 diagnostics,
                 rounds,
                 merges,
-            };
+            });
         }
         facts = closure;
     }
