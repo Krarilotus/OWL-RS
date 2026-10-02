@@ -5192,3 +5192,67 @@ fn integers_of_one_value_and_two_datatypes_sort_as_the_full_order() {
         }
     }
 }
+
+/// A path whose ends are both bound by the patterns before it is followed from the end
+/// with fewer distinct values: here backwards from ten ends instead of forwards from
+/// 2,000 starts, with the same answer.
+#[test]
+fn a_path_bound_at_both_ends_is_followed_from_the_smaller_end() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..2_000u32 {
+        let node = ex(&format!("n{i}"));
+        let quads = [
+            Some(Quad::new(
+                node.clone(),
+                ex("in"),
+                ex("set"),
+                GraphName::DefaultGraph,
+            )),
+            (i % 4 != 3).then(|| {
+                Quad::new(
+                    node.clone(),
+                    ex("next"),
+                    ex(&format!("n{}", i + 1)),
+                    GraphName::DefaultGraph,
+                )
+            }),
+            (i % 4 == 3 && i < 40)
+                .then(|| Quad::new(node.clone(), ex("end"), ex("yes"), GraphName::DefaultGraph)),
+        ];
+        for quad in quads.iter().flatten() {
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let text = format!(
+        "SELECT ?a ?b WHERE {{ {{ ?a <{EX}in> ?s . ?b <{EX}end> ?e }} ?a <{EX}next>+ ?b }}"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let native = rows(
+        evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    let expected = rows(
+        reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    assert_eq!(
+        native.len(),
+        30,
+        "three predecessors for each of the ten ends"
+    );
+    assert_same_rows(&native, &expected, &text);
+    let explanation = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    let path = explanation
+        .steps
+        .iter()
+        .find(|step| step.operator == "path")
+        .expect("a path step");
+    assert!(
+        path.detail.contains("from 10 bound values"),
+        "{}",
+        path.detail
+    );
+}
