@@ -257,6 +257,11 @@ fn digits(s: &str, range: std::ops::Range<usize>) -> Option<u32> {
 /// dates are less than a day (±14 h) apart, so a range over dates is widened by a day and
 /// its edges are checked by the full comparison. The bound needn't be a real date; it only
 /// has to order correctly (fields are compared as year, month, day, timezone).
+/// The timezone field of a date or dateTime payload (the lowest bits of both).
+pub(crate) fn timezone_code(payload: u64) -> u64 {
+    payload & ((1 << TIMEZONE_BITS) - 1)
+}
+
 pub(crate) fn date_widened(id: TermId, later: bool) -> Option<TermId> {
     if id.kind() != TermKind::Date {
         return None;

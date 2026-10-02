@@ -19,6 +19,7 @@
 //! | `LANG(?v) = "tag"`, `LANGMATCHES(LANG(?v), "range")` | the language in the dictionary key |
 //! | `CONTAINS/STRSTARTS/STRENDS(?v or STR(?v), "text")`, `REGEX(…, "pattern", "flags")` | the borrowed lexical form |
 //! | `?v < > <= >= = 42` (and mirrored) | inline integer ids by value |
+//! | `?v < > <= >= = "2000-01-01"^^xsd:date` (or `xsd:dateTime`, and mirrored) | inline ids of the constant's kind and timezone by id (their order is the value order); other values to the generic evaluator |
 //! | `&&`, `||`, `!` | SPARQL's three-valued logic |
 
 use std::cmp::Ordering;
@@ -71,6 +72,8 @@ pub(crate) enum Fast {
     Regex(Variable, bool, Regex),
     /// `?v <op> integer`: `Ordering` of the variable against the constant must be in the set.
     IntCompare(Variable, Vec<Ordering>, i64),
+    /// `?v <op> date` (or dateTime), the constant's inline id: as [`Self::IntCompare`].
+    DateCompare(Variable, Vec<Ordering>, TermId),
 }
 
 fn variable(expr: &Expression) -> Option<&Variable> {
@@ -112,6 +115,18 @@ fn integer_constant(expr: &Expression) -> Option<i64> {
     }
 }
 
+/// An `xsd:date` or `xsd:dateTime` constant with an inline id (canonical, in range).
+fn date_constant(expr: &Expression, snapshot: &Snapshot) -> Option<TermId> {
+    match expr {
+        Expression::Literal(l) if l.datatype() == xsd::DATE || l.datatype() == xsd::DATE_TIME => {
+            snapshot
+                .lookup(l.as_ref().into())
+                .filter(|id| id.date_timezone().is_some())
+        }
+        _ => None,
+    }
+}
+
 fn lang_of(expr: &Expression) -> Option<&Variable> {
     match expr {
         Expression::FunctionCall(Function::Lang, args) if args.len() == 1 => variable(&args[0]),
@@ -128,6 +143,16 @@ pub(crate) fn compile(expr: &Expression, snapshot: &Snapshot) -> Option<Fast> {
         }
         if let (Some(c), Some(v)) = (integer_constant(a), variable(b)) {
             return Some(Fast::IntCompare(
+                v.clone(),
+                orderings.iter().map(|o| o.reverse()).collect(),
+                c,
+            ));
+        }
+        if let (Some(v), Some(c)) = (variable(a), date_constant(b, snapshot)) {
+            return Some(Fast::DateCompare(v.clone(), orderings.to_vec(), c));
+        }
+        if let (Some(c), Some(v)) = (date_constant(a, snapshot), variable(b)) {
+            return Some(Fast::DateCompare(
                 v.clone(),
                 orderings.iter().map(|o| o.reverse()).collect(),
                 c,
@@ -292,6 +317,16 @@ impl Fast {
                     Some(x) => Tri::of(orderings.contains(&x.cmp(constant))),
                     None => Tri::Unknown,
                 },
+                Err(undecided) => undecided,
+            },
+            Self::DateCompare(v, orderings, constant) => match stored(v) {
+                Ok(id)
+                    if id.kind() == constant.kind()
+                        && id.date_timezone() == constant.date_timezone() =>
+                {
+                    Tri::of(orderings.contains(&id.cmp(constant)))
+                }
+                Ok(_) => Tri::Unknown,
                 Err(undecided) => undecided,
             },
         }
