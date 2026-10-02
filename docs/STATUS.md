@@ -100,7 +100,7 @@ From the milestone review (R5–R9), low priority:
 | R5 The verified-credential cache keyed by a keyed hash (HMAC, a per-process key) instead of SHA-256 | done (HMAC-SHA-256 over `sha2`, checked against RFC 4231) |
 | R6 Repository ids compared case-insensitively; Windows device names refused | done (also leading and trailing dots) |
 | R7 Removing a repository by renaming it to `.trash-*` first, swept at start | done |
-| R8 Long `owl:AllDisjointProperties` (a self-join of the triple table): a note or a time-bounded test | open |
+| R8 Long `owl:AllDisjointProperties` (a self-join of the triple table): a note or a time-bounded test | done (the note, in reasoning-semantics.md); a native rule driven by the index's members would remove the cost: open, with G3 |
 | R9 `--set` refused or warned for secret settings | done (refused, pointing to the file or the environment variable) |
 | R1 residue: a commit that adds a long list without deleting one keeps the older index rule beside the new one until the program is rebuilt (sound; bounded by list changes, not by commits) | open |
 
