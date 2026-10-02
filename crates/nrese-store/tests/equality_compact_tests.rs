@@ -148,6 +148,32 @@ fn compact_equality_answers_as_replication() {
     assert!(stored < shown as u64, "stored {stored}, shown {shown}");
 }
 
+/// A statement over representatives deleted from the default graph but still asserted in a
+/// named graph: its copies for the other identities stay inferred (the stored statement
+/// was their only carrier). Found by the fuzz campaign (`NRESE_FUZZ_SEED=180`).
+#[test]
+fn deleting_a_representative_statement_asserted_elsewhere_keeps_its_copies() {
+    let modes = [Mode::Replicate, Mode::Compact];
+    let pipelines = modes.map(pipeline);
+    let steps = [
+        "INSERT DATA { ex:a ex:knows ex:b . GRAPH ex:g { ex:a ex:knows ex:b } }",
+        "INSERT DATA { ex:c owl:sameAs ex:b . ex:d owl:sameAs ex:a }",
+        "DELETE DATA { ex:a ex:knows ex:b }",
+    ];
+    for step in steps {
+        for pipeline in &pipelines {
+            update(pipeline, step);
+        }
+        let want = observe(&pipelines[0]);
+        assert_eq!(observe(&pipelines[1]), want, "after {step}");
+    }
+    assert_eq!(
+        answer(&pipelines[1], "ASK { ex:d ex:knows ex:c }"),
+        answer(&pipelines[0], "ASK { ex:d ex:knows ex:c }")
+    );
+    assert!(answer(&pipelines[1], "ASK { ex:d ex:knows ex:c }").contains("true"));
+}
+
 /// A compact store on disk reopens with its closure current and reads it expanded; under
 /// another equality mode the closure is not current (it has another form).
 #[test]
