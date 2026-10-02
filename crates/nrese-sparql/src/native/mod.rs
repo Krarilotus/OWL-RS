@@ -219,6 +219,7 @@ pub(crate) fn write_results(
     query: &Query,
     options: &QueryOptions,
     format: ResultsFormat,
+    version: Option<&'static str>,
     out: &mut dyn std::io::Write,
 ) -> Option<Result<(), crate::query::WriteResultsError>> {
     let (pattern, form) = match native_pattern(query, options) {
@@ -236,8 +237,8 @@ pub(crate) fn write_results(
         Err(error) => return Some(Err(QueryEvaluationError::from(error).into())),
     };
     if matches!(form, Form::Ask) {
-        let bytes = output::boolean(!solutions.table.is_empty());
-        return Some(out.write_all(bytes).map_err(Into::into));
+        let bytes = output::boolean(!solutions.table.is_empty(), version);
+        return Some(out.write_all(&bytes).map_err(Into::into));
     }
     let computed = ctx.computed.into_inner();
     let token = options.cancellation.clone();
@@ -253,6 +254,7 @@ pub(crate) fn write_results(
         snapshot,
         computed: &computed,
         format,
+        version,
     };
     Some(
         writer
