@@ -116,12 +116,13 @@ The hierarchy isn't stored; the reasoning modes materialise instance-level infer
 
 ## RDF4J protocol
 
-The RDF4J REST protocol, as RDF4J's `HTTPRepository`, GraphDB's clients and the tools built on them speak it, over this server's one dataset: every repository id names it (the list calls it `nrese`), so a client configured for `http://host:8080/repositories/repo` works as is.
+The RDF4J REST protocol, as RDF4J's `HTTPRepository`, GraphDB's clients and the tools built on them speak it. The configured store is repository `nrese` (what `/dataset/…` serves); `PUT /repositories/{id}` creates another (admins; the configuration in the body is not read: the default's settings and reasoning apply, on disk under `repositories/<id>/` of the data directory, opened again at start) and `DELETE /repositories/{id}` removes one with its data. A repository besides the default has no `SERVICE` client and no preloaded ontology.
 
 | Path | What |
 |---|---|
 | `GET /protocol` | the protocol version, `12` |
 | `GET /repositories` | the repository list (SPARQL results) |
+| `PUT`, `DELETE /repositories/{id}` | a repository created or removed (admins) |
 | `GET`, `POST /repositories/{id}` | a SPARQL query (`query`, `infer`, the dataset parameters); a form with `update` is an update |
 | `GET /repositories/{id}/statements` | the statements matching `subj`, `pred`, `obj`, `context` (repeatable), `infer`, in the negotiated RDF format (N-Quads and TriG with their graphs) |
 | `POST /repositories/{id}/statements` | an RDF payload added (into each `context` if given, else into the graphs it names), or a SPARQL update (`update=` form, `application/sparql-update`) |
