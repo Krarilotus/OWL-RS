@@ -97,7 +97,7 @@ From the milestone review (R5–R9), low priority:
 
 | Item | State |
 |---|---|
-| R5 The verified-credential cache keyed by a keyed hash (HMAC, a per-process key) instead of SHA-256 | open |
+| R5 The verified-credential cache keyed by a keyed hash (HMAC, a per-process key) instead of SHA-256 | done (HMAC-SHA-256 over `sha2`, checked against RFC 4231) |
 | R6 Repository ids compared case-insensitively; Windows device names refused | open |
 | R7 Removing a repository by renaming it to `.trash-*` first, swept at start | open |
 | R8 Long `owl:AllDisjointProperties` (a self-join of the triple table): a note or a time-bounded test | open |
