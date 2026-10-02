@@ -36,6 +36,7 @@ mod search;
 mod sets;
 mod sideways;
 mod spatial;
+mod stream;
 mod strings;
 mod substitute;
 mod triple_terms;
@@ -1006,6 +1007,8 @@ struct Context<'a> {
     as_written: bool,
     /// [`QueryOptions::cross_chunk_rows`].
     cross_chunk_rows: usize,
+    /// [`QueryOptions::stream_rows`].
+    stream_rows: Option<usize>,
     /// With a dataset of several default graphs (`FROM <a> FROM <b>`), the graphs whose
     /// merge the default graph is; the scope is then [`GraphScope::Union`].
     merge_set: Option<Vec<TermId>>,
@@ -1059,6 +1062,7 @@ impl<'a> Context<'a> {
             named: resolved.named,
             as_written: options.as_written,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
+            stream_rows: options.stream_rows,
             snapshot,
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
@@ -3577,7 +3581,38 @@ impl<'a> Context<'a> {
 
     // --- aggregation ---------------------------------------------------------------------
 
+    /// GROUP BY: evaluated directly, or in morsels where the pattern's rows don't fit the
+    /// query's memory ([`stream`]: as a retry after the direct evaluation ran out, its
+    /// memory released first).
     fn group(
+        &self,
+        inner: &GraphPattern,
+        variables: &[Variable],
+        aggregates: &[(Variable, AggregateExpression)],
+        having: Option<&Expression>,
+    ) -> NativeResult<Solutions> {
+        let streamable = match self.as_written {
+            true => None,
+            false => stream::Plan::of(inner, aggregates),
+        };
+        if let Some(plan) = &streamable
+            && self.stream_rows.is_some()
+        {
+            return self.group_streamed(plan, variables, aggregates);
+        }
+        let before = self.budget.used();
+        match self.group_direct(inner, variables, aggregates, having) {
+            Err(error) if streamable.is_some() && stream::is_memory_limit(&error) => {
+                self.budget
+                    .release(self.budget.used().saturating_sub(before));
+                let plan = streamable.as_ref().expect("checked");
+                self.group_streamed(plan, variables, aggregates)
+            }
+            result => result,
+        }
+    }
+
+    fn group_direct(
         &self,
         inner: &GraphPattern,
         variables: &[Variable],

@@ -56,7 +56,7 @@ do), **decide** (the owner decides whether the use case needs it).
 | Volcano pull pipeline | Vectorised id tables, streaming results in 64 KiB chunks with backpressure | **have** |
 | Nested-loop, hash and merge joins | Merge, hash and index joins on permutation order, worst-case-optimal (leapfrog) joins for cyclic patterns, parallel joins | **have** |
 | Property path automata | Closures over adjacency in `nrese-exec` | **have** |
-| Memory-bounded operators | Per-query memory budgets (a query over budget stops with an error) | **partial**: spilling of sorts, `DISTINCT` and grouping to disk is a **gap** (plan it with Pf2) |
+| Memory-bounded operators | Per-query memory budgets; a GROUP BY over a basic graph pattern that outgrows them streams instead (morsels of its smallest pattern grouped into partial aggregates and merged, `native/stream.rs`), and a GROUP BY over a cross product is grouped in chunks | **partial**: `DISTINCT`, `ORDER BY` without `LIMIT` and results without aggregation still hold their whole input; spilling them to disk is a **gap** |
 
 ## 4. I/O
 
