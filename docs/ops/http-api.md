@@ -22,6 +22,7 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 | `default-graph-uri`, `named-graph-uri` (repeatable) | The query's dataset; replaces its `FROM` clauses |
 | `infer=false` | Asserted statements only (the default reads asserted and inferred) |
 | `explain=true` | Run the query and return how it ran, as JSON: `executor`, `rewrites` (the rewrites that changed the query before it ran, in order: `triple-terms`, `join-groups`, `filter-pushdown`, `ask-limit`), `rows`, `micros`, and `steps` (one per operator: `depth`, `operator`, `detail`, `estimated_rows`, `rows`, `micros`) |
+| `explain=plan` | Return the plan the query would run as, without running it, as JSON: `executor`, `rewrites`, and `steps` (one per plan node from the top down: `depth`, `operator`, `detail`, `estimated_rows` from the store's statistics, `null` where unknown, as below a `SERVICE`) |
 
 Other parameters are ignored, so clients that send their own (`queryLn`, `timeout`) work.
 

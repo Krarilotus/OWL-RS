@@ -1,5 +1,5 @@
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use nrese_store::{
     CancellationToken, GraphResultFormat, MutationCommand, QueryResultKind, SolutionsResultFormat,
     SparqlQueryRequest, SparqlUpdateRequest, StoreError,
@@ -8,7 +8,7 @@ use nrese_store::{
 use crate::error::ApiError;
 use crate::http::media::{BOOLEAN, GRAPHS, SOLUTIONS, negotiated};
 use crate::http::mutation;
-use crate::http::requests::{QueryOperation, UpdateOperation};
+use crate::http::requests::{Explain, QueryOperation, UpdateOperation};
 use crate::http::result_stream::stream_blocking;
 use crate::policy::PolicyConfig;
 use crate::state::AppState;
@@ -52,7 +52,7 @@ pub async fn execute_query_in(
         prepared.set_origin(origin);
     }
     // The query form decides which formats exist; an EXPLAIN is always JSON.
-    if !explain {
+    if explain == Explain::No {
         let (solutions, graph) = negotiate_formats(prepared.kind(), accept)?;
         prepared.set_formats(solutions, graph);
     }
@@ -60,7 +60,15 @@ pub async fn execute_query_in(
     let store = state.store();
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
-    if explain {
+    if explain == Explain::Plan {
+        // Statistics only, nothing evaluated; off the async threads all the same.
+        let planned = tokio::task::spawn_blocking(move || store.plan_query(&prepared))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+            .map_err(|error| map_query_error(&policy, error))?;
+        return Ok(axum::Json(plan_json(&planned)).into_response());
+    }
+    if explain == Explain::Analyze {
         return stream_blocking(
             deadline,
             cancellation,
@@ -114,6 +122,29 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
         "rewrites": explanation.rewrites,
         "rows": explanation.rows,
         "micros": explanation.micros,
+        "steps": steps,
+    })
+}
+
+/// The JSON form of a plan before running: the rewrites that changed the query, and one
+/// object per node from the top down (`depth` gives the nesting), each with its estimated
+/// rows (`null` where unknown).
+fn plan_json(planned: &nrese_store::PlannedQuery) -> serde_json::Value {
+    let steps: Vec<serde_json::Value> = planned
+        .steps
+        .iter()
+        .map(|step| {
+            serde_json::json!({
+                "depth": step.depth,
+                "operator": step.operator,
+                "detail": step.detail,
+                "estimated_rows": step.estimated_rows,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "executor": "native",
+        "rewrites": planned.rewrites,
         "steps": steps,
     })
 }

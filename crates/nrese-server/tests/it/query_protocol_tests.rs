@@ -198,6 +198,33 @@ async fn explain_reports_how_the_query_ran() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
+async fn explain_plan_shows_the_plan_without_running_it() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (app, _dir) = app_with_triples(1_000, Duration::from_secs(30))?;
+    let query = "SELECT ?s ?v WHERE { ?s <http://example.com/p1> ?v . ?s ?p ?v }";
+    let response = app
+        .oneshot(get(&format!(
+            "/dataset/query?query={}&explain=plan",
+            encode(query)
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let planned: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    assert_eq!(planned["rewrites"], serde_json::json!([]));
+    let steps = planned["steps"].as_array().expect("steps");
+    assert_eq!(steps[0]["operator"], "project");
+    assert!(
+        steps
+            .iter()
+            .any(|s| s["operator"] == "scan" && s["estimated_rows"] == 200),
+        "{steps:?}"
+    );
+    // Nothing ran: no actual rows or times.
+    assert!(steps.iter().all(|s| s.get("rows").is_none()), "{steps:?}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_query_beyond_its_memory_limit_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let (app, _dir) = app_with_triples(2_000, Duration::from_secs(30))?;
     // 8·10⁹ rows: refused before any memory is taken.

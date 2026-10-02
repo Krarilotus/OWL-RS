@@ -45,8 +45,8 @@ pub mod expression {
 pub use native::{ResultsFormat, geometry_literal};
 pub use nrese_exec::{BudgetExceeded, SharedBudget};
 pub use query::{
-    Explanation, PlanStep, QueryOptions, WriteResultsError, evaluate_query, explain_query,
-    runs_natively, write_results,
+    Explanation, PlanStep, PlannedQuery, PlannedStep, QueryOptions, WriteResultsError,
+    evaluate_query, explain_query, plan_query, runs_natively, write_results,
 };
 pub use results::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,

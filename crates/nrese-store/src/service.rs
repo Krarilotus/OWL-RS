@@ -19,7 +19,7 @@ use crate::graph_store_executor::execute_graph_read;
 use crate::loader::preload_ontology;
 use crate::mutation::{MutationCommand, MutationCommitReport};
 use crate::query::{SerializedQueryResult, SparqlQueryRequest};
-use crate::query_executor::{PreparedQuery, explain_prepared, run_query};
+use crate::query_executor::{PreparedQuery, explain_prepared, plan_prepared, run_query};
 use crate::stats::{StoreStats, collect_stats};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 
@@ -366,6 +366,12 @@ impl StoreService {
             &self.settings,
             cancellation,
         )
+    }
+
+    /// The plan `prepared` would run as, each node with its estimated rows, without
+    /// running it (EXPLAIN without ANALYZE).
+    pub fn plan_query(&self, prepared: &PreparedQuery) -> StoreResult<crate::PlannedQuery> {
+        plan_prepared(&self.engine.snapshot(), prepared, &self.settings)
     }
 
     /// Bytes of intermediate results the running queries hold now, the most they held at
