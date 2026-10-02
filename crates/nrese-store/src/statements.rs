@@ -195,10 +195,11 @@ pub(crate) fn contexts(view: &impl ReadView) -> Vec<Term> {
         .collect()
 }
 
-/// `quads` in `format`: with their graphs in N-Quads and TriG, as triples otherwise.
+/// `quads` in `format`: with their graphs in N-Quads, TriG and Binary RDF, as triples
+/// otherwise.
 pub fn serialize_statements(format: GraphResultFormat, quads: Vec<Quad>) -> StoreResult<Vec<u8>> {
     match format {
-        GraphResultFormat::NQuads | GraphResultFormat::TriG => {
+        GraphResultFormat::NQuads | GraphResultFormat::TriG | GraphResultFormat::BinaryRdf => {
             crate::rdf_io::serialize_quads(format.rdf_format(), quads)
         }
         _ => crate::rdf_io::serialize_triples(

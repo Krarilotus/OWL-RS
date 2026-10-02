@@ -1,5 +1,6 @@
 //! The serialiser: settings, then statements written to any `Write`.
 
+use crate::binary::BinaryWriter;
 use std::io::{self, Write};
 
 use nrese_rdf::{GraphNameRef, Iri, Quad, QuadRef, TripleRef};
@@ -92,6 +93,7 @@ impl RdfSerializer {
             turtle,
             rdf_xml,
             json_ld,
+            binary: (self.format == RdfFormat::BinaryRdf).then(BinaryWriter::new),
         }
     }
 }
@@ -107,6 +109,7 @@ pub struct QuadSerializer<W: Write> {
     turtle: Option<TurtleWriter>,
     rdf_xml: Option<RdfXmlWriter>,
     json_ld: Option<JsonLd>,
+    binary: Option<BinaryWriter>,
 }
 
 enum JsonLd {
@@ -139,6 +142,11 @@ impl<W: Write> QuadSerializer<W> {
                     rdf_xml.write(&mut self.buffer, quad)?;
                 }
             }
+            RdfFormat::BinaryRdf => {
+                if let Some(binary) = &mut self.binary {
+                    binary.write(&mut self.buffer, quad)?;
+                }
+            }
             RdfFormat::JsonLd => match &mut self.json_ld {
                 Some(JsonLd::Streaming(writer)) => writer.write(&mut self.buffer, quad)?,
                 Some(JsonLd::Expanded(_, quads)) => quads.push(quad.into_owned()),
@@ -160,6 +168,9 @@ impl<W: Write> QuadSerializer<W> {
         }
         if let Some(rdf_xml) = &mut self.rdf_xml {
             rdf_xml.finish(&mut self.buffer);
+        }
+        if let Some(binary) = &mut self.binary {
+            binary.finish(&mut self.buffer);
         }
         match self.json_ld.take() {
             Some(JsonLd::Streaming(mut writer)) => writer.finish(&mut self.buffer)?,

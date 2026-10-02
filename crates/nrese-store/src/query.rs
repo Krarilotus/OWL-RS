@@ -27,6 +27,9 @@ pub enum GraphResultFormat {
     /// One graph as TriG: its triples in the default graph block.
     TriG,
     JsonLd,
+    /// RDF4J's Binary RDF (`application/x-binary-rdf`), with graph names where the payload
+    /// has them (statements).
+    BinaryRdf,
 }
 
 impl GraphResultFormat {
@@ -38,6 +41,7 @@ impl GraphResultFormat {
             Self::NQuads => "application/n-quads",
             Self::TriG => "application/trig",
             Self::JsonLd => "application/ld+json",
+            Self::BinaryRdf => "application/x-binary-rdf",
         }
     }
 
@@ -49,6 +53,7 @@ impl GraphResultFormat {
             "nq" => Some(Self::NQuads),
             "trig" => Some(Self::TriG),
             "jsonld" => Some(Self::JsonLd),
+            "brf" => Some(Self::BinaryRdf),
             _ => None,
         }
     }
