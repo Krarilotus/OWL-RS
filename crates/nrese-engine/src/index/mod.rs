@@ -25,6 +25,8 @@ pub(crate) mod run;
 use std::ops::Range;
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use std::borrow::Cow;
 
 use keys::PackedKeys;
@@ -134,6 +136,11 @@ impl Layout {
         })
     }
 }
+
+/// Keys per part of a group walk over a large range, walked in parallel: a multiple of
+/// the block size.
+const GROUP_PART: usize = 1 << 16;
+const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IndexVersion {
@@ -343,9 +350,41 @@ impl IndexVersion {
         for run in self.runs.iter() {
             let perm = run.permutation(adapted.permutation);
             let (start, end) = perm.range(&adapted.low, &adapted.high);
-            perm.keys.groups(start, end, position, |value, i, j| {
-                out.push((value, (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64));
-            });
+            let walk = |start: usize, end: usize, out: &mut Vec<(u64, i64)>| {
+                perm.keys.groups(start, end, position, |value, i, j| {
+                    out.push((value, (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64));
+                });
+            };
+            if end - start < 2 * GROUP_PART {
+                walk(start, end, out);
+                continue;
+            }
+            // Large ranges in parts on every core, cut at block boundaries; a group that
+            // spans a cut is added up where the parts meet.
+            let cuts: Vec<usize> = std::iter::once(start)
+                .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
+                .chain(std::iter::once(end))
+                .collect();
+            let parts: Vec<Vec<(u64, i64)>> = cuts
+                .par_windows(2)
+                .map(|cut| {
+                    let mut part = Vec::new();
+                    walk(cut[0], cut[1], &mut part);
+                    part
+                })
+                .collect();
+            let first = out.len();
+            for part in parts {
+                let mut groups = part.into_iter();
+                if let Some((value, count)) = groups.next() {
+                    let spans = out.len() > first && out.last().is_some_and(|l| l.0 == value);
+                    match out.last_mut() {
+                        Some(last) if spans => last.1 += count,
+                        _ => out.push((value, count)),
+                    }
+                }
+                out.extend(groups);
+            }
         }
     }
 

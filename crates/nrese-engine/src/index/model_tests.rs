@@ -338,3 +338,39 @@ fn default_graph_versions_turn_into_quad_versions_at_a_named_graph() {
         }
     }
 }
+
+/// Group counts over ranges large enough to be walked in parallel parts: groups that span
+/// the parts' cuts are added up once, and deletions in a later run still count.
+#[test]
+fn group_counts_of_large_ranges_add_up_across_parts() {
+    // Subject s has 2s + 1 quads: groups of every size, many across the cuts.
+    let quads: Vec<EncodedQuad> = (0..200_000u64)
+        .map(|i| {
+            let s = (i as f64).sqrt() as u64;
+            EncodedQuad::new(term(1000 + s), term(1), term(10_000 + i), graph(0))
+        })
+        .collect();
+    let deletes: Vec<EncodedQuad> = quads.iter().step_by(7).copied().collect();
+    let version =
+        IndexVersion::from_quads(Layout::DefaultGraph, quads.clone()).with_delta(&[], &deletes);
+    let pattern = QuadPattern {
+        subject: None,
+        predicate: Some(term(1)),
+        object: None,
+        graph: GraphSelector::Any,
+    };
+    let plan = AccessPlan::in_permutation(&pattern, Permutation::Psog).unwrap();
+    let mut counts = Vec::new();
+    version.group_counts(&plan, 1, &mut counts);
+    let mut totals = std::collections::BTreeMap::new();
+    for (value, count) in counts {
+        *totals.entry(value).or_insert(0i64) += count;
+    }
+    totals.retain(|_, count| *count != 0);
+    let deleted: BTreeSet<EncodedQuad> = deletes.into_iter().collect();
+    let mut expected = std::collections::BTreeMap::new();
+    for quad in quads.iter().filter(|q| !deleted.contains(q)) {
+        *expected.entry(quad.subject.raw()).or_insert(0i64) += 1;
+    }
+    assert_eq!(totals, expected);
+}
