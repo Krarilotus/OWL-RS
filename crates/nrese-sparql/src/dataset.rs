@@ -191,7 +191,7 @@ impl ResolvedDataset {
     }
 
     /// Whether the dataset has the named graph `graph`, which the store holds.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) fn names(&self, graph: TermId) -> bool {
         self.named
             .as_ref()

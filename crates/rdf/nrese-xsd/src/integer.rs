@@ -135,7 +135,7 @@ impl TryFrom<Decimal> for Integer {
 impl TryFrom<Double> for Integer {
     type Error = RangeError;
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     fn try_from(value: Double) -> Result<Self, RangeError> {
         let v = f64::from(value).trunc();
         // i64::MAX as f64 rounds up to 2^63, which is out of range.

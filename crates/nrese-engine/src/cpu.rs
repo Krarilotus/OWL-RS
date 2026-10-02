@@ -141,14 +141,11 @@ mod x86 {
 
     impl Cpu {
         pub(super) fn read() -> Self {
-            #[allow(unused_unsafe)]
-            let (max, leaf1, max_extended) =
-                // SAFETY: CPUID exists on every x86-64 CPU; leaves 0, 1 and 0x8000_0000 always.
-                unsafe { (__cpuid(0).eax, __cpuid(1), __cpuid(0x8000_0000).eax) };
-            #[allow(unused_unsafe)]
+            // CPUID is a safe function on the supported toolchains: every x86-64 CPU has it; leaves
+            // 0, 1 and 0x8000_0000 always exist; the others are read below their maximum.
+            let (max, leaf1, max_extended) = (__cpuid(0).eax, __cpuid(1), __cpuid(0x8000_0000).eax);
             let leaf7 = if max >= 7 {
-                // SAFETY: CPUID, leaf 7 below the maximum leaf.
-                unsafe { __cpuid_count(7, 0) }
+                __cpuid_count(7, 0)
             } else {
                 CpuidResult {
                     eax: 0,
@@ -157,10 +154,8 @@ mod x86 {
                     edx: 0,
                 }
             };
-            #[allow(unused_unsafe)]
             let extended = if max_extended >= 0x8000_0001 {
-                // SAFETY: CPUID, an extended leaf below the maximum extended leaf.
-                unsafe { __cpuid(0x8000_0001) }
+                __cpuid(0x8000_0001)
             } else {
                 CpuidResult {
                     eax: 0,

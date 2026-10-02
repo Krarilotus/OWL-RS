@@ -241,7 +241,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn check(
         &self,
         shape_ref: ShapeRef,
