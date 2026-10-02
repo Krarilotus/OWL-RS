@@ -294,7 +294,10 @@ fn check_writable(
         .collect();
     graphs.sort_unstable();
     graphs.dedup();
-    match graphs.into_iter().find(|&graph| !writable.allows_id(tx, graph)) {
+    match graphs
+        .into_iter()
+        .find(|&graph| !writable.allows_id(tx, graph))
+    {
         None => Ok(()),
         Some(_) => Err(StoreError::Forbidden(
             "the request would change a graph the requester may not write".to_owned(),
