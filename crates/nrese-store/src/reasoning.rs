@@ -1004,10 +1004,12 @@ pub fn explain(
 /// is asserted or inferred, the rule that derives it and its premises (indexes of steps).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InferenceStep {
+    /// The statement's terms (N-Triples); empty for a `hidden` step.
     pub subject: String,
     pub predicate: String,
     pub object: String,
-    /// `asserted` or `inferred`.
+    /// `asserted`, `inferred`, or `hidden`: asserted in no graph the requester may read
+    /// (the step stays, so the proof's shape does, without the statement).
     pub origin: &'static str,
     /// The rule (`cax-sco`, `prp-trp`, ...); `None` for an asserted fact.
     pub rule: Option<String>,
@@ -1020,10 +1022,14 @@ const EXPLANATION_BUDGET: usize = 4096;
 /// Why the fact `[s, p, o]` holds in `snapshot` under `program`: a derivation of it from
 /// asserted facts ([`nrese_reasoner::v2::explain`]), the fact first. `None` if it doesn't
 /// hold, or no derivation is found within the budget.
+///
+/// `readable`, where the requester may not read every graph, tells whether an asserted
+/// statement is in a graph it may read: steps on others are `hidden`.
 pub fn explain_fact(
     program: &Program,
     snapshot: &Snapshot,
     fact: Triple,
+    readable: Option<&dyn Fn(Triple) -> bool>,
 ) -> Option<Vec<InferenceStep>> {
     let base = SnapshotBase {
         snapshot,
@@ -1038,6 +1044,16 @@ pub fn explain_fact(
             .into_iter()
             .map(|step| {
                 let [s, p, o] = step.fact;
+                if step.rule.is_none() && readable.is_some_and(|readable| !readable(step.fact)) {
+                    return InferenceStep {
+                        subject: String::new(),
+                        predicate: String::new(),
+                        object: String::new(),
+                        origin: "hidden",
+                        rule: None,
+                        premises: step.premises,
+                    };
+                }
                 InferenceStep {
                     subject: decode(s),
                     predicate: decode(p),

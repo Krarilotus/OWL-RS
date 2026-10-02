@@ -33,6 +33,7 @@ fn inferences_are_explained_by_their_derivations() {
     let explain = |s: &str, p: &str, o: &str| {
         store.explain_statement(
             Ruleset::Owl2Rl,
+            &nrese_store::ReadScope::All,
             iri(s).as_ref(),
             iri(p).as_ref(),
             iri(o).as_ref(),
@@ -94,4 +95,56 @@ fn inferences_are_explained_by_their_derivations() {
     assert_eq!(steps[0].origin, "asserted");
     assert!(explain("a", TYPE, "x").is_none());
     assert!(explain("w", "ancestor", "x").is_none());
+}
+
+/// An explanation shows only what the requester may read (graph access): asserted
+/// premises in no readable graph are `hidden` steps; a statement the requester doesn't
+/// see is answered as one that doesn't hold, so `explain` tells nothing about hidden
+/// statements' existence.
+#[test]
+fn explanations_stay_within_the_readers_graphs() {
+    use std::sync::Arc;
+    let store = StoreService::new(in_memory_store_config()).unwrap();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ GRAPH ex:open {{ ex:a a ex:C }}
+                            GRAPH ex:secret {{ ex:C rdfs:subClassOf ex:D . ex:s ex:p ex:o }} }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    let scope = |inferred: bool| {
+        nrese_store::ReadScope::Graphs(Arc::new(nrese_sparql::GraphAccess {
+            graphs: vec![format!("{EX}open")],
+            inferred,
+            ..nrese_sparql::GraphAccess::default()
+        }))
+    };
+    let explain = |scope: &nrese_store::ReadScope, s: &str, p: &str, o: &str| {
+        store.explain_statement(
+            Ruleset::Owl2Rl,
+            scope,
+            iri(s).as_ref(),
+            iri(p).as_ref(),
+            iri(o).as_ref(),
+        )
+    };
+    // `a` is a D: the open premise shown, the secret one hidden.
+    let steps =
+        explain(&scope(true), "a", TYPE, "D").expect("a is a D, and inferences are visible");
+    let origins: Vec<&str> = steps.iter().map(|s| s.origin).collect();
+    assert_eq!(origins[0], "inferred");
+    assert!(
+        origins.contains(&"asserted") && origins.contains(&"hidden"),
+        "{origins:?}"
+    );
+    let hidden = steps.iter().find(|s| s.origin == "hidden").unwrap();
+    assert!(hidden.subject.is_empty() && hidden.object.is_empty());
+    // Inferences not visible: as if it didn't hold.
+    assert!(explain(&scope(false), "a", TYPE, "D").is_none());
+    // A statement asserted only in the secret graph: as if it didn't hold.
+    assert!(explain(&scope(true), "s", "p", "o").is_none());
+    // Unrestricted, everything is shown.
+    let all = explain(&nrese_store::ReadScope::All, "a", TYPE, "D").unwrap();
+    assert!(all.iter().all(|s| s.origin != "hidden"));
 }
