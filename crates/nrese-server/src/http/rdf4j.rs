@@ -55,7 +55,7 @@ use crate::state::AppState;
 /// The RDF4J protocol version answered at `/protocol`.
 const PROTOCOL: &str = "12";
 /// URL parameters, repeated ones in order.
-fn pairs(raw: &RawQuery) -> Result<Vec<(String, String)>, ApiError> {
+pub(crate) fn pairs(raw: &RawQuery) -> Result<Vec<(String, String)>, ApiError> {
     serde_urlencoded::from_str(raw.0.as_deref().unwrap_or_default())
         .map_err(|error| ApiError::bad_request(error.to_string()))
 }
@@ -144,7 +144,7 @@ fn hex(chars: &mut std::str::Chars<'_>, digits: usize) -> Option<char> {
 }
 
 /// The graphs of the `context` parameters (`null`: the default graph).
-fn contexts(pairs: &[(String, String)]) -> Result<Vec<GraphName>, ApiError> {
+pub(crate) fn contexts(pairs: &[(String, String)]) -> Result<Vec<GraphName>, ApiError> {
     pairs
         .iter()
         .filter(|(key, _)| key == "context")
@@ -183,7 +183,7 @@ fn infer(pairs: &[(String, String)]) -> bool {
 }
 
 /// An RDF request body.
-fn payload(headers: &HeaderMap, body: &Bytes) -> Result<RdfPayload, ApiError> {
+pub(crate) fn payload(headers: &HeaderMap, body: &Bytes) -> Result<RdfPayload, ApiError> {
     Ok(RdfPayload {
         payload: body.to_vec(),
         format: parse_graph_content_format(header_value_str(headers.get(header::CONTENT_TYPE)))?,
@@ -244,7 +244,7 @@ fn is_update(headers: &HeaderMap) -> bool {
         || media_type_matches(content_type, "application/sparql-update")
 }
 
-fn update(
+pub(crate) fn update(
     raw: &RawQuery,
     headers: &HeaderMap,
     body: &Bytes,
@@ -262,7 +262,7 @@ fn update(
 /// `ops` as the requester may apply them (graph-level access control): patterns and
 /// `WHERE` clauses see the graphs it may read, and the request fails if it would change
 /// one it may not write.
-fn scoped(ops: Vec<StatementOp>, access: &AccessView) -> StatementsRequest {
+pub(crate) fn scoped(ops: Vec<StatementOp>, access: &AccessView) -> StatementsRequest {
     let ops = ops
         .into_iter()
         .map(|op| match op {
@@ -297,7 +297,7 @@ fn read_error(error: nrese_store::StoreError) -> ApiError {
     }
 }
 
-async fn apply(
+pub(crate) async fn apply(
     state: &AppState,
     ops: Vec<StatementOp>,
     access: &AccessView,
