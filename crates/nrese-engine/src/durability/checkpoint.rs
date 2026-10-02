@@ -540,7 +540,8 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     let bytes: &[u8] = &map;
     let body = &bytes[..bytes.len().saturating_sub(4)];
     let mut reader = Reader::new(body);
-    if reader.bytes(MAGIC.len()) != Some(MAGIC.as_slice()) {
+    // Format 8 is format 9 with the quad layout only.
+    if !matches!(reader.bytes(MAGIC.len()), Some(magic) if magic == MAGIC || magic == MAGIC_V8) {
         return Err(corrupt("bad magic"));
     }
     reader.u64().ok_or_else(|| corrupt("truncated header"))?;
