@@ -327,10 +327,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|name| nrese_engine::IndexEncoding::from_name(&name))
         .unwrap_or_default();
+    // Equality reasoning as the server takes it (`NRESE_REASONING_EQUALITY`).
+    let equality_by_representatives =
+        std::env::var("NRESE_REASONING_EQUALITY").map_or(true, |mode| mode != "replicate");
     let config = StoreConfig {
         query_cache_bytes: 0,
         bulk_load_memory_bytes,
         index_encoding,
+        equality_by_representatives,
         ..config
     };
     let started = Instant::now();

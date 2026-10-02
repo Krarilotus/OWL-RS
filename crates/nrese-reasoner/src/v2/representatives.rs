@@ -177,7 +177,7 @@ pub fn same_as(rules: &[Rule]) -> Option<u64> {
 }
 
 /// The rules without the replacement rules, which rewriting stands in for.
-fn without_replacement(rules: &[Rule]) -> Vec<Rule> {
+pub fn without_replacement(rules: &[Rule]) -> Vec<Rule> {
     rules
         .iter()
         .filter(|r| !batch::is_replacement_rule(r))
