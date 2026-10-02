@@ -11,6 +11,7 @@ use crate::http::request_metrics::RequestMetrics;
 use crate::policy::PolicyAction;
 use crate::policy::PolicyConfig;
 use crate::rate_limit::RateLimiter;
+use crate::repositories::{DEFAULT_REPOSITORY, Repositories};
 use crate::runtime_posture::{DeploymentPosture, RuntimePosture};
 use axum::http::HeaderMap;
 
@@ -24,6 +25,7 @@ pub struct AppState {
     rate_limiter: Arc<RateLimiter>,
     request_metrics: Arc<RequestMetrics>,
     rdf4j: Arc<Rdf4jState>,
+    repositories: Arc<Repositories>,
 }
 
 impl AppState {
@@ -36,6 +38,7 @@ impl AppState {
     ) -> Self {
         let namespaces_file = matches!(store.config().mode, StoreMode::OnDisk)
             .then(|| store.config().data_dir.join("rdf4j-namespaces.json"));
+        let repositories = Arc::new(Repositories::open(store.config(), reasoner.clone()));
         Self {
             pipeline: Arc::new(MutationPipeline::new(Arc::new(store), Arc::new(reasoner))),
             ready: Arc::new(AtomicBool::new(false)),
@@ -45,7 +48,30 @@ impl AppState {
             rate_limiter: Arc::new(RateLimiter::default()),
             request_metrics: Arc::default(),
             rdf4j: Arc::new(Rdf4jState::with_file(namespaces_file)),
+            repositories,
         }
+    }
+
+    /// The repositories besides the default one ([`crate::repositories`]).
+    pub fn repositories(&self) -> &Repositories {
+        &self.repositories
+    }
+
+    /// This server's state as repository `id` sees it: the default repository's own, or a
+    /// copy with that repository's store and RDF4J state. Called on the default's state.
+    pub fn for_repository(&self, id: &str) -> Result<Self, ApiError> {
+        if id == DEFAULT_REPOSITORY {
+            return Ok(self.clone());
+        }
+        let repository = self
+            .repositories
+            .get(id)
+            .ok_or_else(|| ApiError::not_found(format!("no repository '{id}'")))?;
+        Ok(Self {
+            pipeline: repository.pipeline,
+            rdf4j: repository.rdf4j,
+            ..self.clone()
+        })
     }
 
     /// The RDF4J protocol's open transactions and namespaces.

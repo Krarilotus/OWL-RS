@@ -5,6 +5,7 @@
 //! |---|---|
 //! | `GET /protocol` | the protocol version, `12` |
 //! | `GET /repositories` | the repository list |
+//! | `PUT`, `DELETE /repositories/{id}` | a repository created (its configuration in the body is not read: the default's settings apply) or removed with its data |
 //! | `GET`/`POST /repositories/{id}` | a SPARQL query (`query`, `infer`, the dataset parameters) |
 //! | `GET /repositories/{id}/statements` | the statements matching `subj`, `pred`, `obj`, `context` (`infer`), as RDF |
 //! | `POST /repositories/{id}/statements` | an RDF payload added (into `context`), or a SPARQL update (`update=`) |
@@ -16,7 +17,8 @@
 //! | `/repositories/{id}/rdf-graphs/service` | the SPARQL Graph Store protocol |
 //! | `/repositories/{id}/transactions[/{txid}]` | transactions: begin, `action=ADD`, `DELETE`, `UPDATE`, `COMMIT`, `PING`; `DELETE` rolls back |
 //!
-//! Every repository id names the one dataset (the list calls it [`REPOSITORY`]). Terms in
+//! The configured store is repository `nrese`; others are created with `PUT` and removed
+//! with `DELETE /repositories/{id}` ([`crate::repositories`]). Terms in
 //! `subj`, `pred`, `obj` and `context` are written as in N-Triples (`<iri>`, `_:b`,
 //! `"text"@en`, `"1"^^<…#int>`); `context=null` is the default graph. A transaction's
 //! operations are kept on the server and applied in one commit; reads inside one
@@ -50,10 +52,9 @@ use crate::http::requests::{
     accept_header_value, query_from_post, query_from_url, update_from_post,
 };
 use crate::http::sparql;
+use crate::repositories::DEFAULT_REPOSITORY;
 use crate::state::AppState;
 
-/// The id the repository list gives the dataset.
-pub const REPOSITORY: &str = "nrese";
 /// The RDF4J protocol version answered at `/protocol`.
 const PROTOCOL: &str = "12";
 /// Transactions untouched this long are dropped.
@@ -402,37 +403,74 @@ pub async fn repositories(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
     let writable = state.runtime_posture().sparql_update_enabled;
+    let ids = std::iter::once(DEFAULT_REPOSITORY.to_owned()).chain(state.repositories().ids());
+    let rows = ids
+        .map(|id| {
+            vec![
+                literal(format!("/repositories/{id}")),
+                literal(id.as_str()),
+                literal(match id == DEFAULT_REPOSITORY {
+                    true => "NRESE".to_owned(),
+                    false => format!("NRESE: {id}"),
+                }),
+                Some(Literal::from(true).into()),
+                Some(Literal::from(writable).into()),
+            ]
+        })
+        .collect();
     Ok(table(
         &headers,
         &["uri", "id", "title", "readable", "writable"],
-        vec![vec![
-            literal(format!("/repositories/{REPOSITORY}")),
-            literal(REPOSITORY),
-            literal("NRESE"),
-            Some(Literal::from(true).into()),
-            Some(Literal::from(writable).into()),
-        ]],
+        rows,
     ))
+}
+
+/// Creates repository `id` (`PUT /repositories/{id}`); the configuration in the body is
+/// not read.
+pub async fn repository_put(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    let repositories = state.clone();
+    tokio::task::spawn_blocking(move || repositories.repositories().create(&id))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes repository `id` and its data (`DELETE /repositories/{id}`).
+pub async fn repository_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    state.repositories().delete(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn query_get(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     let operation = query_from_url(raw.0.as_deref())?;
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
 }
 
 pub async fn query_post(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    let state = state.for_repository(&id)?;
     // RDF4J sends updates to the statements path, but some clients post them here.
     let content_type = header_value_str(headers.get(header::CONTENT_TYPE));
     let form_update = media_type_matches(content_type, "application/x-www-form-urlencoded")
@@ -451,11 +489,12 @@ pub async fn query_post(
 
 pub async fn statements_get(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_graph_read(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     statements(state, raw, headers, None).await
 }
 
@@ -493,12 +532,13 @@ async fn statements(
 
 pub async fn statements_post(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     let op = if is_update(&headers) {
         StatementOp::Update(update(&raw, &headers, &body)?)
     } else {
@@ -514,12 +554,13 @@ pub async fn statements_post(
 
 pub async fn statements_put(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     state.policy().enforce_rdf_upload_bytes(body.len())?;
     let contexts = contexts(&pairs(&raw)?)?;
     let ops = vec![
@@ -538,11 +579,12 @@ pub async fn statements_put(
 
 pub async fn statements_delete(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     let pattern = pattern(&pairs(&raw)?)?;
     apply(&state, vec![StatementOp::RemoveMatching(pattern)]).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -550,11 +592,12 @@ pub async fn statements_delete(
 
 pub async fn size(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     count(state, raw, None).await
 }
 
@@ -585,10 +628,11 @@ async fn count(
 
 pub async fn contexts_get(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     state.ensure_serving()?;
     let rows = state
         .store()
@@ -601,10 +645,11 @@ pub async fn contexts_get(
 
 pub async fn namespaces_get(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     let rows = state
         .rdf4j()
         .namespaces
@@ -617,20 +662,22 @@ pub async fn namespaces_get(
 
 pub async fn namespaces_delete(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     state.rdf4j().change_namespaces(BTreeMap::clear)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn namespace_get(
     State(state): State<AppState>,
-    Path((_id, prefix)): Path<(String, String)>,
+    Path((id, prefix)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     match state.rdf4j().namespaces.lock().get(&prefix) {
         Some(iri) => Ok(text(iri.clone())),
         None => Err(ApiError::not_found(format!("no namespace '{prefix}'"))),
@@ -639,11 +686,12 @@ pub async fn namespace_get(
 
 pub async fn namespace_put(
     State(state): State<AppState>,
-    Path((_id, prefix)): Path<(String, String)>,
+    Path((id, prefix)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     let iri = std::str::from_utf8(&body)
         .map_err(|_| ApiError::bad_request("the namespace must be UTF-8"))?
         .trim()
@@ -659,10 +707,11 @@ pub async fn namespace_put(
 
 pub async fn namespace_delete(
     State(state): State<AppState>,
-    Path((_id, prefix)): Path<(String, String)>,
+    Path((id, prefix)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     state.rdf4j().change_namespaces(|namespaces| {
         namespaces.remove(&prefix);
     })?;
@@ -671,39 +720,43 @@ pub async fn namespace_delete(
 
 pub async fn graph_store_get(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let state = state.for_repository(&id)?;
     graph_store::get_graph(state, raw, headers).await
 }
 
 pub async fn graph_store_put(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    let state = state.for_repository(&id)?;
     graph_store::put_graph(state, raw, headers, body).await
 }
 
 pub async fn graph_store_post(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    let state = state.for_repository(&id)?;
     graph_store::post_graph(state, raw, headers, body).await
 }
 
 pub async fn graph_store_delete(
     State(state): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
+    let state = state.for_repository(&id)?;
     graph_store::delete_graph(state, raw, headers).await
 }
 
@@ -713,6 +766,7 @@ pub async fn transaction_begin(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     let rdf4j = state.rdf4j();
     let number = rdf4j.next_transaction.fetch_add(1, Ordering::Relaxed);
     let txid = format!("tx-{number}");
@@ -736,12 +790,13 @@ pub async fn transaction_begin(
 
 pub async fn transaction_action(
     State(state): State<AppState>,
-    Path((_id, txid)): Path<(String, String)>,
+    Path((id, txid)): Path<(String, String)>,
     raw: RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     let pairs = pairs(&raw)?;
     let action = param(&pairs, "action")
         .unwrap_or_default()
@@ -816,10 +871,11 @@ pub async fn transaction_action(
 
 pub async fn transaction_rollback(
     State(state): State<AppState>,
-    Path((_id, txid)): Path<(String, String)>,
+    Path((id, txid)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
+    let state = state.for_repository(&id)?;
     match state.rdf4j().transactions.lock().remove(&txid) {
         Some(_) => Ok(StatusCode::NO_CONTENT),
         None => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
