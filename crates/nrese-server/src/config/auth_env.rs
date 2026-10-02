@@ -55,6 +55,16 @@ pub(super) fn parse_auth_config(source: &dyn ConfigSource) -> Result<AuthConfig>
                 }
                 admin_subjects
             },
+            trusted_proxies: match source.get(names::AUTH_MTLS_TRUSTED_PROXIES) {
+                None => crate::auth::peers::AddressRange::loopback(),
+                Some(list) => list
+                    .split([',', ';'])
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(|entry| entry.parse().map_err(anyhow::Error::msg))
+                    .collect::<anyhow::Result<Vec<_>>>()
+                    .with_context(|| names::AUTH_MTLS_TRUSTED_PROXIES)?,
+            },
         })),
         ConfiguredAuthMode::OidcIntrospection => Ok(AuthConfig::OidcIntrospection(
             OidcIntrospectionConfig::new(
@@ -153,6 +163,7 @@ mod tests {
             ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
             ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
             ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
+            ("NRESE_AUTH_MTLS_TRUSTED_PROXIES", None),
             ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
             ("NRESE_AUTH_OIDC_CLIENT_ID", None),
             ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
@@ -180,6 +191,7 @@ mod tests {
             ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
             ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
             ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
+            ("NRESE_AUTH_MTLS_TRUSTED_PROXIES", None),
             ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
             ("NRESE_AUTH_OIDC_CLIENT_ID", None),
             ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
@@ -213,6 +225,7 @@ mod tests {
             ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
             ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
             ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
+            ("NRESE_AUTH_MTLS_TRUSTED_PROXIES", None),
             ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
             ("NRESE_AUTH_OIDC_CLIENT_ID", None),
             ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
@@ -240,6 +253,7 @@ mod tests {
             ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
             ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
             ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
+            ("NRESE_AUTH_MTLS_TRUSTED_PROXIES", None),
             ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
             ("NRESE_AUTH_OIDC_CLIENT_ID", None),
             ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
@@ -293,6 +307,7 @@ mod tests {
                     "CN=admin-1,O=Test".to_owned(),
                     "CN=admin-2,O=Test".to_owned()
                 ]),
+                trusted_proxies: crate::auth::peers::AddressRange::loopback(),
             })
         );
     }
@@ -313,6 +328,7 @@ mod tests {
             ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
             ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
             ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
+            ("NRESE_AUTH_MTLS_TRUSTED_PROXIES", None),
             ("NRESE_AUTH_OIDC_INTROSPECTION_URL", None),
             ("NRESE_AUTH_OIDC_CLIENT_ID", None),
             ("NRESE_AUTH_OIDC_CLIENT_SECRET", None),
@@ -340,6 +356,7 @@ mod tests {
             ("NRESE_AUTH_MTLS_SUBJECT_HEADER", None),
             ("NRESE_AUTH_MTLS_READ_SUBJECTS", None),
             ("NRESE_AUTH_MTLS_ADMIN_SUBJECTS", None),
+            ("NRESE_AUTH_MTLS_TRUSTED_PROXIES", None),
             (
                 "NRESE_AUTH_OIDC_INTROSPECTION_URL",
                 Some("http://127.0.0.1:43123/introspect"),

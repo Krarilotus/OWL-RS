@@ -305,6 +305,9 @@ pub(super) struct RawBearerJwtConfig {
 pub(super) struct RawMtlsConfig {
     #[serde(default)]
     pub subject_header: Option<String>,
+    /// The proxies (addresses or ranges) that may send the subject header.
+    #[serde(default)]
+    pub trusted_proxies: Option<StringOrMany>,
     #[serde(default)]
     pub read_subjects: Option<StringOrMany>,
     #[serde(default)]

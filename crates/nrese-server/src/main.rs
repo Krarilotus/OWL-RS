@@ -192,9 +192,13 @@ async fn run() -> Result<()> {
             tracing::debug!(%error, "could not set TCP_NODELAY on a connection");
         }
     });
-    axum::serve(listener, app)
-        .await
-        .context("nrese-server terminated unexpectedly")
+    // Peer addresses for the mtls mode's trusted proxies.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .context("nrese-server terminated unexpectedly")
 }
 
 /// `nrese-server query`: one query on the configured store as it is (no reasoning first),
