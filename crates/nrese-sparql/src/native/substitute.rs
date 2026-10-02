@@ -168,6 +168,10 @@ impl Values<'_> {
                 path: path.clone(),
                 object: self.term_pattern(object),
             },
+            GraphPattern::Lateral { left, right } => GraphPattern::Lateral {
+                left: p(left),
+                right: p(right),
+            },
             GraphPattern::Join { left, right } => GraphPattern::Join {
                 left: p(left),
                 right: p(right),
@@ -284,13 +288,24 @@ impl Values<'_> {
                 start: *start,
                 length: *length,
             },
+            // A group key put in stays a key, bound to its value before the grouping: over
+            // no rows, GROUP BY with keys gives no group (no row), unlike without keys.
             GraphPattern::Group {
                 inner,
                 variables,
                 aggregates,
             } => GraphPattern::Group {
-                inner: p(inner),
-                variables: kept(variables),
+                inner: Box::new(variables.iter().fold(self.pattern(inner), |grouped, v| {
+                    match self.constant(v) {
+                        Some(constant) => GraphPattern::Extend {
+                            inner: Box::new(grouped),
+                            variable: v.clone(),
+                            expression: constant.expression(),
+                        },
+                        None => grouped,
+                    }
+                })),
+                variables: variables.clone(),
                 aggregates: aggregates
                     .iter()
                     .map(|(v, a)| {
