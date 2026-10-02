@@ -672,3 +672,57 @@ async fn sessions_belong_to_whoever_opened_them() {
     let (status, text) = send(&app, ALICE, Method::DELETE, &transaction, None, "").await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
 }
+
+/// What a user may do in a repository depends on its workspaces there: a workspace bound
+/// to one repository counts in that one only, whichever protocol the request speaks.
+#[tokio::test]
+async fn workspaces_count_in_their_own_repository() {
+    let app = app();
+    let (status, text) = send(
+        &app,
+        ADMIN,
+        Method::PUT,
+        "/api/v1/repositories/bench",
+        Some("application/json"),
+        "{}",
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {text}");
+    let (status, body) = put(
+        &app,
+        ADMIN,
+        "/api/v1/access/settings",
+        json!({ "enforced": true, "reason": "go live" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = put(
+        &app,
+        ALICE,
+        "/api/v1/access/workspaces/lab",
+        json!({ "repository": "bench", "reason": "a lab in bench" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let insert = "update=INSERT+DATA+%7B+GRAPH+%3Curn%3Anrese%3Aworkspace%2Flab%2Fg%3E+%7B+%3Curn%3Aa%3E+%3Curn%3Ap%3E+1+%7D+%7D";
+    let write = |repository: &'static str| {
+        let app = app.clone();
+        async move {
+            send(
+                &app,
+                ALICE,
+                Method::POST,
+                &format!("/repositories/{repository}/statements"),
+                Some("application/x-www-form-urlencoded"),
+                insert,
+            )
+            .await
+        }
+    };
+    // RDF4J on bench: the workspace is alice's there.
+    let (status, text) = write("bench").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+    // On the default repository it isn't.
+    let (status, text) = write("nrese").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+}
