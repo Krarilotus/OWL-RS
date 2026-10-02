@@ -40,7 +40,7 @@ fn is_cancelled(result: &Result<(), StoreError>) -> bool {
 #[test]
 fn cancelling_stops_a_running_query_promptly() {
     let service = service_with_triples(2_000);
-    let prepared = PreparedQuery::parse(&SparqlQueryRequest::new(RUNAWAY)).expect("parse");
+    let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(RUNAWAY)).expect("parse");
     let token = CancellationToken::new();
     let (result, stopped_after) = std::thread::scope(|scope| {
         let worker = scope.spawn(|| service.run_query(&prepared, &token, io::sink()));
@@ -89,7 +89,7 @@ impl Write for CancelAfter<'_> {
 fn results_stream_and_can_be_cancelled_mid_output() {
     let service = service_with_triples(2_000);
     let query = "SELECT * WHERE { ?a ?b ?c . ?d ?e ?f }"; // 4 M rows
-    let prepared = PreparedQuery::parse(&SparqlQueryRequest::new(query)).expect("parse");
+    let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(query)).expect("parse");
     let token = CancellationToken::new();
     let mut out = CancelAfter {
         written: 0,
@@ -124,20 +124,20 @@ fn protocol_dataset_parameters_replace_from_clauses() {
             .count()
     };
     let query = "SELECT ?s FROM <http://example.com/g1> WHERE { ?s ?p ?o }";
-    assert_eq!(count(SparqlQueryRequest::new(query)), 1);
+    assert_eq!(count(SparqlQueryRequest::all(query)), 1);
 
-    let mut request = SparqlQueryRequest::new(query);
+    let mut request = SparqlQueryRequest::all(query);
     request.default_graphs = vec![
         "http://example.com/g1".to_owned(),
         "http://example.com/g2".to_owned(),
     ];
     assert_eq!(count(request), 2, "the protocol dataset replaces FROM");
 
-    let mut request = SparqlQueryRequest::new("SELECT ?s WHERE { GRAPH ?g { ?s ?p ?o } }");
+    let mut request = SparqlQueryRequest::all("SELECT ?s WHERE { GRAPH ?g { ?s ?p ?o } }");
     request.named_graphs = vec!["http://example.com/g2".to_owned()];
     assert_eq!(count(request), 1);
 
-    let mut invalid = SparqlQueryRequest::new(query);
+    let mut invalid = SparqlQueryRequest::all(query);
     invalid.default_graphs = vec!["not an iri".to_owned()];
     let error = service.execute_query(&invalid).unwrap_err();
     assert!(error.is_request_error(), "{error}");
@@ -168,7 +168,7 @@ fn the_default_graph_can_be_the_merge_of_all_graphs() {
     };
     // The values of ?s, in TSV without the header, sorted.
     let subjects = |service: &StoreService, query: &str| -> Vec<String> {
-        let mut request = SparqlQueryRequest::new(query);
+        let mut request = SparqlQueryRequest::all(query);
         request.solutions_format = nrese_store::SolutionsResultFormat::Tsv;
         let result = service.execute_query(&request).expect("query");
         let text = String::from_utf8(result.payload).expect("utf8");
@@ -224,7 +224,7 @@ fn the_default_graph_can_be_the_merge_of_all_graphs() {
         ),
         ["a", "b"]
     );
-    let mut protocol = SparqlQueryRequest::new(plain);
+    let mut protocol = SparqlQueryRequest::all(plain);
     protocol.solutions_format = nrese_store::SolutionsResultFormat::Tsv;
     protocol.default_graphs = vec!["http://example.com/g2".to_owned()];
     let text = String::from_utf8(union.execute_query(&protocol).expect("query").payload).unwrap();
@@ -254,7 +254,7 @@ fn having_may_name_a_select_alias() {
         )
         .expect("data");
     let groups = |having: &str| -> Vec<String> {
-        let mut request = SparqlQueryRequest::new(format!(
+        let mut request = SparqlQueryRequest::all(format!(
             "PREFIX : <http://example.com/>
              SELECT ?g (COUNT(?m) AS ?members) (SUM(?age) / COUNT(?m) AS ?mean)
              WHERE {{ ?g :member ?m . ?m :age ?age }}

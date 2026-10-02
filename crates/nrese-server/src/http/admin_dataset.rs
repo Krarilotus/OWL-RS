@@ -24,7 +24,10 @@ pub async fn backup(state: AppState) -> Result<Response, ApiError> {
     let store = state.store();
     let started = std::time::Instant::now();
     let artifact =
-        tokio::task::spawn_blocking(move || store.export_dataset(DatasetBackupFormat::NQuads))
+        // Administrators only (the caller's guard): every graph.
+        tokio::task::spawn_blocking(move || {
+            store.export_dataset(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)
+        })
             .await
             .map_err(|error| ApiError::internal(error.to_string()))
             .and_then(|result| result.map_err(map_backup_error));

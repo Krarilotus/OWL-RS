@@ -26,7 +26,7 @@ pub type Inferred = Vec<(String, String, String)>;
 
 /// The inferred statements of `store` (the inferred read model).
 pub fn inferred_statements(store: &StoreService) -> Result<Inferred, Box<dyn std::error::Error>> {
-    let mut request = SparqlQueryRequest::new("SELECT ?s ?p ?o WHERE { ?s ?p ?o }");
+    let mut request = SparqlQueryRequest::all("SELECT ?s ?p ?o WHERE { ?s ?p ?o }");
     request.read_model = Some(ReadModel::Inferred);
     request.solutions_format = SolutionsResultFormat::Tsv;
     let tsv = String::from_utf8(store.execute_query(&request)?.payload)?;

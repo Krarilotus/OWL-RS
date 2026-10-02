@@ -902,7 +902,8 @@ pub async fn graphs(
 ) -> Result<Response, ApiError> {
     let access = guard::graph_read_access(&state, &headers).await?;
     let store = state.store();
-    let sizes = tokio::task::spawn_blocking(move || store.graph_sizes(access.read.as_deref()))
+    let scope = access.read_scope();
+    let sizes = tokio::task::spawn_blocking(move || store.graph_sizes(&scope))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let graphs: Vec<GraphSize> = sizes

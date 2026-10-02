@@ -63,10 +63,13 @@ fn store_graph_roundtrip_accepts_official_vcard_turtle_fixture()
         replace: true,
     })?;
 
-    let graph = service.execute_graph_read(&GraphReadRequest {
-        target,
-        format: GraphResultFormat::NTriples,
-    })?;
+    let graph = service.execute_graph_read(
+        &nrese_store::ReadScope::All,
+        &GraphReadRequest {
+            target,
+            format: GraphResultFormat::NTriples,
+        },
+    )?;
     let text = String::from_utf8(graph.payload)?;
     assert!(text.contains("http://www.w3.org/2006/vcard/ns#Individual"));
     Ok(())

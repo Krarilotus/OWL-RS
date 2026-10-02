@@ -95,11 +95,7 @@ impl PreparedQuery {
             query,
             text: request.query.clone(),
             dataset: protocol_dataset(&request.default_graphs, &request.named_graphs)?,
-            read_model: match request
-                .access
-                .as_ref()
-                .is_some_and(|access| !access.inferred)
-            {
+            read_model: match !request.scope.sees_inferred() {
                 // Without the inferred statements: what was asserted, whatever was asked.
                 true => ReadModel::Asserted,
                 false => request
@@ -112,7 +108,7 @@ impl PreparedQuery {
             as_written: request.as_written,
             solutions_format: request.solutions_format,
             graph_format: request.graph_format,
-            access: request.access.clone(),
+            access: request.scope.access().cloned(),
             origin: None,
         })
     }

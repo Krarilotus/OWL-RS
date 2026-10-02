@@ -29,7 +29,8 @@ fn export_snapshot_serializes_default_and_named_graphs() -> Result<(), Box<dyn s
         replace: true,
     })?;
 
-    let artifact = service.export_dataset(DatasetBackupFormat::NQuads)?;
+    let artifact =
+        service.export_dataset(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)?;
     let body = String::from_utf8(artifact.payload.clone())?;
 
     assert_eq!(artifact.media_type, "application/n-quads");
@@ -55,7 +56,8 @@ fn restore_replaces_existing_dataset_and_resets_contents_to_backup()
         payload: b"@prefix ex: <http://example.com/> . ex:source-named ex:p ex:value .".to_vec(),
         replace: true,
     })?;
-    let artifact = source.export_dataset(DatasetBackupFormat::NQuads)?;
+    let artifact =
+        source.export_dataset(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)?;
 
     let target = new_in_memory_service()?;
     target.execute_update_str(
@@ -80,10 +82,13 @@ fn restore_replaces_existing_dataset_and_resets_contents_to_backup()
     assert!(String::from_utf8(live_ask.payload)?.contains("false"));
     assert!(String::from_utf8(source_ask.payload)?.contains("true"));
 
-    let named_graph = target.execute_graph_read(&GraphReadRequest {
-        target: GraphTarget::NamedGraph("http://example.com/graph/source".to_owned()),
-        format: GraphResultFormat::NTriples,
-    })?;
+    let named_graph = target.execute_graph_read(
+        &nrese_store::ReadScope::All,
+        &GraphReadRequest {
+            target: GraphTarget::NamedGraph("http://example.com/graph/source".to_owned()),
+            format: GraphResultFormat::NTriples,
+        },
+    )?;
     assert!(String::from_utf8(named_graph.payload)?.contains("http://example.com/source-named"));
 
     Ok(())
@@ -96,7 +101,8 @@ fn restore_increments_revision_once_for_successful_import() -> Result<(), Box<dy
     source.execute_update_str(
         "INSERT DATA { <http://example.com/a> <http://example.com/p> <http://example.com/b> }",
     )?;
-    let artifact = source.export_dataset(DatasetBackupFormat::NQuads)?;
+    let artifact =
+        source.export_dataset(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)?;
 
     let target = new_in_memory_service()?;
     assert_eq!(target.current_revision(), 0);
@@ -147,7 +153,8 @@ fn backup_restore_roundtrip_preserves_query_results() -> Result<(), Box<dyn std:
             <http://example.com/bob> <http://example.com/likes> <http://example.com/spec> .
         }",
     ))?;
-    let artifact = source.export_dataset(DatasetBackupFormat::NQuads)?;
+    let artifact =
+        source.export_dataset(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)?;
 
     let restored = new_in_memory_service()?;
     restored.restore_dataset(&DatasetRestoreRequest {
@@ -178,7 +185,8 @@ fn on_disk_restore_then_reopen_preserves_restored_dataset() -> Result<(), Box<dy
     source.execute_update_str(
         "INSERT DATA { <http://example.com/persist-s> <http://example.com/p> <http://example.com/persist-o> }",
     )?;
-    let artifact = source.export_dataset(DatasetBackupFormat::NQuads)?;
+    let artifact =
+        source.export_dataset(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)?;
 
     let data_dir = temp.path().join("restore-target");
     {

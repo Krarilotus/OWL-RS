@@ -50,7 +50,7 @@ fn preload_ontology_and_query_roundtrip() -> Result<(), Box<dyn std::error::Erro
     let ask_text = String::from_utf8(ask.payload)?;
     assert!(ask_text.contains("true"));
 
-    let construct = service.execute_query(&SparqlQueryRequest::new(
+    let construct = service.execute_query(&SparqlQueryRequest::all(
         "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
     ))?;
     assert_eq!(construct.kind, QueryResultKind::Graph);
@@ -140,20 +140,26 @@ fn graph_store_named_graph_roundtrip() -> Result<(), Box<dyn std::error::Error>>
     assert!(write_report.created);
     assert_eq!(write_report.revision, 1);
 
-    let read = service.execute_graph_read(&GraphReadRequest {
-        target: named_graph.clone(),
-        format: nrese_store::GraphResultFormat::NTriples,
-    })?;
+    let read = service.execute_graph_read(
+        &nrese_store::ReadScope::All,
+        &GraphReadRequest {
+            target: named_graph.clone(),
+            format: nrese_store::GraphResultFormat::NTriples,
+        },
+    )?;
     let read_body = String::from_utf8(read.payload)?;
     assert!(read_body.contains("http://example.com/s"));
 
     let delete_report = service.execute_graph_delete(&named_graph)?;
     assert!(delete_report.modified);
     assert_eq!(delete_report.revision, 2);
-    let read_after_delete = service.execute_graph_read(&GraphReadRequest {
-        target: named_graph,
-        format: nrese_store::GraphResultFormat::NTriples,
-    })?;
+    let read_after_delete = service.execute_graph_read(
+        &nrese_store::ReadScope::All,
+        &GraphReadRequest {
+            target: named_graph,
+            format: nrese_store::GraphResultFormat::NTriples,
+        },
+    )?;
     assert!(
         String::from_utf8(read_after_delete.payload)?
             .trim()
@@ -218,10 +224,13 @@ fn graph_write_replace_true_replaces_only_target_graph() -> Result<(), Box<dyn s
         replace: true,
     })?;
 
-    let named_read = service.execute_graph_read(&GraphReadRequest {
-        target: named_graph,
-        format: nrese_store::GraphResultFormat::NTriples,
-    })?;
+    let named_read = service.execute_graph_read(
+        &nrese_store::ReadScope::All,
+        &GraphReadRequest {
+            target: named_graph,
+            format: nrese_store::GraphResultFormat::NTriples,
+        },
+    )?;
     let named_text = String::from_utf8(named_read.payload)?;
     assert!(named_text.contains("http://example.com/new"));
     assert!(!named_text.contains("http://example.com/old"));
@@ -302,10 +311,13 @@ fn graph_write_replace_false_appends_to_existing_graph() -> Result<(), Box<dyn s
         replace: false,
     })?;
 
-    let read = service.execute_graph_read(&GraphReadRequest {
-        target: named_graph,
-        format: nrese_store::GraphResultFormat::NTriples,
-    })?;
+    let read = service.execute_graph_read(
+        &nrese_store::ReadScope::All,
+        &GraphReadRequest {
+            target: named_graph,
+            format: nrese_store::GraphResultFormat::NTriples,
+        },
+    )?;
     let text = String::from_utf8(read.payload)?;
     assert!(text.contains("http://example.com/a"));
     assert!(text.contains("http://example.com/b"));
@@ -336,14 +348,20 @@ fn graph_delete_only_affects_target_named_graph() -> Result<(), Box<dyn std::err
 
     service.execute_graph_delete(&graph_one)?;
 
-    let one_after = service.execute_graph_read(&GraphReadRequest {
-        target: graph_one,
-        format: nrese_store::GraphResultFormat::NTriples,
-    })?;
-    let two_after = service.execute_graph_read(&GraphReadRequest {
-        target: graph_two,
-        format: nrese_store::GraphResultFormat::NTriples,
-    })?;
+    let one_after = service.execute_graph_read(
+        &nrese_store::ReadScope::All,
+        &GraphReadRequest {
+            target: graph_one,
+            format: nrese_store::GraphResultFormat::NTriples,
+        },
+    )?;
+    let two_after = service.execute_graph_read(
+        &nrese_store::ReadScope::All,
+        &GraphReadRequest {
+            target: graph_two,
+            format: nrese_store::GraphResultFormat::NTriples,
+        },
+    )?;
     assert!(String::from_utf8(one_after.payload)?.trim().is_empty());
     assert!(String::from_utf8(two_after.payload)?.contains("http://example.com/g2"));
 

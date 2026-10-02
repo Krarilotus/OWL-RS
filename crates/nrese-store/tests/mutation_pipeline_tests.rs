@@ -293,7 +293,7 @@ fn queries_choose_asserted_inferred_or_both() {
         .apply(insert(&data), &MutationTicket::new())
         .expect("data");
     let ask = |query: String, model: Option<nrese_store::ReadModel>, default_graphs: &[&str]| {
-        let mut request = nrese_store::SparqlQueryRequest::new(query);
+        let mut request = nrese_store::SparqlQueryRequest::all(query);
         request.read_model = model;
         request.default_graphs = default_graphs.iter().map(|g| (*g).to_owned()).collect();
         let result = pipeline.store().execute_query(&request).expect("ask");
@@ -893,7 +893,11 @@ fn materialisation_by_representatives_equals_replication() {
             .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
             .expect("rematerialise");
         let mut quads: Vec<String> = store
-            .read_statements(&nrese_store::StatementPattern::default(), true)
+            .read_statements(
+                &nrese_store::ReadScope::All,
+                &nrese_store::StatementPattern::default(),
+                true,
+            )
             .expect("statements")
             .iter()
             .map(ToString::to_string)
@@ -952,7 +956,11 @@ fn a_retired_pipeline_refuses_writes() {
     ));
     update(&new, "INSERT DATA { <urn:c> <urn:p> 3 }").unwrap();
     assert_eq!(
-        store.count_statements(&nrese_store::StatementPattern::default(), false),
+        store.count_statements(
+            &nrese_store::ReadScope::All,
+            &nrese_store::StatementPattern::default(),
+            false
+        ),
         2
     );
 }

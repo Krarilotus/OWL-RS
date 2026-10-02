@@ -222,7 +222,7 @@ fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<(), String> {
     let entailed = |text: &str| -> Result<bool, String> {
         let query = ask(&parse_rdf_xml(text)?);
         let payload = store
-            .execute_query(&SparqlQueryRequest::new(&query))
+            .execute_query(&SparqlQueryRequest::all(&query))
             .map_err(|e| format!("{e}: {query}"))?
             .payload;
         let text = String::from_utf8_lossy(&payload).replace(char::is_whitespace, "");
