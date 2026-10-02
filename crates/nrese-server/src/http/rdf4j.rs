@@ -21,7 +21,8 @@
 //! `"text"@en`, `"1"^^<…#int>`); `context=null` is the default graph. A transaction's
 //! operations are kept on the server and applied in one commit; reads inside one
 //! (`action=QUERY`, `GET`, `SIZE`) see the committed state, not its own changes. Namespaces
-//! live in memory and are lost on restart.
+//! are kept in `rdf4j-namespaces.json` in an on-disk store's directory (in memory
+//! otherwise), written whole at every change.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,24 +63,60 @@ pub struct Rdf4jState {
     next_transaction: AtomicU64,
     transactions: Mutex<HashMap<String, Pending>>,
     namespaces: Mutex<BTreeMap<String, String>>,
+    /// Where the namespaces are kept (on-disk stores).
+    namespaces_file: Option<std::path::PathBuf>,
 }
 
 impl Default for Rdf4jState {
     fn default() -> Self {
-        let namespaces = [
-            ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
-            ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
-            ("owl", "http://www.w3.org/2002/07/owl#"),
-            ("xsd", "http://www.w3.org/2001/XMLSchema#"),
-        ]
-        .into_iter()
-        .map(|(prefix, iri)| (prefix.to_owned(), iri.to_owned()))
-        .collect();
+        Self::with_file(None)
+    }
+}
+
+impl Rdf4jState {
+    /// The state of a store whose namespaces are kept in `file`, if given: read from it
+    /// when it exists, else the four standard prefixes.
+    pub fn with_file(file: Option<std::path::PathBuf>) -> Self {
+        let standard = || {
+            [
+                ("rdf", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+                ("rdfs", "http://www.w3.org/2000/01/rdf-schema#"),
+                ("owl", "http://www.w3.org/2002/07/owl#"),
+                ("xsd", "http://www.w3.org/2001/XMLSchema#"),
+            ]
+            .into_iter()
+            .map(|(prefix, iri)| (prefix.to_owned(), iri.to_owned()))
+            .collect()
+        };
+        let namespaces = file
+            .as_deref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_else(standard);
         Self {
             next_transaction: AtomicU64::new(1),
             transactions: Mutex::default(),
             namespaces: Mutex::new(namespaces),
+            namespaces_file: file,
         }
+    }
+
+    /// Changes the namespaces and keeps them (a temporary file renamed over the old one).
+    fn change_namespaces(
+        &self,
+        change: impl FnOnce(&mut BTreeMap<String, String>),
+    ) -> Result<(), ApiError> {
+        let mut namespaces = self.namespaces.lock();
+        change(&mut namespaces);
+        let Some(path) = &self.namespaces_file else {
+            return Ok(());
+        };
+        let json = serde_json::to_vec_pretty(&*namespaces)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, json)
+            .and_then(|()| std::fs::rename(&temporary, path))
+            .map_err(|error| ApiError::internal(format!("keeping the namespaces: {error}")))
     }
 }
 
@@ -555,7 +592,7 @@ pub async fn namespaces_delete(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
-    state.rdf4j().namespaces.lock().clear();
+    state.rdf4j().change_namespaces(BTreeMap::clear)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -585,7 +622,9 @@ pub async fn namespace_put(
     if iri.is_empty() {
         return Err(ApiError::bad_request("the namespace is empty"));
     }
-    state.rdf4j().namespaces.lock().insert(prefix, iri);
+    state.rdf4j().change_namespaces(|namespaces| {
+        namespaces.insert(prefix, iri);
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -595,7 +634,9 @@ pub async fn namespace_delete(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_update_write(&state, &headers).await?;
-    state.rdf4j().namespaces.lock().remove(&prefix);
+    state.rdf4j().change_namespaces(|namespaces| {
+        namespaces.remove(&prefix);
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 

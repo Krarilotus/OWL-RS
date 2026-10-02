@@ -134,7 +134,7 @@ The RDF4J REST protocol, as RDF4J's `HTTPRepository`, GraphDB's clients and the 
 | `POST /repositories/{id}/transactions` | begins a transaction: `201` with its URL in `Location` |
 | `PUT /…/transactions/{txid}?action=ADD`, `DELETE`, `UPDATE`, `COMMIT`, `PING`, `QUERY`, `GET`, `SIZE`; `DELETE /…/transactions/{txid}` | a transaction's operations; `COMMIT` applies them in one commit, `DELETE` rolls back |
 
-Terms in `subj`, `pred`, `obj` and `context` are written as in N-Triples (`<iri>`, `_:b`, `"text"@en`, `"1"^^<…#int>`), and `context=null` is the default graph. Writes go through the same pipeline as SPARQL updates (validation, reasoning, the SHACL gate) and need the update permission. Limits: a transaction's operations wait on the server and are applied at its commit, so its reads (`QUERY`, `GET`, `SIZE`) see the committed state, not its own changes; transactions untouched for ten minutes are dropped; namespaces live in memory and start as `rdf`, `rdfs`, `owl` and `xsd` at every start.
+Terms in `subj`, `pred`, `obj` and `context` are written as in N-Triples (`<iri>`, `_:b`, `"text"@en`, `"1"^^<…#int>`), and `context=null` is the default graph. Writes go through the same pipeline as SPARQL updates (validation, reasoning, the SHACL gate) and need the update permission. Limits: a transaction's operations wait on the server and are applied at its commit, so its reads (`QUERY`, `GET`, `SIZE`) see the committed state, not its own changes; transactions untouched for ten minutes are dropped. Namespaces start as `rdf`, `rdfs`, `owl` and `xsd`; an on-disk store keeps them in `rdf4j-namespaces.json` in its data directory.
 
 ## SHACL validation
 
