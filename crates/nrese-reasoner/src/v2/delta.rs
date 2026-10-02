@@ -316,7 +316,7 @@ pub fn update_counted<B: Base + ?Sized>(
     'overdelete: while !deleted.is_empty() {
         overdeleted.clear();
         recloses.clear();
-        let mut prover = Prover {
+        let prover = Prover {
             base,
             program: old_program,
             proved: HashSet::new(),
@@ -540,7 +540,23 @@ pub fn update_counted<B: Base + ?Sized>(
                 }
                 candidates.sort_unstable();
                 candidates.dedup();
-                candidates.retain(|&f| stop() || !prover.prove(&old, &extra, f, 0).0);
+                // Each worker its own prover (its own caches and budget): candidates in
+                // parallel.
+                let fresh_prover = || Prover {
+                    base,
+                    program: old_program,
+                    proved: HashSet::new(),
+                    failed: HashSet::new(),
+                    active: HashSet::new(),
+                    budget: prover.budget,
+                };
+                candidates = candidates
+                    .into_par_iter()
+                    .map_init(fresh_prover, |prover, f| {
+                        (stop() || !prover.prove(&old, &extra, f, 0).0).then_some(f)
+                    })
+                    .flatten()
+                    .collect();
                 check_stop()?;
             }
             let delta = extra.advance(candidates);
