@@ -140,7 +140,7 @@ Build a Rust-native reasoning subsystem that scales from practical enterprise cl
 
 ### Tier R4: OWL 2 DL Target
 
-In scope (owner, 2026-10-02): reasoning is the feature NRESE means to lead in. The tiers below are the v1 sketch; the engine v2 design for DL reasoning is still to be written.
+In scope (owner, 2026-10-02): reasoning is the feature NRESE means to lead in. The tiers below are the v1 sketch; the engine v2 design is [ADR-0009](../adr/0009-owl2-dl-reasoning.md) (proposed).
 
 - Wider class expression handling
 - Property characteristics and cardinality-centric reasoning

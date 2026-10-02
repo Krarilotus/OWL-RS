@@ -68,9 +68,10 @@ by the coming frontend; the protocols only translate.
   API (consistency rejects are explained already), with the support graph sets the access
   control needs to show an inference to whoever may read its premises.
 - **OWL 2 DL:** classification, consistency and explanation beyond the materialisable
-  profiles. A design from the research (tableaux, hypertableaux, consequence-based
-  calculi, their combination with materialisation, modular and incremental
-  classification), then the build, measured on the ORE corpora against HermiT, Konclude
+  profiles. The design is [ADR-0009](../adr/0009-owl2-dl-reasoning.md) (proposed): one
+  OWL model from RDF, a hypertableau engine as the complete anchor, consequence-based
+  classification with the EL fast path, certain answers in the store with datalog bounds
+  (PAGOdA's scheme), justifications; measured on the ORE corpora against HermiT, Konclude
   and ELK.
 - **Equality:** incremental merges and splits of `sameAs` classes, joins on
   representatives with late expansion (W4 stage C), strict and canonical answers.
