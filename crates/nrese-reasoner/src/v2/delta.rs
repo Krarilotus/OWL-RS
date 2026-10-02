@@ -35,7 +35,7 @@
 
 use std::borrow::Cow;
 
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 
 use super::batch::{Equality, Store, check, is_replacement_rule, sorted};
@@ -127,6 +127,12 @@ pub struct Update {
     /// The ground program of the state after the change, if it differs from the one given
     /// (or none was given); `None` means the given program still applies.
     pub program: Option<GroundProgram>,
+    /// With support counts given ([`update_counted`]): the changes to them, to apply with
+    /// [`super::supports::Supports::apply`].
+    pub support_changes: Vec<(Triple, i64)>,
+    /// The given counts don't apply to the state after the change (its ground program
+    /// changed): count again ([`super::supports::Supports::count`]).
+    pub supports_stale: bool,
 }
 
 impl std::fmt::Debug for Update {
@@ -223,6 +229,23 @@ pub fn update_until<B: Base + ?Sized>(
     cache: Option<&GroundProgram>,
     stop: Stop<'_>,
 ) -> Result<Update, Interrupted> {
+    update_counted(base, inserted, deleted, rules, cache, None, stop)
+}
+
+/// [`update_until`] with the support counts of the state before the change
+/// ([`super::supports`]): a candidate for overdeletion that keeps a non-recursive
+/// derivation stays without a proof search (Hu, Motik and Horrocks), and the result
+/// carries the counts' changes. The counts must be those of `cache`'s program (or of the
+/// program built here, without a cache).
+pub fn update_counted<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    supports: Option<&super::supports::Supports>,
+    stop: Stop<'_>,
+) -> Result<Update, Interrupted> {
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut result = Update::default();
     let mut clock = std::time::Instant::now();
@@ -244,6 +267,35 @@ pub fn update_until<B: Base + ?Sized>(
         })
     });
     let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
+    let same_as = super::batch::same_as_of(rules.rules);
+    // Support counting: which ground rules are non-recursive, the instances lost and
+    // gained. Off (the counts stale) once the program itself changes.
+    let non_recursive: Vec<bool> = match supports {
+        Some(_) => {
+            let before = Overlay {
+                base,
+                hidden: &inserted_set,
+                extra: &Store::new(deleted.to_vec()),
+            };
+            super::supports::non_recursive(&old_program.rules, schema.rdf_type(), &|term| {
+                super::supports::same_as_partners(&before, same_as, term)
+            })
+        }
+        None => Vec::new(),
+    };
+    let mut counting = supports.is_some();
+    // The lost instances counted so far (rule and bindings): overdeletion may find one
+    // again in a later round, through another premise it overdeletes then.
+    let mut lost: HashSet<(usize, Vec<Option<u64>>)> = HashSet::new();
+    // `sameAs` between classes or properties links keys: a commit changing one leaves
+    // the counts stale.
+    let keys = match supports {
+        Some(_) => super::supports::key_terms(&old_program.rules, schema.rdf_type()),
+        None => HashSet::new(),
+    };
+    let key_same_as =
+        |f: &Triple| same_as == Some(f[1]) && (keys.contains(&f[0]) || keys.contains(&f[2]));
+    let mut changes: HashMap<Triple, i64> = HashMap::new();
 
     lap(0, &mut result);
     // 1. Overdelete, over the old state. With B/F, a candidate with a proof that avoids
@@ -338,8 +390,14 @@ pub fn update_until<B: Base + ?Sized>(
                 }
             }
             let mut jobs = Vec::new();
+            let mut counted_jobs = Vec::new();
             for (r, i) in old_program.variants(&extra) {
-                jobs.extend(Job::variant(&old, &old_program.rules[r], i));
+                let job = Job::variant(&old, &old_program.rules[r], i);
+                if counting && non_recursive[r] {
+                    counted_jobs.extend(job.map(|job| (r, job)));
+                } else {
+                    jobs.extend(job);
+                }
             }
             // Transitive properties, by component: a lost edge (a, b) may support every pair
             // from a predecessor of a (or a) to a successor of b (or b). The relation is
@@ -418,14 +476,42 @@ pub fn update_until<B: Base + ?Sized>(
             };
             let mut candidates = run_jobs_acyclic(&old, &jobs, &overdeletable, stop);
             check_stop()?;
+            // Every lost non-recursive instance, once, whatever its head: the counts stay
+            // exact.
+            let (rule_of, counted): (Vec<usize>, Vec<Job<'_>>) =
+                std::mem::take(&mut counted_jobs).into_iter().unzip();
+            for (j, bindings, facts) in super::eval::run_jobs_instances(&old, &counted, stop) {
+                if !lost.insert((rule_of[j], bindings)) {
+                    continue;
+                }
+                for fact in facts {
+                    *changes.entry(fact).or_default() -= 1;
+                    if overdeletable(fact) {
+                        candidates.push(fact);
+                    }
+                }
+            }
+            check_stop()?;
             candidates.extend(bodiless.into_iter().filter(|&f| overdeletable(f)));
             candidates.extend(component.into_iter().filter(|&f| overdeletable(f)));
             drop(jobs);
+            drop(counted_jobs);
+            if counting && let Some(supports) = supports {
+                // A candidate with a non-recursive derivation left keeps it: no proof
+                // search. If that derivation's premises go later in this commit, its loss
+                // brings the candidate back.
+                candidates.retain(|&f| {
+                    i64::from(supports.of(f)) + changes.get(&f).copied().unwrap_or(0) <= 0
+                });
+            }
             if backward {
                 // Proofs use ground instances whose schema facts are baked in: they are
                 // sound only while no schema or list fact is affected by the change.
                 if candidates.iter().any(|&f| rules.is_program_fact(f)) {
                     backward = false;
+                    counting = false;
+                    changes.clear();
+                    lost.clear();
                     continue 'overdelete;
                 }
                 candidates.sort_unstable();
@@ -522,10 +608,19 @@ pub fn update_until<B: Base + ?Sized>(
             Vec::new()
         };
         candidates.retain(|&f| !state.contains(f));
+        if evaluated != program.rules.len() {
+            counting = false;
+        }
         let mut jobs = Vec::new();
+        let mut counted_jobs = Vec::new();
         for (r, i) in program.variants(&extra) {
             if r < evaluated && !replaced(&program.rules[r]) {
-                jobs.extend(Job::variant(&state, &program.rules[r], i));
+                let job = Job::variant(&state, &program.rules[r], i);
+                if counting && non_recursive[r] {
+                    counted_jobs.extend(job);
+                } else {
+                    jobs.extend(job);
+                }
             }
         }
         for rule in &program.rules[evaluated..] {
@@ -534,6 +629,13 @@ pub fn update_until<B: Base + ?Sized>(
             }
         }
         candidates.extend(run_jobs(&state, &jobs, &|fact| !state.contains(fact), stop));
+        check_stop()?;
+        for fact in run_jobs(&state, &counted_jobs, &|_| true, stop) {
+            *changes.entry(fact).or_default() += 1;
+            if !state.contains(fact) {
+                candidates.push(fact);
+            }
+        }
         check_stop()?;
         if let Some(equality) = &mut equality {
             candidates.extend(equality.run(&state));
@@ -631,11 +733,25 @@ pub fn update_until<B: Base + ?Sized>(
         .filter(|d| !old_program.list_diagnostics.contains(d))
         .copied()
         .collect();
+    let program_changed = matches!(program, Cow::Owned(_));
     result.program = match program {
         Cow::Owned(program) => Some(program),
         Cow::Borrowed(_) => None,
     }
     .or(computed);
+    if supports.is_some() {
+        let equality_changed = inserted
+            .iter()
+            .chain(deleted)
+            .chain(&result.insert)
+            .chain(&result.remove)
+            .any(key_same_as);
+        result.supports_stale = !counting || program_changed || equality_changed;
+        if !result.supports_stale {
+            result.support_changes = changes.into_iter().filter(|&(_, c)| c != 0).collect();
+            result.support_changes.sort_unstable();
+        }
+    }
     Ok(result)
 }
 

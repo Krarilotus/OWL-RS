@@ -2,19 +2,24 @@
 //! and re-insert asserted ABox `rdf:type` statements one at a time, checking each result
 //! against rematerialisation with `--check`.
 //!
+//! With `--batch N`, each change deletes N statements in one commit and puts them back
+//! in another: the per-phase times show where large deletes spend theirs, beside one full
+//! rematerialisation for comparison.
+//!
 //! ```text
-//! cargo run --release -p nrese-reasoner --example v2_delta -- [--changes N] [--check] input.nt...
+//! cargo run --release -p nrese-reasoner --example v2_delta -- [--changes N] [--batch N] [--check] input.nt...
 //! ```
 
 use std::io::BufRead;
 use std::time::Instant;
 
 use nrese_reasoner::v2::batch::{self, Schema};
-use nrese_reasoner::v2::delta::{MemoryBase, Rules, program, update};
+use nrese_reasoner::v2::delta::{MemoryBase, Rules, program, update, update_counted};
 use nrese_reasoner::v2::ir::Triple;
 use nrese_reasoner::v2::ir::Vocabulary;
 use nrese_reasoner::v2::lists::ListVocabulary;
 use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::v2::supports::Supports;
 use nrese_reasoner::v2::vocabulary::LocalVocabulary;
 
 fn split(line: &str) -> Option<[&str; 3]> {
@@ -30,12 +35,16 @@ fn split(line: &str) -> Option<[&str; 3]> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut changes, mut check, mut inputs) = (20usize, false, Vec::new());
+    let mut batch_size = 1usize;
+    let mut counting = false;
     let mut predicate: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--changes" => changes = args.next().and_then(|n| n.parse().ok()).unwrap_or(20),
             "--check" => check = true,
+            "--batch" => batch_size = args.next().and_then(|n| n.parse().ok()).unwrap_or(1),
+            "--counting" => counting = true,
             "--predicate" => predicate = args.next(),
             _ => inputs.push(arg),
         }
@@ -62,7 +71,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lists: Some(&lists),
         schema: &schema,
     };
+    let started = Instant::now();
     let mut inferred = batch::materialise(&asserted, &rules, Some(&lists), &schema).derived;
+    let remat_ms = started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "{} asserted, {} inferred; rematerialisation {remat_ms:.0} ms",
+        asserted.len(),
+        inferred.len()
+    );
     // ABox type statements: IRI subjects, classes outside the W3C vocabularies.
     let targets: Vec<Triple> = asserted
         .iter()
@@ -73,8 +89,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 && !vocabulary.text(t[2]).starts_with("<http://www.w3.org/")
         })
         .step_by(97)
-        .take(changes)
+        .take(changes * batch_size)
         .collect();
+    if batch_size > 1 {
+        return batches(
+            &targets, batch_size, asserted, inferred, compiled, check, counting, &rules, &lists,
+            &schema,
+        );
+    }
     let mut cache = Some(program(&MemoryBase::new(&asserted, &inferred), compiled));
     let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
     let mut phases = [[std::time::Duration::ZERO; 5]; 2];
@@ -180,5 +202,127 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{} changes: deletes p50 {d50:.3} ms p99 {d99:.3} ms | inserts p50 {i50:.3} ms p99 {i99:.3} ms",
         deletes.len()
     );
+    Ok(())
+}
+
+/// `--batch`: each group of `size` targets deleted in one commit (timed, with its phases)
+/// and put back in another.
+#[allow(clippy::too_many_arguments)]
+fn batches(
+    targets: &[Triple],
+    size: usize,
+    mut asserted: Vec<Triple>,
+    mut inferred: Vec<Triple>,
+    compiled: Rules<'_>,
+    check: bool,
+    counting: bool,
+    rules: &[nrese_reasoner::v2::ir::Rule],
+    lists: &ListVocabulary,
+    schema: &Schema,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cache = Some(program(&MemoryBase::new(&asserted, &inferred), compiled));
+    let same_as = batch::same_as_of(rules);
+    let count = |asserted: &[Triple], inferred: &[Triple], ground: &_| {
+        let mut facts: Vec<Triple> = asserted.iter().chain(inferred).copied().collect();
+        facts.sort_unstable();
+        facts.dedup();
+        Supports::of_closure(&facts, ground, schema.rdf_type(), same_as, &|_| true)
+    };
+    let mut supports = counting.then(|| {
+        let started = Instant::now();
+        let supports = count(&asserted, &inferred, cache.as_ref().expect("built"));
+        eprintln!(
+            "support counts: {} facts in {:.0} ms",
+            supports.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        supports
+    });
+    let mut deletes = Vec::new();
+    for group in targets.chunks(size) {
+        for deleting in [true, false] {
+            let after: Vec<Triple> = if deleting {
+                let gone: std::collections::HashSet<&Triple> = group.iter().collect();
+                asserted
+                    .iter()
+                    .copied()
+                    .filter(|t| !gone.contains(t))
+                    .collect()
+            } else {
+                let mut a = asserted.clone();
+                a.extend(group);
+                a.sort_unstable();
+                a.dedup();
+                a
+            };
+            let stack: Vec<Triple> = inferred
+                .iter()
+                .copied()
+                .filter(|t| after.binary_search(t).is_err())
+                .collect();
+            let base = MemoryBase::new(&after, &stack);
+            let new: Vec<Triple> = if deleting {
+                Vec::new()
+            } else {
+                group
+                    .iter()
+                    .copied()
+                    .filter(|t| inferred.binary_search(t).is_err())
+                    .collect()
+            };
+            let del: &[Triple] = if deleting { group } else { &[] };
+            let started = Instant::now();
+            let result = update_counted(
+                &base,
+                &new,
+                del,
+                compiled,
+                cache.as_ref(),
+                supports.as_ref(),
+                nrese_reasoner::v2::eval::NEVER,
+            )
+            .expect("never stopped");
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            if deleting {
+                deletes.push((ms, result.phases, result.remove.len(), result.rounds));
+            }
+            if let Some(program) = result.program {
+                cache = Some(program);
+            }
+            let stale = result.supports_stale;
+            if let Some(supports) = &mut supports {
+                supports.apply(&result.support_changes);
+            }
+            let removal: std::collections::HashSet<Triple> =
+                result.remove.iter().copied().collect();
+            let mut next: Vec<Triple> = stack
+                .into_iter()
+                .filter(|t| !removal.contains(t))
+                .chain(result.insert)
+                .collect();
+            next.sort_unstable();
+            next.dedup();
+            if check {
+                let expected = batch::materialise(&after, rules, Some(lists), schema).derived;
+                assert_eq!(next, expected, "delta differs from rematerialisation");
+            }
+            if stale && supports.is_some() {
+                supports = Some(count(&after, &next, cache.as_ref().expect("built")));
+            }
+            inferred = next;
+            asserted = after;
+        }
+    }
+    for (ms, phases, removed, rounds) in &deletes {
+        let phase = |i: usize| phases[i].as_secs_f64() * 1000.0;
+        println!(
+            "delete {size}: {ms:.1} ms (program {:.1}, overdelete {:.1}, rederive {:.1}, insert {:.1}, consistency {:.1}); {removed} inferred removed, {rounds} rounds",
+            phase(0),
+            phase(1),
+            phase(2),
+            phase(3),
+            phase(4)
+        );
+    }
     Ok(())
 }
