@@ -235,7 +235,7 @@ fn head(text: &str) -> &str {
 
 /// The rules of the `Rules` section: kind (`Id` or `Consistency`), name, body lines, and
 /// the line number of its `Id:` (`text`'s first line is line `first`).
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 fn rule_blocks(
     text: &str,
     first: usize,

@@ -326,7 +326,7 @@ impl<'p> Expander<'p> {
 
     /// Step 13: the entries of `element` into `result`; keys that expand to `@nest` are
     /// collected in `nests`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn expand_entries<'e>(
         &mut self,
         active: &Arc<Context>,
@@ -430,7 +430,7 @@ impl<'p> Expander<'p> {
     }
 
     /// Step 13.4: an entry whose key expands to a keyword.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn keyword_entry<'e>(
         &mut self,
         active: &Arc<Context>,

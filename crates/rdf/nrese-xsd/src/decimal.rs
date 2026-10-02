@@ -383,7 +383,7 @@ impl TryFrom<Float> for Decimal {
 /// Correctly rounded: exact operands and one IEEE division where that is exact enough
 /// (Clinger's fast path), otherwise the decimal text through Rust's parser.
 impl From<Decimal> for Double {
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn from(value: Decimal) -> Self {
         let (negative, whole, fraction) = value.parts();
         if fraction == 0 && whole <= 1 << 53 {
@@ -401,7 +401,7 @@ impl From<Decimal> for Double {
 }
 
 impl From<Decimal> for Float {
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn from(value: Decimal) -> Self {
         let (negative, whole, fraction) = value.parts();
         if fraction == 0 && whole <= 1 << 24 {

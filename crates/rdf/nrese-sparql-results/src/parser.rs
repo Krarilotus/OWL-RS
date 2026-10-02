@@ -138,7 +138,7 @@ impl QueryResultsParser {
 /// Results read from a slice: a boolean, or solutions.
 // Made once per document and matched at once: boxing the parser would put an indirection
 // in front of every row instead.
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub enum SliceQueryResultsParserOutput<'a> {
     Solutions(SliceSolutionsParser<'a>),
     Boolean(bool),
@@ -227,7 +227,7 @@ impl Iterator for SliceSolutionsParser<'_> {
 /// Results read from a reader: a boolean, or solutions.
 // Made once per document and matched at once: boxing the parser would put an indirection
 // in front of every row instead.
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 pub enum ReaderQueryResultsParserOutput<R: Read> {
     Solutions(ReaderSolutionsParser<R>),
     Boolean(bool),
