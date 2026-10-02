@@ -3573,13 +3573,19 @@ impl<'a> Context<'a> {
         let groups = group_rows(&key_table, &keys);
         // Without GROUP BY, an empty input still yields one (empty) group.
         let group_count = groups.len();
-        let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
-        for (row, &group) in groups.group_of.iter().enumerate() {
-            members[group as usize].push(row);
-        }
+        let values =
+            match aggregate_in_one_pass(&solutions, &groups.group_of, group_count, aggregates) {
+                Some(values) => values,
+                None => {
+                    let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
+                    for (row, &group) in groups.group_of.iter().enumerate() {
+                        members[group as usize].push(row);
+                    }
+                    self.aggregate_groups(&solutions, &members, aggregates)?
+                }
+            };
         let mut columns: Vec<Vec<u64>> = groups.keys.clone().into_columns();
         let mut vars: Vec<Variable> = variables.to_vec();
-        let values = self.aggregate_groups(&solutions, &members, aggregates)?;
         for (index, (target, _)) in aggregates.iter().enumerate() {
             let column: Vec<u64> = values
                 .iter()
@@ -4103,6 +4109,142 @@ fn counts_rows(aggregate: &AggregateExpression, scan: &ScanPattern) -> bool {
 
 fn integer(value: u64) -> Term {
     Literal::new_typed_literal(value.to_string(), xsd::INTEGER).into()
+}
+
+/// An `xsd:integer` result as an inline id where it fits, else as a term.
+fn integer_agg(value: i64) -> Agg {
+    match TermId::inline_integer(value) {
+        Some(id) => Agg::Id(id.raw()),
+        None => Agg::Term(Literal::new_typed_literal(value.to_string(), xsd::INTEGER).into()),
+    }
+}
+
+/// What one pass keeps of a group's values for one aggregate.
+#[derive(Clone, Copy, Default)]
+struct Running {
+    /// Bound values.
+    count: u64,
+    sum: i64,
+    overflow: bool,
+    unbound: bool,
+    /// The smallest and largest value, with its id.
+    min: Option<(i64, u64)>,
+    max: Option<(i64, u64)>,
+}
+
+impl Running {
+    fn add(&mut self, id: u64) {
+        if id == UNDEF {
+            self.unbound = true;
+            return;
+        }
+        self.count += 1;
+        let Some(value) = TermId::from_raw(id).as_inline_integer() else {
+            return;
+        };
+        match self.sum.checked_add(value) {
+            Some(sum) => self.sum = sum,
+            None => self.overflow = true,
+        }
+        if self.min.is_none_or(|(m, _)| value < m) {
+            self.min = Some((value, id));
+        }
+        if self.max.is_none_or(|(m, _)| value > m) {
+            self.max = Some((value, id));
+        }
+    }
+}
+
+/// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
+/// or `COUNT`, `SUM`, `AVG`, `MIN` or `MAX` (without DISTINCT) of a variable holding only
+/// inline integers (`COUNT`: any terms): the results [`Aggregator::aggregate_ids`] gives,
+/// without a list of rows per group. `None` for other aggregates. DBpedia q12 summed 1 M
+/// goals into 35 k teams.
+fn aggregate_in_one_pass(
+    solutions: &Solutions,
+    group_of: &[u32],
+    groups: usize,
+    aggregates: &[(Variable, AggregateExpression)],
+) -> Option<Vec<Vec<Agg>>> {
+    // Per aggregate: the column it reads (`None`: the rows) and its function.
+    let mut plan: Vec<(Option<usize>, AggregateFunction)> = Vec::new();
+    for (_, aggregate) in aggregates {
+        match aggregate {
+            AggregateExpression::CountSolutions { distinct: false } => {
+                plan.push((None, AggregateFunction::Count));
+            }
+            AggregateExpression::FunctionCall {
+                name,
+                expr: Expression::Variable(variable),
+                distinct: false,
+            } => {
+                let numeric = matches!(
+                    name,
+                    AggregateFunction::Sum
+                        | AggregateFunction::Avg
+                        | AggregateFunction::Min
+                        | AggregateFunction::Max
+                );
+                if !numeric && *name != AggregateFunction::Count {
+                    return None;
+                }
+                let column = solutions.column(variable)?;
+                if numeric
+                    && !solutions.table.column(column).iter().all(|&id| {
+                        id == UNDEF || TermId::from_raw(id).as_inline_integer().is_some()
+                    })
+                {
+                    return None;
+                }
+                plan.push((Some(column), name.clone()));
+            }
+            _ => return None,
+        }
+    }
+    let mut running = vec![Running::default(); groups * plan.len()];
+    let mut rows = vec![0u64; groups];
+    for (row, &group) in group_of.iter().enumerate() {
+        let group = group as usize;
+        rows[group] += 1;
+        for (a, (column, _)) in plan.iter().enumerate() {
+            if let Some(column) = column {
+                running[group * plan.len() + a].add(solutions.table.get(row, *column));
+            }
+        }
+    }
+    Some(
+        (0..groups)
+            .map(|group| {
+                plan.iter()
+                    .enumerate()
+                    .map(|(a, (column, name))| {
+                        let r = running[group * plan.len() + a];
+                        if column.is_none() {
+                            return integer_agg(rows[group] as i64);
+                        }
+                        match name {
+                            AggregateFunction::Count => integer_agg(r.count as i64),
+                            _ if r.unbound => Agg::Id(UNDEF),
+                            AggregateFunction::Min => Agg::Id(r.min.map_or(UNDEF, |m| m.1)),
+                            AggregateFunction::Max => Agg::Id(r.max.map_or(UNDEF, |m| m.1)),
+                            _ if r.overflow => Agg::Id(UNDEF),
+                            AggregateFunction::Sum => integer_agg(r.sum),
+                            _ if r.count == 0 => Agg::Term(integer(0)),
+                            _ => match Decimal::from(r.sum)
+                                .checked_div(Decimal::from(r.count as i64))
+                            {
+                                Some(avg) => Agg::Term(
+                                    Literal::new_typed_literal(avg.to_string(), xsd::DECIMAL)
+                                        .into(),
+                                ),
+                                None => Agg::Id(UNDEF),
+                            },
+                        }
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
 }
 
 /// A running numeric sum with SPARQL type promotion; `None` once a non-number appears.
