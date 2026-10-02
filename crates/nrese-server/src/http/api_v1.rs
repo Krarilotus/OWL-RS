@@ -391,10 +391,14 @@ struct Explanation {
 
 #[derive(Serialize, utoipa::ToSchema)]
 struct ExplanationStep {
+    /// The statement's terms; left out for a `hidden` step.
+    #[serde(skip_serializing_if = "String::is_empty")]
     subject: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     predicate: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     object: String,
-    /// `asserted` or `inferred`.
+    /// `asserted`, `inferred`, or `hidden` (asserted in no graph the requester may read).
     origin: &'static str,
     /// The rule that derives it, for an inferred step.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -437,9 +441,11 @@ pub async fn explain(
         return Err(ApiError::not_found("reasoning is off: nothing is inferred"));
     };
     let store = state.store();
+    let scope = nrese_store::ReadScope::of(access.read.clone());
     let steps = tokio::task::spawn_blocking(move || {
         store.explain_statement(
             program,
+            &scope,
             subject.as_ref(),
             predicate.as_ref(),
             object.as_ref(),
