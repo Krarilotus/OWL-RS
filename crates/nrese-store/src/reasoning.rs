@@ -984,3 +984,90 @@ pub fn explain(
         evidence,
     }
 }
+
+/// One step of an inference's explanation ([`explain_fact`]), decoded: the fact, whether it
+/// is asserted or inferred, the rule that derives it and its premises (indexes of steps).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceStep {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    /// `asserted` or `inferred`.
+    pub origin: &'static str,
+    /// The rule (`cax-sco`, `prp-trp`, ...); `None` for an asserted fact.
+    pub rule: Option<String>,
+    pub premises: Vec<usize>,
+}
+
+/// Facts an explanation examines at most.
+const EXPLANATION_BUDGET: usize = 4096;
+
+/// Why the fact `[s, p, o]` holds in `snapshot` under `program`: a derivation of it from
+/// asserted facts ([`nrese_reasoner::v2::explain`]), the fact first. `None` if it doesn't
+/// hold, or no derivation is found within the budget.
+pub fn explain_fact(program: &Program, snapshot: &Snapshot, fact: Triple) -> Option<Vec<InferenceStep>> {
+    let base = SnapshotBase {
+        snapshot,
+        axioms: &program.axioms,
+    };
+    let explanation =
+        nrese_reasoner::v2::explain::explain(&base, program.rules(), fact, EXPLANATION_BUDGET)?;
+    let decode = |id: u64| decoded(snapshot.decode(TermId::from_raw(id)), id);
+    Some(
+        explanation
+            .steps
+            .into_iter()
+            .map(|step| {
+                let [s, p, o] = step.fact;
+                InferenceStep {
+                    subject: decode(s),
+                    predicate: decode(p),
+                    object: decode(o),
+                    origin: if step.rule.is_some() { "inferred" } else { "asserted" },
+                    rule: step.rule,
+                    premises: step.premises,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// A committed state as the reasoner reads it: asserted and inferred statements of every
+/// graph, the ruleset's axioms counting as asserted.
+struct SnapshotBase<'a> {
+    snapshot: &'a Snapshot,
+    axioms: &'a [Triple],
+}
+
+impl Base for SnapshotBase<'_> {
+    fn scan(&self, bound: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+        for quad in self
+            .snapshot
+            .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
+        {
+            f(triple(quad));
+        }
+    }
+
+    fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
+        let count = self
+            .snapshot
+            .estimate_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any));
+        usize::try_from(count).unwrap_or(usize::MAX)
+    }
+
+    fn contains(&self, fact: Triple) -> bool {
+        self.snapshot.exists_in(
+            ReadModel::Materialised,
+            &pattern(fact.map(Some), GraphSelector::Any),
+        )
+    }
+
+    fn is_asserted(&self, fact: Triple) -> bool {
+        self.axioms.binary_search(&fact).is_ok()
+            || self.snapshot.exists_in(
+                ReadModel::Asserted,
+                &pattern(fact.map(Some), GraphSelector::Any),
+            )
+    }
+}
