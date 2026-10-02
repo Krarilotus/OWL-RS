@@ -21,76 +21,15 @@
 //! Everything else (the store type, its persistence and indexes) is NRESE's own: a
 //! repository is stored as the server stores its default one.
 
-use std::sync::Arc;
-
 use nrese_rdf::{Quad, Term};
-use nrese_reasoner::{ReasonerConfig, ReasoningMode, UserRules};
-use serde::{Deserialize, Serialize};
+use nrese_reasoner::ReasoningMode;
+
+pub use nrese_store::catalog::{RepositoryRules, RepositorySettings};
 
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 /// User rules in a repository's configuration (NRESE's own vocabulary).
 const CONFIG_RULES: &str = "https://nrese.dev/ns/config#rules";
 const CONFIG_RULES_FORMAT: &str = "https://nrese.dev/ns/config#rulesFormat";
-
-/// A repository's user rules: their text, kept with the settings so that a restart needs
-/// no file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct RepositoryRules {
-    /// Shown in errors and diagnostics: the file name, or `configuration`.
-    pub name: String,
-    /// `n3` or `pie`.
-    pub format: String,
-    pub text: String,
-}
-
-impl RepositoryRules {
-    /// The rules, compiled to check them.
-    fn compile(&self) -> Result<UserRules, String> {
-        let rules = match self.format.as_str() {
-            "pie" => UserRules::pie(self.name.clone(), self.text.clone()),
-            _ => UserRules::n3(self.name.clone(), self.text.clone()),
-        };
-        rules.map_err(|error| format!("rules {}: {error}", self.name))
-    }
-}
-
-/// What a repository is created with besides the server's settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct RepositorySettings {
-    /// Shown in the repository list.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    /// The repository's reasoning, by mode name; the server's when absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
-    /// The repository's user rules, if it has any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rules: Option<RepositoryRules>,
-}
-
-impl RepositorySettings {
-    /// The reasoning mode, if the settings choose one.
-    pub fn reasoning_mode(&self) -> Option<ReasoningMode> {
-        self.reasoning.as_deref().and_then(ReasoningMode::from_name)
-    }
-
-    /// The repository's reasoner configuration, if the settings choose one (else the
-    /// server's applies).
-    pub fn reasoner_config(&self) -> Result<Option<ReasonerConfig>, String> {
-        let Some(mode) = self.reasoning_mode() else {
-            return Ok(None);
-        };
-        let rules = self
-            .rules
-            .as_ref()
-            .map(|rules| rules.compile().map(Arc::new))
-            .transpose()?;
-        ReasonerConfig::for_mode(mode)
-            .with_rules(rules)
-            .map(Some)
-            .map_err(|error| error.to_string())
-    }
-}
 
 /// The part of a configuration IRI after its namespace: `rep.id`, `repositoryID`.
 fn local_name(iri: &str) -> &str {
