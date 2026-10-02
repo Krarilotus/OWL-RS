@@ -2,19 +2,41 @@
 name = "nrese-store"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
-
-[features]
-default = []
-durable-storage = ["oxigraph/rocksdb"]
 
 [dependencies]
 nrese-core = { path = "../nrese-core" }
-oxigraph = { version = "0.5.6", default-features = false }
-sha2 = "0.10.9"
+nrese-engine = { path = "../nrese-engine" }
+nrese-reasoner = { path = "../nrese-reasoner" }
+nrese-shacl = { path = "../nrese-shacl" }
+nrese-sparql = { path = "../nrese-sparql" }
+nrese-rdf = { path = "../rdf/nrese-rdf" }
+nrese-xsd = { path = "../rdf/nrese-xsd" }
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+rayon = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+argon2 = "0.6.0"
+getrandom = "0.4.2"
+utoipa = { workspace = true, optional = true }
+nrese-sparql-results = { path = "../rdf/nrese-sparql-results" }
+nrese-sparql-syntax = { path = "../rdf/nrese-sparql-syntax" }
 thiserror.workspace = true
 tracing.workspace = true
 url = "2.5.7"
 
+[features]
+# Schemas of the types the engine API returns, for its OpenAPI description.
+openapi = ["dep:utoipa"]
+
 [dev-dependencies]
-tempfile = "3.23.0"
+libmimalloc-sys = { workspace = true }
+mimalloc = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

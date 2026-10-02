@@ -16,7 +16,13 @@ pub struct StatusResponse {
 
 #[derive(Debug, Serialize)]
 pub struct ReadyResponse {
+    /// `ready`, `starting`, or `quarantined` (inconsistent data under the configured
+    /// reasoning).
     pub status: &'static str,
+    /// `consistent`, `inconsistent` or `unknown` (no current reasoning state).
+    pub consistency: &'static str,
+    /// Consistency violations in the materialised data, when inconsistent.
+    pub violations: Option<usize>,
     pub revision: u64,
     pub quad_count: u64,
     pub named_graph_count: usize,
@@ -43,6 +49,12 @@ pub struct VersionResponse {
     pub reasoning_profile: &'static str,
     pub reasoning_read_model: &'static str,
     pub reasoning_semantic_tier: &'static str,
+    /// Ruleset, semantics version and fingerprint; changes exactly when this build's
+    /// closure differs. The contract: `docs/spec/reasoning-semantics.md`.
+    pub reasoning_semantics: Option<String>,
+    /// What a query without a dataset reads: `default` (the default graph) or `union`
+    /// (the merge of all graphs).
+    pub default_graph: &'static str,
     pub graph_store_enabled: bool,
     pub graph_write_enabled: bool,
     pub sparql_update_enabled: bool,
@@ -52,8 +64,27 @@ pub struct VersionResponse {
     pub operator_surface_enabled: bool,
     pub metrics_enabled: bool,
     pub user_console_path: &'static str,
+    /// Whether this binary was built with the user console.
+    pub user_console_embedded: bool,
     pub ai_query_suggestions_enabled: bool,
     pub ai_provider: &'static str,
+    /// The resource budgets in effect (`[budgets]` in the configuration).
+    pub budgets: BudgetsResponse,
+}
+
+/// Memory and sizes in bytes (0 = unlimited), times in milliseconds.
+#[derive(Debug, Serialize)]
+pub struct BudgetsResponse {
+    pub query_memory: usize,
+    pub total_query_memory: usize,
+    pub query_timeout_ms: u64,
+    pub update_timeout_ms: u64,
+    pub graph_read_timeout_ms: u64,
+    pub graph_write_timeout_ms: u64,
+    pub query_text: usize,
+    pub update_size: usize,
+    pub upload_size: usize,
+    pub result_cache: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,11 +158,19 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let posture = state.runtime_posture();
 
+    let consistency = state.store().consistency();
     Ok(ReadyResponse {
-        status: if state.is_ready() {
-            "ready"
-        } else {
+        status: if !state.is_started() {
             "starting"
+        } else if state.is_quarantined() {
+            "quarantined"
+        } else {
+            "ready"
+        },
+        consistency: consistency.as_str(),
+        violations: match consistency {
+            nrese_store::ConsistencyStatus::Inconsistent { violations } => Some(violations),
+            _ => None,
         },
         revision: state.store().current_revision(),
         quad_count: stats.quad_count as u64,
@@ -164,6 +203,12 @@ pub fn build_version_response(state: &AppState) -> VersionResponse {
         reasoning_profile: posture.reasoning_profile,
         reasoning_read_model: posture.reasoning_read_model,
         reasoning_semantic_tier: posture.reasoning_semantic_tier,
+        reasoning_semantics: state.reasoner().semantics(),
+        default_graph: if state.store().config().union_default_graph {
+            "union"
+        } else {
+            "default"
+        },
         graph_store_enabled: posture.graph_store_enabled,
         graph_write_enabled: posture.graph_write_enabled,
         sparql_update_enabled: posture.sparql_update_enabled,
@@ -173,8 +218,26 @@ pub fn build_version_response(state: &AppState) -> VersionResponse {
         operator_surface_enabled: posture.operator_surface_enabled,
         metrics_enabled: posture.metrics_enabled,
         user_console_path: USER_CONSOLE_PATH,
+        user_console_embedded: crate::http::console::is_embedded(),
         ai_query_suggestions_enabled: posture.ai_query_suggestions_enabled,
         ai_provider: posture.ai_provider,
+        budgets: {
+            let (limits, timeouts) = (&state.policy().limits, &state.policy().timeouts);
+            let store = state.store();
+            let store = store.config();
+            BudgetsResponse {
+                query_memory: limits.max_query_memory_bytes,
+                total_query_memory: store.total_query_memory_bytes,
+                query_timeout_ms: timeouts.query.as_millis() as u64,
+                update_timeout_ms: timeouts.update.as_millis() as u64,
+                graph_read_timeout_ms: timeouts.graph_read.as_millis() as u64,
+                graph_write_timeout_ms: timeouts.graph_write.as_millis() as u64,
+                query_text: limits.max_query_bytes,
+                update_size: limits.max_update_bytes,
+                upload_size: limits.max_rdf_upload_bytes,
+                result_cache: store.query_cache_bytes,
+            }
+        },
     }
 }
 
@@ -255,6 +318,8 @@ pub fn build_admin_restore_response(
     }
 }
 
+/// Engine v2 always includes durable storage (WAL + checkpoints); the field stays in the
+/// capabilities API for existing clients.
 pub const fn durable_storage_available() -> bool {
-    cfg!(feature = "durable-storage")
+    true
 }

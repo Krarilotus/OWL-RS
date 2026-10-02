@@ -1,11 +1,26 @@
 # NRESE Benchmark and Conformance Harness
 
+
+## Reference engines
+
+Parity targets are **QLever** (performance) and **GraphDB** (semantics); Fuseki stays usable as a correctness reference ([ADR-0004](../adr/0004-parity-targets-qlever-graphdb.md)). The harness compares NRESE against exactly one *reference engine* per run, selected with `--reference-kind` (or `kind` in a connection profile). The kind decides the endpoint layout:
+
+| Kind | Base URL example | Query | Update | Graph Store |
+|---|---|---|---|---|
+| `fuseki` | `http://host:3030/ds` | `/ds/query` | `/ds/update` | `/ds/data` |
+| `graphdb` | `http://host:7200/repositories/repo` | repository URL | `…/statements` | `…/rdf-graphs/service` |
+| `qlever` | `http://host:7001` | server URL | server URL | server root (verify for your version) |
+
+A reference URL without a kind is rejected. For engine versions whose paths differ, set `query_url`, `update_url` and/or `data_url` in the connection profile; they replace the layout-derived URLs. The layout table lives in code in `benches/nrese-bench-harness/src/layout.rs`; update both together.
+
+The Fuseki-specific sections below (local stack, helper script, recorded evidence) are the worked example for one reference kind.
+
 ## Purpose
 
 This document defines a reproducible, Rust-native baseline for:
 
-- performance benchmarking against NRESE and optionally Fuseki
-- compatibility checks between NRESE and Fuseki on representative SPARQL cases
+- performance benchmarking of NRESE, optionally side by side with a reference engine
+- compatibility checks between NRESE and a reference engine on representative SPARQL cases
 
 The harness is intentionally isolated from production crates and lives under:
 
@@ -16,8 +31,8 @@ The harness is intentionally isolated from production crates and lives under:
 - HTTP-level query/update benchmarking via `/dataset/query` and `/dataset/update`
 - compatibility checks for query semantics, update effects, bounded query/update failure semantics, and graph-store semantics
 - normalized response-semantics comparison for graph-store failure paths (status, content type, body class)
-- dataset seeding against both NRESE and Fuseki dataset endpoints
-- optional Basic-Auth against Fuseki-style secured compare stacks
+- dataset seeding against both NRESE and the reference engine
+- optional Basic-Auth against secured reference stacks
 - fixture-driven workloads for repeatable runs
 - optional machine-readable JSON report artifacts (`--report-json`)
 - real-world ontology catalog sync from official ontology sources
@@ -53,13 +68,13 @@ Current manifest format:
   - `update_workload`
   - `compat_suites`
   - optional `[nrese]`
-  - optional `[fuseki]`
+  - optional `[reference]`
   - optional `[invocation_profiles.nrese.<name>]`
-  - optional `[invocation_profiles.fuseki.<name>]`
+  - optional `[invocation_profiles.reference.<name>]`
 
 All paths are resolved relative to the manifest directory unless they are absolute.
 For production-style live parity, transport policy is separated from workload intent.
-Selected connection profiles own live NRESE/Fuseki base URLs, auth headers, timeout defaults, and reusable invalid-auth invocation profiles.
+Selected connection profiles own live NRESE/reference base URLs, the reference engine kind, auth headers, timeout defaults, and reusable invalid-auth invocation profiles.
 Workload packs keep ownership of dataset, workloads, compat suites, and pack-local service defaults.
 Invocation precedence is: selected connection-profile defaults, then pack-local service defaults, then named invocation profiles, then shared case-level headers/timeouts.
 Profile-name collisions between a selected connection profile and a workload pack are rejected instead of silently overridden.
@@ -92,7 +107,7 @@ compat_suites = [
 [nrese]
 timeout_ms = 15000
 
-[fuseki]
+[reference]
 timeout_ms = 15000
 ```
 
@@ -106,8 +121,9 @@ timeout_ms = 15000
 [profiles.secured-live.nrese.headers]
 authorization = "Bearer ${NRESE_COMPARE_READ_TOKEN}"
 
-[profiles.secured-live.fuseki]
-base_url = "${FUSEKI_LIVE_BASE_URL}"
+[profiles.secured-live.reference]
+kind = "graphdb"
+base_url = "${REFERENCE_LIVE_BASE_URL}"
 timeout_ms = 15000
 
 [profiles.secured-live.invocation_profiles.nrese.invalid.headers]
@@ -119,7 +135,7 @@ Secured live-deployment template rules:
 - keep real secrets out of committed pack manifests
 - keep live URLs, auth headers, and timeout defaults in a selected connection profile instead of embedding them in packs
 - use environment placeholders in the connection-profile registry and inject the real values locally or in CI
-- prefer CLI `--fuseki-basic-auth` only when intentionally overriding the selected connection profile
+- prefer CLI `--reference-basic-auth` only when intentionally overriding the selected connection profile
 - keep timeout parity in a separate pack so operators must opt in explicitly once both stacks have comparable timeout ceilings
 
 Environment placeholders are resolved by the harness before request execution, so selected connection profiles can stay versioned while credentials and deployment-specific tokens remain external.
@@ -159,8 +175,6 @@ The secured templates intentionally reuse the existing compat suites:
   - `benches/nrese-bench-harness/fixtures/catalog/ontologies.toml`
 - Seed dataset:
   - `benches/nrese-bench-harness/fixtures/datasets/comparison_seed.ttl`
-- Optional local Fuseki stack:
-  - `ops/fuseki/docker-compose.yml`
 
 ## Prerequisites
 
@@ -181,7 +195,7 @@ If you want a neutral baseline without the project ontology, seed both systems w
 ```powershell
 cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed `
   --nrese-base-url http://127.0.0.1:8080 `
-  --fuseki-base-url http://127.0.0.1:3030/ds `
+  --reference-kind fuseki --reference-base-url http://127.0.0.1:3030/ds `
   --dataset benches/nrese-bench-harness/fixtures/datasets/comparison_seed.ttl `
   --replace true
 ```
@@ -214,7 +228,7 @@ Each catalog entry now also declares typed processing metadata:
 - `semantic_dialects`
 - `reasoning_features`
 - `service_coverage`
-  - `compat` is the canonical selector for official ontology fixtures that should participate in Fuseki parity runs
+  - `compat` is the canonical selector for official ontology fixtures that should participate in reference parity runs
 
 Sync them locally:
 
@@ -239,7 +253,7 @@ For real ontology runs, prefer:
 - `pack-matrix` filters operate on the typed ontology catalog metadata, so the same catalog now acts as both fixture inventory and execution selector for targeted evidence runs
 - `pack-matrix` can also target one exact ontology name on the same selector path when a live parity run needs to stay narrowly scoped
 - `pack-matrix` also validates each catalog-backed baseline pack before execution so pack identity, dataset path, and required compat suites stay aligned with the ontology catalog
-- `pack-matrix` uses the explicit `compat` service surface to select official ontology fixtures that are curated for Fuseki parity runs
+- `pack-matrix` uses the explicit `compat` service surface to select official ontology fixtures that are curated for reference parity runs
 - workload packs can carry `dataset_base_iri`; the live seed path forwards that value as `Content-Location`, so relative-IRI ontologies like PROV-O stay on the same Graph Store parity path as the rest of the catalog
 
 Prebuilt ontology packs now exist for:
@@ -266,19 +280,17 @@ That requirement is validated by the harness for catalog-driven pack execution.
 
 ## 0. Reproducible Dataset Parity
 
-Start Fuseki if you want a local side-by-side comparison stack:
+The local Fuseki stack (`ops/fuseki/`) was removed on 2 October 2026: Fuseki is no longer a
+parity target ([ADR-0004](../adr/0004-parity-targets-qlever-graphdb.md)). Run a reference
+engine yourself if you need one, or use the benchmark suite (`benches/suite`).
 
-```powershell
-docker compose -f ops/fuseki/docker-compose.yml up -d
-```
-
-Then seed the same dataset into NRESE and optionally Fuseki:
+Then seed the same dataset into NRESE and optionally the reference engine:
 
 ```powershell
 cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed `
   --nrese-base-url http://127.0.0.1:8080 `
-  --fuseki-base-url http://127.0.0.1:3030/ds `
-  --fuseki-basic-auth admin:nrese-admin `
+  --reference-kind fuseki --reference-base-url http://127.0.0.1:3030/ds `
+  --reference-basic-auth admin:nrese-admin `
   --dataset benches/nrese-bench-harness/fixtures/datasets/comparison_seed.ttl `
   --replace true
 ```
@@ -303,13 +315,13 @@ What it reports:
 - min/p50/p95/p99/max latency
 - total elapsed milliseconds
 
-## 2. Comparative Performance Run (NRESE vs Fuseki)
+## 2. Comparative Performance Run (NRESE vs reference engine)
 
 ```powershell
 cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- bench `
   --nrese-base-url http://127.0.0.1:8080 `
-  --fuseki-base-url http://127.0.0.1:3030/ds `
-  --fuseki-basic-auth admin:nrese-admin `
+  --reference-kind fuseki --reference-base-url http://127.0.0.1:3030/ds `
+  --reference-basic-auth admin:nrese-admin `
   --iterations 20 `
   --query-workload benches/nrese-bench-harness/fixtures/workloads/query_workload.json `
   --update-workload benches/nrese-bench-harness/fixtures/workloads/update_workload.json
@@ -317,16 +329,16 @@ cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- bench `
 
 Additional output:
 
-- p95 delta for query/update (`NRESE - Fuseki`)
+- p95 delta for query/update (`NRESE - <reference>`)
 - optional JSON report for CI ingestion (same `--report-json` flag)
 
-## 3. Compatibility Run (NRESE vs Fuseki)
+## 3. Compatibility Run (NRESE vs reference engine)
 
 ```powershell
 cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- compat `
   --nrese-base-url http://127.0.0.1:8080 `
-  --fuseki-base-url http://127.0.0.1:3030/ds `
-  --fuseki-basic-auth admin:nrese-admin `
+  --reference-kind fuseki --reference-base-url http://127.0.0.1:3030/ds `
+  --reference-basic-auth admin:nrese-admin `
   --cases benches/nrese-bench-harness/fixtures/compat/protocol_cases.json `
   --report-json artifacts/protocol-compat-report.json
 ```
@@ -387,7 +399,7 @@ Current timeout fixture starter:
 
 - `benches/nrese-bench-harness/fixtures/compat/timeout_failure_cases.json`
 
-Use it as an opt-in suite in a production workload parity pack once both NRESE and Fuseki are deployed with comparable timeout policy and the selected cases are known to cross the configured timeout budget.
+Use it as an opt-in suite in a production workload parity pack once both NRESE and the reference engine are deployed with comparable timeout policy and the selected cases are known to cross the configured timeout budget.
 
 ## 3.1 Workload Pack Preflight
 
@@ -404,9 +416,9 @@ cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-validat
 When `--report-json` is set, the harness emits a machine-readable validation report with:
 
 - selected connection-profile registry path and profile name
-- resolved NRESE/Fuseki base URLs
+- resolved NRESE/reference base URLs
 - compat suites
-- merged NRESE/Fuseki invocation-profile names
+- merged NRESE/reference invocation-profile names
 
 ## 4. Workload Pack Run
 
@@ -415,8 +427,8 @@ This is the preferred production-style execution path when you want one coherent
 ```powershell
 cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
   --nrese-base-url http://127.0.0.1:8080 `
-  --fuseki-base-url http://127.0.0.1:3030/ds `
-  --fuseki-basic-auth admin:nrese-admin `
+  --reference-kind fuseki --reference-base-url http://127.0.0.1:3030/ds `
+  --reference-basic-auth admin:nrese-admin `
   --workload-pack benches/nrese-bench-harness/fixtures/packs/generic-baseline/pack.toml `
   --iterations 20 `
   --report-dir artifacts/generic-baseline
@@ -424,15 +436,15 @@ cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
 
 Execution order:
 
-1. seed dataset into NRESE and optional Fuseki
-2. run all configured compatibility suites if Fuseki is configured
+1. seed dataset into NRESE and the optional reference engine
+2. run all configured compatibility suites if a reference engine is configured
 3. run benchmark workloads
 
 Expected evidence artifacts when `--report-dir` is set:
 
 - `pack-report.json`
 - `bench-report.json`
-- one `*-report.json` artifact per configured compat suite when Fuseki is configured
+- one `*-report.json` artifact per configured compat suite when a reference engine is configured
 
 `pack-report.json` is the canonical index for one workload-pack run. It ties together:
 
@@ -447,7 +459,7 @@ Expected evidence artifacts when `--report-dir` is set:
 If a pack includes `timeout_failure_cases.json`, the resulting suite artifact is indexed the same way as any other compat suite. Timeout parity does not get a separate report type.
 If a pack references named invocation profiles through its compat suites, the harness validates those references before seeding or benchmarking so a selected connection profile and a workload pack cannot drift silently.
 
-For graph-producing cases, the harness now canonicalizes blank nodes before triples-set comparison instead of comparing raw blank-node labels. This keeps official ontology `CONSTRUCT` parity stable across NRESE and Fuseki when both outputs are graph-isomorphic but use different blank-node identifiers.
+For graph-producing cases, the harness now canonicalizes blank nodes before triples-set comparison instead of comparing raw blank-node labels. This keeps official ontology `CONSTRUCT` parity stable across NRESE and the reference engine when both outputs are graph-isomorphic but use different blank-node identifiers.
 
 For existing secured deployments where reseeding or benchmarking is not appropriate, reuse the same pack with `--execution-mode compat-only`:
 
@@ -485,9 +497,9 @@ cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack `
 Before using either template:
 
 - create a local copy of `benches/nrese-bench-harness/fixtures/live/connection-profiles.template.toml` or use it directly in CI
-- export `NRESE_LIVE_BASE_URL`, `FUSEKI_LIVE_BASE_URL`, `NRESE_COMPARE_READ_TOKEN`, and `FUSEKI_COMPARE_READ_TOKEN` in the shell or CI environment
-- uncomment or override the `basic_auth` block only when Fuseki really uses Basic Auth, or supply `--fuseki-basic-auth` to override the selected connection profile on the CLI
-- use `--nrese-base-url` or `--fuseki-base-url` only when you intentionally want to override the selected connection profile at invocation time
+- export `NRESE_LIVE_BASE_URL`, `REFERENCE_LIVE_BASE_URL`, `NRESE_COMPARE_READ_TOKEN`, and `REFERENCE_COMPARE_READ_TOKEN` in the shell or CI environment
+- uncomment or override the `basic_auth` block only when the reference engine really uses Basic Auth, or supply `--reference-basic-auth` to override the selected connection profile on the CLI
+- use `--nrese-base-url` or `--reference-base-url` only when you intentionally want to override the selected connection profile at invocation time
 - keep `policy_failure_cases.json` in the pack so oversize-payload parity stays on the same shared comparator path
 - keep `secured_auth_failure_cases.json` in secured packs so invalid-auth parity uses the same per-side invocation-profile model as the live auth defaults
 - only use the timeout template after aligning timeout ceilings and proxy behavior on both deployments
@@ -584,43 +596,7 @@ These numbers are informative, not release gates. Replacement-grade evidence sti
 - add preflight report gating in CI before authenticated live parity runs are allowed to publish benchmark/compat evidence
 - add ontology-specific workload packs on top of the staged real-world ontology catalog
 
-## Isolated Side-by-Side Stack
+## Side-by-side stacks with Fuseki
 
-If local ports `8080` or `3030` are already in use, run an isolated compare stack:
-
-```powershell
-$env:FUSEKI_PORT = "3031"
-$env:FUSEKI_DATASET = "/ds"
-docker compose -f ops/fuseki/docker-compose.yml up -d
-```
-
-Run NRESE on a separate bind address:
-
-```powershell
-$env:NRESE_BIND_ADDR = "127.0.0.1:18080"
-$env:NRESE_STORE_MODE = "in-memory"
-$env:NRESE_REASONING_MODE = "rules-mvp"
-cargo run -p nrese-server
-```
-
-Then use:
-
-- NRESE: `http://127.0.0.1:18080`
-- Fuseki: `http://127.0.0.1:3031/ds`
-
-## Local External Fuseki Helper
-
-If you keep a local Apache Fuseki install one directory above the repo at `../Apache_Fuseki/apache-jena-fuseki-6.0.0`, you can use:
-
-- `ops/fuseki/run-local-pack-matrix.ps1`
-
-Example:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\ops\fuseki\run-local-pack-matrix.ps1 `
-  -Tier medium `
-  -ExecutionMode full `
-  -ReportDir artifacts\local-fuseki-medium
-```
-
-The helper keeps the external Fuseki process outside the git repo, starts NRESE on an isolated local port, defaults `-ServiceCoverage compat`, and writes logs plus harness reports into the chosen artifact directory.
+Removed with `ops/fuseki/` on 2 October 2026 (see above); the benchmark suite
+(`benches/suite`) compares NRESE with the engines that are targets.

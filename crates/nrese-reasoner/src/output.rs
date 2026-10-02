@@ -1,75 +1,24 @@
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ReasoningStats {
-    pub supported_asserted_triples: u64,
-    pub unsupported_asserted_triples: u64,
-    pub unsupported_blank_node_subjects: u64,
-    pub unsupported_blank_node_objects: u64,
-    pub unsupported_literal_objects: u64,
-    pub flattened_named_graph_quads: u64,
-    pub interned_terms: usize,
-    pub subclass_edge_count: usize,
-    pub subproperty_edge_count: usize,
-    pub type_assertion_count: usize,
-    pub property_assertion_count: usize,
-    pub equality_assertion_count: usize,
-    pub equality_cluster_count: usize,
-    pub inferred_equality_link_count: usize,
-    pub domain_assertion_count: usize,
-    pub range_assertion_count: usize,
-    pub taxonomy_node_count: usize,
-    pub property_taxonomy_node_count: usize,
-}
+//! Reject reports: why a commit violated a consistency rule.
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ReasoningCacheStats {
-    pub execution_cache_hit: bool,
-    pub schema_cache_hit: bool,
-    pub execution_cache_entries: usize,
-    pub schema_cache_entries: usize,
-    pub execution_cache_capacity: usize,
-    pub schema_cache_capacity: usize,
-    pub execution_cache_hits_total: u64,
-    pub execution_cache_misses_total: u64,
-    pub schema_cache_hits_total: u64,
-    pub schema_cache_misses_total: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RejectBlame {
-    pub heuristic: &'static str,
-    pub principal_contributor: String,
-    pub principal_origin: String,
-    pub contextual_contributor: String,
-    pub contextual_origin: String,
-}
-
+/// One fact that took part in a violation: a premise of the consistency rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RejectEvidence {
+    /// The fact's role in the rule (`premise`).
     pub role: &'static str,
     pub subject: String,
     pub predicate: String,
     pub object: String,
+    /// Where the fact comes from: `asserted` or `inferred`.
     pub origin: String,
 }
 
+/// A consistency violation, decoded for a reject report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RejectExplanation {
     pub summary: String,
+    /// The OWL 2 RL rule (`cax-dw`, `prp-irp`, ...).
     pub violated_constraint: String,
+    /// The resource the violation is about (the rule's first bound term).
     pub focus_resource: String,
-    pub primary_conflicting_term: String,
-    pub secondary_conflicting_term: String,
-    pub blame: RejectBlame,
     pub evidence: Vec<RejectEvidence>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct InferenceDelta {
-    pub inferred_triples: u64,
-    pub consistency_violations: u64,
-    pub derived_triples: Vec<(String, String, String)>,
-    pub diagnostics: Vec<String>,
-    pub primary_reject: Option<RejectExplanation>,
-    pub stats: ReasoningStats,
-    pub cache: ReasoningCacheStats,
 }

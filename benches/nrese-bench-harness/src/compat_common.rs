@@ -328,12 +328,7 @@ async fn send_request(
     options: RequestExecutionOptions,
 ) -> Result<RequestOutcome> {
     let timeout_ms = effective_timeout_ms(target, options);
-    let request = apply_timeout(
-        request,
-        RequestExecutionOptions {
-            timeout_ms,
-        },
-    );
+    let request = apply_timeout(request, RequestExecutionOptions { timeout_ms });
     match request.send().await {
         Ok(response) => into_http_outcome(response).await.map(RequestOutcome::Http),
         Err(error) if error.is_timeout() => Ok(RequestOutcome::Timeout { timeout_ms }),
@@ -442,7 +437,7 @@ mod tests {
             timeout_ms: None,
             request_headers: CompatHeaders::new(),
             nrese_profile: None,
-            fuseki_profile: None,
+            reference_profile: None,
             kind: CompatKind::StatusContentTypeBodyClass,
         };
         let outcome = HttpOutcome {
@@ -482,7 +477,7 @@ mod tests {
             timeout_ms: Some(25),
             request_headers: CompatHeaders::new(),
             nrese_profile: None,
-            fuseki_profile: None,
+            reference_profile: None,
             kind: CompatKind::StatusContentTypeBodyClass,
         };
 
@@ -509,12 +504,7 @@ mod tests {
         let request = client.post("http://example.invalid");
         let request = apply_case_headers(
             request,
-            &ServiceTarget::nrese(ServiceConnectionConfig {
-                base_url: "http://example.invalid".to_owned(),
-                headers: CompatHeaders::new(),
-                timeout_ms: None,
-                basic_auth: None,
-            }),
+            &ServiceTarget::nrese(ServiceConnectionConfig::new("http://example.invalid")),
             [("accept", "application/sparql-results+json")],
             &CompatHeaders::from([("accept".to_owned(), "application/n-triples".to_owned())]),
         )
@@ -536,10 +526,10 @@ mod tests {
         let client = Client::new();
         let request = client.post("http://example.invalid");
         let target = ServiceTarget::nrese(ServiceConnectionConfig {
-            base_url: "http://example.invalid".to_owned(),
             headers: CompatHeaders::from([("x-env".to_owned(), "pack".to_owned())]),
             timeout_ms: None,
             basic_auth: None,
+            ..ServiceConnectionConfig::new("http://example.invalid")
         });
 
         let request = apply_case_headers(
@@ -576,12 +566,7 @@ mod tests {
         });
 
         let client = Client::builder().build().expect("client");
-        let target = ServiceTarget::nrese(ServiceConnectionConfig {
-            base_url: format!("http://{addr}"),
-            headers: CompatHeaders::new(),
-            timeout_ms: None,
-            basic_auth: None,
-        });
+        let target = ServiceTarget::nrese(ServiceConnectionConfig::new(format!("http://{addr}")));
         let outcome = execute_query_raw(
             &client,
             &target,
@@ -621,10 +606,8 @@ mod tests {
 
         let client = Client::builder().build().expect("client");
         let target = ServiceTarget::nrese(ServiceConnectionConfig {
-            base_url: format!("http://{addr}"),
-            headers: CompatHeaders::new(),
             timeout_ms: Some(30),
-            basic_auth: None,
+            ..ServiceConnectionConfig::new(format!("http://{addr}"))
         });
         let outcome = execute_query_raw(
             &client,

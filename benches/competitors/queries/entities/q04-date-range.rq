@@ -1,0 +1,5 @@
+# Date range filter
+PREFIX e: <http://example.org/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (COUNT(*) AS ?n) WHERE { ?s e:born ?d FILTER(?d >= "1450-01-01"^^xsd:date && ?d < "1460-01-01"^^xsd:date) }

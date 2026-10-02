@@ -1,0 +1,987 @@
+//! The RDF4J REST protocol (what RDF4J's `HTTPRepository`, GraphDB's clients and tools
+//! built on them speak), over the one dataset this server holds.
+//!
+//! | Path | What |
+//! |---|---|
+//! | `GET /protocol` | the protocol version, `12` |
+//! | `GET /repositories` | the repository list |
+//! | `PUT`, `DELETE /repositories/{id}` | a repository created (title and reasoning from the configuration in the body, [`crate::repository_config`]) or removed with its data |
+//! | `GET`/`POST /repositories/{id}` | a SPARQL query (`query`, `infer`, the dataset parameters) |
+//! | `GET /repositories/{id}/statements` | the statements matching `subj`, `pred`, `obj`, `context` (`infer`), as RDF |
+//! | `POST /repositories/{id}/statements` | an RDF payload added (into `context`), or a SPARQL update (`update=`) |
+//! | `PUT /repositories/{id}/statements` | the statements of `context` (or all) replaced by the payload |
+//! | `DELETE /repositories/{id}/statements` | the statements matching `subj`, `pred`, `obj`, `context` removed |
+//! | `GET /repositories/{id}/size` | the number of statements (in `context`) |
+//! | `GET /repositories/{id}/contexts` | the named graphs |
+//! | `/repositories/{id}/namespaces[/{prefix}]` | namespace prefixes: list, read, set, remove |
+//! | `/repositories/{id}/rdf-graphs/service` | the SPARQL Graph Store protocol |
+//! | `/repositories/{id}/transactions[/{txid}]` | transactions: begin, `action=ADD`, `DELETE`, `UPDATE`, `COMMIT`, `PING`; `DELETE` rolls back |
+//!
+//! The configured store is repository `nrese`; others are created with `PUT` and removed
+//! with `DELETE /repositories/{id}` ([`crate::repositories`]). Terms in
+//! `subj`, `pred`, `obj` and `context` are written as in N-Triples (`<iri>`, `_:b`,
+//! `"text"@en`, `"1"^^<…#int>`); `context=null` is the default graph. A transaction's
+//! operations are kept on the server and applied in one commit; reads inside one
+//! (`action=QUERY`, `GET`, `SIZE`) see its changes: its operations are applied to an engine
+//! transaction that is never committed, holding the writer slot while they read. Namespaces
+//! are kept in `rdf4j-namespaces.json` in an on-disk store's directory (in memory
+//! otherwise), written whole at every change.
+
+use axum::body::Bytes;
+use axum::extract::{Path, RawQuery, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Term};
+
+use crate::access::AccessView;
+use nrese_store::{
+    MutationCommand, RdfPayload, SparqlUpdateRequest, StatementOp, StatementPattern,
+    StatementsRequest,
+};
+
+use crate::error::ApiError;
+use crate::http::graph_store;
+use crate::http::guard;
+use crate::http::media::{GRAPHS, header_value_str, media_type_matches, negotiated};
+use crate::http::mutation;
+use crate::http::rdf_payload::{parse_graph_content_format, parse_rdf_base_iri};
+use crate::http::requests::{
+    accept_header_value, query_from_post, query_from_url, update_from_post,
+};
+use crate::http::sparql;
+use crate::repositories::DEFAULT_REPOSITORY;
+use crate::state::AppState;
+
+/// The RDF4J protocol version answered at `/protocol`.
+const PROTOCOL: &str = "12";
+/// URL parameters, repeated ones in order.
+pub(crate) fn pairs(raw: &RawQuery) -> Result<Vec<(String, String)>, ApiError> {
+    serde_urlencoded::from_str(raw.0.as_deref().unwrap_or_default())
+        .map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
+fn param<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+/// A term written as in N-Triples.
+pub(crate) fn term(text: &str) -> Result<Term, ApiError> {
+    let bad = || ApiError::bad_request(format!("'{text}' is not an N-Triples term"));
+    let text = text.trim();
+    if let Some(iri) = text.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
+        return NamedNode::new(unescape(iri).ok_or_else(bad)?)
+            .map(Term::from)
+            .map_err(|_| bad());
+    }
+    if let Some(label) = text.strip_prefix("_:") {
+        return BlankNode::new(label).map(Term::from).map_err(|_| bad());
+    }
+    let rest = text.strip_prefix('"').ok_or_else(bad)?;
+    // The closing quote: the last one not escaped.
+    let mut end = None;
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '\\' if !escaped => escaped = true,
+            '"' if !escaped => end = Some(i),
+            _ => escaped = false,
+        }
+        if c != '\\' {
+            escaped = false;
+        }
+    }
+    let end = end.ok_or_else(bad)?;
+    let value = unescape(&rest[..end]).ok_or_else(bad)?;
+    let suffix = &rest[end + 1..];
+    if suffix.is_empty() {
+        return Ok(Literal::new_simple_literal(value).into());
+    }
+    if let Some(language) = suffix.strip_prefix('@') {
+        return Literal::new_language_tagged_literal(value, language)
+            .map(Term::from)
+            .map_err(|_| bad());
+    }
+    let datatype = suffix
+        .strip_prefix("^^<")
+        .and_then(|d| d.strip_suffix('>'))
+        .ok_or_else(bad)?;
+    let datatype = NamedNode::new(unescape(datatype).ok_or_else(bad)?).map_err(|_| bad())?;
+    Ok(Literal::new_typed_literal(value, datatype).into())
+}
+
+/// N-Triples string escapes undone.
+fn unescape(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            't' => out.push('\t'),
+            'b' => out.push('\u{8}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            'f' => out.push('\u{c}'),
+            '"' => out.push('"'),
+            '\'' => out.push('\''),
+            '\\' => out.push('\\'),
+            'u' => out.push(hex(&mut chars, 4)?),
+            'U' => out.push(hex(&mut chars, 8)?),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn hex(chars: &mut std::str::Chars<'_>, digits: usize) -> Option<char> {
+    let code: String = chars.take(digits).collect();
+    char::from_u32(u32::from_str_radix(&code, 16).ok()?)
+}
+
+/// The graphs of the `context` parameters (`null`: the default graph).
+pub(crate) fn contexts(pairs: &[(String, String)]) -> Result<Vec<GraphName>, ApiError> {
+    pairs
+        .iter()
+        .filter(|(key, _)| key == "context")
+        .map(|(_, value)| match value.trim() {
+            "null" => Ok(GraphName::DefaultGraph),
+            other => match term(other)? {
+                Term::NamedNode(n) => Ok(GraphName::NamedNode(n)),
+                Term::BlankNode(b) => Ok(GraphName::BlankNode(b)),
+                _ => Err(ApiError::bad_request(format!(
+                    "context '{other}' is neither an IRI, a blank node nor null"
+                ))),
+            },
+        })
+        .collect()
+}
+
+/// The statement pattern of `subj`, `pred`, `obj` and `context`.
+fn pattern(pairs: &[(String, String)]) -> Result<StatementPattern, ApiError> {
+    let optional = |name: &str| param(pairs, name).map(term).transpose();
+    let predicate = match optional("pred")? {
+        None => None,
+        Some(Term::NamedNode(n)) => Some(n),
+        Some(_) => return Err(ApiError::bad_request("pred must be an IRI")),
+    };
+    Ok(StatementPattern {
+        subject: optional("subj")?,
+        predicate,
+        object: optional("obj")?,
+        contexts: contexts(pairs)?,
+    })
+}
+
+fn infer(pairs: &[(String, String)]) -> bool {
+    param(pairs, "infer") != Some("false")
+}
+
+/// An RDF request body.
+pub(crate) fn payload(headers: &HeaderMap, body: &Bytes) -> Result<RdfPayload, ApiError> {
+    Ok(RdfPayload {
+        payload: body.to_vec(),
+        format: parse_graph_content_format(header_value_str(headers.get(header::CONTENT_TYPE)))?,
+        base_iri: parse_rdf_base_iri(headers),
+    })
+}
+
+/// `sesame:wildcard`: in a transaction's `DELETE` payload, any value at that position.
+const WILDCARD: &str = "http://www.openrdf.org/schema/sesame#wildcard";
+/// `rdf4j:nil`: in a `DELETE` payload's graph position, the default graph.
+const NIL: &str = "http://rdf4j.org/schema/rdf4j#nil";
+
+/// A transaction's `DELETE`: each statement of the payload a pattern, as RDF4J's server
+/// reads it (its client removes this way, `clear()` too): `sesame:wildcard` matches any
+/// value, a statement without a graph removes from every graph (or from the `context`
+/// parameters), one in `rdf4j:nil` from the default graph. With `preserveNodeId=true`,
+/// blank nodes refer to the store's.
+fn removals(
+    pairs: &[(String, String)],
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<Vec<StatementOp>, ApiError> {
+    let data = payload(headers, body)?;
+    let preserve = param(pairs, "preserveNodeId").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let parse = match preserve {
+        true => nrese_store::parse_payload_preserving_blank_nodes,
+        false => nrese_store::parse_payload,
+    };
+    let quads = parse(data.format, data.base_iri.as_deref(), &data.payload)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let given = contexts(pairs)?;
+    let wildcard = |term: &Term| matches!(term, Term::NamedNode(node) if node.as_str() == WILDCARD);
+    Ok(quads
+        .into_iter()
+        .map(|quad| {
+            let subject: Term = quad.subject.into();
+            let predicate = (quad.predicate.as_str() != WILDCARD).then_some(quad.predicate);
+            let contexts = match quad.graph_name {
+                GraphName::DefaultGraph => given.clone(),
+                GraphName::NamedNode(node) if node.as_str() == NIL => vec![GraphName::DefaultGraph],
+                graph => vec![graph],
+            };
+            StatementOp::RemoveMatching(StatementPattern {
+                subject: (!wildcard(&subject)).then_some(subject),
+                predicate,
+                object: (!wildcard(&quad.object)).then_some(quad.object),
+                contexts,
+            })
+        })
+        .collect())
+}
+
+/// Whether the body is a SPARQL update (a form with `update`, or `sparql-update`).
+fn is_update(headers: &HeaderMap) -> bool {
+    let content_type = header_value_str(headers.get(header::CONTENT_TYPE));
+    media_type_matches(content_type, "application/x-www-form-urlencoded")
+        || media_type_matches(content_type, "application/sparql-update")
+}
+
+pub(crate) fn update(
+    raw: &RawQuery,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<SparqlUpdateRequest, ApiError> {
+    let operation = update_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), body)?;
+    Ok(SparqlUpdateRequest {
+        update: operation.update,
+        using_graphs: operation.using_graphs,
+        using_named_graphs: operation.using_named_graphs,
+    })
+}
+
+/// A store error of a namespace change: the store's fault.
+fn store_error(error: nrese_store::StoreError) -> ApiError {
+    ApiError::internal(error.to_string())
+}
+
+/// A store error of a read: 403 for a forbidden one.
+fn read_error(error: nrese_store::StoreError) -> ApiError {
+    match error {
+        error @ nrese_store::StoreError::Forbidden(_) => ApiError::forbidden(error.to_string()),
+        error => ApiError::internal(error.to_string()),
+    }
+}
+
+pub(crate) async fn apply(
+    state: &AppState,
+    ops: Vec<StatementOp>,
+    access: &AccessView,
+) -> Result<(), ApiError> {
+    mutation::run(
+        state,
+        MutationCommand::Statements(StatementsRequest::new(ops)),
+        access.requester(),
+        state.policy().timeouts.update,
+        "statement operation exceeded policy timeout",
+    )
+    .await
+    .map(|_| ())
+}
+
+/// A table of terms as SPARQL results, JSON unless the client prefers XML.
+fn table(headers: &HeaderMap, vars: &[&str], rows: Vec<Vec<Option<Term>>>) -> Response {
+    let accept = accept_header_value(headers).unwrap_or_default();
+    let xml = accept.contains("sparql-results+xml") && !accept.contains("sparql-results+json");
+    if xml {
+        let mut out = String::from(
+            "<?xml version=\"1.0\"?>\n<sparql xmlns=\"http://www.w3.org/2005/sparql-results#\">\n<head>",
+        );
+        for var in vars {
+            out.push_str(&format!("<variable name=\"{var}\"/>"));
+        }
+        out.push_str("</head>\n<results>\n");
+        for row in rows {
+            out.push_str("<result>");
+            for (var, value) in vars.iter().zip(row) {
+                let Some(value) = value else { continue };
+                out.push_str(&format!("<binding name=\"{var}\">"));
+                out.push_str(&match value {
+                    Term::NamedNode(n) => format!("<uri>{}</uri>", xml_escape(n.as_str())),
+                    Term::BlankNode(b) => format!("<bnode>{}</bnode>", xml_escape(b.as_str())),
+                    Term::Literal(l) => match (l.language(), l.datatype().as_str()) {
+                        (Some(language), _) => format!(
+                            "<literal xml:lang=\"{}\">{}</literal>",
+                            xml_escape(language),
+                            xml_escape(l.value())
+                        ),
+                        (None, "http://www.w3.org/2001/XMLSchema#string") => {
+                            format!("<literal>{}</literal>", xml_escape(l.value()))
+                        }
+                        (None, datatype) => format!(
+                            "<literal datatype=\"{}\">{}</literal>",
+                            xml_escape(datatype),
+                            xml_escape(l.value())
+                        ),
+                    },
+                    other => format!("<literal>{}</literal>", xml_escape(&other.to_string())),
+                });
+                out.push_str("</binding>");
+            }
+            out.push_str("</result>\n");
+        }
+        out.push_str("</results>\n</sparql>\n");
+        return (
+            [(header::CONTENT_TYPE, "application/sparql-results+xml")],
+            out,
+        )
+            .into_response();
+    }
+    let bindings: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|row| {
+            let mut binding = serde_json::Map::new();
+            for (var, value) in vars.iter().zip(row) {
+                let Some(value) = value else { continue };
+                let json = match value {
+                    Term::NamedNode(n) => serde_json::json!({"type": "uri", "value": n.as_str()}),
+                    Term::BlankNode(b) => serde_json::json!({"type": "bnode", "value": b.as_str()}),
+                    Term::Literal(l) => match (l.language(), l.datatype().as_str()) {
+                        (Some(language), _) => serde_json::json!(
+                            {"type": "literal", "value": l.value(), "xml:lang": language}
+                        ),
+                        (None, "http://www.w3.org/2001/XMLSchema#string") => {
+                            serde_json::json!({"type": "literal", "value": l.value()})
+                        }
+                        (None, datatype) => serde_json::json!(
+                            {"type": "literal", "value": l.value(), "datatype": datatype}
+                        ),
+                    },
+                    other => serde_json::json!({"type": "literal", "value": other.to_string()}),
+                };
+                binding.insert((*var).to_owned(), json);
+            }
+            serde_json::Value::Object(binding)
+        })
+        .collect();
+    let document = serde_json::json!({"head": {"vars": vars}, "results": {"bindings": bindings}});
+    (
+        [(header::CONTENT_TYPE, "application/sparql-results+json")],
+        document.to_string(),
+    )
+        .into_response()
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn literal(text: impl Into<String>) -> Option<Term> {
+    Some(Literal::new_simple_literal(text.into()).into())
+}
+
+fn text(body: String) -> Response {
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
+}
+
+pub async fn protocol() -> Response {
+    text(PROTOCOL.to_owned())
+}
+
+pub async fn repositories(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_query_read(&state, &authenticated).await?;
+    let writable = state.runtime_posture().sparql_update_enabled;
+    let ids = std::iter::once((DEFAULT_REPOSITORY.to_owned(), Some("NRESE".to_owned())))
+        .chain(state.repositories().list());
+    let rows = ids
+        .map(|(id, title)| {
+            vec![
+                literal(format!("/repositories/{id}")),
+                literal(id.as_str()),
+                literal(title.unwrap_or_else(|| format!("NRESE: {id}"))),
+                Some(Literal::from(true).into()),
+                Some(Literal::from(writable).into()),
+            ]
+        })
+        .collect();
+    Ok(table(
+        &headers,
+        &["uri", "id", "title", "readable", "writable"],
+        rows,
+    ))
+}
+
+/// Creates repository `id` (`PUT /repositories/{id}`) with the settings of the
+/// configuration in the body (RDF, Turtle when no type is given).
+pub async fn repository_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_admin_write(&state, &authenticated).await?;
+    let settings = match body.iter().all(u8::is_ascii_whitespace) {
+        true => crate::repository_config::RepositorySettings::default(),
+        false => {
+            let content_type = header_value_str(headers.get(header::CONTENT_TYPE));
+            let format = match content_type {
+                None => nrese_store::GraphResultFormat::Turtle,
+                Some(_) => parse_graph_content_format(content_type)?,
+            };
+            let quads = nrese_store::parse_payload(format, None, &body).map_err(|error| {
+                ApiError::bad_request(format!("repository configuration: {error}"))
+            })?;
+            crate::repository_config::from_config(&id, &quads).map_err(ApiError::bad_request)?
+        }
+    };
+    let repositories = state.clone();
+    tokio::task::spawn_blocking(move || repositories.repositories().create(&id, settings))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes repository `id` and its data (`DELETE /repositories/{id}`).
+pub async fn repository_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_admin_write(&state, &authenticated).await?;
+    state.repositories().delete(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn query_get(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_query_read(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
+    let mut operation = query_from_url(raw.0.as_deref())?;
+    operation.restrict(&access);
+    sparql::execute_query(state, operation, accept_header_value(&headers)).await
+}
+
+pub async fn query_post(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let state = state.for_repository(&id)?;
+    // RDF4J sends updates to the statements path, but some clients post them here.
+    let content_type = header_value_str(headers.get(header::CONTENT_TYPE));
+    let form_update = media_type_matches(content_type, "application/x-www-form-urlencoded")
+        && serde_urlencoded::from_bytes::<Vec<(String, String)>>(&body)
+            .is_ok_and(|pairs| pairs.iter().any(|(key, _)| key == "update"));
+    if form_update || media_type_matches(content_type, "application/sparql-update") {
+        let access = guard::update_access(&state, &authenticated).await?;
+        let request = update(&raw, &headers, &body)?;
+        apply(&state, vec![StatementOp::Update(request)], &access).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let access = guard::query_access(&state, &authenticated).await?;
+    let mut operation =
+        query_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), &body)?;
+    operation.restrict(&access);
+    sparql::execute_query(state, operation, accept_header_value(&headers)).await
+}
+
+pub async fn statements_get(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_graph_read(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
+    statements(state, raw, headers, None, &access).await
+}
+
+/// The statements matching the request's pattern, on the committed data or as `pending`
+/// would leave it.
+async fn statements(
+    state: AppState,
+    raw: RawQuery,
+    headers: HeaderMap,
+    pending: Option<StatementsRequest>,
+    access: &AccessView,
+) -> Result<Response, ApiError> {
+    state.ensure_serving()?;
+    let pairs = pairs(&raw)?;
+    let pattern = pattern(&pairs)?;
+    let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
+    let store = state.store();
+    let (scope, infer) = (access.read_scope(), infer(&pairs));
+    // Streamed as read: a whole repository in constant memory.
+    let deadline = tokio::time::Instant::now() + state.policy().timeouts.graph_read;
+    let cancellation = nrese_store::CancellationToken::new();
+    let token = cancellation.clone();
+    super::result_stream::stream_blocking(
+        deadline,
+        cancellation,
+        format.media_type(),
+        "reading the statements exceeded the policy timeout",
+        move |out| {
+            let read = nrese_store::ReadContext::new(scope)
+                .infer(infer)
+                .on(pending.as_ref())
+                .cancelled_by(token);
+            store
+                .write_statements(&read, &pattern, format, out)
+                .map(|_| ())
+                .map_err(read_error)
+        },
+    )
+    .await
+}
+
+pub async fn statements_post(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
+    let op = if is_update(&headers) {
+        StatementOp::Update(update(&raw, &headers, &body)?)
+    } else {
+        state.policy().enforce_rdf_upload_bytes(body.len())?;
+        StatementOp::Add {
+            data: payload(&headers, &body)?,
+            contexts: contexts(&pairs(&raw)?)?,
+        }
+    };
+    apply(&state, vec![op], &access).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn statements_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
+    state.policy().enforce_rdf_upload_bytes(body.len())?;
+    let contexts = contexts(&pairs(&raw)?)?;
+    let ops = vec![
+        StatementOp::RemoveMatching(StatementPattern {
+            contexts: contexts.clone(),
+            ..StatementPattern::default()
+        }),
+        StatementOp::Add {
+            data: payload(&headers, &body)?,
+            contexts,
+        },
+    ];
+    apply(&state, ops, &access).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn statements_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+) -> Result<StatusCode, ApiError> {
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
+    let pattern = pattern(&pairs(&raw)?)?;
+    apply(&state, vec![StatementOp::RemoveMatching(pattern)], &access).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn size(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+) -> Result<Response, ApiError> {
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_query_read(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
+    count(state, raw, None, &access).await
+}
+
+/// The number of statements (in the request's contexts), on the committed data or as
+/// `pending` would leave it.
+async fn count(
+    state: AppState,
+    raw: RawQuery,
+    pending: Option<StatementsRequest>,
+    access: &AccessView,
+) -> Result<Response, ApiError> {
+    state.ensure_serving()?;
+    let pairs = pairs(&raw)?;
+    let pattern = StatementPattern {
+        contexts: contexts(&pairs)?,
+        ..StatementPattern::default()
+    };
+    let store = state.store();
+    let (scope, infer) = (access.read_scope(), infer(&pairs));
+    let count = tokio::task::spawn_blocking(move || {
+        let read = nrese_store::ReadContext::new(scope)
+            .infer(infer)
+            .on(pending.as_ref());
+        store.count(&read, &pattern)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(read_error)?;
+    Ok(text(count.to_string()))
+}
+
+pub async fn contexts_get(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_query_read(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
+    state.ensure_serving()?;
+    let rows = state
+        .store()
+        .contexts(&access.read_scope())
+        .into_iter()
+        .map(|graph| vec![Some(graph)])
+        .collect();
+    Ok(table(&headers, &["contextID"], rows))
+}
+
+pub async fn namespaces_get(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_query_read(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let rows = state
+        .store()
+        .namespaces()
+        .all()
+        .iter()
+        .map(|(prefix, iri)| vec![literal(prefix.as_str()), literal(iri.as_str())])
+        .collect();
+    Ok(table(&headers, &["prefix", "namespace"], rows))
+}
+
+pub async fn namespaces_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_update_write(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    state.store().namespaces().clear().map_err(store_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn namespace_get(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((id, prefix)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    guard::enforce_query_read(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    match state.store().namespaces().get(&prefix) {
+        Some(iri) => Ok(text(iri)),
+        None => Err(ApiError::not_found(format!("no namespace '{prefix}'"))),
+    }
+}
+
+pub async fn namespace_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((id, prefix)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_update_write(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let iri = std::str::from_utf8(&body)
+        .map_err(|_| ApiError::bad_request("the namespace must be UTF-8"))?
+        .trim()
+        .to_owned();
+    if iri.is_empty() {
+        return Err(ApiError::bad_request("the namespace is empty"));
+    }
+    state
+        .store()
+        .namespaces()
+        .set(&prefix, &iri)
+        .map_err(store_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn namespace_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((id, prefix)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    guard::enforce_update_write(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    state
+        .store()
+        .namespaces()
+        .remove(&prefix)
+        .map_err(store_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn graph_store_get(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let state = state.for_repository(&id)?;
+    graph_store::get_graph(state, authenticated, raw, headers).await
+}
+
+pub async fn graph_store_put(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let state = state.for_repository(&id)?;
+    graph_store::put_graph(state, authenticated, raw, headers, body).await
+}
+
+pub async fn graph_store_post(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let state = state.for_repository(&id)?;
+    graph_store::post_graph(state, authenticated, raw, headers, body).await
+}
+
+pub async fn graph_store_delete(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    raw: RawQuery,
+) -> Result<StatusCode, ApiError> {
+    let state = state.for_repository(&id)?;
+    graph_store::delete_graph(state, authenticated, raw).await
+}
+
+/// `path` as an absolute URL of this server as the request reached it (the `Host` header,
+/// or a proxy's `X-Forwarded-Host` and `X-Forwarded-Proto`): RDF4J's client follows a new
+/// transaction's `Location` as given and fails on a relative one ("Target host is not
+/// specified"). Without a host, the path alone.
+fn absolute(headers: &HeaderMap, path: &str) -> String {
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let Some(host) = value("x-forwarded-host").or_else(|| value("host")) else {
+        return path.to_owned();
+    };
+    let scheme = value("x-forwarded-proto").unwrap_or("http");
+    format!("{scheme}://{host}{path}")
+}
+
+pub async fn transaction_begin(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
+    let txid = state
+        .store()
+        .sessions()
+        .begin(access.origin.as_deref())
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let location = absolute(&headers, &format!("/repositories/{id}/transactions/{txid}"));
+    let mut response = StatusCode::CREATED.into_response();
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(&location).map_err(|error| ApiError::internal(error.to_string()))?,
+    );
+    Ok(response)
+}
+
+pub async fn transaction_action(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((id, txid)): Path<(String, String)>,
+    raw: RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
+    let pairs = pairs(&raw)?;
+    let action = param(&pairs, "action")
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let store = state.store();
+    let sessions = store.sessions();
+    let owner = access.origin.as_deref();
+    if !sessions.ping(&txid, owner) {
+        return Err(ApiError::not_found(format!("no transaction '{txid}'")));
+    }
+    let ops = match action.as_str() {
+        "ADD" => Some(vec![StatementOp::Add {
+            data: payload(&headers, &body)?,
+            contexts: contexts(&pairs)?,
+        }]),
+        "DELETE" => Some(removals(&pairs, &headers, &body)?),
+        "UPDATE" => Some(vec![StatementOp::Update(update(&raw, &headers, &body)?)]),
+        _ => None,
+    };
+    if let Some(ops) = ops {
+        state.policy().enforce_rdf_upload_bytes(body.len())?;
+        return match sessions.add(&txid, owner, ops) {
+            true => Ok(StatusCode::OK.into_response()),
+            false => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
+        };
+    }
+    match action.as_str() {
+        "COMMIT" => {
+            let pending = sessions
+                .take(&txid, owner)
+                .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
+            apply(&state, pending.ops, &access).await?;
+            Ok(StatusCode::OK.into_response())
+        }
+        "PING" => Ok(text(sessions.idle().as_millis().to_string())),
+        // Reads see the transaction's changes (module docs).
+        "QUERY" | "GET" | "SIZE" => {
+            let pending = sessions
+                .pending(&txid, owner)
+                .map(|ops| StatementsRequest {
+                    session: Some(txid.clone()),
+                    ..StatementsRequest::new(ops)
+                })
+                .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
+            match action.as_str() {
+                "QUERY" => {
+                    let mut operation = if body.is_empty() {
+                        query_from_url(raw.0.as_deref())?
+                    } else {
+                        query_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), &body)?
+                    };
+                    operation.restrict(&access);
+                    let accept = accept_header_value(&headers);
+                    sparql::execute_query_in(state, operation, accept, Some(pending)).await
+                }
+                "GET" => statements(state, raw, headers, Some(pending), &access).await,
+                _ => count(state, raw, Some(pending), &access).await,
+            }
+        }
+        other => Err(ApiError::bad_request(format!(
+            "unknown transaction action '{other}'"
+        ))),
+    }
+}
+
+pub async fn transaction_rollback(
+    authenticated: crate::auth::Authenticated,
+    State(state): State<AppState>,
+    Path((id, txid)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &authenticated).await?;
+    let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
+    match state
+        .store()
+        .sessions()
+        .rollback(&txid, access.origin.as_deref())
+    {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terms_as_in_n_triples() {
+        assert_eq!(
+            term("<http://example.com/a>").unwrap(),
+            Term::from(NamedNode::new("http://example.com/a").unwrap())
+        );
+        assert_eq!(
+            term("\"say \\\"hi\\\"\"@en").unwrap(),
+            Term::from(Literal::new_language_tagged_literal("say \"hi\"", "en").unwrap())
+        );
+        assert_eq!(
+            term("\"1\"^^<http://www.w3.org/2001/XMLSchema#int>").unwrap(),
+            Term::from(Literal::new_typed_literal(
+                "1",
+                NamedNode::new("http://www.w3.org/2001/XMLSchema#int").unwrap()
+            ))
+        );
+        assert_eq!(
+            term("\"caf\\u00E9\"").unwrap(),
+            Term::from(Literal::new_simple_literal("café"))
+        );
+        assert!(matches!(term("_:b1").unwrap(), Term::BlankNode(_)));
+        assert!(term("plain").is_err());
+        assert!(term("\"open").is_err());
+    }
+
+    #[test]
+    fn contexts_with_null() {
+        let pairs = vec![
+            ("context".to_owned(), "null".to_owned()),
+            ("context".to_owned(), "<http://example.com/g>".to_owned()),
+        ];
+        let graphs = contexts(&pairs).unwrap();
+        assert_eq!(graphs.len(), 2);
+        assert_eq!(graphs[0], GraphName::DefaultGraph);
+    }
+}

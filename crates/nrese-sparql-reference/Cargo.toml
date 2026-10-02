@@ -1,0 +1,17 @@
+[package]
+name = "nrese-sparql-reference"
+description = "A SPARQL 1.1 evaluator written straight from the specification's algebra, as the reference of NRESE's differential tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+nrese-engine = { path = "../nrese-engine" }
+nrese-sparql = { path = "../nrese-sparql" }
+nrese-rdf = { path = "../rdf/nrese-rdf" }
+nrese-sparql-syntax = { path = "../rdf/nrese-sparql-syntax" }
+
+[lints]
+workspace = true

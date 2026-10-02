@@ -29,7 +29,7 @@ export function useRuntimeData() {
     enabled: Boolean(capabilitiesQuery.data?.reasoning_diagnostics_endpoint),
     queryFn: () =>
       getReasoningDiagnostics(
-        capabilitiesQuery.data?.reasoning_diagnostics_endpoint,
+        capabilitiesQuery.data?.reasoning_diagnostics_endpoint ?? undefined,
       ),
     staleTime: 30000,
   });

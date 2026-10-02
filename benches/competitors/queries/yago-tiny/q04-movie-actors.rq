@@ -1,0 +1,6 @@
+# Two-hop join: actors of movies and their birth places
+PREFIX schema: <http://schema.org/>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?movie ?actor ?place WHERE { ?movie a schema:Movie ; schema:actor ?actor . ?actor schema:birthPlace ?place }

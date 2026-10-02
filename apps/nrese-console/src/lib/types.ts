@@ -47,54 +47,22 @@ export type AiStatus = {
   model?: string | null;
 };
 
-export type ReasoningFeatureMode = {
-  feature: string;
-  mode: string;
-};
-
 export type ReasoningCapability = {
   feature: string;
   maturity: string;
   enabled_by_default: boolean;
 };
 
-export type ConfiguredReasoningPolicy = {
-  preset: string;
-  semantic_tier: string;
-  available_presets: string[];
-  feature_modes: ReasoningFeatureMode[];
-  unsupported_constructs: string;
-};
-
-export type ReasoningCache = {
-  execution_cache_hit: boolean;
-  schema_cache_hit: boolean;
-  execution_cache_entries: number;
-  schema_cache_entries: number;
-  execution_cache_capacity: number;
-  schema_cache_capacity: number;
-  execution_cache_hits_total: number;
-  execution_cache_misses_total: number;
-  schema_cache_hits_total: number;
-  schema_cache_misses_total: number;
-};
-
-export type ReasoningStats = {
-  supported_asserted_triples: number;
-  unsupported_asserted_triples: number;
-  unsupported_blank_node_subjects: number;
-  unsupported_blank_node_objects: number;
-  unsupported_literal_objects: number;
-  flattened_named_graph_quads: number;
-};
-
 export type LastReasoningRun = {
   revision: number;
   status: string;
+  ruleset: string;
   inferred_triples: number;
+  inferred_inserted: number;
+  inferred_deleted: number;
   consistency_violations: number;
-  stats: ReasoningStats;
-  cache: ReasoningCache;
+  rounds: number;
+  elapsed_micros: number;
 };
 
 export type ReasoningDiagnostics = {
@@ -103,7 +71,6 @@ export type ReasoningDiagnostics = {
   profile: string;
   read_model: string;
   capabilities: ReasoningCapability[];
-  configured_policy?: ConfiguredReasoningPolicy | null;
   last_run?: LastReasoningRun | null;
 };
 
@@ -117,6 +84,16 @@ export type QuerySuggestionResponse = {
   provider: string;
   model: string;
   suggestions: QuerySuggestion[];
+};
+
+export type ResourceSuggestion = {
+  iri: string;
+  label?: string | null;
+  score: number;
+};
+
+export type AutocompleteResponse = {
+  suggestions: ResourceSuggestion[];
 };
 
 export type OutputState = {

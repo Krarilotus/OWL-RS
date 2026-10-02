@@ -8,6 +8,7 @@ export const NRESE_ENDPOINTS = {
   update: "/dataset/update",
   tell: "/dataset/tell",
   graphStore: "/dataset/data",
+  autocomplete: "/dataset/autocomplete",
 } as const;
 
 export type GraphMode = "default" | "named";

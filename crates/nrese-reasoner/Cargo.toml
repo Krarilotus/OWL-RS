@@ -2,12 +2,27 @@
 name = "nrese-reasoner"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 license.workspace = true
 
 [dependencies]
 nrese-core = { path = "../nrese-core" }
-tracing.workspace = true
+nrese-exec = { path = "../nrese-exec" }
+# User rules in Notation3 (v2::n3).
+nrese-rdf = { path = "../rdf/nrese-rdf", default-features = false }
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+hashbrown = { workspace = true }
+rayon = { workspace = true }
+thiserror.workspace = true
+
+[features]
+# The naive reference evaluator (v2::naive), the oracle the executors are tested against.
+oracle = []
 
 [dev-dependencies]
-nrese-store = { path = "../nrese-store" }
-tempfile = "3.23.0"
+# Its own tests and examples use the oracle.
+nrese-reasoner = { path = ".", features = ["oracle"] }
+
+[lints]
+workspace = true

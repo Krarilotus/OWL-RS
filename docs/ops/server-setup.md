@@ -63,11 +63,18 @@ Current behavior:
 - `server.deployment_posture` / `NRESE_DEPLOYMENT_POSTURE` is now the explicit deployment-mode selector for `open-workbench`, `read-only-demo`, `internal-authenticated`, and `replacement-grade`.
 - Startup validation now rejects invalid `internal-authenticated` / `replacement-grade` combinations instead of silently serving them.
 
-Durable storage build note:
+Durable storage note:
 
-- `on-disk` mode requires building with `--features durable-storage`.
-- On Windows, the current RocksDB dependency chain may require a working `libclang`/LLVM installation for `bindgen`.
-- If the durable feature is not compiled in, `NRESE_STORE_MODE=on-disk` will fail fast with a typed startup error instead of silently downgrading.
+- `NRESE_STORE_MODE=on-disk` stores a write-ahead log and checkpoints under `NRESE_DATA_DIR`.
+  - It needs no build feature and no native toolchain.
+  - Every commit is synced before it is acknowledged.
+- The data directory is locked. A second server on the same directory fails at startup with a clear error.
+- Checkpoints run in the background and delete the WAL segments they cover.
+- Backups:
+  - **Image backups** (physical): `POST /ops/api/admin/dataset/image` (admins; `?repository=ID` for another repository than the default, into `backups/<ID>-<seconds>/`) writes an image of the current snapshot, the store's checkpoint format with the inferred statements, into `backups/<seconds since 1970>/` of the data directory, with `manifest.json` (revision, counts, size, SHA-256), while writes go on. Offline: `nrese-server backup DIR`. To restore, stop the server and run `nrese-server restore DIR` with the configuration of the target: it checks the image against its manifest and places it in the data directory, which must hold no store; the server then opens at the backup's revision. The image needs an NRESE that reads its checkpoint format.
+  - **N-Quads export**: `GET /ops/api/admin/dataset/backup` and `POST /ops/api/admin/dataset/restore`: asserted statements only, portable to other stores, inferences derived again after a restore.
+  - **Point-in-time restore**: with `store.wal_archive` on, checkpoints move the WAL segments they cover into `wal-archive/` instead of deleting them. `nrese-server restore DIR --wal DATA/wal-archive --wal DATA/wal --until-revision N` restores the image and replays the log up to revision `N` (every commit is one revision: `/readyz` and the logs give them), or with `--until-time 2026-10-02T14:05:00Z` (RFC 3339) the commits made up to that time (logged since WAL version 6), cutting it there; without `--until-revision` as far as the log goes. The target data directory must hold no store. `nrese-server prune-archive R` removes the archived segments whose records all come before revision `R` (after an image backup at `R - 1` or later they are not needed; safe while the server runs).
+  - Or copy the directory while the server is stopped.
 
 External exposure note:
 
@@ -76,33 +83,45 @@ External exposure note:
 - In `mtls` mode, NRESE trusts authenticated client-certificate identity only through the documented trusted reverse-proxy header contract. It does not terminate client TLS certificates directly in-process in the current implementation.
 
 ### 5.2 Reliability and Storage Variables
-- `NRESE_SNAPSHOT_RETENTION` number of retained local snapshots.
-- `NRESE_BACKUP_DIR` path for scheduled backups.
-- `NRESE_BACKUP_INTERVAL` cron-like interval or duration.
-- `NRESE_BACKUP_COMPRESSION` `none|zstd|gzip`.
-- `NRESE_RECOVERY_MODE` `normal|replay|read-only`.
 
-### 5.3 Ontology Preload and Path Discovery
+There are no scheduled-backup or recovery-mode settings yet. Earlier versions of this document listed `NRESE_SNAPSHOT_RETENTION`, `NRESE_BACKUP_*` and `NRESE_RECOVERY_MODE`; none of them were ever implemented. Backups are taken through the admin API (see [backup-restore-drills.md](backup-restore-drills.md)). Checkpoint and WAL settings arrive with roadmap WP E4 and will be documented in [config-reference.md](config-reference.md), the only place config knobs are listed.
 
-`nrese-server` should resolve the ontology preload file in this order:
+### 5.3 Ontology Preload
 
-1. `NRESE_ONTOLOGY_PATH` (explicit override, highest priority)
-2. `../Ontology-Development/files/processed/rg_ontology.ttl` resolved from the `OWL-RS` working directory
-3. `../MEPHISTO/Ontology-Development/files/processed/rg_ontology.ttl` resolved from the `OWL-RS` working directory
-4. `../Ontology-Development/files/raw/rg_ontology.ttl` resolved from the `OWL-RS` working directory
-5. `../MEPHISTO/Ontology-Development/files/raw/rg_ontology.ttl` resolved from the `OWL-RS` working directory
+- Set `NRESE_ONTOLOGY_PATH` (or `store.ontology_path`) to preload an ontology at startup.
+- If it is set and the file is missing, startup fails with a clear error.
+- If it is unset, nothing is preloaded. There are no implicit discovery or fallback paths, so the server behaves the same regardless of the working directory.
 
-Current known local canonical processed path:
+### 5.4 Bulk Loading
 
-- `C:\Users\Johannes\Documents\MEPHISTO\Ontology-Development\files\processed\rg_ontology.ttl`
+Initial loads and full restores of large files use the offline bulk loader instead of HTTP:
 
-Startup behavior requirements:
+```powershell
+$env:NRESE_STORE_MODE = "on-disk"; $env:NRESE_DATA_DIR = ".\data"
+nrese-server load [--config .\config.toml] [--replace] [--graph <IRI>] [--skip-errors] data.nt more.nq ...
+```
 
-- If an explicit `NRESE_ONTOLOGY_PATH` is provided and missing, startup fails fast with a clear error.
-- If discovery is enabled and no fallback path exists, startup continues only if ontology preload is optional in the selected profile.
-- Readiness should remain `not ready` until required ontology preload has completed.
+- **Behaviour:**
+  - The format comes from each file's extension.
+  - `--replace` swaps the dataset instead of adding to it.
+  - `--graph` sets the target graph for triple formats; quad formats keep their own graphs.
+  - Blank nodes are fresh per load.
+  - A syntax error stops the load and changes nothing. With `--skip-errors` the bad statement is skipped instead (a line of N-Triples or N-Quads, a Turtle or TriG statement up to its `.` or the `}` of its graph block), the first 20 are logged, and the load reports how many it skipped. RDF/XML and JSON-LD still stop at the first error; a read error always stops.
+- **Offline only.** The server must not be running on the same data directory; the directory lock enforces this. Validation gates don't run during a bulk load.
+- **Speed.** N-Triples and N-Quads are parsed on all cores and are the fastest input: about 2.7 M triples/s on the reference machine, with 100 M triples in 37 s (`benches/baselines/README.md`). Convert other formats to N-Triples for the largest loads (`nrese-server convert`, below).
 
-## 5.4 Local Test-Server Startup Example (PowerShell)
+### 5.4.1 One-off Queries and Conversions
+
+```powershell
+nrese-server query [--config .\config.toml] [--format json|xml|csv|tsv|nt|ttl|nq|trig|rdf|jsonld] "SELECT ..."
+nrese-server query [--config .\config.toml] --file query.rq
+nrese-server convert data.ttl data.nt
+```
+
+- `query` answers one query from the configured store as it is (no reasoning first; the inferred stack is what the last load or start materialised) and writes the results to standard output: SELECT and ASK in the results format (default JSON), CONSTRUCT and DESCRIBE in the RDF format (default N-Triples). Offline, like `load`.
+- `convert` reads one RDF file and writes it in another format, both taken from the extensions, statement by statement and without a store, so the file can be larger than memory. Blank node labels are kept; a named graph is an error for a format without graphs. The output appears only when complete.
+
+## 5.5 Local Test-Server Startup Example (PowerShell)
 
 ```powershell
 $env:NRESE_BIND_ADDR = "127.0.0.1:8080"

@@ -37,26 +37,19 @@ export type AppStrings = {
   reasoningPresetHint: string;
   reasoningPresetActiveLabel: string;
   reasoningPresetTierLabel: string;
-  reasoningPresetAvailableLabel: string;
   reasoningPolicyUnavailable: string;
-  reasoningUnsupportedLabel: string;
   reasoningLastRunLabel: string;
-  reasoningFeatureModesLabel: string;
+  reasoningRunTitle: string;
+  reasoningRunRulesetLabel: string;
+  reasoningRunInferredLabel: string;
+  reasoningRunChangesLabel: string;
+  reasoningRunViolationsLabel: string;
+  reasoningRunRoundsLabel: string;
+  reasoningRunTimeLabel: string;
   reasoningCapabilitiesLabel: string;
   reasoningCapabilityDefaultLabel: string;
   reasoningCapabilityMaturityLabel: string;
   reasoningConfigSnippetLabel: string;
-  reasoningCacheExecutionLabel: string;
-  reasoningCacheSchemaLabel: string;
-  reasoningCacheExecutionTotalsLabel: string;
-  reasoningCacheSchemaTotalsLabel: string;
-  reasoningCoverageTitle: string;
-  reasoningCoverageSupportedLabel: string;
-  reasoningCoverageUnsupportedLabel: string;
-  reasoningCoverageBlankSubjectLabel: string;
-  reasoningCoverageBlankObjectLabel: string;
-  reasoningCoverageLiteralObjectLabel: string;
-  reasoningCoverageFlattenedQuadsLabel: string;
   graphDefault: string;
   graphNamed: string;
   runQuery: string;
@@ -76,6 +69,12 @@ export type AppStrings = {
   queryAcceptLabel: string;
   namedGraphLabel: string;
   noOutput: string;
+  searchTitle: string;
+  searchHint: string;
+  searchPlaceholder: string;
+  searchNoResults: string;
+  searchUnavailable: string;
+  describeResource: string;
   exampleLabels: Record<
     "overview-query" | "class-count-query" | "insert-update" | "tell-ingest" | "named-graph",
     {

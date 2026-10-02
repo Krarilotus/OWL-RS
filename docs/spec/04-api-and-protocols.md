@@ -1,8 +1,10 @@
 # API and Protocol Specification
 
+> **Scope:** describes the **v1** HTTP surface. Planned additions (RDF4J protocol, multi-repository, federation) are in roadmap Milestone 2.
+
 ## Scope
 
-Define a standards-aligned, enterprise-ready HTTP API layer suitable for a full Rust-native Fuseki-class replacement.
+Define a standards-aligned, enterprise-ready HTTP API layer suitable for a QLever/GraphDB-class RDF database (ADR-0004).
 
 ## Tell / Ask / Services Boundary
 

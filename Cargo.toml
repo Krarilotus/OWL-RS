@@ -1,20 +1,72 @@
 [workspace]
 members = [
     "crates/nrese-core",
+    "crates/nrese-engine",
+    "crates/nrese-exec",
+    "crates/nrese-sparql",
+    "crates/nrese-sparql-reference",
+    "crates/nrese-shacl",
     "crates/nrese-store",
     "crates/nrese-reasoner",
     "crates/nrese-server",
+    "crates/rdf/nrese-json",
+    "crates/rdf/nrese-rdf",
+    "crates/rdf/nrese-rdf-io",
+    "crates/rdf/nrese-sparql-results",
+    "crates/rdf/nrese-sparql-syntax",
+    "crates/rdf/nrese-xsd",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 edition = "2024"
-license = "Apache-2.0"
+# The toolchain every build and test uses (rust-toolchain.toml).
+rust-version = "1.98"
+# The crates are built from this repository, not published to crates.io.
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Krarilotus/OWL-RS"
 version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# `--cfg system_alloc` switches the perf lab to the system allocator (benches/perf-lab.sh).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_alloc)"] }
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1.89"
+foldhash = "0.2"
+hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
+libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
+memchr = "2.8"
+mimalloc = { version = "0.1", default-features = false }
+parking_lot = "0.12"
+quick-xml = "0.42"
+rand = "0.9"
+rayon = "1.10"
+regex = "1.12"
+serde = "1.0.228"
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.41"
+utoipa = "6.0.0"
+
+# Pf7a, measured with the perf lab (benches/baselines/perf-lab/2026-09-27-*): fat LTO with one
+# codegen unit cut the query sets' sum of p50 by 8-19% on top of mimalloc. Unwinding stays on:
+# the server isolates panics per request.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+# `cargo build --profile profiling`: release code with symbols, for perf/samply.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

@@ -1,10 +1,8 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, anyhow};
-use oxigraph::io::{RdfFormat, RdfParser, RdfSerializer};
-use oxigraph::model::GraphNameRef;
-use oxigraph::store::Store;
-use oxrdf::graph::{CanonicalizationAlgorithm, Graph};
+use nrese_rdf::{Graph, GraphName};
+use nrese_rdf_io::{RdfFormat, RdfParser};
 use serde_json::Value;
 
 use crate::model::LatencySummary;
@@ -30,31 +28,17 @@ pub fn canonicalize_rdf_graph_set(
 ) -> Result<BTreeSet<String>> {
     let format = infer_rdf_format_from_content_type(content_type)
         .ok_or_else(|| anyhow!("unsupported RDF graph content type for canonicalization"))?;
-    let store = Store::new().context("failed to allocate temporary RDF canonicalization store")?;
-    let parser = RdfParser::from_format(format).without_named_graphs();
-    store
-        .load_from_slice(parser, payload)
-        .context("failed to parse RDF graph payload")?;
-
     let mut graph = Graph::new();
-    for quad in store.quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph)) {
-        graph.insert(quad?.as_ref());
+    for quad in RdfParser::from_format(format).for_slice(payload) {
+        let quad = quad.context("failed to parse RDF graph payload")?;
+        if quad.graph_name != GraphName::DefaultGraph {
+            return Err(anyhow!("a named graph in a single-graph RDF payload"));
+        }
+        graph.insert(&nrese_rdf::Triple::from(quad));
     }
-    graph.canonicalize(CanonicalizationAlgorithm::Unstable);
-
-    let mut writer = RdfSerializer::from_format(RdfFormat::NTriples).for_writer(Vec::new());
-    for triple in &graph {
-        writer
-            .serialize_triple(triple)
-            .context("failed to serialize canonical graph triple")?;
-    }
-
-    let canonical = writer
-        .finish()
-        .context("failed to finish canonical graph serializer")?;
-    let text = std::str::from_utf8(&canonical).context("graph payload is not valid utf-8")?;
-
-    Ok(text
+    graph.canonicalize();
+    let canonical: String = graph.iter().map(|triple| format!("{triple} .\n")).collect();
+    Ok(canonical
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -81,16 +65,8 @@ pub fn compare_canonical_sets(
         matched: left == right,
         left_count: left.len(),
         right_count: right.len(),
-        left_only_sample: left
-            .difference(right)
-            .take(SAMPLE_LIMIT)
-            .cloned()
-            .collect(),
-        right_only_sample: right
-            .difference(left)
-            .take(SAMPLE_LIMIT)
-            .cloned()
-            .collect(),
+        left_only_sample: left.difference(right).take(SAMPLE_LIMIT).cloned().collect(),
+        right_only_sample: right.difference(left).take(SAMPLE_LIMIT).cloned().collect(),
     }
 }
 
@@ -149,13 +125,12 @@ fn canonicalize_binding_value(name: &str, value: &Value) -> Result<String> {
         .get("value")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("binding value missing lexical form"))?;
-    let datatype = object
-        .get("datatype")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let datatype = object.get("datatype").and_then(Value::as_str).unwrap_or("");
     let language = object.get("xml:lang").and_then(Value::as_str).unwrap_or("");
 
-    Ok(format!("{name}={term_type}|{datatype}|{language}|{lexical}"))
+    Ok(format!(
+        "{name}={term_type}|{datatype}|{language}|{lexical}"
+    ))
 }
 
 pub fn normalize_content_type(content_type: Option<&str>) -> Option<String> {
@@ -264,9 +239,10 @@ mod tests {
 
         let canonical = canonicalize_rdf_graph_set(Some("application/rdf+xml"), payload)
             .expect("canonical graph");
-        assert!(canonical.contains(
-            "<http://example.com/a> <http://example.com/p> <http://example.com/b> ."
-        ));
+        assert!(
+            canonical
+                .contains("<http://example.com/a> <http://example.com/p> <http://example.com/b> .")
+        );
     }
 
     #[test]
@@ -280,10 +256,10 @@ _:b0 <http://example.com/p> <http://example.com/c> .
 _:other <http://example.com/p> <http://example.com/c> .
 "#;
 
-        let left_set = canonicalize_rdf_graph_set(Some("application/n-triples"), left)
-            .expect("left graph");
-        let right_set = canonicalize_rdf_graph_set(Some("application/n-triples"), right)
-            .expect("right graph");
+        let left_set =
+            canonicalize_rdf_graph_set(Some("application/n-triples"), left).expect("left graph");
+        let right_set =
+            canonicalize_rdf_graph_set(Some("application/n-triples"), right).expect("right graph");
 
         assert_eq!(left_set, right_set);
     }
@@ -321,8 +297,16 @@ _:other <http://example.com/p> <http://example.com/c> .
 
         let canonical = canonicalize_bindings_set(&value).expect("bindings set");
         assert_eq!(canonical.len(), 2);
-        assert!(canonical.iter().any(|row| row.contains("http://example.com/a")));
-        assert!(canonical.iter().any(|row| row.contains("http://example.com/b")));
+        assert!(
+            canonical
+                .iter()
+                .any(|row| row.contains("http://example.com/a"))
+        );
+        assert!(
+            canonical
+                .iter()
+                .any(|row| row.contains("http://example.com/b"))
+        );
     }
 
     #[test]

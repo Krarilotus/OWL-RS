@@ -1,0 +1,7 @@
+# Data that breaks the contract: no petitioner, an ill-formed date, no provenance.
+@prefix ex: <https://example.org/model/petitions#> .
+@prefix d: <https://example.org/data/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+d:petition-3 a ex:Petition ;
+  ex:submittedOn "sometime in spring"^^xsd:date .

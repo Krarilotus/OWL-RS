@@ -1,0 +1,167 @@
+# The systems of the benchmark suite and what each can do. A workload runs on a system
+# only if the system has every capability the workload needs (workloads.toml);
+# `suite.py` prints the resulting matrix.
+#
+# capabilities (one vocabulary for systems and workloads):
+#   load, query, update          bulk load; SPARQL 1.1 query; SPARQL 1.1 update
+#   reason-rdfs                  RDFS entailment (subClassOf, subPropertyOf, domain, range)
+#   reason-owl-horst             RDFS plus the pD* OWL rules (inverse, transitive, symmetric,
+#                                sameAs, functional, hasValue, someValuesFrom/allValuesFrom)
+#   reason-owl2-rl               the OWL 2 RL/RDF rules
+#   reason-owl2-ql               OWL 2 QL (by rewriting or materialisation)
+#   reason-custom-rules          user-defined rules (datalog or the vendor's rule language)
+#   reason-incremental           inferences maintained on insert and delete without
+#                                rematerialising
+#   consistency                  inconsistencies detected
+#   explain                      a proof for an inferred statement or a violation
+#   classify                     TBox classification (OWL 2 EL or DL)
+#   shacl-core, shacl-sparql     SHACL validation
+#   fulltext, geosparql, federation
+#
+# `publish`: free = results may be published; permission = only with the vendor's written
+# consent (benches/competitors/README.md). `runs`: how the suite can start it
+# (suitekit/adapters.py): docker, apptainer (the same image as a SIF file), native (a
+# host process).
+#
+# The capabilities of the other systems are from their documentation. An adapter confirms
+# them when it first runs, and a capability that turns out not to work is removed here
+# with a note.
+
+[nrese]
+name = "NRESE"
+publish = "free"
+runs = ["docker", "apptainer", "native"]
+capabilities = [
+  "load", "query", "update",
+  "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
+  "reason-custom-rules", "reason-incremental", "consistency", "explain",
+  "shacl-core", "shacl-sparql", "fulltext", "federation", "geosparql", "classify",
+]
+# What the suite needs and NRESE lacks; each names its step in the parity plan. None
+# since SHACL-SPARQL (C3, 2026-10-02). (reason-custom-rules: user rules in Notation3 since
+# 2026-10-01; builtins and .pie import are B2's rest.)
+missing = {}
+
+# The same server with FSST-compressed vocabularies (`store.vocabulary = "fsst"`): next to
+# `nrese` (plain, the default) it shows the trade-off of a smaller store and less memory
+# against decoding the terms a query reads (office PC: stores 12–16 % smaller, memory 16–25 %
+# lower, query totals even, a scan of the dictionary 14 % slower).
+[nrese-fsst]
+name = "NRESE (FSST vocabulary)"
+publish = "free"
+runs = ["docker", "apptainer", "native"]
+capabilities = [
+  "load", "query", "update",
+  "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
+  "reason-custom-rules", "reason-incremental", "consistency", "explain",
+  "shacl-core", "shacl-sparql", "fulltext", "federation", "geosparql", "classify",
+]
+missing = {}
+
+# The same server on the Oxigraph libraries: the branch baseline/pre-oxigraph-migration,
+# checked out beside the repository (NRESE_OXIGRAPH_SRC elsewhere). Next to `nrese` it
+# shows what the migration to the own RDF libraries changed.
+[nrese-oxigraph]
+name = "NRESE on Oxigraph (baseline/pre-oxigraph-migration)"
+publish = "free"
+runs = ["docker", "apptainer", "native"]
+capabilities = [
+  "load", "query", "update",
+  "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
+  "reason-incremental", "consistency", "explain",
+  "shacl-core", "fulltext", "federation", "geosparql", "classify",
+]
+
+[qlever]
+name = "QLever"
+publish = "free"
+runs = ["docker", "apptainer"]
+capabilities = ["load", "query", "update", "fulltext", "geosparql", "federation"]
+
+[oxigraph]
+name = "Oxigraph"
+publish = "free"
+runs = ["docker", "apptainer"]
+capabilities = ["load", "query", "update", "federation"]
+
+[virtuoso]
+name = "Virtuoso Open Source 7"
+publish = "free"
+runs = ["docker", "apptainer"]
+capabilities = ["load", "query", "update", "fulltext", "geosparql", "federation"]
+
+[jena]
+name = "Apache Jena (TDB2, Fuseki, rule reasoners)"
+publish = "free"
+runs = ["docker", "apptainer"]
+# The rule reasoners work on an in-memory model; TDB2 itself doesn't reason.
+capabilities = [
+  "load", "query", "update",
+  "reason-rdfs", "reason-owl-horst", "reason-custom-rules",
+  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+]
+
+[rdf4j]
+name = "Eclipse RDF4J (native store)"
+publish = "free"
+runs = ["docker"]
+capabilities = ["load", "query", "update", "reason-rdfs", "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation"]
+
+[nemo]
+name = "Nemo (datalog)"
+publish = "free"
+runs = ["docker", "apptainer"]
+# No SPARQL: the kit answers queries over its materialisation with another engine.
+capabilities = ["load", "reason-owl2-rl", "reason-custom-rules"]
+
+[owlrl]
+name = "owlrl (reference OWL 2 RL closure; correctness only)"
+publish = "free"
+runs = ["docker", "apptainer"]
+capabilities = ["load", "reason-rdfs", "reason-owl2-rl"]
+
+[dl-reasoners]
+name = "ELK, HermiT, Konclude (ELK and HermiT via ROBOT, obolibrary/robot)"
+publish = "free"
+runs = []
+capabilities = ["classify", "consistency", "explain"]
+
+[graphdb]
+name = "GraphDB"
+publish = "permission"
+runs = ["docker", "apptainer"]
+capabilities = [
+  "load", "query", "update",
+  "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql", "reason-custom-rules",
+  "reason-incremental", "consistency", "explain",
+  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+]
+
+[rdfox]
+name = "RDFox"
+publish = "permission"
+runs = ["docker", "apptainer"]
+capabilities = [
+  "load", "query", "update",
+  "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-custom-rules",
+  "reason-incremental", "consistency", "explain",
+  "shacl-core", "fulltext", "federation", "geosparql", "classify",
+]
+
+[stardog]
+name = "Stardog"
+publish = "permission"
+runs = []
+# Reasons at query time (rewriting), so "incremental" doesn't apply.
+capabilities = [
+  "load", "query", "update",
+  "reason-rdfs", "reason-owl2-rl", "reason-owl2-ql", "reason-custom-rules",
+  "consistency", "explain",
+  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+]
+
+[anzograph]
+name = "AnzoGraph DB (Altair Graph Lakehouse)"
+publish = "permission"
+runs = ["docker"]
+capabilities = ["load", "query", "update", "reason-rdfs", "reason-owl-horst", "federation"]

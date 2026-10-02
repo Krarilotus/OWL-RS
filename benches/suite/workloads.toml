@@ -1,0 +1,268 @@
+# The workloads of the benchmark suite: what each measures, what a system needs to run
+# it, where it comes from, and whether the repository can run it today.
+#
+# kind:    performance (times and sizes are the result) or conformance (pass counts)
+# tasks:   RT1 to RT7 of docs/design/reasoning-benchmark.md, or the basics
+# needs:   capabilities from systems.toml; `any` lists alternatives (one is enough)
+# state:   ready (a kit in this repository runs it), partial, planned (to add),
+#          blocked (waits for an NRESE capability: `waits-for`)
+# The suite's driver (suite.py run) runs the workloads suitekit/workloads.py defines;
+# the others it lists as not run.
+# check:   how a result is verified before its time counts
+
+# --- reasoning ---------------------------------------------------------------------------
+
+[lubm]
+title = "LUBM: universities, 14 queries"
+kind = "performance"
+tasks = ["RT1", "RT3", "RT2", "RT5"]
+needs = ["load"]
+any = ["reason-owl2-rl", "reason-owl-horst"]
+scales = "1, 10, 100, 1000 universities (0.1 to 130 M statements)"
+source = "UBA generator (rvesse/lubm-uba), univ-bench ontology"
+licence = "GPL-2.0 (generator); data is generated"
+state = "ready"
+kit = "benches/reasoning"
+check = "inferred set against owlrl or Nemo; the published answers for LUBM(1)"
+note = "The standard materialisation benchmark; GraphDB and RDFox publish numbers on it"
+
+[lubm-materialised]
+title = "LUBM with the closure precomputed: the 14 queries on every SPARQL engine"
+kind = "performance"
+tasks = ["RT5"]
+needs = ["load", "query"]
+scales = "1, 10, 100 universities (closure of 0.1 to 13.9 M statements)"
+source = "the lubm workload's data, closed under OWL 2 RL by NRESE (benches/reasoning/prepare-lubm-materialised.sh)"
+licence = "GPL-2.0 (generator); data is generated"
+state = "ready"
+kit = "benches/reasoning"
+check = "row counts across systems; the published answers for LUBM(1)"
+note = "Query engines without a reasoner compete on their own turf: no inference cost, same closed data"
+
+[owl2bench]
+title = "OWL2Bench: one TBox per OWL 2 profile, 22 queries"
+kind = "performance"
+tasks = ["RT1", "RT3"]
+needs = ["load"]
+any = ["reason-owl2-rl", "reason-owl2-ql", "reason-owl-horst", "classify"]
+scales = "1 to N universities per profile (RL, QL, EL, DL)"
+source = "kracr/owl2bench (ISWC 2020); extends UOBM, which it replaces here"
+licence = "queries CC-BY-4.0"
+state = "ready"
+kit = "benches/reasoning"
+check = "inferred set against owlrl or Nemo; answer counts across systems"
+
+[ldbc-spb]
+title = "LDBC Semantic Publishing Benchmark 2.0 (BBC): queries under inference with continuous updates"
+kind = "performance"
+tasks = ["RT3", "RT5"]
+needs = ["load", "query", "update", "reason-rdfs"]
+scales = "50 M, 256 M, 1 B statements"
+source = "github.com/ldbc/ldbc_spb_bm_2.0"
+licence = "to check before use"
+state = "planned"
+check = "the benchmark's own validation of query results and of its OWL 2 RL rules"
+note = "The industry's audited reasoning benchmark (GraphDB publishes audited results). Its advanced query mix also needs fulltext and geosparql"
+
+[integration-rg-gs-gnd]
+title = "RG x GS x GND integration: identity reasoning over real links, 10 competency questions"
+kind = "performance"
+tasks = ["RT1", "RT3"]
+needs = ["load", "query"]
+any = ["reason-owl2-rl", "reason-owl-horst"]
+scales = "example (21 k), cohort, full"
+source = "github.com/HisQu/rgonline-gs-data-integration (read from a checkout, not copied)"
+licence = "none stated: the authors' agreement is needed to publish"
+state = "partial"
+kit = "benches/integration"
+check = "answer counts across systems within one entailment regime"
+note = "NRESE and Fuseki run; cohort and full tiers and the other systems are open"
+
+[real-ontologies]
+title = "DBpedia and YAGO with their ontologies: materialisation over real hierarchies"
+kind = "performance"
+tasks = ["RT1", "RT3"]
+needs = ["load"]
+any = ["reason-rdfs", "reason-owl2-rl", "reason-owl-horst"]
+scales = "DBpedia core 67 M, YAGO 4.5 tiny 23 M"
+source = "the basics kit's datasets plus the DBpedia ontology and the YAGO taxonomy"
+licence = "CC-BY-SA (DBpedia), CC-BY (YAGO)"
+state = "planned"
+check = "inferred set against Nemo"
+
+[consistency]
+title = "Injected contradictions: detection and explanation"
+kind = "performance"
+tasks = ["RT4", "RT7"]
+needs = ["load", "consistency"]
+scales = "LUBM and OWL2Bench data with generated contradictions of each kind"
+source = "a generator of our own, to write"
+licence = "ours"
+state = "planned"
+check = "every injected contradiction found, none on clean data"
+
+[w3c-owl2-rl]
+title = "W3C OWL 2 test cases, RL profile: entailment and consistency"
+kind = "conformance"
+tasks = ["RT1", "RT4"]
+needs = ["load"]
+any = ["reason-owl2-rl"]
+source = "w3.org/2009/11/owl-test (the test case collection; scripts/fetch-w3c-tests.sh)"
+licence = "W3C"
+state = "ready"
+kit = "crates/nrese-store/tests/w3c_owl2_rl"
+check = "the test suite's expected entailments"
+note = "Runs on NRESE in CI: 70 of 89 pass, 16 ask for conclusions outside the RL/RDF rules (expected-failures.txt), 3 skipped"
+
+[ore-2015]
+title = "ORE 2015: classification of 1,920 real ontologies"
+kind = "performance"
+tasks = ["RT6"]
+needs = ["classify"]
+source = "OWL Reasoner Evaluation 2015 corpus (Zenodo)"
+licence = "per ontology"
+state = "planned"
+note = "NRESE classifies the EL part (GET /dataset/classification, example `classify`); the DL ontologies of the corpus are HermiT's and Konclude's"
+check = "class hierarchy against HermiT or ELK"
+
+# --- queries and updates without reasoning (the basics) ------------------------------------
+
+[basics-mix]
+title = "Load, store size, restart and a query mix on real datasets"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query"]
+scales = "olympics 1.8 M, YAGO tiny 23 M, DBpedia core 67 M, Wikidata lexemes 229 M, synthetic entities"
+source = "benches/competitors/prepare-datasets.sh and queries/"
+licence = "per dataset (CC); queries ours"
+state = "ready"
+kit = "benches/competitors"
+check = "row counts across systems"
+
+[sparqloscope]
+title = "Sparqloscope: 105 generated queries covering the SPARQL 1.1 features one by one"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query"]
+scales = "DBLP (about 500 M statements), Wikidata truthy (about 8 B)"
+source = "github.com/ad-freiburg/sparqloscope (ISWC 2025)"
+licence = "to check before use"
+state = "planned"
+check = "result sizes across systems"
+note = "The current cross-engine query benchmark; its authors publish QLever, Virtuoso, MillenniumDB, GraphDB, Blazegraph and Jena on it"
+
+[bsbm]
+title = "Berlin SPARQL Benchmark: e-commerce explore, business intelligence, explore and update"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query", "update"]
+scales = "1 M to 1 B statements"
+source = "wbsg.informatik.uni-mannheim.de/bizer/berlinsparqlbenchmark (generator and driver)"
+licence = "Apache-2.0"
+state = "planned"
+check = "the driver's qualification mode"
+note = "The classic mixed query and update workload; most vendors publish numbers on it"
+
+[watdiv]
+title = "WatDiv: diverse query shapes (linear, star, snowflake, complex) as a stress test"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query"]
+scales = "10 M to 1 B statements"
+source = "dsg.uwaterloo.ca/watdiv"
+licence = "to check before use"
+state = "planned"
+check = "row counts across systems"
+
+[write-scaling]
+title = "Single-statement and batch writes at 1 M, 10 M, 100 M; writes under read load"
+kind = "performance"
+tasks = ["basics", "RT5"]
+needs = ["load", "update"]
+source = "benches/nrese-bench-harness (write-scaling, query-mix --update-endpoint)"
+licence = "ours"
+state = "ready"
+kit = "benches/nrese-bench-harness"
+check = "the written statements are read back"
+
+[w3c-sparql11]
+title = "W3C SPARQL 1.1 test suite: query, update, syntax, result formats"
+kind = "conformance"
+tasks = ["basics"]
+needs = ["query", "update"]
+source = "w3c/rdf-tests"
+licence = "W3C"
+state = "ready"
+kit = "crates/nrese-sparql/tests/w3c_sparql11"
+check = "the suite's expected results"
+note = "Runs on NRESE in CI; for the other systems their published results are cited"
+
+# --- validation, search, space --------------------------------------------------------------
+
+[w3c-shacl]
+title = "W3C SHACL test suite"
+kind = "conformance"
+tasks = ["validation"]
+needs = ["shacl-core"]
+source = "w3c/data-shapes"
+licence = "W3C"
+state = "ready"
+kit = "crates/nrese-shacl/tests"
+check = "the suite's expected reports"
+
+[era-shacl]
+title = "ERA-SHACL-Benchmark: validation time and memory on a real railway knowledge graph"
+kind = "performance"
+tasks = ["validation"]
+needs = ["load", "shacl-core"]
+scales = "three sizes up to 55 M statements, three shape sets"
+source = "github.com/oeg-upm/ERA-SHACL-Benchmark (2025)"
+licence = "to check before use"
+state = "planned"
+check = "the validation reports across engines"
+note = "Parts of its shapes use SHACL-SPARQL"
+
+[fulltext-search]
+title = "Keyword search: ResearchSpace's search queries; LUBMft"
+kind = "performance"
+tasks = ["search"]
+needs = ["load", "query", "fulltext"]
+source = "ResearchSpace's templates; l3s.de/~minack/rdf-fulltext-benchmark"
+licence = "to check before use"
+state = "planned"
+check = "result sets across systems"
+
+[geosparql]
+title = "GeoSPARQL compliance benchmark (206 queries); Geographica 2 for performance"
+kind = "conformance"
+tasks = ["space"]
+needs = ["load", "query", "geosparql"]
+source = "github.com/OpenLinkSoftware/GeoSPARQLBenchmark (scripts/fetch-w3c-tests.sh); geographica.di.uoa.gr"
+licence = "GPL-2.0 (fetched, never copied into this repository); Geographica: to check before use"
+state = "partial"
+kit = "crates/nrese-sparql/tests/geosparql_compliance"
+check = "the benchmark's expected answers"
+note = "The compliance part runs on NRESE in CI: 175 of 212; the 37 others are reference answers that contradict GeoSPARQL's definitions or each other (expected-failures.txt). Geographica 2 (performance) is to add"
+
+[federation]
+title = "FedBench / W3C federation tests"
+kind = "performance"
+tasks = ["federation"]
+needs = ["query", "federation"]
+source = "fedbench.fluidops.net; w3c/rdf-tests"
+licence = "to check before use"
+state = "planned"
+check = "answers against the single-store run"
+
+# --- the consumers ---------------------------------------------------------------------------
+
+[clients]
+title = "ResearchSpace on the store; the Datamodel Workflow's export protocol"
+kind = "conformance"
+tasks = ["integration"]
+needs = ["query", "update"]
+source = "scripts/smoke-researchspace.sh, scripts/smoke-dmw-export.sh"
+licence = "ours"
+state = "ready"
+kit = "scripts"
+check = "the scripts' assertions"

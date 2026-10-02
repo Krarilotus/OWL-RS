@@ -9,9 +9,11 @@ mod io;
 mod layout;
 mod model;
 mod normalize;
-mod payloads;
 mod pack_validation;
+mod payloads;
+mod querymix;
 mod runner;
+mod scaling;
 
 use std::env;
 
@@ -38,5 +40,8 @@ async fn main() -> Result<()> {
         Command::ValidatePack(config) => runner::run_validate_pack(config).await,
         Command::PackMatrix(config) => runner::run_pack_matrix(config).await,
         Command::Seed(config) => runner::run_seed(config).await,
+        Command::WriteScaling(config) => scaling::run_write_scaling(config).await,
+        Command::Generate(config) => scaling::run_generate(&config),
+        Command::QueryMix(config) => querymix::run_query_mix(&config).await.map(drop),
     }
 }
