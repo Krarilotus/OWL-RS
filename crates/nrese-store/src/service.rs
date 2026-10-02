@@ -62,6 +62,7 @@ impl fmt::Debug for StoreService {
 impl StoreService {
     pub fn new(config: StoreConfig) -> StoreResult<Self> {
         config.validate()?;
+        nrese_engine::set_index_encoding(config.index_encoding);
         let engine = match config.mode {
             StoreMode::InMemory => Engine::new(EngineConfig::default())?,
             StoreMode::OnDisk => {

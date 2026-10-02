@@ -39,6 +39,7 @@ use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
 use crate::term::TermId;
 
 pub use compaction::CompactionPolicy;
+pub use keys::{IndexEncoding, set_index_encoding};
 
 /// Which quads a stack of runs may hold, and therefore which permutations it maintains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -165,6 +165,11 @@ api_key = "replace-me"
 - default: `false`
 - on disk, keep the WAL segments that checkpoints cover in `wal-archive/` of the data directory instead of deleting them. With an image backup they restore the store to any later revision (`nrese-server restore DIR --wal ARCHIVE --wal DATA/wal --until-revision N`). The archive grows until pruned (`nrese-server prune-archive R`, with `R` the oldest image backup's revision plus one). Sync it to another machine for recovery from a lost disk
 
+- file key: `store.index_encoding`
+- env override: `NRESE_INDEX_ENCODING`
+- default: `fast`
+- how index blocks are encoded when they are built (loads, compactions, checkpoints): `fast` (frame of reference only, the fastest scans) or `compact` (a block position with few, far-apart values is stored as a palette of them; on the office PC DBpedia core's store is 3.3 % smaller with queries 7 % slower, Wikidata lexemes' 8.6 % smaller with queries even). Both are read either way, so switching needs no reload: blocks built later take the new encoding. Applies to every repository of the server. Checkpoints with palettes are format 10, which older binaries don't read
+
 - file key: `store.ontology_path`
 - env override: `NRESE_ONTOLOGY_PATH`
 - optional; when set, the file is loaded at startup and a missing file is a startup error

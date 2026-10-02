@@ -322,9 +322,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|bytes| bytes.parse().ok())
         .unwrap_or(0);
+    // The index encoding as the server takes it (`NRESE_INDEX_ENCODING`: fast, compact).
+    let index_encoding = std::env::var("NRESE_INDEX_ENCODING")
+        .ok()
+        .and_then(|name| nrese_engine::IndexEncoding::from_name(&name))
+        .unwrap_or_default();
     let config = StoreConfig {
         query_cache_bytes: 0,
         bulk_load_memory_bytes,
+        index_encoding,
         ..config
     };
     let started = Instant::now();

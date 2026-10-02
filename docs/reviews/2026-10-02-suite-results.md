@@ -154,6 +154,21 @@ the `lubm-materialised` workload, below.
   | Wikidata lexemes | 9.16 → 6.37 | 2.92 → 2.49 | 3.39 → 2.69 | 3.52 → 2.89 | 19.0 | 14.4 (−24 %) |
   | DBpedia core | 10.07 → 8.62 | 4.36 → 3.89 | 5.56 → 4.36 | 4.73 → 4.17 | 24.7 | 21.0 (−15 %) |
 
+  Palettes alone (no deltas: keys stay readable in O(1)) take 22.9 (−7.5 %) and 15.9 (−16 %).
+  Built into the store as `store.index_encoding = "compact"` (checkpoint format 10) and
+  measured end to end on the office PC (perf lab, 5 runs after a restart):
+
+  | Store | Size fast → compact | Queries (sum of medians) |
+  |---|---:|---:|
+  | DBpedia core | 3,803 → 3,676 MiB (−3.3 %) | 110.9 → 118.8 ms (+7 %) |
+  | Wikidata lexemes | 1,941 → 1,773 MiB (−8.6 %) | 44.7 → 43.4 ms (even) |
+  | BSBM 10 M (BI) | 813 → 786 MiB (−3.3 %) | even |
+
+  The dictionary is about half of each store, so the index's share of the saving shows
+  less in the total; a palette costs scans a dependent load per value. A trade-off, so a
+  setting with `fast` as the default; deltas (which lose O(1) access) and a compressed
+  vocabulary remain.
+
   Block headers and first keys add 0.81 bytes per key in every permutation; the first keys
   can be derived from the blocks (−0.25), and blocks of 256 keys would halve the rest. The
   objects in SPOG (identifiers in insertion order, random within a subject) are what

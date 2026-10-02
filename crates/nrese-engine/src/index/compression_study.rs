@@ -55,6 +55,8 @@ struct Totals {
     /// Bits of the packed data now, and with the cheapest choice per position.
     now: u64,
     alternative: u64,
+    /// The cheaper of frame of reference and palette only (keys stay O(1) to read).
+    random_access: u64,
     /// How often each choice won: frame of reference, palette, deltas.
     wins: [u64; 3],
 }
@@ -74,6 +76,7 @@ fn study(keys: &PackedKeys, totals: &mut Totals) {
                 continue;
             }
             let mut choices = [now, palette(&values), u64::MAX];
+            totals.random_access += now.min(choices[1]);
             if first_varying {
                 choices[2] = deltas(&values).unwrap_or(u64::MAX);
                 first_varying = false;
@@ -110,10 +113,11 @@ fn compression_study() {
                 let fixed = blocks * (72 + 32);
                 let per_key = |data_bits: u64| (data_bits / 8 + fixed) as f64 / totals.keys as f64;
                 eprintln!(
-                    "{name} {permutation:?}: {} keys, now {:.2} B/key, best of three {:.2} B/key (data {:.2} -> {:.2}); wins FOR {} palette {} deltas {}",
+                    "{name} {permutation:?}: {} keys, now {:.2} B/key, best of three {:.2} B/key, without deltas {:.2} B/key (data {:.2} -> {:.2}); wins FOR {} palette {} deltas {}",
                     totals.keys,
                     per_key(totals.now),
                     per_key(totals.alternative),
+                    per_key(totals.random_access),
                     totals.now as f64 / 8.0 / totals.keys as f64,
                     totals.alternative as f64 / 8.0 / totals.keys as f64,
                     totals.wins[0],
