@@ -70,13 +70,37 @@ A third engine stack beside the asserted and inferred ones:
 - **No filter needed** for readers who may read every graph, and in the compatibility mode (`GraphAccess::inferred` as today).
 - **The cap:** per fact at most `reasoner.support_sets` minimal sets are kept (default 4, the smallest first). Beyond the cap, a fact may stay hidden from a reader one of whose derivations it could see. That is the safe direction, and it is documented and counted.
 
+## Measured (3 October): counts aren't needed for maintenance
+
+Step 1 built counting (`v2::supports`, `delta::update_counted`), exact against fresh counts
+over 40 random seeds. It also showed a cheaper way to the same effect.
+- **The one-step check:** without stored counts, a candidate is kept when a non-recursive rule still derives it in *one step* from what is left. The premises lie in lower components; if one goes later in the commit, its loss brings the candidate back, as with counting.
+- **In parallel:** that check and the B/F proofs of the rest run in parallel, with a prover per worker.
+
+Measured on LUBM(100) (13.4 M asserted, 8.7 M inferred statements; the rematerialisation takes 2.3 s), deletes per commit:
+
+| Deleted | Before (B/F alone) | One-step check, parallel | Stored counts |
+|---|---|---|---|
+| 1 | 0.61 ms | 0.48 ms | 0.46 ms |
+| 1,000 | (LUBM(10): 111 ms) | 6.7 ms | 8.8 ms |
+| 10,000 | (LUBM(10): 134 ms) | 55 ms | 74 ms |
+| 100,000 | | 129 ms | 174 ms |
+
+Stored counts are slower at scale: hash-map updates on every insert and delete, and an initial count (4.5 s on LUBM(100)), against a check that is nearly as fast without them.
+
+**So:**
+- Maintenance runs on the one-step check.
+- The counting code stays, as an option and as the basis of the `count` level.
+- The support stack (step 2) is needed only for the support graph sets of level `acl`.
+- The steps below are re-ordered accordingly.
+
 ## Steps
 
-1. **Recursion analysis and counts, in memory first.**
+1. **Recursion analysis and counts, in memory first.** Done, together with the one-step check (above), which is what maintenance uses.
    - Keys, components, and non-recursive counts during materialisation and in the delta executor's overdeletion.
    - Checked by the property tests (incremental = rematerialisation over random changes) and measured on the delete probes against the previous build.
    - Engine changes only once the counts prove their worth.
-2. **The support stack** in the engine, with persistence; the counts move there.
-3. **Support graph sets and the read filter** (level `acl`).
+2. **The support stack** in the engine, with persistence, holding support graph sets (level `acl`). Counts there only if a workload shows they pay.
+3. **The read filter** for inferred statements under graph access (level `acl`).
 4. **`auto` maintenance** and the rematerialisation threshold.
 5. **Explanations** that prefer derivations whose premises the reader may read.
