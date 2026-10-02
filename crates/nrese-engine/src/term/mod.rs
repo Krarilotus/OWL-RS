@@ -13,6 +13,8 @@ pub(crate) mod hash;
 mod inline;
 pub(crate) mod order;
 mod strings;
+#[cfg(test)]
+mod vocabulary_study;
 pub mod text;
 
 pub use dictionary::{Dictionary, DictionaryStats, TermView};

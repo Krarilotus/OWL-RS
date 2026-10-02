@@ -79,7 +79,7 @@ pub(crate) struct Base {
 
 impl Base {
     /// Entry `index`'s key; empty where a damaged file's offsets point nowhere.
-    fn key(&self, index: u64) -> &[u8] {
+    pub(crate) fn key(&self, index: u64) -> &[u8] {
         let i = index as usize;
         let start = if i == 0 { 0 } else { self.ends[i - 1] as usize };
         self.arena
