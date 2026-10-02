@@ -6,7 +6,7 @@ NRESE is a Rust RDF database under active redesign. The goal is a store that **r
 - **Plan:** [docs/ROADMAP.md](docs/ROADMAP.md)
 - **Status against QLever/GraphDB:** [docs/spec/06-target-capability-matrix.md](docs/spec/06-target-capability-matrix.md)
 - **Decisions:** [docs/adr/](docs/adr/)
-- **Document index (German):** [Spezifikation.md](Spezifikation.md)
+- **Document index:** [docs/README.md](docs/README.md)
 
 ## Current state (engine v2 storage, reasoner v2)
 
@@ -391,7 +391,7 @@ Seed and compare against a reference endpoint:
 
 ## Documentation
 
-The HTTP interface is described in [docs/ops/http-api.md](docs/ops/http-api.md). The document index lives in one place: [Spezifikation.md](Spezifikation.md). Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
+The HTTP interface is described in [docs/ops/http-api.md](docs/ops/http-api.md). The document index lives in one place: [docs/README.md](docs/README.md). Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Licence
 
