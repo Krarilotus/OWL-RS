@@ -89,7 +89,7 @@ pub(super) fn joins(pattern: &GraphPattern) -> bool {
     }
 }
 
-fn in_scope(pattern: &GraphPattern) -> Vec<Variable> {
+pub(super) fn in_scope(pattern: &GraphPattern) -> Vec<Variable> {
     let mut variables = Vec::new();
     bound_variables(pattern, &mut variables);
     variables
@@ -103,7 +103,7 @@ fn add(to: &mut Vec<Variable>, variables: impl IntoIterator<Item = Variable>) {
     }
 }
 
-fn shares(a: &[Variable], b: &[Variable]) -> bool {
+pub(super) fn shares(a: &[Variable], b: &[Variable]) -> bool {
     a.iter().any(|v| b.contains(v))
 }
 

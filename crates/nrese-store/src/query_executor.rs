@@ -242,6 +242,7 @@ pub(crate) fn run_query(
             .equality_closed
             .load(std::sync::atomic::Ordering::Acquire),
         pre_bound: None,
+        cross_chunk_rows: None,
     };
     let alive = || match cancellation.is_cancelled() {
         true => Err(StoreError::SparqlEvaluation(
@@ -314,6 +315,7 @@ pub(crate) fn explain_prepared(
             .equality_closed
             .load(std::sync::atomic::Ordering::Acquire),
         pre_bound: None,
+        cross_chunk_rows: None,
     };
     Ok(explain_query(view, &prepared.query, &options)?)
 }
