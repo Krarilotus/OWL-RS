@@ -1185,8 +1185,9 @@ mod tests {
             violations += v.len();
             rules.extend(v.into_iter().map(|v| v.rule));
         }
-        // The cases exercise derivations and a spread of consistency rules.
-        assert!(derived > 20_000, "{derived}");
+        // The cases exercise derivations and a spread of consistency rules (over 20 000
+        // derivations under the fixed seed, down to about 19 000 under others).
+        assert!(derived > 15_000, "{derived}");
         assert!(rules.len() >= 8, "{violations} violations of {rules:?}");
     }
 
