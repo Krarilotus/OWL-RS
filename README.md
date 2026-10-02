@@ -29,12 +29,12 @@ Measured over HTTP at 10 M triples (details in [benches/baselines/](benches/base
 Durable storage needs no native toolchain. The revision is persistent, and recovery after a crash restores the last acknowledged commit.
 
 Known limits, addressed by later milestones:
-- **Memory:** indexes are bit-packed but held in memory (LUBM(100), 13.4 M asserted and 8.7 M inferred facts: 2.5 GB peak); memory-mapped runs for data larger than RAM are Pf2 step 2.
+- **Memory:** checkpoints are memory-mapped and used in place, so memory grows with what queries touch; data written since the last checkpoint is held in memory.
 - **Default graph:** a query without `GRAPH` reads only the default graph unless `store.default_graph = "union"` is set ([config-reference](docs/ops/config-reference.md)); the speed of that mode hasn't been measured yet.
 - **Reasoning:** the `rdfs` mode is a 6-rule subset; OWL 2 RL omits `eq-ref` and the datatype rules; named graphs aren't reasoning boundaries. See [reasoning-semantics.md](docs/spec/reasoning-semantics.md).
-- **SHACL:** Core validation on request (`/dataset/shacl`, W3C Core suite 98 of 98); validation on commit is a later slice ([docs/design/shacl.md](docs/design/shacl.md)).
-- **ResearchSpace and the Datamodel Workflow** run against it through the standard protocols ([docs/integration/](docs/integration/)); ResearchSpace's keyword search waits for full-text search.
-- **Not yet available:** full-text and geospatial search, the RDF4J protocol, clustering. Order and status: [docs/plan/2026-09-30-graphdb-parity-plan.md](docs/plan/2026-09-30-graphdb-parity-plan.md).
+- **SHACL:** Core and SHACL-SPARQL validation on request (`/dataset/shacl`, W3C suites 98 of 98 and 22 of 22) and as a commit gate (`shacl.gate`).
+- **ResearchSpace and the Datamodel Workflow** run against it through the standard protocols ([docs/integration/](docs/integration/)), full-text search included.
+- **Not yet available:** OWL 2 DL reasoning, vector similarity search, scale-out to clusters, the consolidated frontend. Status of every capability: [docs/spec/06-target-capability-matrix.md](docs/spec/06-target-capability-matrix.md).
 - **Behaviour changes from v1:** literal lexical forms are kept exactly as written, and a named graph exists only while it holds quads. See ADR-0002.
 
 Already fixed on the way (Milestone 0):

@@ -380,6 +380,17 @@ class NreseOxigraph(Nrese):
         return self.source(ctx) / "target"
 
 
+class NreseFsst(Nrese):
+    """NRESE with FSST-compressed vocabularies (`store.vocabulary = "fsst"`): the same build,
+    its checkpoints keeping the dictionary's keys compressed. Next to `nrese` (plain, the
+    default) it shows the trade-off: a smaller store and less memory against decoding."""
+
+    key = "nrese-fsst"
+
+    def spec(self, ctx, name, store, command, env):
+        return super().spec(ctx, name, store, command, {"NRESE_VOCABULARY": "fsst", **env})
+
+
 # --- the other SPARQL stores ------------------------------------------------------------------
 
 class Qlever(Adapter):
@@ -868,7 +879,7 @@ class Owlrl(ClosureAdapter):
                     reason_ms=float(seconds[-1]) * 1000 if seconds else None)
 
 
-ADAPTERS = {a.key: a for a in (Nrese, NreseOxigraph, Qlever, Oxigraph, Jena, Virtuoso, Rdf4j, Graphdb, Rdfox, Anzograph,
+ADAPTERS = {a.key: a for a in (Nrese, NreseOxigraph, NreseFsst, Qlever, Oxigraph, Jena, Virtuoso, Rdf4j, Graphdb, Rdfox, Anzograph,
                                  Nemo, Owlrl)}
 
 

@@ -6,10 +6,12 @@ Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/).
 
 ## 1. Product target
 
-NRESE is a single-node RDF database that combines:
+NRESE is an RDF database and ontology platform, hardware-aware on one machine (every core, the memory, CPU features and GPUs it has) and scaling out to clusters where a use case needs it, each derived setting configurable. It combines:
 
 - **QLever-class query performance and scale** — dictionary-encoded, sorted permutation indexes, merge/worst-case-optimal joins, integrated text search, fast parallel bulk loading.
 - **GraphDB-class semantics and data governance** — materialised, incrementally maintained RDFS / OWL 2 RL reasoning with asserted vs inferred separation, built-in SHACL validation on commit, full-text connectors, transactional writes.
+- **Reasoning beyond the materialisable profiles** — OWL 2 DL (classification, consistency, explanation) is a goal: reasoning is where NRESE means to lead, drawing on the research on tableaux, hypertableaux, consequence-based calculi and their combination with materialisation.
+- **One engine API with a thin connector surface** — every capability is an operation of the core; the protocols (SPARQL, Graph Store, RDF4J, GraphDB compatibility) and the one frontend only translate to it.
 
 Fuseki is no longer the parity target. QLever and GraphDB are, measured with the harness in `benches/nrese-bench-harness` (see [ADR-0004](adr/0004-parity-targets-qlever-graphdb.md)).
 
