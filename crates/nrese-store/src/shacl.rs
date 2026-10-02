@@ -167,6 +167,30 @@ fn validate_view<V: ReadView + Sync>(
     Ok((validate(view, &shapes, data), shapes.len()))
 }
 
+/// Fails if the commit in `tx` changes the graph `shapes_graph` and leaves shapes in it that
+/// don't compile: the shapes graph is a managed object, well-formed whatever wrote it and
+/// whether or not the SHACL gate is on ([`StoreError::ShaclShapes`], one message per
+/// problem).
+pub(crate) fn check_shapes(tx: &Transaction<'_>, shapes_graph: &str) -> StoreResult<()> {
+    let iri = graph_iri(shapes_graph)?;
+    let Some(shapes_id) = tx.lookup(iri.as_ref().into()) else {
+        return Ok(());
+    };
+    if !tx
+        .inserted()
+        .chain(tx.deleted())
+        .any(|quad| quad.graph == shapes_id)
+    {
+        return Ok(());
+    }
+    compile(
+        &tx.pending_snapshot(),
+        Selection::asserted(GraphSelector::Exact(shapes_id)),
+    )
+    .map(drop)
+    .map_err(shapes_error)
+}
+
 /// What the commit in `tx` introduces against the shapes in the graph `shapes_graph` (the
 /// commit gate, C2): the results present after it and not before, over every data graph.
 /// If the commit changes the shapes, both states are validated in full; otherwise only the
@@ -249,9 +273,9 @@ impl StoreService {
                 base_iri,
                 payload,
             } => {
-                // The shapes go into a graph of an open transaction that is never
-                // committed: they share the repository's dictionary, as stored shapes do,
-                // and leave no trace. The transaction holds the writer while it validates.
+                // The shapes go into a graph of a speculative transaction, never committed:
+                // they share the repository's dictionary, as stored shapes do, and leave no
+                // trace. It takes no writer slot, so commits go on meanwhile.
                 let scratch = NamedNodeRef::new_unchecked(REQUEST_SHAPES_GRAPH);
                 let quads = parse_graph(
                     *format,
@@ -260,7 +284,7 @@ impl StoreService {
                     GraphName::NamedNode(scratch.into_owned()),
                     BlankNodes::Fresh,
                 )?;
-                let mut tx = self.engine().transaction();
+                let mut tx = self.engine().speculative();
                 let revision = tx.base().revision();
                 for quad in &quads {
                     tx.insert(quad.as_ref());

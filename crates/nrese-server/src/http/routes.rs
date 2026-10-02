@@ -36,6 +36,12 @@ fn repository_routes() -> Router<AppState> {
             "/shacl",
             get(handlers::shacl_get).post(handlers::shacl_post),
         )
+        .route(
+            "/shapes",
+            get(api_v1::shapes_get)
+                .put(api_v1::shapes_put)
+                .delete(api_v1::shapes_delete),
+        )
         .route("/autocomplete", get(handlers::autocomplete))
         .route("/classification", get(handlers::classification_get))
         .route("/backup", get(handlers::admin_backup_dataset))
