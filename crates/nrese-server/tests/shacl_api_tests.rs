@@ -320,3 +320,55 @@ async fn posted_shapes_validate_without_being_stored() -> TestResult {
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     Ok(())
 }
+
+/// The shapes graph is a managed object: shapes that don't compile are refused, with every
+/// problem, whichever way they are written, and the graph stays as it was.
+#[tokio::test]
+async fn shapes_are_checked_before_they_are_stored() -> TestResult {
+    let app = test_app()?;
+    let shapes_uri = "/api/v1/repositories/nrese/shapes";
+    let broken = format!(
+        "{PREFIXES}ex:S a sh:NodeShape ; sh:targetClass ex:C ;
+           sh:property [ sh:path ex:p ; sh:minCount \"many\" ] ."
+    );
+    let turtle = [("content-type", "text/turtle")];
+    let response = send(&app, Method::PUT, shapes_uri, &turtle, broken.clone()).await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = body_text(response).await?;
+    assert!(text.contains("minCount"), "{text}");
+    // Nothing was stored.
+    let response = send(&app, Method::GET, shapes_uri, &[], Body::empty()).await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let good = format!("{PREFIXES}{SHAPES}");
+    let response = send(&app, Method::PUT, shapes_uri, &turtle, good).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = send(
+        &app,
+        Method::GET,
+        shapes_uri,
+        &[("accept", "text/turtle")],
+        Body::empty(),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await?.contains("PersonShape"));
+
+    // Through SPARQL too (the SHACL gate is off): the update is refused, the shapes stay.
+    let update = format!(
+        "PREFIX ex: <http://example.com/> PREFIX sh: <http://www.w3.org/ns/shacl#>
+         INSERT DATA {{ GRAPH <{SHAPES_GRAPH}> {{ ex:PersonShape sh:minCount \"many\" }} }}"
+    );
+    let response = send(
+        &app,
+        Method::POST,
+        "/dataset/update",
+        &[("content-type", "application/sparql-update")],
+        update,
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = send(&app, Method::DELETE, shapes_uri, &[], Body::empty()).await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    Ok(())
+}

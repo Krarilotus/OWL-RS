@@ -982,3 +982,56 @@ pub async fn repository_patch(
         .map_err(|error| ApiError::internal(error.to_string()))??;
     repository_get(authenticated, State(state), Path(id)).await
 }
+
+/// The Graph Store target of the repository's shapes graph (`?graph=`).
+fn shapes_target(state: &AppState) -> Result<axum::extract::RawQuery, ApiError> {
+    let shapes = state.store().config().shapes_graph.clone();
+    serde_urlencoded::to_string([("graph", shapes)])
+        .map(|query| axum::extract::RawQuery(Some(query)))
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+#[utoipa::path(get, path = "/api/v1/repositories/{id}/shapes", tag = "shacl",
+    params(("id" = String, Path, description = "The repository's id")),
+    responses((status = 200, description = "The shapes graph, in the format the request accepts (Turtle by default)"),
+        (status = 404, description = "No shapes", body = crate::http::openapi::Problem)))]
+/// The repository's SHACL shapes: its shapes graph (`shacl.shapes_graph`), as the Graph
+/// Store Protocol reads it.
+pub async fn shapes_get(
+    authenticated: crate::auth::Authenticated,
+    Repository(state): Repository,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let target = shapes_target(&state)?;
+    super::graph_store::get_graph(state, authenticated, target, headers).await
+}
+
+#[utoipa::path(put, path = "/api/v1/repositories/{id}/shapes", tag = "shacl",
+    params(("id" = String, Path, description = "The repository's id")),
+    request_body(content = String, description = "Shapes in any RDF format NRESE reads (`Content-Type`)"),
+    responses((status = 201, description = "Stored (the graph was empty)"), (status = 200, description = "Replaced"),
+        (status = 400, description = "Shapes that don't compile, one message per problem; nothing stored", body = crate::http::openapi::Problem)))]
+/// Replaces the repository's shapes. They are checked before they are stored: shapes that
+/// don't compile are refused with every problem, and the shapes graph stays as it was (as
+/// for every write to it, whatever the protocol).
+pub async fn shapes_put(
+    authenticated: crate::auth::Authenticated,
+    Repository(state): Repository,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let target = shapes_target(&state)?;
+    super::graph_store::put_graph(state, authenticated, target, headers, body).await
+}
+
+#[utoipa::path(delete, path = "/api/v1/repositories/{id}/shapes", tag = "shacl",
+    params(("id" = String, Path, description = "The repository's id")),
+    responses((status = 204, description = "Removed"), (status = 404, description = "No shapes", body = crate::http::openapi::Problem)))]
+/// Removes the repository's shapes.
+pub async fn shapes_delete(
+    authenticated: crate::auth::Authenticated,
+    Repository(state): Repository,
+) -> Result<StatusCode, ApiError> {
+    let target = shapes_target(&state)?;
+    super::graph_store::delete_graph(state, authenticated, target).await
+}

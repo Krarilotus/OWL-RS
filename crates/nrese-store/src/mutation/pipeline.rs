@@ -193,6 +193,8 @@ impl MutationPipeline {
                 None,
                 None,
             ));
+            crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph)
+                .map_err(store_error)?;
             self.shacl_gate(&tx)?;
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
@@ -231,6 +233,7 @@ impl MutationPipeline {
 
         // Without reasoning, commits don't maintain the inferred stack.
         self.store.invalidate_reasoning().map_err(store_error)?;
+        crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph).map_err(store_error)?;
         self.shacl_gate(&tx)?;
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
