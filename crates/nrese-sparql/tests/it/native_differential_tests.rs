@@ -5439,3 +5439,51 @@ fn long_operator_chains_neither_overflow_nor_print_unreadably() {
         .join()
         .unwrap();
 }
+
+/// Stars are estimated from the characteristic sets: 200 products have a label and a
+/// price, 2,000 persons a label and a name. No subject has a name and a price, which the
+/// sets know and independence doesn't (it estimates 200 rows); and the products' pair is
+/// estimated as what it is.
+#[test]
+fn stars_are_estimated_from_characteristic_sets() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let quad =
+        |s: String, p: &str, o: NamedNode| Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph);
+    for i in 0..200 {
+        tx.insert(quad(format!("product{i}"), "label", ex("l")).as_ref());
+        tx.insert(quad(format!("product{i}"), "price", ex(&format!("p{}", i % 7))).as_ref());
+    }
+    for i in 0..2_000 {
+        tx.insert(quad(format!("person{i}"), "label", ex("l")).as_ref());
+        tx.insert(quad(format!("person{i}"), "name", ex(&format!("n{i}"))).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let bgp = |text: &str| {
+        let query = SparqlParser::new()
+            .parse_query(&format!("PREFIX : <{EX}> SELECT * WHERE {{ {text} }}"))
+            .unwrap();
+        let planned = plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+        let found = rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        )
+        .len();
+        let estimate = planned
+            .steps
+            .iter()
+            .find(|s| s.operator == "bgp")
+            .and_then(|s| s.estimated_rows);
+        (estimate, found)
+    };
+    assert_eq!(bgp("?s :label ?l ; :name ?n ; :price ?p"), (Some(0), 0));
+    assert_eq!(bgp("?s :label ?l ; :price ?p"), (Some(200), 200));
+    // A constant object keeps its share: one price in seven.
+    let (estimate, found) = bgp("?s :label ?l ; :price :p3");
+    assert_eq!(found, (0..200).filter(|i| i % 7 == 3).count());
+    assert!(
+        estimate.is_some_and(|e| e.abs_diff(found as u64) <= 1),
+        "{estimate:?} for {found}"
+    );
+}

@@ -20,6 +20,7 @@
 //!   background worker.
 
 mod bulk;
+pub mod characteristic;
 mod equality;
 mod snapshot;
 pub(crate) mod spill;

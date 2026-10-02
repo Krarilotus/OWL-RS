@@ -5,14 +5,31 @@
 //! exactly from the index ([`Snapshot::distinct_in`]); the engine then keeps it across
 //! revisions until the pattern's match count drifts by more than a quarter. Values may
 //! therefore be slightly stale: they serve cost estimates, never results.
+//!
+//! The default graph's characteristic sets ([`super::characteristic`]) are kept likewise,
+//! per read model, until its size drifts by a quarter. Built at once for up to
+//! [`SYNC_SETS`] statements; beyond, on a thread of their own, while queries plan without
+//! them (no query waits for a scan of the store).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
+use super::characteristic::CharacteristicSets;
 use super::{ReadModel, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
+use crate::term::TermId;
+
+/// Default graphs up to this size get their characteristic sets built at once.
+const SYNC_SETS: u64 = 1 << 20;
+
+/// The characteristic sets of one read model: being built, or built at a size (`None`:
+/// there were too many to keep).
+enum Sets {
+    Building,
+    Built(Option<Arc<CharacteristicSets>>, u64),
+}
 
 /// Cached entries; the cache is cleared when it fills up.
 const ENTRIES: usize = 1 << 14;
@@ -33,6 +50,8 @@ pub(crate) struct Statistics {
     /// is the same version (a transaction's pending snapshot shares its base's revision
     /// number, not its content).
     nodes: Mutex<Vec<NodeCount>>,
+    /// Per read model, the default graph's characteristic sets.
+    sets: Mutex<HashMap<ReadModel, Sets>>,
 }
 
 /// A version (held weakly), what was read of it, and its node count.
@@ -66,6 +85,58 @@ impl Statistics {
         }
         nodes.push((Arc::downgrade(version), model, graphs, n));
         Some(n)
+    }
+
+    /// The characteristic sets of the default graph in `model`, as of a size within a
+    /// quarter of `snapshot`'s: kept, built now (small graphs) or started on a thread of
+    /// their own (`None` until they are there).
+    pub(crate) fn characteristic_sets(
+        self: &Arc<Self>,
+        snapshot: &Snapshot,
+        model: ReadModel,
+    ) -> Option<Arc<CharacteristicSets>> {
+        let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
+        let size = snapshot.count_in(model, &pattern);
+        {
+            let mut sets = self.sets.lock();
+            match sets.get(&model) {
+                Some(Sets::Built(built, at)) if size.abs_diff(*at) <= at / 4 => {
+                    return built.clone();
+                }
+                Some(Sets::Building) => return None,
+                _ => {}
+            }
+            if size > SYNC_SETS {
+                sets.insert(model, Sets::Building);
+            }
+        }
+        let build = move |snapshot: &Snapshot| {
+            snapshot
+                .scan_sorted_in(model, &pattern, Permutation::Gspo)
+                .and_then(CharacteristicSets::build)
+                .map(Arc::new)
+        };
+        if size <= SYNC_SETS {
+            let built = build(snapshot);
+            self.sets
+                .lock()
+                .insert(model, Sets::Built(built.clone(), size));
+            return built;
+        }
+        let (statistics, snapshot) = (Arc::clone(self), snapshot.clone());
+        let started = std::thread::Builder::new()
+            .name("nrese-statistics".to_owned())
+            .spawn(move || {
+                let built = build(&snapshot);
+                statistics
+                    .sets
+                    .lock()
+                    .insert(model, Sets::Built(built, size));
+            });
+        if started.is_err() {
+            self.sets.lock().remove(&model);
+        }
+        None
     }
 
     /// The number of distinct values of `permutation`'s first unbound component among the
