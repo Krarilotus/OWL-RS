@@ -8,7 +8,8 @@
 #
 # Usage: scripts/check.sh            the whole gate (before a push; what CI runs)
 #        scripts/check.sh --changed  only the crates changed against HEAD (staged or not):
-#                                    fmt, clippy and tests for them (the pre-commit hook)
+#                                    fmt, clippy and tests for them, and the lock check
+#                                    when a manifest or lock changed (the pre-commit hook)
 set -u
 cd "$(dirname "$0")/.."
 mode=${1:-all}
@@ -49,6 +50,10 @@ if [ "$mode" = --changed ]; then
     step test "$guarded" test --locked "${packages[@]}" --no-fail-fast
   else
     echo "=== no crate changed: fmt only"
+  fi
+  # A changed manifest or lock can leave another workspace's lock (benches/) stale.
+  if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
+    step locks bash scripts/check-locks.sh
   fi
 else
   step fmt cargo fmt --all --check
