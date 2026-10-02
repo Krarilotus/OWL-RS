@@ -2513,29 +2513,81 @@ impl<'a> Context<'a> {
             order.sort_by_key(|&i| counts[i]);
             let mut rows = vec![f64::NAN; order.len()];
             rows[0] = counts[order[0]] as f64;
+            // Two patterns of one star: the characteristic sets estimate the pair.
+            if let [a, b] = scans
+                && let (Some(x), Some(y)) = (self.star(a, counts[0], 0), self.star(b, counts[1], 0))
+                && a.slots[0] == b.slots[0]
+                && let Some(sets) = self.snapshot.characteristic_sets_in(self.model)
+            {
+                rows[1] = sets.star(&[x.predicate, y.predicate]) * x.selectivity * y.selectivity;
+            }
             return plan::Plan { order, rows };
         }
         let mut vars: Vec<Variable> = Vec::new();
+        let mut index_of = |v: Variable| {
+            vars.iter().position(|x| *x == v).unwrap_or_else(|| {
+                vars.push(v);
+                vars.len() - 1
+            })
+        };
         let inputs: Vec<plan::Input> = scans
             .iter()
             .zip(counts)
-            .map(|(scan, &count)| plan::Input {
-                count,
-                vars: scan
-                    .vars()
-                    .into_iter()
-                    .map(|v| {
-                        let d = self.distinct(scan, &v, count).min(count);
-                        let index = vars.iter().position(|x| *x == v).unwrap_or_else(|| {
-                            vars.push(v);
-                            vars.len() - 1
-                        });
-                        (index, d)
-                    })
-                    .collect(),
+            .map(|(scan, &count)| {
+                let star = match &scan.slots[0] {
+                    Slot::Var(v) => self.star(scan, count, index_of(v.clone())),
+                    _ => None,
+                };
+                plan::Input {
+                    count,
+                    vars: scan
+                        .vars()
+                        .into_iter()
+                        .map(|v| {
+                            let d = self.distinct(scan, &v, count).min(count);
+                            (index_of(v), d)
+                        })
+                        .collect(),
+                    star,
+                }
             })
             .collect();
-        plan::order(&inputs, vars.len(), PROBE_FACTOR)
+        let sets = inputs
+            .iter()
+            .any(|i| i.star.is_some())
+            .then(|| self.snapshot.characteristic_sets_in(self.model))
+            .flatten();
+        plan::order(&inputs, vars.len(), PROBE_FACTOR, sets.as_deref())
+    }
+
+    /// `scan` (with `count` matches) as part of a star on its subject (the variable with
+    /// index `subject`): a variable subject and a constant predicate in the default graph.
+    /// A constant object keeps the share of the predicate's statements it matches.
+    fn star(&self, scan: &ScanPattern, count: u64, subject: usize) -> Option<plan::Star> {
+        let (Slot::Var(_), Slot::Const(predicate)) = (&scan.slots[0], &scan.slots[1]) else {
+            return None;
+        };
+        if !scan.in_default_graph() {
+            return None;
+        }
+        let selectivity = match &scan.slots[2] {
+            Slot::Var(_) => 1.0,
+            _ => {
+                let mut free = scan.clone();
+                free.slots[2] = Slot::Var(Variable::new_unchecked("_star_object"));
+                let all = self.snapshot.estimate_in(self.model, &free.quad_pattern());
+                if all == 0 {
+                    0.0
+                } else {
+                    count as f64 / all as f64
+                }
+            }
+        };
+        Some(plan::Star {
+            subject,
+            predicate: predicate.raw(),
+            selectivity,
+        })
     }
 
     /// Distinct values of `var` among `scan`'s `count` matches: the engine's statistics
@@ -5227,7 +5279,7 @@ fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {
         .collect()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Slot {
     Var(Variable),
     Const(TermId),

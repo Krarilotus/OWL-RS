@@ -7,6 +7,14 @@
 //! its size when scanned, or about one index probe per row of the running result when that
 //! result is much smaller (the executor's rule). BGPs with more than [`DP_PATTERNS`]
 //! patterns are ordered greedily by the same model.
+//!
+//! Stars are estimated from the default graph's characteristic sets where they are known
+//! (`nrese_engine::engine::characteristic`): a pattern `?s p ?o` joined to patterns that
+//! already constrain `?s` by their predicates `P` multiplies the rows by
+//! `star(P ∪ {p}) / star(P)`, the statements of `p` per subject among the subjects that
+//! have `P`, instead of assuming every subject might have `p`.
+
+use nrese_engine::engine::characteristic::CharacteristicSets;
 
 /// Largest BGP ordered exhaustively (2^n subsets).
 const DP_PATTERNS: usize = 12;
@@ -20,6 +28,20 @@ pub(super) struct Input {
     pub count: u64,
     /// Per variable (index into the BGP's variables): its distinct values among the matches.
     pub vars: Vec<(usize, u64)>,
+    /// The pattern as part of a star, if it is one: a variable subject and a constant
+    /// predicate, in the default graph.
+    pub star: Option<Star>,
+}
+
+/// A pattern `?s p o` of a star on `?s`.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Star {
+    /// The subject variable (index into the BGP's variables).
+    pub subject: usize,
+    /// The predicate (raw id).
+    pub predicate: u64,
+    /// The share of `p`'s statements the pattern's object keeps (1 for a variable).
+    pub selectivity: f64,
 }
 
 /// A join order with the estimated rows after each step.
@@ -48,7 +70,12 @@ impl State {
 
 /// The cheapest order for `inputs`; `probe_factor` is the executor's threshold for index
 /// nested loops (the pattern is at least this many times larger than the running result).
-pub(super) fn order(inputs: &[Input], variables: usize, probe_factor: u64) -> Plan {
+pub(super) fn order(
+    inputs: &[Input],
+    variables: usize,
+    probe_factor: u64,
+    sets: Option<&CharacteristicSets>,
+) -> Plan {
     let start = |j: usize| {
         let input = &inputs[j];
         let rows = input.count as f64;
@@ -67,12 +94,38 @@ pub(super) fn order(inputs: &[Input], variables: usize, probe_factor: u64) -> Pl
     let extend = |state: &State, j: usize| -> State {
         let input = &inputs[j];
         let count = input.count as f64;
-        let mut rows = state.rows * count;
+        // A star extended: its rows from the characteristic sets.
+        let star = sets.zip(input.star).and_then(|(sets, star)| {
+            if state.distinct[star.subject] == 0.0 {
+                return None;
+            }
+            let mut predicates: Vec<u64> = state
+                .order
+                .iter()
+                .filter_map(|&i| inputs[i].star)
+                .filter(|s| s.subject == star.subject)
+                .map(|s| s.predicate)
+                .collect();
+            if predicates.is_empty() {
+                return None;
+            }
+            let before = sets.star(&predicates);
+            predicates.push(star.predicate);
+            let after = sets.star(&predicates);
+            let factor = if before > 0.0 { after / before } else { 0.0 };
+            Some((star.subject, factor * star.selectivity))
+        });
+        let mut rows = match star {
+            Some((_, factor)) => state.rows * factor,
+            None => state.rows * count,
+        };
         let mut shared = false;
         for &(v, d) in &input.vars {
             if state.distinct[v] > 0.0 {
                 shared = true;
-                rows /= state.distinct[v].max(d as f64).max(1.0);
+                if star.is_none_or(|(subject, _)| subject != v) {
+                    rows /= state.distinct[v].max(d as f64).max(1.0);
+                }
             }
         }
         let probe = shared && state.rows * (probe_factor as f64) < count;
@@ -188,6 +241,7 @@ mod tests {
         Input {
             count,
             vars: vars.to_vec(),
+            star: None,
         }
     }
 
@@ -199,7 +253,7 @@ mod tests {
             input(300_000, &[(0, 100_000), (1, 2_000)]),
             input(5_000, &[(0, 5_000)]),
         ];
-        let plan = order(&inputs, 2, 32);
+        let plan = order(&inputs, 2, 32, None);
         assert_eq!(plan.order, vec![0, 2, 1]);
         assert_eq!(plan.rows.len(), 3);
     }
@@ -207,7 +261,7 @@ mod tests {
     #[test]
     fn disconnected_patterns_still_get_an_order() {
         let inputs = [input(10, &[(0, 10)]), input(3, &[(1, 3)])];
-        let plan = order(&inputs, 2, 32);
+        let plan = order(&inputs, 2, 32, None);
         assert_eq!(plan.order.len(), 2);
         assert!((plan.rows[1] - 30.0).abs() < 1e-9);
     }
@@ -217,7 +271,7 @@ mod tests {
         let inputs: Vec<Input> = (0..14)
             .map(|i| input(100 + i, &[(0, 100), (i as usize + 1, 50)]))
             .collect();
-        let plan = order(&inputs, 15, 32);
+        let plan = order(&inputs, 15, 32, None);
         let mut sorted = plan.order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..14).collect::<Vec<_>>());
