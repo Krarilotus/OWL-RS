@@ -83,6 +83,34 @@ pub async fn restore(
     Ok((StatusCode::OK, Json(build_admin_restore_response(&report))).into_response())
 }
 
+/// An image backup of the latest snapshot into `backups/<seconds since 1970>` of the data
+/// directory, while writers go on; answers its manifest and directory.
+pub async fn image_backup(state: AppState) -> Result<Response, ApiError> {
+    state.ensure_serving()?;
+    let store = state.store();
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let dir = store
+        .config()
+        .data_dir
+        .join("backups")
+        .join(seconds.to_string());
+    let target = dir.clone();
+    let manifest = tokio::task::spawn_blocking(move || store.backup_image(&target))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(map_backup_error)?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "directory": dir.display().to_string(),
+            "manifest": manifest,
+        })),
+    )
+        .into_response())
+}
+
 fn parse_restore_format(
     content_type: Option<&HeaderValue>,
 ) -> Result<DatasetBackupFormat, ApiError> {

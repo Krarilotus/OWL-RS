@@ -69,7 +69,11 @@ Durable storage note:
   - It needs no build feature and no native toolchain.
   - Every commit is synced before it is acknowledged.
 - The data directory is locked. A second server on the same directory fails at startup with a clear error.
-- Checkpoints run in the background and delete the WAL segments they cover. For backups, use `/admin/dataset/backup` (or copy the directory while the server is stopped).
+- Checkpoints run in the background and delete the WAL segments they cover.
+- Backups:
+  - **Image backups** (physical): `POST /ops/api/admin/dataset/image` (admins) writes an image of the current snapshot, the store's checkpoint format with the inferred statements, into `backups/<seconds since 1970>/` of the data directory, with `manifest.json` (revision, counts, size, SHA-256), while writes go on. Offline: `nrese-server backup DIR`. To restore, stop the server and run `nrese-server restore DIR` with the configuration of the target: it checks the image against its manifest and places it in the data directory, which must hold no store; the server then opens at the backup's revision. The image needs an NRESE that reads its checkpoint format.
+  - **N-Quads export**: `GET /ops/api/admin/dataset/backup` and `POST /ops/api/admin/dataset/restore`: asserted statements only, portable to other stores, inferences derived again after a restore.
+  - Or copy the directory while the server is stopped.
 
 External exposure note:
 

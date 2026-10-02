@@ -10,7 +10,11 @@ use anyhow::{Result, bail};
 /// `nrese-server query [--config PATH] [--format F] (QUERY | --file PATH)` answers one query
 /// from the configured store on standard output (the same lock);
 /// `nrese-server convert INPUT OUTPUT` converts an RDF file into another format (by the
-/// extensions), without a store.
+/// extensions), without a store;
+/// `nrese-server backup DIR` writes an image backup of the configured store into `DIR`
+/// (the same lock: for a running server, `POST /ops/api/admin/dataset/image`);
+/// `nrese-server restore DIR` restores an image backup into the configured data directory,
+/// which must hold no store.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CliConfig {
     pub config_path: Option<PathBuf>,
@@ -27,6 +31,10 @@ pub enum CliCommand {
     CheckConfig,
     Query(QueryCommand),
     Convert(ConvertCommand),
+    /// `backup DIR`: an image backup of the store into `DIR`.
+    Backup(PathBuf),
+    /// `restore DIR`: the image backup in `DIR` into the configured data directory.
+    Restore(PathBuf),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -77,6 +85,12 @@ impl CliConfig {
         } else if args.peek().is_some_and(|argument| argument == "convert") {
             args.next();
             config.command = CliCommand::Convert(ConvertCommand::default());
+        } else if args.peek().is_some_and(|argument| argument == "backup") {
+            args.next();
+            config.command = CliCommand::Backup(PathBuf::new());
+        } else if args.peek().is_some_and(|argument| argument == "restore") {
+            args.next();
+            config.command = CliCommand::Restore(PathBuf::new());
         }
 
         while let Some(argument) = args.next() {
@@ -118,6 +132,15 @@ impl CliConfig {
                     } else {
                         bail!("unsupported argument: {:?}", argument);
                     }
+                    continue;
+                }
+                CliCommand::Backup(dir) | CliCommand::Restore(dir) => {
+                    if argument.to_str().is_some_and(|raw| raw.starts_with("--"))
+                        || !dir.as_os_str().is_empty()
+                    {
+                        bail!("unsupported argument: {:?}", argument);
+                    }
+                    *dir = PathBuf::from(argument);
                     continue;
                 }
                 CliCommand::Convert(convert) => {
@@ -167,6 +190,11 @@ impl CliConfig {
             && convert.output.as_os_str().is_empty()
         {
             bail!("`convert` takes an input and an output file");
+        }
+        if let CliCommand::Backup(dir) | CliCommand::Restore(dir) = &config.command
+            && dir.as_os_str().is_empty()
+        {
+            bail!("`backup` and `restore` take a backup directory");
         }
         Ok(config)
     }
@@ -266,6 +294,19 @@ mod tests {
         );
         assert!(parse(&["convert", "a.ttl"]).is_err());
         assert!(parse(&["convert", "a.ttl", "b.nt", "c.nq"]).is_err());
+        let config = parse(&["backup", "-c", "n.toml", "/backups/one"]).expect("cli config");
+        assert_eq!(
+            config.command,
+            CliCommand::Backup(PathBuf::from("/backups/one"))
+        );
+        assert_eq!(config.config_path, Some(PathBuf::from("n.toml")));
+        let config = parse(&["restore", "/backups/one"]).expect("cli config");
+        assert_eq!(
+            config.command,
+            CliCommand::Restore(PathBuf::from("/backups/one"))
+        );
+        assert!(parse(&["backup"]).is_err());
+        assert!(parse(&["restore", "a", "b"]).is_err());
     }
 
     #[test]

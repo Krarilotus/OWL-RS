@@ -256,3 +256,37 @@ async fn admin_backup_endpoint_is_rate_limited_when_enabled()
 
     Ok(())
 }
+
+/// An image backup of a running on-disk store: into `backups/` of its data directory,
+/// answered with the manifest; admins only.
+#[tokio::test]
+async fn image_backup_writes_a_manifest_into_the_data_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()).with_ontology(support::minimal_fixture_path()),
+        admin_policy(),
+        ReasonerConfig::default(),
+    )?;
+    let request = |token: &str| {
+        Request::builder()
+            .uri("/ops/api/admin/dataset/image")
+            .method(Method::POST)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+    };
+    let denied = app.clone().oneshot(request("reader")?).await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let response = app.oneshot(request("admin")?).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    let directory = std::path::PathBuf::from(json["directory"].as_str().unwrap());
+    assert!(directory.starts_with(dir.path().join("backups")));
+    assert_eq!(json["manifest"]["format"], "nrese-checkpoint");
+    assert!(json["manifest"]["quads"].as_u64().unwrap() > 0);
+    assert_eq!(
+        nrese_store::read_manifest(&directory)?.sha256,
+        json["manifest"]["sha256"]
+    );
+    Ok(())
+}

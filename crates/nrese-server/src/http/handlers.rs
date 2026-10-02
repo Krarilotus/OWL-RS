@@ -118,6 +118,14 @@ pub async fn admin_backup_dataset(
     admin_dataset::backup(state).await
 }
 
+pub async fn admin_image_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    guard::enforce_admin_write(&state, &headers).await?;
+    admin_dataset::image_backup(state).await
+}
+
 pub async fn admin_restore_dataset(
     State(state): State<AppState>,
     headers: HeaderMap,

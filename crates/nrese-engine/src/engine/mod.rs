@@ -66,6 +66,15 @@ impl Default for EngineConfig {
     }
 }
 
+/// An image [`Engine::write_image`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInfo {
+    pub path: std::path::PathBuf,
+    pub revision: u64,
+    pub quads: u64,
+    pub inferred: u64,
+}
+
 /// Point-in-time engine statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineStats {
@@ -592,6 +601,21 @@ impl Engine {
     /// Returns the checkpointed revision.
     pub fn checkpoint(&self) -> EngineResult<u64> {
         self.inner.shared.checkpoint()
+    }
+
+    /// Writes an image of the latest snapshot into `dir`: a checkpoint file (the dictionary
+    /// and both stacks) like the store's own, named by its revision, while writers go on. A
+    /// data directory holding it opens at that revision.
+    pub fn write_image(&self, dir: &std::path::Path) -> EngineResult<ImageInfo> {
+        let snapshot = self.inner.shared.snapshot();
+        let path = crate::durability::checkpoint::write(dir, &snapshot)?;
+        let version = snapshot.version();
+        Ok(ImageInfo {
+            path,
+            revision: snapshot.revision(),
+            quads: version.asserted.len(),
+            inferred: version.inferred.len(),
+        })
     }
 
     pub fn is_durable(&self) -> bool {
