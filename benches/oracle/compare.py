@@ -105,10 +105,31 @@ RULES = {
     "zero-length": "known deviation: zero-length paths from a term outside the graph (completion plan 4.3)",
     "jena-path-values": "Jena's property paths match a bound literal by value (\"01\"^^xsd:integer finds \"1\"^^xsd:int), where the standard asks for the same term; Jena has the extra rows",
     "jena-exists-literal-predicate": "Jena drops the row when a (NOT) EXISTS of two or more patterns gets a literal for a predicate variable; the substituted pattern matches nothing, so NOT EXISTS holds; NRESE has the extra rows",
+    "jena-path-values-aggregated": "Jena's path value matching (jena-path-values) under an aggregate: on the canonical copy both engines agree, Jena answers both copies alike (it matched by value), NRESE doesn't (it matched terms, as the standard asks)",
+    "date-timezones": "= and != between a date or dateTime with a timezone and one without: unequal in NRESE (XSD 1.1: values with and without a timezone are never equal), an error in Jena; NRESE has the extra rows",
 }
 
+DATE = re.compile(r'^"(-?\d{4,}-\d\d-\d\d(?:T[0-9:.]+)?)(Z|[+-]\d\d:\d\d)?"\^\^<http://www\.w3\.org/2001/XMLSchema#date(?:Time)?>$')
 
-def explain(query: str, variables: list[str], ours: list[str], answers: list[list[str]]) -> str | None:
+
+def mixes_timezones(row: str) -> bool:
+    """Whether a row holds a date or dateTime with a timezone and one without."""
+    zones = [m.group(2) is not None for m in map(DATE.match, row.split("\t")) if m]
+    return any(zones) and not all(zones)
+
+
+def explain(query: str, variables: list[str], ours: list[str], answers: list[list[str]],
+            ours_canonical: list[str] | None = None, ordered: bool = False) -> str | None:
+    # NRESE on the canonical copy agrees with Jena there, Jena answers both copies alike, and
+    # NRESE doesn't: Jena matched by value where NRESE matched terms.
+    if (PATH.search(query) and ours_canonical is not None and len(answers) > 1
+            and same(ours_canonical, answers[1], ordered) and same(answers[0], answers[1], ordered)
+            and not same(ours, ours_canonical, ordered)):
+        return "jena-path-values-aggregated"
+    if re.search(r"!?=", query) and answers:
+        extra = list((Counter(ours) - Counter(answers[0])).elements())
+        if extra and not (Counter(answers[0]) - Counter(ours)) and all(mixes_timezones(r) for r in extra):
+            return "date-timezones"
     if any(Counter(ours) == Counter(theirs) for theirs in answers) and "ORDER BY" in query:
         return "order"
     if re.search(r"\b(IRI|URI)\(", query):
@@ -171,7 +192,12 @@ def main(argv):
         if len(answers) > 1 and same(ours, answers[1], ordered):
             counts["agree on canonical numbers"] += 1
             continue
-        rule = explain(query, our_vars, ours, answers)
+        canonical_file = stem.with_suffix(".nrese-canonical")
+        ours_canonical = None
+        if canonical_file.exists():
+            canonical_vars, canonical_rows = table(canonical_file)
+            ours_canonical = [row(l) for l in aligned(canonical_vars, canonical_rows, our_vars)]
+        rule = explain(query, our_vars, ours, answers, ours_canonical, ordered)
         if rule:
             counts["explained"] += 1
             explained[rule].append(where)
