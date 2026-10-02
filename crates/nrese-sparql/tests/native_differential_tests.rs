@@ -488,6 +488,32 @@ fn canonical_number(literal: &Literal) -> Literal {
     }
 }
 
+/// The column of a `(SAMPLE(…) AS ?v)` in a result with `variables`, if the query has one.
+fn sample_column(text: &str, variables: &[String]) -> Option<usize> {
+    let after = &text[text.find("(SAMPLE(")?..];
+    let alias = after[after.find(" AS ?")? + 5..]
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()?;
+    variables.iter().position(|v| v == alias)
+}
+
+/// Rows of tab-separated cells without cell `column`, sorted.
+fn without_column(rows: &[String], column: usize) -> Vec<String> {
+    let mut out: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            row.split('\t')
+                .enumerate()
+                .filter(|(i, _)| *i != column)
+                .map(|(_, cell)| cell)
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// The variables of a query's result (`ASK` for an ASK), as a dump's header.
 fn variables(snapshot: &nrese_engine::Snapshot, query: &nrese_sparql_syntax::Query) -> Vec<String> {
     match evaluate_query(snapshot, query, &QueryOptions::default()).unwrap() {
@@ -1754,7 +1780,17 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
                 evaluate_query(&snapshot, &query, &as_written).unwrap(),
                 false,
             );
-            assert_same_rows(&native, &plain, &format!("against as written: {context}"));
+            // SAMPLE may pick any value of its group, and two plans may visit the rows in
+            // another order: its column is left out of the comparison.
+            let (native_rows, plain_rows) = match sample_column(&text, &variables(&snapshot, &query)) {
+                Some(column) => (without_column(&native, column), without_column(&plain, column)),
+                None => (native.clone(), plain.clone()),
+            };
+            assert_same_rows(
+                &native_rows,
+                &plain_rows,
+                &format!("against as written: {context}"),
+            );
             if !order_dependent {
                 let open = has_extremes(&text);
                 let native = rows_up_to_equal_values(
@@ -4121,7 +4157,7 @@ fn the_remaining_functions_run_natively() {
     // NOW: one instant for the whole query, a dateTime with a timezone.
     assert_eq!(
         one(
-            "SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE { ?s ?p ?o BIND(NOW() AS ?t) FILTER(DATATYPE(?t) = <http://www.w3.org/2001/XMLSchema#dateTime> && TZ(?t) != \"\") }"
+            "SELECT (COUNT(DISTINCT ?t) AS ?n) WHERE { VALUES ?row { 1 2 3 } BIND(NOW() AS ?t) FILTER(DATATYPE(?t) = <http://www.w3.org/2001/XMLSchema#dateTime> && TZ(?t) != \"\") }"
         )[0],
         "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>"
     );
