@@ -1040,6 +1040,7 @@ version = "0.1.0"
 name = "nrese-engine"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "crc32fast",
  "hashbrown 0.16.1",
  "memchr",

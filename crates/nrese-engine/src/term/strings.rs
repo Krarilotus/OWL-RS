@@ -39,6 +39,33 @@ pub struct StringTest<'a> {
     /// Only language-tagged strings with this tag, as stored (what `LANG` returns); the
     /// kinds above are then ignored. With an empty needle, the language alone decides.
     pub language: Option<&'a str>,
+    /// The needle (lower-case ASCII) is found whatever the ASCII case of the text, and a
+    /// text holding U+0130 or U+212A (whose lower case has an ASCII letter without being
+    /// one) passes too: a superset of the texts whose Unicode lower case (`LCASE`) holds
+    /// the needle, which the caller tests exactly.
+    pub ascii_case_insensitive: bool,
+}
+
+/// The characters whose lower case holds an ASCII letter though they aren't ASCII: `İ`
+/// (to `i` and a combining dot) and the Kelvin sign (to `k`).
+const LOWERING_TO_ASCII: [&str; 2] = ["\u{0130}", "\u{212A}"];
+
+/// Whether `text` holds `needle` (lower-case ASCII) at `placement`, whatever its ASCII
+/// case, or one of [`LOWERING_TO_ASCII`].
+fn placed_any_case(text: &[u8], needle: &[u8], placement: Placement) -> bool {
+    let n = needle.len();
+    let special = LOWERING_TO_ASCII
+        .iter()
+        .any(|c| memchr::memmem::find(text, c.as_bytes()).is_some());
+    special
+        || match placement {
+            Placement::Anywhere => text.windows(n).any(|w| w.eq_ignore_ascii_case(needle)),
+            Placement::Start => text.len() >= n && text[..n].eq_ignore_ascii_case(needle),
+            Placement::End => {
+                text.len() >= n && text[text.len() - n..].eq_ignore_ascii_case(needle)
+            }
+            Placement::Whole => text.eq_ignore_ascii_case(needle),
+        }
 }
 
 /// Entries per parallel slice.
@@ -53,11 +80,43 @@ pub(crate) fn matching(
     limit: u64,
     test: &StringTest<'_>,
 ) -> Vec<TermId> {
+    if !test.ascii_case_insensitive || test.needle.is_empty() {
+        let finder = memchr::memmem::Finder::new(test.needle.as_bytes());
+        return matching_with(bytes, ends, first_index, limit, test, &|h| finder.find(h));
+    }
+    // Without regard to ASCII case: the needle by one search (its rare bytes in both
+    // cases first), and the characters lowering to ASCII by `memmem`, each its own pass.
+    let any_case = aho_corasick::AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build([test.needle.as_bytes()])
+        .expect("one short pattern");
+    let mut ids = matching_with(bytes, ends, first_index, limit, test, &|h| {
+        any_case.find(h).map(|m| m.start())
+    });
+    for special in LOWERING_TO_ASCII {
+        let finder = memchr::memmem::Finder::new(special.as_bytes());
+        ids.extend(matching_with(bytes, ends, first_index, limit, test, &|h| {
+            finder.find(h)
+        }));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// [`matching`] with `find` giving the first hit in a haystack.
+fn matching_with(
+    bytes: &[u8],
+    ends: &[u64],
+    first_index: u64,
+    limit: u64,
+    test: &StringTest<'_>,
+    find: &(dyn Fn(&[u8]) -> Option<usize> + Sync),
+) -> Vec<TermId> {
     let entries = ends.len().min(limit as usize);
     if entries == 0 {
         return Vec::new();
     }
-    let finder = memchr::memmem::Finder::new(test.needle.as_bytes());
     let start_of = |i: usize| if i == 0 { 0 } else { ends[i - 1] as usize };
     let mut ids: Vec<TermId> = (0..entries.div_ceil(SLICE))
         .into_par_iter()
@@ -77,7 +136,7 @@ pub(crate) fn matching(
             let mut entry = first;
             let mut at = from;
             // Each hit's entry, then on past that entry: one test per matching entry.
-            while let Some(hit) = finder.find(&bytes[at..to]).map(|offset| at + offset) {
+            while let Some(hit) = find(&bytes[at..to]).map(|offset| at + offset) {
                 entry += ends[entry..last].partition_point(|&end| end as usize <= hit);
                 let (start, end) = (start_of(entry), ends[entry] as usize);
                 if let Some(id) = passes(
@@ -136,6 +195,9 @@ fn placed(
     test: &StringTest<'_>,
 ) -> bool {
     let needle = test.needle.as_bytes();
+    if test.ascii_case_insensitive {
+        return placed_any_case(text, needle, test.placement);
+    }
     match test.placement {
         Placement::Anywhere => {
             (hit >= text_start && hit + needle.len() <= key_len)
@@ -226,6 +288,7 @@ mod tests {
                         lang_strings,
                         typed,
                         language: None,
+                        ascii_case_insensitive: false,
                     };
                     let mut expected: Vec<TermId> = ids
                         .iter()
@@ -282,6 +345,7 @@ mod tests {
                 lang_strings: true,
                 typed: true,
                 language: Some(language),
+                ascii_case_insensitive: false,
             };
             let mut expected: Vec<TermId> = ids
                 .iter()
@@ -302,6 +366,59 @@ mod tests {
                 expected,
                 "{test:?}"
             );
+        }
+    }
+
+    /// Without regard to ASCII case: every text whose Unicode lower case holds the needle
+    /// is found (with İ and the Kelvin sign, whose lower case holds ASCII letters).
+    #[test]
+    fn any_case_finds_every_text_whose_lower_case_holds_the_needle() {
+        let dictionary = Dictionary::default();
+        let texts = [
+            "Michael",
+            "MICHAEL",
+            "MİCHAEL",
+            "mİ",
+            "Kelvin",
+            "300 \u{212A}",
+            "nothing",
+            "MiChAeL x",
+        ];
+        let ids: Vec<TermId> = texts
+            .iter()
+            .map(|t| dictionary.intern(Literal::new_simple_literal(*t).as_ref().into()))
+            .collect();
+        for (needle, placement) in [
+            ("michael", Placement::Anywhere),
+            ("mi", Placement::Start),
+            ("k", Placement::Anywhere),
+            ("michael", Placement::Whole),
+            ("x", Placement::End),
+        ] {
+            let test = StringTest {
+                needle,
+                placement,
+                iris: false,
+                strings: true,
+                lang_strings: true,
+                typed: false,
+                language: None,
+                ascii_case_insensitive: true,
+            };
+            let found = dictionary.matching_strings(&test, u64::MAX);
+            for (text, id) in texts.iter().zip(&ids) {
+                let lower = text.to_lowercase();
+                let exact = match placement {
+                    Placement::Anywhere => lower.contains(needle),
+                    Placement::Start => lower.starts_with(needle),
+                    Placement::End => lower.ends_with(needle),
+                    Placement::Whole => lower == needle,
+                };
+                if exact {
+                    assert!(found.contains(id), "{needle} {placement:?}: {text}");
+                }
+            }
+            assert!(!found.contains(&ids[6]), "{needle}: nothing");
         }
     }
 }

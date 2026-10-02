@@ -447,6 +447,7 @@ impl Dictionary {
             test.placement,
             super::Placement::Start | super::Placement::Whole
         ) && !test.needle.is_empty()
+            && !test.ascii_case_insensitive
             && self.text_order_ready()
         {
             return self.prefix_matches(test, limit);
