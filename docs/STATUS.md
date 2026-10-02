@@ -64,6 +64,7 @@ Last updated: 2 October 2026, branch `refactor/engine-v2`.
 | Item | State | Notes |
 |---|---|---|
 | Inferences and graph access | open, decided | Support graph sets (research designs §4/§6), decided on 2 October; in phase 1 of [the roadmap](plan/2026-10-02-roadmap.md), reasoner provenance first. The audit plan's reasoning scopes are not pursued |
+| Support counts (provenance, [design](design/reasoner-provenance.md) step 1) | started | Non-recursive derivation counts per inferred fact (Hu, Motik and Horrocks), recursion decided per ground key (predicate, or `rdf:type` with its class), equality's `sameAs` premise and class/property `sameAs` in the key graph; the delta executor keeps a candidate with a surviving non-recursive derivation without a proof search, counting each lost instance once. Exact against fresh counts over 40 seeds × 300 random cases; LUBM(10) batch deletes 4.5× faster (1,000 deletes: 111 → 25 ms), checked against rematerialisation. Open: counts recorded during materialisation (the separate pass takes 306 ms on LUBM(10)), the store's use of them, the support stack in the engine (step 2) |
 | `v2` flattened, `nrese-core` folded in | open | |
 | OWL 2 DL | open | [ADR-0009](adr/0009-owl2-dl-reasoning.md) accepted on 2 October and revised after seven research reports; the order is [the roadmap](plan/2026-10-02-roadmap.md), phases 2–4; `owl2-dl` always reports completeness, certain answers by default only where a complete path exists (decided 2 October) |
 
