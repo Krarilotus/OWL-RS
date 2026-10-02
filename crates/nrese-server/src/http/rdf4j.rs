@@ -459,8 +459,10 @@ pub async fn query_get(
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::query_access(&state, &headers).await?;
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_query_read(&state, &headers).await?;
     let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
     let mut operation = query_from_url(raw.0.as_deref())?;
     operation.restrict(&access);
     sparql::execute_query(state, operation, accept_header_value(&headers)).await
@@ -498,8 +500,10 @@ pub async fn statements_get(
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::graph_read_access(&state, &headers).await?;
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_graph_read(&state, &headers).await?;
     let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
     statements(state, raw, headers, None, &access).await
 }
 
@@ -548,8 +552,10 @@ pub async fn statements_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &headers).await?;
     let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
     let op = if is_update(&headers) {
         StatementOp::Update(update(&raw, &headers, &body)?)
     } else {
@@ -570,8 +576,10 @@ pub async fn statements_put(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &headers).await?;
     let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
     state.policy().enforce_rdf_upload_bytes(body.len())?;
     let contexts = contexts(&pairs(&raw)?)?;
     let ops = vec![
@@ -594,8 +602,10 @@ pub async fn statements_delete(
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &headers).await?;
     let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
     let pattern = pattern(&pairs(&raw)?)?;
     apply(&state, vec![StatementOp::RemoveMatching(pattern)], &access).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -607,8 +617,10 @@ pub async fn size(
     raw: RawQuery,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::query_access(&state, &headers).await?;
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_query_read(&state, &headers).await?;
     let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
     count(state, raw, None, &access).await
 }
 
@@ -645,8 +657,10 @@ pub async fn contexts_get(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::query_access(&state, &headers).await?;
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_query_read(&state, &headers).await?;
     let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
     state.ensure_serving()?;
     let rows = state
         .store()
@@ -803,8 +817,10 @@ pub async fn transaction_begin(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &headers).await?;
     let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
     let txid = state
         .store()
         .sessions()
@@ -826,8 +842,10 @@ pub async fn transaction_action(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &headers).await?;
     let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
     let pairs = pairs(&raw)?;
     let action = param(&pairs, "action")
         .unwrap_or_default()
@@ -898,8 +916,10 @@ pub async fn transaction_rollback(
     Path((id, txid)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let access = guard::update_access(&state, &headers).await?;
+    // Authenticated first; the view is the repository's (workspaces are per repository).
+    let identity = guard::enforce_update_write(&state, &headers).await?;
     let state = state.for_repository(&id)?;
+    let access = guard::view(&state, &identity);
     match state
         .store()
         .sessions()
