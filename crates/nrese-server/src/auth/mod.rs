@@ -40,8 +40,8 @@ impl AuthConfig {
 
     /// Checks that the request's credentials allow `action`; returns who it is.
     ///
-    /// `also` may allow what the credentials' grants don't (the access policy's roles,
-    /// [`crate::access::AccessPolicy::allows`]).
+    /// `also` may allow what the credentials' grants don't (the access state's rules,
+    /// [`nrese_store::access::AccessState::grants_read`]).
     pub async fn authorize(
         &self,
         action: PolicyAction,
@@ -60,14 +60,16 @@ impl AuthConfig {
     }
 }
 
-/// Who a request is, as its credentials say: an administrator, and its role names
-/// (claims of a token, `reader` for a static read token, the subject of a client
-/// certificate; `anonymous` without authentication). Graph access ([`crate::access`]) is
-/// decided by the role names.
+/// Who a request is, as its credentials say: an administrator, its role names (claims of
+/// a token, `reader` for a static read token, the subject of a client certificate;
+/// `anonymous` without authentication) and its user name (a token's subject, a client
+/// certificate's subject when it is a valid name). Graph access ([`crate::access`]) is
+/// decided by them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Identity {
     pub admin: bool,
     pub roles: BTreeSet<String>,
+    pub user: Option<String>,
 }
 
 impl Identity {
@@ -76,6 +78,7 @@ impl Identity {
         Self {
             admin: false,
             roles: BTreeSet::from(["anonymous".to_owned()]),
+            user: None,
         }
     }
 
@@ -84,7 +87,16 @@ impl Identity {
         Self {
             admin: grants.contains(&AccessGrant::Admin),
             roles,
+            user: None,
         }
+    }
+
+    /// This identity named `user`, if that is a valid user name.
+    pub fn with_user(mut self, user: Option<&str>) -> Self {
+        self.user = user
+            .filter(|name| nrese_store::access::valid_user_name(name))
+            .map(str::to_owned);
+        self
     }
 }
 

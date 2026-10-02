@@ -59,6 +59,8 @@ impl Eq for OidcIntrospectionConfig {}
 #[derive(Debug, Deserialize)]
 struct IntrospectionResponse {
     active: bool,
+    sub: Option<String>,
+    username: Option<String>,
     scope: Option<String>,
     scp: Option<StringOrMany>,
     role: Option<String>,
@@ -94,7 +96,8 @@ pub async fn authorize(
         response.role.as_deref(),
         response.roles.as_ref(),
     );
-    let identity = Identity::from_grants(&grants, roles);
+    let identity = Identity::from_grants(&grants, roles)
+        .with_user(response.sub.as_deref().or(response.username.as_deref()));
     // An active token is authenticated; its roles may get rights from the access policy.
     if authorize_grants(action, &grants) || also(&identity) {
         Ok(identity)

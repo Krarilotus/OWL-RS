@@ -112,7 +112,7 @@ pub async fn enforce_metrics_read(
 
 /// What `identity` may read and write (graph-level access control, [`crate::access`]).
 pub fn view(state: &AppState, identity: &Identity) -> AccessView {
-    state.policy().access_view(identity)
+    state.access_view(identity)
 }
 
 /// [`enforce_query_read`], and what the requester may read.

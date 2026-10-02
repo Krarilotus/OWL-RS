@@ -24,9 +24,14 @@ pub struct AppState {
     rate_limiter: Arc<RateLimiter>,
     request_metrics: Arc<RequestMetrics>,
     repositories: Arc<Repositories>,
+    /// Users, workspaces and graph policies ([`crate::access`]), server-wide.
+    access: Arc<nrese_store::access::AccessControl>,
+    /// The repository this state serves.
+    repository: Arc<str>,
 }
 
 impl AppState {
+    /// [`Self::try_new`]; panics if the access state can't be opened (for tests).
     pub fn new(
         store: StoreService,
         reasoner: ReasonerService,
@@ -34,8 +39,22 @@ impl AppState {
         ai: AiSuggestionService,
         deployment_posture: DeploymentPosture,
     ) -> Self {
+        Self::try_new(store, reasoner, policy, ai, deployment_posture).expect("access state")
+    }
+
+    /// The server's state: the default repository's store, the others found beside it, and
+    /// the access state in the system store (`system/` of the data directory, or in memory
+    /// with the store), into which a policy file is imported at the first start.
+    pub fn try_new(
+        store: StoreService,
+        reasoner: ReasonerService,
+        policy: PolicyConfig,
+        ai: AiSuggestionService,
+        deployment_posture: DeploymentPosture,
+    ) -> anyhow::Result<Self> {
         let repositories = Arc::new(Repositories::open(store.config(), reasoner.clone()));
-        Self {
+        let access = Arc::new(open_access(store.config(), &policy)?);
+        Ok(Self {
             pipeline: Arc::new(MutationPipeline::new(Arc::new(store), Arc::new(reasoner))),
             ready: Arc::new(AtomicBool::new(false)),
             policy: Arc::new(policy),
@@ -44,7 +63,36 @@ impl AppState {
             rate_limiter: Arc::new(RateLimiter::default()),
             request_metrics: Arc::default(),
             repositories,
-        }
+            access,
+            repository: Arc::from(DEFAULT_REPOSITORY),
+        })
+    }
+
+    /// The access state ([`crate::access`]).
+    pub fn access(&self) -> &nrese_store::access::AccessControl {
+        &self.access
+    }
+
+    /// The id of the repository this state serves.
+    pub fn repository_id(&self) -> &str {
+        &self.repository
+    }
+
+    /// What `identity` may read and write in this state's repository.
+    pub fn access_view(&self, identity: &crate::auth::Identity) -> crate::access::AccessView {
+        self.access
+            .view(&crate::access::principal(identity), &self.repository)
+    }
+
+    /// `identity` as the access state's changes see it: an administrator also when the
+    /// server has no authentication (every endpoint is open then).
+    pub fn access_principal(
+        &self,
+        identity: &crate::auth::Identity,
+    ) -> nrese_store::access::Principal {
+        let mut principal = crate::access::principal(identity);
+        principal.admin |= matches!(self.policy.auth, crate::auth::AuthConfig::None);
+        principal
     }
 
     /// The repositories besides the default one ([`crate::repositories`]).
@@ -64,6 +112,7 @@ impl AppState {
             .ok_or_else(|| ApiError::not_found(format!("no repository '{id}'")))?;
         Ok(Self {
             pipeline: repository.pipeline,
+            repository: Arc::from(id),
             ..self.clone()
         })
     }
@@ -154,7 +203,22 @@ impl AppState {
         action: PolicyAction,
         headers: &HeaderMap,
     ) -> Result<crate::auth::Identity, ApiError> {
-        let identity = self.policy.authorize(action, headers).await?;
+        let state = self.access.state();
+        let also = |identity: &crate::auth::Identity| {
+            let principal = crate::access::principal(identity);
+            match action {
+                PolicyAction::QueryRead
+                | PolicyAction::GraphRead
+                | PolicyAction::ServiceDescriptionRead => state.grants_read(&principal),
+                PolicyAction::UpdateWrite | PolicyAction::GraphWrite | PolicyAction::TellWrite => {
+                    state.grants_write(&principal)
+                }
+                PolicyAction::OperatorRead
+                | PolicyAction::AdminWrite
+                | PolicyAction::MetricsRead => state.is_admin(&principal),
+            }
+        };
+        let identity = self.policy.auth.authorize(action, headers, &also).await?;
         self.rate_limiter.enforce(action, self.policy.rate_limits)?;
         Ok(identity)
     }
@@ -180,4 +244,43 @@ impl AppState {
             StoreMode::OnDisk => "durable",
         }
     }
+}
+
+/// The access state of a server whose default store has `template`'s settings, with the
+/// policy file of `policy` imported if the state is new.
+fn open_access(
+    template: &nrese_store::StoreConfig,
+    policy: &PolicyConfig,
+) -> anyhow::Result<nrese_store::access::AccessControl> {
+    use anyhow::Context;
+    use nrese_store::access::{AccessControl, Change, Principal};
+    let config = match template.mode {
+        StoreMode::OnDisk => nrese_store::StoreConfig::on_disk(template.data_dir.join("system")),
+        StoreMode::InMemory => nrese_store::StoreConfig::in_memory(),
+    };
+    let store = StoreService::new(config).context("the system store (access state)")?;
+    let access = AccessControl::open(store, &policy.workspace_base)
+        .map_err(|error| anyhow::anyhow!("the access state: {error}"))?;
+    if let Some(file) = &policy.access {
+        if access.is_new() {
+            let server = Principal {
+                user: Some("nrese-server".to_owned()),
+                admin: true,
+                ..Principal::default()
+            };
+            access
+                .apply(
+                    &server,
+                    Change::Import((**file).clone()),
+                    "the access policy file, at the first start",
+                )
+                .map_err(|error| anyhow::anyhow!("the access policy file: {error}"))?;
+        } else if access.state().export() != **file {
+            tracing::warn!(
+                "the access policy file differs from the access state, which applies; \
+                 import the file with POST /api/v1/access/import to apply it"
+            );
+        }
+    }
+    Ok(access)
 }

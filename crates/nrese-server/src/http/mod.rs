@@ -1,3 +1,4 @@
+mod access_api;
 mod admin_dataset;
 mod ai;
 mod api_v1;

@@ -26,7 +26,7 @@ pub fn authorize(
     if grants.contains(&AccessGrant::Read) {
         roles.insert("reader".to_owned());
     }
-    let identity = Identity::from_grants(&grants, roles);
+    let identity = Identity::from_grants(&grants, roles).with_user(Some(subject));
 
     // A subject the configuration doesn't list is unknown, whatever a policy names.
     if authorize_grants(action, &grants) || (!grants.is_empty() && also(&identity)) {
