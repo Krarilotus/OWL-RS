@@ -192,7 +192,7 @@ pub(crate) fn apply_statements(
                     // Every graph the removal would change must be writable.
                     let mut allowed = std::collections::HashSet::new();
                     for engine_pattern in &patterns {
-                        for quad in tx.quads_for_pattern(engine_pattern) {
+                        for quad in tx.quads_for_pattern_in(ReadModel::Asserted, engine_pattern) {
                             if allowed.contains(&quad.graph) {
                                 continue;
                             }

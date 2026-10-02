@@ -390,6 +390,20 @@ async fn graph_store_and_rdf4j_follow_the_policy() -> Result<(), Box<dyn std::er
     .await?;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
+    // Deletions remove asserted statements only: one whose pattern matches nothing
+    // but an inferred statement (`a a D`) changes nothing and is allowed, even in a graph
+    // the role may not write.
+    let (status, _) = send(
+        &app,
+        analyst,
+        Method::DELETE,
+        &format!("/repositories/nrese/statements?subj=%3C{EX}a%3E&obj=%3C{EX}D%3E"),
+        None,
+        "",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
     // Endpoints over the whole dataset are for users who may read every graph.
     let (status, _) = send(
         &app,
