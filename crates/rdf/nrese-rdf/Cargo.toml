@@ -15,10 +15,10 @@ xsd = ["dep:nrese-xsd"]
 rdfc = ["dep:sha2"]
 
 [dependencies]
-foldhash = "0.2"
+foldhash = { workspace = true }
 nrese-xsd = { path = "../nrese-xsd", optional = true }
-rand = "0.9"
-sha2 = { version = "0.10", optional = true }
+rand = { workspace = true }
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [lints]

@@ -12,19 +12,19 @@ aho-corasick = "1.1"
 crc32fast = "1.5"
 # FSST-compressed vocabularies (src/term/vocabulary.rs); Apache-2.0.
 fsst = { package = "fsst-rs", version = "0.6" }
-hashbrown = { version = "0.16", default-features = false, features = ["default-hasher", "inline-more"] }
-memchr = "2.8"
+hashbrown = { workspace = true }
+memchr = { workspace = true }
 memmap2 = "0.9"
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
-parking_lot = "0.12"
-rayon = "1.10"
+parking_lot = { workspace = true }
+rayon = { workspace = true }
 rust-stemmers = "1.2"
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tempfile = "3.23.0"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
