@@ -56,6 +56,14 @@ def lubm(root: Path, tier: str, settings: dict) -> Plan:
                 prepare=["bash", "benches/reasoning/prepare-lubm.sh", tier])
 
 
+def lubm_materialised(root: Path, tier: str, settings: dict) -> Plan:
+    queries = root / "benches/reasoning/queries/lubm"
+    return Plan("lubm-materialised", tier, inputs=[f"/data/lubm-{tier}-materialised.nt"], queries=queries,
+                expected=expected_counts(queries / f"expected-lubm-{tier}.tsv"),
+                prepare=["bash", "benches/reasoning/prepare-lubm-materialised.sh", tier],
+                note="the OWL 2 RL closure precomputed by NRESE; every system loads it without inference")
+
+
 def owl2bench(root: Path, tier: str, settings: dict) -> Plan:
     profile, _, n = tier.partition("-")
     regimes = {"rl": ["owl2-rl", "owl-horst"], "ql": ["owl2-ql", "owl2-rl"]}.get(profile)
@@ -149,6 +157,7 @@ def clients(root: Path, tier: str, settings: dict) -> Plan:
 # workload -> (the plan of a tier, the default tiers)
 DEFINITIONS = {
     "lubm": (lubm, ["1"]),
+    "lubm-materialised": (lubm_materialised, ["1"]),
     "owl2bench": (owl2bench, ["rl-1"]),
     "integration-rg-gs-gnd": (integration, ["example"]),
     "basics-mix": (basics, ["olympics"]),
