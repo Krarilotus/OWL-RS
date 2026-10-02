@@ -29,6 +29,7 @@ struct JwtClaims {
     _iss: Option<String>,
     #[serde(rename = "aud")]
     _aud: Option<StringOrMany>,
+    sub: Option<String>,
     scope: Option<String>,
     scp: Option<StringOrMany>,
     role: Option<String>,
@@ -50,7 +51,7 @@ pub fn authorize(
         claims.role.as_deref(),
         claims.roles.as_ref(),
     );
-    let identity = Identity::from_grants(&grants, roles);
+    let identity = Identity::from_grants(&grants, roles).with_user(claims.sub.as_deref());
 
     // A valid token is authenticated; its roles may get rights from the access policy.
     if authorize_grants(action, &grants) || also(&identity) {
@@ -114,6 +115,7 @@ mod tests {
             _nbf: None,
             _iss: None,
             _aud: None,
+            sub: None,
             scope: Some("nrese.read".to_owned()),
             scp: None,
             role: None,

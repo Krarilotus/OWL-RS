@@ -220,6 +220,9 @@ pub(super) struct RawAuthConfig {
     /// The graph access policy file ([`crate::access`]).
     #[serde(default)]
     pub access_policy: Option<String>,
+    /// What workspace graph prefixes start with ([`crate::access`]).
+    #[serde(default)]
+    pub workspace_base: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

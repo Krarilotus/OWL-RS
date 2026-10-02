@@ -1,6 +1,6 @@
 # ADR-0008: Users, workspaces and graph policies in the store
 
-Status: proposed (2026-10-02). The owner's direction: policies modifiable and justifiable at
+Status: accepted (2026-10-02; the personal space is mandatory). The owner's direction: policies modifiable and justifiable at
 the store level, but user control and the users' own space first; the best model for the
 use cases ahead ([gap plan G2b](../plan/2026-10-02-engine-gaps.md)).
 
@@ -64,3 +64,22 @@ API and the UI manage, with an audit log.
 - ResearchSpace's own users and groups map onto these (by token claims or by
   provisioning through the API); the datamodel workflow gets a service account with a
   role.
+
+## Implementation (2 October)
+
+- The state and its rules are the core's (`nrese_store::access`): evaluation, who may change
+  what, the RDF form (vocabulary `https://nrese.dev/ns/access#`) and the history. The
+  server maps credentials to a principal and serves `/api/v1/access/…`
+  ([HTTP interface](../ops/http-api.md#users-workspaces-and-policies-apiv1access)).
+- The state is server-wide, kept in a system store of its own (`system/` of the data
+  directory) rather than a graph of each repository: users and roles span repositories (a
+  workspace names its repository, or applies to all), and a store of its own is out of
+  reach of every query, update, reasoning and SHACL run on the data by construction. It
+  has the data's durability (WAL, checkpoints).
+- Enforcement is a setting of the state, off until a policy file is imported or an
+  administrator turns it on: a server without a policy behaves as before.
+- Personal spaces need no record: `~user` exists for every named user; a record appears
+  when it is shared. Only administrators give a workspace graphs outside its prefix (else
+  any user could take in any graph).
+- Local users (Argon2 passwords) are the next step; provenance-based visibility of
+  inferred statements waits for G3.

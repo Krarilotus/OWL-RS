@@ -145,13 +145,13 @@ async fn run() -> Result<()> {
     let ontology_path = store
         .preloaded_ontology_path()
         .map(|path| path.to_path_buf());
-    let state = AppState::new(
+    let state = AppState::try_new(
         store.clone(),
         reasoner.clone(),
         config.policy.clone(),
         ai,
         config.deployment_posture,
-    );
+    )?;
     state.mark_ready();
     let app = build_app(state);
 

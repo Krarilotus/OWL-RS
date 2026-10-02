@@ -68,10 +68,15 @@ pub(super) fn parse_policy_config(source: &dyn ConfigSource) -> Result<PolicyCon
         {
             None => None,
             Some(path) => Some(std::sync::Arc::new(
-                crate::access::AccessPolicy::load(std::path::Path::new(path.trim()))
+                crate::access::load(std::path::Path::new(path.trim()))
                     .with_context(|| names::ACCESS_POLICY)?,
             )),
         },
+        workspace_base: source
+            .get(names::WORKSPACE_BASE)
+            .map(|base| base.trim().to_owned())
+            .filter(|base| !base.is_empty())
+            .unwrap_or_else(|| "urn:nrese:".to_owned()),
     })
 }
 

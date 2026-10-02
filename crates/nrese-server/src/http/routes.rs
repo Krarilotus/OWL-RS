@@ -1,6 +1,7 @@
 use axum::Router;
 use axum::routing::{delete, get, post, put};
 
+use crate::http::access_api;
 use crate::http::api_v1;
 use crate::http::handlers;
 use crate::http::rdf4j;
@@ -146,6 +147,32 @@ pub fn router(state: AppState) -> Router {
         // The engine API (ADR-0007): every capability for every repository, by the same
         // handlers as the default repository's `/dataset/…` routes.
         .route("/api/v1/repositories", get(api_v1::repositories))
+        // Users, workspaces and graph policies (ADR-0008).
+        .route("/api/v1/access", get(access_api::overview))
+        .route("/api/v1/access/me", get(access_api::me))
+        .route("/api/v1/access/settings", put(access_api::settings_put))
+        .route(
+            "/api/v1/access/roles/{name}",
+            put(access_api::role_put).delete(access_api::role_delete),
+        )
+        .route(
+            "/api/v1/access/users/{name}",
+            put(access_api::user_put).delete(access_api::user_delete),
+        )
+        .route("/api/v1/access/workspaces", get(access_api::workspaces))
+        .route(
+            "/api/v1/access/workspaces/{name}",
+            get(access_api::workspace)
+                .put(access_api::workspace_put)
+                .delete(access_api::workspace_delete),
+        )
+        .route(
+            "/api/v1/access/workspaces/{name}/members/{user}",
+            put(access_api::member_put).delete(access_api::member_delete),
+        )
+        .route("/api/v1/access/history", get(access_api::history))
+        .route("/api/v1/access/import", post(access_api::import))
+        .route("/api/v1/access/export", get(access_api::export))
         .route(
             "/api/v1/repositories/{id}",
             get(api_v1::repository_get)
