@@ -150,6 +150,8 @@ pub fn router(state: AppState) -> Router {
         // Users, workspaces and graph policies (ADR-0008).
         .route("/api/v1/access", get(access_api::overview))
         .route("/api/v1/access/me", get(access_api::me))
+        .route("/api/v1/access/login", post(access_api::login))
+        .route("/api/v1/access/logout", post(access_api::logout))
         .route("/api/v1/access/settings", put(access_api::settings_put))
         .route(
             "/api/v1/access/roles/{name}",

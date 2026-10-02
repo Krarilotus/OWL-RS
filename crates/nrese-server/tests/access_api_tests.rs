@@ -434,3 +434,158 @@ async fn administrators_manage_roles_and_users_with_a_history() {
         ]
     );
 }
+
+async fn send_with(
+    app: &axum::Router,
+    authorization: &str,
+    method: Method,
+    uri: &str,
+    body: &str,
+) -> (StatusCode, String) {
+    let request = Request::builder()
+        .uri(uri)
+        .method(method)
+        .header("authorization", authorization)
+        .header("content-type", "application/json")
+        .header("accept", "application/sparql-results+json, */*;q=0.1")
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    (status, body_text(response).await.unwrap())
+}
+
+async fn update_as(app: &axum::Router, authorization: &str, text: &str) -> StatusCode {
+    let request = Request::builder()
+        .uri("/api/v1/repositories/nrese/update")
+        .method(Method::POST)
+        .header("authorization", authorization)
+        .header("content-type", "application/sparql-update")
+        .body(Body::from(text.to_owned()))
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap().status()
+}
+
+fn basic(user: &str, password: &str) -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    )
+}
+
+#[tokio::test]
+async fn local_users_log_in_with_passwords_besides_tokens() {
+    let app = app();
+    let (status, body) = put(
+        &app,
+        ADMIN,
+        "/api/v1/access/users/dana",
+        json!({ "password": "short", "reason": "desktop user" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = put(
+        &app,
+        ADMIN,
+        "/api/v1/access/users/dana",
+        json!({ "password": "a long enough secret", "reason": "desktop user" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.to_string().contains("argon2"), "{body}");
+    // Basic credentials: dana reads (enforcement is off) and has a personal space.
+    let dana = basic("dana", "a long enough secret");
+    let (status, me) = send_with(&app, &dana, Method::GET, "/api/v1/access/me", "").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    let me: Value = serde_json::from_str(&me).unwrap();
+    assert_eq!(me["user"], "dana");
+    let (status, _) = send_with(
+        &app,
+        &basic("dana", "wrong"),
+        Method::GET,
+        "/api/v1/access/me",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // A session: log in once, then the token.
+    let (status, session) = send_with(
+        &app,
+        "",
+        Method::POST,
+        "/api/v1/access/login",
+        &json!({ "user": "dana", "password": "a long enough secret" }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
+    let session: Value = serde_json::from_str(&session).unwrap();
+    let bearer = format!("Bearer {}", session["token"].as_str().unwrap());
+    assert_eq!(session["expires_in_seconds"], 12 * 3600);
+    let (status, _) = send_with(&app, &bearer, Method::GET, "/api/v1/access/me", "").await;
+    assert_eq!(status, StatusCode::OK);
+    // Writes need enforcement (the personal space) or a role; then dana writes its own.
+    let (status, _) = put(
+        &app,
+        ADMIN,
+        "/api/v1/access/settings",
+        json!({ "enforced": true, "reason": "go live" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let write = |graph: &str| format!("INSERT DATA {{ GRAPH <{graph}> {{ <urn:a> <urn:p> 1 }} }}");
+    assert_eq!(
+        update_as(&app, &bearer, &write("urn:nrese:space/dana/x")).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        update_as(&app, &bearer, &write("urn:nrese:space/erin/x")).await,
+        StatusCode::FORBIDDEN
+    );
+    // dana changes its own password: the session ends, the new password works.
+    let (status, body) = send_with(
+        &app,
+        &bearer,
+        Method::PUT,
+        "/api/v1/access/users/dana",
+        &json!({ "password": "another long secret", "reason": "rotation" }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = send_with(&app, &bearer, Method::GET, "/api/v1/access/me", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send_with(
+        &app,
+        &basic("dana", "another long secret"),
+        Method::GET,
+        "/api/v1/access/me",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // ... but not its roles.
+    let (status, _) = send_with(
+        &app,
+        &basic("dana", "another long secret"),
+        Method::PUT,
+        "/api/v1/access/users/dana",
+        &json!({ "admin": true, "reason": "promotion" }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Logging out ends a session.
+    let (_, session) = send_with(
+        &app,
+        "",
+        Method::POST,
+        "/api/v1/access/login",
+        &json!({ "user": "dana", "password": "another long secret" }).to_string(),
+    )
+    .await;
+    let session: Value = serde_json::from_str(&session).unwrap();
+    let bearer = format!("Bearer {}", session["token"].as_str().unwrap());
+    let (status, _) = send_with(&app, &bearer, Method::POST, "/api/v1/access/logout", "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send_with(&app, &bearer, Method::GET, "/api/v1/access/me", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}

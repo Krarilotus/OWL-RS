@@ -68,6 +68,65 @@ impl AppState {
         })
     }
 
+    /// The identity of a local login the request carries: `Basic` credentials of a user
+    /// with a password, or a session token. `None` without either (the authentication
+    /// mode decides); 401 for wrong ones, 429 after too many.
+    async fn local_identity(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<crate::auth::Identity>, ApiError> {
+        use base64::Engine;
+        if !self.policy.local_logins {
+            return Ok(None);
+        }
+        let Some(value) = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Ok(None);
+        };
+        let identity = |user: String| crate::auth::Identity {
+            admin: false,
+            roles: std::collections::BTreeSet::new(),
+            user: Some(user),
+        };
+        if let Some(token) = value
+            .strip_prefix("Bearer ")
+            .map(str::trim)
+            .filter(|token| token.starts_with(nrese_store::access::SESSION_PREFIX))
+        {
+            return match self.access.session(token) {
+                Some(principal) => Ok(principal.user.map(identity)),
+                None => Err(ApiError::unauthorized(
+                    "the session has ended; log in again",
+                )),
+            };
+        }
+        let Some(encoded) = value.strip_prefix("Basic ") else {
+            return Ok(None);
+        };
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or_else(|| ApiError::unauthorized("malformed Basic credentials"))?;
+        let (user, password) = decoded
+            .split_once(':')
+            .ok_or_else(|| ApiError::unauthorized("malformed Basic credentials"))?;
+        let (user, password) = (user.to_owned(), password.to_owned());
+        let access = Arc::clone(&self.access);
+        let principal = tokio::task::spawn_blocking(move || access.login(&user, &password))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        match principal {
+            Ok(principal) => Ok(principal.user.map(identity)),
+            Err(nrese_store::access::AccessError::Throttled(message)) => {
+                Err(ApiError::too_many_requests(message))
+            }
+            Err(_) => Err(ApiError::unauthorized("wrong user name or password")),
+        }
+    }
+
     /// The access state ([`crate::access`]).
     pub fn access(&self) -> &nrese_store::access::AccessControl {
         &self.access
@@ -218,7 +277,23 @@ impl AppState {
                 | PolicyAction::MetricsRead => state.is_admin(&principal),
             }
         };
-        let identity = self.policy.auth.authorize(action, headers, &also).await?;
+        let identity = match self.local_identity(headers).await? {
+            Some(mut identity) => {
+                let principal = crate::access::principal(&identity);
+                identity.admin = state.is_admin(&principal);
+                let mut grants = std::collections::BTreeSet::from([crate::auth::AccessGrant::Read]);
+                if identity.admin {
+                    grants.insert(crate::auth::AccessGrant::Admin);
+                }
+                if !(crate::auth::authorize_grants(action, &grants) || also(&identity)) {
+                    return Err(ApiError::forbidden(
+                        "the local login does not grant access to this endpoint",
+                    ));
+                }
+                identity
+            }
+            None => self.policy.auth.authorize(action, headers, &also).await?,
+        };
         self.rate_limiter.enforce(action, self.policy.rate_limits)?;
         Ok(identity)
     }

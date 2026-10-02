@@ -20,6 +20,10 @@ pub struct PolicyConfig {
     /// What workspace graph prefixes start with (`urn:nrese:` by default): a personal
     /// space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`.
     pub workspace_base: String,
+    /// Whether users of the access state log in with their passwords (`Basic`
+    /// credentials, or a session from `POST /api/v1/access/login`), besides the
+    /// authentication mode.
+    pub local_logins: bool,
 }
 
 impl Default for PolicyConfig {
@@ -34,6 +38,7 @@ impl Default for PolicyConfig {
             expose_metrics: true,
             access: None,
             workspace_base: "urn:nrese:".to_owned(),
+            local_logins: true,
         }
     }
 }

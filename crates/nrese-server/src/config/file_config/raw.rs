@@ -223,6 +223,9 @@ pub(super) struct RawAuthConfig {
     /// What workspace graph prefixes start with ([`crate::access`]).
     #[serde(default)]
     pub workspace_base: Option<String>,
+    /// Whether local users log in (passwords kept in the access state).
+    #[serde(default)]
+    pub local_logins: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]

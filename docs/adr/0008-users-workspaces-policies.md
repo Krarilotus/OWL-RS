@@ -81,5 +81,8 @@ API and the UI manage, with an audit log.
 - Personal spaces need no record: `~user` exists for every named user; a record appears
   when it is shared. Only administrators give a workspace graphs outside its prefix (else
   any user could take in any graph).
-- Local users (Argon2 passwords) are the next step; provenance-based visibility of
-  inferred statements waits for G3.
+- Local users: Argon2id password hashes in the user's record (never in the history),
+  `Basic` credentials (a verified credential remembered by its SHA-256 while the hash
+  stays) or a session token from `POST /api/v1/access/login`; failures throttled per
+  user name; sessions end with a password change. On by default, beside any token mode.
+- Provenance-based visibility of inferred statements waits for G3.

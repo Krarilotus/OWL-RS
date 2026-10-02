@@ -25,6 +25,7 @@
 //! [ADR-0008]: ../../../../docs/adr/0008-users-workspaces-policies.md
 
 mod control;
+mod login;
 mod rdf;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +37,7 @@ use nrese_sparql::GraphAccess;
 use serde::{Deserialize, Serialize};
 
 pub use control::{AccessControl, ChangeRecord, HISTORY_GRAPH, STATE_GRAPH};
+pub use login::{LoginLimits, SESSION_PREFIX, hash_password, verify_password};
 
 /// What a role grants a user no rule names, when enforcement is on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +138,10 @@ pub struct Settings {
     pub inferred: Inferred,
     /// Whether users who aren't administrators may create workspaces (they own them).
     pub users_create_workspaces: bool,
+    /// The shortest password a local login takes.
+    pub min_password_length: u32,
+    /// How long a local login's session lasts, in hours.
+    pub session_hours: u32,
 }
 
 impl Default for Settings {
@@ -145,6 +151,8 @@ impl Default for Settings {
             fallback: Fallback::Deny,
             inferred: Inferred::Hidden,
             users_create_workspaces: true,
+            min_password_length: 10,
+            session_hours: 12,
         }
     }
 }
@@ -271,6 +279,8 @@ pub enum AccessError {
     Invalid(String),
     NotFound(String),
     Conflict(String),
+    /// Too many failed logins.
+    Throttled(String),
     Store(String),
 }
 
@@ -281,6 +291,7 @@ impl fmt::Display for AccessError {
             | Self::Invalid(m)
             | Self::NotFound(m)
             | Self::Conflict(m)
+            | Self::Throttled(m)
             | Self::Store(m) => f.write_str(m),
         }
     }
@@ -563,12 +574,20 @@ impl AccessState {
         match change {
             Change::Settings(settings) => {
                 only_admins("change the access settings")?;
+                if settings.session_hours == 0 {
+                    return Err(AccessError::Invalid(
+                        "sessions must last an hour at least".to_owned(),
+                    ));
+                }
                 let summary = format!(
-                    "settings: enforced {}, fallback {:?}, inferred {:?}, users create workspaces {}",
+                    "settings: enforced {}, fallback {:?}, inferred {:?}, users create workspaces {}, \
+                     passwords of {} characters at least, sessions of {} hours",
                     settings.enforced,
                     settings.fallback,
                     settings.inferred,
-                    settings.users_create_workspaces
+                    settings.users_create_workspaces,
+                    settings.min_password_length,
+                    settings.session_hours
                 );
                 self.settings = settings;
                 Ok(summary)
