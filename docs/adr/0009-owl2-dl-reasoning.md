@@ -1,7 +1,7 @@
 # ADR-0009: OWL 2 DL reasoning
 
 Status: accepted (2 October 2026). The owner gave the direction ("a complete engine first,
-then the fast layers in front of it"; [the roadmap to the papers](../plan/2026-10-02-roadmap-to-papers.md))
+then the fast layers in front of it"; [the roadmap](../plan/2026-10-02-roadmap.md))
 and left the way to it to the project. Revised the same day after seven research reports
 and their check (outside the repository: `output/dl-research-A…G.md`,
 `output/OWL-RS-dl-research-review-2026-10-02.md`); the revisions are marked below. The
@@ -117,7 +117,10 @@ ships behind its own reasoning mode or endpoint (`/classification` gains `profil
 - Benchmarks of reasoning (the [reasoning benchmark design](../design/reasoning-benchmark.md))
   gain RT tasks for DL classification and certain answers.
 
+## Decided
+
+- **`owl2-dl` answers (the owner, 2 October):** completeness is always reported; certain answers are the default only where a complete path exists.
+
 ## Open for the owner
 
-- Whether `owl2-dl` answers are certain answers by default. The research's recommendation: always report completeness, and give certain answers by default only where the plan has a complete path.
 - Whether SWRL (DL-safe rules) belongs with step 2 or later. The plan's default: later.
