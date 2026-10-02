@@ -672,6 +672,17 @@ fn limited(text: &str) -> Option<usize> {
         .flatten()
 }
 
+/// The logical plan of `query`'s pattern lowers to that pattern again (step 1 of the query
+/// plan: until a rewrite changes it, the plan is the algebra).
+fn plan_round_trips(query: &nrese_sparql_syntax::Query) {
+    use nrese_sparql_syntax::Query;
+    let (Query::Select { pattern, .. }
+    | Query::Construct { pattern, .. }
+    | Query::Describe { pattern, .. }
+    | Query::Ask { pattern, .. }) = query;
+    assert_eq!(&nrese_sparql::plan::Plan::of(pattern).lower(), pattern);
+}
+
 #[test]
 fn native_results_equal_the_reference_on_random_queries() {
     let mut rng = Rng::seeded(20_260_927);
@@ -719,6 +730,7 @@ fn native_results_equal_the_reference_on_random_queries() {
                 fallbacks.push(text);
                 continue;
             }
+            plan_round_trips(&query);
             let native = rows_up_to_equal_values(
                 evaluate_query(&snapshot, &query, &native_options).unwrap(),
                 ordered,
@@ -898,6 +910,7 @@ fn pushed_filters_equal_the_reference() {
                 fallbacks += 1;
                 continue;
             }
+            plan_round_trips(&query);
             let native = rows(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
@@ -1691,6 +1704,7 @@ fn computed_values_equal_the_reference() {
                 fallbacks += 1;
                 continue;
             }
+            plan_round_trips(&query);
             let open = has_extremes(&text);
             let native = rows_up_to_equal_values(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
@@ -2614,6 +2628,7 @@ fn graph_patterns_equal_the_reference() {
                 fallbacks += 1;
                 continue;
             }
+            plan_round_trips(&query);
             let native = rows(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
@@ -3139,6 +3154,7 @@ fn the_merged_default_graph_equals_the_reference() {
                 fallbacks += 1;
                 continue;
             }
+            plan_round_trips(&query);
             let native_in = |options: &QueryOptions| {
                 explain_query(&snapshot, &query, options).unwrap().executor == "native"
             };
@@ -3598,6 +3614,7 @@ fn datasets_and_graph_patterns_equal_the_reference() {
                 fallbacks += 1;
                 continue;
             }
+            plan_round_trips(&query);
             // A silent fallback would hide a query the executor can't take.
             assert_eq!(
                 explain_query(&snapshot, &query, &options).unwrap().executor,

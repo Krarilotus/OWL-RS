@@ -16,6 +16,7 @@
 
 pub mod compat;
 pub mod dataset;
+pub mod plan;
 pub use dataset::GraphAccess;
 mod native;
 pub mod query;
