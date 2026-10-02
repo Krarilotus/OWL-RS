@@ -25,6 +25,8 @@ pub enum ApiError {
     Forbidden(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("not acceptable: {0}")]
     NotAcceptable(String),
     #[error("unsupported media type: {0}")]
@@ -73,6 +75,11 @@ impl ApiError {
 
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::NotFound(message.into())
+    }
+
+    /// The request conflicts with the resource's state (it exists already, say).
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
     }
 
     /// The client accepts no media type the endpoint can produce.
@@ -153,6 +160,13 @@ impl IntoResponse for ApiError {
                 StatusCode::NOT_FOUND,
                 "https://nrese.dev/problems/not-found",
                 "Not Found",
+                detail,
+                None,
+            ),
+            Self::Conflict(detail) => (
+                StatusCode::CONFLICT,
+                "https://nrese.dev/problems/conflict",
+                "Conflict",
                 detail,
                 None,
             ),

@@ -258,6 +258,81 @@ async fn repositories_and_namespaces_in_json() {
 }
 
 #[tokio::test]
+async fn repositories_are_created_and_removed_in_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let base = "/api/v1/repositories/third";
+    let json = Some("application/json");
+    let settings = r#"{"title": "Third", "reasoning": "rdfs"}"#;
+    let (status, text) = send(&app, Method::PUT, base, json, settings).await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let (status, text) = send(&app, Method::PUT, base, json, settings).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+    assert!(text.contains("problems/conflict"), "{text}");
+    let (status, text) = send(&app, Method::GET, base, None, "").await;
+    assert_eq!(status, StatusCode::OK);
+    let view: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(view["title"], "Third");
+    assert_eq!(view["reasoning"], "rdfs");
+    assert_eq!(view["settings"]["reasoning"], "rdfs");
+    // It reasons by its own settings.
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/update"),
+        Some("application/sparql-update"),
+        "PREFIX ex: <http://example.com/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         INSERT DATA { ex:C rdfs:subClassOf ex:D . ex:x a ex:C }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, text) = send(
+        &app,
+        Method::GET,
+        &format!(
+            "{base}/query?query={}",
+            urlencoding("ASK { <http://example.com/x> a <http://example.com/D> }")
+        ),
+        None,
+        "",
+    )
+    .await;
+    assert!(text.contains("true"), "{text}");
+    // Settings that name no reasoning mode are refused.
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        "/api/v1/repositories/fourth",
+        json,
+        r#"{"reasoning": "owl-full"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send(&app, Method::DELETE, base, None, "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(&app, Method::GET, base, None, "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&app, Method::DELETE, "/api/v1/repositories/nrese", None, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+fn urlencoding(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
 async fn sessions_collect_writes_and_commit_them_as_one() {
     let dir = tempfile::tempdir().unwrap();
     let app = test_app_with_store_config(
