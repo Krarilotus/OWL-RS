@@ -49,9 +49,10 @@ This matches GraphDB's `rdfs` with *partialRDFS*. Full RDFS entailment is `rdfs-
 | Axiomatic triples | Not materialised (as W3C allows for the RL/RDF rules). |
 
 **List limits:**
+- Lists of any length are instantiated. `owl:AllDifferent`, `owl:AllDisjointClasses` and `owl:AllDisjointProperties` over more than 100 members become one rule each whose pairs are checked through an index of the members (a rule per pair would be quadratic); shorter ones a rule per pair.
+- A property chain or a key with more than 250 properties can't be one rule (the rule format's variables) and isn't instantiated (`list-too-long`).
 - A list axiom is instantiated for at most 64 member sequences (when `sameAs` makes several nodes one list).
-- Lists of at most 100 members are instantiated.
-- Longer, malformed (a node without `rdf:first`/`rdf:rest`) or cyclic lists are not instantiated, never truncated. Each one is reported as a typed diagnostic (`malformed-list`, `cyclic-list`, `list-too-long`, `too-many-list-variants`) with the axiom and node decoded:
+- Those, malformed (a node without `rdf:first`/`rdf:rest`) and cyclic lists are not instantiated, never truncated. Each one is reported as a typed diagnostic (`malformed-list`, `cyclic-list`, `list-too-long`, `too-many-list-variants`) with the axiom and node decoded:
   - full materialisations (load, startup) report all of them: in the log, and under `last_materialisation` in `/ops/api/diagnostics/reasoning`;
   - a commit reports those it introduced: in the log, and under `last_run`.
 

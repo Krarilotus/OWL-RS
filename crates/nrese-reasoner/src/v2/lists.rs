@@ -8,8 +8,16 @@
 //!
 //! Lists are read from the facts: every node needs an `rdf:first` and an `rdf:rest`, and
 //! the list must end at `rdf:nil` without cycles. Several `rdf:first`s (from equality)
-//! give several member sequences, each instantiated. Malformed or oversized lists produce
-//! a diagnostic and no rules; they're never silently truncated.
+//! give several member sequences, each instantiated. Malformed lists produce a diagnostic
+//! and no rules; they're never silently truncated.
+//!
+//! Lists of any length are instantiated. The pairwise axioms (`owl:AllDifferent`,
+//! `owl:AllDisjointClasses`, `owl:AllDisjointProperties`) would need a rule per pair, so
+//! their lists longer than [`PAIRWISE_MEMBERS`] become one rule per kind of axiom whose
+//! [`Guard::SameList`] asks an index of the members which lists they share: linear in the
+//! members however many there are. The only length limit left is the rule format's: a
+//! property chain or a key over more than [`MAX_RULE_MEMBERS`] properties can't be one
+//! rule (variables are numbered by `u8`) and is diagnosed.
 
 use super::ir::{Atom, Guard, Head, OWL, RDF, Rule, Term, Vocabulary};
 
@@ -154,8 +162,13 @@ type Variant = (Vec<u64>, Vec<[u64; 3]>);
 /// The most member sequences one list axiom may have (see [`ListVocabulary::list`]).
 pub const MAX_VARIANTS: usize = 64;
 
-/// The longest list instantiated; longer ones are diagnosed.
-pub const MAX_MEMBERS: usize = 100;
+/// Lists of pairwise axioms up to this length become a rule per pair; longer ones are
+/// checked through a [`super::ir::ListIndex`] (an implementation choice, not a limit).
+pub const PAIRWISE_MEMBERS: usize = 100;
+
+/// The most properties of a chain or a key that one rule can hold (its variables are
+/// numbered by `u8`).
+pub const MAX_RULE_MEMBERS: usize = 250;
 
 /// Why a list axiom wasn't instantiated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -166,7 +179,7 @@ pub enum ListProblem {
     Cycle { node: u64 },
     /// Equality gives the list more than [`MAX_VARIANTS`] member sequences.
     TooManyVariants,
-    /// A member sequence longer than [`MAX_MEMBERS`].
+    /// A property chain or key with more than [`MAX_RULE_MEMBERS`] properties.
     TooLong { members: usize },
 }
 
@@ -216,7 +229,7 @@ impl ListDiagnostic {
                 format!("owl:sameAs gives it more than {MAX_VARIANTS} member sequences")
             }
             ListProblem::TooLong { members } => {
-                format!("it has {members} members (limit {MAX_MEMBERS})")
+                format!("it has {members} properties, more than a rule holds ({MAX_RULE_MEMBERS})")
             }
         };
         format!(
@@ -287,7 +300,10 @@ pub fn instantiate_with_premises(
                 match voc.list(facts, head) {
                     Ok(variants) => {
                         for (members, used) in variants {
-                            if members.len() <= MAX_MEMBERS {
+                            let rule_sized = !(predicate == voc.property_chain_axiom
+                                || predicate == voc.has_key)
+                                || members.len() <= MAX_RULE_MEMBERS;
+                            if rule_sized {
                                 let before = rules.len();
                                 make(subject, &members, rules);
                                 let mut facts_used = used;
@@ -346,9 +362,6 @@ pub fn instantiate_with_premises(
         "prp-key",
         &mut rules,
         &mut |class, keys, rules| {
-            if keys.len() > 60 {
-                return;
-            }
             let (x, y) = (v(0), v(1));
             let mut body = vec![Atom([x, c(ty), c(class)]), Atom([y, c(ty), c(class)])];
             for (i, &p) in keys.iter().enumerate() {
@@ -442,11 +455,31 @@ pub fn instantiate_with_premises(
             Atom([c(a), c(voc.same_as), c(b)])
         }
     };
+    // Long lists of the pairwise axioms, by kind: their members indexed, and the axioms'
+    // type facts (the rules' schema premises).
+    let long = std::cell::RefCell::new(Long::default());
     lists(
         voc.members,
         "cax-adc, prp-adp, eq-diff2",
         &mut rules,
         &mut |node, members, rules| {
+            if members.len() > PAIRWISE_MEMBERS {
+                let mut long = long.borrow_mut();
+                for (kind, index, premises) in [
+                    (voc.all_disjoint_classes, 0, 0),
+                    (voc.all_different, 1, 1),
+                    (voc.all_disjoint_properties, 2, 2),
+                ] {
+                    if typed(node, kind) {
+                        long.indexes[index].add(members);
+                        long.premises[premises].push([node, ty, kind]);
+                        if kind == voc.all_different {
+                            duplicates(members, node, voc, rules, "eq-diff2");
+                        }
+                    }
+                }
+                return;
+            }
             for (i, &a) in members.iter().enumerate() {
                 for &b in &members[i + 1..] {
                     if typed(node, voc.all_disjoint_classes) {
@@ -485,6 +518,13 @@ pub fn instantiate_with_premises(
             if !typed(node, voc.all_different) {
                 return;
             }
+            if members.len() > PAIRWISE_MEMBERS {
+                let mut long = long.borrow_mut();
+                long.indexes[3].add(members);
+                long.premises[3].push([node, ty, voc.all_different]);
+                duplicates(members, node, voc, rules, "eq-diff3");
+                return;
+            }
             for (i, &a) in members.iter().enumerate() {
                 for &b in &members[i + 1..] {
                     rules.push(rule(
@@ -497,5 +537,81 @@ pub fn instantiate_with_premises(
             }
         },
     );
+    // One rule per kind of long axiom, its pairs checked by the index.
+    let long = long.into_inner();
+    let [classes, different, properties, distinct] = long.indexes;
+    let shared =
+        |index: super::ir::ListIndex| super::ir::SharedListIndex(std::sync::Arc::new(index));
+    let mut native = |name: &str, body: Vec<Atom>, x: Term, y: Term, index, used: Vec<[u64; 3]>| {
+        rules.push(rule(
+            name,
+            body,
+            vec![Guard::NotEqual(x, y), Guard::SameList(x, y, shared(index))],
+            Head::Inconsistent,
+        ));
+        premises.push(used);
+    };
+    let [p_classes, p_different, p_properties, p_distinct] = long.premises;
+    if !classes.is_empty() {
+        native(
+            "cax-adc",
+            vec![Atom([v(0), c(ty), v(1)]), Atom([v(0), c(ty), v(2)])],
+            v(1),
+            v(2),
+            classes,
+            p_classes,
+        );
+    }
+    for (index, used, name) in [
+        (different, p_different, "eq-diff2"),
+        (distinct, p_distinct, "eq-diff3"),
+    ] {
+        if !index.is_empty() {
+            native(
+                name,
+                vec![Atom([v(0), c(voc.same_as), v(1)])],
+                v(0),
+                v(1),
+                index,
+                used,
+            );
+        }
+    }
+    if !properties.is_empty() {
+        native(
+            "prp-adp",
+            vec![Atom([v(0), v(1), v(2)]), Atom([v(0), v(3), v(2)])],
+            v(1),
+            v(3),
+            properties,
+            p_properties,
+        );
+    }
     (rules, premises, diagnostics)
+}
+
+/// The long lists of the pairwise axioms ([`PAIRWISE_MEMBERS`]): disjoint classes,
+/// different individuals (`owl:members`), disjoint properties, different individuals
+/// (`owl:distinctMembers`); their indexes and the axioms' type facts.
+#[derive(Default)]
+struct Long {
+    indexes: [super::ir::ListIndex; 4],
+    premises: [Vec<[u64; 3]>; 4],
+}
+
+/// A long `owl:AllDifferent` list that names an individual twice is inconsistent by
+/// itself (`a sameAs a` holds by eq-ref, which isn't materialised): the axiom's rule.
+fn duplicates(members: &[u64], node: u64, voc: &ListVocabulary, rules: &mut Vec<Rule>, name: &str) {
+    let mut seen = std::collections::HashSet::new();
+    for &member in members {
+        if !seen.insert(member) {
+            rules.push(rule(
+                name,
+                vec![Atom([c(node), c(voc.rdf_type), c(voc.all_different)])],
+                vec![],
+                Head::Inconsistent,
+            ));
+            return;
+        }
+    }
 }
