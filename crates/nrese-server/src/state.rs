@@ -139,8 +139,10 @@ impl AppState {
 
     /// What `identity` may read and write in this state's repository.
     pub fn access_view(&self, identity: &crate::auth::Identity) -> crate::access::AccessView {
-        self.access
-            .view(&crate::access::principal(identity), &self.repository)
+        let principal = crate::access::principal(identity);
+        let mut view = self.access.view(&principal, &self.repository);
+        view.origin = Some(principal.display());
+        view
     }
 
     /// `identity` as the access state's changes see it: an administrator also when the

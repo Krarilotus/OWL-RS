@@ -39,11 +39,15 @@ pub async fn execute_query_in(
     let deadline = tokio::time::Instant::now() + policy.timeouts.query;
 
     let explain = operation.explain;
+    let origin = operation.origin.clone();
     let mut request = build_query_request(operation);
     let memory = policy.limits.max_query_memory_bytes;
     request.memory_limit = (memory > 0).then_some(memory);
     let mut prepared =
         PreparedQuery::parse(&request).map_err(|error| map_query_error(&policy, error))?;
+    if let Some(origin) = origin {
+        prepared.set_origin(origin);
+    }
     // The query form decides which formats exist; an EXPLAIN is always JSON.
     if !explain {
         let (solutions, graph) = negotiate_formats(prepared.kind(), accept)?;
@@ -114,8 +118,12 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
 /// anything else is the server's fault.
 fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
     match error {
+        // The policy deadline cancels a query, and so may an operator
+        // (`DELETE /api/v1/repositories/{id}/queries/{query}`).
         StoreError::SparqlEvaluation(nrese_store::QueryEvaluationError::Cancelled) => {
-            ApiError::timeout(QUERY_TIMEOUT_MESSAGE)
+            ApiError::timeout(
+                "the query was stopped: it exceeded the policy timeout, or an operator cancelled it",
+            )
         }
         // Other queries hold the memory this one asked for: it may succeed later.
         error if error.is_server_memory_limit() => ApiError::unavailable(format!(

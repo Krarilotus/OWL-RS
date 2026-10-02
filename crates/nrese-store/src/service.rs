@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use nrese_engine::{Engine, EngineConfig, ReadModel};
+use nrese_engine::{Engine, EngineConfig, ReadModel, TermId};
 use nrese_sparql::CancellationToken;
 
 use crate::backup::{
@@ -49,6 +49,8 @@ pub struct StoreService {
     namespaces: std::sync::Arc<crate::namespaces::Namespaces>,
     /// Client transactions ([`crate::sessions`]).
     sessions: std::sync::Arc<crate::sessions::Sessions>,
+    /// The queries running now ([`crate::running`]).
+    running: std::sync::Arc<crate::running::RunningQueries>,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -106,6 +108,7 @@ impl StoreService {
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             sessions: std::sync::Arc::default(),
+            running: std::sync::Arc::default(),
             config,
             engine,
             preloaded_ontology,
@@ -285,6 +288,9 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
+        let _running = self
+            .running
+            .register(prepared.text(), prepared.origin(), cancellation);
         let snapshot = self.engine.snapshot();
         let settings = &self.settings;
         if !self.query_cache.enabled() || prepared.volatile() {
@@ -318,6 +324,9 @@ impl StoreService {
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::Explanation> {
+        let _running = self
+            .running
+            .register(prepared.text(), prepared.origin(), cancellation);
         explain_prepared(
             &self.engine.snapshot(),
             prepared,
@@ -393,9 +402,74 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
+        let _running = self
+            .running
+            .register(prepared.text(), prepared.origin(), cancellation);
         self.with_pending(pending, cancellation, |snapshot| {
             run_query(snapshot, prepared, &self.settings, cancellation, out)
         })
+    }
+
+    /// The queries running now ([`crate::running`]).
+    pub fn running_queries(&self) -> &crate::running::RunningQueries {
+        &self.running
+    }
+
+    /// Every graph with statements and its number of asserted statements, the default
+    /// graph first (as `None`), then the named graphs `access` lets the requester read
+    /// (every one with `None`), in IRI order.
+    pub fn graph_sizes(
+        &self,
+        access: Option<&nrese_sparql::GraphAccess>,
+    ) -> Vec<(Option<nrese_rdf::NamedOrBlankNode>, u64)> {
+        use nrese_engine::{GraphSelector, QuadPattern};
+        let snapshot = self.engine.snapshot();
+        let counts: Vec<(TermId, u64)> = snapshot
+            .group_counts_in(
+                ReadModel::Asserted,
+                &QuadPattern::all(),
+                nrese_engine::quad::Permutation::Gspo,
+            )
+            .unwrap_or_else(|| {
+                std::iter::once(TermId::DEFAULT_GRAPH)
+                    .chain(snapshot.named_graphs())
+                    .map(|graph| {
+                        let pattern = QuadPattern {
+                            graph: GraphSelector::Exact(graph),
+                            ..QuadPattern::all()
+                        };
+                        (graph, snapshot.count_in(ReadModel::Asserted, &pattern))
+                    })
+                    .collect()
+            });
+        let mut sizes: Vec<(Option<nrese_rdf::NamedOrBlankNode>, u64)> = Vec::new();
+        for (graph, count) in counts {
+            if count == 0 {
+                continue;
+            }
+            if graph == TermId::DEFAULT_GRAPH {
+                if access.is_none_or(|access| access.default_graph) {
+                    sizes.insert(0, (None, count));
+                }
+                continue;
+            }
+            let name = match snapshot.decode(graph) {
+                Some(nrese_rdf::Term::NamedNode(node)) => {
+                    if access.is_some_and(|access| !access.allows(node.as_str())) {
+                        continue;
+                    }
+                    nrese_rdf::NamedOrBlankNode::NamedNode(node)
+                }
+                Some(nrese_rdf::Term::BlankNode(node)) if access.is_none() => {
+                    nrese_rdf::NamedOrBlankNode::BlankNode(node)
+                }
+                _ => continue,
+            };
+            sizes.push((Some(name), count));
+        }
+        let named = usize::from(sizes.first().is_some_and(|(graph, _)| graph.is_none()));
+        sizes[named..].sort_by_cached_key(|(graph, _)| graph.as_ref().map(ToString::to_string));
+        sizes
     }
 
     /// [`read_statements`](Self::read_statements) on the data as `pending` would leave it.

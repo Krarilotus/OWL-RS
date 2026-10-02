@@ -213,6 +213,8 @@ impl Principal {
 pub struct AccessView {
     pub read: Option<Arc<GraphAccess>>,
     pub write: Option<Arc<GraphAccess>>,
+    /// Who the view is for (a user name, else roles), for logs and running queries.
+    pub origin: Option<String>,
 }
 
 impl AccessView {
@@ -530,6 +532,7 @@ impl AccessState {
         AccessView {
             read: Some(Arc::new(read)),
             write: Some(Arc::new(write)),
+            origin: None,
         }
     }
 
