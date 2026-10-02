@@ -393,8 +393,19 @@ impl Context<'_> {
                     .retain_mask(&mask.iter().map(|m| *m == keep_matching).collect::<Vec<_>>());
                 return Ok(solutions);
             }
-            // One evaluation, one semi- or anti-join.
-            let found = self.eval(pattern)?;
+            // One evaluation, one semi- or anti-join. Only the shared variables' distinct
+            // values matter: the pattern as a set over them (`sets`), which can make a
+            // pattern a sorted group walk of its shared variable.
+            let mut shared: Vec<Variable> = Vec::new();
+            bound_variables(pattern, &mut shared);
+            shared.retain(|v| solutions.column(v).is_some());
+            // In GRAPH ?g the graph is a shared variable too, which the set would drop.
+            let in_default = matches!(*self.graph.borrow(), GraphScope::Default);
+            let found = if self.as_written || shared.is_empty() || !in_default {
+                self.eval(pattern)?
+            } else {
+                self.eval_set(pattern, &shared)?
+            };
             let (lk, rk) = shared_columns(&solutions, &found);
             if !has_undef(&solutions.table, &lk) && !has_undef(&found.table, &rk) {
                 solutions.table = if keep_matching {
