@@ -429,17 +429,27 @@ fn local_logins_check_passwords_open_sessions_and_throttle_failures() {
     control
         .apply(&admin(), set_password(hash), "a local login")
         .unwrap();
-    let principal = control.login("alice", "correct horse battery").unwrap();
+    let principal = control
+        .login("alice", "correct horse battery", None)
+        .unwrap();
     assert_eq!(principal.user.as_deref(), Some("alice"));
     // Verified once, remembered: the same answer again.
-    assert!(control.login("alice", "correct horse battery").is_ok());
+    assert!(
+        control
+            .login("alice", "correct horse battery", None)
+            .is_ok()
+    );
     assert!(matches!(
-        control.login("alice", "wrong"),
+        control.login("alice", "wrong", None),
         Err(AccessError::Forbidden(_))
     ));
-    assert!(control.login("nobody", "correct horse battery").is_err());
+    assert!(
+        control
+            .login("nobody", "correct horse battery", None)
+            .is_err()
+    );
     let (token, lifetime) = control
-        .open_session("alice", "correct horse battery")
+        .open_session("alice", "correct horse battery", None)
         .unwrap();
     assert!(token.starts_with(SESSION_PREFIX));
     assert_eq!(lifetime.as_secs(), 12 * 3600);
@@ -454,16 +464,108 @@ fn local_logins_check_passwords_open_sessions_and_throttle_failures() {
         .apply(&user("alice"), set_password(new), "rotated")
         .unwrap();
     assert!(control.session(&token).is_none());
-    assert!(control.login("alice", "correct horse battery").is_err());
-    // A success clears the count; three failures within the window, and the right
-    // password is refused too, until the window has passed.
+    assert!(
+        control
+            .login("alice", "correct horse battery", None)
+            .is_err()
+    );
+    // A success clears the count; past three failures, the next attempt waits, even
+    // with the right password.
     for _ in 0..2 {
-        assert!(control.login("alice", "guess").is_err());
+        assert!(control.login("alice", "guess", None).is_err());
     }
     assert!(matches!(
-        control.login("alice", "another long secret"),
+        control.login("alice", "another long secret", None),
         Err(AccessError::Throttled(_))
     ));
+}
+
+/// Failed logins are counted per user name and client address (the milestone review's
+/// R2-R4): guesses from one address don't lock the user out elsewhere; an address that
+/// guesses many names waits too; the counts are bounded, names without a login counted
+/// like the others; and refusing a name without a login takes as long as a wrong password.
+#[test]
+fn failed_logins_slow_down_the_guesser_not_the_user() {
+    use std::net::IpAddr;
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    let limits = LoginLimits {
+        failures: 2,
+        address_failures: 4,
+        tracked: 5,
+        ..LoginLimits::default()
+    };
+    let control = AccessControl::open_with(store, "urn:nrese:", limits).unwrap();
+    let hash = control.password_hash("correct horse battery").unwrap();
+    control
+        .apply(
+            &admin(),
+            Change::PutUser {
+                name: "alice".to_owned(),
+                admin: None,
+                roles: None,
+                password_hash: Some(hash),
+            },
+            "a local login",
+        )
+        .unwrap();
+    let address = |text: &str| Some(text.parse::<IpAddr>().unwrap());
+    let (attacker, alice_at) = (address("203.0.113.7"), address("198.51.100.2"));
+    for _ in 0..2 {
+        assert!(matches!(
+            control.login("alice", "guess", attacker),
+            Err(AccessError::Forbidden(_))
+        ));
+    }
+    // The guesser waits, even with the right password; alice, elsewhere, doesn't.
+    assert!(matches!(
+        control.login("alice", "correct horse battery", attacker),
+        Err(AccessError::Throttled(_))
+    ));
+    assert!(
+        control
+            .login("alice", "correct horse battery", alice_at)
+            .is_ok()
+    );
+    // Many names from one address: past four failures over all names, that address waits
+    // for any name; another address doesn't.
+    let sprayer = address("192.0.2.9");
+    for name in ["bob", "carol", "dave", "erin"] {
+        assert!(matches!(
+            control.login(name, "guess", sprayer),
+            Err(AccessError::Forbidden(_))
+        ));
+    }
+    assert!(matches!(
+        control.login("frank", "guess", sprayer),
+        Err(AccessError::Throttled(_))
+    ));
+    assert!(matches!(
+        control.login("frank", "guess", alice_at),
+        Err(AccessError::Forbidden(_))
+    ));
+    // Bounded: many names from many addresses keep at most `tracked` counts each.
+    for i in 0..20 {
+        let _ = control.login(
+            &format!("user{i}"),
+            "guess",
+            address(&format!("10.0.0.{i}")),
+        );
+    }
+    let (pairs, addresses) = control.login_failures_tracked();
+    assert!(pairs <= 5 && addresses <= 5, "{pairs} {addresses}");
+    // A name without a login is refused after as much work as a wrong password.
+    let time = |name: &str, client| {
+        let start = std::time::Instant::now();
+        let _ = control.login(name, "guess", client);
+        start.elapsed()
+    };
+    let _ = time("nobody", address("10.1.0.1"));
+    let unknown = time("nobody", address("10.1.0.2"));
+    let known = time("alice", address("10.1.0.3"));
+    assert!(
+        unknown * 4 >= known,
+        "unknown name {unknown:?}, wrong password {known:?}"
+    );
 }
 
 /// Saved queries live in spaces: a personal space's owner and those it shares with read
