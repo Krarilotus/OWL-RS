@@ -213,6 +213,23 @@ Scans reach storage through a seekable, block-wise cursor. That keeps Pf1 and Pf
 
 ---
 
+### 3.2 After the comparison run of 3 October (owner, 3 October 2026)
+
+In this order, once the full run on the office PC (batches A and B, `benches/runs/`) is in:
+
+1. **The deep-reasoning work and code quality** (now, on the main PC):
+   - the DL engine (phase 3, `docs/design/owl2-dl-performance.md` §6);
+   - improvements across all layers, using the fully vertically integrated store as the advantage;
+   - the structure refactors (reasoner façade first; layers, façades, one owner per concept, typed errors), each checked by an A/B benchmark.
+2. **Extend the benchmark suite:**
+   - the planned workloads (LDBC SPB first: queries under inference with continuous updates; BSBM, WatDiv, Sparqloscope, ERA-SHACL, the consistency injector);
+   - Linux claim-run settings (`benches/PROTOCOL.md` §4);
+   - both Nemo encodings (the general one schema-first, sparq's LUBM-tailored one);
+   - ELK 0.4.3 next to 0.6.0;
+   - counting against B/F where counting may win (UOBM-U, SSPE).
+3. **The full ORE 2015 corpus locally** (1,920 ontologies × consistency, classification and realisation) with the reference reasoners and NRESE, set up and tried out on the office PC and the main PC, **before** the Draco cluster run that gives the paper's numbers.
+4. **"Disproven claims":** a write-up of the published claims that our measurements or the primary sources contradict (with the evidence, the source, the setup), and of the optimisations we can show beyond them; material for the paper's related work and evaluation.
+
 ## 4. Milestones and work packages
 
 ### M0: Foundation & cleanup (size M)
