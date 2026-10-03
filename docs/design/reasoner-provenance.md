@@ -33,9 +33,10 @@ The keys' dependency graph (body key → head key) is condensed into strongly co
 
 | Level | Recorded per inferred fact | Serves |
 |---|---|---|
-| `none` | nothing | the smallest store; maintenance by B/F and DRed as today |
-| `count` (default) | the number of its non-recursive derivations | counting maintenance |
-| `acl` | the count, and its minimal support graph sets | inferred statements under graph access (§4) |
+| `none` (default) | nothing | the smallest store; maintenance by the one-step check, B/F and DRed |
+| `acl` | its minimal support graph sets | inferred statements under graph access (§4) |
+
+(A `count` level was built and measured, then dropped: see "Measured" below.)
 
 `witness` (one derivation per fact, for constant-time explanations) and `full` (every derivation) come later, if explanations need them.
 
@@ -43,9 +44,7 @@ The keys' dependency graph (body key → head key) is condensed into strongly co
 
 A third engine stack beside the asserted and inferred ones:
 - **Layout:** `DefaultGraph`, holding entries `(s, p, o, tag)`, with the same runs, MVCC, WAL, checkpoints and compaction, and set semantics.
-- **The tag** is a `TermId` of a reserved inline kind:
-  - `Count(n)`: one entry per fact with n > 0. A changed count is a tombstone plus an insert;
-  - `Set(id)`: one entry per minimal support graph set, at level `acl`.
+- **The tag** is a `TermId` of a reserved inline kind, `Set(id)`: one entry per minimal support graph set.
 - **Reading:** an SPO-prefix scan gives a fact's provenance, adjacent and sorted.
 - **No heap map:** per-fact provenance stays out of the heap (serving memory is a phase 1 goal). The runs are compressed and mapped like the others.
 - **The set table** maps interned graph-id sets to stable ids, kept with the engine's metadata and checkpointed. Sets are sorted id lists, interned so that facts share them.
@@ -101,7 +100,8 @@ Stored counts are slower at scale: hash-map updates on every insert and delete, 
    - Keys, components, and non-recursive counts during materialisation and in the delta executor's overdeletion.
    - Checked by the property tests (incremental = rematerialisation over random changes) and measured on the delete probes against the previous build.
    - Engine changes only once the counts prove their worth.
-2. **The support stack** in the engine, with persistence, holding support graph sets (level `acl`). Counts there only if a workload shows they pay.
-3. **The read filter** for inferred statements under graph access (level `acl`).
-4. **`auto` maintenance** and the rematerialisation threshold.
-5. **Explanations** that prefer derivations whose premises the reader may read.
+2. **Support graph sets over a closure** (done, 3 October): `nrese_reasoner::v2::graph_sets`, annotated semi-naive evaluation over the ground program with every alternative grounding's schema premises; equal to the closure of every set of graphs over 30 seeds × 150 random ontologies × 8 sets; LUBM(10) in 1.1 s against 0.2 s for the materialisation.
+3. **The support stack** in the engine, with persistence, holding support graph sets (level `acl`). Counts there only if a workload shows they pay.
+4. **The read filter** for inferred statements under graph access (level `acl`).
+5. **`auto` maintenance** and the rematerialisation threshold.
+6. **Explanations** that prefer derivations whose premises the reader may read.
