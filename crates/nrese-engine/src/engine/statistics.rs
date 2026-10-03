@@ -111,10 +111,15 @@ impl Statistics {
             }
         }
         let build = move |snapshot: &Snapshot| {
-            snapshot
+            let sets = snapshot
                 .scan_sorted_in(model, &pattern, Permutation::Gspo)
-                .and_then(CharacteristicSets::build)
-                .map(Arc::new)
+                .and_then(CharacteristicSets::build)?;
+            // The pairs need each subject's set first: a second scan.
+            let sets = match snapshot.scan_sorted_in(model, &pattern, Permutation::Gspo) {
+                Some(quads) => sets.with_pairs(quads),
+                None => sets,
+            };
+            Some(Arc::new(sets))
         };
         if size <= SYNC_SETS {
             let built = build(snapshot);

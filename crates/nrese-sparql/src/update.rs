@@ -268,6 +268,9 @@ fn clear(
 
 fn graph_name(graph: &GraphName) -> OxGraphName {
     match graph {
+        GraphName::NamedNode(name) if crate::compat::names_default_graph(name.as_str()) => {
+            OxGraphName::DefaultGraph
+        }
         GraphName::NamedNode(name) => name.clone().into(),
         GraphName::DefaultGraph => OxGraphName::DefaultGraph,
     }

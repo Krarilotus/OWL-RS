@@ -23,6 +23,11 @@ pub fn parse_graph_target(raw_query: &RawQuery) -> Result<GraphTarget, ApiError>
             has_default = true;
             continue;
         }
+        if key == "graph" && nrese_sparql::compat::names_default_graph(&value) {
+            // Jena's name for the default graph (nrese_sparql::compat).
+            has_default = true;
+            continue;
+        }
         if key == "graph" {
             if graph.is_some() {
                 return Err(ApiError::bad_request(
