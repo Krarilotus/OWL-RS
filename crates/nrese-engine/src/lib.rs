@@ -31,9 +31,11 @@ pub use engine::{
 };
 pub use error::{EngineError, EngineResult};
 pub use index::{CompactionPolicy, IndexEncoding, set_index_encoding};
+/// Vector literals, metrics and indexes ([`Snapshot::vector_search`]).
+pub use nrese_vector as vector;
 pub use quad::{EncodedQuad, EncodedTriple, GraphSelector, QuadPattern};
 pub use term::vocabulary::{VocabularyEncoding, set_vocabulary_encoding};
 pub use term::{
     Dictionary, DictionaryStats, Placement, StringTest, TermId, TermKind, TermView, TextMatch,
-    TextQuery,
+    TextQuery, VectorQuery, VectorSearchReport, VectorStrategy,
 };

@@ -1146,6 +1146,7 @@ dependencies = [
  "memmap2",
  "nrese-rdf",
  "nrese-rdf-io",
+ "nrese-vector",
  "parking_lot",
  "rayon",
  "rust-stemmers",

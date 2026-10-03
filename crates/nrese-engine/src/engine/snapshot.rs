@@ -989,6 +989,24 @@ impl Snapshot {
         matches
     }
 
+    /// The vector literals this snapshot's dictionary holds that are nearest to
+    /// `query.vector`, among those `accept` takes, nearest first, with how the search went
+    /// (whether statements still use them is the caller's to check, in `accept`).
+    pub fn vector_search(
+        &self,
+        query: &crate::VectorQuery,
+        accept: &(dyn Fn(TermId) -> bool + Sync),
+    ) -> (Vec<(TermId, f32)>, crate::VectorSearchReport) {
+        let (hits, report) =
+            self.dictionary
+                .vector_search(query, self.version.dictionary_len, accept);
+        let hits = hits
+            .into_iter()
+            .map(|hit| (TermId::from_raw(hit.id), hit.distance))
+            .collect();
+        (hits, report)
+    }
+
     /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
     /// first (whether statements still use them is the caller's to check).
     pub fn iri_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
