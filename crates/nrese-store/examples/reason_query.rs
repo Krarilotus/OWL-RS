@@ -5,7 +5,8 @@
 //! ```text
 //! cargo run --release -p nrese-store --example reason_query -- \
 //!     [--ruleset owl2-rl|rdfs] [--queries dir] [--runs n] [--timeout-s n]
-//!     [--memory-mib n] [--explain] [--as-written] input.{nt,ttl,...}...
+//!     [--memory-mib n] [--explain] [--as-written] [--inferred-out file.nt]
+//!     input.{nt,ttl,...}...
 //! ```
 //!
 //! - `--runs`: measured runs per query after one warm-up run (default 3); the best counts.
@@ -13,6 +14,9 @@
 //!   exceeds one is reported as `timeout` or `memory`, and the run goes on.
 //! - `--as-written` evaluates the operators where the query puts them (no filter
 //!   pushdown, no set evaluation, paths in full), to compare with.
+//! - `--inferred-out` writes the inferred statements (the inferred stack, not the
+//!   asserted ones) as N-Triples, for closure checks against other reasoners
+//!   (`benches/reasoning/compare_inferred.py`).
 //! - `--explain` prints each query's plan (operators with estimated and actual rows, and
 //!   times) after its timing line.
 //!
@@ -119,6 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut as_written = false;
     let mut equality_report = false;
     let mut skip_unnamed = false;
+    let mut inferred_out = None;
     let (mut runs, mut timeout, mut memory_limit) = (3usize, None, None);
     let number = |value: Option<String>, option: &str| -> Result<u64, String> {
         value
@@ -136,6 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "--queries" => queries = args.next().map(PathBuf::from),
+            "--inferred-out" => inferred_out = args.next().map(PathBuf::from),
             "--commits" => commits = args.next().and_then(|n| n.parse().ok()).unwrap_or(0),
             "--explain" => explain = true,
             "--as-written" => as_written = true,
@@ -190,6 +196,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     print_peak_memory("load and closure");
+
+    if let Some(path) = inferred_out {
+        let mut request = SparqlQueryRequest::all("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }");
+        request.read_model = Some(nrese_engine::ReadModel::Inferred);
+        let prepared = PreparedQuery::parse(&request)?;
+        let out = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        store.run_query(&prepared, &CancellationToken::new(), out)?;
+    }
 
     if commits > 0 {
         commit_latency(&store, ruleset, commits)?;

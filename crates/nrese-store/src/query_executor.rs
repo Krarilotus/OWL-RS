@@ -241,9 +241,34 @@ impl PreparedQuery {
         )
     }
 
-    /// Whether repeating the query may give another answer (see `query_cache::volatile`).
+    /// Whether repeating the query on the same data may give another answer: it calls
+    /// `RAND`, `UUID`, `STRUUID`, `BNODE` or `NOW` (stable within one evaluation, not across
+    /// them), or reads a `SERVICE`, whose data may change without this store's revision.
+    /// Decided on the parsed query, so spacing (`RAND ()`) and words in strings or IRIs
+    /// don't fool it.
     pub(crate) fn volatile(&self) -> bool {
-        crate::query_cache::volatile(&self.text)
+        use nrese_sparql_syntax::algebra::{Expression, Function, GraphPattern};
+        use nrese_sparql_syntax::visit::Node;
+        let pattern = match &self.query {
+            Query::Select { pattern, .. }
+            | Query::Ask { pattern, .. }
+            | Query::Describe { pattern, .. }
+            | Query::Construct { pattern, .. } => pattern,
+        };
+        pattern.find(&mut |node| {
+            matches!(
+                node,
+                Node::Pattern(GraphPattern::Service { .. })
+                    | Node::Expression(Expression::FunctionCall(
+                        Function::Rand
+                            | Function::Uuid
+                            | Function::StrUuid
+                            | Function::BNode
+                            | Function::Now,
+                        _,
+                    ))
+            )
+        })
     }
 
     pub fn kind(&self) -> QueryResultKind {
