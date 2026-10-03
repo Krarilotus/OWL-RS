@@ -27,6 +27,7 @@ ruleset; AnzoGraph through the suite).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -825,8 +826,17 @@ class ClosureAdapter(Adapter):
 
 
 class Nemo(ClosureAdapter):
+    """Nemo (TU Dresden's Rust datalog engine) on an OWL 2 RL encoding. Three encodings, each
+    a system of its own so that every Nemo number names its encoding
+    (benches/reasoning/nemo/): `nemo`, the general translation of the W3C rule tables;
+    `nemo-schemafirst`, the same rules with every schema pattern folded into a small
+    relation first; `nemo-sparq`, sparq's LUBM-tailored encoding, vendored unchanged. The
+    image holds only the pinned Nemo binary; the rules are mounted from the repository, so
+    a run always uses the committed file, and its SHA-256 goes into the step's note."""
+
     key = "nemo"
-    regimes = {"owl2-rl": "benches/reasoning/nemo/owl2rl.rls"}
+    regimes = {"owl2-rl": "owl2-rl"}
+    rules = "owl2rl.rls"
 
     def builds(self):
         return [("nrese-bench/nemo", "reasoning/nemo")]
@@ -836,18 +846,52 @@ class Nemo(ClosureAdapter):
             return "its rules read one N-Triples file; the inputs aren't N-Triples"
         return super().supports(ctx, inputs, regime)
 
+    def program(self) -> str:
+        """Shell lines that leave the program to run in /tmp/rules.rls."""
+        return f"cp /rules/{self.rules} /tmp/rules.rls"
+
     def load(self, ctx, store, inputs, regime):
         self.inputs = inputs
-        script = ('mkdir -p /tmp/in /tmp/nemo && cat "$@" > /tmp/in/input.nt && '
-                  'nmo -I /tmp/in -D /tmp/nemo -o --report short /nemo/owl2rl.rls && '
+        directory = ctx.root / "benches/reasoning/nemo"
+        source = directory / self.rules
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16] if source.exists() else "?"
+        script = (f'mkdir -p /tmp/in /tmp/nemo && cat "$@" > /tmp/in/input.nt && {self.program()} && '
+                  'nmo -I /tmp/in -D /tmp/nemo -o --report short /tmp/rules.rls && '
                   'cp /tmp/nemo/inferred.nt /work/closure.nt')
         spec = Spec(ctx.name("load"), "nrese-bench/nemo", ["sh", "-c", script, "sh", *inputs],
-                    mounts=ctx.mounts(), memory=ctx.memory)
+                    mounts=ctx.mounts(Mount(str(directory), "/rules")), memory=ctx.memory)
         log = ctx.logs / "load.log"
         measured = ctx.runtime.run(spec, log, ctx.timeout_s)
         reasoning = last_int(r"Reasoning: +(\d+)ms", read_text(log))
         return Step(measured, inferred=self.closure_size(ctx), reason_ms=reasoning,
-                    note="load time includes concatenating the inputs")
+                    note=f"encoding {self.rules} sha256 {digest}; load time includes concatenating the inputs")
+
+
+class NemoSchemaFirst(Nemo):
+    key = "nemo-schemafirst"
+    rules = "owl2rl-schemafirst.rls"
+
+
+class NemoSparq(Nemo):
+    """sparq's LUBM-tailored encoding (benches/reasoning/nemo/sparq/README.md): the file
+    unchanged; on a copy, its input placeholder filled in, its own export dropped, and the
+    suite's output rule (the derived statements that weren't asserted) appended."""
+
+    key = "nemo-sparq"
+    rules = "sparq/owl-rl.rls"
+
+    def supports(self, ctx, inputs, regime):
+        # Its rules are the OWL rules the LUBM TBox uses: elsewhere its closure is
+        # incomplete by design, not a result.
+        if not any(Path(path).name == "univ-bench.nt" for path in inputs):
+            return "LUBM-tailored: its rules cover the LUBM TBox (univ-bench) only"
+        return super().supports(ctx, inputs, regime)
+
+    def program(self) -> str:
+        output = ("INFERRED(?s, ?p, ?o) :- closed(?s, ?p, ?o), ~triple(?s, ?p, ?o) .\n"
+                  "@export INFERRED :- ntriples { resource = \"inferred.nt\" } .\n")
+        return (f"sed -e 's/@@DATA@@/input.nt/' -e '/^@export closed/d' /rules/{self.rules} > /tmp/rules.rls && "
+                f"printf '{output}' >> /tmp/rules.rls")
 
 
 class Owlrl(ClosureAdapter):
@@ -880,7 +924,7 @@ class Owlrl(ClosureAdapter):
 
 
 ADAPTERS = {a.key: a for a in (Nrese, NreseOxigraph, NreseFsst, Qlever, Oxigraph, Jena, Virtuoso, Rdf4j, Graphdb, Rdfox, Anzograph,
-                                 Nemo, Owlrl)}
+                                 Nemo, NemoSchemaFirst, NemoSparq, Owlrl)}
 
 
 def adapter(key: str) -> Adapter | None:
