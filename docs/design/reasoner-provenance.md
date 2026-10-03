@@ -90,7 +90,8 @@ Stored counts are slower at scale: hash-map updates on every insert and delete, 
 
 **So:**
 - Maintenance runs on the one-step check.
-- The counting code stays, as an option and as the basis of the `count` level.
+- The counting code was removed (the owner, 3 October: nothing that measures slower stays). What remains is the recursion analysis, `nrese_reasoner::v2::recursion`.
+- The `count` level is dropped; the levels are `none` and `acl`.
 - The support stack (step 2) is needed only for the support graph sets of level `acl`.
 - The steps below are re-ordered accordingly.
 
