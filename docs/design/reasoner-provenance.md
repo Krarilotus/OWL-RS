@@ -101,7 +101,8 @@ Stored counts are slower at scale: hash-map updates on every insert and delete, 
    - Checked by the property tests (incremental = rematerialisation over random changes) and measured on the delete probes against the previous build.
    - Engine changes only once the counts prove their worth.
 2. **Support graph sets over a closure** (done, 3 October): `nrese_reasoner::v2::graph_sets`, annotated semi-naive evaluation over the ground program with every alternative grounding's schema premises; equal to the closure of every set of graphs over 30 seeds × 150 random ontologies × 8 sets; LUBM(10) in 1.1 s against 0.2 s for the materialisation.
-3. **The support stack** in the engine, with persistence, holding support graph sets (level `acl`). Counts there only if a workload shows they pay.
-4. **The read filter** for inferred statements under graph access (level `acl`).
-5. **`auto` maintenance** and the rematerialisation threshold.
-6. **Explanations** that prefer derivations whose premises the reader may read.
+3. **Reads under graph access** (done, 3 October): `inferred = "supported"`; `nrese_store::support` keeps the sets of the latest revision in memory, computed on the first restricted read, and each reader's view as a snapshot with the invisible inferred statements removed (`Snapshot::with_inferred_subset`): no read path needs a filter of its own. This replaces the bitmap join of "Reading under graph access" above for now; the view costs O(k log k) for the smaller side k of the split, once per revision and access set.
+4. **The support stack** in the engine, with persistence across restarts, holding support graph sets (level `acl`). Counts there only if a workload shows they pay.
+5. **Maintenance on commits:** the sets of the facts a commit touches recomputed and propagated forward, instead of all of them at the next restricted read.
+6. **`auto` maintenance** and the rematerialisation threshold.
+7. **Explanations** that prefer derivations whose premises the reader may read.

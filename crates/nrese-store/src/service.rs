@@ -51,6 +51,8 @@ pub struct StoreService {
     sessions: std::sync::Arc<crate::sessions::Sessions>,
     /// The queries running now ([`crate::running`]).
     running: std::sync::Arc<crate::running::RunningQueries>,
+    /// Inferred statements under graph access ([`crate::support`]).
+    supports: std::sync::Arc<crate::support::Supports>,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -109,6 +111,7 @@ impl StoreService {
             namespaces: std::sync::Arc::new(namespaces),
             sessions: std::sync::Arc::default(),
             running: std::sync::Arc::default(),
+            supports: std::sync::Arc::default(),
             config,
             engine,
             preloaded_ontology,
@@ -293,6 +296,43 @@ impl StoreService {
         Ok(prepared)
     }
 
+    /// The latest snapshot as a reader with `access` sees it (`None`: every graph): with
+    /// `inferred = "supported"`, only the inferred statements its graphs support
+    /// ([`crate::support`]).
+    pub fn read_snapshot(
+        &self,
+        access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
+    ) -> nrese_engine::Snapshot {
+        self.view_of(&self.engine.snapshot(), access)
+    }
+
+    /// [`Self::read_snapshot`] of `snapshot`, a committed revision.
+    fn view_of(
+        &self,
+        snapshot: &nrese_engine::Snapshot,
+        access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
+    ) -> nrese_engine::Snapshot {
+        match access {
+            Some(access) if by_support(access) => {
+                let compilation = crate::support::Compilation {
+                    hide_unnamed_classes: self.config.hide_unnamed_classes,
+                    by_representatives: self.config.equality_by_representatives,
+                    compact: self.config.equality_compact,
+                    cap: self.config.support_sets,
+                };
+                self.supports.view(snapshot, access, compilation)
+            }
+            _ => snapshot.clone(),
+        }
+    }
+
+    /// The rules the inferred stack is maintained with (reasoner v2; `None`: none), for
+    /// the support graph sets of [`Self::read_snapshot`]. The mutation pipeline registers
+    /// its own.
+    pub fn use_reasoning_rules(&self, rules: Option<nrese_reasoner::RuleProgram>) {
+        self.supports.use_rules(rules);
+    }
+
     pub fn execute_query(
         &self,
         request: &SparqlQueryRequest,
@@ -324,7 +364,7 @@ impl StoreService {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
-        let snapshot = self.engine.snapshot();
+        let snapshot = self.read_snapshot(prepared.access());
         let settings = &self.settings;
         if !self.query_cache.enabled() || prepared.volatile() {
             return run_query(&snapshot, prepared, settings, cancellation, out);
@@ -361,7 +401,7 @@ impl StoreService {
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         explain_prepared(
-            &self.engine.snapshot(),
+            &self.read_snapshot(prepared.access()),
             prepared,
             &self.settings,
             cancellation,
@@ -371,7 +411,11 @@ impl StoreService {
     /// The plan `prepared` would run as, each node with its estimated rows, without
     /// running it (EXPLAIN without ANALYZE).
     pub fn plan_query(&self, prepared: &PreparedQuery) -> StoreResult<crate::PlannedQuery> {
-        plan_prepared(&self.engine.snapshot(), prepared, &self.settings)
+        plan_prepared(
+            &self.read_snapshot(prepared.access()),
+            prepared,
+            &self.settings,
+        )
     }
 
     /// Bytes of intermediate results the running queries hold now, the most they held at
@@ -404,7 +448,11 @@ impl StoreService {
                 });
             }
         }
-        execute_graph_read(&self.engine.snapshot(), request, read.model())
+        execute_graph_read(
+            &self.read_snapshot(read.scope.access()),
+            request,
+            read.model(),
+        )
     }
 
     /// Runs `read` on the data as it would be after `pending` (an RDF4J transaction's
@@ -431,7 +479,20 @@ impl StoreService {
         crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {
             crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
         })?;
-        let view = tx.pending_snapshot();
+        let view = match scope.access() {
+            Some(access) if by_support(access) => {
+                // The operations aren't reasoned over: the base's inferred statements, as
+                // far as the reader sees them and the operations left them.
+                let base = self.view_of(tx.base(), Some(access));
+                let kept: Vec<nrese_engine::EncodedQuad> = base
+                    .quads_for_pattern_in(ReadModel::Inferred, &nrese_engine::QuadPattern::all())
+                    .filter(|quad| view_has(&tx, quad))
+                    .collect();
+                tx.pending_snapshot()
+                    .with_inferred_subset(nrese_engine::InferredSubset::Only(kept))
+            }
+            _ => tx.pending_snapshot(),
+        };
         self.sessions
             .keep_view(tx.base().clone(), scope, pending, view.clone());
         read(&view)
@@ -574,7 +635,7 @@ impl StoreService {
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
         match context.pending {
-            None => read(&self.engine.snapshot()),
+            None => read(&self.read_snapshot(context.scope.access())),
             Some(pending) => self.with_pending(pending, &context.scope, &context.cancel, read),
         }
     }
@@ -776,6 +837,13 @@ impl StoreService {
         };
         let steps = crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))?;
         let visible = match steps.first().map(|step| step.origin) {
+            Some("inferred") if by_support(access) => {
+                let [s, p, o] = fact.map(nrese_engine::TermId::from_raw);
+                self.view_of(&snapshot, Some(access)).contains_in(
+                    ReadModel::Inferred,
+                    &nrese_engine::EncodedQuad::new(s, p, o, nrese_engine::TermId::DEFAULT_GRAPH),
+                )
+            }
             Some("inferred") => access.inferred,
             Some("asserted") => true,
             _ => false,
@@ -897,6 +965,17 @@ impl StoreService {
             other => unreachable!("restore produced {other:?}"),
         }
     }
+}
+
+/// Whether a reader with `access` sees the inferred statements by their support graph
+/// sets ([`crate::support`]).
+fn by_support(access: &nrese_sparql::GraphAccess) -> bool {
+    access.inferred && access.inferred_by_support
+}
+
+/// Whether the pending state of `tx` holds the inferred `quad`.
+fn view_has(tx: &nrese_engine::Transaction<'_>, quad: &nrese_engine::EncodedQuad) -> bool {
+    tx.contains_in(ReadModel::Inferred, quad)
 }
 
 /// The read model of RDF4J's `infer` parameter.

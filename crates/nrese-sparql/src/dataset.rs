@@ -24,6 +24,9 @@ pub struct GraphAccess {
     /// The inferred statements (they live in the default graph; whether a user who may not
     /// read every graph sees them is the configuration's choice).
     pub inferred: bool,
+    /// With `inferred`: only the inferred statements one of whose derivations uses
+    /// readable graphs alone (their support graph sets); the store hides the others.
+    pub inferred_by_support: bool,
     /// Graph IRIs excluded whatever `graphs` and `prefixes` say (an explicit deny).
     pub excluded: Vec<String>,
     /// IRI prefixes excluded the same way.

@@ -227,6 +227,13 @@ pub const SETTINGS: &[Setting] = &[
         "Whether memberships in unnamed union classes that nothing consumes are derived \
          (default derive).",
     ),
+    setting(
+        "reasoner.support_sets",
+        names::REASONING_SUPPORT_SETS,
+        Integer,
+        "Support graph sets kept per inferred statement for inferred = \"supported\" in the \
+         access policy (default 4, at least 1); fewer can only hide statements.",
+    ),
     // [federation]
     setting(
         "federation.allow",

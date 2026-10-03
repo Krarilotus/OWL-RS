@@ -516,3 +516,50 @@ fn both_stacks_survive_checkpoints_and_reopening() {
         }
     }
 }
+
+/// A snapshot restricted to a subset of its inferred statements reads that subset alone,
+/// in every read path, whichever side of the split names it; the whole snapshot is
+/// unchanged.
+#[test]
+fn inferred_subsets_restrict_every_read() {
+    use nrese_engine::InferredSubset;
+    let engine = engine();
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(triple(1, 2, 3).in_default_graph()));
+    let inferred: Vec<EncodedQuad> = (4..10)
+        .map(|o| triple(1, 2, o).in_default_graph())
+        .collect();
+    for quad in &inferred {
+        assert!(tx.insert_inferred(EncodedTriple::new(
+            quad.subject,
+            quad.predicate,
+            quad.object
+        )));
+    }
+    tx.commit().expect("commit");
+    let whole = engine.snapshot();
+    let (kept, hidden) = inferred.split_at(2);
+    for subset in [
+        InferredSubset::Only(kept.to_vec()),
+        InferredSubset::Without(hidden.to_vec()),
+    ] {
+        let restricted = whole.with_inferred_subset(subset);
+        let expected: BTreeSet<EncodedQuad> = kept.iter().copied().collect();
+        assert_eq!(scan(&restricted, ReadModel::Inferred), expected);
+        assert_eq!(restricted.len_in(ReadModel::Inferred), 2);
+        let pattern = QuadPattern {
+            subject: Some(id(1)),
+            ..QuadPattern::all()
+        };
+        assert_eq!(restricted.count_in(ReadModel::Materialised, &pattern), 3);
+        let sorted: Vec<EncodedQuad> = restricted
+            .scan_sorted_in(ReadModel::Materialised, &pattern, Permutation::Spog)
+            .expect("sorted scan")
+            .collect();
+        assert_eq!(sorted.len(), 3);
+        assert!(!restricted.contains_in(ReadModel::Materialised, &hidden[0]));
+        assert!(restricted.contains_in(ReadModel::Materialised, &kept[0]));
+        assert_eq!(restricted.revision(), whole.revision());
+    }
+    assert_eq!(whole.len_in(ReadModel::Inferred), 6);
+}

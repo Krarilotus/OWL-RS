@@ -147,6 +147,28 @@ impl Program {
         self
     }
 
+    /// The ruleset's axiomatic triples, sorted.
+    pub(crate) fn axioms(&self) -> &[Triple] {
+        &self.axioms
+    }
+
+    /// The ground program of the committed state `snapshot`, as the delta executor
+    /// builds it.
+    pub(crate) fn ground_program(&self, snapshot: &Snapshot) -> GroundProgram {
+        let schema = self.schema_for(snapshot);
+        let base = SnapshotBase {
+            snapshot,
+            axioms: &self.axioms,
+        };
+        delta::program(
+            &base,
+            delta::Rules {
+                schema: &schema,
+                ..self.rules()
+            },
+        )
+    }
+
     /// The schema for a run over `snapshot`: with the unnamed classes to leave out, when
     /// the program does.
     fn schema_for(&self, snapshot: &Snapshot) -> Schema {

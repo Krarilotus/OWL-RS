@@ -1465,7 +1465,7 @@ mod tests {
                     .map(|&(_, g)| g)
                     .collect()
             };
-            let sets = super::graph_sets::support_sets(&full, &ground, &graphs_of, usize::MAX);
+            let sets = super::graph_sets::support_sets(&full, &ground, &[], &graphs_of, usize::MAX);
             for readable in 0u32..8 {
                 let data: Vec<Triple> = placed
                     .iter()

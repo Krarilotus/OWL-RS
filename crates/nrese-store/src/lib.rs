@@ -33,6 +33,7 @@ pub mod sessions;
 pub mod shacl;
 pub mod statements;
 mod stats;
+pub mod support;
 mod tell;
 pub mod update;
 mod view;

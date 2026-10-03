@@ -1,0 +1,155 @@
+//! Inferred statements under graph access with `inferred = "supported"`: a reader sees an
+//! inferred statement when one of its derivations uses graphs it may read alone (support
+//! graph sets, `nrese_store::support`), in every read path.
+
+use std::sync::Arc;
+
+use crate::support::in_memory_store_config;
+use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_sparql::GraphAccess;
+use nrese_store::{
+    ReadContext, ReadScope, SparqlQueryRequest, SparqlUpdateRequest, StatementPattern, StoreService,
+};
+
+const EX: &str = "http://example.com/";
+
+fn store() -> StoreService {
+    let store = StoreService::new(in_memory_store_config()).unwrap();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ ex:C rdfs:subClassOf ex:D . ex:D rdfs:subClassOf ex:E .
+                            GRAPH ex:open {{ ex:a a ex:C }}
+                            GRAPH ex:secret {{ ex:b a ex:C . ex:C rdfs:subClassOf ex:F }} }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    store
+}
+
+fn reader(by_support: bool) -> ReadScope {
+    ReadScope::Graphs(Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: by_support,
+        ..GraphAccess::default()
+    }))
+}
+
+/// The classes `subject` is inferred to be in, as `scope` reads them.
+fn classes(store: &StoreService, scope: &ReadScope, subject: &str) -> Vec<String> {
+    let pattern = StatementPattern {
+        subject: Some(nrese_rdf::NamedNode::new_unchecked(format!("{EX}{subject}")).into()),
+        predicate: Some(nrese_rdf::NamedNode::new_unchecked(
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+        )),
+        ..StatementPattern::default()
+    };
+    let mut classes: Vec<String> = store
+        .statements(&ReadContext::new(scope.clone()), &pattern)
+        .unwrap()
+        .into_iter()
+        .filter(|quad| quad.graph_name.is_default_graph())
+        .map(|quad| quad.object.to_string().replace(EX, ""))
+        .collect();
+    classes.sort();
+    classes.dedup();
+    classes
+}
+
+fn select(store: &StoreService, scope: &ReadScope, query: &str) -> String {
+    let result = store
+        .execute_query(&SparqlQueryRequest::new(
+            format!("PREFIX ex: <{EX}> {query}"),
+            scope.clone(),
+        ))
+        .unwrap();
+    String::from_utf8(result.payload).unwrap()
+}
+
+#[test]
+fn readers_see_the_inferences_their_graphs_support() {
+    let store = store();
+    let supported = reader(true);
+    // `a` is in `open`: its classes over the default graph's schema are visible; F needs
+    // the secret graph's axiom.
+    assert_eq!(classes(&store, &supported, "a"), ["<D>", "<E>"]);
+    // `b` is in `secret` only.
+    assert!(classes(&store, &supported, "b").is_empty());
+    // Every inference with "visible", none with "hidden", all unrestricted.
+    assert_eq!(classes(&store, &reader(false), "a"), ["<D>", "<E>", "<F>"]);
+    assert_eq!(classes(&store, &reader(false), "b"), ["<D>", "<E>", "<F>"]);
+    let hidden = ReadScope::Graphs(Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open")],
+        default_graph: true,
+        ..GraphAccess::default()
+    }));
+    assert!(classes(&store, &hidden, "a").is_empty());
+    assert_eq!(classes(&store, &ReadScope::All, "a"), ["<D>", "<E>", "<F>"]);
+
+    // Queries, counts included, see the same.
+    let count = select(
+        &store,
+        &supported,
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s a ex:D }",
+    );
+    assert!(count.contains("\"1\""), "{count}");
+    let all = select(
+        &store,
+        &ReadScope::All,
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s a ex:D }",
+    );
+    assert!(all.contains("\"2\""), "{all}");
+    let names = select(&store, &supported, "SELECT ?s WHERE { ?s a ex:E }");
+    assert!(
+        names.contains("example.com/a") && !names.contains("example.com/b"),
+        "{names}"
+    );
+
+    // Explanations of statements the reader doesn't see are refused.
+    let explain = |subject: &str, class: &str| {
+        store.explain_statement(
+            Ruleset::Owl2Rl,
+            &supported,
+            nrese_rdf::NamedNode::new_unchecked(format!("{EX}{subject}"))
+                .as_ref()
+                .into(),
+            nrese_rdf::NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+                .as_ref()
+                .into(),
+            nrese_rdf::NamedNode::new_unchecked(format!("{EX}{class}"))
+                .as_ref()
+                .into(),
+        )
+    };
+    assert!(explain("a", "E").is_some());
+    assert!(explain("a", "F").is_none());
+    assert!(explain("b", "D").is_none());
+}
+
+/// A new revision gets its own sets: data the reader may read, added later, supports
+/// what it derives.
+#[test]
+fn support_follows_the_latest_revision() {
+    let store = store();
+    let supported = reader(true);
+    assert!(classes(&store, &supported, "c").is_empty());
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:c a ex:C }} }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    assert_eq!(classes(&store, &supported, "c"), ["<D>", "<E>"]);
+}
+
+/// Without rules registered the sets can't be computed: no inferred statement is shown.
+#[test]
+fn without_rules_nothing_inferred_is_shown() {
+    let store = store();
+    store.use_reasoning_rules(None);
+    assert!(classes(&store, &reader(true), "a").is_empty());
+    assert_eq!(classes(&store, &reader(false), "a"), ["<D>", "<E>", "<F>"]);
+}

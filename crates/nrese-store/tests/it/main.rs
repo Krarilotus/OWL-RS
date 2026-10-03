@@ -12,6 +12,7 @@ mod equality_compact_tests;
 mod explanation_tests;
 mod image_backup_tests;
 mod implicit_prefix_tests;
+mod inferred_access_tests;
 mod mutation_pipeline_tests;
 mod mutation_safety_tests;
 mod query_cache_tests;
