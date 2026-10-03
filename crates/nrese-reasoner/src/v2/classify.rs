@@ -38,6 +38,9 @@ pub struct Classification {
     pub subsumptions: Vec<(u64, u64)>,
     /// Named classes that can have no instance (subclasses of `owl:Nothing`).
     pub unsatisfiable: Vec<u64>,
+    /// Named classes equivalent to `owl:Thing` (superclasses of it): every class is a
+    /// subclass of them, which `subsumptions` doesn't repeat for each.
+    pub top: Vec<u64>,
     /// Axioms (by their predicate or class-expression kind) outside EL, skipped.
     pub skipped: Vec<(u64, &'static str)>,
 }
@@ -576,6 +579,12 @@ fn saturate(
         .enumerate()
         .filter_map(|(c, id)| id.map(|id| (c as Concept, id)))
         .collect();
+    let top = &subsumers[thing as usize];
+    for &(d, id) in &named_ids {
+        if d != thing && d != nothing && top.contains(&d) {
+            result.top.push(id);
+        }
+    }
     for &(c, id) in &named_ids {
         if c == thing || c == nothing {
             continue;
@@ -593,6 +602,7 @@ fn saturate(
     }
     result.subsumptions.sort_unstable();
     result.unsatisfiable.sort_unstable();
+    result.top.sort_unstable();
     result
 }
 
@@ -720,8 +730,11 @@ mod tests {
         // Disjointness: a golem would be a stone and a person.
         let golem = v.iri(&format!("{EX}Golem"));
         assert_eq!(result.unsatisfiable, vec![golem]);
-        // owl:Thing is no superclass in the output; an equivalent of it is.
+        // owl:Thing is no superclass in the output; an equivalent of it is, and is
+        // reported as one.
         assert!(holds(&mut v, &result, "Anything", "Top"));
+        let top = v.iri(&format!("{EX}Top"));
+        assert_eq!(result.top, vec![top]);
     }
 
     #[test]
