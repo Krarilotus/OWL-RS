@@ -6,18 +6,22 @@
 //! reads strings only of the literals it needs ([`Terms`]); nothing here depends on the
 //! store or an engine.
 
+pub mod clauses;
 pub mod diagnostics;
 mod functional;
 pub mod mapping;
 pub mod model;
+pub mod normalise;
 pub mod vocab;
 pub mod write;
 
+pub use clauses::{BodyAtom, Clause, Concept, Facts, Filler, FreshOf, HeadAtom, Normalised, Var};
 pub use diagnostics::Diagnostic;
 pub use mapping::{Ontology, Source, Statement, TermKind, Terms, read};
 pub use model::{
     Axiom, Characteristic, ClassExpr, DataRange, EntityKind, ExprId, Interner, ObjProp, RangeId,
     Term,
 };
+pub use normalise::{Options, normalise, normalise_with};
 pub use vocab::Vocabulary;
 pub use write::{Make, write};

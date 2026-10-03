@@ -655,7 +655,7 @@ under `nrese_dl_*`.
 | Package | Delivers | Gate |
 |---|---|---|
 | 2.1 | `nrese-owl`: structural model, reverse mapping, diagnostics, provenance | the round trip and the W3C suite's documents read (§2) |
-| 2.2 | Normalisation into DL-clauses with metadata and provenance; the EL classifier moved onto it | exhaustive model equivalence on fuzzed ontologies (§3); EL taxonomies unchanged |
+| 2.2 | Normalisation into DL-clauses with metadata and provenance | exhaustive model equivalence on fuzzed ontologies (§3) |
 | 2.3 | The W3C direct-semantics runner, reference reasoner runners, canonical taxonomies, `DISPUTED` records | the runners reproduce published HermiT and ELK results on the development subset |
 | 2.4 | The proof IR; RL and EL derivations moved into it; PULi-style justifications (`one`, `core`, `union`, `top-k`, `all`) for RL and EL; the proof checker | justifications equal to a Horn MUS enumerator on random entailments |
 | 2.5 | The SROIQ(D) fuzzer and metamorphic harness | runs in CI |
@@ -667,7 +667,7 @@ under `nrese_dl_*`.
 | 3.1 | Hypertableau, ALC → SHIQ → SROIQ: blocking, NI, merges, dependency sets, backjumping, semantic branching | the W3C DL suite green, without datatypes |
 | 3.2 | The datatype theory | the W3C DL suite green |
 | 3.3 | Classification and realisation driver | HermiT parity on the development subset |
-| 3.4 | Context core, Horn stage; dispatch and modules | §5's Horn gate; no taxonomy differences |
+| 3.4 | Context core, Horn stage; dispatch and modules; the EL classifier moved onto the structural model and its clauses (with chains kept explicit for EL: the automata of §3 make `∃(r∘s).B ⊑ C` non-Horn, so this waits for an EL clause mode, not 2.2) | §5's Horn gate; no taxonomy differences; EL taxonomies unchanged |
 | 3.5 | Context core, SRIQ and SROIQ stages; dynamic fallback, racing, telemetry | §5's gates |
 | 3.6 | Caches with footprints; parallel classification; profiled SIMD | metamorphic on/off tests; ORE parity with HermiT (Lam et al. 2023: 1,751 classifications, 1,881 consistency checks) |
 | 3.7 | Black-box justifications over the hypertableau; glass-box certificates | equal to the glass-box results where both apply |

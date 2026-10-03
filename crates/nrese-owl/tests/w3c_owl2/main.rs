@@ -12,7 +12,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use nrese_owl::{
-    Diagnostic, Make, Ontology, Statement, Term, TermKind, Terms, Vocabulary, read, write,
+    Diagnostic, Make, Ontology, Statement, Term, TermKind, Terms, Vocabulary, normalise, read,
+    write,
 };
 use nrese_rdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term as RdfTerm, Triple};
 use nrese_rdf_io::{RdfFormat, RdfParser};
@@ -199,6 +200,9 @@ fn check(text: &str) -> Result<(), String> {
         let missing: Vec<&String> = before.iter().filter(|l| !after.contains(l)).collect();
         return Err(format!("round trip lost {missing:?}"));
     }
+    // Normalises (work package 2.2): no construct left unhandled.
+    std::panic::catch_unwind(|| normalise(&ontology))
+        .map_err(|_| "the normalisation panicked".to_owned())?;
     Ok(())
 }
 
