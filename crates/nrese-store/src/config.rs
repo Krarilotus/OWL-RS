@@ -11,7 +11,7 @@ pub enum StoreMode {
 
 /// Typed store configuration. Parsing from env/files lives in `nrese-server/src/config/`.
 /// Support graph sets kept per inferred statement by default ([`StoreConfig::support_sets`]).
-pub const DEFAULT_SUPPORT_SETS: usize = 4;
+pub const DEFAULT_SUPPORT_SETS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreConfig {

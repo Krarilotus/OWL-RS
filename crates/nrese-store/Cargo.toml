@@ -15,6 +15,7 @@ nrese-sparql = { path = "../nrese-sparql" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+hashbrown = { workspace = true }
 rayon = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

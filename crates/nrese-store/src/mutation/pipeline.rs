@@ -41,6 +41,22 @@ pub struct MutationPipeline {
     retired: std::sync::atomic::AtomicBool,
 }
 
+/// The statements `tx` inserts or deletes, asserted and inferred, as reasoner facts.
+fn touched(tx: &nrese_engine::Transaction<'_>) -> Vec<nrese_reasoner::v2::ir::Triple> {
+    let quads = tx.inserted().chain(tx.deleted());
+    let mut facts: Vec<nrese_reasoner::v2::ir::Triple> = quads
+        .map(|q| [q.subject.raw(), q.predicate.raw(), q.object.raw()])
+        .chain(
+            tx.inferred_inserted()
+                .chain(tx.inferred_deleted())
+                .map(|t| [t.subject.raw(), t.predicate.raw(), t.object.raw()]),
+        )
+        .collect();
+    facts.sort_unstable();
+    facts.dedup();
+    facts
+}
+
 impl MutationPipeline {
     pub fn new(store: Arc<StoreService>, reasoner: Arc<ReasonerService>) -> Self {
         store.use_reasoning_rules(reasoner.config().materialised_program());
@@ -200,10 +216,18 @@ impl MutationPipeline {
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
+            // What the commit touched, for the support graph sets kept for readers under
+            // graph access (only while there are any).
+            let supports = self.store.supports();
+            let touched = supports.wants_commits().then(|| touched(&tx));
+            let before = tx.base().revision();
             let summary = tx.commit().map_err(|error| MutationError::Store {
                 kind,
                 source: StoreError::Engine(error),
             })?;
+            if let Some(touched) = touched {
+                supports.note_commit(before, summary.revision, touched);
+            }
             // The program now describes the committed state.
             match changed {
                 Some(program) => *ground = Some((summary.revision, program)),

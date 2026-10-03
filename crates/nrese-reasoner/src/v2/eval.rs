@@ -1256,6 +1256,29 @@ impl GroundProgram {
 }
 
 impl GroundProgram {
+    /// The rules (indexes into `rules`) whose head can give `fact`, each once.
+    pub fn producers(&self, fact: Triple) -> Vec<usize> {
+        let mut found = Vec::new();
+        self.heads.matching_fact(fact, &mut found);
+        let mut rules: Vec<usize> = found.into_iter().map(|(r, _)| r).collect();
+        rules.sort_unstable();
+        rules.dedup();
+        rules
+    }
+
+    /// Every schema fact a rule instance, bodiless fact or transitive predicate was
+    /// grounded on, in any of its alternatives.
+    pub fn schema_premises(&self) -> HashSet<Triple> {
+        self.premises
+            .iter()
+            .chain(self.bodiless_premises.values())
+            .chain(self.transitive_premises.values())
+            .chain(self.other_premises.values().flatten())
+            .flatten()
+            .copied()
+            .collect()
+    }
+
     /// Whether one of the rules `only` marks derives `fact` from `source` in one step.
     pub fn derivable_by<S: Source + ?Sized>(
         &self,

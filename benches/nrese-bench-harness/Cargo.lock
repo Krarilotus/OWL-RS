@@ -1140,6 +1140,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "getrandom 0.4.2",
+ "hashbrown 0.16.1",
  "nrese-core",
  "nrese-engine",
  "nrese-rdf",
