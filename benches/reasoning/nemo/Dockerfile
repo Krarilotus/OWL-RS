@@ -7,5 +7,6 @@ ADD https://github.com/knowsys/nemo/releases/download/${NEMO_VERSION}/nemo_${NEM
 RUN cd /tmp && echo "$(cut -d' ' -f1 nemo.sha256)  nemo.tar.gz" | sha256sum -c - \
  && tar -xzf nemo.tar.gz && find /tmp -name nmo -type f -exec install -m 755 {} /usr/local/bin/nmo \; \
  && rm -rf /tmp/*
-COPY owl2rl.rls /nemo/owl2rl.rls
+# The rules are mounted at run time (/rules, from benches/reasoning/nemo): the image is the
+# pinned binary only, so a run never uses rules baked into an older image.
 ENTRYPOINT ["nmo"]
