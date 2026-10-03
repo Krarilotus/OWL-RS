@@ -18,11 +18,11 @@
 %! schema relations saturate in the first rounds, so their deltas go empty and semi-naive
 %! evaluation stops re-joining them against a growing T; written inline, every rule's
 %! schema atoms are re-planned against the whole triple table in every round. The rules
-%! and the closure are the same as owl2rl.rls (checked set for set on LUBM 1 and 10; see
-%! README.md); the technique is the one sparq's validated Nemo encoding uses
+%! and the closure are the same as owl2rl.rls (checked set for set on LUBM 1 and 10 and
+%! OWL2Bench RL-1; see README.md); the technique is the one sparq's validated Nemo encoding uses
 %! (github.com/sparq-org/sparq, bench/reason-encodings, MIT), applied to the full rule set.
-%! Whether it pays is measured, not assumed: on LUBM 10 and OWL2Bench RL-1 it hasn't
-%! been faster so far (README.md, "Times so far").
+%! Whether it pays is measured, not assumed: on LUBM 10 and OWL2Bench RL-1 it has been
+%! slower so far (README.md, "Times so far").
 
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
