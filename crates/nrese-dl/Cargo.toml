@@ -1,0 +1,20 @@
+[package]
+name = "nrese-dl"
+description = "NRESE OWL 2 DL engines over nrese-owl's DL-clauses: the context-saturation core, the hypertableau, and the bounds (docs/design/owl2-dl.md §5, §6, §8)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+nrese-owl = { path = "../nrese-owl" }
+hashbrown = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+nrese-rdf = { path = "../rdf/nrese-rdf" }
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+
+[lints]
+workspace = true
