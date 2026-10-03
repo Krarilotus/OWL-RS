@@ -33,8 +33,19 @@ in_volume() {
   docker run --rm -v nrese-bench-data:/data -w /data/real alpine sh -euc "$1"
 }
 
+# The Wikidata lexeme dump: the newest, or a dated one (WIKIDATA_LEXEMES_DUMP=YYYYMMDD;
+# Wikimedia keeps dated dumps for a few weeks), so that a rerun can measure the same data.
+if [ -n "${WIKIDATA_LEXEMES_DUMP:-}" ]; then
+  LEXEMES_URL="https://dumps.wikimedia.org/wikidatawiki/entities/$WIKIDATA_LEXEMES_DUMP/wikidata-$WIKIDATA_LEXEMES_DUMP-lexemes.nt.gz"
+else
+  LEXEMES_URL=https://dumps.wikimedia.org/wikidatawiki/entities/latest-lexemes.nt.gz
+fi
+
+# Each download leaves FILE.source beside it: the URL and the server's Last-Modified, so a
+# run's manifest says which release of a "latest" dump it measured.
 download() { # url file
-  in_volume "[ -s '$2' ] || { apk add -q curl >/dev/null; curl -sSfL --retry 3 -o '$2.part' '$1'; mv '$2.part' '$2'; }"
+  in_volume "[ -s '$2' ] || { apk add -q curl >/dev/null; curl -sSfL --retry 3 -o '$2.part' '$1'; mv '$2.part' '$2';
+    echo \"$1 \$(curl -sSfLI '$1' | grep -i '^last-modified:' | tail -1 | cut -d' ' -f2- | tr -d '\r')\" > '$2.source'; }"
 }
 
 # Converts the files matched by a glob (relative to /data/real) into /data/<name>.nt.
@@ -98,7 +109,7 @@ for name in $NAMES; do
       # (the full dump is ~229 M triples and ~31 GB).
       millions=${name#wikidata-lexemes-}
       millions=${millions%m}
-      download https://dumps.wikimedia.org/wikidatawiki/entities/latest-lexemes.nt.gz wikidata-lexemes.nt.gz
+      download "$LEXEMES_URL" wikidata-lexemes.nt.gz
       in_volume "rm -rf '$name.parts' && mkdir '$name.parts'"
       docker run --rm -v nrese-bench-data:/data -v "$HERE:/scripts:ro" "$PYTHON_IMAGE" sh -c \
         "gunzip -c /data/real/wikidata-lexemes.nt.gz | python /scripts/nt-filter.py \
@@ -110,7 +121,7 @@ for name in $NAMES; do
         echo \"$name: \$(wc -l < '/data/$name.nt') triples, \$(du -h '/data/$name.nt' | cut -f1)\""
       ;;
     wikidata-lexemes)
-      download https://dumps.wikimedia.org/wikidatawiki/entities/latest-lexemes.nt.gz wikidata-lexemes.nt.gz
+      download "$LEXEMES_URL" wikidata-lexemes.nt.gz
       in_volume "[ -s wikidata-lexemes.nt ] || gunzip -k wikidata-lexemes.nt.gz"
       convert wikidata-lexemes "wikidata-lexemes.nt" filter
       ;;

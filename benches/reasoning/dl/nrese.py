@@ -58,7 +58,8 @@ def el(args):
                 continue
             closure = cases / "tax" / f"{t}.nrese-el.tsv"
             started = time.monotonic()
-            run = subprocess.run([str(binary), "--out", str(closure), str(cases / "tax" / f"{t}.nt")],
+            run = subprocess.run([str(binary), "--out", str(closure), "--threads", str(args.threads),
+                                  str(cases / "tax" / f"{t}.nt")],
                                  capture_output=True, text=True, timeout=args.timeout)
             ms = int((time.monotonic() - started) * 1000)
             if run.returncode != 0:
@@ -78,6 +79,7 @@ def main():
     e = sub.add_parser("el")
     e.add_argument("cases")
     e.add_argument("--binary", default=str(ROOT / "target" / "release" / "examples" / "classify"))
+    e.add_argument("--threads", type=int, default=1, help="workers of the saturation (default 1)")
     e.add_argument("--timeout", type=int, default=600)
     args = p.parse_args()
     el(args)

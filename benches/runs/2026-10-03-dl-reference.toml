@@ -1,0 +1,35 @@
+# A run record (benches/runs/README.md), written by hand: the DL kit has its own driver
+# (benches/reasoning/dl). Outcomes only; the per-task times are in the kit's results/.
+
+id = "2026-10-03-dl-reference"
+kit = "reasoning/dl"
+purpose = "Work package 2.3: the reference reasoners on the W3C OWL 2 DL suite and the ORE 2015 development subset; NRESE's EL classifier on the EL track"
+baseline = ""
+findings = [
+  "HermiT, Openllet and Konclude agree on 79 of 80 ORE dev tasks; ore_ont_1340 (Openllet differs) is open",
+  "Konclude 0.7.0 answers 30 W3C DL tests wrongly (its own answers; disputed.tsv)",
+  "NRESE's EL classifier agrees on all 20 EL tasks; its quadratic result assembly fixed in c0b5e5c (EMAP 1.77 s -> 0.013 s)",
+]
+started = "2026-10-03"
+host = "Kraris-GPTler"
+machine = "AMD Ryzen 7 7800X3D, 16 threads, 63 GiB; Windows 11; Docker Desktop (image nrese-bench/dl-reference)"
+commit = "00f9b19 (kit); c0b5e5c (NRESE EL rerun)"
+protocol = "W3C: 20 s per task, the published passes HermiT missed rerun at 120 s; ORE dev: 300 s per task, one batch per JVM, a fresh JVM after a timeout"
+commands = [
+  "python w3c.py prepare/manifest; python reference.py run DIR --timeout 20; python w3c.py compare",
+  "python ore.py subset/manifest; python reference.py run DIR --timeout 300; python nrese.py el; python ore.py compare",
+]
+results = "benches/reasoning/dl/results/w3c-2026-10-03.tsv, ore-dev-2026-10-03.tsv (committed)"
+publishable = "all"
+
+pairs = [
+  { workload = "w3c-owl2-dl", tier = "-", system = "hermit", regime = "direct", outcome = "partial", items = "382/411", note = "27 timeouts, 1 crash (WebOnt-Thing-003), no wrong result" },
+  { workload = "w3c-owl2-dl", tier = "-", system = "openllet", regime = "direct", outcome = "wrong", items = "393/411", note = "6 wrong results, 10 timeouts" },
+  { workload = "w3c-owl2-dl", tier = "-", system = "konclude", regime = "direct", outcome = "wrong", items = "275/411", note = "30 wrong results, 100 unsupported (datatypes, keys)" },
+  { workload = "w3c-owl2-dl", tier = "-", system = "elk", regime = "direct", outcome = "partial", items = "93/114", note = "EL tasks only; the rest use constructs outside its fragment" },
+  { workload = "ore-2015", tier = "dev", system = "hermit", regime = "direct", outcome = "ok", items = "80/80" },
+  { workload = "ore-2015", tier = "dev", system = "konclude", regime = "direct", outcome = "partial", items = "79/80", note = "1 error" },
+  { workload = "ore-2015", tier = "dev", system = "openllet", regime = "direct", outcome = "partial", items = "77/80", note = "3 timeouts; differs on ore_ont_1340 (open)" },
+  { workload = "ore-2015", tier = "dev", system = "elk", regime = "direct", outcome = "ok", items = "20/20", note = "EL track" },
+  { workload = "ore-2015", tier = "dev", system = "nrese", regime = "direct", outcome = "partial", items = "20/80", note = "EL track only (20/20 agree); the DL tasks wait for phase 3" },
+]

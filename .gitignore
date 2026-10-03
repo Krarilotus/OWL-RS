@@ -58,3 +58,7 @@ __pycache__/
 
 # Lockfiles of the vendored crates, made when their own tests run
 /vendor/*/Cargo.lock
+
+# The local literature corpus and its wiki (literature/README.md): papers are their
+# publishers' and authors' copyright, never committed
+/literature/

@@ -1,0 +1,199 @@
+# The frozen benchmark datasets (benches/PROTOCOL.md §6; `suite.py data`). Comparisons run
+# on byte-identical data: every file the standard tiers read, with its size and SHA-256, the
+# command that made it and the release of its source. The reserved space holds them for
+# good (budget_gb); scripts/bench-cleanup.sh never removes a catalogued file. Regenerating a
+# file must give the same hash, or it is a new release: freeze it again and say so in the
+# run records that use it.
+
+budget_gb = 300
+volume = "nrese-bench-data"
+
+[[dataset]]
+file = "dbpedia-core.nt"
+workload = "basics-mix"
+tier = "dbpedia-core"
+role = "core"
+made_by = "bash benches/competitors/prepare-datasets.sh dbpedia-core"
+bytes = 9198031814
+sha256 = "a1a26c3684a2b01a9dad43634f2af6f181f4fa3790f8340420a198a5a2a9d6a5"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "entities-10000000.nt"
+workload = "basics-mix"
+tier = "entities-10000000"
+role = "core"
+made_by = "bash benches/competitors/prepare-entities.sh 10000000"
+bytes = 1088333340
+sha256 = "f6d2d939942c002ae38f42d571eda3c1e5d13739038f93cd4c08e01b26345643"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "lubm-1-materialised.nt"
+workload = "lubm-materialised"
+tier = "1"
+role = "core"
+made_by = "bash benches/reasoning/prepare-lubm-materialised.sh 1"
+bytes = 28983258
+sha256 = "f44d4aaeeeef55bf2433b74232fd1318f1876e05fbee072cb2a17e9e6afed1ff"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "lubm-1.nt"
+workload = "lubm"
+tier = "1"
+role = "core"
+made_by = "bash benches/reasoning/prepare-lubm.sh 1"
+bytes = 18102619
+sha256 = "299677a2e26b93170fcd508455f2257b14230d728255fb987d27c2dbab99ae98"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "lubm-10-materialised.nt"
+workload = "lubm-materialised"
+tier = "10"
+role = "core"
+made_by = "bash benches/reasoning/prepare-lubm-materialised.sh 10"
+bytes = 364226598
+sha256 = "2c83a8ced699e65058604e5173a1572c34f8525ff1361354d13c5b97fb4fc698"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "lubm-10.nt"
+workload = "lubm"
+tier = "10"
+role = "core"
+made_by = "bash benches/reasoning/prepare-lubm.sh 10"
+bytes = 231509261
+sha256 = "66f44fa87db99b5b9465e01d95463bdd2c9e94158a2987d39162d042eb4b17ba"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "lubm-100-materialised.nt"
+workload = "lubm-materialised"
+tier = "100"
+role = "core"
+made_by = "bash benches/reasoning/prepare-lubm-materialised.sh 100"
+bytes = 3862706540
+sha256 = "c801f5d51b23fe18bcbde852badb7de3675c2daf883b6bf535752f2679d6f689"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "lubm-100.nt"
+workload = "lubm"
+tier = "100"
+role = "core"
+made_by = "bash benches/reasoning/prepare-lubm.sh 100"
+bytes = 2459544707
+sha256 = "61f43e3fb8fbe6b090223b187e1b1204b6c2c2cb5fbd657230e416ab230a4a0d"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "olympics.nt"
+workload = "basics-mix"
+tier = "olympics"
+role = "core"
+made_by = "bash benches/competitors/prepare-datasets.sh olympics"
+bytes = 337695911
+sha256 = "44e15095a3a9beefe09c512882a08d9b7aa82bba5e48fa22bfbfb361dde01ce0"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "owl2bench-ql-1.nt"
+workload = "owl2bench"
+tier = "ql-1"
+role = "core"
+made_by = "bash benches/reasoning/prepare-owl2bench.sh QL:1"
+bytes = 7658001
+sha256 = "5a80086dc18e284922e0991ab08889484d42d26347b0bc5bea022379172d59ca"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "owl2bench-rl-1.nt"
+workload = "owl2bench"
+tier = "rl-1"
+role = "core"
+made_by = "bash benches/reasoning/prepare-owl2bench.sh RL:1"
+bytes = 7671699
+sha256 = "2454795bdd76fd1cb1ccbb149a4098a1166707acaf9c0a1441e8e6f75ad81499"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "real/dbpedia-labels.ttl.bz2"
+role = "source"
+bytes = 168694622
+sha256 = "b1863f1f8398e677433563d90b87e01a742861373940486a57025fd031f3bc0d"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "real/dbpedia-literals.ttl.bz2"
+role = "source"
+bytes = 152873504
+sha256 = "094b566bc9983842b1e97cecb2119c0e0f640e0a13882cf3f294b91b02ab770a"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "real/dbpedia-objects.ttl.bz2"
+role = "source"
+bytes = 191694609
+sha256 = "76747563b7bb6587d8707ae65489186b54d17acec060da7566397992c171371a"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "real/dbpedia-types.ttl.bz2"
+role = "source"
+bytes = 46387756
+sha256 = "59dc900bea2ec126b8c2a4097be4ccab5f737bf4616a3f1a9d300942e32c2c3e"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "real/olympics.zip"
+role = "source"
+bytes = 13332797
+sha256 = "758dbc09029a303514c3fa70fa9f725f412d24e9db000a65a1d30569e74bd41f"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "real/wikidata-lexemes.nt.gz"
+role = "source"
+source = "https://dumps.wikimedia.org/wikidatawiki/entities/latest-lexemes.nt.gz Fri, 02 Oct 2026 23:32:01 GMT"
+bytes = 1529396508
+sha256 = "752eae695ab9ad401bf883c208b64d02d0acd9a5ee82a97ecf86dc4d0d233b83"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "real/yago-tiny.zip"
+role = "source"
+bytes = 200800361
+sha256 = "c9e52cf0338c9dd6586f4d601b02398fef55253a2be94dcace8ae9115f0d889d"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "univ-bench.nt"
+workload = "lubm"
+tier = "1"
+role = "core"
+made_by = "bash benches/reasoning/prepare-lubm.sh 1"
+bytes = 47781
+sha256 = "2c42947cd544da0bb1466b0a89a558b90f36cde15b824df15c9b4159a0e99210"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "wikidata-lexemes-60m.nt"
+workload = "basics-mix"
+tier = "wikidata-lexemes-60m"
+role = "core"
+made_by = "bash benches/competitors/prepare-datasets.sh wikidata-lexemes-60m"
+bytes = 8445750430
+sha256 = "3e1f64ae6f7f943630deb4696fbb841d3429ac3c49cef84becdc52c5f70c7211"
+frozen = "2026-10-03"
+
+[[dataset]]
+file = "yago-tiny.nt"
+workload = "basics-mix"
+tier = "yago-tiny"
+role = "core"
+made_by = "bash benches/competitors/prepare-datasets.sh yago-tiny"
+bytes = 3246565946
+sha256 = "e65eef7eb720be730d24ca088699089c21f9ddf002667449fa519f9abe311bb3"
+frozen = "2026-10-03"

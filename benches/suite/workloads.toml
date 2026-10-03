@@ -9,6 +9,8 @@
 # The suite's driver (suite.py run) runs the workloads suitekit/workloads.py defines;
 # the others it lists as not run.
 # check:   how a result is verified before its time counts
+# tiers:   the standard tiers: the sizes a full comparison runs (benches/STATUS.md counts
+#          coverage against them; other tiers can run too)
 
 # --- reasoning ---------------------------------------------------------------------------
 
@@ -21,6 +23,7 @@ any = ["reason-owl2-rl", "reason-owl-horst"]
 scales = "1, 10, 100, 1000 universities (0.1 to 130 M statements)"
 source = "UBA generator (rvesse/lubm-uba), univ-bench ontology"
 licence = "GPL-2.0 (generator); data is generated"
+tiers = ["1", "10", "100", "1000"]
 state = "ready"
 kit = "benches/reasoning"
 check = "inferred set against owlrl or Nemo; the published answers for LUBM(1)"
@@ -34,6 +37,7 @@ needs = ["load", "query"]
 scales = "1, 10, 100 universities (closure of 0.1 to 13.9 M statements)"
 source = "the lubm workload's data, closed under OWL 2 RL by NRESE (benches/reasoning/prepare-lubm-materialised.sh)"
 licence = "GPL-2.0 (generator); data is generated"
+tiers = ["1", "10", "100"]
 state = "ready"
 kit = "benches/reasoning"
 check = "row counts across systems; the published answers for LUBM(1)"
@@ -48,6 +52,7 @@ any = ["reason-owl2-rl", "reason-owl2-ql", "reason-owl-horst", "classify"]
 scales = "1 to N universities per profile (RL, QL, EL, DL)"
 source = "kracr/owl2bench (ISWC 2020); extends UOBM, which it replaces here"
 licence = "queries CC-BY-4.0"
+tiers = ["rl-1", "ql-1"]
 state = "ready"
 kit = "benches/reasoning"
 check = "inferred set against owlrl or Nemo; answer counts across systems"
@@ -60,6 +65,7 @@ needs = ["load", "query", "update", "reason-rdfs"]
 scales = "50 M, 256 M, 1 B statements"
 source = "github.com/ldbc/ldbc_spb_bm_2.0"
 licence = "to check before use"
+tiers = ["50m", "256m"]
 state = "planned"
 check = "the benchmark's own validation of query results and of its OWL 2 RL rules"
 note = "The industry's audited reasoning benchmark (GraphDB publishes audited results). Its advanced query mix also needs fulltext and geosparql"
@@ -73,6 +79,7 @@ any = ["reason-owl2-rl", "reason-owl-horst"]
 scales = "example (21 k), cohort, full"
 source = "github.com/HisQu/rgonline-gs-data-integration (read from a checkout, not copied)"
 licence = "none stated: the authors' agreement is needed to publish"
+tiers = ["example", "cohort", "full"]
 state = "partial"
 kit = "benches/integration"
 check = "answer counts across systems within one entailment regime"
@@ -87,6 +94,7 @@ any = ["reason-rdfs", "reason-owl2-rl", "reason-owl-horst"]
 scales = "DBpedia core 67 M, YAGO 4.5 tiny 23 M"
 source = "the basics kit's datasets plus the DBpedia ontology and the YAGO taxonomy"
 licence = "CC-BY-SA (DBpedia), CC-BY (YAGO)"
+tiers = ["dbpedia-core", "yago-tiny"]
 state = "planned"
 check = "inferred set against Nemo"
 
@@ -98,6 +106,7 @@ needs = ["load", "consistency"]
 scales = "LUBM and OWL2Bench data with generated contradictions of each kind"
 source = "a generator of our own, to write"
 licence = "ours"
+tiers = ["lubm-1", "owl2bench-rl-1"]
 state = "planned"
 check = "every injected contradiction found, none on clean data"
 
@@ -109,6 +118,7 @@ needs = ["load"]
 any = ["reason-owl2-rl"]
 source = "w3.org/2009/11/owl-test (the test case collection; scripts/fetch-w3c-tests.sh)"
 licence = "W3C"
+tiers = ["-"]
 state = "ready"
 kit = "crates/nrese-store/tests/w3c_owl2_rl"
 check = "the test suite's expected entailments"
@@ -121,9 +131,38 @@ tasks = ["RT6"]
 needs = ["classify"]
 source = "OWL Reasoner Evaluation 2015 corpus (Zenodo)"
 licence = "per ontology"
+tiers = ["dev", "full"]
+state = "partial"
+kit = "benches/reasoning/dl"
+note = "dev: the development subset (80 tasks: 40 DL and 20 EL classifications, 20 DL consistency checks, up to 5 MB; ore.py subset); full: all 1,920 ontologies x 3 tasks (Draco). NRESE classifies the EL track (benches/reasoning/dl/nrese.py el); its DL engines come with phase 3"
+check = "canonical taxonomies compared by hash across the reference reasoners; differences adjudicated (disputed.tsv)"
+
+[w3c-owl2-dl]
+title = "W3C OWL 2 test cases, species DL, direct semantics: consistency, entailment, non-entailment"
+kind = "conformance"
+tasks = ["RT4", "RT6"]
+needs = ["classify"]
+source = "w3.org/2009/11/owl-test (the test case collection; scripts/fetch-w3c-tests.sh)"
+licence = "W3C"
+tiers = ["-"]
+state = "ready"
+kit = "benches/reasoning/dl"
+check = "the test types; the working group's published results of 2009 (published-2009.tsv); disputed.tsv"
+note = "411 tasks of 311 tests. The reference reasoners run it today (benches/reasoning/dl/README.md); NRESE once its DL engine exists"
+
+[owl2bench-classify]
+title = "OWL2Bench EL and DL: classification and consistency of the generated ontologies"
+kind = "performance"
+tasks = ["RT4", "RT6"]
+needs = ["classify"]
+scales = "EL and DL profiles at 1 and 10 universities"
+source = "kracr/owl2bench (ISWC 2020)"
+licence = "queries CC-BY-4.0"
+tiers = ["el-1", "dl-1", "dl-10"]
 state = "planned"
-note = "NRESE classifies the EL part (GET /dataset/classification, example `classify`); the DL ontologies of the corpus are HermiT's and Konclude's"
-check = "class hierarchy against HermiT or ELK"
+kit = "benches/reasoning/dl"
+check = "canonical taxonomies across the reference reasoners"
+note = "Konclude times out on the DL variants at 1 and 10 (SemREC 2021): opening 4 of docs/design/owl2-dl-performance.md"
 
 # --- queries and updates without reasoning (the basics) ------------------------------------
 
@@ -135,6 +174,7 @@ needs = ["load", "query"]
 scales = "olympics 1.8 M, YAGO tiny 23 M, DBpedia core 67 M, Wikidata lexemes 229 M, synthetic entities"
 source = "benches/competitors/prepare-datasets.sh and queries/"
 licence = "per dataset (CC); queries ours"
+tiers = ["olympics", "yago-tiny", "entities-10000000", "dbpedia-core", "wikidata-lexemes-60m"]
 state = "ready"
 kit = "benches/competitors"
 check = "row counts across systems"
@@ -147,6 +187,7 @@ needs = ["load", "query"]
 scales = "DBLP (about 500 M statements), Wikidata truthy (about 8 B)"
 source = "github.com/ad-freiburg/sparqloscope (ISWC 2025)"
 licence = "to check before use"
+tiers = ["dblp"]
 state = "planned"
 check = "result sizes across systems"
 note = "The current cross-engine query benchmark; its authors publish QLever, Virtuoso, MillenniumDB, GraphDB, Blazegraph and Jena on it"
@@ -159,6 +200,7 @@ needs = ["load", "query", "update"]
 scales = "1 M to 1 B statements"
 source = "wbsg.informatik.uni-mannheim.de/bizer/berlinsparqlbenchmark (generator and driver)"
 licence = "Apache-2.0"
+tiers = ["10m", "100m"]
 state = "planned"
 check = "the driver's qualification mode"
 note = "The classic mixed query and update workload; most vendors publish numbers on it"
@@ -171,6 +213,7 @@ needs = ["load", "query"]
 scales = "10 M to 1 B statements"
 source = "dsg.uwaterloo.ca/watdiv"
 licence = "to check before use"
+tiers = ["10m", "100m"]
 state = "planned"
 check = "row counts across systems"
 
@@ -181,6 +224,7 @@ tasks = ["basics", "RT5"]
 needs = ["load", "update"]
 source = "benches/nrese-bench-harness (write-scaling, query-mix --update-endpoint)"
 licence = "ours"
+tiers = ["1m", "10m"]
 state = "ready"
 kit = "benches/nrese-bench-harness"
 check = "the written statements are read back"
@@ -192,6 +236,7 @@ tasks = ["basics"]
 needs = ["query", "update"]
 source = "w3c/rdf-tests"
 licence = "W3C"
+tiers = ["-"]
 state = "ready"
 kit = "crates/nrese-sparql/tests/w3c_sparql11"
 check = "the suite's expected results"
@@ -206,6 +251,7 @@ tasks = ["validation"]
 needs = ["shacl-core"]
 source = "w3c/data-shapes"
 licence = "W3C"
+tiers = ["-"]
 state = "ready"
 kit = "crates/nrese-shacl/tests"
 check = "the suite's expected reports"
@@ -218,6 +264,7 @@ needs = ["load", "shacl-core"]
 scales = "three sizes up to 55 M statements, three shape sets"
 source = "github.com/oeg-upm/ERA-SHACL-Benchmark (2025)"
 licence = "to check before use"
+tiers = ["-"]
 state = "planned"
 check = "the validation reports across engines"
 note = "Parts of its shapes use SHACL-SPARQL"
@@ -229,6 +276,7 @@ tasks = ["search"]
 needs = ["load", "query", "fulltext"]
 source = "ResearchSpace's templates; l3s.de/~minack/rdf-fulltext-benchmark"
 licence = "to check before use"
+tiers = ["-"]
 state = "planned"
 check = "result sets across systems"
 
@@ -239,6 +287,7 @@ tasks = ["space"]
 needs = ["load", "query", "geosparql"]
 source = "github.com/OpenLinkSoftware/GeoSPARQLBenchmark (scripts/fetch-w3c-tests.sh); geographica.di.uoa.gr"
 licence = "GPL-2.0 (fetched, never copied into this repository); Geographica: to check before use"
+tiers = ["compliance"]
 state = "partial"
 kit = "crates/nrese-sparql/tests/geosparql_compliance"
 check = "the benchmark's expected answers"
@@ -251,6 +300,7 @@ tasks = ["federation"]
 needs = ["query", "federation"]
 source = "fedbench.fluidops.net; w3c/rdf-tests"
 licence = "to check before use"
+tiers = ["-"]
 state = "planned"
 check = "answers against the single-store run"
 
@@ -263,6 +313,7 @@ tasks = ["integration"]
 needs = ["query", "update"]
 source = "scripts/smoke-researchspace.sh, scripts/smoke-dmw-export.sh"
 licence = "ours"
+tiers = ["-"]
 state = "ready"
 kit = "scripts"
 check = "the scripts' assertions"

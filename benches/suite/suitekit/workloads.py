@@ -111,7 +111,8 @@ def basics(root: Path, tier: str, settings: dict) -> Plan:
     family = "entities" if tier.startswith("entities-") else re.sub(r"-\d+m$", "", tier)
     return Plan("basics-mix", tier, inputs=[f"/data/{tier}.nt"],
                 queries=root / f"benches/competitors/queries/{family}",
-                prepare=None if tier.startswith("entities-") else
+                prepare=["bash", "benches/competitors/prepare-entities.sh", tier.removeprefix("entities-")]
+                if tier.startswith("entities-") else
                 ["bash", "benches/competitors/prepare-datasets.sh", tier],
                 note="answer counts cross-checked between systems")
 
