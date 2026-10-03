@@ -9,7 +9,7 @@
 use std::time::Instant;
 
 use super::depset::DepSetId;
-use super::engine::{Engine, Frame, Lit, Step, proof};
+use super::engine::{Engine, Frame, Lit, Step, Stop, proof};
 use super::graph::{Edge, NONE, flag};
 use super::program::{Filler, Number};
 
@@ -114,6 +114,17 @@ impl Engine<'_> {
                     continue;
                 }
                 self.check_time()?;
+                self.check_memory()?;
+                // n successors are pairwise unequal: n² / 2 inequalities, each a fact and
+                // an index entry. Give up before a budget can't hold them.
+                let n = u64::from(number.n);
+                let need = n * n.saturating_sub(1) / 2 * 48 + n * 256;
+                if self.bytes() as u64 + need > self.config.max_memory as u64 {
+                    return Err(Stop::GaveUp(format!(
+                        "≥ {} successors with their inequalities exceed the memory budget",
+                        number.n
+                    )));
+                }
                 let mut fresh = Vec::with_capacity(number.n as usize);
                 for _ in 0..number.n {
                     let t = self.new_node(s, NONE)?;
@@ -128,6 +139,9 @@ impl Engine<'_> {
                         self.add_inequality(u, t, dep, proof::EXPANSION)?;
                     }
                     fresh.push(t);
+                    if fresh.len().is_multiple_of(256) {
+                        self.check_time()?;
+                    }
                 }
                 changed = true;
             }
@@ -161,6 +175,17 @@ impl Engine<'_> {
             for (index, dep) in facts {
                 let number = self.p.at_most[index as usize];
                 let mut found = self.neighbours(s, &number);
+                // The clause this atom stands for binds its successors to any neighbours,
+                // one node twice included: a blockable non-successor of a root then
+                // needs the NI rule.
+                if self.g.nodes[s as usize].flags & flag::ROOT != 0
+                    && found.iter().any(|&(u, _)| {
+                        let n = &self.g.nodes[u as usize];
+                        n.flags & flag::ROOT == 0 && n.parent != s
+                    })
+                {
+                    return Err(super::engine::ni_stop());
+                }
                 if found.len() <= number.n as usize {
                     continue;
                 }

@@ -115,6 +115,10 @@ pub struct Plan {
     pub clause: u32,
     pub trigger: u8,
     pub steps: Vec<Step>,
+    /// Per step, the head atoms whose variables it binds last: if one of them holds, the
+    /// instance is satisfied and the join stops there (for the at-most clauses, this
+    /// cuts every binding of two successors to one node).
+    pub heads_after: Vec<Vec<u8>>,
 }
 
 /// The initial assertions, over individual indexes.
@@ -421,10 +425,13 @@ impl Program {
                 continue;
             }
             for (t, atom) in clause.body.iter().enumerate() {
+                let steps = plan(clause, t);
+                let heads_after = heads_after(clause, t, &steps);
                 let plan = Plan {
                     clause: index as u32,
                     trigger: t as u8,
-                    steps: plan(clause, t),
+                    steps,
+                    heads_after,
                 };
                 match atom {
                     Body::Concept(c, _) => self.by_concept[*c as usize].push(plan),
@@ -454,6 +461,40 @@ fn var(vars: &mut Vec<Var>, v: Var) -> Result<u8, String> {
     }
     vars.push(v);
     Ok((vars.len() - 1) as u8)
+}
+
+/// For each step of a plan, the head atoms (other than nominal ones) it binds last.
+fn heads_after(clause: &HtClause, trigger: usize, steps: &[Step]) -> Vec<Vec<u8>> {
+    let mask = |vs: &[u8]| vs.iter().fold(0u32, |m, &v| m | (1 << v));
+    let head_vars = |h: &Head| -> Option<u32> {
+        Some(match *h {
+            Head::Concept(_, v) | Head::AtLeast(_, v) | Head::AtMost(_, v) => mask(&[v]),
+            Head::Role(_, a, b) | Head::Equal(a, b) => mask(&[a, b]),
+            Head::Nominal(..) => return None,
+        })
+    };
+    let mut bound = match clause.body[trigger] {
+        Body::Concept(_, v) => mask(&[v]),
+        Body::Role(_, a, b) => mask(&[a, b]),
+    };
+    let mut out = Vec::with_capacity(steps.len());
+    for step in steps {
+        let before = bound;
+        if let Step::Extend { to, .. } = *step {
+            bound |= 1 << to;
+        }
+        let ready: Vec<u8> = clause
+            .head
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| {
+                let vars = head_vars(h)?;
+                (vars & !bound == 0 && vars & !before != 0).then_some(i as u8)
+            })
+            .collect();
+        out.push(ready);
+    }
+    out
 }
 
 /// The join order for `clause` triggered by its atom `trigger`: checks as soon as their

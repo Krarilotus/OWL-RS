@@ -33,6 +33,13 @@ pub enum Stop {
 
 pub type Step<T> = Result<T, Stop>;
 
+/// The stop where the NI rule would be needed.
+pub fn ni_stop() -> Stop {
+    Stop::GaveUp(
+        "the NI rule (nominals with inverses and at-most restrictions) is not implemented".into(),
+    )
+}
+
 /// A head atom with its variables bound to nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lit {
@@ -247,6 +254,24 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// Whether `lit` is an annotated equality the NI rule governs (JAIR 2009, Table 5):
+    /// raised by an at-most restriction at a root, between blockable nodes of which one
+    /// isn't the root's successor. The rule applies even where both sides are one node,
+    /// so such an equality never counts as holding.
+    pub fn needs_ni(&self, lit: Lit) -> bool {
+        let Lit::Equal(a, b, root) = lit else {
+            return false;
+        };
+        if root == NONE {
+            return false;
+        }
+        let root = self.g.find(root);
+        let (a, b) = (self.g.find(a), self.g.find(b));
+        let node = |n: u32| &self.g.nodes[n as usize];
+        let blockable = |n: u32| node(n).flags & super::graph::flag::ROOT == 0;
+        blockable(a) && blockable(b) && !(node(a).parent == root && node(b).parent == root)
+    }
+
     /// The head atom `h` under `bind`.
     pub fn lit(&self, h: Head, bind: &[u32]) -> Lit {
         let b = |v: u8| bind[v as usize];
@@ -281,9 +306,13 @@ impl<'a> Engine<'a> {
     pub fn fire(&mut self, clause: u32, bind: &[u32], mut dep: DepSetId) -> Step<()> {
         let c = &self.p.clauses[clause as usize];
         let mut open: [Option<Lit>; 2] = [None, None];
-        let mut count = 0;
+        let (mut count, mut ni) = (0, false);
         for &h in &c.head {
             let lit = self.lit(h, bind);
+            if self.needs_ni(lit) {
+                ni = true;
+                continue;
+            }
             match self.holds(lit) {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
@@ -294,6 +323,9 @@ impl<'a> Engine<'a> {
                 }
                 Err(refuted) => dep = self.deps.union(dep, refuted),
             }
+        }
+        if ni {
+            return Err(ni_stop());
         }
         self.stats.clauses_fired += 1;
         match (count, open[0]) {
@@ -328,6 +360,7 @@ impl<'a> Engine<'a> {
             steps = steps.wrapping_add(1);
             if steps.is_multiple_of(4096) {
                 self.check_time()?;
+                self.check_memory()?;
             }
             if (self.done.equalities as usize) < self.g.equalities.len() {
                 let e = self.g.equalities[self.done.equalities as usize];
@@ -371,6 +404,13 @@ impl<'a> Engine<'a> {
     }
 
     fn apply_firings(&mut self) -> Step<()> {
+        if self.firings.len() >= super::hyper::MAX_FIRINGS {
+            self.firings.clear();
+            return Err(Stop::GaveUp(format!(
+                "a join reached {} clause instances",
+                super::hyper::MAX_FIRINGS
+            )));
+        }
         let firings = std::mem::take(&mut self.firings);
         let mut out = Ok(());
         for f in &firings {
@@ -382,6 +422,29 @@ impl<'a> Engine<'a> {
         self.firings = firings;
         self.firings.clear();
         out
+    }
+
+    /// The engine's memory now: every table, index and arena, by capacity.
+    pub fn bytes(&self) -> usize {
+        use std::mem::size_of;
+        self.g.bytes()
+            + self.deps.len() * 24
+            + self.pending.capacity() * size_of::<Pending>()
+            + self.bindings.capacity() * 4
+            + self.firings.capacity() * size_of::<Firing>()
+            + self.frames.capacity() * size_of::<Frame>()
+            + self.blocking.bytes
+    }
+
+    pub fn check_memory(&self) -> Step<()> {
+        let used = self.bytes();
+        if used > self.config.max_memory {
+            return Err(Stop::GaveUp(format!(
+                "the memory budget ({} MiB) ran out",
+                self.config.max_memory >> 20
+            )));
+        }
+        Ok(())
     }
 
     pub fn check_time(&self) -> Step<()> {
