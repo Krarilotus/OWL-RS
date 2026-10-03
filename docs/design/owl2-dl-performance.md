@@ -265,3 +265,16 @@ The order moves the context core and the bounds first:
   - blocking that is too weak (blow-up) or too eager (lost models);
   - caches reused across branches without their dependencies;
   - an equality merge whose effects on counts, edges and blocking aren't propagated as events.
+
+## 8. Lab log: measured changes, kept and rejected
+
+Each entry gives the change, the A/B, and the decision. Setup unless stated otherwise:
+- **Corpus:** the EL development stratum (50 ORE 2015 ontologies, `tmp/ore-strata`,
+  split `dev`).
+- **Measure:** the `classify` example's profile, saturate time, median of ABBA-interleaved
+  rounds, summed over the ontologies.
+- **Check:** outputs byte-identical between the builds.
+
+| Date | Change | Result | Decision |
+|---|---|---|---|
+| 3 Oct 2026 | **Don't queue known subsumers** (ELK's check before a conclusion is produced), after the profile showed 56% of conclusions repeating known ones | 1 thread: conclusions −34%, saturation **+9%** (5 rounds; the lookup before each push costs more than the push and pop it saves). 16 threads, own context only: −1.3% (7 rounds), inside the noise (identical code differed by 4% at 1 thread) | rejected. The cost is in the hash sets: the lever is their representation (subsumer bitsets over a compacted concept order, §4), not fewer queue entries |
