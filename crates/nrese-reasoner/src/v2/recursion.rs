@@ -1,8 +1,6 @@
-//! Support counts (docs/design/reasoner-provenance.md, step 1): per inferred fact, the
-//! number of its derivations by rule instances that are *non-recursive* with respect to
-//! it (Hu, Motik and Horrocks, AAAI 2018). A deleted premise then removes a fact without
-//! a proof search when one of those derivations survives; the recursive rest is repaired
-//! by B/F or DRed as before ([`super::delta`]).
+//! Which rules of a ground program are non-recursive (docs/design/reasoner-provenance.md):
+//! the delta executor keeps a candidate for overdeletion that one of them still derives in
+//! one step from what is left, without a proof search ([`super::delta`]).
 //!
 //! **Recursion by key.** At the level of predicates almost every OWL 2 RL rule is
 //! recursive (`rdf:type` feeds `rdf:type`). The ground program bakes the schema into the
@@ -14,18 +12,17 @@
 //! and write is conservative: a cycle through a wildcard makes everything on it
 //! recursive.
 //!
-//! **Equality.** The rules the equality module replaces (`eq-rep-*`) aren't rule
-//! instances there and aren't counted. Most of them keep a fact's key (`eq-rep-s`, and
-//! `eq-rep-o` outside `rdf:type`); but each depends on its `sameAs` fact, so `owl:sameAs`
-//! feeds every key, and every key that can derive `sameAs` is on a cycle with it.
-//! `owl:sameAs` between two classes (`eq-rep-o` on a type) or two properties
-//! (`eq-rep-p`) moreover links their keys: those pairs are edges both ways, read from the
-//! data (`partners`). A commit that changes such a `sameAs` leaves the counts stale.
+//! **Equality.** The rules the equality module replaces (`eq-rep-*`) mostly keep a fact's
+//! key (`eq-rep-s`, and `eq-rep-o` outside `rdf:type`); but each depends on its `sameAs`
+//! fact, so `owl:sameAs` feeds every key, and every key that can derive `sameAs` is on a
+//! cycle with it. `owl:sameAs` between two classes (`eq-rep-o` on a type) or two
+//! properties (`eq-rep-p`) moreover links their keys: those pairs are edges both ways,
+//! read from the data (`partners`).
 
 use hashbrown::HashMap;
 
-use super::eval::{GroundProgram, Job, Source, run_jobs};
-use super::ir::{Atom, Head, Rule, Term, Triple};
+use super::eval::Source;
+use super::ir::{Atom, Head, Rule, Term};
 
 /// A node of the key graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -227,27 +224,6 @@ fn components(nodes: usize, edges: &[(usize, usize)]) -> Vec<usize> {
     component
 }
 
-/// The constant classes and predicates of `rules`' atoms: the terms whose `sameAs` links
-/// keys.
-pub fn key_terms(rules: &[Rule], rdf_type: u64) -> hashbrown::HashSet<u64> {
-    let mut out = hashbrown::HashSet::new();
-    for rule in rules {
-        let heads: &[Atom] = match &rule.head {
-            Head::Facts(atoms) => atoms,
-            Head::Inconsistent => &[],
-        };
-        for atom in rule.body.iter().chain(heads) {
-            match node(atom, rdf_type, false) {
-                Node::Class(t) | Node::Predicate(t) => {
-                    out.insert(t);
-                }
-                _ => {}
-            }
-        }
-    }
-    out
-}
-
 /// The `owl:sameAs` partners of `term` in `source` (other than itself).
 pub fn same_as_partners<S: Source + ?Sized>(
     source: &S,
@@ -267,78 +243,6 @@ pub fn same_as_partners<S: Source + ?Sized>(
         );
     }
     out
-}
-
-/// Per inferred fact, its non-recursive derivations.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Supports {
-    counts: HashMap<Triple, u32>,
-}
-
-impl Supports {
-    /// The supports of the closure `source` under `program`: every non-recursive rule
-    /// instance over all facts, counted per head that `inferred` accepts.
-    pub fn count<S: Source + ?Sized>(
-        source: &S,
-        program: &GroundProgram,
-        rdf_type: u64,
-        same_as: Option<u64>,
-        inferred: &(dyn Fn(Triple) -> bool + Sync),
-    ) -> Self {
-        let counted = non_recursive(&program.rules, rdf_type, &|term| {
-            same_as_partners(source, same_as, term)
-        });
-        let jobs: Vec<Job<'_>> = program
-            .rules
-            .iter()
-            .zip(&counted)
-            .filter(|(rule, counted)| **counted && !rule.body.is_empty())
-            .filter_map(|(rule, _)| Job::full(source, rule))
-            .collect();
-        let mut counts: HashMap<Triple, u32> = HashMap::new();
-        for fact in run_jobs(source, &jobs, inferred, super::eval::NEVER) {
-            *counts.entry(fact).or_default() += 1;
-        }
-        Self { counts }
-    }
-
-    /// The supports of an in-memory closure (asserted and inferred facts).
-    pub fn of_closure(
-        facts: &[Triple],
-        program: &GroundProgram,
-        rdf_type: u64,
-        same_as: Option<u64>,
-        inferred: &(dyn Fn(Triple) -> bool + Sync),
-    ) -> Self {
-        let store = super::batch::Store::new(facts.to_vec());
-        Self::count(&store, program, rdf_type, same_as, inferred)
-    }
-
-    /// The non-recursive derivations of `fact`.
-    pub fn of(&self, fact: Triple) -> u32 {
-        self.counts.get(&fact).copied().unwrap_or(0)
-    }
-
-    /// Applies the changes an update computed ([`super::delta::Update::support_changes`]).
-    pub fn apply(&mut self, changes: &[(Triple, i64)]) {
-        for &(fact, change) in changes {
-            let now = i64::from(self.of(fact)) + change;
-            if now <= 0 {
-                self.counts.remove(&fact);
-            } else {
-                self.counts
-                    .insert(fact, u32::try_from(now).unwrap_or(u32::MAX));
-            }
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.counts.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.counts.is_empty()
-    }
 }
 
 #[cfg(test)]

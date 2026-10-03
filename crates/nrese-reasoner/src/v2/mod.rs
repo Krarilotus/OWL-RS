@@ -24,9 +24,9 @@ pub mod n3;
 pub mod naive;
 pub mod pie;
 pub mod program;
+pub mod recursion;
 pub mod representatives;
 pub mod rulesets;
-pub mod supports;
 pub mod unnamed;
 #[cfg(test)]
 mod v1_scenarios;
@@ -1403,154 +1403,6 @@ mod tests {
                 "n = {n}: {reported:?}"
             );
         }
-    }
-
-    /// Support counting (`supports`, `delta::update_counted`) over random ontologies and
-    /// changes: the closure still equals a rematerialisation, and the maintained counts
-    /// equal the counts of the new state after every change (unless the update says they
-    /// are stale, when they are counted again).
-    #[test]
-    fn support_counts_stay_exact_under_random_changes() {
-        use super::delta::{MemoryBase, Rules, program, update_counted};
-        use super::supports::Supports;
-
-        let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
-        let cases = env("NRESE_FUZZ_CASES").unwrap_or(200);
-        let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x5eed_c0de_2026_1003));
-        let (mut counted, mut stale, mut kept) = (0usize, 0usize, 0usize);
-        for case in 0..cases {
-            let lines = random_ontology(&mut next);
-            let mut vocabulary = LocalVocabulary::default();
-            let pool = load(&mut vocabulary, &lines.join("\n"));
-            let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
-            let lists = ListVocabulary::new(&mut vocabulary);
-            let schema = Schema::owl(&mut vocabulary);
-            let compiled = Rules {
-                rules: &rules,
-                lists: Some(&lists),
-                schema: &schema,
-            };
-            let closure =
-                |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema);
-            let mut asserted: Vec<Triple> = pool.iter().copied().filter(|_| next(10) < 7).collect();
-            asserted.sort_unstable();
-            asserted.dedup();
-            let mut inferred = closure(&asserted).derived;
-            let count =
-                |asserted: &[Triple], inferred: &[Triple], ground: &super::eval::GroundProgram| {
-                    let mut facts: Vec<Triple> = asserted.iter().chain(inferred).copied().collect();
-                    facts.sort_unstable();
-                    facts.dedup();
-                    Supports::of_closure(
-                        &facts,
-                        ground,
-                        schema.rdf_type(),
-                        super::batch::same_as_of(&rules),
-                        &|_| true,
-                    )
-                };
-            let mut ground = program(&MemoryBase::new(&asserted, &inferred), compiled);
-            let mut supports = count(&asserted, &inferred, &ground);
-            for step in 0..4 {
-                // Instance data only: schema and list facts change the ground program,
-                // which leaves the counts stale (that path is the rematerialisation's).
-                let abox = |f: &Triple| !schema.is_schema_fact(*f) && !lists.is_list_fact(*f);
-                let insert: Vec<Triple> = pool
-                    .iter()
-                    .copied()
-                    .filter(|f| abox(f) && asserted.binary_search(f).is_err() && next(4) == 0)
-                    .collect();
-                let delete: Vec<Triple> = asserted
-                    .iter()
-                    .copied()
-                    .filter(|f| abox(f) && next(4) == 0)
-                    .collect();
-                let mut after: Vec<Triple> = asserted
-                    .iter()
-                    .copied()
-                    .filter(|f| !delete.contains(f))
-                    .chain(insert.iter().copied())
-                    .collect();
-                after.sort_unstable();
-                after.dedup();
-                let insert: Vec<Triple> = insert
-                    .into_iter()
-                    .filter(|f| !delete.contains(f) && inferred.binary_search(f).is_err())
-                    .collect();
-                let stack: Vec<Triple> = inferred
-                    .iter()
-                    .copied()
-                    .filter(|f| after.binary_search(f).is_err())
-                    .collect();
-                let base = MemoryBase::new(&after, &stack);
-                let result = update_counted(
-                    &base,
-                    &insert,
-                    &delete,
-                    compiled,
-                    Some(&ground),
-                    Some(&supports),
-                    super::eval::NEVER,
-                )
-                .unwrap();
-                let expected = closure(&after).derived;
-                let removal: HashSet<Triple> = result.remove.iter().copied().collect();
-                let mut maintained: Vec<Triple> = stack
-                    .iter()
-                    .copied()
-                    .filter(|f| !removal.contains(f))
-                    .chain(result.insert.iter().copied())
-                    .collect();
-                maintained.sort_unstable();
-                maintained.dedup();
-                let text = |t: &Triple| {
-                    let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
-                    format!("{s} {p} {o}")
-                };
-                let context = || {
-                    format!(
-                        "case {case} step {step}
-ontology:
-{}
-insert {:?}
-delete {:?}",
-                        lines.join(
-                            "
-"
-                        ),
-                        insert.iter().map(text).collect::<Vec<_>>(),
-                        delete.iter().map(text).collect::<Vec<_>>()
-                    )
-                };
-                assert_eq!(
-                    maintained.iter().map(text).collect::<Vec<_>>(),
-                    expected.iter().map(text).collect::<Vec<_>>(),
-                    "{}: the closure",
-                    context()
-                );
-                if let Some(program) = result.program {
-                    ground = program;
-                }
-                if result.supports_stale {
-                    stale += 1;
-                    supports = count(&after, &expected, &ground);
-                } else {
-                    counted += 1;
-                    kept += result.support_changes.len();
-                    supports.apply(&result.support_changes);
-                    assert_eq!(
-                        supports,
-                        count(&after, &expected, &ground),
-                        "{}: the support counts",
-                        context()
-                    );
-                }
-                asserted = after;
-                inferred = expected;
-            }
-        }
-        assert!(counted > 0, "no change was counted ({stale} stale)");
-        eprintln!("{counted} changes counted, {stale} stale, {kept} count changes");
     }
 
     /// Random ontologies under random insert/delete sequences: after every change, the

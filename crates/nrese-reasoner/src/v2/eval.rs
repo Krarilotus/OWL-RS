@@ -694,47 +694,6 @@ fn run_jobs_with<S: Source + ?Sized>(
         .collect()
 }
 
-/// The rule instances `jobs` find: per instance, its job's index, its bindings and the
-/// facts its head derives. For counting instances exactly once where a job may find one
-/// again in a later round (DRed's overdeletion reads facts it may yet overdelete).
-pub fn run_jobs_instances<S: Source + ?Sized>(
-    source: &S,
-    jobs: &[Job<'_>],
-    stop: Stop<'_>,
-) -> Vec<(usize, Vec<Option<u64>>, Vec<Triple>)> {
-    let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
-        .iter()
-        .enumerate()
-        .flat_map(|(j, job)| {
-            (0..job.drivers.len())
-                .step_by(MORSEL)
-                .map(move |start| (j, start..(start + MORSEL).min(job.drivers.len())))
-        })
-        .collect();
-    tasks
-        .par_iter()
-        .map(|(j, range)| {
-            let job = &jobs[*j];
-            let Head::Facts(heads) = &job.rule.head else {
-                return Vec::new();
-            };
-            if stop() {
-                return Vec::new();
-            }
-            let mut out = Vec::new();
-            job.run(source, range.clone(), &mut |bindings| {
-                let facts = heads
-                    .iter()
-                    .map(|h| instantiate_head(h, bindings))
-                    .collect();
-                out.push((*j, bindings.to_vec(), facts));
-            });
-            out
-        })
-        .flatten()
-        .collect()
-}
-
 /// Calls `emit` with every binding of `rule`'s body under which its head derives `fact`,
 /// reading `seg` (a backward, one-step derivation check: DRed's rederivation, and
 /// explanations later).
