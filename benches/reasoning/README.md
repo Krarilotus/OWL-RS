@@ -27,7 +27,7 @@ Everything runs in Docker on the same host. The data lives in the volume `nrese-
 | `oracle/` | owlrl (the reference OWL 2 RL implementation) computes the closure, and pyoxigraph answers the queries over it. Correctness only; never a performance number. |
 | NRESE v2 | `crates/nrese-reasoner/examples/v2_closure.rs`: reasoner v2's batch executor, built in Docker; `local-bulk.sh` adds end-to-end load, queries and commit latency through the store |
 | `jena/` | Jena's rule reasoners (RDFS, OWL micro/mini/full), in memory |
-| `nemo/` | Nemo (Rust datalog, TU Dresden) with `owl2rl.rls`, a translation of the W3C OWL 2 RL/RDF rule tables |
+| `nemo/` | Nemo (Rust datalog, TU Dresden) with three encodings: `owl2rl.rls` (our translation of the W3C OWL 2 RL/RDF rule tables), `owl2rl-schemafirst.rls` (the same, schema folded first) and sparq's LUBM-tailored one; provenance and closure checks in [nemo/README.md](nemo/README.md) |
 
 ## Reading the results
 

@@ -112,10 +112,26 @@ runs = ["docker"]
 capabilities = ["load", "query", "update", "reason-rdfs", "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation"]
 
 [nemo]
-name = "Nemo (datalog)"
+name = "Nemo (datalog), general OWL 2 RL encoding (benches/reasoning/nemo/owl2rl.rls)"
 publish = "free"
 runs = ["docker", "apptainer"]
 # No SPARQL: the kit answers queries over its materialisation with another engine.
+capabilities = ["load", "reason-owl2-rl", "reason-custom-rules"]
+
+# Nemo with the other two encodings (benches/reasoning/nemo/): the same engine, so every
+# Nemo number names the rules it ran.
+[nemo-schemafirst]
+name = "Nemo, general OWL 2 RL encoding with the schema folded first (owl2rl-schemafirst.rls)"
+variant-of = "nemo"
+publish = "free"
+runs = ["docker", "apptainer"]
+capabilities = ["load", "reason-owl2-rl", "reason-custom-rules"]
+
+[nemo-sparq]
+name = "Nemo, sparq's LUBM-tailored encoding (vendored, MIT; a subset of OWL 2 RL)"
+variant-of = "nemo"
+publish = "free"
+runs = ["docker", "apptainer"]
 capabilities = ["load", "reason-owl2-rl", "reason-custom-rules"]
 
 [owlrl]

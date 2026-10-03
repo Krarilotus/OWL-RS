@@ -1,0 +1,125 @@
+% [FABLE-5] sq-hmd7l.31 — Nemo OWL 2 RL/RDF Datalog encoding that REPRODUCES sparq's
+% OWL-RL closure of LUBM(1) EXACTLY (150589 triples, set-for-set — validated, no delta).
+%
+% 🤖 SPARQ agent. Nemo (github.com/knowsys/nemo, Apache-2.0), Rust-native Datalog.
+% This is the validated OWL-RL rule program whose materialization reproduces
+% `sparq-cli reason … owl` on LUBM (crates/sparq-reason/src/owl.rs). Import: the input
+% N-Triples is imported into triple(?s,?p,?o); scripts/bench-adapters/nemo_adapter.py
+% substitutes @@DATA@@/@@OUT@@ and counts the EXPORTED closed(...) facts (see the count
+% note below — Nemo's "Derived N" total also counts the tiny helper IDBs; the closure
+% size is the exported `closed` relation, which the adapter line-counts).
+%
+% ── RULE SET (RDFS-6 + exactly the OWL-RL rules the LUBM TBox exercises) ──────────
+% The LUBM Univ-Bench TBox uses ONLY subClassOf/domain/range/subPropertyOf,
+% owl:inverseOf (3 pairs), owl:TransitiveProperty (subOrganizationOf),
+% owl:someValuesFrom restrictions (8), owl:intersectionOf (6). NO owl:sameAs /
+% functional / cardinality / unionOf / oneOf / hasValue / propertyChain / hasKey, so
+% those rule families NEVER fire and are DELIBERATELY ABSENT (including any would
+% over-count). sparq emits NO reflexive scm-*/eq-* and NO axiomatic owl:Thing typing
+% on LUBM, so this program adds none. VALIDATED: the exported `closed` relation is
+% set-identical to sparq's OWL-RL closure (0 diff both directions, 150589) — the
+% reconciliation is cross-checked in scripts/bench/materialize-same-box.sh.
+%
+% NEMO CONVERGENCE NOTE (load-bearing — sq-hmd7l.31; mechanism written up in sq-3xsx0):
+% the restriction-schema atoms of cls-svf1/scm-svf2 are FIRST folded into a small
+% `svfR(R,onProp,filler)` relation, and the intersectionOf list into `intTail`/`intAll`,
+% BEFORE the join against the (large) type index. Written the naive way — those schema
+% atoms inlined into the recursive `closed` rule — Nemo's semi-naive evaluation does not
+% converge in a reasonable time on LUBM(1). The STRUCTURAL difference, which is what this
+% file can state: every rule here derives into the ONE predicate `closed`, so semi-naive
+% must instantiate each round's delta at EVERY body position of every rule. Inlined,
+% cls-svf1 is a 4-atom rule over `closed` alone — four delta-rules per round, each a
+% 4-way join over a relation that is still growing, and nothing in the program marks the
+% two restriction atoms as schema rather than data, so whether a given round is planned
+% schema-first is left to the engine. Pre-folded, those atoms live in `svfR`, which
+% SATURATES early (on this corpus no rule derives a new owl:onProperty / owl:someValuesFrom
+% triple after the opening rounds), so its delta goes empty and the delta-rules on those
+% positions stop producing; what is re-done each round is a join of a small, stable
+% relation against the type index. The pre-fold does NOT put the schema in a separate
+% recursive component — svfR/intAll are themselves derived from `closed` — it makes the
+% "schema first, data after" order a property of the PROGRAM instead of a hope about the
+% planner, which is the only form of the hint a `.rls` file can carry. The pre-folded form
+% converged in ~2.5s on the work box (non-canonical, directional only) and is logically
+% identical. VLog (bench/reason-encodings/vlog/owl-rl.dlog) evaluates the inlined cls-svf1
+% form directly; both engines agree with sparq set-for-set.
+%
+% UNMEASURED (sq-3xsx0): whether some rule ordering or engine-side hint makes the INLINED
+% form converge under Nemo after all was NOT re-tested — Nemo is a gather-only dep and no
+% binary was available for that change. The paragraph above is about THIS program's join
+% structure, which is inspectable here; the engine-behaviour half needs a Nemo build
+% before it can be stated as measured.
+%
+% cls-int1 and scm-int BOTH use a recursive list walk, so both generalise to any
+% intersectionOf list length (sq-3xsx0 — cls-int1 was previously an explicit decode for
+% lengths 1 and 2, the only arities the LUBM TBox uses, and silently derived nothing for
+% a 3+-conjunct intersection). The LUBM closure is unchanged by that generalisation: on
+% lists of length 1 and 2 the walk derives exactly the facts the explicit decode did
+% (pinned by crates/sparq-reason/tests/datalog_intersection_arity.rs, which runs both
+% rule shapes through a semi-naive Datalog fixpoint). NOT re-measured against a live
+% Nemo in that change — Nemo is a gather-only dep; the harness re-asserts the pinned
+% closure count before recording any timing, so a divergence fails loudly, never silently.
+
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+
+@import triple :- ntriples { resource = "@@DATA@@" } .
+
+% base graph flows into the closure predicate.
+closed(?s, ?p, ?o) :- triple(?s, ?p, ?o) .
+
+% ===== RDFS 6 rules ==========================================================
+closed(?p, rdfs:subPropertyOf, ?r) :- closed(?p, rdfs:subPropertyOf, ?q), closed(?q, rdfs:subPropertyOf, ?r) .
+closed(?c, rdfs:subClassOf, ?e) :- closed(?c, rdfs:subClassOf, ?d), closed(?d, rdfs:subClassOf, ?e) .
+closed(?s, ?q, ?o) :- closed(?p, rdfs:subPropertyOf, ?q), closed(?s, ?p, ?o) .
+closed(?s, rdf:type, ?c) :- closed(?p, rdfs:domain, ?c), closed(?s, ?p, ?o) .
+closed(?o, rdf:type, ?c) :- closed(?p, rdfs:range, ?c), closed(?s, ?p, ?o) .
+closed(?s, rdf:type, ?d) :- closed(?s, rdf:type, ?c), closed(?c, rdfs:subClassOf, ?d) .
+
+% ===== OWL property rules ====================================================
+% prp-inv1/2 — inverseOf, both directions
+closed(?y, ?q, ?x) :- closed(?p, owl:inverseOf, ?q), closed(?x, ?p, ?y) .
+closed(?y, ?p, ?x) :- closed(?p, owl:inverseOf, ?q), closed(?x, ?q, ?y) .
+% prp-trp — TransitiveProperty
+closed(?x, ?p, ?z) :- closed(?p, rdf:type, owl:TransitiveProperty), closed(?x, ?p, ?y), closed(?y, ?p, ?z) .
+
+% ===== OWL restriction / class-expression rules ==============================
+% cls-svf1 — someValuesFrom membership, via a small restriction relation svfR.
+svfR(?r, ?pp, ?cc) :- closed(?r, owl:onProperty, ?pp), closed(?r, owl:someValuesFrom, ?cc) .
+closed(?x, rdf:type, ?r) :- svfR(?r, ?pp, ?cc), closed(?x, ?pp, ?v), closed(?v, rdf:type, ?cc) .
+
+% scm-int — C intersectionOf list => C subClassOf each conjunct (recursive list walk).
+intTail(?c, ?l) :- closed(?c, owl:intersectionOf, ?l) .
+intTail(?c, ?r) :- intTail(?c, ?l), closed(?l, rdf:rest, ?r) .
+closed(?c, rdfs:subClassOf, ?d) :- intTail(?c, ?l), closed(?l, rdf:first, ?d) .
+
+% cls-int1 — intersection membership, GENERIC in list arity (sq-3xsx0). `intAll(?l, ?x)`
+% reads "?x is typed with EVERY conjunct from list cell ?l onward"; the base case is the
+% last cell (rdf:rest = rdf:nil) and the step case peels one conjunct off the front. This
+% matches sparq, which decodes the whole list and requires membership in every conjunct
+% (crates/sparq-reason/src/owl.rs `cls-int1/int2`, `members.iter().all(…)`); an EMPTY
+% intersection list derives nothing on both sides. It supersedes the previous explicit
+% arity-1/arity-2 decode, which silently derived NOTHING for a 3+-conjunct intersection.
+% The PRE-FOLD discipline is preserved: the walk is guarded by intTail, so only cells
+% reachable from an owl:intersectionOf are visited (unrelated RDF lists in the data are
+% never joined against the type index), and the cell ?l — hence the conjunct ?a it holds —
+% is bound from that small, early-saturating relation before the type atom is probed.
+intAll(?l, ?x) :- intTail(?c, ?l), closed(?l, rdf:first, ?a), closed(?l, rdf:rest, <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil>), closed(?x, rdf:type, ?a) .
+intAll(?l, ?x) :- intTail(?c, ?l), closed(?l, rdf:first, ?a), closed(?l, rdf:rest, ?r), intAll(?r, ?x), closed(?x, rdf:type, ?a) .
+closed(?x, rdf:type, ?c) :- closed(?c, owl:intersectionOf, ?l), intAll(?l, ?x) .
+
+% ===== OWL schema-propagation rules ==========================================
+% scm-dom1/scm-rng1 — domain/range climb the subClassOf hierarchy
+closed(?p, rdfs:domain, ?c2) :- closed(?p, rdfs:domain, ?c1), closed(?c1, rdfs:subClassOf, ?c2) .
+closed(?p, rdfs:range, ?c2) :- closed(?p, rdfs:range, ?c1), closed(?c1, rdfs:subClassOf, ?c2) .
+% domain/range descend the subPropertyOf hierarchy
+closed(?p, rdfs:domain, ?c) :- closed(?p, rdfs:subPropertyOf, ?q), closed(?q, rdfs:domain, ?c) .
+closed(?p, rdfs:range, ?c) :- closed(?p, rdfs:subPropertyOf, ?q), closed(?q, rdfs:range, ?c) .
+% scm-dom2/scm-rng2 — domain/range swap across inverseOf
+closed(?p, rdfs:domain, ?c) :- closed(?p, owl:inverseOf, ?q), closed(?q, rdfs:range, ?c) .
+closed(?p, rdfs:range, ?c) :- closed(?p, owl:inverseOf, ?q), closed(?q, rdfs:domain, ?c) .
+
+% scm-svf2 — someValuesFrom restrictions on the same property, subClassOf fillers (via svfR).
+closed(?r1, rdfs:subClassOf, ?r2) :- svfR(?r1, ?pp, ?y1), svfR(?r2, ?pp, ?y2), closed(?y1, rdfs:subClassOf, ?y2) .
+
+@export closed :- csv { resource = "@@OUT@@" } .
