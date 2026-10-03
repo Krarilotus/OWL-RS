@@ -350,6 +350,9 @@ pub struct Dictionary {
     iri_text: RwLock<super::text::TextIndex>,
     /// Built at the first triple-term match, extended at later ones.
     triples: RwLock<TripleIndex>,
+    /// The vector literals, built at the first vector search and extended at later ones
+    /// ([`super::vectors`]).
+    vectors: RwLock<super::vectors::VectorIndex>,
     /// The text order of the entries the mapped base doesn't order ([`super::order`]).
     order: RwLock<super::order::TextOrder>,
     /// Integer-derived literals (`xsd:int`, ...) are dictionary entries, not inline
@@ -584,6 +587,55 @@ impl Dictionary {
             found.id = TermId::new(kind, found.id).raw();
         }
         matches
+    }
+
+    /// The vector literals nearest to `query.vector` among the first `known` entries that
+    /// `accept` takes (by id), nearest first; the index first takes in the vector literals
+    /// interned since the last search, and builds or extends the graph the search uses.
+    pub fn vector_search(
+        &self,
+        query: &super::VectorQuery,
+        known: u64,
+        accept: &(dyn Fn(TermId) -> bool + Sync),
+    ) -> (Vec<nrese_vector::Hit>, super::VectorSearchReport) {
+        if self.vectors.read().covered() < self.len() {
+            let mut vectors = self.vectors.write();
+            let inner = self.inner.read();
+            let end = inner.len();
+            let mut start = vectors.covered();
+            while start < end {
+                let stop = (start + TEXT_BATCH).min(end);
+                let keys: Vec<(u64, Key<'_>)> = (start..stop)
+                    .map(|index| (index, inner.key(index)))
+                    .collect();
+                let literals: Vec<(u64, &str)> = keys
+                    .iter()
+                    .filter_map(|(index, key)| match view_key(key) {
+                        TermView::Typed { value, datatype }
+                            if datatype == nrese_vector::DATATYPE =>
+                        {
+                            Some((TermId::new(TermKind::TypedLiteral, *index).raw(), value))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                vectors.extend(&literals, stop);
+                start = stop;
+            }
+        }
+        if self.vectors.read().needs_graph(query) {
+            self.vectors.write().prepare_graph(query);
+        }
+        let accept = |raw: u64| {
+            let id = TermId::from_raw(raw);
+            id.payload() < known && accept(id)
+        };
+        self.vectors.read().search(query, &accept)
+    }
+
+    /// Bytes of the vector index.
+    pub fn vector_index_bytes(&self) -> usize {
+        self.vectors.read().memory_bytes()
     }
 
     /// The IRIs whose local name's words match `query`, best first; the index first takes

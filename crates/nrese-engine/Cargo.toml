@@ -17,6 +17,7 @@ memchr = { workspace = true }
 memmap2 = "0.9"
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+nrese-vector = { path = "../nrese-vector" }
 parking_lot = { workspace = true }
 rayon = { workspace = true }
 rust-stemmers = "1.2"
