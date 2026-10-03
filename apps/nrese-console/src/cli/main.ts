@@ -3,6 +3,7 @@ import process from "node:process";
 
 import { NreseClient } from "../lib/client";
 import { cliHelpText, parseCliArgs } from "./args";
+import { textReport } from "./report";
 
 async function main(): Promise<void> {
   try {
@@ -41,12 +42,12 @@ async function main(): Promise<void> {
           await resolveBody(options.command.text),
           options.command.accept,
         );
-        printTextResponse(response.status, response.body);
+        printTextResponse(response);
         break;
       }
       case "update": {
         const response = await client.runUpdate(await resolveBody(options.command.text));
-        printTextResponse(response.status, response.body);
+        printTextResponse(response);
         break;
       }
       case "tell": {
@@ -55,7 +56,7 @@ async function main(): Promise<void> {
           options.command.graphMode,
           options.command.graphIri,
         );
-        printTextResponse(response.status, response.body);
+        printTextResponse(response);
         break;
       }
       case "graph-read": {
@@ -63,7 +64,7 @@ async function main(): Promise<void> {
           options.command.graphMode,
           options.command.graphIri,
         );
-        printTextResponse(response.status, response.body);
+        printTextResponse(response);
         break;
       }
       case "graph-write": {
@@ -73,7 +74,7 @@ async function main(): Promise<void> {
           options.command.graphMode,
           options.command.graphIri,
         );
-        printTextResponse(response.status, response.body);
+        printTextResponse(response);
         break;
       }
       case "graph-delete": {
@@ -81,7 +82,7 @@ async function main(): Promise<void> {
           options.command.graphMode,
           options.command.graphIri,
         );
-        printTextResponse(response.status, response.body);
+        printTextResponse(response);
         break;
       }
     }
@@ -104,13 +105,14 @@ function printJson(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
 }
 
-function printTextResponse(status: number, body: string): void {
-  if (!body) {
-    console.log(`status=${status}`);
-    return;
+function printTextResponse(response: { ok: boolean; status: number; body: string }): void {
+  const report = textReport(response);
+  for (const line of report.lines) {
+    console.log(line);
   }
-  console.log(`status=${status}`);
-  console.log(body);
+  if (report.exitCode !== 0) {
+    process.exitCode = report.exitCode;
+  }
 }
 
 void main();
