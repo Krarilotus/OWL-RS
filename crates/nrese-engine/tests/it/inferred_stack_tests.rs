@@ -563,3 +563,62 @@ fn inferred_subsets_restrict_every_read() {
     }
     assert_eq!(whole.len_in(ReadModel::Inferred), 6);
 }
+
+/// A mask of hidden inferred statements carried across a commit by a run per change:
+/// reads see exactly the statements neither hidden nor gone, counts included.
+#[test]
+fn inferred_masks_stack_across_commits() {
+    use nrese_engine::InferredMask;
+    let engine = engine();
+    let quad = |o: u64| triple(1, 2, o).in_default_graph();
+    let infer = |tx: &mut Transaction<'_>, o: u64| {
+        let q = quad(o);
+        assert!(tx.insert_inferred(EncodedTriple::new(q.subject, q.predicate, q.object)));
+    };
+    let mut tx = engine.transaction();
+    for o in 4..10 {
+        infer(&mut tx, o);
+    }
+    tx.commit().expect("commit");
+    let first = engine.snapshot();
+    // Hide 6, 7, 8.
+    let mask = InferredMask::hiding(&first, &[quad(6), quad(7), quad(8)]);
+    let view = first.with_inferred_mask(&mask).expect("same layout");
+    let seen = |view: &Snapshot| -> Vec<u64> {
+        scan(view, ReadModel::Inferred)
+            .into_iter()
+            .map(|q| (0..TERM_COUNT).find(|&n| id(n) == q.object).unwrap())
+            .collect()
+    };
+    assert_eq!(seen(&view), [4, 5, 9]);
+    assert_eq!(view.len_in(ReadModel::Inferred), 3);
+    // A commit removes 7 (hidden) and 4 (shown) and adds 10 and 11.
+    let mut tx = engine.transaction();
+    for o in [7, 4] {
+        let q = quad(o);
+        assert!(tx.remove_inferred(EncodedTriple::new(q.subject, q.predicate, q.object)));
+    }
+    infer(&mut tx, 10);
+    infer(&mut tx, 11);
+    tx.commit().expect("commit");
+    let second = engine.snapshot();
+    // Now hidden: 6 still, 11 newly; 8 shown again; 7 gone.
+    let mask = mask.changed(&second, &[quad(11)], &[quad(8), quad(7)]);
+    assert_eq!(mask.runs(), 2);
+    let view = second.with_inferred_mask(&mask).expect("same layout");
+    assert_eq!(seen(&view), [5, 8, 9, 10]);
+    assert_eq!(view.len_in(ReadModel::Inferred), 4);
+    let pattern = QuadPattern {
+        subject: Some(id(1)),
+        ..QuadPattern::all()
+    };
+    assert_eq!(view.count_in(ReadModel::Inferred, &pattern), 4);
+    assert!(!view.contains_in(ReadModel::Materialised, &quad(6)));
+    assert!(!view.contains_in(ReadModel::Materialised, &quad(7)));
+    assert!(view.contains_in(ReadModel::Materialised, &quad(8)));
+    let sorted: Vec<EncodedQuad> = view
+        .scan_sorted_in(ReadModel::Inferred, &pattern, Permutation::Spog)
+        .expect("sorted scan")
+        .collect();
+    assert_eq!(sorted.len(), 4);
+}

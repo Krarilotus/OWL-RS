@@ -476,6 +476,20 @@ impl IndexVersion {
         }
     }
 
+    /// `self` with `extra` on top, for reading only: their signs add to the stack's, so
+    /// together they must leave each quad at 0 or 1 ([`crate::InferredMask`]).
+    pub(crate) fn with_runs(&self, extra: &[Arc<Run>]) -> Self {
+        let net: i64 = extra.iter().map(|run| run.net()).sum();
+        Self {
+            layout: self.layout,
+            runs: self.runs.iter().chain(extra).cloned().collect(),
+            len: self
+                .len
+                .checked_add_signed(net)
+                .expect("a mask hides only quads the stack holds"),
+        }
+    }
+
     /// A new version with `run` appended. The run must be an exact delta against `self`.
     pub(crate) fn with_run(&self, run: Run) -> Self {
         if run.entries() == 0 {

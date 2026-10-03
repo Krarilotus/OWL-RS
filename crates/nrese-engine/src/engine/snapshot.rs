@@ -32,6 +32,43 @@ pub struct Snapshot {
     equality: Option<TermId>,
 }
 
+/// Inferred statements hidden from a reader, as runs stacked over the inferred stack
+/// ([`Snapshot::with_inferred_mask`]): a first run of tombstones, then one per change,
+/// tombstones for statements hidden since and inserts for those shown again (visible
+/// now, or gone from the stack). A change costs O(c log c) for its c statements, not a
+/// new run of everything hidden.
+#[derive(Debug, Clone, Default)]
+pub struct InferredMask {
+    runs: Vec<Arc<crate::index::run::Run>>,
+}
+
+impl InferredMask {
+    /// A mask hiding `hidden`: inferred statements `snapshot` holds, each once.
+    pub fn hiding(snapshot: &Snapshot, hidden: &[EncodedQuad]) -> Self {
+        Self::default().changed(snapshot, hidden, &[])
+    }
+
+    /// This mask, made for an earlier revision, over `snapshot`: `hide` are statements
+    /// `snapshot`'s stack holds that it didn't hide, `show` statements it hid that are
+    /// to be seen again or that `snapshot`'s stack no longer holds. Each once, the two
+    /// disjoint.
+    pub fn changed(&self, snapshot: &Snapshot, hide: &[EncodedQuad], show: &[EncodedQuad]) -> Self {
+        let mut runs = self.runs.clone();
+        if !(hide.is_empty() && show.is_empty()) {
+            let layout = snapshot.version.inferred.layout();
+            runs.push(Arc::new(crate::index::run::Run::from_delta(
+                layout, show, hide,
+            )));
+        }
+        Self { runs }
+    }
+
+    /// The runs it stacks; past a few, a new mask is cheaper to read.
+    pub fn runs(&self) -> usize {
+        self.runs.len()
+    }
+}
+
 /// The inferred statements a restricted snapshot keeps ([`Snapshot::with_inferred_subset`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InferredSubset {
@@ -102,6 +139,28 @@ impl Snapshot {
             statistics: Arc::default(),
             equality: self.equality,
         }
+    }
+
+    /// This snapshot with the inferred statements `mask` hides removed, as
+    /// [`Self::with_inferred_subset`] does, by stacking its runs: O(r) for its r runs.
+    /// `None` if the mask was built for another layout of the stack.
+    pub fn with_inferred_mask(&self, mask: &InferredMask) -> Option<Snapshot> {
+        let stack = &self.version.inferred;
+        if mask.runs.iter().any(|run| run.layout() != stack.layout()) {
+            return None;
+        }
+        Some(Snapshot {
+            version: Arc::new(Version {
+                asserted: self.version.asserted.clone(),
+                inferred: stack.with_runs(&mask.runs),
+                revision: self.version.revision,
+                dictionary_len: self.version.dictionary_len,
+                equality: Default::default(),
+            }),
+            dictionary: Arc::clone(&self.dictionary),
+            statistics: Arc::default(),
+            equality: self.equality,
+        })
     }
 
     /// The `owl:sameAs` classes reads expand, if equality by representatives is on.

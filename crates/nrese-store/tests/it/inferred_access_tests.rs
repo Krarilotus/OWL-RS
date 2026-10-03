@@ -197,26 +197,37 @@ fn updated_sets_equal_fresh_ones_across_commits() {
         "INSERT DATA { GRAPH ex:open { ex:D rdfs:subClassOf ex:F } }",
         "DELETE DATA { GRAPH ex:secret { ex:c a ex:C } }",
     ];
-    let reader = reader(true);
+    // A reader of one graph (it misses most: a list of what it sees) and one of two (it
+    // sees most: a mask of what it misses).
+    let narrow = reader(true);
+    let broad = ReadScope::Graphs(Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open"), format!("{EX}secret")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    }));
     let seen = |pipeline: &MutationPipeline| -> Vec<String> {
-        ["a", "b", "c", "d", "x", "y", "z"]
-            .iter()
-            .flat_map(|s| {
-                classes(pipeline.store(), &reader, s)
-                    .into_iter()
-                    .map(move |c| format!("{s} a {c}"))
-            })
-            .chain(
-                select(
-                    pipeline.store(),
-                    &reader,
-                    "SELECT ?s ?o WHERE { ?s ex:anc ?o }",
-                )
-                .lines()
-                .filter(|line| line.contains("example.com"))
-                .map(str::to_owned),
-            )
-            .collect()
+        let mut seen = Vec::new();
+        for (name, reader) in [("narrow", &narrow), ("broad", &broad)] {
+            for s in ["a", "b", "c", "d", "x", "y", "z"] {
+                for c in classes(pipeline.store(), reader, s) {
+                    seen.push(format!("{name}: {s} a {c}"));
+                }
+            }
+            let chains = select(
+                pipeline.store(),
+                reader,
+                "SELECT ?s ?o WHERE { ?s ex:anc ?o }",
+            );
+            seen.extend(
+                chains
+                    .lines()
+                    .filter(|line| line.contains("example.com"))
+                    .map(|line| format!("{name}: {line}")),
+            );
+        }
+        seen
     };
     for (step, commit) in commits.iter().enumerate() {
         apply(&updating, commit);
@@ -233,5 +244,6 @@ fn updated_sets_equal_fresh_ones_across_commits() {
     }
     let statistics = updating.store().support_statistics();
     assert!(statistics.updated >= 6, "{statistics:?}");
+    assert!(statistics.patched >= 10, "{statistics:?}");
     assert!(statistics.computed >= 2, "{statistics:?}");
 }
