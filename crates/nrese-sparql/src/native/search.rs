@@ -365,7 +365,7 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
 
 impl Context<'_> {
     /// Whether `id` is the object of a statement in the active graph.
-    fn used_as_object(&self, id: TermId) -> bool {
+    pub(super) fn used_as_object(&self, id: TermId) -> bool {
         let graph = match &*self.graph.borrow() {
             GraphScope::Default => GraphSelector::Exact(TermId::DEFAULT_GRAPH),
             GraphScope::Named(g) => GraphSelector::Exact(*g),

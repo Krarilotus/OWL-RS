@@ -32,6 +32,10 @@ pub enum QueryEvaluationError {
     /// The query uses something the evaluator doesn't implement.
     #[error("not supported: {0}")]
     Unsupported(String),
+    /// A part of the query has a value it can't take (an extension's option, a malformed
+    /// literal it needs).
+    #[error("{0}")]
+    Argument(String),
     #[error("{0}")]
     Unexpected(String),
 }

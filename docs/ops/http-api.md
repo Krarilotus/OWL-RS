@@ -68,6 +68,30 @@ SELECT ?x ?score WHERE { ?x luc:myIndex "tower bridge" ; luc:score ?score }
 
 `text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals and `"lang:xx"`. Without a property, a literal matches as the object of any property. `luc:` takes any index name (there is one index, over every string literal) and finds the resources with a matching literal. Query strings are read as Lucene's syntax as far as this index goes: words, phrases, `word*`, fuzzy `word~` and `word~1`, `AND` (every word needed, else any), `NOT` and `-` (the word is excluded; a phrase after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Scores are the relevance above, not Lucene's.
 
+**Vector similarity search** through a virtual `SERVICE`: the vectors are literals of the datatype `nrv:vector` (`"[0.12, -0.5, 0.33]"^^nrv:vector`, numbers as in a JSON array; what embedding services return), and the search finds the nearest ones:
+
+```sparql
+PREFIX nrv: <urn:nrese:vector:>
+SELECT ?doc ?score WHERE {
+  ?doc ex:embedding ?v .
+  SERVICE nrv:search {
+    ?v nrv:near "[0.12, -0.5, 0.33]"^^nrv:vector ; nrv:k 10 ; nrv:score ?score .
+  }
+}
+```
+
+| Predicate | Object |
+|---|---|
+| `nrv:near` | the query vector: a vector literal, or a variable the rest of the query binds to one (`?other ex:embedding ?q`: a search per value) |
+| `nrv:k` | how many nearest vectors per query vector (default 10, at most 10,000) |
+| `nrv:score` | a variable: the cosine similarity or dot product (`xsd:double`), or the Euclidean distance with `nrv:metric "l2"` |
+| `nrv:rank` | a variable: the rank, from 1 |
+| `nrv:metric` | `"cosine"` (the default), `"dot"` or `"l2"` |
+| `nrv:exact true` | compare every vector |
+| `nrv:searchBudget` | the graph search's beam (default 64): wider finds more of the true nearest, slower |
+
+The subject is the matched vector literal; only literals the query's dataset uses as objects are found, so a user finds no vector of a graph it may not read. When the rest of the query binds the subject first (`?doc ex:embedding ?v` with other conditions on `?doc`), the search is among those values only: an exact scan when they are few (under 2% of the vectors of that dimension), the graph with that filter otherwise. Vectors of each dimension are indexed in memory at the first search and extended with new literals at later ones; up to 20,000 of a dimension are compared exactly, beyond that an HNSW graph per metric is built at the first search that needs it (and extended later). Wrong options are client errors that name the option.
+
 **GeoSPARQL functions** over geometry literals (`geo:wktLiteral`, `geo:geoJSONLiteral`, and `geo:gmlLiteral` for the simple features: points, lines, polygons, envelopes and their multi-forms), in any expression: the Simple Features, Egenhofer and RCC8 relations (`geof:sfWithin`, `geof:ehCovers`, `geof:rcc8ntpp`, …), `geof:relate` (DE-9IM), `geof:distance`, `geof:area`, `geof:length` (with an OGC unit such as `uom:metre`), `geof:buffer`, `convexHull`, `envelope`, `centroid`, `intersection`, `union`, `difference`, `symDifference`, `getSRID`, `isEmpty`, `dimension`, `boundary`, `asWKT`, `asGeoJSON`. Constructions answer in their first argument's serialisation (GeoJSON only in CRS84), coordinates rounded to 9 decimal places; `buffer` in metres works on CRS84 too (in a plane about the geometry); an empty literal is the empty geometry. Coordinates are CRS84 (longitude, latitude) unless the literal names another system (GeoJSON is always CRS84; GML names it in `srsName`); EPSG:4326 is read latitude first. In CRS84, metres are geodesic (WGS84), degrees planar. The relations also work as triple patterns between features and geometries (`?building geo:sfWithin ex:Berlin`, GeoSPARQL's query-rewrite extension): a feature relates through its `geo:hasDefaultGeometry` (else its `geo:hasGeometry`), a geometry through its `geo:asWKT`, `geo:asGeoJSON` or `geo:asGML`; relation statements in the data count as well; an R-tree over the shapes' bounding boxes finds the candidates (built at the first such pattern, kept for the snapshot). A filter `geof:sfWithin(?wkt, constant)` (any relation but the disjointness ones) over a `geo:asWKT`-style pattern starts the joins from the literals the R-tree finds near the constant. Not read: GML curves with arcs and 3D solids. The GeoSPARQL compliance benchmark runs in CI: 175 of its 212 queries pass, the others are reference answers that contradict the standard (`crates/nrese-sparql/tests/geosparql_compliance/expected-failures.txt`).
 
 **Updates:**
