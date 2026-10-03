@@ -877,7 +877,7 @@ impl Dispatch {
 #[derive(Default, Clone)]
 pub struct GroundProgram {
     pub rules: Vec<Rule>,
-    known: HashSet<RuleKey>,
+    known: hashbrown::HashMap<RuleKey, usize>,
     dispatch: Dispatch,
     pub transitive: std::collections::BTreeSet<u64>,
     /// Facts of bodiless instances, not yet handed out ([`Self::take_facts`]).
@@ -890,6 +890,9 @@ pub struct GroundProgram {
     premises: Vec<Vec<Triple>>,
     bodiless_premises: hashbrown::HashMap<Triple, Vec<Triple>>,
     transitive_premises: hashbrown::HashMap<u64, Vec<Triple>>,
+    /// Further sets of schema facts the same ground rule, bodiless fact or transitive
+    /// predicate was grounded on (a proof needs one; support graph sets need all).
+    other_premises: hashbrown::HashMap<Grounding, Vec<Vec<Triple>>>,
     /// Rules by head atom, for backward derivation checks.
     heads: Dispatch,
     /// Ground consistency rules, each with the rule it came from.
@@ -920,8 +923,7 @@ impl GroundProgram {
     /// [`Self::add`], with the schema facts the instance was grounded on.
     fn add_with(&mut self, rule: Rule, premises: Vec<Triple>) -> Option<usize> {
         if let Some(p) = transitive_predicate(&rule) {
-            self.transitive.insert(p);
-            self.transitive_premises.entry(p).or_insert(premises);
+            self.transitive_with(p, premises);
             None
         } else if rule.body.is_empty() {
             if let Head::Facts(heads) = &rule.head {
@@ -930,11 +932,21 @@ impl GroundProgram {
                     if self.bodiless.insert(fact) {
                         self.facts.push(fact);
                         self.bodiless_premises.insert(fact, premises.clone());
+                    } else if self.bodiless_premises.get(&fact) != Some(&premises) {
+                        self.other(Grounding::Bodiless(fact), premises.clone());
                     }
                 }
             }
             None
-        } else if self.known.insert(rule_key(&rule)) {
+        } else {
+            let key = rule_key(&rule);
+            if let Some(&r) = self.known.get(&key) {
+                if self.premises[r] != premises {
+                    self.other(Grounding::Rule(r), premises);
+                }
+                return None;
+            }
+            self.known.insert(key, self.rules.len());
             self.dispatch.push(self.rules.len(), &rule);
             if let Head::Facts(heads) = &rule.head {
                 self.heads.push_atoms(self.rules.len(), heads);
@@ -942,9 +954,52 @@ impl GroundProgram {
             self.rules.push(rule);
             self.premises.push(premises);
             Some(self.rules.len() - 1)
-        } else {
-            None
         }
+    }
+
+    /// Makes `p` transitive, grounded on `premises`.
+    fn transitive_with(&mut self, p: u64, premises: Vec<Triple>) {
+        self.transitive.insert(p);
+        match self.transitive_premises.get(&p) {
+            None => {
+                self.transitive_premises.insert(p, premises);
+            }
+            Some(first) if *first != premises => {
+                self.other(Grounding::Transitive(p), premises);
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Records a further set of schema facts for `grounding` (once each).
+    fn other(&mut self, grounding: Grounding, premises: Vec<Triple>) {
+        let others = self.other_premises.entry(grounding).or_default();
+        if !others.contains(&premises) {
+            others.push(premises);
+        }
+    }
+
+    /// Every set of schema facts `grounding` was grounded on (the first, then the others).
+    pub fn premise_alternatives(&self, grounding: Grounding) -> Vec<&[Triple]> {
+        let first: &[Triple] = match grounding {
+            Grounding::Rule(r) => &self.premises[r],
+            Grounding::Bodiless(fact) => self.bodiless_premises(fact),
+            Grounding::Transitive(p) => self.transitive_premises(p),
+        };
+        std::iter::once(first)
+            .chain(
+                self.other_premises
+                    .get(&grounding)
+                    .into_iter()
+                    .flatten()
+                    .map(Vec::as_slice),
+            )
+            .collect()
+    }
+
+    /// The schema facts that made `p` transitive (empty if it isn't).
+    pub fn transitive_premises(&self, p: u64) -> &[Triple] {
+        self.transitive_premises.get(&p).map_or(&[], Vec::as_slice)
     }
 
     /// The schema facts a bodiless fact was grounded on (empty if none, or not bodiless).
@@ -1020,7 +1075,9 @@ impl GroundProgram {
         // delta: full grounding registers them, delta grounding leaves them alone.
         if let Some(p) = transitive_predicate(rule) {
             if !delta {
-                self.transitive.insert(p);
+                // With the facts it came from (a property chain `p ∘ p ⊑ p` from a list
+                // axiom); vocabulary rules (`scm-sco`, `eq-trans`) come with none.
+                self.transitive_with(p, extra.to_vec());
             }
             return (facts, checks);
         }
@@ -1225,6 +1282,15 @@ impl GroundProgram {
         }
         false
     }
+}
+
+/// What a ground program grounded from schema facts: a rule (by index), a bodiless fact
+/// or a transitive predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Grounding {
+    Rule(usize),
+    Bodiless(Triple),
+    Transitive(u64),
 }
 
 /// The transitivity rule over `p`, for evaluation where the module doesn't apply

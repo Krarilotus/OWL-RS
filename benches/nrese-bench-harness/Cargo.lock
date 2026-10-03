@@ -1073,6 +1073,7 @@ dependencies = [
  "nrese-rdf",
  "nrese-rdf-io",
  "rayon",
+ "smallvec",
  "thiserror 2.0.21",
 ]
 

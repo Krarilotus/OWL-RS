@@ -17,6 +17,7 @@ pub mod classify;
 pub mod delta;
 pub mod eval;
 pub mod explain;
+pub mod graph_sets;
 pub mod ir;
 pub mod lists;
 pub mod n3;
@@ -1403,6 +1404,135 @@ mod tests {
                 "n = {n}: {reported:?}"
             );
         }
+    }
+
+    /// The oracle of `graph_sets` (its test calls it): random ontologies whose statements
+    /// are spread over three graphs; for each set of graphs, the facts with a support set
+    /// inside it equal the closure of its statements.
+    pub(super) fn support_sets_against_closures() {
+        use super::delta::{MemoryBase, Rules, program};
+        let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+        let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
+        let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x6a5e_7c0d_2026_1003));
+        let mut checked = 0;
+        for case in 0..cases {
+            let lines = random_ontology(&mut next);
+            let mut vocabulary = LocalVocabulary::default();
+            let pool = load(
+                &mut vocabulary,
+                &lines.join(
+                    "
+",
+                ),
+            );
+            let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+            let lists = ListVocabulary::new(&mut vocabulary);
+            let schema = Schema::owl(&mut vocabulary);
+            let compiled = Rules {
+                rules: &rules,
+                lists: Some(&lists),
+                schema: &schema,
+            };
+            // Each statement in one graph, a few in two.
+            let mut placed: Vec<(Triple, u32)> = Vec::new();
+            for &fact in &pool {
+                placed.push((fact, next(3) as u32));
+                if next(6) == 0 {
+                    placed.push((fact, next(3) as u32));
+                }
+            }
+            let mut asserted: Vec<Triple> = placed.iter().map(|&(f, _)| f).collect();
+            asserted.sort_unstable();
+            asserted.dedup();
+            let closure = |facts: &[Triple]| {
+                let mut all = batch::materialise(facts, &rules, Some(&lists), &schema).derived;
+                all.extend_from_slice(facts);
+                all.sort_unstable();
+                all.dedup();
+                all
+            };
+            let full = closure(&asserted);
+            let inferred: Vec<Triple> = full
+                .iter()
+                .copied()
+                .filter(|f| asserted.binary_search(f).is_err())
+                .collect();
+            let ground = program(&MemoryBase::new(&asserted, &inferred), compiled);
+            let graphs_of = |fact: Triple| -> Vec<u32> {
+                placed
+                    .iter()
+                    .filter(|&&(f, _)| f == fact)
+                    .map(|&(_, g)| g)
+                    .collect()
+            };
+            let sets = super::graph_sets::support_sets(&full, &ground, &graphs_of, usize::MAX);
+            for readable in 0u32..8 {
+                let data: Vec<Triple> = placed
+                    .iter()
+                    .filter(|&&(_, g)| readable & (1 << g) != 0)
+                    .map(|&(f, _)| f)
+                    .collect();
+                let mut data = data;
+                data.sort_unstable();
+                data.dedup();
+                let expected = closure(&data);
+                let visible: Vec<Triple> = full
+                    .iter()
+                    .copied()
+                    .filter(|f| {
+                        sets.get(f).is_some_and(|sets| {
+                            sets.iter()
+                                .any(|set| set.graphs().all(|g| readable & (1 << g) != 0))
+                        })
+                    })
+                    .collect();
+                if visible != expected {
+                    let text = |t: &Triple| {
+                        let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+                        format!("{s} {p} {o}")
+                    };
+                    let wrong: Vec<Triple> = visible
+                        .iter()
+                        .filter(|f| expected.binary_search(f).is_err())
+                        .chain(
+                            expected
+                                .iter()
+                                .filter(|f| visible.binary_search(f).is_err()),
+                        )
+                        .copied()
+                        .collect();
+                    // Each wrong fact's one-step derivations, with its premises' sets.
+                    let store = super::batch::Store::new(full.clone());
+                    let why: Vec<String> = wrong
+                        .iter()
+                        .flat_map(|&f| {
+                            ground
+                                .named_derivations(&store, f, 20)
+                                .into_iter()
+                                .map(move |d| (f, d))
+                        })
+                        .map(|(f, (rule, body))| {
+                            let premises: Vec<String> = body
+                                .iter()
+                                .map(|b| format!("{} {:?}", text(b), sets.get(b)))
+                                .collect();
+                            format!("{} <- {rule}: {}", text(&f), premises.join(" ; "))
+                        })
+                        .collect();
+                    let ontology: Vec<String> = placed
+                        .iter()
+                        .map(|(f, g)| format!("{} @{g}", text(f)))
+                        .collect();
+                    panic!(
+                        "case {case}, graphs {readable:03b}: wrong {:#?}\nwhy {why:#?}\nontology:\n{}",
+                        wrong.iter().map(text).collect::<Vec<_>>(),
+                        ontology.join("\n")
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
     }
 
     /// Random ontologies under random insert/delete sequences: after every change, the
