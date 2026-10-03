@@ -340,3 +340,25 @@ fn jenas_default_graph_name_as_the_dataset() {
         "{text}"
     );
 }
+
+/// A BGP of more than 64 patterns plans and runs (the planner's greedy path had a 64-bit
+/// membership mask: the review of 3 October 2026, P2): a chain of 70 links over a path
+/// of 71 nodes has one solution.
+#[test]
+fn a_bgp_of_70_patterns_runs() {
+    let service = StoreService::new(StoreConfig::in_memory()).expect("store");
+    let links: String = (0..70)
+        .map(|i| format!("<http://e/n{i}> <http://e/next> <http://e/n{}> .\n", i + 1))
+        .collect();
+    service
+        .execute_update_str(&format!("INSERT DATA {{ {links} }}"))
+        .expect("insert");
+    let chain: String = (0..70)
+        .map(|i| format!("?v{i} <http://e/next> ?v{} .\n", i + 1))
+        .collect();
+    let result = service
+        .execute_query_str(&format!("SELECT (COUNT(*) AS ?n) WHERE {{ {chain} }}"))
+        .expect("query");
+    let text = String::from_utf8(result.payload).unwrap();
+    assert!(text.contains("\"1\""), "{text}");
+}
