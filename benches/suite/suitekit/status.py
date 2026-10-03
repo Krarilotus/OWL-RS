@@ -20,10 +20,11 @@ from .ledger import load_records
 from .workloads import DEFINITIONS, plans
 
 MARK = {"ok": "ok", "partial": "part", "wrong": "WRONG", "failed": "FAIL", "timeout": "T/O",
-        "skipped": "skip", "restricted": "ran*"}
-LEGEND = ("`ok` every step and query ok · `part` some queries not ok · `WRONG` an answer count "
+        "skipped": "skip", "restricted": "ran*", "disputed": "≠?"}
+LEGEND = ("`ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count "
           "differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the "
-          "suite skipped it (reason in the record) · `ran*` ran; a licensed system whose outcome "
+          "suite skipped it (reason in the record) · `≠?` its answers differ from another system's, "
+          "not yet adjudicated · `ran*` ran; a licensed system whose outcome "
           "stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit "
           "for it")
 
@@ -69,7 +70,8 @@ def newest(records: list[dict]) -> dict[tuple, tuple[str, dict, str]]:
     or the newest skip if there is nothing else."""
     best: dict[tuple, tuple[str, dict, str]] = {}
     for record in records:
-        date = str(record.get("started", ""))[:10]
+        # The full start time: two records of one day are ordered by it, not by file name.
+        date = str(record.get("started", ""))
         for pair in record.get("pairs", []):
             key = (pair["workload"], str(pair["tier"]), pair["system"])
             current = best.get(key)
@@ -138,7 +140,7 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
                 continue
             got = [evidence.get((name, t, key)) for t in tiers]
             good = sum(1 for e in got if e and e[1]["outcome"] in ("ok", "restricted"))
-            bad = any(e and e[1]["outcome"] in ("failed", "timeout", "wrong", "partial") for e in got)
+            bad = any(e and e[1]["outcome"] in ("failed", "timeout", "wrong", "partial", "disputed") for e in got)
             ran = any(e and e[1]["outcome"] != "skipped" for e in got)
             cells.append(f"{good}/{len(tiers)}{' !' if bad else ''}" if ran else "·")
         out.append(f"| {name} | {w['state']} | " + " | ".join(cells) + " |")
@@ -163,7 +165,7 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
             row = []
             for key in able:
                 e = evidence.get((name, tier, key))
-                row.append(f"{MARK[e[1]['outcome']]} {e[0][5:]}" if e else "·")
+                row.append(f"{MARK[e[1]['outcome']]} {e[0][5:10]}" if e else "·")
             label = tier if tier in tiers else f"{tier} (extra)"
             out.append(f"| {label} | " + " | ".join(row) + " |")
         out.append("")
@@ -192,7 +194,7 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
         out += gaps(variants)
     out += ["", "### Problems on the newest run", ""]
     for (name, tier, key), (date, pair, rid) in sorted(evidence.items()):
-        if pair["outcome"] in ("failed", "timeout", "wrong", "partial"):
+        if pair["outcome"] in ("failed", "timeout", "wrong", "partial", "disputed"):
             out.append(f"- {name} {tier} on {key}: {pair['outcome']} ({rid}){': ' + pair['note'] if pair.get('note') else ''}")
     out += ["", "### Workloads not ready", ""]
     for name, w in workloads.items():

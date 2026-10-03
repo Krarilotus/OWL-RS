@@ -19,5 +19,5 @@ pairs = [
   { workload = "basics-mix", tier = "yago-tiny", system = "nrese", regime = "none", runs = 3, items = "10/10", outcome = "ok" },
   { workload = "basics-mix", tier = "yago-tiny", system = "oxigraph", regime = "none", runs = 3, items = "10/10", outcome = "ok" },
   { workload = "basics-mix", tier = "yago-tiny", system = "qlever", regime = "none", runs = 3, items = "10/10", outcome = "ok" },
-  { workload = "basics-mix", tier = "yago-tiny", system = "virtuoso", regime = "none", runs = 3, items = "7/10", outcome = "partial", note = "not ok: q01-label-lookup, q03-taxon-path, q08-subclass-path" },
+  { workload = "basics-mix", tier = "yago-tiny", system = "virtuoso", regime = "none", runs = 3, items = "7/10", outcome = "partial", note = "incomplete: q01-label-lookup, q03-taxon-path, q08-subclass-path (q01-label-lookup: 3 failed of 3)" },
 ]

@@ -1,10 +1,15 @@
 """`suite.py report`: result files as Markdown tables, one per workload tier and regime.
 
-Medians over the repetitions. A system with a result cache gets one line per cache mode
-(off, on). "First" is the sum of the queries' first executions on a fresh server (their
-medians over the repetitions); "Repeated" the sum of the medians of the later runs. Systems whose results need the vendor's permission are left
-out unless --include-restricted (their numbers stay on this machine: benches/competitors/
-README.md).
+What is complete, which timings count and how they are estimated is `summary.py`'s, the
+same for every reader. A system with a result cache gets one line per cache mode (off,
+on); the load, store and count figures (measured once per run, before the queries) appear
+on each. "First" sums the queries' first executions on a fresh server, "Repeated" their
+later executions; both over eligible (`ok`) timings only, each query as the median over
+runs of its run medians, and only over the queries with a timing on that line ("n of m"
+when some have none). Wrong answers, incomplete items (a failure or timeout in any
+repetition) and items whose answer counts differ between systems are listed apart. Systems
+whose results need the vendor's permission are left out unless --include-restricted (their
+numbers stay on this machine: benches/competitors/README.md).
 """
 from __future__ import annotations
 
@@ -14,21 +19,41 @@ from pathlib import Path
 from statistics import median
 
 from .schema import read
+from .summary import Pair, summarise
 
 
-def number(text: str) -> float | None:
-    try:
-        return float(text)
-    except (TypeError, ValueError):
-        return None
-
-
-def med(values: list[float]) -> str:
-    values = [v for v in values if v is not None]
+def med(per_run: dict[str, list[float]]) -> str:
+    values = [v for vs in per_run.values() for v in vs]
     if not values:
         return "-"
     m = median(values)
     return f"{m:,.0f}" if m >= 100 else f"{m:,.1f}"
+
+
+def total(items, first: bool) -> str:
+    estimates = [(i.estimate_first() if first else i.estimate()) for i in items]
+    have = [e[0] for e in estimates if e is not None]
+    if not have:
+        return "-"
+    text = f"{sum(have):,.1f}"
+    return text if len(have) == len(items) else f"{text} ({len(have)} of {len(items)})"
+
+
+def line(name: str, pair: Pair, cache: str | None) -> str:
+    steps = pair.steps
+    store = {run: [v for v in vs] for run, vs in steps.get("store MiB", {}).items()}
+    items = pair.items.get(cache, {}) if cache is not None else {}
+    complete = sum(1 for i in items.values() if i.complete)
+    wrong = sorted(n for n, i in items.items() if i.wrong)
+    incomplete = sorted(n for n, i in items.items() if not i.complete and not i.wrong)
+    disputed = sorted(n for n in items if n in pair.disputed)
+    counts = {task: rows for task, rows in pair.counts}
+    return (f"| {name} | {med(steps.get('load ms', {}))} | {med(steps.get('load peak MiB', {}))} | "
+            f"{counts.get('load', '-')} | {counts.get('reason', '-')} | {med(store)} | "
+            f"{med(steps.get('restart ms', {}))} | {med(steps.get('count ms', {}))} | {counts.get('count', '-')} | "
+            f"{complete}/{len(items)} | {total(list(items.values()), True)} | {total(list(items.values()), False)} | "
+            f"{', '.join(wrong) or '-'} | {', '.join(incomplete) or '-'} | {', '.join(disputed) or '-'} | "
+            f"{med(steps.get('serve peak MiB', {}))} |")
 
 
 def main(argv: list[str]) -> int:
@@ -38,54 +63,28 @@ def main(argv: list[str]) -> int:
                    help="include systems whose results need the vendor's permission")
     args = p.parse_args(argv)
     rows = [r for f in args.files for r in read(f)]
-    restricted = {r["system"] for r in rows if r["publish"] == "permission"}
-    if not args.include_restricted:
-        rows = [r for r in rows if r["publish"] != "permission"]
-    groups: dict[tuple, list[dict]] = defaultdict(list)
-    for r in rows:
-        groups[(r["workload"], r["tier"], r["regime"])].append(r)
-    for (workload, tier, regime), group in sorted(groups.items()):
+    pairs = summarise(rows)
+    restricted = {pair.system for pair in pairs.values() if pair.publish == "permission"}
+    tables: dict[tuple, list[Pair]] = defaultdict(list)
+    for pair in pairs.values():
+        if pair.publish == "permission" and not args.include_restricted:
+            continue
+        tables[(pair.workload, pair.tier, pair.regime)].append(pair)
+    for (workload, tier, regime), group in sorted(tables.items()):
         print(f"\n### {workload} {tier} ({regime})\n")
         print("| System | Load ms | Load peak MiB | Asserted | Inferred | Store MiB | Restart ms | Count ms | "
-              "Statements | Queries ok | First, sum ms | Repeated, sum of medians ms | Wrong | Serve peak MiB |")
-        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
-        by_system: dict[str, list[dict]] = defaultdict(list)
-        for r in group:
-            by_system[r["system"]].append(r)
-        # A system with a result cache: one line per mode; the load, store and count
-        # figures (measured once per run, before the queries) appear on each.
-        lines: dict[str, list[dict]] = {}
-        for system, rs in by_system.items():
-            modes = sorted({r.get("cache") or "-" for r in rs if r["task"] == "query"} - {"-"})
-            if not modes:
-                lines[system] = rs
-            for mode in modes:
-                lines[f"{system} (cache {mode})"] = [
-                    r for r in rs if r["task"] != "query" and r["task"] != "serve"
-                    or (r.get("cache") or "-") in (mode, "-")]
-        for system, rs in sorted(lines.items()):
-            def of(task, key="ms"):
-                return [number(r[key]) for r in rs if r["task"] == task and r["status"] == "ok"]
-            if all(r["status"] == "skipped" for r in rs):
-                print(f"| {system} | skipped: {rs[0]['note']} |" + " |" * 12)
+              "Statements | Queries complete | First, sum ms | Repeated, sum ms | Wrong | Incomplete | "
+              "Disputed | Serve peak MiB |")
+        print("|" + "---|" * 16)
+        for pair in sorted(group, key=lambda p: p.system):
+            if not pair.live:
+                print(f"| {pair.system} | skipped: {pair.skipped_note[:120]} |" + " |" * 14)
                 continue
-            queries = [r for r in rs if r["task"] == "query"]
-            per_query: dict[str, list[float]] = defaultdict(list)
-            first: dict[str, list[float]] = defaultdict(list)
-            for r in queries:
-                if r["status"] in ("ok", "wrong") and number(r["ms"]) is not None:
-                    (first if r["repeat"] == "0" else per_query)[r["item"]].append(number(r["ms"]))
-            items = {r["item"] for r in queries}
-            ok_items = {r["item"] for r in queries if r["status"] == "ok"}
-            wrong = sorted({r["item"] for r in queries if r["status"] == "wrong"})
-            total = sum(median(v) for v in per_query.values()) if per_query else None
-            first_total = sum(median(v) for v in first.values()) if first else None
-            store = [b / 1048576 for b in of("size", "bytes") if b is not None]
-            print(f"| {system} | {med(of('load'))} | {med(of('load', 'peak_mib'))} | {med(of('load', 'rows'))} | "
-                  f"{med(of('reason', 'rows'))} | {med(store)} | {med(of('restart'))} | {med(of('count'))} | "
-                  f"{med(of('count', 'rows'))} | {len(ok_items)}/{len(items)} | "
-                  f"{'-' if first_total is None else f'{first_total:,.1f}'} | {'-' if total is None else f'{total:,.1f}'} | {', '.join(wrong) or '-'} | "
-                  f"{med(of('serve', 'peak_mib'))} |")
+            modes = sorted(m for m in pair.items if m != "-")
+            if not modes:
+                print(line(pair.system, pair, "-" if "-" in pair.items else None))
+            for mode in modes:
+                print(line(f"{pair.system} (cache {mode})", pair, mode))
     if restricted and not args.include_restricted:
         print(f"\n(left out, publication needs the vendor's permission: {', '.join(sorted(restricted))})")
     return 0

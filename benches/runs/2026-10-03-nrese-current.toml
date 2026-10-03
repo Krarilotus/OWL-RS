@@ -39,5 +39,5 @@ pairs = [
   { workload = "w3c-owl2-rl", tier = "-", system = "nrese", regime = "-", runs = 1, outcome = "ok" },
   { workload = "w3c-shacl", tier = "-", system = "nrese", regime = "-", runs = 1, outcome = "ok" },
   { workload = "w3c-sparql11", tier = "-", system = "nrese", regime = "-", runs = 1, outcome = "ok" },
-  { workload = "write-scaling", tier = "1m", system = "nrese", regime = "none", runs = 0, outcome = "failed" },
+  { workload = "write-scaling", tier = "1m", system = "nrese", regime = "none", runs = 3, outcome = "ok" },
 ]
