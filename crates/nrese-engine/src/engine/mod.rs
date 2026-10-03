@@ -537,6 +537,7 @@ impl Engine {
         )?;
         let version = recovered.version;
         dictionary.set_derived_dir(dir.as_ref().join("derived"));
+        let derived = dir.as_ref().join("derived");
         tracing::info!(
             dir = %dir.as_ref().display(),
             revision = version.revision,
@@ -544,7 +545,9 @@ impl Engine {
             inferred = version.inferred.len(),
             "engine recovered"
         );
-        Self::build(config, dictionary, Some(recovered.durable), version)
+        let engine = Self::build(config, dictionary, Some(recovered.durable), version)?;
+        engine.inner.shared.statistics.set_dir(derived);
+        Ok(engine)
     }
 
     /// `version.dictionary_len` is replaced by the dictionary's actual length.
@@ -589,6 +592,18 @@ impl Engine {
     /// The latest committed state. Never blocks on writers.
     pub fn snapshot(&self) -> Snapshot {
         self.inner.shared.snapshot()
+    }
+
+    /// Builds the planner's statistics of the latest state now (the default graph's
+    /// characteristic sets in the default read model) and saves them beside the
+    /// checkpoint: after a load, so that no query after a start waits for them or shares
+    /// the machine with their build.
+    pub fn prepare_statistics(&self) {
+        let snapshot = self.snapshot();
+        self.inner
+            .shared
+            .statistics
+            .prepare_sets(&snapshot, ReadModel::default());
     }
 
     /// Equality by representatives (work package W4, stage B): with `Some(sameAs)`, the

@@ -817,6 +817,14 @@ impl StoreService {
         bulk_load(&self.engine, request, progress)
     }
 
+    /// Builds the query planner's statistics of the store as it is now and saves them
+    /// beside its checkpoint ([`nrese_engine::Engine::prepare_statistics`]): the last step
+    /// of a load, so that queries after a start neither wait for them nor share the
+    /// machine with their build.
+    pub fn prepare_statistics(&self) {
+        self.engine.prepare_statistics();
+    }
+
     /// Whether the inferred stack is `program`'s closure as this store computes it.
     pub fn reasoning_is_current(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> bool {
         let program = program.into();
