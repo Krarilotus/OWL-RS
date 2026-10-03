@@ -120,8 +120,8 @@ final class Konclude {
         return new Outcome(null, output);
     }
 
-    /** Konclude's hierarchy as told axioms, over the premise's classes. */
-    private static OWLOntology hierarchy(OWLOntology o, Path output) throws Exception {
+    /** Konclude's (or ELK 0.4.3's) hierarchy as told axioms, over the premise's classes. */
+    static OWLOntology hierarchy(OWLOntology o, Path output) throws Exception {
         OWLOntology hierarchy = Runner.loadFile(output);
         // The premise's classes, so that classes only under owl:Thing are there too.
         for (OWLClass c : o.getClassesInSignature(Imports.INCLUDED)) {

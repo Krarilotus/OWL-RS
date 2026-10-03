@@ -8,7 +8,9 @@ appended to CASES/results.tsv, so that `ore.py compare` sets them beside the ref
   track's tasks. It reads N-Triples: the runner's `ntriples` task converts each ontology
   first (`CASES/tax/ID.nt`, made here through the image when missing). The closure it
   writes becomes the canonical taxonomy with the signature of a reference run
-  (`canonical.py`), so equal hashes mean equal taxonomies.
+  (`canonical.py`), so equal hashes mean equal taxonomies. The detail column holds the
+  hash, then the classifier's profile: its phases in ms and its counters (`profile` line
+  of the `classify` example).
 """
 
 import argparse
@@ -69,7 +71,9 @@ def el(args):
             text = canonical.canonical(canonical.signature(reference), pairs)
             (cases / "tax" / f"{t}.nrese-el.tax").write_text(text, encoding="utf-8", newline="\n")
             digest = hashlib.sha256(text.encode()).hexdigest()
-            out.write(f"{t}\tnrese-el\tclassify\tclassified\t{ms}\t{digest}\n")
+            profile = next((l[len("profile "):] for l in reversed(run.stderr.splitlines())
+                            if l.startswith("profile ")), "")
+            out.write(f"{t}\tnrese-el\tclassify\tclassified\t{ms}\t{digest} {profile}".rstrip() + "\n")
             print(f"{t}: {ms} ms; {run.stderr.strip().splitlines()[-1] if run.stderr.strip() else ''}")
 
 
