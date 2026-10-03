@@ -1424,6 +1424,9 @@ impl<'a> Context<'a> {
                 else {
                     unreachable!("matched above")
                 };
+                if vectors::is_search(name) {
+                    return self.vector_join(local, inner);
+                }
                 let bound = self.eval(local)?;
                 let found = self.service(name, inner, *silent, Some(&bound))?;
                 self.join(bound, found)
