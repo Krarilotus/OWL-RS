@@ -1215,6 +1215,7 @@ dependencies = [
  "nrese-rdf-io",
  "nrese-reasoner",
  "rayon",
+ "smallvec",
  "thiserror 2.0.21",
 ]
 
