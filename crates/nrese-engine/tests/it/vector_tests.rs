@@ -130,8 +130,13 @@ fn large_spaces_are_searched_through_a_graph() {
         metric: Metric::L2,
         ..VectorQuery::new(vec![0.5, 1.2, 3.0], 10)
     };
+    // Past SYNC_BUILD the graph is built on a thread; a warm-up waits for it.
+    snapshot.prepare_vector_graph(&query);
     let (approximate, report) = snapshot.vector_search(&query, &|_| true);
-    assert!(report.graph && report.space == 72_000, "{report:?}");
+    assert!(
+        report.graph && report.space == 72_000 && report.scanned == 0,
+        "{report:?}"
+    );
     let exact = VectorQuery {
         strategy: VectorStrategy::Exact,
         ..query.clone()

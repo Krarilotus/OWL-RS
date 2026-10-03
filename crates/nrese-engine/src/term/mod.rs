@@ -8,6 +8,7 @@
 //! so RDF term identity is preserved (`"01"^^xsd:integer` and `"1"^^xsd:integer` are
 //! different terms and get different ids). See ADR-0002.
 
+pub(crate) mod derived;
 pub(crate) mod dictionary;
 pub(crate) mod hash;
 mod inline;

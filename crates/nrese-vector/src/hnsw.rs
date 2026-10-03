@@ -43,6 +43,17 @@ impl Default for HnswParameters {
     }
 }
 
+/// A graph's parts ([`Hnsw::to_parts`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HnswParts {
+    pub parameters: HnswParameters,
+    pub metric: Metric,
+    /// The entry node and its level.
+    pub entry: Option<(u32, u8)>,
+    /// Each node's links, per level from 0 up.
+    pub links: Vec<Vec<Vec<u32>>>,
+}
+
 /// Nodes inserted one by one before the rest go in parallel.
 const SEQUENTIAL: usize = 256;
 
@@ -81,6 +92,58 @@ impl Hnsw {
 
     pub fn is_empty(&self) -> bool {
         self.links.is_empty()
+    }
+
+    /// The graph's parts, to write it out ([`Self::from_parts`] reads them back).
+    pub fn to_parts(&self) -> HnswParts {
+        HnswParts {
+            parameters: self.parameters,
+            metric: self.metric,
+            entry: *self.entry.read(),
+            links: self
+                .links
+                .iter()
+                .map(|links| links.read().clone())
+                .collect(),
+        }
+    }
+
+    /// The graph of `parts`, if they make one: every link to a node of it, the entry
+    /// one of them at its level.
+    pub fn from_parts(parts: HnswParts) -> Option<Self> {
+        let nodes = parts.links.len();
+        let sound = parts.links.iter().all(|levels| {
+            !levels.is_empty()
+                && levels.len() <= usize::from(MAX_LEVEL) + 1
+                && levels.iter().flatten().all(|&n| (n as usize) < nodes)
+        });
+        let entry_sound = match parts.entry {
+            None => nodes == 0,
+            Some((node, level)) => parts
+                .links
+                .get(node as usize)
+                .is_some_and(|levels| levels.len() == usize::from(level) + 1),
+        };
+        (sound && entry_sound).then(|| Self {
+            parameters: parts.parameters,
+            metric: parts.metric,
+            links: parts.links.into_iter().map(RwLock::new).collect(),
+            entry: RwLock::new(parts.entry),
+        })
+    }
+
+    /// A copy, to extend while searches use this one.
+    pub fn duplicate(&self) -> Self {
+        Self {
+            parameters: self.parameters,
+            metric: self.metric,
+            links: self
+                .links
+                .iter()
+                .map(|links| RwLock::new(links.read().clone()))
+                .collect(),
+            entry: RwLock::new(*self.entry.read()),
+        }
     }
 
     /// Links the vectors appended to `vectors` since the last call.
@@ -175,7 +238,7 @@ impl Hnsw {
 
     fn insert(&self, vectors: &Vectors, position: u32) {
         let level = (self.links[position as usize].read().len() - 1) as u8;
-        let query = Query::new(vectors.get(position));
+        let query = vectors.query_at(position);
         let (entry, top) = {
             let current = *self.entry.read();
             match current {
@@ -242,7 +305,7 @@ impl Hnsw {
             own.push(new);
             return;
         }
-        let from = Query::new(vectors.get(node));
+        let from = vectors.query_at(node);
         let mut candidates: Vec<(f32, u32)> = own
             .iter()
             .map(|&other| (self.distance(vectors, &from, other), other))
@@ -261,7 +324,7 @@ impl Hnsw {
             if chosen.len() == m {
                 break;
             }
-            let from = Query::new(vectors.get(candidate));
+            let from = vectors.query_at(candidate);
             if chosen
                 .iter()
                 .all(|&(_, kept)| self.distance(vectors, &from, kept) > distance)
@@ -477,5 +540,55 @@ mod tests {
                 .search(&vectors, &[1.0, 0.0], 5, 10, &|_| true)
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+    use crate::tests::random_vectors;
+    use crate::{exact, exact_from, merge};
+
+    /// A graph's parts read back give the same answers; a copy extended with new vectors
+    /// finds them, the original stays as it was; a graph over a prefix plus an exact scan
+    /// of the rest answers as one graph does.
+    #[test]
+    fn graphs_round_trip_grow_and_cover_a_prefix() {
+        let all = random_vectors(6_000, 8, 11);
+        let mut prefix = Vectors::new(8);
+        for p in 0..4_000u32 {
+            prefix.push(all.id(p), all.get(p));
+        }
+        let mut graph = Hnsw::new(Metric::L2, HnswParameters::default());
+        graph.extend(&prefix);
+        let query = all.get(5_000).to_vec();
+        let read = Hnsw::from_parts(graph.to_parts()).expect("sound parts");
+        assert_eq!(
+            read.search(&prefix, &query, 5, 64, &|_| true),
+            graph.search(&prefix, &query, 5, 64, &|_| true)
+        );
+        // Prefix graph + exact tail: the true nearest is the queried vector itself.
+        let from_graph = graph.search(&all, &query, 5, 64, &|_| true);
+        let tail = exact_from(&all, graph.len(), &query, 5, Metric::L2, &|_| true);
+        let merged = merge(from_graph.into_iter().chain(tail), 5);
+        assert_eq!(merged[0].id, all.id(5_000));
+        assert_eq!(
+            merged,
+            exact(&all, &query, 5, Metric::L2, &|_| true)[..5].to_vec()
+        );
+        // A copy extended to every vector finds it through the graph; the original
+        // still covers the prefix.
+        let mut grown = graph.duplicate();
+        grown.extend(&all);
+        assert_eq!(grown.len(), 6_000);
+        assert_eq!(graph.len(), 4_000);
+        assert_eq!(
+            grown.search(&all, &query, 1, 64, &|_| true)[0].id,
+            all.id(5_000)
+        );
+        // Unsound parts are refused.
+        let mut bad = graph.to_parts();
+        bad.links[0][0].push(1_000_000);
+        assert!(Hnsw::from_parts(bad).is_none());
     }
 }

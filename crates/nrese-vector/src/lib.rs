@@ -11,17 +11,29 @@ mod hnsw;
 mod kernels;
 mod literal;
 
-pub use hnsw::{Hnsw, HnswParameters};
+pub use hnsw::{Hnsw, HnswParameters, HnswParts};
 pub use kernels::{Metric, dot, squared_l2};
 pub use literal::{DATATYPE, NAMESPACE, ParseError, lexical, parse};
 
 use rayon::prelude::*;
 
+/// Vectors per chunk: appending copies at most the last chunk when a snapshot of the
+/// vectors is held elsewhere (a graph being built), not all of them.
+pub const CHUNK: usize = 4096;
+
 /// Vectors of one dimension, each with an id (a term id): appended, never changed.
-/// Each vector is kept with its norm, so cosine similarity is one dot product.
+/// Each vector is kept with its norm, so cosine similarity is one dot product. Cloning
+/// is cheap: the chunks are shared, and the vectors appended to a clone are its own.
 #[derive(Debug, Clone, Default)]
 pub struct Vectors {
     dimension: usize,
+    chunks: Vec<std::sync::Arc<Chunk>>,
+    len: usize,
+}
+
+/// Up to [`CHUNK`] vectors, their norms and ids.
+#[derive(Debug, Clone, Default)]
+struct Chunk {
     data: Vec<f32>,
     norms: Vec<f32>,
     ids: Vec<u64>,
@@ -40,40 +52,70 @@ impl Vectors {
     }
 
     pub fn len(&self) -> usize {
-        self.ids.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
+        self.len == 0
     }
 
     /// Appends `vector` (of this dimension) with `id`; its position.
     pub fn push(&mut self, id: u64, vector: &[f32]) -> u32 {
         debug_assert_eq!(vector.len(), self.dimension);
-        self.data.extend_from_slice(vector);
-        self.norms.push(dot(vector, vector).sqrt());
-        self.ids.push(id);
-        (self.ids.len() - 1) as u32
+        if self.len.is_multiple_of(CHUNK) {
+            self.chunks.push(std::sync::Arc::new(Chunk {
+                data: Vec::with_capacity(CHUNK * self.dimension),
+                norms: Vec::with_capacity(CHUNK),
+                ids: Vec::with_capacity(CHUNK),
+            }));
+        }
+        let chunk = std::sync::Arc::make_mut(self.chunks.last_mut().expect("a chunk"));
+        chunk.data.extend_from_slice(vector);
+        chunk.norms.push(dot(vector, vector).sqrt());
+        chunk.ids.push(id);
+        self.len += 1;
+        (self.len - 1) as u32
+    }
+
+    fn chunk(&self, position: u32) -> (&Chunk, usize) {
+        let position = position as usize;
+        (&self.chunks[position / CHUNK], position % CHUNK)
     }
 
     /// The vector at `position`.
     pub fn get(&self, position: u32) -> &[f32] {
-        let start = position as usize * self.dimension;
-        &self.data[start..start + self.dimension]
+        let (chunk, at) = self.chunk(position);
+        &chunk.data[at * self.dimension..(at + 1) * self.dimension]
     }
 
     /// The id at `position`.
     pub fn id(&self, position: u32) -> u64 {
-        self.ids[position as usize]
+        let (chunk, at) = self.chunk(position);
+        chunk.ids[at]
+    }
+
+    /// The norm of the vector at `position`.
+    pub fn norm(&self, position: u32) -> f32 {
+        let (chunk, at) = self.chunk(position);
+        chunk.norms[at]
+    }
+
+    /// The vector at `position` as a query (with its kept norm).
+    pub fn query_at(&self, position: u32) -> Query<'_> {
+        Query {
+            vector: self.get(position),
+            norm: self.norm(position),
+        }
     }
 
     /// The distance from `query` (with its norm) to the vector at `position` under
     /// `metric`: smaller is nearer.
     pub fn distance(&self, metric: Metric, query: &Query<'_>, position: u32) -> f32 {
-        let vector = self.get(position);
+        let (chunk, at) = self.chunk(position);
+        let vector = &chunk.data[at * self.dimension..(at + 1) * self.dimension];
         match metric {
             Metric::Cosine => {
-                let norms = query.norm * self.norms[position as usize];
+                let norms = query.norm * chunk.norms[at];
                 if norms == 0.0 {
                     1.0
                 } else {
@@ -87,7 +129,21 @@ impl Vectors {
 
     /// Bytes of the vectors, norms and ids.
     pub fn memory_bytes(&self) -> usize {
-        self.data.capacity() * 4 + self.norms.capacity() * 4 + self.ids.capacity() * 8
+        self.chunks
+            .iter()
+            .map(|c| c.data.capacity() * 4 + c.norms.capacity() * 4 + c.ids.capacity() * 8)
+            .sum()
+    }
+
+    /// Every vector's id and values, in order (for writing them out).
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &[f32])> + '_ {
+        self.chunks.iter().flat_map(move |chunk| {
+            chunk
+                .ids
+                .iter()
+                .zip(chunk.data.chunks_exact(self.dimension.max(1)))
+                .map(|(&id, values)| (id, values))
+        })
     }
 }
 
@@ -115,9 +171,6 @@ pub struct Hit {
     pub distance: f32,
 }
 
-/// Positions per parallel part of an exact scan.
-const SCAN_PART: usize = 16_384;
-
 /// The `k` vectors of `vectors` nearest to `query` among those `accept` takes (by id),
 /// nearest first: every vector compared, on every core.
 pub fn exact(
@@ -127,16 +180,29 @@ pub fn exact(
     metric: Metric,
     accept: &(dyn Fn(u64) -> bool + Sync),
 ) -> Vec<Hit> {
-    if k == 0 || vectors.is_empty() || query.len() != vectors.dimension {
+    exact_from(vectors, 0, query, k, metric, accept)
+}
+
+/// [`exact`] over the vectors from position `start` on: the ones a graph doesn't cover
+/// yet.
+pub fn exact_from(
+    vectors: &Vectors,
+    start: usize,
+    query: &[f32],
+    k: usize,
+    metric: Metric,
+    accept: &(dyn Fn(u64) -> bool + Sync),
+) -> Vec<Hit> {
+    if k == 0 || start >= vectors.len() || query.len() != vectors.dimension {
         return Vec::new();
     }
     let query = Query::new(query);
-    let parts: Vec<Vec<Hit>> = (0..vectors.len())
+    let parts: Vec<Vec<Hit>> = (start / CHUNK..vectors.chunks.len())
         .into_par_iter()
-        .step_by(SCAN_PART)
-        .map(|start| {
+        .map(|c| {
             let mut best = TopK::new(k);
-            for position in start..(start + SCAN_PART).min(vectors.len()) {
+            let first = (c * CHUNK).max(start);
+            for position in first..((c + 1) * CHUNK).min(vectors.len()) {
                 let position = position as u32;
                 let id = vectors.id(position);
                 if accept(id) {
@@ -146,8 +212,13 @@ pub fn exact(
             best.into_sorted()
         })
         .collect();
+    merge(parts.into_iter().flatten(), k)
+}
+
+/// The `k` nearest of `hits`, nearest first.
+pub fn merge(hits: impl IntoIterator<Item = Hit>, k: usize) -> Vec<Hit> {
     let mut best = TopK::new(k);
-    for hit in parts.into_iter().flatten() {
+    for hit in hits {
         best.offer(hit.id, hit.distance);
     }
     best.into_sorted()

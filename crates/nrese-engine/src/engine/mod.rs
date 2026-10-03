@@ -352,7 +352,10 @@ impl Shared {
                 let mut wal = durable.wal.lock();
                 let snapshot = self.snapshot();
                 if checkpoint::exists(durable.root(), snapshot.revision()) {
-                    // Nothing was committed since (and the file may be in use, mapped).
+                    // Nothing was committed since (and the file may be in use, mapped);
+                    // searches since may have extended the derived indexes.
+                    drop(wal);
+                    self.dictionary.save_derived();
                     return Ok(snapshot.revision());
                 }
                 wal.rotate(snapshot.revision() + 1)?;
@@ -371,6 +374,7 @@ impl Shared {
             drop(snapshot);
         }
         checkpoint::remove_older_than(durable.root(), revision)?;
+        self.dictionary.save_derived();
         Ok(revision)
     }
 
@@ -530,6 +534,7 @@ impl Engine {
             config.durability,
         )?;
         let version = recovered.version;
+        dictionary.set_derived_dir(dir.as_ref().join("derived"));
         tracing::info!(
             dir = %dir.as_ref().display(),
             revision = version.revision,
