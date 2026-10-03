@@ -14,12 +14,19 @@
 //! Each fact keeps at most `cap` sets, the smallest first. A set dropped by the cap can
 //! only hide a fact from a reader who could have seen it, never show one to a reader who
 //! couldn't.
+//!
+//! After a change, [`update_support_sets`] recomputes only the facts it can affect (the
+//! forward closure of the facts it touched), from what the others keep.
 
-use hashbrown::HashMap;
+use std::borrow::Cow;
+
+use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
 
 use super::batch::Store;
-use super::eval::{GroundProgram, Grounding, Job, Seg, Source, transitivity};
+use super::eval::{
+    GroundProgram, Grounding, Job, Seg, Source, derivations, instantiate_head, transitivity,
+};
 use super::ir::{Head, Rule, Triple};
 
 /// Driver facts per parallel task.
@@ -81,12 +88,12 @@ impl GraphSet {
 }
 
 /// The facts of `all`, read whole or, as the delta, only the facts whose sets changed.
-struct Changed<'a> {
-    all: &'a Store,
+struct Changed<'a, S: ?Sized> {
+    all: &'a S,
     changed: &'a Store,
 }
 
-impl Source for Changed<'_> {
+impl<S: Source + ?Sized> Source for Changed<'_, S> {
     fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
         match seg {
             Seg::Delta => self.changed.scan(pattern, Seg::All, f),
@@ -103,6 +110,43 @@ impl Source for Changed<'_> {
 
     fn contains(&self, fact: Triple) -> bool {
         self.all.contains(fact)
+    }
+}
+
+/// The sets of facts as an evaluation reads them: `None` for a fact without sets yet.
+trait Lookup: Sync {
+    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, [GraphSet]>>;
+}
+
+impl Lookup for HashMap<Triple, Vec<GraphSet>> {
+    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, [GraphSet]>> {
+        self.get(fact).map(|sets| Cow::Borrowed(sets.as_slice()))
+    }
+}
+
+/// During an update: the facts it recomputes as they are now, the others as they were.
+struct Recomputing<'a> {
+    now: &'a HashMap<Triple, Vec<GraphSet>>,
+    affected: &'a HashSet<Triple>,
+    previous: &'a (dyn Fn(Triple) -> Vec<GraphSet> + Sync),
+}
+
+impl Lookup for Recomputing<'_> {
+    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, [GraphSet]>> {
+        if self.affected.contains(fact) {
+            return self.now.sets_of(fact);
+        }
+        let sets = (self.previous)(*fact);
+        (!sets.is_empty()).then_some(Cow::Owned(sets))
+    }
+}
+
+/// The sets a fact starts with: the empty set for an axiom, else one per graph that
+/// holds it (none for a fact only inferred). At most `cap`.
+pub fn initial_sets(graphs: Vec<u32>, axiom: bool, cap: usize) -> Vec<GraphSet> {
+    match axiom {
+        true => vec![GraphSet::default()],
+        false => minimal(graphs.into_iter().map(GraphSet::of).collect(), cap),
     }
 }
 
@@ -137,16 +181,10 @@ pub fn support_sets(
     let initial: Vec<(Triple, Vec<GraphSet>)> = facts
         .par_iter()
         .filter_map(|&fact| {
-            if axioms.binary_search(&fact).is_ok() {
-                return Some((fact, vec![GraphSet::default()]));
-            }
-            let graphs = graphs_of(fact);
-            (!graphs.is_empty()).then(|| {
-                (
-                    fact,
-                    minimal(graphs.into_iter().map(GraphSet::of).collect(), cap),
-                )
-            })
+            let axiom = axioms.binary_search(&fact).is_ok();
+            let initial =
+                initial_sets(if axiom { Vec::new() } else { graphs_of(fact) }, axiom, cap);
+            (!initial.is_empty()).then_some((fact, initial))
         })
         .collect();
     let mut sets: HashMap<Triple, Vec<GraphSet>> = HashMap::with_capacity(facts.len());
@@ -317,6 +355,277 @@ pub fn support_sets(
     sets
 }
 
+/// A change of the closure, for [`update_support_sets`].
+pub struct Change<'a, S: ?Sized> {
+    /// The facts of the closure after the change, and those the change removed (joins
+    /// must reach what was derived from them).
+    pub source: &'a S,
+    /// Whether a fact is in the closure after the change.
+    pub in_closure: &'a (dyn Fn(Triple) -> bool + Sync),
+    /// Every fact whose own graphs changed, or that the change added to the closure or
+    /// removed from it.
+    pub touched: &'a [Triple],
+    /// A fact's sets before the change.
+    pub previous: &'a (dyn Fn(Triple) -> Vec<GraphSet> + Sync),
+    /// Past this many affected facts the update gives up (a recomputation is cheaper).
+    pub limit: usize,
+}
+
+/// The support graph sets after `change`, for the facts it can affect: those derived,
+/// in any number of steps, from a touched fact. The others keep theirs. Each affected
+/// fact of the closure is in the result, with no sets if none is left; affected facts
+/// outside it aren't.
+///
+/// `program` is the ground program after the change and must have been grounded on the
+/// same schema facts as the one before (the caller compares
+/// [`GroundProgram::schema_premises`]). `None` when the change reaches a schema fact,
+/// or affects more than `change.limit` facts: then [`support_sets`] computes them all.
+///
+/// The affected facts start again from their own graphs: one pass over each one's
+/// derivations takes in what the unaffected facts support, then semi-naive rounds among
+/// the affected facts reach the least fixpoint, as [`support_sets`] does for all.
+pub fn update_support_sets<S: Source + Sync + ?Sized>(
+    change: &Change<'_, S>,
+    program: &GroundProgram,
+    axioms: &[Triple],
+    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
+    cap: usize,
+) -> Option<HashMap<Triple, Vec<GraphSet>>> {
+    let schema = program.schema_premises();
+    let transitive: Vec<(Rule, Grounding)> = program
+        .transitive
+        .iter()
+        .map(|&p| (transitivity(p), Grounding::Transitive(p)))
+        .collect();
+    let rules: Vec<(&Rule, Grounding)> = program
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(r, rule)| (rule, Grounding::Rule(r)))
+        .chain(
+            transitive
+                .iter()
+                .map(|(rule, grounding)| (rule, *grounding)),
+        )
+        .filter(|(rule, _)| !rule.body.is_empty() && matches!(rule.head, Head::Facts(_)))
+        .collect();
+    // The affected facts: the touched ones and what follows from them.
+    let mut affected: HashSet<Triple> = change.touched.iter().copied().collect();
+    if affected.iter().any(|fact| schema.contains(fact)) {
+        return None;
+    }
+    let mut frontier: Vec<Triple> = affected.iter().copied().collect();
+    while !frontier.is_empty() {
+        frontier.sort_unstable();
+        let delta = Store::new(std::mem::take(&mut frontier));
+        let source = Changed {
+            all: change.source,
+            changed: &delta,
+        };
+        let heads = instances(&source, &rules, &|k, bindings, out| {
+            let rule = rules[k].0;
+            if let Head::Facts(heads) = &rule.head {
+                out.extend(heads.iter().map(|head| instantiate_head(head, bindings)));
+            }
+        });
+        for head in heads {
+            if affected.insert(head) {
+                if schema.contains(&head) {
+                    return None;
+                }
+                frontier.push(head);
+            }
+        }
+        if affected.len() > change.limit {
+            return None;
+        }
+    }
+    let members: HashSet<Triple> = affected
+        .iter()
+        .copied()
+        .filter(|&fact| (change.in_closure)(fact))
+        .collect();
+    let empty = GraphSet::default();
+    let mut now: HashMap<Triple, Vec<GraphSet>> = members
+        .iter()
+        .map(|&fact| {
+            let axiom = axioms.binary_search(&fact).is_ok();
+            let graphs = if axiom { Vec::new() } else { graphs_of(fact) };
+            (fact, initial_sets(graphs, axiom, cap))
+        })
+        .collect();
+    // The schema facts' part per rule: they aren't affected, so it is fixed.
+    let schemas: Vec<Vec<GraphSet>> = {
+        let lookup = Recomputing {
+            now: &now,
+            affected: &affected,
+            previous: change.previous,
+        };
+        rules
+            .iter()
+            .map(|&(_, grounding)| grounding_sets(program, grounding, &lookup, cap, &empty))
+            .collect()
+    };
+    let by_grounding: HashMap<Grounding, usize> = rules
+        .iter()
+        .enumerate()
+        .map(|(k, &(_, grounding))| (grounding, k))
+        .collect();
+    let premises_in_closure = |body: &[Triple]| body.iter().all(|&p| (change.in_closure)(p));
+    // Every derivation of every affected fact, against the sets as they start.
+    let found: Vec<(Triple, Vec<GraphSet>)> = {
+        let lookup = Recomputing {
+            now: &now,
+            affected: &affected,
+            previous: change.previous,
+        };
+        let list: Vec<Triple> = members.iter().copied().collect();
+        list.par_iter()
+            .map(|&fact| {
+                let mut from = Vec::new();
+                if program.bodiless.contains(&fact) {
+                    from.extend(grounding_sets(
+                        program,
+                        Grounding::Bodiless(fact),
+                        &lookup,
+                        cap,
+                        &empty,
+                    ));
+                }
+                let mut groundings: Vec<Grounding> = program
+                    .producers(fact)
+                    .into_iter()
+                    .map(Grounding::Rule)
+                    .collect();
+                if program.transitive.contains(&fact[1]) {
+                    groundings.push(Grounding::Transitive(fact[1]));
+                }
+                for grounding in groundings {
+                    let Some(&k) = by_grounding.get(&grounding) else {
+                        continue;
+                    };
+                    let (rule, schema) = (rules[k].0, &schemas[k]);
+                    if schema.is_empty() {
+                        continue;
+                    }
+                    let mut body = Vec::with_capacity(rule.body.len());
+                    derivations(change.source, rule, fact, Seg::All, &mut |bindings| {
+                        body.clear();
+                        body.extend(
+                            rule.body
+                                .iter()
+                                .map(|atom| instantiate_head(atom, bindings)),
+                        );
+                        if premises_in_closure(&body) {
+                            from.extend(premise_sets_from(&body, schema, &lookup, cap));
+                        }
+                        false
+                    });
+                }
+                (fact, from)
+            })
+            .collect()
+    };
+    let mut changed: Vec<Triple> = Vec::new();
+    for (fact, from) in found {
+        if merge(&mut now, fact, from, cap) {
+            changed.push(fact);
+        }
+    }
+    // Semi-naive rounds among the affected facts.
+    while !changed.is_empty() {
+        changed.sort_unstable();
+        let delta = Store::new(std::mem::take(&mut changed));
+        let source = Changed {
+            all: change.source,
+            changed: &delta,
+        };
+        let found = {
+            let lookup = Recomputing {
+                now: &now,
+                affected: &affected,
+                previous: change.previous,
+            };
+            instances(&source, &rules, &|k, bindings, out| {
+                let rule = rules[k].0;
+                let Head::Facts(heads) = &rule.head else {
+                    return;
+                };
+                let body: Vec<Triple> = rule
+                    .body
+                    .iter()
+                    .map(|atom| instantiate_head(atom, bindings))
+                    .collect();
+                if !premises_in_closure(&body) {
+                    return;
+                }
+                let from = premise_sets_from(&body, &schemas[k], &lookup, cap);
+                for head in heads {
+                    let fact = instantiate_head(head, bindings);
+                    if members.contains(&fact) {
+                        out.extend(from.iter().map(|set| (fact, set.clone())));
+                    }
+                }
+            })
+        };
+        let mut by_fact: HashMap<Triple, Vec<GraphSet>> = HashMap::new();
+        for (fact, set) in found {
+            by_fact.entry(fact).or_default().push(set);
+        }
+        for (fact, from) in by_fact {
+            if merge(&mut now, fact, from, cap) {
+                changed.push(fact);
+            }
+        }
+    }
+    Some(now)
+}
+
+/// What `emit` makes of every instance of `rules` (by index) with a premise among
+/// `source`'s delta facts, the instances in parallel morsels.
+fn instances<S, T, E>(source: &S, rules: &[(&Rule, Grounding)], emit: &E) -> Vec<T>
+where
+    S: Source + Sync + ?Sized,
+    T: Send,
+    E: Fn(usize, &[Option<u64>], &mut Vec<T>) + Sync,
+{
+    let jobs: Vec<(usize, Job<'_>)> = rules
+        .iter()
+        .enumerate()
+        .flat_map(|(k, &(rule, _))| {
+            (0..rule.body.len()).filter_map(move |i| {
+                Job::new(
+                    source,
+                    rule,
+                    i,
+                    |j| if j == i { Seg::Delta } else { Seg::All },
+                )
+                .map(|job| (k, job))
+            })
+        })
+        .collect();
+    let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
+        .iter()
+        .enumerate()
+        .flat_map(|(j, (_, job))| {
+            (0..job.drivers())
+                .step_by(MORSEL)
+                .map(move |start| (j, start..(start + MORSEL).min(job.drivers())))
+        })
+        .collect();
+    tasks
+        .par_iter()
+        .flat_map_iter(|(j, range)| {
+            let (k, job) = &jobs[*j];
+            let mut out = Vec::new();
+            job.run(source, range.clone(), &mut |bindings| {
+                emit(*k, bindings, &mut out)
+            });
+            out
+        })
+        .collect()
+}
+
 /// Every fact of `store`.
 fn delta_facts(store: &Store) -> Vec<Triple> {
     let mut out = Vec::new();
@@ -326,10 +635,10 @@ fn delta_facts(store: &Store) -> Vec<Triple> {
 
 /// The sets of the schema facts `grounding` was grounded on: over its alternatives, the
 /// minimal unions of one set per premise; none if no alternative has sets yet.
-fn grounding_sets(
+fn grounding_sets<L: Lookup + ?Sized>(
     program: &GroundProgram,
     grounding: Grounding,
-    sets: &HashMap<Triple, Vec<GraphSet>>,
+    sets: &L,
     cap: usize,
     empty: &GraphSet,
 ) -> Vec<GraphSet> {
@@ -343,10 +652,10 @@ fn grounding_sets(
 
 /// The minimal unions of the sets `start` with one set per premise of `body`; none if a
 /// premise has none yet.
-fn premise_sets_from(
+fn premise_sets_from<L: Lookup + ?Sized>(
     body: &[Triple],
     start: &[GraphSet],
-    sets: &HashMap<Triple, Vec<GraphSet>>,
+    sets: &L,
     cap: usize,
 ) -> Vec<GraphSet> {
     // The usual case, one set everywhere: a single union, nothing to minimise.
@@ -354,10 +663,12 @@ fn premise_sets_from(
         let mut one = only.clone();
         let mut single = true;
         for premise in body {
-            match sets.get(premise).map(Vec::as_slice) {
-                None => return Vec::new(),
-                Some([set]) => one = one.union(set),
-                Some(_) => {
+            let Some(own) = sets.sets_of(premise) else {
+                return Vec::new();
+            };
+            match &*own {
+                [set] => one = one.union(set),
+                _ => {
                     single = false;
                     break;
                 }
@@ -369,12 +680,12 @@ fn premise_sets_from(
     }
     let mut product = start.to_vec();
     for premise in body {
-        let Some(own) = sets.get(premise) else {
+        let Some(own) = sets.sets_of(premise) else {
             return Vec::new();
         };
         let mut next = Vec::with_capacity(product.len() * own.len());
         for a in &product {
-            for b in own {
+            for b in own.iter() {
                 next.push(a.union(b));
             }
         }
@@ -409,5 +720,11 @@ mod tests {
     #[test]
     fn support_sets_give_the_closure_of_each_set_of_graphs() {
         super::super::tests::support_sets_against_closures();
+    }
+
+    /// The update after random changes of where statements are equals a recomputation.
+    #[test]
+    fn updates_equal_recomputation() {
+        super::super::tests::support_set_updates_against_recomputation();
     }
 }

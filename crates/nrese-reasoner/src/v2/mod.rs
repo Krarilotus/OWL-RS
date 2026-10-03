@@ -1535,6 +1535,165 @@ mod tests {
         assert!(checked > 0);
     }
 
+    /// The oracle of `graph_sets::update_support_sets` (its test calls it): random
+    /// ontologies over three graphs, then random changes of where instance statements
+    /// are (added to a graph, removed from one, moved); the update's sets equal those
+    /// computed afresh for every fact of the closure after the change.
+    pub(super) fn support_set_updates_against_recomputation() {
+        use super::delta::{MemoryBase, Rules, program};
+        use super::graph_sets::{Change, support_sets, update_support_sets};
+        let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+        let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
+        let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x5e75_d1ff_2026_1003));
+        let (mut updated, mut refused) = (0, 0);
+        for case in 0..cases {
+            let lines = random_ontology(&mut next);
+            let mut vocabulary = LocalVocabulary::default();
+            let pool = load(&mut vocabulary, &lines.join("\n"));
+            let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+            let lists = ListVocabulary::new(&mut vocabulary);
+            let schema = Schema::owl(&mut vocabulary);
+            let compiled = Rules {
+                rules: &rules,
+                lists: Some(&lists),
+                schema: &schema,
+            };
+            let closure = |facts: &[Triple]| {
+                let mut all = batch::materialise(facts, &rules, Some(&lists), &schema).derived;
+                all.extend_from_slice(facts);
+                all.sort_unstable();
+                all.dedup();
+                all
+            };
+            // The state for statements placed in graphs: closure, program, sets.
+            let state = |placed: &[(Triple, u32)]| {
+                let mut asserted: Vec<Triple> = placed.iter().map(|&(f, _)| f).collect();
+                asserted.sort_unstable();
+                asserted.dedup();
+                let full = closure(&asserted);
+                let inferred: Vec<Triple> = full
+                    .iter()
+                    .copied()
+                    .filter(|f| asserted.binary_search(f).is_err())
+                    .collect();
+                let ground = program(&MemoryBase::new(&asserted, &inferred), compiled);
+                (full, ground)
+            };
+            let graphs_in = |placed: &[(Triple, u32)], fact: Triple| -> Vec<u32> {
+                let mut graphs: Vec<u32> = placed
+                    .iter()
+                    .filter(|&&(f, _)| f == fact)
+                    .map(|&(_, g)| g)
+                    .collect();
+                graphs.sort_unstable();
+                graphs.dedup();
+                graphs
+            };
+            let mut placed: Vec<(Triple, u32)> =
+                pool.iter().map(|&f| (f, next(3) as u32)).collect();
+            let (before, ground_before) = state(&placed);
+            let sets_before = support_sets(
+                &before,
+                &ground_before,
+                &[],
+                &|f| graphs_in(&placed, f),
+                usize::MAX,
+            );
+            // Change placements of statements no grounding rests on.
+            let premises = ground_before.schema_premises();
+            let movable: Vec<usize> = (0..placed.len())
+                .filter(|&i| !premises.contains(&placed[i].0))
+                .collect();
+            if movable.is_empty() {
+                continue;
+            }
+            let old_placed = placed.clone();
+            for _ in 0..=next(3) {
+                let i = movable[next(movable.len())];
+                if placed[i].1 == u32::MAX {
+                    continue;
+                }
+                match next(3) {
+                    0 => placed[i].1 = (placed[i].1 + 1) % 3,
+                    1 => placed.push((placed[i].0, next(3) as u32)),
+                    _ => placed[i].1 = u32::MAX,
+                }
+            }
+            placed.retain(|&(_, g)| g != u32::MAX);
+            let (after, ground_after) = state(&placed);
+            if ground_after.schema_premises() != premises {
+                continue;
+            }
+            // Touched: a fact whose graphs changed, or that entered or left the closure.
+            let mut touched: Vec<Triple> = old_placed
+                .iter()
+                .chain(&placed)
+                .map(|&(f, _)| f)
+                .filter(|&f| graphs_in(&old_placed, f) != graphs_in(&placed, f))
+                .collect();
+            touched.extend(before.iter().filter(|f| after.binary_search(f).is_err()));
+            touched.extend(after.iter().filter(|f| before.binary_search(f).is_err()));
+            touched.sort_unstable();
+            touched.dedup();
+            let removed: Vec<Triple> = before
+                .iter()
+                .copied()
+                .filter(|f| after.binary_search(f).is_err())
+                .collect();
+            let mut reachable = after.clone();
+            reachable.extend_from_slice(&removed);
+            let source = super::batch::Store::new(reachable);
+            let previous = |f: Triple| sets_before.get(&f).cloned().unwrap_or_default();
+            let change = Change {
+                source: &source,
+                in_closure: &|f| after.binary_search(&f).is_ok(),
+                touched: &touched,
+                previous: &previous,
+                limit: usize::MAX,
+            };
+            let Some(update) = update_support_sets(
+                &change,
+                &ground_after,
+                &[],
+                &|f| graphs_in(&placed, f),
+                usize::MAX,
+            ) else {
+                refused += 1;
+                continue;
+            };
+            let expected = support_sets(
+                &after,
+                &ground_after,
+                &[],
+                &|f| graphs_in(&placed, f),
+                usize::MAX,
+            );
+            for &fact in &after {
+                let got = update.get(&fact).cloned().unwrap_or_else(|| previous(fact));
+                let want = expected.get(&fact).cloned().unwrap_or_default();
+                if got != want {
+                    let text = |t: &Triple| {
+                        let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+                        format!("{s} {p} {o}")
+                    };
+                    let shown: Vec<String> = placed
+                        .iter()
+                        .map(|(f, g)| format!("{} @{g}", text(f)))
+                        .collect();
+                    panic!(
+                        "case {case}: {} has {got:?}, recomputed {want:?}; before {:?}; touched {:?}\nplaced:\n{}",
+                        text(&fact),
+                        previous(fact),
+                        touched.iter().map(text).collect::<Vec<_>>(),
+                        shown.join("\n")
+                    );
+                }
+            }
+            updated += 1;
+        }
+        assert!(updated > cases / 4, "updated {updated}, refused {refused}");
+    }
+
     /// Random ontologies under random insert/delete sequences: after every change, the
     /// inferred facts the delta executor maintains equal a rematerialisation, and the
     /// violations it reports are exactly the new ones.

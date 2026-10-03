@@ -326,6 +326,17 @@ impl StoreService {
         }
     }
 
+    /// Inferred statements under graph access ([`crate::support`]): the mutation pipeline
+    /// reports its commits to it.
+    pub(crate) fn supports(&self) -> &crate::support::Supports {
+        &self.supports
+    }
+
+    /// How the support graph sets of [`Self::read_snapshot`] were obtained so far.
+    pub fn support_statistics(&self) -> crate::support::SupportStatistics {
+        self.supports.statistics()
+    }
+
     /// The rules the inferred stack is maintained with (reasoner v2; `None`: none), for
     /// the support graph sets of [`Self::read_snapshot`]. The mutation pipeline registers
     /// its own.

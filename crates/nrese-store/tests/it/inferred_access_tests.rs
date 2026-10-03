@@ -153,3 +153,85 @@ fn without_rules_nothing_inferred_is_shown() {
     assert!(classes(&store, &reader(true), "a").is_empty());
     assert_eq!(classes(&store, &reader(false), "a"), ["<D>", "<E>", "<F>"]);
 }
+
+/// Commits through the mutation pipeline update the sets instead of computing them
+/// afresh: after every commit, a reader sees what a store forced to compute them sees.
+#[test]
+fn updated_sets_equal_fresh_ones_across_commits() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester};
+    let pipeline = || {
+        MutationPipeline::new(
+            Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Rl,
+            ))),
+        )
+    };
+    let (updating, fresh) = (pipeline(), pipeline());
+    let apply = |pipeline: &MutationPipeline, update: &str| {
+        pipeline
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                    "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                     PREFIX owl: <http://www.w3.org/2002/07/owl#> {update}"
+                ))),
+                &Requester::all(),
+                &MutationTicket::new(),
+            )
+            .unwrap();
+    };
+    let commits = [
+        "INSERT DATA { ex:C rdfs:subClassOf ex:D . ex:D rdfs:subClassOf ex:E .
+                       ex:anc a owl:TransitiveProperty .
+                       GRAPH ex:open { ex:a a ex:C . ex:x ex:anc ex:y }
+                       GRAPH ex:secret { ex:b a ex:C . ex:y ex:anc ex:z } }",
+        "INSERT DATA { GRAPH ex:open { ex:c a ex:C } }",
+        "INSERT DATA { GRAPH ex:secret { ex:c a ex:C . ex:z ex:anc ex:w } }",
+        "DELETE DATA { GRAPH ex:open { ex:c a ex:C } }",
+        "DELETE DATA { GRAPH ex:secret { ex:b a ex:C } } ;
+         INSERT DATA { GRAPH ex:open { ex:b a ex:C . ex:y ex:anc ex:z } }",
+        "DELETE DATA { GRAPH ex:open { ex:x ex:anc ex:y } }",
+        "INSERT DATA { GRAPH ex:open { ex:x ex:anc ex:y } GRAPH ex:new { ex:d a ex:D } }",
+        // A schema change: computed afresh.
+        "INSERT DATA { GRAPH ex:open { ex:D rdfs:subClassOf ex:F } }",
+        "DELETE DATA { GRAPH ex:secret { ex:c a ex:C } }",
+    ];
+    let reader = reader(true);
+    let seen = |pipeline: &MutationPipeline| -> Vec<String> {
+        ["a", "b", "c", "d", "x", "y", "z"]
+            .iter()
+            .flat_map(|s| {
+                classes(pipeline.store(), &reader, s)
+                    .into_iter()
+                    .map(move |c| format!("{s} a {c}"))
+            })
+            .chain(
+                select(
+                    pipeline.store(),
+                    &reader,
+                    "SELECT ?s ?o WHERE { ?s ex:anc ?o }",
+                )
+                .lines()
+                .filter(|line| line.contains("example.com"))
+                .map(str::to_owned),
+            )
+            .collect()
+    };
+    for (step, commit) in commits.iter().enumerate() {
+        apply(&updating, commit);
+        apply(&fresh, commit);
+        // Forget the fresh store's sets: they are computed again.
+        fresh
+            .store()
+            .use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+        assert_eq!(
+            seen(&updating),
+            seen(&fresh),
+            "after commit {step}: {commit}"
+        );
+    }
+    let statistics = updating.store().support_statistics();
+    assert!(statistics.updated >= 6, "{statistics:?}");
+    assert!(statistics.computed >= 2, "{statistics:?}");
+}
