@@ -380,6 +380,49 @@ fn rng(seed: u64) -> impl FnMut(u64) -> u64 {
     }
 }
 
+/// A domain over a non-simple role goes through the role's automaton, as a range does:
+/// engines don't add the edges a chain or transitivity implies, so a raw
+/// `R(x, y) → C(x)` would miss them. The models test below can't see that, since its
+/// interpretations are closed under the role inclusions. (Found by the context core's EL
+/// gate on 3 October 2026: `C4 ≡ ∃p1.C1`, `Range(p1) = ∃p2.C3`, `p1 ∘ p2 ⊑ p2`,
+/// `Domain(p2) = C3 ⊓ C5` lost `C4 ⊑ C3`.)
+#[test]
+fn a_domain_over_a_non_simple_role_goes_through_its_automaton() {
+    let (class, role) = (0, 10);
+    let mut o = Ontology::default();
+    let c = o.classes.intern(ClassExpr::Class(class));
+    o.axioms = vec![
+        Axiom::Declaration(EntityKind::Class, class),
+        Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(role)),
+        Axiom::ObjectPropertyDomain(ObjProp::Named(role), ExprId(c)),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let normalised = normalise_with(&o, Options::default());
+    let raw = normalised.clauses.iter().any(|clause| {
+        clause
+            .body
+            .iter()
+            .any(|b| matches!(b, BodyAtom::Role(r, ..) if *r == role))
+            && clause
+                .head
+                .iter()
+                .any(|h| matches!(h, HeadAtom::Concept(Concept::Named(x), _) if *x == class))
+    });
+    assert!(
+        !raw,
+        "a raw domain clause on a transitive role: {:#?}",
+        normalised.clauses
+    );
+    assert!(
+        normalised.clauses.iter().any(|clause| clause
+            .head
+            .iter()
+            .any(|h| matches!(h, HeadAtom::Concept(Concept::Fresh(_), _)))),
+        "the domain isn't routed through a fresh name or automaton state: {:#?}",
+        normalised.clauses
+    );
+}
+
 #[test]
 fn clauses_and_ontologies_have_the_same_models() {
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
