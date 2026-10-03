@@ -363,17 +363,20 @@ fn merge_rows(
     let (mut lefts, mut rights): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     let mut pending = 0;
     let (mut l, end) = (rows.start, rows.end);
-    // The pairs of the runs `l..l_end` and `r..r_end` (one key value).
+    // The pairs of the runs `l..l_end` and `r..r_end` (one key value). Each left row's
+    // pairs are charged before they are made, so a join over its limit (or cancelled)
+    // stops within a step instead of after expanding the whole group (the review of
+    // 3 October 2026, P1).
     let mut pair = |l: usize, l_end: usize, r: usize, r_end: usize| {
         for li in l..l_end {
+            pending += r_end - r;
+            if pending >= LIMIT_STEP {
+                limit.grow(std::mem::take(&mut pending))?;
+            }
             for ri in r..r_end {
                 lefts.push(li as u32);
                 rights.push(ri as u32);
             }
-        }
-        pending += (l_end - l) * (r_end - r);
-        if pending >= LIMIT_STEP {
-            limit.grow(std::mem::take(&mut pending))?;
         }
         Ok(())
     };
@@ -600,6 +603,11 @@ fn sorted_left_join(
         }
         let r_end = (r..b.len()).find(|&x| b[x] != key).unwrap_or(b.len());
         for li in l..l_end {
+            // Charged before the pairs are made, as in `merge_rows`.
+            pending += (r_end - r).max(1);
+            if pending >= LIMIT_STEP {
+                limit.grow(std::mem::take(&mut pending))?;
+            }
             if r == r_end {
                 lefts.push(li as u32);
                 rights.push(END);
@@ -608,10 +616,6 @@ fn sorted_left_join(
                 lefts.push(li as u32);
                 rights.push(ri as u32);
             }
-        }
-        pending += (l_end - l) * (r_end - r).max(1);
-        if pending >= LIMIT_STEP {
-            limit.grow(std::mem::take(&mut pending))?;
         }
         l = l_end;
         r = r_end;
