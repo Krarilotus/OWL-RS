@@ -272,9 +272,84 @@ fn tokens(text: &str) -> (HashMap<String, u16>, u16) {
     (counts, length)
 }
 
+/// The version of [`TextIndex::write`]'s layout.
+const TEXT_FORMAT: u32 = 1;
+
+/// Lengths written per piece.
+const LENGTH_PIECE: usize = 1 << 16;
+
 impl TextIndex {
     pub(crate) fn covered(&self) -> u64 {
         self.covered
+    }
+
+    /// The index as bytes ([`super::derived`]); the stem maps are left out (built again
+    /// per language at the first stemmed search).
+    pub(crate) fn write<W: std::io::Write>(
+        &self,
+        out: &mut super::derived::Writer<W>,
+    ) -> std::io::Result<()> {
+        out.u32(TEXT_FORMAT)?;
+        out.u64(self.covered)?;
+        out.u64(self.documents)?;
+        out.u64(self.total_words)?;
+        out.u64(self.word_count as u64)?;
+        out.u64(self.lengths.len() as u64)?;
+        for piece in self.lengths.chunks(LENGTH_PIECE) {
+            let bytes: Vec<u8> = piece.iter().flat_map(|l| l.to_le_bytes()).collect();
+            out.bytes(&bytes)?;
+        }
+        for shard in &self.shards {
+            out.u64(shard.len() as u64)?;
+            for (word, postings) in shard {
+                out.blob(word.as_bytes())?;
+                out.u64(postings.last)?;
+                out.u32(postings.len)?;
+                out.blob(&postings.bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The index [`Self::write`] wrote; `None` if the bytes aren't one.
+    pub(crate) fn read(input: &mut super::derived::Reader<'_>) -> Option<Self> {
+        if input.u32()? != TEXT_FORMAT {
+            return None;
+        }
+        let covered = input.u64()?;
+        let documents = input.u64()?;
+        let total_words = input.u64()?;
+        let word_count = usize::try_from(input.u64()?).ok()?;
+        let n = input.len(2)?;
+        let lengths: Vec<u16> = input
+            .bytes(n * 2)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
+            .collect();
+        let mut shards = Vec::with_capacity(SHARDS);
+        for _ in 0..SHARDS {
+            let words = input.len(1)?;
+            let mut shard = BTreeMap::new();
+            for _ in 0..words {
+                let word = std::str::from_utf8(input.blob()?).ok()?;
+                let last = input.u64()?;
+                let len = input.u32()?;
+                let bytes = input.blob()?.to_vec();
+                shard.insert(Box::from(word), Postings { bytes, last, len });
+            }
+            shards.push(shard);
+        }
+        input.is_done().then_some(Self {
+            covered,
+            shards,
+            lengths,
+            documents,
+            total_words,
+            word_count,
+            stems: HashMap::new(),
+        })
     }
 
     fn record_length(&mut self, document: u64, length: u16) {

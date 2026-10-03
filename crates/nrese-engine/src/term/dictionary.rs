@@ -66,6 +66,8 @@ pub struct DictionaryStats {
     pub mapped_bytes: u64,
     /// The vector index: the vectors and their graphs ([`super::vectors`]).
     pub vector_bytes: u64,
+    /// Derived indexes read from their files since start ([`super::derived`]).
+    pub derived_loaded: u64,
 }
 
 /// Dictionary entries `0..len` in a mapped checkpoint: their keys one after another, the
@@ -354,13 +356,37 @@ pub struct Dictionary {
     triples: RwLock<TripleIndex>,
     /// The vector literals, built at the first vector search and extended at later ones
     /// ([`super::vectors`]).
-    vectors: RwLock<super::vectors::VectorIndex>,
+    vectors: std::sync::Arc<RwLock<super::vectors::VectorIndex>>,
     /// The text order of the entries the mapped base doesn't order ([`super::order`]).
     order: RwLock<super::order::TextOrder>,
     /// Integer-derived literals (`xsd:int`, ...) are dictionary entries, not inline
     /// ([`TermKind::DerivedInteger`]): stores created before that kind keep them so.
     integers_in_dictionary: std::sync::atomic::AtomicBool,
+    /// Where the derived indexes are kept, and what of them was loaded and saved
+    /// ([`super::derived`]).
+    derived: Derived,
 }
+
+/// The derived indexes' files.
+#[derive(Default)]
+struct Derived {
+    /// `derived/` of a durable store's directory; none in memory.
+    dir: RwLock<Option<std::path::PathBuf>>,
+    /// Per index ([`TEXT`], [`IRI_TEXT`], [`VECTORS`]): whether its file was looked for.
+    looked: [std::sync::atomic::AtomicBool; 3],
+    /// Per index: the entries the last file written covered, and for the vectors the
+    /// vectors their graphs covered.
+    saved: parking_lot::Mutex<[u64; 3]>,
+    saved_graphs: parking_lot::Mutex<usize>,
+    /// Indexes read from their files.
+    loads: std::sync::atomic::AtomicU64,
+}
+
+/// The derived indexes, by position in [`Derived`] and by file name.
+const TEXT: usize = 0;
+const IRI_TEXT: usize = 1;
+const VECTORS: usize = 2;
+const DERIVED_NAMES: [&str; 3] = ["text", "iri-text", "vectors"];
 
 impl std::fmt::Debug for Dictionary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -371,6 +397,177 @@ impl std::fmt::Debug for Dictionary {
 }
 
 impl Dictionary {
+    /// Keeps the derived indexes in `dir` (a durable store's `derived/`): they are read
+    /// from there at their first use and written there by [`Self::save_derived`].
+    pub(crate) fn set_derived_dir(&self, dir: std::path::PathBuf) {
+        *self.derived.dir.write() = Some(dir);
+    }
+
+    /// A fingerprint of entries `0..covered`: their count and the hashes of the keys of
+    /// the first, the middle and the last. `None` if the dictionary holds fewer.
+    fn fingerprint(&self, covered: u64) -> Option<u64> {
+        let inner = self.inner.read();
+        if covered > inner.len() {
+            return None;
+        }
+        let mut fingerprint = key_hash(&covered.to_le_bytes());
+        if covered > 0 {
+            for index in [0, covered / 2, covered - 1] {
+                fingerprint = key_hash(
+                    &[
+                        fingerprint.to_le_bytes(),
+                        key_hash(&inner.key(index)).to_le_bytes(),
+                    ]
+                    .concat(),
+                );
+            }
+        }
+        Some(fingerprint)
+    }
+
+    /// The text index `which` from its file, before its first use after a start (if the
+    /// file is there and fits this dictionary).
+    fn load_text(&self, which: usize, slot: &RwLock<super::text::TextIndex>) {
+        use std::sync::atomic::Ordering;
+        if self.derived.looked[which].swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(dir) = self.derived.dir.read().clone() else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let Some((covered, loaded)) = super::derived::load(&dir, DERIVED_NAMES[which], |covered| {
+            self.fingerprint(covered)
+        }) else {
+            return;
+        };
+        let Some(index) = super::text::TextIndex::read(&mut loaded.reader())
+            .filter(|index| index.covered() == covered)
+        else {
+            tracing::warn!(
+                index = DERIVED_NAMES[which],
+                "derived index unreadable; built anew"
+            );
+            return;
+        };
+        let mut slot = slot.write();
+        if slot.covered() < covered {
+            *slot = index;
+            self.derived.saved.lock()[which] = covered;
+            self.derived
+                .loads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                index = DERIVED_NAMES[which],
+                covered,
+                ms = started.elapsed().as_millis() as u64,
+                "derived index loaded"
+            );
+        }
+    }
+
+    /// The vector index from its file, before its first use after a start.
+    fn load_vectors(&self) {
+        use std::sync::atomic::Ordering;
+        if self.derived.looked[VECTORS].swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(dir) = self.derived.dir.read().clone() else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let Some((covered, loaded)) =
+            super::derived::load(&dir, DERIVED_NAMES[VECTORS], |covered| {
+                self.fingerprint(covered)
+            })
+        else {
+            return;
+        };
+        let Some(index) = super::vectors::VectorIndex::read(&mut loaded.reader())
+            .filter(|index| index.covered() == covered)
+        else {
+            tracing::warn!("vector index unreadable; built anew");
+            return;
+        };
+        let mut slot = self.vectors.write();
+        if slot.covered() < covered {
+            *self.derived.saved_graphs.lock() = index.graph_coverage();
+            *slot = index;
+            self.derived.saved.lock()[VECTORS] = covered;
+            self.derived
+                .loads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                covered,
+                ms = started.elapsed().as_millis() as u64,
+                "vector index loaded"
+            );
+        }
+    }
+
+    /// Writes the derived indexes that cover more entries than their files do (a durable
+    /// store, after a checkpoint). Errors are logged: the indexes are built anew if the
+    /// files are missing.
+    pub(crate) fn save_derived(&self) {
+        let Some(dir) = self.derived.dir.read().clone() else {
+            return;
+        };
+        for (which, slot) in [(TEXT, &self.text), (IRI_TEXT, &self.iri_text)] {
+            let index = slot.read();
+            let covered = index.covered();
+            if covered == 0 || covered <= self.derived.saved.lock()[which] {
+                continue;
+            }
+            let Some(fingerprint) = self.fingerprint(covered) else {
+                continue;
+            };
+            let started = std::time::Instant::now();
+            match super::derived::save(&dir, DERIVED_NAMES[which], covered, fingerprint, |out| {
+                index.write(out)
+            }) {
+                Ok(()) => {
+                    self.derived.saved.lock()[which] = covered;
+                    tracing::info!(
+                        index = DERIVED_NAMES[which],
+                        covered,
+                        ms = started.elapsed().as_millis() as u64,
+                        "derived index written"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(index = DERIVED_NAMES[which], %error, "derived index not written");
+                }
+            }
+        }
+        // The vectors: when they or their graphs cover more than the file does.
+        let index = self.vectors.read();
+        let covered = index.covered();
+        let graphs = index.graph_coverage();
+        let newer = covered > self.derived.saved.lock()[VECTORS]
+            || graphs > *self.derived.saved_graphs.lock();
+        if covered == 0 || !newer || index.is_empty() {
+            return;
+        }
+        let Some(fingerprint) = self.fingerprint(covered) else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        match super::derived::save(&dir, DERIVED_NAMES[VECTORS], covered, fingerprint, |out| {
+            index.write(out)
+        }) {
+            Ok(()) => {
+                self.derived.saved.lock()[VECTORS] = covered;
+                *self.derived.saved_graphs.lock() = graphs;
+                tracing::info!(
+                    covered,
+                    ms = started.elapsed().as_millis() as u64,
+                    "vector index written"
+                );
+            }
+            Err(error) => tracing::warn!(%error, "vector index not written"),
+        }
+    }
+
     /// Number of dictionary entries (inline terms are not counted).
     pub fn len(&self) -> u64 {
         self.inner.read().len()
@@ -409,6 +606,10 @@ impl Dictionary {
         let base = inner.base.as_ref();
         DictionaryStats {
             vector_bytes: self.vectors.read().memory_bytes() as u64,
+            derived_loaded: self
+                .derived
+                .loads
+                .load(std::sync::atomic::Ordering::Relaxed),
             terms: inner.len(),
             arena_bytes: inner.bytes.len() as u64 + base.map_or(0, |b| b.arena.len() as u64),
             // A slot is the stored index plus one control byte.
@@ -543,6 +744,7 @@ impl Dictionary {
     /// The string literals matching `query`, best first; the text index first takes in the
     /// terms interned since the last search.
     pub fn text_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+        self.load_text(TEXT, &self.text);
         if self.text.read().covered() < self.len() {
             let mut text = self.text.write();
             let inner = self.inner.read();
@@ -601,6 +803,43 @@ impl Dictionary {
         known: u64,
         accept: &(dyn Fn(TermId) -> bool + Sync),
     ) -> (Vec<nrese_vector::Hit>, super::VectorSearchReport) {
+        self.cover_vectors();
+        if self.vectors.read().may_need_work(query) {
+            let work = self.vectors.write().work_for(query);
+            match work {
+                super::vectors::Work::None => {}
+                super::vectors::Work::Now => super::vectors::build(&self.vectors, query),
+                super::vectors::Work::Background => super::vectors::build_in_background(
+                    std::sync::Arc::clone(&self.vectors),
+                    query.clone(),
+                ),
+            }
+        }
+        let accept = |raw: u64| {
+            let id = TermId::from_raw(raw);
+            id.payload() < known && accept(id)
+        };
+        self.vectors.read().search(query, &accept)
+    }
+
+    /// Builds the graph a search like `query` uses, covering every vector, before
+    /// returning (a warm-up; searches build it themselves, large ones in the background).
+    pub fn prepare_vector_graph(&self, query: &super::VectorQuery) {
+        self.cover_vectors();
+        let strategy = super::VectorStrategy::Approximate;
+        let query = super::VectorQuery {
+            strategy,
+            ..query.clone()
+        };
+        if self.vectors.read().may_need_work(&query) {
+            super::vectors::build(&self.vectors, &query);
+        }
+    }
+
+    /// The vector index, from its file at the first use, then with the vector literals
+    /// interned since.
+    fn cover_vectors(&self) {
+        self.load_vectors();
         if self.vectors.read().covered() < self.len() {
             let mut vectors = self.vectors.write();
             let inner = self.inner.read();
@@ -626,14 +865,6 @@ impl Dictionary {
                 start = stop;
             }
         }
-        if self.vectors.read().needs_graph(query) {
-            self.vectors.write().prepare_graph(query);
-        }
-        let accept = |raw: u64| {
-            let id = TermId::from_raw(raw);
-            id.payload() < known && accept(id)
-        };
-        self.vectors.read().search(query, &accept)
     }
 
     /// Bytes of the vector index.
@@ -645,6 +876,7 @@ impl Dictionary {
     /// in the IRIs interned since the last search.
     pub fn iri_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
         use rayon::prelude::*;
+        self.load_text(IRI_TEXT, &self.iri_text);
         if self.iri_text.read().covered() < self.len() {
             let mut text = self.iri_text.write();
             let inner = self.inner.read();

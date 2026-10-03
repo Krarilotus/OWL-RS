@@ -1007,6 +1007,13 @@ impl Snapshot {
         (hits, report)
     }
 
+    /// Builds the graph searches like `query` use, covering every vector of its
+    /// dimension, before returning: a warm-up (searches build it themselves, a large one
+    /// on a thread of its own while they scan exactly).
+    pub fn prepare_vector_graph(&self, query: &crate::VectorQuery) {
+        self.dictionary.prepare_vector_graph(query);
+    }
+
     /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
     /// first (whether statements still use them is the caller's to check).
     pub fn iri_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
