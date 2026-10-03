@@ -138,6 +138,17 @@ pub async fn admin_image_backup(
     admin_dataset::image_backup(state, repository).await
 }
 
+/// An image backup of the repository the path names, into `backups/` of the data
+/// directory.
+pub async fn repository_image_backup(
+    authenticated: crate::auth::Authenticated,
+    Repository(state): Repository,
+) -> Result<Response, ApiError> {
+    guard::enforce_admin_write(&state, &authenticated).await?;
+    let id = state.repository_id().to_owned();
+    admin_dataset::image_backup(state, &id).await
+}
+
 pub async fn admin_restore_dataset(
     authenticated: crate::auth::Authenticated,
     Repository(state): Repository,

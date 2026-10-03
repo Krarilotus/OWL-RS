@@ -6,7 +6,7 @@ use crate::state::AppState;
 
 pub const USER_CONSOLE_PATH: &str = "/console";
 pub const OPERATOR_UI_PATH: &str = "/ops";
-pub const REASONING_DIAGNOSTICS_PATH: &str = "/ops/api/diagnostics/reasoning";
+pub const REASONING_DIAGNOSTICS_PATH: &str = "/api/v1/repositories/nrese/reasoning";
 pub const QUERY_ENDPOINT: &str = "/dataset/query";
 pub const UPDATE_ENDPOINT: &str = "/dataset/update";
 /// Queries and updates on one URL (also served at `/dataset`).
@@ -14,10 +14,10 @@ pub const SPARQL_ENDPOINT: &str = "/dataset/sparql";
 pub const TELL_ENDPOINT: &str = "/dataset/tell";
 pub const GRAPH_STORE_ENDPOINT: &str = "/dataset/data";
 pub const SHACL_ENDPOINT: &str = "/dataset/shacl";
-pub const ADMIN_BACKUP_ENDPOINT: &str = "/ops/api/admin/dataset/backup";
-pub const ADMIN_RESTORE_ENDPOINT: &str = "/ops/api/admin/dataset/restore";
-pub const AI_STATUS_ENDPOINT: &str = "/api/ai/status";
-pub const AI_QUERY_SUGGESTIONS_ENDPOINT: &str = "/api/ai/query-suggestions";
+pub const ADMIN_BACKUP_ENDPOINT: &str = "/api/v1/repositories/nrese/backup";
+pub const ADMIN_RESTORE_ENDPOINT: &str = "/api/v1/repositories/nrese/restore";
+pub const AI_STATUS_ENDPOINT: &str = "/api/v1/ai/status";
+pub const AI_QUERY_SUGGESTIONS_ENDPOINT: &str = "/api/v1/ai/query-suggestions";
 pub const SERVICE_DESCRIPTION_ENDPOINT: &str = "/dataset/service-description";
 pub const VERSION_ENDPOINT: &str = "/version";
 pub const HEALTH_ENDPOINT: &str = "/healthz";

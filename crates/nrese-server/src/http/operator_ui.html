@@ -441,8 +441,8 @@ ex:graphSubject ex:graphPredicate ex:graphObject .</textarea>
       statusLine.textContent = "Refreshing runtime snapshot...";
       try {
         const [summaryRes, capabilitiesRes] = await Promise.all([
-          fetch(apiPath("/ops/api/health/extended")),
-          fetch(apiPath("/ops/api/capabilities"))
+          fetch(apiPath("/api/v1/health")),
+          fetch(apiPath("/api/v1/capabilities"))
         ]);
 
         if (!summaryRes.ok) {

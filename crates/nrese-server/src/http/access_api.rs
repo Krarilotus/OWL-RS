@@ -649,7 +649,7 @@ pub async fn logout(
     }
 }
 
-#[utoipa::path(get, path = "/api/v1/queries", tag = "queries",
+#[utoipa::path(get, path = "/api/v1/saved-queries", tag = "queries",
     responses((status = 200, description = "The saved queries the requester may read, by space and name", body = Vec<nrese_store::access::SavedQuery>)))]
 /// The saved queries in the spaces the requester reads: its personal space, those shared
 /// with it, its workspaces (administrators: all).
@@ -661,7 +661,7 @@ pub async fn saved_queries(
     Ok(Json(state.access().saved_queries(&by)).into_response())
 }
 
-#[utoipa::path(get, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+#[utoipa::path(get, path = "/api/v1/saved-queries/{space}/{name}", tag = "queries",
     params(("space" = String, Path, description = "A personal space (`~alice`) or a workspace"), ("name" = String, Path)),
     responses((status = 200, description = "The saved query", body = nrese_store::access::SavedQuery),
         (status = 404, description = "None the requester may read", body = crate::http::openapi::Problem)))]
@@ -675,7 +675,7 @@ pub async fn saved_query(
     Ok(Json(state.access().saved_query(&by, &space, &name)?).into_response())
 }
 
-#[utoipa::path(put, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+#[utoipa::path(put, path = "/api/v1/saved-queries/{space}/{name}", tag = "queries",
     params(("space" = String, Path, description = "A personal space (`~alice`) or a workspace"), ("name" = String, Path, description = "Letters, digits, `.`, `_`, `-`")),
     request_body = nrese_store::access::QueryDraft,
     responses((status = 200, description = "Saved", body = nrese_store::access::SavedQuery),
@@ -708,7 +708,7 @@ pub async fn saved_query_put(
     Ok(Json(saved).into_response())
 }
 
-#[utoipa::path(delete, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+#[utoipa::path(delete, path = "/api/v1/saved-queries/{space}/{name}", tag = "queries",
     params(("space" = String, Path), ("name" = String, Path)),
     responses((status = 204, description = "Removed"),
         (status = 403, description = "Not an editor or owner of the space", body = crate::http::openapi::Problem),
