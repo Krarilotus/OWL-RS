@@ -423,6 +423,50 @@ fn a_domain_over_a_non_simple_role_goes_through_its_automaton() {
     );
 }
 
+/// A transition of a role's automaton names the role inclusions of its edge with the
+/// universal it encodes: a justification through a role hierarchy needs them. (Found by
+/// the context core's proof test on 3 October 2026: `C1 ⊑ ∃p0.(C0 ⊓ C2)`, `p0 ⊑ p2`,
+/// `Transitive(p2)`, `Domain(p2) = C2` gave `C1 ⊑ C2` a justification without `p0 ⊑ p2`.)
+#[test]
+fn automaton_transitions_need_their_role_inclusions() {
+    let (c0, c1, c2, p0, p2) = (0, 1, 2, 10, 12);
+    let mut o = Ontology::default();
+    let class = |o: &mut Ontology, c| ExprId(o.classes.intern(ClassExpr::Class(c)));
+    let (e0, e1, e2) = (class(&mut o, c0), class(&mut o, c1), class(&mut o, c2));
+    let both = ExprId(o.classes.intern(ClassExpr::And(vec![e0, e2])));
+    let some = ExprId(o.classes.intern(ClassExpr::Some(ObjProp::Named(p0), both)));
+    o.axioms = vec![
+        Axiom::SubClassOf(e1, some),
+        Axiom::SubObjectPropertyOf(vec![ObjProp::Named(p0)], ObjProp::Named(p2)),
+        Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(p2)),
+        Axiom::ObjectPropertyDomain(ObjProp::Named(p2), e2),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let inclusion = 1;
+    let normalised = normalise_with(&o, Options::default());
+    let p0_transitions: Vec<&Clause> = normalised
+        .clauses
+        .iter()
+        .filter(|clause| {
+            clause
+                .body
+                .iter()
+                .any(|b| matches!(b, BodyAtom::Role(r, ..) if *r == p0))
+                && clause
+                    .head
+                    .iter()
+                    .all(|h| matches!(h, HeadAtom::Concept(Concept::Fresh(_), _)))
+        })
+        .collect();
+    assert!(!p0_transitions.is_empty(), "{:#?}", normalised.clauses);
+    for clause in p0_transitions {
+        assert!(
+            clause.sources.iter().all(|set| set.contains(&inclusion)),
+            "a p0-transition of p2's automaton without p0 ⊑ p2: {clause:?}"
+        );
+    }
+}
+
 #[test]
 fn clauses_and_ontologies_have_the_same_models() {
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
@@ -660,7 +704,7 @@ fn clauses_and_ontologies_have_the_same_models() {
         // Provenance: every clause comes from an axiom that can produce it.
         for clause in &normalised.clauses {
             assert!(!clause.sources.is_empty(), "{clause:?}");
-            for &s in &clause.sources {
+            for &s in clause.sources.iter().flatten() {
                 assert!(
                     !matches!(o.axioms[s], Axiom::Declaration(..)),
                     "a clause from a declaration: {clause:?}"
