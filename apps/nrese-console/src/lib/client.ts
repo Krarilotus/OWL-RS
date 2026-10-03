@@ -27,34 +27,22 @@ export class NreseClient {
   }
 
   async getRuntimeSnapshot(): Promise<RuntimeSnapshot> {
-    return fetchJson<RuntimeSnapshot>(
-      this.fetchImpl,
-      this.baseUrl,
-      NRESE_ENDPOINTS.runtimeSnapshot,
-    );
+    return this.json<RuntimeSnapshot>(NRESE_ENDPOINTS.runtimeSnapshot);
   }
 
   async getCapabilities(): Promise<Capabilities> {
-    return fetchJson<Capabilities>(
-      this.fetchImpl,
-      this.baseUrl,
-      NRESE_ENDPOINTS.capabilities,
-    );
+    return this.json<Capabilities>(NRESE_ENDPOINTS.capabilities);
   }
 
   /** The server advertises the diagnostics path at runtime, so any path is accepted. */
   async getReasoningDiagnostics(
     endpoint: string = NRESE_ENDPOINTS.reasoningDiagnostics,
   ): Promise<ReasoningDiagnostics> {
-    return fetchJson<ReasoningDiagnostics>(this.fetchImpl, this.baseUrl, endpoint);
+    return this.json<ReasoningDiagnostics>(endpoint);
   }
 
   async getAiStatus(): Promise<AiStatus> {
-    return fetchJson<AiStatus>(
-      this.fetchImpl,
-      this.baseUrl,
-      NRESE_ENDPOINTS.aiStatus,
-    );
+    return this.json<AiStatus>(NRESE_ENDPOINTS.aiStatus);
   }
 
   async getQuerySuggestions(payload: {
@@ -62,77 +50,49 @@ export class NreseClient {
     locale: string;
     current_query?: string;
   }): Promise<QuerySuggestionResponse> {
-    return fetchJson<QuerySuggestionResponse>(
-      this.fetchImpl,
-      this.baseUrl,
-      NRESE_ENDPOINTS.aiQuerySuggestions,
-      {
-        method: "POST",
-        headers: this.mergeHeaders({
-          "Content-Type": "application/json",
-        }),
-        body: JSON.stringify(payload),
-      },
-    );
+    return this.json<QuerySuggestionResponse>(NRESE_ENDPOINTS.aiQuerySuggestions, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
   }
 
   /** Resources whose labels' or local names' words begin with the words of `text`. */
   async autocomplete(text: string, limit = 10): Promise<AutocompleteResponse> {
     const params = new URLSearchParams({ q: text, limit: String(limit) });
-    return fetchJson<AutocompleteResponse>(
-      this.fetchImpl,
-      this.baseUrl,
+    return this.json<AutocompleteResponse>(
       `${NRESE_ENDPOINTS.autocomplete}?${params.toString()}`,
-      { headers: this.mergeHeaders() },
     );
   }
 
   async runQuery(query: string, accept: string) {
-    return fetchText(this.fetchImpl, this.baseUrl, NRESE_ENDPOINTS.query, {
+    return this.text(NRESE_ENDPOINTS.query, {
       method: "POST",
-      headers: this.mergeHeaders({
-        "Content-Type": "application/sparql-query",
-        Accept: accept,
-      }),
+      headers: { "Content-Type": "application/sparql-query", Accept: accept },
       body: query,
     });
   }
 
   async runUpdate(update: string) {
-    return fetchText(this.fetchImpl, this.baseUrl, NRESE_ENDPOINTS.update, {
+    return this.text(NRESE_ENDPOINTS.update, {
       method: "POST",
-      headers: this.mergeHeaders({
-        "Content-Type": "application/sparql-update",
-      }),
+      headers: { "Content-Type": "application/sparql-update" },
       body: update,
     });
   }
 
   async runTell(body: string, graphMode: GraphMode, graphIri: string) {
-    return fetchText(
-      this.fetchImpl,
-      this.baseUrl,
-      `${NRESE_ENDPOINTS.tell}${buildGraphQuery(graphMode, graphIri)}`,
-      {
-        method: "POST",
-        headers: this.mergeHeaders({
-          "Content-Type": "text/turtle",
-        }),
-        body,
-      },
-    );
+    return this.text(`${NRESE_ENDPOINTS.tell}${buildGraphQuery(graphMode, graphIri)}`, {
+      method: "POST",
+      headers: { "Content-Type": "text/turtle" },
+      body,
+    });
   }
 
   async readGraph(graphMode: GraphMode, graphIri: string) {
-    return fetchText(
-      this.fetchImpl,
-      this.baseUrl,
+    return this.text(
       `${NRESE_ENDPOINTS.graphStore}${buildGraphQuery(graphMode, graphIri)}`,
-      {
-        headers: this.mergeHeaders({
-          Accept: "text/turtle",
-        }),
-      },
+      { headers: { Accept: "text/turtle" } },
     );
   }
 
@@ -142,29 +102,34 @@ export class NreseClient {
     graphMode: GraphMode,
     graphIri: string,
   ) {
-    return fetchText(
-      this.fetchImpl,
-      this.baseUrl,
+    return this.text(
       `${NRESE_ENDPOINTS.graphStore}${buildGraphQuery(graphMode, graphIri)}`,
-      {
-        method,
-        headers: this.mergeHeaders({
-          "Content-Type": "text/turtle",
-        }),
-        body,
-      },
+      { method, headers: { "Content-Type": "text/turtle" }, body },
     );
   }
 
   async deleteGraph(graphMode: GraphMode, graphIri: string) {
-    return fetchText(
-      this.fetchImpl,
-      this.baseUrl,
+    return this.text(
       `${NRESE_ENDPOINTS.graphStore}${buildGraphQuery(graphMode, graphIri)}`,
-      {
-        method: "DELETE",
-      },
+      { method: "DELETE" },
     );
+  }
+
+  /** Every request goes through these two, so each carries the configured headers
+   * (authorisation, custom ones) under its own. */
+  private json<T>(path: string, init: RequestInit = {}): Promise<T> {
+    return fetchJson<T>(this.fetchImpl, this.baseUrl, path, this.withHeaders(init));
+  }
+
+  private text(path: string, init: RequestInit = {}) {
+    return fetchText(this.fetchImpl, this.baseUrl, path, this.withHeaders(init));
+  }
+
+  private withHeaders(init: RequestInit): RequestInit {
+    return {
+      ...init,
+      headers: this.mergeHeaders(init.headers as Record<string, string> | undefined),
+    };
   }
 
   private mergeHeaders(headers?: Record<string, string>): Record<string, string> {

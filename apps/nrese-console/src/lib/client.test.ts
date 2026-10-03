@@ -51,4 +51,38 @@ describe("NreseClient", () => {
     expect(fetchImpl.mock.calls[0]?.[0]).toBe("/dataset/autocomplete?q=albert+ein%26&limit=5");
     expect(response.suggestions[0]?.label).toBe("X");
   });
+
+  test("sends the configured headers with every request", async () => {
+    // The review of 3 October 2026 (C3): diagnostics reads and graph DELETE went without.
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } }),
+    );
+    const client = new NreseClient({
+      defaultHeaders: { Authorization: "Bearer token", "X-Tenant": "t1" },
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+
+    await client.getRuntimeSnapshot();
+    await client.getCapabilities();
+    await client.getReasoningDiagnostics();
+    await client.getAiStatus();
+    await client.getQuerySuggestions({ prompt: "p", locale: "en" });
+    await client.autocomplete("x");
+    await client.runQuery("ASK {}", "application/sparql-results+json");
+    await client.runUpdate("INSERT DATA {}");
+    await client.runTell("", "default", "");
+    await client.readGraph("default", "");
+    await client.writeGraph("PUT", "", "default", "");
+    await client.deleteGraph("default", "");
+
+    expect(fetchImpl).toHaveBeenCalledTimes(12);
+    for (const [input, init] of fetchImpl.mock.calls) {
+      expect(init?.headers, String(input)).toMatchObject({
+        Authorization: "Bearer token",
+        "X-Tenant": "t1",
+      });
+    }
+    // A method's own headers stay alongside.
+    expect(fetchImpl.mock.calls[11]?.[1]).toMatchObject({ method: "DELETE" });
+  });
 });
