@@ -348,6 +348,14 @@ pub fn eager_aggregation(pattern: &GraphPattern) -> GraphPattern {
     Plan::of(pattern).eager_aggregation().lower()
 }
 
+/// [`Plan::eager_aggregation_where`] applied to `pattern`.
+pub fn eager_aggregation_where(
+    pattern: &GraphPattern,
+    pays: &dyn Fn(&Plan, &[Variable]) -> bool,
+) -> GraphPattern {
+    Plan::of(pattern).eager_aggregation_where(pays).lower()
+}
+
 impl Plan {
     /// Whether an ORDER BY inside fixes the order of its rows (as the executor's sideways
     /// join sees it: it keeps that order through joins).
@@ -526,7 +534,16 @@ impl Plan {
     /// `B` share a variable (with none, an empty `B` would still leave one partial row).
     /// Other aggregates leave the group as it is.
     pub fn eager_aggregation(self) -> Self {
-        let plan = self.map_inputs(&mut Self::eager_aggregation);
+        self.eager_aggregation_where(&|_, _| true)
+    }
+
+    /// [`Self::eager_aggregation`] where `pays(side, keys)` says that aggregating `side`
+    /// by `keys` first reduces it: a decision for the store's statistics. When each key
+    /// value has about one row on that side, the early group reduces nothing and the plan
+    /// pays for it twice (an extra group, and a join with the other side's rows); the
+    /// planner asks for at least two rows per key value.
+    pub fn eager_aggregation_where(self, pays: &dyn Fn(&Plan, &[Variable]) -> bool) -> Self {
+        let plan = self.map_inputs(&mut |p: Self| p.eager_aggregation_where(pays));
         let Self::Group {
             input,
             keys,
@@ -535,7 +552,7 @@ impl Plan {
         else {
             return plan;
         };
-        match pre_aggregated(&input, &keys, &aggregates) {
+        match pre_aggregated(&input, &keys, &aggregates, pays) {
             Some(rewritten) => rewritten,
             None => Self::Group {
                 input,
@@ -646,6 +663,7 @@ fn pre_aggregated(
     input: &Plan,
     keys: &[Variable],
     aggregates: &[(Variable, AggregateExpression)],
+    pays: &dyn Fn(&Plan, &[Variable]) -> bool,
 ) -> Option<Plan> {
     use nrese_sparql_syntax::algebra::AggregateFunction;
     let Plan::Join(inputs) = input else {
@@ -710,6 +728,10 @@ fn pre_aggregated(
         }
     }
     if shared.is_empty() {
+        return None;
+    }
+    let side = Plan::Join(without.iter().map(|p| (*p).clone()).collect());
+    if !pays(&side, &shared) {
         return None;
     }
     // Names for the partial results that nothing in the group uses.
