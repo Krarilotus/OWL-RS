@@ -21,15 +21,10 @@ use hashbrown::HashMap;
 use super::engine::Engine;
 use super::graph::{NONE, flag};
 
-/// A node's blocking signature: sorted concepts, then (pairwise) the parent's, and the
-/// roles towards and from the parent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-struct Signature {
-    label: Vec<u32>,
-    parent: Vec<u32>,
-    up: Vec<u32>,
-    down: Vec<u32>,
-}
+/// A node's blocking signature, flat: its sorted concepts, then (pairwise) the
+/// parent's, the roles towards the parent and those from it, each part preceded by its
+/// length.
+type Signature = Vec<u32>;
 
 /// A cached signature with what it was read from.
 #[derive(Debug, Clone, Default)]
@@ -50,6 +45,8 @@ pub struct Blocking {
     table: HashMap<u128, Vec<u32>>,
     /// How many nodes the last pass saw.
     extent: u32,
+    /// The cached signatures' bytes (for the memory budget).
+    pub bytes: usize,
 }
 
 impl Engine<'_> {
@@ -68,31 +65,32 @@ impl Engine<'_> {
     }
 
     fn signature(&self, n: u32, pairwise: bool) -> Signature {
-        let mut label: Vec<u32> = self.g.labels(n).map(|f| f.concept).collect();
-        label.sort_unstable();
-        let mut sig = Signature {
-            label,
-            ..Signature::default()
-        };
+        fn part(sig: &mut Signature, items: impl Iterator<Item = u32>) {
+            let at = sig.len();
+            sig.push(0);
+            sig.extend(items);
+            sig[at + 1..].sort_unstable();
+            sig[at] = (sig.len() - at - 1) as u32;
+        }
+        let mut sig = Signature::new();
+        part(&mut sig, self.g.labels(n).map(|f| f.concept));
         if pairwise {
             let p = self.g.nodes[n as usize].parent;
-            sig.parent = self.g.labels(p).map(|f| f.concept).collect();
-            sig.parent.sort_unstable();
-            sig.up = self
+            part(&mut sig, self.g.labels(p).map(|f| f.concept));
+            let up = self
                 .g
                 .out_edges(n)
                 .filter(|(_, e)| e.to == p)
-                .map(|(_, e)| e.role)
-                .collect();
-            sig.up.sort_unstable();
-            sig.down = self
+                .map(|(_, e)| e.role);
+            part(&mut sig, up);
+            let down = self
                 .g
                 .in_edges(n)
                 .filter(|(_, e)| e.from == p)
-                .map(|(_, e)| e.role)
-                .collect();
-            sig.down.sort_unstable();
+                .map(|(_, e)| e.role);
+            part(&mut sig, down);
         }
+        sig.shrink_to_fit();
         sig
     }
 
@@ -113,8 +111,10 @@ impl Engine<'_> {
         let mut h = std::hash::DefaultHasher::new();
         sig.hash(&mut h);
         let low = h.finish();
-        sig.label.len().hash(&mut h);
+        sig.len().hash(&mut h);
         let hash = (u128::from(h.finish()) << 64) | u128::from(low);
+        let old = self.blocking.cache[index].sig.capacity();
+        self.blocking.bytes = (self.blocking.bytes + sig.capacity() * 4).saturating_sub(old * 4);
         self.blocking.cache[index] = Cached {
             generation,
             heads,

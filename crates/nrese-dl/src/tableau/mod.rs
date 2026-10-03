@@ -59,6 +59,8 @@ pub struct Config {
     /// The most nodes a run may create at once.
     pub max_nodes: usize,
     pub timeout: Option<Duration>,
+    /// The most memory a run may hold (its tables, indexes and arenas), in bytes.
+    pub max_memory: usize,
     /// Keep the model a consistent run found ([`Outcome::model`]).
     pub keep_model: bool,
     /// `≤ n` up to this `n` is spelled out in clauses; above it, at-most atoms
@@ -76,6 +78,7 @@ impl Default for Config {
             disjunctions_first: false,
             max_nodes: 2_000_000,
             timeout: None,
+            max_memory: 4 << 30,
             keep_model: false,
             expand_at_most_up_to: Options::default().expand_at_most_up_to,
         }
@@ -130,13 +133,38 @@ pub struct Outcome {
 
 /// Whether `ontology` is consistent.
 pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
+    let ontology = prepared(ontology);
     let normalised = normalise_with(
-        ontology,
+        &ontology,
         Options {
             expand_at_most_up_to: config.expand_at_most_up_to,
         },
     );
-    consistency_of(ontology, &normalised, config)
+    consistency_of(&ontology, &normalised, config)
+}
+
+/// `ontology` with each negative assertion over a non-simple property `¬R(a, b)` as the
+/// equivalent `a : ∀R.¬{b}`, which the normalisation takes through `R`'s automaton.
+pub fn prepared(ontology: &Ontology) -> std::borrow::Cow<'_, Ontology> {
+    use nrese_owl::{Axiom, ClassExpr, ExprId, ObjProp};
+    let non_simple = program::non_simple(ontology);
+    let affected = |a: &Axiom| matches!(a, Axiom::NegativeObjectPropertyAssertion(p, _, _) if non_simple.contains(p));
+    if !ontology.axioms.iter().any(affected) {
+        return std::borrow::Cow::Borrowed(ontology);
+    }
+    let mut o = ontology.clone();
+    for i in 0..o.axioms.len() {
+        if let Axiom::NegativeObjectPropertyAssertion(p, a, b) = o.axioms[i] {
+            if !non_simple.contains(&p) {
+                continue;
+            }
+            let one = ExprId(o.classes.intern(ClassExpr::OneOf(vec![b])));
+            let not = ExprId(o.classes.intern(ClassExpr::Not(one)));
+            let all = ExprId(o.classes.intern(ClassExpr::All(ObjProp::Named(p), not)));
+            o.axioms[i] = Axiom::ClassAssertion(all, a);
+        }
+    }
+    std::borrow::Cow::Owned(o)
 }
 
 /// Whether `ontology`, normalised into `normalised`, is consistent.
