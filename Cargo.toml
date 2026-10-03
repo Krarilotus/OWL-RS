@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/nrese-dl",
     "crates/nrese-engine",
     "crates/nrese-exec",
     "crates/nrese-fuzz",
