@@ -1,0 +1,331 @@
+//! The hypertableau against the semantics, on many fuzzed ontologies (`nrese_owl::fuzz`,
+//! without data): the gate of soundness first (docs/design/owl2-dl.md §11).
+//!
+//! - **Consistent** answers come with the model the graph stands for, folded at the
+//!   blocks; it is closed under the role inclusions and checked against every axiom. A
+//!   folded model can fail where number restrictions meet pairwise blocking (the
+//!   calculus's model is then the unravelling); such answers are confirmed by a search
+//!   for a small model instead, and the rest are counted as unconfirmed.
+//! - **Inconsistent** answers are checked by a search for a model with up to three
+//!   elements (exhaustive where small, sampled otherwise): finding one is a wrong answer.
+//! - **Metamorphic:** the answer is the same with each optimisation off, under renaming
+//!   and with the axioms shuffled.
+//!
+//! `NRESE_FUZZ_CASES` and `NRESE_FUZZ_SEED` widen or move a campaign.
+
+mod semantics;
+
+use std::collections::HashMap;
+
+use nrese_dl::tableau::{Answer, Config, Model, consistency};
+use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
+use nrese_owl::{Concept, Ontology, Term};
+use semantics::{Interp, close, find_model, model_of};
+
+fn env(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+/// The model as an interpretation of the original signature.
+fn interp(m: &Model) -> Option<Interp> {
+    if m.size > 128 || m.size == 0 {
+        return None;
+    }
+    let mut i = Interp {
+        n: m.size as u32,
+        ..Interp::default()
+    };
+    for &(c, e) in &m.concepts {
+        if let Concept::Named(t) = c {
+            *i.concepts.entry(t).or_default() |= 1 << e;
+        }
+    }
+    for &(r, a, b) in &m.roles {
+        i.add_edge(r, a as u32, b as u32);
+    }
+    for &(t, e) in &m.individuals {
+        i.individuals.insert(t, e as u32);
+    }
+    Some(i)
+}
+
+fn configs() -> Vec<(&'static str, Config)> {
+    let base = Config {
+        max_nodes: 20_000,
+        timeout: Some(std::time::Duration::from_secs(2)),
+        ..Config::default()
+    };
+    vec![
+        ("default", base.clone()),
+        (
+            "no-semantic-branching",
+            Config {
+                semantic_branching: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "no-backjumping",
+            Config {
+                backjumping: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "ancestor-blocking",
+            Config {
+                anywhere_blocking: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "pairwise-always",
+            Config {
+                single_blocking: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "at-most-atoms",
+            Config {
+                expand_at_most_up_to: 0,
+                ..base
+            },
+        ),
+    ]
+}
+
+#[derive(Default, Debug)]
+struct Tally {
+    consistent: u64,
+    confirmed_by_model: u64,
+    confirmed_by_search: u64,
+    unconfirmed: u64,
+    inconsistent: u64,
+    unsupported: u64,
+    gave_up: u64,
+}
+
+fn render(o: &Ontology) -> String {
+    let name = |t: Term| format!("t{t}");
+    o.axioms
+        .iter()
+        .map(|a| o.functional(a, &name))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Delta debugging: drops axioms while the default run still gives up (a blow-up's
+/// minimal witness).
+fn shrink(o: &Ontology) {
+    let config = Config {
+        max_nodes: 3000,
+        timeout: Some(std::time::Duration::from_secs(5)),
+        ..Config::default()
+    };
+    let stuck = |o: &Ontology| matches!(consistency(o, &config).answer, Answer::GaveUp(_));
+    let mut cur = o.clone();
+    let mut i = 0;
+    while i < cur.axioms.len() {
+        let mut next = cur.clone();
+        next.axioms.remove(i);
+        next.sources.remove(i);
+        if stuck(&next) {
+            cur = next;
+        } else {
+            i += 1;
+        }
+    }
+    eprintln!(
+        "minimal:
+{}",
+        render(&cur)
+    );
+    let out = consistency(&cur, &config);
+    eprintln!("{:?} {}", out.answer, out.telemetry);
+}
+
+#[test]
+fn answers_agree_with_the_semantics() {
+    let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
+    let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x0020_2610_0333);
+    let mut rng = Rng::new(seed);
+    let mut check = Rng::new(seed ^ 0xA5A5);
+    let mut tally = Tally::default();
+    let mut unconfirmed = Vec::new();
+    for case in 0..cases {
+        let mut names: HashMap<String, Term> = HashMap::new();
+        let mut intern = |n: &Name| {
+            let key = format!("{n:?}");
+            let len = names.len() as Term;
+            *names.entry(key).or_insert(len)
+        };
+        let sizes = Sizes {
+            classes: 3,
+            object_properties: 2,
+            simple: 1,
+            data_properties: 0,
+            individuals: 2,
+            literals: 0,
+        };
+        let sig = Signature::new(sizes, &mut intern);
+        let profile = Profile {
+            axioms: 4 + (case % 5) as usize,
+            depth: 2,
+            el: false,
+            data: false,
+            nominals: case.is_multiple_of(3),
+            numbers: case.is_multiple_of(2),
+            chains: case % 4 == 1,
+            abox: true,
+        };
+        let o = fuzz::ontology(&mut rng, &sig, profile);
+        let shuffled = fuzz::shuffle(&o, &mut rng);
+        if env("NRESE_FUZZ_ONLY").is_some_and(|only| only != case) {
+            continue;
+        }
+        if env("NRESE_FUZZ_ONLY").is_some() {
+            eprintln!("{}", render(&o));
+            if env("NRESE_FUZZ_SHRINK").is_some() {
+                shrink(&o);
+                return;
+            }
+        }
+        let all = configs();
+        let mut first: Option<Answer> = None;
+        // The search for a small model, once per ontology (the configurations agree).
+        let mut searched: Option<Option<Interp>> = None;
+        for (name, config) in &all {
+            let config = Config {
+                keep_model: true,
+                ..config.clone()
+            };
+            let out = consistency(&o, &config);
+            if env("NRESE_FUZZ_ONLY").is_some() {
+                eprintln!("{name}: {:?} {}", out.answer, out.telemetry);
+            }
+            if let Some(f) = &first {
+                // Gave-up runs may differ by budget; answers may not.
+                let decided = |a: &Answer| matches!(a, Answer::Consistent | Answer::Inconsistent);
+                if decided(f) && decided(&out.answer) {
+                    assert_eq!(
+                        f,
+                        &out.answer,
+                        "case {case}: {name} changes the answer\n{}",
+                        render(&o)
+                    );
+                }
+            } else {
+                first = Some(out.answer.clone());
+            }
+            // Every configuration's answer is checked against the semantics.
+            match &out.answer {
+                Answer::Consistent => {
+                    let model = out.model.as_ref().and_then(interp);
+                    let ok = model.is_some_and(|mut i| {
+                        close(&o, &mut i);
+                        model_of(&o, &i)
+                    });
+                    if *name == "default" {
+                        tally.consistent += 1;
+                    }
+                    if ok {
+                        if *name == "default" {
+                            tally.confirmed_by_model += 1;
+                        }
+                        continue;
+                    }
+                    let found = searched
+                        .get_or_insert_with(|| {
+                            find_model(
+                                &o,
+                                &sig.classes,
+                                &sig.object_properties,
+                                &sig.individuals,
+                                3,
+                                5_000,
+                                &mut check,
+                            )
+                        })
+                        .clone();
+                    if *name == "default" {
+                        if found.is_some() {
+                            tally.confirmed_by_search += 1;
+                        } else {
+                            tally.unconfirmed += 1;
+                            unconfirmed.push(format!("case {case}:\n{}", render(&o)));
+                        }
+                    }
+                    assert!(
+                        found.is_some() || profile.numbers,
+                        "case {case} ({name}): consistent, but the folded model fails and no small \
+                         model exists, without number restrictions\n{}\nmodel: {:?}",
+                        render(&o),
+                        out.model
+                    );
+                }
+                Answer::Inconsistent => {
+                    if *name == "default" {
+                        tally.inconsistent += 1;
+                    }
+                    let found = searched
+                        .get_or_insert_with(|| {
+                            find_model(
+                                &o,
+                                &sig.classes,
+                                &sig.object_properties,
+                                &sig.individuals,
+                                3,
+                                5_000,
+                                &mut check,
+                            )
+                        })
+                        .clone();
+                    assert!(
+                        found.is_none(),
+                        "case {case} ({name}): inconsistent, but this is a model: {found:?}\n{}",
+                        render(&o)
+                    );
+                }
+                Answer::Unsupported(why) => {
+                    if *name == "default" {
+                        tally.unsupported += 1;
+                        eprintln!("case {case}: unsupported: {why}");
+                    }
+                }
+                Answer::GaveUp(why) => {
+                    if *name == "default" {
+                        tally.gave_up += 1;
+                        eprintln!("case {case}: gave up: {why}");
+                    }
+                }
+            }
+        }
+        // Renaming and shuffling leave the answer as it is.
+        let base = Config {
+            max_nodes: 20_000,
+            timeout: Some(std::time::Duration::from_secs(2)),
+            ..Config::default()
+        };
+        let renamed = fuzz::rename(&o, &|t| t + 1000);
+        for (what, other) in [("renamed", renamed), ("shuffled", shuffled)] {
+            let answer = consistency(&other, &base).answer;
+            if let Some(f) = &first
+                && matches!(f, Answer::Consistent | Answer::Inconsistent)
+                && matches!(answer, Answer::Consistent | Answer::Inconsistent)
+            {
+                assert_eq!(
+                    f,
+                    &answer,
+                    "case {case}: {what} changes the answer\n{}",
+                    render(&o)
+                );
+            }
+        }
+    }
+    eprintln!("{tally:?}");
+    for u in unconfirmed.iter().take(5) {
+        eprintln!("unconfirmed {u}");
+    }
+    assert!(tally.inconsistent > 0 && tally.consistent > 0, "{tally:?}");
+}
