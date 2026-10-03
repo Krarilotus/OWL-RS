@@ -403,6 +403,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let equality = std::env::var("NRESE_REASONING_EQUALITY").unwrap_or_default();
     let equality_by_representatives = equality != "replicate";
     let equality_compact = equality == "compact";
+    // Where classes are expanded and what answers name (`NRESE_REASONING_EQUALITY_EXPANSION`,
+    // `NRESE_REASONING_EQUALITY_ANSWERS`).
+    let setting = |name: &str| std::env::var(name).unwrap_or_default();
     let config = StoreConfig {
         query_cache_bytes: 0,
         bulk_load_memory_bytes,
@@ -410,6 +413,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vocabulary,
         equality_by_representatives,
         equality_compact,
+        equality_early_expansion: setting("NRESE_REASONING_EQUALITY_EXPANSION") == "early",
+        equality_canonical_answers: setting("NRESE_REASONING_EQUALITY_ANSWERS") == "canonical",
         ..config
     };
     let started = Instant::now();
