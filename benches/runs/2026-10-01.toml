@@ -32,7 +32,7 @@ pairs = [
   { workload = "lubm", tier = "1", system = "qlever", regime = "-", outcome = "skipped", note = "lacks reason-owl2-rl or reason-owl-horst" },
   { workload = "lubm", tier = "1", system = "rdfox", regime = "owl2-rl", outcome = "skipped", note = "needs RDFox.lic in the licences directory, or RDFOX_LICENSE=/path" },
   { workload = "lubm", tier = "1", system = "virtuoso", regime = "-", outcome = "skipped", note = "lacks reason-owl2-rl or reason-owl-horst" },
-  { workload = "lubm", tier = "10", system = "jena", regime = "owl-horst", runs = 1, outcome = "partial" },
+  { workload = "lubm", tier = "10", system = "jena", regime = "owl-horst", runs = 1, outcome = "partial", note = "steps: count failed" },
   { workload = "lubm", tier = "10", system = "nrese", regime = "owl2-rl", runs = 3, items = "14/14", outcome = "ok" },
   { workload = "lubm", tier = "10", system = "nrese-oxigraph", regime = "owl2-rl", runs = 3, items = "14/14", outcome = "ok" },
   { workload = "lubm", tier = "10", system = "owlrl", regime = "owl2-rl", outcome = "skipped", note = "the reference closure runs on the small tiers only" },

@@ -69,6 +69,10 @@ if [ "$mode" = --changed ]; then
   if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
     step locks bash scripts/check-locks.sh
   fi
+  # The benchmark suite's evaluation contracts (completeness, eligible timings, estimator).
+  if printf '%s\n' "${files[@]}" | grep -qE '^benches/suite/'; then
+    step "suite contracts" python -m unittest discover -s benches/suite/tests
+  fi
 else
   step fmt cargo fmt --all --check
   step "fmt (bench harness)" cargo fmt --manifest-path benches/nrese-bench-harness/Cargo.toml --all --check
@@ -79,6 +83,7 @@ else
   step "test (bench harness)" "$guarded" test --locked \
     --manifest-path benches/nrese-bench-harness/Cargo.toml --no-fail-fast
   step locks bash scripts/check-locks.sh
+  step "suite contracts" python -m unittest discover -s benches/suite/tests
   if cargo deny --version > /dev/null 2>&1; then
     step deny cargo deny --all-features check
   else

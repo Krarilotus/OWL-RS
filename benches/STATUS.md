@@ -6,8 +6,8 @@ Generated 2026-10-03 by `python benches/suite/suite.py status --write` from [sui
 
 - **Workloads:** 23 (3 partial, 10 planned, 10 ready)
 - **Systems:** 18 (14 free to publish, 4 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 263; run at least once: 80; ok on their newest run: 65
-- **NRESE:** 17 of its 44 standard tiers ok on their newest run
+- **Pairs** (standard tier × system that can run it; build variants apart): 263; run at least once: 80; ok on their newest run: 62
+- **NRESE:** 18 of its 44 standard tiers ok on their newest run
 - **Run records:** 9, newest 2026-10-03
 
 ## Coverage
@@ -27,11 +27,11 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | ore-2015 | partial | 0/2 ! | · | · | – | – | – | – | – | – | – | 1/2 | 0/2 ! | 0/2 ! | 1/2 | – | · | – | – |
 | w3c-owl2-dl | ready | · | · | · | – | – | – | – | – | – | – | 0/1 ! | 0/1 ! | 0/1 ! | 0/1 ! | – | · | – | – |
 | owl2bench-classify | planned | · | · | · | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – |
-| basics-mix | ready | 5/5 | · | 4/5 | 5/5 | 4/5 ! | 3/5 ! | 4/5 ! | 0/5 ! | – | – | – | – | – | – | 5/5 | · | n/a | · |
+| basics-mix | ready | 5/5 | · | 3/5 ! | 4/5 ! | 3/5 ! | 2/5 ! | 3/5 ! | 0/5 ! | – | – | – | – | – | – | 5/5 | · | n/a | · |
 | sparqloscope | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | · | · | n/a | · |
 | bsbm | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | · | · | n/a | · |
 | watdiv | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | · | · | n/a | · |
-| write-scaling | ready | 0/2 ! | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
+| write-scaling | ready | 1/2 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
 | w3c-sparql11 | ready | 1/1 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
 | w3c-shacl | ready | 1/1 | n/a | n/a | – | – | – | n/a | n/a | – | – | – | – | – | – | n/a | n/a | n/a | – |
 | era-shacl | planned | · | · | · | – | – | – | · | · | – | – | – | – | – | – | · | · | n/a | – |
@@ -40,7 +40,7 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | federation | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | · | · | n/a | · |
 | clients | ready | · | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
 
-`ok` every step and query ok · `part` some queries not ok · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `ran*` ran; a licensed system whose outcome stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it
+`ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `≠?` its answers differ from another system's, not yet adjudicated · `ran*` ran; a licensed system whose outcome stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it
 
 ## Workloads, tier by tier
 
@@ -152,10 +152,10 @@ ready, performance; tasks basics; kit `benches/competitors` (suite driver); chec
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| olympics | ok 10-03 | · | ok 10-02 | ok 10-03 | part 10-03 | part 10-03 | ok 10-03 | part 10-03 | ran* 10-03 | skip 10-02 | · |
+| olympics | ok 10-03 | · | ok 10-02 | ok 10-03 | part 10-03 | WRONG 10-03 | ok 10-03 | part 10-03 | ran* 10-03 | skip 10-02 | · |
 | yago-tiny | ok 10-03 | · | skip 10-02 | ok 10-03 | ok 10-03 | part 10-03 | part 10-03 | · | ran* 10-02 | skip 10-02 | · |
 | entities-10000000 | ok 10-02 | · | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | · | ran* 10-02 | skip 10-02 | · |
-| dbpedia-core | ok 10-03 | · | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | · | ran* 10-02 | skip 10-02 | · |
+| dbpedia-core | ok 10-03 | · | ≠? 10-02 | ≠? 10-02 | ≠? 10-02 | ≠? 10-02 | ≠? 10-02 | · | ran* 10-02 | skip 10-02 | · |
 | wikidata-lexemes-60m | ok 10-03 | · | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | · | ran* 10-02 | skip 10-02 | · |
 
 ### sparqloscope: Sparqloscope: 105 generated queries covering the SPARQL 1.1 features one by one
@@ -190,7 +190,7 @@ ready, performance; tasks basics, RT5; kit `benches/nrese-bench-harness` (suite 
 
 | Tier | nrese |
 |---|---|
-| 1m | FAIL 10-03 |
+| 1m | ok 10-03 |
 | 10m | · |
 
 ### w3c-sparql11: W3C SPARQL 1.1 test suite: query, update, syntax, result formats
@@ -295,12 +295,17 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 
 ### Problems on the newest run
 
-- basics-mix olympics on oxigraph: partial (2026-10-03-full): not ok: q09-no-medal
-- basics-mix olympics on rdf4j: partial (2026-10-03-full): not ok: q09-no-medal
-- basics-mix olympics on virtuoso: partial (2026-10-03-full): not ok: q08-event-hierarchy
-- basics-mix yago-tiny on jena: partial (2026-10-03-full): not ok: *
-- basics-mix yago-tiny on virtuoso: partial (2026-10-03-full): not ok: q01-label-lookup, q03-taxon-path, q08-subclass-path
-- lubm 10 on jena: partial (2026-10-02): not ok: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14
+- basics-mix dbpedia-core on jena: disputed (2026-10-02): answers differ from other systems': q07-subdivision-path
+- basics-mix dbpedia-core on nrese-oxigraph: disputed (2026-10-02): answers differ from other systems': q07-subdivision-path
+- basics-mix dbpedia-core on oxigraph: disputed (2026-10-02): answers differ from other systems': q07-subdivision-path
+- basics-mix dbpedia-core on qlever: disputed (2026-10-02): answers differ from other systems': q07-subdivision-path
+- basics-mix dbpedia-core on virtuoso: disputed (2026-10-02): answers differ from other systems': q07-subdivision-path
+- basics-mix olympics on oxigraph: partial (2026-10-03-full): incomplete: q09-no-medal (q09-no-medal: 3 timeout of 3)
+- basics-mix olympics on rdf4j: partial (2026-10-03-full): incomplete: q09-no-medal (q09-no-medal: 3 timeout of 3)
+- basics-mix olympics on virtuoso: wrong (2026-10-03-full): wrong answer counts: q12-all-labels; incomplete: q08-event-hierarchy (q08-event-hierarchy: 3 failed of 3)
+- basics-mix yago-tiny on jena: partial (2026-10-03-full): incomplete: * (*: 1 failed of 1)
+- basics-mix yago-tiny on virtuoso: partial (2026-10-03-full): incomplete: q01-label-lookup, q03-taxon-path, q08-subclass-path (q01-label-lookup: 1 failed of 1)
+- lubm 10 on jena: partial (2026-10-02): incomplete: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14 (q01: 1 timeout of 1); steps: count failed
 - ore-2015 dev on konclude: partial (2026-10-03-dl-reference): 1 error
 - ore-2015 dev on nrese: partial (2026-10-03-dl-reference): EL track only (20/20 agree); the DL tasks wait for phase 3
 - ore-2015 dev on openllet: partial (2026-10-03-dl-reference): 3 timeouts; differs on ore_ont_1340 (open)
@@ -309,7 +314,6 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - w3c-owl2-dl - on hermit: partial (2026-10-03-dl-reference): 27 timeouts, 1 crash (WebOnt-Thing-003), no wrong result
 - w3c-owl2-dl - on konclude: wrong (2026-10-03-dl-reference): 30 wrong results, 100 unsupported (datatypes, keys)
 - w3c-owl2-dl - on openllet: wrong (2026-10-03-dl-reference): 6 wrong results, 10 timeouts
-- write-scaling 1m on nrese: failed (2026-10-03-nrese-current)
 
 ### Workloads not ready
 

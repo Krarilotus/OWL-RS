@@ -1,0 +1,6 @@
+# Disputes settled by hand (PROTOCOL.md §2: no majority votes). When systems of one regime
+# report different answer counts for a query, the item stays "disputed" in every reader
+# until a line here gives the correct count and why; then systems with that count are
+# undisputed and the others' rows count as wrong. Columns, tab-separated:
+# workload	tier	item	correct rows	why (the evidence, checkable by anyone)
+basics-mix	olympics	q12-all-labels	137026	SELECT ?s ?label over the one pattern ?s rdfs:label ?label returns one row per triple; olympics.nt (frozen, benches/datasets.toml) holds 137,026 distinct rdfs:label triples (grep | sort -u | wc -l, 3 Oct 2026). Virtuoso returns 42 more.
