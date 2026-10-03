@@ -4,6 +4,7 @@
 #   scripts/bench-cleanup.sh             remove everything listed below
 #   scripts/bench-cleanup.sh --dry-run   only say what would be removed
 #   scripts/bench-cleanup.sh --tools     also remove the installed tools (below)
+#   scripts/bench-cleanup.sh --datasets  also remove the reserved dataset volume (deliberately only)
 #
 # The scorecard scripts call this when they exit, so a run cleans up after itself, also
 # when it fails or is interrupted. Between the runs of one batch, set NRESE_BENCH_KEEP=1
@@ -14,8 +15,11 @@
 # prunes "everything unused": other projects' containers, volumes and images are not its
 # business.
 #   containers  <system>-sc, <system>-sc-load, rsc-*      (with their anonymous volumes)
-#   volumes     sc-*, qlever-index-*, nrese-target, nrese-oxigraph-target, nrese-cargo, jena-dist,
-#               and the dataset volume nrese-bench-data
+#   volumes     sc-*, qlever-index-*, nrese-target, nrese-oxigraph-target, nrese-cargo, jena-dist
+#   datasets    the volume nrese-bench-data is reserved (budget in benches/datasets.toml): the
+#               catalogued datasets stay; unpacked intermediates whose archive is there go,
+#               and so do datasets outside the catalogue (unless NRESE_BENCH_KEEP). The volume
+#               itself goes only with --datasets.
 #   images      nrese-bench/* (built here), and the images a run pulled itself (it notes
 #               them in tmp/bench-pulled-images; an image that was already on the
 #               machine is someone else's and stays)
@@ -38,10 +42,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 DRY=
 TOOLS=
+DATASETS=
 for argument in "$@"; do
   case $argument in
     --dry-run) DRY=1 ;;
     --tools) TOOLS=1 ;;
+    --datasets) DATASETS=1 ;;
     *) echo "unknown argument $argument" >&2; exit 2 ;;
   esac
 done
@@ -73,8 +79,26 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   for volume in $(docker volume ls -q | grep -E '^(sc-.*|qlever-index-.*|nrese-target|nrese-oxigraph-target|nrese-cargo|jena-dist)$' || true); do
     run docker volume rm -f "$volume"
   done
-  if [ -z "$KEEP" ] && docker volume inspect nrese-bench-data >/dev/null 2>&1; then
-    run docker volume rm -f nrese-bench-data
+  if docker volume inspect nrese-bench-data >/dev/null 2>&1; then
+    if [ -n "$DATASETS" ]; then
+      run docker volume rm -f nrese-bench-data
+    else
+      # The catalogue's files stay; intermediates with their archive present go, and
+      # files outside the catalogue unless kept for a batch.
+      catalogued=$(python "$ROOT/benches/suite/suite.py" data files 2>/dev/null | tr '\n' ' ')
+      sweep='cd /data || exit 0
+        for f in real/*.ttl; do [ -f "$f.bz2" ] && echo "$f"; done
+        for d in real/*; do [ -d "$d" ] && [ -f "$d.zip" ] && echo "$d"; done
+        for d in *.parts real/*.parts; do [ -d "$d" ] && echo "$d"; done
+        if [ -z "$KEEP" ] && [ -n "$CATALOGUED" ]; then
+          for f in $(find . -type f ! -name "*.source" | sed "s|^\./||"); do
+            case " $CATALOGUED " in *" $f "*) ;; *) case "$f" in real/*) ;; *) echo "$f" ;; esac ;; esac
+          done
+        fi'
+      for item in $(docker run --rm -e KEEP="$KEEP" -e CATALOGUED="$catalogued" -v nrese-bench-data:/data:ro alpine sh -c "$sweep" 2>/dev/null); do
+        run docker run --rm -v nrese-bench-data:/data alpine rm -rf "/data/$item"
+      done
+    fi
   fi
   if [ -z "$KEEP_IMAGES" ]; then
     for image in $(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^nrese-bench/' || true) $PULLED_IMAGES; do
