@@ -1,38 +1,28 @@
-//! Proofs of the context core (docs/design/owl2-dl.md §5, "Proofs"): every derived
+//! Proofs of the context core (docs/design/owl2-dl.md §5, "Proofs"), on fuzzed EL and
+//! Horn ALCHI ontologies: every derived
 //! subsumption and unsatisfiable class has a recorded proof in the proof IR whose leaves
 //! are source axioms, and the axioms of the justification read off it (`one`) entail the
 //! subsumption on their own.
 //!
-//! The RBox axioms are added to each justification for now: `nrese-owl` attributes the
-//! clauses of a role automaton to the universal's axiom only, not to the role inclusions,
-//! chains and transitivity it is built from (reported 3 October 2026; the fix makes
-//! sources an OR of ANDs). Class-axiom provenance is checked strictly.
+//! A clause's sources are alternatives, each a set of axioms that give it together (the
+//! automaton transitions of `nrese-owl` name the role inclusions they come from), so the
+//! justifications are checked strictly: the axioms read off the proof alone.
 
 use nrese_dl::context::{self, Options};
 use nrese_owl::fuzz::Rng;
 use nrese_owl::{Axiom, Ontology};
 
-use super::el::{cases, el_case};
+use super::el::cases;
+use super::metamorphic::case;
 
-/// Whether an axiom is about roles (see the module's note).
-fn rbox(a: &Axiom) -> bool {
-    matches!(
-        a,
-        Axiom::SubObjectPropertyOf(..)
-            | Axiom::EquivalentObjectProperties(..)
-            | Axiom::InverseObjectProperties(..)
-            | Axiom::ObjectCharacteristic(..)
-    )
-}
-
-/// `o` with only the axioms at `keep` (and every declaration and RBox axiom).
+/// `o` with only the axioms at `keep` (and every declaration).
 fn only(o: &Ontology, keep: &[usize]) -> Ontology {
     let mut out = o.clone();
     out.axioms = o
         .axioms
         .iter()
         .enumerate()
-        .filter(|(i, a)| keep.contains(i) || matches!(a, Axiom::Declaration(..)) || rbox(a))
+        .filter(|(i, a)| keep.contains(i) || matches!(a, Axiom::Declaration(..)))
         .map(|(_, a)| a.clone())
         .collect();
     out.sources = vec![Vec::new(); out.axioms.len()];
@@ -45,8 +35,11 @@ fn every_subsumption_has_a_proof_from_a_justification() {
     let mut rng = Rng::new(0x2026_1003_3104);
     let mut checked = 0;
     for i in 0..n {
-        let (table, o) = el_case(&mut rng, i);
-        let saturated = context::saturate(&o, &Options::default()).expect("EL is Horn");
+        // EL, or ALCHI with chains and inverses where it is Horn.
+        let (table, _, o, _) = case(&mut rng, i);
+        let Ok(saturated) = context::saturate(&o, &Options::default()) else {
+            continue;
+        };
         let c = saturated.classification();
         if !c.consistent {
             continue;

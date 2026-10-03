@@ -106,6 +106,10 @@ pub struct Counters {
     pub edges: u64,
     pub peak_agenda: u64,
     pub max_body: u64,
+    /// DL-clause body slots Hyper tried (the index's hits).
+    pub slots: u64,
+    /// Premise lists looked up by the joins.
+    pub lookups: u64,
 }
 
 /// A context's clauses and indexes.
@@ -120,6 +124,13 @@ pub struct Clauses {
     /// `S(x, x)`), for body atoms whose neighbour isn't bound yet.
     pub out_terms: HashMap<RoleId, Vec<CTerm>>,
     pub in_terms: HashMap<RoleId, Vec<CTerm>>,
+    /// The concepts `B` with a head `B(x)` (live or not), for Hyper's keyed role slots.
+    pub concepts: Vec<u32>,
+    /// The concepts `B` with a processed clause `… → B(x)`: Hyper skips a DL-clause whose
+    /// other concept body atoms aren't all here, with a probe each (as the EL classifier's
+    /// conjunction rule tests its subsumer set). It only grows: a clause removed as
+    /// redundant leaves a stronger one with the same head.
+    pub present: hashbrown::HashSet<u32>,
     /// To process: clauses with an empty body first (Sequoia's §5.2.2), then the rest.
     pub agenda: Vec<ClauseId>,
     pub agenda_conditional: Vec<ClauseId>,
@@ -244,7 +255,11 @@ impl Clauses {
     fn index_role(&mut self, head: Atom) {
         let (r, t) = (head.pred(), head.term());
         match head.kind() {
-            Kind::Concept => {}
+            Kind::Concept => {
+                if t == CTerm::X {
+                    self.concepts.push(r);
+                }
+            }
             Kind::Out => {
                 let terms = self.out_terms.entry(r).or_default();
                 if !terms.contains(&t) {

@@ -204,7 +204,8 @@ impl Individuals {
                 .iter()
                 .map(|&s| (s, a, b))
                 .chain(program.by_in[r as usize].iter().map(|&s| (s, b, a)));
-            for ((clause, pos), x, z) in slots.collect::<Vec<_>>() {
+            for (slot, x, z) in slots.collect::<Vec<_>>() {
+                let (clause, pos) = (slot.clause, slot.pos);
                 let dl = &program.clauses[clause as usize];
                 // The slot binds the neighbour: S(x, z) from x's side, S(z, x) from z's.
                 let fits = match dl.body[pos as usize] {
