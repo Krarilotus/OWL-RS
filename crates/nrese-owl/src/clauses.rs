@@ -117,13 +117,16 @@ pub struct Clause {
     pub body: Vec<BodyAtom>,
     /// Empty: the body is contradictory (`⊥`).
     pub head: Vec<HeadAtom>,
-    /// Indexes into the ontology's axioms (more than one where clauses coincided).
-    pub sources: Vec<usize>,
+    /// The axioms the clause comes from, as alternatives: each set's axioms together give
+    /// it (indexes into the ontology's axioms). Most clauses have one set of one axiom;
+    /// clauses that coincided have a set per origin; a transition of a role's automaton
+    /// needs the universal it encodes and the role inclusions of its edge together.
+    pub sources: Vec<Vec<usize>>,
     pub flags: Flags,
 }
 
 impl Clause {
-    pub(crate) fn new(body: Vec<BodyAtom>, head: Vec<HeadAtom>, source: usize) -> Self {
+    pub(crate) fn new(body: Vec<BodyAtom>, head: Vec<HeadAtom>, sources: Vec<usize>) -> Self {
         let mut body = body;
         body.sort();
         body.dedup();
@@ -168,7 +171,7 @@ impl Clause {
         Self {
             body,
             head,
-            sources: vec![source],
+            sources: vec![sources],
             flags,
         }
     }
