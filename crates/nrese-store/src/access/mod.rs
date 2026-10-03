@@ -63,6 +63,10 @@ pub enum Inferred {
     Hidden,
     /// Visible to everyone who may read the default graph.
     Visible,
+    /// Visible to everyone who may read the default graph where one of their derivations
+    /// uses graphs the user may read alone (support graph sets; reasoner v2 without
+    /// `reasoner.equality = "compact"`, else hidden).
+    Supported,
 }
 
 /// A role's right on the store's default graph.
@@ -544,7 +548,8 @@ impl AccessState {
             read.default_graph = false;
             write.default_graph = false;
         }
-        read.inferred = read.default_graph && self.settings.inferred == Inferred::Visible;
+        read.inferred = read.default_graph && self.settings.inferred != Inferred::Hidden;
+        read.inferred_by_support = self.settings.inferred == Inferred::Supported;
         read.service = rules.iter().any(|rule| rule.service);
         AccessView {
             read: Some(Arc::new(read)),

@@ -123,11 +123,13 @@ fn minimal(mut sets: Vec<GraphSet>, cap: usize) -> Vec<GraphSet> {
 }
 
 /// The support graph sets of every fact of the closure `facts` under `program`.
-/// `graphs_of` gives an asserted fact's graphs (none for an inferred one); `cap` bounds
-/// the sets kept per fact.
+/// `graphs_of` gives an asserted fact's graphs (none for an inferred one); `axioms`
+/// (sorted) hold in no graph, for every reader (a ruleset's axiomatic triples); `cap`
+/// bounds the sets kept per fact.
 pub fn support_sets(
     facts: &[Triple],
     program: &GroundProgram,
+    axioms: &[Triple],
     graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
     cap: usize,
 ) -> HashMap<Triple, Vec<GraphSet>> {
@@ -135,6 +137,9 @@ pub fn support_sets(
     let initial: Vec<(Triple, Vec<GraphSet>)> = facts
         .par_iter()
         .filter_map(|&fact| {
+            if axioms.binary_search(&fact).is_ok() {
+                return Some((fact, vec![GraphSet::default()]));
+            }
             let graphs = graphs_of(fact);
             (!graphs.is_empty()).then(|| {
                 (

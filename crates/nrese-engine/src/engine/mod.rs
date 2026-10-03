@@ -45,7 +45,7 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use equality::Classes as EqualityClasses;
-pub use snapshot::Snapshot;
+pub use snapshot::{InferredSubset, Snapshot};
 pub use transaction::{CommitSummary, Transaction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -32,6 +32,15 @@ pub struct Snapshot {
     equality: Option<TermId>,
 }
 
+/// The inferred statements a restricted snapshot keeps ([`Snapshot::with_inferred_subset`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InferredSubset {
+    /// All but these.
+    Without(Vec<EncodedQuad>),
+    /// These alone.
+    Only(Vec<EncodedQuad>),
+}
+
 impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Snapshot")
@@ -62,6 +71,36 @@ impl Snapshot {
         Snapshot {
             equality: None,
             ..self.clone()
+        }
+    }
+
+    /// This snapshot with only a subset of its inferred statements, for a reader who may
+    /// see no more (inferences under graph access): every read, counts and sorted scans
+    /// included, sees the subset alone. `subset` names inferred statements this snapshot
+    /// holds, each once.
+    ///
+    /// O(k log k) for k named statements: the smaller side of the split is named, as
+    /// tombstones over the stack ([`InferredSubset::Without`]) or as a stack of its own
+    /// ([`InferredSubset::Only`]). The result has statistics and equality classes of its
+    /// own, so nothing it reads is cached for, or taken from, the whole snapshot.
+    pub fn with_inferred_subset(&self, subset: InferredSubset) -> Snapshot {
+        let inferred = match subset {
+            InferredSubset::Without(hidden) => self.version.inferred.with_delta(&[], &hidden),
+            InferredSubset::Only(kept) => {
+                crate::index::IndexVersion::from_quads(self.version.inferred.layout(), kept)
+            }
+        };
+        Snapshot {
+            version: Arc::new(Version {
+                asserted: self.version.asserted.clone(),
+                inferred,
+                revision: self.version.revision,
+                dictionary_len: self.version.dictionary_len,
+                equality: Default::default(),
+            }),
+            dictionary: Arc::clone(&self.dictionary),
+            statistics: Arc::default(),
+            equality: self.equality,
         }
     }
 

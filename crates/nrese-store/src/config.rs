@@ -10,6 +10,9 @@ pub enum StoreMode {
 }
 
 /// Typed store configuration. Parsing from env/files lives in `nrese-server/src/config/`.
+/// Support graph sets kept per inferred statement by default ([`StoreConfig::support_sets`]).
+pub const DEFAULT_SUPPORT_SETS: usize = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreConfig {
     pub mode: StoreMode,
@@ -44,6 +47,10 @@ pub struct StoreConfig {
     /// (`reasoner.equality = "compact"`; W4 stage B): storage and commits shrink by the
     /// replication factor, reads of facts about identities pay the expansion.
     pub equality_compact: bool,
+    /// Support graph sets kept per inferred statement for `inferred = "supported"` in the
+    /// access policy (`reasoner.support_sets`, at least 1): the smallest first. A set left
+    /// out can only hide a statement from a reader who could have seen it.
+    pub support_sets: usize,
     /// On disk: check the whole checkpoint when opening (see
     /// `nrese_engine::DurabilityConfig::verify_on_open`). Off: the checkpoint is used in
     /// place and opening reads only its structure.
@@ -156,6 +163,7 @@ impl StoreConfig {
             hide_unnamed_classes: false,
             equality_by_representatives: true,
             equality_compact: false,
+            support_sets: DEFAULT_SUPPORT_SETS,
             verify_on_open: false,
             map_checkpoints: true,
             bulk_load_memory_bytes: 0,
@@ -179,6 +187,7 @@ impl StoreConfig {
             hide_unnamed_classes: false,
             equality_by_representatives: true,
             equality_compact: false,
+            support_sets: DEFAULT_SUPPORT_SETS,
             verify_on_open: false,
             map_checkpoints: true,
             bulk_load_memory_bytes: 0,
@@ -201,6 +210,11 @@ impl StoreConfig {
                 "compact equality storage computes over representatives; it needs \
                  equality_by_representatives"
                     .to_owned(),
+            ));
+        }
+        if self.support_sets == 0 {
+            return Err(StoreError::Configuration(
+                "support_sets must be at least 1".to_owned(),
             ));
         }
         if matches!(self.mode, StoreMode::OnDisk) && self.data_dir.as_os_str().is_empty() {

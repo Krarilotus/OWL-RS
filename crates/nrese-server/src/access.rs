@@ -13,7 +13,8 @@
 //!
 //! ```toml
 //! default = "deny"        # roles no rule names: nothing ("deny") or everything ("allow")
-//! inferred = "hidden"     # inferred statements for users who may not read every graph
+//! inferred = "supported"  # inferred statements for users who may not read every graph:
+//!                         # "hidden" (the default), "visible" or "supported"
 //!
 //! [[role]]
 //! name = "analyst"
@@ -35,9 +36,10 @@
 //!
 //! Reads see a dataset restricted to the readable graphs: the others are absent, not
 //! forbidden ([`nrese_sparql::GraphAccess`]). Inferred statements live in the default
-//! graph and are derived from statements in any graph: a user who may not read every
-//! graph sees them only with `inferred = "visible"` (until the reasoner records which
-//! graphs an inference came from). A write that changes a graph its user may not write is
+//! graph and are derived from statements in any graph. A user who may not read every
+//! graph (but the default graph) sees none of them with `inferred = "hidden"`, all of
+//! them with `"visible"`, and with `"supported"` those one of whose derivations uses
+//! graphs it may read alone (support graph sets: what it could derive itself). A write that changes a graph its user may not write is
 //! refused as a whole.
 
 use std::collections::BTreeSet;
