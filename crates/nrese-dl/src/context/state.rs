@@ -290,6 +290,16 @@ impl Clauses {
         })
     }
 
+    /// The roles `S` with `⊤ → S(x, x)` here.
+    pub fn self_loops(&self) -> impl Iterator<Item = RoleId> + '_ {
+        self.heads.iter().filter_map(|(&atom, list)| {
+            let unconditional = list
+                .iter()
+                .any(|&c| self.recs[c as usize].live && self.recs[c as usize].body == 0);
+            (unconditional && atom == Atom::out(atom.pred(), CTerm::X)).then(|| atom.pred())
+        })
+    }
+
     /// The live unconditional clause with head `head`, if any.
     pub fn unconditional(&self, head: Atom) -> Option<ClauseId> {
         self.heads.get(&head)?.iter().copied().find(|&c| {
