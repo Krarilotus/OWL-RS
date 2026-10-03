@@ -64,6 +64,8 @@ pub struct DictionaryStats {
     pub index_bytes: u64,
     /// Bytes used in place from a mapped checkpoint: keys, end offsets and hash table.
     pub mapped_bytes: u64,
+    /// The vector index: the vectors and their graphs ([`super::vectors`]).
+    pub vector_bytes: u64,
 }
 
 /// Dictionary entries `0..len` in a mapped checkpoint: their keys one after another, the
@@ -406,6 +408,7 @@ impl Dictionary {
         let inner = self.inner.read();
         let base = inner.base.as_ref();
         DictionaryStats {
+            vector_bytes: self.vectors.read().memory_bytes() as u64,
             terms: inner.len(),
             arena_bytes: inner.bytes.len() as u64 + base.map_or(0, |b| b.arena.len() as u64),
             // A slot is the stored index plus one control byte.

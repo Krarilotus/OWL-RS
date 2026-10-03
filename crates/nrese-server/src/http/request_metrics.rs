@@ -88,7 +88,7 @@ struct PerKind {
 /// The kinds of backup operation the metrics tell apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupKind {
-    /// An N-Quads export (`/ops/api/admin/dataset/backup`).
+    /// An N-Quads export (`/api/v1/repositories/{id}/backup`).
     Dump,
     /// An image of the store's snapshot (`…/backup/image`).
     Image,

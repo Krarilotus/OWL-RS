@@ -373,20 +373,70 @@ async fn operator_capabilities_endpoint_exposes_ops_contracts()
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/ops/api/capabilities")
+                .uri("/api/v1/capabilities")
                 .method(Method::GET)
                 .body(Body::empty())?,
         )
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("deprecation").is_none());
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     let text = String::from_utf8(body.to_vec())?;
-    assert!(text.contains("/ops/api/admin/dataset/backup"));
-    assert!(text.contains("/ops/api/admin/dataset/restore"));
-    assert!(text.contains("/ops/api/diagnostics/reasoning"));
-    assert!(text.contains("/api/ai/query-suggestions"));
+    assert!(text.contains("/api/v1/repositories/nrese/backup"));
+    assert!(text.contains("/api/v1/repositories/nrese/restore"));
+    assert!(text.contains("/api/v1/repositories/nrese/reasoning"));
+    assert!(text.contains("/api/v1/ai/query-suggestions"));
     assert!(text.contains("/console"));
+    Ok(())
+}
+
+/// The routes of the earlier release still answer, saying they are deprecated (RFC 9745)
+/// and naming the route that replaces them.
+#[tokio::test]
+async fn earlier_routes_answer_and_name_their_successors() -> Result<(), Box<dyn std::error::Error>>
+{
+    let app = test_app()?;
+    for (old, successor) in [
+        ("/ops/api/capabilities", "/api/v1/capabilities"),
+        ("/ops/api/health/extended", "/api/v1/health"),
+        ("/ops/api/diagnostics/runtime", "/api/v1/diagnostics"),
+        (
+            "/ops/api/diagnostics/reasoning",
+            "/api/v1/repositories/nrese/reasoning",
+        ),
+        ("/api/ai/status", "/api/v1/ai/status"),
+        ("/api/v1/queries", "/api/v1/saved-queries"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(old).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{old}");
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            header("deprecation").as_deref(),
+            Some("@1790985600"),
+            "{old}"
+        );
+        assert_eq!(
+            header("link"),
+            Some(format!("<{successor}>; rel=\"successor-version\"")),
+            "{old}"
+        );
+        let new = app
+            .clone()
+            .oneshot(Request::builder().uri(successor).body(Body::empty())?)
+            .await?;
+        assert_eq!(new.status(), StatusCode::OK, "{successor}");
+        assert!(new.headers().get("deprecation").is_none(), "{successor}");
+    }
     Ok(())
 }
 

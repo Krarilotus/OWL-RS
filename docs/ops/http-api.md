@@ -222,6 +222,7 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 | `…/repositories/{id}/tell`, `/shacl`, `/autocomplete`, `/classification` | as their `/dataset/…` counterparts |
 | `…/repositories/{id}/info`, `/summary`, `/reasoning`, `/service-description` | readiness and statistics, reasoning diagnostics, the service description |
 | `…/repositories/{id}/backup`, `/restore` | N-Quads backup and restore |
+| `POST …/repositories/{id}/image` | An image backup into `backups/` of the data directory (administrators) |
 | `GET …/repositories/{id}/namespaces`, `PUT`/`DELETE …/namespaces/{prefix}` | The repository's prefixes (JSON object; the IRI as the `PUT` body); RDF4J's `/namespaces` reads the same |
 | `POST …/repositories/{id}/sessions` | Opens a client transaction (JSON: `id`, `path`, `idle_seconds`); then `POST {path}/update` (SPARQL update), `POST`/`DELETE {path}/data` (RDF to add or remove, `?graph=` for its graph), `GET`/`POST {path}/query` (reads the data as the session would leave it), `POST {path}/commit`, `DELETE {path}` (rollback). A session exists for the user who opened it only (its id is random; for anyone else it is 404), and reads in it keep their view of the data until the session or the store changes. RDF4J transactions use the same sessions |
 | `GET …/repositories/{id}/explain?subj=&pred=&obj=` | Why a statement holds (terms in N-Triples syntax): `{"steps": [...]}`, the statement first, each step with `subject`, `predicate`, `object`, `origin` (`asserted`, `inferred`), `rule` and `premises` (indexes of steps); the shallowest, smallest derivation from asserted statements, the same on every call. Within the requester's graph access: an asserted premise in no graph it may read is a step with `origin` `hidden` and no terms, and a statement it doesn't see (an inferred one where inferences are hidden from it or its graphs don't support it, an asserted one in no readable graph) is a 404 as if it didn't hold. 404 if it doesn't hold or reasoning is off |
@@ -252,7 +253,7 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 | `PUT`/`DELETE /api/v1/access/workspaces/{name}/members/{user}` | A member's `level`: `owner`, `editor`, `viewer`; a personal space has viewers only; a workspace keeps an owner (409) | owners, administrators |
 | `GET /api/v1/access/history?limit=` | The changes, the latest first (100 by default) | administrators |
 | `POST /api/v1/access/import?reason=`, `GET /api/v1/access/export` | The role rules and fallbacks as a policy file (TOML); importing turns enforcement on | administrators |
-| `GET /api/v1/queries`; `GET`, `PUT`, `DELETE /api/v1/queries/{space}/{name}` | Saved queries (and updates) in a space: a personal space (`~alice`) or a workspace. `PUT` takes `query`, optional `title`, `description` and `repository`; the text must parse (with its repository's namespaces), and the name is letters, digits, `.`, `_`, `-`. Each keeps who changed it last and when | read: whoever reads the space; write: its editors and owners; administrators |
+| `GET /api/v1/saved-queries`; `GET`, `PUT`, `DELETE /api/v1/saved-queries/{space}/{name}` | Saved queries (and updates) in a space: a personal space (`~alice`) or a workspace. `PUT` takes `query`, optional `title`, `description` and `repository`; the text must parse (with its repository's namespaces), and the name is letters, digits, `.`, `_`, `-`. Each keeps who changed it last and when | read: whoever reads the space; write: its editors and owners; administrators |
 
 Graph prefixes: a personal space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`, with `base` from `auth.workspace_base` (`NRESE_WORKSPACE_BASE`, default `urn:nrese:`). User names come from a token's `sub` (or an introspection's `username`) or a client certificate's subject, where they are letters, digits and `. _ @ + | : -`, or from a local login: `Authorization: Basic` with a user's password (Argon2id; a credential verified once is remembered while the password stays), or a session token from `/login`. Local logins work besides any authentication mode (`auth.local_logins`, on by default); a user's sessions end when its password changes or it is removed.
 
@@ -296,7 +297,22 @@ Errors are `application/problem+json` documents. Every response carries `x-reque
 | `/dataset/tell` | Adds an RDF payload to a graph (`POST`) |
 | `/metrics` | Prometheus metrics (below) |
 | `/console`, `/ops` | User console, operator UI |
-| `/ops/api/…` | Operator API: capabilities, diagnostics, backup and restore |
+| `GET /api/v1/capabilities` | What the server offers: surfaces, endpoints, reasoning modes |
+| `GET /api/v1/health` | Readiness and the state of every part (store, reasoning, access, jobs) |
+| `GET /api/v1/diagnostics` | How the server runs: memory, caches, the query budget, requests |
+| `GET /api/v1/ai/status`, `POST /api/v1/ai/query-suggestions` | AI query suggestions, where configured |
+
+**Routes of the earlier release** answer as before until the next release, with `Deprecation: @1790985600` (RFC 9745: since 3 October 2026) and `Link: <successor>; rel="successor-version"`:
+
+| Earlier | Now |
+|---|---|
+| `/ops/api/capabilities` | `/api/v1/capabilities` |
+| `/ops/api/health/extended` | `/api/v1/health` |
+| `/ops/api/diagnostics/runtime` | `/api/v1/diagnostics` |
+| `/ops/api/diagnostics/reasoning`, `/ops/api/dataset/summary` | `/api/v1/repositories/{id}/reasoning`, `…/summary` |
+| `/ops/api/admin/dataset/backup`, `/restore`, `/image` | `/api/v1/repositories/{id}/backup`, `/restore`, `/image` |
+| `/api/ai/status`, `/api/ai/query-suggestions` | `/api/v1/ai/status`, `/api/v1/ai/query-suggestions` |
+| `/api/v1/queries…` (saved queries) | `/api/v1/saved-queries…` (the running queries are `/api/v1/repositories/{id}/queries`) |
 
 `/metrics`, in Prometheus' text format:
 
@@ -312,6 +328,8 @@ Errors are `application/problem+json` documents. Every response carries `x-reque
 | `nrese_index_runs`, `nrese_index_bytes{place}` | Index runs; index data on the heap and mapped from the checkpoint |
 | `nrese_dictionary_terms`, `nrese_dictionary_bytes{part}` | Dictionary terms; their text, the heap's index, and what is mapped |
 | `nrese_wal_bytes_since_checkpoint`, `nrese_compactions_total`, `nrese_checkpoints_total` | What a restart would replay; run merges and checkpoints since start |
+| `nrese_vector_index_bytes` | The vector index (vectors and HNSW graphs) |
+| `nrese_support_sets_total{how}`, `nrese_support_views_total{how}`, `nrese_support_seconds_total{phase}` | Support graph sets for `inferred = "supported"`: computed afresh or updated for a commit, readers' views built or patched, and the time each took |
 | `nrese_process_resident_bytes` | Resident memory (Linux; mapped file pages included, which the OS can drop) |
 | `nrese_backups_total{kind, outcome}` | Backups and restores (`dump`: N-Quads export, `image`, `restore`) that succeeded (`ok`) or `failed` |
 | `nrese_backup_last_success_timestamp_seconds{kind}`, `nrese_backup_last_duration_seconds{kind}`, `nrese_backup_last_bytes{kind}` | The last success of each kind: when it ended (0: none since start), how long it took, its size (for alerting on stale backups) |

@@ -36,6 +36,149 @@ macro_rules! protocol {
     };
 }
 
+/// A route kept for clients of an earlier release: described as deprecated (its answers
+/// carry `Deprecation` and a `Link` to its successor).
+macro_rules! deprecated {
+    ($name:ident, $($spec:tt)*) => {
+        #[utoipa::path($($spec)*)]
+        #[deprecated]
+        #[expect(dead_code)]
+        fn $name() {}
+    };
+}
+
+protocol!(
+    capabilities,
+    get,
+    path = "/api/v1/capabilities",
+    tag = "server",
+    responses((
+        status = 200,
+        description = "What the server offers: protocols, reasoning modes, features",
+        body = serde_json::Value
+    ))
+);
+protocol!(
+    health,
+    get,
+    path = "/api/v1/health",
+    tag = "server",
+    responses((
+        status = 200,
+        description = "Readiness and the state of every part: store, reasoning, access, jobs",
+        body = serde_json::Value
+    ))
+);
+protocol!(
+    diagnostics,
+    get,
+    path = "/api/v1/diagnostics",
+    tag = "server",
+    responses((
+        status = 200,
+        description = "How the server runs: memory, caches, query budget, requests",
+        body = serde_json::Value
+    ))
+);
+protocol!(
+    ai_status,
+    get,
+    path = "/api/v1/ai/status",
+    tag = "server",
+    responses((
+        status = 200,
+        description = "Whether AI query suggestions are on, and their provider",
+        body = serde_json::Value
+    ))
+);
+protocol!(
+    ai_query_suggestions,
+    post,
+    path = "/api/v1/ai/query-suggestions",
+    tag = "server",
+    request_body(
+        content = serde_json::Value,
+        description = "What the user asks for, in words"
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Suggested SPARQL queries",
+            body = serde_json::Value
+        ),
+        (
+            status = 503,
+            description = "Suggestions are off",
+            body = Problem
+        )
+    )
+);
+protocol!(
+    image,
+    post,
+    path = "/api/v1/repositories/{id}/image",
+    tag = "data",
+    params(("id" = String, Path, description = ID)),
+    responses(
+        (
+            status = 200,
+            description = "An image backup written to `backups/` of the data directory",
+            body = serde_json::Value
+        ),
+        (
+            status = 403,
+            description = "Administrators only",
+            body = Problem
+        )
+    )
+);
+deprecated!(
+    saved_queries_before,
+    get,
+    path = "/api/v1/queries",
+    tag = "queries",
+    responses((
+        status = 200,
+        description = "As `GET /api/v1/saved-queries`",
+        body = serde_json::Value
+    ))
+);
+deprecated!(
+    saved_query_before,
+    get,
+    path = "/api/v1/queries/{space}/{name}",
+    tag = "queries",
+    params(("space" = String, Path), ("name" = String, Path)),
+    responses((
+        status = 200,
+        description = "As `GET /api/v1/saved-queries/{space}/{name}`",
+        body = serde_json::Value
+    ))
+);
+deprecated!(
+    saved_query_put_before,
+    put,
+    path = "/api/v1/queries/{space}/{name}",
+    tag = "queries",
+    params(("space" = String, Path), ("name" = String, Path)),
+    responses((
+        status = 200,
+        description = "As `PUT /api/v1/saved-queries/{space}/{name}`",
+        body = serde_json::Value
+    ))
+);
+deprecated!(
+    saved_query_delete_before,
+    delete,
+    path = "/api/v1/queries/{space}/{name}",
+    tag = "queries",
+    params(("space" = String, Path), ("name" = String, Path)),
+    responses((
+        status = 204,
+        description = "As `DELETE /api/v1/saved-queries/{space}/{name}`"
+    ))
+);
+
 protocol!(
     info,
     get,
@@ -224,6 +367,16 @@ protocol!(
         classification,
         backup,
         restore,
+        image,
+        capabilities,
+        health,
+        diagnostics,
+        ai_status,
+        ai_query_suggestions,
+        saved_queries_before,
+        saved_query_before,
+        saved_query_put_before,
+        saved_query_delete_before,
         super::api_v1::namespaces_get,
         super::api_v1::namespace_put,
         super::api_v1::namespace_delete,
@@ -277,6 +430,7 @@ protocol!(
         openapi,
     ),
     tags(
+        (name = "server", description = "The server: capabilities, health, diagnostics, AI query suggestions"),
         (name = "repositories", description = "Repositories: each a store with its own data and reasoning"),
         (name = "sparql", description = "SPARQL queries and updates"),
         (name = "data", description = "Graphs, imports, backups"),

@@ -14,7 +14,7 @@ use anyhow::{Result, bail};
 /// `nrese-server convert INPUT OUTPUT` converts an RDF file into another format (by the
 /// extensions), without a store;
 /// `nrese-server backup DIR` writes an image backup of the configured store into `DIR`
-/// (the same lock: for a running server, `POST /ops/api/admin/dataset/image`);
+/// (the same lock: for a running server, `POST /api/v1/repositories/{id}/image`);
 /// `nrese-server prune-archive REVISION` removes the archived WAL segments whose records all
 /// come before `REVISION` (safe while the server runs);
 /// `nrese-server restore DIR [--wal LOGDIR]... [--until-revision N] [--until-time T]`
