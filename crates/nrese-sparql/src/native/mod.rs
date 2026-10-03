@@ -1894,6 +1894,7 @@ impl<'a> Context<'a> {
             model: self.model,
             graph,
             fixed: None,
+            cancellation: self.cancellation.as_ref(),
         })
     }
 

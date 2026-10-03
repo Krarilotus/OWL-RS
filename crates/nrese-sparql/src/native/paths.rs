@@ -18,7 +18,7 @@
 //!
 //! A bound end is followed by index probes, so `ex:Cat rdfs:subClassOf* ?c` touches only the
 //! nodes it reaches. Open closures are computed per strongly connected component of the
-//! step's pairs ([`transitive_closure`]); the zero-length pairs of `p*` are every node with
+//! step's pairs ([`nrese_exec::graph::transitive_closure`]); the zero-length pairs of `p*` are every node with
 //! itself, without a search. `COUNT` over an open closure ([`PathEvaluator::count_open`])
 //! needs only the closure's size per node and the number of nodes, not its pairs: on YAGO,
 //! `?c rdfs:subClassOf* ?d` has 1.7 million pairs from 133,000 classes and one per node of
@@ -31,7 +31,9 @@
 
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
-use nrese_exec::graph::{Adjacency, closure, closure_sizes_until, reachable, transitive_closure};
+use nrese_exec::graph::{
+    Adjacency, closure, closure_sizes_until, reachable, transitive_closure_until,
+};
 use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
 /// A path with its IRIs resolved to ids; `None` marks an IRI the store doesn't know (no
@@ -104,9 +106,40 @@ pub(crate) struct PathEvaluator<'a> {
     /// other patterns has the zero-length step only as a node of the graph: the path is a
     /// pattern of its own, which the join meets.
     pub(crate) fixed: Option<u64>,
+    /// The query's cancellation, polled inside traversals (closures, searches, the pairs
+    /// of a sequence): a stopped traversal returns what it has, and the caller's check
+    /// reports the cancellation (the review of 3 October 2026, P3).
+    pub(crate) cancellation: Option<&'a crate::CancellationToken>,
 }
 
 impl PathEvaluator<'_> {
+    fn stopped(&self) -> bool {
+        self.cancellation
+            .is_some_and(crate::CancellationToken::is_cancelled)
+    }
+
+    /// [`transitive_closure_until`] stopped with the query: then empty.
+    fn closure_of(&self, edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let cancellation = self.cancellation;
+        let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
+        transitive_closure_until(edges, &stop).unwrap_or_default()
+    }
+
+    /// One step of a search forwards over `path` from `node`: none once stopped, which
+    /// ends the search.
+    fn step_from(&self, path: &Path, node: u64, out: &mut Vec<u64>) {
+        if !self.stopped() {
+            out.extend(self.from(path, node));
+        }
+    }
+
+    /// [`Self::step_from`] backwards.
+    fn step_to(&self, path: &Path, node: u64, out: &mut Vec<u64>) {
+        if !self.stopped() {
+            out.extend(self.to(path, node));
+        }
+    }
+
     fn quads(
         &self,
         subject: Option<u64>,
@@ -234,7 +267,9 @@ impl PathEvaluator<'_> {
         let (Path::OneOrMore(step) | Path::ZeroOrMore(step)) = path else {
             return None;
         };
-        let sizes = closure_sizes_until(&self.open(step), &|| false)?;
+        let cancellation = self.cancellation;
+        let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
+        let sizes = closure_sizes_until(&self.open(step), &stop)?;
         if matches!(path, Path::OneOrMore(_)) {
             return Some(sizes.iter().map(|&(_, reached, _)| reached).sum());
         }
@@ -259,6 +294,7 @@ impl PathEvaluator<'_> {
             Path::Sequence(a, b) => self
                 .from(a, start)
                 .into_iter()
+                .take_while(|_| !self.stopped())
                 .flat_map(|m| self.from(b, m))
                 .collect(),
             Path::Alternative(a, b) => {
@@ -266,12 +302,12 @@ impl PathEvaluator<'_> {
                 ends.extend(self.from(b, start));
                 ends
             }
-            Path::OneOrMore(p) => reachable(start, false, |n, out| out.extend(self.from(p, n))),
+            Path::OneOrMore(p) => reachable(start, false, |n, out| self.step_from(p, n, out)),
             Path::ZeroOrMore(p) => {
                 if !self.is_node(start) {
                     return Vec::new();
                 }
-                reachable(start, true, |n, out| out.extend(self.from(p, n)))
+                reachable(start, true, |n, out| self.step_from(p, n, out))
             }
             Path::ZeroOrOne(p) => {
                 if !self.is_node(start) {
@@ -301,6 +337,7 @@ impl PathEvaluator<'_> {
             Path::Sequence(a, b) => self
                 .to(b, end)
                 .into_iter()
+                .take_while(|_| !self.stopped())
                 .flat_map(|m| self.to(a, m))
                 .collect(),
             Path::Alternative(a, b) => {
@@ -308,12 +345,12 @@ impl PathEvaluator<'_> {
                 starts.extend(self.to(b, end));
                 starts
             }
-            Path::OneOrMore(p) => reachable(end, false, |n, out| out.extend(self.to(p, n))),
+            Path::OneOrMore(p) => reachable(end, false, |n, out| self.step_to(p, n, out)),
             Path::ZeroOrMore(p) => {
                 if !self.is_node(end) {
                     return Vec::new();
                 }
-                reachable(end, true, |n, out| out.extend(self.to(p, n)))
+                reachable(end, true, |n, out| self.step_to(p, n, out))
             }
             Path::ZeroOrOne(p) => {
                 if !self.is_node(end) {
@@ -376,11 +413,11 @@ impl PathEvaluator<'_> {
                 if start == end {
                     self.is_node(start)
                 } else {
-                    reachable(start, false, |n, out| out.extend(self.from(p, n))).contains(&end)
+                    reachable(start, false, |n, out| self.step_from(p, n, out)).contains(&end)
                 }
             }
             Path::OneOrMore(p) => {
-                reachable(start, false, |n, out| out.extend(self.from(p, n))).contains(&end)
+                reachable(start, false, |n, out| self.step_from(p, n, out)).contains(&end)
             }
             Path::ZeroOrOne(p) => {
                 if start == end {
@@ -405,11 +442,13 @@ impl PathEvaluator<'_> {
                 let starts = starts
                     .iter()
                     .copied()
+                    .take_while(|_| !self.stopped())
                     .filter(|&node| !reflexive || self.is_node(node));
                 pairs_of(closure(&adjacency, starts, reflexive))
             }
             _ => starts
                 .iter()
+                .take_while(|_| !self.stopped())
                 .flat_map(|&start| {
                     self.from(path, start)
                         .into_iter()
@@ -430,6 +469,7 @@ impl PathEvaluator<'_> {
                 let ends = ends
                     .iter()
                     .copied()
+                    .take_while(|_| !self.stopped())
                     .filter(|&node| !reflexive || self.is_node(node));
                 pairs_of(closure(&backwards, ends, reflexive))
                     .into_iter()
@@ -438,6 +478,7 @@ impl PathEvaluator<'_> {
             }
             _ => ends
                 .iter()
+                .take_while(|_| !self.stopped())
                 .flat_map(|&end| {
                     self.to(path, end)
                         .into_iter()
@@ -459,6 +500,7 @@ impl PathEvaluator<'_> {
             Path::Sequence(a, b) => self
                 .open(a)
                 .into_iter()
+                .take_while(|_| !self.stopped())
                 .flat_map(|(s, m)| self.from(b, m).into_iter().map(move |o| (s, o)))
                 .collect(),
             Path::Alternative(a, b) => {
@@ -466,9 +508,9 @@ impl PathEvaluator<'_> {
                 pairs.extend(self.open(b));
                 pairs
             }
-            Path::OneOrMore(p) => transitive_closure(&self.open(p)),
+            Path::OneOrMore(p) => self.closure_of(&self.open(p)),
             Path::ZeroOrMore(p) => {
-                let mut pairs = transitive_closure(&self.open(p));
+                let mut pairs = self.closure_of(&self.open(p));
                 // Every node with itself, unless the closure has it already (on a cycle).
                 let mut on_cycle: Vec<u64> = pairs
                     .iter()
@@ -528,4 +570,63 @@ fn merge_union(a: &[u64], b: &[u64], mut f: impl FnMut(u64)) {
         }
     }
     a[i..].iter().chain(&b[j..]).for_each(|&x| f(x));
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_engine::{Engine, EngineConfig};
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+
+    use super::*;
+
+    fn node(i: usize) -> NamedNode {
+        NamedNode::new_unchecked(format!("http://e/n{i}"))
+    }
+
+    #[test]
+    fn cancelled_traversals_stop_inside() {
+        // The review of 3 October 2026 (P3): a closure, a search and the pairs of a
+        // sequence once ran to their end whatever the query's cancellation said.
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let next = NamedNode::new_unchecked("http://e/next");
+        let mut tx = engine.transaction();
+        for i in 0..50 {
+            let quad = Quad::new(node(i), next.clone(), node(i + 1), GraphName::DefaultGraph);
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let step = PropertyPathExpression::NamedNode(next);
+        let plus = Path::resolve(
+            &PropertyPathExpression::OneOrMore(Box::new(step.clone())),
+            &snapshot,
+        );
+        let two = Path::resolve(
+            &PropertyPathExpression::Sequence(Box::new(step.clone()), Box::new(step)),
+            &snapshot,
+        );
+        let token = crate::CancellationToken::new();
+        let evaluator = PathEvaluator {
+            snapshot: &snapshot,
+            model: ReadModel::default(),
+            graph: PathGraph::Default,
+            fixed: None,
+            cancellation: Some(&token),
+        };
+        let first = snapshot.lookup(node(0).as_ref().into()).unwrap().raw();
+        let last = snapshot.lookup(node(50).as_ref().into()).unwrap().raw();
+        assert_eq!(evaluator.open(&plus).len(), 51 * 50 / 2);
+        assert_eq!(evaluator.from(&plus, first).len(), 50);
+        assert_eq!(evaluator.to(&plus, last).len(), 50);
+        assert_eq!(evaluator.open(&two).len(), 49);
+        assert!(evaluator.connects(&plus, first, last));
+
+        token.cancel();
+        assert!(evaluator.open(&plus).is_empty());
+        assert!(evaluator.from(&plus, first).is_empty());
+        assert!(evaluator.to(&plus, last).is_empty());
+        assert!(evaluator.open(&two).is_empty());
+        assert!(!evaluator.connects(&plus, first, last));
+        assert_eq!(evaluator.count_open(&plus), None);
+    }
 }
