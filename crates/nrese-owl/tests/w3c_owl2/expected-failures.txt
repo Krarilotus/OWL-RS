@@ -1,0 +1,5 @@
+# Ontologies of the W3C OWL 2 test cases the reverse mapping can't take yet: one per
+# line, "name (role)<TAB>why".
+New-Feature-Rational-002 (rdfXmlPremiseOntology)	the test data's list ends in rdf:rest <...rdf-syntax-ns#> (the namespace), not rdf:nil
+New-Feature-Rational-003 (rdfXmlPremiseOntology)	the same typo in the list
+FS2RDF-literals-ar (rdfXmlPremiseOntology)	invalid RDF/XML: markup inside a property element with rdf:datatype (only parseType="Literal" may hold it); the parser rightly rejects it

@@ -4,6 +4,7 @@ members = [
     "crates/nrese-engine",
     "crates/nrese-exec",
     "crates/nrese-fuzz",
+    "crates/nrese-owl",
     "crates/nrese-sparql",
     "crates/nrese-sparql-reference",
     "crates/nrese-shacl",

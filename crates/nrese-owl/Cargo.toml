@@ -1,0 +1,17 @@
+[package]
+name = "nrese-owl"
+description = "NRESE OWL 2: the structural model read from RDF, normalisation into DL-clauses, and the proof IR (docs/design/owl2-dl.md)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+nrese-rdf = { path = "../rdf/nrese-rdf" }
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+
+[lints]
+workspace = true
