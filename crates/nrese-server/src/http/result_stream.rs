@@ -1,15 +1,17 @@
 //! Streams output produced on a blocking thread into an HTTP response body.
 //!
-//! - **Backpressure.** The producer writes through a [`ChannelWriter`]: 64 KiB chunks over a
-//!   bounded channel. A slow client slows the producer down instead of the server buffering
-//!   the whole result.
+//! - **Backpressure.** The producer writes through a [`ChannelWriter`]: chunks of at most
+//!   64 KiB (a large write, such as a cached result, is split) over a bounded channel. A
+//!   slow client slows the producer down instead of the server buffering the whole result.
 //! - **Status.** The response status is chosen only when the first chunk (or the producer's
 //!   error) arrives, so errors and timeouts before any output still get a proper status.
 //! - **After the first chunk,** a failure can only abort the connection; the 200 is already
 //!   sent. Clients see a truncated body, as with QLever or Fuseki.
 //! - **Cancellation.** Reaching the deadline, or the client disconnecting (the body is
 //!   dropped), cancels the producer's token, so evaluation stops promptly instead of running
-//!   to completion for nobody.
+//!   to completion for nobody. The deadline holds even if the body isn't polled (a client
+//!   that stops reading): a timer cancels the token, and the producer waits for room in
+//!   the channel only until the deadline, so it lets go of its thread and snapshot.
 
 use std::io;
 
@@ -28,17 +30,42 @@ const CHANNEL_CHUNKS: usize = 8;
 
 type Message = Result<Bytes, ApiError>;
 
-/// `io::Write` that forwards its output in chunks over the channel.
+/// `io::Write` that forwards its output in chunks of at most [`CHUNK_BYTES`] over the
+/// channel, waiting for room until the deadline.
 pub struct ChannelWriter {
     sender: mpsc::Sender<Message>,
     buffer: Vec<u8>,
+    deadline: Instant,
+    runtime: tokio::runtime::Handle,
+}
+
+impl ChannelWriter {
+    /// Sends `message`, waiting for room in the channel until the deadline.
+    fn send(&self, message: Message) -> io::Result<()> {
+        let sent = self.runtime.block_on(tokio::time::timeout_at(
+            self.deadline,
+            self.sender.send(message),
+        ));
+        match sent {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(io::Error::from(io::ErrorKind::BrokenPipe)), // client went away
+            Err(_elapsed) => Err(io::Error::from(io::ErrorKind::TimedOut)), // not read in time
+        }
+    }
 }
 
 impl io::Write for ChannelWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(bytes);
-        if self.buffer.len() >= CHUNK_BYTES {
-            self.flush()?;
+        // Split at the chunk boundary (the review of 3 October 2026, P4): a cached result
+        // arrives in one write, and went out as one chunk of up to 16 MiB.
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let taken = rest.len().min(CHUNK_BYTES - self.buffer.len());
+            self.buffer.extend_from_slice(&rest[..taken]);
+            rest = &rest[taken..];
+            if self.buffer.len() >= CHUNK_BYTES {
+                self.flush()?;
+            }
         }
         Ok(bytes.len())
     }
@@ -48,19 +75,18 @@ impl io::Write for ChannelWriter {
             return Ok(());
         }
         let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(CHUNK_BYTES));
-        self.sender
-            .blocking_send(Ok(Bytes::from(chunk)))
-            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe)) // client went away
+        self.send(Ok(Bytes::from(chunk)))
     }
 }
 
 /// Cancels the token when dropped, i.e. when the response body is dropped: at the end of
-/// the stream (harmless) or when the client disconnects.
-struct CancelOnDrop(CancellationToken);
+/// the stream (harmless) or when the client disconnects; and stops the deadline's timer.
+struct CancelOnDrop(CancellationToken, tokio::task::AbortHandle);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();
+        self.1.abort();
     }
 }
 
@@ -74,20 +100,31 @@ pub async fn stream_blocking(
     produce: impl FnOnce(&mut ChannelWriter) -> Result<(), ApiError> + Send + 'static,
 ) -> Result<Response, ApiError> {
     let (sender, mut receiver) = mpsc::channel::<Message>(CHANNEL_CHUNKS);
+    let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let mut writer = ChannelWriter {
-            sender: sender.clone(),
+            sender,
             buffer: Vec::with_capacity(CHUNK_BYTES),
+            deadline,
+            runtime,
         };
         let result = produce(&mut writer).and_then(|()| {
             io::Write::flush(&mut writer).map_err(|error| ApiError::internal(error.to_string()))
         });
         if let Err(error) = result {
-            let _ = sender.blocking_send(Err(error)); // no receiver: the client is gone
+            let _ = writer.send(Err(error)); // the client is gone, or isn't reading
         }
     });
+    // The deadline as a computation deadline: evaluation stops at it whether or not the
+    // body is being polled (the review of 3 October 2026, P5).
+    let watchdog = cancellation.clone();
+    let watchdog = tokio::spawn(async move {
+        tokio::time::sleep_until(deadline).await;
+        watchdog.cancel();
+    })
+    .abort_handle();
 
-    let guard = CancelOnDrop(cancellation);
+    let guard = CancelOnDrop(cancellation, watchdog);
     let first = match tokio::time::timeout_at(deadline, receiver.recv()).await {
         Err(_elapsed) => return Err(ApiError::timeout(timeout_message)), // guard cancels
         Ok(Some(Err(error))) => return Err(error),
@@ -130,4 +167,78 @@ pub async fn stream_blocking(
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(media_type));
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use futures_util::StreamExt;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_write_goes_out_in_chunks_of_at_most_64_kib() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let response = stream_blocking(
+            deadline,
+            CancellationToken::new(),
+            "text/plain",
+            "timeout",
+            |writer| {
+                io::Write::write_all(writer, &vec![b'x'; 200 * 1024 + 5])
+                    .map_err(|error| ApiError::internal(error.to_string()))
+            },
+        )
+        .await
+        .unwrap();
+        let mut stream = response.into_body().into_data_stream();
+        let mut sizes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            sizes.push(chunk.unwrap().len());
+        }
+        assert_eq!(
+            sizes,
+            vec![CHUNK_BYTES, CHUNK_BYTES, CHUNK_BYTES, 8 * 1024 + 5]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unread_body_stops_its_producer_at_the_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let cancellation = CancellationToken::new();
+        let token = cancellation.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = done.clone();
+        let response = stream_blocking(
+            deadline,
+            cancellation,
+            "text/plain",
+            "timeout",
+            move |writer| {
+                // Writes until it is stopped: by the channel refusing, or by cancellation.
+                let result = loop {
+                    if token.is_cancelled() {
+                        break Ok(());
+                    }
+                    if let Err(error) = io::Write::write_all(writer, &[b'x'; 4096]) {
+                        break Err(ApiError::internal(error.to_string()));
+                    }
+                };
+                finished.store(true, Ordering::SeqCst);
+                result
+            },
+        )
+        .await
+        .unwrap();
+        // The response is held, its body never polled: the channel fills and stays full.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            done.load(Ordering::SeqCst),
+            "the producer still waits for a reader"
+        );
+        drop(response);
+    }
 }
