@@ -356,9 +356,14 @@ impl Writer<'_> {
                 self.disjoint_properties(&members);
             }
             Axiom::InverseObjectProperties(a, b) => {
-                let (a, b) = match a {
-                    ObjProp::Named(_) => (*a, *b),
-                    ObjProp::Inverse(_) => (*b, *a),
+                // A pair of inverses is the pair of the properties (p⁻ = q⁻⁻ iff p = q⁻),
+                // the form an IRI subject can carry.
+                let (a, b) = match (a, b) {
+                    (ObjProp::Inverse(x), ObjProp::Inverse(y)) => {
+                        (ObjProp::Named(*x), ObjProp::Named(*y))
+                    }
+                    (ObjProp::Named(_), _) => (*a, *b),
+                    _ => (*b, *a),
                 };
                 let (a, b) = (self.property(a), self.property(b));
                 self.push(a, term!(self.owl_inverse_of), b);
