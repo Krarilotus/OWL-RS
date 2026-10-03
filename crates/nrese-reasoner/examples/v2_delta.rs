@@ -14,12 +14,11 @@ use std::io::BufRead;
 use std::time::Instant;
 
 use nrese_reasoner::v2::batch::{self, Schema};
-use nrese_reasoner::v2::delta::{MemoryBase, Rules, program, update, update_counted};
+use nrese_reasoner::v2::delta::{MemoryBase, Rules, program, update};
 use nrese_reasoner::v2::ir::Triple;
 use nrese_reasoner::v2::ir::Vocabulary;
 use nrese_reasoner::v2::lists::ListVocabulary;
 use nrese_reasoner::v2::rulesets::Ruleset;
-use nrese_reasoner::v2::supports::Supports;
 use nrese_reasoner::v2::vocabulary::LocalVocabulary;
 
 fn split(line: &str) -> Option<[&str; 3]> {
@@ -36,7 +35,6 @@ fn split(line: &str) -> Option<[&str; 3]> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut changes, mut check, mut inputs) = (20usize, false, Vec::new());
     let mut batch_size = 1usize;
-    let mut counting = false;
     let mut predicate: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -44,7 +42,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--changes" => changes = args.next().and_then(|n| n.parse().ok()).unwrap_or(20),
             "--check" => check = true,
             "--batch" => batch_size = args.next().and_then(|n| n.parse().ok()).unwrap_or(1),
-            "--counting" => counting = true,
             "--predicate" => predicate = args.next(),
             _ => inputs.push(arg),
         }
@@ -93,8 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     if batch_size > 1 {
         return batches(
-            &targets, batch_size, asserted, inferred, compiled, check, counting, &rules, &lists,
-            &schema,
+            &targets, batch_size, asserted, inferred, compiled, check, &rules, &lists, &schema,
         );
     }
     let mut cache = Some(program(&MemoryBase::new(&asserted, &inferred), compiled));
@@ -215,29 +211,11 @@ fn batches(
     mut inferred: Vec<Triple>,
     compiled: Rules<'_>,
     check: bool,
-    counting: bool,
     rules: &[nrese_reasoner::v2::ir::Rule],
     lists: &ListVocabulary,
     schema: &Schema,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut cache = Some(program(&MemoryBase::new(&asserted, &inferred), compiled));
-    let same_as = batch::same_as_of(rules);
-    let count = |asserted: &[Triple], inferred: &[Triple], ground: &_| {
-        let mut facts: Vec<Triple> = asserted.iter().chain(inferred).copied().collect();
-        facts.sort_unstable();
-        facts.dedup();
-        Supports::of_closure(&facts, ground, schema.rdf_type(), same_as, &|_| true)
-    };
-    let mut supports = counting.then(|| {
-        let started = Instant::now();
-        let supports = count(&asserted, &inferred, cache.as_ref().expect("built"));
-        eprintln!(
-            "support counts: {} facts in {:.0} ms",
-            supports.len(),
-            started.elapsed().as_secs_f64() * 1000.0
-        );
-        supports
-    });
     let mut deletes = Vec::new();
     for group in targets.chunks(size) {
         for deleting in [true, false] {
@@ -272,16 +250,7 @@ fn batches(
             };
             let del: &[Triple] = if deleting { group } else { &[] };
             let started = Instant::now();
-            let result = update_counted(
-                &base,
-                &new,
-                del,
-                compiled,
-                cache.as_ref(),
-                supports.as_ref(),
-                nrese_reasoner::v2::eval::NEVER,
-            )
-            .expect("never stopped");
+            let result = update(&base, &new, del, compiled, cache.as_ref());
             let ms = started.elapsed().as_secs_f64() * 1000.0;
             deletes.push((
                 if deleting { "delete" } else { "insert" },
@@ -297,10 +266,6 @@ fn batches(
             if let Some(program) = result.program {
                 cache = Some(program);
             }
-            let stale = result.supports_stale;
-            if let Some(supports) = &mut supports {
-                supports.apply(&result.support_changes);
-            }
             let removal: std::collections::HashSet<Triple> =
                 result.remove.iter().copied().collect();
             let mut next: Vec<Triple> = stack
@@ -313,9 +278,6 @@ fn batches(
             if check {
                 let expected = batch::materialise(&after, rules, Some(lists), schema).derived;
                 assert_eq!(next, expected, "delta differs from rematerialisation");
-            }
-            if stale && supports.is_some() {
-                supports = Some(count(&after, &next, cache.as_ref().expect("built")));
             }
             inferred = next;
             asserted = after;
