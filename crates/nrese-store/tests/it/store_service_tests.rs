@@ -418,3 +418,21 @@ fn a_failed_marker_removal_is_retried() -> Result<(), Box<dyn std::error::Error>
     assert!(store.reasoning_state().is_none());
     Ok(())
 }
+
+/// A graph read stops when its token is cancelled (the HTTP timeout cancels it), instead of
+/// running on for a response that gave up (the review of 3 October 2026, P5).
+#[test]
+fn a_cancelled_graph_read_stops() -> Result<(), Box<dyn std::error::Error>> {
+    let service = StoreService::new(StoreConfig::in_memory())?;
+    service.execute_update_str("INSERT DATA { <http://e/a> <http://e/p> <http://e/b> }")?;
+    let request = GraphReadRequest {
+        target: nrese_store::GraphTarget::DefaultGraph,
+        format: nrese_store::GraphResultFormat::NTriples,
+    };
+    let read = nrese_store::ReadContext::all();
+    assert!(service.execute_graph_read(&read, &request).is_ok());
+    read.cancel.cancel();
+    let error = service.execute_graph_read(&read, &request).unwrap_err();
+    assert!(!error.is_request_error(), "{error}");
+    Ok(())
+}
