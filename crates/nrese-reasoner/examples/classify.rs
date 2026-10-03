@@ -2,8 +2,11 @@
 //! checks against ELK.
 //!
 //! ```text
-//! cargo run --release -p nrese-reasoner --example classify -- --out hierarchy.tsv input.nt...
+//! cargo run --release -p nrese-reasoner --example classify -- --out hierarchy.tsv [--threads N] input.nt...
 //! ```
+//!
+//! `--threads N` saturates on N workers (`classify_parallel`); the default, 1, runs the
+//! sequential saturation.
 //!
 //! Writes one `sub<TAB>super` line per subsumption between named classes (IRIs without
 //! brackets, sorted), `sub<TAB>owl:Nothing` for unsatisfiable classes,
@@ -14,7 +17,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufWriter, Write};
 use std::time::Instant;
 
-use nrese_reasoner::v2::classify::classify;
+use nrese_reasoner::v2::classify::classify_parallel;
 use nrese_reasoner::v2::vocabulary::LocalVocabulary;
 
 fn split(line: &str) -> Option<[&str; 3]> {
@@ -31,10 +34,16 @@ fn split(line: &str) -> Option<[&str; 3]> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let (mut out, mut inputs) = (None, Vec::new());
+    let (mut out, mut inputs, mut threads) = (None, Vec::new(), 1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--out" => out = args.next(),
+            "--threads" => {
+                threads = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .ok_or("--threads N")?
+            }
             _ => inputs.push(arg),
         }
     }
@@ -53,9 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load = started.elapsed();
     let started = Instant::now();
     let names = vocabulary.clone();
-    let result = classify(&triples, &mut vocabulary, &|id| {
-        names.text(id).starts_with('<')
-    });
+    let result = classify_parallel(
+        &triples,
+        &mut vocabulary,
+        &|id| names.text(id).starts_with('<'),
+        threads,
+    );
     let elapsed = started.elapsed();
     let text = |id: u64| vocabulary.text(id).trim_matches(['<', '>']).to_owned();
     let mut file = BufWriter::new(std::fs::File::create(&out)?);

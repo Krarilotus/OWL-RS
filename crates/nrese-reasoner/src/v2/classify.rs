@@ -326,6 +326,37 @@ pub fn classify(
     vocabulary: &mut impl Vocabulary,
     named: &dyn Fn(u64) -> bool,
 ) -> Classification {
+    let (mut tbox, thing, nothing, skipped) = build(triples, vocabulary, named);
+    saturate(&mut tbox, thing, nothing, skipped)
+}
+
+/// Like [`classify`], saturating on `threads` workers (ELK's scheme, *The Incredible ELK*,
+/// JAR 2014): one context per concept with its own inbox, activated by compare-and-swap,
+/// so that a context's state is only ever touched by the one worker that holds its
+/// activation. A link `C →r D` is two messages, a backward link to `D` and a forward link
+/// to `C`, so that every rule finds its premises in one context. The result is
+/// [`classify`]'s: saturation has one fixpoint. One thread runs [`classify`].
+pub fn classify_parallel(
+    triples: &[Triple],
+    vocabulary: &mut impl Vocabulary,
+    named: &dyn Fn(u64) -> bool,
+    threads: usize,
+) -> Classification {
+    if threads <= 1 {
+        return classify(triples, vocabulary, named);
+    }
+    let (mut tbox, thing, nothing, skipped) = build(triples, vocabulary, named);
+    parallel::saturate(&mut tbox, thing, nothing, skipped, threads)
+}
+
+type Built = (Tbox, Concept, Concept, Vec<(u64, &'static str)>);
+
+/// The normalised TBox of `triples`, with `owl:Thing`, `owl:Nothing` and what was skipped.
+fn build(
+    triples: &[Triple],
+    vocabulary: &mut impl Vocabulary,
+    named: &dyn Fn(u64) -> bool,
+) -> Built {
     let names = Names::new(vocabulary);
     let mut by_subject: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
     for &[s, p, o] in triples {
@@ -427,17 +458,22 @@ pub fn classify(
             tbox.ranges.push((r, c));
         }
     }
-    saturate(&mut tbox, thing, nothing, skipped)
+    (tbox, thing, nothing, skipped)
 }
 
-fn saturate(
-    tbox: &mut Tbox,
-    thing: Concept,
-    nothing: Concept,
-    skipped: Vec<(u64, &'static str)>,
-) -> Classification {
+/// The role closure and chain indexes, and the ranges folded into the existentials: what
+/// both saturations need before the rules run.
+struct Prepared {
+    /// Every role's super-roles (reflexive, transitive).
+    supers: Vec<Vec<Role>>,
+    /// `r1 ∘ r2 ⊑ t` by `r1`: `(r2, t)`.
+    chains_first: Vec<Vec<(Role, Role)>>,
+    /// ... and by `r2`: `(r1, t)`.
+    chains_second: Vec<Vec<(Role, Role)>>,
+}
+
+fn prepare(tbox: &mut Tbox) -> Prepared {
     let roles = tbox.role_count as usize;
-    // Every role's super-roles (reflexive, transitive).
     let mut supers: Vec<Vec<Role>> = (0..roles as Role).map(|r| vec![r]).collect();
     loop {
         let mut changed = false;
@@ -478,6 +514,328 @@ fn saturate(
         chains_first[r1 as usize].push((r2, t));
         chains_second[r2 as usize].push((r1, t));
     }
+    Prepared {
+        supers,
+        chains_first,
+        chains_second,
+    }
+}
+
+/// The classification from every concept's subsumers.
+fn assemble(
+    tbox: &Tbox,
+    subsumers: &[HashSet<Concept>],
+    thing: Concept,
+    nothing: Concept,
+    skipped: Vec<(u64, &'static str)>,
+) -> Classification {
+    let mut result = Classification {
+        skipped,
+        ..Classification::default()
+    };
+    let named_ids: Vec<(Concept, u64)> = tbox
+        .named
+        .iter()
+        .enumerate()
+        .filter_map(|(c, id)| id.map(|id| (c as Concept, id)))
+        .collect();
+    let top = &subsumers[thing as usize];
+    for &(d, id) in &named_ids {
+        if d != thing && d != nothing && top.contains(&d) {
+            result.top.push(id);
+        }
+    }
+    for &(c, id) in &named_ids {
+        if c == thing || c == nothing {
+            continue;
+        }
+        let set = &subsumers[c as usize];
+        if set.contains(&nothing) {
+            result.unsatisfiable.push(id);
+            continue;
+        }
+        // Its own subsumers, not every named class: linear in the taxonomy's size.
+        for &d in set {
+            if d != c
+                && d != thing
+                && let Some(super_id) = tbox.named[d as usize]
+            {
+                result.subsumptions.push((id, super_id));
+            }
+        }
+    }
+    result.subsumptions.sort_unstable();
+    result.unsatisfiable.sort_unstable();
+    result.top.sort_unstable();
+    result
+}
+
+mod parallel {
+    //! The parallel saturation of [`super::classify_parallel`].
+
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::{Mutex, MutexGuard};
+
+    use hashbrown::HashSet;
+
+    use super::{Classification, Concept, Prepared, Role, Tbox, assemble, prepare};
+
+    enum Message {
+        /// A subsumer of the context's concept.
+        Sub(Concept),
+        /// `from →r` this context.
+        Backward(Concept, Role),
+        /// This context `→r to`.
+        Forward(Role, Concept),
+    }
+
+    #[derive(Default)]
+    struct State {
+        subsumers: HashSet<Concept>,
+        pred: Vec<(Concept, Role)>,
+        pred_seen: HashSet<(Concept, Role)>,
+        succ: Vec<(Role, Concept)>,
+        succ_seen: HashSet<(Role, Concept)>,
+    }
+
+    #[derive(Default)]
+    struct Context {
+        inbox: Mutex<Vec<Message>>,
+        active: AtomicBool,
+        initialised: AtomicBool,
+        /// Only the worker holding the activation locks it: never contended.
+        state: Mutex<State>,
+    }
+
+    /// A poisoned lock means a worker panicked; the scope re-raises that panic anyway.
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct Saturation<'a> {
+        tbox: &'a Tbox,
+        prepared: Prepared,
+        contexts: Vec<Context>,
+        thing: Concept,
+        nothing: Concept,
+    }
+
+    pub(super) fn saturate(
+        tbox: &mut Tbox,
+        thing: Concept,
+        nothing: Concept,
+        skipped: Vec<(u64, &'static str)>,
+        threads: usize,
+    ) -> Classification {
+        let prepared = prepare(tbox);
+        let n = tbox.named.len();
+        let saturation = Saturation {
+            tbox,
+            prepared,
+            contexts: (0..n).map(|_| Context::default()).collect(),
+            thing,
+            nothing,
+        };
+        let run = || {
+            rayon::scope(|scope| {
+                for c in 0..n as Concept {
+                    if saturation.tbox.named[c as usize].is_some()
+                        && !saturation.contexts[c as usize]
+                            .initialised
+                            .swap(true, SeqCst)
+                    {
+                        saturation.deliver(scope, c, Message::Sub(c));
+                        saturation.deliver(scope, c, Message::Sub(thing));
+                    }
+                }
+            });
+        };
+        match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+            Ok(pool) => pool.install(run),
+            Err(_) => run(),
+        }
+        let subsumers: Vec<HashSet<Concept>> = saturation
+            .contexts
+            .into_iter()
+            .map(|c| {
+                c.state
+                    .into_inner()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .subsumers
+            })
+            .collect();
+        assemble(tbox, &subsumers, thing, nothing, skipped)
+    }
+
+    /// The context a worker is saturating, and the messages it sends itself: those are
+    /// handled in the same activation, without the inbox.
+    struct Own<'o> {
+        context: Concept,
+        local: &'o mut Vec<Message>,
+    }
+
+    impl Saturation<'_> {
+        /// A message into `to`'s inbox; `to` gets a worker unless it has one.
+        fn deliver<'s>(&'s self, scope: &rayon::Scope<'s>, to: Concept, message: Message) {
+            let context = &self.contexts[to as usize];
+            lock(&context.inbox).push(message);
+            if !context.active.swap(true, SeqCst) {
+                scope.spawn(move |scope| self.work(scope, to));
+            }
+        }
+
+        fn send<'s>(
+            &'s self,
+            scope: &rayon::Scope<'s>,
+            own: &mut Own<'_>,
+            to: Concept,
+            message: Message,
+        ) {
+            if to == own.context {
+                own.local.push(message);
+            } else {
+                self.deliver(scope, to, message);
+            }
+        }
+
+        /// `from →t to`: a backward link to `to`, a forward link to `from`; `to` starts
+        /// saturating if it hasn't.
+        fn link<'s>(
+            &'s self,
+            scope: &rayon::Scope<'s>,
+            own: &mut Own<'_>,
+            from: Concept,
+            t: Role,
+            to: Concept,
+        ) {
+            if !self.contexts[to as usize].initialised.swap(true, SeqCst) {
+                self.send(scope, own, to, Message::Sub(to));
+                self.send(scope, own, to, Message::Sub(self.thing));
+            }
+            self.send(scope, own, to, Message::Backward(from, t));
+            self.send(scope, own, from, Message::Forward(t, to));
+        }
+
+        /// Processes a context's messages until its inbox stays empty.
+        fn work<'s>(&'s self, scope: &rayon::Scope<'s>, c: Concept) {
+            let context = &self.contexts[c as usize];
+            loop {
+                let mut batch = std::mem::take(&mut *lock(&context.inbox));
+                if batch.is_empty() {
+                    context.active.store(false, SeqCst);
+                    // A message delivered between the take and the store found the context
+                    // still active and started no worker: take it up here.
+                    if lock(&context.inbox).is_empty() || context.active.swap(true, SeqCst) {
+                        return;
+                    }
+                    continue;
+                }
+                let mut state = lock(&context.state);
+                while let Some(message) = batch.pop() {
+                    let mut own = Own {
+                        context: c,
+                        local: &mut batch,
+                    };
+                    self.handle(scope, &mut own, &mut state, message);
+                }
+            }
+        }
+
+        fn handle<'s>(
+            &'s self,
+            scope: &rayon::Scope<'s>,
+            own: &mut Own<'_>,
+            state: &mut State,
+            message: Message,
+        ) {
+            let (tbox, p, c) = (self.tbox, &self.prepared, own.context);
+            match message {
+                Message::Sub(d) => {
+                    if !state.subsumers.insert(d) {
+                        return;
+                    }
+                    for &e in &tbox.told[d as usize] {
+                        self.send(scope, own, c, Message::Sub(e));
+                    }
+                    for &(b, e) in &tbox.conjunctions[d as usize] {
+                        if state.subsumers.contains(&b) {
+                            self.send(scope, own, c, Message::Sub(e));
+                        }
+                    }
+                    for &(r, b) in &tbox.existentials[d as usize] {
+                        self.link(scope, own, c, r, b);
+                    }
+                    for &(from, r) in &state.pred {
+                        if d == self.nothing {
+                            self.send(scope, own, from, Message::Sub(self.nothing));
+                        }
+                        for &(s, f) in &tbox.filler_of[d as usize] {
+                            if p.supers[r as usize].contains(&s) {
+                                self.send(scope, own, from, Message::Sub(f));
+                            }
+                        }
+                    }
+                }
+                Message::Backward(from, r) => {
+                    if !state.pred_seen.insert((from, r)) {
+                        return;
+                    }
+                    state.pred.push((from, r));
+                    for &e in &state.subsumers {
+                        if e == self.nothing {
+                            self.send(scope, own, from, Message::Sub(self.nothing));
+                        }
+                        for &(s, f) in &tbox.filler_of[e as usize] {
+                            if p.supers[r as usize].contains(&s) {
+                                self.send(scope, own, from, Message::Sub(f));
+                            }
+                        }
+                    }
+                    // Chains with this link first: from →r c →r2 e.
+                    for &s1 in &p.supers[r as usize] {
+                        for &(r2, t) in &p.chains_first[s1 as usize] {
+                            for &(r2_edge, e) in &state.succ {
+                                if p.supers[r2_edge as usize].contains(&r2) {
+                                    self.link(scope, own, from, t, e);
+                                }
+                            }
+                        }
+                    }
+                }
+                Message::Forward(r, to) => {
+                    if !state.succ_seen.insert((r, to)) {
+                        return;
+                    }
+                    state.succ.push((r, to));
+                    // ... and second: b →r1 c →r to.
+                    for &s2 in &p.supers[r as usize] {
+                        for &(r1, t) in &p.chains_second[s2 as usize] {
+                            for &(b, r1_edge) in &state.pred {
+                                if p.supers[r1_edge as usize].contains(&r1) {
+                                    self.link(scope, own, b, t, to);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn saturate(
+    tbox: &mut Tbox,
+    thing: Concept,
+    nothing: Concept,
+    skipped: Vec<(u64, &'static str)>,
+) -> Classification {
+    let Prepared {
+        supers,
+        chains_first,
+        chains_second,
+    } = prepare(tbox);
     let n = tbox.named.len();
     let mut subsumers: Vec<HashSet<Concept>> = vec![HashSet::new(); n];
     let mut succ: Vec<Vec<(Role, Concept)>> = vec![Vec::new(); n];
@@ -569,45 +927,7 @@ fn saturate(
             }
         }
     }
-    let mut result = Classification {
-        skipped,
-        ..Classification::default()
-    };
-    let named_ids: Vec<(Concept, u64)> = tbox
-        .named
-        .iter()
-        .enumerate()
-        .filter_map(|(c, id)| id.map(|id| (c as Concept, id)))
-        .collect();
-    let top = &subsumers[thing as usize];
-    for &(d, id) in &named_ids {
-        if d != thing && d != nothing && top.contains(&d) {
-            result.top.push(id);
-        }
-    }
-    for &(c, id) in &named_ids {
-        if c == thing || c == nothing {
-            continue;
-        }
-        let set = &subsumers[c as usize];
-        if set.contains(&nothing) {
-            result.unsatisfiable.push(id);
-            continue;
-        }
-        // Its own subsumers, not every named class: linear in the taxonomy's size.
-        for &d in set {
-            if d != c
-                && d != thing
-                && let Some(super_id) = tbox.named[d as usize]
-            {
-                result.subsumptions.push((id, super_id));
-            }
-        }
-    }
-    result.subsumptions.sort_unstable();
-    result.unsatisfiable.sort_unstable();
-    result.top.sort_unstable();
-    result
+    assemble(tbox, &subsumers, thing, nothing, skipped)
 }
 
 #[cfg(test)]
