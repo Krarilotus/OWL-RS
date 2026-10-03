@@ -1138,6 +1138,7 @@ dependencies = [
  "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",
+ "nrese-reasoner",
  "rayon",
 ]
 
