@@ -41,6 +41,7 @@ pub struct Profile {
     /// The longest agenda any context had.
     pub peak_agenda_size: u64,
     pub messages: u64,
+    pub slots: u64,
     /// Derivations recorded for proofs.
     pub proof_steps: u64,
     /// Zero in the Horn stage (§4's list, for the later stages).
@@ -59,6 +60,7 @@ impl Profile {
         self.pred_inferences += c.pred;
         self.successor_edges += c.edges;
         self.messages += c.messages;
+        self.slots += c.slots;
         self.peak_agenda_size = self.peak_agenda_size.max(c.peak_agenda);
         self.max_clause_body_width = self.max_clause_body_width.max(c.max_body);
         if c.kept > 0 {
@@ -76,7 +78,7 @@ impl Profile {
              functions={} renamed={} split={} recentred={} dropped_data={} contexts_created={} \
              contexts_saturated={} clauses_generated={} clauses_kept={} redundant_forward={} \
              redundant_backward={} hyper={} pred={} max_head={} max_body={} edges={} \
-             peak_agenda={} messages={} proof_steps={} threads={}",
+             peak_agenda={} messages={} slots={} proof_steps={} threads={}",
             ms(self.normalise),
             ms(self.compile),
             ms(self.saturate),
@@ -102,6 +104,7 @@ impl Profile {
             self.successor_edges,
             self.peak_agenda_size,
             self.messages,
+            self.slots,
             self.proof_steps,
             self.threads,
         );

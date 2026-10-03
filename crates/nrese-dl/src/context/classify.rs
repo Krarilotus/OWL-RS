@@ -257,20 +257,24 @@ impl Saturated {
                 Rule::Pred => "pred",
                 Rule::Succ => "succ",
             };
-            let sources: Vec<usize> = self
+            let alternatives: Vec<Vec<usize>> = self
                 .engine
                 .program
                 .clauses
                 .get(d.dl as usize)
-                .map(|c| c.sources.iter().map(|&s| s as usize).collect())
+                .map(|c| {
+                    c.sources
+                        .iter()
+                        .map(|set| set.iter().map(|&s| s as usize).collect())
+                        .collect()
+                })
                 .unwrap_or_default();
-            if sources.len() > 1 {
-                // Any one of the axioms gives the DL-clause.
-                for &a in &sources {
-                    graph.add(rule, &premises, &[a], fact);
-                }
-            } else {
-                graph.add(rule, &premises, &sources, fact);
+            if alternatives.is_empty() {
+                graph.add(rule, &premises, &[], fact);
+            }
+            // Each alternative set of axioms gives the DL-clause on its own.
+            for set in &alternatives {
+                graph.add(rule, &premises, set, fact);
             }
             for p in premises {
                 if seen.insert(p) {

@@ -207,7 +207,7 @@ mod tests {
         Clause {
             body,
             head,
-            sources: vec![0],
+            sources: vec![vec![0]],
             flags: Default::default(),
         }
     }
