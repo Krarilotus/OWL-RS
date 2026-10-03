@@ -848,7 +848,7 @@ impl Supports {
         // The program's constants by the snapshot's ids: a constant the store doesn't hold
         // gets an id no statement uses (its rules can't fire).
         let unknown = std::cell::Cell::new(u64::MAX >> 1);
-        let program = Program::new(&rules, &|term| {
+        let program = Program::compile(&rules, &|term| {
             snapshot.lookup(term).unwrap_or_else(|| {
                 unknown.set(unknown.get() - 1);
                 TermId::from_raw(unknown.get())

@@ -274,7 +274,7 @@ If you want to work on reasoning:
 - rules are data ([ir.rs](crates/nrese-reasoner/src/ir.rs), [rulesets.rs](crates/nrese-reasoner/src/rulesets.rs)); list axioms are compiled per axiom ([lists.rs](crates/nrese-reasoner/src/lists.rs))
 - [naive.rs](crates/nrese-reasoner/src/naive.rs) is the reference evaluator every executor is tested against
 - [batch.rs](crates/nrese-reasoner/src/batch.rs) materialises (grounding, parallel semi-naive evaluation, transitive and equality modules); [delta.rs](crates/nrese-reasoner/src/delta.rs) maintains the closure per commit (DRed with B/F proofs)
-- the store side (materialisation, commit path, reject explanations) is [crates/nrese-store/src/reasoning.rs](crates/nrese-store/src/reasoning.rs)
+- reasoning over the store's engine (compile, materialise, maintain on commits, explain) is [crates/nrese-reasoner/src/engine/](crates/nrese-reasoner/src/engine/mod.rs); the store decides when ([crates/nrese-store/src/reasoning.rs](crates/nrese-store/src/reasoning.rs) keeps its reports)
 
 If you want to work on HTTP, auth, or operator surfaces:
 

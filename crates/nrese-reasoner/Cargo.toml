@@ -8,12 +8,17 @@ license.workspace = true
 
 [dependencies]
 smallvec = { workspace = true }
+# The store's engine: the reasoner reads its snapshots and maintains its transactions
+# (engine).
+nrese-engine = { path = "../nrese-engine" }
 nrese-exec = { path = "../nrese-exec" }
 # The proof IR justifications are computed on (explain).
 nrese-owl = { path = "../nrese-owl" }
 # User rules in Notation3 (n3).
 nrese-rdf = { path = "../rdf/nrese-rdf", default-features = false }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+# Data values for the datatype consistency rules (engine::datatypes).
+nrese-xsd = { path = "../rdf/nrese-xsd" }
 hashbrown = { workspace = true }
 rayon = { workspace = true }
 thiserror.workspace = true
