@@ -1183,6 +1183,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-owl"
+version = "0.1.0"
+dependencies = [
+ "nrese-rdf",
+ "nrese-rdf-io",
+]
+
+[[package]]
 name = "nrese-rdf"
 version = "0.1.0"
 dependencies = [

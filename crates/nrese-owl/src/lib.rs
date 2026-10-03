@@ -1,0 +1,23 @@
+//! OWL 2 for NRESE (docs/design/owl2-dl.md): the structural model of an ontology read
+//! from RDF triples ([`read`]), with every axiom's source and a diagnostic for whatever
+//! isn't well-formed OWL 2 DL, and the way back to triples ([`write`]).
+//!
+//! It works over the term ids of whatever holds the triples (the store's `TermId`s) and
+//! reads strings only of the literals it needs ([`Terms`]); nothing here depends on the
+//! store or an engine.
+
+pub mod diagnostics;
+mod functional;
+pub mod mapping;
+pub mod model;
+pub mod vocab;
+pub mod write;
+
+pub use diagnostics::Diagnostic;
+pub use mapping::{Ontology, Source, Statement, TermKind, Terms, read};
+pub use model::{
+    Axiom, Characteristic, ClassExpr, DataRange, EntityKind, ExprId, Interner, ObjProp, RangeId,
+    Term,
+};
+pub use vocab::Vocabulary;
+pub use write::{Make, write};
