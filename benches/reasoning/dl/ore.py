@@ -42,7 +42,7 @@ import sys
 import zipfile
 
 TASKS = {"classification": "classify", "consistency": "consistency", "instantiation": "realise"}
-EL_ONLY = {"elk"}
+EL_ONLY = {"elk", "elk-0.4.3"}
 # The development set: tasks per track.
 DEV_TRACKS = {"dl/classification": 100, "el/classification": 60, "pure_dl/classification": 60,
               "dl/consistency": 50, "dl/instantiation": 50}
@@ -204,7 +204,8 @@ def compare(args):
     times = {}
     for line in open(pathlib.Path(args.cases) / "results.tsv", encoding="utf-8"):
         tid, reasoner, task, status, ms, detail = (line.rstrip("\n").split("\t") + [""])[:6]
-        answer = detail if status in ("classified", "realised") else status
+        # The hash first; ELK 0.4.3 appends its stage times.
+        answer = detail.split(" ", 1)[0] if status in ("classified", "realised") else status
         by_task[tid][reasoner] = (status, answer)
         times[(tid, reasoner)] = int(ms)
     tally = collections.Counter()

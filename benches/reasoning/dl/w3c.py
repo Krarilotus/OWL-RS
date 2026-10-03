@@ -33,7 +33,7 @@ TYPES = {
 }
 # (property suffix, extension), by preference.
 FORMATS = [("rdfXml", "rdf"), ("fs", "ofn"), ("owlXml", "owx")]
-PROFILE_OF = {"elk": TEST.EL}
+PROFILE_OF = {"elk": TEST.EL, "elk-0.4.3": TEST.EL}
 
 
 def document(g, test, role):

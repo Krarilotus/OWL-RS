@@ -44,8 +44,8 @@ import org.semanticweb.owlapi.reasoner.SimpleConfiguration;
  * </pre>
  *
  * A manifest line is {@code id<TAB>reasoner<TAB>task<TAB>premise[<TAB>conclusion]}:
- * reasoner {@code hermit}, {@code elk}, {@code openllet} or {@code konclude} (a process of
- * its own, see {@link Konclude}); task {@code consistency},
+ * reasoner {@code hermit}, {@code elk} (0.6.0), {@code openllet}, {@code konclude} or
+ * {@code elk-0.4.3} (processes of their own, see {@link Konclude} and {@link Elk043}); task {@code consistency},
  * {@code entailment} (premise entails every logical axiom of the conclusion),
  * {@code classify} or {@code realise}; or {@code ntriples}, any reasoner: the premise converted to
  * {@code OUT_DIR/id.nt} for systems that read RDF. A result line is
@@ -188,6 +188,9 @@ public final class Runner {
         }
         if (name.equals("konclude")) {
             return Konclude.run(id, task, o, dir, timeout);
+        }
+        if (name.equals("elk-0.4.3")) {
+            return Elk043.run(id, task, o, dir, timeout);
         }
         OWLReasoner r = factory(name).createReasoner(o, new SimpleConfiguration(timeout * 1000));
         running.set(r);

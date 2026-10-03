@@ -5,13 +5,13 @@ The correctness infrastructure of [docs/design/owl2-dl.md](../../../docs/design/
 
 | File | What |
 |---|---|
-| `runner/` | NRESE's own runner for HermiT 1.4.5.519, ELK 0.6.0 and Openllet 2.6.5, all on OWL API 5.1.20, and KoncludeCLI 0.7.0-1138 as a process of its own: consistency, entailment and classification with a timeout per task (a fresh JVM after a timeout), a batch per JVM, the canonical taxonomy, conversions to N-Triples and functional syntax. Not ROBOT, not OWLLink (§11). |
+| `runner/` | NRESE's own runner for HermiT 1.4.5.519, ELK 0.6.0 and Openllet 2.6.5, all on OWL API 5.1.20, and, as processes of their own, KoncludeCLI 0.7.0-1138 and ELK 0.4.3's command line (`elk-0.4.3`, classification only; the detail column adds its own stage times, since the task includes starting its JVM; `ELK043_WORKERS` sets its threads): consistency, entailment and classification with a timeout per task (a fresh JVM after a timeout), a batch per JVM, the canonical taxonomy, conversions to N-Triples and functional syntax. Not ROBOT, not OWLLink (§11). |
 | `Dockerfile` | builds the runner into `nrese-bench/dl-reference` |
 | `reference.py` | runs a manifest on the image with a watchdog (a reasoner that ignores interrupts is stopped and recorded as `timeout`); resumable |
 | `w3c.py` | the W3C OWL 2 test cases of species DL under the direct semantics: `prepare`, `manifest`, `compare` against the test types, `published` and `against` for the working group's results of 14 December 2009 |
 | `published-2009.tsv` | those results, extracted from the archived `Test_results.html` (FaCT++, HermiT, Pellet) |
 | `ore.py` | the ORE 2015 development subset (`subset` by track and size, `manifest`, `compare` by canonical hashes); the corpus is fetched by hash into `.cache/ore2015/`, never committed (CC BY-NC-ND) |
-| `nrese.py` | NRESE's classifiers in the same comparison (`el`: the EL classifier on the EL track, through the runner's `ntriples` conversion and `canonical.py`) |
+| `nrese.py` | NRESE's classifiers in the same comparison (`el`: the EL classifier on the EL track, through the runner's `ntriples` conversion and `canonical.py`); the detail column holds the taxonomy's hash, then the classifier's profile: read, normalise, prepare, saturate, assemble and write times in ms, and the counters (concepts, contexts, subsumers, links, conclusions, duplicates, threads) |
 | `cargo run -p nrese-owl --example fuzz` | random OWL 2 DL ontologies (`nrese_owl::fuzz`, within the global restrictions) as functional-syntax files with a manifest: differential fuzz campaigns on the references, `ore.py compare` lists disagreements |
 | `canonical.py` | the canonical taxonomy from any subsumption closure (NRESE's EL classifier, later `nrese-dl`), with the reference run's signature |
 | `disputed.tsv` | differences settled by hand: `test/task<TAB>reasoner<TAB>result<TAB>why` |

@@ -1,6 +1,6 @@
 # The reference OWL 2 DL reasoners behind NRESE's own runner (docs/design/owl2-dl.md §11):
 # HermiT, ELK and Openllet on OWL API 5.1.20, in one JVM per batch, and KoncludeCLI
-# (v0.7.0-1138, static Linux build) as a process of the runner's.
+# (v0.7.0-1138, static Linux build) and ELK 0.4.3's command line as processes of the runner's.
 #   docker build -t nrese-bench/dl-reference benches/reasoning/dl
 FROM eclipse-temurin:21-jdk AS build
 RUN apt-get update && apt-get install -y --no-install-recommends maven curl unzip && rm -rf /var/lib/apt/lists/*
@@ -21,4 +21,6 @@ COPY --from=eclipse-temurin:21-jre /opt/java/openjdk /opt/java/openjdk
 ENV PATH=/opt/java/openjdk/bin:$PATH
 COPY --from=build /src/target/dl-runner.jar /opt/dl-runner.jar
 COPY --from=build /opt/konclude /opt/konclude
+# ELK 0.4.3's standalone command line (Apache-2.0), run as a process of its own (Elk043.java).
+ADD --checksum=sha256:de1fffafbe0bb19656335b53b4a5a44d8b8feb75e077ad1677ba8a2fb91cac7c https://repo1.maven.org/maven2/org/semanticweb/elk/elk-standalone/0.4.3/elk-standalone-0.4.3.jar /opt/elk-0.4.3/elk-standalone-0.4.3.jar
 ENTRYPOINT ["java", "-Xmx8g", "-jar", "/opt/dl-runner.jar"]
