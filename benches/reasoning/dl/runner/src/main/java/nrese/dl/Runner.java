@@ -24,6 +24,7 @@ import org.semanticweb.owlapi.apibinding.OWLManager;
 import org.semanticweb.owlapi.model.MissingImportHandlingStrategy;
 import org.semanticweb.owlapi.model.OWLAxiom;
 import org.semanticweb.owlapi.model.OWLClass;
+import org.semanticweb.owlapi.model.OWLNamedIndividual;
 import org.semanticweb.owlapi.model.OWLOntology;
 import org.semanticweb.owlapi.model.OWLOntologyLoaderConfiguration;
 import org.semanticweb.owlapi.model.OWLOntologyManager;
@@ -45,12 +46,13 @@ import org.semanticweb.owlapi.reasoner.SimpleConfiguration;
  * A manifest line is {@code id<TAB>reasoner<TAB>task<TAB>premise[<TAB>conclusion]}:
  * reasoner {@code hermit}, {@code elk}, {@code openllet} or {@code konclude} (a process of
  * its own, see {@link Konclude}); task {@code consistency},
- * {@code entailment} (premise entails every logical axiom of the conclusion) or
- * {@code classify}; or {@code ntriples}, any reasoner: the premise converted to
+ * {@code entailment} (premise entails every logical axiom of the conclusion),
+ * {@code classify} or {@code realise}; or {@code ntriples}, any reasoner: the premise converted to
  * {@code OUT_DIR/id.nt} for systems that read RDF. A result line is
  * {@code id<TAB>reasoner<TAB>task<TAB>status<TAB>millis<TAB>detail}, status one of
  * {@code consistent}, {@code inconsistent}, {@code entailed}, {@code not-entailed},
- * {@code classified} (detail: the taxonomy's SHA-256), {@code unsupported},
+ * {@code classified} (detail: the taxonomy's SHA-256), {@code realised} (detail: the
+ * realisation's SHA-256, {@code OUT_DIR/id.reasoner.real}), {@code unsupported},
  * {@code timeout}, {@code parse-error}, {@code error}.
  *
  * <p>The canonical taxonomy ({@code OUT_DIR/id.reasoner.tax}) has one line per class,
@@ -222,6 +224,13 @@ public final class Runner {
                     r.precomputeInferences(InferenceType.CLASS_HIERARCHY);
                     return written(dir, id, name, taxonomy(o, r));
                 }
+                case "realise": {
+                    if (!r.isConsistent()) {
+                        return new String[] {"inconsistent", ""};
+                    }
+                    r.precomputeInferences(InferenceType.CLASS_HIERARCHY, InferenceType.CLASS_ASSERTIONS);
+                    return realised(dir, id, name, realisation(o, r));
+                }
                 default:
                     throw new IllegalArgumentException("unknown task " + task);
             }
@@ -238,11 +247,34 @@ public final class Runner {
             HexFormat.of().formatHex(sha.digest(tax.getBytes(StandardCharsets.UTF_8)))};
     }
 
+    /** Writes a realisation and answers with its hash. */
+    static String[] realised(Path dir, String id, String name, String realisation) throws Exception {
+        Files.writeString(dir.resolve(id + "." + name + ".real"), realisation, StandardCharsets.UTF_8);
+        MessageDigest sha = MessageDigest.getInstance("SHA-256");
+        return new String[] {"realised",
+            HexFormat.of().formatHex(sha.digest(realisation.getBytes(StandardCharsets.UTF_8)))};
+    }
+
+    /**
+     * The canonical realisation: one line {@code a individual rep} per direct type of every
+     * named individual, the type given by its representative as in the taxonomy
+     * ({@code owl:Thing} for an individual with no other type); sorted.
+     */
+    static String realisation(OWLOntology o, OWLReasoner r) {
+        TreeSet<String> lines = new TreeSet<>();
+        for (OWLNamedIndividual i : o.getIndividualsInSignature(Imports.INCLUDED)) {
+            for (Node<OWLClass> type : r.getTypes(i, true)) {
+                lines.add("a " + i.getIRI() + " " + representative(type));
+            }
+        }
+        return lines.isEmpty() ? "" : String.join("\n", lines) + "\n";
+    }
+
     static OWLOntology loadFile(Path path) throws Exception {
         return load(path.toString());
     }
 
-    private static String representative(Node<OWLClass> node) {
+    static String representative(Node<OWLClass> node) {
         if (node.isBottomNode()) {
             return NOTHING;
         }

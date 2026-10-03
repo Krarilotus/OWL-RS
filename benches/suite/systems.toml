@@ -21,7 +21,9 @@
 # `publish`: free = results may be published; permission = only with the vendor's written
 # consent (benches/competitors/README.md). `runs`: how the suite can start it
 # (suitekit/adapters.py): docker, apptainer (the same image as a SIF file), native (a
-# host process).
+# host process); kit: only a kit outside the driver runs it.
+# `variant-of`: another build of a system (a setting or a baseline branch); the status counts
+# its gaps apart, as optional.
 #
 # The capabilities of the other systems are from their documentation. An adapter confirms
 # them when it first runs, and a capability that turns out not to work is removed here
@@ -48,6 +50,7 @@ missing = {}
 # lower, query totals even, a scan of the dictionary 14 % slower).
 [nrese-fsst]
 name = "NRESE (FSST vocabulary)"
+variant-of = "nrese"
 publish = "free"
 runs = ["docker", "apptainer", "native"]
 capabilities = [
@@ -63,6 +66,7 @@ missing = {}
 # shows what the migration to the own RDF libraries changed.
 [nrese-oxigraph]
 name = "NRESE on Oxigraph (baseline/pre-oxigraph-migration)"
+variant-of = "nrese"
 publish = "free"
 runs = ["docker", "apptainer", "native"]
 capabilities = [
@@ -120,11 +124,31 @@ publish = "free"
 runs = ["docker", "apptainer"]
 capabilities = ["load", "reason-rdfs", "reason-owl2-rl"]
 
-[dl-reasoners]
-name = "ELK, HermiT, Konclude (ELK and HermiT via ROBOT, obolibrary/robot)"
+# The OWL 2 DL reference reasoners: the image nrese-bench/dl-reference (benches/reasoning/dl)
+# runs them on the DL kit's workloads; `runs = ["kit"]`: no adapter in the suite's driver.
+[hermit]
+name = "HermiT 1.4.5 (OWL API 5)"
 publish = "free"
-runs = []
+runs = ["kit"]
 capabilities = ["classify", "consistency", "explain"]
+
+[openllet]
+name = "Openllet 2.6.5 (OWL API 5)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["classify", "consistency", "explain"]
+
+[konclude]
+name = "Konclude 0.7.0"
+publish = "free"
+runs = ["kit"]
+capabilities = ["classify", "consistency"]
+
+[elk]
+name = "ELK 0.6.0 (OWL 2 EL only)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["classify"]
 
 [graphdb]
 name = "GraphDB"

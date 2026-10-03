@@ -7,7 +7,8 @@ reasoners do their work), the queries (one warm-up, then the measured repetition
 the harness's `query-mix`), the server's peak memory. After every repetition its
 containers, store and scratch go; after the whole run, what the run itself made (datasets,
 the NRESE build volume, images it pulled or built) goes too, unless kept for a batch
-(--keep, or NRESE_BENCH_KEEP=1; installed tools always stay).
+(--keep, or NRESE_BENCH_KEEP=1; installed tools always stay). What the run was measured
+with (commit, machine, protocol, images, datasets) goes to manifest.json (manifest.py).
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ from pathlib import Path
 from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all
 from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime,
                       run_quiet, shell)
+from .manifest import Manifest, image_ids
 from .schema import Result, Writer
 from .workloads import plans
 
@@ -151,6 +153,7 @@ class Suite:
         self.made_images: list[str] = []
         self.written: list[Result] = []
         self.skips: list[str] = []
+        self.manifest: Manifest | None = None
 
     # --- helpers ---
     def say(self, text: str):
@@ -268,6 +271,36 @@ class Suite:
             out = run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data:ro", "alpine", "sh", "-c", script])
             return out.stdout.split()
         return [f for f in files if not (Path(self.data.source) / f[len("/data/"):]).is_file()]
+
+    def data_sizes(self, inputs: list[str]) -> dict[str, int]:
+        """The sizes of the /data inputs, for the manifest (a changed dataset shows)."""
+        files = sorted({i for i in inputs if i.startswith("/data/")})
+        if not files or self.args.dry_run:
+            return {}
+        if self.data_volume:
+            out = run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data:ro", "alpine",
+                             "stat", "-c", "%n %s", *files])
+            pairs = (line.rsplit(" ", 1) for line in out.stdout.splitlines() if " " in line)
+            return {name: int(size) for name, size in pairs if size.isdigit()}
+        sizes = {}
+        for f in files:
+            path = Path(self.data.source) / f[len("/data/"):]
+            if path.is_file():
+                sizes[f] = path.stat().st_size
+        return sizes
+
+    def data_sources(self) -> list[str]:
+        """Where the downloaded sources came from, and their release (the `.source` files
+        benches/competitors/prepare-datasets.sh leaves beside each download)."""
+        if self.args.dry_run:
+            return []
+        if self.data_volume:
+            out = run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data:ro", "alpine", "sh", "-c",
+                             "cat /data/real/*.source 2>/dev/null"])
+            return [line for line in out.stdout.splitlines() if line.strip()]
+        real = Path(self.data.source) / "real"
+        return [line for f in sorted(real.glob("*.source")) for line in f.read_text().splitlines()
+                if line.strip()] if real.is_dir() else []
 
     def ensure_data(self, plan) -> str | None:
         # Looking for the inputs mounts the volume, which creates it: whether this run made
@@ -500,6 +533,8 @@ class Suite:
         if self.args.runtime == "docker":
             images.setdefault("alpine:latest", None)
         self.ensure_images(images)
+        if self.manifest and self.args.runtime == "docker":
+            self.manifest.update(images=image_ids(list(images)))
         for key in dict.fromkeys(key for _, key, system, _ in chosen if isinstance(system, Nrese)):
             if not self.build_nrese(adapter(key)):
                 return 1
@@ -511,15 +546,31 @@ class Suite:
         for plan, _, system, _ in chosen:
             if system is not None and plan.kind == "cycle" and id(plan) not in unavailable:
                 unavailable[id(plan)] = self.ensure_data(plan) or ""
-        for plan, key, system, regime in chosen:
-            if unavailable.get(id(plan)):
-                self.skip(key, plan, unavailable[id(plan)], regime)
-                continue
-            if plan.kind == "kit":
-                self.kit(plan, key)
-                continue
+        if self.manifest:
+            self.manifest.update(datasets=self.data_sizes(
+                [i for plan, _, system, _ in chosen if system is not None for i in plan.inputs]),
+                sources=self.data_sources())
+        # Per workload tier, the repetitions are interleaved across the systems: every
+        # system's first run, then every system's second, each round in an order rotated by
+        # one, so that drift on the machine (background I/O, heat) falls on every system
+        # alike instead of on whichever ran last (PROTOCOL.md §4).
+        groups: dict[int, list] = {}
+        for entry in chosen:
+            groups.setdefault(id(entry[0]), []).append(entry)
+        for group in groups.values():
+            plan = group[0][0]
+            runnable = []
+            for _, key, system, regime in group:
+                if unavailable.get(id(plan)):
+                    self.skip(key, plan, unavailable[id(plan)], regime)
+                elif plan.kind == "kit":
+                    self.kit(plan, key)
+                else:
+                    runnable.append((key, system, regime))
             for run in range(1, self.args.runs + 1):
-                self.cycle(plan, key, system, regime, run)
+                shift = (run - 1) % max(1, len(runnable))
+                for key, system, regime in runnable[shift:] + runnable[:shift]:
+                    self.cycle(plan, key, system, regime, run)
         self.cross_check()
         self.report_skips()
         self.say(f"\nresults: {self.writer.path}")
@@ -587,12 +638,19 @@ def images(argv: list[str], systems: dict, root: Path) -> int:
 def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
     args = arguments(argv)
     suite = Suite(args, systems, workloads, root)
+    if not args.dry_run:
+        suite.manifest = Manifest(suite.results, root, argv, args, args.runtime, suite.settings)
     atexit.register(suite.cleanup)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    code = None
     try:
-        return suite.run()
+        code = suite.run()
+        return code
     except KeyboardInterrupt:
         print("\ninterrupted: cleaning up", file=sys.stderr)
-        return 130
+        code = 130
+        return code
     finally:
+        if suite.manifest:
+            suite.manifest.finish(code)
         suite.cleanup()
