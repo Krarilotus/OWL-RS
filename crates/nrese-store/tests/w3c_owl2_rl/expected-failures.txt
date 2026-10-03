@@ -6,20 +6,12 @@
 # that: a conclusion the rules have no rule for. None is a missing rule of the ruleset.
 
 # Class expressions in the conclusion (the rules derive memberships in named classes only):
-DisjointClasses-001 # :Stewie a [ owl:complementOf :Girl ]
-DisjointClasses-003 # memberships in two complement classes
-New-Feature-ObjectQCR-002 # :Stewie a [ owl:complementOf :Woman ]
 WebOnt-I5.26-010 # an anonymous owl:minCardinality restriction
 WebOnt-I5.5-005 # an anonymous owl:unionOf class
 
-# Difference (the rules use owl:differentFrom and owl:AllDifferent only to find
-# inconsistencies; none derives them):
-New-Feature-DisjointDataProperties-002 # owl:AllDifferent from disjoint data properties
-New-Feature-DisjointObjectProperties-001 # owl:differentFrom from disjoint object properties
-New-Feature-DisjointObjectProperties-002 # owl:AllDifferent from owl:AllDisjointProperties
-WebOnt-differentFrom-001 # the symmetry of owl:differentFrom
-owl2-rl-rules-fp-differentFrom # owl:differentFrom back through a functional property
-owl2-rl-rules-ifp-differentFrom # owl:differentFrom back through an inverse-functional property
+# Difference and complements (owl:differentFrom, owl:AllDifferent, owl:complementOf,
+# negative property assertions) pass since 3 October: the store's entailment check
+# refutes their opposite (StoreService::entails).
 
 # Axioms about properties and datatypes:
 New-Feature-ReflexiveProperty-001 # reflexivity (not in OWL 2 RL)
