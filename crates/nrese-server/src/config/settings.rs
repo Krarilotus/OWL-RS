@@ -931,6 +931,13 @@ mod tests {
                         source.insert(names::AUTH_OIDC_CLIENT_ID, "c");
                         source.insert(names::AUTH_OIDC_CLIENT_SECRET, "s");
                     }
+                    ("replication.mode", "primary") => {
+                        source.insert(names::STORE_MODE, "on-disk");
+                    }
+                    ("replication.mode", "replica") => {
+                        source.insert(names::STORE_MODE, "on-disk");
+                        source.insert(names::REPLICATION_PRIMARY, "https://primary:8080");
+                    }
                     ("ai.provider", "gemini") => {
                         source.insert(names::AI_GOOGLE_API_KEY, "k");
                     }
