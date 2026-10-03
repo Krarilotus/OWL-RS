@@ -141,8 +141,11 @@ fn support_follows_the_latest_revision() {
             "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:c a ex:C }} }}"
         )))
         .unwrap();
+    // The rematerialisation prepares the new revision's sets in the background (they
+    // were in use); the read waits for that computation instead of starting another.
     store.rematerialise(Ruleset::Owl2Rl).unwrap();
     assert_eq!(classes(&store, &supported, "c"), ["<D>", "<E>"]);
+    assert_eq!(store.support_statistics().computed, 2);
 }
 
 /// Without rules registered the sets can't be computed: no inferred statement is shown.
