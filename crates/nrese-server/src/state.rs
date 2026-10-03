@@ -58,7 +58,7 @@ impl AppState {
         let access = Arc::new(open_access(store.config(), &policy)?);
         let repositories =
             Arc::new(Catalog::open(store, reasoner).map_err(|error| anyhow::anyhow!(error))?);
-        Ok(Self {
+        let state = Self {
             pipeline: Arc::clone(&repositories.default_repository().pipeline),
             ready: Arc::new(AtomicBool::new(false)),
             policy: Arc::new(policy),
@@ -70,7 +70,22 @@ impl AppState {
             access,
             repository: Arc::from(DEFAULT_REPOSITORY),
             jobs: Arc::default(),
-        })
+        };
+        state.prepare_support_sets();
+        Ok(state)
+    }
+
+    /// With `inferred = "supported"` in the access state, every repository's support
+    /// graph sets computed in the background, so first reads don't wait for them.
+    pub fn prepare_support_sets(&self) {
+        if self.access.state().settings.inferred != nrese_store::access::Inferred::Supported {
+            return;
+        }
+        for (id, _) in self.repositories.list() {
+            if let Some(repository) = self.repositories.get(&id) {
+                repository.pipeline.read().store().prepare_support_sets();
+            }
+        }
     }
 
     /// The identity of a local login the request carries: `Basic` credentials of a user

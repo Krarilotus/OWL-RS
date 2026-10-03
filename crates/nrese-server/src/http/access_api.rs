@@ -286,13 +286,15 @@ pub async fn settings_put(
     if let Some(create) = request.users_create_workspaces {
         settings.users_create_workspaces = create;
     }
-    change(
+    let response = change(
         &state,
         &authenticated,
         Change::Settings(settings),
         request.reason,
     )
-    .await
+    .await?;
+    state.prepare_support_sets();
+    Ok(response)
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]

@@ -583,6 +583,9 @@ pub(crate) struct Supports {
     rules: Mutex<Option<RuleProgram>>,
     state: Mutex<State>,
     counters: Counters,
+    /// Whether sets were computed since the rules were set: readers use them, so
+    /// preparing them for a new revision pays.
+    in_use: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -644,6 +647,44 @@ impl Supports {
         *self.rules.lock().unwrap_or_else(|p| p.into_inner()) = rules;
         // Sets and views of other rules are stale.
         *self.state() = State::default();
+    }
+
+    /// Whether readers used sets since the rules were set.
+    pub(crate) fn in_use(&self) -> bool {
+        self.in_use.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Computes the sets of `snapshot` on a thread of its own, unless they are there
+    /// or being computed: the first restricted read then finds them (or waits for
+    /// that computation instead of starting its own).
+    pub(crate) fn prepare(self: &Arc<Self>, snapshot: Snapshot, compilation: Compilation) {
+        let cell = self.cell_for(&snapshot);
+        if cell.get().is_some() {
+            return;
+        }
+        let supports = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("nrese-support-sets".to_owned())
+            .spawn(move || {
+                cell.get_or_init(|| supports.compute(&snapshot, compilation));
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "support graph sets not prepared");
+        }
+    }
+
+    /// The cell of `snapshot`'s sets, which becomes the latest revision's.
+    fn cell_for(&self, snapshot: &Snapshot) -> Cell {
+        let mut state = self.state();
+        if !state
+            .latest
+            .as_ref()
+            .is_some_and(|(seen, ..)| seen.same_version(snapshot))
+        {
+            state.latest = Some((snapshot.clone(), Cell::default(), Vec::new()));
+        }
+        let (_, cell, _) = state.latest.as_ref().expect("set above");
+        Arc::clone(cell)
     }
 
     pub(crate) fn statistics(&self) -> SupportStatistics {
@@ -809,6 +850,8 @@ impl Supports {
         .by_representatives(compilation.by_representatives);
         let cap = compilation.cap.max(1);
         let revision = snapshot.revision();
+        self.in_use
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let started = std::time::Instant::now();
         let updated = self
             .base_for(revision)

@@ -314,16 +314,29 @@ impl StoreService {
     ) -> nrese_engine::Snapshot {
         match access {
             Some(access) if by_support(access) => {
-                let compilation = crate::support::Compilation {
-                    hide_unnamed_classes: self.config.hide_unnamed_classes,
-                    by_representatives: self.config.equality_by_representatives,
-                    compact: self.config.equality_compact,
-                    cap: self.config.support_sets,
-                };
-                self.supports.view(snapshot, access, compilation)
+                self.supports
+                    .view(snapshot, access, self.support_compilation())
             }
             _ => snapshot.clone(),
         }
+    }
+
+    fn support_compilation(&self) -> crate::support::Compilation {
+        crate::support::Compilation {
+            hide_unnamed_classes: self.config.hide_unnamed_classes,
+            by_representatives: self.config.equality_by_representatives,
+            compact: self.config.equality_compact,
+            cap: self.config.support_sets,
+        }
+    }
+
+    /// Computes the support graph sets of the latest revision on a thread of their own,
+    /// so the first read under `inferred = "supported"` doesn't wait for them (at start,
+    /// when the policy turns to it; the store does it itself after a rematerialisation
+    /// while readers use them). Returns at once.
+    pub fn prepare_support_sets(&self) {
+        self.supports
+            .prepare(self.engine.snapshot(), self.support_compilation());
     }
 
     /// Inferred statements under graph access ([`crate::support`]): the mutation pipeline
@@ -953,6 +966,11 @@ impl StoreService {
             .last_materialisation
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(report.clone());
+        // A rematerialisation isn't reported to the sets as commits are: readers that
+        // use them would wait for a computation.
+        if self.supports.in_use() {
+            self.prepare_support_sets();
+        }
         Ok(report)
     }
 
