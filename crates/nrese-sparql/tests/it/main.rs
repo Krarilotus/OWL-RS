@@ -9,3 +9,4 @@ mod geosparql_tests;
 mod lateral_tests;
 mod native_differential_tests;
 mod text_search_tests;
+mod vector_tests;

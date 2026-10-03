@@ -26,6 +26,9 @@ impl Context<'_> {
         silent: bool,
         bound: Option<&Solutions>,
     ) -> NativeResult<Solutions> {
+        if super::vectors::is_search(name) {
+            return self.vector_service(inner, bound);
+        }
         let variable = match name {
             NamedNodePattern::NamedNode(endpoint) => {
                 return self.call_silently(endpoint.as_str(), inner, bound, silent);

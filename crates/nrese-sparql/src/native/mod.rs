@@ -42,6 +42,7 @@ mod strings;
 mod substitute;
 mod triple_terms;
 pub(crate) mod value;
+mod vectors;
 mod wcoj;
 
 use std::cell::{Cell, RefCell};
