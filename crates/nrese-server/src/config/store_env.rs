@@ -31,6 +31,11 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         )?,
         equality_by_representatives: equality.0,
         equality_compact: equality.1,
+        support_sets: super::env_values::parse_usize(
+            source,
+            names::REASONING_SUPPORT_SETS,
+            defaults.support_sets,
+        )?,
         verify_on_open: parse_bool(source, names::VERIFY_ON_OPEN, defaults.verify_on_open)?,
         map_checkpoints: parse_bool(source, names::MAP_CHECKPOINTS, defaults.map_checkpoints)?,
         wal_archive: parse_bool(source, names::WAL_ARCHIVE, defaults.wal_archive)?,

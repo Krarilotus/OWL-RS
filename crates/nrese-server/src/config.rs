@@ -114,6 +114,7 @@ impl ServerConfig {
                 }
                 .to_owned(),
             ),
+            ("reasoner.support_sets", store.support_sets.to_string()),
             (
                 "reasoner.semantics",
                 nrese_reasoner::ReasonerService::new(self.reasoner.clone())

@@ -26,8 +26,8 @@ pub mod term;
 
 pub use durability::{DurabilityConfig, SyncPolicy};
 pub use engine::{
-    BulkLoad, BulkMode, CommitSummary, Engine, EngineConfig, EngineStats, ImageInfo, ReadModel,
-    Rematerialisation, Snapshot, Transaction,
+    BulkLoad, BulkMode, CommitSummary, Engine, EngineConfig, EngineStats, ImageInfo,
+    InferredSubset, ReadModel, Rematerialisation, Snapshot, Transaction,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::{CompactionPolicy, IndexEncoding, set_index_encoding};

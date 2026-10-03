@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let started = Instant::now();
-    let sets = nrese_reasoner::v2::graph_sets::support_sets(&all, &ground, &graph_of, cap);
+    let sets = nrese_reasoner::v2::graph_sets::support_sets(&all, &ground, &[], &graph_of, cap);
     let elapsed = started.elapsed();
     let per_fact: usize = inferred
         .iter()

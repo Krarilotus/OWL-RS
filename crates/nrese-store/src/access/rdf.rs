@@ -104,6 +104,7 @@ pub(super) fn encode(state: &AccessState, graph: &NamedNode) -> Vec<Quad> {
         text(match s.inferred {
             Inferred::Hidden => "hidden",
             Inferred::Visible => "visible",
+            Inferred::Supported => "supported",
         }),
     );
     push(
@@ -225,6 +226,7 @@ pub(super) fn decode(quads: &[Quad], base: &str) -> AccessState {
             };
             settings.inferred = match get("inferred").as_deref() {
                 Some("visible") => Inferred::Visible,
+                Some("supported") => Inferred::Supported,
                 _ => Inferred::Hidden,
             };
             settings.users_create_workspaces =

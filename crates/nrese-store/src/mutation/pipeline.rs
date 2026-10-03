@@ -43,6 +43,7 @@ pub struct MutationPipeline {
 
 impl MutationPipeline {
     pub fn new(store: Arc<StoreService>, reasoner: Arc<ReasonerService>) -> Self {
+        store.use_reasoning_rules(reasoner.config().materialised_program());
         Self {
             store,
             reasoner,
