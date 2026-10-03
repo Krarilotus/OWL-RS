@@ -1001,10 +1001,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nrese-core"
-version = "0.1.0"
-
-[[package]]
 name = "nrese-engine"
 version = "0.1.0"
 dependencies = [
@@ -1073,11 +1069,12 @@ name = "nrese-reasoner"
 version = "0.1.0"
 dependencies = [
  "hashbrown 0.16.1",
- "nrese-core",
+ "nrese-engine",
  "nrese-exec",
  "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",
+ "nrese-xsd",
  "rayon",
  "smallvec",
  "thiserror 2.0.21",
@@ -1147,7 +1144,6 @@ dependencies = [
  "argon2",
  "getrandom 0.4.2",
  "hashbrown 0.16.1",
- "nrese-core",
  "nrese-engine",
  "nrese-rdf",
  "nrese-rdf-io",

@@ -9,7 +9,6 @@ mod bulk_load;
 pub mod catalog;
 mod classification;
 pub mod config;
-mod datatypes;
 mod delta;
 pub mod draft_check;
 pub mod error;

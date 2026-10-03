@@ -20,6 +20,7 @@ pub mod capability;
 pub mod classify;
 pub mod config;
 pub mod delta;
+pub mod engine;
 pub mod eval;
 pub mod explain;
 pub mod graph_sets;
