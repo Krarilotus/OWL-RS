@@ -198,6 +198,9 @@ struct Inner {
     bytes: Vec<u8>,
     /// Their end offsets in `bytes`.
     ends: Vec<u64>,
+    /// Their [`key_hash`]es: the table grows by moving numbers, without reading and
+    /// hashing every key again under the write lock (a bulk load stalled on it).
+    hashes: Vec<u64>,
     /// Their indexes, by [`key_hash`].
     table: HashTable<u64>,
 }
@@ -244,12 +247,9 @@ impl Inner {
         let base_len = self.base_len();
         self.bytes.extend_from_slice(key);
         self.ends.push(self.bytes.len() as u64);
-        let Inner {
-            table, bytes, ends, ..
-        } = self;
-        table.insert_unique(hash, index, |&i| {
-            key_hash(heap_key(bytes, ends, (i - base_len) as usize))
-        });
+        self.hashes.push(hash);
+        let Inner { table, hashes, .. } = self;
+        table.insert_unique(hash, index, |&i| hashes[(i - base_len) as usize]);
         index
     }
 }
@@ -405,7 +405,7 @@ impl Dictionary {
 
     /// A fingerprint of entries `0..covered`: their count and the hashes of the keys of
     /// the first, the middle and the last. `None` if the dictionary holds fewer.
-    fn fingerprint(&self, covered: u64) -> Option<u64> {
+    pub(crate) fn fingerprint(&self, covered: u64) -> Option<u64> {
         let inner = self.inner.read();
         if covered > inner.len() {
             return None;
@@ -613,7 +613,7 @@ impl Dictionary {
             terms: inner.len(),
             arena_bytes: inner.bytes.len() as u64 + base.map_or(0, |b| b.arena.len() as u64),
             // A slot is the stored index plus one control byte.
-            index_bytes: (inner.ends.capacity() * 8 + inner.table.capacity() * 9) as u64,
+            index_bytes: (inner.ends.capacity() * 16 + inner.table.capacity() * 9) as u64,
             mapped_bytes: base.map_or(0, Base::bytes),
         }
     }
@@ -1164,17 +1164,32 @@ impl Dictionary {
                 ]
             })
             .collect();
-        let indexes: Vec<u64> = {
-            let mut inner = self.inner.write();
+        // The keys known already are found under the read lock, which every loading thread
+        // holds at once; only the new ones take the write lock (and are looked up again
+        // there: another thread may have added them in between). Under the write lock alone,
+        // the lookups of every batch ran one after another: on YAGO tiny the whole parse
+        // phase waited on them.
+        let mut found: Vec<Option<u64>> = {
+            let inner = self.inner.read();
             batch
                 .keys
                 .iter()
-                .map(|key| {
-                    let bytes = &batch.arena[key.start..key.end];
-                    self.intern_hashed_locked(&mut inner, bytes, key.hash)
-                })
+                .map(|key| inner.find(key.hash, &batch.arena[key.start..key.end]))
                 .collect()
         };
+        if found.iter().any(Option::is_none) {
+            let mut inner = self.inner.write();
+            for (slot, key) in found.iter_mut().zip(&batch.keys) {
+                if slot.is_none() {
+                    let bytes = &batch.arena[key.start..key.end];
+                    *slot = Some(self.intern_hashed_locked(&mut inner, bytes, key.hash));
+                }
+            }
+        }
+        let indexes: Vec<u64> = found
+            .into_iter()
+            .map(|index| index.unwrap_or_default())
+            .collect();
         let resolve = |slot: Slot| match slot {
             Slot::Id(id) => id,
             Slot::Key(key) => {
@@ -1309,7 +1324,11 @@ impl Dictionary {
             ));
         }
         let Inner {
-            table, bytes, ends, ..
+            table,
+            bytes,
+            ends,
+            hashes: kept,
+            ..
         } = &mut *inner;
         bytes.reserve_exact(keys.iter().map(|key| key.len()).sum());
         ends.reserve_exact(keys.len());
@@ -1333,8 +1352,9 @@ impl Dictionary {
                     "duplicate dictionary key at {index}"
                 )));
             }
-            table.insert_unique(hash, index, |&i| key_hash(key(i)));
+            table.insert_unique(hash, index, |&i| hashes[i as usize]);
         }
+        *kept = hashes;
         Ok(())
     }
 
