@@ -18,8 +18,8 @@ Elsewhere its closure is incomplete by design and wouldn't be a result.
 ## Closure checks (3 October 2026, main PC)
 
 These are set-for-set comparisons of the inferred statements, without timing.
-- **Blank nodes** are compared up to renaming: each blank node gets a name from its
-  statements with IRIs and literals.
+- **Blank nodes** are compared up to renaming (`../compare_blank_nodes.py`): each blank
+  node gets a name from its statements with IRIs and literals.
 - **owlrl comparisons** use the benchmark's normalisation (`../compare_inferred.py`).
 - **Tools:** NRESE's set comes from `reason_query --inferred-out` (nrese-store example), and
   each Nemo set from the encoding run exactly as the suite runs it.
@@ -28,7 +28,7 @@ These are set-for-set comparisons of the inferred statements, without timing.
 |---|---|---|---|---|
 | LUBM 1 | 67,253 | 67,221 | 67,221 | 49,751 |
 | LUBM 10 | 830,003 | 829,971 | 829,971 | 622,249 |
-| OWL2Bench RL-1 | 1,399,563 | 1,399,531 | (pending) | not run (LUBM only) |
+| OWL2Bench RL-1 | 1,399,563 | 1,399,531 | 1,399,531 | not run (LUBM only) |
 
 **NRESE against the general encodings.** The sets are identical, blank nodes included,
 except for **exactly 32 statements** on every tier. These are `dt rdf:type rdfs:Datatype`
@@ -38,8 +38,8 @@ encodings leave out Table 8 and the axiomatic triples, as their headers state.
 `compare_inferred.py` drops statements about RDF/RDFS/XSD vocabulary, so the normalised
 comparison shows no difference.
 
-**`nemo` against `nemo-schemafirst`.** Identical on LUBM 1 and 10, blank nodes included;
-OWL2Bench RL-1 is pending.
+**`nemo` against `nemo-schemafirst`.** Identical on LUBM 1 and 10 and OWL2Bench RL-1, blank
+nodes included, with the same violations.
 
 **Against the owlrl reference (LUBM 1, normalised).** NRESE, `nemo-schemafirst` and
 `nemo-sparq` all have instance precision and recall 1.0 (37,935 statements each).
@@ -64,7 +64,7 @@ only. The benchmark runs on the office PC (batch B) decide.
 |---|---|---|---|---|
 | LUBM 1 | 3.5 s | 2.9–3.5 s | 0.9 s | 0.04 s |
 | LUBM 10 | 37.1 s | 40.0 s | 11.3 s | 0.32 s |
-| OWL2Bench RL-1 | 1,881 s | over 36 min (still running at writing) | – | 0.59 s |
+| OWL2Bench RL-1 | 1,881 s | 3,074 s | – | 0.59 s |
 
 So far, folding the schema first doesn't make the general encoding faster. sparq's
 encoding also does less work: it has no equality, cardinality, union, oneOf, hasValue,
