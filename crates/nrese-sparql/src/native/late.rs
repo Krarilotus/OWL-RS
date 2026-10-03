@@ -134,53 +134,61 @@ impl super::Context<'_> {
 
     /// Every row of `solutions` with each value replaced by each identity of its class,
     /// independently per column (a value outside every class stays), up to `limit` rows.
+    /// Column by column: each row's combinations in odometer order (the last column
+    /// fastest), each column written in one pass.
     fn expand_classes(
         &self,
         solutions: super::Solutions,
         classes: &nrese_engine::EqualityClasses,
         limit: Option<usize>,
     ) -> super::NativeResult<super::Solutions> {
-        let width = solutions.table.width();
+        let (width, rows) = (solutions.table.width(), solutions.table.len());
         let limit = limit.unwrap_or(usize::MAX);
-        let mut out = nrese_exec::IdTable::new(width);
-        let mut values = vec![0u64; width];
-        let mut row = vec![0u64; width];
-        let mut at = vec![0usize; width];
-        for r in 0..solutions.table.len() {
-            if r % (1 << 14) == 0 {
-                self.check()?;
-            }
-            for (c, value) in values.iter_mut().enumerate() {
-                *value = solutions.table.get(r, c);
-            }
-            let choices: Vec<&[u64]> = values.iter().map(|v| classes.members_of(v)).collect();
-            at.iter_mut().for_each(|i| *i = 0);
-            // Every combination, the last column fastest.
-            'combinations: loop {
-                if out.len() >= limit {
-                    break;
-                }
-                for c in 0..width {
-                    row[c] = choices[c][at[c]];
-                }
-                out.push_row(&row);
-                let mut c = width;
-                loop {
-                    if c == 0 {
-                        break 'combinations;
-                    }
-                    c -= 1;
-                    at[c] += 1;
-                    if at[c] < choices[c].len() {
-                        break;
-                    }
-                    at[c] = 0;
-                }
-            }
-            if out.len() >= limit {
-                break;
+        let size = |id: u64| classes.members_of(&id).len();
+        // Each row's number of combinations.
+        let mut factor = vec![1usize; rows];
+        for c in 0..width {
+            for (f, &id) in factor.iter_mut().zip(solutions.table.column(c)) {
+                *f = f.saturating_mul(size(id));
             }
         }
+        if factor.iter().all(|&f| f == 1) && rows <= limit {
+            return Ok(solutions);
+        }
+        // The rows whose combinations fit the limit (the last one maybe in part).
+        let mut total = 0usize;
+        let mut kept = 0;
+        while kept < rows && total < limit {
+            total = total.saturating_add(factor[kept]);
+            kept += 1;
+        }
+        self.check()?;
+        let mut columns: Vec<Vec<u64>> = vec![Vec::new(); width];
+        // Products of the later columns' sizes, per row, built from the last column back.
+        let mut stride = vec![1usize; kept];
+        for c in (0..width).rev() {
+            let column = solutions.table.column(c);
+            let mut out = Vec::with_capacity(total);
+            for r in 0..kept {
+                let members = classes.members_of(&column[r]);
+                let repeat = stride[r];
+                let rounds = factor[r] / (members.len() * repeat);
+                for _ in 0..rounds {
+                    for &member in members {
+                        out.extend(std::iter::repeat_n(member, repeat));
+                    }
+                }
+                stride[r] *= members.len();
+            }
+            out.truncate(limit);
+            columns[c] = out;
+            self.check()?;
+        }
+        let out = if width == 0 {
+            nrese_exec::IdTable::from_rows(0, std::iter::repeat_n(&[][..], total.min(limit)))
+        } else {
+            nrese_exec::IdTable::from_columns(columns)
+        };
         self.consumed(&solutions);
         self.produced(super::Solutions {
             vars: solutions.vars,
