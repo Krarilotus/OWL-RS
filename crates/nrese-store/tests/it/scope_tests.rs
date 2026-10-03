@@ -277,6 +277,31 @@ fn every_write_is_checked_against_its_requesters_scope() {
             "urn:g:secret"
         )))
     );
+    // A write that would change nothing is refused all the same: it succeeding where a new
+    // statement fails would tell what the graph holds (the review of 3 October 2026, A3).
+    let existing = |command: fn(GraphWriteRequest) -> MutationCommand| {
+        command(GraphWriteRequest {
+            target: GraphTarget::NamedGraph("urn:g:secret".to_owned()),
+            format: GraphResultFormat::NTriples,
+            base_iri: None,
+            payload: b"<urn:c> <urn:p> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+                .to_vec(),
+            replace: false,
+        })
+    };
+    assert!(forbidden(
+        store.apply(&existing(MutationCommand::GraphWrite), &writer)
+    ));
+    let tell = MutationCommand::Tell(TellRequest {
+        target: GraphTarget::NamedGraph("urn:g:secret".to_owned()),
+        format: GraphResultFormat::NTriples,
+        base_iri: None,
+        payload: b"<urn:c> <urn:p> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> .".to_vec(),
+    });
+    assert!(forbidden(store.apply(&tell, &writer)));
+    // Deleting a graph that is empty, or absent, likewise.
+    let absent = MutationCommand::GraphDelete(GraphTarget::NamedGraph("urn:g:other".to_owned()));
+    assert!(forbidden(store.apply(&absent, &writer)));
     // A restore changes every graph.
     let restore = MutationCommand::Restore(DatasetRestoreRequest {
         format: DatasetBackupFormat::NQuads,

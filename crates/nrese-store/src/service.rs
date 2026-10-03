@@ -199,7 +199,12 @@ impl StoreService {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(crate::error::StoreError::Io(error)),
+                Err(error) => {
+                    // The file may still be there: the next invalidation tries again (the
+                    // review of 3 October 2026, A4).
+                    self.marker.store(true, Ordering::Release);
+                    return Err(crate::error::StoreError::Io(error));
+                }
             }
         }
         Ok(())

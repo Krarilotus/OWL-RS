@@ -393,3 +393,28 @@ fn on_disk_mode_persists_data_and_revision_across_reopen() -> Result<(), Box<dyn
 
     Ok(())
 }
+
+/// A reasoning marker whose removal failed is removed by the next invalidation (the
+/// review of 3 October 2026, A4): it was considered gone, so a later write left the stale
+/// marker claiming the inferences were current.
+#[test]
+fn a_failed_marker_removal_is_retried() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let store = StoreService::new(StoreConfig::on_disk(dir.path()))?;
+    store.execute_update_str("INSERT DATA { <http://e/a> <http://e/p> <http://e/b> }")?;
+    store.rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Rdfs)?;
+    let marker = dir.path().join("reasoning.state");
+    let recorded = fs::read_to_string(&marker)?;
+    // A directory in its place: removing the file fails on every platform.
+    fs::remove_file(&marker)?;
+    fs::create_dir(&marker)?;
+    fs::write(marker.join("in-the-way"), "")?;
+    assert!(store.invalidate_reasoning().is_err());
+    // The fault is repaired, and the stale marker is back on disk.
+    fs::remove_dir_all(&marker)?;
+    fs::write(&marker, recorded)?;
+    store.invalidate_reasoning()?;
+    assert!(!marker.exists(), "the stale marker survived");
+    assert!(store.reasoning_state().is_none());
+    Ok(())
+}
