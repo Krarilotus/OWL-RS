@@ -22,6 +22,7 @@
 mod bulk;
 pub mod characteristic;
 mod equality;
+mod replication;
 mod snapshot;
 pub(crate) mod spill;
 mod statistics;
@@ -45,6 +46,7 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use equality::Classes as EqualityClasses;
+pub use replication::LogBatch;
 pub use snapshot::{InferredMask, InferredSubset, Snapshot};
 pub use transaction::{CommitSummary, Transaction};
 

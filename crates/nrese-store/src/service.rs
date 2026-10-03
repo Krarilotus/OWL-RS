@@ -671,6 +671,33 @@ impl StoreService {
         crate::image_backup::backup_image(&self.engine, dir)
     }
 
+    /// A read replica's feed: the committed records after revision `after`, at most about
+    /// `max_bytes` ([`nrese_engine::Engine::log_since`]). An error for a log that no
+    /// longer holds them (`EngineError::LogTruncated`): the replica starts from an image.
+    pub fn replication_log(
+        &self,
+        after: u64,
+        max_bytes: usize,
+    ) -> StoreResult<nrese_engine::LogBatch> {
+        self.engine
+            .log_since(after, max_bytes)
+            .map_err(crate::StoreError::Engine)
+    }
+
+    /// Applies a primary's records on this store, a read replica: each becomes a commit
+    /// with the primary's revision ([`nrese_engine::Engine::apply_log`]). Returns the
+    /// revision reached. Support graph sets start afresh (the records don't say what they
+    /// touched in the sets' terms); nothing is reasoned here, the records carry the
+    /// inferences.
+    pub fn apply_replication_log(&self, frames: &[u8]) -> StoreResult<u64> {
+        let revision = self
+            .engine
+            .apply_log(frames)
+            .map_err(crate::StoreError::Engine)?;
+        self.supports().forget();
+        Ok(revision)
+    }
+
     /// At most `limit` resources whose labels' or local names' words begin with the words
     /// of `typed`, best first ([`crate::autocomplete`]); for a scope that reads every graph.
     pub fn autocomplete(

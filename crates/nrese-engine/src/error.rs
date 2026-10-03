@@ -25,4 +25,11 @@ pub enum EngineError {
     /// A speculative transaction ([`crate::Engine::speculative`]) was asked to commit.
     #[error("a speculative transaction can't commit")]
     Speculative,
+    /// The write-ahead log no longer holds the records a replica asked for
+    /// ([`crate::Engine::log_since`]): it starts again from an image of revision `oldest`
+    /// or later.
+    #[error(
+        "the log holds no records after revision {oldest} that were asked for; start from an image"
+    )]
+    LogTruncated { oldest: u64 },
 }

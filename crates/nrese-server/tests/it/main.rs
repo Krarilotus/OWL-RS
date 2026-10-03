@@ -22,6 +22,7 @@ mod policy_api_tests;
 mod query_protocol_tests;
 mod rdf4j_protocol_tests;
 mod recovery_safety_tests;
+mod replication_tests;
 mod shacl_api_tests;
 mod tell_api_tests;
 mod update_safety_tests;

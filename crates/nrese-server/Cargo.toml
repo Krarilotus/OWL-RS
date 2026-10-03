@@ -7,6 +7,8 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+# Replication's image transfer (src/replication.rs).
+tempfile = { workspace = true }
 anyhow.workspace = true
 async-trait.workspace = true
 axum = { version = "0.8.8", features = ["json", "query"] }
@@ -40,7 +42,6 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tower = { version = "0.5.2", features = ["util"] }
 
 [lints]

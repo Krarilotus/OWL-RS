@@ -27,6 +27,9 @@ pub enum ApiError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// What was asked for is gone for good (a replica's log a checkpoint covered).
+    #[error("gone: {0}")]
+    Gone(String),
     #[error("not acceptable: {0}")]
     NotAcceptable(String),
     #[error("unsupported media type: {0}")]
@@ -80,6 +83,11 @@ impl ApiError {
     /// The request conflicts with the resource's state (it exists already, say).
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::Conflict(message.into())
+    }
+
+    /// What was asked for is gone for good (410).
+    pub fn gone(message: impl Into<String>) -> Self {
+        Self::Gone(message.into())
     }
 
     /// The client accepts no media type the endpoint can produce.
@@ -167,6 +175,13 @@ impl IntoResponse for ApiError {
                 StatusCode::CONFLICT,
                 "https://nrese.dev/problems/conflict",
                 "Conflict",
+                detail,
+                None,
+            ),
+            Self::Gone(detail) => (
+                StatusCode::GONE,
+                "https://nrese.dev/problems/gone",
+                "Gone",
                 detail,
                 None,
             ),

@@ -49,6 +49,25 @@ nrese_store_mode_info{{mode=\"{}\",durability=\"{}\"}} 1\n",
         state.store_mode_name(),
         state.durability_name(),
     );
+    let replication = state.replication();
+    if replication.is_replica() {
+        let status = replication.status(state.store().current_revision());
+        body.push_str(&format!(
+            "# HELP nrese_replication_lag_revisions Revisions this replica is behind its primary, as last seen.
+# TYPE nrese_replication_lag_revisions gauge
+nrese_replication_lag_revisions {}
+# HELP nrese_replication_records_applied_total Records of the primary's log applied since start.
+# TYPE nrese_replication_records_applied_total counter
+nrese_replication_records_applied_total {}
+# HELP nrese_replication_healthy Whether the last attempt to follow the primary succeeded.
+# TYPE nrese_replication_healthy gauge
+nrese_replication_healthy {}
+",
+            status.lag_revisions.unwrap_or(0),
+            status.records_applied,
+            u8::from(status.last_error.is_none() && status.last_contact_unix.is_some()),
+        ));
+    }
     body.push_str(&format!(
         "# HELP nrese_query_cache_hits_total Queries answered from the result cache.
 # TYPE nrese_query_cache_hits_total counter

@@ -7,7 +7,7 @@ mod classification;
 mod console;
 mod draft_check;
 mod graph_store;
-mod guard;
+pub(crate) mod guard;
 mod handlers;
 mod media;
 mod metrics;
