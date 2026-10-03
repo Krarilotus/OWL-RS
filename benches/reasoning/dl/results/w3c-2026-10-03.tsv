@@ -1,0 +1,1348 @@
+test	status	task	expected	reasoner	result	ms	verdict	detail
+Consistent Datatype restrictions with Different Types	Approved	consistency	consistent	hermit	consistent	13	pass	
+Consistent Datatype restrictions with Different Types	Approved	consistency	consistent	konclude	consistent	22	pass	
+Consistent Datatype restrictions with Different Types	Approved	consistency	consistent	openllet	consistent	13	pass	
+Consistent owl:real range with DataOneOf	Approved	consistency	consistent	hermit	consistent	11	pass	
+Consistent owl:real range with DataOneOf	Approved	consistency	consistent	konclude	consistent	19	pass	
+Consistent owl:real range with DataOneOf	Approved	consistency	consistent	openllet	consistent	9	pass	
+Consistent-but-all-unsat	Approved	consistency	consistent	hermit	consistent	20	pass	
+Consistent-but-all-unsat	Approved	consistency	consistent	konclude	consistent	27	pass	
+Consistent-but-all-unsat	Approved	consistency	consistent	openllet	consistent	13	pass	
+Consistent-but-all-unsat	Approved	entailment	entailed	hermit	entailed	142	pass	
+Consistent-but-all-unsat	Approved	entailment	entailed	konclude	unsupported	9	unsupported	Konclude's command line has no entailment
+Consistent-but-all-unsat	Approved	entailment	entailed	openllet	entailed	352	pass	
+Consistent-dateTime	Approved	consistency	consistent	hermit	consistent	18	pass	
+Consistent-dateTime	Approved	consistency	consistent	konclude	consistent	22	pass	
+Consistent-dateTime	Approved	consistency	consistent	openllet	consistent	17	pass	
+Contradicting datatype Restrictions	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+Contradicting datatype Restrictions	Approved	consistency	inconsistent	konclude	inconsistent	21	pass	
+Contradicting datatype Restrictions	Approved	consistency	inconsistent	openllet	inconsistent	10	pass	
+Contradicting-dateTime-restrictions	Approved	consistency	inconsistent	hermit	inconsistent	14	pass	
+Contradicting-dateTime-restrictions	Approved	consistency	inconsistent	konclude	inconsistent	21	pass	
+Contradicting-dateTime-restrictions	Approved	consistency	inconsistent	openllet	inconsistent	11	pass	
+Datatype-DataComplementOf-001	Approved	consistency	consistent	hermit	consistent	12	pass	
+Datatype-DataComplementOf-001	Approved	consistency	consistent	konclude	inconsistent	17	wrong-result	
+Datatype-DataComplementOf-001	Approved	consistency	consistent	openllet	consistent	7	pass	
+Datatype-Float-Discrete-001	Approved	consistency	inconsistent	hermit	inconsistent	13	pass	
+Datatype-Float-Discrete-001	Approved	consistency	inconsistent	konclude	consistent	18	wrong-result	
+Datatype-Float-Discrete-001	Approved	consistency	inconsistent	openllet	inconsistent	8	pass	
+Different types in Datatype Restrictions and Complement	Approved	consistency	inconsistent	hermit	inconsistent	13	pass	
+Different types in Datatype Restrictions and Complement	Approved	consistency	inconsistent	konclude	inconsistent	20	pass	
+Different types in Datatype Restrictions and Complement	Approved	consistency	inconsistent	openllet	inconsistent	10	pass	
+DisjointClasses-001	Approved	consistency	consistent	hermit	consistent	6	pass	
+DisjointClasses-001	Approved	consistency	consistent	konclude	consistent	16	pass	
+DisjointClasses-001	Approved	consistency	consistent	openllet	consistent	5	pass	
+DisjointClasses-001	Approved	entailment	entailed	hermit	entailed	18	pass	
+DisjointClasses-001	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+DisjointClasses-001	Approved	entailment	entailed	openllet	entailed	10	pass	
+DisjointClasses-002	Approved	consistency	inconsistent	elk	inconsistent	10	pass	
+DisjointClasses-002	Approved	consistency	inconsistent	hermit	inconsistent	9	pass	
+DisjointClasses-002	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+DisjointClasses-002	Approved	consistency	inconsistent	openllet	inconsistent	12	pass	
+DisjointClasses-003	Approved	consistency	consistent	hermit	consistent	5	pass	
+DisjointClasses-003	Approved	consistency	consistent	konclude	consistent	16	pass	
+DisjointClasses-003	Approved	consistency	consistent	openllet	consistent	5	pass	
+DisjointClasses-003	Approved	entailment	entailed	hermit	entailed	19	pass	
+DisjointClasses-003	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+DisjointClasses-003	Approved	entailment	entailed	openllet	entailed	28	pass	
+FS2RDF-different-individuals-2-annotation-ar		consistency	consistent	elk	consistent	8	pass	
+FS2RDF-different-individuals-2-annotation-ar		consistency	consistent	hermit	consistent	12	pass	
+FS2RDF-different-individuals-2-annotation-ar		consistency	consistent	konclude	consistent	19	pass	
+FS2RDF-different-individuals-2-annotation-ar		consistency	consistent	openllet	consistent	11	pass	
+FS2RDF-different-individuals-2-ar	Approved	consistency	consistent	elk	consistent	5	pass	
+FS2RDF-different-individuals-2-ar	Approved	consistency	consistent	hermit	consistent	9	pass	
+FS2RDF-different-individuals-2-ar	Approved	consistency	consistent	konclude	consistent	16	pass	
+FS2RDF-different-individuals-2-ar	Approved	consistency	consistent	openllet	consistent	8	pass	
+FS2RDF-different-individuals-3-annotation-ar		consistency	consistent	elk	consistent	7	pass	
+FS2RDF-different-individuals-3-annotation-ar		consistency	consistent	hermit	consistent	10	pass	
+FS2RDF-different-individuals-3-annotation-ar		consistency	consistent	konclude	consistent	16	pass	
+FS2RDF-different-individuals-3-annotation-ar		consistency	consistent	openllet	consistent	5	pass	
+FS2RDF-different-individuals-3-ar	Approved	consistency	consistent	elk	consistent	6	pass	
+FS2RDF-different-individuals-3-ar	Approved	consistency	consistent	hermit	consistent	9	pass	
+FS2RDF-different-individuals-3-ar	Approved	consistency	consistent	konclude	consistent	16	pass	
+FS2RDF-different-individuals-3-ar	Approved	consistency	consistent	openllet	consistent	4	pass	
+FS2RDF-disjoint-classes-2-annotation-ar		consistency	consistent	elk	consistent	6	pass	
+FS2RDF-disjoint-classes-2-annotation-ar		consistency	consistent	hermit	consistent	10	pass	
+FS2RDF-disjoint-classes-2-annotation-ar		consistency	consistent	konclude	consistent	16	pass	
+FS2RDF-disjoint-classes-2-annotation-ar		consistency	consistent	openllet	consistent	5	pass	
+FS2RDF-disjoint-classes-2-ar		consistency	consistent	elk	consistent	5	pass	
+FS2RDF-disjoint-classes-2-ar		consistency	consistent	hermit	consistent	9	pass	
+FS2RDF-disjoint-classes-2-ar		consistency	consistent	konclude	consistent	16	pass	
+FS2RDF-disjoint-classes-2-ar		consistency	consistent	openllet	consistent	7	pass	
+FS2RDF-disjoint-classes-3-annotation-ar		consistency	consistent	elk	consistent	5	pass	
+FS2RDF-disjoint-classes-3-annotation-ar		consistency	consistent	hermit	consistent	11	pass	
+FS2RDF-disjoint-classes-3-annotation-ar		consistency	consistent	konclude	consistent	16	pass	
+FS2RDF-disjoint-classes-3-annotation-ar		consistency	consistent	openllet	consistent	5	pass	
+FS2RDF-disjoint-classes-3-ar		consistency	consistent	elk	consistent	5	pass	
+FS2RDF-disjoint-classes-3-ar		consistency	consistent	hermit	consistent	11	pass	
+FS2RDF-disjoint-classes-3-ar		consistency	consistent	konclude	consistent	16	pass	
+FS2RDF-disjoint-classes-3-ar		consistency	consistent	openllet	consistent	5	pass	
+FS2RDF-domain-range-expression-ar		consistency	consistent	hermit	consistent	24	pass	
+FS2RDF-domain-range-expression-ar		consistency	consistent	konclude	consistent	16	pass	
+FS2RDF-domain-range-expression-ar		consistency	consistent	openllet	consistent	8	pass	
+FS2RDF-domain-range-simple-ar		consistency	consistent	elk	consistent	8	pass	
+FS2RDF-domain-range-simple-ar		consistency	consistent	hermit	consistent	14	pass	
+FS2RDF-domain-range-simple-ar		consistency	consistent	konclude	consistent	13	pass	
+FS2RDF-domain-range-simple-ar		consistency	consistent	openllet	consistent	7	pass	
+FS2RDF-equivalent-classes-2-annotation-ar		consistency	consistent	elk	consistent	8	pass	
+FS2RDF-equivalent-classes-2-annotation-ar		consistency	consistent	hermit	consistent	11	pass	
+FS2RDF-equivalent-classes-2-annotation-ar		consistency	consistent	konclude	consistent	13	pass	
+FS2RDF-equivalent-classes-2-annotation-ar		consistency	consistent	openllet	consistent	6	pass	
+FS2RDF-equivalent-classes-2-ar		consistency	consistent	elk	consistent	5	pass	
+FS2RDF-equivalent-classes-2-ar		consistency	consistent	hermit	consistent	9	pass	
+FS2RDF-equivalent-classes-2-ar		consistency	consistent	konclude	consistent	12	pass	
+FS2RDF-equivalent-classes-2-ar		consistency	consistent	openllet	consistent	4	pass	
+FS2RDF-equivalent-classes-3-annotation-ar		consistency	consistent	elk	parse-error	6	parse-error	java.lang.IllegalStateException: no axiom added yet by the consumer
+FS2RDF-equivalent-classes-3-annotation-ar		consistency	consistent	hermit	parse-error	13	parse-error	java.lang.IllegalStateException: no axiom added yet by the consumer
+FS2RDF-equivalent-classes-3-annotation-ar		consistency	consistent	konclude	parse-error	4	parse-error	java.lang.IllegalStateException: no axiom added yet by the consumer
+FS2RDF-equivalent-classes-3-annotation-ar		consistency	consistent	openllet	parse-error	9	parse-error	java.lang.IllegalStateException: no axiom added yet by the consumer
+FS2RDF-equivalent-classes-3-ar		consistency	consistent	elk	consistent	5	pass	
+FS2RDF-equivalent-classes-3-ar		consistency	consistent	hermit	consistent	10	pass	
+FS2RDF-equivalent-classes-3-ar		consistency	consistent	konclude	consistent	21	pass	
+FS2RDF-equivalent-classes-3-ar		consistency	consistent	openllet	consistent	5	pass	
+FS2RDF-literals-ar		consistency	consistent	hermit	consistent	146	pass	
+FS2RDF-literals-ar		consistency	consistent	konclude	consistent	135	pass	
+FS2RDF-literals-ar		consistency	consistent	openllet	consistent	214	pass	
+FS2RDF-negative-property-assertion-ar		consistency	consistent	hermit	consistent	24	pass	
+FS2RDF-negative-property-assertion-ar		consistency	consistent	konclude	consistent	22	pass	
+FS2RDF-negative-property-assertion-ar		consistency	consistent	openllet	consistent	15	pass	
+FS2RDF-no-builtin-prefixes-ar	Approved	consistency	consistent	elk	consistent	6	pass	
+FS2RDF-no-builtin-prefixes-ar	Approved	consistency	consistent	hermit	consistent	12	pass	
+FS2RDF-no-builtin-prefixes-ar	Approved	consistency	consistent	konclude	consistent	13	pass	
+FS2RDF-no-builtin-prefixes-ar	Approved	consistency	consistent	openllet	consistent	5	pass	
+FS2RDF-ontology-annotation-annotation-ar		consistency	consistent	elk	consistent	9	pass	
+FS2RDF-ontology-annotation-annotation-ar		consistency	consistent	hermit	consistent	13	pass	
+FS2RDF-ontology-annotation-annotation-ar		consistency	consistent	konclude	consistent	13	pass	
+FS2RDF-ontology-annotation-annotation-ar		consistency	consistent	openllet	consistent	6	pass	
+FS2RDF-property-attributes-ar		consistency	consistent	hermit	consistent	18	pass	
+FS2RDF-property-attributes-ar		consistency	consistent	konclude	consistent	18	pass	
+FS2RDF-property-attributes-ar		consistency	consistent	openllet	consistent	8	pass	
+FS2RDF-propertychain-2-annotated-ar		consistency	consistent	elk	consistent	5	pass	
+FS2RDF-propertychain-2-annotated-ar		consistency	consistent	hermit	consistent	11	pass	
+FS2RDF-propertychain-2-annotated-ar		consistency	consistent	konclude	consistent	13	pass	
+FS2RDF-propertychain-2-annotated-ar		consistency	consistent	openllet	consistent	7	pass	
+FS2RDF-propertychain-2-ar		consistency	consistent	elk	consistent	5	pass	
+FS2RDF-propertychain-2-ar		consistency	consistent	hermit	consistent	10	pass	
+FS2RDF-propertychain-2-ar		consistency	consistent	konclude	consistent	12	pass	
+FS2RDF-propertychain-2-ar		consistency	consistent	openllet	consistent	5	pass	
+FS2RDF-same-individual-2-annotation-ar		consistency	consistent	hermit	consistent	11	pass	
+FS2RDF-same-individual-2-annotation-ar		consistency	consistent	konclude	consistent	12	pass	
+FS2RDF-same-individual-2-annotation-ar		consistency	consistent	openllet	consistent	5	pass	
+FS2RDF-same-individual-2-ar	Approved	consistency	consistent	elk	consistent	5	pass	
+FS2RDF-same-individual-2-ar	Approved	consistency	consistent	hermit	consistent	8	pass	
+FS2RDF-same-individual-2-ar	Approved	consistency	consistent	konclude	consistent	12	pass	
+FS2RDF-same-individual-2-ar	Approved	consistency	consistent	openllet	consistent	5	pass	
+FS2RDF-same-individual-3-annotation-ar		consistency	consistent	hermit	consistent	12	pass	
+FS2RDF-same-individual-3-annotation-ar		consistency	consistent	konclude	consistent	12	pass	
+FS2RDF-same-individual-3-annotation-ar		consistency	consistent	openllet	consistent	6	pass	
+Footnote-not-about-self		consistency	inconsistent	hermit	inconsistent	12	pass	
+Footnote-not-about-self		consistency	inconsistent	konclude	consistent	20	wrong-result	
+Footnote-not-about-self		consistency	inconsistent	openllet	inconsistent	5	pass	
+Inconsistent Byte Filler	Approved	consistency	inconsistent	hermit	inconsistent	12	pass	
+Inconsistent Byte Filler	Approved	consistency	inconsistent	konclude	inconsistent	19	pass	
+Inconsistent Byte Filler	Approved	consistency	inconsistent	openllet	inconsistent	8	pass	
+Inconsistent Data Complement with the Restrictions	Approved	consistency	inconsistent	hermit	inconsistent	14	pass	
+Inconsistent Data Complement with the Restrictions	Approved	consistency	inconsistent	konclude	inconsistent	21	pass	
+Inconsistent Data Complement with the Restrictions	Approved	consistency	inconsistent	openllet	inconsistent	10	pass	
+Inconsistent Disjoint Dataproperties	Approved	consistency	inconsistent	hermit	inconsistent	12	pass	
+Inconsistent Disjoint Dataproperties	Approved	consistency	inconsistent	konclude	consistent	19	wrong-result	
+Inconsistent Disjoint Dataproperties	Approved	consistency	inconsistent	openllet	inconsistent	9	pass	
+Inconsistent String Pattern with Disjoint Dataproperties	Proposed	consistency	inconsistent	hermit	inconsistent	13	pass	
+Inconsistent String Pattern with Disjoint Dataproperties	Proposed	consistency	inconsistent	konclude	consistent	19	wrong-result	
+Inconsistent String Pattern with Disjoint Dataproperties	Proposed	consistency	inconsistent	openllet	consistent	11	wrong-result	
+Minus Infinity is not in owl:real	Approved	consistency	inconsistent	hermit	inconsistent	12	pass	
+Minus Infinity is not in owl:real	Approved	consistency	inconsistent	konclude	consistent	19	wrong-result	
+Minus Infinity is not in owl:real	Approved	consistency	inconsistent	openllet	inconsistent	11	pass	
+New-Feature-AnnotationAnnotations-001	Approved	consistency	consistent	elk	consistent	5	pass	
+New-Feature-AnnotationAnnotations-001	Approved	consistency	consistent	hermit	consistent	11	pass	
+New-Feature-AnnotationAnnotations-001	Approved	consistency	consistent	konclude	consistent	12	pass	
+New-Feature-AnnotationAnnotations-001	Approved	consistency	consistent	openllet	consistent	5	pass	
+New-Feature-AsymmetricProperty-001	Approved	consistency	inconsistent	hermit	inconsistent	10	pass	
+New-Feature-AsymmetricProperty-001	Approved	consistency	inconsistent	konclude	consistent	16	wrong-result	
+New-Feature-AsymmetricProperty-001	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+New-Feature-AxiomAnnotations-001	Approved	consistency	consistent	elk	consistent	6	pass	
+New-Feature-AxiomAnnotations-001	Approved	consistency	consistent	hermit	consistent	11	pass	
+New-Feature-AxiomAnnotations-001	Approved	consistency	consistent	konclude	consistent	14	pass	
+New-Feature-AxiomAnnotations-001	Approved	consistency	consistent	openllet	consistent	5	pass	
+New-Feature-BottomDataProperty-001	Approved	consistency	inconsistent	elk	consistent	6	wrong-result	
+New-Feature-BottomDataProperty-001	Approved	consistency	inconsistent	hermit	inconsistent	9	pass	
+New-Feature-BottomDataProperty-001	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+New-Feature-BottomDataProperty-001	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+New-Feature-BottomObjectProperty-001	Approved	consistency	inconsistent	elk	consistent	5	wrong-result	
+New-Feature-BottomObjectProperty-001	Approved	consistency	inconsistent	hermit	inconsistent	9	pass	
+New-Feature-BottomObjectProperty-001	Approved	consistency	inconsistent	konclude	consistent	13	wrong-result	
+New-Feature-BottomObjectProperty-001	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+New-Feature-DataQCR-001	Approved	consistency	consistent	hermit	consistent	5	pass	
+New-Feature-DataQCR-001	Approved	consistency	consistent	konclude	consistent	16	pass	
+New-Feature-DataQCR-001	Approved	consistency	consistent	openllet	consistent	4	pass	
+New-Feature-DataQCR-001	Approved	entailment	entailed	hermit	entailed	21	pass	
+New-Feature-DataQCR-001	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+New-Feature-DataQCR-001	Approved	entailment	entailed	openllet	entailed	12	pass	
+New-Feature-DisjointDataProperties-001	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+New-Feature-DisjointDataProperties-001	Approved	consistency	inconsistent	konclude	consistent	17	wrong-result	
+New-Feature-DisjointDataProperties-001	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+New-Feature-DisjointDataProperties-002	Approved	consistency	consistent	hermit	consistent	6	pass	
+New-Feature-DisjointDataProperties-002	Approved	consistency	consistent	konclude	consistent	17	pass	
+New-Feature-DisjointDataProperties-002	Approved	consistency	consistent	openllet	consistent	7	pass	
+New-Feature-DisjointDataProperties-002	Approved	entailment	entailed	hermit	entailed	24	pass	
+New-Feature-DisjointDataProperties-002	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+New-Feature-DisjointDataProperties-002	Approved	entailment	entailed	openllet	not-entailed	15	wrong-result	
+New-Feature-DisjointObjectProperties-001	Approved	consistency	consistent	hermit	consistent	5	pass	
+New-Feature-DisjointObjectProperties-001	Approved	consistency	consistent	konclude	consistent	17	pass	
+New-Feature-DisjointObjectProperties-001	Approved	consistency	consistent	openllet	consistent	5	pass	
+New-Feature-DisjointObjectProperties-001	Approved	entailment	entailed	hermit	entailed	19	pass	
+New-Feature-DisjointObjectProperties-001	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+New-Feature-DisjointObjectProperties-001	Approved	entailment	entailed	openllet	entailed	13	pass	
+New-Feature-DisjointObjectProperties-002	Approved	consistency	consistent	hermit	consistent	6	pass	
+New-Feature-DisjointObjectProperties-002	Approved	consistency	consistent	konclude	consistent	17	pass	
+New-Feature-DisjointObjectProperties-002	Approved	consistency	consistent	openllet	consistent	5	pass	
+New-Feature-DisjointObjectProperties-002	Approved	entailment	entailed	hermit	entailed	20	pass	
+New-Feature-DisjointObjectProperties-002	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+New-Feature-DisjointObjectProperties-002	Approved	entailment	entailed	openllet	entailed	11	pass	
+New-Feature-DisjointUnion-001	Approved	consistency	consistent	hermit	consistent	5	pass	
+New-Feature-DisjointUnion-001	Approved	consistency	consistent	konclude	consistent	16	pass	
+New-Feature-DisjointUnion-001	Approved	consistency	consistent	openllet	consistent	5	pass	
+New-Feature-DisjointUnion-001	Approved	entailment	entailed	hermit	entailed	20	pass	
+New-Feature-DisjointUnion-001	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+New-Feature-DisjointUnion-001	Approved	entailment	entailed	openllet	entailed	15	pass	
+New-Feature-IrreflexiveProperty-001	Approved	consistency	inconsistent	hermit	inconsistent	10	pass	
+New-Feature-IrreflexiveProperty-001	Approved	consistency	inconsistent	konclude	consistent	15	wrong-result	
+New-Feature-IrreflexiveProperty-001	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+New-Feature-Keys-001	Approved	consistency	consistent	elk	consistent	5	pass	
+New-Feature-Keys-001	Approved	consistency	consistent	hermit	consistent	5	pass	
+New-Feature-Keys-001	Approved	consistency	consistent	konclude	consistent	16	pass	
+New-Feature-Keys-001	Approved	consistency	consistent	openllet	consistent	15	pass	
+New-Feature-Keys-001	Approved	entailment	entailed	elk	not-entailed	14	wrong-result	
+New-Feature-Keys-001	Approved	entailment	entailed	hermit	entailed	22	pass	
+New-Feature-Keys-001	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+New-Feature-Keys-001	Approved	entailment	entailed	openllet	entailed	35	pass	
+New-Feature-Keys-002	Approved	consistency	inconsistent	elk	consistent	6	wrong-result	
+New-Feature-Keys-002	Approved	consistency	inconsistent	hermit	inconsistent	10	pass	
+New-Feature-Keys-002	Approved	consistency	inconsistent	konclude	consistent	16	wrong-result	
+New-Feature-Keys-002	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+New-Feature-Keys-003	Approved	consistency	consistent	elk	consistent	5	pass	
+New-Feature-Keys-003	Approved	consistency	consistent	hermit	consistent	5	pass	
+New-Feature-Keys-003	Approved	consistency	consistent	konclude	consistent	16	pass	
+New-Feature-Keys-003	Approved	consistency	consistent	openllet	consistent	5	pass	
+New-Feature-Keys-003	Approved	entailment	entailed	elk	not-entailed	11	wrong-result	
+New-Feature-Keys-003	Approved	entailment	entailed	hermit	entailed	16	pass	
+New-Feature-Keys-003	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+New-Feature-Keys-003	Approved	entailment	entailed	openllet	entailed	10	pass	
+New-Feature-Keys-004	Approved	consistency	consistent	elk	consistent	7	pass	
+New-Feature-Keys-004	Approved	consistency	consistent	hermit	consistent	5	pass	
+New-Feature-Keys-004	Approved	consistency	consistent	konclude	consistent	16	pass	
+New-Feature-Keys-004	Approved	consistency	consistent	openllet	consistent	5	pass	
+New-Feature-Keys-004	Approved	entailment	not-entailed	elk	not-entailed	14	pass	
+New-Feature-Keys-004	Approved	entailment	not-entailed	hermit	not-entailed	14	pass	
+New-Feature-Keys-004	Approved	entailment	not-entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+New-Feature-Keys-004	Approved	entailment	not-entailed	openllet	not-entailed	10	pass	
+New-Feature-Keys-005	Approved	consistency	consistent	elk	consistent	5	pass	
+New-Feature-Keys-005	Approved	consistency	consistent	hermit	consistent	9	pass	
+New-Feature-Keys-005	Approved	consistency	consistent	konclude	consistent	16	pass	
+New-Feature-Keys-005	Approved	consistency	consistent	openllet	consistent	6	pass	
+New-Feature-Keys-006	Approved	consistency	inconsistent	elk	consistent	5	wrong-result	
+New-Feature-Keys-006	Approved	consistency	inconsistent	hermit	inconsistent	11	pass	
+New-Feature-Keys-006	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+New-Feature-Keys-006	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+New-Feature-Keys-007	Approved	consistency	consistent	elk	consistent	5	pass	
+New-Feature-Keys-007	Approved	consistency	consistent	hermit	consistent	5	pass	
+New-Feature-Keys-007	Approved	consistency	consistent	konclude	consistent	16	pass	
+New-Feature-Keys-007	Approved	consistency	consistent	openllet	consistent	8	pass	
+New-Feature-Keys-007	Approved	entailment	not-entailed	elk	not-entailed	12	pass	
+New-Feature-Keys-007	Approved	entailment	not-entailed	hermit	not-entailed	23	pass	
+New-Feature-Keys-007	Approved	entailment	not-entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+New-Feature-Keys-007	Approved	entailment	not-entailed	openllet	not-entailed	10	pass	
+New-Feature-NegativeDataPropertyAssertion-001	Approved	consistency	inconsistent	elk	consistent	6	wrong-result	
+New-Feature-NegativeDataPropertyAssertion-001	Approved	consistency	inconsistent	hermit	inconsistent	9	pass	
+New-Feature-NegativeDataPropertyAssertion-001	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+New-Feature-NegativeDataPropertyAssertion-001	Approved	consistency	inconsistent	openllet	inconsistent	14	pass	
+New-Feature-NegativeObjectPropertyAssertion-001	Approved	consistency	inconsistent	elk	consistent	5	wrong-result	
+New-Feature-NegativeObjectPropertyAssertion-001	Approved	consistency	inconsistent	hermit	inconsistent	8	pass	
+New-Feature-NegativeObjectPropertyAssertion-001	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+New-Feature-NegativeObjectPropertyAssertion-001	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+New-Feature-ObjectPropertyChain-001	Approved	consistency	consistent	elk	consistent	4	pass	
+New-Feature-ObjectPropertyChain-001	Approved	consistency	consistent	hermit	consistent	4	pass	
+New-Feature-ObjectPropertyChain-001	Approved	consistency	consistent	konclude	consistent	12	pass	
+New-Feature-ObjectPropertyChain-001	Approved	consistency	consistent	openllet	consistent	5	pass	
+New-Feature-ObjectPropertyChain-001	Approved	entailment	entailed	elk	entailed	8	pass	no logical axioms
+New-Feature-ObjectPropertyChain-001	Approved	entailment	entailed	hermit	entailed	16	pass	no logical axioms
+New-Feature-ObjectPropertyChain-001	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+New-Feature-ObjectPropertyChain-001	Approved	entailment	entailed	openllet	entailed	9	pass	no logical axioms
+New-Feature-ObjectPropertyChain-BJP-002	Proposed	consistency	consistent	elk	consistent	8	pass	
+New-Feature-ObjectPropertyChain-BJP-002	Proposed	consistency	consistent	hermit	consistent	7	pass	
+New-Feature-ObjectPropertyChain-BJP-002	Proposed	consistency	consistent	konclude	consistent	15	pass	
+New-Feature-ObjectPropertyChain-BJP-002	Proposed	consistency	consistent	openllet	consistent	8	pass	
+New-Feature-ObjectPropertyChain-BJP-002	Proposed	entailment	entailed	elk	unsupported	33	unsupported	entailment of SubPropertyChainOf
+New-Feature-ObjectPropertyChain-BJP-002	Proposed	entailment	entailed	hermit	entailed	21	pass	
+New-Feature-ObjectPropertyChain-BJP-002	Proposed	entailment	entailed	konclude	unsupported	7	unsupported	Konclude's command line has no entailment
+New-Feature-ObjectPropertyChain-BJP-002	Proposed	entailment	entailed	openllet	unsupported	18	unsupported	entailment of SubPropertyChainOf
+New-Feature-ObjectPropertyChain-BJP-003	Approved	consistency	consistent	elk	consistent	5	pass	
+New-Feature-ObjectPropertyChain-BJP-003	Approved	consistency	consistent	hermit	consistent	4	pass	
+New-Feature-ObjectPropertyChain-BJP-003	Approved	consistency	consistent	konclude	consistent	15	pass	
+New-Feature-ObjectPropertyChain-BJP-003	Approved	consistency	consistent	openllet	consistent	4	pass	
+New-Feature-ObjectPropertyChain-BJP-003	Approved	entailment	entailed	elk	entailed	8	pass	no logical axioms
+New-Feature-ObjectPropertyChain-BJP-003	Approved	entailment	entailed	hermit	entailed	16	pass	no logical axioms
+New-Feature-ObjectPropertyChain-BJP-003	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+New-Feature-ObjectPropertyChain-BJP-003	Approved	entailment	entailed	openllet	entailed	9	pass	no logical axioms
+New-Feature-ObjectPropertyChain-BJP-004	Approved	consistency	consistent	elk	consistent	5	pass	
+New-Feature-ObjectPropertyChain-BJP-004	Approved	consistency	consistent	hermit	consistent	4	pass	
+New-Feature-ObjectPropertyChain-BJP-004	Approved	consistency	consistent	konclude	consistent	12	pass	
+New-Feature-ObjectPropertyChain-BJP-004	Approved	consistency	consistent	openllet	consistent	5	pass	
+New-Feature-ObjectPropertyChain-BJP-004	Approved	entailment	not-entailed	elk	unsupported	8	unsupported	entailment of TransitiveObjectProperty
+New-Feature-ObjectPropertyChain-BJP-004	Approved	entailment	not-entailed	hermit	not-entailed	16	pass	
+New-Feature-ObjectPropertyChain-BJP-004	Approved	entailment	not-entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+New-Feature-ObjectPropertyChain-BJP-004	Approved	entailment	not-entailed	openllet	not-entailed	13	pass	
+New-Feature-ObjectQCR-001	Approved	consistency	consistent	hermit	consistent	4	pass	
+New-Feature-ObjectQCR-001	Approved	consistency	consistent	konclude	consistent	16	pass	
+New-Feature-ObjectQCR-001	Approved	consistency	consistent	openllet	consistent	10	pass	
+New-Feature-ObjectQCR-001	Approved	entailment	entailed	hermit	entailed	18	pass	
+New-Feature-ObjectQCR-001	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+New-Feature-ObjectQCR-001	Approved	entailment	entailed	openllet	entailed	9	pass	
+New-Feature-ObjectQCR-002	Approved	consistency	consistent	hermit	consistent	4	pass	
+New-Feature-ObjectQCR-002	Approved	consistency	consistent	konclude	consistent	16	pass	
+New-Feature-ObjectQCR-002	Approved	consistency	consistent	openllet	consistent	5	pass	
+New-Feature-ObjectQCR-002	Approved	entailment	entailed	hermit	entailed	17	pass	
+New-Feature-ObjectQCR-002	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+New-Feature-ObjectQCR-002	Approved	entailment	entailed	openllet	entailed	10	pass	
+New-Feature-Rational-001	Approved	consistency	consistent	hermit	consistent	9	pass	
+New-Feature-Rational-001	Approved	consistency	consistent	konclude	consistent	16	pass	
+New-Feature-Rational-001	Approved	consistency	consistent	openllet	consistent	9	pass	
+New-Feature-Rational-002	Approved	consistency	inconsistent	hermit	inconsistent	11	pass	
+New-Feature-Rational-002	Approved	consistency	inconsistent	konclude	inconsistent	17	pass	
+New-Feature-Rational-002	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+New-Feature-Rational-003	Approved	consistency	consistent	hermit	consistent	10	pass	
+New-Feature-Rational-003	Approved	consistency	consistent	konclude	inconsistent	17	wrong-result	
+New-Feature-Rational-003	Approved	consistency	consistent	openllet	consistent	6	pass	
+New-Feature-ReflexiveProperty-001	Approved	consistency	consistent	elk	consistent	4	pass	
+New-Feature-ReflexiveProperty-001	Approved	consistency	consistent	hermit	consistent	4	pass	
+New-Feature-ReflexiveProperty-001	Approved	consistency	consistent	konclude	consistent	12	pass	
+New-Feature-ReflexiveProperty-001	Approved	consistency	consistent	openllet	consistent	4	pass	
+New-Feature-ReflexiveProperty-001	Approved	entailment	entailed	elk	entailed	14	pass	
+New-Feature-ReflexiveProperty-001	Approved	entailment	entailed	hermit	entailed	16	pass	
+New-Feature-ReflexiveProperty-001	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+New-Feature-ReflexiveProperty-001	Approved	entailment	entailed	openllet	entailed	13	pass	
+New-Feature-SelfRestriction-001	Approved	consistency	consistent	elk	consistent	4	pass	
+New-Feature-SelfRestriction-001	Approved	consistency	consistent	hermit	consistent	4	pass	
+New-Feature-SelfRestriction-001	Approved	consistency	consistent	konclude	consistent	12	pass	
+New-Feature-SelfRestriction-001	Approved	consistency	consistent	openllet	consistent	4	pass	
+New-Feature-SelfRestriction-001	Approved	entailment	entailed	elk	entailed	10	pass	
+New-Feature-SelfRestriction-001	Approved	entailment	entailed	hermit	entailed	16	pass	
+New-Feature-SelfRestriction-001	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+New-Feature-SelfRestriction-001	Approved	entailment	entailed	openllet	entailed	9	pass	
+New-Feature-SelfRestriction-002	Approved	consistency	consistent	elk	consistent	4	pass	
+New-Feature-SelfRestriction-002	Approved	consistency	consistent	hermit	consistent	4	pass	
+New-Feature-SelfRestriction-002	Approved	consistency	consistent	konclude	consistent	12	pass	
+New-Feature-SelfRestriction-002	Approved	consistency	consistent	openllet	consistent	4	pass	
+New-Feature-SelfRestriction-002	Approved	entailment	entailed	elk	not-entailed	9	wrong-result	
+New-Feature-SelfRestriction-002	Approved	entailment	entailed	hermit	entailed	9	pass	
+New-Feature-SelfRestriction-002	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+New-Feature-SelfRestriction-002	Approved	entailment	entailed	openllet	entailed	12	pass	
+New-Feature-TopObjectProperty-001	Approved	consistency	inconsistent	hermit	inconsistent	9	pass	
+New-Feature-TopObjectProperty-001	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+New-Feature-TopObjectProperty-001	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+Plus and Minus Zero Integer	Approved	consistency	consistent	hermit	consistent	11	pass	
+Plus and Minus Zero Integer	Approved	consistency	consistent	konclude	consistent	27	pass	
+Plus and Minus Zero Integer	Approved	consistency	consistent	openllet	consistent	8	pass	
+Plus and Minus Zero are Distinct	Approved	consistency	inconsistent	elk	consistent	9	wrong-result	
+Plus and Minus Zero are Distinct	Approved	consistency	inconsistent	hermit	inconsistent	11	pass	
+Plus and Minus Zero are Distinct	Approved	consistency	inconsistent	konclude	consistent	18	wrong-result	
+Plus and Minus Zero are Distinct	Approved	consistency	inconsistent	openllet	inconsistent	22	pass	
+Qualified-cardinality-boolean	Approved	consistency	consistent	hermit	consistent	7	pass	
+Qualified-cardinality-boolean	Approved	consistency	consistent	konclude	consistent	18	pass	
+Qualified-cardinality-boolean	Approved	consistency	consistent	openllet	consistent	9	pass	
+Qualified-cardinality-boolean	Approved	entailment	entailed	hermit	entailed	24	pass	
+Qualified-cardinality-boolean	Approved	entailment	entailed	konclude	unsupported	7	unsupported	Konclude's command line has no entailment
+Qualified-cardinality-boolean	Approved	entailment	entailed	openllet	entailed	21	pass	
+Qualified-cardinality-restricted-int	Proposed	consistency	consistent	hermit	consistent	7	pass	
+Qualified-cardinality-restricted-int	Proposed	consistency	consistent	konclude	consistent	18	pass	
+Qualified-cardinality-restricted-int	Proposed	consistency	consistent	openllet	consistent	8	pass	
+Qualified-cardinality-restricted-int	Proposed	entailment	entailed	hermit	entailed	24	pass	
+Qualified-cardinality-restricted-int	Proposed	entailment	entailed	konclude	unsupported	6	unsupported	Konclude's command line has no entailment
+Qualified-cardinality-restricted-int	Proposed	entailment	entailed	openllet	not-entailed	19	wrong-result	
+WebOnt-AnnotationProperty-002	Approved	consistency	consistent	hermit	consistent	4	pass	
+WebOnt-AnnotationProperty-002	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-AnnotationProperty-002	Approved	consistency	consistent	openllet	consistent	7	pass	
+WebOnt-AnnotationProperty-002	Approved	entailment	entailed	hermit	entailed	15	pass	
+WebOnt-AnnotationProperty-002	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-AnnotationProperty-002	Approved	entailment	entailed	openllet	entailed	10	pass	
+WebOnt-AnnotationProperty-003	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-AnnotationProperty-003	Approved	consistency	consistent	hermit	consistent	8	pass	
+WebOnt-AnnotationProperty-003	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-AnnotationProperty-003	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-AnnotationProperty-004	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-AnnotationProperty-004	Approved	consistency	consistent	hermit	consistent	8	pass	
+WebOnt-AnnotationProperty-004	Approved	consistency	consistent	konclude	consistent	12	pass	
+WebOnt-AnnotationProperty-004	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-Class-005-direct	Proposed	consistency	consistent	hermit	consistent	4	pass	
+WebOnt-Class-005-direct	Proposed	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-Class-005-direct	Proposed	consistency	consistent	openllet	consistent	6	pass	
+WebOnt-Class-005-direct	Proposed	entailment	entailed	hermit	entailed	16	pass	
+WebOnt-Class-005-direct	Proposed	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-Class-005-direct	Proposed	entailment	entailed	openllet	not-entailed	9	wrong-result	
+WebOnt-I4.5-001	Approved	consistency	consistent	hermit	consistent	5	pass	
+WebOnt-I4.5-001	Approved	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-I4.5-001	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-I4.5-001	Approved	entailment	entailed	hermit	entailed	18	pass	
+WebOnt-I4.5-001	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-I4.5-001	Approved	entailment	entailed	openllet	entailed	10	pass	
+WebOnt-I4.5-002	Approved	consistency	inconsistent	hermit	inconsistent	10	pass	
+WebOnt-I4.5-002	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-I4.5-002	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-I4.6-004	Approved	consistency	consistent	hermit	consistent	4	pass	
+WebOnt-I4.6-004	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I4.6-004	Approved	consistency	consistent	openllet	consistent	7	pass	
+WebOnt-I4.6-004	Approved	entailment	not-entailed	hermit	not-entailed	15	pass	
+WebOnt-I4.6-004	Approved	entailment	not-entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I4.6-004	Approved	entailment	not-entailed	openllet	not-entailed	17	pass	
+WebOnt-I4.6-005-Direct	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-I4.6-005-Direct	Approved	consistency	consistent	hermit	consistent	4	pass	
+WebOnt-I4.6-005-Direct	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I4.6-005-Direct	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I4.6-005-Direct	Approved	entailment	entailed	elk	entailed	8	pass	no logical axioms
+WebOnt-I4.6-005-Direct	Approved	entailment	entailed	hermit	entailed	15	pass	no logical axioms
+WebOnt-I4.6-005-Direct	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I4.6-005-Direct	Approved	entailment	entailed	openllet	entailed	9	pass	no logical axioms
+WebOnt-I5.2-001	Approved	consistency	consistent	hermit	consistent	9	pass	
+WebOnt-I5.2-001	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-I5.2-001	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-I5.2-002	Approved	consistency	consistent	hermit	consistent	4	pass	
+WebOnt-I5.2-002	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-I5.2-002	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-I5.2-002	Approved	entailment	entailed	hermit	entailed	16	pass	
+WebOnt-I5.2-002	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.2-002	Approved	entailment	entailed	openllet	entailed	12	pass	
+WebOnt-I5.2-003	Approved	consistency	consistent	hermit	consistent	9	pass	
+WebOnt-I5.2-003	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-I5.2-003	Approved	consistency	consistent	openllet	consistent	9	pass	
+WebOnt-I5.2-004	Approved	consistency	consistent	hermit	consistent	6	pass	
+WebOnt-I5.2-004	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-I5.2-004	Approved	consistency	consistent	openllet	consistent	6	pass	
+WebOnt-I5.2-004	Approved	entailment	entailed	hermit	entailed	17	pass	
+WebOnt-I5.2-004	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.2-004	Approved	entailment	entailed	openllet	entailed	9	pass	
+WebOnt-I5.2-005	Approved	consistency	consistent	hermit	consistent	11	pass	
+WebOnt-I5.2-005	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-I5.2-005	Approved	consistency	consistent	openllet	consistent	6	pass	
+WebOnt-I5.2-006	Approved	consistency	consistent	hermit	consistent	5	pass	
+WebOnt-I5.2-006	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-I5.2-006	Approved	consistency	consistent	openllet	consistent	10	pass	
+WebOnt-I5.2-006	Approved	entailment	entailed	hermit	entailed	28	pass	
+WebOnt-I5.2-006	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.2-006	Approved	entailment	entailed	openllet	entailed	11	pass	
+WebOnt-I5.21-002	Approved	consistency	consistent	hermit	consistent	6	pass	
+WebOnt-I5.21-002	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-I5.21-002	Approved	consistency	consistent	openllet	consistent	6	pass	
+WebOnt-I5.21-002	Approved	entailment	entailed	hermit	entailed	30	pass	
+WebOnt-I5.21-002	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-I5.21-002	Approved	entailment	entailed	openllet	entailed	24	pass	
+WebOnt-I5.24-003	Approved	consistency	consistent	hermit	consistent	4	pass	
+WebOnt-I5.24-003	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I5.24-003	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.24-003	Approved	entailment	entailed	hermit	entailed	18	pass	
+WebOnt-I5.24-003	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.24-003	Approved	entailment	entailed	openllet	entailed	13	pass	
+WebOnt-I5.24-004	Approved	consistency	consistent	hermit	consistent	4	pass	
+WebOnt-I5.24-004	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I5.24-004	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.24-004	Approved	entailment	entailed	hermit	entailed	17	pass	
+WebOnt-I5.24-004	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.24-004	Approved	entailment	entailed	openllet	entailed	9	pass	
+WebOnt-I5.26-001	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-I5.26-001	Approved	consistency	consistent	hermit	consistent	8	pass	
+WebOnt-I5.26-001	Approved	consistency	consistent	konclude	consistent	12	pass	
+WebOnt-I5.26-001	Approved	consistency	consistent	openllet	consistent	7	pass	
+WebOnt-I5.26-002	Approved	consistency	consistent	elk	consistent	5	pass	
+WebOnt-I5.26-002	Approved	consistency	consistent	hermit	consistent	9	pass	
+WebOnt-I5.26-002	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I5.26-002	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.26-003	Approved	consistency	consistent	hermit	consistent	10	pass	
+WebOnt-I5.26-003	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-I5.26-003	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-I5.26-004	Approved	consistency	consistent	hermit	consistent	9	pass	
+WebOnt-I5.26-004	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-I5.26-004	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.26-005	Approved	consistency	consistent	elk	consistent	5	pass	
+WebOnt-I5.26-005	Approved	consistency	consistent	hermit	consistent	8	pass	
+WebOnt-I5.26-005	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-I5.26-005	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.26-009	Approved	consistency	consistent	hermit	consistent	3	pass	
+WebOnt-I5.26-009	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I5.26-009	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.26-009	Approved	entailment	entailed	hermit	entailed	15	pass	
+WebOnt-I5.26-009	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.26-009	Approved	entailment	entailed	openllet	entailed	8	pass	
+WebOnt-I5.26-010	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-I5.26-010	Approved	consistency	consistent	hermit	consistent	4	pass	
+WebOnt-I5.26-010	Approved	consistency	consistent	konclude	consistent	12	pass	
+WebOnt-I5.26-010	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.26-010	Approved	entailment	entailed	elk	entailed	7	pass	no logical axioms
+WebOnt-I5.26-010	Approved	entailment	entailed	hermit	entailed	14	pass	no logical axioms
+WebOnt-I5.26-010	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.26-010	Approved	entailment	entailed	openllet	entailed	8	pass	no logical axioms
+WebOnt-I5.3-006	Approved	consistency	consistent	hermit	consistent	9	pass	
+WebOnt-I5.3-006	Approved	consistency	consistent	konclude	consistent	21	pass	
+WebOnt-I5.3-006	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.3-008	Approved	consistency	consistent	hermit	consistent	8	pass	
+WebOnt-I5.3-008	Approved	consistency	consistent	konclude	consistent	14	pass	
+WebOnt-I5.3-008	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.3-010	Approved	consistency	consistent	hermit	consistent	9	pass	
+WebOnt-I5.3-010	Approved	consistency	consistent	konclude	consistent	12	pass	
+WebOnt-I5.3-010	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.3-011	Approved	consistency	consistent	hermit	consistent	8	pass	
+WebOnt-I5.3-011	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I5.3-011	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-I5.5-005	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-I5.5-005	Approved	consistency	consistent	hermit	consistent	3	pass	
+WebOnt-I5.5-005	Approved	consistency	consistent	konclude	consistent	12	pass	
+WebOnt-I5.5-005	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.5-005	Approved	entailment	entailed	elk	entailed	8	pass	no logical axioms
+WebOnt-I5.5-005	Approved	entailment	entailed	hermit	entailed	15	pass	no logical axioms
+WebOnt-I5.5-005	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.5-005	Approved	entailment	entailed	openllet	entailed	8	pass	no logical axioms
+WebOnt-I5.8-001	Extracredit	consistency	inconsistent	hermit	timeout	120004	timeout	
+WebOnt-I5.8-001	Extracredit	consistency	inconsistent	konclude	consistent	15	wrong-result	
+WebOnt-I5.8-001	Extracredit	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-I5.8-002	Extracredit	consistency	consistent	hermit	timeout	60004	timeout	
+WebOnt-I5.8-002	Extracredit	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-I5.8-002	Extracredit	consistency	consistent	openllet	consistent	63	pass	
+WebOnt-I5.8-003	Extracredit	consistency	inconsistent	hermit	timeout	60004	timeout	
+WebOnt-I5.8-003	Extracredit	consistency	inconsistent	konclude	consistent	21	wrong-result	
+WebOnt-I5.8-003	Extracredit	consistency	inconsistent	openllet	inconsistent	10	pass	
+WebOnt-I5.8-004	Extracredit	consistency	consistent	hermit	timeout	20003	timeout	
+WebOnt-I5.8-004	Extracredit	consistency	consistent	konclude	consistent	18	pass	
+WebOnt-I5.8-004	Extracredit	consistency	consistent	openllet	consistent	31	pass	
+WebOnt-I5.8-004	Extracredit	entailment	entailed	hermit	timeout	20003	timeout	
+WebOnt-I5.8-004	Extracredit	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.8-004	Extracredit	entailment	entailed	openllet	entailed	39	pass	
+WebOnt-I5.8-005	Extracredit	consistency	consistent	hermit	timeout	20003	timeout	
+WebOnt-I5.8-005	Extracredit	consistency	consistent	konclude	consistent	18	pass	
+WebOnt-I5.8-005	Extracredit	consistency	consistent	openllet	consistent	34	pass	
+WebOnt-I5.8-005	Extracredit	entailment	not-entailed	hermit	timeout	20003	timeout	
+WebOnt-I5.8-005	Extracredit	entailment	not-entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.8-005	Extracredit	entailment	not-entailed	openllet	not-entailed	40	pass	
+WebOnt-I5.8-006	Approved	consistency	consistent	hermit	consistent	19	pass	
+WebOnt-I5.8-006	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I5.8-006	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.8-006	Approved	entailment	entailed	hermit	entailed	326	pass	
+WebOnt-I5.8-006	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.8-006	Approved	entailment	entailed	openllet	entailed	20	pass	
+WebOnt-I5.8-007	Approved	consistency	consistent	hermit	consistent	8	pass	
+WebOnt-I5.8-007	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I5.8-007	Approved	consistency	consistent	openllet	consistent	8	pass	
+WebOnt-I5.8-007	Approved	entailment	not-entailed	hermit	not-entailed	24	pass	
+WebOnt-I5.8-007	Approved	entailment	not-entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.8-007	Approved	entailment	not-entailed	openllet	not-entailed	22	pass	
+WebOnt-I5.8-008	Approved	consistency	consistent	hermit	consistent	8	pass	
+WebOnt-I5.8-008	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I5.8-008	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-I5.8-008	Approved	entailment	entailed	hermit	entailed	23	pass	
+WebOnt-I5.8-008	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.8-008	Approved	entailment	entailed	openllet	entailed	18	pass	
+WebOnt-I5.8-009	Approved	consistency	consistent	hermit	consistent	7	pass	
+WebOnt-I5.8-009	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I5.8-009	Approved	consistency	consistent	openllet	consistent	7	pass	
+WebOnt-I5.8-009	Approved	entailment	entailed	hermit	entailed	22	pass	
+WebOnt-I5.8-009	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.8-009	Approved	entailment	entailed	openllet	entailed	23	pass	
+WebOnt-I5.8-010	Approved	consistency	consistent	hermit	consistent	7	pass	
+WebOnt-I5.8-010	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-I5.8-010	Approved	consistency	consistent	openllet	consistent	6	pass	
+WebOnt-I5.8-010	Approved	entailment	entailed	hermit	entailed	29	pass	
+WebOnt-I5.8-010	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-I5.8-010	Approved	entailment	entailed	openllet	entailed	36	pass	
+WebOnt-I5.8-011	Approved	consistency	consistent	elk	consistent	3	pass	
+WebOnt-I5.8-011	Approved	consistency	consistent	hermit	consistent	6	pass	
+WebOnt-I5.8-011	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-I5.8-011	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-I5.8-011	Approved	entailment	entailed	elk	entailed	6	pass	no logical axioms
+WebOnt-I5.8-011	Approved	entailment	entailed	hermit	entailed	19	pass	no logical axioms
+WebOnt-I5.8-011	Approved	entailment	entailed	konclude	unsupported	2	unsupported	Konclude's command line has no entailment
+WebOnt-I5.8-011	Approved	entailment	entailed	openllet	entailed	8	pass	no logical axioms
+WebOnt-Nothing-001	Approved	consistency	inconsistent	elk	consistent	4	wrong-result	
+WebOnt-Nothing-001	Approved	consistency	inconsistent	hermit	inconsistent	10	pass	
+WebOnt-Nothing-001	Approved	consistency	inconsistent	konclude	inconsistent	14	pass	
+WebOnt-Nothing-001	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-Ontology-001	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-Ontology-001	Approved	consistency	consistent	hermit	consistent	7	pass	
+WebOnt-Ontology-001	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-Ontology-001	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-Ontology-001	Approved	entailment	entailed	elk	entailed	9	pass	
+WebOnt-Ontology-001	Approved	entailment	entailed	hermit	entailed	28	pass	
+WebOnt-Ontology-001	Approved	entailment	entailed	konclude	unsupported	2	unsupported	Konclude's command line has no entailment
+WebOnt-Ontology-001	Approved	entailment	entailed	openllet	entailed	10	pass	
+WebOnt-Restriction-001	Approved	consistency	inconsistent	elk	inconsistent	5	pass	
+WebOnt-Restriction-001	Approved	consistency	inconsistent	hermit	inconsistent	12	pass	
+WebOnt-Restriction-001	Approved	consistency	inconsistent	konclude	inconsistent	14	pass	
+WebOnt-Restriction-001	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-Restriction-002	Approved	consistency	inconsistent	elk	inconsistent	4	pass	
+WebOnt-Restriction-002	Approved	consistency	inconsistent	hermit	inconsistent	11	pass	
+WebOnt-Restriction-002	Approved	consistency	inconsistent	konclude	inconsistent	14	pass	
+WebOnt-Restriction-002	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-Restriction-003	Approved	consistency	consistent	hermit	consistent	15	pass	
+WebOnt-Restriction-003	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-Restriction-003	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-Restriction-004	Approved	consistency	consistent	hermit	consistent	14	pass	
+WebOnt-Restriction-004	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-Restriction-004	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-Restriction-005-direct	Proposed	consistency	consistent	hermit	consistent	6	pass	
+WebOnt-Restriction-005-direct	Proposed	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-Restriction-005-direct	Proposed	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-Restriction-005-direct	Proposed	entailment	entailed	hermit	entailed	26	pass	
+WebOnt-Restriction-005-direct	Proposed	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-Restriction-005-direct	Proposed	entailment	entailed	openllet	not-entailed	11	wrong-result	
+WebOnt-SymmetricProperty-002	Approved	consistency	consistent	hermit	consistent	7	pass	
+WebOnt-SymmetricProperty-002	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-SymmetricProperty-002	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-SymmetricProperty-002	Approved	entailment	entailed	hermit	entailed	32	pass	
+WebOnt-SymmetricProperty-002	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-SymmetricProperty-002	Approved	entailment	entailed	openllet	entailed	14	pass	
+WebOnt-Thing-003	Approved	consistency	inconsistent	elk	inconsistent	4	pass	
+WebOnt-Thing-003	Approved	consistency	inconsistent	hermit	error	12	error	java.lang.NullPointerException: operands cannot be null or empty
+WebOnt-Thing-003	Approved	consistency	inconsistent	konclude	inconsistent	18	pass	
+WebOnt-Thing-003	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-Thing-004	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-Thing-004	Approved	consistency	consistent	hermit	consistent	10	pass	
+WebOnt-Thing-004	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-Thing-004	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-TransitiveProperty-002	Approved	consistency	consistent	hermit	consistent	6	pass	
+WebOnt-TransitiveProperty-002	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-TransitiveProperty-002	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-TransitiveProperty-002	Approved	entailment	entailed	hermit	entailed	23	pass	
+WebOnt-TransitiveProperty-002	Approved	entailment	entailed	konclude	unsupported	2	unsupported	Konclude's command line has no entailment
+WebOnt-TransitiveProperty-002	Approved	entailment	entailed	openllet	entailed	10	pass	
+WebOnt-allValuesFrom-001	Approved	consistency	consistent	hermit	consistent	5	pass	
+WebOnt-allValuesFrom-001	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-allValuesFrom-001	Approved	consistency	consistent	openllet	consistent	6	pass	
+WebOnt-allValuesFrom-001	Approved	entailment	entailed	hermit	entailed	19	pass	
+WebOnt-allValuesFrom-001	Approved	entailment	entailed	konclude	unsupported	2	unsupported	Konclude's command line has no entailment
+WebOnt-allValuesFrom-001	Approved	entailment	entailed	openllet	entailed	9	pass	
+WebOnt-allValuesFrom-002	Approved	consistency	consistent	hermit	consistent	5	pass	
+WebOnt-allValuesFrom-002	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-allValuesFrom-002	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-allValuesFrom-002	Approved	entailment	not-entailed	hermit	not-entailed	21	pass	
+WebOnt-allValuesFrom-002	Approved	entailment	not-entailed	konclude	unsupported	2	unsupported	Konclude's command line has no entailment
+WebOnt-allValuesFrom-002	Approved	entailment	not-entailed	openllet	not-entailed	10	pass	
+WebOnt-backwardCompatibleWith-002	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-backwardCompatibleWith-002	Approved	consistency	consistent	hermit	consistent	10	pass	
+WebOnt-backwardCompatibleWith-002	Approved	consistency	consistent	konclude	consistent	11	pass	
+WebOnt-backwardCompatibleWith-002	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-cardinality-001	Approved	consistency	consistent	hermit	consistent	5	pass	
+WebOnt-cardinality-001	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-cardinality-001	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-cardinality-001	Approved	entailment	entailed	hermit	entailed	20	pass	
+WebOnt-cardinality-001	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-cardinality-001	Approved	entailment	entailed	openllet	entailed	8	pass	
+WebOnt-cardinality-002	Approved	consistency	consistent	hermit	consistent	5	pass	
+WebOnt-cardinality-002	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-cardinality-002	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-cardinality-002	Approved	entailment	entailed	hermit	entailed	18	pass	
+WebOnt-cardinality-002	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-cardinality-002	Approved	entailment	entailed	openllet	entailed	9	pass	
+WebOnt-cardinality-003	Approved	consistency	consistent	hermit	consistent	5	pass	
+WebOnt-cardinality-003	Approved	consistency	consistent	konclude	consistent	14	pass	
+WebOnt-cardinality-003	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-cardinality-003	Approved	entailment	entailed	hermit	entailed	20	pass	
+WebOnt-cardinality-003	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+WebOnt-cardinality-003	Approved	entailment	entailed	openllet	entailed	13	pass	
+WebOnt-cardinality-004	Approved	consistency	consistent	hermit	consistent	5	pass	
+WebOnt-cardinality-004	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-cardinality-004	Approved	consistency	consistent	openllet	consistent	9	pass	
+WebOnt-cardinality-004	Approved	entailment	entailed	hermit	entailed	19	pass	
+WebOnt-cardinality-004	Approved	entailment	entailed	konclude	unsupported	2	unsupported	Konclude's command line has no entailment
+WebOnt-cardinality-004	Approved	entailment	entailed	openllet	entailed	9	pass	
+WebOnt-description-logic-001	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-001	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-001	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-002	Approved	consistency	inconsistent	hermit	inconsistent	12	pass	
+WebOnt-description-logic-002	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-002	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-003	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-003	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-003	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-004	Approved	consistency	inconsistent	hermit	inconsistent	18	pass	
+WebOnt-description-logic-004	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-004	Approved	consistency	inconsistent	openllet	inconsistent	8	pass	
+WebOnt-description-logic-005	Approved	consistency	consistent	hermit	consistent	19	pass	
+WebOnt-description-logic-005	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-description-logic-005	Approved	consistency	consistent	openllet	consistent	6	pass	
+WebOnt-description-logic-006	Approved	consistency	consistent	hermit	consistent	17	pass	
+WebOnt-description-logic-006	Approved	consistency	consistent	konclude	consistent	17	pass	
+WebOnt-description-logic-006	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-007	Approved	consistency	inconsistent	hermit	inconsistent	17	pass	
+WebOnt-description-logic-007	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-007	Approved	consistency	inconsistent	openllet	inconsistent	8	pass	
+WebOnt-description-logic-008	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-008	Approved	consistency	inconsistent	konclude	consistent	15	wrong-result	
+WebOnt-description-logic-008	Approved	consistency	inconsistent	openllet	inconsistent	7	pass	
+WebOnt-description-logic-009	Approved	consistency	consistent	hermit	consistent	16	pass	
+WebOnt-description-logic-009	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-description-logic-009	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-010	Approved	consistency	inconsistent	hermit	inconsistent	17	pass	
+WebOnt-description-logic-010	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-010	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-011	Approved	consistency	inconsistent	hermit	inconsistent	17	pass	
+WebOnt-description-logic-011	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-011	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-012	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-012	Approved	consistency	inconsistent	konclude	consistent	15	wrong-result	
+WebOnt-description-logic-012	Approved	consistency	inconsistent	openllet	inconsistent	8	pass	
+WebOnt-description-logic-013	Approved	consistency	inconsistent	hermit	inconsistent	17	pass	
+WebOnt-description-logic-013	Approved	consistency	inconsistent	konclude	consistent	15	wrong-result	
+WebOnt-description-logic-013	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-014	Approved	consistency	inconsistent	hermit	inconsistent	14	pass	
+WebOnt-description-logic-014	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-014	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-015	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-015	Approved	consistency	inconsistent	konclude	consistent	14	wrong-result	
+WebOnt-description-logic-015	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-016	Approved	consistency	consistent	hermit	consistent	15	pass	
+WebOnt-description-logic-016	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-description-logic-016	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-017	Approved	consistency	inconsistent	hermit	inconsistent	20	pass	
+WebOnt-description-logic-017	Approved	consistency	inconsistent	konclude	consistent	14	wrong-result	
+WebOnt-description-logic-017	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-018	Approved	consistency	consistent	hermit	consistent	18	pass	
+WebOnt-description-logic-018	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-description-logic-018	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-019	Approved	consistency	inconsistent	hermit	inconsistent	19	pass	
+WebOnt-description-logic-019	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-019	Approved	consistency	inconsistent	openllet	inconsistent	7	pass	
+WebOnt-description-logic-020	Approved	consistency	consistent	hermit	consistent	20	pass	
+WebOnt-description-logic-020	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-description-logic-020	Approved	consistency	consistent	openllet	consistent	11	pass	
+WebOnt-description-logic-021	Approved	consistency	consistent	hermit	consistent	30	pass	
+WebOnt-description-logic-021	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-description-logic-021	Approved	consistency	consistent	openllet	consistent	17	pass	
+WebOnt-description-logic-022	Approved	consistency	inconsistent	hermit	inconsistent	21	pass	
+WebOnt-description-logic-022	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-022	Approved	consistency	inconsistent	openllet	inconsistent	8	pass	
+WebOnt-description-logic-023	Approved	consistency	inconsistent	hermit	inconsistent	19	pass	
+WebOnt-description-logic-023	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-023	Approved	consistency	inconsistent	openllet	inconsistent	8	pass	
+WebOnt-description-logic-024	Approved	consistency	consistent	hermit	consistent	17	pass	
+WebOnt-description-logic-024	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-description-logic-024	Approved	consistency	consistent	openllet	consistent	19	pass	
+WebOnt-description-logic-025	Approved	consistency	consistent	hermit	consistent	15	pass	
+WebOnt-description-logic-025	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-description-logic-025	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-026	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-026	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-026	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-027	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-027	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-027	Approved	consistency	inconsistent	openllet	inconsistent	8	pass	
+WebOnt-description-logic-028	Approved	consistency	consistent	hermit	consistent	18	pass	
+WebOnt-description-logic-028	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-description-logic-028	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-029	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-029	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-029	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-030	Approved	consistency	inconsistent	hermit	inconsistent	14	pass	
+WebOnt-description-logic-030	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-030	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-description-logic-031	Approved	consistency	consistent	hermit	consistent	17	pass	
+WebOnt-description-logic-031	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-description-logic-031	Approved	consistency	consistent	openllet	consistent	9	pass	
+WebOnt-description-logic-032	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-032	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-032	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-033	Approved	consistency	inconsistent	hermit	inconsistent	14	pass	
+WebOnt-description-logic-033	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-033	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-034	Approved	consistency	consistent	hermit	consistent	13	pass	
+WebOnt-description-logic-034	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-description-logic-034	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-035	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-035	Approved	consistency	inconsistent	konclude	consistent	16	wrong-result	
+WebOnt-description-logic-035	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-040	Approved	consistency	inconsistent	hermit	inconsistent	24	pass	
+WebOnt-description-logic-040	Approved	consistency	inconsistent	konclude	inconsistent	20	pass	
+WebOnt-description-logic-040	Approved	consistency	inconsistent	openllet	inconsistent	17	pass	
+WebOnt-description-logic-101	Approved	consistency	inconsistent	hermit	inconsistent	13	pass	
+WebOnt-description-logic-101	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-101	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-102	Approved	consistency	inconsistent	hermit	inconsistent	14	pass	
+WebOnt-description-logic-102	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-102	Approved	consistency	inconsistent	openllet	inconsistent	9	pass	
+WebOnt-description-logic-103	Approved	consistency	inconsistent	hermit	inconsistent	13	pass	
+WebOnt-description-logic-103	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-103	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-104	Approved	consistency	inconsistent	hermit	inconsistent	12	pass	
+WebOnt-description-logic-104	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-104	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-105	Approved	consistency	inconsistent	hermit	inconsistent	12	pass	
+WebOnt-description-logic-105	Approved	consistency	inconsistent	konclude	consistent	16	wrong-result	
+WebOnt-description-logic-105	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-description-logic-106	Approved	consistency	inconsistent	hermit	inconsistent	12	pass	
+WebOnt-description-logic-106	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-106	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-107	Approved	consistency	inconsistent	hermit	inconsistent	17	pass	
+WebOnt-description-logic-107	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-107	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-108	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-108	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-108	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-109	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-109	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-109	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-110	Approved	consistency	inconsistent	hermit	inconsistent	17	pass	
+WebOnt-description-logic-110	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-110	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-111	Approved	consistency	inconsistent	hermit	inconsistent	13	pass	
+WebOnt-description-logic-111	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-111	Approved	consistency	inconsistent	openllet	inconsistent	7	pass	
+WebOnt-description-logic-201	Approved	consistency	consistent	hermit	consistent	15	pass	
+WebOnt-description-logic-201	Approved	consistency	consistent	konclude	consistent	23	pass	
+WebOnt-description-logic-201	Approved	consistency	consistent	openllet	consistent	17	pass	
+WebOnt-description-logic-201	Approved	entailment	entailed	hermit	entailed	50	pass	
+WebOnt-description-logic-201	Approved	entailment	entailed	konclude	unsupported	7	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-201	Approved	entailment	entailed	openllet	entailed	26	pass	
+WebOnt-description-logic-202	Extracredit	consistency	consistent	hermit	consistent	335	pass	
+WebOnt-description-logic-202	Extracredit	consistency	consistent	konclude	consistent	21	pass	
+WebOnt-description-logic-202	Extracredit	consistency	consistent	openllet	consistent	17	pass	
+WebOnt-description-logic-202	Extracredit	entailment	entailed	hermit	entailed	397	pass	
+WebOnt-description-logic-202	Extracredit	entailment	entailed	konclude	unsupported	16	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-202	Extracredit	entailment	entailed	openllet	entailed	23	pass	
+WebOnt-description-logic-203	Extracredit	consistency	consistent	hermit	timeout	120003	timeout	
+WebOnt-description-logic-203	Extracredit	consistency	consistent	konclude	consistent	22	pass	
+WebOnt-description-logic-203	Extracredit	consistency	consistent	openllet	consistent	22	pass	
+WebOnt-description-logic-203	Extracredit	entailment	entailed	hermit	timeout	120000	timeout	
+WebOnt-description-logic-203	Extracredit	entailment	entailed	konclude	unsupported	7	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-203	Extracredit	entailment	entailed	openllet	entailed	33	pass	
+WebOnt-description-logic-204	Extracredit	consistency	consistent	hermit	timeout	120004	timeout	
+WebOnt-description-logic-204	Extracredit	consistency	consistent	konclude	consistent	25	pass	
+WebOnt-description-logic-204	Extracredit	consistency	consistent	openllet	consistent	21	pass	
+WebOnt-description-logic-204	Extracredit	entailment	entailed	hermit	timeout	120003	timeout	
+WebOnt-description-logic-204	Extracredit	entailment	entailed	konclude	unsupported	9	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-204	Extracredit	entailment	entailed	openllet	entailed	31	pass	
+WebOnt-description-logic-205	Approved	consistency	consistent	hermit	consistent	22	pass	
+WebOnt-description-logic-205	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-description-logic-205	Approved	consistency	consistent	openllet	consistent	6	pass	
+WebOnt-description-logic-205	Approved	entailment	entailed	hermit	entailed	315	pass	
+WebOnt-description-logic-205	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-205	Approved	entailment	entailed	openllet	entailed	10	pass	
+WebOnt-description-logic-206	Extracredit	consistency	consistent	hermit	consistent	4517	pass	
+WebOnt-description-logic-206	Extracredit	consistency	consistent	konclude	consistent	29	pass	
+WebOnt-description-logic-206	Extracredit	consistency	consistent	openllet	consistent	21	pass	
+WebOnt-description-logic-206	Extracredit	entailment	entailed	hermit	entailed	6534	pass	
+WebOnt-description-logic-206	Extracredit	entailment	entailed	konclude	unsupported	11	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-206	Extracredit	entailment	entailed	openllet	entailed	29	pass	
+WebOnt-description-logic-207	Approved	consistency	consistent	hermit	consistent	7	pass	
+WebOnt-description-logic-207	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-description-logic-207	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-207	Approved	entailment	entailed	hermit	entailed	29	pass	
+WebOnt-description-logic-207	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-207	Approved	entailment	entailed	openllet	entailed	9	pass	
+WebOnt-description-logic-208	Approved	consistency	consistent	hermit	timeout	120004	timeout	
+WebOnt-description-logic-208	Approved	consistency	consistent	konclude	consistent	28	pass	
+WebOnt-description-logic-208	Approved	consistency	consistent	openllet	consistent	22	pass	
+WebOnt-description-logic-208	Approved	entailment	entailed	hermit	timeout	120004	timeout	
+WebOnt-description-logic-208	Approved	entailment	entailed	konclude	unsupported	10	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-208	Approved	entailment	entailed	openllet	entailed	24	pass	
+WebOnt-description-logic-209	Approved	consistency	consistent	hermit	timeout	120004	timeout	
+WebOnt-description-logic-209	Approved	consistency	consistent	konclude	consistent	29	pass	
+WebOnt-description-logic-209	Approved	consistency	consistent	openllet	consistent	20	pass	
+WebOnt-description-logic-209	Approved	entailment	not-entailed	hermit	timeout	120004	timeout	
+WebOnt-description-logic-209	Approved	entailment	not-entailed	konclude	unsupported	10	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-209	Approved	entailment	not-entailed	openllet	not-entailed	26	pass	
+WebOnt-description-logic-501	Approved	consistency	consistent	hermit	consistent	437	pass	
+WebOnt-description-logic-501	Approved	consistency	consistent	konclude	consistent	152	pass	
+WebOnt-description-logic-501	Approved	consistency	consistent	openllet	consistent	168	pass	
+WebOnt-description-logic-502	Approved	consistency	inconsistent	hermit	inconsistent	88	pass	
+WebOnt-description-logic-502	Approved	consistency	inconsistent	konclude	inconsistent	1348	pass	
+WebOnt-description-logic-502	Approved	consistency	inconsistent	openllet	inconsistent	255	pass	
+WebOnt-description-logic-503	Approved	consistency	consistent	hermit	consistent	40	pass	
+WebOnt-description-logic-503	Approved	consistency	consistent	konclude	consistent	19	pass	
+WebOnt-description-logic-503	Approved	consistency	consistent	openllet	consistent	8	pass	
+WebOnt-description-logic-504	Approved	consistency	inconsistent	hermit	inconsistent	27	pass	
+WebOnt-description-logic-504	Approved	consistency	inconsistent	konclude	inconsistent	18	pass	
+WebOnt-description-logic-504	Approved	consistency	inconsistent	openllet	inconsistent	8	pass	
+WebOnt-description-logic-601	Approved	consistency	inconsistent	hermit	inconsistent	32	pass	
+WebOnt-description-logic-601	Approved	consistency	inconsistent	konclude	inconsistent	17	pass	
+WebOnt-description-logic-601	Approved	consistency	inconsistent	openllet	inconsistent	7	pass	
+WebOnt-description-logic-602	Approved	consistency	inconsistent	hermit	inconsistent	17	pass	
+WebOnt-description-logic-602	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-602	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-603	Approved	consistency	inconsistent	hermit	inconsistent	20	pass	
+WebOnt-description-logic-603	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-603	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-description-logic-604	Approved	consistency	inconsistent	hermit	inconsistent	21	pass	
+WebOnt-description-logic-604	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-604	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-605	Approved	consistency	consistent	hermit	consistent	21	pass	
+WebOnt-description-logic-605	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-description-logic-605	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-606	Approved	consistency	consistent	hermit	consistent	28	pass	
+WebOnt-description-logic-606	Approved	consistency	consistent	konclude	consistent	18	pass	
+WebOnt-description-logic-606	Approved	consistency	consistent	openllet	consistent	8	pass	
+WebOnt-description-logic-608	Approved	consistency	inconsistent	hermit	inconsistent	21	pass	
+WebOnt-description-logic-608	Approved	consistency	inconsistent	konclude	inconsistent	17	pass	
+WebOnt-description-logic-608	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-609	Approved	consistency	consistent	hermit	consistent	16	pass	
+WebOnt-description-logic-609	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-description-logic-609	Approved	consistency	consistent	openllet	consistent	7	pass	
+WebOnt-description-logic-610	Approved	consistency	inconsistent	hermit	inconsistent	18	pass	
+WebOnt-description-logic-610	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-610	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-description-logic-611	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-611	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-611	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-description-logic-612	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-612	Approved	consistency	inconsistent	konclude	consistent	16	wrong-result	
+WebOnt-description-logic-612	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-613	Approved	consistency	inconsistent	hermit	inconsistent	18	pass	
+WebOnt-description-logic-613	Approved	consistency	inconsistent	konclude	consistent	16	wrong-result	
+WebOnt-description-logic-613	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-614	Approved	consistency	inconsistent	hermit	inconsistent	14	pass	
+WebOnt-description-logic-614	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-614	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-615	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-615	Approved	consistency	inconsistent	konclude	consistent	16	wrong-result	
+WebOnt-description-logic-615	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-616	Approved	consistency	consistent	hermit	consistent	14	pass	
+WebOnt-description-logic-616	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-description-logic-616	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-617	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-617	Approved	consistency	inconsistent	konclude	consistent	16	wrong-result	
+WebOnt-description-logic-617	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-description-logic-623	Approved	consistency	inconsistent	hermit	inconsistent	21	pass	
+WebOnt-description-logic-623	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-623	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-624	Approved	consistency	consistent	hermit	consistent	16	pass	
+WebOnt-description-logic-624	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-description-logic-624	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-625	Approved	consistency	consistent	hermit	consistent	16	pass	
+WebOnt-description-logic-625	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-description-logic-625	Approved	consistency	consistent	openllet	consistent	9	pass	
+WebOnt-description-logic-626	Approved	consistency	inconsistent	hermit	inconsistent	18	pass	
+WebOnt-description-logic-626	Approved	consistency	inconsistent	konclude	inconsistent	17	pass	
+WebOnt-description-logic-626	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-627	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-627	Approved	consistency	inconsistent	konclude	inconsistent	17	pass	
+WebOnt-description-logic-627	Approved	consistency	inconsistent	openllet	inconsistent	10	pass	
+WebOnt-description-logic-628	Approved	consistency	consistent	hermit	consistent	17	pass	
+WebOnt-description-logic-628	Approved	consistency	consistent	konclude	consistent	17	pass	
+WebOnt-description-logic-628	Approved	consistency	consistent	openllet	consistent	7	pass	
+WebOnt-description-logic-629	Approved	consistency	inconsistent	hermit	inconsistent	18	pass	
+WebOnt-description-logic-629	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-629	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-630	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-630	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-630	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-631	Approved	consistency	consistent	hermit	consistent	16	pass	
+WebOnt-description-logic-631	Approved	consistency	consistent	konclude	consistent	18	pass	
+WebOnt-description-logic-631	Approved	consistency	consistent	openllet	consistent	7	pass	
+WebOnt-description-logic-632	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+WebOnt-description-logic-632	Approved	consistency	inconsistent	konclude	inconsistent	24	pass	
+WebOnt-description-logic-632	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-633	Approved	consistency	inconsistent	hermit	inconsistent	14	pass	
+WebOnt-description-logic-633	Approved	consistency	inconsistent	konclude	inconsistent	16	pass	
+WebOnt-description-logic-633	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-634	Approved	consistency	consistent	hermit	consistent	14	pass	
+WebOnt-description-logic-634	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-description-logic-634	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-641	Approved	consistency	inconsistent	hermit	inconsistent	14	pass	
+WebOnt-description-logic-641	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-641	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-description-logic-642	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-642	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-642	Approved	consistency	inconsistent	openllet	inconsistent	5	pass	
+WebOnt-description-logic-643	Approved	consistency	inconsistent	hermit	inconsistent	14	pass	
+WebOnt-description-logic-643	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-643	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-description-logic-644	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-644	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-644	Approved	consistency	inconsistent	openllet	inconsistent	3	pass	
+WebOnt-description-logic-646	Approved	consistency	inconsistent	hermit	inconsistent	13	pass	
+WebOnt-description-logic-646	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-646	Approved	consistency	inconsistent	openllet	inconsistent	3	pass	
+WebOnt-description-logic-650	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-description-logic-650	Approved	consistency	inconsistent	konclude	inconsistent	15	pass	
+WebOnt-description-logic-650	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-description-logic-661	Approved	consistency	consistent	hermit	consistent	69	pass	
+WebOnt-description-logic-661	Approved	consistency	consistent	konclude	consistent	895	pass	
+WebOnt-description-logic-661	Approved	consistency	consistent	openllet	consistent	30	pass	
+WebOnt-description-logic-661	Approved	entailment	entailed	hermit	entailed	91	pass	
+WebOnt-description-logic-661	Approved	entailment	entailed	konclude	unsupported	12	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-661	Approved	entailment	entailed	openllet	entailed	43	pass	
+WebOnt-description-logic-662	Extracredit	consistency	consistent	hermit	timeout	120004	timeout	
+WebOnt-description-logic-662	Extracredit	consistency	consistent	konclude	timeout	20000	timeout	
+WebOnt-description-logic-662	Extracredit	consistency	consistent	openllet	timeout	20003	timeout	
+WebOnt-description-logic-662	Extracredit	entailment	entailed	hermit	timeout	120005	timeout	
+WebOnt-description-logic-662	Extracredit	entailment	entailed	konclude	unsupported	8	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-662	Extracredit	entailment	entailed	openllet	timeout	20000	timeout	
+WebOnt-description-logic-663	Extracredit	consistency	consistent	hermit	timeout	120003	timeout	
+WebOnt-description-logic-663	Extracredit	consistency	consistent	konclude	consistent	2214	pass	
+WebOnt-description-logic-663	Extracredit	consistency	consistent	openllet	timeout	20003	timeout	
+WebOnt-description-logic-663	Extracredit	entailment	entailed	hermit	timeout	120004	timeout	
+WebOnt-description-logic-663	Extracredit	entailment	entailed	konclude	unsupported	307	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-663	Extracredit	entailment	entailed	openllet	timeout	20003	timeout	
+WebOnt-description-logic-664	Extracredit	consistency	consistent	hermit	timeout	120003	timeout	
+WebOnt-description-logic-664	Extracredit	consistency	consistent	konclude	timeout	20000	timeout	
+WebOnt-description-logic-664	Extracredit	consistency	consistent	openllet	consistent	3454	pass	
+WebOnt-description-logic-664	Extracredit	entailment	entailed	hermit	timeout	120003	timeout	
+WebOnt-description-logic-664	Extracredit	entailment	entailed	konclude	unsupported	35	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-664	Extracredit	entailment	entailed	openllet	timeout	20003	timeout	
+WebOnt-description-logic-665	Approved	consistency	consistent	hermit	consistent	26	pass	
+WebOnt-description-logic-665	Approved	consistency	consistent	konclude	consistent	70	pass	
+WebOnt-description-logic-665	Approved	consistency	consistent	openllet	consistent	10	pass	
+WebOnt-description-logic-665	Approved	entailment	entailed	hermit	entailed	327	pass	
+WebOnt-description-logic-665	Approved	entailment	entailed	konclude	unsupported	255	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-665	Approved	entailment	entailed	openllet	entailed	24	pass	
+WebOnt-description-logic-667	Approved	consistency	consistent	hermit	consistent	18	pass	
+WebOnt-description-logic-667	Approved	consistency	consistent	konclude	consistent	35	pass	
+WebOnt-description-logic-667	Approved	consistency	consistent	openllet	consistent	9	pass	
+WebOnt-description-logic-667	Approved	entailment	entailed	hermit	entailed	43	pass	
+WebOnt-description-logic-667	Approved	entailment	entailed	konclude	unsupported	19	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-667	Approved	entailment	entailed	openllet	entailed	14	pass	
+WebOnt-description-logic-901	Approved	consistency	consistent	hermit	consistent	8	pass	
+WebOnt-description-logic-901	Approved	consistency	consistent	konclude	consistent	20	pass	
+WebOnt-description-logic-901	Approved	consistency	consistent	openllet	consistent	6	pass	
+WebOnt-description-logic-901	Approved	entailment	entailed	hermit	entailed	36	pass	
+WebOnt-description-logic-901	Approved	entailment	entailed	konclude	unsupported	10	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-901	Approved	entailment	entailed	openllet	entailed	19	pass	
+WebOnt-description-logic-902	Approved	consistency	consistent	hermit	consistent	10	pass	
+WebOnt-description-logic-902	Approved	consistency	consistent	konclude	consistent	20	pass	
+WebOnt-description-logic-902	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-description-logic-902	Approved	entailment	not-entailed	hermit	not-entailed	26	pass	
+WebOnt-description-logic-902	Approved	entailment	not-entailed	konclude	unsupported	6	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-902	Approved	entailment	not-entailed	openllet	not-entailed	14	pass	
+WebOnt-description-logic-903	Extracredit	consistency	consistent	hermit	consistent	276	pass	
+WebOnt-description-logic-903	Extracredit	consistency	consistent	konclude	consistent	18	pass	
+WebOnt-description-logic-903	Extracredit	consistency	consistent	openllet	consistent	740	pass	
+WebOnt-description-logic-903	Extracredit	entailment	entailed	hermit	timeout	20001	timeout	
+WebOnt-description-logic-903	Extracredit	entailment	entailed	konclude	unsupported	6	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-903	Extracredit	entailment	entailed	openllet	timeout	20001	timeout	
+WebOnt-description-logic-904	Extracredit	consistency	consistent	hermit	consistent	265	pass	
+WebOnt-description-logic-904	Extracredit	consistency	consistent	konclude	consistent	18	pass	
+WebOnt-description-logic-904	Extracredit	consistency	consistent	openllet	consistent	22	pass	
+WebOnt-description-logic-904	Extracredit	entailment	not-entailed	hermit	timeout	20000	timeout	
+WebOnt-description-logic-904	Extracredit	entailment	not-entailed	konclude	unsupported	5	unsupported	Konclude's command line has no entailment
+WebOnt-description-logic-904	Extracredit	entailment	not-entailed	openllet	not-entailed	158	pass	
+WebOnt-description-logic-905	Approved	consistency	consistent	hermit	consistent	164	pass	
+WebOnt-description-logic-905	Approved	consistency	consistent	konclude	consistent	70	pass	
+WebOnt-description-logic-905	Approved	consistency	consistent	openllet	consistent	120	pass	
+WebOnt-description-logic-906	Extracredit	consistency	consistent	hermit	timeout	20000	timeout	
+WebOnt-description-logic-906	Extracredit	consistency	consistent	konclude	timeout	20050	timeout	
+WebOnt-description-logic-906	Extracredit	consistency	consistent	openllet	timeout	20017	timeout	
+WebOnt-description-logic-907	Extracredit	consistency	consistent	hermit	timeout	20003	timeout	
+WebOnt-description-logic-907	Extracredit	consistency	consistent	konclude	timeout	20075	timeout	
+WebOnt-description-logic-907	Extracredit	consistency	consistent	openllet	timeout	20003	timeout	
+WebOnt-description-logic-908	Approved	consistency	consistent	hermit	consistent	305	pass	
+WebOnt-description-logic-908	Approved	consistency	consistent	konclude	consistent	281	pass	
+WebOnt-description-logic-908	Approved	consistency	consistent	openllet	consistent	320	pass	
+WebOnt-description-logic-909	Extracredit	consistency	inconsistent	hermit	timeout	20473	timeout	
+WebOnt-description-logic-909	Extracredit	consistency	inconsistent	konclude	consistent	35	wrong-result	
+WebOnt-description-logic-909	Extracredit	consistency	inconsistent	openllet	timeout	20000	timeout	
+WebOnt-description-logic-910	Extracredit	consistency	inconsistent	hermit	timeout	20005	timeout	
+WebOnt-description-logic-910	Extracredit	consistency	inconsistent	konclude	timeout	20055	timeout	
+WebOnt-description-logic-910	Extracredit	consistency	inconsistent	openllet	timeout	20211	timeout	
+WebOnt-differentFrom-001	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-differentFrom-001	Approved	consistency	consistent	hermit	consistent	31	pass	
+WebOnt-differentFrom-001	Approved	consistency	consistent	konclude	consistent	49	pass	
+WebOnt-differentFrom-001	Approved	consistency	consistent	openllet	consistent	9	pass	
+WebOnt-differentFrom-001	Approved	entailment	entailed	elk	entailed	11	pass	
+WebOnt-differentFrom-001	Approved	entailment	entailed	hermit	entailed	1147	pass	
+WebOnt-differentFrom-001	Approved	entailment	entailed	konclude	unsupported	219	unsupported	Konclude's command line has no entailment
+WebOnt-differentFrom-001	Approved	entailment	entailed	openllet	entailed	290	pass	
+WebOnt-disjointWith-001	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-disjointWith-001	Approved	consistency	consistent	hermit	consistent	27	pass	
+WebOnt-disjointWith-001	Approved	consistency	consistent	konclude	consistent	22	pass	
+WebOnt-disjointWith-001	Approved	consistency	consistent	openllet	consistent	9	pass	
+WebOnt-disjointWith-001	Approved	entailment	entailed	elk	entailed	10	pass	
+WebOnt-disjointWith-001	Approved	entailment	entailed	hermit	entailed	80	pass	
+WebOnt-disjointWith-001	Approved	entailment	entailed	konclude	unsupported	11	unsupported	Konclude's command line has no entailment
+WebOnt-disjointWith-001	Approved	entailment	entailed	openllet	entailed	21	pass	
+WebOnt-disjointWith-003	Approved	consistency	consistent	elk	consistent	5	pass	
+WebOnt-disjointWith-003	Approved	consistency	consistent	hermit	consistent	34	pass	
+WebOnt-disjointWith-003	Approved	consistency	consistent	konclude	consistent	25	pass	
+WebOnt-disjointWith-003	Approved	consistency	consistent	openllet	consistent	15	pass	
+WebOnt-disjointWith-004	Approved	consistency	consistent	elk	consistent	5	pass	
+WebOnt-disjointWith-004	Approved	consistency	consistent	hermit	consistent	31	pass	
+WebOnt-disjointWith-004	Approved	consistency	consistent	konclude	consistent	23	pass	
+WebOnt-disjointWith-004	Approved	consistency	consistent	openllet	consistent	10	pass	
+WebOnt-disjointWith-005	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-disjointWith-005	Approved	consistency	consistent	hermit	consistent	32	pass	
+WebOnt-disjointWith-005	Approved	consistency	consistent	konclude	consistent	20	pass	
+WebOnt-disjointWith-005	Approved	consistency	consistent	openllet	consistent	8	pass	
+WebOnt-disjointWith-006	Approved	consistency	consistent	elk	consistent	6	pass	
+WebOnt-disjointWith-006	Approved	consistency	consistent	hermit	consistent	32	pass	
+WebOnt-disjointWith-006	Approved	consistency	consistent	konclude	consistent	20	pass	
+WebOnt-disjointWith-006	Approved	consistency	consistent	openllet	consistent	8	pass	
+WebOnt-disjointWith-007	Approved	consistency	consistent	elk	consistent	5	pass	
+WebOnt-disjointWith-007	Approved	consistency	consistent	hermit	consistent	27	pass	
+WebOnt-disjointWith-007	Approved	consistency	consistent	konclude	consistent	23	pass	
+WebOnt-disjointWith-007	Approved	consistency	consistent	openllet	consistent	9	pass	
+WebOnt-disjointWith-008	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-disjointWith-008	Approved	consistency	consistent	hermit	consistent	28	pass	
+WebOnt-disjointWith-008	Approved	consistency	consistent	konclude	consistent	19	pass	
+WebOnt-disjointWith-008	Approved	consistency	consistent	openllet	consistent	7	pass	
+WebOnt-disjointWith-009	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-disjointWith-009	Approved	consistency	consistent	hermit	consistent	20	pass	
+WebOnt-disjointWith-009	Approved	consistency	consistent	konclude	consistent	20	pass	
+WebOnt-disjointWith-009	Approved	consistency	consistent	openllet	consistent	7	pass	
+WebOnt-equivalentClass-001	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-equivalentClass-001	Approved	consistency	consistent	hermit	consistent	43	pass	
+WebOnt-equivalentClass-001	Approved	consistency	consistent	konclude	consistent	29	pass	
+WebOnt-equivalentClass-001	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-equivalentClass-001	Approved	entailment	entailed	elk	entailed	8	pass	
+WebOnt-equivalentClass-001	Approved	entailment	entailed	hermit	entailed	49	pass	
+WebOnt-equivalentClass-001	Approved	entailment	entailed	konclude	unsupported	7	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentClass-001	Approved	entailment	entailed	openllet	entailed	13	pass	
+WebOnt-equivalentClass-002	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-equivalentClass-002	Approved	consistency	consistent	hermit	consistent	21	pass	
+WebOnt-equivalentClass-002	Approved	consistency	consistent	konclude	consistent	14	pass	
+WebOnt-equivalentClass-002	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-equivalentClass-002	Approved	entailment	entailed	elk	entailed	9	pass	
+WebOnt-equivalentClass-002	Approved	entailment	entailed	hermit	entailed	41	pass	
+WebOnt-equivalentClass-002	Approved	entailment	entailed	konclude	unsupported	5	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentClass-002	Approved	entailment	entailed	openllet	entailed	12	pass	
+WebOnt-equivalentClass-003	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-equivalentClass-003	Approved	consistency	consistent	hermit	consistent	18	pass	
+WebOnt-equivalentClass-003	Approved	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-equivalentClass-003	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-equivalentClass-003	Approved	entailment	entailed	elk	entailed	10	pass	
+WebOnt-equivalentClass-003	Approved	entailment	entailed	hermit	entailed	33	pass	
+WebOnt-equivalentClass-003	Approved	entailment	entailed	konclude	unsupported	5	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentClass-003	Approved	entailment	entailed	openllet	entailed	12	pass	
+WebOnt-equivalentClass-004	Approved	consistency	consistent	hermit	consistent	27	pass	
+WebOnt-equivalentClass-004	Approved	consistency	consistent	konclude	consistent	19	pass	
+WebOnt-equivalentClass-004	Approved	consistency	consistent	openllet	consistent	6	pass	
+WebOnt-equivalentClass-004	Approved	entailment	entailed	hermit	entailed	78	pass	
+WebOnt-equivalentClass-004	Approved	entailment	entailed	konclude	unsupported	7	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentClass-004	Approved	entailment	entailed	openllet	entailed	13	pass	
+WebOnt-equivalentClass-005	Approved	consistency	consistent	hermit	consistent	19	pass	
+WebOnt-equivalentClass-005	Approved	consistency	consistent	konclude	consistent	17	pass	
+WebOnt-equivalentClass-005	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-equivalentClass-005	Approved	entailment	not-entailed	hermit	not-entailed	43	pass	
+WebOnt-equivalentClass-005	Approved	entailment	not-entailed	konclude	unsupported	5	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentClass-005	Approved	entailment	not-entailed	openllet	not-entailed	16	pass	
+WebOnt-equivalentClass-006	Approved	consistency	consistent	hermit	consistent	14	pass	
+WebOnt-equivalentClass-006	Approved	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-equivalentClass-006	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-equivalentClass-006	Approved	entailment	entailed	hermit	entailed	50	pass	
+WebOnt-equivalentClass-006	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentClass-006	Approved	entailment	entailed	openllet	entailed	11	pass	
+WebOnt-equivalentClass-008-Direct	Approved	consistency	consistent	elk	consistent	5	pass	
+WebOnt-equivalentClass-008-Direct	Approved	consistency	consistent	hermit	consistent	7	pass	
+WebOnt-equivalentClass-008-Direct	Approved	consistency	consistent	konclude	consistent	16	pass	
+WebOnt-equivalentClass-008-Direct	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-equivalentClass-008-Direct	Approved	entailment	entailed	elk	entailed	7	pass	no logical axioms
+WebOnt-equivalentClass-008-Direct	Approved	entailment	entailed	hermit	entailed	33	pass	no logical axioms
+WebOnt-equivalentClass-008-Direct	Approved	entailment	entailed	konclude	unsupported	5	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentClass-008-Direct	Approved	entailment	entailed	openllet	entailed	11	pass	no logical axioms
+WebOnt-equivalentClass-009	Approved	consistency	consistent	hermit	consistent	26	pass	
+WebOnt-equivalentClass-009	Approved	consistency	consistent	konclude	consistent	19	pass	
+WebOnt-equivalentClass-009	Approved	consistency	consistent	openllet	consistent	7	pass	
+WebOnt-equivalentProperty-001	Approved	consistency	consistent	elk	consistent	10	pass	
+WebOnt-equivalentProperty-001	Approved	consistency	consistent	hermit	consistent	7	pass	
+WebOnt-equivalentProperty-001	Approved	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-equivalentProperty-001	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-equivalentProperty-001	Approved	entailment	entailed	elk	entailed	12	pass	
+WebOnt-equivalentProperty-001	Approved	entailment	entailed	hermit	entailed	33	pass	
+WebOnt-equivalentProperty-001	Approved	entailment	entailed	konclude	unsupported	6	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentProperty-001	Approved	entailment	entailed	openllet	entailed	12	pass	
+WebOnt-equivalentProperty-002	Approved	consistency	consistent	elk	consistent	3	pass	
+WebOnt-equivalentProperty-002	Approved	consistency	consistent	hermit	consistent	7	pass	
+WebOnt-equivalentProperty-002	Approved	consistency	consistent	konclude	consistent	12	pass	
+WebOnt-equivalentProperty-002	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-equivalentProperty-002	Approved	entailment	entailed	elk	unsupported	8	unsupported	entailment of SubObjectPropertyOf
+WebOnt-equivalentProperty-002	Approved	entailment	entailed	hermit	entailed	35	pass	
+WebOnt-equivalentProperty-002	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentProperty-002	Approved	entailment	entailed	openllet	entailed	10	pass	
+WebOnt-equivalentProperty-003	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-equivalentProperty-003	Approved	consistency	consistent	hermit	consistent	6	pass	
+WebOnt-equivalentProperty-003	Approved	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-equivalentProperty-003	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-equivalentProperty-003	Approved	entailment	entailed	elk	unsupported	7	unsupported	entailment of EquivalentObjectProperties
+WebOnt-equivalentProperty-003	Approved	entailment	entailed	hermit	entailed	40	pass	
+WebOnt-equivalentProperty-003	Approved	entailment	entailed	konclude	unsupported	5	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentProperty-003	Approved	entailment	entailed	openllet	entailed	9	pass	
+WebOnt-equivalentProperty-004	Approved	consistency	consistent	hermit	consistent	15	pass	
+WebOnt-equivalentProperty-004	Approved	consistency	consistent	konclude	consistent	14	pass	
+WebOnt-equivalentProperty-004	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-equivalentProperty-004	Approved	entailment	entailed	hermit	entailed	43	pass	
+WebOnt-equivalentProperty-004	Approved	entailment	entailed	konclude	unsupported	7	unsupported	Konclude's command line has no entailment
+WebOnt-equivalentProperty-004	Approved	entailment	entailed	openllet	entailed	14	pass	
+WebOnt-imports-011	Approved	consistency	consistent	elk	consistent	155	pass	
+WebOnt-imports-011	Approved	consistency	consistent	hermit	consistent	161	pass	
+WebOnt-imports-011	Approved	consistency	consistent	konclude	consistent	197	pass	
+WebOnt-imports-011	Approved	consistency	consistent	openllet	consistent	157	pass	
+WebOnt-imports-011	Approved	entailment	entailed	elk	entailed	163	pass	
+WebOnt-imports-011	Approved	entailment	entailed	hermit	entailed	977	pass	
+WebOnt-imports-011	Approved	entailment	entailed	konclude	unsupported	389	unsupported	Konclude's command line has no entailment
+WebOnt-imports-011	Approved	entailment	entailed	openllet	entailed	389	pass	
+WebOnt-maxCardinality-001	Approved	consistency	inconsistent	hermit	inconsistent	17	pass	
+WebOnt-maxCardinality-001	Approved	consistency	inconsistent	konclude	inconsistent	19	pass	
+WebOnt-maxCardinality-001	Approved	consistency	inconsistent	openllet	inconsistent	6	pass	
+WebOnt-miscellaneous-001	Approved	consistency	consistent	hermit	consistent	1084	pass	
+WebOnt-miscellaneous-001	Approved	consistency	consistent	konclude	consistent	531	pass	
+WebOnt-miscellaneous-001	Approved	consistency	consistent	openllet	consistent	700	pass	
+WebOnt-miscellaneous-002	Approved	consistency	consistent	hermit	consistent	1221	pass	
+WebOnt-miscellaneous-002	Approved	consistency	consistent	konclude	consistent	406	pass	
+WebOnt-miscellaneous-002	Approved	consistency	consistent	openllet	consistent	536	pass	
+WebOnt-miscellaneous-011	Extracredit	consistency	consistent	hermit	consistent	488	pass	
+WebOnt-miscellaneous-011	Extracredit	consistency	consistent	konclude	consistent	372	pass	
+WebOnt-miscellaneous-011	Extracredit	consistency	consistent	openllet	consistent	420	pass	
+WebOnt-miscellaneous-011	Extracredit	entailment	entailed	hermit	entailed	1337	pass	
+WebOnt-miscellaneous-011	Extracredit	entailment	entailed	konclude	unsupported	339	unsupported	Konclude's command line has no entailment
+WebOnt-miscellaneous-011	Extracredit	entailment	entailed	openllet	entailed	436	pass	
+WebOnt-miscellaneous-102	Approved	consistency	consistent	hermit	consistent	17	pass	
+WebOnt-miscellaneous-102	Approved	consistency	consistent	konclude	consistent	15	pass	
+WebOnt-miscellaneous-102	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-miscellaneous-103	Approved	consistency	consistent	hermit	consistent	14	pass	
+WebOnt-miscellaneous-103	Approved	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-miscellaneous-103	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-miscellaneous-202	Approved	consistency	consistent	hermit	consistent	152	pass	
+WebOnt-miscellaneous-202	Approved	consistency	consistent	konclude	consistent	18	pass	
+WebOnt-miscellaneous-202	Approved	consistency	consistent	openllet	inconsistent	6	wrong-result	
+WebOnt-miscellaneous-203	Approved	consistency	inconsistent	hermit	inconsistent	18	pass	
+WebOnt-miscellaneous-203	Approved	consistency	inconsistent	konclude	consistent	17	wrong-result	
+WebOnt-miscellaneous-203	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-miscellaneous-204	Approved	consistency	inconsistent	hermit	inconsistent	15	pass	
+WebOnt-miscellaneous-204	Approved	consistency	inconsistent	konclude	consistent	17	wrong-result	
+WebOnt-miscellaneous-204	Approved	consistency	inconsistent	openllet	inconsistent	4	pass	
+WebOnt-miscellaneous-302-Direct	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-miscellaneous-302-Direct	Approved	consistency	consistent	hermit	consistent	7	pass	
+WebOnt-miscellaneous-302-Direct	Approved	consistency	consistent	konclude	consistent	12	pass	
+WebOnt-miscellaneous-302-Direct	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-miscellaneous-302-Direct	Approved	entailment	entailed	elk	entailed	8	pass	
+WebOnt-miscellaneous-302-Direct	Approved	entailment	entailed	hermit	entailed	26	pass	
+WebOnt-miscellaneous-302-Direct	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-miscellaneous-302-Direct	Approved	entailment	entailed	openllet	entailed	7	pass	
+WebOnt-miscellaneous-303	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-miscellaneous-303	Approved	consistency	consistent	hermit	consistent	13	pass	
+WebOnt-miscellaneous-303	Approved	consistency	consistent	konclude	consistent	12	pass	
+WebOnt-miscellaneous-303	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-oneOf-001	Approved	consistency	consistent	hermit	consistent	14	pass	
+WebOnt-oneOf-001	Approved	consistency	consistent	konclude	consistent	12	pass	
+WebOnt-oneOf-001	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-oneOf-004	Approved	consistency	consistent	hermit	consistent	14	pass	
+WebOnt-oneOf-004	Approved	consistency	consistent	konclude	consistent	17	pass	
+WebOnt-oneOf-004	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-oneOf-004	Approved	entailment	entailed	hermit	entailed	43	pass	
+WebOnt-oneOf-004	Approved	entailment	entailed	konclude	unsupported	11	unsupported	Konclude's command line has no entailment
+WebOnt-oneOf-004	Approved	entailment	entailed	openllet	entailed	12	pass	
+WebOnt-sameAs-001	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-sameAs-001	Approved	consistency	consistent	hermit	consistent	6	pass	
+WebOnt-sameAs-001	Approved	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-sameAs-001	Approved	consistency	consistent	openllet	consistent	3	pass	
+WebOnt-sameAs-001	Approved	entailment	entailed	elk	entailed	7	pass	no logical axioms
+WebOnt-sameAs-001	Approved	entailment	entailed	hermit	entailed	26	pass	no logical axioms
+WebOnt-sameAs-001	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-sameAs-001	Approved	entailment	entailed	openllet	entailed	7	pass	no logical axioms
+WebOnt-someValuesFrom-003	Approved	consistency	consistent	elk	consistent	4	pass	
+WebOnt-someValuesFrom-003	Approved	consistency	consistent	hermit	consistent	12	pass	
+WebOnt-someValuesFrom-003	Approved	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-someValuesFrom-003	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-someValuesFrom-003	Approved	entailment	entailed	elk	not-entailed	10	wrong-result	
+WebOnt-someValuesFrom-003	Approved	entailment	entailed	hermit	entailed	34	pass	
+WebOnt-someValuesFrom-003	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-someValuesFrom-003	Approved	entailment	entailed	openllet	entailed	21	pass	
+WebOnt-unionOf-003	Approved	consistency	consistent	hermit	consistent	7	pass	
+WebOnt-unionOf-003	Approved	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-unionOf-003	Approved	consistency	consistent	openllet	consistent	4	pass	
+WebOnt-unionOf-003	Approved	entailment	entailed	hermit	entailed	26	pass	
+WebOnt-unionOf-003	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-unionOf-003	Approved	entailment	entailed	openllet	entailed	8	pass	
+WebOnt-unionOf-004	Approved	consistency	consistent	hermit	consistent	6	pass	
+WebOnt-unionOf-004	Approved	consistency	consistent	konclude	consistent	13	pass	
+WebOnt-unionOf-004	Approved	consistency	consistent	openllet	consistent	5	pass	
+WebOnt-unionOf-004	Approved	entailment	entailed	hermit	entailed	29	pass	
+WebOnt-unionOf-004	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+WebOnt-unionOf-004	Approved	entailment	entailed	openllet	entailed	7	pass	
+bnode2somevaluesfrom	Approved	consistency	consistent	elk	consistent	6	pass	
+bnode2somevaluesfrom	Approved	consistency	consistent	hermit	consistent	10	pass	
+bnode2somevaluesfrom	Approved	consistency	consistent	konclude	consistent	30	pass	
+bnode2somevaluesfrom	Approved	consistency	consistent	openllet	consistent	14	pass	
+bnode2somevaluesfrom	Approved	entailment	entailed	elk	not-entailed	127	wrong-result	
+bnode2somevaluesfrom	Approved	entailment	entailed	hermit	entailed	322	pass	
+bnode2somevaluesfrom	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+bnode2somevaluesfrom	Approved	entailment	entailed	openllet	entailed	193	pass	
+chain2trans1	Approved	consistency	consistent	elk	consistent	6	pass	
+chain2trans1	Approved	consistency	consistent	hermit	consistent	9	pass	
+chain2trans1	Approved	consistency	consistent	konclude	consistent	14	pass	
+chain2trans1	Approved	consistency	consistent	openllet	consistent	9	pass	
+chain2trans1	Approved	entailment	entailed	elk	unsupported	15	unsupported	entailment of TransitiveObjectProperty
+chain2trans1	Approved	entailment	entailed	hermit	entailed	30	pass	
+chain2trans1	Approved	entailment	entailed	konclude	unsupported	4	unsupported	Konclude's command line has no entailment
+chain2trans1	Approved	entailment	entailed	openllet	entailed	13	pass	
+consistent-dataproperty-disjointness	Approved	consistency	consistent	hermit	consistent	103	pass	
+consistent-dataproperty-disjointness	Approved	consistency	consistent	konclude	consistent	41	pass	
+consistent-dataproperty-disjointness	Approved	consistency	consistent	openllet	consistent	65	pass	
+consistent-integer-filler	Approved	consistency	consistent	hermit	consistent	15	pass	
+consistent-integer-filler	Approved	consistency	consistent	konclude	consistent	20	pass	
+consistent-integer-filler	Approved	consistency	consistent	openllet	consistent	15	pass	
+datatype-restriction-min-max-inconsistency	Approved	consistency	inconsistent	hermit	inconsistent	16	pass	
+datatype-restriction-min-max-inconsistency	Approved	consistency	inconsistent	konclude	inconsistent	21	pass	
+datatype-restriction-min-max-inconsistency	Approved	consistency	inconsistent	openllet	inconsistent	9	pass	
+functionality-clash	Approved	consistency	inconsistent	hermit	inconsistent	12	pass	
+functionality-clash	Approved	consistency	inconsistent	konclude	inconsistent	19	pass	
+functionality-clash	Approved	consistency	inconsistent	openllet	inconsistent	9	pass	
+inconsistent-integer-filler	Approved	consistency	inconsistent	hermit	inconsistent	13	pass	
+inconsistent-integer-filler	Approved	consistency	inconsistent	konclude	inconsistent	19	pass	
+inconsistent-integer-filler	Approved	consistency	inconsistent	openllet	inconsistent	10	pass	
+inconsistent_datatypes	Approved	consistency	inconsistent	hermit	inconsistent	12	pass	
+inconsistent_datatypes	Approved	consistency	inconsistent	konclude	inconsistent	19	pass	
+inconsistent_datatypes	Approved	consistency	inconsistent	openllet	inconsistent	10	pass	
+one=two	Approved	consistency	inconsistent	hermit	inconsistent	45	pass	
+one=two	Approved	consistency	inconsistent	konclude	consistent	22	wrong-result	
+one=two	Approved	consistency	inconsistent	openllet	inconsistent	26	pass	
+owl2-rl-anonymous-individual	Approved	consistency	consistent	hermit	consistent	9	pass	
+owl2-rl-anonymous-individual	Approved	consistency	consistent	konclude	consistent	13	pass	
+owl2-rl-anonymous-individual	Approved	consistency	consistent	openllet	consistent	10	pass	
+owl2-rl-invalid-leftside-allvaluesfrom	Approved	consistency	consistent	hermit	consistent	9	pass	
+owl2-rl-invalid-leftside-allvaluesfrom	Approved	consistency	consistent	konclude	consistent	14	pass	
+owl2-rl-invalid-leftside-allvaluesfrom	Approved	consistency	consistent	openllet	consistent	9	pass	
+owl2-rl-invalid-leftside-maxcard	Approved	consistency	consistent	hermit	consistent	10	pass	
+owl2-rl-invalid-leftside-maxcard	Approved	consistency	consistent	konclude	consistent	15	pass	
+owl2-rl-invalid-leftside-maxcard	Approved	consistency	consistent	openllet	consistent	8	pass	
+owl2-rl-invalid-oneof	Approved	consistency	consistent	hermit	consistent	9	pass	
+owl2-rl-invalid-oneof	Approved	consistency	consistent	konclude	consistent	12	pass	
+owl2-rl-invalid-oneof	Approved	consistency	consistent	openllet	consistent	6	pass	
+owl2-rl-invalid-owlreal	Approved	consistency	consistent	hermit	consistent	9	pass	
+owl2-rl-invalid-owlreal	Approved	consistency	consistent	konclude	consistent	11	pass	
+owl2-rl-invalid-owlreal	Approved	consistency	consistent	openllet	consistent	17	pass	
+owl2-rl-invalid-rightside-somevaluesfrom	Approved	consistency	consistent	elk	consistent	14	pass	
+owl2-rl-invalid-rightside-somevaluesfrom	Approved	consistency	consistent	hermit	consistent	8	pass	
+owl2-rl-invalid-rightside-somevaluesfrom	Approved	consistency	consistent	konclude	consistent	11	pass	
+owl2-rl-invalid-rightside-somevaluesfrom	Approved	consistency	consistent	openllet	consistent	20	pass	
+owl2-rl-invalid-rightside-unionof	Approved	consistency	consistent	hermit	consistent	9	pass	
+owl2-rl-invalid-rightside-unionof	Approved	consistency	consistent	konclude	consistent	12	pass	
+owl2-rl-invalid-rightside-unionof	Approved	consistency	consistent	openllet	consistent	5	pass	
+owl2-rl-invalid-unionof	Approved	consistency	consistent	hermit	consistent	9	pass	
+owl2-rl-invalid-unionof	Approved	consistency	consistent	konclude	consistent	12	pass	
+owl2-rl-invalid-unionof	Approved	consistency	consistent	openllet	consistent	4	pass	
+owl2-rl-rules-fp-differentFrom	Approved	consistency	consistent	hermit	consistent	5	pass	
+owl2-rl-rules-fp-differentFrom	Approved	consistency	consistent	konclude	consistent	16	pass	
+owl2-rl-rules-fp-differentFrom	Approved	consistency	consistent	openllet	consistent	5	pass	
+owl2-rl-rules-fp-differentFrom	Approved	entailment	entailed	hermit	entailed	19	pass	
+owl2-rl-rules-fp-differentFrom	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+owl2-rl-rules-fp-differentFrom	Approved	entailment	entailed	openllet	entailed	30	pass	
+owl2-rl-rules-ifp-differentFrom	Approved	consistency	consistent	hermit	consistent	4	pass	
+owl2-rl-rules-ifp-differentFrom	Approved	consistency	consistent	konclude	consistent	15	pass	
+owl2-rl-rules-ifp-differentFrom	Approved	consistency	consistent	openllet	consistent	5	pass	
+owl2-rl-rules-ifp-differentFrom	Approved	entailment	entailed	hermit	entailed	18	pass	
+owl2-rl-rules-ifp-differentFrom	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+owl2-rl-rules-ifp-differentFrom	Approved	entailment	entailed	openllet	entailed	23	pass	
+owl2-rl-valid-mincard	Approved	consistency	consistent	hermit	consistent	10	pass	
+owl2-rl-valid-mincard	Approved	consistency	consistent	konclude	consistent	13	pass	
+owl2-rl-valid-mincard	Approved	consistency	consistent	openllet	consistent	13	pass	
+owl2-rl-valid-oneof	Approved	consistency	consistent	hermit	consistent	10	pass	
+owl2-rl-valid-oneof	Approved	consistency	consistent	konclude	consistent	11	pass	
+owl2-rl-valid-oneof	Approved	consistency	consistent	openllet	consistent	4	pass	
+owl2-rl-valid-rightside-allvaluesfrom	Approved	consistency	consistent	hermit	consistent	8	pass	
+owl2-rl-valid-rightside-allvaluesfrom	Approved	consistency	consistent	konclude	consistent	11	pass	
+owl2-rl-valid-rightside-allvaluesfrom	Approved	consistency	consistent	openllet	consistent	7	pass	
+somevaluesfrom2bnode	Approved	consistency	consistent	elk	consistent	4	pass	
+somevaluesfrom2bnode	Approved	consistency	consistent	hermit	consistent	4	pass	
+somevaluesfrom2bnode	Approved	consistency	consistent	konclude	consistent	11	pass	
+somevaluesfrom2bnode	Approved	consistency	consistent	openllet	consistent	11	pass	
+somevaluesfrom2bnode	Approved	entailment	entailed	elk	not-entailed	9	wrong-result	
+somevaluesfrom2bnode	Approved	entailment	entailed	hermit	entailed	18	pass	
+somevaluesfrom2bnode	Approved	entailment	entailed	konclude	unsupported	3	unsupported	Konclude's command line has no entailment
+somevaluesfrom2bnode	Approved	entailment	entailed	openllet	entailed	23	pass	
+string-integer-clash	Approved	consistency	inconsistent	elk	consistent	7	wrong-result	
+string-integer-clash	Approved	consistency	inconsistent	hermit	inconsistent	11	pass	
+string-integer-clash	Approved	consistency	inconsistent	konclude	inconsistent	18	pass	
+string-integer-clash	Approved	consistency	inconsistent	openllet	inconsistent	9	pass	
