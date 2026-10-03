@@ -660,17 +660,20 @@ under `nrese_dl_*`.
 | 2.4 | The proof IR; RL derivations moved into it (EL's with the EL classifier in 3.4); PULi-style justifications (`one`, `core`, `union`, `top-k`, `all`); the proof checker | justifications equal to a Horn MUS enumerator on random entailments |
 | 2.5 | The SROIQ(D) fuzzer and metamorphic harness | runs in CI |
 
-**Phase 3: the engines**
+**Phase 3: the engines** (reordered on 3 October; the reasons, the measured bar and a
+performance gate for each package are in [owl2-dl-performance.md](owl2-dl-performance.md) §6)
 
 | Package | Delivers | Gate |
 |---|---|---|
-| 3.1 | Hypertableau, ALC → SHIQ → SROIQ: blocking, NI, merges, dependency sets, backjumping, semantic branching | the W3C DL suite green, without datatypes |
-| 3.2 | The datatype theory | the W3C DL suite green |
-| 3.3 | Classification and realisation driver | HermiT parity on the development subset |
-| 3.4 | Context core, Horn stage; dispatch and modules; the EL classifier moved onto the structural model and its clauses (with chains kept explicit for EL: the automata of §3 make `∃(r∘s).B ⊑ C` non-Horn, so this waits for an EL clause mode, not 2.2) | §5's Horn gate; no taxonomy differences; EL taxonomies unchanged |
-| 3.5 | Context core, SRIQ and SROIQ stages; dynamic fallback, racing, telemetry | §5's gates |
-| 3.6 | Caches with footprints; parallel classification; profiled SIMD | metamorphic on/off tests; ORE parity with HermiT (Lam et al. 2023: 1,751 classifications, 1,881 consistency checks) |
-| 3.7 | Black-box justifications over the hypertableau; glass-box certificates | equal to the glass-box results where both apply |
+| 3.0 | The DL lab completed: a stratified ORE development set (≥ 300 tasks), OWL2Bench DL, UOBM; reference results on all; NRESE per-phase timing and counters; committed baselines | the references agree or are adjudicated |
+| 3.1 | Context core, Horn stage, parallel from the start (lock-free context activation, work stealing); dispatch and modules; the EL classifier becomes its EL mode (chains kept explicit for EL: the automata of §3 make `∃(r∘s).B ⊑ C` non-Horn) | §5's Horn gate; EL taxonomies unchanged; ≥ 2× faster than ELK at equal threads on the EL track |
+| 3.2 | Bounds for large ABoxes: U1 compiled and maintained per commit, the gap, consistency through L, U1 and the Horn core | the incremental track against cold rebuilds; LUBM(800) and UOBM(500) ≥ 10× faster than Konclude |
+| 3.3 | Hypertableau, ALC → SHIQ → SROIQ: absorption, lazy unfolding, blocking, NI, merges, dependency sets, backjumping, semantic branching, (un)satisfiability caching | the W3C DL suite green without datatypes; within 3× of Konclude on the development set |
+| 3.4 | Classification and realisation driver (known/possible subsumers, parallel tests, model merging) | taxonomies equal to the references'; within 1.5× of Konclude's sum |
+| 3.5 | The datatype theory | the W3C DL suite green |
+| 3.6 | Context core, SRIQ and SROIQ stages; dynamic fallback, racing, telemetry | §5's gates; the Oxford sample at Konclude's solved count |
+| 3.7 | Caches with footprints, completion-graph reuse, saturation coupling; profiled SIMD | metamorphic on/off tests; the full ORE run at Konclude's level (Draco) |
+| 3.8 | Black-box justifications over the hypertableau; glass-box certificates | equal to the glass-box results where both apply |
 
 The final bar is Konclude's 1,862 of 1,920 ORE classifications (and 1,911 consistency
 checks, 591 of 624 realisations, Lam et al. 2023), on the same machine, with current
