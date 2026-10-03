@@ -17,6 +17,7 @@ mod env_values;
 mod file_config;
 mod policy_env;
 mod reasoner_env;
+mod replication_env;
 pub mod settings;
 mod source;
 mod store_env;
@@ -40,6 +41,7 @@ pub struct ServerConfig {
     pub reasoner: ReasonerConfig,
     pub policy: PolicyConfig,
     pub ai: AiConfig,
+    pub replication: crate::replication::ReplicationConfig,
 }
 
 impl ServerConfig {
@@ -62,6 +64,10 @@ impl ServerConfig {
                 self.deployment_posture.as_str().to_owned(),
             ),
             ("store.mode", format!("{:?}", store.mode)),
+            (
+                "replication.mode",
+                self.replication.mode.as_str().to_owned(),
+            ),
             ("store.data_dir", store.data_dir.display().to_string()),
             ("store.verify_on_open", store.verify_on_open.to_string()),
             ("store.map_checkpoints", store.map_checkpoints.to_string()),
@@ -219,6 +225,12 @@ impl ServerConfig {
         let reasoner = parse_reasoner_config(source)?;
         let policy = parse_policy_config(source)?;
         let ai = parse_ai_config(source)?;
+        let replication = replication_env::parse_replication_config(source)?;
+        if replication.mode != crate::replication::ReplicationMode::Off
+            && store.mode != nrese_store::StoreMode::OnDisk
+        {
+            anyhow::bail!("replication needs an on-disk store (store.mode = \"on-disk\")");
+        }
 
         validate_configuration(deployment_posture, store.mode, &policy)
             .map_err(anyhow::Error::msg)?;
@@ -230,6 +242,7 @@ impl ServerConfig {
             reasoner,
             policy,
             ai,
+            replication,
         })
     }
 }

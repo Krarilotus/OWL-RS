@@ -75,8 +75,10 @@ impl RuntimePosture {
     pub fn from_state(state: &AppState) -> Self {
         let ai_status = state.ai().status();
         let deployment_posture = state.deployment_posture();
-        let graph_write_enabled = deployment_posture.write_surfaces_enabled();
-        let admin_surface_enabled = deployment_posture.admin_surface_enabled();
+        // A read replica takes no writes: what it holds is the primary's.
+        let replica = state.replication().is_replica();
+        let graph_write_enabled = deployment_posture.write_surfaces_enabled() && !replica;
+        let admin_surface_enabled = deployment_posture.admin_surface_enabled() && !replica;
 
         Self {
             deployment_posture: deployment_posture.as_str(),

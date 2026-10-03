@@ -31,6 +31,8 @@ pub struct AppState {
     repository: Arc<str>,
     /// Long operations (imports) running or finished ([`nrese_store::jobs`]).
     jobs: Arc<nrese_store::jobs::Jobs>,
+    /// This server's part in replication ([`crate::replication`]).
+    replication: Arc<crate::replication::ReplicationState>,
 }
 
 impl AppState {
@@ -70,6 +72,7 @@ impl AppState {
             access,
             repository: Arc::from(DEFAULT_REPOSITORY),
             jobs: Arc::default(),
+            replication: Arc::default(),
         };
         state.prepare_support_sets();
         Ok(state)
@@ -207,6 +210,17 @@ impl AppState {
     /// Request outcomes and latencies, for `/metrics`.
     pub fn request_metrics(&self) -> &RequestMetrics {
         &self.request_metrics
+    }
+
+    /// This state with `replication` as its part in replication (set once at start).
+    pub fn with_replication(mut self, replication: crate::replication::ReplicationConfig) -> Self {
+        self.replication = Arc::new(crate::replication::ReplicationState::new(replication));
+        self
+    }
+
+    /// This server's part in replication ([`crate::replication`]).
+    pub fn replication(&self) -> &crate::replication::ReplicationState {
+        &self.replication
     }
 
     pub fn store(&self) -> Arc<StoreService> {

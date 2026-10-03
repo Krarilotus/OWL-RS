@@ -427,6 +427,9 @@ protocol!(
         super::access_api::saved_query_delete,
         super::draft_check::capabilities,
         super::draft_check::check,
+        crate::replication::log,
+        crate::replication::image,
+        crate::replication::status,
         openapi,
     ),
     tags(
@@ -441,6 +444,7 @@ protocol!(
         (name = "access", description = "Users, workspaces, personal spaces, role rules, logins (ADR-0008)"),
         (name = "queries", description = "Saved queries, in personal spaces and workspaces"),
         (name = "draft-check", description = "Isolated checks of pinned inputs for the Datamodel Workflow (dmw-store-check/1); no repository is read or written"),
+        (name = "replication", description = "Read replicas: a primary's log and image, a replica's status (docs/ops/replication.md)"),
     )
 )]
 pub struct ApiDoc;

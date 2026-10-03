@@ -705,6 +705,14 @@ impl Supports {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Forgets the sets: the next ones are computed afresh (after commits that didn't
+    /// report what they touched: a replica's, [`crate::StoreService::apply_replication_log`]).
+    pub(crate) fn forget(&self) {
+        let mut state = self.state();
+        state.computed = None;
+        state.commits.clear();
+    }
+
     /// Whether commits should report what they touched: there are sets to update.
     pub(crate) fn wants_commits(&self) -> bool {
         self.state().computed.is_some()

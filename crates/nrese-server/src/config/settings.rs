@@ -255,6 +255,38 @@ pub const SETTINGS: &[Setting] = &[
         List { delimiter: "," },
         "The endpoints SERVICE may call (IRIs or prefixes, * for any); none by default.",
     ),
+    // [replication]
+    setting(
+        "replication.mode",
+        names::REPLICATION_MODE,
+        Choice(&["off", "primary", "replica"]),
+        "Read replicas (docs/ops/replication.md): a primary ships its log to replicas, \
+         which apply it and answer queries; off by default. Both need an on-disk store.",
+    ),
+    setting(
+        "replication.primary",
+        names::REPLICATION_PRIMARY,
+        Text,
+        "A replica's primary: its base URL (https://primary.example:8080).",
+    ),
+    secret(setting(
+        "replication.token",
+        names::REPLICATION_TOKEN,
+        Text,
+        "The bearer token a replica presents to its primary (an administrator's).",
+    )),
+    setting(
+        "replication.poll",
+        names::REPLICATION_POLL_MS,
+        Amount(Duration),
+        "How long a replica waits before asking again once caught up (default 500ms).",
+    ),
+    setting(
+        "replication.batch_bytes",
+        names::REPLICATION_BATCH_BYTES,
+        Amount(Bytes),
+        "About how much log a replica asks for at once (default 8MiB).",
+    ),
     setting(
         "federation.timeout",
         names::FEDERATION_TIMEOUT_MS,

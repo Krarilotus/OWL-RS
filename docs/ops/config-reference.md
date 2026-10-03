@@ -220,6 +220,16 @@ api_key = "replace-me"
   - queries see asserted and inferred statements by default; `infer=false` or `FROM <http://www.ontotext.com/explicit>` reads asserted statements only, `FROM <http://www.ontotext.com/implicit>` inferred ones
 - switching reasoning off clears the inferred stack at the next startup
 
+## Replication
+
+Read replicas ([replication.md](replication.md)); both sides need an on-disk store.
+
+- file key `replication.mode`, env `NRESE_REPLICATION_MODE`: `off` (the default), `primary` (serve the log and an image to administrators) or `replica` (start from the primary's image when the data directory holds no store, follow its log, take no writes, don't reason)
+- file key `replication.primary`, env `NRESE_REPLICATION_PRIMARY`: a replica's primary, its base URL
+- file key `replication.token`, env `NRESE_REPLICATION_TOKEN`: the bearer token a replica presents to its primary (an administrator's); a secret, never printed
+- file key `replication.poll`, env `NRESE_REPLICATION_POLL_MS`: how long a replica waits before asking again once caught up (default `500ms`)
+- file key `replication.batch_bytes`, env `NRESE_REPLICATION_BATCH_BYTES`: about how much log a replica asks for at once (default `8MiB`)
+
 ## Federation (`SERVICE`)
 
 - file table `[federation]`

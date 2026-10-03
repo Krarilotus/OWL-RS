@@ -298,6 +298,9 @@ Errors are `application/problem+json` documents. Every response carries `x-reque
 | `/metrics` | Prometheus metrics (below) |
 | `/console`, `/ops` | User console, operator UI |
 | `GET /api/v1/capabilities` | What the server offers: surfaces, endpoints, reasoning modes |
+| `GET /api/v1/replication/log?after=N[&max_bytes=M]` | A primary's (`replication.mode = "primary"`), to administrators: the committed records after revision `N`, back to back (`application/vnd.nrese.log`), with `x-nrese-records`, `x-nrese-last-revision`, `x-nrese-latest-revision`; 410 when the log no longer holds them (start from an image); 404 on a server that isn't a primary ([replication.md](replication.md)) |
+| `GET /api/v1/replication/image` | A primary's, to administrators: an image of the latest revision, streamed, its manifest (JSON) in `x-nrese-image-manifest` |
+| `GET /api/v1/replication/status` | `{mode, revision, primary, primary_revision, lag_revisions, records_applied, last_contact_unix, last_error}` (operators) |
 | `GET /api/v1/health` | Readiness and the state of every part (store, reasoning, access, jobs) |
 | `GET /api/v1/diagnostics` | How the server runs: memory, caches, the query budget, requests |
 | `GET /api/v1/ai/status`, `POST /api/v1/ai/query-suggestions` | AI query suggestions, where configured |
