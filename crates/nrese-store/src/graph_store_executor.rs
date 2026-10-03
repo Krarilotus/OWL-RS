@@ -11,17 +11,24 @@ use crate::graph_store::{
 use crate::rdf_io::{BlankNodes, parse_graph, serialize_triples};
 use crate::view::decoded_quads;
 
+/// Reads the target graph; `cancel` stops it (a timeout, a client gone) between
+/// statements: a large graph read no longer runs on after its response gave up (the
+/// review of 3 October 2026, P5).
 pub fn execute_graph_read(
     view: &impl ReadView,
     request: &GraphReadRequest,
     model: ReadModel,
+    cancel: &nrese_sparql::CancellationToken,
 ) -> StoreResult<GraphReadResult> {
-    let triples: Vec<nrese_rdf::Triple> = match request.target.pattern_in(view)? {
-        Some(pattern) => decoded_quads(view, model, &pattern)
-            .map(|quad| quad.map(Into::into))
-            .collect::<StoreResult<Vec<_>>>()?,
-        None => Vec::new(),
-    };
+    let mut triples: Vec<nrese_rdf::Triple> = Vec::new();
+    if let Some(pattern) = request.target.pattern_in(view)? {
+        for (index, quad) in decoded_quads(view, model, &pattern).enumerate() {
+            if index % 4096 == 0 && cancel.is_cancelled() {
+                return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
+            }
+            triples.push(quad?.into());
+        }
+    }
     Ok(GraphReadResult {
         media_type: request.format.media_type(),
         exists: matches!(request.target, GraphTarget::DefaultGraph) || !triples.is_empty(),
