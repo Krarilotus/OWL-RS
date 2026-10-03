@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::{Make, Ontology, Term};
-use nrese_reasoner::v2::classify::classify;
+use nrese_reasoner::v2::classify::{classify, classify_parallel};
 use nrese_reasoner::v2::vocabulary::LocalVocabulary;
 
 /// One id space for the ontology's terms, OWL's vocabulary and blank nodes.
@@ -168,6 +168,67 @@ fn the_el_taxonomy_survives_meaning_preserving_changes() {
     eprintln!(
         "{cases} ontologies: {subsumptions} subsumptions, {unsatisfiable} unsatisfiable classes"
     );
+    assert!(
+        subsumptions > cases as usize,
+        "the generator should give taxonomies to compare"
+    );
+}
+
+/// The parallel saturation reaches the sequential one's fixpoint: the same subsumptions,
+/// unsatisfiable classes and classes equivalent to `owl:Thing`, on every random ontology,
+/// with several workers racing over the contexts.
+#[test]
+fn the_parallel_classification_equals_the_sequential_one() {
+    let cases = std::env::var("NRESE_FUZZ_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200u64);
+    let mut rng = Rng::new(0x2026_1003_1500);
+    let mut subsumptions = 0;
+    for case in 0..cases {
+        let mut ids = Ids {
+            vocabulary: RefCell::new(LocalVocabulary::default()),
+            blanks: 0,
+        };
+        let sizes = Sizes {
+            classes: 8 + rng.below(8) as u32,
+            object_properties: 4,
+            simple: 2,
+            data_properties: 0,
+            individuals: 0,
+            literals: 0,
+        };
+        let sig = Signature::new(sizes, &mut |name| match name {
+            Name::Iri(iri) => ids.term(&format!("<{iri}>")),
+            Name::Integer(n) => ids.term(&format!(
+                "\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+            )),
+        });
+        let mut profile = Profile::el();
+        profile.axioms = 10 + rng.below(30) as usize;
+        let o = fuzz::ontology(&mut rng, &sig, profile);
+        for (_, iri) in nrese_owl::Vocabulary::iris() {
+            ids.term(&format!("<{iri}>"));
+        }
+        let vocabulary = {
+            let v = &ids.vocabulary;
+            nrese_owl::Vocabulary::new(&|iri| Some(v.borrow_mut().term(&format!("<{iri}>"))))
+        };
+        let triples = nrese_owl::write(&o, &vocabulary, &mut ids);
+        let names = ids.vocabulary.borrow().clone();
+        let named = |id: u64| names.text(id).starts_with('<');
+        let sequential = classify(&triples, &mut ids.vocabulary.borrow().clone(), &named);
+        for threads in [2, 4] {
+            let parallel = classify_parallel(
+                &triples,
+                &mut ids.vocabulary.borrow().clone(),
+                &named,
+                threads,
+            );
+            assert_eq!(parallel, sequential, "case {case}, {threads} threads");
+        }
+        subsumptions += sequential.subsumptions.len();
+    }
     assert!(
         subsumptions > cases as usize,
         "the generator should give taxonomies to compare"
