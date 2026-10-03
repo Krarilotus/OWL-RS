@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nrese_engine::ReadModel;
-use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::rulesets::Ruleset;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_sparql::GraphAccess;
 use nrese_store::{

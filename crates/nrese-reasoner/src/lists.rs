@@ -159,7 +159,7 @@ impl ListVocabulary {
 /// A member sequence of a list, with the facts its path uses.
 type Variant = (Vec<u64>, Vec<[u64; 3]>);
 
-/// The most member sequences one list axiom may have (see [`ListVocabulary::list`]).
+/// The most member sequences one list axiom may have (see `ListVocabulary::list`).
 pub const MAX_VARIANTS: usize = 64;
 
 /// Lists of pairwise axioms up to this length become a rule per pair; longer ones are

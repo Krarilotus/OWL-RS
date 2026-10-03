@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use nrese_rdf::{NamedOrBlankNode, Term, Triple};
 use nrese_rdf_io::{RdfFormat, RdfParser};
-use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::rulesets::Ruleset;
 use nrese_store::{BulkLoadRequest, GraphTarget, SparqlQueryRequest, StoreConfig, StoreService};
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");

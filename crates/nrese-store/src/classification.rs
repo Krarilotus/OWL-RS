@@ -1,13 +1,13 @@
 //! OWL 2 EL classification of the store's asserted statements (all graphs), on request
-//! ([`nrese_reasoner::v2::classify`]).
+//! ([`nrese_reasoner::classify`]).
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TermKind};
 use nrese_rdf::{LiteralRef, NamedNodeRef};
-use nrese_reasoner::v2::classify::classify;
-use nrese_reasoner::v2::ir::Vocabulary;
+use nrese_reasoner::classify::classify;
+use nrese_reasoner::ir::Vocabulary;
 
 use crate::{StoreResult, StoreService};
 

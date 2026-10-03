@@ -345,7 +345,7 @@ fn literal(literal: &Literal, vocabulary: &mut impl Vocabulary) -> Result<u64, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::vocabulary::LocalVocabulary;
+    use crate::vocabulary::LocalVocabulary;
 
     fn compiled(text: &str) -> Result<(N3Program, LocalVocabulary), ParseError> {
         let mut vocabulary = LocalVocabulary::default();

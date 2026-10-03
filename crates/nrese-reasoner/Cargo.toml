@@ -8,11 +8,10 @@ license.workspace = true
 
 [dependencies]
 smallvec = { workspace = true }
-nrese-core = { path = "../nrese-core" }
 nrese-exec = { path = "../nrese-exec" }
-# The proof IR justifications are computed on (v2::explain).
+# The proof IR justifications are computed on (explain).
 nrese-owl = { path = "../nrese-owl" }
-# User rules in Notation3 (v2::n3).
+# User rules in Notation3 (n3).
 nrese-rdf = { path = "../rdf/nrese-rdf", default-features = false }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 hashbrown = { workspace = true }
@@ -20,7 +19,7 @@ rayon = { workspace = true }
 thiserror.workspace = true
 
 [features]
-# The naive reference evaluator (v2::naive), the oracle the executors are tested against.
+# The naive reference evaluator (naive), the oracle the executors are tested against.
 oracle = []
 
 [dev-dependencies]

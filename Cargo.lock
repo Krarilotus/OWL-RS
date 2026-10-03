@@ -1131,10 +1131,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nrese-core"
-version = "0.1.0"
-
-[[package]]
 name = "nrese-engine"
 version = "0.1.0"
 dependencies = [
@@ -1218,7 +1214,6 @@ name = "nrese-reasoner"
 version = "0.1.0"
 dependencies = [
  "hashbrown 0.16.1",
- "nrese-core",
  "nrese-exec",
  "nrese-owl",
  "nrese-rdf",
@@ -1242,7 +1237,6 @@ dependencies = [
  "jsonwebtoken",
  "libmimalloc-sys",
  "mimalloc",
- "nrese-core",
  "nrese-engine",
  "nrese-rdf",
  "nrese-reasoner",
@@ -1346,7 +1340,6 @@ dependencies = [
  "hashbrown 0.16.1",
  "libmimalloc-sys",
  "mimalloc",
- "nrese-core",
  "nrese-engine",
  "nrese-rdf",
  "nrese-rdf-io",

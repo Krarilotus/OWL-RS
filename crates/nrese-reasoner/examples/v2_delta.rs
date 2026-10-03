@@ -13,13 +13,13 @@
 use std::io::BufRead;
 use std::time::Instant;
 
-use nrese_reasoner::v2::batch::{self, Schema};
-use nrese_reasoner::v2::delta::{MemoryBase, Rules, program, update};
-use nrese_reasoner::v2::ir::Triple;
-use nrese_reasoner::v2::ir::Vocabulary;
-use nrese_reasoner::v2::lists::ListVocabulary;
-use nrese_reasoner::v2::rulesets::Ruleset;
-use nrese_reasoner::v2::vocabulary::LocalVocabulary;
+use nrese_reasoner::batch::{self, Schema};
+use nrese_reasoner::delta::{MemoryBase, Rules, program, update};
+use nrese_reasoner::ir::Triple;
+use nrese_reasoner::ir::Vocabulary;
+use nrese_reasoner::lists::ListVocabulary;
+use nrese_reasoner::rulesets::Ruleset;
+use nrese_reasoner::vocabulary::LocalVocabulary;
 
 fn split(line: &str) -> Option<[&str; 3]> {
     let line = line.trim();
@@ -211,7 +211,7 @@ fn batches(
     mut inferred: Vec<Triple>,
     compiled: Rules<'_>,
     check: bool,
-    rules: &[nrese_reasoner::v2::ir::Rule],
+    rules: &[nrese_reasoner::ir::Rule],
     lists: &ListVocabulary,
     schema: &Schema,
 ) -> Result<(), Box<dyn std::error::Error>> {

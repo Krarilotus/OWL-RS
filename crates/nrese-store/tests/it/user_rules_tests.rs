@@ -148,7 +148,7 @@ fn changed_rules_make_the_recorded_closure_stale() {
     assert!(!store.reasoning_is_current(&edited));
     // Adding the same rules to a ruleset is another program as well.
     let added = RuleProgram::new(
-        Some(nrese_reasoner::v2::rulesets::Ruleset::Rdfs),
+        Some(nrese_reasoner::rulesets::Ruleset::Rdfs),
         Some(rules(FAMILY)),
     )
     .expect("a program");
