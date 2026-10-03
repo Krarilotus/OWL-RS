@@ -483,6 +483,7 @@ impl StoreService {
             &self.read_snapshot(read.scope.access()),
             request,
             read.model(),
+            &read.cancel,
         )
     }
 

@@ -68,12 +68,17 @@ async fn read_graph(
     let request = GraphReadRequest { target, format };
     let store = state.store();
     let read = nrese_store::ReadContext::new(access.read_scope());
+    // At the timeout the read itself stops, not only the wait for it.
+    let cancel = read.cancel.clone();
     let result = tokio::time::timeout(
         state.policy().timeouts.graph_read,
         tokio::task::spawn_blocking(move || store.execute_graph_read(&read, &request)),
     )
     .await
-    .map_err(|_| ApiError::timeout("graph read exceeded policy timeout"))?
+    .map_err(|_| {
+        cancel.cancel();
+        ApiError::timeout("graph read exceeded policy timeout")
+    })?
     .map_err(|error| ApiError::internal(error.to_string()))?
     .map_err(|error| ApiError::bad_request(error.to_string()))?;
     // Graph Store Protocol §5.2: a graph that doesn't exist is 404, not an empty document.
