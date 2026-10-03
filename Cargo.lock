@@ -1220,6 +1220,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "nrese-core",
  "nrese-exec",
+ "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-reasoner",

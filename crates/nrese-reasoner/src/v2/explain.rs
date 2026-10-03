@@ -11,6 +11,8 @@
 
 use hashbrown::HashMap;
 
+use nrese_owl::ProofGraph;
+
 use super::delta::{Base, Rules};
 use super::eval::{GroundProgram, Seg, Source};
 use super::ir::Triple;
@@ -159,6 +161,93 @@ pub fn explain_with<B: Base + ?Sized>(
     }
     add(fact, &proved, &mut steps, &mut index);
     Some(Explanation { steps })
+}
+
+/// One-step derivations collected per fact for a proof graph: enough for every
+/// justification of ordinary ontologies; past it the graph says it isn't complete.
+const DERIVATIONS: usize = 256;
+
+/// The derivation hypergraph of `fact` over the materialised state `base` (the proof IR of
+/// docs/design/owl2-dl.md §10): every one-step derivation of every fact reachable
+/// backwards from `fact`, with every set of schema facts each rule was grounded on. The
+/// axioms are the asserted facts (and the ruleset's): an asserted fact is an inference of
+/// its own (`asserted`) besides its derivations, so a justification may avoid it.
+/// Justifications, cores, unions and proofs are computed on it ([`nrese_owl::proof`]).
+/// `None` if `fact` doesn't hold; at most `budget` facts examined, past which the graph
+/// is marked incomplete.
+pub fn proof_graph<B: Base + ?Sized>(
+    base: &B,
+    program: &GroundProgram,
+    fact: Triple,
+    budget: usize,
+) -> Option<ProofGraph<Triple, Triple>> {
+    if !base.contains(fact) {
+        return None;
+    }
+    let source = Whole(base);
+    let mut graph = ProofGraph::new(fact);
+    let mut seen: hashbrown::HashSet<Triple> = hashbrown::HashSet::new();
+    let mut queue = vec![fact];
+    while let Some(next) = queue.pop() {
+        if !seen.insert(next) {
+            continue;
+        }
+        if seen.len() > budget {
+            graph.complete = false;
+            break;
+        }
+        if base.is_asserted(next) {
+            graph.add("asserted", &[], &[next], next);
+        }
+        let mut found = program.every_named_derivation(&source, next, DERIVATIONS);
+        if found.len() >= DERIVATIONS {
+            graph.complete = false;
+        }
+        if program.bodiless.contains(&next) {
+            for premises in program.premise_alternatives(super::eval::Grounding::Bodiless(next)) {
+                found.push(("axiom".to_owned(), premises.to_vec()));
+            }
+        }
+        for (rule, body) in found {
+            // Facts of the ruleset hold without premises: axioms as well.
+            graph.add(rule, &body, &[], next);
+            queue.extend(body.iter().copied().filter(|premise| *premise != next));
+        }
+    }
+    Some(graph)
+}
+
+/// Whether `inference` is a valid step over `base`: an asserted fact taken as itself, or
+/// an instance of its rule whose body (and schema facts) is exactly its premises,
+/// re-derived from the rules (the proof checker's check of a step).
+pub fn valid_step<B: Base + ?Sized>(
+    base: &B,
+    program: &GroundProgram,
+    inference: &nrese_owl::Inference<Triple, Triple>,
+) -> bool {
+    if inference.rule == "asserted" {
+        return inference.premises.is_empty()
+            && inference.axioms == [inference.conclusion]
+            && base.is_asserted(inference.conclusion);
+    }
+    let same = |body: &[Triple]| {
+        let mut body = body.to_vec();
+        body.sort_unstable();
+        body.dedup();
+        body.retain(|premise| *premise != inference.conclusion);
+        body == inference.premises
+    };
+    if inference.rule == "axiom" {
+        return program.bodiless.contains(&inference.conclusion)
+            && program
+                .premise_alternatives(super::eval::Grounding::Bodiless(inference.conclusion))
+                .iter()
+                .any(|premises| same(premises));
+    }
+    program
+        .every_named_derivation(&Whole(base), inference.conclusion, usize::MAX)
+        .iter()
+        .any(|(rule, body)| *rule == inference.rule && same(body))
 }
 
 /// A fact proved: the size of its proof (steps, shared ones counted per use) and how.

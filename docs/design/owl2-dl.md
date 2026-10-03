@@ -657,7 +657,7 @@ under `nrese_dl_*`.
 | 2.1 | `nrese-owl`: structural model, reverse mapping, diagnostics, provenance | the round trip and the W3C suite's documents read (§2) |
 | 2.2 | Normalisation into DL-clauses with metadata and provenance | exhaustive model equivalence on fuzzed ontologies (§3) |
 | 2.3 | The W3C direct-semantics runner, reference reasoner runners, canonical taxonomies, `DISPUTED` records | the runners reproduce published HermiT and ELK results on the development subset |
-| 2.4 | The proof IR; RL and EL derivations moved into it; PULi-style justifications (`one`, `core`, `union`, `top-k`, `all`) for RL and EL; the proof checker | justifications equal to a Horn MUS enumerator on random entailments |
+| 2.4 | The proof IR; RL derivations moved into it (EL's with the EL classifier in 3.4); PULi-style justifications (`one`, `core`, `union`, `top-k`, `all`); the proof checker | justifications equal to a Horn MUS enumerator on random entailments |
 | 2.5 | The SROIQ(D) fuzzer and metamorphic harness | runs in CI |
 
 **Phase 3: the engines**

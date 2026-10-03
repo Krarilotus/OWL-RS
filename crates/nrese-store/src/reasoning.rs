@@ -1093,6 +1093,134 @@ pub fn explain_fact(
     )
 }
 
+/// Which justifications of an inferred statement to compute ([`justify_fact`]), in order
+/// of cost (docs/design/owl2-dl.md §10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JustificationMode {
+    /// One minimal set of asserted statements the statement follows from.
+    One,
+    /// The statements every justification has.
+    Core,
+    /// The statements some justification has (the relevant ones).
+    Union,
+    /// The `k` smallest justifications.
+    Top(usize),
+    /// Every justification, smallest first (up to [`JUSTIFICATIONS_AT_MOST`]).
+    All,
+}
+
+/// Justifications listed at most (`all`, `top-k`): past it the answer says it isn't
+/// complete.
+pub const JUSTIFICATIONS_AT_MOST: usize = 1000;
+
+/// Resolution steps a justification enumeration takes at most.
+const JUSTIFICATION_BUDGET: usize = 500_000;
+
+/// A statement of a justification, decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JustifiedStatement {
+    /// The statement's terms (N-Triples); empty when `hidden`.
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    /// `asserted`, or `hidden`: asserted in no graph the requester may read.
+    pub origin: &'static str,
+}
+
+/// The justifications of an inferred statement ([`justify_fact`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JustificationAnswer {
+    pub mode: JustificationMode,
+    /// `one`, `top-k`, `all`: the justifications, smallest first; `core`, `union`: one set.
+    pub sets: Vec<Vec<JustifiedStatement>>,
+    /// Whether the answer is exact: every derivation was collected, and the enumeration
+    /// (`top-k`, `all`, `union`) ended within its limits.
+    pub complete: bool,
+    /// For `one`, `top-k` and `all`: whether a proof of the statement from each listed
+    /// justification was checked step by step against the rules (the proof checker:
+    /// always, so a `false` is an engine error to report). `None` for `core` and `union`.
+    pub verified: Option<bool>,
+}
+
+/// The justifications of the fact `[s, p, o]` in `snapshot` under `program`: minimal sets
+/// of asserted statements it follows from, computed on its proof graph
+/// ([`nrese_reasoner::v2::explain::proof_graph`], the proof IR of `nrese-owl`). `None` if it
+/// doesn't hold. `readable` as for [`explain_fact`].
+pub fn justify_fact(
+    program: &Program,
+    snapshot: &Snapshot,
+    fact: Triple,
+    mode: JustificationMode,
+    readable: Option<&dyn Fn(Triple) -> bool>,
+) -> Option<JustificationAnswer> {
+    let base = SnapshotBase {
+        snapshot,
+        axioms: &program.axioms,
+    };
+    let ground = nrese_reasoner::v2::delta::program(&base, program.rules());
+    let graph = nrese_reasoner::v2::explain::proof_graph(&base, &ground, fact, EXPLANATION_BUDGET)?;
+    let (sets, complete) = match mode {
+        JustificationMode::One => (graph.one().into_iter().collect(), graph.complete),
+        JustificationMode::Core => (vec![graph.core()], graph.complete),
+        JustificationMode::Union => {
+            let (union, complete) = graph.union(JUSTIFICATION_BUDGET);
+            (vec![union], complete)
+        }
+        JustificationMode::Top(_) | JustificationMode::All => {
+            let limit = match mode {
+                JustificationMode::Top(k) => k.min(JUSTIFICATIONS_AT_MOST),
+                _ => JUSTIFICATIONS_AT_MOST,
+            };
+            let found = graph.justifications(limit, JUSTIFICATION_BUDGET);
+            // Top-k asks for k: having them is the whole answer.
+            let complete = found.complete
+                || matches!(mode, JustificationMode::Top(k) if found.found.len() == k && graph.complete);
+            (found.found, complete)
+        }
+    };
+    let verified = match mode {
+        JustificationMode::Core | JustificationMode::Union => None,
+        _ => Some(sets.iter().all(|set| {
+            graph
+                .proof_from(&|a| set.binary_search(a).is_ok())
+                .is_some_and(|proof| {
+                    proof
+                        .check(&|step| {
+                            nrese_reasoner::v2::explain::valid_step(&base, &ground, step)
+                        })
+                        .is_ok()
+                })
+        })),
+    };
+    let decode = |id: u64| decoded(snapshot.decode(TermId::from_raw(id)), id);
+    let statement = |fact: Triple| {
+        if readable.is_some_and(|readable| !readable(fact)) {
+            return JustifiedStatement {
+                subject: String::new(),
+                predicate: String::new(),
+                object: String::new(),
+                origin: "hidden",
+            };
+        }
+        let [s, p, o] = fact;
+        JustifiedStatement {
+            subject: decode(s),
+            predicate: decode(p),
+            object: decode(o),
+            origin: "asserted",
+        }
+    };
+    Some(JustificationAnswer {
+        mode,
+        sets: sets
+            .into_iter()
+            .map(|set| set.into_iter().map(statement).collect())
+            .collect(),
+        complete,
+        verified,
+    })
+}
+
 /// A committed state as the reasoner reads it: asserted and inferred statements of every
 /// graph, the ruleset's axioms counting as asserted.
 struct SnapshotBase<'a> {

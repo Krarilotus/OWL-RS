@@ -437,6 +437,50 @@ async fn explanations_through_the_engine_api() {
     assert_eq!(steps[0]["premises"].as_array().unwrap().len(), 2);
     let (status, _) = send(&app, Method::GET, &explain("X"), None, "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Justifications: the two asserted statements, as one set, checked.
+    let justify = |mode: &str| format!("{}&justifications={mode}", explain("D"));
+    let (status, text) = send(&app, Method::GET, &justify("all"), None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["mode"], "all");
+    assert_eq!(body["complete"], true);
+    assert_eq!(body["verified"], true);
+    let sets = body["justifications"].as_array().unwrap();
+    assert_eq!(sets.len(), 1, "{text}");
+    assert_eq!(sets[0].as_array().unwrap().len(), 2, "{text}");
+    assert!(
+        sets[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["origin"] == "asserted")
+    );
+    let (status, text) = send(&app, Method::GET, &justify("core"), None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["statements"].as_array().unwrap().len(), 2, "{text}");
+    assert!(body.get("verified").is_none());
+    let (status, text) = send(
+        &app,
+        Method::GET,
+        &format!("{}&k=2", justify("top-k")),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let (status, _) = send(
+        &app,
+        Method::GET,
+        &format!("{}&k=0", justify("top-k")),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send(&app, Method::GET, &justify("some"), None, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
