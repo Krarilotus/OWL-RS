@@ -6,9 +6,9 @@ Generated 2026-10-03 by `python benches/suite/suite.py status --write` from [sui
 
 - **Workloads:** 23 (3 partial, 10 planned, 10 ready)
 - **Systems:** 18 (14 free to publish, 4 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 263; run at least once: 79; ok on their newest run: 66
+- **Pairs** (standard tier × system that can run it; build variants apart): 263; run at least once: 80; ok on their newest run: 65
 - **NRESE:** 17 of its 44 standard tiers ok on their newest run
-- **Run records:** 8, newest 2026-10-03
+- **Run records:** 9, newest 2026-10-03
 
 ## Coverage
 
@@ -27,7 +27,7 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | ore-2015 | partial | 0/2 ! | · | · | – | – | – | – | – | – | – | 1/2 | 0/2 ! | 0/2 ! | 1/2 | – | · | – | – |
 | w3c-owl2-dl | ready | · | · | · | – | – | – | – | – | – | – | 0/1 ! | 0/1 ! | 0/1 ! | 0/1 ! | – | · | – | – |
 | owl2bench-classify | planned | · | · | · | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – |
-| basics-mix | ready | 5/5 | · | 4/5 | 5/5 | 4/5 ! | 3/5 ! | 5/5 | · | – | – | – | – | – | – | 5/5 | · | n/a | · |
+| basics-mix | ready | 5/5 | · | 4/5 | 5/5 | 4/5 ! | 3/5 ! | 4/5 ! | 0/5 ! | – | – | – | – | – | – | 5/5 | · | n/a | · |
 | sparqloscope | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | · | · | n/a | · |
 | bsbm | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | · | · | n/a | · |
 | watdiv | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | · | · | n/a | · |
@@ -152,8 +152,8 @@ ready, performance; tasks basics; kit `benches/competitors` (suite driver); chec
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| olympics | ok 10-03 | · | ok 10-02 | ok 10-02 | part 10-02 | part 10-02 | ok 10-02 | · | ran* 10-02 | skip 10-02 | · |
-| yago-tiny | ok 10-03 | · | skip 10-02 | ok 10-02 | ok 10-02 | part 10-02 | ok 10-02 | · | ran* 10-02 | skip 10-02 | · |
+| olympics | ok 10-03 | · | ok 10-02 | ok 10-03 | part 10-03 | part 10-03 | ok 10-03 | part 10-03 | ran* 10-03 | skip 10-02 | · |
+| yago-tiny | ok 10-03 | · | skip 10-02 | ok 10-03 | ok 10-03 | part 10-03 | part 10-03 | · | ran* 10-02 | skip 10-02 | · |
 | entities-10000000 | ok 10-02 | · | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | · | ran* 10-02 | skip 10-02 | · |
 | dbpedia-core | ok 10-03 | · | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | · | ran* 10-02 | skip 10-02 | · |
 | wikidata-lexemes-60m | ok 10-03 | · | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | ok 10-02 | · | ran* 10-02 | skip 10-02 | · |
@@ -263,7 +263,7 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - **ore-2015:** nrese (full); hermit (full); openllet (full); konclude (full); elk (full); rdfox (dev, full)
 - **w3c-owl2-dl:** nrese (-); rdfox (-)
 - **owl2bench-classify:** nrese (el-1, dl-1, dl-10); hermit (el-1, dl-1, dl-10); openllet (el-1, dl-1, dl-10); konclude (el-1, dl-1, dl-10); elk (el-1, dl-1, dl-10); rdfox (el-1, dl-1, dl-10)
-- **basics-mix:** rdf4j (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m); rdfox (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m); anzograph (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m)
+- **basics-mix:** rdf4j (yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m); rdfox (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m); anzograph (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m)
 - **sparqloscope:** nrese (dblp); qlever (dblp); oxigraph (dblp); virtuoso (dblp); jena (dblp); rdf4j (dblp); graphdb (dblp); rdfox (dblp); anzograph (dblp)
 - **bsbm:** nrese (10m, 100m); qlever (10m, 100m); oxigraph (10m, 100m); virtuoso (10m, 100m); jena (10m, 100m); rdf4j (10m, 100m); graphdb (10m, 100m); rdfox (10m, 100m); anzograph (10m, 100m)
 - **watdiv:** nrese (10m, 100m); qlever (10m, 100m); oxigraph (10m, 100m); virtuoso (10m, 100m); jena (10m, 100m); rdf4j (10m, 100m); graphdb (10m, 100m); rdfox (10m, 100m); anzograph (10m, 100m)
@@ -295,9 +295,11 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 
 ### Problems on the newest run
 
-- basics-mix olympics on oxigraph: partial (2026-10-02): not ok: q09-no-medal
-- basics-mix olympics on virtuoso: partial (2026-10-02): not ok: q08-event-hierarchy
-- basics-mix yago-tiny on virtuoso: partial (2026-10-02-yago): not ok: q01-label-lookup, q03-taxon-path, q08-subclass-path
+- basics-mix olympics on oxigraph: partial (2026-10-03-full): not ok: q09-no-medal
+- basics-mix olympics on rdf4j: partial (2026-10-03-full): not ok: q09-no-medal
+- basics-mix olympics on virtuoso: partial (2026-10-03-full): not ok: q08-event-hierarchy
+- basics-mix yago-tiny on jena: partial (2026-10-03-full): not ok: *
+- basics-mix yago-tiny on virtuoso: partial (2026-10-03-full): not ok: q01-label-lookup, q03-taxon-path, q08-subclass-path
 - lubm 10 on jena: partial (2026-10-02): not ok: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14
 - ore-2015 dev on konclude: partial (2026-10-03-dl-reference): 1 error
 - ore-2015 dev on nrese: partial (2026-10-03-dl-reference): EL track only (20/20 agree); the DL tasks wait for phase 3
@@ -331,6 +333,7 @@ Newest first; the records are in [runs/](runs/).
 
 | Run | Started | Kit | Host | Commit | Pairs | Purpose |
 |---|---|---|---|---|---|---|
+| [2026-10-03-full](runs/2026-10-03-full.toml) | 2026-10-03T15:34 | suite | Kraris-GPTler | 5ccf8dbb2e | 12 | Full comparison on the main PC at 5ccf8db; interrupted after 35 min (olympics complete, YAGO tiny begun) and moved to the office PC (2026-10-03-office-a and -b), which runs independently while the main PC is used for development |
 | [2026-10-03-nrese-current](runs/2026-10-03-nrese-current.toml) | 2026-10-03T12:20 | suite | Kraris-GPTler | b963708 +  | 17 | Regression check before the milestone: NRESE at the head of 3 October on the standard tiers, plus OWL2Bench QL-1 and write scaling 1m |
 | [2026-10-03-dl-reference](runs/2026-10-03-dl-reference.toml) | 2026-10-03 | reasoning/dl | Kraris-GPTler | 00f9b19 (kit); c0b5e5c (NRESE EL rerun) | 9 | Work package 2.3: the reference reasoners on the W3C OWL 2 DL suite and the ORE 2015 development subset; NRESE's EL classifier on the EL track |
 | [2026-10-02-yago-head](runs/2026-10-02-yago-head.toml) | 2026-10-02T08:44 | suite | Kraris-GPTler | unknown (before run manifests) | 1 | NRESE on YAGO tiny after the fixes of 2 October |

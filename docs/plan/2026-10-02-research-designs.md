@@ -161,8 +161,10 @@ sets and pairs (RDF-3X lineage) estimate star and chain cardinalities far better
 independence; sampling covers the rest. Factorised representations keep `A × B` as its two
 inputs, and aggregates over them need no enumeration (`COUNT(A × B) = |A|·|B|`, sums
 scaled by multiplicities). EXISTS and subqueries decorrelate into semi- and anti-joins.
-Sparqloscope (ISWC 2025, Wikidata truthy, 8 B triples): QLever 2.3 s geometric mean over
-105 queries, Virtuoso 10.1 s, MillenniumDB 23.3 s; most systems struggle below 10 B.
+Sparqloscope (ISWC 2025; geometric mean over its queries, failures penalised by a factor
+of 2): Wikidata truthy (about 8 B triples) QLever 2.43 s, Virtuoso 11.36 s, MillenniumDB
+22.78 s; DBLP QLever 0.18 s, Virtuoso 0.53 s, MillenniumDB 1.25 s, Jena 15.29 s
+(corrected 3 October against the paper; the earlier figures came from a research report).
 MillenniumDB plans property paths with the rest of the query; reachability indexes and
 path-cardinality statistics help `P31/P279*`.
 
