@@ -13,6 +13,8 @@ hashbrown = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]
+# The bounds' tests evaluate U1 with the rule reasoner and compare it with the RL closure.
+nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 
