@@ -129,6 +129,9 @@ nrese_process_resident_bytes {resident}
         "# HELP nrese_vector_index_bytes The vector index: vectors and their graphs.
 # TYPE nrese_vector_index_bytes gauge
 nrese_vector_index_bytes {}
+# HELP nrese_derived_indexes_loaded_total Derived indexes read from their files since start.
+# TYPE nrese_derived_indexes_loaded_total counter
+nrese_derived_indexes_loaded_total {}
 # HELP nrese_support_sets_total Support graph sets (inferred = \"supported\") computed afresh or updated for a commit.
 # TYPE nrese_support_sets_total counter
 nrese_support_sets_total{{how=\"computed\"}} {}
@@ -144,6 +147,7 @@ nrese_support_seconds_total{{phase=\"update\"}} {}
 nrese_support_seconds_total{{phase=\"view\"}} {}
 ",
         engine.dictionary.vector_bytes,
+        engine.dictionary.derived_loaded,
         support.computed,
         support.updated,
         support.views,
