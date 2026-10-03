@@ -550,3 +550,93 @@ fn random_ontologies_round_trip() {
         assert_round_trip(&o, &mut table);
     }
 }
+
+/// The SROIQ(D) fuzzer (`nrese_owl::fuzz`, work package 2.5): what it generates is OWL 2
+/// DL (no diagnostic at all once written and read back: the global restrictions hold),
+/// round-trips, and normalises with a regular RBox; its transformations keep that.
+#[test]
+fn fuzzed_ontologies_are_owl2_dl() {
+    use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
+    let cases = std::env::var("NRESE_FUZZ_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300u64);
+    let mut rng = Rng::new(0x2026_1003_0250);
+    for case in 0..cases {
+        let mut table = Table::default();
+        let mut intern = |name: &Name| match name {
+            Name::Iri(iri) => table.iri_id(iri),
+            Name::Integer(n) => table.literal(&n.to_string(), &format!("{XSD}integer")),
+        };
+        let sig = Signature::new(Sizes::default(), &mut intern);
+        let profile = if case % 3 == 0 {
+            Profile::el()
+        } else {
+            Profile::sroiq()
+        };
+        let o = fuzz::ontology(&mut rng, &sig, profile);
+        let check = |o: &Ontology, table: &mut Table, what: &str| {
+            let vocabulary = table.vocabulary();
+            let statements: Vec<Statement> = write(o, &vocabulary, table)
+                .into_iter()
+                .map(|triple| Statement { triple, graph: 0 })
+                .collect();
+            let back = read(&statements, table);
+            let names = |t: Term| table.name(t);
+            let axioms: Vec<String> = o.axioms.iter().map(|a| o.functional(a, &names)).collect();
+            assert!(
+                back.diagnostics.is_empty(),
+                "case {case} ({what}): {:?}\n{}",
+                back.diagnostics,
+                axioms.join("\n")
+            );
+            let normalised = nrese_owl::normalise(&back);
+            assert!(
+                normalised.unsupported.is_empty(),
+                "case {case} ({what}): {:?}\n{}",
+                normalised.unsupported,
+                axioms.join("\n")
+            );
+        };
+        check(&o, &mut table, "generated");
+        assert_round_trip(&o, &mut table);
+        // Renamed by swapping two classes and two individuals: still DL, and renaming back
+        // gives the ontology again.
+        let (c0, c1, a0, a1) = (
+            sig.classes[0],
+            sig.classes[1],
+            sig.individuals[0],
+            sig.individuals[1],
+        );
+        let swap = |t: Term| match t {
+            t if t == c0 => c1,
+            t if t == c1 => c0,
+            t if t == a0 => a1,
+            t if t == a1 => a0,
+            t => t,
+        };
+        let renamed = fuzz::rename(&o, &swap);
+        check(&renamed, &mut table, "renamed");
+        let back = fuzz::rename(&renamed, &swap);
+        let render = |o: &Ontology, table: &Table| {
+            let mut v: Vec<String> = o
+                .axioms
+                .iter()
+                .map(|a| o.functional(a, &|t| table.name(t)))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(render(&back, &table), render(&o, &table), "case {case}");
+        let shuffled = fuzz::shuffle(&o, &mut rng);
+        assert_eq!(render(&shuffled, &table), render(&o, &table), "case {case}");
+        let redundant = fuzz::add_redundant(&o, &mut rng, &sig, 3, profile.el);
+        check(&redundant, &mut table, "redundant");
+        let mut fresh = 0;
+        let defined = fuzz::define_fresh(&o, 2, &mut || {
+            fresh += 1;
+            table.iri_id(&format!("{}F{fresh}", fuzz::FUZZ))
+        });
+        check(&defined, &mut table, "defined");
+    }
+}

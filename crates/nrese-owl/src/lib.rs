@@ -9,6 +9,7 @@
 pub mod clauses;
 pub mod diagnostics;
 mod functional;
+pub mod fuzz;
 pub mod mapping;
 pub mod model;
 pub mod normalise;
