@@ -296,6 +296,37 @@ pub fn walk<S: Source + ?Sized>(
     });
 }
 
+/// [`walk`] that stops once `emit` returns true: the rest of a scan under way is passed
+/// over (a scan can't be stopped) and nothing deeper is scanned, so asking for one
+/// derivation doesn't enumerate the whole join (the review of 3 October 2026, P6).
+/// Returns whether `emit` stopped it. Kept apart from [`walk`], which materialisation
+/// runs and which never stops.
+pub fn walk_until<S: Source + ?Sized>(
+    source: &S,
+    body: &[Atom],
+    guards: &[Guard],
+    order: &[(usize, Seg)],
+    depth: usize,
+    bindings: &mut [Option<u64>],
+    emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
+) -> bool {
+    let Some(&(index, seg)) = order.get(depth) else {
+        return guards_hold(guards, bindings) && emit(bindings);
+    };
+    let atom = &body[index];
+    let mut stopped = false;
+    source.scan(pattern(atom, bindings), seg, &mut |fact| {
+        if stopped {
+            return;
+        }
+        if let Some(newly) = bind(atom, fact, bindings) {
+            stopped = walk_until(source, body, guards, order, depth + 1, bindings, emit);
+            unbind(atom, newly, bindings);
+        }
+    });
+    stopped
+}
+
 /// Orders `atoms` after `first`: most bound positions first, then fewest matches.
 pub fn plan<S: Source + ?Sized>(
     source: &S,
@@ -712,9 +743,8 @@ pub fn derivations<S: Source + ?Sized>(
         let Some(newly) = bind(head, fact, &mut bindings) else {
             continue;
         };
-        let mut stop = false;
-        if rule.body.is_empty() {
-            stop = guards_hold(&rule.guards, &bindings) && emit(&bindings);
+        let stop = if rule.body.is_empty() {
+            guards_hold(&rule.guards, &bindings) && emit(&bindings)
         } else {
             let bound: Vec<bool> = bindings.iter().map(Option::is_some).collect();
             let atoms: Vec<usize> = (0..rule.body.len()).collect();
@@ -727,20 +757,16 @@ pub fn derivations<S: Source + ?Sized>(
                 })
                 .expect("a body");
             let order = plan_bound(source, rule, &atoms, first, &bound, |_| seg);
-            walk(
+            walk_until(
                 source,
                 &rule.body,
                 &rule.guards,
                 &order,
                 0,
                 &mut bindings,
-                &mut |b| {
-                    if !stop {
-                        stop = emit(b);
-                    }
-                },
-            );
-        }
+                emit,
+            )
+        };
         unbind(head, newly, &mut bindings);
         if stop {
             return;
@@ -1374,5 +1400,105 @@ pub fn transitivity(p: u64) -> Rule {
         body: vec![Atom([x, Term::Const(p), y]), Atom([y, Term::Const(p), z])],
         guards: Vec::new(),
         head: Head::Facts(vec![Atom([x, Term::Const(p), z])]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::super::ir::{Atom, Head, Rule, Term};
+    use super::*;
+
+    /// Facts in a list; counts the scans and matches of predicate 12.
+    struct Counting {
+        facts: Vec<Triple>,
+        scans: AtomicUsize,
+        matches: AtomicUsize,
+    }
+
+    fn matches(pattern: [Option<u64>; 3], fact: Triple) -> bool {
+        pattern
+            .iter()
+            .zip(fact)
+            .all(|(want, have)| want.is_none_or(|v| v == have))
+    }
+
+    impl Source for Counting {
+        fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, emit: &mut dyn FnMut(Triple)) {
+            if seg == Seg::Delta {
+                return;
+            }
+            if pattern[1] == Some(12) {
+                self.scans.fetch_add(1, Ordering::Relaxed);
+            }
+            for &fact in &self.facts {
+                if matches(pattern, fact) {
+                    if fact[1] == 12 {
+                        self.matches.fetch_add(1, Ordering::Relaxed);
+                    }
+                    emit(fact);
+                }
+            }
+        }
+
+        fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
+            match seg {
+                Seg::Delta => 0,
+                _ => self.facts.iter().filter(|&&f| matches(pattern, f)).count(),
+            }
+        }
+
+        fn contains(&self, fact: Triple) -> bool {
+            self.facts.contains(&fact)
+        }
+    }
+
+    #[test]
+    fn one_derivation_asked_for_scans_one_branch() {
+        // (1 11 ?x), (?x 12 ?y) -> (1 13 2): 100 x's with 100 y's each. Asking for the
+        // first derivation scanned all 100 branches and their 10,000 matches before.
+        let mut facts = Vec::new();
+        for x in 100..200 {
+            facts.push([1, 11, x]);
+            facts.extend((1_000..1_100).map(|y| [x, 12, y]));
+        }
+        let source = Counting {
+            facts,
+            scans: AtomicUsize::new(0),
+            matches: AtomicUsize::new(0),
+        };
+        let rule = Rule {
+            name: "probe".to_owned(),
+            body: vec![
+                Atom([Term::Const(1), Term::Const(11), Term::Var(0)]),
+                Atom([Term::Var(0), Term::Const(12), Term::Var(1)]),
+            ],
+            guards: vec![],
+            head: Head::Facts(vec![Atom([1, 13, 2].map(Term::Const))]),
+        };
+        let mut emitted = 0;
+        derivations(&source, &rule, [1, 13, 2], Seg::All, &mut |_| {
+            emitted += 1;
+            true
+        });
+        assert_eq!(emitted, 1);
+        assert_eq!(
+            source.scans.load(Ordering::Relaxed),
+            1,
+            "one branch scanned"
+        );
+        assert!(
+            source.matches.load(Ordering::Relaxed) <= 100,
+            "{} matches",
+            source.matches.load(Ordering::Relaxed)
+        );
+        // Not stopping, every derivation.
+        let mut all = 0;
+        derivations(&source, &rule, [1, 13, 2], Seg::All, &mut |_| {
+            all += 1;
+            false
+        });
+        assert_eq!(all, 10_000);
     }
 }
