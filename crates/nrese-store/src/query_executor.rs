@@ -50,6 +50,10 @@ pub(crate) struct StoreSettings {
     /// The inferred stack is current under a ruleset with equality reasoning
     /// ([`QueryOptions::equality_closed`](nrese_sparql::QueryOptions)).
     pub equality_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// [`StoreConfig::equality_canonical_answers`](crate::StoreConfig).
+    pub equality_canonical: bool,
+    /// [`StoreConfig::equality_early_expansion`](crate::StoreConfig).
+    pub equality_early_expansion: bool,
 }
 
 /// A parsed query with its protocol dataset and output format. Preparing is cheap and
@@ -357,6 +361,8 @@ pub(crate) fn run_query(
         equality_closed: store
             .equality_closed
             .load(std::sync::atomic::Ordering::Acquire),
+        equality_canonical: store.equality_canonical,
+        equality_early_expansion: store.equality_early_expansion,
         pre_bound: None,
         cross_chunk_rows: None,
         stream_rows: None,
@@ -469,6 +475,8 @@ fn explain_options(
         equality_closed: store
             .equality_closed
             .load(std::sync::atomic::Ordering::Acquire),
+        equality_canonical: store.equality_canonical,
+        equality_early_expansion: store.equality_early_expansion,
         pre_bound: None,
         cross_chunk_rows: None,
         stream_rows: None,

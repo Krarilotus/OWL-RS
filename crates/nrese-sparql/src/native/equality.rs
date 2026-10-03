@@ -83,12 +83,12 @@ impl Context<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((snapshot, representatives)) = cache.as_ref()
-            && snapshot.same_version(self.snapshot)
+            && snapshot.same_version(&self.snapshot)
         {
             return Some(Arc::clone(representatives));
         }
-        let representatives = Arc::new(build(self.snapshot));
-        *cache = Some((self.snapshot.clone(), Arc::clone(&representatives)));
+        let representatives = Arc::new(build(&self.snapshot));
+        *cache = Some(((*self.snapshot).clone(), Arc::clone(&representatives)));
         Some(representatives)
     }
 }

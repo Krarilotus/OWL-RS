@@ -21,6 +21,7 @@ mod fast;
 mod federation;
 mod geo;
 mod geo_formats;
+mod late;
 mod lateral;
 
 /// The reference system (an IRI) and geometry of a GeoSPARQL literal: WKT, GeoJSON or
@@ -1004,7 +1005,9 @@ impl Solutions {
 }
 
 struct Context<'a> {
-    snapshot: &'a Snapshot,
+    /// The snapshot read; owned when it reads equality classes canonically
+    /// ([`QueryOptions::equality_canonical`], [`Context::late_expansion`]).
+    snapshot: Cow<'a, Snapshot>,
     /// Which statements the query reads (asserted, inferred or both).
     model: ReadModel,
     /// Alias IRIs that stand for blank nodes put into a pattern ([`substitute`]).
@@ -1019,7 +1022,7 @@ struct Context<'a> {
     /// subqueries) come and go, and a freed address may hold another expression next.
     numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
     cancellation: Option<CancellationToken>,
-    budget: Budget,
+    budget: Arc<Budget>,
     /// The operators run so far, for EXPLAIN; `None` when not explaining.
     trace: Option<RefCell<Vec<PlanStep>>>,
     /// Nesting depth of the operator being evaluated (for the trace).
@@ -1048,6 +1051,9 @@ struct Context<'a> {
     service_denied: bool,
     /// [`QueryOptions::equality_closed`].
     equality_closed: bool,
+    /// The equality classes to expand after joins over canonical reads (stage C,
+    /// [`Context::late_expansion`]); `None` where reads expand them, or don't need to.
+    late: Option<Arc<nrese_engine::EqualityClasses>>,
 }
 
 /// The active graph of triple patterns.
@@ -1095,7 +1101,14 @@ impl<'a> Context<'a> {
             as_written: options.as_written,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
             stream_rows: options.stream_rows,
-            snapshot,
+            late: match options.equality_canonical || options.equality_early_expansion {
+                true => None,
+                false => snapshot.expand_late(options.read_model),
+            },
+            snapshot: match options.equality_canonical {
+                true => Cow::Owned(snapshot.with_canonical_equality()),
+                false => Cow::Borrowed(snapshot),
+            },
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
@@ -1104,10 +1117,12 @@ impl<'a> Context<'a> {
             decoded: RefCell::default(),
             numbers: RefCell::default(),
             cancellation: options.cancellation.clone(),
-            budget: options
-                .memory_limit
-                .map_or_else(Budget::unlimited, Budget::new)
-                .within(options.shared_memory.clone()),
+            budget: Arc::new(
+                options
+                    .memory_limit
+                    .map_or_else(Budget::unlimited, Budget::new)
+                    .within(options.shared_memory.clone()),
+            ),
             trace: None,
             depth: Cell::new(0),
             limit: Cell::new(None),
@@ -1399,6 +1414,13 @@ impl<'a> Context<'a> {
 
     fn eval_operator(&self, pattern: &GraphPattern) -> NativeResult<Solutions> {
         self.check()?;
+        if let Some(classes) = &self.late
+            && late::joins(pattern)
+            && late::safe(pattern)
+            && self.late_scope()
+        {
+            return self.late_expansion(pattern, classes);
+        }
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns, &[], &mut Vec::new()),
             GraphPattern::Graph { name, inner } => self.graph(name, inner),
@@ -1498,7 +1520,7 @@ impl<'a> Context<'a> {
                     // conjunct still runs on every row, so the ranges only prune). Each
                     // conjunct runs as soon as the join sequence has bound its variables,
                     // so that a selective filter keeps the following joins small.
-                    let hints = ranges::hints(expr, self.snapshot);
+                    let hints = ranges::hints(expr, &self.snapshot);
                     let mut all = Vec::new();
                     pushdown::conjuncts_of(expr, &mut all);
                     let as_written = self.as_written;
@@ -1853,7 +1875,7 @@ impl<'a> Context<'a> {
             GraphScope::Variable(_) => return unsupported("a path read in all graphs at once"),
         };
         Ok(paths::PathEvaluator {
-            snapshot: self.snapshot,
+            snapshot: &self.snapshot,
             model: self.model,
             graph,
             fixed: None,
@@ -1880,7 +1902,7 @@ impl<'a> Context<'a> {
             // A constant end already bounds the path.
             return self.filtered_path(path, None, start);
         };
-        let resolved = paths::Path::resolve(path.path, self.snapshot);
+        let resolved = paths::Path::resolve(path.path, &self.snapshot);
         let evaluator = self.path_evaluator()?;
         // Bound at both ends: followed from the end with fewer values (the join with
         // `bound` keeps the rows whose other end matches).
@@ -1947,7 +1969,7 @@ impl<'a> Context<'a> {
         path: &nrese_sparql_syntax::algebra::PropertyPathExpression,
         object: &TermPattern,
     ) -> NativeResult<Solutions> {
-        let resolved = paths::Path::resolve(path, self.snapshot);
+        let resolved = paths::Path::resolve(path, &self.snapshot);
         let end = |term: &TermPattern| self.path_end(term);
         let mut evaluator = self.path_evaluator()?;
         evaluator.fixed = end(subject).err().or_else(|| end(object).err());
@@ -2112,7 +2134,7 @@ impl<'a> Context<'a> {
                     continue;
                 }
                 let start = Instant::now();
-                if let Some(ranges) = strings::ranges(self.snapshot, &condition, rows) {
+                if let Some(ranges) = strings::ranges(&self.snapshot, &condition, rows) {
                     if self.trace.is_some() {
                         let detail = format!("terms {object} can take");
                         self.note("dictionary string test", detail, None, ranges.len(), start);
@@ -2671,7 +2693,7 @@ impl<'a> Context<'a> {
             .filter(|p| p.iter().any(|x| matches!(x, wcoj::Pos::Var(_))))
             .collect();
         let query = wcoj::Query::new(
-            self.snapshot,
+            &self.snapshot,
             self.model,
             patterns,
             width,
@@ -3014,7 +3036,7 @@ impl<'a> Context<'a> {
             .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
         let probe = Probe {
-            snapshot: self.snapshot,
+            snapshot: &self.snapshot,
             model: self.model,
             table: &result.table,
             scan,
@@ -3300,10 +3322,10 @@ impl<'a> Context<'a> {
         solutions: &Solutions,
         expression: &Expression,
     ) -> NativeResult<Vec<bool>> {
-        let compiled = fast::compile(expression, self.snapshot);
+        let compiled = fast::compile(expression, &self.snapshot);
         let rows = solutions.table.len();
         let mask = FilterMask {
-            snapshot: self.snapshot,
+            snapshot: &self.snapshot,
             evaluator: &self.evaluator,
             compiled: compiled.as_ref(),
             expression,
@@ -3323,13 +3345,14 @@ impl<'a> Context<'a> {
         let computed = self.computed.borrow();
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
+        let snapshot: &Snapshot = &self.snapshot;
         let parts: Vec<Option<Vec<bool>>> = (0..rows.div_ceil(PARALLEL_EXPRESSION_ROWS))
             .into_par_iter()
             .map(|i| {
                 if token.is_some_and(CancellationToken::is_cancelled) {
                     return None;
                 }
-                let decoder = Decoder::new(self.snapshot, computed);
+                let decoder = Decoder::new(snapshot, computed);
                 let range =
                     i * PARALLEL_EXPRESSION_ROWS..((i + 1) * PARALLEL_EXPRESSION_ROWS).min(rows);
                 Some(mask.rows(range, &|id| decoder.term(id)))
@@ -3443,7 +3466,7 @@ impl<'a> Context<'a> {
         let computed = self.computed.borrow();
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
-        let (snapshot, evaluator) = (self.snapshot, &self.evaluator);
+        let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
         let parts: Vec<Option<Vec<Vec<Agg>>>> = bounds
             .par_windows(2)
             .map(|window| {
@@ -3513,7 +3536,7 @@ impl<'a> Context<'a> {
         let terms: Vec<value::Sortable> = if distinct.len() >= PARALLEL_RANKS
             && distinct.iter().all(|&id| computed_index(id).is_none())
         {
-            let snapshot = self.snapshot;
+            let snapshot = &*self.snapshot;
             distinct
                 .par_iter()
                 .map(|&id| {
@@ -3778,7 +3801,7 @@ impl<'a> Context<'a> {
             && start != end
             && let Some(count) = self
                 .path_evaluator()?
-                .count_open(&paths::Path::resolve(path, self.snapshot))
+                .count_open(&paths::Path::resolve(path, &self.snapshot))
         {
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
@@ -4101,7 +4124,7 @@ impl<'a> Context<'a> {
             } else {
                 let computed = self.computed.borrow();
                 let computed: &[Term] = &computed;
-                let (snapshot, evaluator) = (self.snapshot, &self.evaluator);
+                let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
                 missing
                     .par_chunks(PARALLEL_EXPRESSION_ROWS)
                     .flat_map_iter(|part| {

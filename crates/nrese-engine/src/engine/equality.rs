@@ -34,7 +34,10 @@ use crate::term::TermId;
 /// The classes of one version, computed at the first read that needs them and passed on
 /// to the next version while no commit changes a `sameAs` statement.
 #[derive(Default)]
-pub(crate) struct EqualityCell(Mutex<Option<(TermId, Arc<Classes>)>>);
+pub(crate) struct EqualityCell(Mutex<Option<CachedClasses>>);
+
+/// `owl:sameAs`, its classes, and their canonical view once asked for.
+type CachedClasses = (TermId, Arc<Classes>, Option<Arc<Classes>>);
 
 impl std::fmt::Debug for EqualityCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -46,14 +49,27 @@ impl EqualityCell {
     /// The classes of `version` under `same_as`.
     pub(crate) fn classes(&self, version: &Version, same_as: TermId) -> Arc<Classes> {
         let mut cell = self.0.lock();
-        if let Some((id, classes)) = cell.as_ref()
+        if let Some((id, classes, _)) = cell.as_ref()
             && *id == same_as
         {
             return Arc::clone(classes);
         }
         let classes = Arc::new(Classes::of(version, same_as));
-        *cell = Some((same_as, Arc::clone(&classes)));
+        *cell = Some((same_as, Arc::clone(&classes), None));
         classes
+    }
+
+    /// The classes of `version` read canonically: the same aliases, no members to expand
+    /// to ([`Classes::canonical_view`]); made once per version.
+    pub(crate) fn canonical(&self, version: &Version, same_as: TermId) -> Arc<Classes> {
+        let full = self.classes(version, same_as);
+        let mut cell = self.0.lock();
+        match cell.as_mut() {
+            Some((_, classes, canonical)) if Arc::ptr_eq(classes, &full) => {
+                Arc::clone(canonical.get_or_insert_with(|| Arc::new(full.canonical_view())))
+            }
+            _ => Arc::new(full.canonical_view()),
+        }
     }
 }
 
@@ -126,7 +142,27 @@ impl Classes {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
+        self.members.is_empty() && self.aliases.is_empty()
+    }
+
+    /// These classes for canonical reads (stage C): every alias still maps to its
+    /// representative (constants are normalised, an alias's statements are left to its
+    /// representative's copy), but no representative expands, so each stored statement is
+    /// read once.
+    pub(crate) fn canonical_view(&self) -> Self {
+        Self {
+            aliases: self.aliases.clone(),
+            members: HashMap::new(),
+        }
+    }
+
+    /// The identities `id` stands for once expanded: its class's if it represents one,
+    /// else itself.
+    pub fn members_of<'a>(&'a self, id: &'a u64) -> &'a [u64] {
+        match self.members.get(id) {
+            Some(members) => members,
+            None => std::slice::from_ref(id),
+        }
     }
 
     /// The number of classes of two or more identities.
