@@ -1042,6 +1042,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-owl"
+version = "0.1.0"
+
+[[package]]
 name = "nrese-rdf"
 version = "0.1.0"
 dependencies = [
@@ -1071,6 +1075,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "nrese-core",
  "nrese-exec",
+ "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",
  "rayon",

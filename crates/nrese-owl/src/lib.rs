@@ -12,6 +12,7 @@ mod functional;
 pub mod mapping;
 pub mod model;
 pub mod normalise;
+pub mod proof;
 pub mod vocab;
 pub mod write;
 
@@ -23,5 +24,6 @@ pub use model::{
     Term,
 };
 pub use normalise::{Options, normalise, normalise_with};
+pub use proof::{Inference, Justifications, Proof, ProofError, ProofGraph};
 pub use vocab::Vocabulary;
 pub use write::{Make, write};

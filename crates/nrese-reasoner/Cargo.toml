@@ -10,6 +10,8 @@ license.workspace = true
 smallvec = { workspace = true }
 nrese-core = { path = "../nrese-core" }
 nrese-exec = { path = "../nrese-exec" }
+# The proof IR justifications are computed on (v2::explain).
+nrese-owl = { path = "../nrese-owl" }
 # User rules in Notation3 (v2::n3).
 nrese-rdf = { path = "../rdf/nrese-rdf", default-features = false }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
