@@ -124,6 +124,34 @@ nrese_process_resident_bytes {resident}
 "
         ));
     }
+    let support = state.store().support_statistics();
+    body.push_str(&format!(
+        "# HELP nrese_vector_index_bytes The vector index: vectors and their graphs.
+# TYPE nrese_vector_index_bytes gauge
+nrese_vector_index_bytes {}
+# HELP nrese_support_sets_total Support graph sets (inferred = \"supported\") computed afresh or updated for a commit.
+# TYPE nrese_support_sets_total counter
+nrese_support_sets_total{{how=\"computed\"}} {}
+nrese_support_sets_total{{how=\"updated\"}} {}
+# HELP nrese_support_views_total Readers' views built, all and from the reader's earlier one.
+# TYPE nrese_support_views_total counter
+nrese_support_views_total{{how=\"built\"}} {}
+nrese_support_views_total{{how=\"patched\"}} {}
+# HELP nrese_support_seconds_total Time spent on support graph sets and views.
+# TYPE nrese_support_seconds_total counter
+nrese_support_seconds_total{{phase=\"compute\"}} {}
+nrese_support_seconds_total{{phase=\"update\"}} {}
+nrese_support_seconds_total{{phase=\"view\"}} {}
+",
+        engine.dictionary.vector_bytes,
+        support.computed,
+        support.updated,
+        support.views,
+        support.patched,
+        support.computing_us as f64 / 1e6,
+        support.updating_us as f64 / 1e6,
+        support.viewing_us as f64 / 1e6,
+    ));
     state.request_metrics().render(&mut body);
 
     let mut response = (StatusCode::OK, body).into_response();

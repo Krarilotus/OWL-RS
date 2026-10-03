@@ -741,7 +741,7 @@ async fn saved_queries_are_kept_per_space() {
     let (status, body) = put(
         &app,
         ALICE,
-        "/api/v1/queries/~alice/everything",
+        "/api/v1/saved-queries/~alice/everything",
         json!({ "query": "SELECT * WHERE { ?s ?p ?o }", "title": "Everything" }),
     )
     .await;
@@ -750,7 +750,7 @@ async fn saved_queries_are_kept_per_space() {
     let (status, body) = put(
         &app,
         ALICE,
-        "/api/v1/queries/~alice/broken",
+        "/api/v1/saved-queries/~alice/broken",
         json!({ "query": "SELECT * WHERE {" }),
     )
     .await;
@@ -758,23 +758,23 @@ async fn saved_queries_are_kept_per_space() {
     let (status, _) = put(
         &app,
         BOB,
-        "/api/v1/queries/~alice/mine",
+        "/api/v1/saved-queries/~alice/mine",
         json!({ "query": "ASK {}" }),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, list) = get(&app, ALICE, "/api/v1/queries").await;
+    let (status, list) = get(&app, ALICE, "/api/v1/saved-queries").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list.as_array().map(Vec::len), Some(1), "{list}");
-    let (_, list) = get(&app, BOB, "/api/v1/queries").await;
+    let (_, list) = get(&app, BOB, "/api/v1/saved-queries").await;
     assert_eq!(list.as_array().map(Vec::len), Some(0), "{list}");
-    let (status, _) = get(&app, BOB, "/api/v1/queries/~alice/everything").await;
+    let (status, _) = get(&app, BOB, "/api/v1/saved-queries/~alice/everything").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = send(
         &app,
         ALICE,
         Method::DELETE,
-        "/api/v1/queries/~alice/everything",
+        "/api/v1/saved-queries/~alice/everything",
         None,
         "",
     )
