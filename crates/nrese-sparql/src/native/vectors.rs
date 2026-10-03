@@ -51,6 +51,10 @@ const DEFAULT_K: usize = 10;
 /// The most `nrv:k` takes.
 const MAX_K: usize = 10_000;
 
+/// The search goes first when the pattern joined to it is estimated at more than this
+/// many rows per vector wanted.
+const PROBE_ABOVE: usize = 50;
+
 /// A search, as its block states it.
 #[derive(Debug, Clone)]
 struct Search {
@@ -212,6 +216,154 @@ impl Context<'_> {
                     .collect()
             }
         };
+        let mut rows = Rows::new(&search);
+        let mut used: HashMap<u64, bool> = HashMap::new();
+        for (near_id, vector) in queries {
+            self.check()?;
+            let accept = |id: TermId| {
+                candidates
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&id.raw()))
+            };
+            let found = self.nearest(
+                &search,
+                vector,
+                candidates.as_ref().map(HashSet::len),
+                &accept,
+                &mut |id| {
+                    Ok(*used
+                        .entry(id.raw())
+                        .or_insert_with(|| self.used_as_object(id)))
+                },
+            )?;
+            rows.push(self, &search, &found, near_id);
+        }
+        self.produced(rows.into_solutions())
+    }
+
+    /// `Join(local, SERVICE nrv:search { inner })`. Where `local` is estimated to bind
+    /// many rows and the query vector is given, the search goes first: its hits, nearest
+    /// first, are kept while `local` evaluated from the hit has rows (a probe per hit
+    /// through the indexes), until `k` are kept; `local` is then the rows of those
+    /// probes. Otherwise `local` goes first and its values of the matched variable are
+    /// the candidates ([`Self::vector_service`]).
+    pub(super) fn vector_join(
+        &self,
+        local: &GraphPattern,
+        inner: &GraphPattern,
+    ) -> NativeResult<Solutions> {
+        let search = parse(inner)?;
+        let probe_first = match &search.near {
+            Near::Vector(_) => self.estimate(local) >= (PROBE_ABOVE * search.k) as f64,
+            Near::Variable(_) => false,
+        };
+        if !probe_first {
+            let bound = self.eval(local)?;
+            let found = self.vector_service(inner, Some(&bound))?;
+            return self.join(bound, found);
+        }
+        let Near::Vector(vector) = &search.near else {
+            unreachable!("checked above")
+        };
+        self.check()?;
+        let mut probed: Option<Solutions> = None;
+        let found = self.nearest(&search, vector.clone(), None, &|_| true, &mut |id| {
+            if !self.used_as_object(id) {
+                return Ok(false);
+            }
+            let mut table = IdTable::new(1);
+            table.push_row(&[id.raw()]);
+            let seed = Solutions {
+                vars: vec![search.matched.clone()],
+                table,
+                ordered: false,
+            };
+            let rows = self.eval_from(seed, local)?;
+            if rows.table.is_empty() {
+                return Ok(false);
+            }
+            probed = Some(match probed.take() {
+                Some(earlier) => self.union(earlier, rows)?,
+                None => rows,
+            });
+            Ok(true)
+        })?;
+        let mut rows = Rows::new(&search);
+        rows.push(self, &search, &found, None);
+        let found = self.produced(rows.into_solutions())?;
+        let local = match probed {
+            Some(rows) => rows,
+            None => {
+                let mut vars = vec![search.matched.clone()];
+                super::bound_variables(local, &mut vars);
+                let width = vars.len();
+                Solutions {
+                    vars,
+                    table: IdTable::new(width),
+                    ordered: false,
+                }
+            }
+        };
+        self.join(local, found)
+    }
+
+    /// The `search.k` vector literals nearest to `vector` that `accept` takes (ids, for
+    /// the index; `accepted` of them, if known) and `keep` keeps (checked in order,
+    /// nearest first): the index is asked for more until `k` are kept or there are no
+    /// more (a literal no statement uses any more stays in the dictionary, a probe may
+    /// fail).
+    fn nearest(
+        &self,
+        search: &Search,
+        vector: Vec<f32>,
+        accepted: Option<usize>,
+        accept: &(dyn Fn(TermId) -> bool + Sync),
+        keep: &mut dyn FnMut(TermId) -> NativeResult<bool>,
+    ) -> NativeResult<Vec<(TermId, f32)>> {
+        let mut query = VectorQuery {
+            metric: search.metric,
+            strategy: search.strategy,
+            accepted,
+            ..VectorQuery::new(vector, search.k)
+        };
+        if let Some(ef) = search.ef {
+            query.ef = ef;
+        }
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut kept: Vec<(TermId, f32)> = Vec::new();
+        loop {
+            self.check()?;
+            let (hits, report) = self.snapshot.vector_search(&query, accept);
+            let fetched = hits.len();
+            for (id, distance) in hits {
+                if kept.len() == search.k {
+                    break;
+                }
+                if seen.insert(id.raw()) && keep(id)? {
+                    kept.push((id, distance));
+                }
+            }
+            // Enough, or nothing more to fetch.
+            if kept.len() == search.k || fetched < query.k || query.k >= report.space {
+                kept.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+                return Ok(kept);
+            }
+            query.k = (query.k * 4).min(report.space.max(1));
+            query.ef = query.ef.max(query.k);
+        }
+    }
+}
+
+/// The rows of a search: the matched vector, its score and rank, and the query vector
+/// where a variable gives it.
+struct Rows {
+    vars: Vec<Variable>,
+    table: IdTable,
+    near_column: bool,
+}
+
+impl Rows {
+    fn new(search: &Search) -> Self {
         let mut vars = vec![search.matched.clone()];
         vars.extend(search.score.iter().cloned());
         vars.extend(search.rank.iter().cloned());
@@ -222,72 +374,42 @@ impl Context<'_> {
             }
             _ => false,
         };
-        let mut table = IdTable::new(vars.len());
-        let mut used: HashMap<u64, bool> = HashMap::new();
-        for (near_id, vector) in queries {
-            self.check()?;
-            let found = self.nearest_used(&search, vector, candidates.as_ref(), &mut used);
-            for (rank, (id, distance)) in found.into_iter().enumerate() {
-                let mut row = vec![id.raw()];
-                if search.score.is_some() {
-                    let score = f64::from(search.metric.score(distance));
-                    row.push(self.id(&Term::from(Literal::from(score))));
-                }
-                if search.rank.is_some() {
-                    row.push(self.id(&Term::from(Literal::from(rank as i64 + 1))));
-                }
-                if near_column {
-                    row.push(near_id.unwrap_or(UNDEF));
-                }
-                table.push_row(&row);
-            }
-        }
-        self.produced(Solutions {
+        let table = IdTable::new(vars.len());
+        Self {
             vars,
             table,
-            ordered: false,
-        })
+            near_column,
+        }
     }
 
-    /// The `search.k` vector literals nearest to `vector` among `candidates` (all if
-    /// `None`) that the active graph uses as objects: the index is asked for more until
-    /// enough of its hits are used (a literal no statement uses any more stays in the
-    /// dictionary). `used` remembers the checks.
-    fn nearest_used(
-        &self,
+    fn push(
+        &mut self,
+        context: &Context<'_>,
         search: &Search,
-        vector: Vec<f32>,
-        candidates: Option<&HashSet<u64>>,
-        used: &mut HashMap<u64, bool>,
-    ) -> Vec<(TermId, f32)> {
-        let mut query = VectorQuery {
-            metric: search.metric,
-            strategy: search.strategy,
-            accepted: candidates.map(HashSet::len),
-            ..VectorQuery::new(vector, search.k)
-        };
-        if let Some(ef) = search.ef {
-            query.ef = ef;
-        }
-        let accept = |id: TermId| candidates.is_none_or(|set| set.contains(&id.raw()));
-        loop {
-            let (hits, report) = self.snapshot.vector_search(&query, &accept);
-            let fetched = hits.len();
-            let kept: Vec<(TermId, f32)> = hits
-                .into_iter()
-                .filter(|(id, _)| {
-                    *used
-                        .entry(id.raw())
-                        .or_insert_with(|| self.used_as_object(*id))
-                })
-                .take(search.k)
-                .collect();
-            // Enough, or nothing more to fetch.
-            if kept.len() == search.k || fetched < query.k || query.k >= report.space {
-                return kept;
+        found: &[(TermId, f32)],
+        near_id: Option<u64>,
+    ) {
+        for (rank, &(id, distance)) in found.iter().enumerate() {
+            let mut row = vec![id.raw()];
+            if search.score.is_some() {
+                let score = f64::from(search.metric.score(distance));
+                row.push(context.id(&Term::from(Literal::from(score))));
             }
-            query.k = (query.k * 4).min(report.space.max(1));
-            query.ef = query.ef.max(query.k);
+            if search.rank.is_some() {
+                row.push(context.id(&Term::from(Literal::from(rank as i64 + 1))));
+            }
+            if self.near_column {
+                row.push(near_id.unwrap_or(UNDEF));
+            }
+            self.table.push_row(&row);
+        }
+    }
+
+    fn into_solutions(self) -> Solutions {
+        Solutions {
+            vars: self.vars,
+            table: self.table,
+            ordered: false,
         }
     }
 }

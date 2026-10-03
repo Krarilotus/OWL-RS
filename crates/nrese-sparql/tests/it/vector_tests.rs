@@ -279,3 +279,43 @@ fn malformed_searches_are_explained() {
         assert!(message.contains(expected), "{block}: {message}");
     }
 }
+
+/// A large joined pattern: the search goes first and each hit is probed against the
+/// pattern, the hits kept in order until `k` pass; the answer is the bind join's.
+#[test]
+fn searches_go_first_when_the_pattern_is_large() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..720 {
+        let angle = (i as f32 * 0.5).to_radians();
+        let item = ex(&format!("item/{i}"));
+        tx.insert(
+            Quad::new(
+                item.clone(),
+                ex("embedding"),
+                vector(&[angle.cos(), angle.sin()]),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        // Every third item is wanted.
+        let kind = if i % 3 == 0 { "wanted" } else { "other" };
+        tx.insert(Quad::new(item, ex("kind"), ex(kind), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let query = format!(
+        "SELECT ?item ?r WHERE {{
+           ?item ex:kind ex:wanted ; ex:embedding ?v .
+           SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 3 ; nrv:rank ?r }}
+         }} ORDER BY ?r",
+        near(90.2)
+    );
+    let found = rows(&engine, &query, &QueryOptions::default());
+    // Wanted items are at multiples of 1.5 degrees: 90 (item/180), 91.5 (item/183),
+    // 88.5 (item/177).
+    assert_eq!(
+        found,
+        [["item/180", "1"], ["item/183", "2"], ["item/177", "3"]]
+            .map(|r| r.map(str::to_owned).to_vec())
+    );
+}
