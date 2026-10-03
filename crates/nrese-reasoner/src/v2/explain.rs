@@ -109,7 +109,14 @@ pub fn explain_with<B: Base + ?Sized>(
                             false => size(premise, &proved),
                         })
                         .collect::<Option<Vec<usize>>>()?;
-                    Some((1 + sizes.iter().sum::<usize>(), rule, body))
+                    // Saturating: a premise used twice counts twice, so on a proof DAG
+                    // with shared premises the size grows like Fibonacci and can pass
+                    // usize (the review of 3 October 2026, C7). Saturated sizes still
+                    // compare deterministically: then the rule and premises decide.
+                    let total = sizes
+                        .iter()
+                        .fold(1usize, |sum, size| sum.saturating_add(*size));
+                    Some((total, rule, body))
                 })
                 .min();
             if let Some((size, rule, body)) = best {
@@ -275,5 +282,36 @@ impl<B: Base + ?Sized> Source for Whole<'_, B> {
 
     fn contains(&self, fact: Triple) -> bool {
         self.0.contains(fact)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::delta::MemoryBase;
+    use super::super::ir::{Atom, Head, Rule, Term};
+    use super::*;
+
+    #[test]
+    fn a_proof_dag_with_shared_premises_does_not_overflow_its_size() {
+        // Fact i follows from facts i - 1 and i - 2: 101 facts, but counting repeated
+        // uses the proof of the last is Fibonacci(100) steps large.
+        let facts: Vec<Triple> = (0u64..=100).map(|i| [i, 7, 8]).collect();
+        let base = MemoryBase::new(&facts[..2], &facts[2..]);
+        let mut program = GroundProgram::default();
+        let atom = |fact: Triple| Atom(fact.map(Term::Const));
+        for i in 2..=100 {
+            program.add(Rule {
+                name: format!("shared_{i}"),
+                body: vec![atom(facts[i - 1]), atom(facts[i - 2])],
+                guards: vec![],
+                head: Head::Facts(vec![atom(facts[i])]),
+            });
+        }
+        let explanation = explain_with(&base, &program, facts[100], 200).expect("derivable");
+        assert_eq!(
+            explanation.steps.len(),
+            101,
+            "one step per fact, the asserted leaves too"
+        );
     }
 }

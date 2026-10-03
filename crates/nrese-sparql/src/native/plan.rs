@@ -6,7 +6,9 @@
 //! independence: `|R ⋈ P| = |R| · |P| / Π max(d_R(v), d_P(v))`. Accessing a pattern costs
 //! its size when scanned, or about one index probe per row of the running result when that
 //! result is much smaller (the executor's rule). BGPs with more than [`DP_PATTERNS`]
-//! patterns are ordered greedily by the same model.
+//! patterns are ordered greedily by the same model, from every start, or from the
+//! [`GREEDY_STARTS`] cheapest starts beyond [`GREEDY_ALL_STARTS`] patterns (each start
+//! costs n² extensions).
 //!
 //! Stars are estimated from the default graph's characteristic sets where they are known
 //! (`nrese_engine::engine::characteristic`): a pattern `?s p ?o` joined to patterns that
@@ -24,6 +26,12 @@ use nrese_engine::engine::characteristic::CharacteristicSets;
 
 /// Largest BGP ordered exhaustively (2^n subsets).
 const DP_PATTERNS: usize = 12;
+
+/// Largest BGP whose greedy order is tried from every pattern.
+const GREEDY_ALL_STARTS: usize = 64;
+
+/// Starts tried, the cheapest first, for BGPs larger than [`GREEDY_ALL_STARTS`].
+const GREEDY_STARTS: usize = 16;
 
 /// Cost of one index probe relative to reading one scanned row.
 const PROBE_COST: f64 = 4.0;
@@ -202,10 +210,10 @@ pub(super) fn order(
     };
     // Patterns sharing a bound variable with `state`; all others if none does (a cross
     // product is then unavoidable).
-    let candidates = |state: &State, used: u64| -> Vec<usize> {
-        let free: Vec<usize> = (0..inputs.len())
-            .filter(|&j| used & (1 << j) == 0)
-            .collect();
+    // `used(j)`: whether pattern j is in `state` already (a bit mask for the exhaustive
+    // search, a vector for the greedy one, which has no limit on the patterns).
+    let candidates = |state: &State, used: &dyn Fn(usize) -> bool| -> Vec<usize> {
+        let free: Vec<usize> = (0..inputs.len()).filter(|&j| !used(j)).collect();
         let connected: Vec<usize> = free
             .iter()
             .copied()
@@ -230,17 +238,22 @@ pub(super) fn order(
     }
     if n > DP_PATTERNS {
         // Greedy: the cheapest start, then the cheapest extension each time.
+        let mut starts: Vec<State> = (0..n).map(start).collect();
+        if n > GREEDY_ALL_STARTS {
+            starts.sort_by(|a, b| a.cost.total_cmp(&b.cost).then(a.order.cmp(&b.order)));
+            starts.truncate(GREEDY_STARTS);
+        }
         let mut best: Option<State> = None;
-        for j in 0..n {
-            let mut state = start(j);
-            let mut used = 1u64 << j;
+        for mut state in starts {
+            let mut used = vec![false; n];
+            used[state.order[0]] = true;
             while state.order.len() < n {
-                let next = candidates(&state, used)
+                let next = candidates(&state, &|j| used[j])
                     .into_iter()
                     .map(|j| extend(&state, j))
                     .reduce(|a, b| if b.better_than(&a) { b } else { a })
                     .expect("a pattern is left");
-                used |= 1 << next.order[next.order.len() - 1];
+                used[next.order[next.order.len() - 1]] = true;
                 state = next;
             }
             if best.as_ref().is_none_or(|b| state.better_than(b)) {
@@ -257,7 +270,7 @@ pub(super) fn order(
         let Some(state) = best[used as usize].take() else {
             continue;
         };
-        for j in candidates(&state, used) {
+        for j in candidates(&state, &|j| used & (1 << j) != 0) {
             let next = extend(&state, j);
             let slot = &mut best[(used | (1 << j)) as usize];
             if slot.as_ref().is_none_or(|s| next.better_than(s)) {
@@ -316,5 +329,21 @@ mod tests {
         let mut sorted = plan.order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..14).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn bgps_beyond_64_patterns_get_an_order() {
+        // A 64-bit membership mask overflowed at 65 patterns (the review of 3 October
+        // 2026, P2); a chain of 200 patterns over 201 variables.
+        for n in [64usize, 65, 200] {
+            let inputs: Vec<Input> = (0..n)
+                .map(|i| input(1_000 + i as u64, &[(i, 500), (i + 1, 500)]))
+                .collect();
+            let plan = order(&inputs, n + 1, 32, None);
+            let mut sorted = plan.order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..n).collect::<Vec<_>>());
+            assert_eq!(plan.rows.len(), n);
+        }
     }
 }
