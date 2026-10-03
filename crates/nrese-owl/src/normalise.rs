@@ -330,8 +330,13 @@ impl<'a> Normaliser<'a> {
                 }
             }
             Axiom::ObjectPropertyDomain(r, c) => {
-                let c = self.nnf(*c);
-                self.gci(vec![Self::edge(*r, x, y)], vec![Item::Expr(c)], index);
+                // ∃R.⊤ ⊑ C, through the class expressions as a range goes: a non-simple R
+                // then passes its automaton, so an edge a chain or transitivity implies
+                // fires the domain too. A raw `R(x, y) → C(x)` saw asserted edges only
+                // (found by the context core's EL gate, 3 October 2026).
+                let thing = self.e(ClassExpr::Thing);
+                let some = self.e(ClassExpr::Some(*r, thing));
+                self.sub(some, *c, index);
             }
             Axiom::ObjectPropertyRange(r, c) => {
                 let c = self.nnf(*c);
