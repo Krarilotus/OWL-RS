@@ -9,6 +9,7 @@ pub mod http;
 pub mod policy;
 mod rate_limit;
 mod reject_view;
+pub mod replication;
 pub mod repositories;
 pub mod repository_config;
 mod runtime_posture;

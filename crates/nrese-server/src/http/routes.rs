@@ -138,6 +138,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/draft-check", post(draft_check::check))
         // The server: what it offers, how it runs, AI query suggestions.
         .route("/api/v1/capabilities", get(handlers::operator_capabilities))
+        .route("/api/v1/replication/log", get(crate::replication::log))
+        .route("/api/v1/replication/image", get(crate::replication::image))
+        .route(
+            "/api/v1/replication/status",
+            get(crate::replication::status),
+        )
         .route("/api/v1/health", get(handlers::operator_extended_health))
         .route(
             "/api/v1/diagnostics",

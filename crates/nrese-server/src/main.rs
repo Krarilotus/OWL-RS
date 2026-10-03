@@ -97,6 +97,17 @@ async fn run() -> Result<()> {
         );
         return Ok(());
     }
+    let replica = config.replication.mode == nrese_server::replication::ReplicationMode::Replica;
+    if replica && cli.command == CliCommand::Serve {
+        // A replica's start: the primary's image, if the data directory holds no store.
+        if let Some(revision) =
+            nrese_server::replication::bootstrap(&config.replication, &config.store.data_dir)
+                .await
+                .context("starting the replica from its primary's image")?
+        {
+            tracing::info!(revision, primary = ?config.replication.primary, "replica started from an image");
+        }
+    }
     let store = StoreService::new(config.store.clone())?;
     if let CliCommand::Backup(dir) = &cli.command {
         let manifest = store
@@ -137,6 +148,10 @@ async fn run() -> Result<()> {
     // recorded state says it already is (same rules and semantics). Without reasoning, a
     // leftover stack is cleared so reads never see stale inferences.
     match program {
+        // A replica's inferences come with the primary's records.
+        _ if replica => {
+            tracing::info!("read replica: no reasoning here, the primary's log carries it");
+        }
         Some(program) if store.reasoning_is_current(&program) => {
             tracing::info!(ruleset = %program.name(), "inferred stack is current");
         }
@@ -174,6 +189,11 @@ async fn run() -> Result<()> {
         ai,
         config.deployment_posture,
     )?;
+    let state = state.with_replication(config.replication.clone());
+    if replica {
+        nrese_server::replication::follow(state.clone())?;
+        tracing::info!(primary = ?config.replication.primary, "following the primary's log");
+    }
     state.mark_ready();
     let app = build_app(state);
 
