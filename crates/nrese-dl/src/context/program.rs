@@ -62,14 +62,18 @@ impl KindPat {
     }
 }
 
-/// A DL-clause with the source axioms it stands for (any one of them gives it).
+/// Where a DL-clause comes from: alternatives, each a set of axioms (indexes into the
+/// ontology's axioms) that give the clause together. None: a definition of a fresh name
+/// (true in a conservative extension of any axiom set).
+pub type Sources = Box<[Box<[u32]>]>;
+
+/// A DL-clause with the source axioms it stands for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DlClause {
     pub body: Box<[BodyPat]>,
     /// `None`: `⊥`.
     pub head: Option<HeadPat>,
-    /// Indexes into the ontology's axioms.
-    pub sources: Box<[u32]>,
+    pub sources: Sources,
 }
 
 /// A successor function: the existential restriction it is the Skolem function of.
@@ -81,8 +85,19 @@ pub struct Func {
     pub filler: Option<ConceptId>,
 }
 
-/// Where a body atom of a DL-clause sits: clause and position.
-pub type Slot = (u32, u8);
+/// Where a body atom of a DL-clause sits: clause and position, with a guard: another
+/// concept body atom of the clause (its least common one), or [`Slot::NO_GUARD`]. Hyper
+/// rejects most clauses on the guard alone, without reading the clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slot {
+    pub clause: u32,
+    pub guard: u32,
+    pub pos: u8,
+}
+
+impl Slot {
+    pub const NO_GUARD: u32 = u32::MAX;
+}
 
 /// The compiled ontology, immutable while the contexts saturate.
 #[derive(Debug, Clone, Default)]
@@ -97,6 +112,16 @@ pub struct Program {
     pub by_concept: Vec<Vec<Slot>>,
     pub by_out: Vec<Vec<Slot>>,
     pub by_in: Vec<Vec<Slot>>,
+    /// The role slots split for Hyper: of clauses with no concept body atom (`bare`, by
+    /// role), and of the others (`keyed`, by role and the clause's first concept body
+    /// atom, which the context must have for the clause to fire). A role atom of a
+    /// context looks its keyed slots up through the concepts the context has where those
+    /// are fewer than the role's slots (Sequoia's §5.3.2): a role in many clause bodies
+    /// (the split-off parts of EL definitions) then costs what the context holds, not
+    /// what the ontology holds.
+    pub bare: [Vec<Vec<Slot>>; 2],
+    pub keyed_all: [Vec<Vec<Slot>>; 2],
+    pub keyed: hashbrown::HashMap<(u8, RoleId, ConceptId), Vec<Slot>>,
     pub funcs: Vec<Func>,
     /// The successor triggers `Su(O)` (Definition 2), with the fillers of existentials
     /// added: `B(x)`, `S(x, y)`, `S(y, x)`.
@@ -139,16 +164,34 @@ impl Program {
         }
     }
 
-    /// The DL-clause body slots an atom of a context may match (with `σ(x) = x`).
-    pub fn slots(&self, atom: Atom) -> (&[Slot], &[Slot]) {
+    /// The DL-clause body slots an atom of a context may match (with `σ(x) = x`), into
+    /// `out`; `concepts` are the concepts `B` the context has atoms `B(x)` of.
+    pub fn slots(&self, atom: Atom, concepts: &[ConceptId], out: &mut Vec<Slot>) {
+        out.clear();
         let p = atom.pred() as usize;
+        let role = |dir: u8, out: &mut Vec<Slot>| {
+            out.extend_from_slice(&self.bare[dir as usize][p]);
+            let all = &self.keyed_all[dir as usize][p];
+            if all.len() <= concepts.len() {
+                out.extend_from_slice(all);
+            } else {
+                for &b in concepts {
+                    if let Some(slots) = self.keyed.get(&(dir, p as RoleId, b)) {
+                        out.extend_from_slice(slots);
+                    }
+                }
+            }
+        };
         match (atom.kind(), atom.term()) {
-            (Kind::Concept, CTerm::X) => (&self.by_concept[p], &[]),
-            (Kind::Concept, _) => (&[], &[]),
+            (Kind::Concept, CTerm::X) => out.extend_from_slice(&self.by_concept[p]),
+            (Kind::Concept, _) => {}
             // S(x, x) is S(x, z) and S(z, x) with z = x.
-            (Kind::Out, CTerm::X) => (&self.by_out[p], &self.by_in[p]),
-            (Kind::Out, _) => (&self.by_out[p], &[]),
-            (Kind::In, _) => (&self.by_in[p], &[]),
+            (Kind::Out, CTerm::X) => {
+                role(0, out);
+                role(1, out);
+            }
+            (Kind::Out, _) => role(0, out),
+            (Kind::In, _) => role(1, out),
         }
     }
 
@@ -158,6 +201,9 @@ impl Program {
         self.by_concept = vec![Vec::new(); c];
         self.by_out = vec![Vec::new(); r];
         self.by_in = vec![Vec::new(); r];
+        self.bare = [vec![Vec::new(); r], vec![Vec::new(); r]];
+        self.keyed_all = [vec![Vec::new(); r], vec![Vec::new(); r]];
+        self.keyed.clear();
         self.su_concept = vec![false; c];
         self.su_out = vec![false; r];
         self.su_in = vec![false; r];
@@ -177,12 +223,58 @@ impl Program {
                     .unwrap_or(0)
             })
             .collect();
+        // How often each concept is a body atom: guards are the least common.
+        let mut occurs = vec![0u32; c];
+        for clause in &self.clauses {
+            for b in clause.body.iter() {
+                if let BodyPat::Concept(k) = *b {
+                    occurs[k as usize] += 1;
+                }
+            }
+        }
+        let guard = |body: &[BodyPat], pos: usize| -> u32 {
+            body.iter()
+                .enumerate()
+                .filter_map(|(i, b)| match *b {
+                    BodyPat::Concept(k) if i != pos => Some(k),
+                    _ => None,
+                })
+                .min_by_key(|&k| occurs[k as usize])
+                .unwrap_or(Slot::NO_GUARD)
+        };
         for (i, clause) in self.clauses.iter().enumerate() {
             if clause.body.is_empty() {
                 self.facts.push(i as u32);
             }
+            let key = clause.body.iter().find_map(|b| match *b {
+                BodyPat::Concept(c) => Some(c),
+                _ => None,
+            });
             for (pos, atom) in clause.body.iter().enumerate() {
-                let slot = (i as u32, pos as u8);
+                let (dir, s) = match *atom {
+                    BodyPat::Concept(_) => continue,
+                    BodyPat::Out(s, _) => (0u8, s),
+                    BodyPat::In(s, _) => (1u8, s),
+                };
+                let slot = Slot {
+                    clause: i as u32,
+                    guard: guard(&clause.body, pos),
+                    pos: pos as u8,
+                };
+                match key {
+                    None => self.bare[dir as usize][s as usize].push(slot),
+                    Some(b) => {
+                        self.keyed_all[dir as usize][s as usize].push(slot);
+                        self.keyed.entry((dir, s, b)).or_default().push(slot);
+                    }
+                }
+            }
+            for (pos, atom) in clause.body.iter().enumerate() {
+                let slot = Slot {
+                    clause: i as u32,
+                    guard: guard(&clause.body, pos),
+                    pos: pos as u8,
+                };
                 match *atom {
                     BodyPat::Concept(b) => {
                         self.by_concept[b as usize].push(slot);

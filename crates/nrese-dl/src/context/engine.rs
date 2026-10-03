@@ -214,6 +214,7 @@ impl Engine {
                     engine: self,
                     state: &mut state,
                     out: &mut out,
+                    scratch: Default::default(),
                 };
                 for message in batch {
                     worker.handle(message);

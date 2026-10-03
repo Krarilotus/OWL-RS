@@ -51,7 +51,12 @@ pub struct Compiled {
 }
 
 fn axiom_of(clause: &Clause) -> usize {
-    clause.sources.first().copied().unwrap_or(0)
+    clause
+        .sources
+        .first()
+        .and_then(|set| set.first())
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Compiles `n` for the Horn stage; `classes` are the named classes to classify (every
@@ -244,7 +249,12 @@ impl Compiler {
         n
     }
 
-    pub(super) fn add(&mut self, mut body: Vec<BodyPat>, head: Option<HeadPat>, sources: &[u32]) {
+    pub(super) fn add(
+        &mut self,
+        mut body: Vec<BodyPat>,
+        head: Option<HeadPat>,
+        sources: &[Box<[u32]>],
+    ) {
         body.sort_unstable();
         body.dedup();
         // A head that repeats a body atom: a tautology.
@@ -264,7 +274,8 @@ impl Compiler {
         let key = (body.into_boxed_slice(), head);
         if let Some(&at) = self.clauses.get(&key) {
             let clause = &mut self.program.clauses[at];
-            let mut merged: Vec<u32> = clause.sources.iter().chain(sources).copied().collect();
+            let mut merged: Vec<Box<[u32]>> =
+                clause.sources.iter().chain(sources).cloned().collect();
             merged.sort_unstable();
             merged.dedup();
             clause.sources = merged.into_boxed_slice();
@@ -284,7 +295,16 @@ impl Compiler {
     /// Steps 4–6 for one clause.
     fn clause(&mut self, clause: &Clause) -> Result<(), Unsupported> {
         let axiom = axiom_of(clause);
-        let sources: Vec<u32> = clause.sources.iter().map(|&s| s as u32).collect();
+        let sources: Vec<Box<[u32]>> = clause
+            .sources
+            .iter()
+            .map(|set| {
+                let mut set: Vec<u32> = set.iter().map(|&s| s as u32).collect();
+                set.sort_unstable();
+                set.dedup();
+                set.into_boxed_slice()
+            })
+            .collect();
         let mut work = Work {
             body: Vec::new(),
             head: None,
@@ -499,7 +519,12 @@ impl Compiler {
     }
 
     /// Step 6 and the DL-clauses.
-    fn emit(&mut self, work: Work, sources: &[u32], axiom: usize) -> Result<(), Unsupported> {
+    fn emit(
+        &mut self,
+        work: Work,
+        sources: &[Box<[u32]>],
+        axiom: usize,
+    ) -> Result<(), Unsupported> {
         let shape = Unsupported::ClauseShape { axiom };
         let (body, vars) = self.body(&work.body, axiom)?;
         let var = |v: OwlVar| vars.get(&v).copied().ok_or(shape.clone());

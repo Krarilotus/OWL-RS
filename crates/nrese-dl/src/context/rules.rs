@@ -16,8 +16,8 @@
 use hashbrown::HashMap;
 
 use super::atoms::{Atom, CTerm, FuncId, Kind, is_subset, union_into};
-use super::engine::{Engine, Strategy};
-use super::program::{BodyPat, DlClause, HeadPat, TermPat, Var};
+use super::engine::Engine;
+use super::program::{BodyPat, DlClause, HeadPat, Slot, TermPat, Var};
 use super::state::{ClauseId, ClauseRef, Clauses, ContextId, Rule};
 
 /// A message between contexts. Messages a context sends itself stay in its own batch.
@@ -99,7 +99,7 @@ impl Out {
         }
     }
 
-    fn send(&mut self, to: ContextId, message: Message) {
+    pub(super) fn send(&mut self, to: ContextId, message: Message) {
         if to == self.me {
             self.local.push(message);
         } else {
@@ -108,13 +108,65 @@ impl Out {
     }
 }
 
-/// A conclusion waiting to be derived (the joins only read the state).
-struct Pending {
-    body: Vec<Atom>,
+/// Conclusions waiting to be derived (the joins only read the state), flat, in buffers
+/// reused across inferences: no allocation per conclusion.
+#[derive(Debug, Default)]
+pub struct Found {
+    items: Vec<Item>,
+    atoms: Vec<Atom>,
+    premises: Vec<ClauseRef>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Item {
     head: Atom,
     rule: Rule,
     dl: u32,
-    premises: Vec<ClauseRef>,
+    body: (u32, u32),
+    premises: (u32, u32),
+}
+
+impl Found {
+    pub(super) fn clear(&mut self) {
+        self.items.clear();
+        self.atoms.clear();
+        self.premises.clear();
+    }
+
+    /// A conclusion: `body → head` by `rule` (and DL-clause `dl`) from `premises`.
+    pub(super) fn push(
+        &mut self,
+        body: &[Atom],
+        head: Atom,
+        rule: Rule,
+        dl: u32,
+        premises: &[ClauseRef],
+    ) {
+        let b = (self.atoms.len() as u32, body.len() as u32);
+        self.atoms.extend_from_slice(body);
+        let p = (self.premises.len() as u32, premises.len() as u32);
+        self.premises.extend_from_slice(premises);
+        self.items.push(Item {
+            head,
+            rule,
+            dl,
+            body: b,
+            premises: p,
+        });
+    }
+}
+
+/// A worker's buffers, reused across inferences.
+#[derive(Debug, Default)]
+pub struct Scratch {
+    pub(super) slots: Vec<Slot>,
+    pub(super) found: Found,
+    pub(super) bind: Vec<Option<CTerm>>,
+    pub(super) premises: Vec<ClauseId>,
+    pub(super) refs: Vec<ClauseRef>,
+    pub(super) body: Vec<Atom>,
+    pub(super) waiting: Vec<u32>,
+    pub(super) preds: Vec<(ContextId, FuncId)>,
 }
 
 /// The rules on one context, by the worker holding it.
@@ -122,6 +174,7 @@ pub struct Worker<'w> {
     pub engine: &'w Engine,
     pub state: &'w mut State,
     pub out: &'w mut Out,
+    pub scratch: Scratch,
 }
 
 const NONE: u32 = u32::MAX;
@@ -129,13 +182,6 @@ const NONE: u32 = u32::MAX;
 impl Worker<'_> {
     fn me(&self) -> ContextId {
         self.out.me
-    }
-
-    fn local(&self, clause: ClauseId) -> ClauseRef {
-        ClauseRef {
-            context: self.me(),
-            clause,
-        }
     }
 
     /// Handles a message, then the agenda and the messages to itself, to a fixpoint.
@@ -219,9 +265,12 @@ impl Worker<'_> {
                     body,
                     head,
                 });
-                let mut found = Vec::new();
-                self.pred_join(id, None, 0, &[], &mut Vec::new(), &mut found);
-                self.conclude(found);
+                let mut s = std::mem::take(&mut self.scratch);
+                s.found.clear();
+                s.premises.clear();
+                self.pred_join(id, None, 0, &[], &mut s);
+                self.conclude(&s.found);
+                self.scratch = s;
             }
         }
     }
@@ -230,45 +279,48 @@ impl Worker<'_> {
     fn process(&mut self, c: ClauseId) {
         self.state.clauses.recs[c as usize].processed = true;
         let head = self.state.clauses.recs[c as usize].head;
+        if !head.is_bottom() && head.kind() == Kind::Concept && head.term() == CTerm::X {
+            self.state.clauses.present.insert(head.pred());
+        }
         if !head.is_bottom() {
             self.hyper(c, head);
         }
         if self.engine.program.is_pr(head) {
             self.state.pr.push(c);
-            let preds = self.state.preds.clone();
-            for (u, f) in preds {
+            let mut s = std::mem::take(&mut self.scratch);
+            s.preds.clear();
+            s.preds.extend_from_slice(&self.state.preds);
+            for &(u, f) in &s.preds {
                 self.send_pred(c, u, f);
             }
+            self.scratch = s;
         }
         if head.func().is_some() {
-            if let Some(waiting) = self.state.remote_by_atom.get(&head) {
-                let waiting = waiting.clone();
-                let mut found = Vec::new();
-                for r in waiting {
-                    let at = self.state.remote[r as usize]
-                        .body
-                        .iter()
-                        .position(|&a| a == head)
-                        .unwrap_or(0);
-                    self.pred_join(r, Some((at, c)), 0, &[], &mut Vec::new(), &mut found);
-                }
-                self.conclude(found);
-            }
+            self.pred_local(c, head);
             self.succ(c, head);
         }
     }
 
-    fn conclude(&mut self, found: Vec<Pending>) {
+    pub(super) fn conclude(&mut self, found: &Found) {
         let proofs = self.engine.proofs;
-        for p in found {
+        for item in &found.items {
             let counters = &mut self.state.clauses.counters;
-            match p.rule {
+            match item.rule {
                 Rule::Pred => counters.pred += 1,
                 _ => counters.hyper += 1,
             }
-            self.state
-                .clauses
-                .derive(&p.body, p.head, (p.rule, p.dl, &p.premises), proofs);
+            let (b, n) = item.body;
+            let (p, m) = item.premises;
+            self.state.clauses.derive(
+                &found.atoms[b as usize..(b + n) as usize],
+                item.head,
+                (
+                    item.rule,
+                    item.dl,
+                    &found.premises[p as usize..(p + m) as usize],
+                ),
+                proofs,
+            );
         }
     }
 
@@ -276,32 +328,61 @@ impl Worker<'_> {
 
     fn hyper(&mut self, c: ClauseId, head: Atom) {
         let program = &self.engine.program;
-        let (first, second) = program.slots(head);
-        if first.is_empty() && second.is_empty() {
+        let mut s = std::mem::take(&mut self.scratch);
+        let Scratch {
+            slots,
+            found,
+            bind,
+            premises,
+            body,
+            ..
+        } = &mut s;
+        program.slots(head, &self.state.clauses.concepts, slots);
+        if slots.is_empty() {
+            self.scratch = s;
             return;
         }
-        let mut found = Vec::new();
-        let mut bind = Vec::new();
-        let mut premises = vec![c];
-        let body = self.state.clauses.body(c).to_vec();
-        for &(dl, pos) in first.iter().chain(second) {
+        found.clear();
+        premises.clear();
+        premises.push(c);
+        body.clear();
+        body.extend_from_slice(self.state.clauses.body(c));
+        self.state.clauses.counters.slots += slots.len() as u64;
+        let present = &self.state.clauses.present;
+        for &Slot {
+            clause: dl,
+            guard,
+            pos,
+        } in slots.iter()
+        {
+            if guard != Slot::NO_GUARD && !present.contains(&guard) {
+                continue;
+            }
             let clause = &program.clauses[dl as usize];
+            // The other concept atoms must be there: a probe each, before any join.
+            let missing = clause.body.iter().enumerate().any(|(i, b)| {
+                i != pos as usize && matches!(*b, BodyPat::Concept(k) if !present.contains(&k))
+            });
+            if missing {
+                continue;
+            }
             bind.clear();
             bind.resize(program.vars[dl as usize] as usize, None);
-            if !unify(clause.body[pos as usize], head, &mut bind) {
+            if !unify(clause.body[pos as usize], head, bind) {
                 continue;
             }
             self.hyper_join(
                 (clause, dl),
                 (pos as usize, c),
                 0,
-                &mut bind,
-                &body,
-                &mut premises,
-                &mut found,
+                bind,
+                body,
+                premises,
+                found,
             );
         }
         self.conclude(found);
+        self.scratch = s;
     }
 
     /// Joins the body atoms of `dl` from position `i` on with the context's clauses;
@@ -315,17 +396,29 @@ impl Worker<'_> {
         bind: &mut [Option<CTerm>],
         acc: &[Atom],
         premises: &mut Vec<ClauseId>,
-        found: &mut Vec<Pending>,
+        found: &mut Found,
     ) {
         let (clause, id) = dl;
         if i == clause.body.len() {
             if let Some(head) = instantiate(clause.head, bind) {
-                found.push(Pending {
-                    body: acc.to_vec(),
+                let b = (found.atoms.len() as u32, acc.len() as u32);
+                found.atoms.extend_from_slice(acc);
+                let p = found.premises.len() as u32;
+                if self.engine.proofs {
+                    let me = self.me();
+                    found
+                        .premises
+                        .extend(premises.iter().map(|&clause| ClauseRef {
+                            context: me,
+                            clause,
+                        }));
+                }
+                found.items.push(Item {
                     head,
                     rule: Rule::Hyper,
                     dl: id,
-                    premises: self.refs(premises),
+                    body: b,
+                    premises: (p, found.premises.len() as u32 - p),
                 });
             }
             return;
@@ -373,173 +466,6 @@ impl Worker<'_> {
                 }
             },
         }
-    }
-
-    fn refs(&self, premises: &[ClauseId]) -> Vec<ClauseRef> {
-        if !self.engine.proofs {
-            return Vec::new();
-        }
-        premises.iter().map(|&c| self.local(c)).collect()
-    }
-
-    // Pred -------------------------------------------------------------------------------
-
-    /// Sends clause `c` to the predecessor `u` of the edge `u →f` here.
-    fn send_pred(&mut self, c: ClauseId, u: ContextId, f: FuncId) {
-        let rec = self.state.clauses.recs[c as usize];
-        let Some(head) = rec.head.up(f) else {
-            return;
-        };
-        let mut body = Vec::with_capacity(self.state.clauses.body(c).len());
-        for &a in self.state.clauses.body(c) {
-            match a.up(f) {
-                Some(b) => body.push(b),
-                // S(x, x) has no image: the clause says nothing the predecessor can use.
-                None => return,
-            }
-        }
-        body.sort_unstable();
-        let from = self.local(c);
-        self.out.send(
-            u,
-            Message::Pred {
-                from,
-                func: f,
-                body: body.into_boxed_slice(),
-                head,
-            },
-        );
-    }
-
-    /// Joins remote clause `r`'s body from position `i` on with this context's clauses.
-    fn pred_join(
-        &self,
-        r: u32,
-        fixed: Option<(usize, ClauseId)>,
-        i: usize,
-        acc: &[Atom],
-        premises: &mut Vec<ClauseId>,
-        found: &mut Vec<Pending>,
-    ) {
-        let remote = &self.state.remote[r as usize];
-        if i == remote.body.len() {
-            let mut refs = self.refs(premises);
-            if self.engine.proofs {
-                refs.push(remote.from);
-                // The edge's justification (condition S2): the successor's core holds of
-                // f(x) here, by these clauses.
-                for &a in self.engine.core(remote.from.context) {
-                    if let Some(c) = a
-                        .up(remote.func)
-                        .and_then(|h| self.state.clauses.unconditional(h))
-                    {
-                        refs.push(self.local(c));
-                    }
-                }
-            }
-            found.push(Pending {
-                body: acc.to_vec(),
-                head: remote.head,
-                rule: Rule::Pred,
-                dl: NONE,
-                premises: refs,
-            });
-            return;
-        }
-        let clauses = &self.state.clauses;
-        let trigger = fixed.map_or(NONE, |(_, c)| c);
-        let only = fixed.filter(|&(at, _)| at == i).map(|(_, c)| c);
-        let mut union = Vec::new();
-        for p in clauses.premises_for(remote.body[i], trigger) {
-            if only.is_some_and(|c| c != p) {
-                continue;
-            }
-            let body = clauses.body(p);
-            let next: &[Atom] = if body.is_empty() || is_subset(body, acc) {
-                acc
-            } else {
-                union_into(acc, body, &mut union);
-                &union
-            };
-            premises.push(p);
-            self.pred_join(r, fixed, i + 1, next, premises, found);
-            premises.pop();
-        }
-    }
-
-    // Succ -------------------------------------------------------------------------------
-
-    fn succ(&mut self, c: ClauseId, head: Atom) {
-        let Some(f) = head.func() else {
-            return;
-        };
-        let program = &self.engine.program;
-        let unconditional = self.state.clauses.recs[c as usize].body == 0;
-        let entry = self.state.succ.entry(f).or_default();
-        let mut grew = false;
-        if let Some(a) = head.down().filter(|&a| program.is_su(a)) {
-            if !entry.k2.contains(&a) {
-                entry.k2.push(a);
-                grew = true;
-                for e in &mut entry.edges {
-                    if !e.core.contains(&a) && !e.sent.contains(&a) {
-                        e.complete = false;
-                    }
-                }
-            }
-            if unconditional && !entry.k1.contains(&a) {
-                entry.k1.push(a);
-            }
-        }
-        if (!grew && !entry.edges.is_empty()) || entry.edges.iter().any(|e| e.complete) {
-            return;
-        }
-        // No edge holds K₂: the strategy picks the successor.
-        let core: Vec<Atom> = match self.engine.strategy {
-            Strategy::Cautious => program.funcs[f as usize]
-                .filler
-                .map(|b| Atom::concept(b, CTerm::X))
-                .filter(|a| entry.k1.contains(a))
-                .into_iter()
-                .collect(),
-            Strategy::Eager => {
-                let mut k1 = entry.k1.clone();
-                k1.sort_unstable();
-                k1
-            }
-        };
-        let (to, created) = self.engine.context_for(&core);
-        if created {
-            self.out.send(to, Message::Init);
-        }
-        let at = match entry.edges.iter().position(|e| e.to == to) {
-            Some(at) => at,
-            None => {
-                entry.edges.push(Edge {
-                    to,
-                    core: core.into_boxed_slice(),
-                    sent: Vec::new(),
-                    complete: false,
-                });
-                self.state.clauses.counters.edges += 1;
-                self.out.send(
-                    to,
-                    Message::Link {
-                        from: self.out.me,
-                        func: f,
-                    },
-                );
-                entry.edges.len() - 1
-            }
-        };
-        let edge = &mut entry.edges[at];
-        for &a in &entry.k2 {
-            if !edge.core.contains(&a) && !edge.sent.contains(&a) {
-                edge.sent.push(a);
-                self.out.send(to, Message::Possible(a));
-            }
-        }
-        edge.complete = true;
     }
 }
 
