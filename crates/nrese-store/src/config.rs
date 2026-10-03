@@ -47,6 +47,14 @@ pub struct StoreConfig {
     /// (`reasoner.equality = "compact"`; W4 stage B): storage and commits shrink by the
     /// replication factor, reads of facts about identities pay the expansion.
     pub equality_compact: bool,
+    /// With [`Self::equality_compact`]: queries answer with one identity per class, its
+    /// representative (`equality.answers = "canonical"`, stage C): for analytics, where
+    /// the identities are one thing. Off (`"strict"`): every identity, as if replicated.
+    pub equality_canonical_answers: bool,
+    /// With [`Self::equality_compact`]: queries expand the classes at every read (stage
+    /// B, `equality.expansion = "early"`) instead of after the joins where the answer
+    /// can't tell (stage C, `"late"`, the default). The same answers.
+    pub equality_early_expansion: bool,
     /// Support graph sets kept per inferred statement for `inferred = "supported"` in the
     /// access policy (`reasoner.support_sets`, at least 1): the smallest first. A set left
     /// out can only hide a statement from a reader who could have seen it.
@@ -163,6 +171,8 @@ impl StoreConfig {
             hide_unnamed_classes: false,
             equality_by_representatives: true,
             equality_compact: false,
+            equality_canonical_answers: false,
+            equality_early_expansion: false,
             support_sets: DEFAULT_SUPPORT_SETS,
             verify_on_open: false,
             map_checkpoints: true,
@@ -187,6 +197,8 @@ impl StoreConfig {
             hide_unnamed_classes: false,
             equality_by_representatives: true,
             equality_compact: false,
+            equality_canonical_answers: false,
+            equality_early_expansion: false,
             support_sets: DEFAULT_SUPPORT_SETS,
             verify_on_open: false,
             map_checkpoints: true,

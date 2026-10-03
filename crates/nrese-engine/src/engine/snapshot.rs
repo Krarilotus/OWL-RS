@@ -30,6 +30,9 @@ pub struct Snapshot {
     statistics: Arc<Statistics>,
     /// `owl:sameAs`, when reads expand equality classes.
     equality: Option<TermId>,
+    /// Reads give each class's statements once, over its representative (stage C,
+    /// [`Self::with_canonical_equality`]), instead of expanding them.
+    canonical: bool,
 }
 
 /// Inferred statements hidden from a reader, as runs stacked over the inferred stack
@@ -100,6 +103,7 @@ impl Snapshot {
             dictionary,
             statistics,
             equality,
+            canonical: false,
         }
     }
 
@@ -107,8 +111,43 @@ impl Snapshot {
     pub fn stored(&self) -> Snapshot {
         Snapshot {
             equality: None,
+            canonical: false,
             ..self.clone()
         }
+    }
+
+    /// This snapshot reading equality classes canonically (work package W4, stage C):
+    /// each statement of the default graph once, over its terms' representatives, the
+    /// pattern's constants in place; no copies for the other identities. Answers over it
+    /// name one identity per class (`equality.answers = "canonical"`), and a query engine
+    /// joins over it and expands the classes after the joins ([`Self::expand_late`]).
+    /// Without equality classes it reads as this snapshot.
+    pub fn with_canonical_equality(&self) -> Snapshot {
+        Snapshot {
+            canonical: true,
+            ..self.clone()
+        }
+    }
+
+    /// Whether this snapshot reads equality classes canonically.
+    pub fn reads_canonically(&self) -> bool {
+        self.canonical
+    }
+
+    /// The classes to expand after joins over [`Self::with_canonical_equality`], if reads
+    /// in `model` may be done so: equality classes exist, the model shows every copy of a
+    /// statement (the materialised one), and no named graph can hold a copy that should be
+    /// hidden (the asserted stack keeps no named graphs). Joins over the canonical reads,
+    /// expanded, then give the joins over the expanded reads (work package W4, stage C).
+    pub fn expand_late(&self, model: ReadModel) -> Option<Arc<EqualityClasses>> {
+        if self.canonical || model != ReadModel::Materialised {
+            return None;
+        }
+        if self.version.asserted.layout() == crate::index::Layout::Quads {
+            return None;
+        }
+        self.equality_classes()
+            .filter(|classes| !classes.is_empty())
     }
 
     /// This snapshot with only a subset of its inferred statements, for a reader who may
@@ -138,6 +177,7 @@ impl Snapshot {
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
             equality: self.equality,
+            canonical: self.canonical,
         }
     }
 
@@ -160,6 +200,7 @@ impl Snapshot {
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
             equality: self.equality,
+            canonical: self.canonical,
         })
     }
 
@@ -181,8 +222,14 @@ impl Snapshot {
         if model == ReadModel::Asserted || !default_graph {
             return None;
         }
-        self.equality_classes()
-            .filter(|classes| !classes.is_empty())
+        let same_as = self.equality?;
+        let classes = match self.canonical {
+            // The classes without their members: aliases still normalise constants and
+            // mark the statements a representative's copy stands for; nothing expands.
+            true => self.version.equality.canonical(&self.version, same_as),
+            false => self.version.equality.classes(&self.version, same_as),
+        };
+        (!classes.is_empty()).then_some(classes)
     }
 
     /// The expanded matches of `pattern` in `model`, sorted by `permutation` (module docs
@@ -359,6 +406,7 @@ impl Snapshot {
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::clone(&self.statistics),
             equality: self.equality,
+            canonical: self.canonical,
         }
     }
 

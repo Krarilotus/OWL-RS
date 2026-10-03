@@ -31,6 +31,16 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         )?,
         equality_by_representatives: equality.0,
         equality_compact: equality.1,
+        equality_canonical_answers: choice(
+            source,
+            names::REASONING_EQUALITY_ANSWERS,
+            &["strict", "canonical"],
+        )? == Some(1),
+        equality_early_expansion: choice(
+            source,
+            names::REASONING_EQUALITY_EXPANSION,
+            &["late", "early"],
+        )? == Some(1),
         support_sets: super::env_values::parse_usize(
             source,
             names::REASONING_SUPPORT_SETS,
@@ -125,6 +135,25 @@ fn parse_equality(input: Option<&str>) -> Result<(bool, bool)> {
             names::REASONING_EQUALITY
         ),
     })
+}
+
+/// The index of the value of `name` among `choices` (case-insensitive); `None` if unset.
+fn choice(source: &dyn ConfigSource, name: &str, choices: &[&str]) -> Result<Option<usize>> {
+    let Some(value) = source.get(name) else {
+        return Ok(None);
+    };
+    let value = value.trim().to_ascii_lowercase();
+    match choices.iter().position(|c| *c == value) {
+        Some(at) => Ok(Some(at)),
+        None => bail!(
+            "unsupported value '{value}' in {name} (expected {})",
+            choices
+                .iter()
+                .map(|c| format!("'{c}'"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    }
 }
 
 fn parse_unnamed_classes(input: Option<&str>) -> Result<bool> {
