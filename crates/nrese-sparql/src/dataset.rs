@@ -127,6 +127,12 @@ impl ResolvedDataset {
                     .iter()
                     .filter_map(|name| match name {
                         GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
+                        // Jena's name for the default graph (`compat`).
+                        GraphName::NamedNode(n)
+                            if crate::compat::names_default_graph(n.as_str()) =>
+                        {
+                            Some(TermId::DEFAULT_GRAPH)
+                        }
                         GraphName::NamedNode(n) => graph(n.as_ref().into()),
                         GraphName::BlankNode(b) => graph(b.as_ref().into()),
                     })

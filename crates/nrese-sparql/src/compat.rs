@@ -13,6 +13,16 @@
 //! Blazegraph's planner what to do; ResearchSpace's and other Blazegraph clients' queries
 //! carry them. Read as data they match nothing, and the query with them. They are dropped:
 //! NRESE plans on its own.
+//!
+//! **Other stores' names for the default graph.** `urn:x-arq:DefaultGraph` names the
+//! default graph in Jena and Fuseki ([`JENA_DEFAULT_GRAPH`]), and clients written for them
+//! use it: rdflib's SPARQL store writes a graph so named into
+//! `GRAPH <urn:x-arq:DefaultGraph> { … }`. rdflib names its own default graph
+//! `urn:x-rdflib:default` ([`RDFLIB_DEFAULT_GRAPH`]) and asks for it as the query's
+//! `default-graph-uri` while writing its triples into the default graph. Here both are the
+//! default graph: in `GRAPH` patterns of queries and updates, in the data and templates of
+//! updates, in a query's dataset (`FROM`, `default-graph-uri`), and as the Graph Store
+//! Protocol's `?graph=`.
 
 use std::collections::HashMap;
 
@@ -20,6 +30,17 @@ use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern, OrderExpression};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_sparql_syntax::{Query, SparqlParser, SparqlSyntaxError};
+
+/// Jena's and Fuseki's name for the default graph (module docs).
+pub const JENA_DEFAULT_GRAPH: &str = "urn:x-arq:DefaultGraph";
+
+/// rdflib's name for the default graph of a dataset (module docs).
+pub const RDFLIB_DEFAULT_GRAPH: &str = "urn:x-rdflib:default";
+
+/// Whether `iri` names the default graph by another store's convention.
+pub fn names_default_graph(iri: &str) -> bool {
+    iri == JENA_DEFAULT_GRAPH || iri == RDFLIB_DEFAULT_GRAPH
+}
 
 /// Parses a query and applies the compatibility rewrites.
 pub fn parse_query(

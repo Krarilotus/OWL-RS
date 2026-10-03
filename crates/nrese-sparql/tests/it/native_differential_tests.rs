@@ -5488,6 +5488,71 @@ fn stars_are_estimated_from_characteristic_sets() {
     );
 }
 
+/// Chains are estimated from the characteristic pairs: 1,000 offers point at products
+/// with `:product`, 1,000 reviews at persons with `:author`, and the products alone have a
+/// `:price`. `?x :product ?y . ?y :price ?p` has a row per offer, which the pairs know;
+/// independence spreads the 200 prices over all 1,300 subjects and estimates about 150.
+/// `?x :author ?y . ?y :price ?p` has none: no author has a price.
+#[test]
+fn chains_are_estimated_from_characteristic_pairs() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let quad =
+        |s: String, p: &str, o: NamedNode| Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph);
+    for i in 0..200 {
+        tx.insert(quad(format!("product{i}"), "price", ex(&format!("p{}", i % 7))).as_ref());
+    }
+    for i in 0..100 {
+        tx.insert(quad(format!("person{i}"), "name", ex(&format!("n{i}"))).as_ref());
+    }
+    for i in 0..1_000 {
+        tx.insert(
+            quad(
+                format!("offer{i}"),
+                "product",
+                ex(&format!("product{}", i % 200)),
+            )
+            .as_ref(),
+        );
+        tx.insert(
+            quad(
+                format!("review{i}"),
+                "author",
+                ex(&format!("person{}", i % 100)),
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let bgp = |text: &str| {
+        let query = SparqlParser::new()
+            .parse_query(&format!("PREFIX : <{EX}> SELECT * WHERE {{ {text} }}"))
+            .unwrap();
+        let planned = plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+        let found = rows(
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+            false,
+        )
+        .len();
+        let estimate = planned
+            .steps
+            .iter()
+            .find(|s| s.operator == "bgp")
+            .and_then(|s| s.estimated_rows);
+        (estimate, found)
+    };
+    assert_eq!(bgp("?x :product ?y . ?y :price ?p"), (Some(1_000), 1_000));
+    assert_eq!(bgp("?x :author ?y . ?y :price ?p"), (Some(0), 0));
+    // Three patterns: the chain then a star on the offers.
+    let (estimate, found) = bgp("?x :product ?y . ?y :price ?p . ?x :product ?z");
+    assert_eq!(found, 1_000);
+    assert!(
+        estimate.is_some_and(|e| e.abs_diff(found as u64) <= 1),
+        "{estimate:?} for {found}"
+    );
+}
+
 /// Eager aggregation (BSBM BI q4's shape): counts and sums of offers per product
 /// feature are made from per-product partial results, never from a row per feature and
 /// offer; the answers equal the reference evaluator's, also when a sum fails for one
