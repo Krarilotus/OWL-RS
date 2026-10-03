@@ -270,10 +270,10 @@ If you want to work on storage, dataset state, or SPARQL execution:
 
 If you want to work on reasoning:
 
-- start in [docs/design/reasoner-v2.md](docs/design/reasoner-v2.md) and [crates/nrese-reasoner/src/v2/mod.rs](crates/nrese-reasoner/src/v2/mod.rs)
-- rules are data ([ir.rs](crates/nrese-reasoner/src/v2/ir.rs), [rulesets.rs](crates/nrese-reasoner/src/v2/rulesets.rs)); list axioms are compiled per axiom ([lists.rs](crates/nrese-reasoner/src/v2/lists.rs))
-- [naive.rs](crates/nrese-reasoner/src/v2/naive.rs) is the reference evaluator every executor is tested against
-- [batch.rs](crates/nrese-reasoner/src/v2/batch.rs) materialises (grounding, parallel semi-naive evaluation, transitive and equality modules); [delta.rs](crates/nrese-reasoner/src/v2/delta.rs) maintains the closure per commit (DRed with B/F proofs)
+- start in [docs/design/reasoner-v2.md](docs/design/reasoner-v2.md) and [crates/nrese-reasoner/src/lib.rs](crates/nrese-reasoner/src/lib.rs)
+- rules are data ([ir.rs](crates/nrese-reasoner/src/ir.rs), [rulesets.rs](crates/nrese-reasoner/src/rulesets.rs)); list axioms are compiled per axiom ([lists.rs](crates/nrese-reasoner/src/lists.rs))
+- [naive.rs](crates/nrese-reasoner/src/naive.rs) is the reference evaluator every executor is tested against
+- [batch.rs](crates/nrese-reasoner/src/batch.rs) materialises (grounding, parallel semi-naive evaluation, transitive and equality modules); [delta.rs](crates/nrese-reasoner/src/delta.rs) maintains the closure per commit (DRed with B/F proofs)
 - the store side (materialisation, commit path, reject explanations) is [crates/nrese-store/src/reasoning.rs](crates/nrese-store/src/reasoning.rs)
 
 If you want to work on HTTP, auth, or operator surfaces:

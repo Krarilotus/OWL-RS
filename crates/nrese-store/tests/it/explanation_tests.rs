@@ -3,7 +3,7 @@
 
 use crate::support::in_memory_store_config;
 use nrese_rdf::{NamedNode, Term};
-use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::rulesets::Ruleset;
 use nrese_store::{SparqlUpdateRequest, StoreService};
 
 const EX: &str = "http://example.com/";

@@ -1,7 +1,7 @@
 //! The batch executor (reasoner-v2 design §4.1): full materialisation by semi-naive
 //! evaluation over a vertically partitioned working set.
 //!
-//! - **Working set.** One [`Relation`] per predicate: its pairs sorted by subject and by
+//! - **Working set.** One `Relation` per predicate: its pairs sorted by subject and by
 //!   object, plus the last round's delta in both orders.
 //! - **Schema grounding** (design §3.2, [`super::eval::ground`]). Atoms over the TBox
 //!   vocabulary are evaluated against the current facts and substituted into the rest of
@@ -19,7 +19,7 @@
 //! - **Deduplication** is a sort per round, then a merge into each relation. There's no
 //!   shared hash set, and the result doesn't depend on the thread count.
 //!
-//! The naive evaluator ([`super::naive`]) is the oracle: both compute the same closure.
+//! The naive evaluator (`naive`, tests and the `oracle` feature only) is the oracle: both compute the same closure.
 
 use std::sync::Arc;
 

@@ -1,5 +1,5 @@
 //! What a store materialises: a built-in ruleset, the user's rules (Notation3, compiled by
-//! [`super::n3`], or a GraphDB ruleset, compiled by [`super::pie`]), or both, the user's
+//! [`super::n3`], or a GraphDB ruleset, compiled by the crate's `pie` module), or both, the user's
 //! on top.
 //!
 //! A program's [`RuleProgram::name`] and [`RuleProgram::fingerprint`] identify what it
@@ -27,7 +27,7 @@ pub struct UserRules {
 pub enum RuleFormat {
     /// Notation3 ([`super::n3`]).
     N3,
-    /// A GraphDB ruleset, `.pie` ([`super::pie`]).
+    /// A GraphDB ruleset, `.pie` (the crate's `pie` module).
     Pie,
 }
 

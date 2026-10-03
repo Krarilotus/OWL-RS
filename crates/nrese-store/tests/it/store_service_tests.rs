@@ -402,7 +402,7 @@ fn a_failed_marker_removal_is_retried() -> Result<(), Box<dyn std::error::Error>
     let dir = tempdir()?;
     let store = StoreService::new(StoreConfig::on_disk(dir.path()))?;
     store.execute_update_str("INSERT DATA { <http://e/a> <http://e/p> <http://e/b> }")?;
-    store.rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Rdfs)?;
+    store.rematerialise(nrese_reasoner::rulesets::Ruleset::Rdfs)?;
     let marker = dir.path().join("reasoning.state");
     let recorded = fs::read_to_string(&marker)?;
     // A directory in its place: removing the file fails on every platform.

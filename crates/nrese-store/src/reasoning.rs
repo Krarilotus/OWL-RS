@@ -27,14 +27,14 @@ use nrese_engine::{
 };
 use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
 use nrese_reasoner::RuleProgram;
-use nrese_reasoner::v2::batch::{self, Phases, Schema};
-use nrese_reasoner::v2::delta::{self, Base, MemoryBase};
-use nrese_reasoner::v2::eval::GroundProgram;
-use nrese_reasoner::v2::ir::{Rule, Vocabulary};
-use nrese_reasoner::v2::ir::{Triple, Violation};
-use nrese_reasoner::v2::lists::ListDiagnostic;
-use nrese_reasoner::v2::lists::ListVocabulary;
-use nrese_reasoner::v2::unnamed::UnnamedVocabulary;
+use nrese_reasoner::batch::{self, Phases, Schema};
+use nrese_reasoner::delta::{self, Base, MemoryBase};
+use nrese_reasoner::eval::GroundProgram;
+use nrese_reasoner::ir::{Rule, Vocabulary};
+use nrese_reasoner::ir::{Triple, Violation};
+use nrese_reasoner::lists::ListDiagnostic;
+use nrese_reasoner::lists::ListVocabulary;
+use nrese_reasoner::unnamed::UnnamedVocabulary;
 use rayon::prelude::*;
 use std::collections::HashSet;
 
@@ -98,7 +98,7 @@ impl Program {
         let unnamed = UnnamedVocabulary::new(&mut constants);
         let things = rules.iter().any(|rule| rule.name == "scm-cls");
         let rdf_type = constants.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
-        let same_as = nrese_reasoner::v2::representatives::same_as(&rules);
+        let same_as = nrese_reasoner::representatives::same_as(&rules);
         let mut axioms = program
             .axiom_triples(&mut constants)
             .expect("the built-in axioms parse (tested), user facts are checked at startup");
@@ -196,7 +196,7 @@ impl Program {
             .collect();
         candidates.sort_unstable();
         candidates.dedup();
-        nrese_reasoner::v2::unnamed::hidden_classes(
+        nrese_reasoner::unnamed::hidden_classes(
             candidates,
             &|class| {
                 let mut out = quads(any(Some(class), None, None));
@@ -366,14 +366,14 @@ fn triple(quad: EncodedQuad) -> Triple {
 
 /// The closure of `asserted` (any graphs) under `program`, its axioms included.
 pub fn materialise(program: &Program, snapshot: &Snapshot) -> Closure {
-    materialise_until(program, snapshot, nrese_reasoner::v2::eval::NEVER).expect("never stopped")
+    materialise_until(program, snapshot, nrese_reasoner::eval::NEVER).expect("never stopped")
 }
 
 /// [`materialise`], polling `stop` throughout; `Err` if it fired.
 pub fn materialise_until(
     program: &Program,
     snapshot: &Snapshot,
-    stop: nrese_reasoner::v2::eval::Stop<'_>,
+    stop: nrese_reasoner::eval::Stop<'_>,
 ) -> Result<Closure, delta::Interrupted> {
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
@@ -457,7 +457,7 @@ fn by_representatives(
     rebuild: &dyn Fn() -> Grouped,
     same_as: u64,
     schema: &Schema,
-    stop: nrese_reasoner::v2::eval::Stop<'_>,
+    stop: nrese_reasoner::eval::Stop<'_>,
 ) -> Result<batch::Materialisation, delta::Interrupted> {
     let equal = |pairs: &[(u64, u64)]| pairs.iter().any(|&(o, s)| o != s);
     let asserts_equality = input
@@ -467,7 +467,7 @@ fn by_representatives(
     let input = if asserts_equality {
         input
     } else {
-        let rules = nrese_reasoner::v2::representatives::without_replacement(&program.rules);
+        let rules = nrese_reasoner::representatives::without_replacement(&program.rules);
         let first =
             batch::materialise_grouped_until(input, &rules, program.lists.as_ref(), schema, stop)?;
         if !first
@@ -495,7 +495,7 @@ fn by_representatives(
             all
         }
     };
-    let closure = nrese_reasoner::v2::representatives::materialise_until(
+    let closure = nrese_reasoner::representatives::materialise_until(
         &start,
         &program.rules,
         program.lists.as_ref(),
@@ -574,7 +574,7 @@ pub fn equality_report(program: &Program, snapshot: &Snapshot) -> String {
     );
     let replicated_time = started.elapsed();
     let started = Instant::now();
-    let closure = nrese_reasoner::v2::representatives::materialise(
+    let closure = nrese_reasoner::representatives::materialise(
         &input,
         &program.rules,
         program.lists.as_ref(),
@@ -721,7 +721,7 @@ pub fn apply_delta(
     program: &Program,
     ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
-    stop: nrese_reasoner::v2::eval::Stop<'_>,
+    stop: nrese_reasoner::eval::Stop<'_>,
 ) -> Result<(Vec<Violation>, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
     let started = Instant::now();
     // Axioms the state lacks (a store that never rematerialised): added with this commit.
@@ -954,7 +954,7 @@ pub fn explain(
     violation: &Violation,
     tx: &Transaction<'_>,
 ) -> nrese_reasoner::RejectExplanation {
-    use nrese_reasoner::v2::ir::{Head, Term};
+    use nrese_reasoner::ir::{Head, Term};
     let decode = |id: u64| decoded(tx.decode(TermId::from_raw(id)), id);
     let value = |term: Term| match term {
         Term::Const(c) => Some(c),
@@ -1042,7 +1042,7 @@ pub struct InferenceStep {
 const EXPLANATION_BUDGET: usize = 4096;
 
 /// Why the fact `[s, p, o]` holds in `snapshot` under `program`: a derivation of it from
-/// asserted facts ([`nrese_reasoner::v2::explain`]), the fact first. `None` if it doesn't
+/// asserted facts ([`nrese_reasoner::explain`]), the fact first. `None` if it doesn't
 /// hold, or no derivation is found within the budget.
 ///
 /// `readable`, where the requester may not read every graph, tells whether an asserted
@@ -1058,7 +1058,7 @@ pub fn explain_fact(
         axioms: &program.axioms,
     };
     let explanation =
-        nrese_reasoner::v2::explain::explain(&base, program.rules(), fact, EXPLANATION_BUDGET)?;
+        nrese_reasoner::explain::explain(&base, program.rules(), fact, EXPLANATION_BUDGET)?;
     let decode = |id: u64| decoded(snapshot.decode(TermId::from_raw(id)), id);
     Some(
         explanation
@@ -1144,7 +1144,7 @@ pub struct JustificationAnswer {
 
 /// The justifications of the fact `[s, p, o]` in `snapshot` under `program`: minimal sets
 /// of asserted statements it follows from, computed on its proof graph
-/// ([`nrese_reasoner::v2::explain::proof_graph`], the proof IR of `nrese-owl`). `None` if it
+/// ([`nrese_reasoner::explain::proof_graph`], the proof IR of `nrese-owl`). `None` if it
 /// doesn't hold. `readable` as for [`explain_fact`].
 pub fn justify_fact(
     program: &Program,
@@ -1157,8 +1157,8 @@ pub fn justify_fact(
         snapshot,
         axioms: &program.axioms,
     };
-    let ground = nrese_reasoner::v2::delta::program(&base, program.rules());
-    let graph = nrese_reasoner::v2::explain::proof_graph(&base, &ground, fact, EXPLANATION_BUDGET)?;
+    let ground = nrese_reasoner::delta::program(&base, program.rules());
+    let graph = nrese_reasoner::explain::proof_graph(&base, &ground, fact, EXPLANATION_BUDGET)?;
     let (sets, complete) = match mode {
         JustificationMode::One => (graph.one().into_iter().collect(), graph.complete),
         JustificationMode::Core => (vec![graph.core()], graph.complete),
@@ -1185,9 +1185,7 @@ pub fn justify_fact(
                 .proof_from(&|a| set.binary_search(a).is_ok())
                 .is_some_and(|proof| {
                     proof
-                        .check(&|step| {
-                            nrese_reasoner::v2::explain::valid_step(&base, &ground, step)
-                        })
+                        .check(&|step| nrese_reasoner::explain::valid_step(&base, &ground, step))
                         .is_ok()
                 })
         })),

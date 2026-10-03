@@ -59,7 +59,7 @@ pub fn run_owl2_rl_catalog_fixture(
         ontology_path: Some(catalog_fixture_path(filename)),
         ..in_memory_store_config()
     })?);
-    store.rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)?;
+    store.rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)?;
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(

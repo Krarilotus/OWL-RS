@@ -933,7 +933,7 @@ fn saturate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::vocabulary::LocalVocabulary;
+    use crate::vocabulary::LocalVocabulary;
 
     const EX: &str = "http://example.com/";
 

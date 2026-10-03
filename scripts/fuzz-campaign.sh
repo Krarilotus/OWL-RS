@@ -24,7 +24,7 @@ targets=(
   "nrese-shacl:it:incremental_tests::"
   "nrese-engine:it:inferred_stack_tests::"
   "nrese-engine:lib:index::model_tests"
-  "nrese-reasoner:lib:v2::"
+  "nrese-reasoner:lib:"
   "nrese-fuzz:it:parsers_hold"
 )
 

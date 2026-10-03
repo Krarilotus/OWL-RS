@@ -63,7 +63,7 @@ struct Args {
     qerror: bool,
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
-    reason: Option<nrese_reasoner::v2::rulesets::Ruleset>,
+    reason: Option<nrese_reasoner::rulesets::Ruleset>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -107,7 +107,7 @@ fn parse_args() -> Result<Args, String> {
             "--reason" => {
                 let name = value()?;
                 args.reason = Some(
-                    nrese_reasoner::v2::rulesets::Ruleset::from_name(&name)
+                    nrese_reasoner::rulesets::Ruleset::from_name(&name)
                         .ok_or(format!("--reason: unknown ruleset {name}"))?,
                 );
             }

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::support::{assert_inferred_triple, inferred_statements};
-use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::rulesets::Ruleset;
 use nrese_store::{StoreConfig, StoreService};
 
 fn minimal_fixture_path() -> PathBuf {

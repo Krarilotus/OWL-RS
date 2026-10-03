@@ -4,7 +4,7 @@ appended to CASES/results.tsv, so that `ore.py compare` sets them beside the ref
 
     python nrese.py el CASES [--binary target/release/examples/classify]
 
-- `el`: the OWL 2 EL classifier (crates/nrese-reasoner/src/v2/classify.rs), on the EL
+- `el`: the OWL 2 EL classifier (crates/nrese-reasoner/src/classify.rs), on the EL
   track's tasks. It reads N-Triples: the runner's `ntriples` task converts each ontology
   first (`CASES/tax/ID.nt`, made here through the image when missing). The closure it
   writes becomes the canonical taxonomy with the signature of a reference run

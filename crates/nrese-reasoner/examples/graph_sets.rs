@@ -8,12 +8,12 @@
 use std::io::BufRead;
 use std::time::Instant;
 
-use nrese_reasoner::v2::batch::{self, Schema};
-use nrese_reasoner::v2::delta::{MemoryBase, Rules, program};
-use nrese_reasoner::v2::ir::Triple;
-use nrese_reasoner::v2::lists::ListVocabulary;
-use nrese_reasoner::v2::rulesets::Ruleset;
-use nrese_reasoner::v2::vocabulary::LocalVocabulary;
+use nrese_reasoner::batch::{self, Schema};
+use nrese_reasoner::delta::{MemoryBase, Rules, program};
+use nrese_reasoner::ir::Triple;
+use nrese_reasoner::lists::ListVocabulary;
+use nrese_reasoner::rulesets::Ruleset;
+use nrese_reasoner::vocabulary::LocalVocabulary;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut graphs, mut cap, mut inputs) = (8u32, 4usize, Vec::new());
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let started = Instant::now();
-    let sets = nrese_reasoner::v2::graph_sets::support_sets(&all, &ground, &[], &graph_of, cap);
+    let sets = nrese_reasoner::graph_sets::support_sets(&all, &ground, &[], &graph_of, cap);
     let elapsed = started.elapsed();
     let per_fact: usize = inferred
         .iter()

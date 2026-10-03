@@ -480,7 +480,7 @@ fn term(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::vocabulary::LocalVocabulary;
+    use crate::vocabulary::LocalVocabulary;
 
     #[test]
     fn errors_name_the_line_of_their_rule() {

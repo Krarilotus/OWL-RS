@@ -1,4 +1,4 @@
-use nrese_core::{CapabilityMaturity, ReasonerCapability, ReasonerFeature};
+use crate::capability::{CapabilityMaturity, ReasonerCapability, ReasonerFeature};
 
 use crate::config::{ReasonerConfig, ReasoningMode};
 
@@ -73,7 +73,7 @@ pub const fn mode_name(mode: ReasoningMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use nrese_core::ReasonerFeature;
+    use crate::capability::ReasonerFeature;
 
     use super::profile_for_mode;
     use crate::config::ReasoningMode;
