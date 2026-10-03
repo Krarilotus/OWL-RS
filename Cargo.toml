@@ -8,6 +8,7 @@ members = [
     "crates/nrese-sparql-reference",
     "crates/nrese-shacl",
     "crates/nrese-store",
+    "crates/nrese-vector",
     "crates/nrese-reasoner",
     "crates/nrese-server",
     "crates/rdf/nrese-json",

@@ -1359,6 +1359,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-vector"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "rayon",
+]
+
+[[package]]
 name = "nrese-xsd"
 version = "0.1.0"
 dependencies = [
