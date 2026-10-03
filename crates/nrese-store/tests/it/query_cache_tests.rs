@@ -46,9 +46,29 @@ fn repeated_queries_hit_until_the_next_commit() {
 #[test]
 fn volatile_queries_and_a_zero_budget_are_not_cached() {
     let store = store(1 << 20);
-    answer(&store, "SELECT (RAND() AS ?r) WHERE {}");
-    answer(&store, "SELECT (RAND() AS ?r) WHERE {}");
-    assert_eq!(store.query_cache_stats().entries, 0);
+    // Decided on the parsed query: a space before the bracket or lower case doesn't hide
+    // the call (the review of 3 October 2026, C2).
+    for query in [
+        "SELECT (RAND() AS ?r) WHERE {}",
+        "SELECT (RAND () AS ?r) WHERE {}",
+        "SELECT (UUID () AS ?value) WHERE {}",
+        "SELECT ?v WHERE { BIND(struuid  () AS ?v) }",
+        "SELECT ?v WHERE { BIND(BNODE ( ) AS ?v) }",
+        "SELECT ?v WHERE { ?s ?p ?o } ORDER BY NOW ()",
+    ] {
+        let first = answer(&store, query);
+        answer(&store, query);
+        assert_eq!(
+            store.query_cache_stats().entries,
+            0,
+            "{query} was cached: {first}"
+        );
+    }
+    // And the names in a string or an IRI don't make a query volatile.
+    let named = "SELECT ?o WHERE { <http://example.com/SERVICE> ?p ?o FILTER(?o != \"RAND()\") }";
+    answer(&store, named);
+    answer(&store, named);
+    assert_eq!(store.query_cache_stats().entries, 1);
 
     let off = self::store(0);
     answer(&off, QUERY);

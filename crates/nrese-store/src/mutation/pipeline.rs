@@ -117,16 +117,25 @@ impl MutationPipeline {
         if ticket.is_cancelled() {
             return Err(MutationError::Cancelled);
         }
+        if self.is_retired() {
+            return Err(MutationError::Retired);
+        }
 
         // Reasoner v2 maintains the inferred stack from a correct one: materialise it first
-        // if nothing records that it is current (a fresh or preloaded store).
+        // if nothing records that it is current (a fresh or preloaded store). A retired
+        // pipeline must not: its rules are no longer the store's, and the store's closure
+        // belongs to the pipeline that took over. Retirement is part of the stop condition,
+        // which the rematerialisation checks a last time under the writer slot before it
+        // commits, so retiring during this preflight changes nothing either.
         if let Some(rules) = self.reasoner.config().materialised_program()
             && !self.store.reasoning_is_current(&rules)
         {
-            // The request's cancellation stops it; the store stays as it was.
-            let stop = || ticket.is_cancelled();
+            let stop = || ticket.is_cancelled() || self.is_retired();
             match self.store.rematerialise_until(&rules, &stop) {
                 Ok(_) => {}
+                Err(StoreError::MaterialisationCancelled) if self.is_retired() => {
+                    return Err(MutationError::Retired);
+                }
                 Err(StoreError::MaterialisationCancelled) => return Err(MutationError::Cancelled),
                 Err(error) => return Err(store_error(error)),
             }

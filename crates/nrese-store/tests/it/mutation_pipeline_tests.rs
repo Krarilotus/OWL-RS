@@ -1017,6 +1017,61 @@ fn materialisation_by_representatives_equals_replication() {
     assert_eq!(everything(true), replicated);
 }
 
+/// A retired pipeline changes nothing, its preflight included: after the new pipeline
+/// (OWL 2 RL) has established its closure, a write through the old handle (RDFS) is
+/// refused without first rematerialising the store with the old rules. Before, it did:
+/// the inverse property's inference disappeared and the store recorded RDFS
+/// (independent review of 3 October 2026, C1).
+#[test]
+fn a_retired_pipeline_leaves_the_new_closure_alone() {
+    let store = Arc::new(StoreService::new(in_memory_store_config()).unwrap());
+    let config = |mode| ReasonerConfig::for_mode(mode);
+    let old = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(config(ReasoningMode::Rdfs))),
+    );
+    let update = |pipeline: &MutationPipeline, text: &str| {
+        pipeline.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(text)),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+    };
+    update(
+        &old,
+        "INSERT DATA { <urn:p> <http://www.w3.org/2002/07/owl#inverseOf> <urn:q> . <urn:a> <urn:p> <urn:b> }",
+    )
+    .unwrap();
+    let new = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(config(ReasoningMode::Owl2Rl))),
+    );
+    old.retire();
+    update(&new, "INSERT DATA { <urn:c> <urn:p> <urn:d> }").unwrap();
+    let owl = config(ReasoningMode::Owl2Rl)
+        .materialised_program()
+        .unwrap();
+    let inferred = || {
+        store
+            .count(
+                &nrese_store::ReadContext::all(),
+                &nrese_store::StatementPattern::default(),
+            )
+            .unwrap()
+    };
+    let before = inferred();
+    assert!(store.reasoning_is_current(&owl));
+    assert!(matches!(
+        update(&old, "INSERT DATA { <urn:e> <urn:p> <urn:f> }"),
+        Err(nrese_store::MutationError::Retired)
+    ));
+    assert!(
+        store.reasoning_is_current(&owl),
+        "the old rules took over the store"
+    );
+    assert_eq!(inferred(), before, "the closure changed");
+}
+
 /// A pipeline another one took over (a repository's reasoning changed) refuses writes, so
 /// none applies its rules to an inferred stack made for others; the new one writes on.
 #[test]
