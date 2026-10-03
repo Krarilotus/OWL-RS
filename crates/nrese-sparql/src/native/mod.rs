@@ -142,8 +142,8 @@ pub(crate) fn evaluate<'a>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
-    let (pattern, form, _) = native_pattern(query, options)?;
     let ctx = Context::new(&snapshot, options, query_dataset(query), query_base(query));
+    let (pattern, form, _) = native_pattern(query, options, &ctx)?;
     let pattern = match &options.pre_bound {
         Some(values) => {
             // A blank node is put in as an alias IRI that stands for the node.
@@ -197,8 +197,8 @@ pub(crate) fn explain(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<(Vec<&'static str>, Vec<PlanStep>, u64), QueryEvaluationError> {
-    let (pattern, form, rewrites) = native_pattern(query, options)?;
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let (pattern, form, rewrites) = native_pattern(query, options, &ctx)?;
     ctx.trace = Some(RefCell::default());
     let solutions = ctx.eval(&pattern)?;
     let steps = ctx.trace.take().unwrap_or_default().into_inner();
@@ -220,8 +220,8 @@ pub(crate) fn plan(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<(Vec<&'static str>, Vec<crate::query::PlannedStep>), QueryEvaluationError> {
-    let (pattern, _, rewrites) = native_pattern(query, options)?;
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let (pattern, _, rewrites) = native_pattern(query, options, &ctx)?;
     let mut steps = Vec::new();
     ctx.estimate_plan(&crate::plan::Plan::of(&pattern), 0, &mut steps);
     Ok((rewrites, steps))
@@ -240,7 +240,8 @@ pub(crate) fn write_results(
     version: Option<&'static str>,
     out: &mut dyn std::io::Write,
 ) -> Option<Result<(), crate::query::WriteResultsError>> {
-    let (pattern, form, _) = match native_pattern(query, options) {
+    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let (pattern, form, _) = match native_pattern(query, options, &ctx) {
         Ok(native) => native,
         Err(error) => return Some(Err(error.into())),
     };
@@ -317,8 +318,8 @@ pub(crate) fn delete_insert(
     if let Some(what) = unsupported_part(pattern) {
         return Err(QueryEvaluationError::Unsupported(what));
     }
-    let pattern = optimise(pattern.clone(), &mut Vec::new());
     let ctx = Context::new(snapshot, options, using, base);
+    let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
     let solutions = ctx.eval(&pattern)?;
     let computed = ctx.computed.into_inner();
     let table = &solutions.table;
@@ -396,6 +397,7 @@ enum Form<'q> {
 fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
+    ctx: &Context<'_>,
 ) -> Result<(GraphPattern, Form<'q>, Vec<&'static str>), QueryEvaluationError> {
     let (pattern, form) = match query {
         Query::Select { pattern, .. } => (pattern, Form::Select),
@@ -427,7 +429,7 @@ fn native_pattern<'q>(
     let pattern = if options.as_written {
         pattern.clone()
     } else {
-        optimise(pattern.clone(), &mut rewrites)
+        optimise(pattern.clone(), &mut rewrites, ctx)
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
@@ -453,12 +455,18 @@ fn native_pattern<'q>(
 ///   before the join ([`crate::plan::Plan::eager_aggregation`]).
 /// - `filter-pushdown`: each filter moves to the smallest sub-pattern that binds its
 ///   variables ([`pushdown`]).
-fn optimise(pattern: GraphPattern, fired: &mut Vec<&'static str>) -> GraphPattern {
-    type Pass = fn(&GraphPattern) -> GraphPattern;
-    let passes: [(&'static str, Pass); 3] = [
-        ("join-groups", crate::plan::rewrite),
-        ("eager-aggregation", crate::plan::eager_aggregation),
-        ("filter-pushdown", |pattern| {
+fn optimise(
+    pattern: GraphPattern,
+    fired: &mut Vec<&'static str>,
+    ctx: &Context<'_>,
+) -> GraphPattern {
+    let pays = |side: &crate::plan::Plan, keys: &[Variable]| ctx.pre_aggregation_pays(side, keys);
+    let eager = |pattern: &GraphPattern| crate::plan::eager_aggregation_where(pattern, &pays);
+    type Pass<'p> = &'p dyn Fn(&GraphPattern) -> GraphPattern;
+    let passes: [(&'static str, Pass<'_>); 3] = [
+        ("join-groups", &crate::plan::rewrite),
+        ("eager-aggregation", &eager),
+        ("filter-pushdown", &|pattern| {
             pushdown::push_filters(pattern.clone())
         }),
     ];

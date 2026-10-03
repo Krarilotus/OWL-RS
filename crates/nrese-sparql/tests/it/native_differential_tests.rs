@@ -5557,6 +5557,62 @@ fn chains_are_estimated_from_characteristic_pairs() {
 /// feature are made from per-product partial results, never from a row per feature and
 /// offer; the answers equal the reference evaluator's, also when a sum fails for one
 /// product (a non-numeric price) and for a group the rewrite doesn't apply to (AVG).
+/// The early group must pay for itself: with one offer per product (the shape of DBpedia's
+/// career stations, one goal count each), aggregating the offers by product first reduces
+/// nothing, and the plan stays as written (dbpedia-core q12 got 3× slower without the
+/// statistics' say, 3 October 2026). The answers are the same either way.
+#[test]
+fn groups_over_joins_stay_where_the_early_group_reduces_nothing() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let add = |tx: &mut nrese_engine::Transaction, s: String, p: &str, o: Term| {
+        tx.insert(Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph).as_ref());
+    };
+    for product in 0..60 {
+        add(
+            &mut tx,
+            format!("product{product}"),
+            "team",
+            ex(&format!("t{}", product % 9)).into(),
+        );
+        add(
+            &mut tx,
+            format!("offer{product}"),
+            "product",
+            ex(&format!("product{product}")).into(),
+        );
+        add(
+            &mut tx,
+            format!("offer{product}"),
+            "price",
+            Literal::new_typed_literal(format!("{product}"), xsd::INTEGER).into(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let oracle = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    let text = format!(
+        "PREFIX : <{EX}> SELECT ?team (SUM(?price) AS ?total) WHERE {{ ?product :team ?team . ?offer :product ?product ; :price ?price }} GROUP BY ?team"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    assert!(
+        !explained.rewrites.contains(&"eager-aggregation"),
+        "{:?}",
+        explained.rewrites
+    );
+    let native = rows(
+        evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
+    assert_eq!(native, expected);
+    assert_eq!(native.len(), 9);
+}
+
 #[test]
 fn groups_over_joins_aggregate_before_joining() {
     let engine = Engine::new(EngineConfig::default()).unwrap();

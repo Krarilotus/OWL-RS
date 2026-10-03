@@ -28,6 +28,42 @@ use crate::plan::Plan;
 use crate::query::PlannedStep;
 
 impl Context<'_> {
+    /// Whether grouping `side` by `keys` before it is joined reduces it enough to pay for
+    /// the extra group ([`crate::plan::Plan::eager_aggregation_where`]): its estimated rows
+    /// at least twice the distinct key values (each key's fewest distinct values over
+    /// the side's triple patterns, the keys taken as independent). Unknown estimates leave
+    /// the plan as written.
+    pub(super) fn pre_aggregation_pays(&self, side: &Plan, keys: &[Variable]) -> bool {
+        let Some(rows) = self.estimate_plan(side, 0, &mut Vec::new()) else {
+            return false;
+        };
+        let Plan::Join(inputs) = side else {
+            return false;
+        };
+        let mut groups = 1.0f64;
+        for key in keys {
+            let distinct = inputs
+                .iter()
+                .filter_map(|input| match input {
+                    Plan::Scan(triple) => Some(triple),
+                    _ => None,
+                })
+                .filter_map(|triple| {
+                    let scan = self.scan_pattern(triple)?;
+                    scan.vars().contains(key).then(|| {
+                        let count = self.snapshot.estimate_in(self.model, &scan.quad_pattern());
+                        self.distinct(&scan, key, count) as f64
+                    })
+                })
+                .fold(f64::INFINITY, f64::min);
+            if !distinct.is_finite() {
+                return false;
+            }
+            groups *= distinct.max(1.0);
+        }
+        rows >= 2.0 * groups.min(rows)
+    }
+
     /// Appends `plan`'s nodes to `steps` (depth first, a node before its inputs) with their
     /// estimated rows; returns the estimate of `plan` (`None`: unknown).
     pub(super) fn estimate_plan(
