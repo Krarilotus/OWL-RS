@@ -24,6 +24,8 @@
 //! restrictions, complements, cardinalities, inverses, nominals) are skipped and
 //! counted: the hierarchy is then complete for the EL part only.
 
+use std::time::{Duration, Instant};
+
 use hashbrown::{HashMap, HashSet};
 
 use super::ir::{OWL, RDF, RDFS, Vocabulary};
@@ -43,6 +45,33 @@ pub struct Classification {
     pub top: Vec<u64>,
     /// Axioms (by their predicate or class-expression kind) outside EL, skipped.
     pub skipped: Vec<(u64, &'static str)>,
+}
+
+/// Where a classification spent its time and what it did, for the DL lab
+/// (docs/design/owl2-dl-performance.md §5): kept apart from [`Classification`] so equal
+/// results compare equal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Profile {
+    /// Reading the triples into the normalised TBox.
+    pub normalise: Duration,
+    /// The role closure, chain indexes and ranges.
+    pub prepare: Duration,
+    pub saturate: Duration,
+    /// The result from the subsumer sets.
+    pub assemble: Duration,
+    /// Concepts of the normalised TBox (named and fresh).
+    pub concepts: usize,
+    /// Contexts saturated (concepts some rule reached).
+    pub contexts: usize,
+    /// Subsumers derived, summed over the contexts.
+    pub subsumers: usize,
+    /// Distinct links `C →r D`.
+    pub links: usize,
+    /// Conclusions processed (subsumers and links, duplicates included) ...
+    pub conclusions: u64,
+    /// ... of which were already known.
+    pub duplicates: u64,
+    pub threads: usize,
 }
 
 struct Names {
@@ -326,8 +355,7 @@ pub fn classify(
     vocabulary: &mut impl Vocabulary,
     named: &dyn Fn(u64) -> bool,
 ) -> Classification {
-    let (mut tbox, thing, nothing, skipped) = build(triples, vocabulary, named);
-    saturate(&mut tbox, thing, nothing, skipped)
+    classify_profiled(triples, vocabulary, named, 1).0
 }
 
 /// Like [`classify`], saturating on `threads` workers (ELK's scheme, *The Incredible ELK*,
@@ -342,11 +370,30 @@ pub fn classify_parallel(
     named: &dyn Fn(u64) -> bool,
     threads: usize,
 ) -> Classification {
-    if threads <= 1 {
-        return classify(triples, vocabulary, named);
-    }
+    classify_profiled(triples, vocabulary, named, threads).0
+}
+
+/// [`classify_parallel`] with its [`Profile`]: the phases' times and the counters.
+pub fn classify_profiled(
+    triples: &[Triple],
+    vocabulary: &mut impl Vocabulary,
+    named: &dyn Fn(u64) -> bool,
+    threads: usize,
+) -> (Classification, Profile) {
+    let started = Instant::now();
     let (mut tbox, thing, nothing, skipped) = build(triples, vocabulary, named);
-    parallel::saturate(&mut tbox, thing, nothing, skipped, threads)
+    let mut profile = Profile {
+        normalise: started.elapsed(),
+        concepts: tbox.named.len(),
+        threads: threads.max(1),
+        ..Profile::default()
+    };
+    let result = if threads <= 1 {
+        saturate(&mut tbox, thing, nothing, skipped, &mut profile)
+    } else {
+        parallel::saturate(&mut tbox, thing, nothing, skipped, threads, &mut profile)
+    };
+    (result, profile)
 }
 
 type Built = (Tbox, Concept, Concept, Vec<(u64, &'static str)>);
@@ -578,7 +625,9 @@ mod parallel {
 
     use hashbrown::HashSet;
 
-    use super::{Classification, Concept, Prepared, Role, Tbox, assemble, prepare};
+    use std::time::Instant;
+
+    use super::{Classification, Concept, Prepared, Profile, Role, Tbox, assemble, prepare};
 
     enum Message {
         /// A subsumer of the context's concept.
@@ -596,6 +645,9 @@ mod parallel {
         pred_seen: HashSet<(Concept, Role)>,
         succ: Vec<(Role, Concept)>,
         succ_seen: HashSet<(Role, Concept)>,
+        /// Messages handled, and how many repeated what the context knew ([`Profile`]).
+        handled: u64,
+        repeated: u64,
     }
 
     #[derive(Default)]
@@ -628,8 +680,12 @@ mod parallel {
         nothing: Concept,
         skipped: Vec<(u64, &'static str)>,
         threads: usize,
+        profile: &mut Profile,
     ) -> Classification {
+        let started = Instant::now();
         let prepared = prepare(tbox);
+        profile.prepare = started.elapsed();
+        let started = Instant::now();
         let n = tbox.named.len();
         let saturation = Saturation {
             tbox,
@@ -656,17 +712,29 @@ mod parallel {
             Ok(pool) => pool.install(run),
             Err(_) => run(),
         }
+        let initialised = saturation
+            .contexts
+            .iter()
+            .filter(|c| c.initialised.load(SeqCst))
+            .count();
         let subsumers: Vec<HashSet<Concept>> = saturation
             .contexts
             .into_iter()
             .map(|c| {
-                c.state
-                    .into_inner()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .subsumers
+                let state = c.state.into_inner().unwrap_or_else(|p| p.into_inner());
+                profile.links += state.succ.len();
+                profile.conclusions += state.handled;
+                profile.duplicates += state.repeated;
+                state.subsumers
             })
             .collect();
-        assemble(tbox, &subsumers, thing, nothing, skipped)
+        profile.saturate = started.elapsed();
+        profile.contexts = initialised;
+        profile.subsumers = subsumers.iter().map(HashSet::len).sum();
+        let started = Instant::now();
+        let result = assemble(tbox, &subsumers, thing, nothing, skipped);
+        profile.assemble = started.elapsed();
+        result
     }
 
     /// The context a worker is saturating, and the messages it sends itself: those are
@@ -751,9 +819,11 @@ mod parallel {
             message: Message,
         ) {
             let (tbox, p, c) = (self.tbox, &self.prepared, own.context);
+            state.handled += 1;
             match message {
                 Message::Sub(d) => {
                     if !state.subsumers.insert(d) {
+                        state.repeated += 1;
                         return;
                     }
                     for &e in &tbox.told[d as usize] {
@@ -780,6 +850,7 @@ mod parallel {
                 }
                 Message::Backward(from, r) => {
                     if !state.pred_seen.insert((from, r)) {
+                        state.repeated += 1;
                         return;
                     }
                     state.pred.push((from, r));
@@ -806,6 +877,7 @@ mod parallel {
                 }
                 Message::Forward(r, to) => {
                     if !state.succ_seen.insert((r, to)) {
+                        state.repeated += 1;
                         return;
                     }
                     state.succ.push((r, to));
@@ -830,12 +902,17 @@ fn saturate(
     thing: Concept,
     nothing: Concept,
     skipped: Vec<(u64, &'static str)>,
+    profile: &mut Profile,
 ) -> Classification {
+    let started = Instant::now();
     let Prepared {
         supers,
         chains_first,
         chains_second,
     } = prepare(tbox);
+    profile.prepare = started.elapsed();
+    let started = Instant::now();
+    let (mut conclusions, mut duplicates) = (0u64, 0u64);
     let n = tbox.named.len();
     let mut subsumers: Vec<HashSet<Concept>> = vec![HashSet::new(); n];
     let mut succ: Vec<Vec<(Role, Concept)>> = vec![Vec::new(); n];
@@ -860,9 +937,11 @@ fn saturate(
         }
     }
     while let Some(item) = todo.pop() {
+        conclusions += 1;
         match item {
             Item::Sub(c, d) => {
                 if !subsumers[c as usize].insert(d) {
+                    duplicates += 1;
                     continue;
                 }
                 for &e in &tbox.told[d as usize] {
@@ -889,6 +968,7 @@ fn saturate(
             }
             Item::Link(c, r, d) => {
                 if !links.insert((c, r, d)) {
+                    duplicates += 1;
                     continue;
                 }
                 init(d, &mut initialised, &mut todo);
@@ -927,7 +1007,16 @@ fn saturate(
             }
         }
     }
-    assemble(tbox, &subsumers, thing, nothing, skipped)
+    profile.saturate = started.elapsed();
+    profile.contexts = initialised.iter().filter(|&&i| i).count();
+    profile.subsumers = subsumers.iter().map(HashSet::len).sum();
+    profile.links = links.len();
+    profile.conclusions = conclusions;
+    profile.duplicates = duplicates;
+    let started = Instant::now();
+    let result = assemble(tbox, &subsumers, thing, nothing, skipped);
+    profile.assemble = started.elapsed();
+    result
 }
 
 #[cfg(test)]

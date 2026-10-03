@@ -11,13 +11,15 @@
 //! Writes one `sub<TAB>super` line per subsumption between named classes (IRIs without
 //! brackets, sorted), `sub<TAB>owl:Nothing` for unsatisfiable classes,
 //! `owl:Thing<TAB>super` for classes equivalent to `owl:Thing`, and prints the time and
-//! what was skipped.
+//! what was skipped, then, as its last line, the profile (`nrese_reasoner::classify::Profile`)
+//! as `name=value` pairs: the phases in milliseconds (reading and writing included) and the
+//! counters, which the DL lab records (`benches/reasoning/dl/nrese.py`).
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufWriter, Write};
 use std::time::Instant;
 
-use nrese_reasoner::classify::classify_parallel;
+use nrese_reasoner::classify::classify_profiled;
 use nrese_reasoner::vocabulary::LocalVocabulary;
 
 fn split(line: &str) -> Option<[&str; 3]> {
@@ -62,13 +64,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load = started.elapsed();
     let started = Instant::now();
     let names = vocabulary.clone();
-    let result = classify_parallel(
+    let (result, profile) = classify_profiled(
         &triples,
         &mut vocabulary,
         &|id| names.text(id).starts_with('<'),
         threads,
     );
     let elapsed = started.elapsed();
+    let started = Instant::now();
     let text = |id: u64| vocabulary.text(id).trim_matches(['<', '>']).to_owned();
     let mut file = BufWriter::new(std::fs::File::create(&out)?);
     for &(sub, sup) in &result.subsumptions {
@@ -81,6 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writeln!(file, "owl:Thing\t{}", text(class))?;
     }
     file.flush()?;
+    let write = started.elapsed();
     let mut skipped: BTreeMap<&str, usize> = BTreeMap::new();
     for (_, kind) in &result.skipped {
         *skipped.entry(kind).or_default() += 1;
@@ -93,6 +97,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result.subsumptions.len(),
         result.unsatisfiable.len(),
         skipped
+    );
+    let ms = |d: std::time::Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
+    eprintln!(
+        "profile read={} normalise={} prepare={} saturate={} assemble={} write={} concepts={} contexts={} subsumers={} links={} conclusions={} duplicates={} threads={}",
+        ms(load),
+        ms(profile.normalise),
+        ms(profile.prepare),
+        ms(profile.saturate),
+        ms(profile.assemble),
+        ms(write),
+        profile.concepts,
+        profile.contexts,
+        profile.subsumers,
+        profile.links,
+        profile.conclusions,
+        profile.duplicates,
+        profile.threads
     );
     Ok(())
 }
