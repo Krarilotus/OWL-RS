@@ -82,13 +82,14 @@ struct Gci {
     source: usize,
 }
 
-/// An automaton over roles: states, the start, the end, transitions (`None`: ε).
+/// An automaton over roles: states, the start, the end, transitions (`None`: ε), each
+/// with the role-inclusion axioms it comes from (none for the role's own edge).
 #[derive(Debug, Clone)]
 struct Nfa {
     states: u32,
     start: u32,
     end: u32,
-    edges: Vec<(u32, Option<ObjProp>, u32)>,
+    edges: Vec<(u32, Option<ObjProp>, u32, Vec<usize>)>,
 }
 
 impl Nfa {
@@ -101,7 +102,7 @@ impl Nfa {
             edges: self
                 .edges
                 .iter()
-                .map(|&(a, label, b)| (b, label.map(ObjProp::inverse), a))
+                .map(|(a, label, b, axioms)| (*b, label.map(ObjProp::inverse), *a, axioms.clone()))
                 .collect(),
         }
     }
@@ -115,8 +116,9 @@ struct Normaliser<'a> {
     queue: Vec<Gci>,
     positive: HashMap<ExprId, u32>,
     negative: HashMap<ExprId, u32>,
-    /// Role inclusions `chain ⊑ named role`, normalised to a named superrole.
-    rias: Vec<(Vec<ObjProp>, Term)>,
+    /// Role inclusions `chain ⊑ named role`, normalised to a named superrole, with the
+    /// axiom each comes from.
+    rias: Vec<(Vec<ObjProp>, Term, usize)>,
     non_simple: HashSet<Term>,
     automata: HashMap<(ObjProp, Item), u32>,
     clause_index: HashMap<(Vec<BodyAtom>, Vec<HeadAtom>), usize>,
@@ -833,12 +835,18 @@ impl<'a> Normaliser<'a> {
     }
 
     fn add(&mut self, body: Vec<BodyAtom>, head: Vec<HeadAtom>, source: usize) {
-        let clause = Clause::new(body, head, source);
+        self.add_needing(body, head, vec![source]);
+    }
+
+    /// Adds the clause that `needed`'s axioms give together; a clause already there gets
+    /// `needed` as another way to it.
+    fn add_needing(&mut self, body: Vec<BodyAtom>, head: Vec<HeadAtom>, needed: Vec<usize>) {
+        let clause = Clause::new(body, head, needed.clone());
         let key = (clause.body.clone(), clause.head.clone());
         if let Some(&at) = self.clause_index.get(&key) {
             let sources = &mut self.out.clauses[at].sources;
-            if !sources.contains(&source) {
-                sources.push(source);
+            if !sources.contains(&needed) {
+                sources.push(needed);
             }
             return;
         }
@@ -851,50 +859,50 @@ impl<'a> Normaliser<'a> {
     /// The role inclusions of the RBox, each over a named superrole, and the non-simple
     /// roles.
     fn role_inclusions(&mut self) {
-        let mut rias: Vec<(Vec<ObjProp>, ObjProp)> = Vec::new();
-        for axiom in &self.ontology.axioms {
+        let mut rias: Vec<(Vec<ObjProp>, ObjProp, usize)> = Vec::new();
+        for (index, axiom) in self.ontology.axioms.iter().enumerate() {
             match axiom {
-                Axiom::SubObjectPropertyOf(chain, sup) => rias.push((chain.clone(), *sup)),
+                Axiom::SubObjectPropertyOf(chain, sup) => rias.push((chain.clone(), *sup, index)),
                 Axiom::EquivalentObjectProperties(ps) => {
                     for &a in ps {
                         for &b in ps {
                             if a != b {
-                                rias.push((vec![a], b));
+                                rias.push((vec![a], b, index));
                             }
                         }
                     }
                 }
                 Axiom::InverseObjectProperties(a, b) => {
-                    rias.push((vec![*a], b.inverse()));
-                    rias.push((vec![*b], a.inverse()));
+                    rias.push((vec![*a], b.inverse(), index));
+                    rias.push((vec![*b], a.inverse(), index));
                 }
                 Axiom::ObjectCharacteristic(Characteristic::Symmetric, r) => {
-                    rias.push((vec![r.inverse()], *r));
+                    rias.push((vec![r.inverse()], *r, index));
                 }
                 Axiom::ObjectCharacteristic(Characteristic::Transitive, r) => {
-                    rias.push((vec![*r, *r], *r));
+                    rias.push((vec![*r, *r], *r, index));
                 }
                 _ => {}
             }
         }
         // Over a named superrole: w ⊑ R⁻ is w⁻ reversed ⊑ R.
-        for (chain, sup) in rias {
+        for (chain, sup, index) in rias {
             let (chain, named) = match sup {
                 ObjProp::Named(p) => (chain, p),
                 ObjProp::Inverse(p) => (chain.iter().rev().map(|r| r.inverse()).collect(), p),
             };
-            self.rias.push((chain, named));
+            self.rias.push((chain, named, index));
         }
         // Non-simple: the superroles of chains and transitive roles, up the hierarchy.
         let mut seeds: Vec<Term> = self
             .rias
             .iter()
-            .filter(|(chain, _)| chain.len() > 1)
-            .map(|&(_, sup)| sup)
+            .filter(|(chain, ..)| chain.len() > 1)
+            .map(|&(_, sup, _)| sup)
             .collect();
         while let Some(role) = seeds.pop() {
             if self.non_simple.insert(role) {
-                for (chain, sup) in &self.rias {
+                for (chain, sup, _) in &self.rias {
                     if chain.len() == 1 && chain[0].named() == role {
                         seeds.push(*sup);
                     }
@@ -915,9 +923,10 @@ impl<'a> Normaliser<'a> {
             states: 2,
             start: 0,
             end: 1,
-            edges: vec![(0, Some(r), 1)],
+            edges: vec![(0, Some(r), 1, Vec::new())],
         };
-        let path = |nfa: &mut Nfa, from: u32, labels: &[ObjProp], to: u32| {
+        // A path for the role inclusion `axiom`: each of its edges needs that axiom.
+        let path = |nfa: &mut Nfa, from: u32, labels: &[ObjProp], to: u32, axiom: usize| {
             let mut at = from;
             for (i, &label) in labels.iter().enumerate() {
                 let next = if i + 1 == labels.len() {
@@ -926,30 +935,30 @@ impl<'a> Normaliser<'a> {
                     nfa.states += 1;
                     nfa.states - 1
                 };
-                nfa.edges.push((at, Some(label), next));
+                nfa.edges.push((at, Some(label), next, vec![axiom]));
                 at = next;
             }
             if labels.is_empty() {
-                nfa.edges.push((from, None, to));
+                nfa.edges.push((from, None, to, vec![axiom]));
             }
         };
-        for (chain, sup) in &self.rias {
-            if *sup != role || chain[..] == [r] {
+        for &(ref chain, sup, axiom) in &self.rias {
+            if sup != role || chain[..] == [r] {
                 continue;
             }
             if chain[..] == [r, r] {
-                nfa.edges.push((1, None, 0));
+                nfa.edges.push((1, None, 0, vec![axiom]));
             } else if chain.len() > 1 && chain[0] == r {
-                path(&mut nfa, 1, &chain[1..], 1);
+                path(&mut nfa, 1, &chain[1..], 1, axiom);
             } else if chain.len() > 1 && chain[chain.len() - 1] == r {
-                path(&mut nfa, 0, &chain[..chain.len() - 1], 0);
+                path(&mut nfa, 0, &chain[..chain.len() - 1], 0, axiom);
             } else {
-                path(&mut nfa, 0, chain, 1);
+                path(&mut nfa, 0, chain, 1, axiom);
             }
         }
         // Splice in the automata of the other non-simple roles on the edges.
         let edges = std::mem::take(&mut nfa.edges);
-        for (a, label, b) in edges {
+        for (a, label, b, axioms) in edges {
             match label {
                 Some(s) if s.named() != role && self.non_simple.contains(&s.named()) => {
                     let inner = self.nfa(s.named(), stack)?;
@@ -959,13 +968,19 @@ impl<'a> Normaliser<'a> {
                     };
                     let offset = nfa.states;
                     nfa.states += inner.states;
-                    nfa.edges.push((a, None, inner.start + offset));
-                    nfa.edges.push((inner.end + offset, None, b));
-                    for (p, l, q) in inner.edges {
-                        nfa.edges.push((p + offset, l, q + offset));
+                    // The spliced automaton stands for the edge: it needs the edge's axioms,
+                    // and its own edges theirs too.
+                    nfa.edges
+                        .push((a, None, inner.start + offset, axioms.clone()));
+                    nfa.edges
+                        .push((inner.end + offset, None, b, axioms.clone()));
+                    for (p, l, q, inner_axioms) in inner.edges {
+                        let mut needed = axioms.clone();
+                        needed.extend(inner_axioms);
+                        nfa.edges.push((p + offset, l, q + offset, needed));
                     }
                 }
-                _ => nfa.edges.push((a, label, b)),
+                _ => nfa.edges.push((a, label, b, axioms)),
             }
         }
         stack.pop();
@@ -996,20 +1011,27 @@ impl<'a> Normaliser<'a> {
         self.automata
             .insert((role, filler), names[nfa.start as usize]);
         let state = |s: u32| Concept::Fresh(names[s as usize]);
-        for &(a, label, b) in &nfa.edges {
+        // A transition needs the universal and the role inclusions of its edge together
+        // (justifications through a role hierarchy or chain name them: found by the
+        // context core's proof test, 3 October 2026).
+        for (a, label, b, axioms) in &nfa.edges {
+            let mut needed = vec![source];
+            needed.extend(axioms);
+            needed.sort_unstable();
+            needed.dedup();
             match label {
-                Some(edge) => self.add(
+                Some(edge) => self.add_needing(
                     vec![
-                        BodyAtom::Concept(state(a), Var::X),
-                        Self::edge(edge, Var::X, Var::Y(0)),
+                        BodyAtom::Concept(state(*a), Var::X),
+                        Self::edge(*edge, Var::X, Var::Y(0)),
                     ],
-                    vec![HeadAtom::Concept(state(b), Var::Y(0))],
-                    source,
+                    vec![HeadAtom::Concept(state(*b), Var::Y(0))],
+                    needed,
                 ),
-                None => self.add(
-                    vec![BodyAtom::Concept(state(a), Var::X)],
-                    vec![HeadAtom::Concept(state(b), Var::X)],
-                    source,
+                None => self.add_needing(
+                    vec![BodyAtom::Concept(state(*a), Var::X)],
+                    vec![HeadAtom::Concept(state(*b), Var::X)],
+                    needed,
                 ),
             }
         }
