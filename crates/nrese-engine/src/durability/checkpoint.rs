@@ -47,6 +47,8 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use super::codec::{Reader, put_u32, put_u64};
 use crate::engine::{Snapshot, Stack};
 use crate::error::{EngineError, EngineResult};
@@ -185,30 +187,78 @@ fn write_dictionary<W: Write>(
     let chunks = || {
         (0..len.div_ceil(KEY_CHUNK)).map(move |c| (c * KEY_CHUNK, ((c + 1) * KEY_CHUNK).min(len)))
     };
-    // The key lengths and the hash table, in one pass.
+    let started = std::time::Instant::now();
+    // The key lengths and the hash table. Each key is read once, on every core, for its
+    // stored length and its home slot; the table is then filled in slot order, each entry
+    // at the first free slot from its home (what linear probing finds), in one sweep over
+    // the table instead of a cache miss per entry. Lookups don't depend on the order the
+    // entries went in.
     let slot_count = base_slots(len) as usize;
     let mask = slot_count - 1;
     let mut slots = vec![0u32; slot_count];
     let mut lengths: Vec<u32> = Vec::with_capacity(len as usize);
-    // A key as stored: plain, or compressed into `stored`.
-    let mut stored = Vec::new();
-    for (from, to) in chunks() {
-        dictionary.for_each_key(from, to, |key| {
-            let mut slot = key_hash(key) as usize & mask;
-            while slots[slot] != 0 {
-                slot = (slot + 1) & mask;
+    let stored_len = |key: &[u8], stored: &mut Vec<u8>| match codec {
+        None => key.len(),
+        Some(codec) => {
+            stored.clear();
+            codec.compress(key, stored);
+            stored.len()
+        }
+    };
+    if slot_count <= 1 << 32 {
+        let ranges: Vec<(u64, u64)> = chunks().collect();
+        let parts: Vec<(Vec<u64>, Vec<u32>)> = ranges
+            .into_par_iter()
+            .map(|(from, to)| {
+                let n = (to - from) as usize;
+                let (mut homes, mut lens) = (Vec::with_capacity(n), Vec::with_capacity(n));
+                let mut stored = Vec::new();
+                dictionary.for_each_key(from, to, |key| {
+                    let home = (key_hash(key) as usize & mask) as u64;
+                    homes.push(home << 32 | (from + homes.len() as u64));
+                    lens.push(stored_len(key, &mut stored) as u32);
+                });
+                (homes, lens)
+            })
+            .collect();
+        let mut placed: Vec<u64> = Vec::with_capacity(len as usize);
+        for (homes, lens) in parts {
+            placed.extend_from_slice(&homes);
+            lengths.extend_from_slice(&lens);
+        }
+        placed.par_sort_unstable();
+        let mut next = 0usize;
+        let mut wrapped = Vec::new();
+        for entry in placed {
+            let (home, index) = ((entry >> 32) as usize, (entry & 0xffff_ffff) as u32);
+            let slot = home.max(next);
+            if slot >= slot_count {
+                // Past the end, probing wraps around to the start.
+                wrapped.push(index);
+                continue;
             }
-            let length = match codec {
-                None => key.len(),
-                Some(codec) => {
-                    stored.clear();
-                    codec.compress(key, &mut stored);
-                    stored.len()
+            slots[slot] = index + 1;
+            next = slot + 1;
+        }
+        let mut slot = 0;
+        for index in wrapped {
+            while slots[slot] != 0 {
+                slot += 1;
+            }
+            slots[slot] = index + 1;
+        }
+    } else {
+        let mut stored = Vec::new();
+        for (from, to) in chunks() {
+            dictionary.for_each_key(from, to, |key| {
+                let mut slot = key_hash(key) as usize & mask;
+                while slots[slot] != 0 {
+                    slot = (slot + 1) & mask;
                 }
-            };
-            lengths.push(length as u32);
-            slots[slot] = lengths.len() as u32;
-        });
+                lengths.push(stored_len(key, &mut stored) as u32);
+                slots[slot] = lengths.len() as u32;
+            });
+        }
     }
     if lengths.len() as u64 != len {
         return Err(EngineError::Corruption(
@@ -223,6 +273,7 @@ fn write_dictionary<W: Write>(
         )
     })?;
     drop(lengths);
+    let hashed = started.elapsed();
     put_u64(&mut out.buffer, len);
     put_u64(&mut out.buffer, arena_len);
     put_u64(&mut out.buffer, slot_count as u64);
@@ -249,13 +300,23 @@ fn write_dictionary<W: Write>(
         put_u32(&mut out.buffer, slot);
         out.drain()?;
     }
+    let written = started.elapsed();
     let order = dictionary.text_order(len);
+    let ordered = started.elapsed();
     out.pad();
     put_u64(&mut out.buffer, order.len() as u64);
     for index in order {
         put_u32(&mut out.buffer, index);
         out.drain()?;
     }
+    tracing::debug!(
+        entries = len,
+        hash_ms = hashed.as_millis() as u64,
+        keys_and_slots_ms = (written - hashed).as_millis() as u64,
+        text_order_ms = (ordered - written).as_millis() as u64,
+        order_write_ms = (started.elapsed() - ordered).as_millis() as u64,
+        "checkpoint dictionary written"
+    );
     Ok(())
 }
 
@@ -372,6 +433,10 @@ fn read_dictionary(
 
 /// Whether there is a checkpoint of `revision` (its content is that revision's: a committed
 /// revision is never reused).
+fn out_written(path: &Path) -> u64 {
+    fs::metadata(path).map_or(0, |m| m.len())
+}
+
 pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
     checkpoint_path(dir, revision, EXTENSION).exists()
 }
@@ -424,18 +489,27 @@ pub(crate) fn write_parts<'a>(
         None => 0,
     };
     put_u64(&mut out.buffer, flags);
+    // Where the time goes, for the load log (bulk loads build the permutations here).
+    let started = std::time::Instant::now();
     write_dictionary(&mut out, dictionary, dictionary_len, codec.as_ref())?;
+    let dictionary_ms = started.elapsed().as_millis() as u64;
+    let (mut build, mut write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     for (stack, layout) in Stack::ALL.into_iter().zip(layouts) {
         let permutations = layout.permutations();
         put_u32(&mut out.buffer, permutations.len() as u32);
         for &permutation in permutations {
             out.buffer.push(permutation as u8);
+            let asked = std::time::Instant::now();
             let keys = packed(stack, permutation)?;
+            build += asked.elapsed();
+            let writing = std::time::Instant::now();
             let at = out.position();
             keys.write(Some(at), &mut |piece| out.write_bytes(piece))?;
+            write += writing.elapsed();
         }
     }
     out.flush_buffer()?;
+    let syncing = std::time::Instant::now();
     let magic = MAGIC;
     let mut crc = crc32fast::Hasher::new();
     crc.update(magic);
@@ -446,11 +520,22 @@ pub(crate) fn write_parts<'a>(
     let mut file = inner.into_inner().map_err(|error| error.into_error())?;
     file.seek(std::io::SeekFrom::Start(0))?;
     file.write_all(magic)?;
+    let flushed = syncing.elapsed();
     file.sync_all()?;
     drop(file);
     let path = checkpoint_path(dir, revision, EXTENSION);
     fs::rename(&tmp, &path)?;
     super::sync_dir(dir)?;
+    tracing::debug!(
+        revision,
+        bytes = out_written(&path),
+        dictionary_ms,
+        permutations_build_ms = build.as_millis() as u64,
+        permutations_write_ms = write.as_millis() as u64,
+        flush_ms = flushed.as_millis() as u64,
+        sync_ms = (syncing.elapsed() - flushed).as_millis() as u64,
+        "checkpoint written"
+    );
     Ok(path)
 }
 

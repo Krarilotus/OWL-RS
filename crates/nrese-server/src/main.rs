@@ -142,6 +142,14 @@ async fn run() -> Result<()> {
                 );
             }
         }
+        // The planner's statistics belong to the loaded store: built here, saved beside
+        // the checkpoint, read by the server at its first query.
+        let started = std::time::Instant::now();
+        store.prepare_statistics();
+        tracing::info!(
+            ms = started.elapsed().as_millis() as u64,
+            "planner statistics prepared"
+        );
         return Ok(());
     }
     // Reasoner v2: bring the inferred stack in line with the configured rules, unless the
