@@ -6,8 +6,9 @@
 //! ```
 //!
 //! Writes one `sub<TAB>super` line per subsumption between named classes (IRIs without
-//! brackets, sorted), `sub<TAB>owl:Nothing` for unsatisfiable classes, and prints the
-//! time and what was skipped.
+//! brackets, sorted), `sub<TAB>owl:Nothing` for unsatisfiable classes,
+//! `owl:Thing<TAB>super` for classes equivalent to `owl:Thing`, and prints the time and
+//! what was skipped.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufWriter, Write};
@@ -63,6 +64,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for &class in &result.unsatisfiable {
         writeln!(file, "{}\towl:Nothing", text(class))?;
+    }
+    for &class in &result.top {
+        writeln!(file, "owl:Thing\t{}", text(class))?;
     }
     file.flush()?;
     let mut skipped: BTreeMap<&str, usize> = BTreeMap::new();
