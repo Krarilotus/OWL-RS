@@ -10,6 +10,10 @@ OWL 2 DL is in scope and is where NRESE means to lead: "the core feature catalog
 exceptional at reasoning, and the widest research field to draw from for improvements and
 clever design techniques".
 
+
+**The engineering design** (data structures, algorithms, tests and gates per component):
+[design/owl2-dl.md](../design/owl2-dl.md).
+
 ## Context
 
 What NRESE reasons with today ([reasoner v2](../design/reasoner-v2.md)):
