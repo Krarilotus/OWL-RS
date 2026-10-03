@@ -55,7 +55,8 @@ classifications, each ontology at most 5 MB, 300 s per task. Each time is a whol
 
 The records report A collected stand:
 - **Konclude on ORE 2015:**
-  - 1,862 of 1,920 classifications, 1,911 consistency checks and 591 of 624 realisations, each with a 30-minute limit and 64 GB (Lam et al. 2023);
+  - 1,862 of 1,920 classifications, 1,911 consistency checks and 591 of 624 realisations, each with a 30-minute limit and 64 GB (Lam et al. 2023; their Konclude failures came from the OWLLink adapter, which is why our runner calls KoncludeCLI directly);
+  - in the competition itself (ORE 2015 journal report, Parsia et al. 2017, Table 5, which counts wrong answers apart; the workshop's table counted them as solved): classification 288 solved and 10 wrong, realisation 247 and 14, consistency 303 and 2;
   - 698 of the 703 Oxford ontologies.
 - **ELK on SNOMED CT:** 18.6 s with one worker, 4.85 s with eight on a 2011 quad-core: a speed-up of 3.84 (*The Incredible ELK*, Table 11†).
 - **Sequoia (consequence-based SROIQ):**
@@ -65,7 +66,8 @@ The records report A collected stand:
   - LUBM(800) needs 2,692 s to get ready for query answering with one thread, 828 s with four and 439 s with eight (Table 3; corrected 3 October: the 389 s quoted earlier is UOBM(500) at four threads);
   - UOBM(500) needs 1,228 s, 389 s and 245 s;
   - the time is dominated by consistency checking.
-- **Konclude's own gaps** (SemREC 2021): it times out on classifying OWL2Bench's OWL 2 DL variants at sizes 1 and 10, while the RL, QL and EL variants take 2–20 s.
+- **Konclude's own gaps** (SemREC 2021, Table 1): it times out on classifying OWL2Bench's OWL 2 DL variants at sizes 1 and 10, while the RL, QL and EL variants take 2–20 s. In OWL2Bench's own paper (Singh et al. 2020, §4.1) only Openllet classified the DL variant, at sizes 1 and 2.
+- **The Rust field:** OxidOWL (2026), a Rust tableau reasoner, completes 51% of ORE 2015 at 180 s, and about half of its finished realisations are correct; none of the Rust DL reasoners publishes W3C DL suite results.
 
 ## 2. Where NRESE can lead, and the targets
 
@@ -207,7 +209,7 @@ permits.
 
 **Regression baselines:**
 - **Committed:** NRESE's per-ontology times, as JSON under `benches/baselines/dl/`. A package that slows a tier's sum by more than 5% (beyond noise) explains why, or doesn't merge.
-- **Publishing:** HermiT (LGPL), Konclude (LGPL), ELK (Apache) and Openllet (AGPL) results may be published; the commercial systems' may not (`benches/competitors/README.md`).
+- **Publishing:** HermiT (LGPL-3.0), Konclude 0.7 (LGPL-3.0), ELK (Apache-2.0) and Openllet (AGPL-3.0) results may be published; the commercial systems' may not (`benches/competitors/README.md`).
 
 **Profiling before optimising** (the project's rule): sampling profiles (Windows ETW on the
 main PC, `perf` on the office PC) for every tier whose sum regresses or misses its gate;

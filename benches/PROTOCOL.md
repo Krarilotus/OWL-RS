@@ -68,6 +68,13 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   - Containers that must stay up (the DMW containers on the main PC) are idle.
   - The manifest records the machine's Docker CPU and memory limits.
 
+**Claim runs on Linux** (the office PC, Draco) add what a desktop can't promise:
+- the memory limit of each system's cgroup (`memory.max`) and its peak (`memory.peak`) instead of sampled RSS;
+- the system's cores pinned (`--cpuset-cpus`), the client on others;
+- the CPU governor on `performance`, turbo as configured and recorded;
+- the page cache dropped before each cold run (`echo 3 > /proc/sys/vm/drop_caches`, sudo);
+- all of it recorded in the manifest.
+
 ## 5. Statistics
 
 - **Per query:** the median of the measured repeats within a repetition, then the median over the repetitions.
