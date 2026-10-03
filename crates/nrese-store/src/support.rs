@@ -32,7 +32,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use hashbrown::HashSet;
 use nrese_engine::quad::Permutation;
 use nrese_engine::{
-    EncodedQuad, GraphSelector, InferredSubset, QuadPattern, ReadModel, Snapshot, TermId,
+    EncodedQuad, GraphSelector, InferredMask, InferredSubset, QuadPattern, ReadModel, Snapshot,
+    TermId,
 };
 use nrese_reasoner::RuleProgram;
 use nrese_reasoner::v2::eval::{Seg, Source};
@@ -327,54 +328,44 @@ impl SupportSets {
         }
     }
 
-    /// [`Self::subset`] from the subset `earlier` of the revision these sets were updated
-    /// from, corrected for the facts that changed since: O(k + c log n) for a list of k
-    /// statements and c changed facts. `None` if these sets weren't updated from
-    /// `revision`.
-    pub fn subset_from(
+    /// For a reader with `access`, how the statements of the facts that changed since
+    /// `earlier` (the sets these were updated from, of the snapshot `before`) stand now.
+    /// `None` if these sets weren't updated from `earlier`'s revision.
+    fn changes_since(
         &self,
         snapshot: &Snapshot,
+        earlier: &SupportSets,
+        before: &Snapshot,
         access: &GraphAccess,
-        revision: u64,
-        earlier: &InferredSubset,
-    ) -> Option<InferredSubset> {
+    ) -> Option<Changes> {
         let (from, changed) = self.since.as_ref()?;
-        if *from != revision {
+        if *from != before.revision() {
             return None;
         }
-        let visible_sets = self.visible_sets(snapshot, access);
-        let (list, keep_visible) = match earlier {
-            InferredSubset::Only(list) => (list, true),
-            InferredSubset::Without(list) => (list, false),
+        let visible_now = self.visible_sets(snapshot, access);
+        let visible_before = earlier.visible_sets(before, access);
+        let mut changes = Changes {
+            changed: Arc::clone(changed),
+            ..Changes::default()
         };
-        let mut added: Vec<EncodedQuad> = changed
-            .iter()
-            .map(|&[s, p, o]| {
-                let id = TermId::from_raw;
-                EncodedQuad::new(id(s), id(p), id(o), TermId::DEFAULT_GRAPH)
-            })
-            .filter(|quad| {
-                snapshot.contains_in(ReadModel::Inferred, quad)
-                    && self.visible(triple(*quad), &visible_sets) == keep_visible
-            })
-            .collect();
-        added.sort_unstable();
-        let mut next = Vec::with_capacity(list.len() + added.len());
-        let mut added = added.into_iter().peekable();
-        for &quad in list {
-            if changed.binary_search(&triple(quad)).is_ok() {
-                continue;
+        for &fact in changed.iter() {
+            let [s, p, o] = fact.map(TermId::from_raw);
+            let quad = EncodedQuad::new(s, p, o, TermId::DEFAULT_GRAPH);
+            let hidden_before = before.contains_in(ReadModel::Inferred, &quad)
+                && !earlier.visible(fact, &visible_before);
+            let present = snapshot.contains_in(ReadModel::Inferred, &quad);
+            let visible = present && self.visible(fact, &visible_now);
+            let hidden = present && !visible;
+            if visible {
+                changes.visible.push(quad);
             }
-            while let Some(first) = added.next_if(|&first| first < quad) {
-                next.push(first);
+            match (hidden_before, hidden) {
+                (false, true) => changes.hide.push(quad),
+                (true, false) => changes.show.push(quad),
+                _ => {}
             }
-            next.push(quad);
         }
-        next.extend(added);
-        Some(match keep_visible {
-            true => InferredSubset::Only(next),
-            false => InferredSubset::Without(next),
-        })
+        Some(changes)
     }
 
     /// How many facts have entries, how many sets they have in all, and how many have as
@@ -395,6 +386,58 @@ impl SupportSets {
         let at_cap = counts.values().filter(|&&n| n >= cap).count();
         (counts.len(), total, at_cap)
     }
+}
+
+/// How the statements of changed facts stand for a reader, against an earlier revision
+/// ([`SupportSets::changes_since`]); each list sorted.
+#[derive(Debug, Default)]
+struct Changes {
+    /// The changed facts.
+    changed: Arc<Vec<Triple>>,
+    /// Their statements visible now.
+    visible: Vec<EncodedQuad>,
+    /// Hidden now, not before (absent, or visible).
+    hide: Vec<EncodedQuad>,
+    /// Hidden before, not now (visible, or gone).
+    show: Vec<EncodedQuad>,
+}
+
+/// A reader's view of a revision, kept to build its view of the next one from.
+#[derive(Debug)]
+struct Reader {
+    access: Arc<GraphAccess>,
+    snapshot: Snapshot,
+    sets: Arc<SupportSets>,
+    form: Form,
+}
+
+/// What a reader misses: the statements it misses, as runs over the stack (when it sees
+/// most), or the statements it sees (when it misses most).
+#[derive(Debug, Clone)]
+enum Form {
+    Mask(InferredMask),
+    Only(Arc<Vec<EncodedQuad>>),
+}
+
+/// Runs a mask stacks before it is built again as one.
+const MASK_RUNS: usize = 8;
+
+/// `list` (sorted statements a reader sees) without the changed facts' statements, with
+/// those it sees now.
+fn patched(list: &[EncodedQuad], changes: &Changes) -> Vec<EncodedQuad> {
+    let mut next = Vec::with_capacity(list.len() + changes.visible.len());
+    let mut added = changes.visible.iter().copied().peekable();
+    for &quad in list {
+        if changes.changed.binary_search(&triple(quad)).is_ok() {
+            continue;
+        }
+        while let Some(first) = added.next_if(|&first| first < quad) {
+            next.push(first);
+        }
+        next.push(quad);
+    }
+    next.extend(added);
+    next
 }
 
 /// The sets a fact starts with.
@@ -583,8 +626,8 @@ struct State {
     computed: Option<(u64, Arc<SupportSets>)>,
     /// The commits reported since: the revisions before and after, the facts touched.
     commits: Vec<(u64, u64, Arc<[Triple]>)>,
-    /// Each reader's last subset, and the revision it is of.
-    subsets: Vec<(Arc<GraphAccess>, u64, Arc<InferredSubset>)>,
+    /// Each reader's last view.
+    readers: Vec<Arc<Reader>>,
 }
 
 /// How the store's configuration compiles the rules.
@@ -684,38 +727,59 @@ impl Supports {
         .clone()
     }
 
-    /// The view of `snapshot` for `access` under `sets`: from the reader's last subset
-    /// where the sets were updated from its revision, else from the whole stack.
+    /// The view of `snapshot` for `access` under `sets`: from the reader's last one where
+    /// the sets were updated from its revision, else from the whole stack.
     fn build_view(
         &self,
         snapshot: &Snapshot,
         access: &Arc<GraphAccess>,
-        sets: &SupportSets,
+        sets: &Arc<SupportSets>,
     ) -> Snapshot {
         let started = std::time::Instant::now();
         let earlier = self
             .state()
-            .subsets
+            .readers
             .iter()
-            .find(|(seen, ..)| **seen == **access)
-            .map(|(_, revision, subset)| (*revision, Arc::clone(subset)));
-        let patched = earlier
-            .and_then(|(revision, subset)| sets.subset_from(snapshot, access, revision, &subset));
-        if patched.is_some() {
-            Counters::add(&self.counters.patched, 1);
-        }
-        let subset = Arc::new(patched.unwrap_or_else(|| sets.subset(snapshot, access)));
+            .find(|reader| *reader.access == **access)
+            .cloned();
+        let form = earlier
+            .and_then(|reader| {
+                let changes =
+                    sets.changes_since(snapshot, &reader.sets, &reader.snapshot, access)?;
+                Some(match &reader.form {
+                    Form::Mask(mask) => {
+                        let mask = mask.changed(snapshot, &changes.hide, &changes.show);
+                        (mask.runs() <= MASK_RUNS).then_some(Form::Mask(mask))?
+                    }
+                    Form::Only(list) => Form::Only(Arc::new(patched(list, &changes))),
+                })
+            })
+            .inspect(|_| Counters::add(&self.counters.patched, 1))
+            .unwrap_or_else(|| match sets.subset(snapshot, access) {
+                InferredSubset::Without(hidden) => {
+                    Form::Mask(InferredMask::hiding(snapshot, &hidden))
+                }
+                InferredSubset::Only(shown) => Form::Only(Arc::new(shown)),
+            });
+        let view = match &form {
+            Form::Mask(mask) => snapshot
+                .with_inferred_mask(mask)
+                .expect("a mask built for this stack's layout"),
+            Form::Only(list) => snapshot.with_inferred_subset(InferredSubset::Only(list.to_vec())),
+        };
         {
             let mut state = self.state();
-            state.subsets.retain(|(seen, ..)| **seen != **access);
-            if state.subsets.len() >= VIEWS {
-                state.subsets.remove(0);
+            state.readers.retain(|reader| *reader.access != **access);
+            if state.readers.len() >= VIEWS {
+                state.readers.remove(0);
             }
-            state
-                .subsets
-                .push((Arc::clone(access), snapshot.revision(), Arc::clone(&subset)));
+            state.readers.push(Arc::new(Reader {
+                access: Arc::clone(access),
+                snapshot: snapshot.clone(),
+                sets: Arc::clone(sets),
+                form,
+            }));
         }
-        let view = snapshot.with_inferred_subset((*subset).clone());
         Counters::add(&self.counters.views, 1);
         Counters::add(&self.counters.viewing, started.elapsed().as_micros() as u64);
         view
