@@ -990,6 +990,11 @@ impl StoreService {
             reported.diagnostics_total,
             "materialisation skipped an ontology axiom",
         );
+        // The last word under the writer slot: a caller whose claim ended meanwhile (a
+        // retired pipeline, a cancelled request) changes nothing.
+        if stop() {
+            return Err(crate::StoreError::MaterialisationCancelled);
+        }
         let summary = rematerialisation.finish(closure.inferred)?;
         nrese_engine::memory::release_all();
         self.record_reasoning(crate::ReasoningState::of_with(

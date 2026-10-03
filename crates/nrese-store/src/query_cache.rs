@@ -125,15 +125,6 @@ impl QueryCache {
     }
 }
 
-/// True if `query` may give another answer when repeated on the same data.
-pub(crate) fn volatile(query: &str) -> bool {
-    let upper = query.to_ascii_uppercase();
-    // SERVICE: the endpoint's data may change without this store's revision.
-    ["NOW(", "RAND(", "UUID(", "BNODE(", "SERVICE"]
-        .iter()
-        .any(|function| upper.contains(function))
-}
-
 /// A writer that forwards to `inner` and keeps a copy up to `limit` bytes.
 pub(crate) struct Tee<W> {
     pub inner: W,
@@ -193,13 +184,5 @@ mod tests {
         assert!(cache.get(&key("huge", 2)).is_none());
         let stats = cache.stats();
         assert!(stats.hits >= 2 && stats.misses >= 5, "{stats:?}");
-    }
-
-    #[test]
-    fn volatile_queries_are_detected() {
-        assert!(volatile("SELECT (now() AS ?t) {}"));
-        assert!(volatile("SELECT ?x { BIND(STRUUID() AS ?x) }"));
-        assert!(volatile("SELECT ?x { BIND(RAND() AS ?x) }"));
-        assert!(!volatile("SELECT ?s { ?s ?p ?o }"));
     }
 }
