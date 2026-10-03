@@ -572,10 +572,14 @@ mod growth_tests {
         let tail = exact_from(&all, graph.len(), &query, 5, Metric::L2, &|_| true);
         let merged = merge(from_graph.into_iter().chain(tail), 5);
         assert_eq!(merged[0].id, all.id(5_000));
-        assert_eq!(
-            merged,
-            exact(&all, &query, 5, Metric::L2, &|_| true)[..5].to_vec()
-        );
+        // The graph's part is approximate (and its parallel build not deterministic): at
+        // least 4 of the exact 5 nearest, the exact tail's own hit first.
+        let truth: Vec<u64> = exact(&all, &query, 5, Metric::L2, &|_| true)[..5]
+            .iter()
+            .map(|hit| hit.id)
+            .collect();
+        let found = merged.iter().filter(|hit| truth.contains(&hit.id)).count();
+        assert!(found >= 4, "{merged:?} against {truth:?}");
         // A copy extended to every vector finds it through the graph; the original
         // still covers the prefix.
         let mut grown = graph.duplicate();
