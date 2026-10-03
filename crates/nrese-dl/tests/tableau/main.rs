@@ -319,3 +319,71 @@ fn budgets_give_up() {
         Answer::GaveUp(_)
     ));
 }
+
+#[test]
+fn the_ni_rule_is_never_skipped_silently() {
+    // JAIR 2009's caterpillar (8): S(a, a), a: ∃R.B, B ⊑ ∃R.C, C ⊑ ∃S.D, D ⊑ {a}, S
+    // inverse-functional. Consistent; the derivation needs the NI rule (on c ≈ c), which
+    // the engine lacks: it must give up, not answer from a model that isn't one.
+    let mut b = Build::default();
+    let [bb, c, d] = [2, 3, 4].map(|t| b.class(t));
+    let (r, s) = (ObjProp::Named(200), ObjProp::Named(201));
+    b.role_assertion(201, 100, 100);
+    let rb = b.some(r, bb);
+    b.assert(rb, 100);
+    let rc = b.some(r, c);
+    b.sub(bb, rc);
+    let sd = b.some(s, d);
+    b.sub(c, sd);
+    let a = b.e(ClassExpr::OneOf(vec![100]));
+    b.sub(d, a);
+    b.characteristic(Characteristic::InverseFunctional, s);
+    for expand in [0, 2] {
+        let config = Config {
+            expand_at_most_up_to: expand,
+            ..Config::default()
+        };
+        let answer = consistency(&b.o, &config).answer;
+        eprintln!("caterpillar, expand {expand}: {answer:?}");
+        assert!(
+            matches!(answer, Answer::Consistent | Answer::GaveUp(_)),
+            "{answer:?}"
+        );
+    }
+}
+
+#[test]
+fn premature_blocking_without_the_ni_rule_is_caught() {
+    // JAIR 2009's (9): A(a), a: ∃R.B, A ⊑ ∀R⁻.⊥, B ⊑ ∃R.B, B ⊑ ∃S.{a}, R
+    // inverse-functional, ⊤ ⊑ ≤3 S⁻.⊤. Inconsistent; without the NI rule a blocked chain
+    // looks like a model (Figure 9a). The engine may give up, never answer consistent.
+    let mut b = Build::default();
+    let [a, bb] = [1, 2].map(|t| b.class(t));
+    let (r, s) = (ObjProp::Named(200), ObjProp::Named(201));
+    let thing = b.e(ClassExpr::Thing);
+    let nothing = b.e(ClassExpr::Nothing);
+    b.assert(a, 100);
+    let rb = b.some(r, bb);
+    b.assert(rb, 100);
+    let none_back = b.all(ObjProp::Inverse(200), nothing);
+    b.sub(a, none_back);
+    b.sub(bb, rb);
+    let at_a = b.e(ClassExpr::OneOf(vec![100]));
+    let s_a = b.some(s, at_a);
+    b.sub(bb, s_a);
+    b.characteristic(Characteristic::InverseFunctional, r);
+    let at_most = b.e(ClassExpr::Max(3, ObjProp::Inverse(201), thing));
+    b.sub(thing, at_most);
+    for expand in [0, 2, 3] {
+        let config = Config {
+            expand_at_most_up_to: expand,
+            ..Config::default()
+        };
+        let answer = consistency(&b.o, &config).answer;
+        eprintln!("premature blocking, expand {expand}: {answer:?}");
+        assert!(
+            matches!(answer, Answer::Inconsistent | Answer::GaveUp(_)),
+            "{expand}: {answer:?}"
+        );
+    }
+}

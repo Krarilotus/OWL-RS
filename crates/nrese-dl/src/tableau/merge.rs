@@ -10,7 +10,7 @@
 //! stops the run as `gave-up`, never with an answer.
 
 use super::depset::DepSetId;
-use super::engine::{Engine, Lit, Step, Stop, proof};
+use super::engine::{Engine, Lit, Step, ni_stop, proof};
 use super::graph::{NONE, flag};
 
 impl Engine<'_> {
@@ -24,16 +24,8 @@ impl Engine<'_> {
             let d = self.g.inequalities[i as usize].dep;
             return Err(self.clash(dep, d));
         }
-        if at_root != NONE {
-            let root = self.g.find(at_root);
-            let blockable = |n: u32| self.g.nodes[n as usize].flags & flag::ROOT == 0;
-            let successor = |n: u32| self.g.nodes[n as usize].parent == root;
-            if blockable(a) && blockable(b) && !(successor(a) && successor(b)) {
-                return Err(Stop::GaveUp(
-                    "the NI rule (nominals with inverses and at-most restrictions) is not implemented"
-                        .into(),
-                ));
-            }
+        if self.needs_ni(Lit::Equal(a, b, at_root)) {
+            return Err(ni_stop());
         }
         let (from, into) = self.direction(a, b);
         self.stats.merges += 1;

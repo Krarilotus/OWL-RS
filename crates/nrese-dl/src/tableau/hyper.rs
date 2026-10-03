@@ -5,8 +5,12 @@
 //! join reads a graph nobody changes under it.
 
 use super::depset::{DepSetId, DepSets};
-use super::graph::{Graph, NONE};
+use super::graph::{Graph, NONE, flag};
 use super::program::{Body, Head, HtClause, MAX_VARS, Plan, Program, Step};
+
+/// The most instances one join may collect: past it the join stops, and the engine gives
+/// up (a bound on memory, never a dropped instance).
+pub const MAX_FIRINGS: usize = 1 << 20;
 
 /// A clause instance whose head doesn't hold yet.
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +72,16 @@ fn run(
     dep: DepSetId,
     out: &mut Vec<Firing>,
 ) {
+    if out.len() >= MAX_FIRINGS {
+        return;
+    }
+    if step > 0
+        && plan.heads_after[step - 1]
+            .iter()
+            .any(|&h| atom_holds(g, clause.head[h as usize], bind))
+    {
+        return;
+    }
     let Some(&s) = plan.steps.get(step) else {
         if !head_holds(g, clause, bind) {
             out.push(Firing {
@@ -127,13 +141,25 @@ fn run(
 
 /// Whether a head atom already holds (a quick filter; nominals are left to the engine).
 fn head_holds(g: &Graph, clause: &HtClause, bind: &[u32; MAX_VARS]) -> bool {
+    clause.head.iter().any(|&h| atom_holds(g, h, bind))
+}
+
+fn atom_holds(g: &Graph, h: Head, bind: &[u32; MAX_VARS]) -> bool {
     let b = |v: u8| bind[v as usize];
-    clause.head.iter().any(|&h| match h {
+    match h {
         Head::Concept(c, v) => g.concept(b(v), c).is_some(),
         Head::Role(r, x, y) => g.edge(r, b(x), b(y)).is_some(),
         Head::AtLeast(n, v) => g.number(b(v), false, n).is_some(),
         Head::AtMost(n, v) => g.number(b(v), true, n).is_some(),
-        Head::Equal(x, y) => g.find(b(x)) == g.find(b(y)),
+        // Not where the NI rule applies (a blockable non-successor of a root x).
+        Head::Equal(x, y) => {
+            let (s, t) = (g.find(b(x)), g.find(b(y)));
+            let (root, node) = (&g.nodes[b(0) as usize], &g.nodes[s as usize]);
+            s == t
+                && !(root.flags & flag::ROOT != 0
+                    && node.flags & flag::ROOT == 0
+                    && node.parent != b(0))
+        }
         Head::Nominal(..) => false,
-    })
+    }
 }

@@ -89,6 +89,7 @@ impl Engine<'_> {
     /// One round; `false` when nothing is left to do.
     fn step(&mut self) -> Step<bool> {
         self.check_time()?;
+        self.check_memory()?;
         self.saturate()?;
         if !self.config.disjunctions_first && self.expand_at_least()? {
             return Ok(true);
@@ -126,8 +127,13 @@ impl Engine<'_> {
             let mut dep = pend.dep;
             let mut open = Vec::new();
             let mut satisfied = false;
+            let mut ni = false;
             for &h in &clause.head {
                 let lit = self.lit(h, &bind);
+                if self.needs_ni(lit) {
+                    ni = true;
+                    continue;
+                }
                 match self.holds(lit) {
                     Ok(true) => {
                         satisfied = true;
@@ -140,6 +146,9 @@ impl Engine<'_> {
             if satisfied {
                 self.pending_open = at as u32;
                 continue;
+            }
+            if ni {
+                return Err(super::engine::ni_stop());
             }
             return match open.len() {
                 0 => Err(self.clash(dep, DepSetId::EMPTY)),

@@ -16,9 +16,97 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use nrese_dl::tableau::{Config, consistency};
+use nrese_dl::tableau::{Answer, Config, Model, consistency};
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::{Axiom, ClassExpr, ObjProp, Ontology, Term};
+
+/// The test's semantics: the direct semantics on finite interpretations.
+#[path = "../tests/tableau_fuzz/semantics.rs"]
+mod semantics;
+
+/// A consistent answer's folded model checked against the axioms, or an inconsistent
+/// answer's minimal core (axioms dropped while it stays inconsistent) with a search for a
+/// small model of the core.
+fn witness(
+    o: &Ontology,
+    sig: &Signature,
+    answer: &Answer,
+    model: Option<&Model>,
+    config: &Config,
+    names: &[String],
+) {
+    let name = |t: Term| names.get(t as usize).cloned().unwrap_or(format!("t{t}"));
+    match answer {
+        Answer::Consistent => {
+            let checked = model
+                .filter(|m| m.size > 0 && m.size <= 128)
+                .is_some_and(|m| {
+                    let mut i = semantics::Interp {
+                        n: m.size as u32,
+                        ..semantics::Interp::default()
+                    };
+                    for &(c, e) in &m.concepts {
+                        if let nrese_owl::Concept::Named(t) = c {
+                            *i.concepts.entry(t).or_default() |= 1 << e;
+                        }
+                    }
+                    for &(r, a, b) in &m.roles {
+                        i.add_edge(r, a as u32, b as u32);
+                    }
+                    for &(t, e) in &m.individuals {
+                        i.individuals.insert(t, e as u32);
+                    }
+                    semantics::close(o, &mut i);
+                    semantics::model_of(o, &i)
+                });
+            eprintln!(
+                "witness: the folded model {}",
+                if checked {
+                    "is a model of every axiom"
+                } else {
+                    "fails (number restrictions under pairwise blocking?)"
+                }
+            );
+        }
+        Answer::Inconsistent => {
+            let mut core = o.clone();
+            let mut i = 0;
+            while i < core.axioms.len() {
+                let mut next = core.clone();
+                next.axioms.remove(i);
+                next.sources.remove(i);
+                if consistency(&next, config).answer == Answer::Inconsistent {
+                    core = next;
+                } else {
+                    i += 1;
+                }
+            }
+            eprintln!("witness: a minimal inconsistent core:");
+            for a in &core.axioms {
+                eprintln!("  {}", core.functional(a, &name));
+            }
+            let mut rng = Rng::new(1);
+            let found = semantics::find_model(
+                &core,
+                &sig.classes,
+                &sig.object_properties,
+                &sig.individuals,
+                3,
+                200_000,
+                &mut rng,
+            );
+            eprintln!(
+                "witness: a model of the core with up to 3 elements: {}",
+                if found.is_some() {
+                    "FOUND"
+                } else {
+                    "none found"
+                }
+            );
+        }
+        _ => {}
+    }
+}
 
 fn profile(name: &str, case: u64) -> Option<(Sizes, Profile)> {
     let base = Profile {
@@ -144,8 +232,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let (mut seed, mut count, mut only, mut out) = (0x0020_2610_0333_u64, 100u64, None, None);
     let (mut profile_name, mut timeout) = ("test".to_owned(), 60u64);
+    let mut witness_mode = false;
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
+        if arg == "--witness" {
+            witness_mode = true;
+            continue;
+        }
         match arg.as_str() {
             "--seed" => seed = value()?.parse()?,
             "--count" => count = value()?.parse()?,
@@ -190,8 +283,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if only.is_some_and(|k| k != case) {
             continue;
         }
+        let config = Config {
+            keep_model: witness_mode,
+            ..config.clone()
+        };
         let result = consistency(&o, &config);
         let id = format!("fuzz-{seed}-{case}");
+        if witness_mode {
+            witness(
+                &o,
+                &sig,
+                &result.answer,
+                result.model.as_ref(),
+                &config,
+                &names,
+            );
+        }
         println!("{id}\t{}\t{}", result.answer.class(), result.telemetry);
         if let fuzz_answer @ nrese_dl::tableau::Answer::GaveUp(why)
         | fuzz_answer @ nrese_dl::tableau::Answer::Unsupported(why) = &result.answer
@@ -206,7 +313,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(dir) = &out {
             let name = |t: Term| names[t as usize].clone();
-            let mut text = String::from("Prefix(owl:=<http://www.w3.org/2002/07/owl#>)\n");
+            let mut text = String::from(
+                "Prefix(owl:=<http://www.w3.org/2002/07/owl#>)\n\
+                 Prefix(rdf:=<http://www.w3.org/1999/02/22-rdf-syntax-ns#>)\n\
+                 Prefix(rdfs:=<http://www.w3.org/2000/01/rdf-schema#>)\n\
+                 Prefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)\n",
+            );
             writeln!(text, "Ontology(<http://example.org/{id}>")?;
             for a in &o.axioms {
                 writeln!(text, "{}", o.functional(a, &name))?;
