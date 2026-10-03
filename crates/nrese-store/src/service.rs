@@ -101,6 +101,8 @@ impl StoreService {
                 .then(|| nrese_sparql::SharedBudget::new(config.total_query_memory_bytes)),
             services: std::sync::Arc::default(),
             equality_closed: std::sync::Arc::default(),
+            equality_canonical: config.equality_canonical_answers,
+            equality_early_expansion: config.equality_early_expansion,
         };
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),

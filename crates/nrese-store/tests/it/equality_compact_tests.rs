@@ -352,3 +352,168 @@ fn compact_equality_answers_as_replication_on_random_data() {
         }
     }
 }
+
+fn pipeline_with(config: StoreConfig) -> MutationPipeline {
+    MutationPipeline::new(
+        Arc::new(StoreService::new(config).expect("store")),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    )
+}
+
+/// Stage C: the classes expanded after the joins (`equality.expansion = "late"`, the
+/// default) answer as stage B's expanding reads and as replication, on random data
+/// without named graphs (where late expansion applies) and on queries of every shape:
+/// joins, OPTIONAL and UNION over representatives, and above and around them the
+/// operators that stay expanded early (FILTER, MINUS, paths, DISTINCT, groups, LIMIT).
+/// Canonical answers (`equality.answers = "canonical"`) name one identity per class.
+#[test]
+fn late_expansion_answers_as_early_expansion_and_replication() {
+    let compact = |early: bool, canonical: bool| StoreConfig {
+        equality_by_representatives: true,
+        equality_compact: true,
+        equality_early_expansion: early,
+        equality_canonical_answers: canonical,
+        ..in_memory_store_config()
+    };
+    for seed in 1..=16u64 {
+        let mut random = Lcg(fuzz(seed ^ 0x5eed));
+        let entity = |i: usize| format!("ex:e{i}");
+        let predicates = ["ex:p", "ex:q", "ex:r", "ex:f"];
+        let fact = |random: &mut Lcg| {
+            format!(
+                "{} {} {} .",
+                entity(random.below(10)),
+                predicates[random.below(predicates.len())],
+                entity(random.below(10))
+            )
+        };
+        let mut data = String::from(
+            "ex:f a owl:FunctionalProperty . ex:q rdfs:subPropertyOf ex:p .
+             ex:e0 a ex:C . ex:C rdfs:subClassOf ex:D . ex:e3 a ex:D . ",
+        );
+        for _ in 0..24 {
+            data.push_str(&fact(&mut random));
+        }
+        for _ in 0..1 + random.below(5) {
+            data.push_str(&format!(
+                "{} owl:sameAs {} .",
+                entity(random.below(10)),
+                entity(random.below(10))
+            ));
+        }
+        let pipelines = [
+            pipeline(Mode::Replicate),
+            pipeline_with(compact(true, false)),
+            pipeline_with(compact(false, false)),
+        ];
+        let commits = [
+            format!("INSERT DATA {{ {data} }}"),
+            format!(
+                "INSERT DATA {{ {} owl:sameAs {} . {} }}",
+                entity(random.below(10)),
+                entity(random.below(10)),
+                fact(&mut random)
+            ),
+            format!("DELETE DATA {{ {} }}", fact(&mut random)),
+        ];
+        for commit in &commits {
+            for pipeline in &pipelines {
+                let _ = pipeline.apply(
+                    MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                        "{PREFIXES}{commit}"
+                    ))),
+                    &nrese_store::Requester::all(),
+                    &MutationTicket::new(),
+                );
+            }
+            let (a, p) = (entity(random.below(10)), predicates[random.below(3)]);
+            let queries = [
+                format!("SELECT ?x ?z WHERE {{ ?x {p} ?y . ?y ex:q ?z }} ORDER BY ?x ?z"),
+                "SELECT ?x ?y ?z WHERE { ?x ex:p ?y . ?y ex:p ?z . ?z ex:r ?x } ORDER BY ?x ?y ?z"
+                    .to_owned(),
+                "SELECT (COUNT(*) AS ?n) WHERE { ?x ex:p ?y . ?y ex:p ?z }".to_owned(),
+                format!("SELECT ?y ?z WHERE {{ {a} ex:p ?y . ?y ?q ?z }} ORDER BY ?y ?q ?z"),
+                "SELECT ?x ?y WHERE { ?x ex:p ?y . ?y ex:p ?x } ORDER BY ?x ?y".to_owned(),
+                "SELECT ?x ?w WHERE { ?x ex:p ?y OPTIONAL { ?y ex:r ?w } } ORDER BY ?x ?y ?w"
+                    .to_owned(),
+                "SELECT ?x ?y WHERE { { ?x ex:p ?y } UNION { ?x ex:r ?y . ?y a ex:D } } ORDER BY ?x ?y"
+                    .to_owned(),
+                "SELECT ?y (COUNT(?x) AS ?n) WHERE { ?x ex:p ?y . ?x ?r ?z } GROUP BY ?y ORDER BY ?y"
+                    .to_owned(),
+                "SELECT DISTINCT ?x WHERE { ?x ex:p ?y . ?y a ex:D } ORDER BY ?x".to_owned(),
+                "SELECT ?x ?y WHERE { ?x owl:sameAs ?y . ?y ex:p ?z } ORDER BY ?x ?y ?z".to_owned(),
+                format!(
+                    "SELECT ?x ?y WHERE {{ ?x ex:p ?y . ?y ex:q ?z FILTER(?x != {a}) }} ORDER BY ?x ?y"
+                ),
+                "SELECT ?x ?y WHERE { ?x ex:p ?y . ?y ex:p ?z MINUS { ?x ex:q ?y } } ORDER BY ?x ?y"
+                    .to_owned(),
+                "SELECT ?x ?y WHERE { ?x ex:p+ ?y . ?y ex:r ?z } ORDER BY ?x ?y ?z".to_owned(),
+                "SELECT (COUNT(*) AS ?n) WHERE { SELECT * WHERE { ?x ex:p ?y . ?y ?q ?z } LIMIT 7 }"
+                    .to_owned(),
+                "SELECT ?x (STR(?y) AS ?s) WHERE { ?x ex:p ?y . ?y ex:p ?z } ORDER BY ?x ?s ?z"
+                    .to_owned(),
+                "ASK { ?x ex:p ?y . ?y ex:r ?x }".to_owned(),
+            ];
+            for query in &queries {
+                let want = answer(&pipelines[0], query);
+                let early = answer(&pipelines[1], query);
+                let late = answer(&pipelines[2], query);
+                assert_eq!(early, want, "seed {seed}, early, after {commit}: {query}");
+                assert_eq!(late, want, "seed {seed}, late, after {commit}: {query}");
+            }
+        }
+    }
+
+    // Canonical answers: one identity per class, its representative.
+    let canonical = pipeline_with(compact(false, true));
+    let strict = pipeline_with(compact(false, false));
+    let data = "INSERT DATA { ex:a ex:p ex:x . ex:b owl:sameAs ex:a . ex:c owl:sameAs ex:a .
+                ex:x ex:q ex:y . ex:y owl:sameAs ex:z }";
+    update(&canonical, data);
+    update(&strict, data);
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { ?s ex:p ?x . ?x ex:q ?o }";
+    let (strict_count, canonical_count) = (answer(&strict, q), answer(&canonical, q));
+    // Every identity of each class (3 for ?s, 2 for ?o), and one per class.
+    assert!(strict_count.contains("\"6\""), "{strict_count}");
+    assert!(canonical_count.contains("\"1\""), "{canonical_count}");
+    // A constant keeps its own name.
+    let text = answer(&canonical, "SELECT ?o WHERE { ex:b ex:p ?o }");
+    assert!(text.contains("http://example.com/x"), "{text}");
+
+    // The late path ran: the plan shows the expansion over the joined representatives,
+    // and early expansion doesn't.
+    let early = pipeline_with(compact(true, false));
+    update(&early, data);
+    let operators = |pipeline: &MutationPipeline| {
+        let prepared = pipeline
+            .store()
+            .prepare_query(&nrese_store::SparqlQueryRequest::new(
+                format!("{PREFIXES}{q}"),
+                nrese_store::ReadScope::All,
+            ))
+            .unwrap();
+        let explanation = pipeline
+            .store()
+            .explain_query(&prepared, &nrese_store::CancellationToken::new())
+            .unwrap();
+        explanation
+            .steps
+            .iter()
+            .map(|s| s.operator.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        operators(&strict)
+            .iter()
+            .any(|o| o == "late equality expansion"),
+        "{:?}",
+        operators(&strict)
+    );
+    assert!(
+        !operators(&early)
+            .iter()
+            .any(|o| o == "late equality expansion")
+    );
+}

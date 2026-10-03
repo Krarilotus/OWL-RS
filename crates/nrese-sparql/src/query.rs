@@ -39,6 +39,16 @@ pub struct QueryOptions {
     /// rules): every fact about one identity holds for the others. Some operators then
     /// work on one representative per identity class where the answer can't tell.
     pub equality_closed: bool,
+    /// With equality classes kept over representatives (`reasoner.equality = "compact"`):
+    /// answer with one identity per class, the representative, instead of every identity
+    /// (`equality.answers = "canonical"`, work package W4 stage C): for analytics, where
+    /// the identities are one thing. Constants of the query keep their own names.
+    pub equality_canonical: bool,
+    /// With equality classes kept over representatives: expand them at every read (stage
+    /// B), not after the joins (stage C, the default: the parts of a query whose answer
+    /// can't tell the identities apart are joined over representatives and expanded
+    /// once). The answers are the same; this is the comparison and an escape hatch.
+    pub equality_early_expansion: bool,
     /// Pre-bound variables (SHACL-SPARQL's `$this`, `$value`, parameters): their values
     /// are put in for them throughout the query before it is evaluated, as SHACL §5.6
     /// defines pre-binding. A subquery sees them only where it projects them; the query's

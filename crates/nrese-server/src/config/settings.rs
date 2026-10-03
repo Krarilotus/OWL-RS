@@ -221,6 +221,20 @@ pub const SETTINGS: &[Setting] = &[
         "How owl:sameAs is reasoned with and stored (default representatives).",
     ),
     setting(
+        "reasoner.equality_answers",
+        names::REASONING_EQUALITY_ANSWERS,
+        Choice(&["strict", "canonical"]),
+        "With equality = compact: answer with every identity of an owl:sameAs class \
+         (strict, the default), or with its representative only (canonical, for analytics).",
+    ),
+    setting(
+        "reasoner.equality_expansion",
+        names::REASONING_EQUALITY_EXPANSION,
+        Choice(&["late", "early"]),
+        "With equality = compact: expand owl:sameAs classes after the joins where the \
+         answer can't tell (late, the default) or at every read (early). The same answers.",
+    ),
+    setting(
         "reasoner.unnamed_classes",
         names::REASONING_UNNAMED_CLASSES,
         Choice(&["derive", "skip"]),
