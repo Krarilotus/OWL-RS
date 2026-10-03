@@ -20,6 +20,11 @@ document decides what is built first and how fast it has to be.
   - *The Incredible ELK* (Kazakov, Krötzsch and Simančík, JAR 2014†);
   - *Parallel Reasoning in Sequoia* (ISWC 2025).
 - NRESE's own runs of 3 October (`benches/reasoning/dl/results/`).
+- Research report H (the owner's deep-research report of 3 October, `output/dl-research-H-owner-deep-research.md`):
+  - cross-domain algorithm engineering from SAT, SMT, CP, MaxSAT and theorem proving;
+  - the benchmark metrics;
+  - the failure modes.
+  - What it adds is in §3 ("What the solver communities add"), §5 and §7. Its claims about CaDiCaL 3.0 (SAT 2026) and the Baobab preprint (2026) haven't been checked against the papers yet.
 
 † marks figures from before 2018: valid for design choices, not as today's state.
 
@@ -113,10 +118,31 @@ switch has an on/off metamorphic test (the design's rule three).
 - **Thread pools beat message passing** for parallel saturation: up to 2.62× (ISWC 2025).
 - **Equality and number restrictions are where it explodes:** the design's dynamic fallback and racing (§4) exist for this.
 
+### What the solver communities add (report H)
+
+Report H's thesis: the next gains in expressive reasoning come from SAT/SMT/ATP-style
+algorithm engineering around the DL calculus, not from a new calculus. The transferable
+mechanisms, and where each lands:
+
+| Mechanism | From | In NRESE | Package |
+|---|---|---|---|
+| **Conflict-driven search:** nondeterministic choices (disjuncts, merges, `≤`-choices) as *stable decision literals*; a clash's minimised reason set as a learned nogood; activity-based choice order; restarts. Dependency-directed backjumping is the start, not the end. Nogoods must be over canonical decisions, never over completion-graph addresses that merges and blocking invalidate | CDCL (CaDiCaL, Kissat) | the hypertableau's dependency sets become decision-literal sets from 3.3 on; learning is an experiment with an ablation | 3.3 (literals), 3.9 (learning) |
+| **Cardinality as a propagator with explanations:** `≤ n R.C` over the current successors as an at-most constraint; native propagation for small ones, a pseudo-Boolean encoding (totaliser, sorting network) or a PB/SAT backend for large ones; explanations feed the conflict analysis | PB solving, Z3's cardinality encodings, CP-SAT | the `≤`-rule's merge search behind a backend interface (`add_at_most`, `assert_equal`, `explain_conflict`, push/pop) | 3.3 (native), 3.6 (PB backend) |
+| **Equality with explanations:** union-find with rollback and a reason forest, so that "which decisions made a = b" is answerable | SMT congruence closure | `owl:sameAs` stage C already keeps a union-find; the tableau's merges get the rollback and reason edges | 3.3 |
+| **Watch lists:** universals and role-chain steps fire on `(role, concept)` events, not by scanning a node's restrictions after every edge | SAT watched literals | the hypertableau's and the context core's triggers | 3.1, 3.3 |
+| **Hash-consing** of concepts, clauses, chain-automaton states and datatype descriptors | ATP term sharing | `nrese-owl`'s interned IR (exists for terms; extended to clauses) | 3.1 |
+| **Adaptive label sets:** a sorted small vector, promoted to a dense or compressed bitmap at a density threshold measured on the machine | SAT and database engineering | §4 "subsumer sets as bitsets", made adaptive | 3.1, 3.7 |
+| **Budgeted preprocessing:** an expensive simplification runs only when the cheap feature vector predicts it pays (CaDiCaL's inprocessing schedule) | SAT inprocessing | normalisation stages with budgets; the feature vector of design §4 decides | 3.0, 3.4 |
+| **Portfolio and algorithm selection:** a cheap structural feature vector (constructor counts, profile islands, ABox size) routes each module to EL saturation, Horn core, hypertableau variant or a race; a wrong prediction costs time, never correctness | MORe, SAT portfolios, Vampire schedules | the dispatcher of design §4 (by module, per sub-task) with the feature vector logged per task | 3.0 (features), 3.6 (racing) |
+| **Learned ordering only:** a model may order choices or pick a strategy; it never prunes a branch | NeuroCore, unsat-core guidance | after the deterministic baselines; off by default | later than phase 3 |
+| **Proof-producing normalisation:** each normalised clause carries its source axioms and the rule that made it | proof logging in SAT/ATP | the proof IR of 2.4 already records provenance; normalisation steps become proof steps | 3.0 |
+
 ### What NRESE does not take
 
-- **GPU offload for the search:** no evidence for a sound and complete GPU SROIQ reasoner (A, B). GPU only for a data-parallel kernel a profile names.
+- **GPU offload for the search:** no evidence for a sound and complete GPU SROIQ reasoner (A, B, H). GPU is used only for a data-parallel kernel that a profile names: batched label intersections, large ABox joins, batches of independent entailment tests (H, after HT-HEDL 2024).
 - **Majority votes between reasoners:** NRESE adjudicates (2.3).
+- **Whole-ontology SAT encodings with a fixed number of anonymous objects:** under the direct semantics, UNSAT then only means "no model of that size". Bounded encodings are allowed only as a subordinate procedure, or where a completeness bound is proved (H).
+- **Fine-grained distributed tableau:** distribution is for independent modules, ontologies and classification jobs only (H).
 
 ## 4. NRESE's own levers, level by level
 
@@ -150,11 +176,33 @@ project's existing engines can do.
 |---|---|---|---|
 | dev | the ORE 2015 development subsets (80 tasks today; grow to 300+ stratified by track, size and expressivity, ORE's `metadata.csv` giving the strata), the W3C suite, OWL2Bench EL/QL/RL/DL at 1 and 10, LUBM/UOBM | main PC | every work package |
 | full | ORE 2015 entire (1,920 × 3 tasks), the Oxford corpus | Draco cluster | milestones |
-| large | SNOMED CT (with a licence), NCBO/BioPortal large ontologies, LUBM(800), UOBM(500), ChEMBL, Reactome, UniProt | main PC (64 GB), Draco | phase 3 end and phase 4 |
+| large | SNOMED CT (with a licence), the 21 large NCBO BioPortal ontologies of Lam et al. 2023 (most of the six reasoners they evaluated solved fewer than half the tasks), the Gene Ontology, LUBM(800), UOBM(500), ChEMBL, Reactome, UniProt | main PC (64 GB), Draco | phase 3 end and phase 4 |
 
-**The protocol** (report A): 30-minute limit, 64 GB, results at 1 thread and at all cores,
-fresh process per task for cold numbers, 10 repetitions for the claim runs, median and p95
-beside the mean, and every result class kept apart.
+**Reference reasoners to add:** Whelk (EL+RL, Balhoff et al., TGDK 2024), the newest EL
+and RL rival, compared against ELK in its own paper. It joins the runner if its licence
+permits.
+
+**The protocol** (report A, completed with H; the general rules are [benches/PROTOCOL.md](../../benches/PROTOCOL.md)):
+- **Limits and threads:** a 30-minute limit and 64 GB; results at 1 thread and at all cores.
+- **Process:** a fresh process per task for cold numbers.
+- **Repetitions:** 10 for the claim runs.
+- **Result classes kept apart:** solved, timeout, out of memory, unsupported, wrong.
+- **Never only means over solved tasks:**
+  - solved counts;
+  - median, p90, p95 and p99;
+  - a PAR-2 score (a timeout counts twice the limit);
+  - cactus plots;
+  - peak RSS and bytes per input axiom.
+- **Robustness:** a rerun with the axioms in shuffled order (`ore.py manifest --shuffle-seed`, to add). An engine whose time depends on the axiom order is reported with its spread.
+- **Blind holdout:** a fixed, seeded 20% of every stratified corpus is never looked at while tuning. Claims are made on the holdout.
+- **Ablations:** every optimisation is shown as a chain on one build, with the same hardware, input order and limits. Example: baseline → +adaptive labels → +watch lists → +backjumping → +learning → +parallel. Each link must be an on/off switch.
+- **Counters per run:** next to the per-phase times, the counters of design §11 plus H's list:
+  - decisions, conflicts, backjumps, learned nogoods;
+  - generated nodes, merges, blocking tests and hits;
+  - cache queries and hits;
+  - rule firings and duplicate derivations;
+  - peak nodes and edges, bytes per assertion;
+  - steals.
 
 **Regression baselines:**
 - **Committed:** NRESE's per-ontology times, as JSON under `benches/baselines/dl/`. A package that slows a tier's sum by more than 5% (beyond noise) explains why, or doesn't merge.
@@ -183,6 +231,18 @@ longer has to put the hypertableau first to have something to check against.
 | 3.6 | **The context core, SRIQ and SROIQ stages;** dynamic fallback and racing | the design's §5 gates | Oxford sample: ≥ Konclude's solved count; equality-heavy strata no slower than the hypertableau alone |
 | 3.7 | **Caches with footprints, completion-graph reuse, saturation coupling;** profiled SIMD | on/off metamorphic tests | Konclude's level or better on the full ORE run (Draco): solved counts, mean, p50, peak RSS |
 | 3.8 | **Black-box justifications** over the hypertableau | equal to the glass-box results where both apply | time to the first and all justifications reported |
+| 3.9 | **Conflict-driven hypertableau (research):** learned nogoods over stable decision literals (disjuncts, merges, `≤`-choices), activity-based choice order, restarts, nogood database management; a proof that learning keeps soundness and completeness | no answer changes with learning on or off (metamorphic); the proof in the design | an ablation against plain backjumping on the disjunction- and cardinality-heavy strata: a statistically robust gain on the holdout, or the switch stays off |
+
+Report H's cheap, publishable steps sit inside these packages, each with its own ablation:
+- adaptive labels (3.1);
+- compiled watch lists (3.1, 3.3);
+- proof-producing normalisation (3.0);
+- parallel taxonomy building (3.4);
+- PB-assisted number restrictions (3.6);
+- incremental module maintenance (3.2).
+
+Conflict learning (3.9) is the strongest research contribution of the DL half of the
+paper.
 
 The order moves the context core and the bounds first:
 - **Where the openings are:** they carry openings 1–3, where NRESE can lead by a large factor.
@@ -195,3 +255,10 @@ The order moves the context core and the bounds first:
 - **Same-machine comparisons only.** The published means come from other CPUs: on this machine they serve only as orientation, never as a claim (A).
 - **Large ABoxes and certain answers.** The 10× target of opening 1 counts only answers whose status is `complete`. If the gap needs exact services, their time is included.
 - **Concurrency gains are sub-linear.** ELK: 3.8× on 8 threads. Konclude: 1.2× over its whole corpus. The targets hold at 1 thread too, reported apart.
+- **Overfitting to the development set.** Claims are made on the blind holdout and the full corpus (§5).
+- **Optimisations that change answers** (H's failure modes). Each has a metamorphic test or a dedicated check:
+  - closed-world or unique-name leakage;
+  - role-chain rewrites that break the regularity and simple-role conditions;
+  - blocking that is too weak (blow-up) or too eager (lost models);
+  - caches reused across branches without their dependencies;
+  - an equality merge whose effects on counts, edges and blocking aren't propagated as events.

@@ -274,10 +274,15 @@ Proofs aren't rebuilt afterwards. E's condition is a tested property, not an ass
 
 ### Parallelism
 
-**Ownership with message passing, not locks inside a context (B):**
-- A worker owns a context and saturates it.
-- Clauses for other contexts go to their queues as immutable messages.
-- Shared state is immutable: the clauses, interned ids and the term order.
+**Ownership through activation, messages between contexts, a pool of workers** (ELK's
+scheme, *The Incredible ELK*; B; Sequoia 2025 found thread pools beat dedicated
+message-passing threads):
+- **Activation.** Each context has an inbox and an activation flag. Whoever sends a message to an inactive context sets the flag (compare-and-swap) and schedules it on the pool. Rayon's work stealing shares the active contexts among the workers. A context's state is only ever touched by the one worker holding its activation, so it needs no lock inside.
+- **Messages.** Clauses for other contexts go to their inboxes as immutable messages. Messages a context sends itself stay in its own batch.
+- **Links.** A link `C →r D` is two messages, a backward link to `D` and a forward link to `C`. Every rule then finds its premises in one context: rules over the link and D's subsumers run at D; chains `B → C → D` meet at their middle context.
+- **Termination.** The scope ends when no context is active or has mail.
+- **Shared state is immutable:** the clauses, interned ids and the term order.
+- **First implemented** for the EL classifier (`classify_parallel`, package 3.1 step 1), checked against the sequential saturation on random ontologies.
 
 Expectations are modest. Konclude went from 1 to 4 workers for 1.20× over its whole corpus,
 and 2.94× on the hard FMA case (B, 2014†). Parallelism pays on hard contexts, and cheap
@@ -668,12 +673,13 @@ performance gate for each package are in [owl2-dl-performance.md](owl2-dl-perfor
 | 3.0 | The DL lab completed: a stratified ORE development set (≥ 300 tasks), OWL2Bench DL, UOBM; reference results on all; NRESE per-phase timing and counters; committed baselines | the references agree or are adjudicated |
 | 3.1 | Context core, Horn stage, parallel from the start (lock-free context activation, work stealing); dispatch and modules; the EL classifier becomes its EL mode (chains kept explicit for EL: the automata of §3 make `∃(r∘s).B ⊑ C` non-Horn) | §5's Horn gate; EL taxonomies unchanged; ≥ 2× faster than ELK at equal threads on the EL track |
 | 3.2 | Bounds for large ABoxes: U1 compiled and maintained per commit, the gap, consistency through L, U1 and the Horn core | the incremental track against cold rebuilds; LUBM(800) and UOBM(500) ≥ 10× faster than Konclude |
-| 3.3 | Hypertableau, ALC → SHIQ → SROIQ: absorption, lazy unfolding, blocking, NI, merges, dependency sets, backjumping, semantic branching, (un)satisfiability caching | the W3C DL suite green without datatypes; within 3× of Konclude on the development set |
+| 3.3 | Hypertableau, ALC → SHIQ → SROIQ: absorption, lazy unfolding, blocking, NI, merges (rollback union-find with reasons), dependency sets over stable decision literals, backjumping, semantic branching, (un)satisfiability caching, watch lists, a native cardinality propagator with explanations | the W3C DL suite green without datatypes; within 3× of Konclude on the development set |
 | 3.4 | Classification and realisation driver (known/possible subsumers, parallel tests, model merging) | taxonomies equal to the references'; within 1.5× of Konclude's sum |
 | 3.5 | The datatype theory | the W3C DL suite green |
 | 3.6 | Context core, SRIQ and SROIQ stages; dynamic fallback, racing, telemetry | §5's gates; the Oxford sample at Konclude's solved count |
 | 3.7 | Caches with footprints, completion-graph reuse, saturation coupling; profiled SIMD | metamorphic on/off tests; the full ORE run at Konclude's level (Draco) |
 | 3.8 | Black-box justifications over the hypertableau; glass-box certificates | equal to the glass-box results where both apply |
+| 3.9 | Conflict-driven hypertableau (research): learned nogoods, activity order, restarts ([performance plan](owl2-dl-performance.md) §6) | no answer changes on or off; a robust gain on the holdout or the switch stays off |
 
 The final bar is Konclude's 1,862 of 1,920 ORE classifications (and 1,911 consistency
 checks, 591 of 624 realisations, Lam et al. 2023), on the same machine, with current
