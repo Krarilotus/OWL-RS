@@ -1,29 +1,33 @@
-"""`suite.py compare`: a run against a baseline run, pair by pair: what got slower, what got
-faster, what answers differently. The regression check before a milestone.
+"""`suite.py compare`: a run against a baseline run, pair by pair: what was lost or broke,
+what answers differently, what got slower or faster. The regression check before a
+milestone.
 
     suite.py compare BASE NEW [--systems nrese] [--threshold 0.10] [--min-ms 2]
 
 BASE and NEW are results directories or results.csv files (several, comma-separated).
+Completeness, timing eligibility and the estimator are `summary.py`'s, the same as the
+report's and the ledger's.
 
-Per query: the median of the measured repetitions within each run, then the median over the
-runs. Its noise is the spread of the per-run medians relative to their median (with one
-run: the interquartile range of the repetitions, or "?" with fewer than four). A change
-counts only if the ratio exceeds
-1 + max(threshold, noise of both sides) and the absolute difference exceeds --min-ms; the
-rest is reported as within noise. Load, store size, restart, count and peak memory are
-compared the same way over the runs. Differing answer or statement counts are listed first:
-they are correctness findings, not performance ones. Restricted systems are left out unless
---include-restricted.
+Printed first, because they decide whether a timing may be compared at all:
+- pairs and queries the baseline has and the new run doesn't, and loads or steps that
+  failed in the new run (lost work is never silently dropped from the comparison);
+- changed statement or answer counts, wrong answers, queries complete before and
+  incomplete now, and queries whose answers differ between systems (disputed).
+
+Then the speed verdict, over the queries that are complete, correct and undisputed on both
+sides only: a change counts if the ratio exceeds 1 + max(threshold, noise of both sides)
+and the absolute difference exceeds --min-ms; the rest is within noise. Load, store size,
+restart, count and peak memory are compared the same way over the runs. Restricted systems
+are left out unless --include-restricted.
 """
 from __future__ import annotations
 
 import argparse
 import math
-from collections import defaultdict
 from pathlib import Path
-from statistics import median, quantiles
 
 from .schema import read
+from .summary import Item, Pair, estimate, summarise
 
 
 def files(spec: str) -> list[Path]:
@@ -34,71 +38,16 @@ def files(spec: str) -> list[Path]:
     return out
 
 
-def number(text) -> float | None:
-    try:
-        return float(text)
-    except (TypeError, ValueError):
-        return None
-
-
-def summarise(values_per_run: dict[str, list[float]]) -> tuple[float, float] | None:
-    """(median over runs of the per-run medians, relative noise)."""
-    per_run = [median(v) for v in values_per_run.values() if v]
-    if not per_run:
-        return None
-    m = median(per_run)
-    if m <= 0:
-        return m, 0.0
-    if len(per_run) >= 2:
-        return m, (max(per_run) - min(per_run)) / m
-    only = next(v for v in values_per_run.values() if v)
-    if len(only) >= 4:
-        q = quantiles(only, n=4)
-        return m, (q[2] - q[0]) / m
-    return m, None  # too few values to estimate the noise
-
-
-def collect(paths: list[Path], systems: set[str] | None, restricted: bool):
-    """group -> {"steps": metric -> run -> [values], "queries": item -> run -> [ms],
-    "first": item -> run -> [ms], "answers": item -> {rows}, "counts": {rows}}"""
-    groups: dict[tuple, dict] = defaultdict(lambda: {
-        "steps": defaultdict(lambda: defaultdict(list)), "queries": defaultdict(lambda: defaultdict(list)),
-        "first": defaultdict(lambda: defaultdict(list)), "answers": defaultdict(set), "counts": set(),
-        "status": defaultdict(set)})
+def collect(paths: list[Path], systems: set[str] | None, restricted: bool) -> dict[tuple, Pair]:
+    rows = []
     for path in paths:
         for r in read(path):
             if systems and r["system"] not in systems:
                 continue
             if r["publish"] == "permission" and not restricted:
                 continue
-            if r["status"] == "skipped":
-                continue
-            cache = r.get("cache") or "-"
-            key = (r["workload"], r["tier"], r["system"], r["regime"])
-            run = f"{path}:{r['run']}"
-            task = r["task"]
-            ms = number(r["ms"])
-            if task == "query":
-                g = groups[key + (cache,)]
-                g["status"][r["item"]].add(r["status"])
-                if r["status"] in ("ok", "wrong") and ms is not None:
-                    (g["first"] if str(r["repeat"]) == "0" else g["queries"])[r["item"]][run].append(ms)
-                    if r["rows"] != "":
-                        g["answers"][r["item"]].add(r["rows"])
-                continue
-            if r["status"] != "ok":
-                continue
-            # Steps are measured once per run, before the queries: they belong to every cache line.
-            for g in [groups[key + ("-",)]]:
-                if ms is not None and task in ("load", "reason", "restart", "count"):
-                    g["steps"][f"{task} ms"][run].append(ms)
-                if task in ("load", "serve") and number(r["peak_mib"]) is not None:
-                    g["steps"][f"{task} peak MiB"][run].append(number(r["peak_mib"]))
-                if task == "size" and number(r["bytes"]) is not None:
-                    g["steps"]["store MiB"][run].append(number(r["bytes"]) / 2**20)
-                if task in ("load", "reason", "count") and r["rows"] != "":
-                    g["counts"].add((task, r["rows"]))
-    return groups
+            rows.append(r | {"run": f"{path.parent.name}/{r['run']}"})
+    return summarise(rows)
 
 
 def verdict(base, new, threshold: float, min_abs: float) -> str:
@@ -118,6 +67,10 @@ def fmt(x: float) -> str:
     return f"{x:,.0f}" if abs(x) >= 100 else f"{x:,.1f}"
 
 
+def eligible(item: Item, name: str, pair: Pair) -> bool:
+    return item.complete and name not in pair.disputed
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="suite.py compare", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -131,34 +84,37 @@ def main(argv: list[str]) -> int:
     systems = set(args.systems.split(",")) if args.systems else None
     base = collect(files(args.base), systems, args.include_restricted)
     new = collect(files(args.new), systems, args.include_restricted)
-    common = sorted(set(base) & set(new))
     print(f"# {args.new} against {args.base}\n")
-    print(f"threshold {args.threshold:.0%} or the measured noise, whichever is larger; at least {args.min_ms} ms\n")
-    only = sorted(set(new) - set(base))
-    if only:
-        print("New pairs without a baseline: " + "; ".join(" ".join(k[:3]) + (f" cache {k[4]}" if k[4] != "-" else "")
-                                                         for k in only) + "\n")
-    totals = {"slower": 0, "faster": 0, "=": 0}
+    print(f"threshold {args.threshold:.0%} or the measured noise, whichever is larger; at least {args.min_ms} ms; "
+          "only complete, correct, undisputed queries enter the speed verdict\n")
+    lost_pairs = sorted(k for k, pair in base.items() if pair.live and (k not in new or not new[k].live))
+    if lost_pairs:
+        print("**Lost: pairs the baseline ran and the new run didn't:** "
+              + "; ".join(" ".join(k) for k in lost_pairs) + "\n")
+    added = sorted(k for k, pair in new.items() if pair.live and (k not in base or not base[k].live))
+    if added:
+        print("New pairs without a baseline: " + "; ".join(" ".join(k) for k in added) + "\n")
+    totals = {"slower": 0, "faster": 0, "=": 0, "not comparable": 0}
     findings = []
-    for key in common:
+    for key in sorted(set(base) & set(new)):
         b, n = base[key], new[key]
-        workload, tier, system, regime, cache = key
-        title = f"{workload} {tier}, {system} ({regime}{', cache ' + cache if cache != '-' else ''})"
+        if not (b.live and n.live):
+            continue
+        title = f"{key[0]} {key[1]}, {key[2]} ({n.regime})"
         lines = []
-        # Correctness first.
-        if cache == "-" and b["counts"] and n["counts"] and b["counts"] != n["counts"]:
-            lines.append(f"- **statement counts differ:** {sorted(b['counts'])} -> {sorted(n['counts'])}")
-        for item in sorted(set(b["answers"]) & set(n["answers"])):
-            if b["answers"][item] != n["answers"][item]:
-                lines.append(f"- **{item}: answers differ:** {'/'.join(sorted(b['answers'][item]))} -> "
-                             f"{'/'.join(sorted(n['answers'][item]))}")
-        for item in sorted(set(b["status"]) & set(n["status"])):
-            if "ok" in b["status"][item] and "ok" not in n["status"][item]:
-                lines.append(f"- **{item}: was ok, now {'/'.join(sorted(n['status'][item]))}**")
+        # What decides whether the timings may be compared at all.
+        failed = len(n.loads) - len(n.ok_runs())
+        if failed:
+            lines.append(f"- **{failed} of {len(n.loads)} loads not ok in the new run**")
+        failed_steps = sorted({f"{t} {s}" for (t, s), c in n.other.items() if s != "ok"})
+        if failed_steps:
+            lines.append(f"- **steps not ok in the new run:** {', '.join(failed_steps)}")
+        if b.counts and n.counts and b.counts != n.counts:
+            lines.append(f"- **statement counts differ:** {sorted(b.counts)} -> {sorted(n.counts)}")
         # Steps: always shown, marked where beyond noise.
         steps = []
-        for metric in sorted(set(b["steps"]) & set(n["steps"])):
-            sb, sn = summarise(b["steps"][metric]), summarise(n["steps"][metric])
+        for metric in sorted(set(b.steps) & set(n.steps)):
+            sb, sn = estimate(b.steps[metric]), estimate(n.steps[metric])
             if sb and sn and sb[0] > 0:
                 v = verdict(sb, sn, args.threshold, args.min_ms if metric.endswith("ms") else 0)
                 if metric.endswith("MiB"):
@@ -169,35 +125,57 @@ def main(argv: list[str]) -> int:
                     findings.append(f"{title}: {metric} {sn[0] / sb[0]:.2f}x ({v})")
         if steps:
             lines.append("- steps: " + "; ".join(steps))
-        # Queries.
-        ratios, sums = [], [0.0, 0.0]
-        changed = []
-        for item in sorted(set(b["queries"]) & set(n["queries"])):
-            sb, sn = summarise(b["queries"][item]), summarise(n["queries"][item])
-            if not (sb and sn):
-                continue
-            sums[0] += sb[0]
-            sums[1] += sn[0]
-            if sb[0] > 0 and sn[0] > 0:
-                ratios.append(sn[0] / sb[0])
-            v = verdict(sb, sn, args.threshold, args.min_ms)
-            totals[v] += 1
-            if v != "=":
-                changed.append((sn[0] / sb[0], item, sb, sn, v))
-        if ratios:
-            geo = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
-            lines.insert(0, f"- queries: sum of medians {fmt(sums[0])} -> {fmt(sums[1])} ms "
-                            f"({sums[1] / sums[0] if sums[0] else float('nan'):.2f}x), geometric mean of ratios "
-                            f"{geo:.2f}x over {len(ratios)} queries")
-        for ratio, item, sb, sn, v in sorted(changed, reverse=True):
-            noise = "/".join("?" if x is None else f"{x:.0%}" for x in (sb[1], sn[1]))
-            lines.append(f"  - {item}: {fmt(sb[0])} -> {fmt(sn[0])} ms ({ratio:.2f}x, {v}; noise {noise})")
-            if v == "slower":
-                findings.append(f"{title}: {item} {ratio:.2f}x")
+        for cache in sorted(set(b.items) | set(n.items)):
+            bi, ni = b.items.get(cache, {}), n.items.get(cache, {})
+            label = "" if cache == "-" else f" (cache {cache})"
+            missing = sorted(set(bi) - set(ni))
+            if missing:
+                lines.append(f"- **lost queries{label}:** {', '.join(missing)}")
+            notes, changed, ratios, sums = [], [], [], [0.0, 0.0]
+            for name in sorted(set(bi) & set(ni)):
+                ib, inn = bi[name], ni[name]
+                if ib.answers and inn.answers and ib.answers != inn.answers:
+                    notes.append(f"**{name}: answers differ** {'/'.join(sorted(ib.answers))} -> "
+                                 f"{'/'.join(sorted(inn.answers))}")
+                if inn.wrong:
+                    notes.append(f"**{name}: wrong answer** ({inn.problems()})")
+                elif ib.complete and not inn.complete:
+                    notes.append(f"**{name}: was complete, now {inn.problems()}**")
+                if name in n.disputed:
+                    notes.append(f"{name}: answers differ between systems in the new run (disputed)")
+                if not (eligible(ib, name, b) and eligible(inn, name, n)):
+                    totals["not comparable"] += 1
+                    continue
+                sb, sn = ib.estimate(), inn.estimate()
+                if not (sb and sn):
+                    totals["not comparable"] += 1
+                    continue
+                sums[0] += sb[0]
+                sums[1] += sn[0]
+                if sb[0] > 0 and sn[0] > 0:
+                    ratios.append(sn[0] / sb[0])
+                v = verdict(sb, sn, args.threshold, args.min_ms)
+                totals[v] += 1
+                if v != "=":
+                    changed.append((sn[0] / sb[0], name, sb, sn, v))
+            if ratios:
+                geo = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
+                lines.append(f"- queries{label}: sum of medians {fmt(sums[0])} -> {fmt(sums[1])} ms "
+                             f"({sums[1] / sums[0] if sums[0] else float('nan'):.2f}x), geometric mean of ratios "
+                             f"{geo:.2f}x over {len(ratios)} comparable queries of {len(set(bi) & set(ni))}")
+            lines.extend(f"  - {note}" for note in notes)
+            for ratio, name, sb, sn, v in sorted(changed, reverse=True):
+                noise = "/".join("?" if x is None else f"{x:.0%}" for x in (sb[1], sn[1]))
+                lines.append(f"  - {name}{label}: {fmt(sb[0])} -> {fmt(sn[0])} ms ({ratio:.2f}x, {v}; noise {noise})")
+                if v == "slower":
+                    findings.append(f"{title}: {name}{label} {ratio:.2f}x")
         if lines:
             print(f"## {title}\n")
             print("\n".join(lines) + "\n")
-    print(f"**Queries:** {totals['slower']} slower, {totals['faster']} faster, {totals['=']} within noise.")
+    print(f"**Queries:** {totals['slower']} slower, {totals['faster']} faster, {totals['=']} within noise, "
+          f"{totals['not comparable']} not comparable (incomplete, wrong, disputed or without timings).")
+    if lost_pairs:
+        print(f"**Lost pairs:** {len(lost_pairs)}")
     if findings:
-        print("\n**Slower beyond noise:**\n" + "\n".join(f"- {f}" for f in findings))
+        print("\n**Worse beyond noise:**\n" + "\n".join(f"- {f}" for f in findings))
     return 0

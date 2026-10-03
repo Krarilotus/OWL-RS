@@ -19,10 +19,10 @@ from __future__ import annotations
 import argparse
 import json
 import tomllib
-from collections import defaultdict
 from pathlib import Path
 
 from .schema import read
+from .summary import summarise
 
 HAND_FIELDS = ("purpose", "baseline", "findings")
 FALLBACK_FIELDS = ("commit", "machine", "host", "started", "finished", "protocol")
@@ -69,46 +69,6 @@ def load_records(runs_dir: Path) -> list[dict]:
     return records
 
 
-def outcome(rows: list[dict]) -> dict:
-    """How one (workload, tier, system) came out in a run."""
-    publish = rows[0]["publish"]
-    live = [r for r in rows if r["status"] != "skipped"]
-    regime = next((r["regime"] for r in live if r["regime"] not in ("", "-")), None) \
-        or next((r["regime"] for r in rows if r["regime"] not in ("", "-")), "-")
-    if not live:
-        return {"regime": regime, "outcome": "skipped", "note": rows[0]["note"][:160]}
-    if publish == "permission":
-        return {"regime": regime, "outcome": "restricted",
-                "note": "ran; results stay local until the vendor permits publishing"}
-    loads = [r for r in live if r["task"] in ("load", "conformance")]
-    ok_runs = {r["run"] for r in loads if r["status"] == "ok"}
-    queries = [r for r in live if r["task"] == "query"]
-    items = {r["item"] for r in queries}
-    ok_items = {r["item"] for r in queries if r["status"] == "ok"}
-    wrong = sorted({r["item"] for r in queries if r["status"] == "wrong"})
-    others = [r for r in live if r["task"] not in ("load", "conformance", "query")]
-    result = {"regime": regime, "runs": len(ok_runs)}
-    if items:
-        result["items"] = f"{len(ok_items)}/{len(items)}"
-    if not ok_runs:
-        statuses = {r["status"] for r in loads} or {"failed"}
-        result["outcome"] = "timeout" if statuses == {"timeout"} else "failed"
-        bad = next((r for r in loads if r["status"] != "ok"), None)
-        if bad is not None and bad["note"]:
-            result["note"] = bad["note"][:160]
-    elif wrong:
-        result["outcome"] = "wrong"
-        result["note"] = "wrong answer counts: " + ", ".join(wrong)[:140]
-    elif len(ok_items) < len(items) or any(r["status"] != "ok" for r in others + loads):
-        result["outcome"] = "partial"
-        failed = sorted(items - ok_items)
-        if failed:
-            result["note"] = "not ok: " + ", ".join(failed)[:150]
-    else:
-        result["outcome"] = "ok"
-    return result
-
-
 def from_results(directory: Path, root: Path) -> dict:
     rows = read(directory / "results.csv") if (directory / "results.csv").exists() else []
     manifest = {}
@@ -142,12 +102,9 @@ def from_results(directory: Path, root: Path) -> dict:
         record["started"] = rows[0]["date"]
         record["host"] = rows[0]["host"]
         record["commit"] = "unknown (before run manifests)"
-    by_pair: dict[tuple, list[dict]] = defaultdict(list)
-    for r in rows:
-        by_pair[(r["workload"], r["tier"], r["system"])].append(r)
     pairs = []
-    for (workload, tier, system), group in sorted(by_pair.items()):
-        pairs.append({"workload": workload, "tier": tier, "system": system} | outcome(group))
+    for (workload, tier, system), pair in sorted(summarise(rows).items()):
+        pairs.append({"workload": workload, "tier": tier, "system": system} | pair.outcome())
     record["pairs"] = pairs
     restricted = any(p["outcome"] == "restricted" for p in pairs)
     record["publishable"] = "free systems only" if restricted else "all"
