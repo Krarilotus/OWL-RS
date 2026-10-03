@@ -24,7 +24,7 @@
 //! restrictions, complements, cardinalities, inverses, nominals) are skipped and
 //! counted: the hierarchy is then complete for the EL part only.
 
-use std::collections::{HashMap, HashSet};
+use hashbrown::{HashMap, HashSet};
 
 use super::ir::{OWL, RDF, RDFS, Vocabulary};
 
@@ -594,8 +594,12 @@ fn saturate(
             result.unsatisfiable.push(id);
             continue;
         }
-        for &(d, super_id) in &named_ids {
-            if d != c && d != thing && set.contains(&d) {
+        // Its own subsumers, not every named class: linear in the taxonomy's size.
+        for &d in set {
+            if d != c
+                && d != thing
+                && let Some(super_id) = tbox.named[d as usize]
+            {
                 result.subsumptions.push((id, super_id));
             }
         }
