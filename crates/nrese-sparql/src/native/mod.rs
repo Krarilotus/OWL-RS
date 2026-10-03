@@ -340,6 +340,9 @@ pub(crate) fn delete_insert(
             },
         };
         let graph = |g: &GraphNamePattern| match g {
+            GraphNamePattern::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
+                Some(nrese_rdf::GraphName::DefaultGraph)
+            }
             GraphNamePattern::NamedNode(n) => Some(nrese_rdf::GraphName::from(n.clone())),
             GraphNamePattern::DefaultGraph => Some(nrese_rdf::GraphName::DefaultGraph),
             GraphNamePattern::Variable(v) => match value(v)? {
@@ -1754,6 +1757,10 @@ impl<'a> Context<'a> {
 
     fn graph(&self, name: &NamedNodePattern, inner: &GraphPattern) -> NativeResult<Solutions> {
         let variable = match name {
+            // Jena's name for the default graph (`compat`): the store's default graph.
+            NamedNodePattern::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
+                return self.in_graph(GraphScope::Default, inner);
+            }
             NamedNodePattern::NamedNode(n) => {
                 let id = self
                     .lookup_const(n.as_ref().into())
@@ -2542,13 +2549,23 @@ impl<'a> Context<'a> {
             order.sort_by_key(|&i| counts[i]);
             let mut rows = vec![f64::NAN; order.len()];
             rows[0] = counts[order[0]] as f64;
-            // Two patterns of one star: the characteristic sets estimate the pair.
+            // Two patterns of one star: the characteristic sets estimate the pair; an edge
+            // and a star on its object: the characteristic pairs estimate the chain.
             if let [a, b] = scans
                 && let (Some(x), Some(y)) = (self.star(a, counts[0], 0), self.star(b, counts[1], 0))
-                && a.slots[0] == b.slots[0]
                 && let Some(sets) = self.snapshot.characteristic_sets_in(self.model)
             {
-                rows[1] = sets.star(&[x.predicate, y.predicate]) * x.selectivity * y.selectivity;
+                if a.slots[0] == b.slots[0] {
+                    rows[1] =
+                        sets.star(&[x.predicate, y.predicate]) * x.selectivity * y.selectivity;
+                } else if let Some((edge, star)) = match (&a.slots[2], &b.slots[2]) {
+                    (Slot::Var(_), _) if a.slots[2] == b.slots[0] => Some((x, y)),
+                    (_, Slot::Var(_)) if b.slots[2] == a.slots[0] => Some((y, x)),
+                    _ => None,
+                } && let Some(chain) = sets.pair(&[], edge.predicate, &[star.predicate])
+                {
+                    rows[1] = chain * edge.selectivity * star.selectivity;
+                }
             }
             return plan::Plan { order, rows };
         }
@@ -2567,8 +2584,15 @@ impl<'a> Context<'a> {
                     Slot::Var(v) => self.star(scan, count, index_of(v.clone())),
                     _ => None,
                 };
+                let edge_object = match (&star, &scan.slots[2]) {
+                    (Some(_), Slot::Var(o)) if scan.slots[0] != scan.slots[2] => {
+                        Some(index_of(o.clone()))
+                    }
+                    _ => None,
+                };
                 plan::Input {
                     count,
+                    edge_object,
                     vars: scan
                         .vars()
                         .into_iter()

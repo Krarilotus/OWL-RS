@@ -13,6 +13,12 @@
 //! already constrain `?s` by their predicates `P` multiplies the rows by
 //! `star(P ∪ {p}) / star(P)`, the statements of `p` per subject among the subjects that
 //! have `P`, instead of assuming every subject might have `p`.
+//!
+//! Chains are estimated from characteristic pairs where they are known: a star pattern on
+//! `?y` joined after an edge `?x p ?y` multiplies the rows by
+//! `pair(X, p, Y ∪ {q}) / pair(X, p, Y)` (`X`, `Y` the predicates the state already puts
+//! on `?x` and `?y`): the share of `p`'s links from such subjects whose object has `q`,
+//! instead of assuming every object of `p` might.
 
 use nrese_engine::engine::characteristic::CharacteristicSets;
 
@@ -31,6 +37,9 @@ pub(super) struct Input {
     /// The pattern as part of a star, if it is one: a variable subject and a constant
     /// predicate, in the default graph.
     pub star: Option<Star>,
+    /// The pattern as an edge `?x p ?y` between two variables, if it is one (a star
+    /// pattern with a variable object): the object variable.
+    pub edge_object: Option<usize>,
 }
 
 /// A pattern `?s p o` of a star on `?s`.
@@ -94,26 +103,57 @@ pub(super) fn order(
     let extend = |state: &State, j: usize| -> State {
         let input = &inputs[j];
         let count = input.count as f64;
-        // A star extended: its rows from the characteristic sets.
-        let star = sets.zip(input.star).and_then(|(sets, star)| {
-            if state.distinct[star.subject] == 0.0 {
+        // A star pattern on `?y` after an edge `?x p ?y`: its rows from the
+        // characteristic pairs.
+        let chained = sets.zip(input.star).and_then(|(sets, star)| {
+            if state.distinct[star.subject] == 0.0 || !sets.has_pairs() {
                 return None;
             }
-            let mut predicates: Vec<u64> = state
-                .order
-                .iter()
-                .filter_map(|&i| inputs[i].star)
-                .filter(|s| s.subject == star.subject)
-                .map(|s| s.predicate)
-                .collect();
-            if predicates.is_empty() {
-                return None;
-            }
-            let before = sets.star(&predicates);
-            predicates.push(star.predicate);
-            let after = sets.star(&predicates);
+            let edge = state.order.iter().copied().find(|&i| {
+                inputs[i].edge_object == Some(star.subject)
+                    && inputs[i].star.is_some_and(|e| e.subject != star.subject)
+            })?;
+            let edge_star = inputs[edge].star?;
+            let on = |subject: usize, skip: Option<usize>| -> Vec<u64> {
+                state
+                    .order
+                    .iter()
+                    .filter(|&&i| Some(i) != skip)
+                    .filter_map(|&i| inputs[i].star)
+                    .filter(|s| s.subject == subject)
+                    .map(|s| s.predicate)
+                    .collect()
+            };
+            let from = on(edge_star.subject, Some(edge));
+            let mut to = on(star.subject, None);
+            let before = sets.pair(&from, edge_star.predicate, &to)?;
+            to.push(star.predicate);
+            let after = sets.pair(&from, edge_star.predicate, &to)?;
             let factor = if before > 0.0 { after / before } else { 0.0 };
             Some((star.subject, factor * star.selectivity))
+        });
+        // A star extended: its rows from the characteristic sets.
+        let star = chained.or_else(|| {
+            sets.zip(input.star).and_then(|(sets, star)| {
+                if state.distinct[star.subject] == 0.0 {
+                    return None;
+                }
+                let mut predicates: Vec<u64> = state
+                    .order
+                    .iter()
+                    .filter_map(|&i| inputs[i].star)
+                    .filter(|s| s.subject == star.subject)
+                    .map(|s| s.predicate)
+                    .collect();
+                if predicates.is_empty() {
+                    return None;
+                }
+                let before = sets.star(&predicates);
+                predicates.push(star.predicate);
+                let after = sets.star(&predicates);
+                let factor = if before > 0.0 { after / before } else { 0.0 };
+                Some((star.subject, factor * star.selectivity))
+            })
         });
         let mut rows = match star {
             Some((_, factor)) => state.rows * factor,
@@ -242,6 +282,7 @@ mod tests {
             count,
             vars: vars.to_vec(),
             star: None,
+            edge_object: None,
         }
     }
 

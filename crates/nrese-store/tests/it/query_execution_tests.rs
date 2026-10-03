@@ -281,3 +281,62 @@ fn having_may_name_a_select_alias() {
     // The same, written as the standard has it.
     assert_eq!(groups("COUNT(?m) >= 2 && SUM(?age) / COUNT(?m) > 5"), ["a"]);
 }
+
+/// Jena's and Fuseki's name for the default graph, `urn:x-arq:DefaultGraph`, which clients
+/// written for them use (rdflib's SPARQL store writes a graph so named into
+/// `GRAPH <urn:x-arq:DefaultGraph> { … }`): the default graph in update data, in `GRAPH`
+/// patterns and in update templates.
+#[test]
+fn jenas_default_graph_name_is_the_default_graph() {
+    let service = StoreService::new(StoreConfig::in_memory()).expect("store");
+    let ask = |query: &str| {
+        let result = service.execute_query_str(query).expect("query");
+        String::from_utf8(result.payload).unwrap().contains("true")
+    };
+    service
+        .execute_update_str(
+            "INSERT DATA { GRAPH <urn:x-arq:DefaultGraph> { <http://e/a> <http://e/p> <http://e/b> } }",
+        )
+        .expect("insert");
+    assert!(
+        ask("ASK { <http://e/a> <http://e/p> <http://e/b> }"),
+        "in the default graph"
+    );
+    assert!(!ask("ASK { GRAPH ?g { ?s ?p ?o } }"), "no named graph made");
+    assert!(ask(
+        "ASK { GRAPH <urn:x-arq:DefaultGraph> { <http://e/a> <http://e/p> <http://e/b> } }"
+    ));
+    service
+        .execute_update_str(
+            "DELETE { GRAPH <urn:x-arq:DefaultGraph> { ?s ?p ?o } } \
+             INSERT { GRAPH <urn:x-arq:DefaultGraph> { ?o ?p ?s } } \
+             WHERE { GRAPH <urn:x-arq:DefaultGraph> { ?s ?p ?o } }",
+        )
+        .expect("delete/insert");
+    assert!(
+        ask("ASK { <http://e/b> <http://e/p> <http://e/a> }"),
+        "templates too"
+    );
+    assert!(!ask("ASK { <http://e/a> <http://e/p> <http://e/b> }"));
+    assert!(!ask("ASK { GRAPH ?g { ?s ?p ?o } }"));
+}
+
+/// Jena's name for the default graph as the query's dataset (`FROM`, as rdflib's SPARQL
+/// store sends it): the store's default graph.
+#[test]
+fn jenas_default_graph_name_as_the_dataset() {
+    let service = StoreService::new(StoreConfig::in_memory()).expect("store");
+    service
+        .execute_update_str(
+            "INSERT DATA { <http://e/a> <http://e/p> <http://e/b> GRAPH <http://e/g> { <http://e/c> <http://e/p> <http://e/d> } }",
+        )
+        .expect("insert");
+    let result = service
+        .execute_query_str("SELECT ?s FROM <urn:x-arq:DefaultGraph> WHERE { ?s ?p ?o }")
+        .expect("query");
+    let text = String::from_utf8(result.payload).unwrap();
+    assert!(
+        text.contains("http://e/a") && !text.contains("http://e/c"),
+        "{text}"
+    );
+}

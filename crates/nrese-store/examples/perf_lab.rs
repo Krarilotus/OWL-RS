@@ -4,7 +4,7 @@
 //! cargo run --release -p nrese-store --example perf_lab -- \
 //!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
-//!     [--explain] [--format tsv|json|xml|csv] [--shapes FILE] [--reason RULESET]
+//!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE] [--reason RULESET]
 //! ```
 //!
 //! - **Data:** `--load` bulk-loads files, into memory or, with `--store`, into an on-disk
@@ -24,6 +24,10 @@
 //!   `--explain` prints each query's plan after its measurement: every operator with its
 //!   estimated and actual rows and its time (inputs included), where the time goes when a
 //!   profiler isn't at hand.
+//!   `--qerror` measures the planner's estimates: every operator with an estimate, over
+//!   every query, gets its q-error, `max(estimate, rows) / min(estimate, rows)` (both at
+//!   least 1; Moerkotte et al., VLDB 2009), summarised per operator (median, p90, max, the
+//!   share within 2×) and in the JSON report.
 //!
 //! This is the loop every Phase 2–5 work package is measured with before the Docker
 //! scorecard confirms it against other systems. It runs anywhere the data is; the wrapper
@@ -56,6 +60,7 @@ struct Args {
     json: Option<PathBuf>,
     baseline: Option<PathBuf>,
     explain: bool,
+    qerror: bool,
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
     reason: Option<nrese_reasoner::v2::rulesets::Ruleset>,
@@ -74,6 +79,7 @@ fn parse_args() -> Result<Args, String> {
         json: None,
         baseline: None,
         explain: false,
+        qerror: false,
         format: SolutionsResultFormat::Tsv,
         shapes: None,
         reason: None,
@@ -96,6 +102,7 @@ fn parse_args() -> Result<Args, String> {
             "--json" => args.json = Some(value()?.into()),
             "--baseline" => args.baseline = Some(value()?.into()),
             "--explain" => args.explain = true,
+            "--qerror" => args.qerror = true,
             "--shapes" => args.shapes = Some(value()?.into()),
             "--reason" => {
                 let name = value()?;
@@ -268,6 +275,65 @@ fn explain(store: &StoreService, text: &str) {
         }
         Err(error) => println!("    explain failed: {error}"),
     }
+}
+
+/// The q-errors of `text`'s estimated operators, by operator.
+fn qerrors(store: &StoreService, text: &str, into: &mut BTreeMap<String, Vec<f64>>) {
+    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+        return;
+    };
+    let Ok(explanation) = store.explain_query(&prepared, &CancellationToken::new()) else {
+        return;
+    };
+    for step in &explanation.steps {
+        if let Some(estimate) = step.estimated_rows {
+            let (e, r) = (estimate.max(1) as f64, step.rows.max(1) as f64);
+            into.entry(step.operator.clone())
+                .or_default()
+                .push(e.max(r) / e.min(r));
+        }
+    }
+}
+
+/// `operator  n  median  p90  max  within 2x` per operator and over all; the JSON object.
+fn qerror_summary(by_operator: &BTreeMap<String, Vec<f64>>) -> String {
+    let stats = |values: &[f64]| {
+        let mut v = values.to_vec();
+        v.sort_by(f64::total_cmp);
+        let at = |q: f64| v[((v.len() - 1) as f64 * q).round() as usize];
+        let within = v.iter().filter(|&&x| x <= 2.0).count() as f64 / v.len() as f64;
+        (v.len(), at(0.5), at(0.9), *v.last().unwrap(), within)
+    };
+    println!(
+        "{:<20} {:>6} {:>9} {:>9} {:>11} {:>9}",
+        "q-error", "n", "median", "p90", "max", "within 2x"
+    );
+    let mut all: Vec<f64> = Vec::new();
+    let mut json = Vec::new();
+    for (operator, values) in by_operator {
+        let (n, median, p90, max, within) = stats(values);
+        println!(
+            "{operator:<20} {n:>6} {median:>9.2} {p90:>9.2} {max:>11.1} {:>8.0}%",
+            within * 100.0
+        );
+        json.push(format!(
+            "    {:?}: {{\"n\": {n}, \"median\": {median:.3}, \"p90\": {p90:.3}, \"max\": {max:.1}, \"within_2x\": {within:.3}}}",
+            operator
+        ));
+        all.extend(values);
+    }
+    if !all.is_empty() {
+        let (n, median, p90, max, within) = stats(&all);
+        println!(
+            "{:<20} {n:>6} {median:>9.2} {p90:>9.2} {max:>11.1} {:>8.0}%",
+            "all",
+            within * 100.0
+        );
+        json.push(format!(
+            "    \"all\": {{\"n\": {n}, \"median\": {median:.3}, \"p90\": {p90:.3}, \"max\": {max:.1}, \"within_2x\": {within:.3}}}"
+        ));
+    }
+    format!("{{\n{}\n  }}", json.join(",\n"))
 }
 
 /// Peak and current resident memory in MiB, where the OS reports it (Linux).
@@ -443,12 +509,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut report = Vec::new();
     let mut sum_p50 = 0.0;
+    let mut estimates: BTreeMap<String, Vec<f64>> = BTreeMap::new();
     for file in &files {
         let name = file.file_stem().unwrap().to_string_lossy().into_owned();
         let text = std::fs::read_to_string(file)?;
         let m = measure(&store, &text, &args);
         if args.explain {
             explain(&store, &text);
+        }
+        if args.qerror {
+            qerrors(&store, &text, &mut estimates);
         }
         if let Some(error) = &m.error {
             println!("{name:<28} error: {error}");
@@ -475,14 +545,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let memory = memory_mib();
     println!("sum of p50: {sum_p50:.1} ms");
+    let qerror_json = (args.qerror && !estimates.is_empty()).then(|| qerror_summary(&estimates));
     if let Some((peak, rss)) = memory {
         println!("memory: peak {peak} MiB, resident {rss} MiB");
     }
     if let Some(path) = &args.json {
         let json = format!(
-            "{{\n  \"label\": {:?},\n  \"open_s\": {open_s:.3},\n  \"load_s\": {load_s:.3},\n  \"peak_mib\": {},\n  \"sum_p50_ms\": {sum_p50:.3},\n  \"queries\": [\n{}\n  ]\n}}\n",
+            "{{\n  \"label\": {:?},\n  \"open_s\": {open_s:.3},\n  \"load_s\": {load_s:.3},\n  \"peak_mib\": {},\n  \"sum_p50_ms\": {sum_p50:.3},{}\n  \"queries\": [\n{}\n  ]\n}}\n",
             args.label,
             memory.map_or(0, |(peak, _)| peak),
+            qerror_json.map_or(String::new(), |q| format!("\n  \"qerror\": {q},")),
             report.join(",\n")
         );
         std::fs::write(path, json)?;

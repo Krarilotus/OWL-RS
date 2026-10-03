@@ -212,6 +212,15 @@ mod tests {
     }
 
     #[test]
+    fn graph_target_reads_jenas_default_graph_name_as_the_default_graph() {
+        let target = parse_graph_target(&RawQuery(Some(
+            "graph=urn%3Ax-arq%3ADefaultGraph".to_owned(),
+        )))
+        .expect("target should parse");
+        assert_eq!(target, nrese_store::GraphTarget::DefaultGraph);
+    }
+
+    #[test]
     fn graph_target_rejects_conflicting_default_and_graph() {
         let result = parse_graph_target(&RawQuery(Some(
             "default=&graph=http%3A%2F%2Fexample.com%2Fg".to_owned(),
