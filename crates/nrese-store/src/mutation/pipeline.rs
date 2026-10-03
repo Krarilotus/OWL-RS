@@ -164,7 +164,7 @@ impl MutationPipeline {
             // Reasoner v2: the closure goes into the inferred stack, in this transaction.
             let program = self.program.get_or_init(|| {
                 let tx = &tx;
-                crate::reasoning::Program::new(&rules, &|term| tx.intern(term))
+                crate::reasoning::Program::compile(&rules, &|term| tx.intern(term))
                     .hiding_unnamed_classes(self.store.config().hide_unnamed_classes)
                     .by_representatives(self.store.config().equality_by_representatives)
                     .storing_representatives(self.store.config().equality_compact)
@@ -189,7 +189,7 @@ impl MutationPipeline {
                 "the commit leaves an ontology axiom unusable",
             );
             if let Some(violation) = violations.first() {
-                let explanation = crate::reasoning::explain(program, violation, &tx);
+                let explanation = crate::reasoning::explain_violation(program, violation, &tx);
                 let attribution =
                     attribute_reject_delta(&explanation, &MutationDeltaPreview::of(&tx));
                 let mut detail = format!(

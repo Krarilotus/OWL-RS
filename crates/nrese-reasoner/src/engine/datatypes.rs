@@ -14,9 +14,9 @@
 //! fold lexical forms into each other; ill-typed literals (no data value) aren't judged.
 //! A datatype outside OWL 2's list is not judged either.
 
+use crate::ir::{Triple, Violation};
 use nrese_engine::{TermId, TermKind};
 use nrese_rdf::{Literal, Term};
-use nrese_reasoner::ir::{Triple, Violation};
 use nrese_xsd::{DateTime, Decimal, Double, Float, Integer};
 use std::str::FromStr;
 

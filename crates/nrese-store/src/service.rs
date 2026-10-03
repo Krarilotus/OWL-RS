@@ -909,7 +909,7 @@ impl StoreService {
         program: nrese_reasoner::RuleProgram,
     ) -> crate::reasoning::Program {
         let unknown = std::cell::Cell::new(u64::MAX >> 1);
-        crate::reasoning::Program::new(&program, &|term| {
+        crate::reasoning::Program::compile(&program, &|term| {
             snapshot.lookup(term).unwrap_or_else(|| {
                 unknown.set(unknown.get() - 1);
                 nrese_engine::TermId::from_raw(unknown.get())
@@ -952,7 +952,7 @@ impl StoreService {
     /// `program` on the asserted data ([`crate::reasoning::equality_report`]).
     pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
         let tx = self.engine.transaction();
-        let program = crate::reasoning::Program::new(&program.into(), &|term| tx.intern(term));
+        let program = crate::reasoning::Program::compile(&program.into(), &|term| tx.intern(term));
         crate::reasoning::equality_report(&program, tx.base())
     }
 
@@ -979,10 +979,11 @@ impl StoreService {
         let asserted = rematerialisation
             .base()
             .len_in(nrese_engine::ReadModel::Asserted);
-        let program = crate::reasoning::Program::new(rules, &|term| rematerialisation.intern(term))
-            .hiding_unnamed_classes(self.config.hide_unnamed_classes)
-            .by_representatives(self.config.equality_by_representatives)
-            .storing_representatives(self.config.equality_compact);
+        let program =
+            crate::reasoning::Program::compile(rules, &|term| rematerialisation.intern(term))
+                .hiding_unnamed_classes(self.config.hide_unnamed_classes)
+                .by_representatives(self.config.equality_by_representatives)
+                .storing_representatives(self.config.equality_compact);
         let closure = crate::reasoning::materialise_until(&program, rematerialisation.base(), stop)
             .map_err(|_| crate::StoreError::MaterialisationCancelled)?;
         let inferred = closure.inferred.len() as u64;

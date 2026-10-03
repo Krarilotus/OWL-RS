@@ -1214,11 +1214,13 @@ name = "nrese-reasoner"
 version = "0.1.0"
 dependencies = [
  "hashbrown 0.16.1",
+ "nrese-engine",
  "nrese-exec",
  "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-reasoner",
+ "nrese-xsd",
  "rayon",
  "smallvec",
  "thiserror 2.0.21",
