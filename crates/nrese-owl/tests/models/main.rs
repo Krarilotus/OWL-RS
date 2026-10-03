@@ -421,6 +421,16 @@ fn a_domain_over_a_non_simple_role_goes_through_its_automaton() {
         "the domain isn't routed through a fresh name or automaton state: {:#?}",
         normalised.clauses
     );
+    // And Horn: a domain is a universal over the inverse, no disjunction (the U1 bound
+    // turned a disjunctive domain into typing every element).
+    assert!(
+        normalised
+            .clauses
+            .iter()
+            .all(|clause| clause.head.len() <= 1),
+        "a disjunctive clause from a domain: {:#?}",
+        normalised.clauses
+    );
 }
 
 /// A transition of a role's automaton names the role inclusions of its edge with the
