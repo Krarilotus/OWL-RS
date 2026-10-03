@@ -817,62 +817,92 @@ impl StoreService {
         object: nrese_rdf::TermRef<'_>,
     ) -> Option<Vec<crate::reasoning::InferenceStep>> {
         let snapshot = self.engine.snapshot();
-        // The program's constants by the snapshot's ids, without the writer: a constant
-        // the store doesn't hold gets an id no statement uses (its rules can't fire).
+        let program = self.bound_program(&snapshot, program.into());
+        let fact = Self::fact_of(&snapshot, [subject, predicate, object])?;
+        let crate::ReadScope::Graphs(access) = scope else {
+            return crate::reasoning::explain_fact(&program, &snapshot, fact, None);
+        };
+        let readable = |fact: [u64; 3]| readable_asserted(&snapshot, access, fact);
+        let steps = crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))?;
+        let visible = match steps.first().map(|step| step.origin) {
+            Some("inferred") => self.inferred_visible(&snapshot, access, fact),
+            Some("asserted") => true,
+            _ => false,
+        };
+        visible.then_some(steps)
+    }
+
+    /// The justifications of the statement `subject predicate object` under `program`:
+    /// minimal sets of asserted statements it follows from, as `mode` asks
+    /// ([`crate::reasoning::justify_fact`]). `None` if it doesn't hold. Within `scope` as
+    /// [`Self::explain_statement`]: a statement the requester doesn't see is `None`, and
+    /// asserted statements in no readable graph are `hidden`.
+    pub fn justify_statement(
+        &self,
+        program: impl Into<nrese_reasoner::RuleProgram>,
+        scope: &crate::ReadScope,
+        statement: [nrese_rdf::TermRef<'_>; 3],
+        mode: crate::reasoning::JustificationMode,
+    ) -> Option<crate::reasoning::JustificationAnswer> {
+        let snapshot = self.engine.snapshot();
+        let program = self.bound_program(&snapshot, program.into());
+        let fact = Self::fact_of(&snapshot, statement)?;
+        let crate::ReadScope::Graphs(access) = scope else {
+            return crate::reasoning::justify_fact(&program, &snapshot, fact, mode, None);
+        };
+        let readable = |fact: [u64; 3]| readable_asserted(&snapshot, access, fact);
+        let visible = readable(fact) || self.inferred_visible(&snapshot, access, fact);
+        if !visible {
+            return None;
+        }
+        crate::reasoning::justify_fact(&program, &snapshot, fact, mode, Some(&readable))
+    }
+
+    /// `program` with its constants by the snapshot's ids, without the writer: a constant
+    /// the store doesn't hold gets an id no statement uses (its rules can't fire).
+    fn bound_program(
+        &self,
+        snapshot: &nrese_engine::Snapshot,
+        program: nrese_reasoner::RuleProgram,
+    ) -> crate::reasoning::Program {
         let unknown = std::cell::Cell::new(u64::MAX >> 1);
-        let program = crate::reasoning::Program::new(&program.into(), &|term| {
+        crate::reasoning::Program::new(&program, &|term| {
             snapshot.lookup(term).unwrap_or_else(|| {
                 unknown.set(unknown.get() - 1);
                 nrese_engine::TermId::from_raw(unknown.get())
             })
         })
-        .hiding_unnamed_classes(self.config.hide_unnamed_classes);
-        let fact = [
-            snapshot.lookup(subject)?.raw(),
-            snapshot.lookup(predicate)?.raw(),
-            snapshot.lookup(object)?.raw(),
-        ];
-        let crate::ReadScope::Graphs(access) = scope else {
-            return crate::reasoning::explain_fact(&program, &snapshot, fact, None);
-        };
-        let readable = |[s, p, o]: [u64; 3]| {
-            let id = nrese_engine::TermId::from_raw;
-            let pattern = nrese_engine::QuadPattern {
-                subject: Some(id(s)),
-                predicate: Some(id(p)),
-                object: Some(id(o)),
-                graph: nrese_engine::GraphSelector::Any,
-            };
-            snapshot
-                .quads_for_pattern_in(nrese_engine::ReadModel::Asserted, &pattern)
-                .any(|quad| {
-                    let graph = if quad.graph.is_default_graph() {
-                        nrese_rdf::GraphName::DefaultGraph
-                    } else {
-                        match snapshot.decode(quad.graph) {
-                            Some(nrese_rdf::Term::NamedNode(n)) => {
-                                nrese_rdf::GraphName::NamedNode(n)
-                            }
-                            _ => return false,
-                        }
-                    };
-                    access.allows_graph(&graph)
-                })
-        };
-        let steps = crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))?;
-        let visible = match steps.first().map(|step| step.origin) {
-            Some("inferred") if by_support(access) => {
-                let [s, p, o] = fact.map(nrese_engine::TermId::from_raw);
-                self.view_of(&snapshot, Some(access)).contains_in(
-                    ReadModel::Inferred,
-                    &nrese_engine::EncodedQuad::new(s, p, o, nrese_engine::TermId::DEFAULT_GRAPH),
-                )
-            }
-            Some("inferred") => access.inferred,
-            Some("asserted") => true,
-            _ => false,
-        };
-        visible.then_some(steps)
+        .hiding_unnamed_classes(self.config.hide_unnamed_classes)
+    }
+
+    /// A statement by the snapshot's ids; `None` if a term isn't in the store.
+    fn fact_of(
+        snapshot: &nrese_engine::Snapshot,
+        [s, p, o]: [nrese_rdf::TermRef<'_>; 3],
+    ) -> Option<[u64; 3]> {
+        Some([
+            snapshot.lookup(s)?.raw(),
+            snapshot.lookup(p)?.raw(),
+            snapshot.lookup(o)?.raw(),
+        ])
+    }
+
+    /// Whether the requester sees `fact` as an inferred statement.
+    fn inferred_visible(
+        &self,
+        snapshot: &nrese_engine::Snapshot,
+        access: &std::sync::Arc<nrese_sparql::GraphAccess>,
+        fact: [u64; 3],
+    ) -> bool {
+        if by_support(access) {
+            let [s, p, o] = fact.map(nrese_engine::TermId::from_raw);
+            self.view_of(snapshot, Some(access)).contains_in(
+                ReadModel::Inferred,
+                &nrese_engine::EncodedQuad::new(s, p, o, nrese_engine::TermId::DEFAULT_GRAPH),
+            )
+        } else {
+            access.inferred
+        }
     }
 
     /// The closure's size with equality replicated and over representatives, for
@@ -1013,4 +1043,32 @@ fn read_model(infer: bool) -> crate::ReadModel {
         true => crate::ReadModel::Materialised,
         false => crate::ReadModel::Asserted,
     }
+}
+
+/// Whether `fact` is asserted in a graph `access` may read.
+fn readable_asserted(
+    snapshot: &nrese_engine::Snapshot,
+    access: &nrese_sparql::GraphAccess,
+    [s, p, o]: [u64; 3],
+) -> bool {
+    let id = nrese_engine::TermId::from_raw;
+    let pattern = nrese_engine::QuadPattern {
+        subject: Some(id(s)),
+        predicate: Some(id(p)),
+        object: Some(id(o)),
+        graph: nrese_engine::GraphSelector::Any,
+    };
+    snapshot
+        .quads_for_pattern_in(nrese_engine::ReadModel::Asserted, &pattern)
+        .any(|quad| {
+            let graph = if quad.graph.is_default_graph() {
+                nrese_rdf::GraphName::DefaultGraph
+            } else {
+                match snapshot.decode(quad.graph) {
+                    Some(nrese_rdf::Term::NamedNode(n)) => nrese_rdf::GraphName::NamedNode(n),
+                    _ => return false,
+                }
+            };
+            access.allows_graph(&graph)
+        })
 }

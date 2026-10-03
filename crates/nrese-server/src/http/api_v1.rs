@@ -409,8 +409,11 @@ struct ExplanationStep {
 
 #[utoipa::path(get, path = "/api/v1/repositories/{id}/explain", tag = "reasoning",
     params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("subj" = String, Query, description = "N-Triples term"),
-        ("pred" = String, Query, description = "N-Triples term"), ("obj" = String, Query, description = "N-Triples term")),
-    responses((status = 200, description = "`{\"steps\": [...]}`: the statement first, each step with its premises", body = Explanation),
+        ("pred" = String, Query, description = "N-Triples term"), ("obj" = String, Query, description = "N-Triples term"),
+        ("justifications" = Option<String>, Query, description = "Instead of one derivation, minimal sets of asserted statements the statement follows from: `one`, `core` (in every set), `union` (in some set), `top-k` (the `k` smallest), `all` (smallest first)"),
+        ("k" = Option<usize>, Query, description = "For `justifications=top-k`: how many (default 3)")),
+    responses((status = 200, description = "`{\"steps\": [...]}`: the statement first, each step with its premises; with `justifications`, `{\"mode\", \"justifications\" | \"statements\", \"complete\", \"verified\"}`", body = Explanation),
+        (status = 400, description = "An unknown `justifications` mode", body = crate::http::openapi::Problem),
         (status = 403, description = "The requester doesn't see inferred statements", body = crate::http::openapi::Problem),
         (status = 404, description = "The statement doesn't hold, or reasoning is off", body = crate::http::openapi::Problem)))]
 /// Why the statement `subj pred obj` (N-Triples terms, as RDF4J's parameters) holds: a
@@ -442,6 +445,46 @@ pub async fn explain(
     };
     let store = state.store();
     let scope = nrese_store::ReadScope::of(access.read.clone());
+    let param = |name: &str| {
+        pairs
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    if let Some(mode) = param("justifications") {
+        use nrese_store::reasoning::JustificationMode;
+        let mode = match mode.as_str() {
+            "one" => JustificationMode::One,
+            "core" => JustificationMode::Core,
+            "union" => JustificationMode::Union,
+            "all" => JustificationMode::All,
+            "top-k" => JustificationMode::Top(match param("k") {
+                Some(k) => k
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|k| *k > 0)
+                    .ok_or_else(|| ApiError::bad_request("k must be a positive number"))?,
+                None => 3,
+            }),
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "justifications is one, core, union, top-k or all, not {other}"
+                )));
+            }
+        };
+        let answer = tokio::task::spawn_blocking(move || {
+            store.justify_statement(
+                program,
+                &scope,
+                [subject.as_ref(), predicate.as_ref(), object.as_ref()],
+                mode,
+            )
+        })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
+        return Ok(Json(Justified::from(answer)).into_response());
+    }
     let steps = tokio::task::spawn_blocking(move || {
         store.explain_statement(
             program,
@@ -466,6 +509,73 @@ pub async fn explain(
         })
         .collect();
     Ok(Json(Explanation { steps }).into_response())
+}
+
+/// The justifications of a statement (`explain?justifications=...`).
+#[derive(Serialize, utoipa::ToSchema)]
+struct Justified {
+    /// `one`, `core`, `union`, `top-k` or `all`.
+    mode: &'static str,
+    /// `one`, `top-k`, `all`: the minimal sets, smallest first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    justifications: Option<Vec<Vec<JustifiedStatement>>>,
+    /// `core`: the statements in every set; `union`: those in some set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statements: Option<Vec<JustifiedStatement>>,
+    /// Whether the answer is exact (no budget or limit cut it short).
+    complete: bool,
+    /// `one`, `top-k`, `all`: whether a proof from each set was checked against the rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified: Option<bool>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct JustifiedStatement {
+    /// The statement's terms; left out for a `hidden` statement.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    subject: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    predicate: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    object: String,
+    /// `asserted`, or `hidden` (asserted in no graph the requester may read).
+    origin: &'static str,
+}
+
+impl From<nrese_store::reasoning::JustificationAnswer> for Justified {
+    fn from(answer: nrese_store::reasoning::JustificationAnswer) -> Self {
+        use nrese_store::reasoning::JustificationMode;
+        let convert =
+            |set: Vec<nrese_store::reasoning::JustifiedStatement>| -> Vec<JustifiedStatement> {
+                set.into_iter()
+                    .map(|s| JustifiedStatement {
+                        subject: s.subject,
+                        predicate: s.predicate,
+                        object: s.object,
+                        origin: s.origin,
+                    })
+                    .collect()
+            };
+        let mode = match answer.mode {
+            JustificationMode::One => "one",
+            JustificationMode::Core => "core",
+            JustificationMode::Union => "union",
+            JustificationMode::Top(_) => "top-k",
+            JustificationMode::All => "all",
+        };
+        let single = matches!(
+            answer.mode,
+            JustificationMode::Core | JustificationMode::Union
+        );
+        let mut sets: Vec<Vec<JustifiedStatement>> = answer.sets.into_iter().map(convert).collect();
+        Self {
+            mode,
+            statements: single.then(|| sets.pop().unwrap_or_default()),
+            justifications: (!single).then_some(sets),
+            complete: answer.complete,
+            verified: answer.verified,
+        }
+    }
 }
 
 #[derive(Serialize, utoipa::ToSchema)]

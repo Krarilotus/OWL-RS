@@ -1214,6 +1214,55 @@ impl GroundProgram {
         bodies
     }
 
+    /// [`Self::named_derivations`] with every set of schema facts each ground rule (and
+    /// transitivity) was grounded on, not only the first: the derivations a justification
+    /// enumeration needs (a bodiless instance's are [`Self::premise_alternatives`]). At most
+    /// `limit`.
+    pub fn every_named_derivation<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        limit: usize,
+    ) -> Vec<(String, Vec<Triple>)> {
+        let mut producers = Vec::new();
+        self.heads.matching_fact(fact, &mut producers);
+        producers.sort_unstable();
+        producers.dedup_by_key(|(r, _)| *r);
+        let transitive = self
+            .transitive
+            .contains(&fact[1])
+            .then(|| transitivity(fact[1]));
+        let rules = producers
+            .into_iter()
+            .map(|(r, _)| (&self.rules[r], Grounding::Rule(r)))
+            .chain(
+                transitive
+                    .as_ref()
+                    .map(|rule| (rule, Grounding::Transitive(fact[1]))),
+            );
+        let mut bodies = Vec::new();
+        for (rule, grounding) in rules {
+            let alternatives = self.premise_alternatives(grounding);
+            derivations(source, rule, fact, Seg::All, &mut |bindings| {
+                let body: Vec<Triple> = rule
+                    .body
+                    .iter()
+                    .map(|atom| instantiate_head(atom, bindings))
+                    .collect();
+                for premises in &alternatives {
+                    let mut full = body.clone();
+                    full.extend_from_slice(premises);
+                    bodies.push((rule.name.clone(), full));
+                }
+                bodies.len() >= limit
+            });
+            if bodies.len() >= limit {
+                break;
+            }
+        }
+        bodies
+    }
+
     /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`):
     /// a bodiless instance, a rule whose head matches it, or transitivity.
     pub fn derivable<S: Source + ?Sized>(&self, source: &S, fact: Triple) -> bool {
