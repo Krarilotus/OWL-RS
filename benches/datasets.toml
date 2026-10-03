@@ -89,6 +89,16 @@ sha256 = "61f43e3fb8fbe6b090223b187e1b1204b6c2c2cb5fbd657230e416ab230a4a0d"
 frozen = "2026-10-03"
 
 [[dataset]]
+file = "lubm-1000.nt"
+workload = "lubm"
+tier = "1000"
+role = "core"
+made_by = "bash benches/reasoning/prepare-lubm.sh 1000"
+bytes = 24713200527
+sha256 = "8563ef20d5ff129e7d5597130317f6636b3f5b15503d544b7958477ec6ac3720"
+frozen = "2026-10-03"
+
+[[dataset]]
 file = "olympics.nt"
 workload = "basics-mix"
 tier = "olympics"

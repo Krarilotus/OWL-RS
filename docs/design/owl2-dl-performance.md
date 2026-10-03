@@ -47,7 +47,8 @@ classifications, each ontology at most 5 MB, 300 s per task. Each time is a whol
 
 **What the table says:**
 - **Konclude** is the bar for expressive classification: its slowest case is under 0.9 s, while HermiT's tail reaches 43 s.
-- **NRESE's EL classifier** already beats ELK on every one of the 20 EL ontologies. One quadratic step had made it slower on the largest; it was fixed on 3 October.
+- **NRESE's EL classifier** already beats ELK 0.6.0 on every one of the 20 EL ontologies. One quadratic step had made it slower on the largest; it was fixed on 3 October.
+- **Which ELK.** The Whelk paper (Balhoff et al., TGDK 2024) measured ELK 0.6.0, the version in our runner, far slower than ELK 0.4.3 on large ontologies: NCI Thesaurus 23.2 s against 2.4 s, uberon-go-cl-ro 99.7 s against 2.3 s. ELK 0.4.3 joins the reference runner (package 3.0), and every EL claim is made against the faster of the two.
 - **The subset is small.** Before any claim, the full EL track, a stratified DL sample of at least 300 ontologies, and the Oxford sample are run (§5).
 
 ### From the literature
@@ -61,8 +62,8 @@ The records report A collected stand:
   - 610 of 703 Oxford ontologies under 10 s, falling behind Konclude where equality and numbers explode;
   - its 2025 parallel version gains up to 2.62× with a thread pool on hard ontologies.
 - **Konclude on large ABoxes** (DL 2020, 8 cores, 480 GB):
-  - LUBM(800) needs 2,692 s to get ready for query answering with one thread and 389 s with four;
-  - UOBM(500) needs 1,228 s and 309 s;
+  - LUBM(800) needs 2,692 s to get ready for query answering with one thread, 828 s with four and 439 s with eight (Table 3; corrected 3 October: the 389 s quoted earlier is UOBM(500) at four threads);
+  - UOBM(500) needs 1,228 s, 389 s and 245 s;
   - the time is dominated by consistency checking.
 - **Konclude's own gaps** (SemREC 2021): it times out on classifying OWL2Bench's OWL 2 DL variants at sizes 1 and 10, while the RL, QL and EL variants take 2–20 s.
 
