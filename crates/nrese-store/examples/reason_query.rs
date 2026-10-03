@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::rulesets::Ruleset;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
     BulkLoadRequest, CancellationToken, GraphTarget, MutationCommand, MutationPipeline,

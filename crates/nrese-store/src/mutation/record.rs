@@ -1,4 +1,4 @@
-use nrese_core::ReasonerRunStatus;
+use nrese_reasoner::ReasonerRunStatus;
 use nrese_reasoner::RejectExplanation;
 
 use super::attribution::RejectAttribution;

@@ -11,11 +11,11 @@
 use std::io::{BufRead, BufWriter, Write};
 use std::time::Instant;
 
-use nrese_reasoner::v2::batch::{self, Schema};
-use nrese_reasoner::v2::lists::ListVocabulary;
-use nrese_reasoner::v2::naive::materialise;
-use nrese_reasoner::v2::rulesets::Ruleset;
-use nrese_reasoner::v2::vocabulary::LocalVocabulary;
+use nrese_reasoner::batch::{self, Schema};
+use nrese_reasoner::lists::ListVocabulary;
+use nrese_reasoner::naive::materialise;
+use nrese_reasoner::rulesets::Ruleset;
+use nrese_reasoner::vocabulary::LocalVocabulary;
 
 /// Splits an N-Triples line into its three terms (in N-Triples syntax).
 fn split(line: &str) -> Option<[&str; 3]> {

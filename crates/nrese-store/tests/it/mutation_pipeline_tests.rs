@@ -98,7 +98,7 @@ fn gate_rejection_is_recorded_and_not_committed() {
         .expect("trigger");
     assert_eq!(trigger.2, "http://example.com/B");
     let run = pipeline.last_reasoning_run().expect("recorded");
-    assert_eq!(run.status, nrese_core::ReasonerRunStatus::Rejected);
+    assert_eq!(run.status, nrese_reasoner::ReasonerRunStatus::Rejected);
 }
 
 fn delete(triple: &str) -> MutationCommand {
@@ -218,14 +218,14 @@ fn rematerialise_installs_the_closure_of_existing_data() {
     assert!(!contains(&plain, &inferred));
     let report = plain
         .store()
-        .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Rdfs)
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Rdfs)
         .expect("rematerialise");
     assert_eq!((report.inferred_inserted, report.inferred_deleted), (1, 0));
     assert!(contains(&plain, &inferred));
     // Unchanged data: no new revision.
     let again = plain
         .store()
-        .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Rdfs)
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Rdfs)
         .expect("again");
     assert_eq!(again.revision, report.revision);
 }
@@ -303,7 +303,7 @@ fn owl2_rl_commits_keep_the_inferred_stack_exact() {
         }
         let check = pipeline
             .store()
-            .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
             .expect("rematerialise");
         assert_eq!(
             (check.inferred_inserted, check.inferred_deleted),
@@ -389,7 +389,7 @@ fn reasoning_state_tracks_whether_inferences_are_current() {
         query_cache_bytes: 0,
         ..nrese_store::StoreConfig::default()
     };
-    let ruleset = nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl;
+    let ruleset = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
     let current = |store: &StoreService| {
         store
             .reasoning_state()
@@ -460,7 +460,7 @@ fn inconsistent_baselines_are_quarantined_until_repaired() {
                            <{EX}x> a <{EX}A> , <{EX}B> }}"
         )))
         .expect("import");
-    let ruleset = nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl;
+    let ruleset = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
     let report = store.rematerialise(ruleset).expect("rematerialise");
     assert_eq!(report.violations, 1);
     assert_eq!(
@@ -557,7 +557,7 @@ fn unusable_list_axioms_are_reported() {
         )
         .expect("data");
     let report = store
-        .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
         .expect("rematerialise");
     assert_eq!(report.diagnostics_total, 1);
     let diagnostic = &report.diagnostics[0];
@@ -638,7 +638,7 @@ fn cancelled_reasoning_commits_stop_promptly_and_change_nothing() {
         )
         .expect("data");
     store
-        .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
         .expect("rematerialise");
     let owl = MutationPipeline::new(
         Arc::clone(&store),
@@ -730,7 +730,7 @@ fn full_rdfs_keeps_its_axioms() {
     let before = crate::support::inferred_statements(pipeline.store()).unwrap();
     pipeline
         .store()
-        .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::RdfsFull)
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::RdfsFull)
         .unwrap();
     let mut after = crate::support::inferred_statements(pipeline.store()).unwrap();
     let mut before = before;
@@ -765,7 +765,7 @@ fn unnamed_union_memberships_are_left_out_on_request() {
         };
         let store = std::sync::Arc::new(StoreService::new(config).unwrap());
         store
-            .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
             .unwrap();
         let pipeline = MutationPipeline::new(
             std::sync::Arc::clone(&store),
@@ -846,7 +846,7 @@ fn a_stopped_rematerialisation_changes_nothing() {
     )
     .unwrap();
     let store = StoreService::new(in_memory_store_config().with_ontology(path)).unwrap();
-    let ruleset = nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl;
+    let ruleset = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
     let error = store.rematerialise_until(ruleset, &|| true).unwrap_err();
     assert!(matches!(
         error,
@@ -888,7 +888,7 @@ fn datatype_consistency() {
         std::fs::write(&path, format!("{schema}{data}")).unwrap();
         let store = StoreService::new(in_memory_store_config().with_ontology(path)).unwrap();
         store
-            .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
             .unwrap()
             .violations
     };
@@ -975,7 +975,7 @@ fn materialisation_by_representatives_equals_replication() {
             })
             .expect("load");
         store
-            .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
             .expect("rematerialise");
         let mut quads: Vec<String> = store
             .statements(

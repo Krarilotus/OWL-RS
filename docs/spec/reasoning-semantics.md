@@ -1,6 +1,6 @@
 # Reasoning: supported semantics
 
-This is the contract for what NRESE's reasoning computes, as implemented on 30 September 2026 (`SEMANTICS_VERSION` 2). A mode name alone doesn't state it; this page does. The source of truth is `crates/nrese-reasoner/src/v2/rulesets.rs` (the rule text) and `lists.rs` (list axioms).
+This is the contract for what NRESE's reasoning computes, as implemented on 30 September 2026 (`SEMANTICS_VERSION` 2). A mode name alone doesn't state it; this page does. The source of truth is `crates/nrese-reasoner/src/rulesets.rs` (the rule text) and `lists.rs` (list axioms).
 
 ## Modes
 
@@ -103,7 +103,7 @@ Startup skips rematerialisation only if the ruleset and the fingerprint match. A
 
 ## User rules (Notation3)
 
-`reasoner.rules` / `NRESE_REASONING_RULES` names a Notation3 file. Its rules compile into the same rule IR as the built-in rulesets (`crates/nrese-reasoner/src/v2/n3.rs`), so they are materialised, maintained on every commit, and checked for consistency the same way.
+`reasoner.rules` / `NRESE_REASONING_RULES` names a Notation3 file. Its rules compile into the same rule IR as the built-in rulesets (`crates/nrese-reasoner/src/n3.rs`), so they are materialised, maintained on every commit, and checked for consistency the same way.
 
 | N3 | Meaning |
 |---|---|

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::v2::program::{RuleProgram, UserRules};
-use crate::v2::rulesets::Ruleset;
+use crate::program::{RuleProgram, UserRules};
+use crate::rulesets::Ruleset;
 
 /// The reasoning mode of a store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

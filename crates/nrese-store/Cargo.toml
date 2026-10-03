@@ -7,7 +7,6 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-nrese-core = { path = "../nrese-core" }
 nrese-engine = { path = "../nrese-engine" }
 nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-shacl = { path = "../nrese-shacl" }

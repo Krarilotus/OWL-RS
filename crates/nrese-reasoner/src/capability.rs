@@ -1,3 +1,6 @@
+//! What a reasoner can do and how a run ended: the types the server reports
+//! (formerly the `nrese-core` crate).
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReasonerFeature {
     RdfsSubclassClosure,

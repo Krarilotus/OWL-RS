@@ -1,4 +1,4 @@
-use nrese_core::ReasonerCapability;
+use crate::capability::ReasonerCapability;
 
 use crate::config::{ReasonerConfig, ReasoningMode};
 use crate::profile::{ReasonerProfile, profile_for_config};
@@ -50,7 +50,7 @@ impl ReasonerService {
             format!(
                 "{} v{} {:016x}",
                 program.name(),
-                crate::v2::rulesets::SEMANTICS_VERSION,
+                crate::rulesets::SEMANTICS_VERSION,
                 program.fingerprint()
             )
         })

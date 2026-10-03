@@ -575,7 +575,7 @@ fn compile_rule(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::vocabulary::LocalVocabulary;
+    use crate::vocabulary::LocalVocabulary;
 
     #[test]
     fn errors_name_the_line_of_their_rule_or_axiom() {
@@ -717,7 +717,7 @@ fn graphdb_rulesets_compile() {
     for path in &files {
         let text = std::fs::read_to_string(path).expect("read");
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let mut vocabulary = crate::v2::vocabulary::LocalVocabulary::default();
+        let mut vocabulary = crate::vocabulary::LocalVocabulary::default();
         // GraphDB's OWL 2 QL and RL rulesets use what the IR doesn't express (module docs).
         let unsupported = if name.contains("owl2-ql") {
             Some("isn't bound by a premise")

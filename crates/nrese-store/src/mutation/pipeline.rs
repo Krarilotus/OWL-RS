@@ -35,16 +35,16 @@ pub struct MutationPipeline {
     /// Reasoner v2's ground program and the committed revision it describes. Writers
     /// outside the pipeline (bulk loads, rematerialisation) change the revision, which
     /// invalidates it.
-    ground: std::sync::Mutex<Option<(u64, nrese_reasoner::v2::eval::GroundProgram)>>,
+    ground: std::sync::Mutex<Option<(u64, nrese_reasoner::eval::GroundProgram)>>,
     /// Set when another pipeline (other rules) took over the store: writes are refused
     /// from then on, so none applies this pipeline's rules to a stack made for others.
     retired: std::sync::atomic::AtomicBool,
 }
 
 /// The statements `tx` inserts or deletes, asserted and inferred, as reasoner facts.
-fn touched(tx: &nrese_engine::Transaction<'_>) -> Vec<nrese_reasoner::v2::ir::Triple> {
+fn touched(tx: &nrese_engine::Transaction<'_>) -> Vec<nrese_reasoner::ir::Triple> {
     let quads = tx.inserted().chain(tx.deleted());
-    let mut facts: Vec<nrese_reasoner::v2::ir::Triple> = quads
+    let mut facts: Vec<nrese_reasoner::ir::Triple> = quads
         .map(|q| [q.subject.raw(), q.predicate.raw(), q.object.raw()])
         .chain(
             tx.inferred_inserted()

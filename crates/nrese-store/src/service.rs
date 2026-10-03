@@ -963,7 +963,7 @@ impl StoreService {
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,
     ) -> StoreResult<crate::reasoning::MaterialisationReport> {
-        self.rematerialise_until(program, nrese_reasoner::v2::eval::NEVER)
+        self.rematerialise_until(program, nrese_reasoner::eval::NEVER)
     }
 
     /// [`Self::rematerialise`], stopped when `stop` fires: then nothing changes and
@@ -971,7 +971,7 @@ impl StoreService {
     pub fn rematerialise_until(
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,
-        stop: nrese_reasoner::v2::eval::Stop<'_>,
+        stop: nrese_reasoner::eval::Stop<'_>,
     ) -> StoreResult<crate::reasoning::MaterialisationReport> {
         let rules = &program.into();
         let started = std::time::Instant::now();

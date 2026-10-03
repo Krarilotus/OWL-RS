@@ -1,4 +1,4 @@
-//! OWL 2 EL classification of N-Triples files (`v2::classify`), for the ORE workload and
+//! OWL 2 EL classification of N-Triples files (`classify`), for the ORE workload and
 //! checks against ELK.
 //!
 //! ```text
@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufWriter, Write};
 use std::time::Instant;
 
-use nrese_reasoner::v2::classify::classify_parallel;
-use nrese_reasoner::v2::vocabulary::LocalVocabulary;
+use nrese_reasoner::classify::classify_parallel;
+use nrese_reasoner::vocabulary::LocalVocabulary;
 
 fn split(line: &str) -> Option<[&str; 3]> {
     let line = line.trim();

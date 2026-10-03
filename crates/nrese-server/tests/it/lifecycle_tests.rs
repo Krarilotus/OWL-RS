@@ -3,7 +3,7 @@
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::rulesets::Ruleset;
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::policy::PolicyConfig;
 use nrese_store::{SparqlUpdateRequest, StoreConfig, StoreService};

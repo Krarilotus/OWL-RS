@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::{Make, Ontology, Term};
-use nrese_reasoner::v2::classify::{classify, classify_parallel};
-use nrese_reasoner::v2::vocabulary::LocalVocabulary;
+use nrese_reasoner::classify::{classify, classify_parallel};
+use nrese_reasoner::vocabulary::LocalVocabulary;
 
 /// One id space for the ontology's terms, OWL's vocabulary and blank nodes.
 struct Ids {

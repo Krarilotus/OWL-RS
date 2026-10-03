@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::support::in_memory_store_config;
-use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::rulesets::Ruleset;
 use nrese_sparql::GraphAccess;
 use nrese_store::{
     ReadContext, ReadScope, SparqlQueryRequest, SparqlUpdateRequest, StatementPattern, StoreService,

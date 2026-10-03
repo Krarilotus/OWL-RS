@@ -213,9 +213,9 @@ fn actual(engine: &Engine, text: &str) -> Result<Answer, String> {
 /// The statements RDFS derives from `quads` (reasoner v2; statements with a literal
 /// subject left out).
 fn rdfs_closure(quads: &[Quad]) -> Vec<Quad> {
-    use nrese_reasoner::v2::batch::{self, Schema};
-    use nrese_reasoner::v2::rulesets::Ruleset;
-    use nrese_reasoner::v2::vocabulary::LocalVocabulary;
+    use nrese_reasoner::batch::{self, Schema};
+    use nrese_reasoner::rulesets::Ruleset;
+    use nrese_reasoner::vocabulary::LocalVocabulary;
     let mut vocabulary = LocalVocabulary::default();
     let rules = Ruleset::Rdfs.rules(&mut vocabulary).unwrap();
     let schema = Schema::owl(&mut vocabulary);

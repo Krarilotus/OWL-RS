@@ -3,7 +3,7 @@
 //! expected a consistency violation. v1-specific details (statistics, heuristic blame,
 //! "unsupported construct" diagnostics) have no v2 counterpart.
 
-use super::tests::scenario;
+use super::scenario;
 
 #[test]
 fn consistency_disjoint_type_conflicts_detect_asserted_and_inferred_types() {

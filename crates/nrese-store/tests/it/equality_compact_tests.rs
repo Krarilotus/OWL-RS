@@ -206,7 +206,7 @@ fn compact_equality_survives_a_restart() {
     assert!(
         pipeline
             .store()
-            .reasoning_is_current(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .reasoning_is_current(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
     );
     assert_eq!(observe(&pipeline), before);
     drop(pipeline);
@@ -214,7 +214,7 @@ fn compact_equality_survives_a_restart() {
     assert!(
         !other
             .store()
-            .reasoning_is_current(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .reasoning_is_current(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
     );
 }
 

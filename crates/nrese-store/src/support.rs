@@ -6,7 +6,7 @@
 //!
 //! - **The sets** ([`SupportSets`]) are computed for a committed revision on the first
 //!   read that needs them, from the stack and the ground program
-//!   ([`nrese_reasoner::v2::graph_sets`]); readers of that revision wait for one
+//!   ([`nrese_reasoner::graph_sets`]); readers of that revision wait for one
 //!   computation. Once there are sets, the mutation pipeline reports what each commit
 //!   touched, and the next revision's sets are the last ones updated for the facts that
 //!   can follow from those ([`SupportSets::updated`]): a base shared between revisions,
@@ -36,11 +36,11 @@ use nrese_engine::{
     TermId,
 };
 use nrese_reasoner::RuleProgram;
-use nrese_reasoner::v2::eval::{Seg, Source};
-use nrese_reasoner::v2::graph_sets::{
+use nrese_reasoner::eval::{Seg, Source};
+use nrese_reasoner::graph_sets::{
     Change, GraphSet, initial_sets, support_sets, update_support_sets,
 };
-use nrese_reasoner::v2::ir::Triple;
+use nrese_reasoner::ir::Triple;
 use nrese_sparql::GraphAccess;
 
 use crate::reasoning::Program;

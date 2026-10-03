@@ -157,7 +157,7 @@ impl ReasoningState {
 
 #[cfg(test)]
 mod tests {
-    use nrese_reasoner::v2::rulesets::Ruleset;
+    use nrese_reasoner::rulesets::Ruleset;
 
     use super::*;
 
