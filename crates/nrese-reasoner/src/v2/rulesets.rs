@@ -25,7 +25,9 @@
 //! Every ruleset is validated by the tests: it parses, every rule is safe, and the
 //! evaluator's closure equals the owlrl oracle's on the benchmark data.
 
-use super::ir::{ParseError, Rule, Vocabulary, parse_rules};
+use super::ir::{
+    ParseError, Rule, RuleSource, Vocabulary, parse_rules, parse_sources, rule_sources,
+};
 
 /// The named rulesets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,8 +62,11 @@ pub const ALL: [Ruleset; 6] = [
 pub const SEMANTICS_VERSION: u32 = 2;
 
 impl Ruleset {
-    /// Identifies what this ruleset derives: FNV-1a over [`SEMANTICS_VERSION`], the name and
-    /// the rule text. Stable across builds and platforms (no std hasher, which may change).
+    /// Identifies what this ruleset derives: FNV-1a over [`SEMANTICS_VERSION`], the name,
+    /// the rule text, and the name and text of every OWL 2 RL rule it adds (the bodies it
+    /// compiles, so editing one changes the fingerprint of every ruleset using it: the
+    /// review of 3 October 2026, C6). Stable across builds and platforms (no std hasher,
+    /// which may change).
     pub fn fingerprint(self) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         let mut feed = |bytes: &[u8]| {
@@ -73,8 +78,9 @@ impl Ruleset {
         feed(&SEMANTICS_VERSION.to_le_bytes());
         feed(self.name().as_bytes());
         feed(self.text().as_bytes());
-        for name in self.owl_rules().unwrap_or_default() {
-            feed(name.as_bytes());
+        for rule in self.added_rules() {
+            feed(rule.name.as_bytes());
+            feed(rule.source.as_bytes());
         }
         feed(self.axioms().as_bytes());
         hash
@@ -133,14 +139,21 @@ impl Ruleset {
 
     pub fn rules(self, vocabulary: &mut impl Vocabulary) -> Result<Vec<Rule>, ParseError> {
         let mut rules = parse_rules(self.text(), vocabulary)?;
-        if let Some(names) = self.owl_rules() {
-            rules.extend(
-                parse_rules(OWL2_RL, vocabulary)?
-                    .into_iter()
-                    .filter(|rule| names.contains(&rule.name.as_str())),
-            );
-        }
+        rules.extend(parse_sources(self.added_rules(), vocabulary)?);
         Ok(rules)
+    }
+
+    /// The OWL 2 RL rules [`Ruleset::owl_rules`] names, as written in [`OWL2_RL`]: what
+    /// [`Ruleset::rules`] compiles and [`Ruleset::fingerprint`] hashes.
+    fn added_rules(self) -> Vec<RuleSource> {
+        let Some(names) = self.owl_rules() else {
+            return Vec::new();
+        };
+        rule_sources(OWL2_RL)
+            .expect("the OWL 2 RL text starts with a rule")
+            .into_iter()
+            .filter(|rule| names.contains(&rule.name.as_str()))
+            .collect()
     }
 
     /// The axiomatic triples ([`Ruleset::axioms`]) as ids.
@@ -430,3 +443,22 @@ scm-avf1: (?c1 owl:allValuesFrom ?y1), (?c1 owl:onProperty ?p), (?c2 owl:allValu
 scm-avf2: (?c1 owl:allValuesFrom ?y), (?c1 owl:onProperty ?p1), (?c2 owl:allValuesFrom ?y),
           (?c2 owl:onProperty ?p2), (?p1 rdfs:subPropertyOf ?p2) -> (?c2 rdfs:subClassOf ?c1)
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_added_rule_is_in_the_owl2_rl_text() {
+        for ruleset in ALL {
+            let added = ruleset.added_rules();
+            for name in ruleset.owl_rules().unwrap_or_default() {
+                assert!(
+                    added.iter().any(|rule| rule.name == *name),
+                    "{}: {name} isn't an OWL 2 RL rule",
+                    ruleset.name()
+                );
+            }
+        }
+    }
+}

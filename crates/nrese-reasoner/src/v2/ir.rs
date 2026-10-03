@@ -257,8 +257,21 @@ impl std::error::Error for ParseError {}
 
 /// Parses rules in the syntax above, interning constants through `vocabulary`.
 pub fn parse_rules(text: &str, vocabulary: &mut impl Vocabulary) -> Result<Vec<Rule>, ParseError> {
+    parse_sources(rule_sources(text)?, vocabulary)
+}
+
+/// One rule's text: its name, its source (continuation lines joined) and the line it
+/// starts on, for its errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuleSource {
+    pub name: String,
+    pub source: String,
+    pub line: usize,
+}
+
+/// The rules of `text`, unparsed.
+pub(crate) fn rule_sources(text: &str) -> Result<Vec<RuleSource>, ParseError> {
     // Join continuation lines: a rule starts with `name:` at the beginning of a line.
-    // Each rule keeps the line it starts on, for its errors.
     let mut sources: Vec<(String, String, usize)> = Vec::new();
     for (number, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or_default();
@@ -284,9 +297,19 @@ pub fn parse_rules(text: &str, vocabulary: &mut impl Vocabulary) -> Result<Vec<R
             .at(number + 1, column));
         }
     }
+    Ok(sources
+        .into_iter()
+        .map(|(name, source, line)| RuleSource { name, source, line })
+        .collect())
+}
+
+pub(crate) fn parse_sources(
+    sources: Vec<RuleSource>,
+    vocabulary: &mut impl Vocabulary,
+) -> Result<Vec<Rule>, ParseError> {
     sources
         .into_iter()
-        .map(|(name, source, line)| {
+        .map(|RuleSource { name, source, line }| {
             parse_rule(&name, &source, vocabulary)
                 .map_err(|message| ParseError::new(name, message).at(line, 1))
         })
