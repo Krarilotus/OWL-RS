@@ -21,68 +21,16 @@
 //!    A complemented filler `¬B` gets a fresh name `N` with `N(x) ∧ B(x) → ⊥`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::fmt;
 
 use nrese_owl::{
     BodyAtom, Clause, Concept, Filler, HeadAtom, Normalised, ObjProp, Term, Var as OwlVar,
 };
 
+use super::abox::Abox;
 use super::atoms::{ConceptId, FuncId, MAX_ID, RoleId, TermOrder};
 use super::horn;
 use super::program::{BodyPat, DlClause, Func, HeadPat, KindPat, Program, TermPat, Var};
-
-/// Why the Horn stage gives an ontology up. Each names an axiom (an index into the
-/// ontology's axioms) where there is one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unsupported {
-    /// A clause with two head atoms that no renaming of fresh names makes Horn
-    /// (`None`: the fresh names' polarities contradict one another).
-    NotHorn {
-        axiom: Option<usize>,
-    },
-    /// Equality: functional properties, `≤ n`, keys.
-    Equality {
-        axiom: usize,
-    },
-    Nominals {
-        axiom: usize,
-    },
-    /// A clause that requires data values (`∃d.R`, `≥ n d.R`) or data assertions.
-    Datatypes {
-        axiom: usize,
-    },
-    /// Assertions the Horn stage can't place (property assertions need nominals).
-    Assertions(&'static str),
-    /// A clause outside the DL-clause shapes (e.g. a role atom between two neighbours).
-    ClauseShape {
-        axiom: usize,
-    },
-    /// What the normalisation couldn't cover itself.
-    Normalisation {
-        axiom: usize,
-        why: &'static str,
-    },
-    /// More concepts, roles or functions than an atom holds.
-    TooLarge,
-}
-
-impl fmt::Display for Unsupported {
-    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Unsupported::NotHorn { axiom: Some(a) } => write!(out, "not Horn (axiom {a})"),
-            Unsupported::NotHorn { axiom: None } => write!(out, "not Horn (no renaming)"),
-            Unsupported::Equality { axiom } => write!(out, "equality (axiom {axiom})"),
-            Unsupported::Nominals { axiom } => write!(out, "nominals (axiom {axiom})"),
-            Unsupported::Datatypes { axiom } => write!(out, "datatypes (axiom {axiom})"),
-            Unsupported::Assertions(what) => write!(out, "assertions: {what}"),
-            Unsupported::ClauseShape { axiom } => write!(out, "clause shape (axiom {axiom})"),
-            Unsupported::Normalisation { axiom, why } => write!(out, "{why} (axiom {axiom})"),
-            Unsupported::TooLarge => write!(out, "too many concepts or roles"),
-        }
-    }
-}
-
-impl std::error::Error for Unsupported {}
+pub use super::unsupported::Unsupported;
 
 /// What the compilation did, for the profile.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,12 +42,11 @@ pub struct CompileStats {
     pub recentred: usize,
 }
 
-/// The program, the individuals' asserted concepts, and the statistics.
+/// The program, the assertions, and the statistics.
 #[derive(Debug, Clone)]
 pub struct Compiled {
     pub program: Program,
-    /// Per individual (equal ones merged): the concepts asserted of it, sorted.
-    pub individuals: Vec<Vec<ConceptId>>,
+    pub abox: Abox,
     pub stats: CompileStats,
 }
 
@@ -173,7 +120,7 @@ pub fn compile(n: &Normalised, classes: &[Term]) -> Result<Compiled, Unsupported
     for clause in &kept {
         c.clause(clause)?;
     }
-    let individuals = c.individuals(n);
+    let abox = c.abox(n)?;
     if c.next > MAX_ID || c.program.funcs.len() > (MAX_ID / 2) as usize {
         return Err(Unsupported::TooLarge);
     }
@@ -182,7 +129,7 @@ pub fn compile(n: &Normalised, classes: &[Term]) -> Result<Compiled, Unsupported
     c.program.index();
     Ok(Compiled {
         program: c.program,
-        individuals,
+        abox,
         stats: c.stats,
     })
 }
@@ -204,9 +151,6 @@ fn admissible<'n>(
         });
     }
     let facts = &n.facts;
-    if !facts.roles.is_empty() {
-        return Err(Unsupported::Assertions("object property assertions"));
-    }
     if !facts.not_roles.is_empty() {
         return Err(Unsupported::Assertions(
             "negative object property assertions",
@@ -218,8 +162,10 @@ fn admissible<'n>(
     for &(axiom, why) in &n.unsupported {
         // Datatype definitions only constrain data values, of which there are none once
         // the data clauses are dropped; keys only apply to individuals with property
-        // values, and there are no property assertions.
-        if why.starts_with("datatype definitions") || why.starts_with("keys") {
+        // values (and then make them equal, which needs equality).
+        if why.starts_with("datatype definitions")
+            || (why.starts_with("keys") && facts.roles.is_empty())
+        {
             continue;
         }
         return Err(Unsupported::Normalisation { axiom, why });
@@ -245,9 +191,9 @@ fn admissible<'n>(
     Ok(kept)
 }
 
-struct Compiler {
+pub(super) struct Compiler {
     index: HashMap<Term, ConceptId>,
-    program: Program,
+    pub(super) program: Program,
     flips: Vec<bool>,
     fresh_base: u32,
     /// The next internal concept.
@@ -269,26 +215,26 @@ struct Work {
 
 impl Compiler {
     /// A concept and whether it is flipped (stands for its complement now).
-    fn concept(&self, c: Concept) -> (ConceptId, bool) {
+    pub(super) fn concept(&self, c: Concept) -> (ConceptId, bool) {
         match c {
             Concept::Named(t) => (self.index[&t], false),
             Concept::Fresh(q) => (self.fresh_base + q, self.flips[q as usize]),
         }
     }
 
-    fn role(&mut self, r: Term) -> RoleId {
+    pub(super) fn role(&mut self, r: Term) -> RoleId {
         let next = self.roles.len() as RoleId;
         *self.roles.entry(r).or_insert(next)
     }
 
-    fn internal(&mut self) -> ConceptId {
+    pub(super) fn internal(&mut self) -> ConceptId {
         self.next += 1;
         self.next - 1
     }
 
     /// A concept `N` with `N(x) ∧ c(x) → ⊥`. It is a definition (`N := ¬c`), true in a
     /// conservative extension of any axiom set, so it has no source axiom.
-    fn negation(&mut self, c: ConceptId) -> ConceptId {
+    pub(super) fn negation(&mut self, c: ConceptId) -> ConceptId {
         if let Some(&n) = self.negations.get(&c) {
             return n;
         }
@@ -298,7 +244,7 @@ impl Compiler {
         n
     }
 
-    fn add(&mut self, mut body: Vec<BodyPat>, head: Option<HeadPat>, sources: &[u32]) {
+    pub(super) fn add(&mut self, mut body: Vec<BodyPat>, head: Option<HeadPat>, sources: &[u32]) {
         body.sort_unstable();
         body.dedup();
         // A head that repeats a body atom: a tautology.
@@ -631,49 +577,6 @@ impl Compiler {
         self.program.funcs.push(key);
         self.funcs.insert(key, f);
         f
-    }
-
-    /// The individuals' concepts, `SameIndividual` merged.
-    fn individuals(&mut self, n: &Normalised) -> Vec<Vec<ConceptId>> {
-        let mut ids: HashMap<Term, usize> = HashMap::new();
-        let mut parent: Vec<usize> = Vec::new();
-        let mut id = |t: Term, parent: &mut Vec<usize>| {
-            *ids.entry(t).or_insert_with(|| {
-                parent.push(parent.len());
-                parent.len() - 1
-            })
-        };
-        fn find(parent: &mut [usize], mut i: usize) -> usize {
-            while parent[i] != i {
-                parent[i] = parent[parent[i]];
-                i = parent[i];
-            }
-            i
-        }
-        for &(a, b, _) in &n.facts.same {
-            let (a, b) = (id(a, &mut parent), id(b, &mut parent));
-            let (a, b) = (find(&mut parent, a), find(&mut parent, b));
-            parent[a] = b;
-        }
-        let mut sets: HashMap<usize, Vec<ConceptId>> = HashMap::new();
-        for &(c, a, _) in &n.facts.concepts {
-            let i = id(a, &mut parent);
-            let root = find(&mut parent, i);
-            let (cid, flipped) = self.concept(c);
-            let cid = if flipped { self.negation(cid) } else { cid };
-            sets.entry(root).or_default().push(cid);
-        }
-        let mut out: Vec<Vec<ConceptId>> = sets
-            .into_values()
-            .map(|mut v| {
-                v.sort_unstable();
-                v.dedup();
-                v
-            })
-            .collect();
-        out.sort();
-        out.dedup();
-        out
     }
 }
 

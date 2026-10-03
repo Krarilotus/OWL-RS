@@ -205,6 +205,76 @@ fn a_range_on_a_chains_superproperty() {
     assert!(!unsat(&mut table, &c, "C1"));
 }
 
+/// Property assertions: what the clauses derive along named edges, both ways, and
+/// through transitivity, existentials and self-loops.
+#[test]
+fn assertions_along_named_edges() {
+    let mut table = Table::default();
+    let consistent = |table: &mut Table, build: &dyn Fn(&mut Build)| {
+        let mut b = Build::new(table);
+        build(&mut b);
+        classify(&b.done(), 1).expect("Horn").consistent
+    };
+    // A ⊑ ∀r.B, B ⊓ C ⊑ ⊥, A(a), r(a, b): C(b) clashes.
+    let forward = |b: &mut Build, clash: bool| {
+        let (a, bb, cc) = (b.c("A"), b.c("B"), b.c("C"));
+        let r = b.r("r");
+        let all = b.all(r, bb);
+        b.sub(a, all);
+        let both = b.and(&[bb, cc]);
+        let bot = b.e(ClassExpr::Nothing);
+        b.sub(both, bot);
+        let (i, j) = (b.t("i"), b.t("j"));
+        b.axiom(Axiom::ClassAssertion(a, i));
+        b.axiom(Axiom::ObjectPropertyAssertion(r.named(), i, j));
+        if clash {
+            b.axiom(Axiom::ClassAssertion(cc, j));
+        }
+    };
+    assert!(consistent(&mut table, &|b| forward(b, false)));
+    assert!(!consistent(&mut table, &|b| forward(b, true)));
+    // ∃r.B ⊑ D at the subject, D ⊓ E ⊑ ⊥; transitivity: s(i, j), s(j, k), B(k), E(i).
+    let back = |b: &mut Build, transitive: bool| {
+        let (bb, d, e) = (b.c("B"), b.c("D"), b.c("E"));
+        let s = b.r("s");
+        if transitive {
+            b.axiom(Axiom::ObjectCharacteristic(Characteristic::Transitive, s));
+        }
+        let some = b.some(s, bb);
+        b.sub(some, d);
+        let de = b.and(&[d, e]);
+        let bot = b.e(ClassExpr::Nothing);
+        b.sub(de, bot);
+        let (i, j, k) = (b.t("i"), b.t("j"), b.t("k"));
+        b.axiom(Axiom::ObjectPropertyAssertion(s.named(), i, j));
+        b.axiom(Axiom::ObjectPropertyAssertion(s.named(), j, k));
+        b.axiom(Axiom::ClassAssertion(bb, k));
+        b.axiom(Axiom::ClassAssertion(e, i));
+    };
+    assert!(consistent(&mut table, &|b| back(b, false)));
+    assert!(!consistent(&mut table, &|b| back(b, true)));
+    // An edge fires an existential: ∃r.⊤ ⊑ ∃s.F, F ⊑ ⊥.
+    assert!(!consistent(&mut table, &|b| {
+        let f = b.c("F");
+        let (r, s) = (b.r("r"), b.r("s"));
+        let thing = b.e(ClassExpr::Thing);
+        let (any, some) = (b.some(r, thing), b.some(s, f));
+        b.sub(any, some);
+        let bot = b.e(ClassExpr::Nothing);
+        b.sub(f, bot);
+        let (i, j) = (b.t("i"), b.t("j"));
+        b.axiom(Axiom::ObjectPropertyAssertion(r.named(), i, j));
+    }));
+    // A reflexive role disjoint from an asserted self-loop's.
+    assert!(!consistent(&mut table, &|b| {
+        let (r, s) = (b.r("r"), b.r("s"));
+        b.axiom(Axiom::ObjectCharacteristic(Characteristic::Reflexive, s));
+        b.axiom(Axiom::DisjointObjectProperties(vec![r, s]));
+        let i = b.t("i");
+        b.axiom(Axiom::ObjectPropertyAssertion(r.named(), i, i));
+    }));
+}
+
 #[test]
 fn what_the_horn_stage_gives_up() {
     let mut table = Table::default();

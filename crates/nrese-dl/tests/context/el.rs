@@ -23,7 +23,7 @@ pub fn sizes(case: u64) -> Sizes {
         object_properties: 3 + (case % 3) as u32,
         simple: 2,
         data_properties: 0,
-        individuals: 0,
+        individuals: 3,
         literals: 0,
     }
 }

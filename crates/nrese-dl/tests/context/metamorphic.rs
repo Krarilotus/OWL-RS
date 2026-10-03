@@ -53,7 +53,8 @@ fn restricted(c: &Classification, keep: &[u64]) -> Classification {
     }
 }
 
-/// A random ontology: EL, or ALCHI with chains and inverses (often not Horn).
+/// A random ontology: EL, or ALCHI with chains and inverses (often not Horn), a quarter
+/// of those with assertions.
 fn case(rng: &mut Rng, n: u64) -> (Table, Signature, Ontology, bool) {
     let mut table = Table::default();
     let sig = Signature::new(sizes(n), &mut |name| table.intern(name));
@@ -70,7 +71,7 @@ fn case(rng: &mut Rng, n: u64) -> (Table, Signature, Ontology, bool) {
             data: false,
             nominals: false,
             numbers: false,
-            abox: false,
+            abox: n % 4 == 1,
             ..Profile::sroiq()
         }
     };
