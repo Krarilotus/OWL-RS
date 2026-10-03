@@ -6,7 +6,8 @@
 //! ```
 //!
 //! `--threads N` saturates on N workers (`classify_parallel`); the default, 1, runs the
-//! sequential saturation.
+//! sequential saturation. `--repeat N` classifies N times in the process (for profilers
+//! and warm timings); the output and profile are the last run's.
 //!
 //! Writes one `sub<TAB>super` line per subsumption between named classes (IRIs without
 //! brackets, sorted), `sub<TAB>owl:Nothing` for unsatisfiable classes,
@@ -36,7 +37,7 @@ fn split(line: &str) -> Option<[&str; 3]> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let (mut out, mut inputs, mut threads) = (None, Vec::new(), 1);
+    let (mut out, mut inputs, mut threads, mut repeat) = (None, Vec::new(), 1, 1usize);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--out" => out = args.next(),
@@ -45,6 +46,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .next()
                     .and_then(|n| n.parse().ok())
                     .ok_or("--threads N")?
+            }
+            "--repeat" => {
+                repeat = args
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .ok_or("--repeat N")?
             }
             _ => inputs.push(arg),
         }
@@ -62,8 +69,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let load = started.elapsed();
-    let started = Instant::now();
     let names = vocabulary.clone();
+    for _ in 1..repeat {
+        let mut scratch = vocabulary.clone();
+        classify_profiled(
+            &triples,
+            &mut scratch,
+            &|id| names.text(id).starts_with('<'),
+            threads,
+        );
+    }
+    let started = Instant::now();
     let (result, profile) = classify_profiled(
         &triples,
         &mut vocabulary,
