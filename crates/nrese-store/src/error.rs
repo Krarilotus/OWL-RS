@@ -66,12 +66,22 @@ pub enum Refusal {
 }
 
 impl StoreError {
+    /// The evaluation error, of a query or of an update's pattern: both are classified
+    /// alike (the review of 3 October 2026, A6).
+    fn evaluation(&self) -> Option<&QueryEvaluationError> {
+        match self {
+            Self::SparqlEvaluation(error)
+            | Self::SparqlUpdate(nrese_sparql::UpdateError::Evaluation(error)) => Some(error),
+            _ => None,
+        }
+    }
+
     /// The query needed more memory than its limit
     /// ([`SparqlQueryRequest::memory_limit`](crate::SparqlQueryRequest::memory_limit)).
     pub fn is_memory_limit(&self) -> bool {
         matches!(
-            self,
-            Self::SparqlEvaluation(QueryEvaluationError::MemoryLimit(_))
+            self.evaluation(),
+            Some(QueryEvaluationError::MemoryLimit(_))
         )
     }
 
@@ -80,9 +90,8 @@ impl StoreError {
     /// used up. The same query may succeed later.
     pub fn is_server_memory_limit(&self) -> bool {
         matches!(
-            self,
-            Self::SparqlEvaluation(QueryEvaluationError::MemoryLimit(exceeded))
-                if exceeded.shared
+            self.evaluation(),
+            Some(QueryEvaluationError::MemoryLimit(exceeded)) if exceeded.shared
         )
     }
 
@@ -90,7 +99,17 @@ impl StoreError {
     /// features) rather than the store. Transports map these to client errors. A cancelled
     /// evaluation is neither: the transport decides what cancelled it.
     pub fn is_request_error(&self) -> bool {
+        if let Some(error) = self.evaluation() {
+            return !matches!(
+                error,
+                QueryEvaluationError::Dataset(_)
+                    | QueryEvaluationError::MemoryLimit(_)
+                    | QueryEvaluationError::Unexpected(_)
+                    | QueryEvaluationError::Cancelled
+            );
+        }
         match self {
+            Self::SparqlUpdate(nrese_sparql::UpdateError::Cancelled) => false,
             Self::SparqlSyntax(_)
             | Self::SparqlUpdate(_)
             | Self::InvalidGraphIri(_)
@@ -98,13 +117,7 @@ impl StoreError {
             | Self::ShaclShapes(_)
             | Self::Forbidden(_)
             | Self::FileParse { .. } => true,
-            Self::SparqlEvaluation(error) => !matches!(
-                error,
-                QueryEvaluationError::Dataset(_)
-                    | QueryEvaluationError::MemoryLimit(_)
-                    | QueryEvaluationError::Unexpected(_)
-                    | QueryEvaluationError::Cancelled
-            ),
+            Self::SparqlEvaluation(_) => unreachable!("classified above"),
             Self::Configuration(_)
             | Self::Io(_)
             | Self::Engine(_)
@@ -112,5 +125,32 @@ impl StoreError {
             | Self::MaterialisationCancelled
             | Self::LoadCancelled => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_sparql::UpdateError;
+
+    use super::*;
+
+    #[test]
+    fn an_update_s_evaluation_error_is_classified_as_a_query_s() {
+        let errors: [fn() -> QueryEvaluationError; 3] = [
+            || QueryEvaluationError::Unexpected("probe".into()),
+            || QueryEvaluationError::Cancelled,
+            || QueryEvaluationError::Unsupported("probe".into()),
+        ];
+        for error in errors {
+            let query = StoreError::SparqlEvaluation(error());
+            let update = StoreError::SparqlUpdate(UpdateError::Evaluation(error()));
+            assert_eq!(
+                query.is_request_error(),
+                update.is_request_error(),
+                "{query}"
+            );
+            assert_eq!(query.is_memory_limit(), update.is_memory_limit());
+        }
+        assert!(!StoreError::SparqlUpdate(UpdateError::Cancelled).is_request_error());
     }
 }

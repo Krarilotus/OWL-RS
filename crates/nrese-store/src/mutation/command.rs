@@ -71,8 +71,16 @@ impl MutationCommand {
         requester: &crate::Requester,
         context: &UpdateContext<'_>,
     ) -> Result<MutationCommitReport, StoreError> {
-        if let Self::Restore(_) = self {
-            requester.write.require_all("a restore")?;
+        match self {
+            Self::Restore(_) => requester.write.require_all("a restore")?,
+            // The target, whether or not the write changes it: a write of statements the
+            // graph has already would otherwise succeed where a new one is refused, telling
+            // a requester who may not read the graph what it holds (the review of
+            // 3 October 2026, A3).
+            Self::Tell(request) => require_writable(requester, &request.target)?,
+            Self::GraphWrite(request) => require_writable(requester, &request.target)?,
+            Self::GraphDelete(target) => require_writable(requester, target)?,
+            Self::Update(_) | Self::Statements(_) => {}
         }
         let report = self.apply_unchecked(tx, requester, context)?;
         if let Some(writable) = requester.write.access() {
@@ -198,6 +206,22 @@ fn check_writable(
     {
         None => Ok(()),
         Some(graph) => Err(crate::Refusal::Write(graph_name(tx, graph)).into()),
+    }
+}
+
+/// Refuses a graph-level command whose target `requester` may not write.
+fn require_writable(
+    requester: &crate::Requester,
+    target: &crate::GraphTarget,
+) -> Result<(), StoreError> {
+    let Some(writable) = requester.write.access() else {
+        return Ok(());
+    };
+    let graph = target.graph_name()?;
+    if writable.allows_graph(&graph) {
+        Ok(())
+    } else {
+        Err(crate::Refusal::Write(graph).into())
     }
 }
 

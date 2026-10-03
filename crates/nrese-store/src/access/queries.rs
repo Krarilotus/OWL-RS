@@ -118,7 +118,24 @@ fn check(text: &str, namespaces: &NamespaceMap) -> Result<(), AccessError> {
 }
 
 fn resource(space: &str, name: &str) -> NamedNode {
-    iri(&format!("{QUERY}{space}/{name}"))
+    iri(&format!("{QUERY}{}/{}", segment(space), segment(name)))
+}
+
+/// `text` as an IRI path segment: the bytes an IRI can't hold percent-encoded (of what
+/// names allow, `|` in user names, so `~alice|tenant` has a personal space: the review of
+/// 3 October 2026, A5). The rest stays as written, so resources saved before keep their
+/// IRIs (`~alice@example.org`).
+fn segment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => out.push(char::from(byte)),
+            b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+'
+            | b',' | b';' | b'=' | b':' | b'@' => out.push(char::from(byte)),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn quads(query: &SavedQuery) -> Vec<Quad> {

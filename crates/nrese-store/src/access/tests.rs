@@ -568,6 +568,38 @@ fn failed_logins_slow_down_the_guesser_not_the_user() {
     );
 }
 
+/// A user name with a character an IRI can't hold (`|`) has a personal space for queries
+/// too (the review of 3 October 2026, A5): the query's resource encodes it.
+#[test]
+fn a_user_name_with_a_bar_saves_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        let store = StoreService::new(StoreConfig::on_disk(dir.path())).unwrap();
+        AccessControl::open(store, "urn:nrese:").unwrap()
+    };
+    let draft = QueryDraft {
+        query: "ASK {}".to_owned(),
+        ..QueryDraft::default()
+    };
+    let namespaces = crate::NamespaceMap::new();
+    let tenant = user("alice|tenant");
+    open()
+        .save_query(&tenant, "~alice|tenant", "q", draft, &namespaces)
+        .unwrap();
+    let control = open();
+    let saved = control.saved_queries(&tenant);
+    assert_eq!(
+        saved
+            .iter()
+            .map(|q| (q.space.as_str(), q.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("~alice|tenant", "q")]
+    );
+    control.delete_query(&tenant, "~alice|tenant", "q").unwrap();
+    drop(control);
+    assert!(open().saved_queries(&tenant).is_empty());
+}
+
 /// Saved queries live in spaces: a personal space's owner and those it shares with read
 /// them; editors and owners of a workspace change its queries; they outlive a restart and
 /// are checked to parse (with the repository's prefixes) before they are stored.
