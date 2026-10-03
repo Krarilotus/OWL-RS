@@ -16,9 +16,12 @@
 //! - [`rules`]: the rules on one context;
 //! - [`engine`]: the contexts, created on demand, and their parallel saturation (ELK's
 //!   activation scheme on rayon);
+//! - [`abox`]: consistency of assertions (no nominals): individuals' contexts and the
+//!   clauses on the edges between them, to a fixpoint;
 //! - [`classify`]: classification, the taxonomy and proofs of its subsumptions;
 //!   [`canonical`]: the canonical taxonomy of the DL lab; [`profile`]: the telemetry.
 
+pub mod abox;
 pub mod atoms;
 pub mod canonical;
 pub mod classify;
@@ -29,6 +32,7 @@ pub mod profile;
 pub mod program;
 pub mod rules;
 pub mod state;
+pub mod unsupported;
 
 pub use classify::{Classification, Options, Saturated, classify, saturate, signature};
 pub use compile::Unsupported;

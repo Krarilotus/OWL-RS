@@ -1,18 +1,16 @@
 //! Classification with the context core (docs/design/owl2-dl.md §7): one query context per
 //! named class (core `A(x)`, Algorithm 1 of Bate et al. for every class in one run, as
-//! Sequoia does), one with the empty core for `owl:Thing`, and one per individual with
-//! its asserted classes. After saturation, `⊤ → B(x)` in `A`'s context is `A ⊑ B`, and
+//! Sequoia does) and one with the empty core for `owl:Thing`; the individuals' contexts
+//! come from [`super::abox`]. After saturation, `⊤ → B(x)` in `A`'s context is `A ⊑ B`, and
 //! `⊤ → ⊥` is `A ⊑ ⊥`.
 
 use std::time::Instant;
 
-use nrese_owl::{
-    Axiom, Characteristic, ClassExpr, EntityKind, ExprId, Ontology, ProofGraph, Term,
-    normalise_with,
-};
+use nrese_owl::{Axiom, ClassExpr, EntityKind, Ontology, ProofGraph, Term, normalise_with};
 
+use super::abox::Individuals;
 use super::atoms::{Atom, CTerm, ConceptId};
-use super::compile::{Unsupported, compile};
+use super::compile::{Compiled, Unsupported, compile};
 use super::engine::{Engine, Strategy, lock};
 use super::profile::Profile;
 use super::state::{ClauseRef, ContextId, Rule};
@@ -77,42 +75,6 @@ pub fn signature(ontology: &Ontology) -> Vec<Term> {
     out
 }
 
-/// `ontology` with each `ObjectPropertyDomain(R, C)` as `∃R.⊤ ⊑ C`, if it has chains or
-/// transitive properties (`None` otherwise: nothing to change).
-///
-/// A workaround: `nrese-owl` normalises a domain into the raw clause `R(x, y) → C(x)`,
-/// while the edges a chain or transitivity implies are never explicit (only universals
-/// over non-simple roles follow them, through the automata), so a domain of a non-simple
-/// role misses implied edges. As an existential on the left, the domain is a universal and
-/// goes through the automaton. For simple roles both give the same clause. To remove once
-/// the normalisation does this itself (reported 3 October 2026).
-fn domains_as_existentials(ontology: &Ontology) -> Option<Ontology> {
-    let complex = ontology.axioms.iter().any(|a| {
-        matches!(a, Axiom::SubObjectPropertyOf(chain, _) if chain.len() > 1)
-            || matches!(
-                a,
-                Axiom::ObjectCharacteristic(Characteristic::Transitive, _)
-            )
-    });
-    if !complex
-        || !ontology
-            .axioms
-            .iter()
-            .any(|a| matches!(a, Axiom::ObjectPropertyDomain(..)))
-    {
-        return None;
-    }
-    let mut out = ontology.clone();
-    let thing = ExprId(out.classes.intern(ClassExpr::Thing));
-    for axiom in &mut out.axioms {
-        if let Axiom::ObjectPropertyDomain(r, c) = *axiom {
-            let some = ExprId(out.classes.intern(ClassExpr::Some(r, thing)));
-            *axiom = Axiom::SubClassOf(some, c);
-        }
-    }
-    Some(out)
-}
-
 /// A saturated context structure, with what it was built for.
 pub struct Saturated {
     engine: Engine,
@@ -120,7 +82,8 @@ pub struct Saturated {
     /// The query context of each named concept.
     query: Vec<ContextId>,
     top: ContextId,
-    individuals: Vec<ContextId>,
+    /// The individuals' contexts and the clauses on their edges found no clash.
+    assertions_consistent: bool,
     profile: Profile,
 }
 
@@ -144,8 +107,7 @@ pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Uns
         ..Profile::default()
     };
     let started = Instant::now();
-    let rewritten = domains_as_existentials(ontology);
-    let normalised = normalise_with(rewritten.as_ref().unwrap_or(ontology), options.normalise);
+    let normalised = normalise_with(ontology, options.normalise);
     profile.normalise = started.elapsed();
     let started = Instant::now();
     let classes = signature(ontology);
@@ -157,30 +119,17 @@ pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Uns
     profile.roles = compiled.program.roles as usize;
     profile.functions = compiled.program.funcs.len();
     let started = Instant::now();
-    let named = compiled.program.named();
-    let engine = Engine::new(compiled.program, options.strategy, options.proofs);
+    let Compiled { program, abox, .. } = compiled;
+    let named = program.named();
+    let engine = Engine::new(program, options.strategy, options.proofs);
     let query: Vec<ContextId> = (0..named)
         .map(|c| engine.context_for(&[Atom::concept(c, CTerm::X)]).0)
         .collect();
     let (top, _) = engine.context_for(&[]);
-    let individuals: Vec<ContextId> = compiled
-        .individuals
-        .iter()
-        .map(|concepts| {
-            let mut core: Vec<Atom> = concepts
-                .iter()
-                .map(|&c| Atom::concept(c, CTerm::X))
-                .collect();
-            core.sort_unstable();
-            engine.context_for(&core).0
-        })
-        .collect();
     let mut seeds = query.clone();
     seeds.push(top);
-    seeds.extend(&individuals);
-    seeds.sort_unstable();
-    seeds.dedup();
     engine.run(&seeds, options.threads);
+    let individuals = Individuals::saturate(&engine, &abox, options.threads);
     profile.saturate = started.elapsed();
     profile.contexts_created = engine.count();
     for (_, state) in engine.states() {
@@ -197,7 +146,7 @@ pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Uns
         classes,
         query,
         top,
-        individuals,
+        assertions_consistent: individuals.consistent,
         profile,
     })
 }
@@ -227,7 +176,7 @@ impl Saturated {
 
     /// Whether the ontology has a model.
     pub fn consistent(&self) -> bool {
-        !self.unsat(self.top) && !self.individuals.iter().any(|&i| self.unsat(i))
+        !self.unsat(self.top) && self.assertions_consistent
     }
 
     /// The taxonomy.
