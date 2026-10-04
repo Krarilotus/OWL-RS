@@ -418,20 +418,62 @@ fn the_bottom_property_relates_nothing() {
 }
 
 #[test]
-fn the_universal_property_is_unsupported_not_ordinary() {
-    // 501 is owl:topObjectProperty. a: ¬∃⊤.⊤ is inconsistent (a itself is a ⊤-successor
-    // of a); read as an ordinary property it would look consistent.
+fn the_universal_property_relates_everything() {
+    // 501 is owl:topObjectProperty.
+    let top = ObjProp::Named(501);
+    let universal = |b: &mut Build| b.o.builtin.top_object = Some(501);
+    // a: ¬∃U.⊤ is inconsistent (a is a U-successor of itself; New-Feature-TopObjectProperty-001).
     let mut b = Build::default();
-    b.o.builtin.top_object = Some(501);
+    universal(&mut b);
     let thing = b.e(ClassExpr::Thing);
-    let some = b.some(ObjProp::Named(501), thing);
+    let some = b.some(top, thing);
     let none = b.not(some);
     b.assert(none, 100);
-    assert!(
-        matches!(answer(&b.o), Answer::Unsupported(_)),
-        "{:?}",
-        answer(&b.o)
-    );
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // a: ∀U.C reaches an unrelated b: ¬C.
+    let mut b = Build::default();
+    universal(&mut b);
+    let c = b.class(1);
+    let all = b.all(top, c);
+    b.assert(all, 100);
+    let nc = b.not(c);
+    b.assert(nc, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // ... but without b it holds, and a: ∃U.C with C ⊑ ∃R.C too.
+    b.o.axioms.pop();
+    b.o.sources.pop();
+    let rc = b.some(ObjProp::Named(200), c);
+    b.sub(c, rc);
+    let some_c = b.some(top, c);
+    b.assert(some_c, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    // D ⊑ ∃U.C with C ⊑ ⊥ makes D empty, not the ontology inconsistent; d: D does.
+    let mut b = Build::default();
+    universal(&mut b);
+    let [c, d] = [1, 2].map(|t| b.class(t));
+    let some_c = b.some(top, c);
+    b.sub(d, some_c);
+    let nothing = b.e(ClassExpr::Nothing);
+    b.sub(c, nothing);
+    let thing = b.e(ClassExpr::Thing);
+    b.assert(thing, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.assert(d, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // ¬U(a, b) can't hold; U(a, b) always does.
+    let mut b = Build::default();
+    universal(&mut b);
+    b.role_assertion(501, 100, 101);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.axiom(Axiom::NegativeObjectPropertyAssertion(501, 100, 101));
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // A cardinality over U (OWL 2 DL forbids it: U isn't simple) is unsupported.
+    let mut b = Build::default();
+    universal(&mut b);
+    let thing = b.e(ClassExpr::Thing);
+    let two = b.e(ClassExpr::Max(2, top, thing));
+    b.assert(two, 100);
+    assert!(matches!(answer(&b.o), Answer::Unsupported(_)));
 }
 
 #[test]
