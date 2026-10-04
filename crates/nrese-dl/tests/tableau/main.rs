@@ -533,3 +533,30 @@ fn an_inverse_pair_with_a_transitive_role_is_regular() {
     assert!(normalise(&b.o).unsupported.is_empty());
     assert_eq!(answer(&b.o), Answer::Inconsistent);
 }
+
+#[test]
+fn a_branch_too_large_to_expand_is_abandoned_not_the_run() {
+    // a: A, A ⊑ (C ⊓ ≥10⁹ R) ⊔ {o}: the first disjunct can't be expanded within a budget,
+    // the second is a model (as in DL-909, which the search order decided).
+    let mut b = Build::default();
+    let [a, c] = [1, 2].map(|t| b.class(t));
+    let thing = b.e(ClassExpr::Thing);
+    let huge = b.e(ClassExpr::Min(1_000_000_000, ObjProp::Named(200), thing));
+    let big = b.and(&[c, huge]);
+    let o = b.e(ClassExpr::OneOf(vec![300]));
+    let either = b.or(&[big, o]);
+    b.sub(a, either);
+    b.assert(a, 100);
+    let config = Config {
+        timeout: Some(std::time::Duration::from_secs(5)),
+        max_memory: 256 << 20,
+        ..Config::default()
+    };
+    assert_eq!(consistency(&b.o, &config).answer, Answer::Consistent);
+    // With a ≠ o the other branch clashes: the run gives up, it doesn't refute.
+    b.different(100, 300);
+    assert!(matches!(
+        consistency(&b.o, &config).answer,
+        Answer::GaveUp(_)
+    ));
+}
