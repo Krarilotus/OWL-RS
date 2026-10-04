@@ -13,9 +13,18 @@
 //!   type and fragment. `NRESE_W3C_OUT` names a TSV file for the per-test results.
 //! - Known wrong answers are listed in `expected-wrong.txt` with their cause; the run
 //!   fails on any other wrong answer, and on a listed one that is no longer wrong.
+//! - Tests whose expected answer is wrong under the direct semantics are listed in
+//!   `disputed.txt` with a witness model (checked by `disputed_witnesses_are_models`);
+//!   they are counted apart, and the run fails if one of them changes its answer.
 
 mod negate;
 mod rdf;
+#[allow(
+    dead_code,
+    reason = "the fuzz test's semantics; the witness check uses a part"
+)]
+#[path = "../tableau_fuzz/semantics.rs"]
+mod semantics;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -31,6 +40,18 @@ use rdf::{Table, parse_rdf_xml};
 
 const TEST: &str = "http://www.w3.org/2007/OWL/testOntology#";
 const EXPECTED_WRONG: &str = include_str!("expected-wrong.txt");
+const DISPUTED: &str = include_str!("disputed.txt");
+
+/// The lines of a list: `(id, rest)`.
+fn listed(text: &str) -> Vec<(&str, &str)> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let (id, rest) = l.split_once('\t').unwrap_or((l, ""));
+            (id.trim(), rest.trim())
+        })
+        .collect()
+}
 
 fn suite_path() -> PathBuf {
     std::env::var_os("NRESE_W3C_OWL_TESTS").map_or_else(
@@ -341,6 +362,80 @@ fn hard_search_tests_are_decided() {
     }
 }
 
+/// The witness of every disputed test is a model of its premise.
+#[test]
+fn disputed_witnesses_are_models() {
+    let Ok(text) = std::fs::read_to_string(suite_path()) else {
+        return;
+    };
+    let cases = read_cases(&text);
+    for (id, model) in listed(DISPUTED) {
+        let name = id.split(" (").next().unwrap_or(id);
+        let case = cases
+            .iter()
+            .find(|c| c.name == name)
+            .expect("the suite has the test");
+        let premise = case
+            .documents
+            .get("Premise")
+            .or_else(|| case.documents.get("Input"))
+            .expect("a premise");
+        let mut table = Table::default();
+        let o = table.ontology(premise, &case.imports).expect("reads");
+        let i = witness(model, &table);
+        let failing: Vec<String> = o
+            .axioms
+            .iter()
+            .filter(|a| !semantics::holds(&o, a, &i))
+            .map(|a| o.functional(a, &|t| table.name(t)))
+            .collect();
+        assert!(failing.is_empty(), "{id}: the witness fails {failing:#?}");
+    }
+}
+
+/// The interpretation a `disputed.txt` model line describes.
+fn witness(line: &str, table: &Table) -> semantics::Interp {
+    use nrese_owl::Terms;
+    let mut parts = line.split("; ");
+    let n: u32 = parts
+        .next()
+        .and_then(|p| p.split(' ').next())
+        .and_then(|k| k.parse().ok())
+        .expect("N elements");
+    let mut i = semantics::Interp {
+        n,
+        ..semantics::Interp::default()
+    };
+    for part in parts {
+        let (iri, value) = part.split_once(" = ").expect("<iri> = value");
+        let term = table
+            .iri(iri.trim_start_matches('<').trim_end_matches('>'))
+            .unwrap_or_else(|| panic!("{iri} is in the premise"));
+        let value = value.trim();
+        if let Some(set) = value.strip_prefix('{').and_then(|v| v.strip_suffix('}')) {
+            if set.contains('(') {
+                for pair in set
+                    .split("),")
+                    .map(|p| p.trim_matches(|c| " ()".contains(c)))
+                {
+                    let (a, b) = pair.split_once(',').expect("(j, k)");
+                    i.add_edge(term, a.trim().parse().unwrap(), b.trim().parse().unwrap());
+                }
+            } else {
+                let mask = set
+                    .split(',')
+                    .filter(|k| !k.trim().is_empty())
+                    .fold(0u128, |m, k| m | 1 << k.trim().parse::<u32>().unwrap());
+                i.concepts.insert(term, mask);
+            }
+        } else {
+            i.individuals
+                .insert(term, value.parse().expect("an element"));
+        }
+    }
+    i
+}
+
 #[test]
 fn the_w3c_dl_suite() {
     let path = suite_path();
@@ -364,6 +459,8 @@ fn the_w3c_dl_suite() {
     let mut by_fragment: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
     let (mut wrong, mut rows) = (Vec::new(), String::new());
+    let disputed: Vec<&str> = listed(DISPUTED).into_iter().map(|(id, _)| id).collect();
+    let mut changed = Vec::new();
     for case in read_cases(&text) {
         if only
             .as_ref()
@@ -378,7 +475,13 @@ fn the_w3c_dl_suite() {
             }
             let (verdict, features) = run_case(&case, kind);
             let ms = started.elapsed().as_millis();
+            let id = format!("{} ({kind})", case.name);
+            let is_disputed = disputed.contains(&id.as_str());
+            if is_disputed && !matches!(verdict, Verdict::Wrong(_)) {
+                changed.push(format!("{id}: {verdict:?}"));
+            }
             let (class, detail) = match &verdict {
+                Verdict::Wrong(why) if is_disputed => ("disputed", why.clone()),
                 Verdict::Pass => ("pass", String::new()),
                 Verdict::Wrong(why) => {
                     wrong.push(format!("{} ({kind}): {why}", case.name));
@@ -407,11 +510,14 @@ fn the_w3c_dl_suite() {
     if let Some(out) = std::env::var_os("NRESE_W3C_OUT") {
         std::fs::write(out, rows).expect("writes the results");
     }
-    let expected: Vec<&str> = EXPECTED_WRONG
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-        .map(|l| l.split('\t').next().unwrap_or(l).trim())
+    let expected: Vec<&str> = listed(EXPECTED_WRONG)
+        .into_iter()
+        .map(|(id, _)| id)
         .collect();
+    assert!(
+        changed.is_empty(),
+        "disputed tests that changed their answer:\n{changed:#?}"
+    );
     let ids: Vec<String> = wrong
         .iter()
         .map(|w| w.split("): ").next().unwrap_or(w).to_owned() + ")")

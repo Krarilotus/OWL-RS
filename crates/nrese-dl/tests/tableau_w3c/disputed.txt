@@ -1,0 +1,7 @@
+# W3C tests whose expected answer is wrong under the direct semantics: one per line,
+# "name (TestType)<TAB>model", the model a witness the `disputed_witnesses_are_models` test
+# checks against the premise: "N elements", then `<individual IRI> = k`, `<class IRI> =
+# {k, ...}` and `<property IRI> = {(j, k), ...}`, separated by "; ", everything not named
+# empty. The run counts these apart and fails if one of them stops answering against the
+# test (the answer it gives is the model's).
+WebOnt-description-logic-909 (InconsistencyTest)	1 elements; <http://www.w3.org/2002/03owlt/description-logic/inconsistent909#d> = 0; <http://www.w3.org/2002/03owlt/description-logic/inconsistent909#only-d> = {0}
