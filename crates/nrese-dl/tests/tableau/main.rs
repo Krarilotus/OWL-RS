@@ -2,6 +2,7 @@
 //! engine handles, consistent and inconsistent, with every optimisation on and off.
 
 mod build;
+mod sat;
 
 use build::Build;
 use nrese_dl::tableau::{Answer, Config, consistency, satisfiable};

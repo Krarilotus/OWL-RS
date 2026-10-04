@@ -14,9 +14,10 @@ use super::engine::{Engine, Lit, Step, ni_stop, proof};
 use super::graph::{NONE, flag};
 
 impl Engine<'_> {
-    /// Merges `a` and `b` (as they are now) by the equality's `dep`.
+    /// Merges what `a` and `b` stand for now, by the equality's `dep` and the merges that
+    /// made them stand for it (an equality waits in the queue while other merges happen).
     pub fn merge(&mut self, a: u32, b: u32, dep: DepSetId, at_root: u32) -> Step<()> {
-        let (a, b) = (self.g.find(a), self.g.find(b));
+        let (a, b, dep) = self.canonical_pair(a, b, dep);
         if a == b || !self.g.live(a) || !self.g.live(b) {
             return Ok(());
         }
@@ -33,7 +34,7 @@ impl Engine<'_> {
         self.copy_facts(from, into, dep)?;
         let flags = self.g.nodes[from as usize].flags | flag::MERGED;
         self.g.set_flags(from, flags);
-        self.g.set_representative(from, into);
+        self.g.set_representative(from, into, dep);
         Ok(())
     }
 

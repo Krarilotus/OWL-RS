@@ -142,6 +142,23 @@ impl<'a> Engine<'a> {
         self.g.find(self.roots[individual as usize])
     }
 
+    /// The node `node` stands for now, and what the merges that made it so depend on.
+    pub fn canonical(&mut self, node: u32) -> (u32, DepSetId) {
+        let mut dep = DepSetId::EMPTY;
+        let deps = &mut self.deps;
+        let n = self.g.find_with(node, |d| dep = deps.union(dep, d));
+        (n, dep)
+    }
+
+    /// `a ≈ b` between the nodes `a` and `b` stand for now, with `dep` and what those
+    /// merges depend on.
+    pub fn canonical_pair(&mut self, a: u32, b: u32, dep: DepSetId) -> (u32, u32, DepSetId) {
+        let (a, da) = self.canonical(a);
+        let (b, db) = self.canonical(b);
+        let d = self.deps.union(da, db);
+        (a, b, self.deps.union(dep, d))
+    }
+
     /// Asserts `lit` with `dep`; a clash if its negation holds.
     pub fn assert(&mut self, lit: Lit, dep: DepSetId, proof: u32) -> Step<()> {
         match lit {
@@ -169,7 +186,7 @@ impl<'a> Engine<'a> {
                 }
             }
             Lit::Equal(a, b, at_root) => {
-                let (a, b) = (self.g.find(a), self.g.find(b));
+                let (a, b, dep) = self.canonical_pair(a, b, dep);
                 if a == b {
                     return Ok(());
                 }
@@ -190,7 +207,7 @@ impl<'a> Engine<'a> {
         match lit {
             Lit::Concept(c, n) => self.add_negative(n, c, dep, proof::NEGATION),
             Lit::Equal(a, b, _) => {
-                let (a, b) = (self.g.find(a), self.g.find(b));
+                let (a, b, dep) = self.canonical_pair(a, b, dep);
                 self.add_inequality(a, b, dep, proof::NEGATION)
             }
             Lit::Role(..) | Lit::Number { .. } => Ok(()),
@@ -224,7 +241,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Whether `lit` holds; `Err(dep)` if it is refuted (with what refutes it).
-    pub fn holds(&self, lit: Lit) -> Result<bool, DepSetId> {
+    pub fn holds(&mut self, lit: Lit) -> Result<bool, DepSetId> {
         Ok(match lit {
             Lit::Concept(c, n) => {
                 if self.g.concept(n, c).is_some() {
@@ -242,12 +259,16 @@ impl<'a> Engine<'a> {
                 node,
             } => self.g.number(node, at_most, number).is_some(),
             Lit::Equal(a, b, _) => {
-                let (a, b) = (self.g.find(a), self.g.find(b));
-                if a == b {
+                let (s, t) = (self.g.find(a), self.g.find(b));
+                if s == t {
                     return Ok(true);
                 }
-                if let Some(i) = self.g.unequal(a, b) {
-                    return Err(self.g.inequalities[i as usize].dep);
+                if let Some(i) = self.g.unequal(s, t) {
+                    // Refuted between the nodes `a` and `b` were merged into: by the
+                    // inequality and those merges.
+                    let d = self.g.inequalities[i as usize].dep;
+                    let (_, _, d) = self.canonical_pair(a, b, d);
+                    return Err(d);
                 }
                 false
             }
@@ -297,7 +318,9 @@ impl<'a> Engine<'a> {
                 };
                 Lit::Equal(b(x), b(y), root)
             }
-            Head::Nominal(i, v) => Lit::Equal(b(v), self.root(i), NONE),
+            // The individual's own node: whoever asserts or tests the equality follows it
+            // to its representative with the merges' dependencies.
+            Head::Nominal(i, v) => Lit::Equal(b(v), self.roots[i as usize], NONE),
         }
     }
 
