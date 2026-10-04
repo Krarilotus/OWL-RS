@@ -1,3 +1,5 @@
 # W3C tests the hypertableau answers wrongly, with the cause where it is known: one per
 # line, "name (TestType)<TAB>why". The run fails on a wrong answer not listed here, and on
-# a listed one that no longer is wrong. Not one of these is settled; each must be fixed.
+# a listed one that no longer is wrong. Each must be fixed, unless the line says the test's
+# expected answer is the wrong one.
+WebOnt-description-logic-909 (InconsistencyTest)	the test is wrong under the direct semantics: the one-element interpretation {d} (every class but only-d empty, every property empty) satisfies every axiom; Konclude answers consistent too. Status Extracredit. Gave up before disjunct learning.

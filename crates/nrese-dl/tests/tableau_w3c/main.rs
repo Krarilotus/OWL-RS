@@ -320,6 +320,27 @@ fn read_cases(text: &str) -> Vec<Case> {
     out
 }
 
+/// W3C tests that are hard for the search, decided within a budget: DL-202 (a modal
+/// formula as definitions, 20 s and given up before disjunct learning; HermiT 0.3 s) and
+/// DL-206 (HermiT 3 s).
+#[test]
+fn hard_search_tests_are_decided() {
+    let Ok(text) = std::fs::read_to_string(suite_path()) else {
+        return;
+    };
+    for name in [
+        "WebOnt-description-logic-202",
+        "WebOnt-description-logic-206",
+    ] {
+        let case = read_cases(&text)
+            .into_iter()
+            .find(|c| c.name == name)
+            .expect("the suite has it");
+        let (verdict, _) = run_case(&case, "ConsistencyTest");
+        assert_eq!(verdict, Verdict::Pass, "{name}");
+    }
+}
+
 #[test]
 fn the_w3c_dl_suite() {
     let path = suite_path();
