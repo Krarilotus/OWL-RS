@@ -120,11 +120,12 @@ impl fmt::Display for Telemetry {
         let g = &self.gap;
         write!(
             f,
-            "answers: L {}, U1 {}, gap {}, L not in U1 {}; {} of {} predicate queries exact; \
+            "answers: L {}, U1 {}, gap {}, open data values {}, L not in U1 {}; {} of {} predicate queries exact; \
              clashes {}, consistency proved: {}",
             g.lower,
             g.upper,
             g.gap,
+            g.open,
             g.lower_only,
             g.exact_queries,
             g.predicates.len(),
