@@ -87,6 +87,13 @@ fn configs() -> Vec<(&'static str, Config)> {
             },
         ),
         (
+            "no-disjunct-learning",
+            Config {
+                disjunct_learning: false,
+                ..base.clone()
+            },
+        ),
+        (
             "at-most-atoms",
             Config {
                 expand_at_most_up_to: 0,

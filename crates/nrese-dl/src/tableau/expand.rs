@@ -247,6 +247,23 @@ impl Engine<'_> {
         self.branch_with(alternatives, premise, true)
     }
 
+    /// Opens a branch point over the disjuncts of `clause` (`heads`: each alternative's
+    /// head atom) and takes the first.
+    pub fn branch_on_clause(
+        &mut self,
+        alternatives: Vec<Lit>,
+        premise: DepSetId,
+        clause: u32,
+        heads: Vec<u8>,
+    ) -> Step<()> {
+        self.branch_with(alternatives, premise, true)?;
+        if let Some(frame) = self.frames.last_mut() {
+            frame.clause = clause;
+            frame.heads = heads;
+        }
+        Ok(())
+    }
+
     /// Opens a branch point; `semantic`: later alternatives are taken with the failed
     /// ones' negations (where semantic branching is on).
     pub fn branch_with(
@@ -265,6 +282,8 @@ impl Engine<'_> {
             ni_open: self.ni.open,
             semantic,
             alternatives,
+            clause: NONE,
+            heads: Vec::new(),
             next: 0,
             premise,
             failed: DepSetId::EMPTY,
