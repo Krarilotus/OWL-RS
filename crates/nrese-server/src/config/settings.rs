@@ -316,6 +316,13 @@ pub const SETTINGS: &[Setting] = &[
         "Intermediate results of all running queries together; 0 is unlimited (default 50%).",
     ),
     setting(
+        "budgets.process_memory",
+        names::PROCESS_MEMORY_BYTES,
+        Amount(BytesOrShare),
+        "The memory the server may hold before a materialisation or a commit's reasoning \
+         stops with an error instead of taking the machine; 0 is unlimited (default 75%).",
+    ),
+    setting(
         "budgets.bulk_load_memory",
         names::BULK_LOAD_MEMORY,
         Amount(BytesOrShare),

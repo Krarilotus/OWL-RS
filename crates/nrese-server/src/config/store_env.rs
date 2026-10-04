@@ -25,6 +25,9 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         total_query_memory_bytes: parse_total_query_memory(
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
         )?,
+        process_memory_bytes: parse_process_memory(
+            source.get(names::PROCESS_MEMORY_BYTES).as_deref(),
+        )?,
         federation: parse_federation(source)?,
         hide_unnamed_classes: parse_unnamed_classes(
             source.get(names::REASONING_UNNAMED_CLASSES).as_deref(),
@@ -207,6 +210,17 @@ fn parse_federation(source: &dyn ConfigSource) -> Result<nrese_store::Federation
 
 /// The share of the machine's memory that all running queries may hold by default.
 pub const DEFAULT_TOTAL_QUERY_MEMORY: &str = "50%";
+
+/// The share of the machine's (or the container's) memory the process may hold before
+/// long operations stop, by default.
+pub const DEFAULT_PROCESS_MEMORY: &str = "75%";
+
+fn parse_process_memory(input: Option<&str>) -> Result<u64> {
+    let text = input.unwrap_or(DEFAULT_PROCESS_MEMORY);
+    let bytes = super::units::parse_memory(text)
+        .with_context(|| format!("failed to parse {}", names::PROCESS_MEMORY_BYTES))?;
+    Ok(bytes.unwrap_or(0))
+}
 
 /// Bytes or a share of the machine's memory; `0` is unlimited, and so is a share where
 /// the machine's memory isn't known.

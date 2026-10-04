@@ -32,6 +32,11 @@ pub struct StoreConfig {
     /// unlimited. A query that asks for more than is left fails with
     /// [`StoreError::is_server_memory_limit`](crate::StoreError::is_server_memory_limit).
     pub total_query_memory_bytes: usize,
+    /// The memory the process may hold before a long operation (a materialisation, the
+    /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`](crate::StoreError::ProcessMemoryLimit)
+    /// instead of taking the machine; 0 is no limit. By default three quarters of what the
+    /// process may use ([`default_process_memory_bytes`]).
+    pub process_memory_bytes: u64,
     /// Which remote endpoints `SERVICE` may call.
     pub federation: FederationConfig,
     /// Reasoning leaves out memberships in unnamed union classes that nothing consumes
@@ -157,6 +162,12 @@ impl Default for StoreConfig {
     }
 }
 
+/// Three quarters of the memory the process may use (the container's limit, else the
+/// machine's: [`nrese_exec::memory::available_bytes`]); 0 (no limit) where unknown.
+pub fn default_process_memory_bytes() -> u64 {
+    nrese_exec::memory::available_bytes().map_or(0, |bytes| bytes / 4 * 3)
+}
+
 impl StoreConfig {
     pub fn in_memory() -> Self {
         Self {
@@ -167,6 +178,7 @@ impl StoreConfig {
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
             total_query_memory_bytes: 0,
+            process_memory_bytes: default_process_memory_bytes(),
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             equality_by_representatives: true,
@@ -193,6 +205,7 @@ impl StoreConfig {
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
             total_query_memory_bytes: 0,
+            process_memory_bytes: default_process_memory_bytes(),
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             equality_by_representatives: true,
