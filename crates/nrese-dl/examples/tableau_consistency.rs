@@ -4,7 +4,8 @@
 //! ```text
 //! cargo run --release -p nrese-dl --example tableau_consistency -- [--timeout SECS]
 //!     [--no-semantic-branching] [--no-backjumping] [--ancestor-blocking] [--pairwise-always]
-//!     [--disjunctions-first] [--expand-at-most N] FILE...
+//!     [--disjunctions-first] [--no-disjunct-learning] [--full-blocking] [--expand-at-most N]
+//!     FILE...
 //! ```
 //!
 //! Each FILE is N-Triples (`.nt`, as the reference runner's `ntriples` task writes it) or
@@ -87,6 +88,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--ancestor-blocking" => config.anywhere_blocking = false,
             "--pairwise-always" => config.single_blocking = false,
             "--disjunctions-first" => config.disjunctions_first = true,
+            "--no-disjunct-learning" => config.disjunct_learning = false,
+            "--full-blocking" => config.incremental_blocking = false,
             "--expand-at-most" => {
                 config.expand_at_most_up_to = args.next().ok_or("--expand-at-most N")?.parse()?;
             }

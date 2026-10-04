@@ -74,21 +74,31 @@ impl Engine<'_> {
         false
     }
 
-    /// The ≥-rule on every node that isn't blocked; whether anything was added.
+    /// The ≥-rule on every node that isn't blocked; whether anything was added. It looks
+    /// at the nodes that changed since its last pass (the blocking pass collects them).
     pub fn expand_at_least(&mut self) -> Step<bool> {
-        // What changes from here on lowers the floor again for the next pass.
-        let floor = std::mem::replace(&mut self.g.dirty, NONE);
-        self.compute_blocking(floor);
+        self.update_blocking();
+        let len = self.g.nodes.len() as u32;
+        let from = std::mem::replace(&mut self.blocking.expand_from, NONE).min(len);
+        let mut nodes = std::mem::take(&mut self.blocking.expand);
+        nodes.retain(|&n| n < from);
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes.extend(from..len);
         let started = Instant::now();
-        let out = self.expand_at_least_inner(floor);
+        let out = self.expand_at_least_inner(&nodes);
         self.stats.expand += started.elapsed();
+        if out.is_err() {
+            // A stop leaves them unexpanded: they are looked at again after it.
+            self.blocking.expand.extend(nodes);
+        }
         out
     }
 
-    fn expand_at_least_inner(&mut self, floor: u32) -> Step<bool> {
+    fn expand_at_least_inner(&mut self, nodes: &[u32]) -> Step<bool> {
         let mut changed = false;
         let len = self.g.nodes.len() as u32;
-        for s in floor.min(len)..len {
+        for &s in nodes.iter().filter(|&&s| s < len) {
             let node = &self.g.nodes[s as usize];
             if node.numbers == NONE || !node.live() || self.blocked(s) {
                 continue;
