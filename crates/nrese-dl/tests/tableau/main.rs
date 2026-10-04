@@ -439,3 +439,27 @@ fn the_universal_property_is_unsupported_not_ordinary() {
         answer(&b.o)
     );
 }
+
+#[test]
+fn horn_encodings_keep_their_answers() {
+    // Man ⊔ Woman ⊑ Person, Person ⊓ ∃worksFor.Org ⊑ Employee with worksFor transitive;
+    // a: Man, worksFor(a, b), worksFor(b, c), c: Org, Employee ⊑ ⊥: inconsistent, and
+    // consistent without c: Org.
+    let mut b = Build::default();
+    let [man, woman, person, org, employee] = [1, 2, 3, 4, 5].map(|t| b.class(t));
+    let works_for = ObjProp::Named(200);
+    b.characteristic(Characteristic::Transitive, works_for);
+    let either = b.or(&[man, woman]);
+    b.sub(either, person);
+    let some = b.some(works_for, org);
+    let both = b.and(&[person, some]);
+    b.sub(both, employee);
+    let nothing = b.e(ClassExpr::Nothing);
+    b.sub(employee, nothing);
+    b.assert(man, 100);
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(200, 101, 102);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.assert(org, 102);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
