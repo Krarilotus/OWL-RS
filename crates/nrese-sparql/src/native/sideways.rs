@@ -97,14 +97,24 @@ impl Context<'_> {
     }
 
     /// `Join(left, right)`, the smaller side first and the other evaluated from it.
+    ///
+    /// A `VALUES` goes first whatever the other side's estimate: its rows are given, so
+    /// starting from them costs nothing, and if probing from them doesn't pay the other
+    /// side is evaluated alone as it would have been. A BGP's estimate is its smallest
+    /// pattern's count, which says nothing of what its joins expand to: a one-row
+    /// `VALUES` against a star whose smallest pattern had 7 statements stayed second, and
+    /// the star was evaluated for all 673,884 provenance chains of the Zebratlas release
+    /// before the one edge was joined (4 October 2026).
     pub(super) fn join_sideways(
         &self,
         left: &GraphPattern,
         right: &GraphPattern,
     ) -> NativeResult<Solutions> {
+        let values = |p: &GraphPattern| matches!(p, GraphPattern::Values { .. });
         let swap = !ordered(left)
             && !ordered(right)
-            && self.estimate(right) * PROBE_FACTOR as f64 <= self.estimate(left);
+            && !values(left)
+            && (values(right) || self.estimate(right) * PROBE_FACTOR as f64 <= self.estimate(left));
         let (first, second) = if swap { (right, left) } else { (left, right) };
         let bound = self.eval(first)?;
         self.eval_from(bound, second)
