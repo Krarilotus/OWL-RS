@@ -18,6 +18,7 @@ fn answer(o: &nrese_owl::Ontology) -> Answer {
             backjumping: bits & 2 != 0,
             anywhere_blocking: bits & 4 != 0,
             single_blocking: bits & 8 != 0,
+            check_blocking: true,
             ..Config::default()
         };
         answers.push(consistency(o, &config).answer);

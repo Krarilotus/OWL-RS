@@ -100,9 +100,8 @@ impl Engine<'_> {
         if self.ni.open as usize == self.ni.pending.len() {
             return Ok(false);
         }
-        // Indirectly blocked nodes are left alone: blocking must be current. The floor
-        // stays for the ≥-rule's pass, which expands from it.
-        self.compute_blocking(self.g.dirty);
+        // Indirectly blocked nodes are left alone: blocking must be current.
+        self.update_blocking();
         let mut changed = false;
         let mut settled = true;
         let mut at = self.ni.open as usize;

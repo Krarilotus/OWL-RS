@@ -7,12 +7,25 @@
 //!   the roles of the edges between the two, both ways.
 //!
 //! Candidate blockers are found through a 128-bit hash of the signature, and the exact
-//! signature is compared after a hash hit, so the whole pass takes a linear number of
-//! lookups. Signatures are cached per node and reused while the lists they were read
-//! from are unchanged (same heads, same cut generation). Single blocking is used only
-//! where it is complete: the clauses are simple (Definition 10, no inverses). Anywhere
-//! blocking can be switched to ancestor blocking.
+//! signature is compared after a hash hit. Signatures are cached per node and reused while
+//! the lists they were read from are unchanged (same heads, same cut generation). Single
+//! blocking is used only where it is complete: the clauses are simple (Definition 10, no
+//! inverses). Anywhere blocking can be switched to ancestor blocking.
+//!
+//! **Incremental** (`Config::incremental_blocking`): a pass rechecks only what a change
+//! can affect, in creation order, since a node's status depends on earlier nodes only:
+//! the nodes whose facts or edges changed (the graph's touched list), under pairwise
+//! blocking their children (whose signatures hold the parent's label), the children of a
+//! node whose status changed (indirect blocking), the nodes a node blocked when it
+//! changes, and the later nodes listed under a node's new signature (it may block them
+//! now). A backtrack's cut redoes every node from the lowest it changed. Recomputing every
+//! node from the lowest changed one after each choice made the passes quadratic in the
+//! graph (DL-209's entailment case: 19 of 25 s). With `Config::check_blocking` each pass
+//! is compared with a recomputation from scratch (the oracle for the debug and fuzz runs:
+//! a wrongly blocked node would be unsound).
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
@@ -34,8 +47,8 @@ struct Cached {
     hash: u128,
     sig: Signature,
     valid: bool,
-    /// Listed in the table of unblocked nodes under `hash`.
-    in_table: bool,
+    /// The hash it is listed under in the table of unblocked nodes, if it is.
+    listed: Option<u128>,
 }
 
 /// The blocking pass's reusable state (cold data beside the hot nodes).
@@ -47,6 +60,16 @@ pub struct Blocking {
     extent: u32,
     /// The cached signatures' bytes (for the memory budget).
     pub bytes: usize,
+    /// By blocker: the nodes it blocked when they were checked (stale entries are
+    /// rechecked harmlessly).
+    blocked_by: HashMap<u32, Vec<u32>>,
+    /// The pass a node was last queued in.
+    queued: Vec<u32>,
+    pass: u32,
+    /// The nodes the ≥-rule must look at again (checked or changed since its last pass):
+    /// these, and every node from `expand_from` on.
+    pub expand: Vec<u32>,
+    pub expand_from: u32,
 }
 
 impl Engine<'_> {
@@ -115,79 +138,327 @@ impl Engine<'_> {
         let hash = (u128::from(h.finish()) << 64) | u128::from(low);
         let old = self.blocking.cache[index].sig.capacity();
         self.blocking.bytes = (self.blocking.bytes + sig.capacity() * 4).saturating_sub(old * 4);
+        let listed = self.blocking.cache[index].listed;
         self.blocking.cache[index] = Cached {
             generation,
             heads,
             hash,
             sig,
             valid: true,
-            in_table: false,
+            listed,
         };
         hash
     }
 
-    /// Recomputes the blocking status of every node from `floor` on; those before it
-    /// keep theirs (nothing they depend on changed).
-    pub fn compute_blocking(&mut self, floor: u32) {
+    /// Removes `n` from the table of unblocked nodes; the hash it was listed under.
+    #[inline]
+    fn unlist(&mut self, n: u32) -> Option<u128> {
+        let c = self.blocking.cache.get_mut(n as usize)?;
+        c.listed?;
+        let hash = c.listed.take()?;
+        if let Some(bucket) = self.blocking.table.get_mut(&hash) {
+            bucket.retain(|&t| t != n);
+        }
+        Some(hash)
+    }
+
+    fn queue(&mut self, heap: &mut BinaryHeap<Reverse<u32>>, n: u32) {
+        let i = n as usize;
+        if i >= self.g.nodes.len() {
+            return;
+        }
+        if self.blocking.queued.len() <= i {
+            self.blocking.queued.resize(i + 1, 0);
+        }
+        if self.blocking.queued[i] != self.blocking.pass {
+            self.blocking.queued[i] = self.blocking.pass;
+            heap.push(Reverse(n));
+        }
+    }
+
+    /// The live children of `n` (its successors in the tree).
+    fn children(&self, n: u32) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .g
+            .out_edges(n)
+            .map(|(_, e)| e.to)
+            .chain(self.g.in_edges(n).map(|(_, e)| e.from))
+            .filter(|&c| c != n && self.g.nodes[c as usize].parent == n && self.g.live(c))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The nodes linked to `n` by an edge, either way.
+    fn neighbours_of(&self, n: u32) -> Vec<u32> {
+        self.g
+            .out_edges(n)
+            .map(|(_, e)| e.to)
+            .chain(self.g.in_edges(n).map(|(_, e)| e.from))
+            .collect()
+    }
+
+    /// Brings every node's blocking status up to date (see the module's description).
+    pub fn update_blocking(&mut self) {
         let started = Instant::now();
         let pairwise = self.pairwise();
         let len = self.g.nodes.len() as u32;
-        let floor = floor.min(self.blocking.extent).min(len);
-        let mut table = std::mem::take(&mut self.blocking.table);
-        // Unlist the nodes the pass redoes (including any cut away since).
-        let upto = (self.blocking.extent as usize).min(self.blocking.cache.len());
-        for n in floor as usize..upto {
-            let c = &mut self.blocking.cache[n];
-            if c.in_table {
-                c.in_table = false;
-                if let Some(bucket) = table.get_mut(&c.hash) {
-                    bucket.retain(|&t| t as usize != n);
+        let touched = std::mem::take(&mut self.g.touched);
+        let mut floor = std::mem::replace(&mut self.g.full_from, NONE);
+        if !self.config.incremental_blocking {
+            floor = touched.iter().copied().fold(floor, u32::min);
+        }
+        self.blocking.pass = self.blocking.pass.wrapping_add(1);
+        if self.blocking.cache.len() < len as usize {
+            self.blocking.cache.resize(len as usize, Cached::default());
+        }
+        let mut heap = BinaryHeap::new();
+        let floor = floor.min(len);
+        if floor < len || floor < self.blocking.extent {
+            // Everything from `floor` on, including what a cut removed since.
+            let upto = (self.blocking.extent as usize).min(self.blocking.cache.len());
+            let (cache, table) = (&mut self.blocking.cache, &mut self.blocking.table);
+            for (n, c) in cache[floor as usize..upto].iter_mut().enumerate() {
+                if let Some(hash) = c.listed.take()
+                    && let Some(bucket) = table.get_mut(&hash)
+                {
+                    let n = (n + floor as usize) as u32;
+                    bucket.retain(|&t| t != n);
                 }
             }
         }
-        for n in floor..len {
-            let node = self.g.nodes[n as usize];
-            if !node.live() {
-                continue;
+        let mut touched = touched;
+        touched.retain(|&n| n < floor.min(len));
+        touched.sort_unstable();
+        touched.dedup();
+        for &n in &touched {
+            self.queue(&mut heap, n);
+            if pairwise {
+                for c in self.children(n) {
+                    self.queue(&mut heap, c);
+                }
             }
-            let mut flags = node.flags & !flag::BLOCKED;
-            let mut blocker = NONE;
-            if flags & flag::ROOT == 0 {
-                let parent = self.g.nodes[node.parent as usize];
-                if parent.flags & flag::BLOCKED != 0 {
-                    flags |= flag::INDIRECTLY_BLOCKED;
-                } else {
-                    self.stats.blocking_tests += 1;
-                    let hash = self.refresh(n, pairwise);
-                    self.g.nodes[n as usize].blocking_hash = hash;
-                    let cache = &self.blocking.cache;
-                    let sig = &cache[n as usize].sig;
-                    let found = table.get(&hash).and_then(|cands| {
-                        cands.iter().copied().find(|&t| {
-                            &cache[t as usize].sig == sig
-                                && (self.config.anywhere_blocking || self.g.descends(n, t))
-                        })
-                    });
-                    match found {
-                        Some(t) => {
-                            flags |= flag::DIRECTLY_BLOCKED;
-                            blocker = t;
-                            self.stats.blocking_hits += 1;
+        }
+        // Before `floor`, what changed and what that affects; from it on every node, in
+        // order (what a change there affects is redone anyway, so nothing is passed on).
+        while let Some(&Reverse(n)) = heap.peek() {
+            if n >= floor {
+                break;
+            }
+            heap.pop();
+            self.recheck(n, pairwise, true, &mut heap);
+        }
+        for n in floor..len {
+            self.recheck_unlisted(n, pairwise);
+        }
+        self.blocking.expand_from = self.blocking.expand_from.min(floor);
+        self.blocking.extent = len;
+        self.stats.blocking += started.elapsed();
+        if self.config.check_blocking {
+            self.check_blocking(pairwise);
+        }
+    }
+
+    /// Recomputes `n`'s status in a pass that redoes every node from some floor up to and
+    /// beyond `n`, in order: `n` is unlisted already, and what its change affects is
+    /// redone anyway.
+    fn recheck_unlisted(&mut self, n: u32, pairwise: bool) {
+        let node = self.g.nodes[n as usize];
+        if !node.live() {
+            return;
+        }
+        let old = node.flags & flag::BLOCKED;
+        let mut flags = node.flags & !flag::BLOCKED;
+        let mut blocker = NONE;
+        if flags & flag::ROOT == 0 {
+            if self.g.nodes[node.parent as usize].flags & flag::BLOCKED != 0 {
+                flags |= flag::INDIRECTLY_BLOCKED;
+            } else {
+                self.stats.blocking_tests += 1;
+                let hash = self.refresh(n, pairwise);
+                self.g.nodes[n as usize].blocking_hash = hash;
+                let cache = &self.blocking.cache;
+                let sig = &cache[n as usize].sig;
+                let found = self.blocking.table.get(&hash).and_then(|cands| {
+                    cands.iter().copied().find(|&t| {
+                        t < n
+                            && &cache[t as usize].sig == sig
+                            && (self.config.anywhere_blocking || self.g.descends(n, t))
+                    })
+                });
+                match found {
+                    Some(t) => {
+                        flags |= flag::DIRECTLY_BLOCKED;
+                        blocker = t;
+                        self.stats.blocking_hits += 1;
+                        if !(old == flag::DIRECTLY_BLOCKED && node.blocker == t) {
+                            self.blocking.blocked_by.entry(t).or_default().push(n);
                         }
-                        None => {
-                            table.entry(hash).or_default().push(n);
-                            self.blocking.cache[n as usize].in_table = true;
-                        }
+                    }
+                    None => {
+                        let bucket = self.blocking.table.entry(hash).or_default();
+                        let at = bucket.partition_point(|&t| t < n);
+                        bucket.insert(at, n);
+                        self.blocking.cache[n as usize].listed = Some(hash);
                     }
                 }
             }
-            // Blocking status is recomputed before every use: no trail.
-            self.g.nodes[n as usize].flags = flags;
-            self.g.nodes[n as usize].blocker = blocker;
         }
-        self.blocking.extent = len;
-        self.blocking.table = table;
-        self.stats.blocking += started.elapsed();
+        self.g.nodes[n as usize].flags = flags;
+        self.g.nodes[n as usize].blocker = blocker;
+        if flags & flag::BLOCKED != old {
+            let neighbours = self.neighbours_of(n);
+            self.blocking.expand.extend(neighbours);
+        }
+    }
+
+    /// Recomputes `n`'s status and, if `propagate`, queues what its change affects.
+    fn recheck(
+        &mut self,
+        n: u32,
+        pairwise: bool,
+        propagate: bool,
+        heap: &mut BinaryHeap<Reverse<u32>>,
+    ) {
+        let node = self.g.nodes[n as usize];
+        let old = (
+            node.flags & flag::BLOCKED,
+            self.blocking.cache[n as usize].listed,
+        );
+        let mut flags = node.flags & !flag::BLOCKED;
+        let mut blocker = NONE;
+        let mut listed = None;
+        if !node.live() || flags & flag::ROOT != 0 {
+            self.unlist(n);
+        } else if self.g.nodes[node.parent as usize].flags & flag::BLOCKED != 0 {
+            flags |= flag::INDIRECTLY_BLOCKED;
+            self.unlist(n);
+        } else {
+            self.stats.blocking_tests += 1;
+            let hash = self.refresh(n, pairwise);
+            self.g.nodes[n as usize].blocking_hash = hash;
+            let cache = &self.blocking.cache;
+            let sig = &cache[n as usize].sig;
+            let found = self.blocking.table.get(&hash).and_then(|cands| {
+                cands.iter().copied().find(|&t| {
+                    t < n
+                        && &cache[t as usize].sig == sig
+                        && (self.config.anywhere_blocking || self.g.descends(n, t))
+                })
+            });
+            match found {
+                Some(t) => {
+                    flags |= flag::DIRECTLY_BLOCKED;
+                    blocker = t;
+                    self.stats.blocking_hits += 1;
+                    self.unlist(n);
+                    // Listed once per blocker: a node blocked by `t` is in `t`'s list (a
+                    // list taken resets its nodes' blockers, so they are listed again).
+                    if !(old.0 == flag::DIRECTLY_BLOCKED && node.blocker == t) {
+                        self.blocking.blocked_by.entry(t).or_default().push(n);
+                    }
+                }
+                None => {
+                    if old.1 != Some(hash) {
+                        self.unlist(n);
+                        let bucket = self.blocking.table.entry(hash).or_default();
+                        let at = bucket.partition_point(|&t| t < n);
+                        bucket.insert(at, n);
+                        self.blocking.cache[n as usize].listed = Some(hash);
+                    }
+                    listed = Some(hash);
+                }
+            }
+        }
+        // Blocking status is recomputed before every use: no trail.
+        self.g.nodes[n as usize].flags = flags;
+        self.g.nodes[n as usize].blocker = blocker;
+        if propagate {
+            self.blocking.expand.push(n);
+        }
+        if flags & flag::BLOCKED != old.0 {
+            // Their ≥-restrictions count non-successor neighbours that aren't blocked.
+            let neighbours = self.neighbours_of(n);
+            self.blocking.expand.extend(neighbours);
+        }
+        if !propagate {
+            return;
+        }
+        if flags & flag::BLOCKED != old.0 {
+            for c in self.children(n) {
+                self.queue(heap, c);
+            }
+        }
+        if old.1.is_some() && old.1 != listed {
+            // What it blocked must find another blocker, or none.
+            if let Some(blocked) = self.blocking.blocked_by.remove(&n) {
+                for b in blocked {
+                    if (b as usize) < self.g.nodes.len() && self.g.nodes[b as usize].blocker == n {
+                        self.g.nodes[b as usize].blocker = NONE;
+                    }
+                    self.queue(heap, b);
+                }
+            }
+        }
+        if let Some(hash) = listed
+            && old.1 != listed
+        {
+            // It may block later nodes with its signature.
+            let later: Vec<u32> = self
+                .blocking
+                .table
+                .get(&hash)
+                .map(|b| b.iter().copied().filter(|&t| t > n).collect())
+                .unwrap_or_default();
+            for t in later {
+                self.queue(heap, t);
+            }
+        }
+    }
+
+    /// Recomputes every node's blocking status from scratch.
+    pub fn recompute_blocking(&mut self) {
+        self.g.full_from = 0;
+        self.update_blocking();
+    }
+
+    /// The oracle: every node's status as a recomputation from scratch has it (panics on
+    /// a difference).
+    fn check_blocking(&self, pairwise: bool) {
+        let len = self.g.nodes.len();
+        let mut status = vec![0u32; len];
+        let mut seen: std::collections::HashMap<Signature, Vec<u32>> =
+            std::collections::HashMap::new();
+        for n in 0..len as u32 {
+            let node = &self.g.nodes[n as usize];
+            if !node.live() || node.flags & flag::ROOT != 0 {
+                continue;
+            }
+            if status[node.parent as usize] != 0 {
+                status[n as usize] = flag::INDIRECTLY_BLOCKED;
+                continue;
+            }
+            let sig = self.signature(n, pairwise);
+            let blocked = seen.get(&sig).is_some_and(|ts| {
+                ts.iter()
+                    .any(|&t| self.config.anywhere_blocking || self.g.descends(n, t))
+            });
+            if blocked {
+                status[n as usize] = flag::DIRECTLY_BLOCKED;
+            } else {
+                seen.entry(sig).or_default().push(n);
+            }
+        }
+        for (n, (node, &expected)) in self.g.nodes.iter().zip(&status).enumerate() {
+            if node.live() {
+                assert_eq!(
+                    node.flags & flag::BLOCKED,
+                    expected,
+                    "node {n}: blocking status differs from a recomputation"
+                );
+            }
+        }
     }
 
     pub fn blocked(&self, n: u32) -> bool {

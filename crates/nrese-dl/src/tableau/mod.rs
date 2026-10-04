@@ -57,6 +57,12 @@ pub struct Config {
     /// Decide disjunctions before the ≥-rule expands (else the design's order: the
     /// ≥-rule first, disjunctions when nothing else is left).
     pub disjunctions_first: bool,
+    /// Recheck only the nodes a change can affect for blocking (else every node from the
+    /// lowest changed one).
+    pub incremental_blocking: bool,
+    /// Compare every blocking pass with a recomputation from scratch, and panic on a
+    /// difference (for tests: the oracle of the incremental pass).
+    pub check_blocking: bool,
     /// Try a clause's disjuncts in HermiT's order and move those that failed more often
     /// to the back (else in the clause's order).
     pub disjunct_learning: bool,
@@ -81,6 +87,8 @@ impl Default for Config {
             single_blocking: true,
             disjunctions_first: false,
             disjunct_learning: true,
+            incremental_blocking: true,
+            check_blocking: false,
             max_nodes: 2_000_000,
             timeout: None,
             max_memory: 4 << 30,
