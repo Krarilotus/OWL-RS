@@ -9,19 +9,21 @@
 //!   fires, an inconsistency test when one does; a positive entailment test when its
 //!   conclusion, blank nodes read as variables and the ontology header left out, is in the
 //!   closure (or the premise is inconsistent, which entails everything); a negative
-//!   entailment test when it isn't.
+//!   entailment test when it isn't. Conclusions the rules never derive (`owl:differentFrom`,
+//!   `owl:AllDifferent`, complements, negative property assertions) are decided by
+//!   refutation (`StoreService::entails`).
 //! - The OWL 2 RL/RDF rules are complete only for ground atomic conclusions from RL
 //!   premises (theorem PR1 of the profiles document); the tests they can't pass are listed
 //!   in `expected-failures.txt`. The run fails on any failure not in the list, and on any
 //!   listed test that passes.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use nrese_rdf::{NamedOrBlankNode, Term, Triple};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_reasoner::rulesets::Ruleset;
-use nrese_store::{BulkLoadRequest, GraphTarget, SparqlQueryRequest, StoreConfig, StoreService};
+use nrese_store::{BulkLoadRequest, GraphTarget, StoreConfig, StoreService};
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
 
@@ -59,7 +61,6 @@ const TRANSLATIONS: &[(&str, &str)] = &[
 ];
 const TEST: &str = "http://www.w3.org/2007/OWL/testOntology#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const OWL_ONTOLOGY: &str = "http://www.w3.org/2002/07/owl#Ontology";
 
 fn suite_path() -> PathBuf {
     std::env::var_os("NRESE_W3C_OWL_TESTS").map_or_else(
@@ -157,40 +158,6 @@ fn cases(triples: &[Triple]) -> BTreeMap<String, Case> {
         .collect()
 }
 
-/// An ASK for a conclusion: its triples, blank nodes as variables, the ontology header
-/// (everything said about the `owl:Ontology` node) left out.
-fn ask(conclusion: &[Triple]) -> String {
-    let headers: HashSet<&NamedOrBlankNode> = conclusion
-        .iter()
-        .filter(|t| {
-            t.predicate.as_str() == RDF_TYPE
-                && matches!(&t.object, Term::NamedNode(n) if n.as_str() == OWL_ONTOLOGY)
-        })
-        .map(|t| &t.subject)
-        .collect();
-    let term = |t: &Term| match t {
-        Term::BlankNode(b) => format!(
-            "?b{}",
-            b.as_str()
-                .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
-        ),
-        other => other.to_string(),
-    };
-    let patterns: Vec<String> = conclusion
-        .iter()
-        .filter(|t| !headers.contains(&t.subject))
-        .map(|t| {
-            format!(
-                "{} <{}> {} .",
-                term(&t.subject.clone().into()),
-                t.predicate.as_str(),
-                term(&t.object)
-            )
-        })
-        .collect();
-    format!("ASK {{ {} }}", patterns.join(" "))
-}
-
 fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<(), String> {
     let stem = name.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
     let file = match (&case.premise, TRANSLATIONS.iter().find(|(n, _)| *n == name)) {
@@ -219,14 +186,15 @@ fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<(), String> {
         .rematerialise(Ruleset::Owl2Rl)
         .map_err(|e| e.to_string())?;
     let inconsistent = report.violations > 0;
+    // The store's entailment check: the closure for positive statements, refutation for
+    // the negative ones (owl:differentFrom, owl:AllDifferent, complements, negative
+    // property assertions).
     let entailed = |text: &str| -> Result<bool, String> {
-        let query = ask(&parse_rdf_xml(text)?);
-        let payload = store
-            .execute_query(&SparqlQueryRequest::all(&query))
-            .map_err(|e| format!("{e}: {query}"))?
-            .payload;
-        let text = String::from_utf8_lossy(&payload).replace(char::is_whitespace, "");
-        Ok(text.contains("\"boolean\":true"))
+        let conclusion = parse_rdf_xml(text)?;
+        store
+            .entails(Ruleset::Owl2Rl, &conclusion)
+            .map(nrese_store::Entailment::holds)
+            .map_err(|e| e.to_string())
     };
     for kind in &case.kinds {
         match kind.as_str() {

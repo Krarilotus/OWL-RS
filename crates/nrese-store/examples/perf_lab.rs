@@ -5,6 +5,7 @@
 //!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
 //!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE] [--reason RULESET]
+//!     [--results DIR]
 //! ```
 //!
 //! - **Data:** `--load` bulk-loads files, into memory or, with `--store`, into an on-disk
@@ -21,6 +22,8 @@
 //!   clients ask for).
 //!   `--reason` materialises a ruleset (`owl2-rl`, `rdfs`, ...) after the load, timed, and
 //!   the queries read the materialised data (the default read model).
+//!   `--results` writes each query's serialised answer to `DIR/<query>.out` (once, after
+//!   the measurement), to compare answers with another engine's.
 //!   `--explain` prints each query's plan after its measurement: every operator with its
 //!   estimated and actual rows and its time (inputs included), where the time goes when a
 //!   profiler isn't at hand.
@@ -64,6 +67,7 @@ struct Args {
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
     reason: Option<nrese_reasoner::rulesets::Ruleset>,
+    results: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -83,6 +87,7 @@ fn parse_args() -> Result<Args, String> {
         format: SolutionsResultFormat::Tsv,
         shapes: None,
         reason: None,
+        results: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -102,6 +107,7 @@ fn parse_args() -> Result<Args, String> {
             "--json" => args.json = Some(value()?.into()),
             "--baseline" => args.baseline = Some(value()?.into()),
             "--explain" => args.explain = true,
+            "--results" => args.results = Some(value()?.into()),
             "--qerror" => args.qerror = true,
             "--shapes" => args.shapes = Some(value()?.into()),
             "--reason" => {
@@ -192,6 +198,28 @@ fn run_once(
         QueryResultKind::Graph => sink.lines,
     };
     Ok((rows, elapsed))
+}
+
+/// The query's answer, serialised as the measurement does, into `path`.
+fn write_results(
+    store: &StoreService,
+    text: &str,
+    args: &Args,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut request = SparqlQueryRequest::all(text);
+    request.solutions_format = args.format;
+    let mut prepared = PreparedQuery::parse(&request)?;
+    if prepared.kind() == QueryResultKind::Boolean {
+        request.solutions_format = SolutionsResultFormat::Json;
+        prepared = PreparedQuery::parse(&request)?;
+    }
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    store.run_query(&prepared, &CancellationToken::new(), file)?;
+    Ok(())
 }
 
 fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
@@ -519,6 +547,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let name = file.file_stem().unwrap().to_string_lossy().into_owned();
         let text = std::fs::read_to_string(file)?;
         let m = measure(&store, &text, &args);
+        if let Some(dir) = &args.results {
+            write_results(&store, &text, &args, &dir.join(format!("{name}.out")))?;
+        }
         if args.explain {
             explain(&store, &text);
         }
