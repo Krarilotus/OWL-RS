@@ -57,6 +57,9 @@ pub struct Config {
     /// Decide disjunctions before the ≥-rule expands (else the design's order: the
     /// ≥-rule first, disjunctions when nothing else is left).
     pub disjunctions_first: bool,
+    /// Try a clause's disjuncts in HermiT's order and move those that failed more often
+    /// to the back (else in the clause's order).
+    pub disjunct_learning: bool,
     /// The most nodes a run may create at once.
     pub max_nodes: usize,
     pub timeout: Option<Duration>,
@@ -77,6 +80,7 @@ impl Default for Config {
             anywhere_blocking: true,
             single_blocking: true,
             disjunctions_first: false,
+            disjunct_learning: true,
             max_nodes: 2_000_000,
             timeout: None,
             max_memory: 4 << 30,

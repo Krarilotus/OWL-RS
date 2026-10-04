@@ -74,6 +74,10 @@ pub struct Frame {
     /// choice, which picks among fresh individuals rather than a disjunction that holds).
     pub semantic: bool,
     pub alternatives: Vec<Lit>,
+    /// For a disjunction of a clause: the clause (else `NONE`) and each alternative's
+    /// head atom, to count its failures.
+    pub clause: u32,
+    pub heads: Vec<u8>,
     pub next: usize,
     /// What the disjunction itself depends on.
     pub premise: DepSetId,
@@ -107,6 +111,8 @@ pub struct Engine<'a> {
     pub firings: Vec<Firing>,
     pub blocking: super::blocking::Blocking,
     pub ni: super::ni::Ni,
+    /// Per clause and head atom: how often that disjunct failed (disjunct learning).
+    pub failures: Vec<Vec<u32>>,
 }
 
 impl<'a> Engine<'a> {
@@ -127,6 +133,7 @@ impl<'a> Engine<'a> {
             firings: Vec::new(),
             blocking: super::blocking::Blocking::default(),
             ni: super::ni::Ni::default(),
+            failures: Vec::new(),
         }
     }
 

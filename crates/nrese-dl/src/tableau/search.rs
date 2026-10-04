@@ -16,6 +16,7 @@ use std::time::Instant;
 use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step, Stop, proof};
 use super::graph::{Annot, NONE};
+use super::program::{Filler, Head};
 
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,14 +132,14 @@ impl Engine<'_> {
             let annotation = clause.annotation;
             let mut open = Vec::new();
             let mut satisfied = false;
-            for &h in &clause.head {
+            for (i, &h) in clause.head.iter().enumerate() {
                 let lit = self.lit(h, &bind, annotation);
                 match self.holds(lit) {
                     Ok(true) => {
                         satisfied = true;
                         break;
                     }
-                    Ok(false) => open.push(lit),
+                    Ok(false) => open.push((lit, i as u8)),
                     Err(refuted) => dep = self.deps.union(dep, refuted),
                 }
             }
@@ -148,11 +149,46 @@ impl Engine<'_> {
             }
             return match open.len() {
                 0 => Err(self.clash(dep, DepSetId::EMPTY)),
-                1 => self.assert(open[0], dep, clause.source).map(|()| true),
-                _ => self.branch(open, dep).map(|()| true),
+                1 => self.assert(open[0].0, dep, clause.source).map(|()| true),
+                _ => {
+                    self.order_disjuncts(pend.clause, &mut open);
+                    let (alternatives, heads) = open.into_iter().unzip();
+                    self.branch_on_clause(alternatives, dep, pend.clause, heads)
+                        .map(|()| true)
+                }
             };
         }
         Ok(false)
+    }
+
+    /// The order to try a clause's open disjuncts in (HermiT's, Glimm et al., JAR 2014,
+    /// `GroundDisjunctionHeader`): at-least restrictions over a negated concept first,
+    /// then concepts and the other atoms, then the other at-least restrictions; within
+    /// each group, those that failed less often first (the clause's order on ties).
+    fn order_disjuncts(&mut self, clause: u32, open: &mut [(Lit, u8)]) {
+        if !self.config.disjunct_learning {
+            return;
+        }
+        let heads = &self.p.clauses[clause as usize].head;
+        if self.failures.len() <= clause as usize {
+            self.failures.resize(clause as usize + 1, Vec::new());
+        }
+        let failures = &mut self.failures[clause as usize];
+        if failures.len() < heads.len() {
+            failures.resize(heads.len(), 0);
+        }
+        let group = |h: Head| match h {
+            Head::AtLeast(n, _) => {
+                if matches!(self.p.at_least[n as usize].filler, Filler::Not(_)) {
+                    0
+                } else {
+                    2
+                }
+            }
+            _ => 1,
+        };
+        let failures = &self.failures[clause as usize];
+        open.sort_by_key(|&(_, i)| (group(heads[i as usize]), failures[i as usize]));
     }
 
     /// Takes the next alternative of the newest branch point.
@@ -207,6 +243,17 @@ impl Engine<'_> {
             };
             let failed = self.deps.union(frame.failed, rest);
             frame.failed = failed;
+            if frame.clause != NONE {
+                // The alternative taken failed: it goes further back next time.
+                let (clause, head) = (frame.clause as usize, frame.heads[frame.next]);
+                if let Some(count) = self
+                    .failures
+                    .get_mut(clause)
+                    .and_then(|c| c.get_mut(head as usize))
+                {
+                    *count = count.saturating_add(1);
+                }
+            }
             frame.next += 1;
             let frame = frame.clone();
             self.restore(&frame);
