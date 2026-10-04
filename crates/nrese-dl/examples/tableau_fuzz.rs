@@ -3,10 +3,11 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-dl --example tableau_fuzz -- [--seed S] [--count N] [--only K]
-//!     [--profile alc|alchi|shiq|sroiq] [--out DIR] [--timeout SECS]
+//!     [--profile alc|alchi|shiq|sroiq|ni] [--out DIR] [--timeout SECS] [--switches]
 //! ```
 //!
-//! Prints `case<TAB>answer<TAB>telemetry` per ontology. The default profile and seed
+//! Prints `case<TAB>answer<TAB>telemetry` per ontology; `--switches` adds a
+//! `case<TAB>disagree<TAB>…` line for every switch combination that decides otherwise. The default profile and seed
 //! generate the same ontologies as the `tableau_fuzz` test (`--profile test`). With
 //! `--out`, writes `DIR/fuzz-S-K.ofn` and `DIR/manifest.tsv` (consistency tasks for
 //! `reference.py run`, HermiT, Openllet and Konclude) and `DIR/nrese.tsv` with the
@@ -23,6 +24,10 @@ use nrese_owl::{Axiom, ClassExpr, ObjProp, Ontology, Term};
 /// The test's semantics: the direct semantics on finite interpretations.
 #[path = "../tests/tableau_fuzz/semantics.rs"]
 mod semantics;
+
+/// Ontologies biased to the NI rule (`--profile ni`).
+#[path = "../tests/tableau_fuzz/ni_gen.rs"]
+mod ni_gen;
 
 /// A consistent answer's folded model checked against the axioms, or an inconsistent
 /// answer's minimal core (axioms dropped while it stays inconsistent) with a search for a
@@ -128,6 +133,8 @@ fn profile(name: &str, case: u64) -> Option<(Sizes, Profile)> {
         literals: 0,
     };
     Some(match name {
+        // The sizes only: `ni_gen` makes the ontology.
+        "ni" => (ni_gen::sizes(), base),
         "test" => (
             small,
             Profile {
@@ -232,11 +239,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let (mut seed, mut count, mut only, mut out) = (0x0020_2610_0333_u64, 100u64, None, None);
     let (mut profile_name, mut timeout) = ("test".to_owned(), 60u64);
-    let mut witness_mode = false;
+    let (mut witness_mode, mut switches) = (false, false);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
         if arg == "--witness" {
             witness_mode = true;
+            continue;
+        }
+        if arg == "--switches" {
+            switches = true;
             continue;
         }
         match arg.as_str() {
@@ -273,7 +284,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
         };
         let sig = Signature::new(sizes, &mut intern);
-        let o = fuzz::ontology(&mut rng, &sig, prof);
+        let o = if profile_name == "ni" {
+            ni_gen::ontology(&mut rng, &sig)
+        } else {
+            fuzz::ontology(&mut rng, &sig, prof)
+        };
         let _ = fuzz::shuffle(&o, &mut rng);
         let o = match profile_name.as_str() {
             "alc" => restrict(&o, false, false),
@@ -289,6 +304,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let result = consistency(&o, &config);
         let id = format!("fuzz-{seed}-{case}");
+        if switches {
+            // Every switch combination and at-most encoding: a decided answer other than
+            // the default's is a disagreement.
+            for bits in 0..32u32 {
+                let other = Config {
+                    semantic_branching: bits & 1 != 0,
+                    backjumping: bits & 2 != 0,
+                    anywhere_blocking: bits & 4 != 0,
+                    single_blocking: bits & 8 != 0,
+                    expand_at_most_up_to: if bits & 16 != 0 { 0 } else { 2 },
+                    ..config.clone()
+                };
+                let answer = consistency(&o, &other).answer;
+                let decided = |a: &Answer| matches!(a, Answer::Consistent | Answer::Inconsistent);
+                if decided(&answer) && decided(&result.answer) && answer != result.answer {
+                    println!("{id}	disagree	switches {bits:05b}: {}", answer.class());
+                }
+            }
+        }
         if witness_mode {
             witness(
                 &o,
