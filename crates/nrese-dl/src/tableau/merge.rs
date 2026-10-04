@@ -5,18 +5,17 @@
 //! points at the target from then on. Everything changed in place goes on the trail, so
 //! a backtrack undoes the merge (no path compression).
 //!
-//! The NI-rule is not implemented: a merge it would govern (two blockable neighbours of
-//! a root, one of them not its successor, raised by an at-most restriction at the root)
-//! stops the run as `gave-up`, never with an answer.
+//! A merge the NI rule governs (two blockable neighbours of a root, one of them not its
+//! successor, raised by an at-most restriction at the root) is left to it (`ni.rs`).
 
 use super::depset::DepSetId;
-use super::engine::{Engine, Lit, Step, ni_stop, proof};
-use super::graph::{NONE, flag};
+use super::engine::{Engine, Lit, Step, proof};
+use super::graph::{Annot, NONE, flag};
 
 impl Engine<'_> {
     /// Merges what `a` and `b` stand for now, by the equality's `dep` and the merges that
     /// made them stand for it (an equality waits in the queue while other merges happen).
-    pub fn merge(&mut self, a: u32, b: u32, dep: DepSetId, at_root: u32) -> Step<()> {
+    pub fn merge(&mut self, a: u32, b: u32, dep: DepSetId, annot: Annot) -> Step<()> {
         let (a, b, dep) = self.canonical_pair(a, b, dep);
         if a == b || !self.g.live(a) || !self.g.live(b) {
             return Ok(());
@@ -25,8 +24,9 @@ impl Engine<'_> {
             let d = self.g.inequalities[i as usize].dep;
             return Err(self.clash(dep, d));
         }
-        if self.needs_ni(Lit::Equal(a, b, at_root)) {
-            return Err(ni_stop());
+        if self.needs_ni(Lit::Equal(a, b, annot)) {
+            self.ni_defer(a, b, dep, annot);
+            return Ok(());
         }
         let (from, into) = self.direction(a, b);
         self.stats.merges += 1;

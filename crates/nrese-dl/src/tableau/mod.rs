@@ -15,7 +15,7 @@
 //! inconsistency found without it stands and a model found without it is `unsupported`;
 //! a budget ends a run as `gave-up`.
 //!
-//! Not yet: the NI rule (runs that need it give up), datatypes (package 3.5),
+//! Not yet: datatypes (package 3.5),
 //! satisfiability caching and completion-graph reuse (3.7).
 
 mod blocking;
@@ -26,6 +26,7 @@ mod graph;
 mod hyper;
 mod merge;
 mod model;
+mod ni;
 mod program;
 mod search;
 mod telemetry;

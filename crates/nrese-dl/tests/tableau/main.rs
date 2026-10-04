@@ -2,6 +2,7 @@
 //! engine handles, consistent and inconsistent, with every optimisation on and off.
 
 mod build;
+mod ni;
 mod sat;
 
 use build::Build;
@@ -324,8 +325,7 @@ fn budgets_give_up() {
 #[test]
 fn the_ni_rule_is_never_skipped_silently() {
     // JAIR 2009's caterpillar (8): S(a, a), a: ∃R.B, B ⊑ ∃R.C, C ⊑ ∃S.D, D ⊑ {a}, S
-    // inverse-functional. Consistent; the derivation needs the NI rule (on c ≈ c), which
-    // the engine lacks: it must give up, not answer from a model that isn't one.
+    // inverse-functional. Consistent; the derivation needs the NI rule (on c ≈ c).
     let mut b = Build::default();
     let [bb, c, d] = [2, 3, 4].map(|t| b.class(t));
     let (r, s) = (ObjProp::Named(200), ObjProp::Named(201));
@@ -346,10 +346,7 @@ fn the_ni_rule_is_never_skipped_silently() {
         };
         let answer = consistency(&b.o, &config).answer;
         eprintln!("caterpillar, expand {expand}: {answer:?}");
-        assert!(
-            matches!(answer, Answer::Consistent | Answer::GaveUp(_)),
-            "{answer:?}"
-        );
+        assert_eq!(answer, Answer::Consistent);
     }
 }
 
@@ -357,7 +354,7 @@ fn the_ni_rule_is_never_skipped_silently() {
 fn premature_blocking_without_the_ni_rule_is_caught() {
     // JAIR 2009's (9): A(a), a: ∃R.B, A ⊑ ∀R⁻.⊥, B ⊑ ∃R.B, B ⊑ ∃S.{a}, R
     // inverse-functional, ⊤ ⊑ ≤3 S⁻.⊤. Inconsistent; without the NI rule a blocked chain
-    // looks like a model (Figure 9a). The engine may give up, never answer consistent.
+    // looks like a model (Figure 9a).
     let mut b = Build::default();
     let [a, bb] = [1, 2].map(|t| b.class(t));
     let (r, s) = (ObjProp::Named(200), ObjProp::Named(201));
@@ -382,10 +379,7 @@ fn premature_blocking_without_the_ni_rule_is_caught() {
         };
         let answer = consistency(&b.o, &config).answer;
         eprintln!("premature blocking, expand {expand}: {answer:?}");
-        assert!(
-            matches!(answer, Answer::Inconsistent | Answer::GaveUp(_)),
-            "{expand}: {answer:?}"
-        );
+        assert_eq!(answer, Answer::Inconsistent, "{expand}");
     }
 }
 
