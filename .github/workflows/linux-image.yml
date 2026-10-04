@@ -1,0 +1,123 @@
+name: Linux image
+
+on:
+  pull_request:
+    branches: [main, refactor/engine-v2]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .cargo/**
+      - crates/**
+      - apps/nrese-console/**
+      - scripts/smoke-image.py
+      - .github/workflows/linux-image.yml
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the checked image to GHCR (otherwise artifact only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
+      artifact: ${{ steps.source.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Record exact source
+        id: source
+        run: |
+          revision=$(git rev-parse HEAD)
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "artifact=nrese-linux-amd64-$revision-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+      - name: Build existing Dockerfile for portable Linux amd64
+        env:
+          REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          docker build --platform linux/amd64 \
+            --build-arg CARGO_BUILD_JOBS=2 --build-arg NRESE_TARGET_CPU=portable \
+            --build-arg NRESE_SOURCE_REVISION="$REVISION" -t nrese-checked:"$REVISION" .
+      - name: Check the actual capped image
+        env:
+          REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          python3 scripts/smoke-image.py --image nrese-checked:"$REVISION" \
+            --revision "$REVISION" --output artifacts/image-receipt.json
+      - name: Export the checked image with its receipt
+        env:
+          REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          docker save nrese-checked:"$REVISION" | gzip > artifacts/nrese-linux-amd64.tar.gz
+          cd artifacts
+          sha256sum nrese-linux-amd64.tar.gz image-receipt.json > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.source.outputs.artifact }}
+          path: artifacts/
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.check.outputs.artifact }}
+          path: artifacts
+      - name: Verify and load the exact checked image
+        env:
+          REVISION: ${{ needs.check.outputs.revision }}
+        run: |
+          cd artifacts
+          sha256sum --check SHA256SUMS
+          gzip -dc nrese-linux-amd64.tar.gz | docker load
+          expected=$(python3 -c 'import json; print(json.load(open("image-receipt.json"))["image_id"])')
+          actual=$(docker image inspect nrese-checked:"$REVISION" --format '{{.Id}}')
+          test "$actual" = "$expected"
+      - name: Publish by source commit and record registry digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_USER: ${{ github.actor }}
+          OWNER: ${{ github.repository_owner }}
+          REVISION: ${{ needs.check.outputs.revision }}
+        run: |
+          owner=$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/$owner/nrese:sha-$REVISION"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GH_USER" --password-stdin
+          trap 'docker logout ghcr.io' EXIT
+          docker tag nrese-checked:"$REVISION" "$image"
+          docker push "$image" | tee artifacts/publish.log
+          digest=$(sed -n 's/.*digest: \(sha256:[0-9a-f]*\).*/\1/p' artifacts/publish.log | tail -1)
+          test -n "$digest"
+          printf 'ghcr.io/%s/nrese@%s\n' "$owner" "$digest" > artifacts/image-reference.txt
+          cat artifacts/image-reference.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.check.outputs.artifact }}-registry
+          path: |
+            artifacts/image-reference.txt
+            artifacts/image-receipt.json
+          if-no-files-found: error
