@@ -178,10 +178,21 @@ impl MutationPipeline {
                 .map(|(_, program)| program);
             // A cancelled request stops the reasoning; dropping `tx` then discards both
             // the asserted and the inferred changes, and releases the writer.
-            let stop = || ticket.is_cancelled();
+            // So does the process's memory limit: the commit is refused, not the machine.
+            let watch = self.store.memory_watch();
+            let over = || watch.as_ref().is_some_and(|watch| watch.exceeded());
+            let stop = || ticket.is_cancelled() || over();
             let (violations, materialisation, changed) =
-                crate::reasoning::apply_delta(program, cached, &mut tx, &stop)
-                    .map_err(|_| MutationError::Cancelled)?;
+                crate::reasoning::apply_delta(program, cached, &mut tx, &stop).map_err(|_| {
+                    match &watch {
+                        Some(watch) if watch.exceeded() => {
+                            store_error(StoreError::ProcessMemoryLimit {
+                                limit: watch.limit(),
+                            })
+                        }
+                        _ => MutationError::Cancelled,
+                    }
+                })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
             crate::reasoning::log_diagnostics(
                 &materialisation.diagnostics,

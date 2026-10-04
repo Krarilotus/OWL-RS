@@ -75,23 +75,9 @@ pub(super) fn parse_memory(text: &str) -> Result<Option<u64>> {
 }
 
 /// The memory this process may use: the container's limit if there is one, else the
-/// machine's. Known on Linux (where the server is deployed); `None` elsewhere.
+/// machine's (`nrese_store::memory::available_bytes`, on Linux and Windows).
 pub fn machine_memory_bytes() -> Option<u64> {
-    let read = |path: &str| std::fs::read_to_string(path).ok();
-    let machine = read("/proc/meminfo").and_then(|text| {
-        let line = text.lines().find(|line| line.starts_with("MemTotal:"))?;
-        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        Some(kib * 1024)
-    })?;
-    // cgroup v2, then v1; "max" and absurd values mean "no limit".
-    let container = [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ]
-    .iter()
-    .filter_map(|path| read(path)?.trim().parse::<u64>().ok())
-    .find(|&limit| limit > 0 && limit < machine);
-    Some(container.unwrap_or(machine))
+    nrese_store::memory::available_bytes()
 }
 
 /// A size for people: `4 GiB`, `512 MiB`, `1536 B`.
