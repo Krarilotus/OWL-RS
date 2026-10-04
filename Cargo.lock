@@ -1170,6 +1170,7 @@ dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.16.1",
  "rayon",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1355,6 +1356,7 @@ dependencies = [
  "libmimalloc-sys",
  "mimalloc",
  "nrese-engine",
+ "nrese-exec",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-reasoner",
