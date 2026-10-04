@@ -1,27 +1,5 @@
 # W3C tests the hypertableau answers wrongly, with the cause where it is known: one per
 # line, "name (TestType)<TAB>why". The run fails on a wrong answer not listed here, and on
 # a listed one that no longer is wrong. Not one of these is settled; each must be fixed.
-New-Feature-BottomDataProperty-001 (InconsistencyTest)	nrese-owl reads owl:bottomDataProperty as an ordinary property (its vocabulary has no top/bottom properties)
-New-Feature-BottomObjectProperty-001 (InconsistencyTest)	nrese-owl reads owl:bottomObjectProperty as an ordinary property
-New-Feature-TopObjectProperty-001 (InconsistencyTest)	nrese-owl reads owl:topObjectProperty as an ordinary property (i : ¬∃top.⊤ needs the universal role)
-WebOnt-description-logic-601 (InconsistencyTest)	nrese-owl's reader drops cardinality restrictions over data properties silently (no diagnostic, nothing unsupported): C.1.comp ≡ ≤0 P.1 and three more are missing
-WebOnt-description-logic-602 (InconsistencyTest)	not investigated; the DL-6xx tests share 601's pattern (cardinalities over data properties), presumably the same reader gap
-WebOnt-description-logic-603 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-604 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-608 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-610 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-611 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-612 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-613 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-614 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-615 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-617 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-630 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-633 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-641 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-642 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-643 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-646 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-Restriction-005-direct (PositiveEntailmentTest)	not investigated: answered not entailed
-WebOnt-imports-011 (PositiveEntailmentTest)	not investigated: answered not entailed (imports are not resolved by the runner)
-WebOnt-miscellaneous-011 (PositiveEntailmentTest)	not investigated: answered not entailed
+WebOnt-imports-011 (PositiveEntailmentTest)	the runner reads the premise without its owl:imports (support011-A has Man ⊑ Mortal)
+WebOnt-miscellaneous-011 (PositiveEntailmentTest)	the runner reads the premise without its owl:imports (the wine and food ontologies)

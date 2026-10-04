@@ -12,8 +12,9 @@
 //!   `R(x, y) ∧ O_a(x) ∧ O_b(y) → ⊥`.
 //!
 //! What the engine can't take is left out and recorded in [`Program::weakened`]: data
-//! clauses and assertions, the axioms the normalisation reports unsupported, and negative
-//! assertions over non-simple properties. Leaving clauses out only weakens the ontology,
+//! clauses and assertions, the axioms the normalisation reports unsupported, the axioms
+//! the reader couldn't read (its fatal diagnostics), and negative assertions over
+//! non-simple properties. Leaving clauses out only weakens the ontology,
 //! so "inconsistent" stays a sound answer and "consistent" becomes `unsupported`.
 
 use std::collections::BTreeSet;
@@ -167,6 +168,13 @@ impl Program {
         let reasons: BTreeSet<&str> = normalised.unsupported.iter().map(|(_, r)| *r).collect();
         for reason in reasons {
             p.weakened.push(format!("axioms left out: {reason}"));
+        }
+        // What the reader couldn't take as OWL 2 DL: the axioms it is part of are left out.
+        let fatal = ontology.diagnostics.iter().filter(|d| d.is_fatal()).count();
+        if fatal > 0 {
+            p.weakened.push(format!(
+                "{fatal} reader diagnostics (not OWL 2 DL, left out)"
+            ));
         }
         let mut data_clauses = 0usize;
         for (index, clause) in normalised.clauses.iter().enumerate() {
