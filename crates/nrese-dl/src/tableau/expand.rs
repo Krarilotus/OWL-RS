@@ -118,8 +118,11 @@ impl Engine<'_> {
                 // n successors are pairwise unequal: n² / 2 inequalities, each a fact and
                 // an index entry. Give up before a budget can't hold them.
                 let n = u64::from(number.n);
-                let need = n * n.saturating_sub(1) / 2 * 48 + n * 256;
-                if self.bytes() as u64 + need > self.config.max_memory as u64 {
+                // Saturating: a cardinality near u32::MAX overflows the product.
+                let need = (n.saturating_mul(n.saturating_sub(1)) / 2)
+                    .saturating_mul(48)
+                    .saturating_add(n * 256);
+                if (self.bytes() as u64).saturating_add(need) > self.config.max_memory as u64 {
                     return Err(Stop::GaveUp(format!(
                         "≥ {} successors with their inequalities exceed the memory budget",
                         number.n
