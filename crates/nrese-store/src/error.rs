@@ -39,6 +39,13 @@ pub enum StoreError {
     /// A materialisation was stopped; the previous inferred stack stands.
     #[error("materialisation cancelled")]
     MaterialisationCancelled,
+    /// A long operation stopped because the process reached its memory limit
+    /// ([`crate::StoreConfig::process_memory_bytes`]); nothing of it was applied.
+    #[error(
+        "stopped at the process's memory limit ({} MiB); nothing was applied",
+        .limit / (1 << 20)
+    )]
+    ProcessMemoryLimit { limit: u64 },
     /// A bulk load was stopped ([`crate::LoadProgress::cancel`]); nothing of it was
     /// committed.
     #[error("the load was cancelled; nothing of it was committed")]
@@ -123,6 +130,7 @@ impl StoreError {
             | Self::Engine(_)
             | Self::OntologyFileNotFound { .. }
             | Self::MaterialisationCancelled
+            | Self::ProcessMemoryLimit { .. }
             | Self::LoadCancelled => false,
         }
     }
