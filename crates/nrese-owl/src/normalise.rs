@@ -18,6 +18,9 @@
 //!    edge an engine sees is explicit (equisatisfiable; exact on interpretations closed
 //!    under the role inclusions).
 //! 5. **The ABox** as facts, a complex class assertion through a fresh name.
+//! 6. **Built-in properties:** the bottom properties relate nothing (`⊤ ⊑ ∀R.⊥`, through
+//!    R's automaton where chains reach it); an axiom that mentions a top (universal)
+//!    property is reported unsupported, never read as one over an ordinary property.
 //!
 //! Every clause keeps the axioms it came from.
 
@@ -60,11 +63,22 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
     let mut n = Normaliser::new(ontology);
     n.expand_up_to = options.expand_at_most_up_to.min(Options::MAX_EXPANSION);
     for (index, axiom) in ontology.axioms.iter().enumerate() {
+        if n.uses_top(axiom) {
+            n.out.unsupported.push((index, UNIVERSAL));
+            continue;
+        }
         n.axiom(index, axiom);
     }
+    n.bottom_properties();
     n.drain();
     n.finish()
 }
+
+/// The most GCIs one GCI is distributed into over its conjunctions.
+const MAX_DISTRIBUTED: usize = 16;
+
+/// Why an axiom over a universal property is left out.
+const UNIVERSAL: &str = "the universal properties (owl:topObjectProperty, owl:topDataProperty)";
 
 /// A disjunct of a GCI being clausified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -297,6 +311,41 @@ impl<'a> Normaliser<'a> {
         match role {
             ObjProp::Named(p) => HeadAtom::Role(p, from, to),
             ObjProp::Inverse(p) => HeadAtom::Role(p, to, from),
+        }
+    }
+
+    /// Whether `axiom` mentions a universal property.
+    fn uses_top(&self, axiom: &Axiom) -> bool {
+        let builtin = self.ontology.builtin;
+        if builtin.top_object.is_none() && builtin.top_data.is_none() {
+            return false;
+        }
+        crate::properties::mentions(self.ontology, axiom, &|t| builtin.is_top(t))
+    }
+
+    /// The bottom properties relate nothing: `⊤ ⊑ ∀R.⊥` for the object property (a GCI,
+    /// so that a chain reaching it passes R's automaton), `R(x, v) → ⊥` for the data
+    /// property; from each axiom that mentions them.
+    fn bottom_properties(&mut self) {
+        let builtin = self.ontology.builtin;
+        let ontology = self.ontology;
+        for (index, axiom) in ontology.axioms.iter().enumerate() {
+            if let Some(bottom) = builtin.bottom_object
+                && crate::properties::mentions(ontology, axiom, &|t| t == bottom)
+            {
+                let nothing = self.e(ClassExpr::Nothing);
+                let none = self.e(ClassExpr::All(ObjProp::Named(bottom), nothing));
+                self.gci(Vec::new(), vec![Item::Expr(none)], index);
+            }
+            if let Some(bottom) = builtin.bottom_data
+                && crate::properties::mentions(ontology, axiom, &|t| t == bottom)
+            {
+                self.add(
+                    vec![BodyAtom::Data(bottom, Var::X, Var::V(0))],
+                    Vec::new(),
+                    index,
+                );
+            }
         }
     }
 
@@ -562,9 +611,37 @@ impl<'a> Normaliser<'a> {
             positive: false,
         });
         self.negative.insert(e, q);
+        if let ClassExpr::Some(r, d) = self.get(e)
+            && self.non_simple.contains(&r.named())
+        {
+            // `∃R.D ⊑ Q` as `D ⊑ ∀R⁻.Q`: Horn through R⁻'s automaton where D is a
+            // literal (`∀R.¬D ⊔ Q` would put R's start state beside Q in a head).
+            let start = self.automaton(r.inverse(), Item::Fresh(q), source);
+            let not_d = self.nnf_not(d);
+            self.gci(
+                Vec::new(),
+                vec![Item::Expr(not_d), Item::Fresh(start)],
+                source,
+            );
+            return q;
+        }
         let not = self.nnf_not(e);
         self.gci(Vec::new(), vec![Item::Expr(not), Item::Fresh(q)], source);
         q
+    }
+
+    /// Whether `c` (in negation normal form) clausifies into body atoms only: a negated
+    /// name or nominal, or `⊥`.
+    fn negative_filler(&self, c: ExprId) -> bool {
+        match self.get(c) {
+            ClassExpr::Nothing => true,
+            ClassExpr::Not(inner) => match self.get(inner) {
+                ClassExpr::Class(_) => true,
+                ClassExpr::OneOf(xs) => xs.len() == 1,
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     // Clausification -------------------------------------------------------------------
@@ -599,16 +676,27 @@ impl<'a> Normaliser<'a> {
         let Some(items) = self.flatten(gci.items) else {
             return;
         };
-        // A conjunction alone, or beside fresh literals only (a positive name's definition
-        // `¬Q ⊔ (A ⊓ B)`): a GCI per conjunct. Among other disjuncts: a fresh name.
-        let exprs: Vec<ExprId> = items
+        // A conjunction among the disjuncts: a GCI per conjunct, `(A ⊓ B) ⊔ R` as
+        // `A ⊔ R` and `B ⊔ R`, so that `A ⊔ B ⊑ C` gives the Horn clauses `A → C` and
+        // `B → C` (a fresh name for `¬A ⊓ ¬B` made it `⊤ → C ∨ Q`: found by the U1
+        // bound, which then typed everything C on OWL2Bench; 4 October 2026). Up to
+        // `MAX_DISTRIBUTED` GCIs from one; past that, fresh names.
+        let conjuncts: Vec<(ExprId, usize)> = items
             .iter()
             .filter_map(|i| match i {
-                Item::Expr(e) => Some(*e),
+                Item::Expr(e) => match self.get(*e) {
+                    ClassExpr::And(xs) => Some((*e, xs.len())),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect();
-        if let [e] = exprs[..]
+        let product = conjuncts
+            .iter()
+            .try_fold(1usize, |acc, &(_, n)| acc.checked_mul(n))
+            .unwrap_or(usize::MAX);
+        if let Some(&(e, _)) = conjuncts.first()
+            && product <= MAX_DISTRIBUTED
             && let ClassExpr::And(xs) = self.get(e)
         {
             for x in xs {
@@ -645,6 +733,7 @@ impl<'a> Normaliser<'a> {
             })
             .max()
             .unwrap_or(0);
+        let many = items.len() > 1;
         for item in items {
             let e = match item {
                 Item::Fresh(q) => {
@@ -701,6 +790,17 @@ impl<'a> Normaliser<'a> {
                         return;
                     }
                     if self.non_simple.contains(&r.named()) {
+                        // `∀R.¬D` beside other disjuncts: `¬P` for a name `∃R.D ⊑ P`, which
+                        // goes through R⁻'s automaton as `D ⊑ ∀R⁻.P` and stays Horn (the
+                        // start state of R's own automaton made `A ⊓ ∃R.D ⊑ B` the
+                        // disjunction `A → B ∨ Q`; 4 October 2026).
+                        if many && self.negative_filler(c) {
+                            let d = self.nnf_not(c);
+                            let some = self.e(ClassExpr::Some(r, d));
+                            let p = self.fresh_negative(some, gci.source);
+                            body.push(BodyAtom::Concept(Concept::Fresh(p), Var::X));
+                            continue;
+                        }
                         // Along the automaton of r: its start state at x.
                         let start = self.automaton(r, Item::Expr(c), gci.source);
                         head.push(HeadAtom::Concept(Concept::Fresh(start), Var::X));
@@ -864,6 +964,9 @@ impl<'a> Normaliser<'a> {
     fn role_inclusions(&mut self) {
         let mut rias: Vec<(Vec<ObjProp>, ObjProp, usize)> = Vec::new();
         for (index, axiom) in self.ontology.axioms.iter().enumerate() {
+            if self.uses_top(axiom) {
+                continue;
+            }
             match axiom {
                 Axiom::SubObjectPropertyOf(chain, sup) => rias.push((chain.clone(), *sup, index)),
                 Axiom::EquivalentObjectProperties(ps) => {
@@ -914,14 +1017,76 @@ impl<'a> Normaliser<'a> {
         }
     }
 
+    /// The role expressions equivalent to `r` (`r` included), each with the role
+    /// inclusions that make it a subrole of `r`: those `r` reaches by the single-role
+    /// inclusions and that reach `r` back. `R ⊑ S⁻` with `S ⊑ R⁻` (an inverse pair)
+    /// makes `S⁻` one of `R`'s.
+    fn equivalents(&self, r: ObjProp) -> Vec<(ObjProp, Vec<usize>)> {
+        // Everything `from` is a subrole of, with the inclusions on the way.
+        let up = |from: ObjProp| -> Vec<(ObjProp, Vec<usize>)> {
+            let mut seen: Vec<(ObjProp, Vec<usize>)> = vec![(from, Vec::new())];
+            let mut at = 0;
+            while at < seen.len() {
+                let (x, via) = seen[at].clone();
+                at += 1;
+                for (chain, sup, axiom) in &self.rias {
+                    if let [only] = chain[..] {
+                        let next = if only == x {
+                            ObjProp::Named(*sup)
+                        } else if only == x.inverse() {
+                            ObjProp::Inverse(*sup)
+                        } else {
+                            continue;
+                        };
+                        if !seen.iter().any(|(y, _)| *y == next) {
+                            let mut via = via.clone();
+                            via.push(*axiom);
+                            seen.push((next, via));
+                        }
+                    }
+                }
+            }
+            seen
+        };
+        up(r)
+            .into_iter()
+            .filter_map(|(x, _)| {
+                let back = up(x).into_iter().find(|(y, _)| *y == r)?;
+                let mut via = back.1;
+                via.sort_unstable();
+                via.dedup();
+                Some((x, via))
+            })
+            .collect()
+    }
+
     /// The automaton of the non-simple role `role` (named), with the automata of the
     /// non-simple roles it builds on spliced in; `None` for an irregular RBox.
+    ///
+    /// Roles equivalent to `role` (up to inverse: an inverse pair, a cycle of
+    /// subproperties) are one role here (Horrocks and Sattler's order is on their
+    /// classes): their inclusions are read as `role`'s, and an edge of `role` matches an
+    /// edge of each of them. Splicing them into each other was taken for a cycle, an
+    /// irregular RBox (ore_ont_15971: `after` inverse of the transitive `before`).
     fn nfa(&self, role: Term, stack: &mut Vec<Term>) -> Option<Nfa> {
         if stack.contains(&role) {
             return None;
         }
-        stack.push(role);
         let r = ObjProp::Named(role);
+        let members = self.equivalents(r);
+        let class: Vec<ObjProp> = members.iter().map(|(x, _)| *x).collect();
+        let names: Vec<Term> = class.iter().map(|x| x.named()).collect();
+        stack.extend(&names);
+        // A label as `role` where it is one of `role`'s class.
+        let canonical = |x: ObjProp| -> ObjProp {
+            if class.contains(&x) {
+                r
+            } else if class.contains(&x.inverse()) {
+                r.inverse()
+            } else {
+                x
+            }
+        };
         let mut nfa = Nfa {
             states: 2,
             start: 0,
@@ -945,8 +1110,22 @@ impl<'a> Normaliser<'a> {
                 nfa.edges.push((from, None, to, vec![axiom]));
             }
         };
-        for &(ref chain, sup, axiom) in &self.rias {
-            if sup != role || chain[..] == [r] {
+        for (chain, sup, axiom) in &self.rias {
+            // The inclusions into the class, as inclusions into `role`.
+            let chain: Vec<ObjProp> = if class.contains(&ObjProp::Named(*sup)) {
+                chain.iter().map(|&x| canonical(x)).collect()
+            } else if class.contains(&ObjProp::Inverse(*sup)) {
+                chain
+                    .iter()
+                    .rev()
+                    .map(|&x| canonical(x.inverse()))
+                    .collect()
+            } else {
+                continue;
+            };
+            let axiom = *axiom;
+            if chain[..] == [r] {
+                // Within the class: its members' edges are `role`'s (below).
                 continue;
             }
             if chain[..] == [r, r] {
@@ -956,14 +1135,26 @@ impl<'a> Normaliser<'a> {
             } else if chain.len() > 1 && chain[chain.len() - 1] == r {
                 path(&mut nfa, 0, &chain[..chain.len() - 1], 0, axiom);
             } else {
-                path(&mut nfa, 0, chain, 1, axiom);
+                path(&mut nfa, 0, &chain, 1, axiom);
             }
         }
-        // Splice in the automata of the other non-simple roles on the edges.
+        // An edge of `role` (or its inverse) matches each member of the class; the other
+        // non-simple roles on the edges have their automata spliced in.
         let edges = std::mem::take(&mut nfa.edges);
         for (a, label, b, axioms) in edges {
             match label {
-                Some(s) if s.named() != role && self.non_simple.contains(&s.named()) => {
+                Some(s) if s.named() == role => {
+                    for (member, via) in &members {
+                        let member = if s == r { *member } else { member.inverse() };
+                        // The edge needs the inclusions that make the member `role`.
+                        let mut needed = axioms.clone();
+                        needed.extend(via);
+                        needed.sort_unstable();
+                        needed.dedup();
+                        nfa.edges.push((a, Some(member), b, needed));
+                    }
+                }
+                Some(s) if self.non_simple.contains(&s.named()) => {
                     let inner = self.nfa(s.named(), stack)?;
                     let inner = match s {
                         ObjProp::Named(_) => inner,
@@ -986,7 +1177,7 @@ impl<'a> Normaliser<'a> {
                 _ => nfa.edges.push((a, label, b, axioms)),
             }
         }
-        stack.pop();
+        stack.truncate(stack.len() - names.len());
         Some(nfa)
     }
 
