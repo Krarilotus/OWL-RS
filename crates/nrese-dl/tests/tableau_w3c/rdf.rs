@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use nrese_owl::{Ontology, Statement, Term, TermKind, Terms, read};
-use nrese_rdf::{NamedNode, Term as RdfTerm, Triple};
+use nrese_rdf::{BlankNode, NamedNode, NamedOrBlankNode, Term as RdfTerm, Triple};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 
 /// RDF/XML with its entity declarations in double quotes (the test cases write
@@ -34,6 +34,23 @@ pub fn parse_rdf_xml(text: &str) -> Result<Vec<Triple>, String> {
         .map_err(|e| e.to_string())?
         .for_reader(quoted_entities(text).as_bytes())
         .map(|quad| quad.map(Triple::from).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// `triples` with their blank nodes renamed apart from other documents' (`tag`).
+fn relabelled(triples: Vec<Triple>, tag: usize) -> Vec<Triple> {
+    let rename = |b: &BlankNode| BlankNode::new_unchecked(format!("import{tag}x{}", b.as_str()));
+    triples
+        .into_iter()
+        .map(|mut t| {
+            if let NamedOrBlankNode::BlankNode(b) = &t.subject {
+                t.subject = NamedOrBlankNode::BlankNode(rename(b));
+            }
+            if let RdfTerm::BlankNode(b) = &t.object {
+                t.object = RdfTerm::BlankNode(rename(b));
+            }
+            t
+        })
         .collect()
 }
 
@@ -67,9 +84,37 @@ impl Table {
         matches!(self.terms.get(t as usize), Some(RdfTerm::BlankNode(_)))
     }
 
-    /// The ontology of an RDF/XML document; why not, if it has a fatal diagnostic.
-    pub fn ontology(&mut self, text: &str) -> Result<Ontology, String> {
-        let triples = parse_rdf_xml(text)?;
+    /// The ontology of an RDF/XML document with its imports closure, the imported
+    /// documents by ontology IRI (the test case's `test:importedOntology`); why not, if an
+    /// import isn't given or the reader has a fatal diagnostic.
+    pub fn ontology(
+        &mut self,
+        text: &str,
+        imports: &HashMap<String, String>,
+    ) -> Result<Ontology, String> {
+        const IMPORTS: &str = "http://www.w3.org/2002/07/owl#imports";
+        let mut triples = parse_rdf_xml(text)?;
+        let mut done: Vec<String> = Vec::new();
+        let mut at = 0;
+        while at < triples.len() {
+            let t = &triples[at];
+            at += 1;
+            if t.predicate.as_str() != IMPORTS {
+                continue;
+            }
+            let RdfTerm::NamedNode(iri) = &t.object else {
+                return Err("an owl:imports of a non-IRI".into());
+            };
+            let iri = iri.as_str().to_owned();
+            if done.contains(&iri) {
+                continue;
+            }
+            let Some(document) = imports.get(&iri) else {
+                return Err(format!("imports {iri}, which the test case doesn't give"));
+            };
+            done.push(iri);
+            triples.extend(relabelled(parse_rdf_xml(document)?, done.len()));
+        }
         let statements: Vec<Statement> = triples
             .into_iter()
             .map(|t| Statement {
