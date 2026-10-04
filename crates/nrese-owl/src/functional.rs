@@ -100,6 +100,7 @@ impl Functional<'_> {
 
     fn r(&self, id: RangeId) -> String {
         match self.ontology.range(id) {
+            DataRange::Literal => "rdfs:Literal".to_owned(),
             DataRange::Datatype(t) => self.n(*t),
             DataRange::And(xs) => format!("DataIntersectionOf({})", self.rs(xs)),
             DataRange::Or(xs) => format!("DataUnionOf({})", self.rs(xs)),
