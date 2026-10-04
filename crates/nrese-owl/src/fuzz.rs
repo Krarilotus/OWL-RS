@@ -655,6 +655,7 @@ fn map_range(
         return done;
     }
     let mapped = match o.ranges.get(r.0).clone() {
+        DataRange::Literal => DataRange::Literal,
         DataRange::Datatype(t) => DataRange::Datatype(f(t)),
         DataRange::And(v) => DataRange::And(canonical(
             v.into_iter()

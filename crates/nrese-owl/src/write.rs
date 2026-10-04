@@ -202,10 +202,7 @@ impl Writer<'_> {
                 };
                 let node = self.restriction(p);
                 let number = self.number(n);
-                let literal = matches!(
-                    self.ontology.range(r),
-                    DataRange::Datatype(t) if Some(*t) == self.v.rdfs_literal
-                );
+                let literal = matches!(self.ontology.range(r), DataRange::Literal);
                 if literal {
                     let predicate = [
                         term!(self.owl_min_cardinality),
@@ -243,6 +240,7 @@ impl Writer<'_> {
             node
         };
         match range {
+            DataRange::Literal => term!(self.rdfs_literal),
             DataRange::Datatype(t) => t,
             DataRange::And(xs) | DataRange::Or(xs) => {
                 let union = matches!(self.ontology.range(id), DataRange::Or(_));

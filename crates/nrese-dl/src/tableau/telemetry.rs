@@ -1,0 +1,74 @@
+//! What a hypertableau run did (docs/design/owl2-dl.md §11, owl2-dl-performance.md §5):
+//! per-phase times and the search counters, so that thresholds and gates come from runs,
+//! not guesses.
+
+use std::fmt;
+use std::time::Duration;
+
+/// Per-phase times and counters of one run.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Telemetry {
+    /// Compiling the DL-clauses into HT-clauses and join plans.
+    pub compile: Duration,
+    /// Deterministic saturation: hyperresolution, merges, clash checks.
+    pub saturate: Duration,
+    /// Computing the blocking status.
+    pub blocking: Duration,
+    /// The at-least and at-most rules.
+    pub expand: Duration,
+    /// Choosing disjuncts and backtracking.
+    pub search: Duration,
+    pub total: Duration,
+
+    pub nodes_created: u64,
+    pub peak_nodes: u64,
+    pub branch_points: u64,
+    /// Backtracks that skipped at least one branch level, and the levels skipped.
+    pub backjumps: u64,
+    pub levels_skipped: u64,
+    pub clashes: u64,
+    pub merges: u64,
+    /// Nodes whose blocking status was computed, and those found directly blocked.
+    pub blocking_tests: u64,
+    pub blocking_hits: u64,
+    pub clauses_fired: u64,
+    pub facts: u64,
+    /// The hot node's size (one cache line) and the amortised bytes per node at the peak
+    /// (every table, index and the trail, by capacity).
+    pub bytes_per_hot_node: u64,
+    pub bytes_per_node: u64,
+    pub dependency_sets: u64,
+}
+
+impl fmt::Display for Telemetry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        write!(
+            f,
+            "compile_ms={:.3} saturate_ms={:.3} blocking_ms={:.3} expand_ms={:.3} search_ms={:.3} \
+             total_ms={:.3} nodes_created={} peak_nodes={} branch_points={} backjumps={} \
+             levels_skipped={} clashes={} merges={} blocking_tests={} blocking_hits={} \
+             clauses_fired={} facts={} bytes_per_hot_node={} bytes_per_node={} dependency_sets={}",
+            ms(self.compile),
+            ms(self.saturate),
+            ms(self.blocking),
+            ms(self.expand),
+            ms(self.search),
+            ms(self.total),
+            self.nodes_created,
+            self.peak_nodes,
+            self.branch_points,
+            self.backjumps,
+            self.levels_skipped,
+            self.clashes,
+            self.merges,
+            self.blocking_tests,
+            self.blocking_hits,
+            self.clauses_fired,
+            self.facts,
+            self.bytes_per_hot_node,
+            self.bytes_per_node,
+            self.dependency_sets
+        )
+    }
+}
