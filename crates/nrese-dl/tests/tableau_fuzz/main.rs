@@ -51,13 +51,22 @@ fn interp(m: &Model) -> Option<Interp> {
 }
 
 fn configs() -> Vec<(&'static str, Config)> {
+    // Every blocking pass is checked against a recomputation from scratch.
     let base = Config {
         max_nodes: 20_000,
         timeout: Some(std::time::Duration::from_secs(2)),
+        check_blocking: true,
         ..Config::default()
     };
     vec![
         ("default", base.clone()),
+        (
+            "full-blocking-passes",
+            Config {
+                incremental_blocking: false,
+                ..base.clone()
+            },
+        ),
         (
             "no-semantic-branching",
             Config {

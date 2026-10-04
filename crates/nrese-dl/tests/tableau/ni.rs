@@ -17,6 +17,7 @@ fn configs() -> impl Iterator<Item = Config> {
         timeout: Some(Duration::from_secs(2)),
         max_nodes: 100_000,
         max_memory: 512 << 20,
+        check_blocking: true,
         ..Config::default()
     })
 }

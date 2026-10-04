@@ -27,7 +27,7 @@ pub struct Model {
 impl Engine<'_> {
     /// The folded model of the graph as it is (call after a run ended in a model).
     pub fn model(&mut self) -> Model {
-        self.compute_blocking(0);
+        self.recompute_blocking();
         let len = self.g.nodes.len();
         let mut element = vec![NONE; len];
         let mut size = 0usize;
