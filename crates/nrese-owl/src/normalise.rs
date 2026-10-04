@@ -1017,14 +1017,76 @@ impl<'a> Normaliser<'a> {
         }
     }
 
+    /// The role expressions equivalent to `r` (`r` included), each with the role
+    /// inclusions that make it a subrole of `r`: those `r` reaches by the single-role
+    /// inclusions and that reach `r` back. `R ⊑ S⁻` with `S ⊑ R⁻` (an inverse pair)
+    /// makes `S⁻` one of `R`'s.
+    fn equivalents(&self, r: ObjProp) -> Vec<(ObjProp, Vec<usize>)> {
+        // Everything `from` is a subrole of, with the inclusions on the way.
+        let up = |from: ObjProp| -> Vec<(ObjProp, Vec<usize>)> {
+            let mut seen: Vec<(ObjProp, Vec<usize>)> = vec![(from, Vec::new())];
+            let mut at = 0;
+            while at < seen.len() {
+                let (x, via) = seen[at].clone();
+                at += 1;
+                for (chain, sup, axiom) in &self.rias {
+                    if let [only] = chain[..] {
+                        let next = if only == x {
+                            ObjProp::Named(*sup)
+                        } else if only == x.inverse() {
+                            ObjProp::Inverse(*sup)
+                        } else {
+                            continue;
+                        };
+                        if !seen.iter().any(|(y, _)| *y == next) {
+                            let mut via = via.clone();
+                            via.push(*axiom);
+                            seen.push((next, via));
+                        }
+                    }
+                }
+            }
+            seen
+        };
+        up(r)
+            .into_iter()
+            .filter_map(|(x, _)| {
+                let back = up(x).into_iter().find(|(y, _)| *y == r)?;
+                let mut via = back.1;
+                via.sort_unstable();
+                via.dedup();
+                Some((x, via))
+            })
+            .collect()
+    }
+
     /// The automaton of the non-simple role `role` (named), with the automata of the
     /// non-simple roles it builds on spliced in; `None` for an irregular RBox.
+    ///
+    /// Roles equivalent to `role` (up to inverse: an inverse pair, a cycle of
+    /// subproperties) are one role here (Horrocks and Sattler's order is on their
+    /// classes): their inclusions are read as `role`'s, and an edge of `role` matches an
+    /// edge of each of them. Splicing them into each other was taken for a cycle, an
+    /// irregular RBox (ore_ont_15971: `after` inverse of the transitive `before`).
     fn nfa(&self, role: Term, stack: &mut Vec<Term>) -> Option<Nfa> {
         if stack.contains(&role) {
             return None;
         }
-        stack.push(role);
         let r = ObjProp::Named(role);
+        let members = self.equivalents(r);
+        let class: Vec<ObjProp> = members.iter().map(|(x, _)| *x).collect();
+        let names: Vec<Term> = class.iter().map(|x| x.named()).collect();
+        stack.extend(&names);
+        // A label as `role` where it is one of `role`'s class.
+        let canonical = |x: ObjProp| -> ObjProp {
+            if class.contains(&x) {
+                r
+            } else if class.contains(&x.inverse()) {
+                r.inverse()
+            } else {
+                x
+            }
+        };
         let mut nfa = Nfa {
             states: 2,
             start: 0,
@@ -1048,8 +1110,22 @@ impl<'a> Normaliser<'a> {
                 nfa.edges.push((from, None, to, vec![axiom]));
             }
         };
-        for &(ref chain, sup, axiom) in &self.rias {
-            if sup != role || chain[..] == [r] {
+        for (chain, sup, axiom) in &self.rias {
+            // The inclusions into the class, as inclusions into `role`.
+            let chain: Vec<ObjProp> = if class.contains(&ObjProp::Named(*sup)) {
+                chain.iter().map(|&x| canonical(x)).collect()
+            } else if class.contains(&ObjProp::Inverse(*sup)) {
+                chain
+                    .iter()
+                    .rev()
+                    .map(|&x| canonical(x.inverse()))
+                    .collect()
+            } else {
+                continue;
+            };
+            let axiom = *axiom;
+            if chain[..] == [r] {
+                // Within the class: its members' edges are `role`'s (below).
                 continue;
             }
             if chain[..] == [r, r] {
@@ -1059,14 +1135,26 @@ impl<'a> Normaliser<'a> {
             } else if chain.len() > 1 && chain[chain.len() - 1] == r {
                 path(&mut nfa, 0, &chain[..chain.len() - 1], 0, axiom);
             } else {
-                path(&mut nfa, 0, chain, 1, axiom);
+                path(&mut nfa, 0, &chain, 1, axiom);
             }
         }
-        // Splice in the automata of the other non-simple roles on the edges.
+        // An edge of `role` (or its inverse) matches each member of the class; the other
+        // non-simple roles on the edges have their automata spliced in.
         let edges = std::mem::take(&mut nfa.edges);
         for (a, label, b, axioms) in edges {
             match label {
-                Some(s) if s.named() != role && self.non_simple.contains(&s.named()) => {
+                Some(s) if s.named() == role => {
+                    for (member, via) in &members {
+                        let member = if s == r { *member } else { member.inverse() };
+                        // The edge needs the inclusions that make the member `role`.
+                        let mut needed = axioms.clone();
+                        needed.extend(via);
+                        needed.sort_unstable();
+                        needed.dedup();
+                        nfa.edges.push((a, Some(member), b, needed));
+                    }
+                }
+                Some(s) if self.non_simple.contains(&s.named()) => {
                     let inner = self.nfa(s.named(), stack)?;
                     let inner = match s {
                         ObjProp::Named(_) => inner,
@@ -1089,7 +1177,7 @@ impl<'a> Normaliser<'a> {
                 _ => nfa.edges.push((a, label, b, axioms)),
             }
         }
-        stack.pop();
+        stack.truncate(stack.len() - names.len());
         Some(nfa)
     }
 
