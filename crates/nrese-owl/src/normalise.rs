@@ -74,6 +74,9 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
     n.finish()
 }
 
+/// The most GCIs one GCI is distributed into over its conjunctions.
+const MAX_DISTRIBUTED: usize = 16;
+
 /// Why an axiom over a universal property is left out.
 const UNIVERSAL: &str = "the universal properties (owl:topObjectProperty, owl:topDataProperty)";
 
@@ -608,9 +611,37 @@ impl<'a> Normaliser<'a> {
             positive: false,
         });
         self.negative.insert(e, q);
+        if let ClassExpr::Some(r, d) = self.get(e)
+            && self.non_simple.contains(&r.named())
+        {
+            // `∃R.D ⊑ Q` as `D ⊑ ∀R⁻.Q`: Horn through R⁻'s automaton where D is a
+            // literal (`∀R.¬D ⊔ Q` would put R's start state beside Q in a head).
+            let start = self.automaton(r.inverse(), Item::Fresh(q), source);
+            let not_d = self.nnf_not(d);
+            self.gci(
+                Vec::new(),
+                vec![Item::Expr(not_d), Item::Fresh(start)],
+                source,
+            );
+            return q;
+        }
         let not = self.nnf_not(e);
         self.gci(Vec::new(), vec![Item::Expr(not), Item::Fresh(q)], source);
         q
+    }
+
+    /// Whether `c` (in negation normal form) clausifies into body atoms only: a negated
+    /// name or nominal, or `⊥`.
+    fn negative_filler(&self, c: ExprId) -> bool {
+        match self.get(c) {
+            ClassExpr::Nothing => true,
+            ClassExpr::Not(inner) => match self.get(inner) {
+                ClassExpr::Class(_) => true,
+                ClassExpr::OneOf(xs) => xs.len() == 1,
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     // Clausification -------------------------------------------------------------------
@@ -645,16 +676,27 @@ impl<'a> Normaliser<'a> {
         let Some(items) = self.flatten(gci.items) else {
             return;
         };
-        // A conjunction alone, or beside fresh literals only (a positive name's definition
-        // `¬Q ⊔ (A ⊓ B)`): a GCI per conjunct. Among other disjuncts: a fresh name.
-        let exprs: Vec<ExprId> = items
+        // A conjunction among the disjuncts: a GCI per conjunct, `(A ⊓ B) ⊔ R` as
+        // `A ⊔ R` and `B ⊔ R`, so that `A ⊔ B ⊑ C` gives the Horn clauses `A → C` and
+        // `B → C` (a fresh name for `¬A ⊓ ¬B` made it `⊤ → C ∨ Q`: found by the U1
+        // bound, which then typed everything C on OWL2Bench; 4 October 2026). Up to
+        // `MAX_DISTRIBUTED` GCIs from one; past that, fresh names.
+        let conjuncts: Vec<(ExprId, usize)> = items
             .iter()
             .filter_map(|i| match i {
-                Item::Expr(e) => Some(*e),
+                Item::Expr(e) => match self.get(*e) {
+                    ClassExpr::And(xs) => Some((*e, xs.len())),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect();
-        if let [e] = exprs[..]
+        let product = conjuncts
+            .iter()
+            .try_fold(1usize, |acc, &(_, n)| acc.checked_mul(n))
+            .unwrap_or(usize::MAX);
+        if let Some(&(e, _)) = conjuncts.first()
+            && product <= MAX_DISTRIBUTED
             && let ClassExpr::And(xs) = self.get(e)
         {
             for x in xs {
@@ -691,6 +733,7 @@ impl<'a> Normaliser<'a> {
             })
             .max()
             .unwrap_or(0);
+        let many = items.len() > 1;
         for item in items {
             let e = match item {
                 Item::Fresh(q) => {
@@ -747,6 +790,17 @@ impl<'a> Normaliser<'a> {
                         return;
                     }
                     if self.non_simple.contains(&r.named()) {
+                        // `∀R.¬D` beside other disjuncts: `¬P` for a name `∃R.D ⊑ P`, which
+                        // goes through R⁻'s automaton as `D ⊑ ∀R⁻.P` and stays Horn (the
+                        // start state of R's own automaton made `A ⊓ ∃R.D ⊑ B` the
+                        // disjunction `A → B ∨ Q`; 4 October 2026).
+                        if many && self.negative_filler(c) {
+                            let d = self.nnf_not(c);
+                            let some = self.e(ClassExpr::Some(r, d));
+                            let p = self.fresh_negative(some, gci.source);
+                            body.push(BodyAtom::Concept(Concept::Fresh(p), Var::X));
+                            continue;
+                        }
                         // Along the automaton of r: its start state at x.
                         let start = self.automaton(r, Item::Expr(c), gci.source);
                         head.push(HeadAtom::Concept(Concept::Fresh(start), Var::X));

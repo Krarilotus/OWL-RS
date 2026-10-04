@@ -368,6 +368,44 @@ fn unreadable_expressions_are_reported() {
     );
 }
 
+/// Horn axioms give Horn clauses (found by the U1 bound on OWL2Bench, 4 October 2026): a
+/// union on the left (`A ⊔ B ⊑ C` was `⊤ → C ∨ Q`) and an existential over a non-simple
+/// property on the left (`A ⊓ ∃R.D ⊑ B` was `A → B ∨ Q`, Q the start of R's automaton).
+#[test]
+fn horn_axioms_stay_horn() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        ex:worksFor a owl:ObjectProperty , owl:TransitiveProperty .
+        ex:partOf a owl:ObjectProperty . ex:partOf rdfs:subPropertyOf ex:worksFor .
+        [ a owl:Class ; owl:unionOf ( ex:Man ex:Woman ) ] rdfs:subClassOf ex:Person .
+        [ a owl:Class ; owl:intersectionOf ( ex:Person
+            [ a owl:Restriction ; owl:onProperty ex:worksFor ;
+              owl:someValuesFrom ex:Organization ] ) ] rdfs:subClassOf ex:Employee .
+        [ a owl:Restriction ; owl:onProperty ex:worksFor ; owl:someValuesFrom ex:Org ]
+            rdfs:subClassOf ex:Member .
+        ex:Boss rdfs:subClassOf [ a owl:Class ; owl:intersectionOf ( ex:Person
+            [ a owl:Restriction ; owl:onProperty ex:worksFor ;
+              owl:allValuesFrom ex:Organization ] ) ] .
+        "#,
+    );
+    let ontology = read(&statements, &table);
+    assert!(
+        ontology.diagnostics.is_empty(),
+        "{:?}",
+        ontology.diagnostics
+    );
+    let normalised = nrese_owl::normalise(&ontology);
+    let disjunctive: Vec<_> = normalised
+        .clauses
+        .iter()
+        .filter(|c| !c.flags.horn)
+        .collect();
+    assert!(disjunctive.is_empty(), "{disjunctive:#?}");
+    assert!(normalised.unsupported.is_empty());
+}
+
 /// Model → RDF → model is the identity on `ontology`.
 fn assert_round_trip(ontology: &Ontology, table: &mut Table) {
     let vocabulary = table.vocabulary();
