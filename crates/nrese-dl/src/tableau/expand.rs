@@ -209,6 +209,15 @@ impl Engine<'_> {
                 for &(_, d) in &found {
                     premise = self.deps.union(premise, d);
                 }
+                // A merge the NI rule has pending already satisfies the atom's clause.
+                let pending = found.iter().enumerate().any(|(i, &(a, _))| {
+                    found[i + 1..]
+                        .iter()
+                        .any(|&(b, _)| self.ni_pending(a, b, annot))
+                });
+                if pending {
+                    continue;
+                }
                 let mut alternatives = Vec::new();
                 for (i, &(a, _)) in found.iter().enumerate() {
                     for &(b, _) in &found[i + 1..] {

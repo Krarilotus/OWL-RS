@@ -57,18 +57,26 @@ impl Ni {
 }
 
 impl Engine<'_> {
-    /// Defers `a ≈ b @annot` to the NI rule; `false` if it is pending already.
-    pub fn ni_defer(&mut self, a: u32, b: u32, dep: DepSetId, annot: Annot) -> bool {
+    /// Whether `a ≈ b @annot` waits for the NI rule (it is in the ABox, then: a clause
+    /// instance with it in its head is satisfied).
+    pub fn ni_pending(&self, a: u32, b: u32, annot: Annot) -> bool {
+        if annot.root == NONE {
+            return false;
+        }
         let g = &self.g;
         let key = |a: u32, b: u32, annot: Annot| {
             let (a, b) = (g.find(a), g.find(b));
             (a.min(b), a.max(b), g.find(annot.root), annot.number)
         };
         let new = key(a, b, annot);
-        if self.ni.pending[self.ni.open as usize..]
+        self.ni.pending[self.ni.open as usize..]
             .iter()
             .any(|p| key(p.a, p.b, p.annot) == new)
-        {
+    }
+
+    /// Defers `a ≈ b @annot` to the NI rule; `false` if it is pending already.
+    pub fn ni_defer(&mut self, a: u32, b: u32, dep: DepSetId, annot: Annot) -> bool {
+        if self.ni_pending(a, b, annot) {
             return false;
         }
         self.ni.pending.push(NiPending { a, b, dep, annot });
@@ -108,6 +116,15 @@ impl Engine<'_> {
                 root: u,
                 number: p.annot.number,
             };
+            // Pruned with a merge's descendants: the equality went with it (pruning
+            // removes every assertion about them).
+            let gone = !self.g.live(s) || !self.g.live(t) || !self.g.live(u);
+            if gone {
+                if settled {
+                    self.ni.open = at as u32;
+                }
+                continue;
+            }
             if !self.needs_ni(Lit::Equal(s, t, annot)) {
                 if settled {
                     self.ni.open = at as u32;
