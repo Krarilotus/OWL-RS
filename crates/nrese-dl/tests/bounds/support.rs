@@ -321,6 +321,10 @@ pub fn upper_within(
         closure.extend(m.derived);
         // Facts a head with a merged constant derived, over its representative.
         if !classes.merge(pairs(&closure).into_iter()) {
+            if classes.members.is_empty() {
+                closure.sort_unstable();
+                break closure;
+            }
             let mut closure: Vec<Triple> = closure.iter().map(|&t| classes.rewrite(t)).collect();
             closure.sort_unstable();
             closure.dedup();
@@ -328,6 +332,14 @@ pub fn upper_within(
         }
         facts = closure;
     };
+    if classes.members.is_empty() {
+        return Some(Closure {
+            facts: closure.clone(),
+            violations: Vec::new(),
+            representatives: closure,
+            classes,
+        });
+    }
     let shown = |r: u64| -> Vec<u64> {
         match classes.members(r) {
             [] => vec![r],
