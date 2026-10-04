@@ -8,9 +8,9 @@
 //! `memchr` inside them. A `.` at depth 0 followed by whitespace (or the end, or a
 //! comment), and a `}` that closes a TriG block, end a statement for certain; every other
 //! `.` is left alone (a boundary missed costs nothing, a wrong one would corrupt the parse).
-//! The skim also records every `@prefix`, `@base`, `PREFIX` and `BASE` directive, so each
-//! chunk starts with exactly the prefixes and base in force where it begins, wherever the
-//! directives are in the document.
+//! The skim also records every `@prefix`, `@base`, `PREFIX` and `BASE` directive, and RDF
+//! 1.2's `@version` and `VERSION`, so each chunk starts with exactly the prefixes, base and
+//! version in force where it begins, wherever the directives are in the document.
 //!
 //! Oxigraph's Turtle splitter guesses instead (a `.` after which three triples parse) and
 //! says it can fail or give wrong results on directives after the start or Turtle inside
@@ -86,7 +86,7 @@ pub(crate) struct Skimmer {
     /// and where the statement began.
     start: Option<(u64, Vec<u8>)>,
     /// The directive being read: its text so far, and whether it ends at a '.' (`@` forms)
-    /// or after its IRI (SPARQL forms).
+    /// or after its IRI or, for `VERSION`, its string (SPARQL forms).
     directive: Option<(Vec<u8>, bool)>,
 }
 
@@ -160,10 +160,13 @@ impl Skimmer {
                     // A comment before the statement.
                 } else {
                     first.push(b);
-                    // As the lexer reads them: `@` and a run of letters that is `prefix` or
-                    // `base`; or a name that is `PREFIX` or `BASE` in any case and not
-                    // followed by `:` (that would be a prefixed name). No whitespace needs
-                    // to follow (`BASE<…>`, `@prefix:<…>`).
+                    // As the lexer reads them: `@` and a run of letters that is `prefix`,
+                    // `base` or `version`; or a name that is `PREFIX`, `BASE` or `VERSION`
+                    // in any case and not followed by `:` (that would be a prefixed name).
+                    // No whitespace needs to follow (`BASE<…>`, `@prefix:<…>`). A
+                    // `VERSION "1.2"` read as a statement ran on to the next `.` and
+                    // swallowed the directive after it (a release whose second line
+                    // declared `prov:` failed to load in parallel, 4 October 2026).
                     let (run, dotted) = match first.split_first() {
                         Some((b'@', rest)) => (rest, true),
                         _ => (&first[..], false),
@@ -177,7 +180,7 @@ impl Skimmer {
                                 || c >= 0x80
                         }
                     };
-                    let keywords: [&[u8]; 2] = [b"prefix", b"base"];
+                    let keywords: [&[u8]; 3] = [b"prefix", b"base", b"version"];
                     let same = |word: &[u8], keyword: &[u8]| {
                         if dotted {
                             word == keyword
@@ -344,13 +347,20 @@ impl Skimmer {
                             escaped: false,
                         };
                         i += 1;
-                    } else if count == 2 {
-                        // `""`: the empty string; this byte is after it.
-                        self.state = State::Normal;
                     } else {
-                        self.state = State::Short {
-                            quote,
-                            escaped: false,
+                        // The byte is read again in the next state: take it back from a
+                        // directive's text (a `VERSION` string held it twice).
+                        if let Some((text, _)) = &mut self.directive {
+                            text.pop();
+                        }
+                        self.state = if count == 2 {
+                            // `""`: the empty string; this byte is after it.
+                            State::Normal
+                        } else {
+                            State::Short {
+                                quote,
+                                escaped: false,
+                            }
                         };
                     }
                 }
@@ -368,7 +378,8 @@ impl Skimmer {
                             if let Some((text, _)) = &mut self.directive {
                                 text.extend_from_slice(&bytes[i + 1..i + k + 1]);
                             }
-                            self.state = if bytes[i + k] == quote {
+                            let closed = bytes[i + k] == quote;
+                            self.state = if closed {
                                 State::Normal
                             } else {
                                 State::Short {
@@ -377,8 +388,25 @@ impl Skimmer {
                                 }
                             };
                             i += k + 1;
+                            // A SPARQL-style `VERSION` ends with its string (only short
+                            // strings may follow it).
+                            if closed
+                                && matches!(&self.directive, Some((text, false))
+                                    if text.trim_ascii_start().len() >= 7
+                                        && text.trim_ascii_start()[..7].eq_ignore_ascii_case(b"version"))
+                            {
+                                let at = base + i as u64;
+                                count_lines(self, &mut counted, i);
+                                self.boundary(at);
+                            }
                         }
-                        None => i = n,
+                        None => {
+                            // The string goes on in the next piece: keep this piece's part.
+                            if let Some((text, _)) = &mut self.directive {
+                                text.extend_from_slice(&bytes[i + 1..]);
+                            }
+                            i = n;
+                        }
                     }
                 }
                 State::Long {
@@ -506,6 +534,32 @@ mod tests {
         for piece in [1, 2, 3, 7, 64] {
             let other = skim(text, text.len(), piece);
             assert_eq!(other.cuts, every.cuts, "pieces of {piece}");
+        }
+    }
+
+    /// RDF 1.2's version directives are directives: `VERSION "1.2"` ends with its string
+    /// and doesn't swallow the directive after it (a release declaring `prov:` on its
+    /// second line failed to load in parallel, 4 October 2026).
+    #[test]
+    fn version_directives_are_directives() {
+        let text = "VERSION \"1.2\"\n@prefix prov: <http://www.w3.org/ns/prov#> .\n@version '1.2' .\nversion\"1.2\"\nPREFIX ex: <http://e/>\nex:a prov:wasGeneratedBy ex:b .\n";
+        for piece in [1, 2, 3, 7, 64] {
+            let found = skim(text, text.len(), piece);
+            assert_eq!(
+                found
+                    .directives
+                    .iter()
+                    .map(|(_, d)| d.trim())
+                    .collect::<Vec<_>>(),
+                [
+                    "VERSION \"1.2\"",
+                    "@prefix prov: <http://www.w3.org/ns/prov#> .",
+                    "@version '1.2' .",
+                    "version\"1.2\"",
+                    "PREFIX ex: <http://e/>"
+                ],
+                "pieces of {piece}"
+            );
         }
     }
 }

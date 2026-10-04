@@ -8,6 +8,7 @@ mod bulk_load_tests;
 mod catalog_ontology_store_tests;
 mod catalog_reasoner_fixture_tests;
 mod convert_tests;
+mod entailment_tests;
 mod equality_compact_tests;
 mod explanation_tests;
 mod image_backup_tests;
