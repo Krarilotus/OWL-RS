@@ -19,8 +19,9 @@
 //!    under the role inclusions).
 //! 5. **The ABox** as facts, a complex class assertion through a fresh name.
 //! 6. **Built-in properties:** the bottom properties relate nothing (`⊤ ⊑ ∀R.⊥`, through
-//!    R's automaton where chains reach it); an axiom that mentions a top (universal)
-//!    property is reported unsupported, never read as one over an ordinary property.
+//!    R's automaton where chains reach it); the universal object property goes through a
+//!    hub individual (`universal.rs`); an axiom that mentions the universal data property
+//!    is reported unsupported, never read as one over an ordinary property.
 //!
 //! Every clause keeps the axioms it came from.
 
@@ -60,14 +61,42 @@ pub fn normalise(ontology: &Ontology) -> Normalised {
 
 /// The clauses and facts of `ontology`.
 pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
+    // The universal object property through a hub (`universal.rs`), axiom for axiom.
+    let rewritten = ontology.builtin.top_object.and_then(|top| {
+        let used = ontology
+            .axioms
+            .iter()
+            .any(|a| crate::properties::mentions(ontology, a, &|t| t == top));
+        used.then(|| {
+            let mut r = crate::universal::rewrite(ontology, top);
+            r.ontology.builtin.top_object = None;
+            r
+        })
+    });
+    let ontology = rewritten.as_ref().map_or(ontology, |r| &r.ontology);
     let mut n = Normaliser::new(ontology);
     n.expand_up_to = options.expand_at_most_up_to.min(Options::MAX_EXPANSION);
+    if let Some(r) = &rewritten {
+        for &index in &r.unsupported {
+            n.out
+                .unsupported
+                .push((index, crate::universal::UNSUPPORTED));
+        }
+    }
     for (index, axiom) in ontology.axioms.iter().enumerate() {
         if n.uses_top(axiom) {
             n.out.unsupported.push((index, UNIVERSAL));
             continue;
         }
         n.axiom(index, axiom);
+    }
+    if let Some(r) = &rewritten {
+        // ⊤ ⊑ ∃u.{h}, from every axiom that uses the universal property.
+        let hub = n.e(ClassExpr::OneOf(vec![r.hub]));
+        let to_hub = n.e(ClassExpr::Some(ObjProp::Named(r.hub), hub));
+        for &index in &r.uses {
+            n.gci(Vec::new(), vec![Item::Expr(to_hub)], index);
+        }
     }
     n.bottom_properties();
     n.drain();
@@ -78,7 +107,7 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
 const MAX_DISTRIBUTED: usize = 16;
 
 /// Why an axiom over a universal property is left out.
-const UNIVERSAL: &str = "the universal properties (owl:topObjectProperty, owl:topDataProperty)";
+const UNIVERSAL: &str = "the universal data property (owl:topDataProperty)";
 
 /// A disjunct of a GCI being clausified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -314,13 +343,13 @@ impl<'a> Normaliser<'a> {
         }
     }
 
-    /// Whether `axiom` mentions a universal property.
+    /// Whether `axiom` mentions the universal data property (the object one is encoded
+    /// before: `universal.rs`).
     fn uses_top(&self, axiom: &Axiom) -> bool {
-        let builtin = self.ontology.builtin;
-        if builtin.top_object.is_none() && builtin.top_data.is_none() {
+        let Some(top) = self.ontology.builtin.top_data else {
             return false;
-        }
-        crate::properties::mentions(self.ontology, axiom, &|t| builtin.is_top(t))
+        };
+        crate::properties::mentions(self.ontology, axiom, &|t| t == top)
     }
 
     /// The bottom properties relate nothing: `⊤ ⊑ ∀R.⊥` for the object property (a GCI,
