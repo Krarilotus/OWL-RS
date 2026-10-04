@@ -18,6 +18,9 @@
 //!    edge an engine sees is explicit (equisatisfiable; exact on interpretations closed
 //!    under the role inclusions).
 //! 5. **The ABox** as facts, a complex class assertion through a fresh name.
+//! 6. **Built-in properties:** the bottom properties relate nothing (`⊤ ⊑ ∀R.⊥`, through
+//!    R's automaton where chains reach it); an axiom that mentions a top (universal)
+//!    property is reported unsupported, never read as one over an ordinary property.
 //!
 //! Every clause keeps the axioms it came from.
 
@@ -60,11 +63,19 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
     let mut n = Normaliser::new(ontology);
     n.expand_up_to = options.expand_at_most_up_to.min(Options::MAX_EXPANSION);
     for (index, axiom) in ontology.axioms.iter().enumerate() {
+        if n.uses_top(axiom) {
+            n.out.unsupported.push((index, UNIVERSAL));
+            continue;
+        }
         n.axiom(index, axiom);
     }
+    n.bottom_properties();
     n.drain();
     n.finish()
 }
+
+/// Why an axiom over a universal property is left out.
+const UNIVERSAL: &str = "the universal properties (owl:topObjectProperty, owl:topDataProperty)";
 
 /// A disjunct of a GCI being clausified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -297,6 +308,41 @@ impl<'a> Normaliser<'a> {
         match role {
             ObjProp::Named(p) => HeadAtom::Role(p, from, to),
             ObjProp::Inverse(p) => HeadAtom::Role(p, to, from),
+        }
+    }
+
+    /// Whether `axiom` mentions a universal property.
+    fn uses_top(&self, axiom: &Axiom) -> bool {
+        let builtin = self.ontology.builtin;
+        if builtin.top_object.is_none() && builtin.top_data.is_none() {
+            return false;
+        }
+        crate::properties::mentions(self.ontology, axiom, &|t| builtin.is_top(t))
+    }
+
+    /// The bottom properties relate nothing: `⊤ ⊑ ∀R.⊥` for the object property (a GCI,
+    /// so that a chain reaching it passes R's automaton), `R(x, v) → ⊥` for the data
+    /// property; from each axiom that mentions them.
+    fn bottom_properties(&mut self) {
+        let builtin = self.ontology.builtin;
+        let ontology = self.ontology;
+        for (index, axiom) in ontology.axioms.iter().enumerate() {
+            if let Some(bottom) = builtin.bottom_object
+                && crate::properties::mentions(ontology, axiom, &|t| t == bottom)
+            {
+                let nothing = self.e(ClassExpr::Nothing);
+                let none = self.e(ClassExpr::All(ObjProp::Named(bottom), nothing));
+                self.gci(Vec::new(), vec![Item::Expr(none)], index);
+            }
+            if let Some(bottom) = builtin.bottom_data
+                && crate::properties::mentions(ontology, axiom, &|t| t == bottom)
+            {
+                self.add(
+                    vec![BodyAtom::Data(bottom, Var::X, Var::V(0))],
+                    Vec::new(),
+                    index,
+                );
+            }
         }
     }
 
@@ -864,6 +910,9 @@ impl<'a> Normaliser<'a> {
     fn role_inclusions(&mut self) {
         let mut rias: Vec<(Vec<ObjProp>, ObjProp, usize)> = Vec::new();
         for (index, axiom) in self.ontology.axioms.iter().enumerate() {
+            if self.uses_top(axiom) {
+                continue;
+            }
             match axiom {
                 Axiom::SubObjectPropertyOf(chain, sup) => rias.push((chain.clone(), *sup, index)),
                 Axiom::EquivalentObjectProperties(ps) => {

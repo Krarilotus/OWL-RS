@@ -64,6 +64,40 @@ pub struct Ontology {
     pub diagnostics: Vec<Diagnostic>,
     /// Annotation statements and the ontology header, read past.
     pub annotations: usize,
+    /// The source's ids of the properties with a fixed meaning.
+    pub builtin: BuiltinProperties,
+}
+
+/// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
+/// the source doesn't have the IRI): the normalisation gives them their semantics or
+/// reports what uses them as unsupported, never reads them as ordinary properties.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BuiltinProperties {
+    /// `owl:topObjectProperty`: every pair of individuals.
+    pub top_object: Option<Term>,
+    /// `owl:bottomObjectProperty`: no pair.
+    pub bottom_object: Option<Term>,
+    /// `owl:topDataProperty`: every individual with every data value.
+    pub top_data: Option<Term>,
+    /// `owl:bottomDataProperty`: no pair.
+    pub bottom_data: Option<Term>,
+}
+
+impl BuiltinProperties {
+    /// Their ids in a source, by its vocabulary.
+    pub fn of(v: &Vocabulary) -> Self {
+        Self {
+            top_object: v.owl_top_object_property,
+            bottom_object: v.owl_bottom_object_property,
+            top_data: v.owl_top_data_property,
+            bottom_data: v.owl_bottom_data_property,
+        }
+    }
+
+    /// Whether `property` is one of the universal properties.
+    pub fn is_top(&self, property: Term) -> bool {
+        Some(property) == self.top_object || Some(property) == self.top_data
+    }
 }
 
 impl Ontology {
@@ -115,6 +149,21 @@ struct Reader<'a> {
     diagnostics: Vec<Diagnostic>,
     reported: HashSet<(Term, &'static str)>,
     annotations: usize,
+}
+
+/// The classes whose instances are declared entities: OWL 2's, and the RDFS and OWL 1
+/// synonyms the mapping reads as them (`rdfs:Class`, `owl:DataRange`).
+fn declaration_kinds(v: &Vocabulary) -> [(Option<Term>, EntityKind); 8] {
+    [
+        (v.owl_class, EntityKind::Class),
+        (v.rdfs_class, EntityKind::Class),
+        (v.owl_object_property, EntityKind::ObjectProperty),
+        (v.owl_datatype_property, EntityKind::DataProperty),
+        (v.owl_annotation_property, EntityKind::AnnotationProperty),
+        (v.rdfs_datatype, EntityKind::Datatype),
+        (v.owl_data_range, EntityKind::Datatype),
+        (v.owl_named_individual, EntityKind::NamedIndividual),
+    ]
 }
 
 /// `Some(id) == Some(x)` without matching an absent term.
@@ -219,14 +268,7 @@ impl<'a> Reader<'a> {
 
     fn declarations(&mut self) {
         let v = self.v;
-        let kinds = [
-            (v.owl_class, EntityKind::Class),
-            (v.owl_object_property, EntityKind::ObjectProperty),
-            (v.owl_datatype_property, EntityKind::DataProperty),
-            (v.owl_annotation_property, EntityKind::AnnotationProperty),
-            (v.rdfs_datatype, EntityKind::Datatype),
-            (v.owl_named_individual, EntityKind::NamedIndividual),
-        ];
+        let kinds = declaration_kinds(&v);
         // Characteristics other than functional make an object property.
         let object_only = [
             v.owl_inverse_functional,
@@ -254,6 +296,20 @@ impl<'a> Reader<'a> {
                 let entry = self.declared.entry(s).or_default();
                 if !entry.contains(&EntityKind::ObjectProperty) {
                     entry.push(EntityKind::ObjectProperty);
+                }
+            }
+        }
+        // The built-in properties are declared by OWL 2 itself.
+        for (property, kind) in [
+            (v.owl_top_object_property, EntityKind::ObjectProperty),
+            (v.owl_bottom_object_property, EntityKind::ObjectProperty),
+            (v.owl_top_data_property, EntityKind::DataProperty),
+            (v.owl_bottom_data_property, EntityKind::DataProperty),
+        ] {
+            if let Some(property) = property {
+                let entry = self.declared.entry(property).or_default();
+                if !entry.contains(&kind) {
+                    entry.push(kind);
                 }
             }
         }
@@ -331,7 +387,13 @@ impl<'a> Reader<'a> {
         match self.kind(term) {
             TermKind::Iri => Some(ObjProp::Named(term)),
             TermKind::Blank => {
-                let inverse = self.one(term, self.v.owl_inverse_of)?;
+                let Some(inverse) = self.one(term, self.v.owl_inverse_of) else {
+                    self.report(Diagnostic::Malformed {
+                        node: term,
+                        what: "a blank node where a property belongs, without owl:inverseOf",
+                    });
+                    return None;
+                };
                 if self.kind(inverse) != TermKind::Iri {
                     self.report(Diagnostic::Malformed {
                         node: term,
@@ -341,7 +403,13 @@ impl<'a> Reader<'a> {
                 }
                 Some(ObjProp::Inverse(inverse))
             }
-            TermKind::Literal => None,
+            TermKind::Literal => {
+                self.report(Diagnostic::Malformed {
+                    node: term,
+                    what: "a literal where a property belongs",
+                });
+                None
+            }
         }
     }
 
@@ -370,6 +438,14 @@ impl<'a> Reader<'a> {
                 // Guards against a cycle through this node.
                 self.class_memo.insert(term, None);
                 let found = self.blank_class(term);
+                if found.is_none() {
+                    // Whatever made it unreadable may not have been reported; the axiom
+                    // it belongs to is left out, never silently.
+                    self.report(Diagnostic::Malformed {
+                        node: term,
+                        what: "a class expression that can't be read",
+                    });
+                }
                 self.class_memo.insert(term, found);
                 found
             }
@@ -382,7 +458,7 @@ impl<'a> Reader<'a> {
 
     fn blank_class(&mut self, node: Term) -> Option<ExprId> {
         let v = self.v;
-        for class_type in [v.owl_class, v.owl_restriction] {
+        for class_type in [v.owl_class, v.rdfs_class, v.owl_restriction] {
             if self.has_type(node, class_type) {
                 self.collect([node, v.rdf_type?, class_type?]);
             }
@@ -453,9 +529,10 @@ impl<'a> Reader<'a> {
             Some(parsed)
         };
         if data {
+            // `rdfs:Literal`, whether or not the source has a term for its IRI (a
+            // cardinality over a data property was dropped where it hadn't).
             let literal_range = |reader: &mut Self| -> Option<RangeId> {
-                let literal = reader.v.rdfs_literal?;
-                Some(reader.intern_range(DataRange::Datatype(literal)))
+                Some(reader.intern_range(DataRange::Literal))
             };
             if let Some(filler) = self.one(node, v.owl_some_values_from) {
                 let range = self.range(filler)?;
@@ -548,6 +625,9 @@ impl<'a> Reader<'a> {
     /// The data range `term` stands for.
     fn range(&mut self, term: Term) -> Option<RangeId> {
         match self.kind(term) {
+            TermKind::Iri if is(term, self.v.rdfs_literal) => {
+                Some(self.intern_range(DataRange::Literal))
+            }
             TermKind::Iri => Some(self.intern_range(DataRange::Datatype(term))),
             TermKind::Literal => {
                 self.report(Diagnostic::Malformed {
@@ -563,6 +643,12 @@ impl<'a> Reader<'a> {
                 }
                 self.range_memo.insert(term, None);
                 let found = self.blank_range(term);
+                if found.is_none() {
+                    self.report(Diagnostic::Malformed {
+                        node: term,
+                        what: "a data range that can't be read",
+                    });
+                }
                 self.range_memo.insert(term, found);
                 found
             }
@@ -571,8 +657,10 @@ impl<'a> Reader<'a> {
 
     fn blank_range(&mut self, node: Term) -> Option<RangeId> {
         let v = self.v;
-        if self.has_type(node, v.rdfs_datatype) {
-            self.collect([node, v.rdf_type?, v.rdfs_datatype?]);
+        for range_type in [v.rdfs_datatype, v.owl_data_range] {
+            if self.has_type(node, range_type) {
+                self.collect([node, v.rdf_type?, range_type?]);
+            }
         }
         let ranges = |reader: &mut Self, list: Term| -> Option<Vec<RangeId>> {
             let members = reader.list(list)?;
@@ -939,14 +1027,7 @@ impl<'a> Reader<'a> {
     /// An `rdf:type` statement: a declaration, a characteristic, or a class assertion.
     fn typing(&mut self, s: Term, o: Term, triple: [Term; 3]) {
         let v = self.v;
-        let declarations = [
-            (v.owl_class, EntityKind::Class),
-            (v.owl_object_property, EntityKind::ObjectProperty),
-            (v.owl_datatype_property, EntityKind::DataProperty),
-            (v.owl_annotation_property, EntityKind::AnnotationProperty),
-            (v.rdfs_datatype, EntityKind::Datatype),
-            (v.owl_named_individual, EntityKind::NamedIndividual),
-        ];
+        let declarations = declaration_kinds(&v);
         if let Some(&(_, kind)) = declarations.iter().find(|(c, _)| is(o, *c)) {
             if self.kind(s) == TermKind::Iri {
                 self.add(Axiom::Declaration(kind, s), triple);
@@ -993,6 +1074,10 @@ impl<'a> Reader<'a> {
             v.owl_deprecated_class,
             v.owl_deprecated_property,
             v.owl_ontology_property,
+            // The typing of properties and list cells in RDF: nothing under the direct
+            // semantics (a property is typed by its declaration or its use).
+            v.rdf_property,
+            v.rdf_list,
         ];
         if header.iter().any(|&c| is(o, c)) {
             self.annotations += 1;
@@ -1076,6 +1161,7 @@ impl<'a> Reader<'a> {
             sources,
             diagnostics: self.diagnostics,
             annotations: self.annotations,
+            builtin: BuiltinProperties::of(&self.v),
         };
         crate::diagnostics::check_global_restrictions(&mut ontology);
         ontology

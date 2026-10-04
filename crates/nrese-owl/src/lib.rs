@@ -14,12 +14,13 @@ pub mod mapping;
 pub mod model;
 pub mod normalise;
 pub mod proof;
+mod properties;
 pub mod vocab;
 pub mod write;
 
 pub use clauses::{BodyAtom, Clause, Concept, Facts, Filler, FreshOf, HeadAtom, Normalised, Var};
 pub use diagnostics::Diagnostic;
-pub use mapping::{Ontology, Source, Statement, TermKind, Terms, read};
+pub use mapping::{BuiltinProperties, Ontology, Source, Statement, TermKind, Terms, read};
 pub use model::{
     Axiom, Characteristic, ClassExpr, DataRange, EntityKind, ExprId, Interner, ObjProp, RangeId,
     Term,

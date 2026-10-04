@@ -6,7 +6,7 @@ mod sat;
 
 use build::Build;
 use nrese_dl::tableau::{Answer, Config, consistency, satisfiable};
-use nrese_owl::{Characteristic, ClassExpr, ObjProp, normalise};
+use nrese_owl::{Axiom, Characteristic, ClassExpr, ObjProp, normalise};
 
 /// The answer under every combination of the switches; they must agree.
 fn answer(o: &nrese_owl::Ontology) -> Answer {
@@ -387,4 +387,55 @@ fn premature_blocking_without_the_ni_rule_is_caught() {
             "{expand}: {answer:?}"
         );
     }
+}
+
+#[test]
+fn the_bottom_property_relates_nothing() {
+    // 500 is owl:bottomObjectProperty. a: ∃⊥.⊤ is inconsistent; so is an edge a
+    // subproperty or a chain puts into it.
+    let bottom = 500;
+    let with_bottom = |b: &mut Build| b.o.builtin.bottom_object = Some(bottom);
+    let mut b = Build::default();
+    with_bottom(&mut b);
+    let thing = b.e(ClassExpr::Thing);
+    let some = b.some(ObjProp::Named(bottom), thing);
+    b.assert(some, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+
+    let mut b = Build::default();
+    with_bottom(&mut b);
+    b.axiom(Axiom::SubObjectPropertyOf(
+        vec![ObjProp::Named(200)],
+        ObjProp::Named(bottom),
+    ));
+    b.role_assertion(200, 100, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+
+    let mut b = Build::default();
+    with_bottom(&mut b);
+    b.axiom(Axiom::SubObjectPropertyOf(
+        vec![ObjProp::Named(200), ObjProp::Named(201)],
+        ObjProp::Named(bottom),
+    ));
+    b.role_assertion(200, 100, 101);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.role_assertion(201, 101, 102);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn the_universal_property_is_unsupported_not_ordinary() {
+    // 501 is owl:topObjectProperty. a: ¬∃⊤.⊤ is inconsistent (a itself is a ⊤-successor
+    // of a); read as an ordinary property it would look consistent.
+    let mut b = Build::default();
+    b.o.builtin.top_object = Some(501);
+    let thing = b.e(ClassExpr::Thing);
+    let some = b.some(ObjProp::Named(501), thing);
+    let none = b.not(some);
+    b.assert(none, 100);
+    assert!(
+        matches!(answer(&b.o), Answer::Unsupported(_)),
+        "{:?}",
+        answer(&b.o)
+    );
 }

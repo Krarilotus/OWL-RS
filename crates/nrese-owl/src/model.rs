@@ -71,7 +71,10 @@ pub enum ClassExpr {
 /// A data range; operands are interned.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DataRange {
-    /// A datatype (`rdfs:Literal` included).
+    /// `rdfs:Literal`, every data value: the IRI read so, and the filler of a data
+    /// cardinality without one (also where the source has no term for the IRI).
+    Literal,
+    /// A datatype other than `rdfs:Literal`.
     Datatype(Term),
     And(Vec<RangeId>),
     Or(Vec<RangeId>),
