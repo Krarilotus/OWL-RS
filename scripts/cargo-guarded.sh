@@ -15,8 +15,9 @@
 #   full build writes several GB, and a full system disk affects every program.
 #
 # It also keeps a build from taking the whole machine: half the cores unless
-# CARGO_BUILD_JOBS says otherwise, and low process priority, so other work on the same
-# machine and disk (editors, containers, WSL) stays responsive.
+# CARGO_BUILD_JOBS says otherwise, low process priority, so other work on the same
+# machine and disk (editors, containers, WSL) stays responsive, and on Windows a memory
+# cap on the build and everything it runs (NRESE_MEMORY_CAP_GB, default half the RAM).
 #
 # Code is generated for this machine's CPU unless NRESE_TARGET_CPU says otherwise
 # (`portable`, `x86-64-v3`, …; see scripts/lib/target-cpu.sh).
@@ -76,6 +77,22 @@ fi
 require_free_gb "$MIN_FREE_GB" "cargo $*" "$ROOT"
 
 export_target_cpu_rustflags
+
+# A memory cap on everything this build starts (rustc, test binaries, examples): half the
+# machine's memory unless NRESE_MEMORY_CAP_GB says otherwise (0: none). On Windows the
+# script's own process joins a job object with that limit before cargo starts, so every
+# child inherits it and a runaway test fails its allocation instead of taking the machine
+# (one committed 128 GB on a 64 GB PC on 3 October 2026). Elsewhere it isn't enforced
+# yet: the office runs go through containers with their own limits.
+if [ -z "${NRESE_MEMORY_CAP_GB:-}" ]; then
+  total_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || printf 0)
+  NRESE_MEMORY_CAP_GB=$(( total_kb / 2 / 1048576 ))
+fi
+if [ "${NRESE_MEMORY_CAP_GB:-0}" -gt 0 ] && [ -r "/proc/$$/winpid" ] && command -v powershell >/dev/null 2>&1; then
+  powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$ROOT/scripts/lib/memory-cap.ps1")" \
+    -ProcessId "$(cat "/proc/$$/winpid")" -LimitGB "$NRESE_MEMORY_CAP_GB" >&2 \
+    || printf 'memory cap not applied; building uncapped\n' >&2
+fi
 
 if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
   cores=$(nproc 2>/dev/null || printf 4)

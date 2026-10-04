@@ -12,6 +12,8 @@ pub mod config;
 mod delta;
 pub mod draft_check;
 pub mod error;
+/// The process's memory and the limit long operations stop at ([`StoreConfig::process_memory_bytes`]).
+pub use nrese_exec::memory;
 pub mod graph_store;
 mod graph_store_executor;
 pub mod image_backup;
