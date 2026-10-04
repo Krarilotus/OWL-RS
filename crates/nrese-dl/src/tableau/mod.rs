@@ -63,8 +63,8 @@ pub struct Config {
     /// Compare every blocking pass with a recomputation from scratch, and panic on a
     /// difference (for tests: the oracle of the incremental pass).
     pub check_blocking: bool,
-    /// Try a clause's disjuncts in HermiT's order and move those that failed more often
-    /// to the back (else in the clause's order).
+    /// Try a clause's disjuncts that failed less often first, at-least restrictions over a
+    /// positive filler last (else in the clause's order).
     pub disjunct_learning: bool,
     /// The most nodes a run may create at once.
     pub max_nodes: usize,

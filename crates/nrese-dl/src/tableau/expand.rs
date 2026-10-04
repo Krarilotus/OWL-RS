@@ -133,10 +133,13 @@ impl Engine<'_> {
                     .saturating_mul(48)
                     .saturating_add(n * 256);
                 if (self.bytes() as u64).saturating_add(need) > self.config.max_memory as u64 {
-                    return Err(Stop::GaveUp(format!(
-                        "≥ {} successors with their inequalities exceed the memory budget",
-                        number.n
-                    )));
+                    return Err(Stop::Abandon(
+                        dep,
+                        format!(
+                            "≥ {} successors with their inequalities exceed the memory budget",
+                            number.n
+                        ),
+                    ));
                 }
                 let mut fresh = Vec::with_capacity(number.n as usize);
                 for _ in 0..number.n {

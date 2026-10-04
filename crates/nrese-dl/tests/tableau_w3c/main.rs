@@ -8,6 +8,8 @@
 //! - Documents are read with their `owl:imports` closure, from the documents the suite
 //!   gives for import (`test:importedOntologyIRI`); an import it doesn't give is
 //!   `not-run`.
+//! - `NRESE_W3C_SWITCHES` (`no-disjunct-learning`, `full-blocking`, comma-separated)
+//!   switches optimisations off, for A/B runs.
 //! - Every test ends as `pass`, `wrong`, or not decided with the reason (`unsupported`,
 //!   `gave-up`, `not-run`). A wrong answer fails the run; the rest is reported by test
 //!   type and fragment. `NRESE_W3C_OUT` names a TSV file for the per-test results.
@@ -88,9 +90,14 @@ fn config() -> Config {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
+    // `NRESE_W3C_SWITCHES`: optimisations to switch off, for A/B runs.
+    let off = std::env::var("NRESE_W3C_SWITCHES").unwrap_or_default();
+    let off = |name: &str| off.split(',').any(|s| s.trim() == name);
     Config {
         timeout: Some(Duration::from_secs(secs)),
         max_memory: 2 << 30,
+        disjunct_learning: !off("no-disjunct-learning"),
+        incremental_blocking: !off("full-blocking"),
         ..Config::default()
     }
 }
