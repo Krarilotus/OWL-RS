@@ -950,6 +950,12 @@ impl StoreService {
 
     /// The closure's size with equality replicated and over representatives, for
     /// `program` on the asserted data ([`crate::reasoning::equality_report`]).
+    /// A watch over the process's memory limit; `None` without a limit.
+    pub(crate) fn memory_watch(&self) -> Option<nrese_exec::memory::MemoryWatch> {
+        let limit = self.config.process_memory_bytes;
+        (limit > 0).then(|| nrese_exec::memory::MemoryWatch::new(limit))
+    }
+
     pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
         let tx = self.engine.transaction();
         let program = crate::reasoning::Program::compile(&program.into(), &|term| tx.intern(term));
@@ -967,7 +973,10 @@ impl StoreService {
     }
 
     /// [`Self::rematerialise`], stopped when `stop` fires: then nothing changes and
-    /// [`StoreError::MaterialisationCancelled`](crate::StoreError) is returned.
+    /// [`StoreError::MaterialisationCancelled`](crate::StoreError) is returned. It also
+    /// stops when the process passes its memory limit
+    /// ([`crate::StoreConfig::process_memory_bytes`]), with
+    /// [`StoreError::ProcessMemoryLimit`](crate::StoreError).
     pub fn rematerialise_until(
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,
@@ -984,8 +993,17 @@ impl StoreService {
                 .hiding_unnamed_classes(self.config.hide_unnamed_classes)
                 .by_representatives(self.config.equality_by_representatives)
                 .storing_representatives(self.config.equality_compact);
-        let closure = crate::reasoning::materialise_until(&program, rematerialisation.base(), stop)
-            .map_err(|_| crate::StoreError::MaterialisationCancelled)?;
+        let watch = self.memory_watch();
+        let stop = || stop() || watch.as_ref().is_some_and(|watch| watch.exceeded());
+        let stopped = || match &watch {
+            Some(watch) if watch.exceeded() => crate::StoreError::ProcessMemoryLimit {
+                limit: watch.limit(),
+            },
+            _ => crate::StoreError::MaterialisationCancelled,
+        };
+        let closure =
+            crate::reasoning::materialise_until(&program, rematerialisation.base(), &stop)
+                .map_err(|_| stopped())?;
         let inferred = closure.inferred.len() as u64;
         let base = rematerialisation.base();
         let reported = crate::reasoning::MaterialisationReport::default()
@@ -1000,7 +1018,7 @@ impl StoreService {
         // The last word under the writer slot: a caller whose claim ended meanwhile (a
         // retired pipeline, a cancelled request) changes nothing.
         if stop() {
-            return Err(crate::StoreError::MaterialisationCancelled);
+            return Err(stopped());
         }
         let summary = rematerialisation.finish(closure.inferred)?;
         nrese_engine::memory::release_all();

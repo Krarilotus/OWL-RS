@@ -1027,6 +1027,7 @@ dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.16.1",
  "rayon",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1145,6 +1146,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hashbrown 0.16.1",
  "nrese-engine",
+ "nrese-exec",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-reasoner",
