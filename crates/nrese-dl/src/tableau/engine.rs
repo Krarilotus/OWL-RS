@@ -29,6 +29,10 @@ pub enum Stop {
     Clash(DepSetId),
     /// A budget ran out, or a rule this engine doesn't have is needed.
     GaveUp(String),
+    /// This branch can't be completed within the budgets (an at-least restriction too
+    /// large to expand), by what it depends on: the search goes on with the others, and
+    /// a model found there is an answer, a refutation of all of them is not.
+    Abandon(DepSetId, String),
 }
 
 pub type Step<T> = Result<T, Stop>;

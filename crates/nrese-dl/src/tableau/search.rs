@@ -16,7 +16,6 @@ use std::time::Instant;
 use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step, Stop, proof};
 use super::graph::{Annot, NONE};
-use super::program::{Filler, Head};
 
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,22 +66,34 @@ impl Engine<'_> {
         if let Err(stop) = self.init(test) {
             return match stop {
                 Stop::Clash(_) => End::Refuted,
-                Stop::GaveUp(why) => End::GaveUp(why),
+                Stop::GaveUp(why) | Stop::Abandon(_, why) => End::GaveUp(why),
             };
         }
+        // Why a branch was abandoned, if one was: a refutation is then no answer.
+        let mut abandoned: Option<String> = None;
         loop {
             let stop = match self.step() {
                 Ok(true) => continue,
                 Ok(false) => return End::Model,
                 Err(stop) => stop,
             };
-            match stop {
+            let dep = match stop {
                 Stop::GaveUp(why) => return End::GaveUp(why),
-                Stop::Clash(dep) => match self.backtrack(dep) {
-                    Ok(true) => {}
-                    Ok(false) => return End::Refuted,
-                    Err(why) => return End::GaveUp(why),
-                },
+                Stop::Clash(dep) => dep,
+                Stop::Abandon(dep, why) => {
+                    abandoned.get_or_insert(why);
+                    dep
+                }
+            };
+            match self.backtrack(dep) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return match abandoned {
+                        Some(why) => End::GaveUp(why),
+                        None => End::Refuted,
+                    };
+                }
+                Err(why) => return End::GaveUp(why),
             }
         }
     }
@@ -161,10 +172,13 @@ impl Engine<'_> {
         Ok(false)
     }
 
-    /// The order to try a clause's open disjuncts in (HermiT's, Glimm et al., JAR 2014,
-    /// `GroundDisjunctionHeader`): at-least restrictions over a negated concept first,
-    /// then concepts and the other atoms, then the other at-least restrictions; within
-    /// each group, those that failed less often first (the clause's order on ties).
+    /// The order to try a clause's open disjuncts in: those that failed less often first,
+    /// the clause's order on ties (HermiT's disjunct learning, Glimm et al., JAR 2014,
+    /// `GroundDisjunctionHeader`). HermiT also groups the disjuncts first (at-least
+    /// restrictions over a negated concept first, over others last); in the A/B (5 October
+    /// 2026) the whole grouping made DL-623 and the wine ontology branch several times as
+    /// often, its second half the wine ontology, and DL-664 run out of time, while neither
+    /// changed DL-202 to DL-209. Learning acts only once a disjunct has failed.
     fn order_disjuncts(&mut self, clause: u32, open: &mut [(Lit, u8)]) {
         if !self.config.disjunct_learning {
             return;
@@ -177,18 +191,8 @@ impl Engine<'_> {
         if failures.len() < heads.len() {
             failures.resize(heads.len(), 0);
         }
-        let group = |h: Head| match h {
-            Head::AtLeast(n, _) => {
-                if matches!(self.p.at_least[n as usize].filler, Filler::Not(_)) {
-                    0
-                } else {
-                    2
-                }
-            }
-            _ => 1,
-        };
         let failures = &self.failures[clause as usize];
-        open.sort_by_key(|&(_, i)| (group(heads[i as usize]), failures[i as usize]));
+        open.sort_by_key(|&(_, i)| failures[i as usize]);
     }
 
     /// Takes the next alternative of the newest branch point.
@@ -260,7 +264,7 @@ impl Engine<'_> {
             if frame.next < frame.alternatives.len() {
                 match self.take_alternative() {
                     Ok(()) => break Ok(true),
-                    Err(Stop::Clash(d)) => {
+                    Err(Stop::Clash(d) | Stop::Abandon(d, _)) => {
                         dep = d;
                         continue;
                     }
