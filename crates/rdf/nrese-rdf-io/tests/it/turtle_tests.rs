@@ -313,6 +313,33 @@ fn parallel_parsing_is_exact() {
     }
 }
 
+/// A document that starts with RDF 1.2's `VERSION "1.2"` parses in parallel: each chunk
+/// gets the prefixes declared after it (the skim took the version for a statement and
+/// lost the next directive, so later chunks didn't know `prov:`; found loading the
+/// Zebratlas release, 4 October 2026).
+#[test]
+fn a_versioned_document_parses_in_parallel() {
+    let mut text = String::from(
+        "VERSION \"1.2\"\n@prefix prov: <http://www.w3.org/ns/prov#> .\n@prefix ex: <http://e/> .\n",
+    );
+    for i in 0..400 {
+        text.push_str(&format!("ex:s{i} prov:wasGeneratedBy ex:run{i} .\n"));
+    }
+    let sequential: BTreeSet<Quad> = parse(RdfFormat::Turtle, &text)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(sequential.len(), 400);
+    for parts in [2, 4, 9] {
+        let parsers = RdfParser::from_format(RdfFormat::Turtle)
+            .split_slice_for_parallel_parsing(text.as_bytes(), parts)
+            .unwrap();
+        assert!(parsers.len() > 1);
+        let quads: BTreeSet<Quad> = parsers.into_iter().flatten().map(|q| q.unwrap()).collect();
+        assert_eq!(quads, sequential, "in {parts} parts");
+    }
+}
+
 /// Recovering: a statement with a syntax error is reported and skipped up to its `.` (or
 /// the `}` ending its TriG block), and parsing goes on; without, it stops there.
 #[test]
