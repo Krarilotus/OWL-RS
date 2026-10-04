@@ -463,3 +463,36 @@ fn horn_encodings_keep_their_answers() {
     b.assert(org, 102);
     assert_eq!(answer(&b.o), Answer::Inconsistent);
 }
+
+#[test]
+fn an_inverse_pair_with_a_transitive_role_is_regular() {
+    // ore_ont_15971: after inverse of before, before transitive. a: ∀before.¬C,
+    // before(a, b), after(c, b) (so before(b, c)), c: C is inconsistent; it was
+    // "unsupported: an irregular role hierarchy".
+    let mut b = Build::default();
+    let c = b.class(1);
+    let (before, after) = (ObjProp::Named(200), ObjProp::Named(201));
+    b.axiom(Axiom::InverseObjectProperties(before, after));
+    b.characteristic(Characteristic::Transitive, before);
+    let nc = b.not(c);
+    let all = b.all(before, nc);
+    b.assert(all, 100);
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(201, 102, 101);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.assert(c, 102);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // ... and along after: c: ∀after.¬C, before(a, b), before(b, c), a: C.
+    let mut b = Build::default();
+    let c = b.class(1);
+    b.axiom(Axiom::InverseObjectProperties(before, after));
+    b.characteristic(Characteristic::Transitive, before);
+    let nc = b.not(c);
+    let all = b.all(after, nc);
+    b.assert(all, 102);
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(200, 101, 102);
+    b.assert(c, 100);
+    assert!(normalise(&b.o).unsupported.is_empty());
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
