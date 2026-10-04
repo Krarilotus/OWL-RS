@@ -243,20 +243,48 @@ pub fn materialise_until(
             rounds,
             ..
         } = batch::materialise_owned_until(rewritten.clone(), &rules, lists, schema, stop)?;
+        let input_len = rewritten.len();
         let mut closure = rewritten;
         closure.extend(derived);
         closure.par_sort_unstable();
         closure.dedup();
-        let new_equalities = closure.iter().any(|t| t[1] == same_as && t[0] != t[2]);
-        if !new_equalities {
-            return Ok(RepresentativeClosure {
-                facts: closure,
-                classes,
-                violations,
-                diagnostics,
-                rounds,
-                merges,
-            });
+        // Done when no class grows and the round added nothing modulo equality. A rule
+        // head naming a constant that isn't its class's representative derives a fact
+        // over that constant in every round (a `sameAs` too): only its rewrite says
+        // whether it is new, and the rewrite can feed rules that join on the
+        // representative, hence one more round. Without such heads every fact is over
+        // representatives, and a round that merges nothing ends it.
+        let grows = closure.iter().any(|t| {
+            t[1] == same_as && classes.representative(t[0]) != classes.representative(t[2])
+        });
+        if !grows {
+            let finished =
+                if classes.is_empty() || closure.par_iter().all(|&t| classes.rewrite(t) == t) {
+                    Some(std::mem::take(&mut closure))
+                } else {
+                    let mut rewritten: Vec<Triple> =
+                        closure.par_iter().map(|&t| classes.rewrite(t)).collect();
+                    rewritten.par_sort_unstable();
+                    rewritten.dedup();
+                    // The round's input was over representatives, so it is in `rewritten`:
+                    // the same length means the same facts.
+                    if rewritten.len() == input_len {
+                        Some(rewritten)
+                    } else {
+                        closure = rewritten;
+                        None
+                    }
+                };
+            if let Some(facts) = finished {
+                return Ok(RepresentativeClosure {
+                    facts,
+                    classes,
+                    violations,
+                    diagnostics,
+                    rounds,
+                    merges,
+                });
+            }
         }
         facts = closure;
     }
