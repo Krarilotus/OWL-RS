@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step, Stop, proof};
-use super::graph::NONE;
+use super::graph::{Annot, NONE};
 
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +55,7 @@ impl Engine<'_> {
             self.add_inequality(x, y, DepSetId::EMPTY, proof::ASSERTED)?;
         }
         for &(i, j) in &a.same {
-            let lit = Lit::Equal(self.roots[i as usize], self.roots[j as usize], NONE);
+            let lit = Lit::Equal(self.roots[i as usize], self.roots[j as usize], Annot::NONE);
             self.assert(lit, DepSetId::EMPTY, proof::ASSERTED)?;
         }
         Ok(())
@@ -91,6 +91,9 @@ impl Engine<'_> {
         self.check_time()?;
         self.check_memory()?;
         self.saturate()?;
+        if self.apply_ni()? {
+            return Ok(true);
+        }
         if !self.config.disjunctions_first && self.expand_at_least()? {
             return Ok(true);
         }
@@ -125,15 +128,11 @@ impl Engine<'_> {
             }
             let bind: Vec<u32> = bind.to_vec();
             let mut dep = pend.dep;
+            let annotation = clause.annotation;
             let mut open = Vec::new();
             let mut satisfied = false;
-            let mut ni = false;
             for &h in &clause.head {
-                let lit = self.lit(h, &bind);
-                if self.needs_ni(lit) {
-                    ni = true;
-                    continue;
-                }
+                let lit = self.lit(h, &bind, annotation);
                 match self.holds(lit) {
                     Ok(true) => {
                         satisfied = true;
@@ -147,8 +146,15 @@ impl Engine<'_> {
                 self.pending_open = at as u32;
                 continue;
             }
-            if ni {
-                return Err(super::engine::ni_stop());
+            // A lone equality the NI rule governs and has pending already: left to it
+            // (its nodes are indirectly blocked, or it is applied next round).
+            if let [lit @ Lit::Equal(a, b, annot)] = open[..]
+                && self.needs_ni(lit)
+            {
+                if self.ni_defer(a, b, dep, annot) {
+                    return Ok(true);
+                }
+                continue;
             }
             return match open.len() {
                 0 => Err(self.clash(dep, DepSetId::EMPTY)),
@@ -168,10 +174,11 @@ impl Engine<'_> {
         let lit = frame.alternatives[frame.next];
         let (premise, failed) = (frame.premise, frame.failed);
         let tried: Vec<Lit> = frame.alternatives[..frame.next].to_vec();
+        let semantic = frame.semantic;
         let single = self.deps.single(level);
         let dep = self.deps.union(premise, single);
         self.assert(lit, dep, proof::CHOICE)?;
-        if self.config.semantic_branching {
+        if self.config.semantic_branching && semantic {
             for t in tried {
                 self.negate(t, failed)?;
             }
@@ -241,6 +248,8 @@ impl Engine<'_> {
         self.pending.truncate(frame.pending as usize);
         self.bindings.truncate(frame.bindings as usize);
         self.pending_open = frame.pending_open;
+        self.ni.pending.truncate(frame.ni_pending as usize);
+        self.ni.open = frame.ni_open;
         // The queues were empty when the branch point was opened.
         self.done.nodes = frame.mark.nodes;
         self.done.unary = frame.mark.unary;

@@ -134,8 +134,24 @@ pub struct Equality {
     pub a: u32,
     pub b: u32,
     pub dep: DepSetId,
-    /// Raised by an at-most restriction at this root: the merge may need the NI rule.
-    pub at_root: u32,
+    /// Raised by an at-most restriction at a root: the merge may need the NI rule.
+    pub annot: Annot,
+}
+
+/// The annotation `@u ≤ n R.B` of an equality (JAIR 2009, Definition 5): the root `u` an
+/// at-most restriction raised it at, and the restriction (an index into
+/// `Program::annotations`); `NONE` parts where there is none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Annot {
+    pub root: u32,
+    pub number: u32,
+}
+
+impl Annot {
+    pub const NONE: Self = Self {
+        root: NONE,
+        number: NONE,
+    };
 }
 
 /// What changed in place, to undo.

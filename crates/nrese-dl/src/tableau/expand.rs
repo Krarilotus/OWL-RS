@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use super::depset::DepSetId;
 use super::engine::{Engine, Frame, Lit, Step, Stop, proof};
-use super::graph::{Edge, NONE, flag};
+use super::graph::{Annot, Edge, NONE, flag};
 use super::program::{Filler, Number};
 
 impl Engine<'_> {
@@ -178,16 +178,28 @@ impl Engine<'_> {
             for (index, dep) in facts {
                 let number = self.p.at_most[index as usize];
                 let mut found = self.neighbours(s, &number);
+                let annot = Annot {
+                    root: if self.g.nodes[s as usize].flags & flag::ROOT != 0 {
+                        s
+                    } else {
+                        NONE
+                    },
+                    number: self.p.at_most_annotation[index as usize],
+                };
                 // The clause this atom stands for binds its successors to any neighbours,
                 // one node twice included: a blockable non-successor of a root then
-                // needs the NI rule.
-                if self.g.nodes[s as usize].flags & flag::ROOT != 0
-                    && found.iter().any(|&(u, _)| {
-                        let n = &self.g.nodes[u as usize];
-                        n.flags & flag::ROOT == 0 && n.parent != s
-                    })
-                {
-                    return Err(super::engine::ni_stop());
+                // raises `u ≈ u` for the NI rule.
+                if annot.root != NONE {
+                    let mut raised = false;
+                    for &(u, d) in &found {
+                        if self.needs_ni(Lit::Equal(u, u, annot)) {
+                            let d = self.deps.union(dep, d);
+                            raised |= self.ni_defer(u, u, d, annot);
+                        }
+                    }
+                    if raised {
+                        return Ok(true);
+                    }
                 }
                 if found.len() <= number.n as usize {
                     continue;
@@ -197,11 +209,6 @@ impl Engine<'_> {
                 for &(_, d) in &found {
                     premise = self.deps.union(premise, d);
                 }
-                let root = if self.g.nodes[s as usize].flags & flag::ROOT != 0 {
-                    s
-                } else {
-                    NONE
-                };
                 let mut alternatives = Vec::new();
                 for (i, &(a, _)) in found.iter().enumerate() {
                     for &(b, _) in &found[i + 1..] {
@@ -210,7 +217,7 @@ impl Engine<'_> {
                                 let d = self.g.inequalities[k as usize].dep;
                                 premise = self.deps.union(premise, d);
                             }
-                            None => alternatives.push(Lit::Equal(a, b, root)),
+                            None => alternatives.push(Lit::Equal(a, b, annot)),
                         }
                     }
                 }
@@ -228,12 +235,26 @@ impl Engine<'_> {
 
     /// Opens a branch point over `alternatives` and takes the first.
     pub fn branch(&mut self, alternatives: Vec<Lit>, premise: DepSetId) -> Step<()> {
+        self.branch_with(alternatives, premise, true)
+    }
+
+    /// Opens a branch point; `semantic`: later alternatives are taken with the failed
+    /// ones' negations (where semantic branching is on).
+    pub fn branch_with(
+        &mut self,
+        alternatives: Vec<Lit>,
+        premise: DepSetId,
+        semantic: bool,
+    ) -> Step<()> {
         self.stats.branch_points += 1;
         self.frames.push(Frame {
             mark: self.g.mark(),
             pending: self.pending.len() as u32,
             bindings: self.bindings.len() as u32,
             pending_open: self.pending_open,
+            ni_pending: self.ni.pending.len() as u32,
+            ni_open: self.ni.open,
+            semantic,
             alternatives,
             next: 0,
             premise,
