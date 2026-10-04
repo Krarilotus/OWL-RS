@@ -269,9 +269,10 @@ impl<'a> Engine<'a> {
                 number,
                 node,
             } => self.g.number(node, at_most, number).is_some(),
-            Lit::Equal(a, b, _) => {
+            Lit::Equal(a, b, annot) => {
                 let (s, t) = (self.g.find(a), self.g.find(b));
-                if s == t && !self.needs_ni(lit) {
+                let ni = self.needs_ni(lit);
+                if (s == t && !ni) || (ni && self.ni_pending(a, b, annot)) {
                     return Ok(true);
                 }
                 if let Some(i) = self.g.unequal(s, t) {

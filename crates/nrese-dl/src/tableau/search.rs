@@ -146,16 +146,6 @@ impl Engine<'_> {
                 self.pending_open = at as u32;
                 continue;
             }
-            // A lone equality the NI rule governs and has pending already: left to it
-            // (its nodes are indirectly blocked, or it is applied next round).
-            if let [lit @ Lit::Equal(a, b, annot)] = open[..]
-                && self.needs_ni(lit)
-            {
-                if self.ni_defer(a, b, dep, annot) {
-                    return Ok(true);
-                }
-                continue;
-            }
             return match open.len() {
                 0 => Err(self.clash(dep, DepSetId::EMPTY)),
                 1 => self.assert(open[0], dep, clause.source).map(|()| true),
