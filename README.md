@@ -60,6 +60,9 @@ Already fixed on the way (Milestone 0):
 
 ## Quick start with Docker
 
+For a portable Linux amd64 image with source provenance and a capped acceptance
+check, see [the checked image workflow](docs/ops/linux-image.md).
+
 ```bash
 docker build -t nrese .
 docker run -p 8080:8080 -v nrese-data:/var/lib/nrese/data nrese

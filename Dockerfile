@@ -26,8 +26,8 @@ COPY .cargo .cargo
 COPY crates crates
 # The server's build script embeds the console it finds here.
 COPY --from=console /src/apps/nrese-console/dist apps/nrese-console/dist
-# `--build-arg CARGO_BUILD_JOBS=8` keeps the build from taking every core.
-ARG CARGO_BUILD_JOBS=default
+# Two jobs by default; `--build-arg CARGO_BUILD_JOBS=8` opts into a larger builder.
+ARG CARGO_BUILD_JOBS=2
 # Code for x86-64-v3 (AVX2: server CPUs of the last decade), so the image runs wherever it
 # is pushed. For the building machine's own CPU (benchmark and local images):
 # `--build-arg NRESE_TARGET_CPU=native`; for any x86-64: `portable`
@@ -43,12 +43,17 @@ FROM debian:bookworm-slim
 # provider's token introspection); for an internal certificate authority, mount your CA
 # bundle and point SSL_CERT_FILE at it.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /var/lib/nrese --shell /usr/sbin/nologin nrese \
     && mkdir -p /var/lib/nrese/data \
     && chown -R nrese:nrese /var/lib/nrese
 COPY --from=build /src/target/release/nrese-server /usr/local/bin/nrese-server
+ARG NRESE_SOURCE_REVISION=unknown
+ARG NRESE_TARGET_CPU=x86-64-v3
+LABEL org.opencontainers.image.source="https://github.com/Krarilotus/OWL-RS" \
+    org.opencontainers.image.revision="${NRESE_SOURCE_REVISION}" \
+    io.nrese.target-cpu="${NRESE_TARGET_CPU}"
 USER nrese
 WORKDIR /var/lib/nrese
 # Durable storage in the volume, reachable from outside the container. Everything else
@@ -58,4 +63,5 @@ ENV NRESE_BIND_ADDR=0.0.0.0:8080 \
     NRESE_DATA_DIR=/var/lib/nrese/data
 VOLUME /var/lib/nrese/data
 EXPOSE 8080
-ENTRYPOINT ["nrese-server"]
+# Forward stop signals and reap children even when the server has no signal handler.
+ENTRYPOINT ["/usr/bin/tini", "--", "nrese-server"]
