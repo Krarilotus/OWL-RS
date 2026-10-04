@@ -8,6 +8,8 @@ license.workspace = true
 
 [dependencies]
 nrese-engine = { path = "../nrese-engine" }
+# The process's memory and its limit (memory).
+nrese-exec = { path = "../nrese-exec" }
 nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-shacl = { path = "../nrese-shacl" }
 nrese-sparql = { path = "../nrese-sparql" }

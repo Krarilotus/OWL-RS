@@ -7,6 +7,7 @@
 //! - [`group`]: grouping with aggregates over sorted or unsorted input
 //! - [`graph`]: adjacency, reachability and closures (property paths, hierarchies)
 //! - [`budget`]: per-query memory accounting
+//! - [`memory`]: the process's memory, and a watch for limits on long operations
 //!
 //! Everything here works on ids: it never decodes a term. Operations that need values
 //! (numeric comparison, ordering, aggregation) take them through the caller's resolver,
@@ -20,6 +21,7 @@ pub mod budget;
 pub mod graph;
 pub mod group;
 pub mod join;
+pub mod memory;
 pub mod table;
 
 pub use budget::{Budget, BudgetExceeded, SharedBudget};

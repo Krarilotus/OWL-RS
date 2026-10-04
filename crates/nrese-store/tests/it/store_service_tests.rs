@@ -436,3 +436,34 @@ fn a_cancelled_graph_read_stops() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!error.is_request_error(), "{error}");
     Ok(())
 }
+
+/// A materialisation stops at the process's memory limit with its own error and changes
+/// nothing, instead of taking the machine (a test of the U1 bound grew to 128 GB on a
+/// 64 GB machine on 3 October 2026).
+#[test]
+fn a_materialisation_stops_at_the_process_memory_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let config = StoreConfig {
+        process_memory_bytes: 1,
+        ..StoreConfig::in_memory()
+    };
+    let store = StoreService::new(config)?;
+    store.execute_update_str(
+        "INSERT DATA { <http://e/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://e/D> .
+                       <http://e/a> a <http://e/C> }",
+    )?;
+    let error = store
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Rdfs)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            nrese_store::StoreError::ProcessMemoryLimit { limit: 1 }
+        ),
+        "{error}"
+    );
+    assert!(!error.is_request_error());
+    assert!(store.reasoning_state().is_none(), "nothing was applied");
+    // By default the limit is three quarters of what the process may use.
+    assert!(StoreConfig::in_memory().process_memory_bytes > 0);
+    Ok(())
+}
