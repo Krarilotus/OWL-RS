@@ -9,6 +9,10 @@
 //!   cut removes facts newest first, so restoring each head from the removed fact's
 //!   `next` gives back the old lists exactly.
 //! - **Trail:** only node flags and representatives change in place (pruning, merging).
+//! - **Merges have dependencies:** a merged node keeps what its merge depended on, and
+//!   following a node to its representative collects them ([`Graph::find_with`]): a fact
+//!   stated about a node that was merged since holds of the representative only by those
+//!   merges (HermiT's canonical-node dependency set).
 //! - **Membership:** a hash index per table; the hyperresolution joins and the clash
 //!   checks ask it.
 
@@ -137,8 +141,15 @@ pub struct Equality {
 /// What changed in place, to undo.
 #[derive(Debug, Clone, Copy)]
 pub enum Undo {
-    Flags { node: u32, old: u32 },
-    Representative { node: u32, old: u32 },
+    Flags {
+        node: u32,
+        old: u32,
+    },
+    Representative {
+        node: u32,
+        old: u32,
+        old_dep: DepSetId,
+    },
 }
 
 /// The lengths of every table: a point to cut back to.
@@ -169,6 +180,9 @@ pub struct Graph {
     pub inequalities: Vec<Inequality>,
     pub equalities: Vec<Equality>,
     pub trail: Vec<Undo>,
+    /// By node: what its merge into its representative depended on (read only while the
+    /// node is merged).
+    pub merge_deps: Vec<DepSetId>,
     /// Counts cuts: a fact index can be reused after one, so caches keyed by list heads
     /// are valid within one generation only.
     pub generation: u32,
@@ -224,6 +238,7 @@ impl Graph {
             flags,
             blocking_hash: 0,
         });
+        self.merge_deps.push(DepSetId::EMPTY);
         id
     }
 
@@ -252,10 +267,23 @@ impl Graph {
         }
     }
 
-    pub fn set_representative(&mut self, node: u32, to: u32) {
+    /// The node `node` was merged into, followed to a node that wasn't merged; `each` is
+    /// given what every merge on the way depended on.
+    pub fn find_with(&self, mut node: u32, mut each: impl FnMut(DepSetId)) -> u32 {
+        while self.nodes[node as usize].flags & flag::MERGED != 0 {
+            each(self.merge_deps[node as usize]);
+            node = self.nodes[node as usize].representative;
+        }
+        node
+    }
+
+    /// Records that `node` is merged into `to` by `dep`.
+    pub fn set_representative(&mut self, node: u32, to: u32, dep: DepSetId) {
         let old = self.nodes[node as usize].representative;
-        self.trail.push(Undo::Representative { node, old });
+        let old_dep = self.merge_deps[node as usize];
+        self.trail.push(Undo::Representative { node, old, old_dep });
         self.nodes[node as usize].representative = to;
+        self.merge_deps[node as usize] = dep;
     }
 
     // Membership -------------------------------------------------------------------------
@@ -431,8 +459,9 @@ impl Graph {
                     }
                     self.nodes[node as usize].flags = old
                 }
-                Some(Undo::Representative { node, old }) => {
-                    self.nodes[node as usize].representative = old
+                Some(Undo::Representative { node, old, old_dep }) => {
+                    self.nodes[node as usize].representative = old;
+                    self.merge_deps[node as usize] = old_dep;
                 }
                 None => break,
             }
@@ -524,6 +553,7 @@ impl Graph {
         }
         self.equalities.truncate(mark.equalities as usize);
         self.nodes.truncate(alive);
+        self.merge_deps.truncate(alive);
     }
 
     // Iteration ------------------------------------------------------------------------
@@ -619,6 +649,7 @@ impl Graph {
             + self.inequalities.capacity() * size_of::<Inequality>()
             + self.equalities.capacity() * size_of::<Equality>()
             + self.trail.capacity() * size_of::<Undo>()
+            + self.merge_deps.capacity() * size_of::<DepSetId>()
             + (self.unary_ix.capacity() + self.negative_ix.capacity()) * 12
             + self.edge_ix.capacity() * 16
             + (self.number_ix.capacity() + self.inequality_ix.capacity()) * 12

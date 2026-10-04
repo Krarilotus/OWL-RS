@@ -22,7 +22,6 @@ WebOnt-description-logic-641 (InconsistencyTest)	not investigated; presumably 60
 WebOnt-description-logic-642 (InconsistencyTest)	not investigated; presumably 601's reader gap
 WebOnt-description-logic-643 (InconsistencyTest)	not investigated; presumably 601's reader gap
 WebOnt-description-logic-646 (InconsistencyTest)	not investigated; presumably 601's reader gap
-WebOnt-description-logic-501 (ConsistencyTest)	not investigated: answered inconsistent (ALCO); an engine or reader error, the most serious open item
 WebOnt-Restriction-005-direct (PositiveEntailmentTest)	not investigated: answered not entailed
 WebOnt-imports-011 (PositiveEntailmentTest)	not investigated: answered not entailed (imports are not resolved by the runner)
 WebOnt-miscellaneous-011 (PositiveEntailmentTest)	not investigated: answered not entailed
