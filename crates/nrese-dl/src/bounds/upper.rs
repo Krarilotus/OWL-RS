@@ -52,11 +52,9 @@
 //!   clauses are listed in [`Program::unchecked`], and a clash-free U1 proves
 //!   consistency only without them ([`Program::proves_consistency`]).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use nrese_owl::{
-    Axiom, Characteristic, ClassExpr, Concept, EntityKind, Normalised, ObjProp, Ontology, Term,
-};
+use nrese_owl::{Axiom, Characteristic, ClassExpr, Concept, Normalised, ObjProp, Ontology, Term};
 
 use super::program::{
     Approximations, Atom, Names, Origin, Program, Provenance, Rule, Signature, Slot,
@@ -128,7 +126,7 @@ pub fn compile_with(
     ]
     .map(|local| iri(&format!("{OWL}{local}")));
     let mut c = Compiler {
-        program: Program::new(names, signature(ontology, normalised)),
+        program: Program::new(names, Signature::of(ontology, normalised)),
         normalised,
         iri,
         nominals: HashMap::new(),
@@ -157,98 +155,6 @@ pub fn compile_with(
     c.program.incomplete.sort_unstable();
     c.program.incomplete.dedup();
     c.program
-}
-
-/// The named entities of the ontology and its clauses.
-fn signature(ontology: &Ontology, n: &Normalised) -> Signature {
-    let mut classes = BTreeSet::new();
-    let mut roles = BTreeSet::new();
-    let mut data = BTreeSet::new();
-    let mut individuals = BTreeSet::new();
-    for id in 0..n.classes.len() as u32 {
-        match n.classes.get(id) {
-            ClassExpr::Class(t) => {
-                classes.insert(*t);
-            }
-            ClassExpr::OneOf(xs) => individuals.extend(xs.iter().copied()),
-            ClassExpr::HasValue(r, a) => {
-                roles.insert(r.named());
-                individuals.insert(*a);
-            }
-            ClassExpr::Some(r, _)
-            | ClassExpr::All(r, _)
-            | ClassExpr::HasSelf(r)
-            | ClassExpr::Min(_, r, _)
-            | ClassExpr::Max(_, r, _)
-            | ClassExpr::Exact(_, r, _) => {
-                roles.insert(r.named());
-            }
-            ClassExpr::DataSome(d, _)
-            | ClassExpr::DataAll(d, _)
-            | ClassExpr::DataHasValue(d, _)
-            | ClassExpr::DataMin(_, d, _)
-            | ClassExpr::DataMax(_, d, _)
-            | ClassExpr::DataExact(_, d, _) => {
-                data.insert(*d);
-            }
-            _ => {}
-        }
-    }
-    for axiom in &ontology.axioms {
-        let mut role = |ps: &[ObjProp]| roles.extend(ps.iter().map(|p| p.named()));
-        match axiom {
-            Axiom::Declaration(EntityKind::Class, t) | Axiom::DisjointUnion(t, _) => {
-                classes.insert(*t);
-            }
-            Axiom::Declaration(EntityKind::ObjectProperty, t) => role(&[ObjProp::Named(*t)]),
-            Axiom::Declaration(EntityKind::DataProperty, t)
-            | Axiom::DataPropertyDomain(t, _)
-            | Axiom::DataPropertyRange(t, _)
-            | Axiom::FunctionalDataProperty(t) => {
-                data.insert(*t);
-            }
-            Axiom::Declaration(EntityKind::NamedIndividual, t) | Axiom::ClassAssertion(_, t) => {
-                individuals.insert(*t);
-            }
-            Axiom::SubObjectPropertyOf(chain, sup) => {
-                role(chain);
-                role(&[*sup]);
-            }
-            Axiom::EquivalentObjectProperties(ps) | Axiom::DisjointObjectProperties(ps) => role(ps),
-            Axiom::InverseObjectProperties(a, b) => role(&[*a, *b]),
-            Axiom::ObjectPropertyDomain(r, _)
-            | Axiom::ObjectPropertyRange(r, _)
-            | Axiom::ObjectCharacteristic(_, r) => role(&[*r]),
-            Axiom::HasKey(_, ps, ds) => {
-                role(ps);
-                data.extend(ds.iter().copied());
-            }
-            Axiom::SubDataPropertyOf(a, b) => data.extend([*a, *b]),
-            Axiom::EquivalentDataProperties(ds) | Axiom::DisjointDataProperties(ds) => {
-                data.extend(ds.iter().copied())
-            }
-            Axiom::ObjectPropertyAssertion(p, a, b)
-            | Axiom::NegativeObjectPropertyAssertion(p, a, b) => {
-                role(&[ObjProp::Named(*p)]);
-                individuals.extend([*a, *b]);
-            }
-            Axiom::DataPropertyAssertion(d, a, _)
-            | Axiom::NegativeDataPropertyAssertion(d, a, _) => {
-                data.insert(*d);
-                individuals.insert(*a);
-            }
-            Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => {
-                individuals.extend(xs.iter().copied())
-            }
-            _ => {}
-        }
-    }
-    Signature {
-        classes: classes.into_iter().collect(),
-        object_properties: roles.into_iter().collect(),
-        data_properties: data.into_iter().collect(),
-        individuals: individuals.into_iter().collect(),
-    }
 }
 
 /// The compiler's state: the program so far, the clauses' expressions, and the interner.
@@ -311,6 +217,13 @@ impl Compiler<'_> {
     pub(super) fn clash(&self, at: Slot) -> Atom {
         let clash = Slot::Const(self.program.names.clash);
         Atom([at, clash, clash])
+    }
+
+    /// A term of U1's own (a predicate of its machinery), internal.
+    fn own(&mut self, iri: &str) -> Term {
+        let id = (self.iri)(iri);
+        self.program.add_internal(id);
+        id
     }
 
     pub(super) fn skolem(&mut self, iri: &str) -> Term {
@@ -453,39 +366,49 @@ impl Compiler<'_> {
                 self.program.facts.push((fact, assertion(source)));
             }
         }
-        // Negative assertions and differences as `⊥` rules over the individuals' classes.
-        let (x, y) = (Slot::Var(0), Slot::Var(1));
-        let mut rules = Vec::new();
-        for &(p, a, b, source) in &facts.not_roles {
-            let (na, nb) = (self.nominal(a), self.nominal(b));
-            let body = vec![
-                self.type_atom(x, na),
-                Atom([x, Slot::Const(p), y]),
-                self.type_atom(y, nb),
-            ];
-            rules.push((body, source));
-        }
-        for &(d, a, v, source) in &facts.not_data {
-            let na = self.nominal(a);
-            let body = vec![
-                self.type_atom(x, na),
-                Atom([x, Slot::Const(d), Slot::Const(v)]),
-            ];
-            rules.push((body, source));
-        }
+        // Differences and negative assertions as facts over U1's own predicates, with
+        // one `⊥` rule per predicate: linear in the assertions (a rule per pair made
+        // 2,429 rules of OWL2Bench's differences), and right under equality by copying
+        // and by representatives alike (two equal individuals make `x different x`).
         let clash = self.program.names.clash;
+        let different = self.own(&format!("{U1}different"));
+        let (x, y) = (Slot::Var(0), Slot::Var(1));
+        let mut negated: BTreeMap<Term, Term> = BTreeMap::new();
         for &(a, b, source) in &facts.different {
             if a == b {
                 // `a` different from itself: a clash outright.
                 self.program.facts.push(([a, clash, clash], bottom(source)));
-                continue;
+            } else {
+                self.program.facts.push(([a, different, b], bottom(source)));
             }
-            let (na, nb) = (self.nominal(a), self.nominal(b));
-            rules.push((vec![self.type_atom(x, na), self.type_atom(x, nb)], source));
         }
-        for (k, (body, source)) in rules.into_iter().enumerate() {
+        let negative = facts.not_roles.iter().map(|&(p, a, b, s)| (p, a, b, s));
+        let negative = negative.chain(facts.not_data.iter().map(|&(d, a, v, s)| (d, a, v, s)));
+        for (p, a, b, source) in negative.collect::<Vec<_>>() {
+            let not = match negated.get(&p) {
+                Some(&not) => not,
+                None => {
+                    let not = self.own(&format!("{U1}not{p}"));
+                    negated.insert(p, not);
+                    not
+                }
+            };
+            self.program.facts.push(([a, not, b], bottom(source)));
+        }
+        let builtin = Provenance {
+            origin: Origin::Builtin,
+            sources: Vec::new(),
+            approximations: Approximations::default(),
+        };
+        if !facts.different.is_empty() {
+            let body = vec![Atom([x, Slot::Const(different), x])];
             let head = vec![self.clash(x)];
-            self.push(format!("u1-a{k}"), body, head, bottom(source));
+            self.push("u1-different".to_owned(), body, head, builtin.clone());
+        }
+        for (p, not) in negated {
+            let body = vec![Atom([x, Slot::Const(not), y]), Atom([x, Slot::Const(p), y])];
+            let head = vec![self.clash(x)];
+            self.push(format!("u1-not{p}"), body, head, builtin.clone());
         }
         // Individuals the rules may not type: owl:Thing outright.
         let mut individuals: BTreeSet<Term> = BTreeSet::new();

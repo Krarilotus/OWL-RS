@@ -5,6 +5,13 @@
 //! body components its variables are in; for the others it only matters that they are
 //! satisfiable at `x`, which a projection rule `Cⱼ(x, ȳⱼ) → Pⱼ(x)` derives. The rewriting
 //! is exact: the rules derive the same atoms over the ontology's vocabulary.
+//!
+//! A single part the head doesn't need is cut off the centre's atoms the same way:
+//! `Person(x) ∧ takesCourse(x, y) ∧ Course(y) → Student(x)` as `takesCourse(x, y) ∧
+//! Course(y) → P(x)` and `Person(x) ∧ P(x) → Student(x)`. The rule reasoner's planner
+//! takes the atom with most known positions next, constants and bound variables alike,
+//! so from `Person(x)` it may pick `Course(y)`, the smaller relation, and join every
+//! person with every course (LUBM(1): 13·10⁶ bindings, U1 thirteen times L's time).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -60,7 +67,8 @@ impl Compiler<'_> {
         projections: &mut Projections,
     ) {
         let (core, parts) = components(&body, x);
-        if parts.len() < 2 {
+        // One part and nothing beside it: nothing to cut.
+        if parts.is_empty() || (parts.len() == 1 && core.is_empty()) {
             self.push(name, body, head, provenance);
             return;
         }
@@ -80,6 +88,12 @@ impl Compiler<'_> {
             touched.sort_unstable();
             touched.dedup();
             groups.entry(touched).or_default().push(atom);
+        }
+        if groups.keys().all(|touched| touched.len() == parts.len()) {
+            // Every head atom needs every part.
+            let head = groups.into_values().flatten().collect();
+            self.push(name, body, head, provenance);
+            return;
         }
         let single = groups.len() == 1;
         for (g, (touched, head)) in groups.into_iter().enumerate() {
