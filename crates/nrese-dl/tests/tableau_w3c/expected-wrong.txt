@@ -1,5 +1,3 @@
 # W3C tests the hypertableau answers wrongly, with the cause where it is known: one per
 # line, "name (TestType)<TAB>why". The run fails on a wrong answer not listed here, and on
 # a listed one that no longer is wrong. Not one of these is settled; each must be fixed.
-WebOnt-imports-011 (PositiveEntailmentTest)	the runner reads the premise without its owl:imports (support011-A has Man ⊑ Mortal)
-WebOnt-miscellaneous-011 (PositiveEntailmentTest)	the runner reads the premise without its owl:imports (the wine and food ontologies)

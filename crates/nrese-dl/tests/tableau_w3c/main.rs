@@ -5,6 +5,9 @@
 //!
 //! - The suite: `.cache/owl-test/all.rdf` (scripts/fetch-w3c-tests.sh) or the file
 //!   `NRESE_W3C_OWL_TESTS` points to; skipped without it unless `NRESE_W3C_REQUIRED`.
+//! - Documents are read with their `owl:imports` closure, from the documents the suite
+//!   gives for import (`test:importedOntologyIRI`); an import it doesn't give is
+//!   `not-run`.
 //! - Every test ends as `pass`, `wrong`, or not decided with the reason (`unsupported`,
 //!   `gave-up`, `not-run`). A wrong answer fails the run; the rest is reported by test
 //!   type and fragment. `NRESE_W3C_OUT` names a TSV file for the per-test results.
@@ -44,6 +47,11 @@ struct Case {
     types: Vec<String>,
     /// By role: `Premise`, `Conclusion`, `NonConclusion`, `Input`.
     documents: HashMap<String, String>,
+    /// `test:importedOntologyIRI`, of an imported document.
+    iri: Option<String>,
+    /// Every document the suite gives for import, by ontology IRI (`test:importedOntology`
+    /// lists them per case, not always all a case's premise imports).
+    imports: HashMap<String, String>,
 }
 
 /// How a test ended.
@@ -189,7 +197,7 @@ fn run_case(case: &Case, kind: &str) -> (Verdict, Features) {
             features,
         );
     };
-    let premise = match table.ontology(premise_text) {
+    let premise = match table.ontology(premise_text, &case.imports) {
         Ok(o) => o,
         Err(why) => return (Verdict::Open(format!("not-run: {why}")), features),
     };
@@ -238,7 +246,7 @@ fn run_case(case: &Case, kind: &str) -> (Verdict, Features) {
                     features,
                 );
             };
-            let conclusion = match table.ontology(text) {
+            let conclusion = match table.ontology(text, &case.imports) {
                 Ok(o) => o,
                 Err(why) => return (Verdict::Open(format!("not-run: {why}")), features),
             };
@@ -277,6 +285,11 @@ fn read_cases(text: &str) -> Vec<Case> {
         };
         match local {
             "identifier" => case.name = value.unwrap_or_default(),
+            "importedOntologyIRI" => {
+                if let RdfTerm::NamedNode(n) = &t.object {
+                    case.iri = Some(n.as_str().to_owned());
+                }
+            }
             "species" => case.dl |= object_local.as_deref() == Some("DL"),
             "semantics" => case.direct |= object_local.as_deref() == Some("DIRECT"),
             _ => {
@@ -291,9 +304,17 @@ fn read_cases(text: &str) -> Vec<Case> {
             }
         }
     }
+    let library: HashMap<String, String> = cases
+        .values()
+        .filter_map(|c| Some((c.iri.clone()?, c.documents.get("Input")?.clone())))
+        .collect();
     let mut out: Vec<Case> = cases
         .into_values()
         .filter(|c| c.dl && c.direct && !c.name.is_empty())
+        .map(|mut c| {
+            c.imports = library.clone();
+            c
+        })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
