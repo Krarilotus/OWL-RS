@@ -284,6 +284,128 @@ fn malformed_input_is_reported() {
     assert!(lines.contains(&"ObjectPropertyAssertion(ex:undeclared ex:x ex:y)".to_owned()));
 }
 
+/// What the W3C OWL 2 DL tests showed read wrongly or dropped silently: a cardinality over
+/// a data property where the source has no term for `rdfs:Literal` (DL-601: the axiom was
+/// dropped without a diagnostic), RDF's `rdfs:Class`, `rdf:Property` and `rdf:List`
+/// typing (read as class assertions: Restriction-005), and the built-in properties
+/// (read as ordinary ones, by use).
+#[test]
+fn reserved_vocabulary_is_read_by_its_meaning() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        ex:P a owl:DatatypeProperty .
+        ex:C owl:equivalentClass [ a owl:Restriction ; owl:onProperty ex:P ;
+            owl:maxCardinality "0"^^xsd:nonNegativeInteger ] .
+        ex:D a rdfs:Class . ex:p a rdf:Property . _:cell a rdf:List .
+        ex:x a [ a owl:Restriction , rdfs:Class ; owl:onProperty ex:q ;
+            owl:allValuesFrom ex:D ] .
+        ex:q a owl:ObjectProperty .
+        ex:i a [ a owl:Restriction ; owl:onProperty owl:bottomDataProperty ;
+            owl:someValuesFrom rdfs:Literal ] .
+        "#,
+    );
+    let ontology = read(&statements, &table);
+    let lines = rendered(&ontology, &table);
+    for expected in [
+        "EquivalentClasses(DataMaxCardinality(0 ex:P rdfs:Literal) ex:C)",
+        "Declaration(Class(ex:D))",
+        "ClassAssertion(ObjectAllValuesFrom(ex:q ex:D) ex:x)",
+        "ClassAssertion(DataSomeValuesFrom(<http://www.w3.org/2002/07/owl#bottomDataProperty> rdfs:Literal) ex:i)",
+    ] {
+        assert!(
+            lines.contains(&expected.to_owned()),
+            "missing {expected}\nread:\n{}",
+            lines.join("\n")
+        );
+    }
+    assert!(
+        !lines.iter().any(|l| l.contains("rdf-schema#Class>")
+            || l.contains("#Property>")
+            || l.contains("#List>")),
+        "reserved classes read as classes:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        ontology.diagnostics.is_empty(),
+        "{:?}",
+        ontology.diagnostics
+    );
+    assert_eq!(
+        ontology.builtin.bottom_data,
+        table.iri("http://www.w3.org/2002/07/owl#bottomDataProperty")
+    );
+    assert_round_trip(&ontology, &mut table);
+}
+
+/// An expression the reader can't take leaves its axiom out with a diagnostic, never
+/// silently (a qualified cardinality without its class was dropped without one).
+#[test]
+fn unreadable_expressions_are_reported() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        ex:p a owl:ObjectProperty .
+        ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ;
+            owl:maxQualifiedCardinality "1"^^xsd:nonNegativeInteger ] .
+        "#,
+    );
+    let ontology = read(&statements, &table);
+    assert!(
+        !ontology
+            .axioms
+            .iter()
+            .any(|a| matches!(a, Axiom::SubClassOf(..))),
+        "{:?}",
+        ontology.axioms
+    );
+    assert!(
+        ontology.diagnostics.iter().any(|d| d.is_fatal()),
+        "{:?}",
+        ontology.diagnostics
+    );
+}
+
+/// Horn axioms give Horn clauses (found by the U1 bound on OWL2Bench, 4 October 2026): a
+/// union on the left (`A ⊔ B ⊑ C` was `⊤ → C ∨ Q`) and an existential over a non-simple
+/// property on the left (`A ⊓ ∃R.D ⊑ B` was `A → B ∨ Q`, Q the start of R's automaton).
+#[test]
+fn horn_axioms_stay_horn() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        ex:worksFor a owl:ObjectProperty , owl:TransitiveProperty .
+        ex:partOf a owl:ObjectProperty . ex:partOf rdfs:subPropertyOf ex:worksFor .
+        [ a owl:Class ; owl:unionOf ( ex:Man ex:Woman ) ] rdfs:subClassOf ex:Person .
+        [ a owl:Class ; owl:intersectionOf ( ex:Person
+            [ a owl:Restriction ; owl:onProperty ex:worksFor ;
+              owl:someValuesFrom ex:Organization ] ) ] rdfs:subClassOf ex:Employee .
+        [ a owl:Restriction ; owl:onProperty ex:worksFor ; owl:someValuesFrom ex:Org ]
+            rdfs:subClassOf ex:Member .
+        ex:Boss rdfs:subClassOf [ a owl:Class ; owl:intersectionOf ( ex:Person
+            [ a owl:Restriction ; owl:onProperty ex:worksFor ;
+              owl:allValuesFrom ex:Organization ] ) ] .
+        "#,
+    );
+    let ontology = read(&statements, &table);
+    assert!(
+        ontology.diagnostics.is_empty(),
+        "{:?}",
+        ontology.diagnostics
+    );
+    let normalised = nrese_owl::normalise(&ontology);
+    let disjunctive: Vec<_> = normalised
+        .clauses
+        .iter()
+        .filter(|c| !c.flags.horn)
+        .collect();
+    assert!(disjunctive.is_empty(), "{disjunctive:#?}");
+    assert!(normalised.unsupported.is_empty());
+}
+
 /// Model → RDF → model is the identity on `ontology`.
 fn assert_round_trip(ontology: &Ontology, table: &mut Table) {
     let vocabulary = table.vocabulary();

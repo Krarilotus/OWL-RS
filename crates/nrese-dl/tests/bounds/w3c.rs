@@ -8,7 +8,7 @@
 //!   it must be in U1, as a fact or by an open data value (`Bounds::is_open`).
 //!   Assertions over reserved vocabulary (`c rdf:type rdfs:Class`) state no OWL 2 DL atom.
 //! - **Consistency tests:** counted as proved consistent where `Bounds::consistent`.
-//! - In every case L ⊆ U1, unless L violates a consistency rule.
+//! - In every case L ⊆ U1, unless L violates a consistency rule or axioms are left out.
 //!
 //! Cases that import other ontologies are left out: the test case holds only its own.
 //! The test cases: `.cache/owl-test/all.rdf` (scripts/fetch-w3c-tests.sh), or the file
@@ -251,7 +251,12 @@ fn w3c_inconsistencies_clash_and_entailed_assertions_are_in_u1() {
         let incomplete = !program.incomplete.is_empty();
         let proves = program.proves_consistency();
         let missing = bounds.lower_not_in_upper();
-        if !missing.is_empty() && lower.violations.is_empty() {
+        // Where axioms are left out (`program.incomplete`), U1 bounds only what the rest
+        // gives: New-Feature-TopObjectProperty-001's one axiom is over the universal
+        // property, so its individual is in L (`i a owl:Thing`) and nowhere in U1.
+        if !missing.is_empty() && lower.violations.is_empty() && incomplete {
+            *tally.entry("L not in U1, U1 incomplete").or_default() += 1;
+        } else if !missing.is_empty() && lower.violations.is_empty() {
             let some: Vec<String> = missing
                 .iter()
                 .take(3)
