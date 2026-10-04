@@ -1042,6 +1042,62 @@ fn representatives_expand_to_the_replicated_closure() {
     );
 }
 
+/// Equality by representatives ends when a rule head names a constant that isn't its
+/// class's representative, and the rewritten fact feeds a rule joining on the
+/// representative. Found by the DL bounds (U1's Skolem constants, 4 October 2026): the
+/// head re-derived `x p constant` in every round, which counted as new, and the closure
+/// never ended.
+#[test]
+fn a_head_constant_that_is_no_representative_ends_the_closure() {
+    use super::ir::parse_rules;
+    use super::representatives;
+    let mut vocabulary = LocalVocabulary::default();
+    // ex:a is interned first: it represents its class with owl:Thing.
+    let input = load(
+        &mut vocabulary,
+        "ex:a owl:sameAs owl:Thing
+         ex:a rdf:type owl:Restriction
+         ex:s rdf:type owl:Class",
+    );
+    let text = [
+        "eq-sym:   (?x owl:sameAs ?y) -> (?y owl:sameAs ?x)",
+        "eq-trans: (?x owl:sameAs ?y), (?y owl:sameAs ?z) -> (?x owl:sameAs ?z)",
+        "eq-rep-s: (?s owl:sameAs ?t), (?s ?p ?o) -> (?t ?p ?o)",
+        "eq-rep-p: (?p owl:sameAs ?q), (?s ?p ?o) -> (?s ?q ?o)",
+        "eq-rep-o: (?o owl:sameAs ?t), (?s ?p ?o) -> (?s ?p ?t)",
+        "head: (?x rdf:type owl:Class) -> (?x rdfs:seeAlso owl:Thing), (?x owl:sameAs ?x)",
+        "join: (?x rdfs:seeAlso ?y), (?y rdf:type owl:Restriction) -> (?x rdf:type owl:DeprecatedClass)",
+    ];
+    let rules = parse_rules(&text.join("\n"), &mut vocabulary).unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let replicated = batch::materialise(&input, &rules, None, &schema);
+    let mut expected: HashSet<Triple> = input.iter().copied().collect();
+    expected.extend(replicated.derived.iter().copied());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let stop = move || std::time::Instant::now() >= deadline;
+    let closure = representatives::materialise_until(&input, &rules, None, &schema, &stop)
+        .expect("the closure ends");
+    let expanded: HashSet<Triple> = closure
+        .facts
+        .iter()
+        .flat_map(|&f| closure.classes.expand(f))
+        .collect();
+    assert_eq!(expanded, expected);
+    let deprecated = [
+        vocabulary.iri(&format!("{EX}s")),
+        vocabulary.iri(&format!("{}type", super::ir::RDF)),
+        vocabulary.iri(&format!("{}DeprecatedClass", super::ir::OWL)),
+    ];
+    assert!(closure.facts.contains(&deprecated));
+    assert!(
+        closure
+            .facts
+            .iter()
+            .all(|&t| closure.classes.rewrite(t) == t),
+        "every fact is over representatives"
+    );
+}
+
 /// Equality-heavy data: the batch executor's equality module equals the generic
 /// `eq-rep-*` rules of the naive evaluator (chains of `sameAs` that merge classes over
 /// several rounds, equal predicates, equal objects).
