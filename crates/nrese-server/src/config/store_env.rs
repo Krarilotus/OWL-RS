@@ -22,6 +22,9 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             .get(names::SHACL_SHAPES_GRAPH)
             .unwrap_or(defaults.shapes_graph),
         union_default_graph: parse_default_graph(source.get(names::DEFAULT_GRAPH).as_deref())?,
+        geosparql_stated_only: parse_geosparql_relations(
+            source.get(names::GEOSPARQL_RELATIONS).as_deref(),
+        )?,
         total_query_memory_bytes: parse_total_query_memory(
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
         )?,
@@ -252,6 +255,17 @@ fn parse_default_graph(input: Option<&str>) -> Result<bool> {
         Some(unknown) => bail!(
             "unsupported value '{unknown}' in {} (expected 'default' or 'union')",
             names::DEFAULT_GRAPH
+        ),
+    }
+}
+
+fn parse_geosparql_relations(input: Option<&str>) -> Result<bool> {
+    match input.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("computed") => Ok(false),
+        Some("stated") => Ok(true),
+        Some(unknown) => bail!(
+            "unsupported value '{unknown}' in {} (expected 'computed' or 'stated')",
+            names::GEOSPARQL_RELATIONS
         ),
     }
 }

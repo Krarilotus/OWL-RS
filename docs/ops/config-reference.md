@@ -135,6 +135,14 @@ api_key = "replace-me"
 - cost: `union` runs on the native executor like `default`, but reads graph-last index orders and drops repeated statements, and the shortcuts that answer from index counts alone (`COUNT(*)` of one pattern, range filters, the worst-case-optimal join) don't apply. How much slower that is hasn't been measured yet
 - `/version` reports the mode as `default_graph`
 
+- file key: `store.geosparql_relations`
+- env override: `NRESE_GEOSPARQL_RELATIONS`
+- values: `computed` (the default), `stated`
+- what a GeoSPARQL relation in a triple pattern (`?building geo:sfWithin ex:Berlin`) matches:
+  - `computed`: the statements that assert it and the pairs whose geometries stand in it (GeoSPARQL's query-rewrite extension);
+  - `stated`: the asserted statements only (the topology vocabulary without the rewrite), for data whose relations are curated, or where computing them from geometries is unwanted
+- the filter functions (`geof:sfWithin(?a, ?b)`) compute from geometries in both modes
+
 - file key: `shacl.shapes_graph`
 - env override: `NRESE_SHACL_SHAPES_GRAPH`
 - default: `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph` (the graph RDF4J and GraphDB use)

@@ -28,6 +28,9 @@ pub struct StoreConfig {
     /// The default graph of queries and update `WHERE` clauses that name no dataset is
     /// the merge of all graphs, not only the default graph.
     pub union_default_graph: bool,
+    /// GeoSPARQL relations in triple patterns read only the statements that assert them,
+    /// without the query-rewrite extension computing them from geometries.
+    pub geosparql_stated_only: bool,
     /// Bytes of intermediate results all running queries may hold together; 0 is
     /// unlimited. A query that asks for more than is left fails with
     /// [`StoreError::is_server_memory_limit`](crate::StoreError::is_server_memory_limit).
@@ -177,6 +180,7 @@ impl StoreConfig {
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
+            geosparql_stated_only: false,
             total_query_memory_bytes: 0,
             process_memory_bytes: default_process_memory_bytes(),
             federation: FederationConfig::default(),
@@ -204,6 +208,7 @@ impl StoreConfig {
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
+            geosparql_stated_only: false,
             total_query_memory_bytes: 0,
             process_memory_bytes: default_process_memory_bytes(),
             federation: FederationConfig::default(),

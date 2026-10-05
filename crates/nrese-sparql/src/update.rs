@@ -42,6 +42,9 @@ pub struct UpdateOptions {
     pub access: Option<Arc<crate::GraphAccess>>,
     /// The graphs the update may change. `None`: every graph.
     pub writable: Option<Arc<crate::GraphAccess>>,
+    /// GeoSPARQL relations in `WHERE` clauses read the asserted statements only
+    /// ([`crate::QueryOptions::geosparql_stated_only`]).
+    pub geosparql_stated_only: bool,
 }
 
 impl UpdateOptions {
@@ -149,6 +152,7 @@ fn apply_operation(
                 dataset: options.using.clone(),
                 services: options.services.clone(),
                 access: options.access.clone(),
+                geosparql_stated_only: options.geosparql_stated_only,
                 ..crate::query::QueryOptions::default()
             };
             let (deletes, inserts) = crate::native::delete_insert(

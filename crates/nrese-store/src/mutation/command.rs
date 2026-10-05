@@ -127,6 +127,8 @@ pub(crate) struct UpdateContext<'a> {
     /// Stops a long-running `WHERE` clause.
     pub cancellation: &'a CancellationToken,
     pub union_default_graph: bool,
+    /// [`crate::StoreConfig::geosparql_stated_only`].
+    pub geosparql_stated_only: bool,
     pub services: Option<nrese_sparql::Services>,
     /// The repository's namespaces: what a prefix an update uses without declaring it
     /// means (as for queries, [`crate::PreparedQuery::parse_with`]).
@@ -167,6 +169,7 @@ pub(crate) fn apply_sparql_update(
         services: context.services.clone(),
         access: requester.read.access().cloned(),
         writable: requester.write.access().cloned(),
+        geosparql_stated_only: context.geosparql_stated_only,
     };
     apply_update(tx, &update, &options).map_err(|error| match error {
         nrese_sparql::UpdateError::Forbidden(graph) => crate::Refusal::Write(graph).into(),
