@@ -13,3 +13,4 @@ One file per decision that is expensive to reverse. Format: context → decision
 | [0007](0007-one-engine-api.md) | One engine API; protocols and the frontend translate to it | accepted |
 | [0008](0008-users-workspaces-policies.md) | Users, workspaces and graph policies in the store | accepted |
 | [0009](0009-owl2-dl-reasoning.md) | OWL 2 DL reasoning: one OWL model, hypertableau, consequence-based classification, certain answers with datalog bounds | proposed |
+| [0010](0010-standing-product-decisions.md) | Standing product decisions: reasoning leads, configurable defaults, one execution core, Rust natively, no C/C++ speed dependencies, licence | accepted |
