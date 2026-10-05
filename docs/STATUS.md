@@ -12,7 +12,10 @@ in the branch), **deferred** (not done, with the reason and where it went), or *
   (30 September, 1 October) are records of their date; their status columns are not kept
   up to date.
 
-Last updated: 2 October 2026, branch `refactor/engine-v2`.
+Last updated: 6 October 2026, branch `refactor/engine-v2`. What is left before v2 goes to
+`main`, with owners and state, is the status table of the
+[merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1; the rows below are the record
+by goal.
 
 ## Audit work (the outside audit of 2 October)
 

@@ -58,7 +58,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         index_encoding: match source.get(names::INDEX_ENCODING) {
             None => defaults.index_encoding,
             Some(name) => {
-                nrese_engine::IndexEncoding::from_name(name.trim()).with_context(|| {
+                nrese_store::IndexEncoding::from_name(name.trim()).with_context(|| {
                     format!(
                         "{} must be 'fast' or 'compact', not '{name}'",
                         names::INDEX_ENCODING
@@ -69,7 +69,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         vocabulary: match source.get(names::VOCABULARY) {
             None => defaults.vocabulary,
             Some(name) => {
-                nrese_engine::VocabularyEncoding::from_name(name.trim()).with_context(|| {
+                nrese_store::VocabularyEncoding::from_name(name.trim()).with_context(|| {
                     format!(
                         "{} must be 'plain' or 'fsst', not '{name}'",
                         names::VOCABULARY
