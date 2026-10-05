@@ -102,16 +102,28 @@ pub fn classify(
 
 /// Normalises, compiles and saturates `ontology`.
 pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Unsupported> {
+    let started = Instant::now();
+    let normalised = normalise_with(ontology, options.normalise);
+    let normalise = started.elapsed();
+    let classes = signature(ontology);
+    let mut saturated = saturate_normalised(&normalised, &classes, options)?;
+    saturated.profile.normalise = normalise;
+    Ok(saturated)
+}
+
+/// Compiles and saturates DL-clauses for the named classes `classes` (the classification
+/// driver's Horn lower bound runs it on the Horn part of an ontology's clauses).
+pub fn saturate_normalised(
+    normalised: &nrese_owl::Normalised,
+    classes: &[Term],
+    options: &Options,
+) -> Result<Saturated, Unsupported> {
     let mut profile = Profile {
         threads: options.threads.max(1),
         ..Profile::default()
     };
     let started = Instant::now();
-    let normalised = normalise_with(ontology, options.normalise);
-    profile.normalise = started.elapsed();
-    let started = Instant::now();
-    let classes = signature(ontology);
-    let compiled = compile(&normalised, &classes)?;
+    let compiled = compile(normalised, classes)?;
     profile.compile = started.elapsed();
     profile.compiled = compiled.stats;
     profile.dl_clauses = compiled.program.clauses.len();
