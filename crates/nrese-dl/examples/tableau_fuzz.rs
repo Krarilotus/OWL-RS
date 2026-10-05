@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-dl --example tableau_fuzz -- [--seed S] [--count N] [--only K]
-//!     [--profile alc|alchi|shiq|sroiq|ni] [--out DIR] [--timeout SECS] [--switches]
+//!     [--profile alc|alchi|shiq|sroiq|d|sroiqd|ni] [--out DIR] [--timeout SECS] [--switches]
 //! ```
 //!
 //! Prints `case<TAB>answer<TAB>telemetry` per ontology; `--switches` adds a
@@ -179,6 +179,42 @@ fn profile(name: &str, case: u64) -> Option<(Sizes, Profile)> {
             },
             Profile {
                 axioms: 8 + (case % 6) as usize,
+                numbers: true,
+                chains: true,
+                nominals: true,
+                ..base
+            },
+        ),
+        // Data properties over integer ranges, facets, enumerations and complements: `d`
+        // with few classes so that the data part decides, `sroiqd` with everything.
+        "d" => (
+            Sizes {
+                classes: 3,
+                object_properties: 1,
+                simple: 1,
+                data_properties: 2,
+                individuals: 3,
+                literals: 4,
+            },
+            Profile {
+                axioms: 6 + (case % 6) as usize,
+                data: true,
+                numbers: case.is_multiple_of(2),
+                ..base
+            },
+        ),
+        "sroiqd" => (
+            Sizes {
+                classes: 4,
+                object_properties: 3,
+                simple: 2,
+                data_properties: 2,
+                individuals: 3,
+                literals: 4,
+            },
+            Profile {
+                axioms: 8 + (case % 6) as usize,
+                data: true,
                 numbers: true,
                 chains: true,
                 nominals: true,
