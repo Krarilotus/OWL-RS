@@ -91,6 +91,8 @@ pub struct StoreConfig {
     /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
+    /// The `owl2-dl` mode's settings (`dl.*`), used when the reasoner runs that mode.
+    pub dl: crate::dl::DlConfig,
 }
 
 /// The SHACL commit gate's policy.
@@ -197,6 +199,7 @@ impl StoreConfig {
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
+            dl: crate::dl::DlConfig::default(),
         }
     }
 
@@ -225,6 +228,7 @@ impl StoreConfig {
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
+            dl: crate::dl::DlConfig::default(),
         }
     }
 
@@ -240,6 +244,11 @@ impl StoreConfig {
                 "compact equality storage computes over representatives; it needs \
                  equality_by_representatives"
                     .to_owned(),
+            ));
+        }
+        if self.dl.max_candidates == 0 || self.dl.timeout.is_zero() {
+            return Err(StoreError::Configuration(
+                "dl.max_candidates and dl.timeout must be above 0".to_owned(),
             ));
         }
         if self.support_sets == 0 {
