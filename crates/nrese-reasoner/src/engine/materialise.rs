@@ -35,6 +35,7 @@ pub fn materialise_until(
     snapshot: &Snapshot,
     stop: crate::eval::Stop<'_>,
 ) -> Result<Closure, delta::Interrupted> {
+    nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
     let result = match program.same_as.filter(|_| program.by_representatives) {
@@ -54,6 +55,7 @@ pub fn materialise_until(
             stop,
         )?,
     };
+    nrese_exec::heap::phase("reasoner: datatype checks");
     let mut violations = result.violations;
     violations.extend(super::datatypes::violations(
         &result.derived,
@@ -61,6 +63,7 @@ pub fn materialise_until(
         program.same_as,
         &|id| snapshot.decode(TermId::from_raw(id)),
     ));
+    nrese_exec::heap::phase("store: encode");
     Ok(Closure {
         inferred: result
             .derived
