@@ -161,5 +161,7 @@ fn atom_holds(g: &Graph, h: Head, bind: &[u32; MAX_VARS]) -> bool {
                     && node.parent != b(0))
         }
         Head::Nominal(..) => false,
+        // Recorded between the two values' representatives (the theory decides the rest).
+        Head::Unequal(x, y) => g.unequal(g.find(b(x)), g.find(b(y))).is_some(),
     }
 }

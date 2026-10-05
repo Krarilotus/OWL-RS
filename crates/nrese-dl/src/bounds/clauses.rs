@@ -211,6 +211,10 @@ impl Compiler<'_> {
                     approx.data = true;
                     unchecked.get_or_insert("the equality of data values");
                 }
+                HeadAtom::DataUnequal(..) => {
+                    approx.data = true;
+                    unchecked.get_or_insert("the inequality of data values");
+                }
             }
         }
         if let Some(why) = unchecked {

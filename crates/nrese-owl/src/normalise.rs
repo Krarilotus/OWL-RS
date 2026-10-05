@@ -563,12 +563,16 @@ impl<'a> Normaliser<'a> {
                 }
             }
             Axiom::DisjointDataProperties(ps) => {
-                let v = Var::V(0);
+                // Two data variables and their inequality, decided by the datatype theory:
+                // one shared variable matched only values on one data node, and missed a
+                // literal and an equal value made for an existential (W3C "Inconsistent
+                // Disjoint Dataproperties" answered consistent, 5 October 2026).
+                let (v, w) = (Var::V(0), Var::V(1));
                 for (i, &a) in ps.iter().enumerate() {
                     for &b in &ps[i + 1..] {
                         self.add(
-                            vec![BodyAtom::Data(a, x, v), BodyAtom::Data(b, x, v)],
-                            Vec::new(),
+                            vec![BodyAtom::Data(a, x, v), BodyAtom::Data(b, x, w)],
+                            vec![HeadAtom::DataUnequal(v, w)],
                             index,
                         );
                     }
