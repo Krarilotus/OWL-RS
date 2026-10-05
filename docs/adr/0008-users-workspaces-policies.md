@@ -2,7 +2,7 @@
 
 Status: accepted (2026-10-02; the personal space is mandatory). The owner's direction: policies modifiable and justifiable at
 the store level, but user control and the users' own space first; the best model for the
-use cases ahead ([gap plan G2b](../plan/2026-10-02-engine-gaps.md)).
+use cases ahead (STATUS, goal G2).
 
 ## Context
 

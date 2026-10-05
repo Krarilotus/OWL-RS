@@ -1,4 +1,4 @@
-//! EXPLAIN before running (the query plan's step 3, docs/plan/2026-10-02-plan-ir.md): the
+//! EXPLAIN before running (the query plan's step 3, docs/design/query-plan.md): the
 //! plan after the rewrites, each node with an estimate of its rows, read from the store's
 //! statistics without evaluating anything.
 //!

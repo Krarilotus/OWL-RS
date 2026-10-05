@@ -28,7 +28,7 @@ Backend-owned HTTP behavior:
 
 Specification source of truth:
 
-- [docs/spec/04-api-and-protocols.md](../spec/04-api-and-protocols.md)
+- [docs/ops/http-api.md](../ops/http-api.md)
 
 ## Rules
 
