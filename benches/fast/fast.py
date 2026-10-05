@@ -528,35 +528,63 @@ def run(args) -> int:
 # --- compare ---------------------------------------------------------------------------------
 
 def pooled(report: dict) -> dict[str, dict]:
-    """Per case: its samples pooled over the repetitions, statuses, peak memory."""
+    """Per case: its samples per repetition, statuses, peak memory, the metric per repetition."""
     out: dict[str, dict] = {}
     for r in report["records"]:
-        entry = out.setdefault(r["case"], {"samples": {}, "status": [], "peaks": [], "metrics": []})
+        entry = out.setdefault(r["case"], {"reps": [], "status": [], "peaks": [], "metrics": []})
         entry["status"].append(r["status"])
         if r.get("peak_mib"):
             entry["peaks"].append(r["peak_mib"])
         if isinstance(r.get("metric"), (int, float)):
             entry["metrics"].append(r["metric"])
-        for series, values in (r.get("samples") or {}).items():
-            entry["samples"].setdefault(series, []).extend(v for v in values if v is not None)
+        samples = {k: thin(sorted(v for v in vs if v is not None)) for k, vs in (r.get("samples") or {}).items()}
+        if any(samples.values()):
+            entry["reps"].append(samples)
     return out
 
 
-def statistic(samples: dict[str, list[float]]) -> float:
-    return sum(statistics.median(v) for v in samples.values() if v)
+def thin(values: list[float], at_most: int = 200) -> list[float]:
+    """At most `at_most` evenly spaced order statistics of sorted `values`: the same
+    distribution, small enough to resample quickly."""
+    if len(values) <= at_most:
+        return values
+    step = (len(values) - 1) / (at_most - 1)
+    return [values[round(i * step)] for i in range(at_most)]
 
 
-def bootstrap_ratio(base: dict, new: dict, rounds: int = 2000, seed: int = 1) -> tuple[float, float, float]:
-    """The ratio new/base of the summed medians, and its 95 % bootstrap interval."""
+def statistic(reps: list[dict[str, list[float]]], series: list[str]) -> float:
+    """The sum over series of the median of their samples, pooled over `reps`."""
+    total = 0.0
+    for s in series:
+        values = [v for rep in reps for v in rep.get(s, [])]
+        if values:
+            total += statistics.median(values)
+    return total
+
+
+def spread(entry: dict) -> float:
+    """The range of the per-repetition metrics relative to their median (PROTOCOL.md §5)."""
+    m = [v for v in entry["metrics"] if v]
+    if len(m) < 2:
+        return 0.0
+    return (max(m) - min(m)) / statistics.median(m)
+
+
+def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed: int = 1) -> tuple[float, float, float]:
+    """The ratio new/base of the summed medians and its 95 % interval, by a two-level
+    bootstrap: repetitions drawn with replacement, then samples within each, so that the
+    spread between runs widens the interval as much as the spread within them."""
     rng = random.Random(seed)
-    series = [s for s in base if s in new and base[s] and new[s]]
-    if not series:
+    series = sorted({s for rep in base for s in rep} & {s for rep in new for s in rep})
+    if not series or not base or not new:
         return float("nan"), float("nan"), float("nan")
 
-    def draw(samples):
-        return sum(statistics.median(rng.choices(samples[s], k=len(samples[s]))) for s in series)
+    def draw(reps):
+        chosen = [rng.choice(reps) for _ in reps]
+        return statistic([{s: rng.choices(rep[s], k=len(rep[s])) for s in series if rep.get(s)}
+                          for rep in chosen], series)
 
-    point = statistic({s: new[s] for s in series}) / max(statistic({s: base[s] for s in series}), 1e-9)
+    point = statistic(new, series) / max(statistic(base, series), 1e-9)
     ratios = sorted(draw(new) / max(draw(base), 1e-9) for _ in range(rounds))
     return point, ratios[int(0.025 * rounds)], ratios[int(0.975 * rounds) - 1]
 
@@ -565,32 +593,45 @@ def compare(args) -> int:
     base_report = json.loads(Path(args.base).read_text(encoding="utf-8"))
     new_report = json.loads(Path(args.new).read_text(encoding="utf-8"))
     base, new = pooled(base_report), pooled(new_report)
-    print(f"{'case':<26} {'base ms':>11} {'new ms':>11} {'ratio':>7} {'95% CI':>15} {'peak MiB':>17}  verdict")
+    for name, report in (("base", base_report), ("new", new_report)):
+        if report.get("reps", 2) < 2:
+            print(f"warning: the {name} run has one repetition: its spread is unknown, so a verdict "
+                  "rests on the 10 % floor alone (run --reps 2 or more)")
+    print(f"{'case':<26} {'base ms':>11} {'new ms':>11} {'ratio':>7} {'95% CI':>15} {'spread':>7} {'peak MiB':>17}  verdict")
     regressions = 0
+    spreads = []
     for case in sorted(set(base) | set(new)):
         b, n = base.get(case), new.get(case)
         if not b or not n:
             print(f"{case:<26} {'only in one run':>45}")
             continue
-        if any(s not in ("ok",) for s in n["status"]) and set(n["status"]) != set(b["status"]):
+        if set(n["status"]) != set(b["status"]):
             print(f"{case:<26} status {','.join(sorted(set(b['status'])))} -> {','.join(sorted(set(n['status'])))}  CHANGED")
             regressions += 1
             continue
-        ratio, low, high = bootstrap_ratio(b["samples"], n["samples"])
-        bm, nm = statistic(b["samples"]), statistic(n["samples"])
+        ratio, low, high = bootstrap_ratio(b["reps"], n["reps"])
+        series = sorted({s for rep in b["reps"] for s in rep} & {s for rep in n["reps"] for s in rep})
+        bm, nm = statistic(b["reps"], series), statistic(n["reps"], series)
+        # A change counts beyond max(10 %, the measured spread of both sides), beyond 2 ms,
+        # and with the interval excluding 1.
+        threshold = max(0.10, spread(b), spread(n))
+        spreads.append(max(spread(b), spread(n)))
         verdict = "same"
-        if low > 1.0 and ratio >= 1.10 and nm - bm >= 2.0:
+        if low > 1.0 and ratio >= 1 + threshold and nm - bm >= 2.0:
             verdict, regressions = "SLOWER", regressions + 1
-        elif high < 1.0 and ratio <= 1 / 1.10 and bm - nm >= 2.0:
+        elif high < 1.0 and ratio <= 1 / (1 + threshold) and bm - nm >= 2.0:
             verdict = "faster"
         bp, np_ = (max(b["peaks"]) if b["peaks"] else None), (max(n["peaks"]) if n["peaks"] else None)
-        if bp and np_ and np_ > bp * 1.10 and np_ - bp > 64:
+        if bp and np_ and np_ > bp * (1 + max(0.10, threshold)) and np_ - bp > 64:
             verdict += ", MORE MEMORY"
             regressions += 1
         peaks = f"{bp or '-'} -> {np_ or '-'}"
-        print(f"{case:<26} {bm:>11.1f} {nm:>11.1f} {ratio:>7.2f} {f'[{low:.2f}, {high:.2f}]':>15} {peaks:>17}  {verdict}")
-    print(f"\n{regressions} regression(s) beyond the interval (a change counts at ≥ 10 % and ≥ 2 ms, "
-          "with the 95 % interval of the ratio excluding 1)")
+        print(f"{case:<26} {bm:>11.1f} {nm:>11.1f} {ratio:>7.2f} {f'[{low:.2f}, {high:.2f}]':>15} "
+              f"{threshold:>6.0%} {peaks:>17}  {verdict}")
+    if spreads:
+        print(f"\nspread between repetitions: median {statistics.median(spreads):.0%}, max {max(spreads):.0%}")
+    print(f"{regressions} regression(s): a change counts beyond max(10 %, the spread of both sides) and 2 ms, "
+          "with the 95 % interval of the ratio (repetitions and samples resampled) excluding 1")
     return 1 if regressions else 0
 
 
