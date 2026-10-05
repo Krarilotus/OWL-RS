@@ -12,8 +12,9 @@
 //!   look a core up or create its context.
 //! - **Termination:** the scope ends when no context is active or has mail.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 
 use hashbrown::HashMap;
 
@@ -108,6 +109,20 @@ pub struct Engine {
     pub proofs: bool,
     contexts: Arena,
     registry: Mutex<HashMap<Box<[Atom]>, ContextId>>,
+    budget: Budget,
+    /// The budget ran out: the workers drop what is left (the saturation is then
+    /// incomplete and says so).
+    exhausted: AtomicBool,
+}
+
+/// What a saturation may use (the dynamic fallback's budgets, design §4, in their first
+/// form): past it, the run stops and is reported, never answered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Budget {
+    pub deadline: Option<Instant>,
+    /// The most conclusions one join of the Pred rule may produce (its premises'
+    /// combinations can grow as their product).
+    pub max_join: Option<usize>,
 }
 
 impl Engine {
@@ -118,7 +133,41 @@ impl Engine {
             proofs,
             contexts: Arena::new(),
             registry: Mutex::new(HashMap::new()),
+            budget: Budget::default(),
+            exhausted: AtomicBool::new(false),
         }
+    }
+
+    /// The engine with a budget.
+    pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    pub fn budget(&self) -> Budget {
+        self.budget
+    }
+
+    /// Whether the budget ran out (then the saturation is incomplete).
+    pub fn exhausted(&self) -> bool {
+        self.exhausted.load(Relaxed)
+    }
+
+    /// Marks the budget spent.
+    pub fn exhaust(&self) {
+        self.exhausted.store(true, Relaxed);
+    }
+
+    /// Whether the deadline passed (marks the budget spent if so).
+    pub(super) fn out_of_time(&self) -> bool {
+        if self.exhausted() {
+            return true;
+        }
+        if self.budget.deadline.is_some_and(|d| Instant::now() >= d) {
+            self.exhaust();
+            return true;
+        }
+        false
     }
 
     pub fn count(&self) -> usize {
@@ -197,7 +246,11 @@ impl Engine {
     fn work(&self, c: ContextId, deliver: &mut dyn FnMut(ContextId, Message)) {
         let context = self.context(c);
         loop {
-            let batch = std::mem::take(&mut *lock(&context.inbox));
+            let mut batch = std::mem::take(&mut *lock(&context.inbox));
+            if !batch.is_empty() && self.out_of_time() {
+                // Out of budget: the messages are dropped, the run reports it.
+                batch.clear();
+            }
             if batch.is_empty() {
                 context.active.store(false, SeqCst);
                 // A message delivered between the take and the store found the context

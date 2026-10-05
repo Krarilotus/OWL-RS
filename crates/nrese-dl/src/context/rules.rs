@@ -127,6 +127,11 @@ struct Item {
 }
 
 impl Found {
+    /// Conclusions so far.
+    pub(super) fn len(&self) -> usize {
+        self.items.len()
+    }
+
     pub(super) fn clear(&mut self) {
         self.items.clear();
         self.atoms.clear();

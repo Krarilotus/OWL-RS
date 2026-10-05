@@ -11,7 +11,7 @@ use nrese_owl::{Axiom, ClassExpr, EntityKind, Ontology, ProofGraph, Term, normal
 use super::abox::Individuals;
 use super::atoms::{Atom, CTerm, ConceptId};
 use super::compile::{Compiled, Unsupported, compile};
-use super::engine::{Engine, Strategy, lock};
+use super::engine::{Budget, Engine, Strategy, lock};
 use super::profile::Profile;
 use super::state::{ClauseRef, ContextId, Rule};
 
@@ -25,6 +25,8 @@ pub struct Options {
     pub proofs: bool,
     /// How `nrese-owl` normalises.
     pub normalise: nrese_owl::Options,
+    /// What the saturation may use (unlimited by default); past it, [`Unsupported::Budget`].
+    pub budget: Budget,
 }
 
 impl Default for Options {
@@ -34,6 +36,7 @@ impl Default for Options {
             strategy: Strategy::Cautious,
             proofs: true,
             normalise: nrese_owl::Options::default(),
+            budget: Budget::default(),
         }
     }
 }
@@ -133,7 +136,7 @@ pub fn saturate_normalised(
     let started = Instant::now();
     let Compiled { program, abox, .. } = compiled;
     let named = program.named();
-    let engine = Engine::new(program, options.strategy, options.proofs);
+    let engine = Engine::new(program, options.strategy, options.proofs).with_budget(options.budget);
     let query: Vec<ContextId> = (0..named)
         .map(|c| engine.context_for(&[Atom::concept(c, CTerm::X)]).0)
         .collect();
@@ -142,6 +145,9 @@ pub fn saturate_normalised(
     seeds.push(top);
     engine.run(&seeds, options.threads);
     let individuals = Individuals::saturate(&engine, &abox, options.threads);
+    if engine.exhausted() {
+        return Err(Unsupported::Budget);
+    }
     profile.saturate = started.elapsed();
     profile.contexts_created = engine.count();
     for (_, state) in engine.states() {
