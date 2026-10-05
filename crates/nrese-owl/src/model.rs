@@ -84,6 +84,36 @@ pub enum DataRange {
     Restriction(Term, Vec<(Term, Term)>),
 }
 
+/// A literal as its source writes it: the lexical form, the datatype's IRI and the
+/// language tag (`None` where the source doesn't give them).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Literal {
+    pub lexical: String,
+    pub datatype: Option<String>,
+    pub language: Option<String>,
+}
+
+/// The literals and the datatype and facet IRIs the axioms use, by term: what a datatype
+/// theory reads values from (the model itself has only term ids). A literal or IRI
+/// missing here is one the source didn't give; the reasoners say so rather than guess.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DataTerms {
+    pub literals: HashMap<Term, Literal>,
+    pub iris: HashMap<Term, String>,
+}
+
+impl DataTerms {
+    /// Adds `other`'s terms (an imported axiom's, say).
+    pub fn extend(&mut self, other: &DataTerms) {
+        for (t, l) in &other.literals {
+            self.literals.entry(*t).or_insert_with(|| l.clone());
+        }
+        for (t, i) in &other.iris {
+            self.iris.entry(*t).or_insert_with(|| i.clone());
+        }
+    }
+}
+
 /// What an entity is declared as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EntityKind {

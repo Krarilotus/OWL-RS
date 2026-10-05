@@ -271,7 +271,7 @@ impl Engine<'_> {
         let old = node.flags & flag::BLOCKED;
         let mut flags = node.flags & !flag::BLOCKED;
         let mut blocker = NONE;
-        if flags & flag::ROOT == 0 {
+        if flags & (flag::ROOT | flag::CONCRETE) == 0 {
             if self.g.nodes[node.parent as usize].flags & flag::BLOCKED != 0 {
                 flags |= flag::INDIRECTLY_BLOCKED;
             } else {
@@ -329,7 +329,7 @@ impl Engine<'_> {
         let mut flags = node.flags & !flag::BLOCKED;
         let mut blocker = NONE;
         let mut listed = None;
-        if !node.live() || flags & flag::ROOT != 0 {
+        if !node.live() || flags & (flag::ROOT | flag::CONCRETE) != 0 {
             self.unlist(n);
         } else if self.g.nodes[node.parent as usize].flags & flag::BLOCKED != 0 {
             flags |= flag::INDIRECTLY_BLOCKED;
@@ -432,7 +432,7 @@ impl Engine<'_> {
             std::collections::HashMap::new();
         for n in 0..len as u32 {
             let node = &self.g.nodes[n as usize];
-            if !node.live() || node.flags & flag::ROOT != 0 {
+            if !node.live() || node.flags & (flag::ROOT | flag::CONCRETE) != 0 {
                 continue;
             }
             if status[node.parent as usize] != 0 {
