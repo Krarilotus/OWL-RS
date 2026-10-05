@@ -32,14 +32,19 @@ benchmark runs.
 | Distinct values by a group walk (NOT EXISTS sides, sets) | DBpedia q13 25 → 3.1 ms | `distinct_values_walk_the_index` (`group walk`) |
 | Worst-case-optimal joins for cyclic patterns | LUBM 100 q2 18 → 4.8 ms | `triangles_join_worst_case_optimally` (`wcoj`) |
 | String filters on the dictionary | Wikidata q06 148 → 0.06 ms | `string_filters_test_the_dictionary` (`dictionary string test`) |
-| Sideways information passing, LIMIT pushdown, closures by components, EXISTS as sets | see §3 | missing: these operators don't report themselves in EXPLAIN yet |
+| Sideways information passing | Zebratlas Q03 about 1,200× (§3) | `patterns_joined_to_rows_are_evaluated_from_them` (`sideways`, from 2 rows) |
+| LIMIT pushdown | Wikidata q04 3,380 → 21 ms | `limits_stop_the_joins_early` (`limit pushdown`, one morsel of 1,024 rows) |
+| Closures by components | YAGO q08 11,432 → 24 ms | `closures_run_by_components` (`closure`) |
+| EXISTS as sets | DBpedia q13 25 → 3.1 ms | `exists_runs_once_as_a_set` (`anti join`, `semi join`) |
 | DL: lazy unfolding in a portfolio | W3C DL-204 timeout → 6 ms | `hard_search_tests_are_decided` (DL-202, 204, 206, 661) |
 | DL: minimal automata, transitions the inclusions imply (P3) | ore_ont_1066 379 k → 56 k clauses, 1.42 → 0.15 s | `universals_over_a_large_role_hierarchy_stay_small` (≤ 400 clauses; 220 on 5 Oct) |
 | DL: `∃R.D ⊑ C` over a non-simple R read as `D ⊑ ∀R⁻.C` (Horn), also at the top of a subclass axiom | ore_ont_10212 gave up at 60 s → 0.24 s (HermiT 0.19 s) | `existentials_over_transitive_roles_on_the_left_stay_horn` (no disjunction with an empty body) |
 | Canonicalisation without factorial branching | a thousand twins: linear | `many_equal_children_are_twins` (search leaves bounded) |
 
 Plan guards live in `crates/nrese-sparql/tests/it/plan_guard_tests.rs`. A new win gets its
-row and its guard in the same commit.
+row and its guard in the same commit. Every operator EXPLAIN reports carries the planner's
+estimate beside its actual rows (`explain_estimates_every_operator`), so `perf_lab
+--qerror` measures them all.
 
 ## 1. Where NRESE stands (office batches A and B, 3-5 October 2026)
 

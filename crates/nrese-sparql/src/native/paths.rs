@@ -110,6 +110,9 @@ pub(crate) struct PathEvaluator<'a> {
     /// of a sequence): a stopped traversal returns what it has, and the caller's check
     /// reports the cancellation (the review of 3 October 2026, P3).
     pub(crate) cancellation: Option<&'a crate::CancellationToken>,
+    /// Closures computed per strongly connected component so far (an open `p+` or `p*`,
+    /// or its size for `COUNT`), for EXPLAIN.
+    pub(crate) closures: std::cell::Cell<usize>,
 }
 
 impl PathEvaluator<'_> {
@@ -120,6 +123,7 @@ impl PathEvaluator<'_> {
 
     /// [`transitive_closure_until`] stopped with the query: then empty.
     fn closure_of(&self, edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        self.closures.set(self.closures.get() + 1);
         let cancellation = self.cancellation;
         let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
         transitive_closure_until(edges, &stop).unwrap_or_default()
@@ -267,6 +271,7 @@ impl PathEvaluator<'_> {
         let (Path::OneOrMore(step) | Path::ZeroOrMore(step)) = path else {
             return None;
         };
+        self.closures.set(self.closures.get() + 1);
         let cancellation = self.cancellation;
         let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
         let sizes = closure_sizes_until(&self.open(step), &stop)?;
@@ -612,6 +617,7 @@ mod tests {
             graph: PathGraph::Default,
             fixed: None,
             cancellation: Some(&token),
+            closures: Default::default(),
         };
         let first = snapshot.lookup(node(0).as_ref().into()).unwrap().raw();
         let last = snapshot.lookup(node(50).as_ref().into()).unwrap().raw();
