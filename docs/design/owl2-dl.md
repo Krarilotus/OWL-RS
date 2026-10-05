@@ -3,7 +3,7 @@
 **What this is.** The engineering design behind [ADR-0009](../adr/0009-owl2-dl-reasoning.md):
 for each component, its data structures, its algorithms in order, how it is tested, and
 which optimisations it gets at which level. It is the plan for phases 2 to 4 of the
-[roadmap](../plan/2026-10-02-roadmap.md).
+[roadmap](../ROADMAP.md).
 
 **Sources.**
 - Seven research reports, A to G (2 October; outside the repository in `output/dl-research-A…G.md`):

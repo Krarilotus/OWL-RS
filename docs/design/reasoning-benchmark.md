@@ -2,7 +2,7 @@
 
 Status: **plan**, 2026-09-26; §7 to §9 (a real integration workload, cluster runs, the evaluation for a paper) added 2026-09-30.
 
-Ontology reasoning is what NRESE is built to be best at. Load, storage and plain SPARQL speed are the basics; the [basics scorecard](../../benches/competitors/SCORECARD.md) guards them against regressions. This benchmark measures the claims of [reasoner-v2.md](reasoner-v2.md) (targets T1–T9) against the systems that reason today, and it tracks NRESE through M3.
+Ontology reasoning is what NRESE is built to be best at. Load, storage and plain SPARQL speed are the basics; the basics scorecard (`benches/competitors/scorecard.sh`) guards them against regressions. This benchmark measures the claims of [reasoner-v2.md](reasoner-v2.md) (targets T1–T9) against the systems that reason today, and it tracks NRESE through M3.
 
 ## 1. Tasks
 
@@ -61,7 +61,7 @@ Ontology reasoning is what NRESE is built to be best at. Load, storage and plain
   - `prepare-*.sh` runs the official generators (LUBM UBA, OWL2Bench, both Java, in Docker) and fetches ontologies.
   - One adapter per system and task: materialise, maintain, query, check, classify.
   - `reasoning-scorecard.sh` runs everything and writes to the git-ignored `results/`.
-  - `REASONING-SCORECARD.md` holds the publishable systems' results.
+  - Each run gets a record in `benches/runs/`.
 - **Same fairness rules as the basics kit.** Each vendor's own loader and reasoner settings, the same input, the same host, repeated runs on the reference machine. The licence rules in `benches/competitors/README.md` apply unchanged.
 
 ## 6. Staging
@@ -112,7 +112,7 @@ Added on 30 September 2026. Kit and instructions: [benches/integration](../../be
 
 The eight questions both answer have the same row counts. CQ01 is an empty file. Fuseki kept working on the abandoned CQ05 while the later questions ran, so its later times are upper bounds. Without reasoning (`nrese-plain`) the nine questions take 6 ms together, and answer less. The last column is where NRESE started: CQ02 to CQ04 from the first run on this machine, the others measured in the process on the development PC.
 
-**What it showed about NRESE** (work packages W1 to W7 in the [plan](../plan/2026-09-30-graphdb-parity-plan.md), §5b). Fixed the same day:
+**What it showed about NRESE** (work packages W1 to W7 in the [plan](../adr/0010-standing-product-decisions.md), §5b). Fixed the same day:
 - `HAVING` on a `SELECT` alias returned no rows (CQ10).
 - A group's filters ran after all its joins, also inside a basic graph pattern (CQ06, CQ07, CQ08, CQ09).
 - A property path with two variable ends was computed for every node of the graph before it was joined (CQ03, CQ04, CQ10).
@@ -149,7 +149,7 @@ What the paper claims, and the experiment that supports each claim. Every experi
 | Queries under entailment are answered fast and completely | RT3: the query sets after materialisation; latency, answers, throughput with 8 clients | LUBM (14 queries), OWL2Bench (22), the integration workload (10) | As RT1, and Stardog, Virtuoso (query-time reasoning) | Answers against published or oracle answers; row counts across systems |
 | A real integration workload runs on a workstation | RT1 and RT3 on the tiers of §7; the memory each system needs to finish | The integration workload | Fuseki as its project runs it; GraphDB, RDFox | Row counts across systems within one entailment regime |
 | Inconsistencies are found and explained | RT4 and RT7: injected contradictions; detection time, explanation size | LUBM and OWL2Bench with injected contradictions; the project's own ontologies | GraphDB, RDFox, Stardog | Every injected contradiction found, none on clean data; each proof step is a rule application |
-| The basics are not what it costs | The [basics scorecard](../../benches/competitors/SCORECARD.md): load, store size, restart, query mix, throughput, writes under read load | olympics, YAGO tiny, DBpedia core, Wikidata lexemes | QLever, Oxigraph, Virtuoso, Jena TDB2 (none of them reasons) | Row counts across systems |
+| The basics are not what it costs | The basics scorecard (`benches/competitors/scorecard.sh`): load, store size, restart, query mix, throughput, writes under read load | olympics, YAGO tiny, DBpedia core, Wikidata lexemes | QLever, Oxigraph, Virtuoso, Jena TDB2 (none of them reasons) | Row counts across systems |
 
 **Rules for every experiment:**
 - Versions pinned, each vendor's own loader and tuning guidance, configurations published with the results.
