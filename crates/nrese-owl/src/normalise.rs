@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::automata::Nfa;
 use crate::clauses::{
     BodyAtom, Clause, Concept, Filler, FreshOf, HeadAtom, Normalised, SafeRule, Var,
 };
@@ -42,6 +43,15 @@ pub struct Options {
     /// are equal (quadratic in `n`, but plain resolution for the engines); above it, an
     /// at-most atom. At most [`Options::MAX_EXPANSION`].
     pub expand_at_most_up_to: u32,
+    /// Unfold a class's only, acyclic definition `A ≡ D` lazily (`definitions.rs`): `A ⊑ D`
+    /// and `¬D` for each `¬A`, not `D ⊑ A` everywhere. Equisatisfiable, but a model of the
+    /// clauses under-approximates such classes. Off by default.
+    pub lazy_definitions: bool,
+    /// Every clause names exactly the axioms it needs (for proofs and justifications). Off,
+    /// the automata of non-simple roles are minimised (`automata.rs`): far fewer clauses
+    /// over large role hierarchies, with sources that may name more than needed. On by
+    /// default.
+    pub exact_provenance: bool,
 }
 
 impl Options {
@@ -52,6 +62,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             expand_at_most_up_to: 2,
+            lazy_definitions: false,
+            exact_provenance: true,
         }
     }
 }
@@ -78,6 +90,11 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
     let ontology = rewritten.as_ref().map_or(ontology, |r| &r.ontology);
     let mut n = Normaliser::new(ontology);
     n.expand_up_to = options.expand_at_most_up_to.min(Options::MAX_EXPANSION);
+    n.exact_provenance = options.exact_provenance;
+    if options.lazy_definitions {
+        n.unfolded = crate::definitions::unfolded(ontology);
+        n.out.unfolded = n.unfolded.by_axiom.len();
+    }
     if let Some(r) = &rewritten {
         for &index in &r.unsupported {
             n.out
@@ -126,7 +143,7 @@ const UNIVERSAL: &str = "the universal data property (owl:topDataProperty)";
 type Members = Vec<(ObjProp, Vec<usize>)>;
 
 /// A disjunct of a GCI being clausified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Item {
     Expr(ExprId),
     /// A fresh name (positive) or its complement.
@@ -139,32 +156,6 @@ struct Gci {
     body: Vec<BodyAtom>,
     items: Vec<Item>,
     source: usize,
-}
-
-/// An automaton over roles: states, the start, the end, transitions (`None`: ε), each
-/// with the role-inclusion axioms it comes from (none for the role's own edge).
-#[derive(Debug, Clone)]
-struct Nfa {
-    states: u32,
-    start: u32,
-    end: u32,
-    edges: Vec<(u32, Option<ObjProp>, u32, Vec<usize>)>,
-}
-
-impl Nfa {
-    /// The automaton of the inverse role: every path reversed.
-    fn inverse(&self) -> Nfa {
-        Nfa {
-            states: self.states,
-            start: self.end,
-            end: self.start,
-            edges: self
-                .edges
-                .iter()
-                .map(|(a, label, b, axioms)| (*b, label.map(ObjProp::inverse), *a, axioms.clone()))
-                .collect(),
-        }
-    }
 }
 
 struct Normaliser<'a> {
@@ -180,14 +171,23 @@ struct Normaliser<'a> {
     rias: Vec<(Vec<ObjProp>, Term, usize)>,
     non_simple: HashSet<Term>,
     automata: HashMap<(ObjProp, Item), u32>,
+    /// Each non-simple role expression's automaton (`None`: irregular), built once.
+    nfas: HashMap<ObjProp, Option<std::rc::Rc<Nfa>>>,
+    /// Each named non-simple role's automaton as spliced into others (minimal where
+    /// provenance needn't be exact); `None`: irregular.
+    base_nfas: std::cell::RefCell<HashMap<Term, Option<std::rc::Rc<Nfa>>>>,
+    /// Transitions name exactly the inclusions they need (`Options::exact_provenance`).
+    exact_provenance: bool,
     /// The single-role inclusions as edges between role expressions, both ways (`R ⊑ S`
     /// gives `R → S` and `R⁻ → S⁻`), with the axiom of each.
     up: HashMap<ObjProp, Vec<(ObjProp, usize)>>,
     down: HashMap<ObjProp, Vec<(ObjProp, usize)>>,
     /// The roles equivalent to a role, as [`Normaliser::equivalents`] computes them.
     equivalent: std::cell::RefCell<HashMap<ObjProp, Members>>,
-    clause_index: HashMap<(Vec<BodyAtom>, Vec<HeadAtom>), usize>,
+    clause_index: HashMap<(Vec<BodyAtom>, Vec<HeadAtom>), usize, foldhash::fast::RandomState>,
     expand_up_to: u32,
+    /// Definitions unfolded lazily (`Options::lazy_definitions`).
+    unfolded: crate::definitions::Unfolded,
 }
 
 impl<'a> Normaliser<'a> {
@@ -203,11 +203,15 @@ impl<'a> Normaliser<'a> {
             rias: Vec::new(),
             non_simple: HashSet::new(),
             automata: HashMap::new(),
+            nfas: HashMap::new(),
+            base_nfas: Default::default(),
+            exact_provenance: true,
             up: HashMap::new(),
             down: HashMap::new(),
             equivalent: std::cell::RefCell::new(HashMap::new()),
-            clause_index: HashMap::new(),
+            clause_index: HashMap::default(),
             expand_up_to: Options::default().expand_at_most_up_to,
+            unfolded: Default::default(),
         };
         n.role_inclusions();
         n
@@ -272,6 +276,10 @@ impl<'a> Normaliser<'a> {
     fn nnf_not(&mut self, id: ExprId) -> ExprId {
         let expr = self.get(id);
         let out = match expr {
+            ClassExpr::Class(a) if self.unfolded.by_class.contains_key(&a) => {
+                let d = self.unfolded.by_class[&a];
+                return self.nnf_not(d);
+            }
             ClassExpr::Class(_) | ClassExpr::HasSelf(_) => ClassExpr::Not(id),
             ClassExpr::OneOf(xs) => {
                 // ¬{a, b} = ¬{a} ⊓ ¬{b}: each a literal of its own.
@@ -416,6 +424,12 @@ impl<'a> Normaliser<'a> {
         match axiom {
             Axiom::Declaration(..) => {}
             Axiom::SubClassOf(a, b) => self.sub(*a, *b, index),
+            Axiom::EquivalentClasses(_) if self.unfolded.by_axiom.contains_key(&index) => {
+                // `A ⊑ D` only, with `¬A` as a literal (elsewhere it unfolds to `¬D`).
+                let (a, d) = self.unfolded.by_axiom[&index];
+                let (not_a, d) = (self.e(ClassExpr::Not(a)), self.nnf(d));
+                self.gci(Vec::new(), vec![Item::Expr(not_a), Item::Expr(d)], index);
+            }
             Axiom::EquivalentClasses(xs) => {
                 for pair in xs.windows(2) {
                     self.sub(pair[0], pair[1], index);
@@ -764,7 +778,7 @@ impl<'a> Normaliser<'a> {
                 _ => out.push(item),
             }
         }
-        out.sort_by_key(|i| format!("{i:?}"));
+        out.sort_unstable();
         out.dedup();
         Some(out)
     }
@@ -1180,6 +1194,26 @@ impl<'a> Normaliser<'a> {
     /// edge of each of them. Splicing them into each other was taken for a cycle, an
     /// irregular RBox (ore_ont_15971: `after` inverse of the transitive `before`).
     fn nfa(&self, role: Term, stack: &mut Vec<Term>) -> Option<Nfa> {
+        if let Some(known) = self.base_nfas.borrow().get(&role) {
+            return known.as_deref().cloned();
+        }
+        let built = self.nfa_uncached(role, stack).map(|nfa| {
+            // Minimal before it is spliced into others: they stay small too.
+            if self.exact_provenance {
+                nfa
+            } else {
+                nfa.minimal()
+            }
+        });
+        if built.is_some() || stack.is_empty() {
+            self.base_nfas
+                .borrow_mut()
+                .insert(role, built.clone().map(std::rc::Rc::new));
+        }
+        built
+    }
+
+    fn nfa_uncached(&self, role: Term, stack: &mut Vec<Term>) -> Option<Nfa> {
         if stack.contains(&role) {
             return None;
         }
@@ -1297,7 +1331,26 @@ impl<'a> Normaliser<'a> {
         if let Some(&start) = self.automata.get(&(role, filler)) {
             return start;
         }
-        let Some(nfa) = self.nfa(role.named(), &mut Vec::new()) else {
+        let nfa = match self.nfas.get(&role) {
+            Some(known) => known.clone(),
+            None => {
+                let built = self.nfa(role.named(), &mut Vec::new()).map(|nfa| {
+                    let nfa = match role {
+                        ObjProp::Named(_) => nfa,
+                        ObjProp::Inverse(_) => nfa.inverse(),
+                    };
+                    // The inverse of a minimal automaton isn't deterministic.
+                    let nfa = match role {
+                        ObjProp::Inverse(_) if !self.exact_provenance => nfa.minimal(),
+                        _ => nfa,
+                    };
+                    std::rc::Rc::new(self.unimplied(nfa))
+                });
+                self.nfas.insert(role, built.clone());
+                built
+            }
+        };
+        let Some(nfa) = nfa else {
             self.out
                 .unsupported
                 .push((source, "an irregular role hierarchy"));
@@ -1305,10 +1358,6 @@ impl<'a> Normaliser<'a> {
             let q = self.new_fresh(FreshOf::State { role, state: 0 });
             self.automata.insert((role, filler), q);
             return q;
-        };
-        let nfa = match role {
-            ObjProp::Named(_) => nfa,
-            ObjProp::Inverse(_) => nfa.inverse(),
         };
         let names: Vec<u32> = (0..nfa.states)
             .map(|state| self.new_fresh(FreshOf::State { role, state }))
@@ -1347,6 +1396,54 @@ impl<'a> Normaliser<'a> {
             source,
         );
         names[nfa.start as usize]
+    }
+
+    /// The automaton less the transitions another transition between the same states
+    /// implies: an edge of a role is an edge of each role the single-role inclusions lead
+    /// it to (they are clauses), so a transition on `S` beside one on `R` with `S ⊑ R`
+    /// adds nothing (of roles each leading to the other, the least is kept). On a
+    /// transitive role with a large hierarchy below it this is most of them (ore_ont_1066:
+    /// 4,451 clauses per universal).
+    fn unimplied(&self, mut nfa: Nfa) -> Nfa {
+        let mut by_states: HashMap<(u32, u32), Vec<ObjProp>> = HashMap::new();
+        for (a, label, b, _) in &nfa.edges {
+            if let Some(l) = label {
+                by_states.entry((*a, *b)).or_default().push(*l);
+            }
+        }
+        let mut above: HashMap<ObjProp, HashSet<ObjProp>> = HashMap::new();
+        for labels in by_states.values().filter(|ls| ls.len() > 1) {
+            for &r in labels {
+                above.entry(r).or_insert_with(|| {
+                    let mut seen = HashSet::from([r]);
+                    let mut queue = vec![r];
+                    while let Some(x) = queue.pop() {
+                        for &(y, _) in self.up.get(&x).into_iter().flatten() {
+                            if seen.insert(y) {
+                                queue.push(y);
+                            }
+                        }
+                    }
+                    seen
+                });
+            }
+        }
+        let mut implied: HashSet<(u32, u32, ObjProp)> = HashSet::new();
+        for (&(a, b), labels) in by_states.iter().filter(|(_, ls)| ls.len() > 1) {
+            for &l in labels {
+                let covered = labels.iter().any(|&other| {
+                    other != l
+                        && above[&l].contains(&other)
+                        && (!above[&other].contains(&l) || other < l)
+                });
+                if covered {
+                    implied.insert((a, b, l));
+                }
+            }
+        }
+        nfa.edges
+            .retain(|(a, label, b, _)| label.is_none_or(|l| !implied.contains(&(*a, *b, l))));
+        nfa
     }
 
     fn finish(self) -> Normalised {

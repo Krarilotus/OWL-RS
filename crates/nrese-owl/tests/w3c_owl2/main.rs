@@ -8,6 +8,8 @@
 //! - Ontologies the reader can't take yet are listed in `expected-failures.txt`, with why;
 //!   the run fails on any failure not listed, and on any listed one that passes.
 
+mod functional;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
@@ -200,6 +202,8 @@ fn check(text: &str) -> Result<(), String> {
         let missing: Vec<&String> = before.iter().filter(|l| !after.contains(l)).collect();
         return Err(format!("round trip lost {missing:?}"));
     }
+    // Written in the functional syntax and read back: the same model.
+    functional::round_trip(&ontology, &mut table)?;
     // Normalises (work package 2.2): no construct left unhandled.
     std::panic::catch_unwind(|| normalise(&ontology))
         .map_err(|_| "the normalisation panicked".to_owned())?;

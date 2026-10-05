@@ -70,7 +70,7 @@ pub struct Options {
     pub lower_bound_timeout: Duration,
     /// The most conclusions one join of the context core may produce, per run.
     pub max_join: usize,
-    /// How `nrese-owl` normalises.
+    /// How `nrese-owl` normalises (never with lazy definitions: see the default).
     pub normalise: nrese_owl::Options,
 }
 
@@ -96,7 +96,14 @@ impl Default for Options {
             timeout: None,
             lower_bound_timeout: Duration::from_secs(2),
             max_join: 1 << 20,
-            normalise: nrese_owl::Options::default(),
+            // No lazy unfolding: it under-approximates the unfolded classes in a model, and
+            // the driver reads its subsumers off model labels. No proofs are read here, so
+            // the minimal automata do.
+            normalise: nrese_owl::Options {
+                lazy_definitions: false,
+                exact_provenance: false,
+                ..nrese_owl::Options::default()
+            },
         }
     }
 }

@@ -29,6 +29,9 @@ pub(crate) struct JsonLdSettings {
     pub(crate) unchecked: bool,
     pub(crate) max_depth: usize,
     pub(crate) options: JsonLdOptions,
+    /// After an element of a streamed top-level array (or `@graph` array) fails to
+    /// expand, go on with the next ([`crate::RdfParser::recovering`]).
+    pub(crate) recover: bool,
 }
 
 enum State {
@@ -57,6 +60,7 @@ struct Core {
     base: Option<Arc<Iri<String>>>,
     unchecked: bool,
     max_depth: usize,
+    recover: bool,
     arena: QuadArena,
     next: usize,
 }
@@ -110,6 +114,7 @@ impl<'a> JsonLdParser<'a> {
                 base: settings.base.map(Arc::new),
                 unchecked: settings.unchecked,
                 max_depth: settings.max_depth,
+                recover: settings.recover,
                 arena: QuadArena::default(),
                 next: 0,
             },
@@ -125,10 +130,9 @@ impl<'a> JsonLdParser<'a> {
                 Some(Ok(core.arena.quad(i)))
             }
             Ok(false) => None,
-            Err(error) => {
-                self.core.state = State::Done;
-                Some(Err(error))
-            }
+            // The state says whether to go on: a step that fails leaves it `Done`, unless
+            // it skipped one element of a stream and recovers.
+            Err(error) => Some(Err(error)),
         }
     }
 
@@ -196,20 +200,20 @@ impl Core {
                         parser.next_event().map_err(syntax)?;
                     }
                     Some(element) => {
-                        let items = {
-                            let mut expander =
-                                Expander::new(&mut self.processor).with_base_url(self.base.clone());
-                            expander
-                                .expand(&active, property, &element, false)
-                                .map_err(processing)?
-                                .into_vec()
-                        };
-                        self.emit(&items);
-                        self.state = State::Items {
-                            parser: parser.state(),
-                            active,
-                            property,
-                        };
+                        let expanded = Expander::new(&mut self.processor)
+                            .with_base_url(self.base.clone())
+                            .expand(&active, property, &element, false)
+                            .map(|items| items.into_vec());
+                        // The element was read whole: a recovering parser skips it and
+                        // goes on with the next.
+                        if expanded.is_ok() || self.recover {
+                            self.state = State::Items {
+                                parser: parser.state(),
+                                active,
+                                property,
+                            };
+                        }
+                        self.emit(&expanded.map_err(processing)?);
                     }
                 }
             }

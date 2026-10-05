@@ -525,6 +525,14 @@ impl<'a> Engine<'a> {
     }
 
     pub fn check_time(&self) -> Step<()> {
+        if self
+            .config
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.is_cancelled())
+        {
+            return Err(Stop::GaveUp("cancelled".into()));
+        }
         if let Some(limit) = self.config.timeout
             && self.started.elapsed() > limit
         {

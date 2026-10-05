@@ -140,6 +140,19 @@ pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
     reader.finish()
 }
 
+/// What every reader adds to the axioms it read: the literals' parts, the anonymous
+/// individuals, and the diagnostics of OWL 2 DL's global restrictions.
+pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
+    ontology.data = data_terms(ontology, terms);
+    ontology.anonymous = ontology
+        .axioms
+        .iter()
+        .flat_map(individuals)
+        .filter(|&t| terms.kind(t) == TermKind::Blank)
+        .collect();
+    crate::diagnostics::check_global_restrictions(ontology);
+}
+
 /// The individuals an assertion is about.
 fn individuals(axiom: &Axiom) -> Vec<Term> {
     match axiom {
@@ -1113,7 +1126,10 @@ impl<'a> Reader<'a> {
             }
         } else if self.declared_as(p, EntityKind::AnnotationProperty)
             || self.is_builtin_annotation(p)
+            || self.has_type(s, v.owl_ontology)
         {
+            // An annotation, or a statement about the ontology: its header's annotations
+            // (an anonymous ontology's too: its node is a blank node).
             self.annotations += 1;
         } else if self.kind(o) == TermKind::Literal || self.is_data_property(p) {
             self.add(Axiom::DataPropertyAssertion(p, s, o), triple);
@@ -1263,14 +1279,7 @@ impl<'a> Reader<'a> {
             data: DataTerms::default(),
             anonymous: BTreeSet::new(),
         };
-        ontology.data = data_terms(&ontology, self.terms);
-        ontology.anonymous = ontology
-            .axioms
-            .iter()
-            .flat_map(individuals)
-            .filter(|&t| self.terms.kind(t) == TermKind::Blank)
-            .collect();
-        crate::diagnostics::check_global_restrictions(&mut ontology);
+        complete(&mut ontology, self.terms);
         ontology
     }
 }

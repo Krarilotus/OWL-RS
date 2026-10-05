@@ -30,6 +30,7 @@ mod keys;
 mod merge;
 mod model;
 mod ni;
+mod portfolio;
 mod probe;
 mod program;
 mod search;
@@ -40,6 +41,7 @@ use std::time::{Duration, Instant};
 use nrese_owl::{Concept, Normalised, Ontology, Options, Term, normalise_with};
 
 pub use model::Model;
+pub use portfolio::Cancel;
 pub use probe::{At, Label, Labels, Prepared, Probe, ProbeOutcome, Want};
 pub use telemetry::Telemetry;
 
@@ -85,6 +87,17 @@ pub struct Config {
     /// `≤ n` up to this `n` is spelled out in clauses; above it, at-most atoms
     /// (`nrese_owl::Options`).
     pub expand_at_most_up_to: u32,
+    /// Unfold a class's only, acyclic Boolean definition lazily
+    /// (`nrese_owl::Options::lazy_definitions`); never when the model is kept, as it
+    /// under-approximates such classes. Which clauses decide sooner depends on the
+    /// ontology: with [`Config::portfolio`] both run side by side.
+    pub lazy_definitions: bool,
+    /// Where lazy unfolding changes the clauses and two cores are free, race the plain and
+    /// the unfolded clauses (`portfolio`), each with half the memory budget; else the
+    /// unfolded clauses alone if this is off, the plain ones if cores are short.
+    pub portfolio: bool,
+    /// Stops the run at its next budget check, answering `GaveUp`.
+    pub cancel: Option<Cancel>,
 }
 
 impl Default for Config {
@@ -102,6 +115,9 @@ impl Default for Config {
             timeout: None,
             max_memory: 4 << 30,
             keep_model: false,
+            lazy_definitions: true,
+            portfolio: true,
+            cancel: None,
             expand_at_most_up_to: Options::default().expand_at_most_up_to,
         }
     }
@@ -158,13 +174,28 @@ pub struct Outcome {
 /// Whether `ontology` is consistent.
 pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
     let ontology = prepared(ontology);
-    let normalised = normalise_with(
-        &ontology,
-        Options {
-            expand_at_most_up_to: config.expand_at_most_up_to,
-        },
-    );
-    consistency_of(&ontology, &normalised, config)
+    // The engine reads no provenance: minimal automata.
+    let options = |lazy_definitions| Options {
+        expand_at_most_up_to: config.expand_at_most_up_to,
+        lazy_definitions,
+        exact_provenance: false,
+    };
+    if !config.lazy_definitions || config.keep_model {
+        return consistency_of(
+            &ontology,
+            &normalise_with(&ontology, options(false)),
+            config,
+        );
+    }
+    let unfolded = normalise_with(&ontology, options(true));
+    if unfolded.unfolded == 0 || !config.portfolio {
+        return consistency_of(&ontology, &unfolded, config);
+    }
+    let plain = normalise_with(&ontology, options(false));
+    if !portfolio::cores_to_spare() {
+        return consistency_of(&ontology, &plain, config);
+    }
+    portfolio::race(&ontology, &[&plain, &unfolded], config)
 }
 
 /// `ontology` with each negative assertion over a non-simple property `¬R(a, b)` as the

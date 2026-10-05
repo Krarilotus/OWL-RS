@@ -2,8 +2,9 @@
 //! component with its own interface, called by the hypertableau.
 //!
 //! - [`Ranges`]: the ontology's data ranges as sets of values over `nrese-xsd`'s value
-//!   spaces (the OWL 2 datatype map), exact or bounded both ways where a range can't be
-//!   decided (patterns, language ranges, datatypes outside the map), and saying so;
+//!   spaces (the OWL 2 datatype map), patterns and language ranges included, exact or
+//!   bounded both ways where a range can't be decided (datatypes outside the map, patterns
+//!   of binary data, more patterns than `MAX_PATTERNS`), and saying so;
 //! - [`DatatypeTheory`]: `add_literal`, `add_range` with polarity, `add_not_equal`,
 //!   `merge`, `min_cardinality`, and `check(component) -> Sat | Clash(DepSetId)`, solved
 //!   per connected component of data variables, clashes carrying dependency sets.

@@ -85,7 +85,7 @@ impl Build {
     }
 
     /// A fresh term (above the hand-picked ones), with an IRI if `iri` is given.
-    fn term(&mut self, iri: Option<String>) -> Term {
+    pub fn term(&mut self, iri: Option<String>) -> Term {
         let t = 1_000_000 + (self.o.data.literals.len() + self.o.data.iris.len()) as Term;
         if let Some(iri) = iri {
             self.o.data.iris.insert(t, iri);
