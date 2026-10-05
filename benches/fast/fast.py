@@ -7,6 +7,7 @@ hour, run like unit tests for performance (README.md here; cases.toml).
     python benches/fast/fast.py run [--cases A,B] [--areas X,Y] [--reps 2] [--label L]
     python benches/fast/fast.py compare BASE.json NEW.json
     python benches/fast/fast.py compete [--cases A,B] [--systems S,T]   NRESE beside its comparators
+    python benches/fast/fast.py table [--baseline R] [--write]   the cases as CATALOG.md's table
     python benches/fast/fast.py clean                    removes the generated data and scratch
 
 `run` generates each case's data once (deterministic; kept in the volume nrese-fast-data),
@@ -162,16 +163,17 @@ def ensure_data(spec: str) -> dict:
     return json.loads(out)["expect"]
 
 
-def vector_queries(expect: dict) -> Path:
-    """The vector case's queries, written from the generator's query vectors."""
-    directory = SCRATCH / "queries" / "vectors"
+def vector_queries(expect: dict, exact: bool) -> Path:
+    """The vector cases' queries, written from the generator's query vectors."""
+    directory = SCRATCH / "queries" / ("vectors-exact" if exact else "vectors")
     directory.mkdir(parents=True, exist_ok=True)
+    option = " ; nrv:exact true" if exact else ""
     for q in range(5):
         (directory / f"knn-{q}.rq").write_text(
             "PREFIX e: <http://example.org/fast/>\nPREFIX nrv: <urn:nrese:vector:>\n"
             f"SELECT ?item WHERE {{ ?item e:kind e:k3 ; e:embedding ?v .\n"
-            f"  SERVICE nrv:search {{ ?v nrv:near \"{expect[f'query_{q}']}\"^^nrv:vector ; nrv:k 10 ; nrv:rank ?r }} }}\n"
-            "ORDER BY ?r\n", encoding="utf-8")
+            f"  SERVICE nrv:search {{ ?v nrv:near \"{expect[f'query_{q}']}\"^^nrv:vector ; nrv:k 10{option} ;"
+            " nrv:rank ?r } }\nORDER BY ?r\n", encoding="utf-8")
     return directory
 
 
@@ -179,8 +181,8 @@ def queries_path(case: dict, expect: dict) -> str | None:
     name = case.get("queries", "")
     if not name:
         return None
-    if name == "@vectors":
-        return "/out/queries/vectors"
+    if name.startswith("@vectors"):
+        return f"/out/queries/{name[1:]}"
     if name in ("lubm", "owl2bench"):
         return f"/src/benches/reasoning/queries/{name}"
     return f"/src/benches/fast/queries/{name}"
@@ -231,8 +233,8 @@ def run_case(case: dict, label: str, rep: int) -> dict:
     for extra in case.get("extra", []):
         ensure_data(extra)
     data = data_file(case["data"])
-    if case.get("queries") == "@vectors":
-        vector_queries(expect)
+    if case.get("queries", "").startswith("@vectors"):
+        vector_queries(expect, exact=case["queries"] == "@vectors-exact")
     name = f"fast-{case['name']}-{ROOT.name}"
     tool = case.get("tool", "perf_lab")
     out_json = f"/out/{case['name']}.json"
@@ -255,7 +257,7 @@ def run_case(case: dict, label: str, rep: int) -> dict:
         if "setup" in case:
             setup = ["/target/release/examples/perf_lab", *substitute(case["setup"], data, scratch)]
             script = f"rm -rf {scratch} && mkdir -p {scratch} && {' '.join(setup)} >/dev/null 2>&1 && "
-        if case.get("queries") == "@vectors":
+        if case.get("queries", "").startswith("@vectors"):
             command += ["--results", f"/out/results/{case['name']}"]
         samples_runs = []
         code = 0
@@ -284,7 +286,8 @@ def run_case(case: dict, label: str, rep: int) -> dict:
             record["notes"].append(err.strip().splitlines()[-1][:300] if err.strip() else f"exit {code}")
     elif tool == "tableau":
         files = [data] * repeat + ([data_file(case["data_alt"])] * repeat if case.get("data_alt") else [])
-        command = ["/target/release/examples/tableau_consistency", "--timeout", "300", *files]
+        timeout = str(case.get("timeout_s", 300))
+        command = ["/target/release/examples/tableau_consistency", "--timeout", timeout, *files]
         code, out, err, wall = container(name, case["cap_gb"], command)
         rows = parse_tableau(out)
         main = [r for r in rows if r["file"] == data]
@@ -298,6 +301,8 @@ def run_case(case: dict, label: str, rep: int) -> dict:
         if code != 0 or not rows:
             record["status"] = classify_failure(code, err, result)
             record["notes"].append(err.strip()[-300:])
+        elif result.get("answer") in ("gave-up", "timeout", "unsupported"):
+            record["status"] = "gave-up"
     elif tool in ("classify-el", "classify-horn"):
         binary = "classify" if tool == "classify-el" else "context_classify"
         out_tsv = f"/out/{case['name']}.tsv"
@@ -308,7 +313,11 @@ def run_case(case: dict, label: str, rep: int) -> dict:
         lines = out.split()
         if code == 0 and len(lines) >= 2:
             result["hash"], result["subsumptions"] = lines[-2], int(lines[-1])
-        total = next((result[k] for k in ("total_ms", "whole_ms", "classify_ms", "saturate_ms") if k in result), None)
+        # The context core's profile has `total`; the EL classifier's, its phases.
+        phases = ("read", "normalise", "prepare", "saturate", "assemble", "write")
+        total = result.get("total")
+        if total is None and all(isinstance(result.get(k), float) for k in phases):
+            total = sum(result[k] for k in phases)
         result["whole_ms"] = total
         result["samples_ms"] = [total] if total is not None else []
         record["wall_s"] = round(wall, 2)
@@ -318,7 +327,7 @@ def run_case(case: dict, label: str, rep: int) -> dict:
     record["metric"] = metric_value(case, result)
     record["samples"] = samples(case, result)
     record["peak_mib"] = result.get("cgroup_peak_mib") or result.get("peak_mib")
-    if case.get("queries") == "@vectors" and record["status"] == "ok":
+    if case.get("queries", "").startswith("@vectors") and record["status"] == "ok":
         result["recall"] = vector_recall(case, expect)
     record["checks"] = [check(path, want, result, expect, alt_expect) for path, want in case.get("check", {}).items()]
     record["routes"] = [route(path, want, result) for path, want in case.get("route", {}).items()]
@@ -417,7 +426,18 @@ def route(path: str, want: str, result: dict) -> dict:
     return {"path": path, "expected": want, "got": got, "ok": compare_op(got, want)}
 
 
+def cold_ms(result: dict) -> float | None:
+    """Opening the store and the first execution of each query, in ms."""
+    if "open_s" not in result:
+        return None
+    return result["open_s"] * 1000.0 + result.get("sum_p50_ms", 0.0)
+
+
 def metric_value(case: dict, result: dict):
+    if case["metric"] == "cold_ms":
+        values = [cold_ms(r) for r in result.get("_repeats", [result])]
+        values = [v for v in values if v is not None]
+        return statistics.median(values) if values else None
     value = lookup(case["metric"], result)
     if case["metric"] in ("load_s", "open_s") and value is not None:
         value = value * 1000.0
@@ -431,6 +451,8 @@ def metric_value(case: dict, result: dict):
 def samples(case: dict, result: dict) -> dict:
     """Per series, the measured samples (ms) the metric is a median or sum of medians of."""
     metric = case["metric"]
+    if metric == "cold_ms":
+        return {"_": [v for v in (cold_ms(r) for r in result.get("_repeats", [result])) if v is not None]}
     if metric == "sum_p50_ms":
         return {q["name"]: q["samples_ms"] for q in result.get("queries", []) if "samples_ms" in q}
     section = metric.split(".")[0]
@@ -484,13 +506,15 @@ def run(args) -> int:
             mark = "" if record["status"] == record.get("expected_outcome", "ok") else "  <<<"
             metric = record.get("metric")
             print(f"rep {rep} {case['name']:<24} {record['status']:<13} "
-                  f"{(f'{metric:,.1f} ms' if isinstance(metric, (int, float)) else '-'):>14} "
+                  f"{(f'{metric:,.{1 if metric >= 10 else 4}f} ms' if isinstance(metric, (int, float)) else '-'):>14} "
                   f"peak {record.get('peak_mib') or '-':>6} MiB  {record['case_s']:>6.1f} s{mark}", flush=True)
             for c in record["checks"] + record["routes"]:
                 if not c["ok"]:
                     print(f"      {c['path']}: expected {c['expected']}, got {c['got']}")
             for note in record.get("notes", []):
                 print(f"      {note}")
+            if case.get("known") and record["status"] == record.get("expected_outcome"):
+                print(f"      known: {case['known']}")
             out.write_text(json.dumps(report, indent=1), encoding="utf-8")
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
@@ -580,6 +604,46 @@ def list_cases(args) -> int:
     return 0
 
 
+TURF = {"qlever": "QLever", "oxigraph": "Oxigraph", "virtuoso": "Virtuoso", "jena": "Jena", "rdf4j": "RDF4J",
+        "nemo": "Nemo", "glog-vlog": "GLog/VLog (no runner: Nemo stands in)", "elk": "ELK", "konclude": "Konclude",
+        "hermit": "HermiT", "openllet": "Openllet"}
+MARKERS = ("<!-- fast-cases:start (fast.py table --write) -->", "<!-- fast-cases:end -->")
+
+
+def table(args) -> int:
+    """The cases as CATALOG.md's table: semantics, comparators and home turf per case, and
+    each case's time and peak in a baseline (`--baseline`)."""
+    cases = load_cases()
+    times: dict[str, tuple] = {}
+    if args.baseline:
+        report = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
+        for r in report["records"]:
+            times.setdefault(r["case"], (r.get("case_s"), r.get("peak_mib"), r.get("status")))
+    lines = ["| Case | Area | NRESE runs | Comparators (system: semantics) | Home turf of | Measures |"
+             + (" Case s, peak MiB |" if times else ""),
+             "|---|---|---|---|---|---|" + ("---|" if times else "")]
+    for c in cases:
+        systems = ", ".join(f"{s.split(':')[0]}: {s.split(':')[1]}" for s in c.get("systems", [])) \
+            or "none: NRESE's own column"
+        turf = TURF.get(c.get("home_turf", ""), c.get("home_turf", ""))
+        row = f"| `{c['name']}` | {c['area']} | {c['semantics']} | {systems} | {turf} | {c['what']} |"
+        if times:
+            s_, peak, status = times.get(c["name"], (None, None, None))
+            note = "" if status in (None, "ok", c.get("outcome")) else f" ({status})"
+            row += f" {s_ if s_ is not None else '-'}, {peak or '-'}{note} |"
+        lines.append(row)
+    text = "\n".join(lines)
+    if not args.write:
+        print(text)
+        return 0
+    path = ROOT / "benches" / "CATALOG.md"
+    catalog = path.read_text(encoding="utf-8")
+    start, end = catalog.index(MARKERS[0]) + len(MARKERS[0]), catalog.index(MARKERS[1])
+    path.write_text(catalog[:start] + "\n" + text + "\n" + catalog[end:], encoding="utf-8")
+    print(f"wrote {len(cases)} cases into {path.relative_to(ROOT)}")
+    return 0
+
+
 def clean(args) -> int:
     docker(["volume", "rm", DATA_VOLUME])
     import shutil
@@ -589,6 +653,7 @@ def clean(args) -> int:
 
 
 def main() -> int:
+    sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
     for name in ("list", "run", "compete"):
@@ -604,6 +669,9 @@ def main() -> int:
             s.add_argument("--runs", type=int, default=1)
             s.add_argument("--licensed", action="store_true",
                            help="also the licensed systems (results stay in benches/fast/results)")
+    t = sub.add_parser("table")
+    t.add_argument("--baseline", help="a run's report, for each case's time and peak")
+    t.add_argument("--write", action="store_true", help="into benches/CATALOG.md between its markers")
     sub.add_parser("build")
     sub.add_parser("clean")
     c = sub.add_parser("compare")
@@ -613,7 +681,8 @@ def main() -> int:
     if args.command == "compete":
         from compete import compete
         return compete(args)
-    return {"list": list_cases, "build": build, "run": run, "compare": compare, "clean": clean}[args.command](args)
+    return {"list": list_cases, "build": build, "run": run, "compare": compare, "clean": clean,
+            "table": table}[args.command](args)
 
 
 if __name__ == "__main__":

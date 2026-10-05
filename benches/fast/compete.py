@@ -79,14 +79,18 @@ def export_closure(case: dict) -> str | None:
     return target
 
 
-def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: str) -> list[dict]:
+def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: str,
+              queries: Path | None = None) -> list[dict]:
     """The suite's driver on tier CASE~SEMANTICS for NRESE and `systems`; its rows."""
     tier = f"{case['name']}~{semantics}"
     out = RESULTS / stamp / tier.replace("~", "-")
     cap = max(int(case["cap_gb"]), 8)
     env = {**fast.ENV, "NRESE_TARGET_VOLUME": fast.TARGET_VOLUME, "DOCKER_MEMORY": f"{cap}g",
            "JAVA_HEAP": f"{max(cap - 2, 2)}g", "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS", "4"),
-           "NRESE_MEMORY_CAP_GB": os.environ.get("NRESE_MEMORY_CAP_GB", "8")}
+           "NRESE_MEMORY_CAP_GB": os.environ.get("NRESE_MEMORY_CAP_GB", "8"),
+           "CARGO_TARGET_DIR": str(fast.ROOT / "target")}
+    if queries:
+        env["FAST_QUERIES"] = str(queries)
     command = [sys.executable, str(fast.ROOT / "benches/suite/suite.py"), "run",
                "--systems", ",".join(["nrese", *systems]), "--workloads", "fast", "--tier", f"fast={tier}",
                "--runs", str(runs), "--query-runs", "3", "--cache", "off", "--skip-build",
@@ -186,7 +190,31 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
                                                      "detail": parts[5] if len(parts) > 5 else ""})
     if done.returncode not in (0, 3):
         print(f"  the DL runner exited {done.returncode}: {done.stderr.strip()[-200:]}")
-    return {"results": results, "wall_s": round(wall, 1), "nrese_ms": nrese_ms}
+    out = {"results": results, "wall_s": round(wall, 1), "nrese_ms": nrese_ms}
+    if task == "classify":
+        out["nrese_taxonomy"] = nrese_taxonomy(case, work, results)
+    return out
+
+
+def nrese_taxonomy(case: dict, work: str, results: dict) -> str | None:
+    """NRESE's closure (the fast run's `--out`) as the canonical taxonomy over a reference
+    run's signature (benches/reasoning/dl/canonical.py): its SHA-256, which equals a
+    reference's when the taxonomies are the same."""
+    sys.path.insert(0, str(fast.ROOT / "benches" / "reasoning" / "dl"))
+    import canonical
+    closure = fast.SCRATCH / f"{case['name']}.tsv"
+    reference = next((r for r, v in results.items() if v.get("status") == "classified"), None)
+    if reference is None or not closure.exists():
+        return None
+    tax = fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "cat",
+                       f"/work/{work}-tax/{case['name']}.{reference}.tax"])
+    if tax.returncode != 0:
+        return None
+    signature_file = fast.SCRATCH / f"{case['name']}.{reference}.tax"
+    signature_file.write_text(tax.stdout, encoding="utf-8")
+    pairs = [tuple(line.rstrip("\n").split("\t")[:2]) for line in open(closure, encoding="utf-8") if "\t" in line]
+    text = canonical.canonical(canonical.signature(signature_file), pairs)
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def nemo_custom(case: dict) -> dict:
@@ -214,20 +242,56 @@ def nrese_metric(case: dict) -> tuple[float | None, dict]:
     return record.get("metric"), record
 
 
+def merged_queries(cases: list[dict], key: str) -> Path | None:
+    """The queries of `cases` in one directory, each named CASE--QUERY.rq; None if a case
+    has none."""
+    directory = fast.SCRATCH / "queries" / "merged" / key
+    if directory.exists():
+        for old in directory.glob("*.rq"):
+            old.unlink()
+    directory.mkdir(parents=True, exist_ok=True)
+    for case in cases:
+        name = case.get("queries", "")
+        if not name or name.startswith("@"):
+            return None
+        source = (fast.ROOT / "benches/reasoning/queries" / name if name in ("lubm", "owl2bench")
+                  else fast.HERE / "queries" / name)
+        for query in sorted(source.glob("*.rq")):
+            (directory / f"{case['name']}--{query.name}").write_text(query.read_text(encoding="utf-8"),
+                                                                      encoding="utf-8")
+    return directory
+
+
+def split(summary: dict[str, dict], case: str) -> dict[str, dict]:
+    """A merged run's summary restricted to one case's queries (renamed back)."""
+    out = {}
+    for system, s in summary.items():
+        queries = {q.split("--", 1)[1]: v for q, v in s["queries"].items() if q.startswith(f"{case}--")}
+        out[system] = {**s, "queries": queries}
+    return out
+
+
 def compete(args) -> int:
     cases = fast.select(fast.load_cases(), args)
     only = set(args.systems.split(",")) if args.systems else None
     stamp = datetime.datetime.now().strftime("%Y-%m-%d-%H%M")
     report = {"started": stamp, "git": fast.manifest.git(fast.ROOT), "cases": {}}
     licensed = getattr(args, "licensed", False)
+    (RESULTS / stamp).mkdir(parents=True, exist_ok=True)
+
+    def save():
+        (RESULTS / stamp / "compete.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+
+    # Suite jobs, grouped: the cases on the same data and semantics load it once per system.
+    groups: dict[tuple, dict] = {}
     for case in cases:
         entries = comparators(case, only)
         if not entries:
             continue
         print(f"\n{case['name']} ({case['semantics']})", flush=True)
         fast.ensure_data(case["data"])
-        result = {"semantics": case["semantics"], "comparisons": {}, "no_runner": []}
-        by_semantics: dict[str, list[str]] = {}
+        result = report["cases"].setdefault(case["name"], {"semantics": case["semantics"], "comparisons": {},
+                                                            "no_runner": []})
         dl: list[str] = []
         for system, semantics in entries:
             if system in LICENSED and not licensed:
@@ -237,7 +301,12 @@ def compete(args) -> int:
             elif system == "nemo" and semantics == "custom":
                 result["comparisons"]["nemo:custom"] = nemo_custom(case)
             elif system in SUITE_SYSTEMS and semantics in FAST_REGIMES:
-                by_semantics.setdefault(semantics, []).append(system)
+                clients = "--clients" in case.get("args", [])
+                data = (case["name"],) if semantics == "closure" else (case["data"], *case.get("extra", []))
+                group = groups.setdefault((data, semantics, clients), {"cases": [], "systems": set()})
+                if case not in group["cases"]:
+                    group["cases"].append(case)
+                group["systems"].add(system)
             else:
                 result["no_runner"].append(f"{system}:{semantics}")
         if dl:
@@ -245,26 +314,33 @@ def compete(args) -> int:
             dl_result = dl_run(case, dl, metric, stamp)
             dl_result["nrese_answer"] = record.get("result", {}).get("answer")
             dl_result["nrese_hash"] = record.get("result", {}).get("hash")
+            dl_result["nrese_status"] = record.get("status")
             result["comparisons"]["dl"] = dl_result
         if "nemo:custom" in result["comparisons"]:
             metric, record = nrese_metric(case)
             result["comparisons"]["nemo:custom"]["nrese_reason_ms"] = record.get("metric")
-            result["comparisons"]["nemo:custom"]["nrese_pairs"] = \
-                next((c["got"] for c in record.get("checks", []) if c["path"].startswith("q.paths")), None)
-        if any(s in ("plain", "closure") or s in FAST_REGIMES for s in by_semantics):
-            copy_volume_files(case)
-        for semantics, systems in by_semantics.items():
-            if semantics == "closure" and export_closure(case) is None:
-                result["no_runner"].append("closure export failed")
-                continue
-            rows = suite_run(case, semantics, systems, args.runs, stamp)
-            summary = summarise_suite(rows)
-            result["comparisons"][semantics] = {"summary": summary, "verdicts": verdicts(summary)}
-        report["cases"][case["name"]] = result
+            result["comparisons"]["nemo:custom"]["nrese_pairs"] =                 next((c["got"] for c in record.get("checks", []) if c["path"].startswith("q.paths")), None)
         print_case(case["name"], result)
-        RESULTS.mkdir(parents=True, exist_ok=True)
-        (RESULTS / stamp).mkdir(parents=True, exist_ok=True)
-        (RESULTS / stamp / "compete.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+        save()
+    for (data, semantics, clients), group in groups.items():
+        first = group["cases"][0]
+        copy_volume_files(first)
+        if semantics == "closure" and export_closure(first) is None:
+            for case in group["cases"]:
+                report["cases"][case["name"]]["no_runner"].append("closure export failed")
+            continue
+        key = f"{first['name']}-{semantics}" + ("-clients" if clients else "")
+        queries = merged_queries(group["cases"], key) if len(group["cases"]) > 1 else None
+        rows = suite_run(first, semantics, sorted(group["systems"]), args.runs, stamp, queries)
+        summary = summarise_suite(rows)
+        for case in group["cases"]:
+            mine = split(summary, case["name"]) if queries else summary
+            report["cases"][case["name"]]["comparisons"][semantics] = {"summary": mine, "verdicts": verdicts(mine)}
+            print(f"\n{case['name']} ({semantics})")
+            print_case(case["name"], {"comparisons": {semantics: report["cases"][case["name"]]["comparisons"][semantics]},
+                                      "no_runner": []})
+        save()
+    save()
     print(f"\nresults: {(RESULTS / stamp / 'compete.json').relative_to(fast.ROOT)}")
     return 0
 
@@ -274,8 +350,14 @@ def print_case(name: str, result: dict):
         if semantics == "dl":
             r = comparison
             print(f"  DL: NRESE {r['nrese_ms']} ms (answer {r.get('nrese_answer')}, hash {r.get('nrese_hash')})")
+            ours = r.get("nrese_taxonomy")
+            if ours:
+                print(f"    NRESE's taxonomy {ours[:16]}")
             for reasoner, v in r["results"].items():
-                print(f"    {reasoner:<9} {v.get('status', '-'):<13} {v.get('ms', '-')} ms  {v.get('taxonomy', '')}")
+                same = ""
+                if ours and v.get("status") == "classified":
+                    same = "taxonomy equal" if v.get("detail", "").startswith(ours) else "TAXONOMY DIFFERS"
+                print(f"    {reasoner:<9} {v.get('status', '-'):<13} {v.get('ms', '-')} ms  {same}")
             continue
         if semantics == "nemo:custom":
             print(f"  nemo (custom rules): {comparison}")
