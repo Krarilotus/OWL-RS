@@ -8,6 +8,7 @@
 
 use std::time::Instant;
 
+use super::BRANCH_BUDGET;
 use super::depset::DepSetId;
 use super::engine::{Engine, Frame, Lit, Step, Stop, proof};
 use super::graph::{Annot, Edge, NONE, flag};
@@ -295,6 +296,16 @@ impl Engine<'_> {
         premise: DepSetId,
         semantic: bool,
     ) -> Step<()> {
+        if self
+            .config
+            .max_branch_points
+            .is_some_and(|m| self.stats.branch_points >= m)
+        {
+            return Err(Stop::GaveUp(format!(
+                "{BRANCH_BUDGET} ({})",
+                self.stats.branch_points
+            )));
+        }
         self.stats.branch_points += 1;
         self.frames.push(Frame {
             mark: self.g.mark(),
