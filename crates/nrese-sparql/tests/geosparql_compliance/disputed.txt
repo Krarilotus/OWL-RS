@@ -1,0 +1,42 @@
+# Disputed answers of the GeoSPARQL compliance benchmark (OpenLink Software, pinned in
+# scripts/fetch-w3c-tests.sh). Format: <query name> # reason.
+#
+# Every entry is a query whose reference answer contradicts GeoSPARQL's definitions, with
+# the evidence. The topology is checked independently with GEOS (DE-9IM matrices by
+# shapely, `python scripts/geosparql-oracle.py .cache/geosparql-benchmark/src/main/resources
+# <query>...`): it agrees with NRESE on every entry below. The run fails if a listed query
+# starts to match the reference, or an unlisted one stops matching.
+#
+# Requirements 4 to 6 (the relation vocabularies, asserted relations only) run with the
+# query-rewrite extension off (`QueryOptions::geosparql_stated_only`); requirements 28 to 30
+# with it on. Both pass.
+
+# geof:distance in metres: 0.1 degree of longitude at 34.35 degrees north is 9,195 m on
+# WGS84, NRESE's answer between C and G; the reference says 9,387.01 m (and 10,194.1 m
+# where NRESE finds 9,206 m to E): neither geodesic nor planar, and no single projection.
+query-r19-1-1 # reference distances aren't geodesic
+query-r19-1-2 # reference distances aren't geodesic
+query-r19-1-3 # reference distances aren't geodesic
+query-r19-1-4 # reference distances aren't geodesic
+
+# geof:buffer(?g, 10.0, uom:metre): every reference answer buffers by 10 degrees.
+query-r19-2-1 # the reference buffers by 10 degrees, not 10 metres
+query-r19-2-2 # the reference buffers by 10 degrees, not 10 metres
+
+# The reference leaves out relations that GeoSPARQL's DE-9IM definitions give, or has ones
+# they don't (GEOS on the dataset's coordinates):
+query-r28-3 # A sfIntersects itself and the points B, D and G place inside or on it; the reference leaves them out (GEOS: A, AExactGeom, APointGeom, BPointGeom, DPointGeom, GPointGeom intersect A)
+query-r29-5 # G lies inside A without touching its boundary: ehContains, not ehCovers (GEOS: A relate G = 212FF1FF2, boundaries apart; ehCovers needs T*TFT*FF*)
+query-r29-6 # the same pair from the other side: ehInside, not ehCoveredBy
+query-r30-2 # the reference leaves out the line E, disjoint from B (GEOS: B relate E = FF2FF1102, rcc8dc FFTFFTTTT holds)
+query-r30-5 # the reference has A as its own proper part, the point F, and G, which is inside A without touching its boundary (GEOS: A relate A = 2FFF1FFF2, equal; G is ntppi)
+query-r30-6 # the same, from the other side
+query-r30-7 # the reference has A as its own non-tangential proper part (GEOS: equal, 2FFF1FFF2)
+query-r30-8 # the reference has A as its own non-tangential proper part (GEOS: equal, 2FFF1FFF2)
+
+# The GeoSPARQL specification's example queries (Annex B): their answers predate the
+# benchmark's features G, H and I, and query 5 counts a line as overlapping a polygon.
+query01 # G lies inside A too (GEOS: A relate G = 212FF1FF2, sfContains T*****FF* holds)
+query04 # G is nearer to C than E (great circle 9,175 m against 9,186 m; planar both 0.1 degrees); H and I have empty geometries, whose distance is an error, which ORDER BY puts first (SPARQL 1.1 §15.1)
+query05 # E is a line: it crosses A (GEOS: E relate A = 1010F0212); Simple Features overlaps needs the same dimension
+query05_detail # the same; and a UNION keeps its duplicates, which the reference lists once

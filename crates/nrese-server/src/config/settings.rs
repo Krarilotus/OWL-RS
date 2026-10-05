@@ -128,6 +128,14 @@ pub const SETTINGS: &[Setting] = &[
          graphs (default default).",
     ),
     setting(
+        "store.geosparql_relations",
+        names::GEOSPARQL_RELATIONS,
+        Choice(&["computed", "stated"]),
+        "What GeoSPARQL relations in triple patterns match: those stated and those computed \
+         from the geometries (the query-rewrite extension, default computed), or the stated \
+         ones only.",
+    ),
+    setting(
         "store.import_directory",
         names::IMPORT_DIR,
         Text,

@@ -97,6 +97,7 @@ impl StoreService {
         ));
         let settings = crate::query_executor::StoreSettings {
             union_default_graph: config.union_default_graph,
+            geosparql_stated_only: config.geosparql_stated_only,
             query_memory: (config.total_query_memory_bytes > 0)
                 .then(|| nrese_sparql::SharedBudget::new(config.total_query_memory_bytes)),
             services: std::sync::Arc::default(),
@@ -281,6 +282,7 @@ impl StoreService {
         crate::mutation::command::UpdateContext {
             cancellation,
             union_default_graph: self.config.union_default_graph,
+            geosparql_stated_only: self.config.geosparql_stated_only,
             services: self.services(),
             namespaces: self.namespaces.all(),
         }

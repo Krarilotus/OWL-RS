@@ -65,6 +65,10 @@ pub struct QueryOptions {
     /// The graphs the query's user may read (graph-level access control): its dataset is
     /// restricted to them. `None`: every graph.
     pub access: Option<std::sync::Arc<crate::GraphAccess>>,
+    /// GeoSPARQL relations in triple patterns (`?a geo:sfWithin ?b`) read only the
+    /// statements that assert them: GeoSPARQL's topology vocabulary without its
+    /// query-rewrite extension, which by default also computes them from the geometries.
+    pub geosparql_stated_only: bool,
 }
 
 /// Evaluates `query` against `view` over the engine's id tables (`native`); a transaction

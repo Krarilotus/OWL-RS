@@ -15,8 +15,12 @@
 //!   written from another start vertex fails there); XSD numbers and booleans by value (numbers within a
 //!   relative 1e-9: geodesic computations differ in the last digits); blank nodes as one
 //!   placeholder.
-//! - Known failures are listed in `expected-failures.txt`; the run fails on any failure not
-//!   in the list and on any listed query that passes.
+//! - Requirements 4 to 6 (the relation vocabularies) expect the asserted relations only, and
+//!   run with the query-rewrite extension off (`QueryOptions::geosparql_stated_only`);
+//!   the others with it on, as NRESE answers by default.
+//! - Queries whose reference answer contradicts GeoSPARQL's definitions are listed in
+//!   `disputed.txt` with the evidence (GEOS, `scripts/geosparql-oracle.py`); the run fails
+//!   on any failure not in the list and on any listed query that matches the reference.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,7 +34,7 @@ use nrese_sparql_results::{
 };
 use nrese_sparql_syntax::SparqlParser;
 
-const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
+const DISPUTED: &str = include_str!("disputed.txt");
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 const GEO: &str = "http://www.opengis.net/ont/geosparql#";
 
@@ -186,12 +190,16 @@ fn expected(path: &Path) -> Result<Answer, String> {
     }
 }
 
-fn actual(engine: &Engine, text: &str) -> Result<Answer, String> {
+fn actual(engine: &Engine, text: &str, stated_only: bool) -> Result<Answer, String> {
     let query = SparqlParser::new()
         .parse_query(text)
         .map_err(|e| e.to_string())?;
     let snapshot = engine.snapshot();
-    match evaluate_query(&snapshot, &query, &QueryOptions::default()).map_err(|e| e.to_string())? {
+    let options = QueryOptions {
+        geosparql_stated_only: stated_only,
+        ..QueryOptions::default()
+    };
+    match evaluate_query(&snapshot, &query, &options).map_err(|e| e.to_string())? {
         QueryResults::Boolean(b) => Ok(Answer::Boolean(b)),
         QueryResults::Solutions(solutions) => {
             let mut rows = Vec::new();
@@ -309,7 +317,11 @@ fn geosparql_compliance_benchmark() {
         } else {
             &plain
         };
-        let result = actual(engine, &text).and_then(|answer| {
+        // Requirements 4 to 6: the relation vocabularies, without the query rewrite.
+        let stated_only = ["query-r04-", "query-r05-", "query-r06-"]
+            .iter()
+            .any(|requirement| name.starts_with(requirement));
+        let result = actual(engine, &text, stated_only).and_then(|answer| {
             for alternative in &alternatives {
                 if same(&answer, &expected(alternative)?, ordered) {
                     return Ok(());
@@ -324,27 +336,27 @@ fn geosparql_compliance_benchmark() {
             }
         }
     }
-    let expected_failures: std::collections::BTreeSet<&str> = EXPECTED_FAILURES
+    let disputed: std::collections::BTreeSet<&str> = DISPUTED
         .lines()
         .map(|line| line.split('#').next().unwrap_or("").trim())
         .filter(|name| !name.is_empty())
         .collect();
     let new: Vec<_> = failed
         .iter()
-        .filter(|(name, _)| !expected_failures.contains(name.as_str()))
+        .filter(|(name, _)| !disputed.contains(name.as_str()))
         .collect();
-    let fixed: Vec<_> = expected_failures
+    let fixed: Vec<_> = disputed
         .iter()
         .filter(|name| !failed.contains_key(**name))
         .collect();
     eprintln!(
-        "GeoSPARQL compliance benchmark: {passed} of {} queries pass, {} fail ({} expected)",
+        "GeoSPARQL compliance benchmark: {passed} of {} queries match the reference, {} don't ({} disputed)",
         queries.len(),
         failed.len(),
         failed.len() - new.len()
     );
     assert!(
         new.is_empty() && fixed.is_empty(),
-        "failures not in expected-failures.txt: {new:#?}\nlisted but now passing (remove from expected-failures.txt): {fixed:#?}"
+        "failures not in disputed.txt: {new:#?}\nlisted but now matching the reference (check, then remove from disputed.txt): {fixed:#?}"
     );
 }

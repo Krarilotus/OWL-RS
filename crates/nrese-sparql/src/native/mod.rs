@@ -1065,6 +1065,9 @@ struct Context<'a> {
     /// The equality classes to expand after joins over canonical reads (stage C,
     /// [`Context::late_expansion`]); `None` where reads expand them, or don't need to.
     late: Option<Arc<nrese_engine::EqualityClasses>>,
+    /// Whether GeoSPARQL relations in triple patterns are computed from geometries too
+    /// (the query-rewrite extension; not [`QueryOptions::geosparql_stated_only`]).
+    spatial_rewrite: bool,
 }
 
 /// The active graph of triple patterns.
@@ -1082,6 +1085,25 @@ enum GraphScope {
 }
 
 impl<'a> Context<'a> {
+    /// Whether `triple` is a GeoSPARQL relation computed from geometries
+    /// ([`spatial`]): not when only stated relations are read.
+    fn is_spatial(&self, triple: &TriplePattern) -> bool {
+        self.spatial_rewrite && spatial::is_spatial(triple)
+    }
+
+    /// [`spatial::split`], when relations are computed from geometries.
+    #[allow(clippy::type_complexity)]
+    fn spatial_split(
+        &self,
+        triples: &[TriplePattern],
+    ) -> Option<(Vec<TriplePattern>, Vec<TriplePattern>, Vec<TriplePattern>)> {
+        if self.spatial_rewrite {
+            spatial::split(triples)
+        } else {
+            None
+        }
+    }
+
     /// `dataset` is the query's own (`FROM`); the protocol's, in `options`, replaces it.
     fn new(
         snapshot: &'a Snapshot,
@@ -1110,6 +1132,7 @@ impl<'a> Context<'a> {
             merge_set,
             named: resolved.named,
             as_written: options.as_written,
+            spatial_rewrite: !options.geosparql_stated_only,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
             stream_rows: options.stream_rows,
             late: match options.equality_canonical || options.equality_early_expansion {
@@ -2036,7 +2059,7 @@ impl<'a> Context<'a> {
         let limit = self.limit.take();
         // GeoSPARQL relations between features (`spatial`): those with a constant side
         // start the joins, the others follow them.
-        if let Some((first, later, rest)) = spatial::split(triples) {
+        if let Some((first, later, rest)) = self.spatial_split(triples) {
             let mut result = Solutions::unit();
             for triple in &first {
                 result = self.spatial_join(result, triple)?;
@@ -2385,7 +2408,7 @@ impl<'a> Context<'a> {
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
     ) -> NativeResult<Solutions> {
         // GeoSPARQL relations (`spatial`) join after the other patterns.
-        if let Some((first, later, rest)) = spatial::split(triples) {
+        if let Some((first, later, rest)) = self.spatial_split(triples) {
             let mut result = if rest.is_empty() {
                 result
             } else {
@@ -3253,7 +3276,7 @@ impl<'a> Context<'a> {
         };
         if self.merge_set.is_some()
             || search::is_search(triple, patterns)
-            || spatial::is_spatial(triple)
+            || self.is_spatial(triple)
         {
             return Ok(None);
         }
@@ -3801,7 +3824,7 @@ impl<'a> Context<'a> {
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
             && !search::is_search(triple, patterns)
-            && !spatial::is_spatial(triple)
+            && !self.is_spatial(triple)
         {
             let count = match self.scan_pattern(triple) {
                 // The index counts quads; in the merged default graph a statement in
@@ -3850,7 +3873,7 @@ impl<'a> Context<'a> {
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
             && !search::is_search(triple, patterns)
-            && !spatial::is_spatial(triple)
+            && !self.is_spatial(triple)
             && let Some(scan) = self.scan_pattern(triple)
             && !scan.repeats_variable()
             && !scan.merged()

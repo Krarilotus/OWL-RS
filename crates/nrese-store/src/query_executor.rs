@@ -42,6 +42,8 @@ impl SolutionsResultFormat {
 pub(crate) struct StoreSettings {
     /// [`StoreConfig::union_default_graph`](crate::StoreConfig).
     pub union_default_graph: bool,
+    /// [`StoreConfig::geosparql_stated_only`](crate::StoreConfig).
+    pub geosparql_stated_only: bool,
     /// The budget for all running queries together, if the store has one.
     pub query_memory: Option<std::sync::Arc<nrese_sparql::SharedBudget>>,
     /// Who answers `SERVICE` calls, once the application installs a client
@@ -382,6 +384,7 @@ pub(crate) fn run_query(
         as_written: prepared.as_written,
         shared_memory: store.query_memory.clone(),
         union_default_graph: store.union_default_graph,
+        geosparql_stated_only: store.geosparql_stated_only,
         services: store.services.get().cloned(),
         equality_closed: store
             .equality_closed
@@ -496,6 +499,7 @@ fn explain_options(
         as_written: prepared.as_written,
         shared_memory: store.query_memory.clone(),
         union_default_graph: store.union_default_graph,
+        geosparql_stated_only: store.geosparql_stated_only,
         services: store.services.get().cloned(),
         equality_closed: store
             .equality_closed
