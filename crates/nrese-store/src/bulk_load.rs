@@ -13,8 +13,9 @@
 //!   next run in full (M2, M3).
 //! - **Bad statements.** A syntax error stops the load, unless `skip_errors`: then the
 //!   statement is skipped (a line of N-Triples or N-Quads, a statement of Turtle or TriG up
-//!   to its `.`), logged (the first [`LOGGED_ERRORS`]) and counted, and the load goes on.
-//!   Other formats still stop; a read error always does.
+//!   to its `.`, the rest of an RDF/XML node element below `rdf:RDF`), logged (the first
+//!   [`LOGGED_ERRORS`]) and counted, and the load goes on. Other formats, and XML that
+//!   isn't well-formed, still stop; a read error always does.
 
 use std::fs::File;
 use std::io::BufReader;
