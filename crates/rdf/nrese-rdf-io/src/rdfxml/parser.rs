@@ -47,6 +47,9 @@ pub(crate) struct RdfXmlSettings {
     pub(crate) base: Option<Iri<String>>,
     pub(crate) blank_nodes: BlankNodes,
     pub(crate) unchecked: bool,
+    /// After a syntax error, go on after the outermost node element it is in
+    /// ([`crate::RdfParser::recovering`]).
+    pub(crate) recover: bool,
 }
 
 /// What an open element is.
@@ -172,6 +175,8 @@ pub(crate) struct RdfXmlParser<R: BufRead> {
     capturing: usize,
     pub(crate) current: Option<Quad>,
     done: bool,
+    /// The XML reader failed (not well-formed) or the input ended: nothing to resume.
+    broken: bool,
 }
 
 type Step<T> = Result<T, RdfParseError>;
@@ -223,6 +228,7 @@ impl<R: BufRead> RdfXmlParser<R> {
             capturing: 0,
             current: None,
             done: false,
+            broken: false,
         }
     }
 
@@ -238,11 +244,56 @@ impl<R: BufRead> RdfXmlParser<R> {
                 return Ok(false);
             }
             if let Err(error) = self.event() {
-                self.done = true;
                 self.queue.clear();
+                let syntax = matches!(error, RdfParseError::Syntax(_));
+                self.done = !(syntax && self.settings.recover && self.resync());
                 return Err(error);
             }
         }
+    }
+
+    /// After a syntax error: the rest of the outermost node element it is in (below
+    /// `rdf:RDF`, or the document's root) is skipped, with the statements of the failing
+    /// event not handed out yet, and parsing goes on after that element. `false` where
+    /// there is nothing to resume: the XML isn't well-formed, the input ended, or the error
+    /// is in `rdf:RDF` itself.
+    fn resync(&mut self) -> bool {
+        if self.broken {
+            return false;
+        }
+        // The stack's index of the outermost node element.
+        let top = match self.stack.first().map(|scope| &scope.frame) {
+            Some(Frame::Rdf) => 1,
+            Some(_) => 0,
+            None => return false,
+        };
+        // Elements open in the XML: one namespace entry each, pushed at a start tag and
+        // popped at its end tag even when the element's own handling failed.
+        let open = self.namespaces.len();
+        if open <= top {
+            // The outermost node element has ended (its end tag failed): go on after it.
+            self.stack.truncate(top);
+            self.capturing = 0;
+            return top == 1 && open == 1;
+        }
+        let depth = open - top - 1;
+        if self.stack.len() > top {
+            self.stack.truncate(top + 1);
+            self.stack[top].frame = Frame::Ignored { depth };
+        } else {
+            // Its start tag failed before its frame was pushed.
+            let inherited = self
+                .stack
+                .last()
+                .map(|scope| scope.inherited.clone())
+                .unwrap_or_default();
+            self.stack.push(Scope {
+                frame: Frame::Ignored { depth },
+                inherited,
+            });
+        }
+        self.capturing = 0;
+        true
     }
 
     fn error(&self, message: impl Into<String>) -> RdfParseError {
@@ -416,10 +467,13 @@ impl<R: BufRead> RdfXmlParser<R> {
     }
 
     fn dispatch(&mut self, buffer: &mut Vec<u8>) -> Step<()> {
-        let event = self
-            .reader
-            .read_event_into(buffer)
-            .map_err(|e| self.error(format!("not well-formed XML: {e}")))?;
+        let event = match self.reader.read_event_into(buffer) {
+            Ok(event) => event,
+            Err(e) => {
+                self.broken = true;
+                return Err(self.error(format!("not well-formed XML: {e}")));
+            }
+        };
         match event {
             Event::Start(start) => {
                 self.open_namespaces(&start)?;
@@ -491,6 +545,7 @@ impl<R: BufRead> RdfXmlParser<R> {
                 Ok(())
             }
             Event::Eof => {
+                self.broken = true;
                 if !self.stack.is_empty() {
                     return Err(self.error("the document ends inside an element"));
                 }
@@ -1198,6 +1253,8 @@ impl<R: BufRead> RdfXmlParser<R> {
                 escape_text(text, xml);
                 Ok(())
             }
+            // An ignored element is ignored with everything in it, its text too.
+            Some(Frame::Ignored { .. }) => Ok(()),
             _ if text.chars().all(|c| matches!(c, ' ' | '\t' | '\n' | '\r')) => Ok(()),
             _ => Err(self.error("text where only elements may stand")),
         }
