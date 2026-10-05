@@ -268,6 +268,9 @@ pub(crate) struct PermutationBuilder {
     wanted: Vec<Permutation>,
     /// Permutations built ahead of being asked for.
     ready: Vec<(Permutation, PackedKeys)>,
+    /// Full sorts of the keys so far (the first one included): what deriving saves, and
+    /// what a guard test counts.
+    sorts: usize,
 }
 
 impl PermutationBuilder {
@@ -287,7 +290,14 @@ impl PermutationBuilder {
             order: Permutation::Spog,
             wanted: wanted.to_vec(),
             ready: Vec::new(),
+            sorts: 1,
         }
+    }
+
+    /// Full sorts of the keys so far.
+    #[cfg(test)]
+    pub(crate) fn sorts(&self) -> usize {
+        self.sorts
     }
 
     /// The quads' keys in `permutation`, packed.
@@ -350,6 +360,7 @@ impl PermutationBuilder {
         });
         self.keys.par_sort_unstable();
         self.order = permutation;
+        self.sorts += 1;
     }
 
     /// Builds the wanted permutations derivable from the keys as they are.

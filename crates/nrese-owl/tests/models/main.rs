@@ -847,3 +847,51 @@ fn clauses_and_ontologies_have_the_same_models() {
     eprintln!("{compared} interpretations compared, {models} models");
     assert!(models > 0 && models < compared, "{models} of {compared}");
 }
+
+/// A transitive role over forty transitive subroles, under thirty universals (the shape of
+/// ore_ont_1066: one `DisjointClasses(A, ∃part_of.B)` made 4,451 clauses). Minimal automata
+/// and transitions the role inclusions imply keep the clauses near a handful per universal
+/// (docs/design/performance.md §0, P3); this fails at once if that is lost.
+#[test]
+fn universals_over_a_large_role_hierarchy_stay_small() {
+    let mut o = Ontology::default();
+    let r = 1000;
+    let mut axioms = vec![Axiom::ObjectCharacteristic(
+        Characteristic::Transitive,
+        ObjProp::Named(r),
+    )];
+    for i in 1..=40 {
+        let s = r + i;
+        axioms.push(Axiom::ObjectCharacteristic(
+            Characteristic::Transitive,
+            ObjProp::Named(s),
+        ));
+        axioms.push(Axiom::SubObjectPropertyOf(
+            vec![ObjProp::Named(s)],
+            ObjProp::Named(r),
+        ));
+    }
+    for j in 0..30u64 {
+        let a = ExprId(o.classes.intern(ClassExpr::Class(2 * j)));
+        let b = ExprId(o.classes.intern(ClassExpr::Class(2 * j + 1)));
+        let some = ExprId(o.classes.intern(ClassExpr::Some(ObjProp::Named(r), b)));
+        axioms.push(Axiom::DisjointClasses(vec![a, some]));
+    }
+    o.sources = vec![Vec::new(); axioms.len()];
+    o.axioms = axioms;
+    let count = |exact_provenance| {
+        normalise_with(
+            &o,
+            Options {
+                exact_provenance,
+                ..Options::default()
+            },
+        )
+        .clauses
+        .len()
+    };
+    let (minimal, exact) = (count(false), count(true));
+    // 220 and 4,990 on 5 October.
+    assert!(minimal <= 400, "{minimal} clauses with minimal automata");
+    assert!(exact <= 6000, "{exact} clauses with exact provenance");
+}
