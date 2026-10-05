@@ -6,6 +6,58 @@ pub const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 pub const OWL: &str = "http://www.w3.org/2002/07/owl#";
 pub const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
+/// The IRIs of the OWL 2 datatype map's datatypes and facets, `rdfs:Literal` and
+/// `rdf:langString`: those a source's ids are looked up by when it can't give an IRI's
+/// text.
+pub fn data_iris() -> Vec<String> {
+    let xsd = [
+        "decimal",
+        "integer",
+        "nonNegativeInteger",
+        "nonPositiveInteger",
+        "positiveInteger",
+        "negativeInteger",
+        "long",
+        "int",
+        "short",
+        "byte",
+        "unsignedLong",
+        "unsignedInt",
+        "unsignedShort",
+        "unsignedByte",
+        "float",
+        "double",
+        "string",
+        "normalizedString",
+        "token",
+        "language",
+        "Name",
+        "NCName",
+        "NMTOKEN",
+        "boolean",
+        "hexBinary",
+        "base64Binary",
+        "anyURI",
+        "dateTime",
+        "dateTimeStamp",
+        "minInclusive",
+        "maxInclusive",
+        "minExclusive",
+        "maxExclusive",
+        "length",
+        "minLength",
+        "maxLength",
+        "pattern",
+    ];
+    let mut out: Vec<String> = xsd.iter().map(|l| format!("{XSD}{l}")).collect();
+    out.extend(["real", "rational"].map(|l| format!("{OWL}{l}")));
+    out.extend(
+        ["PlainLiteral", "langString", "XMLLiteral", "langRange"].map(|l| format!("{RDF}{l}")),
+    );
+    out.push(format!("{RDFS}Literal"));
+    out
+}
+
 macro_rules! vocabulary {
     ($($field:ident = $ns:ident $local:literal),* $(,)?) => {
         /// The ids of the terms the mapping reads.

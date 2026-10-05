@@ -58,6 +58,11 @@ impl Engine<'_> {
             let lit = Lit::Equal(self.roots[i as usize], self.roots[j as usize], Annot::NONE);
             self.assert(lit, DepSetId::EMPTY, proof::ASSERTED)?;
         }
+        let literals = self.literal_nodes()?;
+        for &(r, i, l) in &self.p.assertions.data {
+            let lit = Lit::Role(r, self.roots[i as usize], literals[l as usize]);
+            self.assert(lit, DepSetId::EMPTY, proof::ASSERTED)?;
+        }
         Ok(())
     }
 
@@ -103,6 +108,10 @@ impl Engine<'_> {
         self.check_time()?;
         self.check_memory()?;
         self.saturate()?;
+        self.check_data()?;
+        if self.apply_keys()? {
+            return Ok(true);
+        }
         if self.apply_ni()? {
             return Ok(true);
         }
@@ -296,5 +305,10 @@ impl Engine<'_> {
         self.done.unary = frame.mark.unary;
         self.done.edges = frame.mark.edges;
         self.done.equalities = frame.mark.equalities;
+        // What the datatype stage checked before the branch point stays checked.
+        let d = &mut self.data_done;
+        d.unary = d.unary.min(frame.mark.unary);
+        d.negatives = d.negatives.min(frame.mark.negatives);
+        d.inequalities = d.inequalities.min(frame.mark.inequalities);
     }
 }

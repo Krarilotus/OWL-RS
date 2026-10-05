@@ -193,6 +193,19 @@ pub struct Facts {
     pub not_data: Vec<(Term, Term, Term, usize)>,
 }
 
+/// A DL-safe rule (Motik, Sattler and Studer, *Query Answering for OWL-DL with Rules*, JWS
+/// 2005): its object variables bind to named individuals only, its data variables to data
+/// values of theirs. What a key becomes: `HasKey(C (P…) (D…))` is
+/// `C(x) ∧ C(y₀) ∧ ⋀ Pᵢ(x, yᵢ) ∧ Pᵢ(y₀, yᵢ) ∧ ⋀ Dⱼ(x, vⱼ) ∧ Dⱼ(y₀, vⱼ) → x ≈ y₀`
+/// (`C` a fresh name `Q` with `C ⊑ Q` where it isn't one; no class atom for `owl:Thing`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafeRule {
+    pub body: Vec<BodyAtom>,
+    pub head: Vec<HeadAtom>,
+    /// The axiom it comes from.
+    pub source: usize,
+}
+
 /// An ontology in DL-clauses.
 #[derive(Debug, Clone, Default)]
 pub struct Normalised {
@@ -207,4 +220,10 @@ pub struct Normalised {
     /// to them).
     pub classes: Interner<ClassExpr>,
     pub ranges: Interner<DataRange>,
+    /// Keys as DL-safe rules (their axioms are also in `unsupported`, under
+    /// [`crate::UNSUPPORTED_KEYS`], for engines that don't apply them).
+    pub rules: Vec<SafeRule>,
+    /// Datatype definitions: the datatype and its range (also in `unsupported`, under
+    /// [`crate::UNSUPPORTED_DATATYPE_DEFINITIONS`]).
+    pub definitions: Vec<(Term, RangeId)>,
 }

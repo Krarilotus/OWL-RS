@@ -28,7 +28,7 @@ const MEMO_LIMIT: usize = 1 << 20;
 
 /// The arena of dependency sets.
 #[derive(Debug)]
-pub(crate) struct DepSets {
+pub struct DepSets {
     /// `(point, rest)` per set; index 0 is the empty set.
     cells: Vec<(u32, DepSetId)>,
     index: HashMap<(u32, DepSetId), DepSetId>,
@@ -170,6 +170,11 @@ impl DepSets {
     /// Interned sets, for the memory measure.
     pub fn len(&self) -> usize {
         self.cells.len()
+    }
+
+    /// Whether only the empty set is interned.
+    pub fn is_empty(&self) -> bool {
+        self.cells.len() == 1
     }
 }
 

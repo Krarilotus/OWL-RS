@@ -19,14 +19,18 @@ mod universal;
 pub mod vocab;
 pub mod write;
 
-pub use clauses::{BodyAtom, Clause, Concept, Facts, Filler, FreshOf, HeadAtom, Normalised, Var};
+pub use clauses::{
+    BodyAtom, Clause, Concept, Facts, Filler, FreshOf, HeadAtom, Normalised, SafeRule, Var,
+};
 pub use diagnostics::Diagnostic;
 pub use mapping::{BuiltinProperties, Ontology, Source, Statement, TermKind, Terms, read};
 pub use model::{
-    Axiom, Characteristic, ClassExpr, DataRange, EntityKind, ExprId, Interner, ObjProp, RangeId,
-    Term,
+    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, EntityKind, ExprId, Interner, Literal,
+    ObjProp, RangeId, Term,
 };
-pub use normalise::{Options, normalise, normalise_with};
+pub use normalise::{
+    Options, UNSUPPORTED_DATATYPE_DEFINITIONS, UNSUPPORTED_KEYS, normalise, normalise_with,
+};
 pub use proof::{Inference, Justifications, Proof, ProofError, ProofGraph};
 pub use vocab::Vocabulary;
 pub use write::{Make, write};
