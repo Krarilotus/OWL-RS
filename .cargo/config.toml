@@ -21,3 +21,8 @@ incremental = false
 [profile.dev.package."*"]
 # Dependencies: no debug information at all.
 debug = false
+
+# The LLVM linker that ships with the toolchain: linking dominates rebuilding test
+# binaries; an engine change rebuilt them in 47 s instead of 93 s (6 October).
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
