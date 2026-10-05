@@ -7,6 +7,7 @@ has been measured so far. Start here.
 |---|---|
 | What is measured, what isn't, and how did it last come out? | [STATUS.md](STATUS.md), generated: `python benches/suite/suite.py status --write` |
 | How is it measured, and why can the numbers be trusted? | [PROTOCOL.md](PROTOCOL.md): the rules every kit follows |
+| Which benchmarks exist in each field, what do they cost, and which do we run? | [CATALOG.md](CATALOG.md) |
 | What did a given run cover, on which commit and machine? | [runs/](runs/README.md): one record per run |
 | Which workloads and systems exist, and which pair can run? | [suite/workloads.toml](suite/workloads.toml), [suite/systems.toml](suite/systems.toml); `suite.py` prints the matrix |
 | How do I run something? | §"A run, step by step" below |
@@ -18,6 +19,7 @@ has been measured so far. Start here.
 benches/
 ├── README.md            this map
 ├── PROTOCOL.md          the rules: fairness, correctness first, repetitions, statistics, records, publishing
+├── CATALOG.md           the benchmarks per field: what each measures, its cost, core / representative / later
 ├── STATUS.md            generated: coverage matrix, tier tables, gaps, problems, runs
 ├── runs/                one record per run: scope, commit, machine, protocol, outcome per pair (committed)
 ├── baselines/           committed NRESE reference numbers the regression gates compare against
