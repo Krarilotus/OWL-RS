@@ -172,9 +172,11 @@ pub struct Outcome {
 /// Whether `ontology` is consistent.
 pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
     let ontology = prepared(ontology);
+    // The engine reads no provenance: minimal automata.
     let options = |lazy_definitions| Options {
         expand_at_most_up_to: config.expand_at_most_up_to,
         lazy_definitions,
+        exact_provenance: false,
     };
     if !config.lazy_definitions || config.keep_model {
         return consistency_of(

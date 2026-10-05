@@ -7,6 +7,7 @@
 //! reads strings only of the literals it needs ([`Terms`]); nothing here depends on the
 //! store or an engine.
 
+mod automata;
 pub mod clauses;
 mod definitions;
 pub mod diagnostics;
