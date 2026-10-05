@@ -100,6 +100,7 @@ pub struct Done {
     pub equalities: u32,
 }
 
+#[derive(Clone)]
 pub struct Engine<'a> {
     pub p: &'a Program,
     pub config: &'a Config,
@@ -126,6 +127,10 @@ pub struct Engine<'a> {
     pub data_approximate: Option<String>,
     /// The root the test's concepts were asserted on (`NONE`: no test).
     pub probe: u32,
+    /// Branch levels at or below this belong to a base the run was resumed from
+    /// ([`super::probe::Base`]): a backtrack that would go there stops the run instead
+    /// (`GaveUp` with [`super::search::FLOOR`]).
+    pub floor: u32,
 }
 
 impl<'a> Engine<'a> {
@@ -151,6 +156,7 @@ impl<'a> Engine<'a> {
             theory: crate::datatypes::DatatypeTheory::default(),
             data_approximate: None,
             probe: NONE,
+            floor: 0,
         }
     }
 

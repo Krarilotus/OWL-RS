@@ -65,6 +65,9 @@ pub struct Options {
     /// With nominals: test on the terminology first and keep a model whose probed part
     /// is detached from the individuals (else the test runs again with the assertions).
     pub detached_probes: bool,
+    /// Tests with the individuals start from their model built once (else each builds it
+    /// again): completion-graph reuse ([`crate::tableau::Base`]).
+    pub reuse_model: bool,
     /// Each hypertableau test's budgets (its memory budget is per worker: 256 MiB).
     pub tableau: tableau::Config,
     /// A deadline for the whole classification; what isn't decided by then is reported.
@@ -90,6 +93,7 @@ impl Default for Options {
             skip_seen: true,
             tbox_only: true,
             detached_probes: true,
+            reuse_model: true,
             // A class test that needs more is lost for any deadline worth having, and the
             // engine checks its budget only every few thousand steps: a lower budget keeps
             // an overshoot small (on ore_ont_9724 one test overshot 1 GiB to a 5 GiB

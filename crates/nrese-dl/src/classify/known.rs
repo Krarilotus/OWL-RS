@@ -118,6 +118,10 @@ fn saturate(
             }
             Err(why) => why,
         };
+        super::trace(&format!(
+            "lower bound: the context core refuses {} clauses: {why}",
+            part.len()
+        ));
         use crate::context::Unsupported as U;
         match why {
             U::NotHorn { .. } if part.iter().any(|&i| !n.clauses[i].flags.horn) => {
