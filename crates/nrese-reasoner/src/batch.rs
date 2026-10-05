@@ -129,6 +129,20 @@ impl Run {
         }
     }
 
+    /// The pairs matching the bound positions: one contiguous slice of one order, and
+    /// whether that order is `(object, subject)`.
+    fn matching(&self, s: Option<u64>, o: Option<u64>) -> (&[Pair], bool) {
+        match (s, o) {
+            (Some(s), Some(o)) => match self.so.binary_search(&(s, o)) {
+                Ok(at) => (&self.so[at..=at], false),
+                Err(_) => (&[], false),
+            },
+            (Some(s), None) => (range(&self.so, s), false),
+            (None, Some(o)) => (range(&self.os, o), true),
+            (None, None) => (&self.so, false),
+        }
+    }
+
     fn estimate(&self, s: Option<u64>, o: Option<u64>) -> usize {
         match (s, o) {
             (Some(s), Some(o)) => usize::from(self.contains(s, o)),
@@ -244,6 +258,28 @@ impl Relation {
         }
     }
 
+    /// The matches of the bound positions in `seg`, as the slices of the runs that
+    /// hold them, in [`Relation::scan`]'s order: each with whether its order is
+    /// `(object, subject)`, and whether its pairs are read as old (the recent run, whose
+    /// delta pairs are skipped).
+    fn matching(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> [(&[Pair], bool, bool); 2] {
+        fn slice(run: &Run, s: Option<u64>, o: Option<u64>, old: bool) -> (&[Pair], bool, bool) {
+            let (pairs, swapped) = run.matching(s, o);
+            (pairs, swapped, old)
+        }
+        match seg {
+            Seg::Delta => [slice(&self.delta, s, o, false), (&[], false, false)],
+            Seg::All => [
+                slice(&self.base, s, o, false),
+                slice(&self.recent, s, o, false),
+            ],
+            Seg::Old => [
+                slice(&self.base, s, o, false),
+                slice(&self.recent, s, o, true),
+            ],
+        }
+    }
+
     /// An upper bound on the matches of the bound positions in `seg`.
     fn estimate(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> usize {
         match seg {
@@ -324,6 +360,14 @@ impl Store {
         self.index.get(&p).map(|&i| &self.relations[i])
     }
 
+    /// The relation of `p`, or every relation where `p` is open, with their predicates.
+    fn relations_of(&self, p: Option<u64>) -> Box<dyn Iterator<Item = (u64, &Relation)> + '_> {
+        match p {
+            Some(p) => Box::new(self.relation(p).map(|r| (p, r)).into_iter()),
+            None => Box::new(self.predicates.iter().copied().zip(&self.relations)),
+        }
+    }
+
     /// Adds `candidates` and makes the new ones the delta; returns the new ones.
     pub(crate) fn advance(&mut self, candidates: Vec<Triple>) -> Vec<Triple> {
         self.advance_checked(candidates, true)
@@ -402,6 +446,46 @@ impl Source for Store {
 
     fn contains(&self, [s, p, o]: Triple) -> bool {
         self.relation(p).is_some_and(|r| r.contains(s, o))
+    }
+
+    fn matches_len(&self, [s, p, o]: [Option<u64>; 3], seg: Seg) -> Option<usize> {
+        Some(
+            self.relations_of(p)
+                .map(|(_, relation)| {
+                    let slices = relation.matching(s, o, seg);
+                    slices.iter().map(|(pairs, ..)| pairs.len()).sum::<usize>()
+                })
+                .sum(),
+        )
+    }
+
+    fn scan_range(
+        &self,
+        [s, p, o]: [Option<u64>; 3],
+        seg: Seg,
+        range: std::ops::Range<usize>,
+        f: &mut dyn FnMut(Triple),
+    ) {
+        let mut at = 0;
+        for (p, relation) in self.relations_of(p) {
+            for (pairs, swapped, old) in relation.matching(s, o, seg) {
+                let (start, end) = (at, at + pairs.len());
+                at = end;
+                if end <= range.start {
+                    continue;
+                }
+                if start >= range.end {
+                    return;
+                }
+                let part = &pairs[range.start.max(start) - start..range.end.min(end) - start];
+                for &(a, b) in part {
+                    let (s, o) = if swapped { (b, a) } else { (a, b) };
+                    if !(old && relation.delta.contains(s, o)) {
+                        f([s, p, o]);
+                    }
+                }
+            }
+        }
     }
 }
 

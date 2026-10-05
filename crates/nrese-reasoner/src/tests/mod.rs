@@ -1900,3 +1900,48 @@ fn delta_equals_rematerialisation_under_random_changes() {
         "{inserted} inserted, {removed} removed"
     );
 }
+
+/// The batch store's in-place drivers ([`Source::scan_range`]) visit exactly what a scan
+/// of the same pattern and segment visits, in the same order, however the positions are
+/// split into morsels: every shape of bound positions, every segment, an open predicate.
+#[test]
+fn in_place_drivers_visit_what_a_scan_visits() {
+    use super::eval::{Seg, Source};
+    let mut next = rng(0x5eed_d21e);
+    for _ in 0..40 {
+        let facts = |next: &mut dyn FnMut(usize) -> usize, n: usize| -> Vec<Triple> {
+            (0..n)
+                .map(|_| [next(12) as u64, 100 + next(3) as u64, next(12) as u64])
+                .collect()
+        };
+        let mut store = batch::Store::new(facts(&mut next, 60));
+        store.advance(facts(&mut next, 40));
+        store.advance(facts(&mut next, 30));
+        let term = |next: &mut dyn FnMut(usize) -> usize, base: u64, n: usize| {
+            (next(2) == 0).then(|| base + next(n) as u64)
+        };
+        for _ in 0..30 {
+            let pattern = [
+                term(&mut next, 0, 12),
+                term(&mut next, 100, 3),
+                term(&mut next, 0, 12),
+            ];
+            for seg in [Seg::Delta, Seg::Old, Seg::All] {
+                let mut scanned = Vec::new();
+                store.scan(pattern, seg, &mut |t| scanned.push(t));
+                let len = store
+                    .matches_len(pattern, seg)
+                    .expect("the store indexes its matches");
+                assert!(len >= scanned.len());
+                let morsel = 1 + next(7);
+                let mut ranged = Vec::new();
+                for start in (0..len).step_by(morsel) {
+                    store.scan_range(pattern, seg, start..(start + morsel).min(len), &mut |t| {
+                        ranged.push(t)
+                    });
+                }
+                assert_eq!(ranged, scanned, "{pattern:?} {seg:?} morsel {morsel}");
+            }
+        }
+    }
+}

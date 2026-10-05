@@ -41,6 +41,30 @@ pub trait Source: Sync {
     fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize;
     /// Whether `fact` is in [`Seg::All`].
     fn contains(&self, fact: Triple) -> bool;
+    /// The number of positions of `seg`'s matches of `pattern` in a fixed order, if the
+    /// source can visit any range of them without collecting them first
+    /// ([`Source::scan_range`]); `None` if it can't. A position may hold a fact that
+    /// isn't in `seg` (the source skips it), so this may exceed the matches.
+    fn matches_len(&self, _pattern: [Option<u64>; 3], _seg: Seg) -> Option<usize> {
+        None
+    }
+    /// Calls `f` with the matches of `pattern` in `seg` at positions `range` of the order
+    /// [`Source::matches_len`] counts. Called only where that is `Some`.
+    fn scan_range(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        range: std::ops::Range<usize>,
+        f: &mut dyn FnMut(Triple),
+    ) {
+        let mut at = 0;
+        self.scan(pattern, seg, &mut |fact| {
+            if range.contains(&at) {
+                f(fact);
+            }
+            at += 1;
+        });
+    }
 }
 
 /// A [`Source`]'s facts (all segments) for list instantiation.
@@ -560,7 +584,19 @@ pub fn instantiate_head(atom: &Atom, bindings: &[Option<u64>]) -> Triple {
 pub struct Job<'r> {
     pub rule: &'r Rule,
     order: Vec<(usize, Seg)>,
-    drivers: Vec<Triple>,
+    /// The driver atom's constants and segment.
+    pattern: [Option<u64>; 3],
+    seg: Seg,
+    drivers: Drivers,
+}
+
+/// A job's driver matches: collected, or read in place by position where the source can
+/// ([`Source::matches_len`]). Collecting copied every match of every job before a round
+/// ran: 391 M facts (9.4 GB) in the second OWL 2 RL round of LUBM 1000, the round's
+/// memory peak (5 October 2026).
+enum Drivers {
+    Collected(Vec<Triple>),
+    InPlace(usize),
 }
 
 impl<'r> Job<'r> {
@@ -582,13 +618,24 @@ impl<'r> Job<'r> {
         }
         let atoms: Vec<usize> = (0..rule.body.len()).collect();
         let order = plan(source, rule, &atoms, first, &seg_of);
-        let mut drivers = Vec::new();
-        source.scan(constants(&rule.body[first]), seg_of(first), &mut |fact| {
-            drivers.push(fact)
-        });
-        (!drivers.is_empty()).then_some(Self {
+        let (pattern, seg) = (constants(&rule.body[first]), seg_of(first));
+        let drivers = match source.matches_len(pattern, seg) {
+            Some(0) => return None,
+            Some(len) => Drivers::InPlace(len),
+            None => {
+                let mut drivers = Vec::new();
+                source.scan(pattern, seg, &mut |fact| drivers.push(fact));
+                if drivers.is_empty() {
+                    return None;
+                }
+                Drivers::Collected(drivers)
+            }
+        };
+        Some(Self {
             rule,
             order,
+            pattern,
+            seg,
             drivers,
         })
     }
@@ -611,8 +658,12 @@ impl<'r> Job<'r> {
         Self::new(source, rule, first, |_| Seg::All)
     }
 
+    /// The driver positions, which [`Job::run`] takes ranges of.
     pub fn drivers(&self) -> usize {
-        self.drivers.len()
+        match &self.drivers {
+            Drivers::Collected(drivers) => drivers.len(),
+            Drivers::InPlace(len) => *len,
+        }
     }
 
     /// Runs the variant for `drivers[range]`, calling `emit` with each complete binding.
@@ -624,7 +675,7 @@ impl<'r> Job<'r> {
     ) {
         let mut bindings = vec![None; self.rule.variables()];
         let driver = &self.rule.body[self.order[0].0];
-        for &fact in &self.drivers[range] {
+        let mut visit = |fact: Triple| {
             if let Some(newly) = bind(driver, fact, &mut bindings) {
                 walk(
                     source,
@@ -637,6 +688,10 @@ impl<'r> Job<'r> {
                 );
                 unbind(driver, newly, &mut bindings);
             }
+        };
+        match &self.drivers {
+            Drivers::Collected(drivers) => drivers[range].iter().for_each(|&fact| visit(fact)),
+            Drivers::InPlace(_) => source.scan_range(self.pattern, self.seg, range, &mut visit),
         }
     }
 }
@@ -689,9 +744,9 @@ fn run_jobs_with<S: Source + ?Sized>(
         .iter()
         .enumerate()
         .flat_map(|(j, job)| {
-            (0..job.drivers.len())
+            (0..job.drivers())
                 .step_by(MORSEL)
-                .map(move |start| (j, start..(start + MORSEL).min(job.drivers.len())))
+                .map(move |start| (j, start..(start + MORSEL).min(job.drivers())))
         })
         .collect();
     tasks
