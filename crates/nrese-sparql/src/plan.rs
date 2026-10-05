@@ -1,4 +1,4 @@
-//! The logical plan of a query (docs/plan/2026-10-02-plan-ir.md, step 1): the algebra's
+//! The logical plan of a query (docs/design/query-plan.md, step 1): the algebra's
 //! operators with joins and unions as lists, so that rewrites (step 2) can reorder and
 //! merge them; a basic graph pattern is a join of its triple patterns.
 //!

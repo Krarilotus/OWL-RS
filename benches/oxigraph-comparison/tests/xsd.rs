@@ -1,6 +1,6 @@
 //! `nrese_xsd` against `oxsdatatypes` on generated lexical forms and operations. Where
 //! they differ by design, the difference is checked against the specification instead
-//! (see `docs/plan/2026-10-01-oxigraph-migration.md`, `nrese-xsd`).
+//! (see `docs/design/rdf-bundle.md`, `nrese-xsd`).
 
 use std::collections::BTreeMap;
 use std::fmt::Display;

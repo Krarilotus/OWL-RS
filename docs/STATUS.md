@@ -6,13 +6,12 @@ in the branch), **deferred** (not done, with the reason and where it went), or *
 
 - What the product can do, capability by capability: the
   [capability matrix](spec/06-target-capability-matrix.md).
-- Why and in which order: [the roadmap](plan/2026-10-02-roadmap.md) (the order from 2 October on), and the plans it builds on ([audit work](plan/2026-10-02-audit-work.md),
-  [engine gaps](plan/2026-10-02-engine-gaps.md), [research designs](plan/2026-10-02-research-designs.md),
-  [query plan](plan/2026-10-02-plan-ir.md)). They hold design and order, no status. Older plans
-  (30 September, 1 October) are records of their date; their status columns are not kept
-  up to date.
+- Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
 
-Last updated: 5 October 2026, branch `refactor/engine-v2` (G4 and C from branch `g4/eager-aggregates`).
+Last updated: 6 October 2026, branch `refactor/engine-v2`. What is left before v2 goes to
+`main`, with owners and state, is the status table of the
+[merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1; the rows below are the record
+by goal.
 
 ## Audit work (the outside audit of 2 October)
 
@@ -25,7 +24,7 @@ Last updated: 5 October 2026, branch `refactor/engine-v2` (G4 and C from branch 
 | A2 Reads in client transactions without the writer slot | done | Speculative transactions; the view cached per session by base version, operation count and the reader's access |
 | A2 The reasoner's list cap | done | Lists of any length; native rules where expansion is quadratic |
 | A2 `Decoded::keep` without the moved `Box` | done | Raw pointers with a `Drop`; a test |
-| A2 Miri over the engine's unsafe code | deferred | Never ran (Miri isn't installed on the main PC). Planned as a recurring job on the office PC: [F2](plan/2026-10-02-audit-work.md#f-assurance) |
+| A2 Miri over the engine's unsafe code | deferred | Never ran (Miri isn't installed on the main PC). Planned with the refactoring after the merge to `main` ([roadmap](ROADMAP.md) step 4) |
 | A2 Dead wildcard arms | done | Four deleted; six covered real variants and name them |
 | A3 `scripts/check.sh` gate, pre-commit and pre-push hooks | done | The pre-commit gate tests the changed crates and every crate depending on them |
 | A3 Workspace lints, resolver 3, `rust-version`, `publish = false` | done | Every suppression is an `#[expect]`; no `#[allow]` left |
@@ -51,7 +50,7 @@ Last updated: 5 October 2026, branch `refactor/engine-v2` (G4 and C from branch 
 
 | Item | State | Notes |
 |---|---|---|
-| Design | done | [The query plan](plan/2026-10-02-plan-ir.md): a migration in steps |
+| Design | done | [The query plan](design/query-plan.md): a migration in steps |
 | Algebra walker | done | `nrese_sparql_syntax::visit`; the executor's plain searches use it |
 | Step 1: the logical plan | done | `nrese_sparql::plan`: built from the algebra and lowered back, the identity on every random query of the differential tests |
 | Step 2: rewrites on the plan | started | Named rewrites, in order, for queries and update `WHERE`s alike: `join-groups` (groups joined to each other become one basic graph pattern; inputs with an `ORDER BY` keep their place), `eager-aggregation`, `filter-pushdown`; EXPLAIN lists those that changed the query (`rewrites`). Open: pushdown on the plan itself, and the executor's match-guard strategies (paths from their bound end, limit placement, bind joins to `SERVICE`) as rewrites |

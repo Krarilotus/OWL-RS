@@ -261,10 +261,6 @@ The benchmark scripts check free space the same way before they create datasets 
 
 ### Where To Start
 
-If you want to work on shared contracts:
-
-- start in [crates/nrese-core/src/lib.rs](crates/nrese-core/src/lib.rs)
-
 If you want to work on storage, dataset state, or SPARQL execution:
 
 - start in [crates/nrese-store/src/lib.rs](crates/nrese-store/src/lib.rs)
@@ -299,13 +295,7 @@ If you want to work on the user frontend:
 - styling tokens and layout files are under `apps/nrese-console/src/styles/`
 - extension guidance is in [docs/dev/frontend-extension-guide.md](docs/dev/frontend-extension-guide.md)
 
-If you want to work on benchmarks or compatibility checks:
-
-- start in [benches/nrese-bench-harness/src/main.rs](benches/nrese-bench-harness/src/main.rs)
-- keep per-case request customization in the shared compat request path instead of adding endpoint-specific compare logic
-- workflow details are in [docs/ops/benchmark-and-conformance.md](docs/ops/benchmark-and-conformance.md)
-- manifest-driven production-style harness runs are also defined there; do not duplicate pack format rules elsewhere
-- real-world ontology catalog guidance is in [docs/ops/ontology-fixture-catalog.md](docs/ops/ontology-fixture-catalog.md)
+If you want to work on benchmarks: start at [benches/README.md](benches/README.md) (the map of every kit) and [benches/PROTOCOL.md](benches/PROTOCOL.md) (the rules).
 
 ### Project Rules
 
@@ -389,7 +379,7 @@ cargo test --manifest-path benches/nrese-bench-harness/Cargo.toml
 
 Seed and compare against a reference endpoint:
 
-- see [docs/ops/benchmark-and-conformance.md](docs/ops/benchmark-and-conformance.md)
+- see [benches/nrese-bench-harness/README.md](benches/nrese-bench-harness/README.md)
 
 ## Documentation
 

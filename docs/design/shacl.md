@@ -1,6 +1,6 @@
 # SHACL validation: design
 
-Status: design for phase C of the [parity plan](../plan/2026-09-30-graphdb-parity-plan.md) (30 September 2026). Slices C1a, C1b, C2 and C3 are done (C2 and C3 on 2 October 2026); C1c is planned.
+Status: design for phase C of the [parity plan](../adr/0010-standing-product-decisions.md) (30 September 2026). Slices C1a, C1b, C2 and C3 are done (C2 and C3 on 2 October 2026); C1c is planned.
 
 ## 1. Goal and scope
 

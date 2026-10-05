@@ -28,5 +28,10 @@ pub fn extended_health(state: AppState) -> Result<Response, ApiError> {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    Ok((status, Json(build_extended_health_response(&state, ready))).into_response())
+    Ok((
+        status,
+        axum::Extension(crate::error::Verbatim),
+        Json(build_extended_health_response(&state, ready)),
+    )
+        .into_response())
 }

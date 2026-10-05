@@ -3,7 +3,7 @@
 Status: accepted (2026-10-02); `/ops/api/*` and `/api/ai/*` replaced on 2026-10-03 (aliases
 with `Deprecation` and `Link` headers for one release). The owner's direction: one consolidated engine API that every
 connector and the coming frontend build on, connectors shimmed to a minimum, the logic in
-the core ([gap plan G2](../plan/2026-10-02-engine-gaps.md)).
+the core (STATUS, goal G2).
 
 ## Context
 
