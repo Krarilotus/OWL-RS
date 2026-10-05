@@ -508,3 +508,48 @@ fn a_subsumption_through_a_disjunction() {
     assert!(text.contains("< http://e/1 http://e/4\n"), "{text}");
     assert!(!text.contains("< http://e/1 http://www.w3.org"), "{text}");
 }
+
+/// Guard (saturation coupling): a terminology the Horn stage refuses as a whole (a
+/// functional property, so equality) whose Horn part is exact for every class: the
+/// driver decides all 2,000 classes and `owl:Thing` from it and runs no hypertableau
+/// test of a class (ore_ont_7127, 65 k classes: 43 s of tests before, none after).
+#[test]
+fn an_exact_horn_part_needs_no_class_test() {
+    let mut o = Ontology::default();
+    let n: Term = 2000;
+    let (r, s) = (100_000, 100_001);
+    let class = |o: &mut Ontology, t: Term| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    for i in 0..n {
+        let (a, b) = (class(&mut o, i), class(&mut o, i + 1));
+        let some = ExprId(
+            o.classes
+                .intern(ClassExpr::Some(nrese_owl::ObjProp::Named(r), b)),
+        );
+        o.axioms.push(Axiom::SubClassOf(a, some));
+        if i % 2 == 0 {
+            o.axioms.push(Axiom::SubClassOf(a, b));
+        }
+    }
+    o.axioms.push(Axiom::ObjectCharacteristic(
+        nrese_owl::Characteristic::Functional,
+        nrese_owl::ObjProp::Named(s),
+    ));
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let t = classify::classify(&o, &options());
+    assert!(t.complete(), "{:?}", t.incomplete);
+    assert_eq!(t.profile.path, "tableau", "{}", t.profile.line());
+    assert_eq!(
+        t.profile.exact_classes,
+        n as usize + 1,
+        "{}",
+        t.profile.line()
+    );
+    assert_eq!(
+        t.profile.sat_tests + t.profile.candidate_tests,
+        0,
+        "{}",
+        t.profile.line()
+    );
+    assert!(t.classification.subsumptions.contains(&(0, 1)));
+    assert!(!t.classification.subsumptions.contains(&(1, 2)));
+}
