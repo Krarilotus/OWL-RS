@@ -174,16 +174,23 @@ impl Run {
     }
 }
 
-/// The pairs of one predicate, in two sorted runs: a large base and a small recent run
-/// that takes each round's delta. The recent run is folded into the base once it reaches
-/// a quarter of its size, so a round costs its delta plus the recent run, not the whole
-/// relation, and the total merge work stays O(n log n).
+/// The pairs of one predicate, in sorted runs: the store's input, apart, and what was
+/// added since, in a large base and a small recent run that takes each round's delta.
+/// The recent run is folded into the base once it reaches a quarter of its size, so a
+/// round costs its delta plus the recent run, not the whole relation, and the total
+/// merge work stays O(n log n). The input, kept apart, makes the added pairs the base
+/// and the recent run: what a materialisation derived, without a list of its own.
 #[derive(Default)]
 pub(crate) struct Relation {
+    /// The pairs the store started with, once the first round has read them as its
+    /// delta.
+    input: Run,
     base: Run,
     recent: Run,
     /// The last round's pairs (also in `recent`).
     delta: Run,
+    /// Whether the delta is still the input (the store's first round is to come).
+    fresh: bool,
 }
 
 /// The pairs whose first component is `key`.
@@ -229,12 +236,13 @@ impl Relation {
     }
 
     pub(crate) fn contains(&self, s: u64, o: u64) -> bool {
-        self.base.contains(s, o) || self.recent.contains(s, o)
+        self.base.contains(s, o) || self.recent.contains(s, o) || self.input.contains(s, o)
     }
 
     /// Every pair, in no particular order.
     pub(crate) fn pairs(&self) -> Vec<Pair> {
-        let mut out = Vec::with_capacity(self.base.len() + self.recent.len());
+        let mut out = Vec::with_capacity(self.input.len() + self.base.len() + self.recent.len());
+        out.extend_from_slice(&self.input.so);
         out.extend_from_slice(&self.base.so);
         out.extend_from_slice(&self.recent.so);
         out
@@ -246,11 +254,13 @@ impl Relation {
         match seg {
             Seg::Delta => self.delta.scan(s, o, &all, f),
             Seg::All => {
+                self.input.scan(s, o, &all, f);
                 self.base.scan(s, o, &all, f);
                 self.recent.scan(s, o, &all, f);
             }
-            // The delta is in `recent` only, so the base needs no filter.
+            // The delta is in `recent` only, so the input and the base need no filter.
             Seg::Old => {
+                self.input.scan(s, o, &all, f);
                 self.base.scan(s, o, &all, f);
                 let old = |s: u64, o: u64| !self.delta.contains(s, o);
                 self.recent.scan(s, o, &old, f);
@@ -262,18 +272,21 @@ impl Relation {
     /// hold them, in [`Relation::scan`]'s order: each with whether its order is
     /// `(object, subject)`, and whether its pairs are read as old (the recent run, whose
     /// delta pairs are skipped).
-    fn matching(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> [(&[Pair], bool, bool); 2] {
+    fn matching(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> [(&[Pair], bool, bool); 3] {
         fn slice(run: &Run, s: Option<u64>, o: Option<u64>, old: bool) -> (&[Pair], bool, bool) {
             let (pairs, swapped) = run.matching(s, o);
             (pairs, swapped, old)
         }
+        let none = (&[][..], false, false);
         match seg {
-            Seg::Delta => [slice(&self.delta, s, o, false), (&[], false, false)],
+            Seg::Delta => [slice(&self.delta, s, o, false), none, none],
             Seg::All => [
+                slice(&self.input, s, o, false),
                 slice(&self.base, s, o, false),
                 slice(&self.recent, s, o, false),
             ],
             Seg::Old => [
+                slice(&self.input, s, o, false),
                 slice(&self.base, s, o, false),
                 slice(&self.recent, s, o, true),
             ],
@@ -284,14 +297,21 @@ impl Relation {
     fn estimate(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> usize {
         match seg {
             Seg::Delta => self.delta.estimate(s, o),
-            Seg::Old | Seg::All => self.base.estimate(s, o) + self.recent.estimate(s, o),
+            Seg::Old | Seg::All => {
+                self.input.estimate(s, o) + self.base.estimate(s, o) + self.recent.estimate(s, o)
+            }
         }
     }
 
     /// Makes `new` (sorted, deduplicated, disjoint from the relation) the delta.
     fn advance(&mut self, new: Vec<Pair>) {
-        // Fold the recent run into the base first, so the new delta stays in `recent`.
-        if self.recent.len() * 4 > self.base.len() {
+        if self.fresh {
+            // The first round read the input as its delta (and recent run, shared): it
+            // goes apart, unmoved.
+            self.input = std::mem::take(&mut self.recent);
+            self.fresh = false;
+        } else if self.recent.len() * 4 > self.base.len() {
+            // Fold the recent run into the base first, so the new delta stays in `recent`.
             let recent = std::mem::take(&mut self.recent);
             if self.base.len() == 0 {
                 self.base = recent;
@@ -323,6 +343,9 @@ impl Store {
     pub(crate) fn new(input: Vec<Triple>) -> Self {
         let mut store = Self::default();
         store.advance(input);
+        for relation in &mut store.relations {
+            relation.fresh = true;
+        }
         store
     }
 
@@ -338,9 +361,11 @@ impl Store {
             .map(|(_, os)| {
                 let delta = Run::from_os(os);
                 Relation {
+                    input: Run::default(),
                     base: Run::default(),
                     recent: delta.clone(),
                     delta,
+                    fresh: true,
                 }
             })
             .collect();
@@ -370,16 +395,60 @@ impl Store {
 
     /// Adds `candidates` and makes the new ones the delta; returns the new ones.
     pub(crate) fn advance(&mut self, candidates: Vec<Triple>) -> Vec<Triple> {
-        self.advance_checked(candidates, true)
+        let news = self.news(candidates, true);
+        let mut delta = Vec::with_capacity(news.iter().map(Vec::len).sum());
+        for (pairs, &p) in news.iter().zip(&self.predicates) {
+            delta.extend(pairs.iter().map(|&(s, o)| [s, p, o]));
+        }
+        self.install(news);
+        delta
     }
 
     /// [`Self::advance`] for candidates known to be absent from the store (filtered
-    /// against it when they were derived): skips the membership check.
-    pub(crate) fn advance_new(&mut self, candidates: Vec<Triple>) -> Vec<Triple> {
-        self.advance_checked(candidates, false)
+    /// against it when they were derived): skips the membership check, and returns only
+    /// how many were new and whether one is a schema fact, not the facts.
+    pub(crate) fn advance_new(
+        &mut self,
+        candidates: Vec<Triple>,
+        schema: &Schema,
+    ) -> (usize, bool) {
+        let news = self.news(candidates, false);
+        let count = news.iter().map(Vec::len).sum();
+        let schema_facts = news
+            .par_iter()
+            .zip(self.predicates.par_iter())
+            .any(|(pairs, &p)| pairs.iter().any(|&(s, o)| schema.is_schema_fact([s, p, o])));
+        self.install(news);
+        (count, schema_facts)
     }
 
-    fn advance_checked(&mut self, mut candidates: Vec<Triple>, check: bool) -> Vec<Triple> {
+    /// Every pair added since the input, as facts, in no particular order: what a
+    /// materialisation from the input derived.
+    pub(crate) fn derived(&self) -> Vec<Triple> {
+        let mut out = Vec::with_capacity(
+            self.relations
+                .iter()
+                .map(|r| r.base.len() + r.recent.len())
+                .sum(),
+        );
+        for (relation, &p) in self.relations.iter().zip(&self.predicates) {
+            for run in [&relation.base, &relation.recent] {
+                out.extend(run.so.iter().map(|&(s, o)| [s, p, o]));
+            }
+        }
+        out
+    }
+
+    /// Makes `news` (per relation) the relations' deltas.
+    fn install(&mut self, news: Vec<Vec<Pair>>) {
+        self.relations
+            .par_iter_mut()
+            .zip(news.into_par_iter())
+            .for_each(|(relation, pairs)| relation.advance(pairs));
+    }
+
+    /// The new pairs of `candidates` per relation (relations added for new predicates).
+    fn news(&mut self, mut candidates: Vec<Triple>, check: bool) -> Vec<Vec<Pair>> {
         candidates.par_sort_unstable_by_key(|&[s, p, o]| (p, s, o));
         candidates.dedup();
         let chunks: Vec<&[Triple]> = candidates.chunk_by(|a, b| a[1] == b[1]).collect();
@@ -409,15 +478,7 @@ impl Store {
         for (index, pairs) in groups {
             news[index] = pairs;
         }
-        let mut delta = Vec::with_capacity(news.iter().map(Vec::len).sum());
-        for (pairs, &p) in news.iter().zip(&self.predicates) {
-            delta.extend(pairs.iter().map(|&(s, o)| [s, p, o]));
-        }
-        self.relations
-            .par_iter_mut()
-            .zip(news.into_par_iter())
-            .for_each(|(relation, pairs)| relation.advance(pairs));
-        delta
+        news
     }
 }
 
@@ -768,7 +829,6 @@ fn run(
         ..Phases::default()
     };
     let mut result = Materialisation::default();
-    let mut derived: Vec<Triple> = Vec::new();
     let mut program = GroundProgram::default();
     let mut transitive = Transitive::default();
     let mut equality = Equality::for_rules(rules);
@@ -823,14 +883,13 @@ fn run(
         phases.modules += clock.elapsed();
         let clock = std::time::Instant::now();
         // Every candidate was checked against the store, which a round doesn't change.
-        let delta = store.advance_new(candidates);
+        let (new, schema_facts) = store.advance_new(candidates, schema);
         phases.merge += clock.elapsed();
-        if delta.is_empty() {
+        if new == 0 {
             break;
         }
         transitive.observe(&store);
-        regrounding = delta.iter().any(|&t| schema.is_schema_fact(t));
-        derived.extend(delta);
+        regrounding = schema_facts;
     }
     result.ground_rules = program.rules.len();
     result.transitive = transitive.predicates.len();
@@ -847,6 +906,8 @@ fn run(
     result.violations = sorted(found);
     phases.consistency = clock.elapsed();
     result.phases = phases;
+    let mut derived = store.derived();
+    drop(store);
     derived.par_sort_unstable();
     result.derived = derived;
     Ok(result)
