@@ -30,9 +30,11 @@ pub fn geometry_literal(term: &nrese_rdf::Term) -> Option<(String, ::geo::Geomet
     geo::parse(term).map(|shape| (shape.crs, shape.geometry))
 }
 mod output;
+mod path_joins;
 mod paths;
 mod plan;
 mod pushdown;
+pub(crate) use pushdown::per_solution;
 mod ranges;
 mod search;
 mod sets;
@@ -911,6 +913,19 @@ fn supported_triple(triple: &TriplePattern) -> bool {
     term(&triple.subject) && term(&triple.object)
 }
 
+/// `v`'s place in `vars`, added at the end if it isn't there.
+fn variable_index(vars: &mut Vec<Variable>, v: Variable) -> usize {
+    vars.iter().position(|x| *x == v).unwrap_or_else(|| {
+        vars.push(v);
+        vars.len() - 1
+    })
+}
+
+/// EXPLAIN's estimate of the rows `expression` keeps of `rows` ([`pushdown::selectivity`]).
+fn filtered(rows: usize, expression: &Expression) -> Option<u64> {
+    Some((rows as f64 * pushdown::selectivity(expression)).round() as u64)
+}
+
 /// A property path pattern, with the filter directly on it, if any.
 struct PathPattern<'q> {
     subject: &'q TermPattern,
@@ -1335,6 +1350,9 @@ impl<'a> Context<'a> {
             return self.eval_operator(pattern);
         };
         let depth = self.depth.get();
+        // The plan's estimate of what this operator gives (`estimate`), as `plan_query`
+        // shows it before running.
+        let estimated_rows = self.estimate_rows(pattern);
         let index = {
             let mut trace = trace.borrow_mut();
             let (operator, detail) = describe(pattern);
@@ -1342,7 +1360,7 @@ impl<'a> Context<'a> {
                 depth,
                 operator: operator.to_owned(),
                 detail,
-                estimated_rows: None,
+                estimated_rows,
                 rows: 0,
                 micros: 0,
             });
@@ -1510,8 +1528,14 @@ impl<'a> Context<'a> {
                 object,
             } => self.path(subject, path, object),
             GraphPattern::Join { left, right } => {
-                // A path joined to a pattern is evaluated second, from the values the
-                // pattern binds to one of its ends.
+                // Paths joined to triple patterns: ordered with them (`path_joins`).
+                if !self.as_written
+                    && let Some(join) = path_joins::PathJoin::of(pattern)
+                {
+                    return self.join_with_paths(&join);
+                }
+                // A path joined to another pattern is evaluated second, from the values
+                // the pattern binds to one of its ends.
                 match (as_path(left), as_path(right)) {
                     (_, Some(path)) => {
                         let bound = self.eval(left)?;
@@ -1918,6 +1942,7 @@ impl<'a> Context<'a> {
             graph,
             fixed: None,
             cancellation: self.cancellation.as_ref(),
+            closures: Cell::new(0),
         })
     }
 
@@ -1956,6 +1981,8 @@ impl<'a> Context<'a> {
         } else {
             return self.filtered_path(path, None, start);
         };
+        let estimate = || self.path_estimate(path, Some(from));
+        self.note_closures(&evaluator, path.path, estimate, pairs.len(), start);
         let (vars, table) = if s == o {
             let same = pairs.into_iter().filter(|(a, b)| a == b).map(|(a, _)| a);
             (vec![s], IdTable::from_columns(vec![same.collect()]))
@@ -1981,6 +2008,7 @@ impl<'a> Context<'a> {
     ) -> NativeResult<Solutions> {
         let (subject, object) = (path.subject, path.object);
         let mut detail = format!("{subject} {} {object}", path.path);
+        let bound_values = reached.as_ref().map(|(_, values)| *values);
         let mut solutions = match reached {
             Some((solutions, values)) => {
                 detail.push_str(&format!(" from {values} bound values"));
@@ -1989,17 +2017,34 @@ impl<'a> Context<'a> {
             None => self.path(subject, path.path, object)?,
         };
         if self.trace.is_some() {
-            self.note("path", detail, None, solutions.table.len(), start);
+            let estimate = self.path_estimate(path, bound_values);
+            self.note("path", detail, estimate, solutions.table.len(), start);
         }
         if let Some(filter) = path.filter {
             let start = Instant::now();
+            let estimate = filtered(solutions.table.len(), filter);
             solutions = self.filter(solutions, filter)?;
             if self.trace.is_some() {
                 let rows = solutions.table.len();
-                self.note("filter", filter.to_string(), None, rows, start);
+                self.note("filter", filter.to_string(), estimate, rows, start);
             }
         }
         Ok(solutions)
+    }
+
+    /// Notes a closure computed per strongly connected component by `evaluator` (EXPLAIN).
+    fn note_closures(
+        &self,
+        evaluator: &paths::PathEvaluator<'_>,
+        path: &nrese_sparql_syntax::algebra::PropertyPathExpression,
+        estimate: impl FnOnce() -> Option<u64>,
+        rows: usize,
+        start: Instant,
+    ) {
+        if self.trace.is_some() && evaluator.closures.get() > 0 {
+            let detail = format!("{path} by strongly connected components");
+            self.note("closure", detail, estimate(), rows, start);
+        }
     }
 
     fn path(
@@ -2008,6 +2053,7 @@ impl<'a> Context<'a> {
         path: &nrese_sparql_syntax::algebra::PropertyPathExpression,
         object: &TermPattern,
     ) -> NativeResult<Solutions> {
+        let start = Instant::now();
         let resolved = paths::Path::resolve(path, &self.snapshot);
         let end = |term: &TermPattern| self.path_end(term);
         let mut evaluator = self.path_evaluator()?;
@@ -2038,6 +2084,16 @@ impl<'a> Context<'a> {
                 (vec![s, o], IdTable::from_columns(vec![starts, ends]))
             }
         };
+        let estimate = || {
+            let pattern = PathPattern {
+                subject,
+                path,
+                object,
+                filter: None,
+            };
+            Some(self.path_size(&pattern).round() as u64)
+        };
+        self.note_closures(&evaluator, path, estimate, table.len(), start);
         self.produced(Solutions {
             vars,
             table,
@@ -2176,7 +2232,17 @@ impl<'a> Context<'a> {
                 if let Some(ranges) = strings::ranges(&self.snapshot, &condition, rows) {
                     if self.trace.is_some() {
                         let detail = format!("terms {object} can take");
-                        self.note("dictionary string test", detail, None, ranges.len(), start);
+                        // The object's distinct values the conjuncts on it keep (each
+                        // passing term is a range of one id or more).
+                        let selectivity: f64 = filters
+                            .iter()
+                            .filter(|(_, read)| read.as_slice() == std::slice::from_ref(object))
+                            .map(|(conjunct, _)| pushdown::selectivity(conjunct))
+                            .product();
+                        let distinct = self.distinct(s, object, rows) as f64;
+                        let estimate = Some((distinct * selectivity).round() as u64);
+                        let found = ranges.len();
+                        self.note("dictionary string test", detail, estimate, found, start);
                     }
                     found.push(ranges::Hint {
                         variable: condition.variable.clone(),
@@ -2227,7 +2293,8 @@ impl<'a> Context<'a> {
             if self.trace.is_some() {
                 let detail = triples.iter().map(ToString::to_string).collect::<Vec<_>>();
                 let rows = solutions.table.len();
-                self.note("wcoj", detail.join(" . "), None, rows, start);
+                let estimate = self.bgp_estimate(&scans, &counts);
+                self.note("wcoj", detail.join(" . "), estimate, rows, start);
             }
             return Ok(solutions);
         }
@@ -2256,9 +2323,13 @@ impl<'a> Context<'a> {
             })
             .collect();
         let plan = self.join_order(&scans, &planned);
+        // Two patterns the orderer only sorts: the larger bounds their join (`estimate`).
         let estimate = |step: usize| {
             let rows = plan.rows[step];
-            rows.is_finite().then(|| rows.round() as u64)
+            Some(match rows.is_finite() {
+                true => rows.round() as u64,
+                false => plan.order[..=step].iter().map(|&i| planned[i]).max()?,
+            })
         };
         let order = &plan.order;
         let first = order[0];
@@ -2337,10 +2408,20 @@ impl<'a> Context<'a> {
         let Some(limit) = limit.filter(|_| result.table.width() > 0) else {
             return join_rest(result, filters);
         };
+        // EXPLAIN: the rows the limit lets the pattern stop at, against what it would give.
+        let limited = |detail: String, rows: usize, start: Instant| {
+            if self.trace.is_some() {
+                let estimate = estimate(order.len() - 1).map(|e| e.min(limit as u64));
+                self.note("limit pushdown", detail, estimate, rows, start);
+            }
+        };
         if order.len() == 1 {
-            if result.table.len() > limit {
+            let read = result.table.len();
+            if read > limit {
                 result.table.slice(0, Some(limit));
             }
+            let detail = format!("{limit} wanted: the first of {read} rows of one pattern");
+            limited(detail, result.table.len(), start);
             return Ok(result);
         }
         if result.table.len() <= MIN_MORSEL {
@@ -2381,6 +2462,12 @@ impl<'a> Context<'a> {
         if let Some(applied) = applied {
             *filters = applied;
         }
+        let detail = format!(
+            "{limit} wanted: {} morsel(s), {from} of {} rows of the first pattern joined",
+            parts.len(),
+            result.table.len()
+        );
+        limited(detail, rows, start);
         let vars = parts[0].vars.clone();
         let tables = parts
             .into_iter()
@@ -2463,6 +2550,17 @@ impl<'a> Context<'a> {
             .filter(|&(c, _)| !result.table.column(c).contains(&UNDEF))
             .map(|(_, v)| v.clone())
             .collect();
+        // EXPLAIN's estimates, from the seed's rows on: each pattern multiplies the rows by
+        // its count over the distinct values of the variables it shares (independence,
+        // as the join orderer; the seed's rows taken as distinct).
+        let begun = Instant::now();
+        let seed_rows = result.table.len();
+        let mut estimated = seed_rows as f64;
+        let mut distinct: HashMap<Variable, f64> = result
+            .vars
+            .iter()
+            .map(|v| (v.clone(), estimated.max(1.0)))
+            .collect();
         let mut left: Vec<usize> = (0..scans.len()).collect();
         while !left.is_empty() {
             let connected = |i: &usize| scans[*i].vars().iter().any(|v| result.column(v).is_some());
@@ -2482,6 +2580,25 @@ impl<'a> Context<'a> {
             let probe = !shared.is_empty()
                 && self.merge_set.is_none()
                 && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
+            if self.trace.is_some() {
+                let count = counts[next] as f64;
+                let mut divisor = 1.0f64;
+                for v in scans[next].vars() {
+                    let d = self.distinct(&scans[next], &v, counts[next]) as f64;
+                    let joined = match distinct.get(&v) {
+                        Some(&seen) => {
+                            divisor *= seen.max(d).max(1.0);
+                            seen.min(d)
+                        }
+                        None => d,
+                    };
+                    distinct.insert(v, joined.max(1.0));
+                }
+                estimated = estimated * count / divisor;
+                for d in distinct.values_mut() {
+                    *d = d.min(estimated.max(1.0));
+                }
+            }
             result = if probe {
                 self.probe_join(result, &scans[next], &shared)?
             } else {
@@ -2491,7 +2608,8 @@ impl<'a> Context<'a> {
             if self.trace.is_some() {
                 let operator = if probe { "index join" } else { "join" };
                 let rows = result.table.len();
-                self.note(operator, triples[next].to_string(), None, rows, start);
+                let estimate = Some(estimated.round() as u64);
+                self.note(operator, triples[next].to_string(), estimate, rows, start);
             }
             for v in scans[next].vars() {
                 if !bound.contains(&v) {
@@ -2499,6 +2617,11 @@ impl<'a> Context<'a> {
                 }
             }
             result = self.filter_among(result, filters, &bound)?;
+        }
+        if self.trace.is_some() {
+            let detail = format!("{} pattern(s) from {seed_rows} rows", triples.len());
+            let estimate = Some(estimated.round() as u64);
+            self.note("sideways", detail, estimate, result.table.len(), begun);
         }
         Ok(result)
     }
@@ -2564,10 +2687,11 @@ impl<'a> Context<'a> {
             }
             let (conjunct, _) = filters.remove(index);
             let start = Instant::now();
+            let estimate = filtered(solutions.table.len(), conjunct);
             solutions = self.filter(solutions, conjunct)?;
             if self.trace.is_some() {
                 let rows = solutions.table.len();
-                self.note("filter", conjunct.to_string(), None, rows, start);
+                self.note("filter", conjunct.to_string(), estimate, rows, start);
             }
         }
         Ok(solutions)
@@ -2576,6 +2700,12 @@ impl<'a> Context<'a> {
     /// The order in which to join a BGP's patterns ([`plan`]; `counts` are exact). Two
     /// patterns start with the smaller one; larger BGPs are planned with distinct counts.
     fn join_order(&self, scans: &[ScanPattern], counts: &[u64]) -> plan::Plan {
+        if scans.is_empty() {
+            return plan::Plan {
+                order: Vec::new(),
+                rows: Vec::new(),
+            };
+        }
         if scans.len() <= 2 {
             let mut order: Vec<usize> = (0..scans.len()).collect();
             order.sort_by_key(|&i| counts[i]);
@@ -2602,13 +2732,32 @@ impl<'a> Context<'a> {
             return plan::Plan { order, rows };
         }
         let mut vars: Vec<Variable> = Vec::new();
-        let mut index_of = |v: Variable| {
-            vars.iter().position(|x| *x == v).unwrap_or_else(|| {
-                vars.push(v);
-                vars.len() - 1
-            })
-        };
-        let inputs: Vec<plan::Input> = scans
+        let inputs = self.plan_inputs(scans, counts, &mut vars);
+        self.order_inputs(&inputs, vars.len())
+    }
+
+    /// The join orderer's order of `inputs` over `variables` variables, with the
+    /// characteristic sets where an input is part of a star.
+    fn order_inputs(&self, inputs: &[plan::Input], variables: usize) -> plan::Plan {
+        let sets = inputs
+            .iter()
+            .any(|i| i.star.is_some())
+            .then(|| self.snapshot.characteristic_sets_in(self.model))
+            .flatten();
+        plan::order(inputs, variables, PROBE_FACTOR, sets.as_deref())
+    }
+
+    /// The join orderer's inputs for `scans` with their `counts`: distinct values per
+    /// variable (numbered by their place in `vars`, which gets the new ones), stars and
+    /// edges for the characteristic sets and pairs.
+    fn plan_inputs(
+        &self,
+        scans: &[ScanPattern],
+        counts: &[u64],
+        vars: &mut Vec<Variable>,
+    ) -> Vec<plan::Input> {
+        let mut index_of = |v: Variable| variable_index(vars, v);
+        scans
             .iter()
             .zip(counts)
             .map(|(scan, &count)| {
@@ -2636,13 +2785,7 @@ impl<'a> Context<'a> {
                     star,
                 }
             })
-            .collect();
-        let sets = inputs
-            .iter()
-            .any(|i| i.star.is_some())
-            .then(|| self.snapshot.characteristic_sets_in(self.model))
-            .flatten();
-        plan::order(&inputs, vars.len(), PROBE_FACTOR, sets.as_deref())
+            .collect()
     }
 
     /// `scan` (with `count` matches) as part of a star on its subject (the variable with
@@ -2790,7 +2933,7 @@ impl<'a> Context<'a> {
                     order.join(", "),
                     stats.lookups.load(std::sync::atomic::Ordering::Relaxed)
                 ),
-                estimated_rows: None,
+                estimated_rows: self.bgp_estimate(scans, counts),
                 rows: table.len() as u64,
                 micros: 0,
             });
@@ -3299,6 +3442,7 @@ impl<'a> Context<'a> {
                 None => solutions,
             }));
         };
+        let start = Instant::now();
         let places: Vec<Vec<usize>> = vars_unique
             .iter()
             .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
@@ -3359,6 +3503,13 @@ impl<'a> Context<'a> {
             if more.is_none() {
                 break;
             }
+        }
+        if self.trace.is_some() {
+            let count = self.snapshot.estimate_in(self.model, &scan.quad_pattern()) as f64;
+            let kept = filter.map_or(1.0, pushdown::selectivity);
+            let estimate = Some(((count * kept).round() as u64).min(limit as u64));
+            let detail = format!("{triple} until {limit} rows");
+            self.note("limit pushdown", detail, estimate, out.len(), start);
         }
         let solutions = Solutions {
             vars: vars_unique,
@@ -3846,6 +3997,7 @@ impl<'a> Context<'a> {
         // COUNT(*) of an open closure (`?a p* ?b`, `?a p+ ?b`): from the closure's size
         // per node, without building its pairs. Its pairs are distinct, so DISTINCT counts
         // the same.
+        let begun = Instant::now();
         if variables.is_empty()
             && let [(target, AggregateExpression::CountSolutions { .. })] = aggregates
             && let GraphPattern::Path {
@@ -3859,6 +4011,10 @@ impl<'a> Context<'a> {
                 .path_evaluator()?
                 .count_open(&paths::Path::resolve(path, &self.snapshot))
         {
+            if self.trace.is_some() {
+                let detail = format!("COUNT of {path} from the closure's size per component");
+                self.note("closure", detail, Some(1), 1, begun);
+            }
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
             return Ok(Solutions {
@@ -3891,7 +4047,9 @@ impl<'a> Context<'a> {
             {
                 if self.trace.is_some() {
                     let detail = format!("{key} of {triple}");
-                    self.note("group count", detail, None, groups.len(), start);
+                    let count = self.snapshot.estimate_in(self.model, &scan.quad_pattern());
+                    let estimate = Some(self.distinct(&scan, key, count));
+                    self.note("group count", detail, estimate, groups.len(), start);
                 }
                 let mut columns = vec![
                     groups
@@ -4437,7 +4595,9 @@ fn describe(pattern: &GraphPattern) -> (&'static str, String) {
             },
         ),
         GraphPattern::Group { variables, .. } => ("group", list(variables)),
-        _ => ("operator", String::new()),
+        GraphPattern::Graph { name, .. } => ("graph", name.to_string()),
+        GraphPattern::Service { name, .. } => ("service", name.to_string()),
+        GraphPattern::Lateral { .. } => ("lateral", String::new()),
     }
 }
 

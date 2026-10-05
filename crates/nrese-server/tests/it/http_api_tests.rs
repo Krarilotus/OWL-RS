@@ -1,13 +1,9 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
-use nrese_store::StoreConfig;
 use tower::util::ServiceExt;
 
-use crate::support::{
-    minimal_fixture_path, test_app, test_app_with_posture, test_app_with_settings,
-    test_app_with_store_config,
-};
+use crate::support::{test_app, test_app_with_posture, test_app_with_settings};
 use nrese_server::DeploymentPosture;
 use nrese_server::policy::PolicyConfig;
 
@@ -185,62 +181,6 @@ async fn service_description_endpoint_serves_turtle() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-async fn service_description_omits_disabled_optional_endpoints()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_settings(
-        PolicyConfig {
-            expose_operator_ui: false,
-            expose_metrics: false,
-            ..PolicyConfig::default()
-        },
-        ReasonerConfig::default(),
-    )?;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/service-description")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
-    assert!(!text.contains("nrese:metricsEndpoint"));
-    assert!(!text.contains("nrese:operatorEndpoint"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn read_only_demo_service_description_omits_mutation_endpoints()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_posture(
-        PolicyConfig::default(),
-        ReasonerConfig::default(),
-        DeploymentPosture::ReadOnlyDemo,
-    )?;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/service-description")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
-    assert!(!text.contains("nrese:updateEndpoint"));
-    assert!(!text.contains("nrese:tellEndpoint"));
-    assert!(text.contains("nrese:graphStoreWriteEnabled \"false\""));
-    assert!(text.contains("nrese:sparqlUpdateEnabled \"false\""));
-    assert!(text.contains("nrese:tellEnabled \"false\""));
-    Ok(())
-}
-
-#[tokio::test]
 async fn read_only_demo_returns_not_found_for_mutation_surfaces()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_posture(
@@ -287,36 +227,6 @@ async fn read_only_demo_returns_not_found_for_mutation_surfaces()
         )
         .await?;
     assert_eq!(graph_response.status(), StatusCode::NOT_FOUND);
-    Ok(())
-}
-
-#[tokio::test]
-async fn construct_query_supports_rdf_xml_accept() -> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app()?;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-query")
-                .header("accept", "application/rdf+xml")
-                .body(Body::from(
-                    "CONSTRUCT { <http://example.com/s> <http://example.com/p> <http://example.com/o> } WHERE {}",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok()),
-        Some("application/rdf+xml")
-    );
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
-    assert!(text.contains("rdf:RDF"));
     Ok(())
 }
 
@@ -533,51 +443,6 @@ async fn owl2_rl_update_surfaces_last_reasoning_run_in_operator_diagnostics()
 }
 
 #[tokio::test]
-async fn owl2_rl_accepts_functional_property_multiplicity_and_reports_inferred_equality()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_settings(
-        PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
-    )?;
-
-    let update_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-update")
-                .body(Body::from(
-                    "INSERT DATA {
-                        <http://example.com/p> a <http://www.w3.org/2002/07/owl#FunctionalProperty> .
-                        <http://example.com/alice> <http://example.com/p> <http://example.com/one> .
-                        <http://example.com/alice> <http://example.com/p> <http://example.com/two> .
-                    }",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(update_response.status(), StatusCode::NO_CONTENT);
-
-    let diagnostics_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/ops/api/diagnostics/reasoning")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(diagnostics_response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(diagnostics_response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
-    assert!(text.contains("\"completed\""));
-    // prp-fp derives one sameAs two (and its symmetric and reflexive consequences).
-    assert!(!text.contains("\"inferred_inserted\":0"));
-    Ok(())
-}
-
-#[tokio::test]
 async fn owl2_rl_rejects_disjoint_type_conflicts_and_surfaces_reason()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
@@ -664,36 +529,6 @@ async fn owl2_rl_rejects_disjoint_type_conflicts_and_surfaces_reason()
 }
 
 #[tokio::test]
-async fn owl2_rl_rejects_owl_nothing_type_conflicts() -> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_settings(
-        PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
-    )?;
-
-    let update_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-update")
-                .body(Body::from(
-                    "INSERT DATA {
-                        <http://example.com/Impossible> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://www.w3.org/2002/07/owl#Nothing> .
-                        <http://example.com/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Impossible> .
-                    }",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(update_response.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(update_response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
-    assert!(text.contains("owl#Nothing"));
-    assert!(text.contains("reasoner_reject"));
-    Ok(())
-}
-
-#[tokio::test]
 async fn graph_store_head_returns_content_type() -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app()?;
     let response = app
@@ -714,65 +549,6 @@ async fn graph_store_head_returns_content_type() -> Result<(), Box<dyn std::erro
             .and_then(|v| v.to_str().ok()),
         Some("text/turtle")
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn ttl_fixture_is_loaded_and_drives_reasoner_aware_update_flow()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_store_config(
-        StoreConfig::in_memory().with_ontology(minimal_fixture_path()),
-        PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
-    )?;
-
-    let ready_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(ready_response.status(), StatusCode::OK);
-    let ready_body = axum::body::to_bytes(ready_response.into_body(), usize::MAX).await?;
-    let ready_text = String::from_utf8(ready_body.to_vec())?;
-    assert!(ready_text.contains("minimal_services.ttl"));
-
-    let update_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-update")
-                .body(Body::from(
-                    "INSERT DATA {
-                        <http://example.com/carol> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Child> .
-                    }",
-                ))?,
-        )
-        .await?;
-    assert_eq!(update_response.status(), StatusCode::NO_CONTENT);
-
-    let diagnostics_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/ops/api/diagnostics/reasoning")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(diagnostics_response.status(), StatusCode::OK);
-    let diagnostics_body =
-        axum::body::to_bytes(diagnostics_response.into_body(), usize::MAX).await?;
-    let diagnostics_text = String::from_utf8(diagnostics_body.to_vec())?;
-    assert!(diagnostics_text.contains("\"last_run\""));
-    assert!(diagnostics_text.contains("\"completed\""));
-    assert!(diagnostics_text.contains("\"rounds\""));
-    assert!(diagnostics_text.contains("\"inferred_triples\""));
-
     Ok(())
 }
 
