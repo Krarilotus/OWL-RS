@@ -1,0 +1,51 @@
+# The server image for x86-64 and arm64 (Dockerfile): built on request, pushed to the
+# GitHub container registry only when asked (publishing is a release decision).
+#   gh workflow run images.yml --ref refactor/engine-v2                  (build both, push nothing)
+#   gh workflow run images.yml --ref main -f push=true -f tag=0.1.0      (build and push)
+name: Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: Push the images to ghcr.io
+        type: boolean
+        default: false
+      tag:
+        description: The image tag
+        type: string
+        default: edge
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Server image (linux/amd64, linux/arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The Rust build cross-compiles on the runner; emulation only runs the final stage's
+      # package installation for arm64.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: log in to ghcr.io
+        if: inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Image names are lower case; the owner's name may not be.
+      - name: image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/nrese" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ inputs.push }}
+          tags: ${{ steps.image.outputs.name }}:${{ inputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

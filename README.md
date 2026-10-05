@@ -65,6 +65,8 @@ docker build -t nrese .
 docker run -p 8080:8080 -v nrese-data:/var/lib/nrese/data nrese
 ```
 
+The image builds for x86-64 and arm64 (AWS Graviton, Ampere, Apple silicon, Raspberry Pi 5): `docker buildx build --platform linux/amd64,linux/arm64 -t nrese .` cross-compiles both on the building machine. By default it generates code for x86-64-v3 and Neoverse N1; `--build-arg NRESE_TARGET_CPU=portable` gives a binary for any CPU of the architecture, and `native` one for the building machine's.
+
 The server is then at `http://localhost:8080`: the console at `/console`, SPARQL at `/dataset/sparql`, the Graph Store at `/dataset/data` ([HTTP interface](docs/ops/http-api.md)). Data is kept in the `nrese-data` volume. Settings are environment variables, for example `-e NRESE_DEFAULT_GRAPH=union -e NRESE_REASONING_MODE=owl2-rl` ([configuration](docs/ops/config-reference.md)). The image has no authentication switched on; set `NRESE_AUTH_MODE` before exposing it.
 
 Using it with other systems:
