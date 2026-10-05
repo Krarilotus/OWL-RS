@@ -93,3 +93,4 @@ medians), and kept or rejected.
 
 | Date | Idea | Measurement | Kept |
 |---|---|---|---|
+| 5 Oct | **P1-F1, drivers read in place.** A rule job copied every match of its driving atom (24 B each) before the round ran: 391 M copies (9.4 GB) in round 2 of LUBM 1000, the peak. The batch store now hands out numbered slices of its sorted runs (`Source::matches_len`, `scan_range`), so morsels read the runs directly; other sources still copy | Office PC, interleaved medians. LUBM 1000: peak heap 22.2 → 12.9 GB, reasoning 43.1 → 29.7 s. LUBM 100: 3.46 → 2.89 s, 2.89 → 2.51 GB. OWL2Bench RL-1: 0.54 → 0.48 s, 0.61 → 0.48 GB. Same closures | kept |
