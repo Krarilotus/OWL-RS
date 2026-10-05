@@ -13,6 +13,33 @@ Rules for every entry:
 - Licensed systems (GraphDB, RDFox, Stardog, AnzoGraph) appear only by name, never with
   results, until their vendors permit it.
 
+## 0. Wins to keep: check these before a rewrite, and guard them
+
+The ideas that gave the largest measured wins. They aren't fixed: a better idea may replace
+one. But a rewrite of the code they live in, or a work package handed to an agent, starts by
+reading this table, and keeps the win or measures its replacement against it. Each has a
+**guard**: a cheap, deterministic test that fails at once if the win is lost (counts, plan
+shapes, bounds), so regressions are caught where they happen rather than by chance in large
+benchmark runs.
+
+| Win | Measured | Guard |
+|---|---|---|
+| Drivers read the batch store's runs in place, no copied drivers (P1-F1) | LUBM 1000 peak 22.2 → 12.9 GB, reasoning −31 % | missing: a byte counter on the batch store |
+| No list of derived facts; the input kept apart (P1-F4) | LUBM 1000 peak 15.2 → 13.4 GB | missing (as F1) |
+| Candidates deduplicated and probed in order per morsel (P1-F8) | LUBM 1000 reasoning −7.5 % | missing: a probe counter |
+| Permutations derived by a stable partition (P1-F7) | LUBM 1000 load 30.0 → 26.5 s | `planned_layouts_sort_as_few_times_as_designed` (2 sorts default graph, 3 named graphs) |
+| Group counts on the index (`COUNT … GROUP BY` one pattern) | Wikidata q07 2,101 → 0.18 ms | `group_counts_walk_the_index` (plan shows `group count`) |
+| Distinct values by a group walk (NOT EXISTS sides, sets) | DBpedia q13 25 → 3.1 ms | `distinct_values_walk_the_index` (`group walk`) |
+| Worst-case-optimal joins for cyclic patterns | LUBM 100 q2 18 → 4.8 ms | `triangles_join_worst_case_optimally` (`wcoj`) |
+| String filters on the dictionary | Wikidata q06 148 → 0.06 ms | `string_filters_test_the_dictionary` (`dictionary string test`) |
+| Sideways information passing, LIMIT pushdown, closures by components, EXISTS as sets | see §3 | missing: these operators don't report themselves in EXPLAIN yet |
+| DL: lazy unfolding in a portfolio | W3C DL-204 timeout → 6 ms | `hard_search_tests_are_decided` (DL-202, 204, 206, 661) |
+| DL: minimal automata, transitions the inclusions imply (P3) | ore_ont_1066 379 k → 56 k clauses, 1.42 → 0.15 s | `universals_over_a_large_role_hierarchy_stay_small` (≤ 400 clauses; 220 on 5 Oct) |
+| Canonicalisation without factorial branching | a thousand twins: linear | `many_equal_children_are_twins` (search leaves bounded) |
+
+Plan guards live in `crates/nrese-sparql/tests/it/plan_guard_tests.rs`. A new win gets its
+row and its guard in the same commit.
+
 ## 1. Where NRESE stands (office batches A and B, 3-5 October 2026)
 
 Ryzen 9 5950X, 31 GiB, Docker; 3 runs, 3 measured repetitions each, cache off and on,
