@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step, Stop, proof};
-use super::graph::NONE;
+use super::graph::{Annot, NONE};
 
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +55,7 @@ impl Engine<'_> {
             self.add_inequality(x, y, DepSetId::EMPTY, proof::ASSERTED)?;
         }
         for &(i, j) in &a.same {
-            let lit = Lit::Equal(self.roots[i as usize], self.roots[j as usize], NONE);
+            let lit = Lit::Equal(self.roots[i as usize], self.roots[j as usize], Annot::NONE);
             self.assert(lit, DepSetId::EMPTY, proof::ASSERTED)?;
         }
         Ok(())
@@ -66,22 +66,34 @@ impl Engine<'_> {
         if let Err(stop) = self.init(test) {
             return match stop {
                 Stop::Clash(_) => End::Refuted,
-                Stop::GaveUp(why) => End::GaveUp(why),
+                Stop::GaveUp(why) | Stop::Abandon(_, why) => End::GaveUp(why),
             };
         }
+        // Why a branch was abandoned, if one was: a refutation is then no answer.
+        let mut abandoned: Option<String> = None;
         loop {
             let stop = match self.step() {
                 Ok(true) => continue,
                 Ok(false) => return End::Model,
                 Err(stop) => stop,
             };
-            match stop {
+            let dep = match stop {
                 Stop::GaveUp(why) => return End::GaveUp(why),
-                Stop::Clash(dep) => match self.backtrack(dep) {
-                    Ok(true) => {}
-                    Ok(false) => return End::Refuted,
-                    Err(why) => return End::GaveUp(why),
-                },
+                Stop::Clash(dep) => dep,
+                Stop::Abandon(dep, why) => {
+                    abandoned.get_or_insert(why);
+                    dep
+                }
+            };
+            match self.backtrack(dep) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return match abandoned {
+                        Some(why) => End::GaveUp(why),
+                        None => End::Refuted,
+                    };
+                }
+                Err(why) => return End::GaveUp(why),
             }
         }
     }
@@ -91,6 +103,9 @@ impl Engine<'_> {
         self.check_time()?;
         self.check_memory()?;
         self.saturate()?;
+        if self.apply_ni()? {
+            return Ok(true);
+        }
         if !self.config.disjunctions_first && self.expand_at_least()? {
             return Ok(true);
         }
@@ -125,21 +140,17 @@ impl Engine<'_> {
             }
             let bind: Vec<u32> = bind.to_vec();
             let mut dep = pend.dep;
+            let annotation = clause.annotation;
             let mut open = Vec::new();
             let mut satisfied = false;
-            let mut ni = false;
-            for &h in &clause.head {
-                let lit = self.lit(h, &bind);
-                if self.needs_ni(lit) {
-                    ni = true;
-                    continue;
-                }
+            for (i, &h) in clause.head.iter().enumerate() {
+                let lit = self.lit(h, &bind, annotation);
                 match self.holds(lit) {
                     Ok(true) => {
                         satisfied = true;
                         break;
                     }
-                    Ok(false) => open.push(lit),
+                    Ok(false) => open.push((lit, i as u8)),
                     Err(refuted) => dep = self.deps.union(dep, refuted),
                 }
             }
@@ -147,16 +158,41 @@ impl Engine<'_> {
                 self.pending_open = at as u32;
                 continue;
             }
-            if ni {
-                return Err(super::engine::ni_stop());
-            }
             return match open.len() {
                 0 => Err(self.clash(dep, DepSetId::EMPTY)),
-                1 => self.assert(open[0], dep, clause.source).map(|()| true),
-                _ => self.branch(open, dep).map(|()| true),
+                1 => self.assert(open[0].0, dep, clause.source).map(|()| true),
+                _ => {
+                    self.order_disjuncts(pend.clause, &mut open);
+                    let (alternatives, heads) = open.into_iter().unzip();
+                    self.branch_on_clause(alternatives, dep, pend.clause, heads)
+                        .map(|()| true)
+                }
             };
         }
         Ok(false)
+    }
+
+    /// The order to try a clause's open disjuncts in: those that failed less often first,
+    /// the clause's order on ties (HermiT's disjunct learning, Glimm et al., JAR 2014,
+    /// `GroundDisjunctionHeader`). HermiT also groups the disjuncts first (at-least
+    /// restrictions over a negated concept first, over others last); in the A/B (5 October
+    /// 2026) the whole grouping made DL-623 and the wine ontology branch several times as
+    /// often, its second half the wine ontology, and DL-664 run out of time, while neither
+    /// changed DL-202 to DL-209. Learning acts only once a disjunct has failed.
+    fn order_disjuncts(&mut self, clause: u32, open: &mut [(Lit, u8)]) {
+        if !self.config.disjunct_learning {
+            return;
+        }
+        let heads = &self.p.clauses[clause as usize].head;
+        if self.failures.len() <= clause as usize {
+            self.failures.resize(clause as usize + 1, Vec::new());
+        }
+        let failures = &mut self.failures[clause as usize];
+        if failures.len() < heads.len() {
+            failures.resize(heads.len(), 0);
+        }
+        let failures = &self.failures[clause as usize];
+        open.sort_by_key(|&(_, i)| failures[i as usize]);
     }
 
     /// Takes the next alternative of the newest branch point.
@@ -168,10 +204,11 @@ impl Engine<'_> {
         let lit = frame.alternatives[frame.next];
         let (premise, failed) = (frame.premise, frame.failed);
         let tried: Vec<Lit> = frame.alternatives[..frame.next].to_vec();
+        let semantic = frame.semantic;
         let single = self.deps.single(level);
         let dep = self.deps.union(premise, single);
         self.assert(lit, dep, proof::CHOICE)?;
-        if self.config.semantic_branching {
+        if self.config.semantic_branching && semantic {
             for t in tried {
                 self.negate(t, failed)?;
             }
@@ -210,13 +247,24 @@ impl Engine<'_> {
             };
             let failed = self.deps.union(frame.failed, rest);
             frame.failed = failed;
+            if frame.clause != NONE {
+                // The alternative taken failed: it goes further back next time.
+                let (clause, head) = (frame.clause as usize, frame.heads[frame.next]);
+                if let Some(count) = self
+                    .failures
+                    .get_mut(clause)
+                    .and_then(|c| c.get_mut(head as usize))
+                {
+                    *count = count.saturating_add(1);
+                }
+            }
             frame.next += 1;
             let frame = frame.clone();
             self.restore(&frame);
             if frame.next < frame.alternatives.len() {
                 match self.take_alternative() {
                     Ok(()) => break Ok(true),
-                    Err(Stop::Clash(d)) => {
+                    Err(Stop::Clash(d) | Stop::Abandon(d, _)) => {
                         dep = d;
                         continue;
                     }
@@ -241,6 +289,8 @@ impl Engine<'_> {
         self.pending.truncate(frame.pending as usize);
         self.bindings.truncate(frame.bindings as usize);
         self.pending_open = frame.pending_open;
+        self.ni.pending.truncate(frame.ni_pending as usize);
+        self.ni.open = frame.ni_open;
         // The queues were empty when the branch point was opened.
         self.done.nodes = frame.mark.nodes;
         self.done.unary = frame.mark.unary;

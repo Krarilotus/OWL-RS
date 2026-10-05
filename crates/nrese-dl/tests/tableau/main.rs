@@ -2,6 +2,7 @@
 //! engine handles, consistent and inconsistent, with every optimisation on and off.
 
 mod build;
+mod ni;
 mod sat;
 
 use build::Build;
@@ -17,6 +18,7 @@ fn answer(o: &nrese_owl::Ontology) -> Answer {
             backjumping: bits & 2 != 0,
             anywhere_blocking: bits & 4 != 0,
             single_blocking: bits & 8 != 0,
+            check_blocking: true,
             ..Config::default()
         };
         answers.push(consistency(o, &config).answer);
@@ -324,8 +326,7 @@ fn budgets_give_up() {
 #[test]
 fn the_ni_rule_is_never_skipped_silently() {
     // JAIR 2009's caterpillar (8): S(a, a), a: ∃R.B, B ⊑ ∃R.C, C ⊑ ∃S.D, D ⊑ {a}, S
-    // inverse-functional. Consistent; the derivation needs the NI rule (on c ≈ c), which
-    // the engine lacks: it must give up, not answer from a model that isn't one.
+    // inverse-functional. Consistent; the derivation needs the NI rule (on c ≈ c).
     let mut b = Build::default();
     let [bb, c, d] = [2, 3, 4].map(|t| b.class(t));
     let (r, s) = (ObjProp::Named(200), ObjProp::Named(201));
@@ -346,10 +347,7 @@ fn the_ni_rule_is_never_skipped_silently() {
         };
         let answer = consistency(&b.o, &config).answer;
         eprintln!("caterpillar, expand {expand}: {answer:?}");
-        assert!(
-            matches!(answer, Answer::Consistent | Answer::GaveUp(_)),
-            "{answer:?}"
-        );
+        assert_eq!(answer, Answer::Consistent);
     }
 }
 
@@ -357,7 +355,7 @@ fn the_ni_rule_is_never_skipped_silently() {
 fn premature_blocking_without_the_ni_rule_is_caught() {
     // JAIR 2009's (9): A(a), a: ∃R.B, A ⊑ ∀R⁻.⊥, B ⊑ ∃R.B, B ⊑ ∃S.{a}, R
     // inverse-functional, ⊤ ⊑ ≤3 S⁻.⊤. Inconsistent; without the NI rule a blocked chain
-    // looks like a model (Figure 9a). The engine may give up, never answer consistent.
+    // looks like a model (Figure 9a).
     let mut b = Build::default();
     let [a, bb] = [1, 2].map(|t| b.class(t));
     let (r, s) = (ObjProp::Named(200), ObjProp::Named(201));
@@ -382,10 +380,7 @@ fn premature_blocking_without_the_ni_rule_is_caught() {
         };
         let answer = consistency(&b.o, &config).answer;
         eprintln!("premature blocking, expand {expand}: {answer:?}");
-        assert!(
-            matches!(answer, Answer::Inconsistent | Answer::GaveUp(_)),
-            "{expand}: {answer:?}"
-        );
+        assert_eq!(answer, Answer::Inconsistent, "{expand}");
     }
 }
 
@@ -424,20 +419,62 @@ fn the_bottom_property_relates_nothing() {
 }
 
 #[test]
-fn the_universal_property_is_unsupported_not_ordinary() {
-    // 501 is owl:topObjectProperty. a: ¬∃⊤.⊤ is inconsistent (a itself is a ⊤-successor
-    // of a); read as an ordinary property it would look consistent.
+fn the_universal_property_relates_everything() {
+    // 501 is owl:topObjectProperty.
+    let top = ObjProp::Named(501);
+    let universal = |b: &mut Build| b.o.builtin.top_object = Some(501);
+    // a: ¬∃U.⊤ is inconsistent (a is a U-successor of itself; New-Feature-TopObjectProperty-001).
     let mut b = Build::default();
-    b.o.builtin.top_object = Some(501);
+    universal(&mut b);
     let thing = b.e(ClassExpr::Thing);
-    let some = b.some(ObjProp::Named(501), thing);
+    let some = b.some(top, thing);
     let none = b.not(some);
     b.assert(none, 100);
-    assert!(
-        matches!(answer(&b.o), Answer::Unsupported(_)),
-        "{:?}",
-        answer(&b.o)
-    );
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // a: ∀U.C reaches an unrelated b: ¬C.
+    let mut b = Build::default();
+    universal(&mut b);
+    let c = b.class(1);
+    let all = b.all(top, c);
+    b.assert(all, 100);
+    let nc = b.not(c);
+    b.assert(nc, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // ... but without b it holds, and a: ∃U.C with C ⊑ ∃R.C too.
+    b.o.axioms.pop();
+    b.o.sources.pop();
+    let rc = b.some(ObjProp::Named(200), c);
+    b.sub(c, rc);
+    let some_c = b.some(top, c);
+    b.assert(some_c, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    // D ⊑ ∃U.C with C ⊑ ⊥ makes D empty, not the ontology inconsistent; d: D does.
+    let mut b = Build::default();
+    universal(&mut b);
+    let [c, d] = [1, 2].map(|t| b.class(t));
+    let some_c = b.some(top, c);
+    b.sub(d, some_c);
+    let nothing = b.e(ClassExpr::Nothing);
+    b.sub(c, nothing);
+    let thing = b.e(ClassExpr::Thing);
+    b.assert(thing, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.assert(d, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // ¬U(a, b) can't hold; U(a, b) always does.
+    let mut b = Build::default();
+    universal(&mut b);
+    b.role_assertion(501, 100, 101);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.axiom(Axiom::NegativeObjectPropertyAssertion(501, 100, 101));
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // A cardinality over U (OWL 2 DL forbids it: U isn't simple) is unsupported.
+    let mut b = Build::default();
+    universal(&mut b);
+    let thing = b.e(ClassExpr::Thing);
+    let two = b.e(ClassExpr::Max(2, top, thing));
+    b.assert(two, 100);
+    assert!(matches!(answer(&b.o), Answer::Unsupported(_)));
 }
 
 #[test]
@@ -495,4 +532,31 @@ fn an_inverse_pair_with_a_transitive_role_is_regular() {
     b.assert(c, 100);
     assert!(normalise(&b.o).unsupported.is_empty());
     assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn a_branch_too_large_to_expand_is_abandoned_not_the_run() {
+    // a: A, A ⊑ (C ⊓ ≥10⁹ R) ⊔ {o}: the first disjunct can't be expanded within a budget,
+    // the second is a model (as in DL-909, which the search order decided).
+    let mut b = Build::default();
+    let [a, c] = [1, 2].map(|t| b.class(t));
+    let thing = b.e(ClassExpr::Thing);
+    let huge = b.e(ClassExpr::Min(1_000_000_000, ObjProp::Named(200), thing));
+    let big = b.and(&[c, huge]);
+    let o = b.e(ClassExpr::OneOf(vec![300]));
+    let either = b.or(&[big, o]);
+    b.sub(a, either);
+    b.assert(a, 100);
+    let config = Config {
+        timeout: Some(std::time::Duration::from_secs(5)),
+        max_memory: 256 << 20,
+        ..Config::default()
+    };
+    assert_eq!(consistency(&b.o, &config).answer, Answer::Consistent);
+    // With a ≠ o the other branch clashes: the run gives up, it doesn't refute.
+    b.different(100, 300);
+    assert!(matches!(
+        consistency(&b.o, &config).answer,
+        Answer::GaveUp(_)
+    ));
 }

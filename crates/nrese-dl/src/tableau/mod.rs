@@ -15,7 +15,7 @@
 //! inconsistency found without it stands and a model found without it is `unsupported`;
 //! a budget ends a run as `gave-up`.
 //!
-//! Not yet: the NI rule (runs that need it give up), datatypes (package 3.5),
+//! Not yet: datatypes (package 3.5),
 //! satisfiability caching and completion-graph reuse (3.7).
 
 mod blocking;
@@ -26,6 +26,7 @@ mod graph;
 mod hyper;
 mod merge;
 mod model;
+mod ni;
 mod program;
 mod search;
 mod telemetry;
@@ -56,6 +57,19 @@ pub struct Config {
     /// Decide disjunctions before the ≥-rule expands (else the design's order: the
     /// ≥-rule first, disjunctions when nothing else is left).
     pub disjunctions_first: bool,
+    /// Recheck only the nodes a change can affect for blocking (else every node from the
+    /// lowest changed one).
+    pub incremental_blocking: bool,
+    /// Compare every blocking pass with a recomputation from scratch, and panic on a
+    /// difference (for tests: the oracle of the incremental pass).
+    pub check_blocking: bool,
+    /// Try a clause's disjuncts that failed less often first, the clause's order on ties
+    /// (else always in the clause's order). Known search variance (A/B, 5 October 2026):
+    /// the learned order can lead a search to larger models, DL-663 (47 ms vs 21 ms,
+    /// 37,000 branch points vs 13,000) and ore_ont_2901 (30 ms vs 27 ms, 8% more nodes);
+    /// against those, the W3C suite and the ORE development set take half the time and 13
+    /// tests are faster, DL-202, 206 and 664 within the budget they ran out of.
+    pub disjunct_learning: bool,
     /// The most nodes a run may create at once.
     pub max_nodes: usize,
     pub timeout: Option<Duration>,
@@ -76,6 +90,9 @@ impl Default for Config {
             anywhere_blocking: true,
             single_blocking: true,
             disjunctions_first: false,
+            disjunct_learning: true,
+            incremental_blocking: true,
+            check_blocking: false,
             max_nodes: 2_000_000,
             timeout: None,
             max_memory: 4 << 30,

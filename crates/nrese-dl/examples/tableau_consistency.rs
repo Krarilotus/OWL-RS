@@ -2,7 +2,10 @@
 //! search counters (docs/design/owl2-dl-performance.md §5), for the DL lab.
 //!
 //! ```text
-//! cargo run --release -p nrese-dl --example tableau_consistency -- [--timeout SECS] FILE...
+//! cargo run --release -p nrese-dl --example tableau_consistency -- [--timeout SECS]
+//!     [--no-semantic-branching] [--no-backjumping] [--ancestor-blocking] [--pairwise-always]
+//!     [--disjunctions-first] [--no-disjunct-learning] [--full-blocking] [--expand-at-most N]
+//!     FILE...
 //! ```
 //!
 //! Each FILE is N-Triples (`.nt`, as the reference runner's `ntriples` task writes it) or
@@ -75,15 +78,27 @@ fn parse(path: &str) -> Result<Vec<Triple>, Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let (mut timeout, mut files) = (300u64, Vec::new());
+    let mut config = Config::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--timeout" => timeout = args.next().ok_or("--timeout SECS")?.parse()?,
+            // The switches, for the lab: each flips the default.
+            "--no-semantic-branching" => config.semantic_branching = false,
+            "--no-backjumping" => config.backjumping = false,
+            "--ancestor-blocking" => config.anywhere_blocking = false,
+            "--pairwise-always" => config.single_blocking = false,
+            "--disjunctions-first" => config.disjunctions_first = true,
+            "--no-disjunct-learning" => config.disjunct_learning = false,
+            "--full-blocking" => config.incremental_blocking = false,
+            "--expand-at-most" => {
+                config.expand_at_most_up_to = args.next().ok_or("--expand-at-most N")?.parse()?;
+            }
             _ => files.push(arg),
         }
     }
     let config = Config {
         timeout: Some(Duration::from_secs(timeout)),
-        ..Config::default()
+        ..config
     };
     for path in files {
         let started = Instant::now();

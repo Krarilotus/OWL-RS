@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use super::Config;
 use super::depset::{DepSetId, DepSets};
-use super::graph::{Graph, Mark, NONE};
+use super::graph::{Annot, Graph, Mark, NONE};
 use super::hyper::{Firing, join_concept, join_edge};
 use super::program::{ConceptId, Head, Program, RoleId};
 use super::telemetry::Telemetry;
@@ -29,15 +29,18 @@ pub enum Stop {
     Clash(DepSetId),
     /// A budget ran out, or a rule this engine doesn't have is needed.
     GaveUp(String),
+    /// This branch can't be completed within the budgets (an at-least restriction too
+    /// large to expand), by what it depends on: the search goes on with the others, and
+    /// a model found there is an answer, a refutation of all of them is not.
+    Abandon(DepSetId, String),
 }
 
 pub type Step<T> = Result<T, Stop>;
 
-/// The stop where the NI rule would be needed.
+/// The stop where the NI rule would be needed but the equality's at-most restriction
+/// isn't known (a clause whose equalities don't spell one out).
 pub fn ni_stop() -> Stop {
-    Stop::GaveUp(
-        "the NI rule (nominals with inverses and at-most restrictions) is not implemented".into(),
-    )
+    Stop::GaveUp("the NI rule on an equality without its at-most restriction".into())
 }
 
 /// A head atom with its variables bound to nodes.
@@ -50,8 +53,8 @@ pub enum Lit {
         number: u32,
         node: u32,
     },
-    /// `a ≈ b`; `at_root` is the root an at-most restriction raised it at, else NONE.
-    Equal(u32, u32, u32),
+    /// `a ≈ b` with its annotation (the at-most restriction at a root that raised it).
+    Equal(u32, u32, Annot),
 }
 
 /// A disjunction waiting for a choice: the clause and its binding.
@@ -69,7 +72,16 @@ pub struct Frame {
     pub pending: u32,
     pub bindings: u32,
     pub pending_open: u32,
+    pub ni_pending: u32,
+    pub ni_open: u32,
+    /// Take later alternatives with the failed ones' negations (not for the NI rule's
+    /// choice, which picks among fresh individuals rather than a disjunction that holds).
+    pub semantic: bool,
     pub alternatives: Vec<Lit>,
+    /// For a disjunction of a clause: the clause (else `NONE`) and each alternative's
+    /// head atom, to count its failures.
+    pub clause: u32,
+    pub heads: Vec<u8>,
     pub next: usize,
     /// What the disjunction itself depends on.
     pub premise: DepSetId,
@@ -102,6 +114,9 @@ pub struct Engine<'a> {
     pub started: Instant,
     pub firings: Vec<Firing>,
     pub blocking: super::blocking::Blocking,
+    pub ni: super::ni::Ni,
+    /// Per clause and head atom: how often that disjunct failed (disjunct learning).
+    pub failures: Vec<Vec<u32>>,
 }
 
 impl<'a> Engine<'a> {
@@ -121,6 +136,8 @@ impl<'a> Engine<'a> {
             started: Instant::now(),
             firings: Vec::new(),
             blocking: super::blocking::Blocking::default(),
+            ni: super::ni::Ni::default(),
+            failures: Vec::new(),
         }
     }
 
@@ -185,18 +202,23 @@ impl<'a> Engine<'a> {
                     self.stats.facts += 1;
                 }
             }
-            Lit::Equal(a, b, at_root) => {
+            Lit::Equal(a, b, annot) => {
                 let (a, b, dep) = self.canonical_pair(a, b, dep);
-                if a == b {
-                    return Ok(());
-                }
                 if let Some(i) = self.g.unequal(a, b) {
                     let d = self.g.inequalities[i as usize].dep;
                     return Err(self.clash(dep, d));
                 }
+                if self.needs_ni(Lit::Equal(a, b, annot)) {
+                    // The NI rule's, before the ≈-rule (rule precedence), even if a = b.
+                    self.ni_defer(a, b, dep, annot);
+                    return Ok(());
+                }
+                if a == b {
+                    return Ok(());
+                }
                 self.g
                     .equalities
-                    .push(super::graph::Equality { a, b, dep, at_root });
+                    .push(super::graph::Equality { a, b, dep, annot });
             }
         }
         Ok(())
@@ -258,9 +280,10 @@ impl<'a> Engine<'a> {
                 number,
                 node,
             } => self.g.number(node, at_most, number).is_some(),
-            Lit::Equal(a, b, _) => {
+            Lit::Equal(a, b, annot) => {
                 let (s, t) = (self.g.find(a), self.g.find(b));
-                if s == t {
+                let ni = self.needs_ni(lit);
+                if (s == t && !ni) || (ni && self.ni_pending(a, b, annot)) {
                     return Ok(true);
                 }
                 if let Some(i) = self.g.unequal(s, t) {
@@ -280,21 +303,22 @@ impl<'a> Engine<'a> {
     /// isn't the root's successor. The rule applies even where both sides are one node,
     /// so such an equality never counts as holding.
     pub fn needs_ni(&self, lit: Lit) -> bool {
-        let Lit::Equal(a, b, root) = lit else {
+        let Lit::Equal(a, b, annot) = lit else {
             return false;
         };
-        if root == NONE {
+        if annot.root == NONE {
             return false;
         }
-        let root = self.g.find(root);
+        let root = self.g.find(annot.root);
         let (a, b) = (self.g.find(a), self.g.find(b));
         let node = |n: u32| &self.g.nodes[n as usize];
         let blockable = |n: u32| node(n).flags & super::graph::flag::ROOT == 0;
         blockable(a) && blockable(b) && !(node(a).parent == root && node(b).parent == root)
     }
 
-    /// The head atom `h` under `bind`.
-    pub fn lit(&self, h: Head, bind: &[u32]) -> Lit {
+    /// The head atom `h` under `bind`, of a clause whose equalities have the annotation
+    /// `annotation` (`NONE` if none).
+    pub fn lit(&self, h: Head, bind: &[u32], annotation: u32) -> Lit {
         let b = |v: u8| bind[v as usize];
         match h {
             Head::Concept(c, v) => Lit::Concept(c, b(v)),
@@ -316,11 +340,18 @@ impl<'a> Engine<'a> {
                 } else {
                     NONE
                 };
-                Lit::Equal(b(x), b(y), root)
+                Lit::Equal(
+                    b(x),
+                    b(y),
+                    Annot {
+                        root,
+                        number: annotation,
+                    },
+                )
             }
             // The individual's own node: whoever asserts or tests the equality follows it
             // to its representative with the merges' dependencies.
-            Head::Nominal(i, v) => Lit::Equal(b(v), self.roots[i as usize], NONE),
+            Head::Nominal(i, v) => Lit::Equal(b(v), self.roots[i as usize], Annot::NONE),
         }
     }
 
@@ -329,13 +360,9 @@ impl<'a> Engine<'a> {
     pub fn fire(&mut self, clause: u32, bind: &[u32], mut dep: DepSetId) -> Step<()> {
         let c = &self.p.clauses[clause as usize];
         let mut open: [Option<Lit>; 2] = [None, None];
-        let (mut count, mut ni) = (0, false);
+        let mut count = 0;
         for &h in &c.head {
-            let lit = self.lit(h, bind);
-            if self.needs_ni(lit) {
-                ni = true;
-                continue;
-            }
+            let lit = self.lit(h, bind, c.annotation);
             match self.holds(lit) {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
@@ -346,9 +373,6 @@ impl<'a> Engine<'a> {
                 }
                 Err(refuted) => dep = self.deps.union(dep, refuted),
             }
-        }
-        if ni {
-            return Err(ni_stop());
         }
         self.stats.clauses_fired += 1;
         match (count, open[0]) {
@@ -388,7 +412,7 @@ impl<'a> Engine<'a> {
             if (self.done.equalities as usize) < self.g.equalities.len() {
                 let e = self.g.equalities[self.done.equalities as usize];
                 self.done.equalities += 1;
-                self.merge(e.a, e.b, e.dep, e.at_root)?;
+                self.merge(e.a, e.b, e.dep, e.annot)?;
                 continue;
             }
             if (self.done.nodes as usize) < self.g.nodes.len() {
@@ -457,6 +481,7 @@ impl<'a> Engine<'a> {
             + self.firings.capacity() * size_of::<Firing>()
             + self.frames.capacity() * size_of::<Frame>()
             + self.blocking.bytes
+            + self.ni.bytes()
     }
 
     pub fn check_memory(&self) -> Step<()> {
