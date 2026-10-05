@@ -357,6 +357,18 @@ impl<'a> Normaliser<'a> {
     }
 
     fn sub(&mut self, sub: ExprId, sup: ExprId, source: usize) {
+        // `∃R.D ⊑ E` over a non-simple R as the equivalent `D ⊑ ∀R⁻.E`, as `fresh_negative`
+        // does for nested occurrences: Horn through R⁻'s automaton where E is a literal.
+        // Read as `∀R.¬D ⊔ E`, R's start state stands beside E in a head with an empty
+        // body, a disjunction at every node (ore_ont_10212: definitions `C ≡ ∃has_part.D`
+        // over the transitive has_part grew the model without end; HermiT 0.2 s).
+        let nnf_sub = self.nnf(sub);
+        if let ClassExpr::Some(r, d) = self.get(nnf_sub)
+            && self.non_simple.contains(&r.named())
+        {
+            let all = self.e(ClassExpr::All(r.inverse(), sup));
+            return self.sub(d, all, source);
+        }
         let (a, b) = (self.nnf_not(sub), self.nnf(sup));
         self.gci(Vec::new(), vec![Item::Expr(a), Item::Expr(b)], source);
     }

@@ -895,3 +895,31 @@ fn universals_over_a_large_role_hierarchy_stay_small() {
     assert!(minimal <= 400, "{minimal} clauses with minimal automata");
     assert!(exact <= 6000, "{exact} clauses with exact provenance");
 }
+
+/// `C ≡ ∃R.D` over a transitive R: the reverse direction `∃R.D ⊑ C` is read as
+/// `D ⊑ ∀R⁻.C`, Horn through R⁻'s automaton. Read as `∀R.¬D ⊔ C` it put a disjunction with
+/// an empty body on every node, and the model grew without end (ore_ont_10212: gave up at
+/// 60 s; 0.24 s after; docs/design/performance.md §0).
+#[test]
+fn existentials_over_transitive_roles_on_the_left_stay_horn() {
+    let mut o = Ontology::default();
+    let (r, s) = (1000, 1001);
+    let class = |o: &mut Ontology, t| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    let (c, a, b) = (class(&mut o, 1), class(&mut o, 2), class(&mut o, 3));
+    // D = A ⊓ ∃S.B: not a literal, as in the real definitions (∃bearer_of.Q ⊓ ∃part_of.…).
+    let s_b = ExprId(o.classes.intern(ClassExpr::Some(ObjProp::Named(s), b)));
+    let d = ExprId(o.classes.intern(ClassExpr::And(vec![a, s_b])));
+    let some = ExprId(o.classes.intern(ClassExpr::Some(ObjProp::Named(r), d)));
+    o.axioms = vec![
+        Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(r)),
+        Axiom::EquivalentClasses(vec![c, some]),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let normalised = normalise_with(&o, Options::default());
+    let universal: Vec<&Clause> = normalised
+        .clauses
+        .iter()
+        .filter(|clause| clause.body.is_empty() && clause.head.len() > 1)
+        .collect();
+    assert!(universal.is_empty(), "{universal:#?}");
+}
