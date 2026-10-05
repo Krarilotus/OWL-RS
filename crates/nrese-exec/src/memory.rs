@@ -12,7 +12,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-/// The bytes the process holds now; `None` where the platform doesn't say.
+/// The private memory the process holds now (anonymous on Linux, committed private on
+/// Windows; mapped files excluded, since the kernel reclaims them); `None` where the
+/// platform doesn't say.
 pub fn process_bytes() -> Option<u64> {
     imp::process_bytes()
 }
@@ -124,10 +126,16 @@ mod imp {
     /// store runs on; reading it would need libc.
     const PAGE: u64 = 4096;
 
+    /// The anonymous resident memory: resident minus shared (file-backed and shared
+    /// memory), as Windows's committed private bytes count. The store's mapped checkpoint
+    /// and dictionary are file pages the kernel reclaims under pressure; counted, they
+    /// could stop a materialisation that fits (LUBM 1000 maps about 5 GB).
     pub fn process_bytes() -> Option<u64> {
         let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let resident: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        Some(resident * PAGE)
+        let mut fields = statm.split_whitespace().skip(1);
+        let resident: u64 = fields.next()?.parse().ok()?;
+        let shared: u64 = fields.next()?.parse().ok()?;
+        Some(resident.saturating_sub(shared) * PAGE)
     }
 
     pub fn available_bytes() -> Option<u64> {
