@@ -75,6 +75,16 @@ impl Worker<'_> {
         acc: &[Atom],
         s: &mut Scratch,
     ) {
+        if self.engine.exhausted() {
+            return;
+        }
+        let found = s.found.len();
+        if self.engine.budget().max_join.is_some_and(|m| found >= m)
+            || (found % 4096 == 4095 && self.engine.out_of_time())
+        {
+            self.engine.exhaust();
+            return;
+        }
         let remote = &self.state.remote[r as usize];
         if i == remote.body.len() {
             s.refs.clear();
