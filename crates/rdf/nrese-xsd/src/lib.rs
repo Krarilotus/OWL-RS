@@ -1,5 +1,5 @@
 //! XML Schema 1.1 datatypes with the XPath 3.1 operations SPARQL uses: numbers, booleans,
-//! dates, times, durations.
+//! dates, times, durations; and the OWL 2 datatype map's value spaces ([`owl`]).
 //!
 //! Part of the RDF bundle (`crates/rdf`), replacing `oxsdatatypes`, and independent of RDF.
 //! Every value is `Copy`. Parsing accepts exactly the XSD lexical forms. `Display` writes
@@ -21,6 +21,7 @@ mod duration;
 mod error;
 mod floating;
 mod integer;
+pub mod owl;
 
 pub use boolean::Boolean;
 pub use date_time::{
