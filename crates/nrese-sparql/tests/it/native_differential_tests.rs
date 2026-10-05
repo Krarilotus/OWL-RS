@@ -5553,11 +5553,7 @@ fn chains_are_estimated_from_characteristic_pairs() {
     );
 }
 
-/// Eager aggregation (BSBM BI q4's shape): counts and sums of offers per product
-/// feature are made from per-product partial results, never from a row per feature and
-/// offer; the answers equal the reference evaluator's, also when a sum fails for one
-/// product (a non-numeric price) and for a group the rewrite doesn't apply to (AVG).
-/// The early group must pay for itself: with one offer per product (the shape of DBpedia's
+/// The early group of eager aggregation must pay for itself: with one offer per product (the shape of DBpedia's
 /// career stations, one goal count each), aggregating the offers by product first reduces
 /// nothing, and the plan stays as written (dbpedia-core q12 got 3× slower without the
 /// statistics' say, 3 October 2026). The answers are the same either way.
@@ -5613,6 +5609,11 @@ fn groups_over_joins_stay_where_the_early_group_reduces_nothing() {
     assert_eq!(native.len(), 9);
 }
 
+/// Eager aggregation (BSBM BI q4's shape): counts, sums, extremes and averages of offers
+/// per product feature are made from per-product partial results, never from a row per
+/// feature and offer; the answers equal the reference evaluator's, also when an aggregate
+/// fails for one product (a non-numeric price), and for a group the rewrite doesn't apply
+/// to (COUNT DISTINCT).
 #[test]
 fn groups_over_joins_aggregate_before_joining() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -5656,7 +5657,16 @@ fn groups_over_joins_aggregate_before_joining() {
             "(COUNT(?price) AS ?n) (SUM(?price) AS ?total) (COUNT(*) AS ?rows)",
             true,
         ),
-        ("(AVG(?price) AS ?mean)", false),
+        ("(AVG(?price) AS ?mean)", true),
+        (
+            "(MIN(?price) AS ?low) (MAX(DISTINCT ?price) AS ?high) (AVG(?price) AS ?mean) (COUNT(*) AS ?rows)",
+            true,
+        ),
+        (
+            "(MIN(STR(?price)) AS ?first) (AVG(?price * 1.5) AS ?scaled)",
+            true,
+        ),
+        ("(COUNT(DISTINCT ?price) AS ?prices)", false),
     ] {
         let text = format!(
             "PREFIX : <{EX}> SELECT ?feature {aggregates} WHERE {{ ?product :type :T ; :feature ?feature . ?offer :product ?product ; :price ?price }} GROUP BY ?feature"
@@ -5677,4 +5687,286 @@ fn groups_over_joins_aggregate_before_joining() {
         assert_eq!(native, expected, "{aggregates}");
         assert_eq!(native.len(), 7);
     }
+}
+
+/// A value of an offer for [`eager_aggregation_equals_the_reference_on_random_groups`]:
+/// numbers of each type (exact in binary, so sums don't depend on their order), a
+/// non-canonical integer and a derived one, durations of both summable types, and terms
+/// that are no numbers. `kinds` narrows the draw, so that many groups are all numbers or
+/// all durations and their sums and averages are bound.
+fn eager_value(rng: &mut Rng, kinds: u64) -> Term {
+    let n = rng.below(9);
+    let typed = |lexical: String, datatype| Literal::new_typed_literal(lexical, datatype).into();
+    match (kinds, rng.below(12)) {
+        (0, _) => typed(n.to_string(), xsd::INTEGER),
+        (1, k) => match k % 6 {
+            0 | 1 => typed(n.to_string(), xsd::INTEGER),
+            2 => typed(format!("{n}.5"), xsd::DECIMAL),
+            3 => typed(format!("{n}.25"), xsd::FLOAT),
+            4 => typed(format!("{n}.75E0"), xsd::DOUBLE),
+            _ => typed(format!("0{n}"), xsd::INT),
+        },
+        (2, k) => match k % 2 {
+            0 => typed(format!("PT{n}H"), xsd::DAY_TIME_DURATION),
+            _ => typed(format!("P{n}DT30M"), xsd::DAY_TIME_DURATION),
+        },
+        (_, 0) => typed(format!("P{n}M"), xsd::YEAR_MONTH_DURATION),
+        (_, 1) => typed(format!("PT{n}M"), xsd::DAY_TIME_DURATION),
+        (_, 2) => Literal::new_simple_literal(format!("s{n}")).into(),
+        (_, 3) => Literal::new_language_tagged_literal_unchecked(format!("t{n}"), "en").into(),
+        (_, 4) => ex(&format!("e{n}")).into(),
+        (_, 5) => typed(format!("200{}-01-01", n % 3), xsd::DATE),
+        (_, 6) => typed(format!("0{n}"), xsd::INTEGER),
+        (_, 7) => typed(format!("{n}.5"), xsd::DECIMAL),
+        (_, 8) => typed(format!("{n}.75E0"), xsd::DOUBLE),
+        _ => typed(n.to_string(), xsd::INTEGER),
+    }
+}
+
+/// Eager aggregation, differentially: random groups over the join of products (with one
+/// or two key properties) and their offers (none to four, one or two values each, some
+/// without a second value: unbound under OPTIONAL), with every aggregate the rewrite takes
+/// (COUNT, SUM, AVG, MIN, MAX, DISTINCT extremes) over values, expressions that fail on
+/// some (`?v * 2` on strings and dates, a cast) and unbound values, mixed with one it
+/// doesn't take (COUNT DISTINCT). Each query is answered three ways, which must agree: the
+/// reference evaluator on the query as written, the executor with its own rewrites (the
+/// early group where the statistics say it pays), and the executor on the plan with the
+/// early group forced. The values' sums are exact in every numeric type, so the answers
+/// are compared term for term; extremes by value (`MIN` of `"07"` and `"7"` may give
+/// either).
+#[test]
+fn eager_aggregation_equals_the_reference_on_random_groups() {
+    let mut rng = Rng::seeded(20_261_005);
+    let (mut checked, mut rewritten, mut bound) = (0, 0, 0);
+    for _ in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let kinds = rng.below(4);
+        let add = |tx: &mut nrese_engine::Transaction, s: String, p: &str, o: Term| {
+            tx.insert(Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph).as_ref());
+        };
+        for product in 0..2 + rng.below(12) {
+            for _ in 0..1 + rng.below(2) {
+                let key = ex(&format!("k{}", rng.below(4)));
+                add(&mut tx, format!("product{product}"), "key", key.into());
+            }
+            if rng.below(3) > 0 {
+                let other = Literal::new_typed_literal(rng.below(2).to_string(), xsd::INTEGER);
+                add(&mut tx, format!("product{product}"), "other", other.into());
+            }
+            for offer in 0..rng.below(5) {
+                let offer = format!("offer{product}_{offer}");
+                let product = ex(&format!("product{product}"));
+                add(&mut tx, offer.clone(), "product", product.into());
+                for _ in 0..1 + rng.below(2) {
+                    let value = eager_value(&mut rng, kinds);
+                    add(&mut tx, offer.clone(), "v", value);
+                }
+                if rng.below(2) == 0 {
+                    let value = eager_value(&mut rng, kinds);
+                    add(&mut tx, offer.clone(), "w", value);
+                }
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..30 {
+            let argument = *rng.pick(&[
+                "?v",
+                "?v",
+                "?w",
+                "(?v * 2)",
+                "COALESCE(?w, ?v)",
+                "<http://www.w3.org/2001/XMLSchema#double>(?v)",
+                "STRLEN(STR(?v))",
+            ]);
+            let aggregates: Vec<String> = (0..1 + rng.below(3))
+                .map(|i| {
+                    let function = *rng.pick(&[
+                        "COUNT(*)",
+                        "COUNT(ARG)",
+                        "SUM(ARG)",
+                        "AVG(ARG)",
+                        "AVG(ARG)",
+                        "MIN(ARG)",
+                        "MAX(ARG)",
+                        "MIN(DISTINCT ARG)",
+                        "MAX(DISTINCT ARG)",
+                        "COUNT(DISTINCT ARG)",
+                    ]);
+                    format!("({} AS ?x{i})", function.replace("ARG", argument))
+                })
+                .collect();
+            let keys = *rng.pick(&["?k", "?k", "?k ?o2"]);
+            let products = match keys {
+                "?k ?o2" => "?p <EXkey> ?k ; <EXother> ?o2 .",
+                _ => "?p <EXkey> ?k .",
+            };
+            let side = match rng.below(3) {
+                0 => "?o <EXproduct> ?p ; <EXv> ?v . ?o <EXw> ?w",
+                _ => "?o <EXproduct> ?p ; <EXv> ?v OPTIONAL { ?o <EXw> ?w }",
+            };
+            let modifier = *rng.pick(&["", "", " HAVING (COUNT(*) > 1)", " ORDER BY ?k"]);
+            let text = format!(
+                "SELECT {keys} {} WHERE {{ {products} {{ {side} }} }} GROUP BY {keys}{modifier}",
+                aggregates.join(" ")
+            )
+            .replace("<EX", &format!("<{EX}"));
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let nrese_sparql_syntax::Query::Select { pattern, .. } = &query else {
+                unreachable!("a select")
+            };
+            let joined = nrese_sparql::plan::rewrite(pattern);
+            let forced = nrese_sparql::plan::eager_aggregation(&joined);
+            let decomposable = !text.contains("COUNT(DISTINCT");
+            assert_eq!(forced != joined, decomposable, "{text}");
+            rewritten += usize::from(decomposable);
+            let forced = nrese_sparql_syntax::Query::Select {
+                dataset: None,
+                pattern: forced,
+                base_iri: None,
+            };
+            let as_written = QueryOptions {
+                as_written: true,
+                ..QueryOptions::default()
+            };
+            let expected = rows_up_to_equal_values(
+                reference(&snapshot, &query, &as_written).unwrap(),
+                false,
+                true,
+            );
+            let native = rows_up_to_equal_values(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+                true,
+            );
+            assert_eq!(native, expected, "{text}");
+            let early = rows_up_to_equal_values(
+                evaluate_query(&snapshot, &forced, &as_written).unwrap(),
+                false,
+                true,
+            );
+            assert_eq!(early, expected, "the early group forced: {text}\n{forced}");
+            checked += 1;
+            bound += usize::from(expected.iter().any(|row| {
+                row.split('\t')
+                    .skip(keys.split(' ').count())
+                    .any(|cell| cell != "UNDEF")
+            }));
+        }
+    }
+    // The comparison must cover the rewrite, and answers that aren't all unbound.
+    assert!(
+        rewritten * 2 > checked,
+        "{rewritten} of {checked} rewritten"
+    );
+    assert!(
+        bound * 2 > checked,
+        "{bound} of {checked} with bound aggregates"
+    );
+}
+
+/// Paths ordered with the triple patterns they are joined to (`path_joins`), on random
+/// graphs: one to three patterns and one or two paths (closures, sequences, inverses,
+/// alternatives, `?`), with constant or shared ends and filters, against the reference
+/// evaluator. Most queries must take the planned route (EXPLAIN's "paths ordered with
+/// patterns"), with the path first in some and later in others.
+#[test]
+fn paths_ordered_with_patterns_equal_the_reference() {
+    let mut rng = Rng::seeded(20_261_006);
+    let (mut checked, mut planned, mut path_first) = (0, 0, 0);
+    for _ in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let nodes = 4 + rng.below(30);
+        for _ in 0..10 + rng.below(120) {
+            let object: Term = match rng.below(8) {
+                0 => Literal::new_typed_literal(rng.below(5).to_string(), xsd::INTEGER).into(),
+                _ => ex(&format!("e{}", rng.below(nodes))).into(),
+            };
+            let quad = Quad::new(
+                ex(&format!("e{}", rng.below(nodes))),
+                ex(&format!("p{}", rng.below(4))),
+                object,
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..25 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+            let node = |rng: &mut Rng| format!("<{EX}e{}>", rng.below(6));
+            let end = |rng: &mut Rng| match rng.below(3) {
+                0 => node(rng),
+                _ => rng.pick(&["?a", "?b", "?c"]).to_string(),
+            };
+            let mut parts: Vec<String> = Vec::new();
+            for _ in 0..1 + rng.below(3) {
+                let (s, o) = (rng.pick(&["?a", "?b"]).to_string(), end(&mut rng));
+                parts.push(format!("{s} {} {o} .", p(&mut rng)));
+            }
+            for _ in 0..1 + rng.below(2) {
+                let path = match rng.below(7) {
+                    0 => format!("{}+", p(&mut rng)),
+                    1 => format!("{}*", p(&mut rng)),
+                    2 => format!("{}/{}", p(&mut rng), p(&mut rng)),
+                    3 => format!("^{}", p(&mut rng)),
+                    4 => format!("({}|{})+", p(&mut rng), p(&mut rng)),
+                    5 => format!("{}?", p(&mut rng)),
+                    _ => format!("(^{})*", p(&mut rng)),
+                };
+                parts.push(format!("{} {path} {} .", end(&mut rng), end(&mut rng)));
+            }
+            if rng.below(3) == 0 {
+                parts.push(format!("FILTER(?a != {})", node(&mut rng)));
+            }
+            for i in (1..parts.len()).rev() {
+                let j = rng.below(i as u64 + 1) as usize;
+                parts.swap(i, j);
+            }
+            let text = format!("SELECT * WHERE {{ {} }}", parts.join(" "));
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let expected = rows(
+                reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            assert_eq!(native, expected, "{text}");
+            let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+            if let Some(step) = explained
+                .steps
+                .iter()
+                .find(|s| s.operator == "paths ordered with patterns")
+            {
+                planned += 1;
+                let first = step.detail.split(", then ").next().unwrap_or("");
+                path_first += usize::from(
+                    first.contains(&format!("<{EX}p"))
+                        && !first.ends_with('.')
+                        && first
+                            .split(' ')
+                            .nth(1)
+                            .is_some_and(|p| p.contains(['+', '*', '/', '^', '?', '|'])),
+                );
+            }
+            plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+            checked += 1;
+        }
+    }
+    assert!(
+        planned * 2 > checked,
+        "{planned} of {checked} planned with their paths"
+    );
+    assert!(
+        path_first * 10 > planned,
+        "a path first in {path_first} of {planned}"
+    );
 }
