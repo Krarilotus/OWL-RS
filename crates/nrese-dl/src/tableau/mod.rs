@@ -63,8 +63,12 @@ pub struct Config {
     /// Compare every blocking pass with a recomputation from scratch, and panic on a
     /// difference (for tests: the oracle of the incremental pass).
     pub check_blocking: bool,
-    /// Try a clause's disjuncts that failed less often first, at-least restrictions over a
-    /// positive filler last (else in the clause's order).
+    /// Try a clause's disjuncts that failed less often first, the clause's order on ties
+    /// (else always in the clause's order). Known search variance (A/B, 5 October 2026):
+    /// the learned order can lead a search to larger models, DL-663 (47 ms vs 21 ms,
+    /// 37,000 branch points vs 13,000) and ore_ont_2901 (30 ms vs 27 ms, 8% more nodes);
+    /// against those, the W3C suite and the ORE development set take half the time and 13
+    /// tests are faster, DL-202, 206 and 664 within the budget they ran out of.
     pub disjunct_learning: bool,
     /// The most nodes a run may create at once.
     pub max_nodes: usize,
