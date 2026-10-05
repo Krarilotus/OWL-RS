@@ -214,9 +214,11 @@ fn rule_jobs_copy_no_drivers_and_rounds_keep_no_derived_facts_list() {
 /// concatenated, never grown by doubling), merges each predicate's into chunks without a
 /// sorted copy of all of them, folds the recent run into the base a chunk at a time, and
 /// the derived facts are listed while the working set is taken apart. So no phase holds
-/// much beside the working set. With chunks of 1,024 pairs, so that this input's runs
-/// have many, the rounds peaked 9.6 % and the listing 1.7 % above the final working set
-/// on 5 October 2026; runs of one chunk each (no fold by chunks) peak 23.6 % above it.
+/// much beside the working set: counted in bytes per fact of the final working set
+/// above it (not as a share of it, which P1-F11 shrank). With chunks of 1,024 pairs, so
+/// that this input's runs have many: the rounds 3.55, the listing 0.52 bytes per fact on
+/// 6 October 2026; reverted, one-vector folds 8.10, a one-vector union 8.40,
+/// concatenated candidates 19.50, the listing beside the whole working set 9.74.
 #[test]
 fn rounds_hold_no_second_copy_beside_the_working_set() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -224,6 +226,7 @@ fn rounds_hold_no_second_copy_beside_the_working_set() {
     let (result, phases, before) = materialise(DEPARTMENTS);
     batch::set_chunk_pairs(1 << 20);
     let store = result.counters.store_bytes.last().expect("rounds").total();
+    let facts = store_facts(&result);
     let peak = |labels: &[&str]| {
         phases
             .iter()
@@ -239,15 +242,41 @@ fn rounds_hold_no_second_copy_beside_the_working_set() {
         "reasoner: merge",
         "reasoner: install",
     ]);
+    let per_fact = |bytes: usize| bytes.saturating_sub(store) as f64 / facts as f64;
+    let rounds = per_fact(rounds);
     assert!(
-        rounds * 100 <= store * 115,
-        "the rounds peaked at {rounds} bytes, the working set holds {store}"
+        rounds <= 6.0,
+        "the rounds held {rounds:.2} bytes per fact beside the working set, at most 6"
     );
-    let listing = peak(&["reasoner: derived"]);
+    let listing = per_fact(peak(&["reasoner: derived"]));
     assert!(
-        listing * 100 <= store * 110,
-        "listing the derived facts peaked at {listing} bytes, the working set holds {store}"
+        listing <= 3.0,
+        "listing the derived facts held {listing:.2} bytes per fact beside the working set, at most 3"
     );
+}
+
+/// P1-F11. A relation keeps its `(object, subject)` order only if a rule of the program
+/// can look it up by object alone (or grounding reads it): here `takesCourse`, `advisor`,
+/// `teacherOf`, the degrees and the inverse `member`, among others, keep only their
+/// subject order. Every order kept, the final working set holds 32 bytes per fact; 22.4
+/// on 6 October 2026. No lookup by object meets a relation without that order.
+#[test]
+fn relations_keep_no_object_order_their_rules_never_use() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let (result, _, _) = materialise(DEPARTMENTS);
+    assert_eq!(result.counters.lookups_without_order, 0);
+    let store = result.counters.store_bytes.last().expect("rounds").total();
+    let facts = store_facts(&result);
+    assert!(
+        store <= facts * BYTES_PER_FACT,
+        "{store} bytes for {facts} facts, at most {BYTES_PER_FACT} each"
+    );
+}
+
+/// The facts of the working set at the end: the input's and the derived ones.
+fn store_facts(result: &Materialisation) -> usize {
+    let input = grouped(lubm_like(&mut LocalVocabulary::default(), DEPARTMENTS));
+    input.iter().map(|(_, pairs)| pairs.len()).sum::<usize>() + result.derived.len()
 }
 
 /// P1-F8. A morsel's candidates are checked against the working set once each, in
@@ -272,3 +301,6 @@ fn membership_probes_are_distinct_and_ordered_per_morsel() {
 /// 5 October 2026 (37,014, 49,813, 8,016 and 200 in its four rounds). Deterministic: a
 /// change of the rules or the input shape that adds probes for a reason re-measures it.
 const PROBES: u64 = 95_043;
+
+/// See [`relations_keep_no_object_order_their_rules_never_use`].
+const BYTES_PER_FACT: usize = 26;
