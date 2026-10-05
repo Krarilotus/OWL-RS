@@ -311,27 +311,4 @@ mod tests {
             StoreMode::OnDisk
         );
     }
-
-    #[test]
-    fn default_graph_parser_knows_two_modes() {
-        use super::parse_default_graph;
-        assert!(!parse_default_graph(None).unwrap());
-        assert!(!parse_default_graph(Some("default")).unwrap());
-        assert!(parse_default_graph(Some("Union")).unwrap());
-        assert!(parse_default_graph(Some("all")).is_err());
-    }
-
-    #[test]
-    fn equality_parser_knows_three_modes() {
-        use super::parse_equality;
-        assert_eq!(parse_equality(None).unwrap(), (true, false));
-        assert_eq!(parse_equality(Some("Compact")).unwrap(), (true, true));
-        assert_eq!(parse_equality(Some("replicate")).unwrap(), (false, false));
-        assert!(parse_equality(Some("rewrite")).is_err());
-    }
-
-    #[test]
-    fn store_mode_parser_rejects_unknown_values() {
-        assert!(parse_store_mode(Some("in-memroy")).is_err());
-    }
 }

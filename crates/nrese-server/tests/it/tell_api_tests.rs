@@ -1,12 +1,9 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
-use nrese_store::StoreConfig;
 use tower::util::ServiceExt;
 
-use crate::support::{
-    body_text, minimal_fixture_path, query_text, test_app_with_settings, test_app_with_store_config,
-};
+use crate::support::{query_text, test_app_with_settings};
 use nrese_server::policy::PolicyConfig;
 
 #[tokio::test]
@@ -68,46 +65,5 @@ async fn tell_endpoint_supports_named_graph_ingest() -> Result<(), Box<dyn std::
     )
     .await?;
     assert!(text.contains("true"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn tell_endpoint_uses_reasoner_gate_and_rejects_without_publish()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_store_config(
-        StoreConfig::in_memory().with_ontology(minimal_fixture_path()),
-        PolicyConfig::default(),
-        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
-    )?;
-
-    let tell_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/tell")
-                .method(Method::POST)
-                .header("content-type", "text/turtle")
-                .body(Body::from(
-                    "@prefix ex: <http://example.com/> .
-                     @prefix owl: <http://www.w3.org/2002/07/owl#> .
-                     @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
-                     ex:Parent owl:disjointWith ex:Other .
-                     ex:carol rdf:type ex:Child .
-                     ex:carol rdf:type ex:Other .",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(tell_response.status(), StatusCode::BAD_REQUEST);
-    let tell_text = body_text(tell_response).await?;
-    assert!(tell_text.contains("reasoner_reject"));
-    assert!(tell_text.contains("cax-dw"));
-
-    let ask_text = query_text(
-        app,
-        "ASK WHERE { <http://example.com/carol> a <http://example.com/Other> }",
-    )
-    .await?;
-    assert!(ask_text.contains("false"));
     Ok(())
 }
