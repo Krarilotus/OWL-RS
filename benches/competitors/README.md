@@ -24,7 +24,7 @@ consent. This repository is public, so **committing results counts as publishing
 - GraphDB and RDFox numbers stay local until written permission exists. Record the permission (who, when, scope) in this file before publishing.
 - Our designs come from the published literature cited in `docs/design/`. We never derive them from observing the vendors' products.
 
-Results: [SCORECARD.md](SCORECARD.md) holds the run of 26 September 2026 (free-to-publish systems only). It predates NRESE's own query executor and is kept as a historical record; there is no current scorecard until the rerun.
+Results: one record per run in [../runs/](../runs/README.md).
 
 ## What's here
 

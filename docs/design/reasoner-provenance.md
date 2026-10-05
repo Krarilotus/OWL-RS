@@ -1,9 +1,9 @@
 # Reasoner provenance: support counts and support graph sets (design, 3 October 2026)
 
 **Why:**
-- [Research designs §6](../plan/2026-10-02-research-designs.md) asks for support counts always, provenance at a chosen level, and maintenance chosen per commit.
+- [Research designs §6](research-designs.md) asks for support counts always, provenance at a chosen level, and maintenance chosen per commit.
 - §4 asks for inferred statements to be visible to a reader who may read the graphs of at least one of their derivations (support graph sets, decided on 2 October).
-- The [roadmap](../plan/2026-10-02-roadmap.md) puts both in phase 1, under "reasoning that leads".
+- The [roadmap](../ROADMAP.md) puts both in phase 1, under "reasoning that leads".
 
 ## Today
 

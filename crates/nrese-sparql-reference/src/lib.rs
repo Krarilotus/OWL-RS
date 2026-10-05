@@ -1,5 +1,5 @@
 //! A SPARQL 1.1 evaluator written straight from the specification's algebra (§18), as the
-//! reference of NRESE's differential tests (docs/plan/2026-10-01-oxigraph-migration.md).
+//! reference of NRESE's differential tests (docs/design/rdf-bundle.md).
 //!
 //! It evaluates the algebra the way §18.5 and §18.6 define it: solutions as maps from
 //! variables to terms, multisets as lists, every operator on the whole of its inputs, no
