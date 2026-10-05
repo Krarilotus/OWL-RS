@@ -5,11 +5,12 @@
 //! cargo run --release -p nrese-dl --example tableau_consistency -- [--timeout SECS]
 //!     [--no-semantic-branching] [--no-backjumping] [--ancestor-blocking] [--pairwise-always]
 //!     [--disjunctions-first] [--no-disjunct-learning] [--full-blocking] [--expand-at-most N]
-//!     [--exact-provenance] FILE...
+//!     [--exact-provenance] [--no-lazy-definitions] FILE...
 //! ```
 //!
 //! `NRESE_CLAUSE_STATS=1` also prints, on standard error, the clauses per kind of axiom
-//! they come from and the axioms with the most clauses.
+//! they come from and the axioms with the most clauses; `NRESE_CLAUSE_DUMP=1` every clause
+//! and what each fresh name stands for.
 //!
 //! Each FILE is N-Triples (`.nt`, as the reference runner's `ntriples` task writes it),
 //! OWL functional syntax (a file that starts with `Prefix(` or `Ontology(`, as the ORE
@@ -178,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--no-disjunct-learning" => config.disjunct_learning = false,
             "--full-blocking" => config.incremental_blocking = false,
             "--exact-provenance" => exact_provenance = true,
+            "--no-lazy-definitions" => config.lazy_definitions = false,
             "--expand-at-most" => {
                 config.expand_at_most_up_to = args.next().ok_or("--expand-at-most N")?.parse()?;
             }
@@ -210,6 +212,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let normalise_time = at.elapsed();
         if std::env::var_os("NRESE_CLAUSE_STATS").is_some() {
             clause_stats(&ontology, &normalised);
+        }
+        if std::env::var_os("NRESE_CLAUSE_DUMP").is_some() {
+            for c in &normalised.clauses {
+                eprintln!("{:?} -> {:?}", c.body, c.head);
+            }
+            for (i, f) in normalised.fresh.iter().enumerate() {
+                eprintln!("fresh {i}: {f:?}");
+            }
         }
         let out = consistency_of(&ontology, &normalised, &config);
         let reason = match &out.answer {

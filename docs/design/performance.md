@@ -13,6 +13,34 @@ Rules for every entry:
 - Licensed systems (GraphDB, RDFox, Stardog, AnzoGraph) appear only by name, never with
   results, until their vendors permit it.
 
+## 0. Wins to keep: check these before a rewrite, and guard them
+
+The ideas that gave the largest measured wins. They aren't fixed: a better idea may replace
+one. But a rewrite of the code they live in, or a work package handed to an agent, starts by
+reading this table, and keeps the win or measures its replacement against it. Each has a
+**guard**: a cheap, deterministic test that fails at once if the win is lost (counts, plan
+shapes, bounds), so regressions are caught where they happen rather than by chance in large
+benchmark runs.
+
+| Win | Measured | Guard |
+|---|---|---|
+| Drivers read the batch store's runs in place, no copied drivers (P1-F1) | LUBM 1000 peak 22.2 → 12.9 GB, reasoning −31 % | missing: a byte counter on the batch store |
+| No list of derived facts; the input kept apart (P1-F4) | LUBM 1000 peak 15.2 → 13.4 GB | missing (as F1) |
+| Candidates deduplicated and probed in order per morsel (P1-F8) | LUBM 1000 reasoning −7.5 % | missing: a probe counter |
+| Permutations derived by a stable partition (P1-F7) | LUBM 1000 load 30.0 → 26.5 s | `planned_layouts_sort_as_few_times_as_designed` (2 sorts default graph, 3 named graphs) |
+| Group counts on the index (`COUNT … GROUP BY` one pattern) | Wikidata q07 2,101 → 0.18 ms | `group_counts_walk_the_index` (plan shows `group count`) |
+| Distinct values by a group walk (NOT EXISTS sides, sets) | DBpedia q13 25 → 3.1 ms | `distinct_values_walk_the_index` (`group walk`) |
+| Worst-case-optimal joins for cyclic patterns | LUBM 100 q2 18 → 4.8 ms | `triangles_join_worst_case_optimally` (`wcoj`) |
+| String filters on the dictionary | Wikidata q06 148 → 0.06 ms | `string_filters_test_the_dictionary` (`dictionary string test`) |
+| Sideways information passing, LIMIT pushdown, closures by components, EXISTS as sets | see §3 | missing: these operators don't report themselves in EXPLAIN yet |
+| DL: lazy unfolding in a portfolio | W3C DL-204 timeout → 6 ms | `hard_search_tests_are_decided` (DL-202, 204, 206, 661) |
+| DL: minimal automata, transitions the inclusions imply (P3) | ore_ont_1066 379 k → 56 k clauses, 1.42 → 0.15 s | `universals_over_a_large_role_hierarchy_stay_small` (≤ 400 clauses; 220 on 5 Oct) |
+| DL: `∃R.D ⊑ C` over a non-simple R read as `D ⊑ ∀R⁻.C` (Horn), also at the top of a subclass axiom | ore_ont_10212 gave up at 60 s → 0.24 s (HermiT 0.19 s) | `existentials_over_transitive_roles_on_the_left_stay_horn` (no disjunction with an empty body) |
+| Canonicalisation without factorial branching | a thousand twins: linear | `many_equal_children_are_twins` (search leaves bounded) |
+
+Plan guards live in `crates/nrese-sparql/tests/it/plan_guard_tests.rs`. A new win gets its
+row and its guard in the same commit.
+
 ## 1. Where NRESE stands (office batches A and B, 3-5 October 2026)
 
 Ryzen 9 5950X, 31 GiB, Docker; 3 runs, 3 measured repetitions each, cache off and on,
@@ -104,3 +132,4 @@ medians), and kept or rejected.
 | 5 Oct | **P3-a, transitions the role inclusions imply** (`Normaliser::unimplied`). Simple role inclusions are clauses (`S(x, y) → R(x, y)`), so an automaton transition on `S` beside the same transition on `R` is entailed and dropped (of mutually including roles the least is kept). Found by counting clauses per source axiom: one `DisjointClasses(A, ∃part_of.B)` gave 4,451 clauses | ore_ont_1066 (SRIQ, 52 k axioms), main PC: 379 k → 258 k clauses, engine 440 → 220 ms; same models (`clauses_and_ontologies_have_the_same_models`, 2,000 cases) | kept |
 | 5 Oct | **P3-b, minimal automata where provenance needn't be exact** (`automata.rs`, `Options::exact_provenance`; the tableau reads no provenance). The automaton of a transitive role over a hierarchy of transitive subroles is spliced from theirs with ε-moves; ε-free, determinised, Moore-minimised and trimmed, it is a few states. Each role's automaton is built once and minimised before it is spliced into others; transitions carry the union of the axioms they stand for | ore_ont_1066: 258 k → 55.7 k clauses, engine about 230 → 45 ms. ORE development set, 100 consistency and instantiation tasks (main PC, 20 s budget, best of two passes each): same answers (93 consistent, 4 inconsistent, 3 undecided), whole 20.5 → 16.0 s, engine 15.3 → 11.2 s, 1.21 M → 1.00 M clauses | kept |
 | 5 Oct | **P3-c, the normaliser's own costs** (profile on the office PC with `perf`). Each role's automaton prepared once (orientation, minimisation, pruning) instead of per filler; ε-closures on demand with a mark array instead of B-tree sets; GCI disjuncts sorted by their derived order instead of a `Debug` string each; foldhash for the expression interner and the clause index | ore_ont_1066, office PC: normalise 238 → 130 → 80 → 68 ms over the steps, whole run 320 → 147 ms (main PC at the start of P3: 1.42 s, normalise 0.85 s). Left: allocation (a third of the run with the system allocator), the functional-syntax reader through the lab's term table (ore_ont_1840: 0.2 s for 10.8 MB) | kept |
+| 5 Oct | **DL, `∃R.D ⊑ C` over a transitive R as `D ⊑ ∀R⁻.C` at the top of a subclass axiom** (`Normaliser::sub`). Found by re-running NRESE against the stored reference results: ore_ont_10212 (ALEHIF, BFO's transitive `part_of`/`has_part`) gave up with 0 clashes and a model that only grew. Delta debugging shrank it to 15 definitions `C ≡ ∃has_part.D`; their reverse direction became `[] → C ∨ Q` (Q the automaton's start state), a disjunction at every node, whose `C` branch generates more `has_part` successors. HermiT's reading, already ours for nested occurrences, makes it Horn | ore_ont_10212: gave up at 60 s → 0.24 s whole (HermiT 0.19 s, Konclude 0.72 s). ORE dev, 100 consistency and instantiation tasks: same answers, one more decided (ore_ont_14221: gave up at 20 s → 2.0 s), the sum over tasks decided in both 36.1 → 20.1 s. W3C OWL 2 DL unchanged (403) | kept |
