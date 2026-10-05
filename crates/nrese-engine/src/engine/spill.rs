@@ -82,7 +82,7 @@ impl Spill {
     fn write_chunk(&mut self, quads: Vec<EncodedQuad>) -> std::io::Result<()> {
         let layout = Layout::holding(&quads);
         let chunk = self.chunks.len();
-        let mut builder = PermutationBuilder::new(quads);
+        let mut builder = PermutationBuilder::planned(quads, layout.permutations());
         for &permutation in layout.permutations() {
             let packed = builder.packed(permutation);
             let file = File::create(self.path(chunk, permutation))?;
