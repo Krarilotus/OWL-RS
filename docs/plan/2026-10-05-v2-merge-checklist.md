@@ -16,8 +16,9 @@ measured here (benches/PROTOCOL.md, interleaved, confidence intervals).
       characteristic pairs.
 - [ ] Materialisation memory (P1): the transient fold, unused relations pruned.
 - [ ] OWL 2 QL: tree-witness rewriting of the existential part over the RL closure.
-- [ ] Usability: one error envelope across CLI, HTTP and console; EXPLAIN with estimated
-      against actual rows.
+- [x] Usability: one error envelope across CLI, HTTP and console (every error a problem
+      document with its request id; the console and its CLI print it).
+- [ ] EXPLAIN with estimated against actual rows for every operator (with G4).
 
 ## 2. Measurements that decide the next reasoning gains
 
@@ -52,6 +53,14 @@ Deferred to v3 or later: GPU, distribution, worst-case-optimal joins inside rule
       curve; outcome classes; confidence intervals.
 - [ ] DL: the reference comparison re-run on equal resources (the 3 October references ran
       in 2-CPU containers).
+- [ ] **Home turf:** each competitor measured on what it is best at, not only on our
+      workloads. For example: QLever on full Wikidata or UniProt queries and text search;
+      Virtuoso on many parallel clients (BSBM explore, multi-client); Oxigraph embedded and
+      small stores; Jena on TDB2 loads and its rule engine; GLog/VLog and RDFox on
+      materialisation (RDFox internal only); HermiT and Konclude on classification.
+      Before choosing the cases, research each one's documented use cases in the literature
+      wiki. A competitor we don't beat on its own ground is a finding to work on, not a row
+      to leave out.
 
 ## 4. The merge gate
 

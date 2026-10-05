@@ -43,6 +43,10 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   - Both lines are reported.
 - **Defaults first, tuning documented.** Each system runs with its documented defaults and the vendor's recommended settings for the workload. Any further tuning is in its adapter, with the reason, and applies to every run.
 - **Regimes are compared only within themselves.** A reasoning workload names the regimes it accepts, in order of preference, and each system runs the first one it has.
+  - **NRESE runs every case,** in every profile it has (RDFS variants, OWL-Horst, OWL 2 QL, RL, EL, DL). Each case keeps its own NRESE baseline. Competitors run only the cases whose semantics they support.
+  - **Stores without reasoning** (QLever, Oxigraph, Virtuoso, …) run the plain-SPARQL cases. They also run a reasoning workload's queries over NRESE's closure loaded as data. That compares the query side fairly and puts a number on what reasoning in the store buys.
+  - **A profile no competitor supports** is reported in a column of its own, not as a comparison.
+  - **Home turf:** each competitor also runs on what it documents as its strength (the v2 merge checklist, §3).
 - **Licensed systems** follow [competitors/README.md](competitors/README.md):
   - their rows carry `publish = permission`, and their numbers stay on the machine;
   - their records say only that they ran (`restricted`).
