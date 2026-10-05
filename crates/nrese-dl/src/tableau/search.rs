@@ -16,6 +16,37 @@ use std::time::Instant;
 use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step, Stop, proof};
 use super::graph::{Annot, NONE};
+use super::program::ConceptId;
+
+/// Where a run's test goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Site {
+    /// No test: the ontology's consistency.
+    Nothing,
+    /// A fresh root.
+    Fresh,
+    /// An individual's root, by its index.
+    Individual(u32),
+}
+
+/// A run's test: concepts asserted and refuted at one root.
+#[derive(Debug, Clone)]
+pub struct Seed {
+    pub site: Site,
+    pub positive: Vec<ConceptId>,
+    pub negative: Vec<ConceptId>,
+}
+
+impl Seed {
+    /// No test.
+    pub fn none() -> Self {
+        Self {
+            site: Site::Nothing,
+            positive: Vec::new(),
+            negative: Vec::new(),
+        }
+    }
+}
 
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,18 +59,28 @@ pub enum End {
 }
 
 impl Engine<'_> {
-    /// Roots for the individuals and the assertions, at level 0.
-    pub fn init(&mut self, test: Option<u32>) -> Step<()> {
+    /// Roots for the individuals, the test and the assertions, at level 0.
+    pub fn init(&mut self, seed: &Seed) -> Step<()> {
         for i in 0..self.p.individuals.len() as u32 {
             let n = self.new_node(NONE, i)?;
             self.roots.push(n);
         }
-        if let Some(concept) = test {
-            let n = self.new_node(NONE, NONE)?;
-            self.assert(Lit::Concept(concept, n), DepSetId::EMPTY, proof::ASSERTED)?;
-        } else if self.p.individuals.is_empty() {
-            // A model has at least one element (the calculus's non-empty ABox).
-            self.new_node(NONE, NONE)?;
+        let at = match seed.site {
+            Site::Fresh => self.new_node(NONE, NONE)?,
+            Site::Individual(i) => self.roots[i as usize],
+            Site::Nothing if self.p.individuals.is_empty() => {
+                // A model has at least one element (the calculus's non-empty ABox).
+                self.new_node(NONE, NONE)?;
+                NONE
+            }
+            Site::Nothing => NONE,
+        };
+        self.probe = at;
+        for &c in &seed.positive {
+            self.assert(Lit::Concept(c, at), DepSetId::EMPTY, proof::ASSERTED)?;
+        }
+        for &c in &seed.negative {
+            self.add_negative(at, c, DepSetId::EMPTY, proof::ASSERTED)?;
         }
         let a = &self.p.assertions;
         for &(c, i) in &a.concepts {
@@ -67,8 +108,8 @@ impl Engine<'_> {
     }
 
     /// Runs to a model, a refutation or a stop.
-    pub fn run(&mut self, test: Option<u32>) -> End {
-        if let Err(stop) = self.init(test) {
+    pub fn run(&mut self, seed: &Seed) -> End {
+        if let Err(stop) = self.init(seed) {
             return match stop {
                 Stop::Clash(_) => End::Refuted,
                 Stop::GaveUp(why) | Stop::Abandon(_, why) => End::GaveUp(why),
