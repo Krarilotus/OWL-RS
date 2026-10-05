@@ -19,7 +19,7 @@
 //! | `rdfs-full` | every RDFS entailment rule (RDF 1.1 Semantics §9.2) and the finite RDF and RDFS axiomatic triples |
 //! | `rdfs-plus` | `rdfs` with equality, inverse, symmetric, transitive, functional and inverse functional properties, equivalent classes and properties |
 //! | `owl-horst` | `rdfs-plus` with `hasValue`, `someValuesFrom` and `allValuesFrom` (ter Horst's pD*) |
-//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains, ranges, inverses, `someValuesFrom owl:Thing`, and the disjointness checks |
+//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains, ranges, inverses, reflexive properties, `someValuesFrom owl:Thing`, and the disjointness checks |
 //! | `owl2-rl` | the OWL 2 RL/RDF rules |
 //!
 //! Every ruleset is validated by the tests: it parses, every rule is safe, and the
@@ -107,7 +107,7 @@ impl Ruleset {
         match self {
             Self::Rdfs | Self::RdfsPlus | Self::OwlHorst => RDFS,
             Self::RdfsFull => RDFS_FULL,
-            Self::Owl2Ql => "",
+            Self::Owl2Ql => OWL2_QL_OWN,
             Self::Owl2Rl => OWL2_RL,
         }
     }
@@ -316,6 +316,24 @@ pub const OWL_HORST: &[&str] = &[
     "prp-trp", "prp-eqp1", "prp-eqp2", "prp-inv1", "prp-inv2", "cax-eqc1", "cax-eqc2", "scm-eqc1",
     "scm-eqc2", "scm-eqp1", "scm-eqp2", "cls-hv1", "cls-hv2", "cls-svf1", "cls-svf2", "cls-avf",
 ];
+
+/// OWL 2 QL's own rules, beside the OWL 2 RL ones [`OWL2_QL`] names: a reflexive property
+/// (`ReflexiveObjectProperty`, in QL but not in RL) relates every individual to itself.
+/// Under the Direct Semantics that is every element; materialised, every term used as
+/// an individual: a class's member, either end of an object property, a data property's
+/// subject, a declared named individual. Without them OWL2Bench QL's q01 (`?x :knows ?y`)
+/// missed the 3,677 pairs `a :knows a` (GraphDB's 5,104 rows; office batch B, 5 October
+/// 2026).
+pub const OWL2_QL_OWN: &str = r#"
+prp-refl-c: (?p rdf:type owl:ReflexiveProperty), (?x rdf:type ?c), (?c rdf:type owl:Class)
+            -> (?x ?p ?x)
+prp-refl-o: (?p rdf:type owl:ReflexiveProperty), (?x ?q ?y), (?q rdf:type owl:ObjectProperty)
+            -> (?x ?p ?x), (?y ?p ?y)
+prp-refl-d: (?p rdf:type owl:ReflexiveProperty), (?x ?q ?v), (?q rdf:type owl:DatatypeProperty)
+            -> (?x ?p ?x)
+prp-refl-i: (?p rdf:type owl:ReflexiveProperty), (?x rdf:type owl:NamedIndividual)
+            -> (?x ?p ?x)
+"#;
 
 /// OWL 2 QL, materialised: its axioms without the existentials on the right of
 /// `SubClassOf` (they would invent individuals), and its consistency checks.

@@ -360,6 +360,43 @@ fn profiles_derive_what_they_define() {
     assert_eq!(run(Ruleset::Owl2Rl), ([t, t, f, f, t, t, t, t], t));
 }
 
+/// OWL 2 QL has reflexive properties (RL hasn't): every term used as an individual is
+/// related to itself, and nothing else is. OWL2Bench QL's q01 missed these pairs
+/// (office batch B, 5 October 2026).
+#[test]
+fn a_reflexive_property_relates_every_individual_to_itself_under_ql() {
+    let data = "ex:knows rdf:type owl:ReflexiveProperty
+         ex:C rdf:type owl:Class
+         ex:a rdf:type ex:C
+         ex:q rdf:type owl:ObjectProperty
+         ex:b ex:q ex:c
+         ex:d rdf:type owl:DatatypeProperty
+         ex:e ex:d \"v\"^^<http://www.w3.org/2001/XMLSchema#string>
+         ex:f rdf:type owl:NamedIndividual";
+    let run = |ruleset: Ruleset| {
+        let mut vocabulary = LocalVocabulary::default();
+        let input = load(&mut vocabulary, data);
+        let (derived, _) = both_with(ruleset, &mut vocabulary, &input);
+        let knows = vocabulary.iri(&format!("{EX}knows"));
+        let mut selves: Vec<String> = derived
+            .iter()
+            .filter(|t| t[1] == knows)
+            .map(|t| {
+                assert_eq!(t[0], t[2], "only pairs of a term with itself");
+                vocabulary.text(t[0]).to_owned()
+            })
+            .collect();
+        selves.sort();
+        selves
+    };
+    let expected: Vec<String> = ["a", "b", "c", "e", "f"]
+        .iter()
+        .map(|local| format!("<{EX}{local}>"))
+        .collect();
+    assert_eq!(run(Ruleset::Owl2Ql), expected);
+    assert!(run(Ruleset::Owl2Rl).is_empty());
+}
+
 /// Random small ontologies: the batch executor equals the naive one under every
 /// profile.
 #[test]
