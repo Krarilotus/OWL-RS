@@ -61,13 +61,15 @@ pub fn horn_lower_bound(
     // The clauses of the part, by index into the normalisation's.
     let kept: Vec<usize> = (0..all.len()).filter(|&i| admissible(&all[i])).collect();
     // First everything admissible (the context core renames what it can into Horn
-    // clauses), with half the time; then the Horn clauses alone.
-    let half = budget.deadline.map(|d| {
+    // clauses); then the Horn clauses alone.
+    // The first, fuller part gets three quarters: where it saturates, it is the one that
+    // makes classes exact.
+    let most = budget.deadline.map(|d| {
         let now = std::time::Instant::now();
-        now + d.saturating_duration_since(now) / 2
+        now + d.saturating_duration_since(now) * 3 / 4
     });
     let first = crate::context::Budget {
-        deadline: half,
+        deadline: most,
         ..budget
     };
     let horn: Vec<usize> = kept

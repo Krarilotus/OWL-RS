@@ -66,7 +66,8 @@ pub struct Options {
     pub tableau: tableau::Config,
     /// A deadline for the whole classification; what isn't decided by then is reported.
     pub timeout: Option<Duration>,
-    /// The longest the Horn lower bound may take (it is only an optimisation).
+    /// The longest the Horn lower bound may take (it is only an optimisation), and never
+    /// more than half of what is left of [`Options::timeout`].
     pub lower_bound_timeout: Duration,
     /// The most conclusions one join of the context core may produce, per run.
     pub max_join: usize,
@@ -94,7 +95,9 @@ impl Default for Options {
                 ..tableau::Config::default()
             },
             timeout: None,
-            lower_bound_timeout: Duration::from_secs(2),
+            // ore_ont_7127 (65 k classes) needs 3.9 s, and then no class needs a test: at
+            // 2 s it ran out, and 65 k tests took 43 s.
+            lower_bound_timeout: Duration::from_secs(60),
             max_join: 1 << 20,
             // No lazy unfolding: it under-approximates the unfolded classes in a model, and
             // the driver reads its subsumers off model labels. No proofs are read here, so
@@ -143,7 +146,12 @@ impl Deadline {
         options: &Options,
         limit: Option<Duration>,
     ) -> crate::context::Budget {
-        let limit = limit.map(|l| Instant::now() + l);
+        let now = Instant::now();
+        let limit = limit.map(|l| {
+            // At most half of what is left: the tests still need time if it fails.
+            let left = self.0.map_or(l, |d| d.saturating_duration_since(now) / 2);
+            now + l.min(left)
+        });
         let deadline = match (self.0, limit) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
