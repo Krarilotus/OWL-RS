@@ -275,7 +275,7 @@ async fn image_backup_writes_a_manifest_into_the_data_directory()
     };
     let denied = app.clone().oneshot(request("reader")?).await?;
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-    let response = app.oneshot(request("admin")?).await?;
+    let response = app.clone().oneshot(request("admin")?).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
     let directory = std::path::PathBuf::from(json["directory"].as_str().unwrap());
@@ -286,5 +286,22 @@ async fn image_backup_writes_a_manifest_into_the_data_directory()
         nrese_store::read_manifest(&directory)?.sha256,
         json["manifest"]["sha256"]
     );
+    // More backups within the same second each get a directory of their own (found by
+    // the HTTP fuzzing: the second one failed with a 500).
+    let mut directories = vec![directory];
+    for _ in 0..3 {
+        let response = app.clone().oneshot(request("admin")?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+        directories.push(std::path::PathBuf::from(
+            json["directory"].as_str().unwrap(),
+        ));
+    }
+    directories.sort();
+    directories.dedup();
+    assert_eq!(directories.len(), 4, "{directories:?}");
+    for directory in &directories {
+        nrese_store::read_manifest(directory)?;
+    }
     Ok(())
 }
