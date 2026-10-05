@@ -97,15 +97,60 @@ pub fn rewrite(tbox: &Tbox, cq: &Cq, limits: &Limits) -> Outcome {
     if tbox.is_empty() {
         return Outcome::Unchanged;
     }
+    let Some(mut witnesses) = tree_witnesses(tbox, cq, limits.witnesses, limits.candidates) else {
+        return Outcome::Exceeded("tree witnesses");
+    };
+    // A witness the rest of the query implies goes, with its atoms: its root is stated to
+    // be a class that generates it, so every model has the tree it maps into. The query
+    // keeps its certain answers (Ontop's CQ subsumption, ISWC 2013 §2.1); a star of arms
+    // on a class that generates them all becomes the class atom.
+    let original = cq;
+    let mut reduced = std::borrow::Cow::Borrowed(cq);
+    loop {
+        // Every implied witness at once, as long as their atoms and the atoms implying
+        // them are apart; then the witnesses of what is left.
+        let mut gone: HashSet<usize> = HashSet::new();
+        let mut kept: HashSet<usize> = HashSet::new();
+        for witness in &witnesses {
+            let Some(because) = implied(tbox, &reduced, witness) else {
+                continue;
+            };
+            if witness
+                .atoms
+                .iter()
+                .all(|a| !gone.contains(a) && !kept.contains(a))
+                && !gone.contains(&because)
+            {
+                gone.extend(witness.atoms.iter().copied());
+                kept.insert(because);
+            }
+        }
+        if gone.is_empty() {
+            break;
+        }
+        let atoms = reduced
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !gone.contains(i))
+            .map(|(_, a)| a.clone())
+            .collect();
+        reduced = std::borrow::Cow::Owned(Cq {
+            atoms,
+            ..reduced.into_owned()
+        });
+        let Some(next) = tree_witnesses(tbox, &reduced, limits.witnesses, limits.candidates) else {
+            return Outcome::Exceeded("tree witnesses");
+        };
+        witnesses = next;
+    }
+    let cq: &Cq = &reduced;
     let existential = (0..cq.vars)
         .filter(|&v| cq.existential[v as usize] && cq.atoms.iter().any(|a| a.has_var(v)))
         .count();
     if existential > limits.existential_vars {
         return Outcome::Exceeded("existential variables");
     }
-    let Some(witnesses) = tree_witnesses(tbox, cq, limits.witnesses, limits.candidates) else {
-        return Outcome::Exceeded("tree witnesses");
-    };
     let mut alternatives: HashMap<Term, Option<Vec<Basic>>> = HashMap::new();
     for atom in &cq.atoms {
         if let Atom::Class(_, class) = atom {
@@ -115,21 +160,38 @@ pub fn rewrite(tbox: &Tbox, cq: &Cq, limits: &Limits) -> Outcome {
         }
     }
     if witnesses.is_empty() && alternatives.values().all(Option::is_none) {
-        return Outcome::Unchanged;
+        if cq.atoms.len() == original.atoms.len() {
+            return Outcome::Unchanged;
+        }
+        return Outcome::Rewritten(Rewriting {
+            branches: vec![Branch {
+                parts: cq.atoms.iter().cloned().map(Part::Atom).collect(),
+                merged: Vec::new(),
+            }],
+            vars: cq.vars,
+            witnesses: 0,
+        });
     }
     let Some(sets) = independent_sets(&witnesses, limits.branches) else {
         return Outcome::Exceeded("branches");
     };
     let mut builder = Build {
-        tbox,
         cq,
         alternatives: &alternatives,
         next: cq.vars,
     };
+    // Each witness's fold once, for every branch it is in.
+    let folds: Vec<Vec<Basic>> = witnesses
+        .iter()
+        .map(|w| tbox.generator_alternatives(w.generators.iter().copied()))
+        .collect();
     let mut branches = Vec::new();
     let mut size = 0;
     for set in sets {
-        let chosen: Vec<&TreeWitness> = set.iter().map(|&i| &witnesses[i]).collect();
+        let chosen: Vec<(&TreeWitness, &[Basic])> = set
+            .iter()
+            .map(|&i| (&witnesses[i], folds[i].as_slice()))
+            .collect();
         if let Some(branch) = builder.branch(&chosen) {
             size += branch.size();
             if size > limits.size {
@@ -144,6 +206,20 @@ pub fn rewrite(tbox: &Tbox, cq: &Cq, limits: &Limits) -> Outcome {
         branches,
         vars: builder.next,
         witnesses: witnesses.len(),
+    })
+}
+
+/// The atom of `cq` that implies `witness`, if one does: the witness has one root, and the
+/// atom states the root to be of a class below the left side of an axiom that generates
+/// it.
+fn implied(tbox: &Tbox, cq: &Cq, witness: &TreeWitness) -> Option<usize> {
+    let [root] = witness.roots[..] else {
+        return None;
+    };
+    cq.atoms.iter().enumerate().position(|(i, atom)| {
+        matches!(atom, Atom::Class(t, class) if *t == root
+            && !witness.atoms.contains(&i)
+            && tbox.generates(*class, &witness.generators))
     })
 }
 
@@ -192,7 +268,6 @@ fn independent_sets(witnesses: &[TreeWitness], limit: usize) -> Option<Vec<Vec<u
 }
 
 struct Build<'a> {
-    tbox: &'a Tbox,
     cq: &'a Cq,
     alternatives: &'a HashMap<Term, Option<Vec<Basic>>>,
     next: u32,
@@ -204,13 +279,14 @@ impl Build<'_> {
         self.next - 1
     }
 
-    /// The branch of the witnesses `chosen`; `None` if it can't match (roots on two
-    /// constants, or a witness no named individual generates).
-    fn branch(&mut self, chosen: &[&TreeWitness]) -> Option<Branch> {
+    /// The branch of the witnesses `chosen`, each with its fold (the basic concepts its root
+    /// may be stated to be); `None` if it can't match (roots on two constants, or a witness
+    /// no named individual generates).
+    fn branch(&mut self, chosen: &[(&TreeWitness, &[Basic])]) -> Option<Branch> {
         let cq = self.cq;
         // The roots of each witness are one individual.
         let mut classes: Vec<Vec<QTerm>> = Vec::new();
-        for witness in chosen.iter().filter(|w| !w.roots.is_empty()) {
+        for (witness, _) in chosen.iter().filter(|(w, _)| !w.roots.is_empty()) {
             let mut class: Vec<QTerm> = witness.roots.clone();
             classes.retain(|other| {
                 if other.iter().any(|t| class.contains(t)) {
@@ -250,7 +326,7 @@ impl Build<'_> {
         let map = |t: QTerm| stands_for.get(&t).copied().unwrap_or(t);
         let covered: HashSet<usize> = chosen
             .iter()
-            .flat_map(|w| w.atoms.iter().copied())
+            .flat_map(|(w, _)| w.atoms.iter().copied())
             .collect();
         let mut parts: Vec<Part> = Vec::new();
         for (i, atom) in cq.atoms.iter().enumerate() {
@@ -272,23 +348,17 @@ impl Build<'_> {
                 parts.push(part);
             }
         }
-        for witness in chosen {
+        for &(witness, fold) in chosen {
             let root = match witness.roots.first() {
                 Some(&root) => map(root),
                 None => QTerm::Var(self.fresh()),
             };
-            let alternatives = self
-                .tbox
-                .generator_alternatives(witness.generators.iter().copied());
-            if alternatives.is_empty() {
+            if fold.is_empty() {
                 return None;
             }
             let fresh = self.fresh();
             parts.push(Part::Any(
-                alternatives
-                    .into_iter()
-                    .map(|b| stated(b, root, fresh))
-                    .collect(),
+                fold.iter().map(|&b| stated(b, root, fresh)).collect(),
             ));
         }
         let mut merged: Vec<(u32, QTerm)> = stands_for

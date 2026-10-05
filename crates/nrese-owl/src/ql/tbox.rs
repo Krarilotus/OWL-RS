@@ -70,6 +70,9 @@ pub struct Tbox {
     data: HashSet<Term>,
     pub(crate) generators: Vec<Generator>,
     pub(crate) types: Vec<Type>,
+    /// Per role, the types whose incoming role is included in it: the elements an edge of
+    /// that role from their parent reaches.
+    pub(crate) reaching: HashMap<Role, Vec<usize>>,
     /// Whether some inclusion isn't one the materialisation applies.
     gaps: bool,
     thing: Option<Term>,
@@ -194,6 +197,18 @@ impl Tbox {
             .collect();
         let alternatives = self.minimal(candidates);
         (alternatives != [Basic::Class(class)]).then_some(alternatives)
+    }
+
+    /// Whether every instance of `class` generates one of the generating axioms `axioms`:
+    /// the class is below one of their left sides.
+    pub(crate) fn generates(&self, class: Term, axioms: &[usize]) -> bool {
+        let Some(id) = self.id(Basic::Class(class)) else {
+            return false;
+        };
+        let above = reach(&self.up, [id]);
+        axioms
+            .iter()
+            .any(|&g| above.contains(&self.generators[g].left))
     }
 
     /// The alternatives for a root that generates any of the generating axioms `axioms`:
@@ -566,6 +581,15 @@ impl Builder {
             children.sort_unstable();
             children.dedup();
             tbox.types[ty].children = children;
+            let role = tbox.types[ty].role;
+            let mut sup: Vec<Role> = tbox
+                .sup
+                .get(&role)
+                .map_or_else(|| vec![role], |s| s.iter().copied().collect());
+            sup.sort();
+            for sigma in sup {
+                tbox.reaching.entry(sigma).or_default().push(ty);
+            }
         }
         tbox.gaps = tbox
             .up

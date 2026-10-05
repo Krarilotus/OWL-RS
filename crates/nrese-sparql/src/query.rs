@@ -144,6 +144,9 @@ pub struct Explanation {
     /// Solutions (1 or 0 for ASK); CONSTRUCT and DESCRIBE count triples.
     pub rows: u64,
     pub micros: u64,
+    /// What the OWL 2 QL rewriting did, and whether the answers are complete; `None` where
+    /// it doesn't apply.
+    pub ql: Option<crate::ql::QlReport>,
 }
 
 /// Runs `query` like [`evaluate_query`], consuming its results, and reports how it ran:
@@ -155,13 +158,14 @@ pub fn explain_query<V: ReadView>(
 ) -> Result<Explanation, QueryEvaluationError> {
     let start = std::time::Instant::now();
     let snapshot = view.evaluation_snapshot();
-    let (rewrites, steps, rows) = crate::native::explain(&snapshot, query, options)?;
+    let (rewrites, steps, rows, ql) = crate::native::explain(&snapshot, query, options)?;
     Ok(Explanation {
         executor: "native",
         rewrites,
         steps,
         rows,
         micros: start.elapsed().as_micros() as u64,
+        ql,
     })
 }
 
@@ -184,6 +188,8 @@ pub struct PlannedQuery {
     /// The rewrites that changed the query, in the order applied (as in [`Explanation`]).
     pub rewrites: Vec<&'static str>,
     pub steps: Vec<PlannedStep>,
+    /// As in [`Explanation`].
+    pub ql: Option<crate::ql::QlReport>,
 }
 
 /// The plan `query` would run as on `view`, after the rewrites, each node with an estimate
@@ -194,8 +200,23 @@ pub fn plan_query<V: ReadView>(
     options: &QueryOptions,
 ) -> Result<PlannedQuery, QueryEvaluationError> {
     let snapshot = view.evaluation_snapshot();
-    let (rewrites, steps) = crate::native::plan(&snapshot, query, options)?;
-    Ok(PlannedQuery { rewrites, steps })
+    let (rewrites, steps, ql) = crate::native::plan(&snapshot, query, options)?;
+    Ok(PlannedQuery {
+        rewrites,
+        steps,
+        ql,
+    })
+}
+
+/// What the OWL 2 QL rewriting does to `query` on `view` and whether its answers are
+/// complete (docs/design/ql-rewriting.md), without running it; `None` where the rewriting
+/// doesn't apply. The status [`evaluate_query`]'s answers on the same view go with.
+pub fn ql_report<V: ReadView>(
+    view: &V,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<Option<crate::ql::QlReport>, QueryEvaluationError> {
+    crate::native::ql_report(&view.evaluation_snapshot(), query, options)
 }
 
 /// True if `query` would run on the native executor over a snapshot with default options.

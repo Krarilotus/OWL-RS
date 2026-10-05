@@ -337,3 +337,33 @@ fn rewritings_stop_at_their_bounds() {
         Outcome::Exceeded("branches")
     );
 }
+
+#[test]
+fn witnesses_the_query_implies_are_dropped() {
+    let axioms = "SubClassOf(:Wellbore ObjectSomeValuesFrom(:drilledBy owl:Thing))
+        SubClassOf(:Wellbore ObjectSomeValuesFrom(:permit owl:Thing))
+        SubClassOf(:Exploration :Wellbore)";
+    // The root is stated to be a class that generates both arms: the class atom alone.
+    assert_eq!(
+        rewritten(
+            axioms,
+            "Exploration(?w), drilledBy(?w ?a), permit(?w ?b)",
+            &["a", "b"]
+        ),
+        ["Exploration(?w)"]
+    );
+    // Not stated: four branches, the arms folded one by one.
+    assert_eq!(
+        rewritten(axioms, "drilledBy(?w ?a), permit(?w ?b)", &["a", "b"]).len(),
+        4
+    );
+    // A projected arm stays.
+    assert_eq!(
+        rewritten(
+            axioms,
+            "Wellbore(?w), drilledBy(?w ?a), permit(?w ?b)",
+            &["b"]
+        ),
+        ["Wellbore(?w) drilledBy(?w ?a)"]
+    );
+}

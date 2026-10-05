@@ -272,7 +272,16 @@ fn queries_without_tree_witnesses_plan_as_before() {
         let query = parse(query);
         let off = plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
         let with = plan_query(&snapshot, &query, &on()).unwrap();
-        assert_eq!(off, with, "{query}");
+        assert_eq!(
+            (&off.rewrites, &off.steps),
+            (&with.rewrites, &with.steps),
+            "{query}"
+        );
+        // Nothing rewritten, and nothing missing.
+        assert_eq!(
+            with.ql.unwrap_or_default(),
+            nrese_sparql::ql::QlReport::default()
+        );
     }
     let plain = engine(
         ":Manager rdfs:subClassOf :Employee . :worksFor rdfs:domain :Person .
@@ -286,7 +295,16 @@ fn queries_without_tree_witnesses_plan_as_before() {
         let query = parse(query);
         let off = plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
         let with = plan_query(&snapshot, &query, &on()).unwrap();
-        assert_eq!(off, with, "{query}");
+        assert_eq!(
+            (&off.rewrites, &off.steps),
+            (&with.rewrites, &with.steps),
+            "{query}"
+        );
+        // Nothing rewritten, and nothing missing.
+        assert_eq!(
+            with.ql.unwrap_or_default(),
+            nrese_sparql::ql::QlReport::default()
+        );
     }
 }
 

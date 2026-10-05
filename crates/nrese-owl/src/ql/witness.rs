@@ -170,17 +170,29 @@ impl Search<'_> {
                 })
                 .collect()
         } else {
-            let first = interior
+            // A variable next to a root, and the role of the edge from the root to it: only
+            // the types that edge can reach are tried.
+            let (first, role) = atoms
                 .iter()
-                .copied()
-                .find(|&v| {
-                    atoms.iter().any(|&i| {
-                        let terms = self.cq.atoms[i].terms();
-                        terms.contains(&QTerm::Var(v)) && terms.iter().any(|t| roots.contains(t))
-                    })
+                .find_map(|&i| match self.cq.atoms[i] {
+                    Atom::Role(s, p, QTerm::Var(o))
+                        if roots.contains(&s) && interior.contains(&o) =>
+                    {
+                        Some((o, ObjProp::Named(p)))
+                    }
+                    Atom::Role(QTerm::Var(s), p, o)
+                        if roots.contains(&o) && interior.contains(&s) =>
+                    {
+                        Some((s, ObjProp::Inverse(p)))
+                    }
+                    _ => None,
                 })
                 .expect("an atom of q_t has a root");
-            (0..tbox.types.len())
+            tbox.reaching
+                .get(&role)
+                .into_iter()
+                .flatten()
+                .copied()
                 .filter(|&ty| self.maps(&interior, &atoms, &roots, first, ty))
                 .collect()
         };

@@ -14,15 +14,9 @@ use nrese_rdf::{NamedNode, NamedNodeRef, Term, Variable};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
-const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+use crate::ql::QlReport;
 
-/// What the rewriting did to a query, for EXPLAIN.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Report {
-    pub rewritten: bool,
-    /// A pattern reached a bound and runs as written.
-    pub limited: bool,
-}
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// The variables the context of a pattern reads: all of them, or these.
 #[derive(Clone)]
@@ -74,7 +68,7 @@ pub(crate) fn rewrite_query(
     limits: &Limits,
     needed: Option<Vec<Variable>>,
     set: bool,
-) -> (GraphPattern, Report) {
+) -> (GraphPattern, QlReport) {
     let mut rewriter = Rewriter {
         tbox,
         snapshot,
@@ -82,8 +76,7 @@ pub(crate) fn rewrite_query(
         rdf_type: snapshot
             .lookup(NamedNodeRef::new_unchecked(RDF_TYPE).into())
             .map(TermId::raw),
-        patterns: 0,
-        report: Report::default(),
+        report: QlReport::default(),
     };
     let needed = match needed {
         None => Needed::All,
@@ -98,9 +91,7 @@ struct Rewriter<'a> {
     snapshot: &'a Snapshot,
     limits: &'a Limits,
     rdf_type: Option<u64>,
-    /// Basic graph patterns rewritten so far: names their new variables apart.
-    patterns: usize,
-    report: Report,
+    report: QlReport,
 }
 
 impl Rewriter<'_> {
@@ -235,17 +226,23 @@ impl Rewriter<'_> {
         let (cq, terms) = self.query(patterns, needed);
         let rewriting = match rewrite(self.tbox, &cq, self.limits) {
             Outcome::Unchanged => return original,
-            Outcome::Exceeded(_) => {
-                self.report.limited = true;
+            Outcome::Exceeded(what) => {
+                self.report.limits.push(what);
+                self.report.completeness.add(format!(
+                    "a basic graph pattern reached the rewriting's bound on {what} and ran as written"
+                ));
                 return original;
             }
             Outcome::Rewritten(r) => r,
         };
-        self.report.rewritten = true;
-        self.patterns += 1;
+        self.report.patterns += 1;
+        self.report.witnesses += rewriting.witnesses;
+        self.report.branches += rewriting.branches.len();
+        self.report.atoms += rewriting.size();
+        // Names the new variables of each rewritten pattern apart.
         let names = Names {
             terms: &terms,
-            pattern: self.patterns,
+            pattern: self.report.patterns,
         };
         let union = rewriting
             .branches
