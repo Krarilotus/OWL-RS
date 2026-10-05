@@ -54,7 +54,7 @@ pub(crate) struct Type {
 }
 
 /// The compiled QL TBox.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct Tbox {
     basics: Vec<Basic>,
     ids: HashMap<Basic, u32>,
@@ -73,6 +73,8 @@ pub struct Tbox {
     /// Whether some inclusion isn't one the materialisation applies.
     gaps: bool,
     thing: Option<Term>,
+    /// [`Self::class_alternatives`] per class, as queries ask for them.
+    alternatives: std::sync::RwLock<HashMap<Term, Option<Vec<Basic>>>>,
 }
 
 /// What makes an anonymous element's type: the role that reached it, its filler, and
@@ -162,6 +164,20 @@ impl Tbox {
     /// existentials below it whose instances the materialisation doesn't already make
     /// instances of another alternative. `None` if there is nothing to add.
     pub(crate) fn class_alternatives(&self, class: Term) -> Option<Vec<Basic>> {
+        let known = self.alternatives.read().unwrap_or_else(|p| p.into_inner());
+        if let Some(alternatives) = known.get(&class) {
+            return alternatives.clone();
+        }
+        drop(known);
+        let alternatives = self.compute_class_alternatives(class);
+        self.alternatives
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(class, alternatives.clone());
+        alternatives
+    }
+
+    fn compute_class_alternatives(&self, class: Term) -> Option<Vec<Basic>> {
         if !self.gaps && self.generators.is_empty() {
             return None;
         }

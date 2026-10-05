@@ -68,8 +68,11 @@ roots of a witness are made one term (`BIND` for an equated answer variable).
 fact the hierarchy, domains, ranges and inverses give is stored), so the rewriting adds
 only:
 - the tree witnesses (the topology), and
-- the class memberships that only an existential gives (`A ⊑ ∃R`, `∃R ⊑ B`: `A ⊑ B`, which
-  no RL rule derives); each class atom gets them as alternatives.
+- the class memberships the closure lacks: those only an existential gives (`A ⊑ ∃R`,
+  `∃R ⊑ B`: `A ⊑ B`, which no RL rule derives), and those of QL inclusions the ruleset
+  doesn't apply (intersections on the right and unions on the left under `owl2-ql`, whose
+  ruleset has no list rules; inclusions through inverse expressions); each class atom
+  gets them as alternatives.
 
 Alternatives the closure already implies are dropped: `B` is left out when another
 alternative (or the atom itself) follows from it by what the ruleset materialises
@@ -83,6 +86,8 @@ the plain union. Elsewhere (bags, `COUNT`), a pattern gives its materialised row
 their multiplicities, plus **one row per answer that only the rewriting finds**:
 `P ∪ (DISTINCT π_V(rewriting) FILTER NOT EXISTS P)`, `V` its non-existential variables.
 So queries without witnesses keep their bags exactly, and no answer is counted twice.
+`COUNT(*)` reads every variable of the solutions it counts, so none of them is existential
+for it; `COUNT(?x)` reads only `?x`.
 
 ## 4. Switching it on
 
@@ -106,10 +111,19 @@ unrewritten (sound, perhaps incomplete), and EXPLAIN shows `ql-limit`.
 
 ## 6. Evidence
 
-- Unit tests of the witness computation (`nrese-owl` `ql/tests.rs`).
+- Unit tests of the witness computation (`nrese-owl` `ql/tests.rs`, 11; Ontop's example
+  gives its four queries) and of the SPARQL side (`nrese-sparql` `tests/it/ql_tests.rs`, 7,
+  with the two guards).
 - A differential test: random small QL ontologies, data and conjunctive queries; the
-  store's answers (owl2-ql closure plus rewriting) against certain answers computed by a
-  separate bounded chase (`nrese-store/tests/it/ql_rewriting_tests.rs`).
-- The W3C OWL 2 test cases of the QL profile, conclusions as `ASK` queries
-  (`nrese-store/tests/w3c_owl2_ql`); none of them goes through an existential.
+  store's answers (`owl2-ql` or `owl2-rl` closure plus rewriting, sets and bags) against
+  certain answers computed by a separate bounded chase
+  (`nrese-store/tests/it/ql_rewriting_tests.rs`; 600 queries in the gate, 24,000 on two
+  more seeds on 5 October with 571 answers found only through the rewriting: no
+  difference).
+- The W3C OWL 2 test cases of the QL profile under the Direct Semantics, query-shaped
+  conclusions as `ASK` (`nrese-store/tests/w3c_owl2_ql`): 51 pass, 9 fail as listed with
+  their causes (difference without equality rules, class expressions without an axiom,
+  two inconsistencies the `owl2-ql` ruleset doesn't detect), 2 import other ontologies. No
+  conclusion of the suite goes through an anonymous individual, so the suite checks that
+  the rewriting breaks nothing; the differential test checks what it adds.
 - Measured cost and answers gained: performance.md §6.

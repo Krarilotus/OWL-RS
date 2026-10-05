@@ -421,9 +421,12 @@ fn native_pattern<'q>(
     // OWL 2 QL answers through existentials, before the optimiser, also as written: it
     // changes the answers, not just the plan.
     let rewritten_ql;
-    let pattern = match ql_rewriting(query, options) {
-        Some(ql) => {
-            let tbox = ql.tbox(&ctx.snapshot);
+    // A schema with nothing to rewrite leaves the query alone, unread.
+    let ql = ql_rewriting(query, options)
+        .map(|ql| (ql, ql.tbox(&ctx.snapshot)))
+        .filter(|(_, tbox)| !tbox.is_empty());
+    let pattern = match ql {
+        Some((ql, tbox)) => {
             let (needed, set) = match &form {
                 Form::Select => (None, false),
                 Form::Ask => (Some(Vec::new()), true),
