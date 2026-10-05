@@ -207,9 +207,10 @@ impl<'e> BulkLoad<'e> {
                     inferred_inserted: 0,
                     inferred_deleted: current.inferred.len(),
                 };
+                let layout = Layout::holding(&quads);
                 let next = Next::Streamed {
-                    layout: Layout::holding(&quads),
-                    builder: PermutationBuilder::new(quads),
+                    layout,
+                    builder: PermutationBuilder::planned(quads, layout.permutations()),
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                 };

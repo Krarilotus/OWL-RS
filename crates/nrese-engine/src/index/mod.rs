@@ -20,6 +20,7 @@
 pub(crate) mod compaction;
 #[cfg(test)]
 mod compression_study;
+mod derive;
 pub(crate) mod keys;
 mod merge;
 pub(crate) mod run;
