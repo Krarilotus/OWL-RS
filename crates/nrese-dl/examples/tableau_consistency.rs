@@ -59,6 +59,27 @@ impl Terms for Table {
             .get(&RdfTerm::NamedNode(NamedNode::new_unchecked(iri)))
             .copied()
     }
+
+    fn datatype(&self, term: Term) -> Option<String> {
+        match self.terms.get(term as usize)? {
+            RdfTerm::Literal(l) => Some(l.datatype().as_str().to_owned()),
+            _ => None,
+        }
+    }
+
+    fn language(&self, term: Term) -> Option<String> {
+        match self.terms.get(term as usize)? {
+            RdfTerm::Literal(l) => l.language().map(str::to_owned),
+            _ => None,
+        }
+    }
+
+    fn iri_text(&self, term: Term) -> Option<String> {
+        match self.terms.get(term as usize)? {
+            RdfTerm::NamedNode(n) => Some(n.as_str().to_owned()),
+            _ => None,
+        }
+    }
 }
 
 fn parse(path: &str) -> Result<Vec<Triple>, Box<dyn std::error::Error>> {

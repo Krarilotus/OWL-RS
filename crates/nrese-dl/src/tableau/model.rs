@@ -31,15 +31,19 @@ impl Engine<'_> {
         let len = self.g.nodes.len();
         let mut element = vec![NONE; len];
         let mut size = 0usize;
+        let concrete = |n: usize| self.g.nodes[n].flags & super::graph::flag::CONCRETE != 0;
         for (n, slot) in element.iter_mut().enumerate() {
-            if self.g.nodes[n].live() && !self.blocked(n as u32) {
+            if self.g.nodes[n].live() && !self.blocked(n as u32) && !concrete(n) {
                 *slot = size as u32;
                 size += 1;
             }
         }
         let at = |n: u32| -> Option<usize> {
             let node = &self.g.nodes[n as usize];
-            if !node.live() || self.indirectly_blocked(n) {
+            if !node.live()
+                || self.indirectly_blocked(n)
+                || node.flags & super::graph::flag::CONCRETE != 0
+            {
                 return None;
             }
             let e = if self.blocked(n) {
@@ -54,7 +58,7 @@ impl Engine<'_> {
             ..Model::default()
         };
         for n in 0..len as u32 {
-            if self.g.live(n) && !self.blocked(n) {
+            if element[n as usize] != NONE {
                 for f in self.g.labels(n) {
                     if let ConceptName::Clause(c) = self.p.concepts[f.concept as usize] {
                         m.concepts.push((c, element[n as usize] as usize));
