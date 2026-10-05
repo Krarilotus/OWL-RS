@@ -33,6 +33,7 @@ mod output;
 mod paths;
 mod plan;
 mod pushdown;
+pub(crate) use pushdown::per_solution;
 mod ranges;
 mod search;
 mod sets;
