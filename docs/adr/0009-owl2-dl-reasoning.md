@@ -1,7 +1,7 @@
 # ADR-0009: OWL 2 DL reasoning
 
 Status: accepted (2 October 2026). The owner gave the direction ("a complete engine first,
-then the fast layers in front of it"; [the roadmap](../plan/2026-10-02-roadmap.md))
+then the fast layers in front of it"; [the roadmap](../ROADMAP.md))
 and left the way to it to the project. Revised the same day after seven research reports
 and their check (outside the repository: `output/dl-research-A…G.md`,
 `output/OWL-RS-dl-research-review-2026-10-02.md`); the revisions are marked below. The

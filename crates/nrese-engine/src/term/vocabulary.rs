@@ -1,5 +1,5 @@
 //! FSST-compressed dictionary keys (`store.vocabulary = "fsst"`; design §3 item 4,
-//! docs/plan/2026-10-02-research-designs.md).
+//! docs/design/research-designs.md).
 //!
 //! A checkpoint written with [`VocabularyEncoding::Fsst`] stores each key as its tag byte
 //! followed by the rest compressed with FSST (Boncz, Neumann, Leis, VLDB 2020): one symbol
