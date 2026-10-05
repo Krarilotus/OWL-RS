@@ -167,14 +167,34 @@ pub(crate) fn trace(what: &str) {
     }
 }
 
-/// Runs `f` on a pool of `threads` workers (on the calling thread for one).
-pub(crate) fn with_pool<T: Send>(threads: usize, f: impl FnOnce() -> T + Send) -> T {
-    if threads <= 1 {
-        return f();
+/// The workers of a run: the calling thread alone for one, else a pool of their own
+/// (never rayon's global pool, so a run uses the threads it was given).
+pub(crate) struct Workers(Option<rayon::ThreadPool>);
+
+impl Workers {
+    pub(crate) fn new(threads: usize) -> Self {
+        if threads <= 1 {
+            return Self(None);
+        }
+        Self(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .ok(),
+        )
     }
-    match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
-        Ok(pool) => pool.install(f),
-        Err(_) => f(),
+
+    /// `f` of each item, in order.
+    pub(crate) fn map<T: Sync, R: Send>(
+        &self,
+        items: &[T],
+        f: impl Fn(&T) -> R + Sync + Send,
+    ) -> Vec<R> {
+        use rayon::prelude::*;
+        match &self.0 {
+            Some(pool) => pool.install(|| items.par_iter().map(&f).collect()),
+            None => items.iter().map(f).collect(),
+        }
     }
 }
 
