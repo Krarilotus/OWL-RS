@@ -210,6 +210,46 @@ fn rule_jobs_copy_no_drivers_and_rounds_keep_no_derived_facts_list() {
     );
 }
 
+/// P1-F9 and P1-F10. A round holds its candidates as its morsels found them (not
+/// concatenated, never grown by doubling), merges each predicate's into chunks without a
+/// sorted copy of all of them, folds the recent run into the base a chunk at a time, and
+/// the derived facts are listed while the working set is taken apart. So no phase holds
+/// much beside the working set. With chunks of 1,024 pairs, so that this input's runs
+/// have many, the rounds peaked 9.6 % and the listing 1.7 % above the final working set
+/// on 5 October 2026; runs of one chunk each (no fold by chunks) peak 23.6 % above it.
+#[test]
+fn rounds_hold_no_second_copy_beside_the_working_set() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    batch::set_chunk_pairs(1024);
+    let (result, phases, before) = materialise(DEPARTMENTS);
+    batch::set_chunk_pairs(1 << 20);
+    let store = result.counters.store_bytes.last().expect("rounds").total();
+    let peak = |labels: &[&str]| {
+        phases
+            .iter()
+            .filter(|phase| labels.contains(&phase.label))
+            .map(|phase| phase.peak - before)
+            .max()
+            .expect("the phases ran")
+    };
+    let rounds = peak(&[
+        "reasoner: grounding",
+        "reasoner: joins",
+        "reasoner: modules",
+        "reasoner: merge",
+        "reasoner: install",
+    ]);
+    assert!(
+        rounds * 100 <= store * 115,
+        "the rounds peaked at {rounds} bytes, the working set holds {store}"
+    );
+    let listing = peak(&["reasoner: derived"]);
+    assert!(
+        listing * 100 <= store * 110,
+        "listing the derived facts peaked at {listing} bytes, the working set holds {store}"
+    );
+}
+
 /// P1-F8. A morsel's candidates are checked against the working set once each, in
 /// (predicate, subject, object) order. Unsorted, every probe misses the cache at each
 /// level of each binary search; without the deduplication about half the probes repeat.

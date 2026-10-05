@@ -64,14 +64,19 @@ pub fn materialise_until(
         &|id| snapshot.decode(TermId::from_raw(id)),
     ));
     nrese_exec::heap::phase("store: encode");
-    Ok(Closure {
-        inferred: result
+    // At its exact size: collected by doubling, the list held up to twice the facts, and
+    // at a doubling three times, beside them (LUBM 1000: 6.6 GB at this step's peak).
+    let mut inferred = Vec::with_capacity(result.derived.len() + axioms.len());
+    inferred.extend(
+        result
             .derived
             .into_iter()
             .chain(axioms)
             .filter(|&t| storable(t))
-            .map(encode)
-            .collect(),
+            .map(encode),
+    );
+    Ok(Closure {
+        inferred,
         violations,
         diagnostics: result.diagnostics,
         rounds: result.rounds,
