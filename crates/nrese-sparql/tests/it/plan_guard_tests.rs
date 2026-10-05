@@ -238,3 +238,25 @@ fn explain_estimates_every_operator() {
         );
     }
 }
+
+/// Paths planned with the patterns they are joined to: a path from a constant that
+/// reaches few nodes goes first and the large pattern is probed from what it reaches,
+/// instead of the pattern being joined whole and the path after it.
+#[test]
+fn selective_paths_join_first() {
+    let steps = steps(
+        &engine(),
+        "SELECT * WHERE { ?s e:label ?l . e:n1 e:knows? ?s }",
+    );
+    let planned = steps
+        .iter()
+        .find(|s| s.operator == "paths ordered with patterns");
+    assert!(
+        planned.is_some_and(|s| s.detail.starts_with("<http://example.org/n1>") && s.rows == 4),
+        "{steps:#?}"
+    );
+    assert!(
+        steps.iter().any(|s| s.operator == "sideways"),
+        "the labels probed from the path's rows: {steps:#?}"
+    );
+}
