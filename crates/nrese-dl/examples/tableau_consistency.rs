@@ -151,6 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &ontology,
             Options {
                 expand_at_most_up_to: config.expand_at_most_up_to,
+                lazy_definitions: config.lazy_definitions && !config.keep_model,
             },
         );
         let normalise_time = at.elapsed();

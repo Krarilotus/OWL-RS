@@ -42,6 +42,10 @@ pub struct Options {
     /// are equal (quadratic in `n`, but plain resolution for the engines); above it, an
     /// at-most atom. At most [`Options::MAX_EXPANSION`].
     pub expand_at_most_up_to: u32,
+    /// Unfold a class's only, acyclic definition `A ≡ D` lazily (`definitions.rs`): `A ⊑ D`
+    /// and `¬D` for each `¬A`, not `D ⊑ A` everywhere. Equisatisfiable, but a model of the
+    /// clauses under-approximates such classes. Off by default.
+    pub lazy_definitions: bool,
 }
 
 impl Options {
@@ -52,6 +56,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             expand_at_most_up_to: 2,
+            lazy_definitions: false,
         }
     }
 }
@@ -78,6 +83,10 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
     let ontology = rewritten.as_ref().map_or(ontology, |r| &r.ontology);
     let mut n = Normaliser::new(ontology);
     n.expand_up_to = options.expand_at_most_up_to.min(Options::MAX_EXPANSION);
+    if options.lazy_definitions {
+        n.unfolded = crate::definitions::unfolded(ontology);
+        n.out.unfolded = n.unfolded.by_axiom.len();
+    }
     if let Some(r) = &rewritten {
         for &index in &r.unsupported {
             n.out
@@ -188,6 +197,8 @@ struct Normaliser<'a> {
     equivalent: std::cell::RefCell<HashMap<ObjProp, Members>>,
     clause_index: HashMap<(Vec<BodyAtom>, Vec<HeadAtom>), usize>,
     expand_up_to: u32,
+    /// Definitions unfolded lazily (`Options::lazy_definitions`).
+    unfolded: crate::definitions::Unfolded,
 }
 
 impl<'a> Normaliser<'a> {
@@ -208,6 +219,7 @@ impl<'a> Normaliser<'a> {
             equivalent: std::cell::RefCell::new(HashMap::new()),
             clause_index: HashMap::new(),
             expand_up_to: Options::default().expand_at_most_up_to,
+            unfolded: Default::default(),
         };
         n.role_inclusions();
         n
@@ -272,6 +284,10 @@ impl<'a> Normaliser<'a> {
     fn nnf_not(&mut self, id: ExprId) -> ExprId {
         let expr = self.get(id);
         let out = match expr {
+            ClassExpr::Class(a) if self.unfolded.by_class.contains_key(&a) => {
+                let d = self.unfolded.by_class[&a];
+                return self.nnf_not(d);
+            }
             ClassExpr::Class(_) | ClassExpr::HasSelf(_) => ClassExpr::Not(id),
             ClassExpr::OneOf(xs) => {
                 // ¬{a, b} = ¬{a} ⊓ ¬{b}: each a literal of its own.
@@ -416,6 +432,12 @@ impl<'a> Normaliser<'a> {
         match axiom {
             Axiom::Declaration(..) => {}
             Axiom::SubClassOf(a, b) => self.sub(*a, *b, index),
+            Axiom::EquivalentClasses(_) if self.unfolded.by_axiom.contains_key(&index) => {
+                // `A ⊑ D` only, with `¬A` as a literal (elsewhere it unfolds to `¬D`).
+                let (a, d) = self.unfolded.by_axiom[&index];
+                let (not_a, d) = (self.e(ClassExpr::Not(a)), self.nnf(d));
+                self.gci(Vec::new(), vec![Item::Expr(not_a), Item::Expr(d)], index);
+            }
             Axiom::EquivalentClasses(xs) => {
                 for pair in xs.windows(2) {
                     self.sub(pair[0], pair[1], index);

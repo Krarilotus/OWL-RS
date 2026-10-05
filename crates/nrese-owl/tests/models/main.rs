@@ -704,6 +704,8 @@ fn clauses_and_ontologies_have_the_same_models() {
             &o,
             Options {
                 expand_at_most_up_to: if case % 2 == 0 { 2 } else { 0 },
+                // The clauses' models are the ontology's: not so when read one way.
+                lazy_definitions: false,
             },
         );
         assert!(

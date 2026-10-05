@@ -8,6 +8,7 @@
 //! store or an engine.
 
 pub mod clauses;
+mod definitions;
 pub mod diagnostics;
 pub mod functional;
 pub mod fuzz;
