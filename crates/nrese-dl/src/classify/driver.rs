@@ -107,6 +107,7 @@ impl<'a> Driver<'a> {
                 self.options.threads,
                 self.deadline
                     .budget(self.options, Some(self.options.lower_bound_timeout)),
+                self.options.lower_bound_strategy,
             ) {
                 if lower.inconsistent {
                     return self.inconsistent();

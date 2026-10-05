@@ -191,6 +191,14 @@ fn variants() -> Vec<(&'static str, Options)> {
             },
         ),
         (
+            "split-lower-bound",
+            Options {
+                context_core: false,
+                lower_bound_strategy: nrese_dl::context::Strategy::Split,
+                ..base.clone()
+            },
+        ),
+        (
             "no-reuse-model",
             Options {
                 context_core: false,

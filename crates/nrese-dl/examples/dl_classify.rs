@@ -12,6 +12,8 @@
 //!   --lower-bound-timeout SECS  the Horn lower bound's budget
 //!   --repeat N            run N times; times are the median of the runs
 //!   --expand-at-most N    spell `≤ n` out as clauses up to this `n` (else at-most atoms)
+//!   --split-lower-bound   the lower bound's context core with Strategy::Split
+//!   --max-join N          the most conclusions one context-core join may make
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
 //!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
 //!   --no-skip-seen --no-tbox-only --no-detached-probes --no-reuse-model
@@ -211,6 +213,10 @@ fn args() -> Result<Args, String> {
             "--no-detached-probes" => a.options.detached_probes = false,
             "--no-reuse-model" => a.options.reuse_model = false,
             "--clauses" => a.clauses = true,
+            "--split-lower-bound" => {
+                a.options.lower_bound_strategy = nrese_dl::context::Strategy::Split;
+            }
+            "--max-join" => a.options.max_join = number("--max-join")? as usize,
             "--expand-at-most" => {
                 let n = number("--expand-at-most")? as u32;
                 a.options.normalise.expand_at_most_up_to = n;
