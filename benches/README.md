@@ -69,6 +69,20 @@ benches/
 | [probes](probes/README.md) | one property at a time | one script each | stdout | — |
 | [cluster](cluster/README.md) | the suite on Draco | `suite.sbatch` | the job's directory | record in `runs/` |
 
+## Lab tools
+
+Single measurements and diagnoses outside the kits, run with
+`scripts/cargo-guarded.sh run --release -p <crate> --example <name> -- …` (each file's
+header says how). `benches/probes/` has the HTTP-level probes.
+
+| Area | Examples |
+|---|---|
+| Store, load, restart | `nrese-store`: `perf_lab` (the perf lab), `restart`, `reason_query`, `support_sets`, `vector_search`; `nrese-engine`: `insert_latency`, `image` (a store image in the current format); `nrese-rdf-io`: `parse_parallel` (why a parallel load rejects a file) |
+| Rule reasoning | `nrese-reasoner`: `v2_closure` (closures for the oracle), `v2_delta` (commit latency against rematerialisation), `graph_sets`, `classify` (EL, against ELK) |
+| DL | `nrese-dl`: `tableau_consistency` (per-phase times, search counters), `context_classify`, `bounds_eval` (the L and U1 bounds), `tableau_fuzz`; `nrese-owl`: `fuzz` (random OWL 2 DL ontologies), `ofn_speed` (the functional-syntax reader's speed gate) |
+| Studies kept for open targets | `nrese-engine`'s ignored tests `compression_study` and `vocabulary_study` (store-size options, P2 in [performance.md](../docs/design/performance.md) §6) |
+| Office PC | `scripts/office/`: dataset preparation (`dbpedia.sh`, `wikidata.sh`) and the perf lab there (`perflab.sh`) |
+
 ## A run, step by step
 
 ```text
