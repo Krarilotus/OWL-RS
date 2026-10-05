@@ -10,13 +10,17 @@
 mod datatype;
 mod line;
 mod rational;
+mod regular;
 mod set;
 pub mod text;
+mod texts;
 mod value;
 mod xml;
 
 pub use datatype::{Datatype, Facet};
 pub use line::{Cut, Line, Segment};
 pub use rational::{NumberError, Rational};
+pub use regular::PatternError;
 pub use set::{Count, ValueSet, facet};
+pub use texts::MAX_PATTERNS;
 pub use value::{LiteralError, Value};

@@ -152,6 +152,7 @@ dependencies = [
 name = "nrese-xsd"
 version = "0.1.0"
 dependencies = [
+ "regex-syntax",
  "thiserror",
 ]
 
@@ -358,6 +359,12 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom",
 ]
+
+[[package]]
+name = "regex-syntax"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "ryu-js"

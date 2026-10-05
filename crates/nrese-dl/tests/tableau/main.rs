@@ -338,6 +338,34 @@ fn disjoint_data_properties_compare_values() {
     assert_eq!(answer(&b.o), Answer::Inconsistent);
 }
 
+/// The W3C test "Inconsistent String Pattern with Disjoint Dataproperties": `a(b|c)` has
+/// two strings, and both are taken by the disjoint property; with one taken, the other
+/// is left.
+#[test]
+fn patterns_count_their_strings() {
+    for (taken, expected) in [
+        (&["ab", "ac"][..], Answer::Inconsistent),
+        (&["ab"][..], Answer::Consistent),
+    ] {
+        let mut b = Build::default();
+        b.axiom(Axiom::DisjointDataProperties(vec![400, 401]));
+        for s in taken {
+            let l = b.literal(s, "string");
+            b.axiom(Axiom::DataPropertyAssertion(400, 100, l));
+        }
+        let string = b.term(Some("http://www.w3.org/2001/XMLSchema#string".into()));
+        let facet = b.term(Some("http://www.w3.org/2001/XMLSchema#pattern".into()));
+        let pattern = b.literal("a(b|c)", "string");
+        let range = b.range(nrese_owl::DataRange::Restriction(
+            string,
+            vec![(facet, pattern)],
+        ));
+        let some = b.e(ClassExpr::DataSome(401, range));
+        b.assert(some, 100);
+        assert_eq!(answer(&b.o), expected, "{taken:?}");
+    }
+}
+
 /// Cardinalities against the values a range has: 256 bytes, but not 257.
 #[test]
 fn data_cardinalities_count_values() {
