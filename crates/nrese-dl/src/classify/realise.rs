@@ -17,7 +17,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
-use nrese_owl::{Axiom, ClassExpr, EntityKind, Ontology, Term, normalise_with};
+use nrese_owl::{Axiom, ClassExpr, EntityKind, Ontology, Term};
 use rayon::prelude::*;
 
 use super::driver::{insert_sorted, intersect_opt, reason, union_into};
@@ -90,7 +90,7 @@ pub fn realise(ontology: &Ontology, options: &Options) -> Realisation {
     }
     let t = Instant::now();
     let prepared = tableau::prepared(ontology);
-    let normalised = normalise_with(&prepared, options.normalise);
+    let (normalised, _) = super::clauses(&prepared, options);
     let classes = &taxonomy.classification.classes;
     let program = Prepared::new(&prepared, &normalised, classes, &individuals);
     let mut work = Work::new(&taxonomy.classification, &individuals, options, deadline);

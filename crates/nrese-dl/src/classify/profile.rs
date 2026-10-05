@@ -12,6 +12,8 @@ pub struct Profile {
     /// `context-core` (the Horn stage took the ontology) or `tableau`.
     pub path: &'static str,
     pub normalise: Duration,
+    /// The fresh names eliminated before the engines ran.
+    pub inlined: super::inline::Inlined,
     /// The hypertableau programs' compilation.
     pub compile: Duration,
     /// The Horn part's saturation (or, on the context-core path, all of it).
@@ -27,6 +29,10 @@ pub struct Profile {
     pub classes: usize,
     /// Whether the tests ran without the individuals.
     pub tbox_only: bool,
+    /// The Horn part's taxonomy was exact: no hypertableau test of a class.
+    pub exact: bool,
+    /// Which engine decided consistency (`context-core`, `tableau`).
+    pub consistency_by: &'static str,
     /// Subsumptions and unsatisfiable classes the Horn part proved.
     pub lower_known: usize,
     pub lower_unsat: usize,
@@ -67,7 +73,7 @@ impl Profile {
             s,
             "path={} normalise={:.1} compile={:.1} lower_bound={:.1} consistency={:.1} \
              satisfiability={:.1} top={:.1} subsumption={:.1} realisation={:.1} total={:.1} \
-             threads={} classes={} tbox_only={} lower_known={} lower_unsat={} tests={} \
+             threads={} classes={} eliminated={} flipped={} wide={}->{} tbox_only={} exact={} consistency_by={} lower_known={} lower_unsat={} tests={} \
              sat_tests={} sat_skipped={} labels_seen={} candidates={} candidate_tests={} \
              positive={} pruned={} type_candidates={} type_tests={} type_positive={} \
              nodes_created={} branch_points={} clashes={}",
@@ -83,7 +89,13 @@ impl Profile {
             ms(self.total),
             self.threads,
             self.classes,
+            self.inlined.eliminated,
+            self.inlined.flipped,
+            self.inlined.wide_before,
+            self.inlined.wide_after,
             self.tbox_only,
+            self.exact,
+            self.consistency_by,
             self.lower_known,
             self.lower_unsat,
             self.tests,

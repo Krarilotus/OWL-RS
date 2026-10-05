@@ -141,6 +141,30 @@ fn variants() -> Vec<(&'static str, Options)> {
             },
         ),
         (
+            "no-inline",
+            Options {
+                inline: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "no-inline-tableau",
+            Options {
+                inline: false,
+                context_core: false,
+                exact_lower_bound: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "no-exact-shortcut",
+            Options {
+                context_core: false,
+                exact_lower_bound: false,
+                ..base.clone()
+            },
+        ),
+        (
             "no-lower-bound",
             Options {
                 context_core: false,
@@ -152,6 +176,7 @@ fn variants() -> Vec<(&'static str, Options)> {
             "no-model-pruning",
             Options {
                 context_core: false,
+                exact_lower_bound: false,
                 model_pruning: false,
                 ..base.clone()
             },
@@ -160,6 +185,7 @@ fn variants() -> Vec<(&'static str, Options)> {
             "no-skip-seen",
             Options {
                 context_core: false,
+                exact_lower_bound: false,
                 skip_seen: false,
                 ..base.clone()
             },
@@ -168,6 +194,7 @@ fn variants() -> Vec<(&'static str, Options)> {
             "no-tbox-only",
             Options {
                 context_core: false,
+                exact_lower_bound: false,
                 tbox_only: false,
                 ..base.clone()
             },
@@ -176,6 +203,7 @@ fn variants() -> Vec<(&'static str, Options)> {
             "parallel",
             Options {
                 context_core: false,
+                exact_lower_bound: false,
                 threads: 3,
                 ..base
             },
