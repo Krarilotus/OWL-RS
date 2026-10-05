@@ -22,6 +22,10 @@ pub enum ReasoningMode {
     /// The OWL 2 RL/RDF rules: inferences materialised into the inferred stack, and
     /// consistency violations reject the commits that cause them.
     Owl2Rl,
+    /// OWL 2 DL (docs/design/owl2-dl.md §8): the OWL 2 RL closure is materialised as the
+    /// lower bound, and the store adds the DL engines: consistency of every commit, the
+    /// upper bound, and a completeness status on every answer (`nrese-store`'s `dl`).
+    Owl2Dl,
     /// The user's rules only ([`ReasonerConfig::rules`]); any other mode adds them to its
     /// ruleset.
     Custom,
@@ -47,6 +51,7 @@ impl ReasoningMode {
             Self::OwlHorst => "owl-horst",
             Self::Owl2Ql => "owl2-ql",
             Self::Owl2Rl => "owl2-rl",
+            Self::Owl2Dl => "owl2-dl",
             Self::Custom => "custom",
         }
     }
@@ -60,8 +65,13 @@ impl ReasoningMode {
             Self::RdfsPlus => Some(Ruleset::RdfsPlus),
             Self::OwlHorst => Some(Ruleset::OwlHorst),
             Self::Owl2Ql => Some(Ruleset::Owl2Ql),
-            Self::Owl2Rl => Some(Ruleset::Owl2Rl),
+            Self::Owl2Rl | Self::Owl2Dl => Some(Ruleset::Owl2Rl),
         }
+    }
+
+    /// Whether the store reasons under OWL 2 DL on top of the materialised ruleset.
+    pub const fn is_dl(self) -> bool {
+        matches!(self, Self::Owl2Dl)
     }
 
     /// The mode that materialises `ruleset`.
@@ -76,7 +86,7 @@ impl ReasoningMode {
     pub fn from_name(name: &str) -> Option<Self> {
         std::iter::once(Self::Disabled)
             .chain(Self::REASONING)
-            .chain(std::iter::once(Self::Custom))
+            .chain([Self::Owl2Dl, Self::Custom])
             .find(|mode| mode.as_str() == name)
     }
 }

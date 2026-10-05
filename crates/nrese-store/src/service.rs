@@ -53,6 +53,8 @@ pub struct StoreService {
     running: std::sync::Arc<crate::running::RunningQueries>,
     /// Inferred statements under graph access ([`crate::support`]).
     supports: std::sync::Arc<crate::support::Supports>,
+    /// The `owl2-dl` mode's state ([`crate::dl`]).
+    dl: std::sync::Arc<crate::dl::Dl>,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -115,6 +117,7 @@ impl StoreService {
             sessions: std::sync::Arc::default(),
             running: std::sync::Arc::default(),
             supports: std::sync::Arc::default(),
+            dl: std::sync::Arc::default(),
             config,
             engine,
             preloaded_ontology,
@@ -364,6 +367,17 @@ impl StoreService {
     /// its own.
     pub fn use_reasoning_rules(&self, rules: Option<nrese_reasoner::RuleProgram>) {
         self.supports.use_rules(rules);
+    }
+
+    /// Switches the `owl2-dl` mode's work on or off ([`crate::dl`]): the mutation
+    /// pipeline running the reasoner's `owl2-dl` mode registers it.
+    pub fn use_dl(&self, active: bool) {
+        self.dl.set_active(active);
+    }
+
+    /// The `owl2-dl` mode's state.
+    pub fn dl(&self) -> &crate::dl::Dl {
+        &self.dl
     }
 
     pub fn execute_query(
