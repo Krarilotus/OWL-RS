@@ -39,6 +39,6 @@ pub use classify::{
     Classification, Options, Saturated, classify, saturate, saturate_normalised, signature,
 };
 pub use compile::Unsupported;
-pub use engine::Strategy;
+pub use engine::{Budget, Strategy};
 pub use profile::Profile;
 pub use state::ClauseRef;
