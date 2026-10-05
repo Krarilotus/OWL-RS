@@ -410,6 +410,8 @@ class Suite:
         command = [self.harness(), "query-mix", "--endpoint", endpoint.query, "--queries", str(plan.queries),
                    "--label", key, "--warmup", "1", "--runs", str(self.args.query_runs),
                    "--timeout-s", str(self.args.query_timeout_s), "--report-json", str(report)]
+        if plan.clients:
+            command += ["--clients", str(plan.clients), "--duration-s", str(plan.duration_s)]
         if self.args.order == "shuffled":
             seed = self.args.seed * 1000 + run
             command += ["--order", "shuffled", "--seed", str(seed)]
@@ -420,10 +422,20 @@ class Suite:
         if self.args.dry_run:
             return
         try:
-            queries = json.loads(report.read_text(encoding="utf-8"))["queries"]
+            mix = json.loads(report.read_text(encoding="utf-8"))
+            queries = mix["queries"]
         except (OSError, ValueError, KeyError) as e:
             self.emit(base, task="query", item="*", status="failed", note=f"no query report: {e}")
             return
+        throughput = mix.get("throughput")
+        if throughput:
+            # Concurrent clients: the slowest query's p99 as the time, completed queries as rows.
+            p99 = max((q["p99_ms"] for q in throughput["per_query"] if q.get("p99_ms") is not None), default=None)
+            self.emit(base, task="query", item=f"clients-{throughput['clients']}", repeat=1,
+                      status="ok" if not throughput["errors"] else "failed", ms=p99 if p99 is not None else "",
+                      rows=throughput["completed"],
+                      note=f"{throughput['queries_per_s']:.1f} queries/s; {throughput['errors']} errors; "
+                           f"time = the slowest query's p99")
         for q in queries:
             if q.get("error"):
                 timeout = "timed out" in q["error"].lower() or "timeout" in q["error"].lower()

@@ -304,6 +304,22 @@ tiers = ["-"]
 state = "planned"
 check = "answers against the single-store run"
 
+# --- the fast suite -----------------------------------------------------------------------
+
+[fast]
+title = "The fast suite's cases on their comparators: each case under the semantics a system supports"
+kind = "performance"
+tasks = ["basics", "RT1", "RT3"]
+needs = ["load", "query"]
+scales = "generated, 10-300 s per case (benches/fast/cases.toml)"
+source = "benches/fast: perf_lab generate (deterministic, seeded) and the reasoning kit's LUBM and OWL2Bench"
+licence = "ours; LUBM GPL-2.0 (generator), OWL2Bench queries CC-BY-4.0"
+tiers = ["q-cycles~plain", "rl-hierarchy~closure", "rl-clique"]
+state = "partial"
+kit = "benches/fast"
+check = "the generator's own answers and pinned counts (fast.py run); answer counts across systems"
+note = "Tier = CASE~SEMANTICS (benches/fast/compete.py prepares the data in the volume nrese-fast-data). NRESE runs every case in benches/fast/fast.py; this workload is the comparison"
+
 # --- the consumers ---------------------------------------------------------------------------
 
 [clients]

@@ -289,7 +289,8 @@ class Nrese(Adapter):
     regimes = {"none": "disabled", "rdfs": "rdfs", "owl-horst": "owl-horst",
                "owl2-rl": "owl2-rl", "owl2-ql": "owl2-ql"}
     runtimes = {"docker", "apptainer", "process"}
-    target_volume = "nrese-target"  # the Docker build's output, mounted at /target
+    # The Docker build's output, mounted at /target (NRESE_TARGET_VOLUME: a worktree's own).
+    target_volume = os.environ.get("NRESE_TARGET_VOLUME", "nrese-target")
     bin_setting = "NRESE_BIN"
 
     def source(self, ctx: Context) -> Path:
