@@ -4,7 +4,7 @@
 
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
-use nrese_sparql::{QueryOptions, explain_query};
+use nrese_sparql::{PlanStep, QueryOptions, explain_query};
 use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.org/";
@@ -54,8 +54,8 @@ fn engine() -> Engine {
     engine
 }
 
-/// The operators `query` ran with.
-fn operators(engine: &Engine, query: &str) -> Vec<String> {
+/// How `query` ran: every operator with its estimated and actual rows.
+fn steps(engine: &Engine, query: &str) -> Vec<PlanStep> {
     let text = format!("PREFIX e: <{EX}> {query}");
     let query = SparqlParser::new()
         .parse_query(&text)
@@ -63,6 +63,11 @@ fn operators(engine: &Engine, query: &str) -> Vec<String> {
     explain_query(&engine.snapshot(), &query, &QueryOptions::default())
         .unwrap()
         .steps
+}
+
+/// The operators `query` ran with.
+fn operators(engine: &Engine, query: &str) -> Vec<String> {
+    steps(engine, query)
         .into_iter()
         .map(|s| s.operator)
         .collect()
@@ -135,4 +140,101 @@ fn string_filters_test_the_dictionary() {
         "SELECT ?s WHERE { ?s e:label ?l FILTER(CONTAINS(?l, \"number 12\")) }",
         "dictionary string test",
     );
+}
+
+/// Sideways information passing: a pattern joined to rows already computed is evaluated
+/// from them, probing the index per row (Zebratlas Q03: about 1,200x).
+#[test]
+fn patterns_joined_to_rows_are_evaluated_from_them() {
+    let steps = steps(
+        &engine(),
+        "SELECT * WHERE { VALUES ?s { e:n1 e:n2 } ?s e:knows ?o . ?o e:label ?l }",
+    );
+    let sideways = steps.iter().find(|s| s.operator == "sideways");
+    assert!(
+        sideways.is_some_and(|s| s.rows == 6 && s.detail.contains("from 2 rows")),
+        "{steps:#?}"
+    );
+}
+
+/// LIMIT pushdown: a LIMIT without ORDER BY stops the pattern's joins once it has enough
+/// rows (Wikidata q04, LIMIT 100 k: 3,380 -> 21 ms).
+#[test]
+fn limits_stop_the_joins_early() {
+    let steps = steps(
+        &engine(),
+        "SELECT * WHERE { ?s e:knows ?o . ?o e:label ?l } LIMIT 5",
+    );
+    let limit = steps.iter().find(|s| s.operator == "limit pushdown");
+    // 1,024 rows of the first pattern in the first morsel, not all 3,000 or 9,000.
+    assert!(
+        limit.is_some_and(|s| s.detail.contains("1 morsel(s), 1024 of")),
+        "{steps:#?}"
+    );
+}
+
+/// Closures by components: `p+` and `p*` through strongly connected components; `COUNT`
+/// of a closure from the components' sizes (YAGO q08: 11,432 -> 24 ms).
+#[test]
+fn closures_run_by_components() {
+    let steps = steps(
+        &engine(),
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:knows+ ?b }",
+    );
+    assert!(steps.iter().any(|s| s.operator == "closure"), "{steps:#?}");
+}
+
+/// EXISTS as sets: the pattern evaluated once and semi- or anti-joined in place
+/// (DBpedia q13: 25 -> 3.1 ms).
+#[test]
+fn exists_runs_once_as_a_set() {
+    let engine = engine();
+    let not = operators(
+        &engine,
+        "SELECT ?s WHERE { ?s e:kind e:k1 FILTER NOT EXISTS { ?s e:knows e:n5 } }",
+    );
+    assert!(not.iter().any(|o| o == "anti join"), "{not:?}");
+    let exists = operators(
+        &engine,
+        "SELECT ?s WHERE { ?s e:kind e:k1 FILTER EXISTS { ?s e:knows ?o } }",
+    );
+    assert!(exists.iter().any(|o| o == "semi join"), "{exists:?}");
+}
+
+/// EXPLAIN shows every operator's estimated rows beside its actual ones (the merge
+/// checklist's item): the operators the query names and those inside them.
+#[test]
+fn explain_estimates_every_operator() {
+    let engine = engine();
+    for query in [
+        "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s e:kind ?k } GROUP BY ?k",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind ?k FILTER NOT EXISTS { ?s e:label ?l } }",
+        "SELECT * WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:knows ?a }",
+        "SELECT ?s WHERE { ?s e:label ?l FILTER(CONTAINS(?l, \"number 12\")) }",
+        "SELECT * WHERE { VALUES ?s { e:n1 e:n2 } ?s e:knows ?o . ?o e:label ?l }",
+        "SELECT * WHERE { ?s e:knows ?o . ?o e:label ?l } LIMIT 5",
+        "SELECT * WHERE { ?s e:label ?l } LIMIT 5",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:knows+ ?b }",
+        "SELECT ?s WHERE { ?s e:kind e:k1 FILTER NOT EXISTS { ?s e:knows e:n5 } }",
+        "SELECT ?s WHERE { ?s e:kind e:k1 FILTER EXISTS { ?s e:knows ?o } }",
+        "SELECT ?s ?o WHERE { ?s e:kind e:k1 OPTIONAL { ?s e:knows ?o FILTER(?o != e:n3) } }",
+        "SELECT * WHERE { { ?s e:kind e:k1 } UNION { ?s e:kind e:k2 } MINUS { ?s e:knows e:n9 } }",
+        "SELECT DISTINCT ?k WHERE { ?s e:kind ?k BIND(STR(?k) AS ?t) } ORDER BY ?t LIMIT 3",
+        "SELECT * WHERE { ?s e:kind e:k3 . ?s e:knows/e:knows ?f }",
+        "SELECT * WHERE { e:n1 e:knows+ ?f . ?f e:kind e:k2 }",
+        "SELECT ?k (AVG(STRLEN(?l)) AS ?m) WHERE { ?s e:kind ?k . ?s e:knows ?o . ?o e:label ?l } GROUP BY ?k",
+        "SELECT * WHERE { ?s e:kind e:k1 { SELECT ?s (COUNT(*) AS ?n) WHERE { ?s e:knows ?o } GROUP BY ?s } }",
+        "SELECT * WHERE { GRAPH ?g { ?s e:kind ?k } }",
+    ] {
+        let steps = steps(&engine, query);
+        let missing: Vec<&PlanStep> = steps
+            .iter()
+            .filter(|s| s.estimated_rows.is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{query}
+{missing:#?}"
+        );
+    }
 }
