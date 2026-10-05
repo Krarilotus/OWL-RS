@@ -23,7 +23,9 @@
 //! taxonomy format) and a [`Realisation`] in the reference runner's format; both report
 //! whether they are complete and, if not, why.
 
+mod consistency;
 mod driver;
+pub mod inline;
 pub mod known;
 mod profile;
 pub mod realise;
@@ -45,11 +47,17 @@ pub struct Options {
     pub threads: usize,
     /// Classify Horn ontologies with the context core (else the tableau driver only).
     pub context_core: bool,
+    /// Eliminate the fresh names resolution can eliminate ([`inline`]).
+    pub inline: bool,
     /// Known subsumers from the context core on the Horn part of a non-Horn ontology.
     pub horn_lower_bound: bool,
+    /// Where that part is exact (nothing left out but data clauses no value needs), take
+    /// its taxonomy without testing a class (else the hypertableau checks every class).
+    pub exact_lower_bound: bool,
     /// Cut possible subsumers by every model's labels (else only the class's own model).
     pub model_pruning: bool,
-    /// A class seen in a model needs no satisfiability test of its own.
+    /// A class seen in a model needs no satisfiability test of its own where it has no
+    /// candidates left (else every class gets one).
     pub skip_seen: bool,
     /// Classify without the individuals where they can't matter (no nominals): their
     /// consistency is checked once, then the tests run on the terminology alone.
@@ -58,6 +66,10 @@ pub struct Options {
     pub tableau: tableau::Config,
     /// A deadline for the whole classification; what isn't decided by then is reported.
     pub timeout: Option<Duration>,
+    /// The longest the Horn lower bound may take (it is only an optimisation).
+    pub lower_bound_timeout: Duration,
+    /// The most conclusions one join of the context core may produce, per run.
+    pub max_join: usize,
     /// How `nrese-owl` normalises.
     pub normalise: nrese_owl::Options,
 }
@@ -67,7 +79,9 @@ impl Default for Options {
         Self {
             threads: 1,
             context_core: true,
+            inline: true,
             horn_lower_bound: true,
+            exact_lower_bound: true,
             model_pruning: true,
             skip_seen: true,
             tbox_only: true,
@@ -76,6 +90,8 @@ impl Default for Options {
                 ..tableau::Config::default()
             },
             timeout: None,
+            lower_bound_timeout: Duration::from_secs(2),
+            max_join: 1 << 20,
             normalise: nrese_owl::Options::default(),
         }
     }
@@ -110,6 +126,23 @@ impl Deadline {
         self.0.is_some_and(|d| Instant::now() >= d)
     }
 
+    /// The context core's budget within the deadline (and `limit` from now, if given).
+    pub(crate) fn budget(
+        &self,
+        options: &Options,
+        limit: Option<Duration>,
+    ) -> crate::context::Budget {
+        let limit = limit.map(|l| Instant::now() + l);
+        let deadline = match (self.0, limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        crate::context::Budget {
+            deadline,
+            max_join: Some(options.max_join),
+        }
+    }
+
     /// The tableau's per-test configuration within the deadline.
     pub(crate) fn config(&self, base: &tableau::Config) -> tableau::Config {
         let mut c = base.clone();
@@ -118,6 +151,19 @@ impl Deadline {
             c.timeout = Some(c.timeout.map_or(left, |t| t.min(left)));
         }
         c
+    }
+}
+
+/// With `NRESE_CLASSIFY_TRACE` set, the phases as they start, on stderr (for the lab).
+pub(crate) fn trace(what: &str) {
+    static ON: std::sync::OnceLock<Option<Instant>> = std::sync::OnceLock::new();
+    if let Some(start) =
+        ON.get_or_init(|| std::env::var_os("NRESE_CLASSIFY_TRACE").map(|_| Instant::now()))
+    {
+        eprintln!(
+            "trace {:>9.1} ms {what}",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
     }
 }
 
@@ -137,18 +183,28 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
     let started = Instant::now();
     let deadline = Deadline::new(options.timeout);
     let classes = crate::context::signature(ontology);
+    let t = Instant::now();
+    let ontology = tableau::prepared(ontology);
+    trace("normalise");
+    let (normalised, inlined) = clauses(&ontology, options);
+    let normalise = t.elapsed();
+    trace("context core");
     if options.context_core {
         let core = crate::context::Options {
             threads: options.threads,
             proofs: false,
             normalise: options.normalise,
+            budget: deadline.budget(options, None),
             ..crate::context::Options::default()
         };
-        if let Ok((classification, p)) = crate::context::classify(ontology, &core) {
+        let t = Instant::now();
+        if let Ok(saturated) = crate::context::saturate_normalised(&normalised, &classes, &core) {
+            let classification = saturated.classification();
             let profile = Profile {
                 path: "context-core",
-                normalise: p.normalise,
-                lower_bound: p.compile + p.saturate + p.assemble,
+                normalise,
+                inlined,
+                lower_bound: t.elapsed(),
                 classes: classes.len(),
                 total: started.elapsed(),
                 threads: options.threads,
@@ -161,14 +217,23 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
             };
         }
     }
-    let t = Instant::now();
-    let ontology = tableau::prepared(ontology);
-    let normalised = normalise_with(&ontology, options.normalise);
-    let normalise = t.elapsed();
+    trace("driver");
     let mut taxonomy = classify_normalised(&ontology, &normalised, &classes, options, deadline);
     taxonomy.profile.normalise += normalise;
+    taxonomy.profile.inlined = inlined;
     taxonomy.profile.total = started.elapsed();
     taxonomy
+}
+
+/// The clauses the engines get: `nrese-owl`'s normalisation of `ontology` (prepared),
+/// with the fresh names eliminated that can be ([`inline`]).
+pub(crate) fn clauses(ontology: &Ontology, options: &Options) -> (Normalised, inline::Inlined) {
+    let normalised = normalise_with(ontology, options.normalise);
+    if options.inline {
+        inline::eliminate(&normalised)
+    } else {
+        (normalised, inline::Inlined::default())
+    }
 }
 
 /// Classifies `normalised` (of `ontology`, prepared) over `classes` with the tableau driver.

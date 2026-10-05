@@ -22,6 +22,7 @@ use std::time::Instant;
 use nrese_owl::{Normalised, Ontology, Term};
 use rayon::prelude::*;
 
+use super::consistency::{self, Verdict};
 use super::known::{self, Lower};
 use super::{Classification, Deadline, Options, Profile, Taxonomy, with_pool};
 use crate::tableau::{Answer, At, Labels, Prepared, Probe, ProbeOutcome, Want};
@@ -89,70 +90,93 @@ impl<'a> Driver<'a> {
 
     pub(crate) fn classify(mut self) -> Taxonomy {
         let started = Instant::now();
-        let full = Prepared::new(self.ontology, self.normalised, self.classes, &[]);
-        self.profile.compile += full.compile_time();
-        // 1. Consistency.
-        let t = Instant::now();
-        let out = full.probe(
-            &Probe {
-                at: At::Nothing,
-                positive: &[],
-                negative: &[],
-            },
-            &self.config(),
-            Want {
-                elements: self.options.model_pruning,
-                individuals: false,
-            },
-        );
-        self.profile.consistency = t.elapsed();
-        self.profile.tests += 1;
-        match &out.answer {
-            Answer::Inconsistent => return self.inconsistent(),
-            Answer::Consistent => {}
-            other => self.incomplete.push(format!(
-                "consistency not decided ({}): {}",
-                other.class(),
-                reason(other)
-            )),
-        }
-        if let Some(labels) = &out.labels {
-            self.observe(labels, None);
-        }
-        let tbox;
-        let tests =
-            if self.options.tbox_only && !full.features().nominals && has_facts(self.normalised) {
-                let mut terminology = self.normalised.clone();
-                terminology.facts = Default::default();
-                tbox = Prepared::new(self.ontology, &terminology, self.classes, &[]);
-                self.profile.compile += tbox.compile_time();
-                self.profile.tbox_only = true;
-                &tbox
-            } else {
-                &full
-            };
-        // Known subsumers from the Horn part.
+        super::trace("lower bound");
+        // Known subsumers from the Horn part (perhaps all of them).
+        let mut exact = false;
+        let mut lower_top = Vec::new();
         if self.options.horn_lower_bound {
             let t = Instant::now();
-            if let Some(lower) =
-                known::horn_lower_bound(self.normalised, self.classes, self.options.threads)
-            {
+            if let Some(lower) = known::horn_lower_bound(
+                self.normalised,
+                self.classes,
+                self.options.threads,
+                self.deadline
+                    .budget(self.options, Some(self.options.lower_bound_timeout)),
+            ) {
+                if lower.inconsistent {
+                    return self.inconsistent();
+                }
+                exact = lower.exact && self.options.exact_lower_bound;
+                lower_top.clone_from(&lower.top);
                 self.apply_lower(&lower);
             }
             self.profile.lower_bound = t.elapsed();
         }
-        // 2. Satisfiability.
+        super::trace("consistency");
+        // 1. Consistency: the context core where it can, else the hypertableau.
         let t = Instant::now();
-        self.satisfiability(tests);
-        self.profile.satisfiability = t.elapsed();
-        // 3. owl:Thing.
-        let t = Instant::now();
-        let top = self.top(tests);
-        self.profile.top = t.elapsed();
-        // 4. Subsumption tests.
-        let t = Instant::now();
-        let subsumers = self.subsumptions(tests, &top);
-        self.profile.subsumption = t.elapsed();
+        let by_core = if self.options.context_core {
+            consistency::by_context_core(
+                self.ontology,
+                self.normalised,
+                self.classes,
+                &self.config(),
+                self.options.threads,
+                self.deadline.budget(self.options, None),
+            )
+        } else {
+            None
+        };
+        let mut full = None;
+        match by_core {
+            Some(Verdict::Inconsistent) => return self.inconsistent(),
+            Some(Verdict::Consistent) => self.profile.consistency_by = "context-core",
+            None => {
+                let program = Prepared::new(self.ontology, self.normalised, self.classes, &[]);
+                self.profile.compile += program.compile_time();
+                let out = program.probe(
+                    &Probe {
+                        at: At::Nothing,
+                        positive: &[],
+                        negative: &[],
+                    },
+                    &self.config(),
+                    Want {
+                        elements: self.options.model_pruning && !exact,
+                        individuals: false,
+                    },
+                );
+                self.profile.tests += 1;
+                self.profile.consistency_by = "tableau";
+                match &out.answer {
+                    Answer::Inconsistent => return self.inconsistent(),
+                    Answer::Consistent => {}
+                    other => self.incomplete.push(format!(
+                        "consistency not decided ({}): {}",
+                        other.class(),
+                        reason(other)
+                    )),
+                }
+                if let Some(labels) = &out.labels {
+                    self.observe(labels, None);
+                }
+                full = Some(program);
+            }
+        }
+        self.profile.consistency = t.elapsed();
+        let (subsumers, top) = if exact {
+            // The Horn part's taxonomy is the terminology's, and the individuals can't
+            // change it (no nominals in an exact part).
+            self.profile.exact = true;
+            for s in &mut self.status {
+                if *s == Status::Open {
+                    *s = Status::Sat;
+                }
+            }
+            (self.known.clone(), lower_top)
+        } else {
+            self.tableau_phases(full)
+        };
         let mut c = Classification {
             classes: self.classes.to_vec(),
             consistent: true,
@@ -200,6 +224,45 @@ impl<'a> Driver<'a> {
             incomplete: self.incomplete,
             profile: self.profile,
         }
+    }
+
+    /// Phases 2 to 4 on the hypertableau: the subsumers of each class and `owl:Thing`'s.
+    fn tableau_phases(&mut self, full: Option<Prepared>) -> (Vec<Vec<u32>>, Vec<u32>) {
+        super::trace("tableau programs");
+        let has_nominals = |p: &Prepared| p.features().nominals;
+        let full = full.unwrap_or_else(|| {
+            let p = Prepared::new(self.ontology, self.normalised, self.classes, &[]);
+            self.profile.compile += p.compile_time();
+            p
+        });
+        let tbox;
+        let tests = if self.options.tbox_only && !has_nominals(&full) && has_facts(self.normalised)
+        {
+            let mut terminology = self.normalised.clone();
+            terminology.facts = Default::default();
+            tbox = Prepared::new(self.ontology, &terminology, self.classes, &[]);
+            self.profile.compile += tbox.compile_time();
+            self.profile.tbox_only = true;
+            &tbox
+        } else {
+            &full
+        };
+        // 2. Satisfiability.
+        super::trace("satisfiability");
+        let t = Instant::now();
+        self.satisfiability(tests);
+        self.profile.satisfiability = t.elapsed();
+        // 3. owl:Thing.
+        super::trace("owl:Thing");
+        let t = Instant::now();
+        let top = self.top(tests);
+        self.profile.top = t.elapsed();
+        // 4. Subsumption tests.
+        super::trace("subsumption tests");
+        let t = Instant::now();
+        let subsumers = self.subsumptions(tests, &top);
+        self.profile.subsumption = t.elapsed();
+        (subsumers, top)
     }
 
     fn inconsistent(self) -> Taxonomy {
@@ -272,10 +335,14 @@ impl<'a> Driver<'a> {
             while at < order.len() && batch.len() < wave {
                 let c = order[at];
                 at += 1;
-                let seen = self.possible[c as usize].is_some();
                 match self.status[c as usize] {
                     Status::Open => batch.push(c),
-                    Status::Sat if seen && !self.options.skip_seen => batch.push(c),
+                    // Seen in a model: satisfiable. Its own model still pays where it has
+                    // candidates left: one test for its known subsumers instead of one
+                    // per candidate.
+                    Status::Sat if !self.options.skip_seen || self.has_candidates(c) => {
+                        batch.push(c);
+                    }
                     _ => {}
                 }
             }
@@ -320,6 +387,15 @@ impl<'a> Driver<'a> {
             }
         }
         self.profile.sat_skipped = n - self.profile.sat_tests as usize;
+    }
+
+    /// Whether `c` has possible subsumers that aren't known.
+    fn has_candidates(&self, c: u32) -> bool {
+        let known = &self.known[c as usize];
+        self.possible[c as usize].as_ref().is_some_and(|p| {
+            p.iter()
+                .any(|&d| d != c && known.binary_search(&d).is_err())
+        })
     }
 
     /// The classes equivalent to `owl:Thing`.
