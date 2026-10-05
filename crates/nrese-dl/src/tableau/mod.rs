@@ -42,7 +42,7 @@ use nrese_owl::{Concept, Normalised, Ontology, Options, Term, normalise_with};
 
 pub use model::Model;
 pub use portfolio::Cancel;
-pub use probe::{At, Label, Labels, Prepared, Probe, ProbeOutcome, Want};
+pub use probe::{At, Base, From, Label, Labels, Prepared, Probe, ProbeOutcome, Want};
 pub use telemetry::Telemetry;
 
 use engine::Engine;

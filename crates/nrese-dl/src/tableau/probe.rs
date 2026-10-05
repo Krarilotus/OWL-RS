@@ -168,6 +168,14 @@ impl Prepared {
     /// Runs `probe`; a model's labels as `want` asks.
     pub fn probe(&self, probe: &Probe<'_>, config: &Config, want: Want) -> ProbeOutcome {
         let started = Instant::now();
+        let seed = self.seed(probe);
+        let mut engine = Engine::new(&self.program, config);
+        let end = engine.run(&seed);
+        self.outcome(&mut engine, end, want, started)
+    }
+
+    /// The engine's test for `probe`.
+    fn seed(&self, probe: &Probe<'_>) -> Seed {
         let site = match probe.at {
             At::Nothing => Site::Nothing,
             At::Fresh => Site::Fresh,
@@ -176,7 +184,7 @@ impl Prepared {
                 p => Site::Individual(p),
             },
         };
-        let seed = Seed {
+        Seed {
             site,
             positive: probe
                 .positive
@@ -188,13 +196,20 @@ impl Prepared {
                 .iter()
                 .map(|&c| self.concept_of[c as usize])
                 .collect(),
-        };
-        let mut engine = Engine::new(&self.program, config);
-        let end = engine.run(&seed);
+        }
+    }
+
+    /// A run's answer, telemetry and labels.
+    fn outcome(
+        &self,
+        engine: &mut Engine<'_>,
+        end: End,
+        want: Want,
+        started: Instant,
+    ) -> ProbeOutcome {
         let model = end == End::Model;
-        let answer = answer_of(end, &self.program, &engine);
-        let labels =
-            (answer == Answer::Consistent && model).then(|| self.labels(&mut engine, want));
+        let answer = answer_of(end, &self.program, engine);
+        let labels = (answer == Answer::Consistent && model).then(|| self.labels(engine, want));
         let mut telemetry = engine.stats.clone();
         telemetry.total = started.elapsed();
         ProbeOutcome {
@@ -204,6 +219,24 @@ impl Prepared {
         }
     }
 
+    /// The base of probes on this program's individuals ([`Base`]); `None` where the
+    /// program has none, or their consistency isn't a model (refuted, out of budget).
+    pub fn base<'p>(&'p self, config: &'p Config) -> Option<Base<'p>> {
+        if self.program.individuals.is_empty() {
+            return None;
+        }
+        let mut engine = Engine::new(&self.program, config);
+        engine.init(&Seed::none()).ok()?;
+        engine.saturate().ok()?;
+        let deterministic = engine.clone();
+        let end = engine.search(None);
+        let model = (end == End::Model).then_some(engine);
+        Some(Base {
+            prepared: self,
+            deterministic,
+            model,
+        })
+    }
     /// The labels of the model `engine` ended in.
     fn labels(&self, engine: &mut Engine<'_>, want: Want) -> Labels {
         engine.recompute_blocking();
@@ -315,5 +348,56 @@ impl Prepared {
         label.known.sort_unstable();
         label.known.dedup();
         label
+    }
+}
+
+/// Completion-graph reuse for probes on a program with individuals (Steigmiller's thesis,
+/// §7.1: Det-C, and the model of the consistency test as a base): the individuals' part is
+/// built once, and each probe starts from a copy.
+///
+/// - **From the model** of the individuals: the probe's concepts are added and the search
+///   goes on above the model's choices ([`Engine::floor`]). A refutation that depends on
+///   none of them stands (the probe's concepts and the deterministic facts hold in every
+///   branch); a model is a model. Where a clash would undo a choice of the base, the run
+///   stops and the probe goes on:
+/// - **from the deterministic state:** the assertions saturated before any choice, a
+///   complete search from there.
+pub struct Base<'p> {
+    prepared: &'p Prepared,
+    deterministic: Engine<'p>,
+    model: Option<Engine<'p>>,
+}
+
+/// How a probe from a base was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum From {
+    Model,
+    Deterministic,
+}
+
+impl Base<'_> {
+    /// Runs `probe` from the base (its configuration is the base's).
+    pub fn probe(&self, probe: &Probe<'_>, want: Want) -> (ProbeOutcome, From) {
+        let started = Instant::now();
+        let seed = self.prepared.seed(probe);
+        fn fresh<'q>(base: &Engine<'q>) -> Engine<'q> {
+            let mut engine = base.clone();
+            engine.started = Instant::now();
+            engine.stats = Telemetry::default();
+            engine
+        }
+        if let Some(model) = &self.model {
+            let mut engine = fresh(model);
+            engine.floor = engine.frames.len() as u32;
+            let end = engine.resume(&seed);
+            if end != End::GaveUp(super::search::FLOOR.into()) {
+                let out = self.prepared.outcome(&mut engine, end, want, started);
+                return (out, From::Model);
+            }
+        }
+        let mut engine = fresh(&self.deterministic);
+        let end = engine.resume(&seed);
+        let out = self.prepared.outcome(&mut engine, end, want, started);
+        (out, From::Deterministic)
     }
 }

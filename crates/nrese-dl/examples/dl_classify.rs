@@ -14,7 +14,7 @@
 //!   --expand-at-most N    spell `≤ n` out as clauses up to this `n` (else at-most atoms)
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
 //!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
-//!   --no-skip-seen --no-tbox-only --no-detached-probes
+//!   --no-skip-seen --no-tbox-only --no-detached-probes --no-reuse-model
 //!                         switch an optimisation off (the taxonomy must not change)
 //! ```
 //!
@@ -209,6 +209,7 @@ fn args() -> Result<Args, String> {
             "--no-skip-seen" => a.options.skip_seen = false,
             "--no-tbox-only" => a.options.tbox_only = false,
             "--no-detached-probes" => a.options.detached_probes = false,
+            "--no-reuse-model" => a.options.reuse_model = false,
             "--clauses" => a.clauses = true,
             "--expand-at-most" => {
                 let n = number("--expand-at-most")? as u32;
