@@ -122,7 +122,24 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
         "rewrites": explanation.rewrites,
         "rows": explanation.rows,
         "micros": explanation.micros,
+        "ql": ql_json(explanation.ql.as_ref()),
         "steps": steps,
+    })
+}
+
+/// What the OWL 2 QL rewriting did and whether the answers are complete (`null` where it
+/// doesn't apply).
+fn ql_json(report: Option<&nrese_sparql::ql::QlReport>) -> serde_json::Value {
+    report.map_or(serde_json::Value::Null, |r| {
+        serde_json::json!({
+            "completeness": r.completeness.as_str(),
+            "reasons": r.completeness.reasons(),
+            "patterns": r.patterns,
+            "witnesses": r.witnesses,
+            "branches": r.branches,
+            "atoms": r.atoms,
+            "limits": r.limits,
+        })
     })
 }
 
@@ -145,6 +162,7 @@ fn plan_json(planned: &nrese_store::PlannedQuery) -> serde_json::Value {
     serde_json::json!({
         "executor": "native",
         "rewrites": planned.rewrites,
+        "ql": ql_json(planned.ql.as_ref()),
         "steps": steps,
     })
 }

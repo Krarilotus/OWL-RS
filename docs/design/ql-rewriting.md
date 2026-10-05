@@ -104,10 +104,20 @@ without existential variables and without affected class atoms is unchanged too.
 
 ## 5. Limits
 
-Tree witnesses can be exponential in the query. Per basic graph pattern: at most 16
-existential variables, 64 tree witnesses, 256 branches, and 4,096 triple patterns in the
-rewriting (guard `rewritings_stay_within_their_bounds`). Over a limit the pattern runs
-unrewritten (sound, perhaps incomplete), and EXPLAIN shows `ql-limit`.
+Tree witnesses can be exponential in the query: k independent ones give 2^k branches.
+- **Implied witnesses go first.** A witness with one root, where another atom states the
+  root to be a class that generates it, holds in every model: its atoms are dropped
+  before branching (Ontop's CQ subsumption, ISWC 2013 §2.1). On NPD a star of 47
+  existential arms on `ExplorationWellbore` becomes its class atom (0.6 ms).
+- **Bounds.** Per basic graph pattern: at most 16 existential variables, 64 tree
+  witnesses, 256 branches, and 4,096 triple patterns in the rewriting (guard
+  `rewritings_stay_within_their_bounds`). Over a bound the pattern runs as written, and
+  the answer says it may be incomplete (§7). On NPD the same arms without the class atom
+  hit the size bound at k = 8, the branch bound at k = 9 and 12, the variable bound at
+  k = 17 and 47, each within 0.7 ms.
+- **Reported.** EXPLAIN (`explain=true` and `explain=plan`) gives `ql`: the patterns
+  rewritten, their witnesses, branches and triple patterns, the bounds reached, and the
+  completeness.
 
 ## 6. Evidence
 
@@ -126,4 +136,12 @@ unrewritten (sound, perhaps incomplete), and EXPLAIN shows `ql-limit`.
   two inconsistencies the `owl2-ql` ruleset doesn't detect), 2 import other ontologies. No
   conclusion of the suite goes through an anonymous individual, so the suite checks that
   the rewriting breaks nothing; the differential test checks what it adds.
+- NPD (Lanti et al., EDBT 2015; ontology and queries at a pinned commit,
+  `benches/reasoning/prepare-npd.sh`): 10 of its 31 queries are rewritten, each with one
+  tree witness, 2 branches and 4–17 triple patterns; none comes near a bound. Ontop's
+  5,000-subquery rewritings of NPD come from unfolding through mappings and hierarchies,
+  which the closure makes unnecessary here; its 73 rewriting branches for q6 don't arise,
+  because each of q6's blank nodes touches a projected variable. NPD's data is relational
+  (a MySQL dump and R2RML mappings) and no longer published as RDF: query times on it are
+  the next measurement.
 - Measured cost and answers gained: performance.md §6.

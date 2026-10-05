@@ -144,7 +144,7 @@ pub(crate) fn evaluate<'a>(
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
     let ctx = Context::new(&snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, form, _) = native_pattern(query, options, &ctx)?;
+    let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
     let pattern = match &options.pre_bound {
         Some(values) => {
             // A blank node is put in as an alias IRI that stands for the node.
@@ -197,9 +197,9 @@ pub(crate) fn explain(
     snapshot: &Snapshot,
     query: &Query,
     options: &QueryOptions,
-) -> Result<(Vec<&'static str>, Vec<PlanStep>, u64), QueryEvaluationError> {
+) -> Result<ExplainParts, QueryEvaluationError> {
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, form, rewrites) = native_pattern(query, options, &ctx)?;
+    let (pattern, form, rewrites, ql) = native_pattern(query, options, &ctx)?;
     ctx.trace = Some(RefCell::default());
     let solutions = ctx.eval(&pattern)?;
     let steps = ctx.trace.take().unwrap_or_default().into_inner();
@@ -211,7 +211,7 @@ pub(crate) fn explain(
             construct(snapshot, ctx.computed.into_inner(), solutions, template).count()
         }
     };
-    Ok((rewrites, steps, rows as u64))
+    Ok((rewrites, steps, rows as u64, ql))
 }
 
 /// The plan `query` would run as, after the rewrites, with estimated rows per node
@@ -220,12 +220,41 @@ pub(crate) fn plan(
     snapshot: &Snapshot,
     query: &Query,
     options: &QueryOptions,
-) -> Result<(Vec<&'static str>, Vec<crate::query::PlannedStep>), QueryEvaluationError> {
+) -> Result<PlanParts, QueryEvaluationError> {
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, _, rewrites) = native_pattern(query, options, &ctx)?;
+    let (pattern, _, rewrites, ql) = native_pattern(query, options, &ctx)?;
     let mut steps = Vec::new();
     ctx.estimate_plan(&crate::plan::Plan::of(&pattern), 0, &mut steps);
-    Ok((rewrites, steps))
+    Ok((rewrites, steps, ql))
+}
+
+/// The rewrites, the steps with their rows, the rows, and what the QL rewriting did.
+type ExplainParts = (
+    Vec<&'static str>,
+    Vec<PlanStep>,
+    u64,
+    Option<crate::ql::QlReport>,
+);
+
+/// The rewrites, the planned steps, and what the QL rewriting did.
+type PlanParts = (
+    Vec<&'static str>,
+    Vec<crate::query::PlannedStep>,
+    Option<crate::ql::QlReport>,
+);
+
+/// What the QL rewriting does to `query` (`None` where it doesn't apply), without
+/// running it: the status that goes with its answers.
+pub(crate) fn ql_report(
+    snapshot: &Snapshot,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<Option<crate::ql::QlReport>, QueryEvaluationError> {
+    if ql_rewriting(query, options).is_none() {
+        return Ok(None);
+    }
+    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    Ok(native_pattern(query, options, &ctx)?.3)
 }
 
 pub use output::ResultsFormat;
@@ -242,7 +271,7 @@ pub(crate) fn write_results(
     out: &mut dyn std::io::Write,
 ) -> Option<Result<(), crate::query::WriteResultsError>> {
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, form, _) = match native_pattern(query, options, &ctx) {
+    let (pattern, form, _, _) = match native_pattern(query, options, &ctx) {
         Ok(native) => native,
         Err(error) => return Some(Err(error.into())),
     };
@@ -393,13 +422,22 @@ enum Form<'q> {
     Describe,
 }
 
+/// A query as the executor runs it: its pattern, its form, the rewrites that changed it,
+/// and what the QL rewriting did.
+type NativePattern<'q> = (
+    GraphPattern,
+    Form<'q>,
+    Vec<&'static str>,
+    Option<crate::ql::QlReport>,
+);
+
 /// The pattern of a query the native executor runs, as it runs it ([`optimise`]), the
 /// query form, and the rewrites that changed it.
 fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
     ctx: &Context<'_>,
-) -> Result<(GraphPattern, Form<'q>, Vec<&'static str>), QueryEvaluationError> {
+) -> Result<NativePattern<'q>, QueryEvaluationError> {
     let (pattern, form) = match query {
         Query::Select { pattern, .. } => (pattern, Form::Select),
         Query::Ask { pattern, .. } => (pattern, Form::Ask),
@@ -421,10 +459,12 @@ fn native_pattern<'q>(
     // OWL 2 QL answers through existentials, before the optimiser, also as written: it
     // changes the answers, not just the plan.
     let rewritten_ql;
+    let active = ql_rewriting(query, options);
     // A schema with nothing to rewrite leaves the query alone, unread.
-    let ql = ql_rewriting(query, options)
+    let ql = active
         .map(|ql| (ql, ql.tbox(&ctx.snapshot)))
         .filter(|(_, tbox)| !tbox.is_empty());
+    let mut ql_report = active.map(|_| crate::ql::QlReport::default());
     let pattern = match ql {
         Some((ql, tbox)) => {
             let (needed, set) = match &form {
@@ -442,12 +482,13 @@ fn native_pattern<'q>(
             };
             let (out, report) =
                 ql::rewrite_query(pattern, &tbox, &ctx.snapshot, ql.limits(), needed, set);
-            if report.rewritten {
+            if report.patterns > 0 {
                 rewrites.push("ql-tree-witness");
             }
-            if report.limited {
+            if !report.limits.is_empty() {
                 rewrites.push("ql-limit");
             }
+            ql_report = Some(report);
             rewritten_ql = out;
             &rewritten_ql
         }
@@ -479,7 +520,7 @@ fn native_pattern<'q>(
         }
         _ => pattern,
     };
-    Ok((pattern, form, rewrites))
+    Ok((pattern, form, rewrites, ql_report))
 }
 
 /// The QL rewriting, if it applies to `query`: on, and the query reads the inferred

@@ -279,6 +279,18 @@ fn explain(store: &StoreService, text: &str) {
         });
     match explained {
         Ok(explanation) => {
+            if let Some(ql) = &explanation.ql {
+                println!(
+                    "    ql: {} patterns, {} witnesses, {} branches, {} atoms, limits {:?}, {} {:?}",
+                    ql.patterns,
+                    ql.witnesses,
+                    ql.branches,
+                    ql.atoms,
+                    ql.limits,
+                    ql.completeness.as_str(),
+                    ql.completeness.reasons()
+                );
+            }
             for step in &explanation.steps {
                 let mut detail = step.detail.clone();
                 if detail.len() > 90 {
