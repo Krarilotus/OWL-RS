@@ -60,6 +60,7 @@ fn touched(tx: &nrese_engine::Transaction<'_>) -> Vec<nrese_reasoner::ir::Triple
 impl MutationPipeline {
     pub fn new(store: Arc<StoreService>, reasoner: Arc<ReasonerService>) -> Self {
         store.use_reasoning_rules(reasoner.config().materialised_program());
+        store.use_dl(reasoner.config().mode().is_dl());
         Self {
             store,
             reasoner,
