@@ -7,7 +7,8 @@
 //!   `NRESE_W3C_OWL_TESTS` points to; skipped without it unless `NRESE_W3C_REQUIRED`.
 //! - Documents are read with their `owl:imports` closure, from the documents the suite
 //!   gives for import (`test:importedOntologyIRI`); an import it doesn't give is
-//!   `not-run`.
+//!   `not-run`. A role without an RDF/XML document is read from its functional-syntax
+//!   one (`nrese_owl::read_functional`).
 //! - `NRESE_W3C_SWITCHES` (`no-disjunct-learning`, `full-blocking`, comma-separated)
 //!   switches optimisations off, for A/B runs.
 //! - Every test ends as `pass`, `wrong`, or not decided with the reason (`unsupported`,
@@ -70,6 +71,8 @@ struct Case {
     types: Vec<String>,
     /// By role: `Premise`, `Conclusion`, `NonConclusion`, `Input`.
     documents: HashMap<String, String>,
+    /// The same roles' functional-syntax documents.
+    functional: HashMap<String, String>,
     /// `test:importedOntologyIRI`, of an imported document.
     iri: Option<String>,
     /// Every document the suite gives for import, by ontology IRI (`test:importedOntology`
@@ -217,22 +220,23 @@ fn fragment(f: &Features) -> String {
     s
 }
 
+/// The ontology of a case's document of one of `roles` (the first it has): from RDF/XML,
+/// else from the functional syntax; `None` if it has none.
+fn document(case: &Case, roles: &[&str], table: &mut Table) -> Option<Result<Ontology, String>> {
+    if let Some(text) = roles.iter().find_map(|r| case.documents.get(*r)) {
+        return Some(table.ontology(text, &case.imports));
+    }
+    let text = roles.iter().find_map(|r| case.functional.get(*r))?;
+    Some(table.functional(text))
+}
+
 fn run_case(case: &Case, kind: &str) -> (Verdict, Features) {
     let mut features = Features::default();
     let mut table = Table::default();
-    let premise_text = case
-        .documents
-        .get("Premise")
-        .or_else(|| case.documents.get("Input"));
-    let Some(premise_text) = premise_text else {
-        return (
-            Verdict::Open("not-run: no RDF/XML premise".into()),
-            features,
-        );
-    };
-    let premise = match table.ontology(premise_text, &case.imports) {
-        Ok(o) => o,
-        Err(why) => return (Verdict::Open(format!("not-run: {why}")), features),
+    let premise = match document(case, &["Premise", "Input"], &mut table) {
+        None => return (Verdict::Open("not-run: no premise".into()), features),
+        Some(Err(why)) => return (Verdict::Open(format!("not-run: {why}")), features),
+        Some(Ok(o)) => o,
     };
     if std::env::var_os("NRESE_W3C_DUMP").is_some() {
         for a in &premise.axioms {
@@ -273,15 +277,10 @@ fn run_case(case: &Case, kind: &str) -> (Verdict, Features) {
             } else {
                 "NonConclusion"
             };
-            let Some(text) = case.documents.get(role) else {
-                return (
-                    Verdict::Open(format!("not-run: no RDF/XML {role}")),
-                    features,
-                );
-            };
-            let conclusion = match table.ontology(text, &case.imports) {
-                Ok(o) => o,
-                Err(why) => return (Verdict::Open(format!("not-run: {why}")), features),
+            let conclusion = match document(case, &[role], &mut table) {
+                None => return (Verdict::Open(format!("not-run: no {role}")), features),
+                Some(Err(why)) => return (Verdict::Open(format!("not-run: {why}")), features),
+                Some(Ok(o)) => o,
             };
             match entailed(&premise, &conclusion, &table, &mut features) {
                 Ok(e) if e == positive => Verdict::Pass,
@@ -330,9 +329,16 @@ fn read_cases(text: &str) -> Vec<Case> {
                     local
                         .strip_prefix("rdfXml")
                         .and_then(|r| r.strip_suffix("Ontology")),
-                    value,
+                    value.clone(),
                 ) {
                     case.documents.insert(role.to_owned(), text);
+                } else if let (Some(role), Some(text)) = (
+                    local
+                        .strip_prefix("fs")
+                        .and_then(|r| r.strip_suffix("Ontology")),
+                    value,
+                ) {
+                    case.functional.insert(role.to_owned(), text);
                 }
             }
         }
