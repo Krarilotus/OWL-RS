@@ -399,6 +399,17 @@ fn heap_profile(phases: Vec<nrese_exec::heap::Phase>) {
             mib(after)
         );
     }
+    eprintln!("heap profile by round (MiB requested): phase, peak, live after");
+    let mut round = 0;
+    for phase in &phases {
+        round += usize::from(phase.label == "reasoner: grounding");
+        eprintln!(
+            "  {round:>2} {:<28} {:>10.1} {:>10.1}",
+            phase.label,
+            mib(phase.peak),
+            mib(phase.live_after)
+        );
+    }
     let top = phases
         .iter()
         .max_by_key(|phase| phase.peak)
@@ -529,12 +540,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         nrese_exec::heap::start("store: compile");
         let started = Instant::now();
-        let report = store.rematerialise(ruleset)?;
+        // The process's memory while it reasons, read every 20 ms: the peak counter of
+        // the OS also holds the load's.
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let (report, sampled) = std::thread::scope(|scope| {
+            let sampler = scope.spawn(|| {
+                let mut peak = 0;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    peak = peak.max(nrese_exec::memory::process_bytes().unwrap_or(0));
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                peak
+            });
+            let report = store.rematerialise(ruleset);
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            (report, sampler.join().expect("the sampler ends"))
+        });
+        let report = report?;
         eprintln!(
             "reasoned ({}): {} inferred in {:.2} s",
             ruleset.name(),
             report.inferred,
             started.elapsed().as_secs_f64()
+        );
+        eprintln!(
+            "reasoning: process memory peak {} MiB (sampled)",
+            sampled / 1048576
         );
         heap_profile(nrese_exec::heap::finish());
     }

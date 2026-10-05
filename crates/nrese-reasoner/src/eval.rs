@@ -737,15 +737,19 @@ pub struct Probes {
     pub unordered: std::sync::atomic::AtomicU64,
 }
 
-/// [`run_jobs`], counting its probes into `probes` (once per morsel).
-pub fn run_jobs_counted<S: Source + ?Sized>(
+/// [`run_jobs`] by morsel: each morsel's facts, sorted by (predicate, subject, object) and
+/// distinct, are handed to `finish`, and its results come back in the morsels' order,
+/// not concatenated (a caller that regroups them needs no copy of all of them). Counts
+/// the probes into `probes` (once per morsel).
+pub fn run_jobs_by_morsel<S: Source + ?Sized, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
     keep: &(dyn Fn(Triple) -> bool + Sync),
     stop: Stop<'_>,
     probes: &Probes,
-) -> Vec<Triple> {
-    run_jobs_with(source, jobs, keep, false, stop, Some(probes))
+    finish: &(dyn Fn(Vec<Triple>) -> T + Sync),
+) -> Vec<T> {
+    run_morsels(source, jobs, keep, false, stop, Some(probes), finish)
 }
 
 /// [`run_jobs`] without circular derivations: those whose head is one of their own
@@ -769,6 +773,18 @@ fn run_jobs_with<S: Source + ?Sized>(
     stop: Stop<'_>,
     probes: Option<&Probes>,
 ) -> Vec<Triple> {
+    run_morsels(source, jobs, keep, acyclic, stop, probes, &|facts| facts).concat()
+}
+
+fn run_morsels<S: Source + ?Sized, T: Send>(
+    source: &S,
+    jobs: &[Job<'_>],
+    keep: &(dyn Fn(Triple) -> bool + Sync),
+    acyclic: bool,
+    stop: Stop<'_>,
+    probes: Option<&Probes>,
+    finish: &(dyn Fn(Vec<Triple>) -> T + Sync),
+) -> Vec<T> {
     let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
         .iter()
         .enumerate()
@@ -783,10 +799,10 @@ fn run_jobs_with<S: Source + ?Sized>(
         .map(|(j, range)| {
             let job = &jobs[*j];
             let Head::Facts(heads) = &job.rule.head else {
-                return Vec::new();
+                return finish(Vec::new());
             };
             if stop() {
-                return Vec::new();
+                return finish(Vec::new());
             }
             let mut out = Vec::new();
             job.run(source, range.clone(), &mut |bindings| {
@@ -821,9 +837,8 @@ fn run_jobs_with<S: Source + ?Sized>(
                 probes.probes.fetch_add(asked, Relaxed);
                 probes.unordered.fetch_add(unordered, Relaxed);
             }
-            out
+            finish(out)
         })
-        .flatten()
         .collect()
 }
 
