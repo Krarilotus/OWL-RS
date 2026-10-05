@@ -425,6 +425,64 @@ impl PackedKeys {
         }
     }
 
+    /// Packs `len` sorted keys that `gather` produces a block at a time (it appends the
+    /// keys at the positions of the range it is given), in parallel, without holding
+    /// them all: a permutation derived through positions ([`super::derive`]). Each block
+    /// is gathered twice, once for its header and once to pack it.
+    pub(crate) fn from_sorted_gathered(
+        len: usize,
+        gather: impl Fn(std::ops::Range<usize>, &mut Vec<Key>) + Sync,
+    ) -> Self {
+        let encoding = current_encoding();
+        let blocks = len.div_ceil(BLOCK);
+        let range = |b: usize| b * BLOCK..((b + 1) * BLOCK).min(len);
+        let block_of = |b: usize, keys: &mut Vec<Key>| {
+            keys.clear();
+            gather(range(b), keys);
+            debug_assert!(keys.is_sorted(), "keys must be sorted");
+        };
+        let (mut headers, firsts): (Vec<Header>, Vec<Key>) = (0..blocks)
+            .into_par_iter()
+            .map_init(
+                || Vec::with_capacity(BLOCK),
+                |keys, b| {
+                    block_of(b, keys);
+                    (Header::of(keys, encoding), keys[0])
+                },
+            )
+            .unzip();
+        let mut words = 0;
+        for (b, header) in headers.iter_mut().enumerate() {
+            header.offset = words as u64;
+            words += header.words(range(b).len());
+        }
+        let mut data = vec![0u64; words + 1];
+        let mut slices: Vec<&mut [u64]> = Vec::with_capacity(blocks);
+        let mut rest = data.as_mut_slice();
+        for (b, header) in headers.iter().enumerate() {
+            let (bits, tail) = rest.split_at_mut(header.words(range(b).len()));
+            slices.push(bits);
+            rest = tail;
+        }
+        slices
+            .into_par_iter()
+            .zip(headers.par_iter())
+            .enumerate()
+            .for_each_init(
+                || Vec::with_capacity(BLOCK),
+                |keys, (b, (bits, header))| {
+                    block_of(b, keys);
+                    header.pack(keys, bits);
+                },
+            );
+        Self {
+            len,
+            headers: Storage::Owned(headers.into_boxed_slice()),
+            firsts: Storage::Owned(firsts.into_boxed_slice()),
+            data: Storage::Owned(data.into_boxed_slice()),
+        }
+    }
+
     /// Packs keys arriving in sorted order (a merged scan), without holding them all.
     pub(crate) fn from_sorted_iter(keys: impl Iterator<Item = Key>) -> Self {
         let mut packed = Self::default();

@@ -12,6 +12,7 @@
 use rayon::prelude::*;
 
 use super::Layout;
+use super::derive::Ordered;
 use super::keys::PackedKeys;
 use crate::quad::{EncodedQuad, Key, Permutation};
 
@@ -126,7 +127,7 @@ impl Run {
     /// replacement and checkpoint loading. O(n log n), parallel over permutations and within
     /// each sort.
     pub(crate) fn from_quads(layout: Layout, quads: Vec<EncodedQuad>) -> Self {
-        let mut builder = PermutationBuilder::new(quads);
+        let mut builder = PermutationBuilder::planned(quads, layout.permutations());
         let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
         for &permutation in layout.permutations() {
             perms[permutation as usize] = PermutationRun {
@@ -250,37 +251,135 @@ impl Run {
 }
 
 /// The packed permutations of a set of quads, one after another, from one array of keys,
-/// 32 bytes per quad, in the quads' place (the same size): each permutation in turn
-/// reorders the keys in place, sorts them and packs them. Building the permutations at
-/// once, or from copies, would hold several such arrays.
+/// 32 bytes per quad, in the quads' place (the same size). A permutation that is another's
+/// partitioned by a leading component with few values (PSOG from SPOG, POSG from OSPG,
+/// graph-first from graph-last) is derived by a stable counting partition of the keys'
+/// positions, 4 bytes each ([`super::derive`]); the others reorder the keys in place and
+/// sort them. Knowing
+/// the permutations it will be asked for ([`Self::planned`]), it sorts the ones the others
+/// derive from and derives those as soon as it can, keeping them packed until asked:
+/// default-graph quads take two sorts instead of four, quads in named graphs three
+/// instead of seven.
 pub(crate) struct PermutationBuilder {
     keys: Vec<Key>,
     /// The order the keys are in.
     order: Permutation,
+    /// The permutations still to be asked for and not built yet.
+    wanted: Vec<Permutation>,
+    /// Permutations built ahead of being asked for.
+    ready: Vec<(Permutation, PackedKeys)>,
 }
 
 impl PermutationBuilder {
-    /// For `quads`, in any order and with duplicates.
-    pub(crate) fn new(mut quads: Vec<EncodedQuad>) -> Self {
+    /// For `quads`, in any order and with duplicates, nothing planned: every permutation
+    /// asked for in the layout's order is sorted (the tests' oracle).
+    #[cfg(test)]
+    pub(crate) fn new(quads: Vec<EncodedQuad>) -> Self {
+        Self::planned(quads, &[])
+    }
+
+    /// For `quads`, to be asked for the permutations in `wanted`, in any order.
+    pub(crate) fn planned(mut quads: Vec<EncodedQuad>, wanted: &[Permutation]) -> Self {
         quads.par_sort_unstable();
         quads.dedup();
         Self {
             keys: quads.into_iter().map(EncodedQuad::components).collect(),
             order: Permutation::Spog,
+            wanted: wanted.to_vec(),
+            ready: Vec::new(),
         }
     }
 
     /// The quads' keys in `permutation`, packed.
     pub(crate) fn packed(&mut self, permutation: Permutation) -> PackedKeys {
-        if permutation != self.order {
-            let order = self.order;
-            self.keys.par_iter_mut().for_each(|key| {
-                *key = permutation.to_key(&order.key_to_quad(key));
-            });
-            self.keys.par_sort_unstable();
-            self.order = permutation;
+        self.wanted.retain(|&p| p != permutation);
+        if let Some(at) = self.ready.iter().position(|(p, _)| *p == permutation) {
+            return self.ready.swap_remove(at).1;
         }
-        PackedKeys::from_sorted(&self.keys)
+        if permutation == self.order {
+            let packed = PackedKeys::from_sorted(&self.keys);
+            self.derive_ahead();
+            return packed;
+        }
+        let own = Ordered {
+            keys: &self.keys,
+            base: self.order,
+            order: self.order,
+            positions: None,
+        };
+        if let Some(positions) = own.partitioned(permutation) {
+            let packed = self.ordered(permutation, &positions).packed();
+            self.derive_ahead_from(permutation, Some(&positions));
+            return packed;
+        }
+        // Sorted: a wanted permutation this one derives from, built ahead, else this one.
+        let source = self
+            .wanted
+            .iter()
+            .copied()
+            .find(|&source| super::derive::derivable(source, permutation).is_some())
+            .unwrap_or(permutation);
+        self.sort_into(source);
+        if source == permutation {
+            let packed = PackedKeys::from_sorted(&self.keys);
+            self.derive_ahead();
+            return packed;
+        }
+        self.wanted.retain(|&p| p != source);
+        self.ready
+            .push((source, PackedKeys::from_sorted(&self.keys)));
+        self.derive_ahead();
+        self.packed(permutation)
+    }
+
+    /// The keys visited in `order` through `positions`.
+    fn ordered<'k>(&'k self, order: Permutation, positions: &'k [u32]) -> Ordered<'k> {
+        Ordered {
+            keys: &self.keys,
+            base: self.order,
+            order,
+            positions: Some(positions),
+        }
+    }
+
+    /// Reorders the keys into `permutation` and sorts them.
+    fn sort_into(&mut self, permutation: Permutation) {
+        let order = self.order;
+        self.keys.par_iter_mut().for_each(|key| {
+            *key = permutation.to_key(&order.key_to_quad(key));
+        });
+        self.keys.par_sort_unstable();
+        self.order = permutation;
+    }
+
+    /// Builds the wanted permutations derivable from the keys as they are.
+    fn derive_ahead(&mut self) {
+        self.derive_ahead_from(self.order, None);
+    }
+
+    /// Builds the wanted permutations derivable from the keys visited in `order` through
+    /// `positions` (`None`: as they are), and those derivable from them in turn.
+    fn derive_ahead_from(&mut self, order: Permutation, positions: Option<&[u32]>) {
+        let derivable: Vec<Permutation> = self
+            .wanted
+            .iter()
+            .copied()
+            .filter(|&p| super::derive::derivable(order, p).is_some())
+            .collect();
+        for permutation in derivable {
+            let from = Ordered {
+                keys: &self.keys,
+                base: self.order,
+                order,
+                positions,
+            };
+            if let Some(derived) = from.partitioned(permutation) {
+                let packed = self.ordered(permutation, &derived).packed();
+                self.wanted.retain(|&p| p != permutation);
+                self.ready.push((permutation, packed));
+                self.derive_ahead_from(permutation, Some(&derived));
+            }
+        }
     }
 }
 
