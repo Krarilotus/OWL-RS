@@ -4,10 +4,10 @@
 //!
 //! Only fragments whose canonical form doesn't depend on what this leaves out are decided:
 //! elements, attributes, text, character and the predefined entity references, CDATA
-//! sections, and namespace declarations each used by the element they are on. Comments,
-//! processing instructions, document type declarations, other entities, namespace
-//! declarations an element doesn't use itself and prefixes declared outside the
-//! fragment give `None`: the caller doesn't know the value.
+//! sections, and namespace declarations (rendered where visibly used, as exclusive
+//! canonicalisation does). Comments, processing instructions, document type declarations,
+//! other entities and prefixes declared outside the fragment give `None`: the caller
+//! doesn't know the value.
 
 /// The canonical form of the fragment `text`, if it is well-formed and decided here.
 pub fn canonical(text: &str) -> Option<String> {
@@ -16,6 +16,7 @@ pub fn canonical(text: &str) -> Option<String> {
         at: 0,
         out: String::new(),
         scopes: Vec::new(),
+        rendered: Vec::new(),
     };
     p.content(None)?;
     (p.at == p.s.len()).then_some(p.out)
@@ -27,6 +28,8 @@ struct Parser<'a> {
     out: String,
     /// Per open element: its namespace declarations (prefix, IRI).
     scopes: Vec<Vec<(String, String)>>,
+    /// Per open element: the declarations its canonical form renders.
+    rendered: Vec<Vec<(String, String)>>,
 }
 
 impl Parser<'_> {
@@ -213,9 +216,10 @@ impl Parser<'_> {
         } else {
             self.at += 1;
         }
-        // Exclusive canonicalisation keeps a declaration where it is visibly used and not
-        // already in force; only fragments where that is the declaration as written are
-        // decided.
+        // Exclusive canonicalisation renders a declaration on each element that visibly
+        // uses its prefix (in its name or an attribute's), unless an output ancestor
+        // already rendered the same; declarations nothing uses are left out.
+        self.scopes.push(declarations);
         let prefix_of = |qname: &str| qname.split_once(':').map_or("", |(p, _)| p).to_owned();
         let mut used = vec![prefix_of(&name)];
         for (a, _) in &attributes {
@@ -223,16 +227,21 @@ impl Parser<'_> {
                 used.push(prefix_of(a));
             }
         }
-        for (prefix, iri) in &declarations {
-            let inherited = self.lookup(prefix);
-            if !used.contains(prefix) || inherited.as_deref() == Some(iri.as_str()) {
-                return None;
-            }
-        }
-        self.scopes.push(declarations.clone());
-        for prefix in &used {
-            if !prefix.is_empty() && prefix != "xml" && self.lookup(prefix).is_none() {
-                return None;
+        used.sort();
+        used.dedup();
+        let mut rendered: Vec<(String, String)> = Vec::new();
+        for prefix in used.iter().filter(|p| *p != "xml") {
+            let iri = match self.lookup(prefix) {
+                Some(iri) => iri,
+                // An unprefixed name without a default namespace: none to render, but an
+                // ancestor's rendered default is undone.
+                None if prefix.is_empty() => String::new(),
+                // A prefix declared outside the fragment.
+                None => return None,
+            };
+            let before = self.rendered_value(prefix).unwrap_or_default();
+            if before != iri {
+                rendered.push((prefix.clone(), iri));
             }
         }
         // Attributes by namespace IRI, then local name (unqualified ones first).
@@ -245,10 +254,9 @@ impl Parser<'_> {
             keyed.push((ns, local, a, v));
         }
         keyed.sort();
-        declarations.sort();
         self.out.push('<');
         self.out.push_str(&name);
-        for (prefix, iri) in &declarations {
+        for (prefix, iri) in &rendered {
             self.out.push_str(if prefix.is_empty() {
                 " xmlns"
             } else {
@@ -259,6 +267,7 @@ impl Parser<'_> {
             self.escape_attribute(iri);
             self.out.push('"');
         }
+        self.rendered.push(rendered);
         for (_, _, a, v) in &keyed {
             self.out.push(' ');
             self.out.push_str(a);
@@ -274,7 +283,18 @@ impl Parser<'_> {
         self.out.push_str(&name);
         self.out.push('>');
         self.scopes.pop();
+        self.rendered.pop();
         Some(())
+    }
+
+    /// The value the nearest output ancestor rendered for `prefix`.
+    fn rendered_value(&self, prefix: &str) -> Option<String> {
+        self.rendered
+            .iter()
+            .rev()
+            .flat_map(|s| s.iter())
+            .find(|(p, _)| p == prefix)
+            .map(|(_, iri)| iri.clone())
     }
 
     fn lookup(&self, prefix: &str) -> Option<String> {
@@ -318,6 +338,43 @@ mod tests {
         assert_ne!(canonical("<b>Good!</b>"), canonical("<b>Bad!</b>"));
     }
 
+    /// Declarations move to where they are used (the W3C test FS2RDF-literals-ar's
+    /// literal): unused ones go, used ones render once per output path.
+    #[test]
+    fn declarations_render_where_used() {
+        let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+        let owl = "http://www.w3.org/2002/07/owl#";
+        let text = [
+            &format!("<rdf:RDF xmlns:ex=\"urn:ex\" xmlns:owl=\"{owl}\" xmlns:rdf=\"{rdf}\">"),
+            "<owl:Ontology></owl:Ontology><rdf:Description rdf:about=\"x\">",
+            "<owl:differentFrom rdf:resource=\"y\"/></rdf:Description></rdf:RDF>",
+        ]
+        .concat();
+        let expected = [
+            &format!("<rdf:RDF xmlns:rdf=\"{rdf}\">"),
+            &format!("<owl:Ontology xmlns:owl=\"{owl}\"></owl:Ontology>"),
+            "<rdf:Description rdf:about=\"x\">",
+            &format!("<owl:differentFrom xmlns:owl=\"{owl}\" rdf:resource=\"y\">"),
+            "</owl:differentFrom></rdf:Description></rdf:RDF>",
+        ]
+        .concat();
+        assert_eq!(canonical(&text).unwrap(), expected);
+        // The same declared where it is used: the same value.
+        let moved = [
+            &format!("<rdf:RDF xmlns:rdf=\"{rdf}\"><owl:Ontology xmlns:owl=\"{owl}\"/>"),
+            "<rdf:Description rdf:about=\"x\">",
+            &format!("<owl:differentFrom xmlns:owl=\"{owl}\" rdf:resource=\"y\"/>"),
+            "</rdf:Description></rdf:RDF>",
+        ]
+        .concat();
+        assert_eq!(canonical(&text), canonical(&moved));
+        // A default namespace undone below an element that rendered one.
+        assert_eq!(
+            canonical("<a xmlns=\"urn:x\"><b xmlns=\"\"/></a>").unwrap(),
+            "<a xmlns=\"urn:x\"><b xmlns=\"\"></b></a>"
+        );
+    }
+
     #[test]
     fn undecided_and_malformed_fragments() {
         for text in [
@@ -327,12 +384,15 @@ mod tests {
             "<a></b>",
             "&nbsp;",
             "<p:a/>",
-            "<a xmlns:p=\"urn:x\"/>",
             "<a x='1' x='2'/>",
         ] {
             assert_eq!(canonical(text), None, "{text}");
         }
         assert_eq!(canonical(""), Some(String::new()));
+        assert_eq!(
+            canonical("<a xmlns:p=\"urn:x\"/>"),
+            Some("<a></a>".to_owned())
+        );
         assert_eq!(canonical("plain"), Some("plain".to_owned()));
     }
 }
