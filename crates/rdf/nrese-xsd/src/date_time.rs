@@ -552,6 +552,13 @@ temporal!(
 );
 
 impl DateTime {
+    /// The instant (raw `Decimal` seconds since the epoch in UTC, a missing timezone read
+    /// as UTC) and the timezone in minutes: together what identifies the value (the OWL 2
+    /// datatype map's identity, `owl` module).
+    pub(crate) fn timeline(self) -> (i128, Option<i16>) {
+        (self.instant, self.timezone.map(|t| t.minutes))
+    }
+
     /// The current time, in UTC.
     pub fn now() -> Self {
         let since = std::time::SystemTime::now()

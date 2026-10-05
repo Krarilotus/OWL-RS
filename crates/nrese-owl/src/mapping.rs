@@ -10,12 +10,12 @@
 //! its use (a literal object makes it a data property), with a diagnostic. Blank nodes
 //! that build expressions are read once; one used by two expressions is reported.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::diagnostics::Diagnostic;
 use crate::model::{
-    Axiom, Characteristic, ClassExpr, DataRange, EntityKind, ExprId, Interner, ObjProp, RangeId,
-    Term, canonical,
+    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, EntityKind, ExprId, Interner, Literal,
+    ObjProp, RangeId, Term, canonical,
 };
 use crate::vocab::Vocabulary;
 
@@ -34,6 +34,23 @@ pub trait Terms {
     fn lexical(&self, term: Term) -> Option<String>;
     /// The id of an IRI, if the source has it.
     fn iri(&self, iri: &str) -> Option<Term>;
+
+    /// A literal's datatype IRI (`rdf:langString` for a language-tagged one), if the
+    /// source gives it: the datatype theory needs it for the literal's value.
+    fn datatype(&self, _term: Term) -> Option<String> {
+        None
+    }
+
+    /// A literal's language tag, if it has one and the source gives it.
+    fn language(&self, _term: Term) -> Option<String> {
+        None
+    }
+
+    /// The text of an IRI, if the source gives it (datatypes and facets beyond those the
+    /// vocabulary knows).
+    fn iri_text(&self, _term: Term) -> Option<String> {
+        None
+    }
 }
 
 /// A statement of the source: a triple and its graph.
@@ -66,6 +83,10 @@ pub struct Ontology {
     pub annotations: usize,
     /// The source's ids of the properties with a fixed meaning.
     pub builtin: BuiltinProperties,
+    /// The literals, datatypes and facets of the data axioms, as the source gives them.
+    pub data: DataTerms,
+    /// The individuals that are blank nodes (anonymous: keys don't apply to them).
+    pub anonymous: BTreeSet<Term>,
 }
 
 /// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
@@ -117,6 +138,88 @@ pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
     reader.declarations();
     reader.axioms();
     reader.finish()
+}
+
+/// The individuals an assertion is about.
+fn individuals(axiom: &Axiom) -> Vec<Term> {
+    match axiom {
+        Axiom::ClassAssertion(_, a)
+        | Axiom::DataPropertyAssertion(_, a, _)
+        | Axiom::NegativeDataPropertyAssertion(_, a, _) => vec![*a],
+        Axiom::ObjectPropertyAssertion(_, a, b)
+        | Axiom::NegativeObjectPropertyAssertion(_, a, b) => vec![*a, *b],
+        Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => xs.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// The literals and datatype and facet IRIs the ontology's data axioms and ranges use,
+/// with their parts as `terms` gives them.
+fn data_terms(o: &Ontology, terms: &dyn Terms) -> DataTerms {
+    let mut literals: BTreeSet<Term> = BTreeSet::new();
+    let mut iris: BTreeSet<Term> = BTreeSet::new();
+    for id in 0..o.ranges.len() as u32 {
+        match o.ranges.get(id) {
+            DataRange::Datatype(t) => {
+                iris.insert(*t);
+            }
+            DataRange::OneOf(xs) => literals.extend(xs),
+            DataRange::Restriction(t, facets) => {
+                iris.insert(*t);
+                for &(f, v) in facets {
+                    iris.insert(f);
+                    literals.insert(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    for id in 0..o.classes.len() as u32 {
+        if let ClassExpr::DataHasValue(_, v) = o.classes.get(id) {
+            literals.insert(*v);
+        }
+    }
+    for a in &o.axioms {
+        match a {
+            Axiom::DataPropertyAssertion(_, _, v)
+            | Axiom::NegativeDataPropertyAssertion(_, _, v) => {
+                literals.insert(*v);
+            }
+            Axiom::DatatypeDefinition(t, _) => {
+                iris.insert(*t);
+            }
+            _ => {}
+        }
+    }
+    // IRIs: as the source writes them, else those of the datatype map it has ids for.
+    let mut known: HashMap<Term, String> = HashMap::new();
+    for iri in crate::vocab::data_iris() {
+        if let Some(t) = terms.iri(&iri) {
+            known.insert(t, iri);
+        }
+    }
+    let mut out = DataTerms::default();
+    for t in literals {
+        if terms.kind(t) != TermKind::Literal {
+            continue;
+        }
+        if let Some(lexical) = terms.lexical(t) {
+            out.literals.insert(
+                t,
+                Literal {
+                    lexical,
+                    datatype: terms.datatype(t),
+                    language: terms.language(t),
+                },
+            );
+        }
+    }
+    for t in iris {
+        if let Some(iri) = terms.iri_text(t).or_else(|| known.get(&t).cloned()) {
+            out.iris.insert(t, iri);
+        }
+    }
+    out
 }
 
 struct Reader<'a> {
@@ -1157,7 +1260,16 @@ impl<'a> Reader<'a> {
             diagnostics: self.diagnostics,
             annotations: self.annotations,
             builtin: BuiltinProperties::of(&self.v),
+            data: DataTerms::default(),
+            anonymous: BTreeSet::new(),
         };
+        ontology.data = data_terms(&ontology, self.terms);
+        ontology.anonymous = ontology
+            .axioms
+            .iter()
+            .flat_map(individuals)
+            .filter(|&t| self.terms.kind(t) == TermKind::Blank)
+            .collect();
         crate::diagnostics::check_global_restrictions(&mut ontology);
         ontology
     }

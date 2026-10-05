@@ -34,6 +34,9 @@ pub mod flag {
     /// Blocking status, recomputed before each expansion.
     pub const DIRECTLY_BLOCKED: u32 = 8;
     pub const INDIRECTLY_BLOCKED: u32 = 16;
+    /// A data value (concrete node): a leaf, never blocked nor a blocker, no centre of a
+    /// clause, outside the NI rule (`data.rs`).
+    pub const CONCRETE: u32 = 32;
     pub const DEAD: u32 = PRUNED | MERGED;
     pub const BLOCKED: u32 = DIRECTLY_BLOCKED | INDIRECTLY_BLOCKED;
 }

@@ -1,6 +1,10 @@
 //! Ontologies by hand, in the structural model (terms are plain numbers).
 
-use nrese_owl::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp, Ontology, Term};
+use nrese_owl::{
+    Axiom, Characteristic, ClassExpr, DataRange, ExprId, Literal, ObjProp, Ontology, RangeId, Term,
+};
+
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
 #[derive(Default)]
 pub struct Build {
@@ -78,5 +82,51 @@ impl Build {
 
     pub fn different(&mut self, a: Term, b: Term) {
         self.axiom(Axiom::DifferentIndividuals(vec![a.min(b), a.max(b)]));
+    }
+
+    /// A fresh term (above the hand-picked ones), with an IRI if `iri` is given.
+    fn term(&mut self, iri: Option<String>) -> Term {
+        let t = 1_000_000 + (self.o.data.literals.len() + self.o.data.iris.len()) as Term;
+        if let Some(iri) = iri {
+            self.o.data.iris.insert(t, iri);
+        }
+        t
+    }
+
+    /// A literal `"lexical"^^xsd:datatype`.
+    pub fn literal(&mut self, lexical: &str, datatype: &str) -> Term {
+        let t = self.term(None);
+        self.o.data.literals.insert(
+            t,
+            Literal {
+                lexical: lexical.to_owned(),
+                datatype: Some(format!("{XSD}{datatype}")),
+                language: None,
+            },
+        );
+        t
+    }
+
+    pub fn range(&mut self, r: DataRange) -> RangeId {
+        RangeId(self.o.ranges.intern(r))
+    }
+
+    /// `xsd:datatype`.
+    pub fn datatype(&mut self, datatype: &str) -> RangeId {
+        let t = self.term(Some(format!("{XSD}{datatype}")));
+        self.range(DataRange::Datatype(t))
+    }
+
+    /// `xsd:datatype[facet value, …]`, each value an `xsd:integer`.
+    pub fn restricted(&mut self, datatype: &str, facets: &[(&str, i64)]) -> RangeId {
+        let t = self.term(Some(format!("{XSD}{datatype}")));
+        let mut pairs = Vec::new();
+        for &(facet, value) in facets {
+            let f = self.term(Some(format!("{XSD}{facet}")));
+            let v = self.literal(&value.to_string(), "integer");
+            pairs.push((f, v));
+        }
+        pairs.sort();
+        self.range(DataRange::Restriction(t, pairs))
     }
 }

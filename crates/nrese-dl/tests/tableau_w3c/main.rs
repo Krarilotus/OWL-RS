@@ -142,6 +142,7 @@ fn entailed(
             continue;
         }
         let mut o = premise.clone();
+        o.data.extend(&conclusion.data);
         let imported = import(conclusion, axiom, &mut o);
         let Some(cases) = Negator::new(&mut o).cases(&imported) else {
             open.get_or_insert(format!(
@@ -189,6 +190,7 @@ fn merge_features(into: &mut Features, f: Features) {
     into.numbers |= f.numbers;
     into.nominals |= f.nominals;
     into.disjunctions |= f.disjunctions;
+    into.datatypes |= f.datatypes;
     into.weakened |= f.weakened;
 }
 
@@ -205,6 +207,9 @@ fn fragment(f: &Features) -> String {
     }
     if f.numbers {
         s.push('Q');
+    }
+    if f.datatypes {
+        s.push_str("(D)");
     }
     if f.weakened {
         s.push_str("(D/keys)");
