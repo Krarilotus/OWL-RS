@@ -40,6 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .manifest import docker_memory_bytes
 from .runtime import PREFIX, DockerRuntime, Measured, Mount, Runtime, Server, Spec
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -94,7 +95,17 @@ class Context:
 
     @property
     def memory(self) -> str | None:
-        return self.setting("DOCKER_MEMORY") or None
+        """Every container's hard memory cap, without swap: DOCKER_MEMORY, "0" for none,
+        by default 90 % of Docker's memory. A run past it is killed in its container
+        instead of making the host thrash (nemo-sparq on LUBM 1000, 5 October 2026); it
+        couldn't have finished within the memory anyway."""
+        setting = self.setting("DOCKER_MEMORY")
+        if setting == "0":
+            return None
+        if setting:
+            return setting
+        total = docker_memory_bytes()
+        return f"{total * 9 // 10 // 1048576}m" if total else None
 
 
 @dataclass
