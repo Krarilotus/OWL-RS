@@ -468,7 +468,18 @@ fn automaton_transitions_need_their_role_inclusions() {
                     .all(|h| matches!(h, HeadAtom::Concept(Concept::Fresh(_), _)))
         })
         .collect();
-    assert!(!p0_transitions.is_empty(), "{:#?}", normalised.clauses);
+    // A p0-edge reaches p2's automaton through a transition on p0 or, where the inclusion
+    // clause makes it a p2-edge too, through that clause: either way p0 ⊑ p2 is named.
+    let through_inclusion = normalised.clauses.iter().any(|clause| {
+        matches!(clause.body[..], [BodyAtom::Role(r, ..)] if r == p0)
+            && matches!(clause.head[..], [HeadAtom::Role(r, ..)] if r == p2)
+            && clause.sources.iter().all(|set| set.contains(&inclusion))
+    });
+    assert!(
+        !p0_transitions.is_empty() || through_inclusion,
+        "{:#?}",
+        normalised.clauses
+    );
     for clause in p0_transitions {
         assert!(
             clause.sources.iter().all(|set| set.contains(&inclusion)),
@@ -706,6 +717,8 @@ fn clauses_and_ontologies_have_the_same_models() {
                 expand_at_most_up_to: if case % 2 == 0 { 2 } else { 0 },
                 // The clauses' models are the ontology's: not so when read one way.
                 lazy_definitions: false,
+                // Minimal automata accept the same words: the same models.
+                exact_provenance: case % 3 != 0,
             },
         );
         assert!(
