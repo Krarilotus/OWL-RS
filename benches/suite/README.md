@@ -81,4 +81,4 @@ next to this directory keep their own drivers for what they do beyond the suite
 ([../README.md](../README.md), "Kits"), and they write their run records by hand
 ([../runs/README.md](../runs/README.md)).
 
-**The order of work** (owner decision, 30 September 2026): NRESE implements and tunes every capability first; the comparison runs come after. The audit behind these files is [docs/reviews/2026-09-30-benchmark-suite-and-readiness-audit.md](../../docs/reviews/2026-09-30-benchmark-suite-and-readiness-audit.md).
+**The order of work** (owner decision, 30 September 2026): NRESE implements and tunes every capability first; the comparison runs come after.

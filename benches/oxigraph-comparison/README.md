@@ -1,6 +1,6 @@
 # NRESE's RDF bundle against Oxigraph
 
-The migration away from the Oxigraph libraries (`docs/plan/2026-10-01-oxigraph-migration.md`)
+The migration away from the Oxigraph libraries (`docs/design/rdf-bundle.md`)
 requires each replacement to be at least as good as what it replaces: standards coverage,
 speed, and fewer bugs. This crate is where that is measured. It is a workspace of its own,
 so the NRESE workspace never depends on an Oxigraph crate.

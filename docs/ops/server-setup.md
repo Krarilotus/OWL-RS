@@ -121,6 +121,19 @@ nrese-server convert data.ttl data.nt
 - `query` answers one query from the configured store as it is (no reasoning first; the inferred stack is what the last load or start materialised) and writes the results to standard output: SELECT and ASK in the results format (default JSON), CONSTRUCT and DESCRIBE in the RDF format (default N-Triples). Offline, like `load`.
 - `convert` reads one RDF file and writes it in another format, both taken from the extensions, statement by statement and without a store, so the file can be larger than memory. Blank node labels are kept; a named graph is an error for a format without graphs. The output appears only when complete.
 
+### 5.4.2 Moving Data In from Another Store
+
+From Fuseki, GraphDB, RDF4J or any SPARQL store: export the dataset as N-Quads (named
+graphs kept), load it with `nrese-server load`, then check before switching clients over:
+- the statement count per graph (`SELECT ?g (COUNT(*) AS ?n) { GRAPH ?g { ?s ?p ?o } } GROUP BY ?g`, and the default graph) on both sides;
+- the application's own queries and updates on both sides, compared by result;
+- with reasoning on, that the source store's ruleset matches the configured mode
+  ([reasoning semantics](../spec/reasoning-semantics.md)): a different ruleset changes
+  the answers, not only their speed.
+
+Keep the old store until the comparison passes; switching back is changing the client's
+endpoint.
+
 ## 5.5 Local Test-Server Startup Example (PowerShell)
 
 ```powershell
