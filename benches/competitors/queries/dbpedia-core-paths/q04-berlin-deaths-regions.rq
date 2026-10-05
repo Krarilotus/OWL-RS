@@ -1,0 +1,5 @@
+# A path from the values a selective pattern binds (its place stays after the pattern)
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbr: <http://dbpedia.org/resource/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?person ?place ?region WHERE { ?person dbo:birthPlace dbr:Berlin ; dbo:deathPlace ?place . ?place dbo:subdivision+ ?region }

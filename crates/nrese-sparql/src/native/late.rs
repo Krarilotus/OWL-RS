@@ -83,6 +83,10 @@ impl super::Context<'_> {
         // A LIMIT meant for the next basic graph pattern: any rows will do, so the
         // expanded rows are cut instead.
         let limit = self.limit.take();
+        let estimate = match self.trace {
+            Some(_) => self.estimate_rows(pattern),
+            None => None,
+        };
         let child = self.canonical_child();
         let solutions = child.eval(pattern)?;
         let rows = solutions.table.len();
@@ -92,7 +96,7 @@ impl super::Context<'_> {
             self.note(
                 "late equality expansion",
                 detail,
-                None,
+                estimate,
                 expanded.table.len(),
                 start,
             );
