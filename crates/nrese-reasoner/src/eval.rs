@@ -769,11 +769,18 @@ fn run_jobs_with<S: Source + ?Sized>(
                             .body
                             .iter()
                             .any(|atom| instantiate_head(atom, bindings) == fact);
-                    if !circular && keep(fact) {
+                    if !circular {
                         out.push(fact);
                     }
                 }
             });
+            // The morsel's duplicates go before `keep` probes the source, and the probes
+            // run in (predicate, subject, object) order: about half of an OWL 2 RL round's
+            // candidates repeat within it, and sorted probes walk a relation's sorted run
+            // forward instead of missing the cache at every level of every search.
+            out.sort_unstable_by_key(|&[s, p, o]| (p, s, o));
+            out.dedup();
+            out.retain(|&fact| keep(fact));
             out
         })
         .flatten()
