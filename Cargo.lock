@@ -1196,6 +1196,7 @@ dependencies = [
 name = "nrese-owl"
 version = "0.1.0"
 dependencies = [
+ "foldhash 0.2.0",
  "nrese-rdf",
  "nrese-rdf-io",
 ]
@@ -1390,6 +1391,7 @@ dependencies = [
 name = "nrese-xsd"
 version = "0.1.0"
 dependencies = [
+ "regex-syntax",
  "thiserror 2.0.21",
 ]
 

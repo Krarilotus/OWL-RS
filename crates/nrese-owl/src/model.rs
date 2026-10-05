@@ -192,14 +192,15 @@ impl Axiom {
 #[derive(Debug, Clone)]
 pub struct Interner<T> {
     values: Vec<T>,
-    ids: HashMap<T, u32>,
+    /// Hashed with foldhash: interning is a hot path of reading and normalising.
+    ids: HashMap<T, u32, foldhash::fast::RandomState>,
 }
 
 impl<T> Default for Interner<T> {
     fn default() -> Self {
         Self {
             values: Vec::new(),
-            ids: HashMap::new(),
+            ids: HashMap::default(),
         }
     }
 }

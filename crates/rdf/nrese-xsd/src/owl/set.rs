@@ -25,7 +25,8 @@ use std::ops::Bound;
 use super::datatype::{Datatype, Facet};
 use super::line::{Line, integer_range};
 use super::rational::Rational;
-use super::text;
+use super::regular::{self, Family};
+use super::texts::Texts;
 use super::value::Value;
 
 /// How many values a set has: at least `lo`, at most `hi` (`u64::MAX`: unbounded).
@@ -60,7 +61,7 @@ impl Count {
         self.hi < n
     }
 
-    fn plus(self, other: Self) -> Self {
+    pub(crate) fn plus(self, other: Self) -> Self {
         Self {
             lo: self.lo.saturating_add(other.lo),
             hi: self.hi.saturating_add(other.hi),
@@ -82,7 +83,7 @@ impl Count {
 // Families with a base form and finitely many exceptions ---------------------------------
 
 /// A form of a value space that complements, intersects and counts.
-trait Base: Clone + PartialEq + std::fmt::Debug {
+pub(super) trait Base: Clone + PartialEq + std::fmt::Debug {
     type V: Ord + Clone + std::fmt::Debug;
     fn contains(&self, v: &Self::V) -> bool;
     fn union(&self, other: &Self) -> Self;
@@ -173,7 +174,7 @@ impl<B: Base> Patched<B> {
 /// Values summed over the lengths (integer points from `floor`) of a line, `per` giving
 /// each length's count. Every family counted so has at least a thousand values of each
 /// length past 64, so a longer run is "many" past its first 64 lengths.
-fn count_integers(line: &Line<i128>, floor: i128, per: impl Fn(i128) -> Count) -> Count {
+pub(super) fn count_integers(line: &Line<i128>, floor: i128, per: impl Fn(i128) -> Count) -> Count {
     let mut total = Count::ZERO;
     for s in line.segments() {
         let (lo, hi) = integer_range(&s);
@@ -204,89 +205,7 @@ fn count_ordinals(line: &Line<i128>) -> Count {
     })
 }
 
-/// Strings, by length per region.
-#[derive(Debug, Clone, PartialEq)]
-struct Strings([Line<i128>; text::REGIONS]);
-
-impl Strings {
-    fn none() -> Self {
-        Self(std::array::from_fn(|_| Line::empty()))
-    }
-
-    /// The regions from `floor` on, any length.
-    fn from_region(floor: usize) -> Self {
-        Self(std::array::from_fn(|r| {
-            if r >= floor {
-                Line::full()
-            } else {
-                Line::empty()
-            }
-        }))
-    }
-
-    fn map(&self, f: impl Fn(&Line<i128>) -> Line<i128>) -> Self {
-        Self(std::array::from_fn(|r| f(&self.0[r])))
-    }
-
-    fn zip(&self, o: &Self, f: impl Fn(&Line<i128>, &Line<i128>) -> Line<i128>) -> Self {
-        Self(std::array::from_fn(|r| f(&self.0[r], &o.0[r])))
-    }
-}
-
-fn char_length(s: &str) -> i128 {
-    s.chars().count() as i128
-}
-
-impl Base for Strings {
-    type V = String;
-
-    fn contains(&self, v: &String) -> bool {
-        self.0[text::region(v)].contains(&char_length(v))
-    }
-
-    fn union(&self, o: &Self) -> Self {
-        self.zip(o, Line::union)
-    }
-
-    fn intersection(&self, o: &Self) -> Self {
-        self.zip(o, Line::intersection)
-    }
-
-    fn complement(&self) -> Self {
-        self.map(Line::complement)
-    }
-
-    fn count(&self) -> Count {
-        let mut total = Count::ZERO;
-        for (r, line) in self.0.iter().enumerate() {
-            total = total.plus(count_integers(line, 0, |len| {
-                let (lo, hi) = text::count(r, len as u64);
-                Count { lo, hi }
-            }));
-        }
-        total
-    }
-
-    fn values(&self, limit: u64) -> Option<Vec<String>> {
-        let mut out = Vec::new();
-        for (r, line) in self.0.iter().enumerate() {
-            for s in line.segments() {
-                let (lo, hi) = integer_range(&s);
-                let lo = lo.unwrap_or(0).max(0);
-                let hi = hi?;
-                for len in lo..=hi {
-                    out.extend(text::strings(r, len as u64)?);
-                    if out.len() as u64 > limit {
-                        return None;
-                    }
-                }
-            }
-        }
-        Some(out)
-    }
-}
-
-/// Sequences (of bytes, or characters of an IRI) by length.
+/// Byte sequences by length.
 #[derive(Debug, Clone, PartialEq)]
 struct Lengths<V> {
     line: Line<i128>,
@@ -341,27 +260,6 @@ impl Sequence for Vec<u8> {
                 .collect();
         }
         Some(out)
-    }
-}
-
-impl Sequence for String {
-    fn length(&self) -> i128 {
-        char_length(self)
-    }
-
-    fn count(length: i128) -> Count {
-        if length == 0 {
-            Count::exact(1)
-        } else {
-            Count {
-                lo: 1000,
-                hi: u64::MAX,
-            }
-        }
-    }
-
-    fn all(length: i128, _: u64) -> Option<Vec<Self>> {
-        (length == 0).then(|| vec![String::new()])
     }
 }
 
@@ -625,13 +523,13 @@ pub struct ValueSet {
     float_nan: bool,
     double: Line<i128>,
     double_nan: bool,
-    strings: Patched<Strings>,
-    tagged: Patched<Whole<(String, String)>>,
+    strings: Patched<Texts<String>>,
+    tagged: Patched<Texts<(String, String)>>,
     boolean: [bool; 2],
     times: Patched<Times>,
     hex: Patched<Lengths<Vec<u8>>>,
     base64: Patched<Lengths<Vec<u8>>>,
-    iris: Patched<Lengths<String>>,
+    iris: Patched<Texts<String>>,
     xml: Patched<Whole<String>>,
 }
 
@@ -643,8 +541,8 @@ impl ValueSet {
             float_nan: false,
             double: Line::empty(),
             double_nan: false,
-            strings: Patched::of(Strings::none()),
-            tagged: Patched::of(Whole::of(false)),
+            strings: Patched::of(Texts::none(Family::Strings)),
+            tagged: Patched::of(Texts::none(Family::Strings)),
             boolean: [false; 2],
             times: Patched::of(Times {
                 zoned: Line::empty(),
@@ -652,7 +550,7 @@ impl ValueSet {
             }),
             hex: Patched::of(Lengths::of(Line::empty())),
             base64: Patched::of(Lengths::of(Line::empty())),
-            iris: Patched::of(Lengths::of(Line::empty())),
+            iris: Patched::of(Texts::none(Family::Iris)),
             xml: Patched::of(Whole::of(false)),
         }
     }
@@ -683,14 +581,14 @@ impl ValueSet {
                 s.double_nan = true;
             }
             Datatype::PlainLiteral => {
-                s.strings = Patched::of(Strings::from_region(0));
-                s.tagged = Patched::of(Whole::of(true));
+                s.strings = Patched::of(Texts::from_region(Family::Strings, 0));
+                s.tagged = Patched::of(Texts::from_region(Family::Strings, 0));
             }
-            Datatype::LangString => s.tagged = Patched::of(Whole::of(true)),
+            Datatype::LangString => s.tagged = Patched::of(Texts::from_region(Family::Strings, 0)),
             Datatype::Boolean => s.boolean = [true; 2],
             Datatype::HexBinary => s.hex = Patched::of(Lengths::of(non_negative())),
             Datatype::Base64Binary => s.base64 = Patched::of(Lengths::of(non_negative())),
-            Datatype::AnyUri => s.iris = Patched::of(Lengths::of(non_negative())),
+            Datatype::AnyUri => s.iris = Patched::of(Texts::from_region(Family::Iris, 0)),
             Datatype::DateTime => {
                 s.times = Patched::of(Times {
                     zoned: Line::full(),
@@ -712,7 +610,7 @@ impl ValueSet {
                     };
                     s.real[0] = Line::interval(bound(lo), bound(hi));
                 } else if let Some(floor) = d.string_floor() {
-                    s.strings = Patched::of(Strings::from_region(floor));
+                    s.strings = Patched::of(Texts::from_region(Family::Strings, floor));
                 }
             }
         }
@@ -764,6 +662,22 @@ impl ValueSet {
         s
     }
 
+    /// A text facet's values for a string datatype: its strings, and for
+    /// `rdf:PlainLiteral` (and `rdf:langString`) the tagged strings whose text it holds of.
+    fn texts(&mut self, datatype: Datatype, set: Texts<String>) -> Option<()> {
+        let tagged = || Texts::<(String, String)>::retyped(&set);
+        match datatype {
+            Datatype::PlainLiteral => {
+                self.tagged = Patched::of(tagged());
+                self.strings = Patched::of(set);
+            }
+            Datatype::LangString => self.tagged = Patched::of(tagged()),
+            d if d.string_floor().is_some() => self.strings = Patched::of(set),
+            _ => return None,
+        }
+        Some(())
+    }
+
     pub fn contains(&self, value: &Value) -> bool {
         match value {
             Value::Real(r) => self.real[class_of(r)].contains(r),
@@ -801,7 +715,6 @@ impl ValueSet {
                 ..c
             }
         };
-        let iris = self.iris.complement();
         Self {
             real: std::array::from_fn(|c| self.real[c].complement()),
             float: self.float.complement().intersection(&floats(INF32)),
@@ -814,10 +727,7 @@ impl ValueSet {
             times: self.times.complement(),
             hex: lengths(&self.hex),
             base64: lengths(&self.base64),
-            iris: Patched {
-                base: Lengths::of(iris.base.line.intersection(&non_negative())),
-                ..iris
-            },
+            iris: self.iris.complement(),
             xml: self.xml.complement(),
         }
     }
@@ -978,8 +888,8 @@ fn non_negative() -> Line<i128> {
 }
 
 /// The values of `datatype` that satisfy the facet with `value`, or `None` where that
-/// isn't decided here (patterns, language ranges, lengths of language-tagged strings) or
-/// the facet doesn't apply to the datatype with that value (not in its facet space).
+/// isn't decided here (patterns of binary data) or the facet doesn't apply to the datatype
+/// with that value (not in its facet space, or not a regular expression).
 pub fn facet(datatype: Datatype, facet: Facet, value: &Value) -> Option<ValueSet> {
     let mut s = ValueSet::empty();
     let order = matches!(
@@ -1027,13 +937,21 @@ pub fn facet(datatype: Datatype, facet: Facet, value: &Value) -> Option<ValueSet
             match d {
                 Datatype::HexBinary => s.hex = Patched::of(Lengths::of(line)),
                 Datatype::Base64Binary => s.base64 = Patched::of(Lengths::of(line)),
-                Datatype::AnyUri => s.iris = Patched::of(Lengths::of(line)),
-                d if d.string_floor().is_some() => {
-                    s.strings = Patched::of(Strings(std::array::from_fn(|_| line.clone())))
-                }
-                // rdf:PlainLiteral's lengths count its language-tagged strings too.
-                _ => return None,
+                Datatype::AnyUri => s.iris = Patched::of(Texts::of_lengths(Family::Iris, &line)),
+                d => s.texts(d, Texts::of_lengths(Family::Strings, &line))?,
             }
+        }
+        (d, Value::String(source)) if facet == Facet::Pattern => {
+            let pattern = regular::pattern(source).ok()?;
+            match d {
+                Datatype::AnyUri => s.iris = Patched::of(Texts::matching(Family::Iris, pattern)),
+                d => s.texts(d, Texts::matching(Family::Strings, pattern))?,
+            }
+        }
+        (Datatype::PlainLiteral | Datatype::LangString, Value::String(range))
+            if facet == Facet::LangRange =>
+        {
+            s.tagged = Patched::of(Texts::matching(Family::Strings, regular::lang_range(range)));
         }
         _ => return None,
     }
@@ -1244,14 +1162,69 @@ mod tests {
         let tagged = Value::parse("a", Datatype::LangString, Some("en")).unwrap();
         assert!(ValueSet::of(Datatype::PlainLiteral).contains(&tagged));
         assert!(!ValueSet::of(Datatype::String).contains(&tagged));
-        assert!(
-            facet(
-                Datatype::String,
-                Facet::Pattern,
-                &lit("a", Datatype::String)
-            )
-            .is_none()
+    }
+
+    #[test]
+    fn patterns_and_language_ranges() {
+        let string = |s: &str| lit(s, Datatype::String);
+        let tagged = |s: &str, tag: &str| Value::LangString(s.into(), tag.into());
+        let pattern = |d, p: &str| restricted(d, &[(Facet::Pattern, string(p))]);
+        // The W3C test "Inconsistent String Pattern with Disjoint Dataproperties".
+        let ab_ac = pattern(Datatype::String, "a(b|c)");
+        assert_eq!(ab_ac.count(), Count::exact(2));
+        assert_eq!(ab_ac.values(5), Some(vec![string("ab"), string("ac")]));
+        let without_ab = ab_ac.intersection(&ValueSet::single(&string("ab")).complement());
+        assert_eq!(without_ab.count(), Count::exact(1));
+        assert!(without_ab.contains(&string("ac")) && !without_ab.contains(&string("ab")));
+        // With lengths and with each other.
+        let short_numbers = restricted(
+            Datatype::String,
+            &[
+                (Facet::Pattern, string("[0-9]+")),
+                (Facet::MaxLength, lit("2", Datatype::Integer)),
+            ],
         );
+        assert_eq!(short_numbers.count(), Count::exact(110));
+        let both = short_numbers.intersection(&pattern(Datatype::String, "1.*"));
+        assert_eq!(both.count(), Count::exact(11));
+        assert_eq!(
+            both.union(&short_numbers.complement()).complement().count(),
+            Count::exact(99)
+        );
+        // Within the type: a token doesn't start with a space.
+        assert!(pattern(Datatype::Token, " a").is_empty());
+        assert_eq!(pattern(Datatype::String, " a").count(), Count::exact(1));
+        // rdf:PlainLiteral: on the text of tagged strings too; lengths likewise.
+        let plain = pattern(Datatype::PlainLiteral, "a(b|c)");
+        assert!(plain.contains(&tagged("ab", "en")) && !plain.contains(&tagged("x", "en")));
+        assert_eq!(plain.count(), Count::MANY);
+        let empty = restricted(
+            Datatype::PlainLiteral,
+            &[(Facet::Length, lit("0", Datatype::Integer))],
+        );
+        assert!(empty.contains(&string("")) && empty.contains(&tagged("", "de")));
+        assert!(!empty.contains(&tagged("a", "de")));
+        // Language ranges.
+        let range = |r: &str| restricted(Datatype::PlainLiteral, &[(Facet::LangRange, string(r))]);
+        let en = range("EN");
+        assert!(en.contains(&tagged("x", "en-gb")) && !en.contains(&tagged("x", "fr")));
+        assert!(!en.contains(&string("x")));
+        assert!(
+            en.complement()
+                .intersection(&ValueSet::of(Datatype::PlainLiteral))
+                .contains(&tagged("x", "fr"))
+        );
+        assert!(en.intersection(&range("fr")).is_empty());
+        assert!(!en.intersection(&range("en-*-gb")).is_empty());
+        assert_eq!(en.count(), Count::MANY);
+        // IRIs.
+        let http = pattern(Datatype::AnyUri, "http://.*");
+        assert!(http.contains(&lit("http://e.org/", Datatype::AnyUri)));
+        assert!(!http.contains(&lit("urn:x", Datatype::AnyUri)));
+        // Not decided: binary data; not a pattern at all.
+        for (d, p) in [(Datatype::HexBinary, "0A"), (Datatype::String, "(")] {
+            assert!(facet(d, Facet::Pattern, &string(p)).is_none(), "{d:?} {p}");
+        }
     }
 
     #[test]

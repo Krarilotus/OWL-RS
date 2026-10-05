@@ -232,4 +232,6 @@ pub struct Normalised {
     /// Datatype definitions: the datatype and its range (also in `unsupported`, under
     /// [`crate::UNSUPPORTED_DATATYPE_DEFINITIONS`]).
     pub definitions: Vec<(Term, RangeId)>,
+    /// How many class definitions are lazily unfolded (`Options::lazy_definitions`).
+    pub unfolded: usize,
 }

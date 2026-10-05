@@ -2,6 +2,8 @@
 //! says, malformed input diagnosed, and the round trip model → RDF → model the identity,
 //! on a sample ontology and on random ones.
 
+mod functional;
+
 use std::collections::HashMap;
 
 use nrese_owl::{
@@ -467,6 +469,31 @@ fn reserved_vocabulary_is_read_by_its_meaning() {
         table.iri("http://www.w3.org/2002/07/owl#bottomDataProperty")
     );
     assert_round_trip(&ontology, &mut table);
+}
+
+/// Statements about the ontology (its header's annotations) are annotations, an anonymous
+/// ontology's too, never assertions about an individual (the ontology node was read as an
+/// individual: found by the functional-syntax reader's comparison, FS2RDF-ontology-
+/// annotation-annotation-ar).
+#[test]
+fn statements_about_the_ontology_are_annotations() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        [] a owl:Ontology ; ex:for ex:eqc .
+        ex:o a owl:Ontology ; ex:about ex:thing ; ex:note "text" .
+        "#,
+    );
+    let ontology = read(&statements, &table);
+    assert!(ontology.axioms.is_empty(), "{:?}", ontology.axioms);
+    // The two header typings and the three statements about the ontologies.
+    assert_eq!(ontology.annotations, 5);
+    assert!(
+        ontology.diagnostics.is_empty(),
+        "{:?}",
+        ontology.diagnostics
+    );
 }
 
 /// An expression the reader can't take leaves its axiom out with a diagnostic, never

@@ -93,8 +93,10 @@ impl RdfParser {
     /// Goes on after a syntax error: the error is returned, the statements after it follow.
     /// Turtle and TriG skip the rest of the statement (up to the `.` ending it, or the `}`
     /// ending its graph block); RDF/XML skips the rest of the outermost node element the
-    /// error is in, unless the XML isn't well-formed. N-Triples and N-Quads go on after a
-    /// bad line anyway; other formats stop at the first error. A read error always stops.
+    /// error is in, unless the XML isn't well-formed; JSON-LD skips an element of a
+    /// top-level array (or of a top-level object's `@graph` array) that fails to expand,
+    /// unless the JSON is malformed. N-Triples and N-Quads go on after a bad line anyway;
+    /// other formats stop at the first error. A read error always stops.
     pub fn recovering(mut self) -> Self {
         self.recover = true;
         self
@@ -198,6 +200,7 @@ impl RdfParser {
             unchecked: self.unchecked,
             max_depth: self.max_nesting,
             options: self.json_ld.clone(),
+            recover: self.recover,
         }
     }
 

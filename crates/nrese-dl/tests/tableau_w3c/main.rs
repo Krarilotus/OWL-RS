@@ -7,8 +7,12 @@
 //!   `NRESE_W3C_OWL_TESTS` points to; skipped without it unless `NRESE_W3C_REQUIRED`.
 //! - Documents are read with their `owl:imports` closure, from the documents the suite
 //!   gives for import (`test:importedOntologyIRI`); an import it doesn't give is
-//!   `not-run`.
-//! - `NRESE_W3C_SWITCHES` (`no-disjunct-learning`, `full-blocking`, comma-separated)
+//!   `not-run`. A role without an RDF/XML document, or whose RDF/XML can't be read, is
+//!   read from its functional-syntax one (`nrese_owl::read_functional`).
+//! - A conclusion's assertions about anonymous individuals are an existential: each
+//!   tree of them is rolled up into a class expression (`rollup`).
+//! - `NRESE_W3C_SWITCHES` (`no-disjunct-learning`, `full-blocking`,
+//!   `no-lazy-definitions`, comma-separated)
 //!   switches optimisations off, for A/B runs.
 //! - Every test ends as `pass`, `wrong`, or not decided with the reason (`unsupported`,
 //!   `gave-up`, `not-run`). A wrong answer fails the run; the rest is reported by test
@@ -21,6 +25,7 @@
 
 mod negate;
 mod rdf;
+mod rollup;
 #[allow(
     dead_code,
     reason = "the fuzz test's semantics; the witness check uses a part"
@@ -34,7 +39,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use nrese_dl::tableau::{Answer, Config, Features, Outcome, consistency};
-use nrese_owl::{Axiom, Ontology, Term};
+use nrese_owl::{Axiom, ClassExpr, ExprId, Ontology, Term};
 use nrese_rdf::{NamedOrBlankNode, Term as RdfTerm};
 
 use negate::{Negator, import};
@@ -70,6 +75,8 @@ struct Case {
     types: Vec<String>,
     /// By role: `Premise`, `Conclusion`, `NonConclusion`, `Input`.
     documents: HashMap<String, String>,
+    /// The same roles' functional-syntax documents.
+    functional: HashMap<String, String>,
     /// `test:importedOntologyIRI`, of an imported document.
     iri: Option<String>,
     /// Every document the suite gives for import, by ontology IRI (`test:importedOntology`
@@ -98,6 +105,7 @@ fn config() -> Config {
         max_memory: 2 << 30,
         disjunct_learning: !off("no-disjunct-learning"),
         incremental_blocking: !off("full-blocking"),
+        lazy_definitions: !off("no-lazy-definitions"),
         ..Config::default()
     }
 }
@@ -136,9 +144,41 @@ fn entailed(
     features: &mut Features,
 ) -> Result<bool, String> {
     let mut open: Option<String> = None;
+    let anonymous: Vec<&Axiom> = conclusion
+        .axioms
+        .iter()
+        .filter(|a| axiom_mentions_blank(a, table))
+        .collect();
+    if !anonymous.is_empty() {
+        let mut o = premise.clone();
+        o.data.extend(&conclusion.data);
+        match rollup::roll_up(conclusion, &anonymous, |t| table.is_blank(t), &mut o) {
+            Err(why) => {
+                open.get_or_insert(why);
+            }
+            Ok(groups) => {
+                for c in groups {
+                    // Some individual is a `c` iff `⊤ ⊑ ¬c` is inconsistent with the premise.
+                    let mut test = o.clone();
+                    let thing = ExprId(test.classes.intern(ClassExpr::Thing));
+                    let not = ExprId(test.classes.intern(ClassExpr::Not(c)));
+                    test.axioms.push(Axiom::SubClassOf(thing, not));
+                    test.sources.push(Vec::new());
+                    let out: Outcome = consistency(&test, &config());
+                    merge_features(features, out.features);
+                    match out.answer {
+                        Answer::Inconsistent => {}
+                        Answer::Consistent => return Ok(false),
+                        other => {
+                            open.get_or_insert(open_reason(&other));
+                        }
+                    }
+                }
+            }
+        }
+    }
     for axiom in &conclusion.axioms {
         if axiom_mentions_blank(axiom, table) {
-            open.get_or_insert("not-run: an anonymous individual in the conclusion".into());
             continue;
         }
         let mut o = premise.clone();
@@ -181,6 +221,9 @@ fn axiom_mentions_blank(axiom: &Axiom, table: &Table) -> bool {
         Axiom::ObjectPropertyAssertion(_, x, y)
         | Axiom::NegativeObjectPropertyAssertion(_, x, y) => b(x) || b(y),
         Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => xs.iter().any(b),
+        Axiom::DataPropertyAssertion(_, x, _) | Axiom::NegativeDataPropertyAssertion(_, x, _) => {
+            b(x)
+        }
         _ => false,
     }
 }
@@ -217,22 +260,27 @@ fn fragment(f: &Features) -> String {
     s
 }
 
+/// The ontology of a case's document of one of `roles` (the first it has): from RDF/XML,
+/// else (or where the RDF/XML can't be read) from the functional syntax; `None` if it has
+/// none.
+fn document(case: &Case, roles: &[&str], table: &mut Table) -> Option<Result<Ontology, String>> {
+    let functional = roles.iter().find_map(|r| case.functional.get(*r));
+    if let Some(text) = roles.iter().find_map(|r| case.documents.get(*r)) {
+        return Some(match (table.ontology(text, &case.imports), functional) {
+            (Err(_), Some(text)) => table.functional(text),
+            (read, _) => read,
+        });
+    }
+    Some(table.functional(functional?))
+}
+
 fn run_case(case: &Case, kind: &str) -> (Verdict, Features) {
     let mut features = Features::default();
     let mut table = Table::default();
-    let premise_text = case
-        .documents
-        .get("Premise")
-        .or_else(|| case.documents.get("Input"));
-    let Some(premise_text) = premise_text else {
-        return (
-            Verdict::Open("not-run: no RDF/XML premise".into()),
-            features,
-        );
-    };
-    let premise = match table.ontology(premise_text, &case.imports) {
-        Ok(o) => o,
-        Err(why) => return (Verdict::Open(format!("not-run: {why}")), features),
+    let premise = match document(case, &["Premise", "Input"], &mut table) {
+        None => return (Verdict::Open("not-run: no premise".into()), features),
+        Some(Err(why)) => return (Verdict::Open(format!("not-run: {why}")), features),
+        Some(Ok(o)) => o,
     };
     if std::env::var_os("NRESE_W3C_DUMP").is_some() {
         for a in &premise.axioms {
@@ -273,15 +321,10 @@ fn run_case(case: &Case, kind: &str) -> (Verdict, Features) {
             } else {
                 "NonConclusion"
             };
-            let Some(text) = case.documents.get(role) else {
-                return (
-                    Verdict::Open(format!("not-run: no RDF/XML {role}")),
-                    features,
-                );
-            };
-            let conclusion = match table.ontology(text, &case.imports) {
-                Ok(o) => o,
-                Err(why) => return (Verdict::Open(format!("not-run: {why}")), features),
+            let conclusion = match document(case, &[role], &mut table) {
+                None => return (Verdict::Open(format!("not-run: no {role}")), features),
+                Some(Err(why)) => return (Verdict::Open(format!("not-run: {why}")), features),
+                Some(Ok(o)) => o,
             };
             match entailed(&premise, &conclusion, &table, &mut features) {
                 Ok(e) if e == positive => Verdict::Pass,
@@ -330,9 +373,16 @@ fn read_cases(text: &str) -> Vec<Case> {
                     local
                         .strip_prefix("rdfXml")
                         .and_then(|r| r.strip_suffix("Ontology")),
-                    value,
+                    value.clone(),
                 ) {
                     case.documents.insert(role.to_owned(), text);
+                } else if let (Some(role), Some(text)) = (
+                    local
+                        .strip_prefix("fs")
+                        .and_then(|r| r.strip_suffix("Ontology")),
+                    value,
+                ) {
+                    case.functional.insert(role.to_owned(), text);
                 }
             }
         }

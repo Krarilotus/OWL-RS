@@ -12,12 +12,14 @@ use nrese_owl::{Axiom, Characteristic, ClassExpr, ObjProp, normalise};
 /// The answer under every combination of the switches; they must agree.
 fn answer(o: &nrese_owl::Ontology) -> Answer {
     let mut answers = Vec::new();
-    for bits in 0..16u32 {
+    for bits in 0..32u32 {
         let config = Config {
             semantic_branching: bits & 1 != 0,
             backjumping: bits & 2 != 0,
             anywhere_blocking: bits & 4 != 0,
             single_blocking: bits & 8 != 0,
+            lazy_definitions: bits & 16 != 0,
+            portfolio: false,
             check_blocking: true,
             ..Config::default()
         };
@@ -28,6 +30,49 @@ fn answer(o: &nrese_owl::Ontology) -> Answer {
         "switches change the answer: {answers:?}"
     );
     answers.remove(0)
+}
+
+/// Definitions unfolded lazily: `¬A` as `¬D` wherever it occurs (directly, under a value
+/// restriction, or through another definition); `answer` checks each with and without.
+#[test]
+fn lazily_unfolded_definitions_keep_answers() {
+    let r = ObjProp::Named(300);
+    // k_grz's shape: A ≡ ¬B ⊓ ¬C, D ≡ ∃r.A; D(a).
+    let mut b = Build::default();
+    let (a, bb, c, d) = (b.class(1), b.class(2), b.class(3), b.class(4));
+    let (nb, nc) = (b.not(bb), b.not(c));
+    let def_a = b.and(&[nb, nc]);
+    b.equivalent(a, def_a);
+    let def_d = b.some(r, a);
+    b.equivalent(d, def_d);
+    b.assert(d, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    // ... and D's successor can't be A: a clash only the forward direction finds.
+    let nd = b.all(r, bb);
+    b.assert(nd, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // A ≡ B ⊓ C with B(a), C(a): ¬A(a), A ⊑ ⊥, or E ≡ ¬A with E(a) each need B ⊓ C ⊑ A.
+    for case in 0..3 {
+        let mut b = Build::default();
+        let (a, bb, c, e) = (b.class(1), b.class(2), b.class(3), b.class(5));
+        let def_a = b.and(&[bb, c]);
+        b.equivalent(a, def_a);
+        b.assert(bb, 100);
+        b.assert(c, 100);
+        let na = b.not(a);
+        match case {
+            0 => b.assert(na, 100),
+            1 => {
+                let nothing = b.e(ClassExpr::Nothing);
+                b.sub(a, nothing);
+            }
+            _ => {
+                b.equivalent(e, na);
+                b.assert(e, 100);
+            }
+        }
+        assert_eq!(answer(&b.o), Answer::Inconsistent, "case {case}");
+    }
 }
 
 #[test]
@@ -336,6 +381,34 @@ fn disjoint_data_properties_compare_values() {
     b.axiom(Axiom::DataPropertyAssertion(400, 100, ten));
     b.axiom(Axiom::DataPropertyAssertion(401, 100, ten));
     assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+/// The W3C test "Inconsistent String Pattern with Disjoint Dataproperties": `a(b|c)` has
+/// two strings, and both are taken by the disjoint property; with one taken, the other
+/// is left.
+#[test]
+fn patterns_count_their_strings() {
+    for (taken, expected) in [
+        (&["ab", "ac"][..], Answer::Inconsistent),
+        (&["ab"][..], Answer::Consistent),
+    ] {
+        let mut b = Build::default();
+        b.axiom(Axiom::DisjointDataProperties(vec![400, 401]));
+        for s in taken {
+            let l = b.literal(s, "string");
+            b.axiom(Axiom::DataPropertyAssertion(400, 100, l));
+        }
+        let string = b.term(Some("http://www.w3.org/2001/XMLSchema#string".into()));
+        let facet = b.term(Some("http://www.w3.org/2001/XMLSchema#pattern".into()));
+        let pattern = b.literal("a(b|c)", "string");
+        let range = b.range(nrese_owl::DataRange::Restriction(
+            string,
+            vec![(facet, pattern)],
+        ));
+        let some = b.e(ClassExpr::DataSome(401, range));
+        b.assert(some, 100);
+        assert_eq!(answer(&b.o), expected, "{taken:?}");
+    }
 }
 
 /// Cardinalities against the values a range has: 256 bytes, but not 257.

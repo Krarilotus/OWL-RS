@@ -1,5 +1,6 @@
-//! Classification and realisation with the DL driver (`nrese_dl::classify`) of N-Triples or
-//! RDF/XML files, for the DL lab.
+//! Classification and realisation with the DL driver (`nrese_dl::classify`) of N-Triples,
+//! RDF/XML or functional-syntax files (`.ofn`, or any text starting with `Prefix(` or
+//! `Ontology(`, as the ORE corpus's `.owl` files do; imports not followed), for the DL lab.
 //!
 //! ```text
 //! cargo run --release -p nrese-dl --example dl_classify -- [options] input.nt...
@@ -23,8 +24,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use nrese_dl::classify::{self, Options};
-use nrese_owl::{Statement, Term, TermKind, Terms};
-use nrese_rdf::{NamedNode, Term as RdfTerm, Triple};
+use nrese_owl::{FunctionalReader, Intern, Statement, Term, TermKind, Terms};
+use nrese_rdf::{BlankNode, Literal, NamedNode, Term as RdfTerm, Triple};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 
 /// The terms of the triples, by id.
@@ -96,6 +97,36 @@ impl Terms for Table {
             _ => None,
         }
     }
+}
+
+impl Intern for Table {
+    fn iri_id(&mut self, iri: &str) -> Term {
+        self.id(NamedNode::new_unchecked(iri).into())
+    }
+
+    fn literal_id(&mut self, lexical: &str, datatype: &str, language: Option<&str>) -> Term {
+        let literal = match language {
+            Some(tag) => Literal::new_language_tagged_literal(lexical, tag).unwrap_or_else(|_| {
+                Literal::new_language_tagged_literal_unchecked(lexical, tag.to_lowercase())
+            }),
+            None => Literal::new_typed_literal(lexical, NamedNode::new_unchecked(datatype)),
+        };
+        self.id(literal.into())
+    }
+
+    fn blank_id(&mut self, label: &str, document: u32) -> Term {
+        self.id(BlankNode::new_unchecked(format!("d{document}x{label}")).into())
+    }
+}
+
+/// Whether a file is in the functional syntax: `.ofn`, or a text that starts with
+/// `Prefix(` or `Ontology(` (the ORE corpus's `.owl` files).
+fn functional(path: &str, text: Option<&str>) -> bool {
+    path.ends_with(".ofn")
+        || text.is_some_and(|t| {
+            let t = t.trim_start();
+            t.starts_with("Prefix(") || t.starts_with("Ontology(")
+        })
 }
 
 /// The triples of an N-Triples (`.nt`) or RDF/XML file.
@@ -188,16 +219,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a = args()?;
     let started = Instant::now();
     let (mut table, mut triples) = (Table::default(), Vec::new());
+    // Functional-syntax documents are read into the model directly (their imports are
+    // not followed); RDF files as triples.
+    let mut documents: Vec<String> = Vec::new();
     for path in &a.inputs {
-        load(path, &mut table, &mut triples)?;
+        let head = if path.ends_with(".nt") || path.ends_with(".rdf") {
+            None
+        } else {
+            Some(std::fs::read_to_string(path)?)
+        };
+        match head {
+            Some(text) if functional(path, Some(&text)) => documents.push(text),
+            _ => load(path, &mut table, &mut triples)?,
+        }
     }
     let read = started.elapsed();
     let statements: Vec<Statement> = triples
         .iter()
         .map(|&triple| Statement { triple, graph: 0 })
         .collect();
+    let ontology_of = |table: &mut Table| -> nrese_owl::Ontology {
+        if documents.is_empty() {
+            return nrese_owl::read(&statements, &*table);
+        }
+        let mut reader = FunctionalReader::new(table);
+        for d in &documents {
+            reader.read(d);
+        }
+        reader.finish()
+    };
     if a.clauses {
-        let ontology = nrese_owl::read(&statements, &table);
+        let ontology = ontology_of(&mut table);
         let n = nrese_owl::normalise(&nrese_dl::tableau::prepared(&ontology));
         let wide: Vec<_> = n.clauses.iter().filter(|c| c.head.len() > 1).collect();
         println!(
@@ -231,7 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last = None;
     for _ in 0..a.repeat {
         let started = Instant::now();
-        let ontology = nrese_owl::read(&statements, &table);
+        let ontology = ontology_of(&mut table);
         let owl = started.elapsed();
         if a.real.is_some() {
             let r = classify::realise(&ontology, &a.options);
