@@ -19,8 +19,8 @@
 
 use crate::mapping::Ontology;
 use crate::model::{
-    Axiom, Characteristic, ClassExpr, DataRange, EntityKind, ExprId, ObjProp, RangeId, Term,
-    canonical,
+    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, EntityKind, ExprId, Literal, ObjProp,
+    RangeId, Term, canonical,
 };
 
 /// The IRIs of generated entities: `{FUZZ}C0`, `{FUZZ}p0`, `{FUZZ}d0`, `{FUZZ}a0`.
@@ -134,6 +134,28 @@ impl Signature {
             facets,
             literals,
         }
+    }
+
+    /// The parts of its literals and the IRIs of its datatype and facets (what a reader
+    /// gives an ontology in `Ontology::data`).
+    pub fn data_terms(&self) -> DataTerms {
+        let mut data = DataTerms::default();
+        for (i, &t) in self.literals.iter().enumerate() {
+            data.literals.insert(
+                t,
+                Literal {
+                    lexical: i.to_string(),
+                    datatype: Some(format!("{XSD}integer")),
+                    language: None,
+                },
+            );
+        }
+        data.iris.insert(self.integer, format!("{XSD}integer"));
+        data.iris
+            .insert(self.facets[0], format!("{XSD}minInclusive"));
+        data.iris
+            .insert(self.facets[1], format!("{XSD}maxInclusive"));
+        data
     }
 
     /// Declarations of every entity (OWL 2 DL wants them; the reader then has no guesses).
@@ -611,6 +633,7 @@ pub fn ontology(rng: &mut Rng, sig: &Signature, profile: Profile) -> Ontology {
     let mut o = g.o;
     o.sources = vec![Vec::new(); axioms.len()];
     o.axioms = axioms;
+    o.data = sig.data_terms();
     o
 }
 
@@ -632,6 +655,21 @@ pub fn rename(o: &Ontology, f: &dyn Fn(Term) -> Term) -> Ontology {
     axioms.dedup();
     out.sources = vec![Vec::new(); axioms.len()];
     out.axioms = axioms;
+    out.data = DataTerms {
+        literals: o
+            .data
+            .literals
+            .iter()
+            .map(|(&t, l)| (f(t), l.clone()))
+            .collect(),
+        iris: o
+            .data
+            .iris
+            .iter()
+            .map(|(&t, i)| (f(t), i.clone()))
+            .collect(),
+    };
+    out.anonymous = o.anonymous.iter().map(|&t| f(t)).collect();
     out
 }
 
