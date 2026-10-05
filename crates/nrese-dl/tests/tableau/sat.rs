@@ -109,6 +109,7 @@ fn configs() -> impl Iterator<Item = Config> {
         timeout: Some(std::time::Duration::from_secs(2)),
         max_nodes: 10_000,
         max_memory: 256 << 20,
+        check_blocking: true,
         ..Config::default()
     })
 }

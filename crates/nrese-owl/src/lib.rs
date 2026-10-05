@@ -15,6 +15,7 @@ pub mod model;
 pub mod normalise;
 pub mod proof;
 mod properties;
+mod universal;
 pub mod vocab;
 pub mod write;
 

@@ -134,8 +134,24 @@ pub struct Equality {
     pub a: u32,
     pub b: u32,
     pub dep: DepSetId,
-    /// Raised by an at-most restriction at this root: the merge may need the NI rule.
-    pub at_root: u32,
+    /// Raised by an at-most restriction at a root: the merge may need the NI rule.
+    pub annot: Annot,
+}
+
+/// The annotation `@u ≤ n R.B` of an equality (JAIR 2009, Definition 5): the root `u` an
+/// at-most restriction raised it at, and the restriction (an index into
+/// `Program::annotations`); `NONE` parts where there is none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Annot {
+    pub root: u32,
+    pub number: u32,
+}
+
+impl Annot {
+    pub const NONE: Self = Self {
+        root: NONE,
+        number: NONE,
+    };
 }
 
 /// What changed in place, to undo.
@@ -186,10 +202,11 @@ pub struct Graph {
     /// Counts cuts: a fact index can be reused after one, so caches keyed by list heads
     /// are valid within one generation only.
     pub generation: u32,
-    /// The lowest node whose facts, edges or flags changed since the last blocking and
-    /// expansion pass: a node's blocking status depends only on the nodes before it, so
-    /// the passes start here.
-    pub dirty: u32,
+    /// The nodes whose facts, edges or flags changed since the last blocking pass.
+    pub touched: Vec<u32>,
+    /// The lowest node a cut changed since the last blocking pass (`NONE`: none): the
+    /// pass redoes every node from it.
+    pub full_from: u32,
     unary_ix: HashMap<u64, u32>,
     negative_ix: HashMap<u64, u32>,
     edge_ix: HashMap<(u32, u32, u32), u32>,
@@ -212,7 +229,7 @@ impl Graph {
     }
 
     fn touch(&mut self, node: u32) {
-        self.dirty = self.dirty.min(node);
+        self.touched.push(node);
     }
 
     pub fn new_node(&mut self, parent: u32, named: u32) -> u32 {
@@ -386,7 +403,9 @@ impl Graph {
         });
         self.nodes[from as usize].first_out = id;
         self.nodes[to as usize].first_in = id;
-        self.touch(from.min(to));
+        // Both ends: a pairwise signature holds the edges between a node and its parent.
+        self.touch(from);
+        self.touch(to);
         true
     }
 
@@ -514,6 +533,7 @@ impl Graph {
             );
         }
         self.touch(low);
+        self.full_from = self.full_from.min(low);
         for f in self.unary.drain(mark.unary as usize..).rev() {
             self.unary_ix.remove(&key(f.node, f.concept));
             if (f.node as usize) < alive {

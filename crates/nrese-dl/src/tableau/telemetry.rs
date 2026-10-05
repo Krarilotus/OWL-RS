@@ -28,6 +28,8 @@ pub struct Telemetry {
     pub levels_skipped: u64,
     pub clashes: u64,
     pub merges: u64,
+    /// Applications of the NI rule.
+    pub ni_applications: u64,
     /// Nodes whose blocking status was computed, and those found directly blocked.
     pub blocking_tests: u64,
     pub blocking_hits: u64,
@@ -47,7 +49,7 @@ impl fmt::Display for Telemetry {
             f,
             "compile_ms={:.3} saturate_ms={:.3} blocking_ms={:.3} expand_ms={:.3} search_ms={:.3} \
              total_ms={:.3} nodes_created={} peak_nodes={} branch_points={} backjumps={} \
-             levels_skipped={} clashes={} merges={} blocking_tests={} blocking_hits={} \
+             levels_skipped={} clashes={} merges={} ni={} blocking_tests={} blocking_hits={} \
              clauses_fired={} facts={} bytes_per_hot_node={} bytes_per_node={} dependency_sets={}",
             ms(self.compile),
             ms(self.saturate),
@@ -62,6 +64,7 @@ impl fmt::Display for Telemetry {
             self.levels_skipped,
             self.clashes,
             self.merges,
+            self.ni_applications,
             self.blocking_tests,
             self.blocking_hits,
             self.clauses_fired,

@@ -19,8 +19,9 @@
 //!    under the role inclusions).
 //! 5. **The ABox** as facts, a complex class assertion through a fresh name.
 //! 6. **Built-in properties:** the bottom properties relate nothing (`⊤ ⊑ ∀R.⊥`, through
-//!    R's automaton where chains reach it); an axiom that mentions a top (universal)
-//!    property is reported unsupported, never read as one over an ordinary property.
+//!    R's automaton where chains reach it); the universal object property goes through a
+//!    hub individual (`universal.rs`); an axiom that mentions the universal data property
+//!    is reported unsupported, never read as one over an ordinary property.
 //!
 //! Every clause keeps the axioms it came from.
 
@@ -60,14 +61,42 @@ pub fn normalise(ontology: &Ontology) -> Normalised {
 
 /// The clauses and facts of `ontology`.
 pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
+    // The universal object property through a hub (`universal.rs`), axiom for axiom.
+    let rewritten = ontology.builtin.top_object.and_then(|top| {
+        let used = ontology
+            .axioms
+            .iter()
+            .any(|a| crate::properties::mentions(ontology, a, &|t| t == top));
+        used.then(|| {
+            let mut r = crate::universal::rewrite(ontology, top);
+            r.ontology.builtin.top_object = None;
+            r
+        })
+    });
+    let ontology = rewritten.as_ref().map_or(ontology, |r| &r.ontology);
     let mut n = Normaliser::new(ontology);
     n.expand_up_to = options.expand_at_most_up_to.min(Options::MAX_EXPANSION);
+    if let Some(r) = &rewritten {
+        for &index in &r.unsupported {
+            n.out
+                .unsupported
+                .push((index, crate::universal::UNSUPPORTED));
+        }
+    }
     for (index, axiom) in ontology.axioms.iter().enumerate() {
         if n.uses_top(axiom) {
             n.out.unsupported.push((index, UNIVERSAL));
             continue;
         }
         n.axiom(index, axiom);
+    }
+    if let Some(r) = &rewritten {
+        // ⊤ ⊑ ∃u.{h}, from every axiom that uses the universal property.
+        let hub = n.e(ClassExpr::OneOf(vec![r.hub]));
+        let to_hub = n.e(ClassExpr::Some(ObjProp::Named(r.hub), hub));
+        for &index in &r.uses {
+            n.gci(Vec::new(), vec![Item::Expr(to_hub)], index);
+        }
     }
     n.bottom_properties();
     n.drain();
@@ -78,7 +107,10 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
 const MAX_DISTRIBUTED: usize = 16;
 
 /// Why an axiom over a universal property is left out.
-const UNIVERSAL: &str = "the universal properties (owl:topObjectProperty, owl:topDataProperty)";
+const UNIVERSAL: &str = "the universal data property (owl:topDataProperty)";
+
+/// The roles equivalent to one, each with the inclusions that make it a subrole of it.
+type Members = Vec<(ObjProp, Vec<usize>)>;
 
 /// A disjunct of a GCI being clausified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -135,6 +167,12 @@ struct Normaliser<'a> {
     rias: Vec<(Vec<ObjProp>, Term, usize)>,
     non_simple: HashSet<Term>,
     automata: HashMap<(ObjProp, Item), u32>,
+    /// The single-role inclusions as edges between role expressions, both ways (`R ⊑ S`
+    /// gives `R → S` and `R⁻ → S⁻`), with the axiom of each.
+    up: HashMap<ObjProp, Vec<(ObjProp, usize)>>,
+    down: HashMap<ObjProp, Vec<(ObjProp, usize)>>,
+    /// The roles equivalent to a role, as [`Normaliser::equivalents`] computes them.
+    equivalent: std::cell::RefCell<HashMap<ObjProp, Members>>,
     clause_index: HashMap<(Vec<BodyAtom>, Vec<HeadAtom>), usize>,
     expand_up_to: u32,
 }
@@ -152,6 +190,9 @@ impl<'a> Normaliser<'a> {
             rias: Vec::new(),
             non_simple: HashSet::new(),
             automata: HashMap::new(),
+            up: HashMap::new(),
+            down: HashMap::new(),
+            equivalent: std::cell::RefCell::new(HashMap::new()),
             clause_index: HashMap::new(),
             expand_up_to: Options::default().expand_at_most_up_to,
         };
@@ -314,13 +355,13 @@ impl<'a> Normaliser<'a> {
         }
     }
 
-    /// Whether `axiom` mentions a universal property.
+    /// Whether `axiom` mentions the universal data property (the object one is encoded
+    /// before: `universal.rs`).
     fn uses_top(&self, axiom: &Axiom) -> bool {
-        let builtin = self.ontology.builtin;
-        if builtin.top_object.is_none() && builtin.top_data.is_none() {
+        let Some(top) = self.ontology.builtin.top_data else {
             return false;
-        }
-        crate::properties::mentions(self.ontology, axiom, &|t| builtin.is_top(t))
+        };
+        crate::properties::mentions(self.ontology, axiom, &|t| t == top)
     }
 
     /// The bottom properties relate nothing: `⊤ ⊑ ∀R.⊥` for the object property (a GCI,
@@ -999,6 +1040,17 @@ impl<'a> Normaliser<'a> {
             };
             self.rias.push((chain, named, index));
         }
+        for (chain, sup, axiom) in &self.rias {
+            if let [only] = chain[..] {
+                for (a, b) in [
+                    (only, ObjProp::Named(*sup)),
+                    (only.inverse(), ObjProp::Inverse(*sup)),
+                ] {
+                    self.up.entry(a).or_default().push((b, *axiom));
+                    self.down.entry(b).or_default().push((a, *axiom));
+                }
+            }
+        }
         // Non-simple: the superroles of chains and transitive roles, up the hierarchy.
         let mut seeds: Vec<Term> = self
             .rias
@@ -1022,42 +1074,45 @@ impl<'a> Normaliser<'a> {
     /// inclusions and that reach `r` back. `R ⊑ S⁻` with `S ⊑ R⁻` (an inverse pair)
     /// makes `S⁻` one of `R`'s.
     fn equivalents(&self, r: ObjProp) -> Vec<(ObjProp, Vec<usize>)> {
-        // Everything `from` is a subrole of, with the inclusions on the way.
-        let up = |from: ObjProp| -> Vec<(ObjProp, Vec<usize>)> {
-            let mut seen: Vec<(ObjProp, Vec<usize>)> = vec![(from, Vec::new())];
+        if let Some(known) = self.equivalent.borrow().get(&r) {
+            return known.clone();
+        }
+        // The role expressions reachable from `from` along `edges`, each with the
+        // inclusions on the way (breadth first: one path each).
+        let reach = |edges: &HashMap<ObjProp, Vec<(ObjProp, usize)>>| {
+            let mut seen: HashMap<ObjProp, Vec<usize>> = HashMap::new();
+            seen.insert(r, Vec::new());
+            let mut queue = vec![r];
             let mut at = 0;
-            while at < seen.len() {
-                let (x, via) = seen[at].clone();
+            while at < queue.len() {
+                let x = queue[at];
                 at += 1;
-                for (chain, sup, axiom) in &self.rias {
-                    if let [only] = chain[..] {
-                        let next = if only == x {
-                            ObjProp::Named(*sup)
-                        } else if only == x.inverse() {
-                            ObjProp::Inverse(*sup)
-                        } else {
-                            continue;
-                        };
-                        if !seen.iter().any(|(y, _)| *y == next) {
-                            let mut via = via.clone();
-                            via.push(*axiom);
-                            seen.push((next, via));
-                        }
+                for &(y, axiom) in edges.get(&x).into_iter().flatten() {
+                    if !seen.contains_key(&y) {
+                        let mut via = seen[&x].clone();
+                        via.push(axiom);
+                        seen.insert(y, via);
+                        queue.push(y);
                     }
                 }
             }
             seen
         };
-        up(r)
+        let above = reach(&self.up);
+        let below = reach(&self.down);
+        // Equivalent: above and below; a member needs the inclusions that lead it to `r`.
+        let mut out: Vec<(ObjProp, Vec<usize>)> = below
             .into_iter()
-            .filter_map(|(x, _)| {
-                let back = up(x).into_iter().find(|(y, _)| *y == r)?;
-                let mut via = back.1;
+            .filter(|(x, _)| above.contains_key(x))
+            .map(|(x, mut via)| {
                 via.sort_unstable();
                 via.dedup();
-                Some((x, via))
+                (x, via)
             })
-            .collect()
+            .collect();
+        out.sort();
+        self.equivalent.borrow_mut().insert(r, out.clone());
+        out
     }
 
     /// The automaton of the non-simple role `role` (named), with the automata of the
