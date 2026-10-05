@@ -108,6 +108,24 @@ fn triangles_join_worst_case_optimally() {
     );
 }
 
+/// Eager aggregation: a group over a join aggregates the side its aggregates read before
+/// the join, `AVG`, `MIN` and `MAX` included (BSBM BI q4's shape, an average of offer
+/// prices per product feature).
+#[test]
+fn averages_over_joins_aggregate_before_joining() {
+    let text = format!(
+        "PREFIX e: <{EX}> SELECT ?k (AVG(STRLEN(?l)) AS ?mean) (MAX(?l) AS ?last) WHERE {{ ?s e:kind ?k . ?s e:knows ?o . ?o e:label ?l }} GROUP BY ?k"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let explained = explain_query(&engine().snapshot(), &query, &QueryOptions::default()).unwrap();
+    assert!(
+        explained.rewrites.contains(&"eager-aggregation"),
+        "{:?}",
+        explained.rewrites
+    );
+    assert_eq!(explained.rows, 10);
+}
+
 /// String filters on the dictionary: CONTAINS on a large pattern's object runs once per
 /// distinct term, and the passing ids semi-join the scan.
 #[test]
