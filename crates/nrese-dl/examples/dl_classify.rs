@@ -9,7 +9,9 @@
 //!   --timeout SECS        a deadline for the whole run
 //!   --test-timeout SECS   a budget per hypertableau test
 //!   --repeat N            run N times; times are the median of the runs
-//!   --no-context-core --no-lower-bound --no-model-pruning --no-skip-seen --no-tbox-only
+//!   --clauses             print the DL-clauses with more than one head atom, then stop
+//!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
+//!   --no-skip-seen --no-tbox-only
 //!                         switch an optimisation off (the taxonomy must not change)
 //! ```
 //!
@@ -107,7 +109,8 @@ fn load(
         RdfFormat::RdfXml
     };
     let file = std::io::BufReader::new(std::fs::File::open(path)?);
-    for quad in RdfParser::from_format(format).for_reader(file) {
+    // Unchecked: the OWL API's conversions keep the relative IRIs its input had.
+    for quad in RdfParser::from_format(format).unchecked().for_reader(file) {
         let t = Triple::from(quad?);
         out.push([
             table.id(t.subject.into()),
@@ -132,6 +135,7 @@ struct Args {
     real: Option<String>,
     options: Options,
     repeat: usize,
+    clauses: bool,
     inputs: Vec<String>,
 }
 
@@ -141,6 +145,7 @@ fn args() -> Result<Args, String> {
         real: None,
         options: Options::default(),
         repeat: 1,
+        clauses: false,
         inputs: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
@@ -160,10 +165,13 @@ fn args() -> Result<Args, String> {
             "--tax" => a.tax = it.next(),
             "--real" => a.real = it.next(),
             "--no-context-core" => a.options.context_core = false,
+            "--no-inline" => a.options.inline = false,
             "--no-lower-bound" => a.options.horn_lower_bound = false,
+            "--no-exact-shortcut" => a.options.exact_lower_bound = false,
             "--no-model-pruning" => a.options.model_pruning = false,
             "--no-skip-seen" => a.options.skip_seen = false,
             "--no-tbox-only" => a.options.tbox_only = false,
+            "--clauses" => a.clauses = true,
             _ if arg.starts_with("--") => return Err(format!("unknown option {arg}")),
             _ => a.inputs.push(arg),
         }
@@ -183,6 +191,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|&triple| Statement { triple, graph: 0 })
         .collect();
+    if a.clauses {
+        let ontology = nrese_owl::read(&statements, &table);
+        let n = nrese_owl::normalise(&nrese_dl::tableau::prepared(&ontology));
+        let wide: Vec<_> = n.clauses.iter().filter(|c| c.head.len() > 1).collect();
+        println!(
+            "{} clauses, {} with more than one head atom",
+            n.clauses.len(),
+            wide.len()
+        );
+        for c in wide.iter().take(10) {
+            println!("{:?} -> {:?} (axioms {:?})", c.body, c.head, c.sources);
+        }
+        // Every clause mentioning the first wide clause's fresh names.
+        let fresh: Vec<String> = wide
+            .first()
+            .map(|c| {
+                format!("{:?}", c.head)
+                    .split("Fresh(")
+                    .skip(1)
+                    .map(|t| format!("Fresh({}", &t[..=t.find(')').unwrap_or(0)]))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for c in &n.clauses {
+            let text = format!("{:?} -> {:?}", c.body, c.head);
+            if fresh.iter().any(|f| text.contains(f.as_str())) {
+                println!("  uses {fresh:?}: {text}");
+            }
+        }
+        return Ok(());
+    }
     let mut runs = Vec::new();
     let mut last = None;
     for _ in 0..a.repeat {
