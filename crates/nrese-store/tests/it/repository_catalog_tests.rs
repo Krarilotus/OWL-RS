@@ -138,3 +138,44 @@ fn the_catalogue_refuses_what_it_cant_do() {
         Err(CatalogError::NotFound(_))
     ));
 }
+
+#[test]
+fn a_repository_keeps_its_own_query_timeout() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let timed = |ms| RepositorySettings {
+        query_timeout_ms: Some(ms),
+        ..RepositorySettings::default()
+    };
+    {
+        let catalog = open(dir.path());
+        for refused in [0, nrese_store::catalog::MAX_QUERY_TIMEOUT_MS + 1] {
+            assert!(matches!(
+                catalog.create("public", timed(refused)),
+                Err(CatalogError::Invalid(_))
+            ));
+        }
+        catalog.create("public", timed(10_000)).expect("created");
+        let settings = catalog.settings("public").expect("settings");
+        assert_eq!(
+            settings.query_timeout(),
+            Some(std::time::Duration::from_secs(10))
+        );
+    }
+    // Opened again from its settings file.
+    let catalog = open(dir.path());
+    assert_eq!(
+        catalog
+            .settings("public")
+            .expect("reopened")
+            .query_timeout_ms,
+        Some(10_000)
+    );
+    // A hand-written file with a timeout the API refuses doesn't open.
+    let file = dir.path().join("repositories").join("broken");
+    std::fs::create_dir_all(&file).expect("dir");
+    std::fs::write(file.join("repository.json"), r#"{"query_timeout_ms": 0}"#).expect("file");
+    drop(catalog);
+    let catalog = open(dir.path());
+    assert!(catalog.settings("broken").is_none());
+    assert!(catalog.settings("public").is_some());
+}

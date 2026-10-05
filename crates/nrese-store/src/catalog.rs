@@ -71,9 +71,23 @@ pub struct RepositorySettings {
     /// The repository's user rules, if it has any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<RepositoryRules>,
+    /// How long one query on this repository may run, in milliseconds; the server's
+    /// query timeout when absent. Lets one server hold datasets with different budgets,
+    /// e.g. a small one answering an application in seconds beside a large public one.
+    /// Applies to repositories other than the default, which keeps the server's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_timeout_ms: Option<u64>,
 }
 
+/// The longest per-repository query timeout: one hour.
+pub const MAX_QUERY_TIMEOUT_MS: u64 = 3_600_000;
+
 impl RepositorySettings {
+    /// The repository's own query timeout, if its settings give one.
+    pub fn query_timeout(&self) -> Option<std::time::Duration> {
+        self.query_timeout_ms.map(std::time::Duration::from_millis)
+    }
+
     /// The reasoning mode, if the settings choose one.
     pub fn reasoning_mode(&self) -> Option<ReasoningMode> {
         self.reasoning.as_deref().and_then(ReasoningMode::from_name)
@@ -262,6 +276,11 @@ impl Catalog {
                     // Created before settings were kept: the server's.
                     Err(_) => RepositorySettings::default(),
                 };
+                // Settings written by hand meet the same checks as those sent to the API.
+                if let Err(error) = check(&settings) {
+                    tracing::warn!(repository = %id, %error, "repository settings refused");
+                    continue;
+                }
                 match repositories.start(&id, settings) {
                     Ok(repository) => {
                         repositories.others.write().insert(id, repository);
@@ -366,6 +385,13 @@ pub fn check(settings: &RepositorySettings) -> Result<(), CatalogError> {
         && settings.reasoning_mode().is_none()
     {
         return Err(CatalogError::Invalid(format!("no reasoning mode '{name}'")));
+    }
+    if let Some(ms) = settings.query_timeout_ms
+        && !(1..=MAX_QUERY_TIMEOUT_MS).contains(&ms)
+    {
+        return Err(CatalogError::Invalid(format!(
+            "query_timeout_ms must be between 1 and {MAX_QUERY_TIMEOUT_MS}, not {ms}"
+        )));
     }
     settings.reasoner_config().map_err(CatalogError::Invalid)?;
     Ok(())

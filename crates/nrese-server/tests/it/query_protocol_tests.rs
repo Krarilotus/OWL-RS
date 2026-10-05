@@ -279,3 +279,86 @@ async fn a_query_beyond_the_servers_memory_budget_is_told_to_retry()
     assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_repository_answers_within_its_own_query_timeout()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let policy = PolicyConfig {
+        timeouts: RequestTimeouts {
+            query: Duration::from_secs(60),
+            ..RequestTimeouts::default()
+        },
+        ..PolicyConfig::default()
+    };
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        policy,
+        ReasonerConfig::default(),
+    )?;
+    let send = |method: Method, uri: &str, content_type: &str, body: String| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", content_type)
+            .body(Body::from(body))
+    };
+    let created = app
+        .clone()
+        .oneshot(send(
+            Method::PUT,
+            "/api/v1/repositories/quick",
+            "application/json",
+            r#"{"query_timeout_ms": 300}"#.to_owned(),
+        )?)
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let refused = app
+        .clone()
+        .oneshot(send(
+            Method::PUT,
+            "/api/v1/repositories/never",
+            "application/json",
+            r#"{"query_timeout_ms": 0}"#.to_owned(),
+        )?)
+        .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let data: String = (0..2_000)
+        .map(|i| format!("<http://example.com/s{i}> <http://example.com/p> \"value {i}\" .\n"))
+        .collect();
+    let inserted = app
+        .clone()
+        .oneshot(send(
+            Method::POST,
+            "/api/v1/repositories/quick/update",
+            "application/sparql-update",
+            format!("INSERT DATA {{ {data} }}"),
+        )?)
+        .await?;
+    assert!(inserted.status().is_success(), "{}", inserted.status());
+    // Seconds of work: the repository's 300 ms stops it, not the server's minute.
+    let query = "SELECT (COUNT(*) AS ?n) WHERE { ?a ?b ?c . ?d ?e ?f FILTER(REGEX(CONCAT(STR(?c), STR(?f)), \"^(a|b)*x$\")) }";
+    let started = Instant::now();
+    let response = app
+        .clone()
+        .oneshot(get(&format!(
+            "/api/v1/repositories/quick/query?query={}",
+            encode(query)
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the repository's deadline: {:?}",
+        started.elapsed()
+    );
+    // The default repository keeps the server's budget.
+    let response = app
+        .oneshot(get(&format!(
+            "/dataset/query?query={}",
+            encode("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
