@@ -61,6 +61,61 @@ const DECLARATIONS: &[(&str, &str)] = &[
 /// The list-valued properties whose lists are read.
 const LISTS: &[&str] = &["intersectionOf", "unionOf", "disjointUnionOf"];
 
+/// What the QL rewriting did to one query (EXPLAIN, and with every answer).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QlReport {
+    /// Basic graph patterns rewritten.
+    pub patterns: usize,
+    /// Their tree witnesses.
+    pub witnesses: usize,
+    /// Branches of their unions.
+    pub branches: usize,
+    /// Triple patterns of their rewritings, alternatives counted.
+    pub atoms: usize,
+    /// The bounds reached ([`Limits`]): those patterns ran as written.
+    pub limits: Vec<&'static str>,
+    pub completeness: Completeness,
+}
+
+/// Whether the answers through anonymous individuals are complete (docs/design/
+/// ql-rewriting.md §5): `Complete`, or `SoundOnly` with the reasons some may be missing.
+/// Answers are never changed for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Completeness {
+    #[default]
+    Complete,
+    SoundOnly(Vec<String>),
+}
+
+impl Completeness {
+    /// `complete` or `sound-only`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::SoundOnly(_) => "sound-only",
+        }
+    }
+
+    pub fn reasons(&self) -> &[String] {
+        match self {
+            Self::Complete => &[],
+            Self::SoundOnly(reasons) => reasons,
+        }
+    }
+
+    /// Adds a reason (once).
+    pub fn add(&mut self, reason: String) {
+        match self {
+            Self::Complete => *self = Self::SoundOnly(vec![reason]),
+            Self::SoundOnly(reasons) => {
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
+            }
+        }
+    }
+}
+
 /// A store's QL rewriting: what its closure applies, the bounds, and the schema compiled
 /// for the last snapshot read.
 #[derive(Debug)]
