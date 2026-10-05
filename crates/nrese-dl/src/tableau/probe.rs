@@ -171,7 +171,7 @@ impl Prepared {
         let seed = self.seed(probe);
         let mut engine = Engine::new(&self.program, config);
         let end = engine.run(&seed);
-        self.outcome(&mut engine, end, want, started)
+        self.outcome(&mut engine, end, want, started, None)
     }
 
     /// The engine's test for `probe`.
@@ -206,10 +206,12 @@ impl Prepared {
         end: End,
         want: Want,
         started: Instant,
+        since: Option<(u32, u32)>,
     ) -> ProbeOutcome {
         let model = end == End::Model;
         let answer = answer_of(end, &self.program, engine);
-        let labels = (answer == Answer::Consistent && model).then(|| self.labels(engine, want));
+        let labels =
+            (answer == Answer::Consistent && model).then(|| self.labels_since(engine, want, since));
         let mut telemetry = engine.stats.clone();
         telemetry.total = started.elapsed();
         ProbeOutcome {
@@ -231,14 +233,25 @@ impl Prepared {
         let deterministic = engine.clone();
         let end = engine.search(None);
         let model = (end == End::Model).then_some(engine);
+        let point = model.as_ref().map(|m| (m.checkpoint(), m.frames.len()));
         Some(Base {
             prepared: self,
             deterministic,
             model,
+            point,
+            pool: std::sync::Mutex::new(Vec::new()),
         })
     }
-    /// The labels of the model `engine` ended in.
-    fn labels(&self, engine: &mut Engine<'_>, want: Want) -> Labels {
+    /// The labels of the model `engine` ended in. With `since` (a base's node and
+    /// unary-fact counts), the other elements are only those the run added or gave new
+    /// facts: the base's own elements were read once ([`Base::labels`]), and leaving
+    /// labels out only prunes less.
+    fn labels_since(
+        &self,
+        engine: &mut Engine<'_>,
+        want: Want,
+        since: Option<(u32, u32)>,
+    ) -> Labels {
         engine.recompute_blocking();
         let mut out = Labels::default();
         // The nodes as asserted: `label` follows their merges with what those depend on.
@@ -262,8 +275,23 @@ impl Prepared {
             });
         }
         if want.elements {
+            let changed: Option<Vec<bool>> = since.map(|(nodes, unary)| {
+                let mut c = vec![false; engine.g.nodes.len()];
+                for slot in c.iter_mut().skip(nodes as usize) {
+                    *slot = true;
+                }
+                for f in &engine.g.unary[(unary as usize).min(engine.g.unary.len())..] {
+                    if let Some(slot) = c.get_mut(f.node as usize) {
+                        *slot = true;
+                    }
+                }
+                c
+            });
             let mut seen: hashbrown::HashSet<Vec<u32>> = hashbrown::HashSet::new();
             for n in 0..engine.g.nodes.len() as u32 {
+                if changed.as_ref().is_some_and(|c| !c[n as usize]) {
+                    continue;
+                }
                 let node = &engine.g.nodes[n as usize];
                 if n == probe || !node.live() || node.flags & (flag::BLOCKED | flag::CONCRETE) != 0
                 {
@@ -366,6 +394,12 @@ pub struct Base<'p> {
     prepared: &'p Prepared,
     deterministic: Engine<'p>,
     model: Option<Engine<'p>>,
+    /// The model's state to roll back to, and its open branch points.
+    point: Option<(super::engine::Frame, usize)>,
+    /// Engines at the model's state, one per probe running at once: a probe runs on one
+    /// and rolls it back afterwards (the trail undoes it, as a backtrack does), instead
+    /// of copying the model each time.
+    pool: std::sync::Mutex<Vec<Engine<'p>>>,
 }
 
 /// How a probe from a base was answered.
@@ -376,6 +410,17 @@ pub enum From {
 }
 
 impl Base<'_> {
+    /// The labels of the individuals' model (`None` if it isn't one): read once, so
+    /// that probes from it read only what they change.
+    pub fn labels(&self, want: Want) -> Option<Labels> {
+        let mut engine = self.model.as_ref()?.clone();
+        let started = Instant::now();
+        let out = self
+            .prepared
+            .outcome(&mut engine, End::Model, want, started, None);
+        out.labels
+    }
+
     /// Runs `probe` from the base (its configuration is the base's).
     pub fn probe(&self, probe: &Probe<'_>, want: Want) -> (ProbeOutcome, From) {
         let started = Instant::now();
@@ -386,18 +431,43 @@ impl Base<'_> {
             engine.stats = Telemetry::default();
             engine
         }
-        if let Some(model) = &self.model {
-            let mut engine = fresh(model);
-            engine.floor = engine.frames.len() as u32;
+        if let (Some(model), Some((point, frames))) = (&self.model, &self.point) {
+            let pooled = self
+                .pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop();
+            let mut engine = match pooled {
+                Some(mut e) => {
+                    e.started = Instant::now();
+                    e.stats = Telemetry::default();
+                    e
+                }
+                None => fresh(model),
+            };
+            let approximate = engine.data_approximate.clone();
+            engine.floor = *frames as u32;
+            let since = (model.g.nodes.len() as u32, model.g.unary.len() as u32);
             let end = engine.resume(&seed);
-            if end != End::GaveUp(super::search::FLOOR.into()) {
-                let out = self.prepared.outcome(&mut engine, end, want, started);
+            let done = end != End::GaveUp(super::search::FLOOR.into());
+            let out = done.then(|| {
+                self.prepared
+                    .outcome(&mut engine, end, want, started, Some(since))
+            });
+            engine.rollback(point, *frames);
+            engine.data_approximate = approximate;
+            engine.floor = 0;
+            self.pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(engine);
+            if let Some(out) = out {
                 return (out, From::Model);
             }
         }
         let mut engine = fresh(&self.deterministic);
         let end = engine.resume(&seed);
-        let out = self.prepared.outcome(&mut engine, end, want, started);
+        let out = self.prepared.outcome(&mut engine, end, want, started, None);
         (out, From::Deterministic)
     }
 }

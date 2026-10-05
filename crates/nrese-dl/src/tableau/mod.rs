@@ -79,6 +79,9 @@ pub struct Config {
     pub disjunct_learning: bool,
     /// The most nodes a run may create at once.
     pub max_nodes: usize,
+    /// The most branch points a run may open (`None`: no limit): a deterministic bound
+    /// on the search, for tests that must not depend on the machine's speed.
+    pub max_branch_points: Option<u64>,
     pub timeout: Option<Duration>,
     /// The most memory a run may hold (its tables, indexes and arenas), in bytes.
     pub max_memory: usize,
@@ -112,6 +115,7 @@ impl Default for Config {
             incremental_blocking: true,
             check_blocking: false,
             max_nodes: 2_000_000,
+            max_branch_points: None,
             timeout: None,
             max_memory: 4 << 30,
             keep_model: false,
@@ -122,6 +126,9 @@ impl Default for Config {
         }
     }
 }
+
+/// Why a run gave up when [`Config::max_branch_points`] ran out.
+pub const BRANCH_BUDGET: &str = "the branch-point budget ran out";
 
 /// The answer of a consistency or satisfiability test.
 #[derive(Debug, Clone, PartialEq, Eq)]
