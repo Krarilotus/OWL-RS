@@ -86,6 +86,9 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
         }
     }
     for (index, axiom) in ontology.axioms.iter().enumerate() {
+        if n.tautology(axiom) {
+            continue;
+        }
         if n.uses_top(axiom) {
             n.out.unsupported.push((index, UNIVERSAL));
             continue;
@@ -363,6 +366,14 @@ impl<'a> Normaliser<'a> {
             ObjProp::Named(p) => HeadAtom::Role(p, from, to),
             ObjProp::Inverse(p) => HeadAtom::Role(p, to, from),
         }
+    }
+
+    /// Whether `axiom` holds in every interpretation by the meaning of the universal data
+    /// property: `SubDataPropertyOf(p, owl:topDataProperty)`. Nothing to encode, so it is
+    /// neither a clause nor unsupported (ontologies declare their data properties so).
+    fn tautology(&self, axiom: &Axiom) -> bool {
+        matches!(axiom, Axiom::SubDataPropertyOf(_, sup)
+            if Some(*sup) == self.ontology.builtin.top_data)
     }
 
     /// Whether `axiom` mentions the universal data property (the object one is encoded

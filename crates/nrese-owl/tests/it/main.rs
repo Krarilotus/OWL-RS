@@ -337,6 +337,39 @@ ex:D a rdfs:Datatype ; owl:equivalentClass [ a rdfs:Datatype ; owl:onDatatype xs
     assert!(reasons.contains(&nrese_owl::UNSUPPORTED_DATATYPE_DEFINITIONS));
 }
 
+/// `SubDataPropertyOf(p, owl:topDataProperty)` holds in every interpretation: no clause,
+/// and not unsupported; any other axiom over the universal data property still is.
+#[test]
+fn a_data_property_below_the_top_one_is_a_tautology() {
+    let mut table = Table::default();
+    let text = format!(
+        "{PREFIXES}
+ex:p a owl:DatatypeProperty ; rdfs:subPropertyOf owl:topDataProperty .
+"
+    );
+    let statements = load(&mut table, &text);
+    let o = read(&statements, &table);
+    assert_eq!(
+        o.axioms
+            .iter()
+            .filter(|a| matches!(a, Axiom::SubDataPropertyOf(..)))
+            .count(),
+        1
+    );
+    let n = nrese_owl::normalise(&o);
+    assert!(n.unsupported.is_empty(), "{:?}", n.unsupported);
+    assert!(n.clauses.is_empty(), "{:?}", n.clauses);
+    let text = format!(
+        "{PREFIXES}
+ex:p a owl:DatatypeProperty . owl:topDataProperty rdfs:subPropertyOf ex:p .
+"
+    );
+    let mut table = Table::default();
+    let statements = load(&mut table, &text);
+    let n = nrese_owl::normalise(&read(&statements, &table));
+    assert_eq!(n.unsupported.len(), 1);
+}
+
 #[test]
 fn malformed_input_is_reported() {
     let mut table = Table::default();
