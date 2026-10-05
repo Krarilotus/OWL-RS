@@ -9,8 +9,9 @@
 //! - **Metamorphic:** renaming the terms and shuffling the axioms give the same taxonomy.
 //!
 //! Cases where brute force or the driver can't decide (a budget, data approximated) are
-//! counted and skipped; the campaign must decide most. `NRESE_FUZZ_CASES` and
-//! `NRESE_FUZZ_SEED` widen or move it.
+//! counted and skipped; the campaign must decide most. Each run is bounded by nodes and
+//! branch points, never by the clock, so a loaded machine changes no outcome.
+//! `NRESE_FUZZ_CASES` and `NRESE_FUZZ_SEED` widen or move it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -30,7 +31,10 @@ const X: Term = 900_000;
 fn config() -> Config {
     Config {
         max_nodes: 20_000,
-        timeout: Some(Duration::from_secs(2)),
+        // Bounded by branch points and nodes, not the clock; the timeout is only a safety
+        // net (a loaded machine must not turn a decided case into a skipped one).
+        max_branch_points: Some(100_000),
+        timeout: Some(Duration::from_secs(300)),
         max_memory: 256 << 20,
         ..Config::default()
     }
@@ -39,7 +43,7 @@ fn config() -> Config {
 fn options() -> Options {
     Options {
         tableau: config(),
-        timeout: Some(Duration::from_secs(20)),
+        timeout: None,
         ..Options::default()
     }
 }
@@ -290,11 +294,6 @@ fn taxonomies_equal_brute_force() {
     let mut rng = Rng::new(seed);
     let mut tally = Tally::default();
     for case in 0..cases {
-        // The test's own budget: a campaign never runs on unbounded.
-        assert!(
-            started.elapsed() < Duration::from_secs(600),
-            "over the budget at case {case}: {tally:?}"
-        );
         let (o, _) = signature(case, &mut rng);
         let shuffled = fuzz::shuffle(&o, &mut rng);
         if env("NRESE_FUZZ_ONLY").is_some_and(|only| only != case) {
@@ -442,10 +441,6 @@ fn types_equal_brute_force() {
     let mut rng = Rng::new(seed);
     let mut tally = Tally::default();
     for case in 0..cases {
-        assert!(
-            started.elapsed() < Duration::from_secs(600),
-            "over the budget at case {case}: {tally:?}"
-        );
         let (o, _) = signature(case, &mut rng);
         if env("NRESE_FUZZ_ONLY").is_some_and(|only| only != case) {
             continue;

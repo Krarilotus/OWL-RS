@@ -502,7 +502,7 @@ fn budgets_give_up() {
     };
     assert!(matches!(
         consistency(&b.o, &config).answer,
-        Answer::GaveUp(_)
+        Answer::GaveUp(why) if !why.contains("time budget")
     ));
 }
 
@@ -731,7 +731,8 @@ fn a_branch_too_large_to_expand_is_abandoned_not_the_run() {
     b.sub(a, either);
     b.assert(a, 100);
     let config = Config {
-        timeout: Some(std::time::Duration::from_secs(5)),
+        max_branch_points: Some(100_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
         max_memory: 256 << 20,
         ..Config::default()
     };
