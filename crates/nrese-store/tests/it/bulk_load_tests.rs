@@ -191,15 +191,22 @@ fn skip_errors_loads_the_good_statements() {
         "@prefix ex: <http://example.com/> .\nex:t1 ex:p 1 .\nex:t2 ex:p ex:q ex:r .\nex:t3 ex:p 3 .\n",
     )
     .unwrap();
+    // RDF/XML: the node element with the bad language tag goes, the others stay.
+    let xml = dir.path().join("doc.rdf");
+    fs::write(
+        &xml,
+        "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" xmlns:e=\"http://example.com/\">         <rdf:Description rdf:about=\"http://example.com/x1\"><e:p>1</e:p></rdf:Description>         <rdf:Description rdf:about=\"http://example.com/x2\"><e:p xml:lang=\"es/wn\">2</e:p></rdf:Description>         <rdf:Description rdf:about=\"http://example.com/x3\"><e:p>3</e:p></rdf:Description>         </rdf:RDF>",
+    )
+    .unwrap();
     let service = service();
     let report = service
         .bulk_load(&BulkLoadRequest {
             skip_errors: true,
-            ..request(&[&lines, &turtle])
+            ..request(&[&lines, &turtle, &xml])
         })
         .unwrap();
-    assert_eq!(report.skipped, 2);
-    assert_eq!(report.inserted, 13);
+    assert_eq!(report.skipped, 3);
+    assert_eq!(report.inserted, 15);
     // Without: the first bad statement stops the load.
     let service = self::service();
     assert!(service.bulk_load(&request(&[&lines])).is_err());
