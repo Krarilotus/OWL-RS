@@ -25,20 +25,26 @@ L4  nrese-server                  HTTP transport, auth, policy, posture, UI host
 L3  nrese-store                   application service: operations, mutation pipeline, validation gates, backup
 L2  nrese-sparql  nrese-reasoner  nrese-shacl
                                   query/update evaluation · materialisation & consistency · shape validation
-L1  nrese-engine  nrese-exec      term dictionary, quad indexes, MVCC snapshots, transactions, durability
-                                  · id tables, joins, grouping, closures, memory budgets
-L0  nrese-core                    shared vocabulary: capability/report contracts, error kinds
+L1  nrese-engine  nrese-exec  nrese-vector  nrese-owl  nrese-dl
+                                  term dictionary, quad indexes, MVCC snapshots, transactions, durability
+                                  · id tables, joins, grouping, closures, memory budgets · vector indexes
+                                  · the OWL 2 structural model and normaliser · the DL engines
+L0  crates/rdf/: nrese-rdf  nrese-rdf-io  nrese-sparql-syntax  nrese-sparql-results  nrese-xsd  nrese-json
+                                  the RDF model, syntaxes, SPARQL syntax and results, XSD and OWL datatypes
 ```
 
-Tooling outside the layer model: `benches/nrese-bench-harness` (black-box HTTP comparison against reference engines).
+Outside the layer model: `nrese-sparql-reference` (the SPARQL evaluator written from the specification, the oracle of the differential tests; used by tests only), `nrese-fuzz` (fuzz targets for every parser of untrusted input), and `benches/` (the benchmark kits).
 
 ### 2.1 Crate ownership
 
 | Crate | Owns | Must not own |
 |---|---|---|
-| `nrese-core` | Report and capability contracts shared by several L2+ crates (reasoning run reports, validation report shapes). | Anything with an algorithm or I/O. |
+| `crates/rdf/` | The RDF model (`nrese-rdf`: IRIs, terms, quads, canonicalisation), every RDF syntax (`nrese-rdf-io`), SPARQL syntax and algebra (`nrese-sparql-syntax`), the results formats (`nrese-sparql-results`), XSD values and the OWL 2 datatype map (`nrese-xsd`), JSON (`nrese-json`). | Storage, evaluation, reasoning. |
 | `nrese-engine` | Term model and dictionary encoding (`TermId`), quad indexes in all needed permutations, LSM runs and compaction, MVCC snapshots, the commit protocol, the write-ahead log and checkpoints, bulk load, cardinality statistics. | SPARQL semantics, RDF syntax parsing, validation or reasoning rules, HTTP. |
 | `nrese-exec` | Id-level execution shared by SPARQL and reasoning: column-major id tables, merge/hash/left/anti joins, worst-case-optimal intersection, grouping and aggregation, graph closures, per-query memory budgets. It never decodes a term and depends on no NRESE crate. | Term values, storage, SPARQL or rule semantics. |
+| `nrese-vector` | Vector literals' distances and indexes (exact scan, HNSW). | Terms, storage, SPARQL. |
+| `nrese-owl` | The OWL 2 structural model read from RDF or the functional syntax, its diagnostics, and the normaliser into DL-clauses (automata for role inclusions, lazy definitions). | Search, storage, rule evaluation. |
+| `nrese-dl` | The OWL 2 DL engines over `nrese-owl`'s clauses: the tableau with its portfolio, classification and realisation. | Storage, SPARQL, HTTP; when to run (the store and reasoner decide). |
 | `nrese-sparql` | SPARQL 1.1 query and update evaluation over an engine snapshot: the native executor (the only one) and its planner (EXPLAIN), query cancellation, dataset specification (`FROM`, protocol `default-graph-uri`), update-to-delta planning, result serialisation. | Commit decisions, validation, persistence, HTTP. |
 | `nrese-reasoner` | Reasoning profiles, rule sets, materialisation, incremental maintenance, consistency checks, explanations. | Storage layout, HTTP, SHACL. |
 | `nrese-shacl` | Shapes-graph compilation, SHACL Core (later SHACL-SPARQL) validation, incremental validation scoped to a delta, validation reports. It reads through `nrese-sparql`'s `ReadView` and uses its value semantics, because SHACL defines its constraints through SPARQL's operators; `nrese-sparql` never depends on it ([design/shacl.md](design/shacl.md)). | Storage layout, reasoning, HTTP, when to validate and what a failure means for a commit. |
