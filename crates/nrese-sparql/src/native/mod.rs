@@ -33,6 +33,7 @@ mod output;
 mod paths;
 mod plan;
 mod pushdown;
+mod ql;
 mod ranges;
 mod search;
 mod sets;
@@ -417,6 +418,38 @@ fn native_pattern<'q>(
     } else {
         pattern
     };
+    // OWL 2 QL answers through existentials, before the optimiser, also as written: it
+    // changes the answers, not just the plan.
+    let rewritten_ql;
+    let pattern = match ql_rewriting(query, options) {
+        Some(ql) => {
+            let tbox = ql.tbox(&ctx.snapshot);
+            let (needed, set) = match &form {
+                Form::Select => (None, false),
+                Form::Ask => (Some(Vec::new()), true),
+                Form::Construct(template) => {
+                    let mut vars = Vec::new();
+                    GraphPattern::Bgp {
+                        patterns: template.to_vec(),
+                    }
+                    .on_in_scope_variable(|v| vars.push(v.clone()));
+                    (Some(vars), true)
+                }
+                Form::Describe => (None, true),
+            };
+            let (out, report) =
+                ql::rewrite_query(pattern, &tbox, &ctx.snapshot, ql.limits(), needed, set);
+            if report.rewritten {
+                rewrites.push("ql-tree-witness");
+            }
+            if report.limited {
+                rewrites.push("ql-limit");
+            }
+            rewritten_ql = out;
+            &rewritten_ql
+        }
+        None => pattern,
+    };
     let template_supported = match &form {
         Form::Construct(template) => template.iter().all(supported_template_triple),
         _ => true,
@@ -444,6 +477,22 @@ fn native_pattern<'q>(
         _ => pattern,
     };
     Ok((pattern, form, rewrites))
+}
+
+/// The QL rewriting, if it applies to `query`: on, and the query reads the inferred
+/// statements of the default graph without a dataset, access restrictions or pre-bound
+/// variables (docs/design/ql-rewriting.md §1).
+fn ql_rewriting<'o>(
+    query: &Query,
+    options: &'o QueryOptions,
+) -> Option<&'o crate::ql::QlRewriting> {
+    let ql = options.ql.as_deref()?;
+    (options.read_model == ReadModel::Materialised
+        && options.dataset.is_none()
+        && query_dataset(query).is_none()
+        && options.access.is_none()
+        && options.pre_bound.is_none())
+    .then_some(ql)
 }
 
 /// The rewrites the executor applies to a query's (or an update's) pattern, in order;

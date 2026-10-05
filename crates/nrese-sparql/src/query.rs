@@ -69,6 +69,12 @@ pub struct QueryOptions {
     /// statements that assert them: GeoSPARQL's topology vocabulary without its
     /// query-rewrite extension, which by default also computes them from the geometries.
     pub geosparql_stated_only: bool,
+    /// OWL 2 QL answers through existentials (docs/design/ql-rewriting.md): the store's
+    /// tree-witness rewriting, set while its closure is current under a ruleset that makes
+    /// the data H-complete; `None`: off. Applies to queries over the default graph that read
+    /// the inferred statements, without a dataset, access restrictions or pre-bound
+    /// variables.
+    pub ql: Option<std::sync::Arc<crate::ql::QlRewriting>>,
 }
 
 /// Evaluates `query` against `view` over the engine's id tables (`native`); a transaction
@@ -131,7 +137,8 @@ pub struct Explanation {
     /// `native`: the executor (one; the field stays for the report's format).
     pub executor: &'static str,
     /// The rewrites that changed the query before it ran, in the order applied:
-    /// `triple-terms`, `join-groups`, `filter-pushdown`, `ask-limit`.
+    /// `triple-terms`, `ql-tree-witness` (and `ql-limit` where a pattern reached a bound of
+    /// the QL rewriting), `join-groups`, `filter-pushdown`, `ask-limit`.
     pub rewrites: Vec<&'static str>,
     pub steps: Vec<PlanStep>,
     /// Solutions (1 or 0 for ASK); CONSTRUCT and DESCRIBE count triples.
