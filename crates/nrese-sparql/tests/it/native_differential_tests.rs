@@ -5867,3 +5867,106 @@ fn eager_aggregation_equals_the_reference_on_random_groups() {
         "{bound} of {checked} with bound aggregates"
     );
 }
+
+/// Paths ordered with the triple patterns they are joined to (`path_joins`), on random
+/// graphs: one to three patterns and one or two paths (closures, sequences, inverses,
+/// alternatives, `?`), with constant or shared ends and filters, against the reference
+/// evaluator. Most queries must take the planned route (EXPLAIN's "paths ordered with
+/// patterns"), with the path first in some and later in others.
+#[test]
+fn paths_ordered_with_patterns_equal_the_reference() {
+    let mut rng = Rng::seeded(20_261_006);
+    let (mut checked, mut planned, mut path_first) = (0, 0, 0);
+    for _ in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let nodes = 4 + rng.below(30);
+        for _ in 0..10 + rng.below(120) {
+            let object: Term = match rng.below(8) {
+                0 => Literal::new_typed_literal(rng.below(5).to_string(), xsd::INTEGER).into(),
+                _ => ex(&format!("e{}", rng.below(nodes))).into(),
+            };
+            let quad = Quad::new(
+                ex(&format!("e{}", rng.below(nodes))),
+                ex(&format!("p{}", rng.below(4))),
+                object,
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..25 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+            let node = |rng: &mut Rng| format!("<{EX}e{}>", rng.below(6));
+            let end = |rng: &mut Rng| match rng.below(3) {
+                0 => node(rng),
+                _ => rng.pick(&["?a", "?b", "?c"]).to_string(),
+            };
+            let mut parts: Vec<String> = Vec::new();
+            for _ in 0..1 + rng.below(3) {
+                let (s, o) = (rng.pick(&["?a", "?b"]).to_string(), end(&mut rng));
+                parts.push(format!("{s} {} {o} .", p(&mut rng)));
+            }
+            for _ in 0..1 + rng.below(2) {
+                let path = match rng.below(7) {
+                    0 => format!("{}+", p(&mut rng)),
+                    1 => format!("{}*", p(&mut rng)),
+                    2 => format!("{}/{}", p(&mut rng), p(&mut rng)),
+                    3 => format!("^{}", p(&mut rng)),
+                    4 => format!("({}|{})+", p(&mut rng), p(&mut rng)),
+                    5 => format!("{}?", p(&mut rng)),
+                    _ => format!("(^{})*", p(&mut rng)),
+                };
+                parts.push(format!("{} {path} {} .", end(&mut rng), end(&mut rng)));
+            }
+            if rng.below(3) == 0 {
+                parts.push(format!("FILTER(?a != {})", node(&mut rng)));
+            }
+            for i in (1..parts.len()).rev() {
+                let j = rng.below(i as u64 + 1) as usize;
+                parts.swap(i, j);
+            }
+            let text = format!("SELECT * WHERE {{ {} }}", parts.join(" "));
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let expected = rows(
+                reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            assert_eq!(native, expected, "{text}");
+            let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+            if let Some(step) = explained
+                .steps
+                .iter()
+                .find(|s| s.operator == "paths ordered with patterns")
+            {
+                planned += 1;
+                let first = step.detail.split(", then ").next().unwrap_or("");
+                path_first += usize::from(
+                    first.contains(&format!("<{EX}p"))
+                        && !first.ends_with('.')
+                        && first
+                            .split(' ')
+                            .nth(1)
+                            .is_some_and(|p| p.contains(['+', '*', '/', '^', '?', '|'])),
+                );
+            }
+            plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+            checked += 1;
+        }
+    }
+    assert!(
+        planned * 2 > checked,
+        "{planned} of {checked} planned with their paths"
+    );
+    assert!(
+        path_first * 10 > planned,
+        "a path first in {path_first} of {planned}"
+    );
+}

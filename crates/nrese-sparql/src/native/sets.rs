@@ -150,6 +150,12 @@ impl Context<'_> {
         needed: &[Variable],
     ) -> NativeResult<Solutions> {
         let solutions = match pattern {
+            // Paths joined to triple patterns: ordered with them (`path_joins`).
+            GraphPattern::Join { .. }
+                if !self.as_written && super::path_joins::PathJoin::of(pattern).is_some() =>
+            {
+                self.eval(pattern)?
+            }
             GraphPattern::Join { left, right } => {
                 let (left_scope, right_scope) = (in_scope(left), in_scope(right));
                 let mut keep = needed.to_vec();
