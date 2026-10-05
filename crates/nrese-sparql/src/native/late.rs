@@ -120,6 +120,7 @@ impl super::Context<'_> {
             limit: Cell::new(None),
             graph: RefCell::new(self.graph.borrow().clone()),
             as_written: self.as_written,
+            spatial_rewrite: self.spatial_rewrite,
             cross_chunk_rows: self.cross_chunk_rows,
             stream_rows: self.stream_rows,
             merge_set: self.merge_set.clone(),

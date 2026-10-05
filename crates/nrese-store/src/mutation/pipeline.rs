@@ -153,6 +153,7 @@ impl MutationPipeline {
         let context = crate::mutation::command::UpdateContext {
             cancellation: ticket.evaluation_token(),
             union_default_graph: self.store.config().union_default_graph,
+            geosparql_stated_only: self.store.config().geosparql_stated_only,
             services: self.store.services(),
             namespaces: self.store.namespaces().all(),
         };

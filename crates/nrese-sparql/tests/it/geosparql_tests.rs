@@ -406,6 +406,60 @@ fn stated_relations_count_too() {
     );
 }
 
+/// With the query-rewrite extension off (`geosparql_stated_only`), a relation in a triple
+/// pattern matches the statements that assert it and nothing computed from geometries;
+/// the filter functions still compute (GeoSPARQL's requirements 4 to 6 against 28 to 30).
+#[test]
+fn stated_only_reads_the_asserted_relations() {
+    let engine = engine();
+    let mut tx = engine.transaction();
+    let geo = |local: &str| {
+        NamedNode::new_unchecked(format!("http://www.opengis.net/ont/geosparql#{local}"))
+    };
+    let ex = |local: &str| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+    tx.insert(Quad::new(ex("x"), geo("sfContains"), ex("y"), GraphName::DefaultGraph).as_ref());
+    tx.commit().unwrap();
+    let names = |query: &str, stated_only: bool| -> Vec<String> {
+        let query = SparqlParser::new()
+            .parse_query(&format!("{PREFIXES}{query}"))
+            .unwrap();
+        let options = QueryOptions {
+            geosparql_stated_only: stated_only,
+            ..QueryOptions::default()
+        };
+        let snapshot = engine.snapshot();
+        let QueryResults::Solutions(solutions) =
+            evaluate_query(&snapshot, &query, &options).unwrap()
+        else {
+            panic!("solutions")
+        };
+        let mut names: Vec<String> = solutions
+            .map(|s| match s.unwrap().iter().next().map(|(_, t)| t.clone()) {
+                Some(Term::NamedNode(n)) => n
+                    .as_str()
+                    .trim_start_matches("http://example.com/")
+                    .to_owned(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    // The square contains `inner` and the point `centre` by their geometries.
+    let computed = names("SELECT ?b WHERE { ex:square geo:sfContains ?b }", false);
+    assert!(computed.contains(&"inner".to_owned()), "{computed:?}");
+    assert!(names("SELECT ?b WHERE { ex:square geo:sfContains ?b }", true).is_empty());
+    for stated_only in [false, true] {
+        assert_eq!(
+            names("SELECT ?b WHERE { ex:x geo:sfContains ?b }", stated_only),
+            ["y"]
+        );
+    }
+    let filtered = "SELECT ?b WHERE { ex:square geo:asWKT ?s . ?b geo:asWKT ?w \
+                    FILTER(geof:sfContains(?s, ?w)) }";
+    assert_eq!(names(filtered, true), names(filtered, false));
+}
+
 /// Relations as triple patterns: between random geometries, `?a geo:R ?b` equals the
 /// filter `geof:R(wkt(?a), wkt(?b))` for every relation (the R-tree finds the candidates,
 /// or every object for disjointness), and features stand in for their default geometry.
