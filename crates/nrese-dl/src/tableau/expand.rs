@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use super::depset::DepSetId;
 use super::engine::{Engine, Frame, Lit, Step, Stop, proof};
-use super::graph::{Edge, NONE, flag};
+use super::graph::{Annot, Edge, NONE, flag};
 use super::program::{Filler, Number};
 
 impl Engine<'_> {
@@ -74,21 +74,31 @@ impl Engine<'_> {
         false
     }
 
-    /// The ≥-rule on every node that isn't blocked; whether anything was added.
+    /// The ≥-rule on every node that isn't blocked; whether anything was added. It looks
+    /// at the nodes that changed since its last pass (the blocking pass collects them).
     pub fn expand_at_least(&mut self) -> Step<bool> {
-        // What changes from here on lowers the floor again for the next pass.
-        let floor = std::mem::replace(&mut self.g.dirty, NONE);
-        self.compute_blocking(floor);
+        self.update_blocking();
+        let len = self.g.nodes.len() as u32;
+        let from = std::mem::replace(&mut self.blocking.expand_from, NONE).min(len);
+        let mut nodes = std::mem::take(&mut self.blocking.expand);
+        nodes.retain(|&n| n < from);
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes.extend(from..len);
         let started = Instant::now();
-        let out = self.expand_at_least_inner(floor);
+        let out = self.expand_at_least_inner(&nodes);
         self.stats.expand += started.elapsed();
+        if out.is_err() {
+            // A stop leaves them unexpanded: they are looked at again after it.
+            self.blocking.expand.extend(nodes);
+        }
         out
     }
 
-    fn expand_at_least_inner(&mut self, floor: u32) -> Step<bool> {
+    fn expand_at_least_inner(&mut self, nodes: &[u32]) -> Step<bool> {
         let mut changed = false;
         let len = self.g.nodes.len() as u32;
-        for s in floor.min(len)..len {
+        for &s in nodes.iter().filter(|&&s| s < len) {
             let node = &self.g.nodes[s as usize];
             if node.numbers == NONE || !node.live() || self.blocked(s) {
                 continue;
@@ -123,10 +133,13 @@ impl Engine<'_> {
                     .saturating_mul(48)
                     .saturating_add(n * 256);
                 if (self.bytes() as u64).saturating_add(need) > self.config.max_memory as u64 {
-                    return Err(Stop::GaveUp(format!(
-                        "≥ {} successors with their inequalities exceed the memory budget",
-                        number.n
-                    )));
+                    return Err(Stop::Abandon(
+                        dep,
+                        format!(
+                            "≥ {} successors with their inequalities exceed the memory budget",
+                            number.n
+                        ),
+                    ));
                 }
                 let mut fresh = Vec::with_capacity(number.n as usize);
                 for _ in 0..number.n {
@@ -178,16 +191,28 @@ impl Engine<'_> {
             for (index, dep) in facts {
                 let number = self.p.at_most[index as usize];
                 let mut found = self.neighbours(s, &number);
+                let annot = Annot {
+                    root: if self.g.nodes[s as usize].flags & flag::ROOT != 0 {
+                        s
+                    } else {
+                        NONE
+                    },
+                    number: self.p.at_most_annotation[index as usize],
+                };
                 // The clause this atom stands for binds its successors to any neighbours,
                 // one node twice included: a blockable non-successor of a root then
-                // needs the NI rule.
-                if self.g.nodes[s as usize].flags & flag::ROOT != 0
-                    && found.iter().any(|&(u, _)| {
-                        let n = &self.g.nodes[u as usize];
-                        n.flags & flag::ROOT == 0 && n.parent != s
-                    })
-                {
-                    return Err(super::engine::ni_stop());
+                // raises `u ≈ u` for the NI rule.
+                if annot.root != NONE {
+                    let mut raised = false;
+                    for &(u, d) in &found {
+                        if self.needs_ni(Lit::Equal(u, u, annot)) {
+                            let d = self.deps.union(dep, d);
+                            raised |= self.ni_defer(u, u, d, annot);
+                        }
+                    }
+                    if raised {
+                        return Ok(true);
+                    }
                 }
                 if found.len() <= number.n as usize {
                     continue;
@@ -197,11 +222,15 @@ impl Engine<'_> {
                 for &(_, d) in &found {
                     premise = self.deps.union(premise, d);
                 }
-                let root = if self.g.nodes[s as usize].flags & flag::ROOT != 0 {
-                    s
-                } else {
-                    NONE
-                };
+                // A merge the NI rule has pending already satisfies the atom's clause.
+                let pending = found.iter().enumerate().any(|(i, &(a, _))| {
+                    found[i + 1..]
+                        .iter()
+                        .any(|&(b, _)| self.ni_pending(a, b, annot))
+                });
+                if pending {
+                    continue;
+                }
                 let mut alternatives = Vec::new();
                 for (i, &(a, _)) in found.iter().enumerate() {
                     for &(b, _) in &found[i + 1..] {
@@ -210,7 +239,7 @@ impl Engine<'_> {
                                 let d = self.g.inequalities[k as usize].dep;
                                 premise = self.deps.union(premise, d);
                             }
-                            None => alternatives.push(Lit::Equal(a, b, root)),
+                            None => alternatives.push(Lit::Equal(a, b, annot)),
                         }
                     }
                 }
@@ -228,13 +257,46 @@ impl Engine<'_> {
 
     /// Opens a branch point over `alternatives` and takes the first.
     pub fn branch(&mut self, alternatives: Vec<Lit>, premise: DepSetId) -> Step<()> {
+        self.branch_with(alternatives, premise, true)
+    }
+
+    /// Opens a branch point over the disjuncts of `clause` (`heads`: each alternative's
+    /// head atom) and takes the first.
+    pub fn branch_on_clause(
+        &mut self,
+        alternatives: Vec<Lit>,
+        premise: DepSetId,
+        clause: u32,
+        heads: Vec<u8>,
+    ) -> Step<()> {
+        self.branch_with(alternatives, premise, true)?;
+        if let Some(frame) = self.frames.last_mut() {
+            frame.clause = clause;
+            frame.heads = heads;
+        }
+        Ok(())
+    }
+
+    /// Opens a branch point; `semantic`: later alternatives are taken with the failed
+    /// ones' negations (where semantic branching is on).
+    pub fn branch_with(
+        &mut self,
+        alternatives: Vec<Lit>,
+        premise: DepSetId,
+        semantic: bool,
+    ) -> Step<()> {
         self.stats.branch_points += 1;
         self.frames.push(Frame {
             mark: self.g.mark(),
             pending: self.pending.len() as u32,
             bindings: self.bindings.len() as u32,
             pending_open: self.pending_open,
+            ni_pending: self.ni.pending.len() as u32,
+            ni_open: self.ni.open,
+            semantic,
             alternatives,
+            clause: NONE,
+            heads: Vec::new(),
             next: 0,
             premise,
             failed: DepSetId::EMPTY,

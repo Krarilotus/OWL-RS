@@ -20,6 +20,8 @@
 use std::collections::BTreeSet;
 
 use hashbrown::HashMap;
+
+use super::graph::NONE;
 use nrese_owl::{
     Axiom, BodyAtom, Characteristic, Clause, Concept, Filler as OwlFiller, HeadAtom, Normalised,
     ObjProp, Ontology, Term, Var,
@@ -93,6 +95,10 @@ pub struct HtClause {
     pub vars: u8,
     /// The index of the DL-clause it came from in [`Normalised::clauses`] (its proof).
     pub source: u32,
+    /// The at-most restriction its equalities stand for (an index into
+    /// [`Program::annotations`]: the annotation `@x ≤ n R.B` of JAIR 2009, Definition 5),
+    /// or `NONE`.
+    pub annotation: u32,
 }
 
 /// One step of a join plan.
@@ -143,6 +149,11 @@ pub struct Program {
     pub at_least: Vec<Number>,
     pub at_most: Vec<Number>,
     numbers: HashMap<(bool, Number), u32>,
+    /// The at-most restrictions equalities are annotated with (the NI rule's `≤ n R.B`).
+    pub annotations: Vec<Number>,
+    annotation_ids: HashMap<Number, u32>,
+    /// By at-most atom (index into `at_most`): its annotation.
+    pub at_most_annotation: Vec<u32>,
     pub clauses: Vec<HtClause>,
     /// Plans by the concept and by the role of their trigger atom.
     pub by_concept: Vec<Vec<Plan>>,
@@ -251,6 +262,83 @@ impl Program {
         id
     }
 
+    /// The annotation id of `number`.
+    fn annotation(&mut self, number: Number) -> u32 {
+        if let Some(&id) = self.annotation_ids.get(&number) {
+            return id;
+        }
+        let id = self.annotations.len() as u32;
+        self.annotations.push(number);
+        self.annotation_ids.insert(number, id);
+        id
+    }
+
+    /// The at-most restriction a clause's equalities between successors spell out: `≤ n
+    /// R.B(x)` as `R(x, y₀) ∧ B(y₀) ∧ … ∧ R(x, yₙ) ∧ B(yₙ) → ⋁ yᵢ ≈ yⱼ`; `NONE` if they
+    /// don't have that shape.
+    fn clause_annotation(&mut self, body: &[Body], head: &[Head]) -> u32 {
+        let mut ys: Vec<u8> = Vec::new();
+        for h in head {
+            if let Head::Equal(a, b) = *h {
+                if a == 0 || b == 0 {
+                    return NONE;
+                }
+                ys.extend([a, b]);
+            }
+        }
+        ys.sort_unstable();
+        ys.dedup();
+        if ys.len() < 2 {
+            return NONE;
+        }
+        let mut shape: Option<(RoleExpr, Vec<ConceptId>)> = None;
+        for &y in &ys {
+            let roles: Vec<RoleExpr> = body
+                .iter()
+                .filter_map(|b| match *b {
+                    Body::Role(r, 0, v) if v == y => Some(RoleExpr {
+                        role: r,
+                        inverse: false,
+                    }),
+                    Body::Role(r, v, 0) if v == y => Some(RoleExpr {
+                        role: r,
+                        inverse: true,
+                    }),
+                    _ => None,
+                })
+                .collect();
+            let [role] = roles[..] else {
+                return NONE;
+            };
+            let mut fillers: Vec<ConceptId> = body
+                .iter()
+                .filter_map(|b| match *b {
+                    Body::Concept(c, v) if v == y => Some(c),
+                    _ => None,
+                })
+                .collect();
+            fillers.sort_unstable();
+            match &shape {
+                None => shape = Some((role, fillers)),
+                Some(known) if *known == (role, fillers) => {}
+                Some(_) => return NONE,
+            }
+        }
+        let Some((role, fillers)) = shape else {
+            return NONE;
+        };
+        let filler = match fillers[..] {
+            [] => Filler::Top,
+            [c] => Filler::Is(c),
+            _ => return NONE,
+        };
+        self.annotation(Number {
+            n: ys.len() as u32 - 1,
+            role,
+            filler,
+        })
+    }
+
     fn role_expr(&mut self, role: ObjProp) -> RoleExpr {
         match role {
             ObjProp::Named(t) => RoleExpr {
@@ -348,7 +436,12 @@ impl Program {
                         filler: self.filler(*filler),
                     };
                     self.simple &= !number.role.inverse;
-                    Head::AtMost(self.number(true, number), var(&mut vars, *v)?)
+                    let id = self.number(true, number);
+                    if self.at_most_annotation.len() <= id as usize {
+                        let annotation = self.annotation(number);
+                        self.at_most_annotation.push(annotation);
+                    }
+                    Head::AtMost(id, var(&mut vars, *v)?)
                 }
                 HeadAtom::Equal(a, b) => Head::Equal(var(&mut vars, *a)?, var(&mut vars, *b)?),
                 HeadAtom::Nominal(t, v) => {
@@ -364,11 +457,13 @@ impl Program {
         if vars.len() != bound {
             return Err("a head variable not in the body".into());
         }
+        let annotation = self.clause_annotation(&body, &head);
         Ok(HtClause {
             body,
             head,
             vars: bound as u8,
             source,
+            annotation,
         })
     }
 
@@ -413,6 +508,7 @@ impl Program {
                 head: Vec::new(),
                 vars: 2,
                 source: source as u32,
+                annotation: NONE,
             });
         }
         // Every individual's guard holds at it.

@@ -93,11 +93,6 @@ impl BuiltinProperties {
             bottom_data: v.owl_bottom_data_property,
         }
     }
-
-    /// Whether `property` is one of the universal properties.
-    pub fn is_top(&self, property: Term) -> bool {
-        Some(property) == self.top_object || Some(property) == self.top_data
-    }
 }
 
 impl Ontology {

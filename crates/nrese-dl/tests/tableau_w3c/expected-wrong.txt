@@ -1,3 +1,3 @@
 # W3C tests the hypertableau answers wrongly, with the cause where it is known: one per
 # line, "name (TestType)<TAB>why". The run fails on a wrong answer not listed here, and on
-# a listed one that no longer is wrong. Not one of these is settled; each must be fixed.
+# a listed one that no longer is wrong. Each must be fixed.
