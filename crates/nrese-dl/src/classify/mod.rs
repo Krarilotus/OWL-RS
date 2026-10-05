@@ -75,6 +75,8 @@ pub struct Options {
     /// The longest the Horn lower bound may take (it is only an optimisation), and never
     /// more than half of what is left of [`Options::timeout`].
     pub lower_bound_timeout: Duration,
+    /// How the lower bound's context core picks successor contexts.
+    pub lower_bound_strategy: crate::context::Strategy,
     /// The most conclusions one join of the context core may produce, per run.
     pub max_join: usize,
     /// How `nrese-owl` normalises (never with lazy definitions: see the default).
@@ -106,6 +108,7 @@ impl Default for Options {
             // ore_ont_7127 (65 k classes) needs 3.9 s, and then no class needs a test: at
             // 2 s it ran out, and 65 k tests took 43 s.
             lower_bound_timeout: Duration::from_secs(60),
+            lower_bound_strategy: crate::context::Strategy::Cautious,
             max_join: 1 << 20,
             // No lazy unfolding: it under-approximates the unfolded classes in a model, and
             // the driver reads its subsumers off model labels. No proofs are read here, so

@@ -56,6 +56,7 @@ pub fn horn_lower_bound(
     classes: &[Term],
     threads: usize,
     budget: crate::context::Budget,
+    strategy: crate::context::Strategy,
 ) -> Option<Lower> {
     let all = &normalised.clauses;
     // The clauses of the part, by index into the normalisation's.
@@ -78,13 +79,13 @@ pub fn horn_lower_bound(
         .filter(|&i| all[i].flags.horn)
         .collect();
     let all_horn = horn.len() == kept.len();
-    if let Some(l) = saturate(normalised, kept, classes, threads, first) {
+    if let Some(l) = saturate(normalised, kept, classes, threads, first, strategy) {
         return Some(l);
     }
     if all_horn {
         return None;
     }
-    saturate(normalised, horn, classes, threads, budget)
+    saturate(normalised, horn, classes, threads, budget, strategy)
 }
 
 /// The context core on the clauses `part` (indexes) of `n`, dropping clauses it refuses a
@@ -95,11 +96,13 @@ fn saturate(
     classes: &[Term],
     threads: usize,
     budget: crate::context::Budget,
+    strategy: crate::context::Strategy,
 ) -> Option<Lower> {
     let options = crate::context::Options {
         threads,
         proofs: false,
         budget,
+        strategy,
         ..crate::context::Options::default()
     };
     let build = |part: &[usize]| Normalised {
