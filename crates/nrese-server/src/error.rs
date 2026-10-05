@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -124,144 +126,117 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // Server faults are logged once, here; the request span carries the request id,
-        // which the response returns in `x-request-id`.
+        // which the response returns in `x-request-id` and the problem in `request_id`.
         if let Self::Internal(detail) = &self {
             tracing::error!(%detail, "request failed on the server side");
         }
-        let (status, problem_type, title, detail, reasoner_reject) = match self {
-            Self::BadRequest(detail) => (
-                StatusCode::BAD_REQUEST,
-                "https://nrese.dev/problems/bad-request",
-                "Bad Request",
-                detail,
-                None,
-            ),
+        let rejected = matches!(self, Self::ReasonerReject { .. });
+        let (status, detail, reasoner_reject) = match self {
+            Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail, None),
             Self::BadRequestPlainText(detail) => {
                 let mut response = (StatusCode::BAD_REQUEST, detail).into_response();
                 response
                     .headers_mut()
                     .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+                response.extensions_mut().insert(Verbatim);
                 return response;
             }
-            Self::ReasonerReject { detail, reject } => (
-                StatusCode::BAD_REQUEST,
-                "https://nrese.dev/problems/reasoner-reject",
-                "Reasoner Reject",
-                detail,
-                *reject,
-            ),
-            Self::Unauthorized(detail) => (
-                StatusCode::UNAUTHORIZED,
-                "https://nrese.dev/problems/unauthorized",
-                "Unauthorized",
-                detail,
-                None,
-            ),
-            Self::Forbidden(detail) => (
-                StatusCode::FORBIDDEN,
-                "https://nrese.dev/problems/forbidden",
-                "Forbidden",
-                detail,
-                None,
-            ),
-            Self::NotFound(detail) => (
-                StatusCode::NOT_FOUND,
-                "https://nrese.dev/problems/not-found",
-                "Not Found",
-                detail,
-                None,
-            ),
-            Self::Conflict(detail) => (
-                StatusCode::CONFLICT,
-                "https://nrese.dev/problems/conflict",
-                "Conflict",
-                detail,
-                None,
-            ),
-            Self::Gone(detail) => (
-                StatusCode::GONE,
-                "https://nrese.dev/problems/gone",
-                "Gone",
-                detail,
-                None,
-            ),
-            Self::NotAcceptable(detail) => (
-                StatusCode::NOT_ACCEPTABLE,
-                "https://nrese.dev/problems/not-acceptable",
-                "Not Acceptable",
-                detail,
-                None,
-            ),
-            Self::UnsupportedMediaType(detail) => (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "https://nrese.dev/problems/unsupported-media-type",
-                "Unsupported Media Type",
-                detail,
-                None,
-            ),
-            Self::PayloadTooLarge(detail) => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "https://nrese.dev/problems/payload-too-large",
-                "Payload Too Large",
-                detail,
-                None,
-            ),
-            Self::TooManyRequests(detail) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "https://nrese.dev/problems/too-many-requests",
-                "Too Many Requests",
-                detail,
-                None,
-            ),
-            Self::Timeout(detail) => (
-                StatusCode::REQUEST_TIMEOUT,
-                "https://nrese.dev/problems/timeout",
-                "Request Timeout",
-                detail,
-                None,
-            ),
-            Self::ServiceUnavailable(detail) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "https://nrese.dev/problems/service-unavailable",
-                "Service Unavailable",
-                detail,
-                None,
-            ),
-            Self::Internal(detail) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "https://nrese.dev/problems/internal-error",
-                "Internal Error",
-                detail,
-                None,
-            ),
+            Self::ReasonerReject { detail, reject } => (StatusCode::BAD_REQUEST, detail, *reject),
+            Self::Unauthorized(detail) => (StatusCode::UNAUTHORIZED, detail, None),
+            Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
+            Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
+            Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
+            Self::Gone(detail) => (StatusCode::GONE, detail, None),
+            Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail, None),
+            Self::UnsupportedMediaType(detail) => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, detail, None)
+            }
+            Self::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail, None),
+            Self::TooManyRequests(detail) => (StatusCode::TOO_MANY_REQUESTS, detail, None),
+            Self::Timeout(detail) => (StatusCode::REQUEST_TIMEOUT, detail, None),
+            Self::ServiceUnavailable(detail) => (StatusCode::SERVICE_UNAVAILABLE, detail, None),
+            Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail, None),
         };
-
-        let body = ProblemJson {
-            r#type: problem_type,
-            title,
-            status: status.as_u16(),
-            detail,
-            instance: None,
-            trace_id: None,
-            reasoner_reject,
+        let (problem_type, title) = if rejected {
+            (
+                Cow::Borrowed("https://nrese.dev/problems/reasoner-reject"),
+                Cow::Borrowed("Reasoner Reject"),
+            )
+        } else {
+            kind(status)
         };
-
-        let mut response = (status, Json(body)).into_response();
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/problem+json"),
-        );
-        response
+        problem(
+            status,
+            &ProblemJson {
+                r#type: problem_type,
+                title,
+                status: status.as_u16(),
+                detail,
+                reasoner_reject,
+            },
+        )
     }
 }
 
+/// Marks an error status whose body must stay as written: the plain-text profile for
+/// SPARQL parse errors, for clients that show the message as text, and the readiness
+/// documents a 503 carries (`/readyz`, the extended health), which probes read. The
+/// envelope layer (`http::problems`) leaves it alone.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Verbatim;
+
+/// A status's problem type and title: the one place they are named, for the handlers'
+/// errors and for what the framework answers on its own.
+pub(crate) fn kind(status: StatusCode) -> (Cow<'static, str>, Cow<'static, str>) {
+    let named = |slug: &'static str, title: &'static str| {
+        (
+            Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
+            Cow::Borrowed(title),
+        )
+    };
+    match status {
+        StatusCode::BAD_REQUEST => named("bad-request", "Bad Request"),
+        StatusCode::UNAUTHORIZED => named("unauthorized", "Unauthorized"),
+        StatusCode::FORBIDDEN => named("forbidden", "Forbidden"),
+        StatusCode::NOT_FOUND => named("not-found", "Not Found"),
+        StatusCode::CONFLICT => named("conflict", "Conflict"),
+        StatusCode::GONE => named("gone", "Gone"),
+        StatusCode::NOT_ACCEPTABLE => named("not-acceptable", "Not Acceptable"),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            named("unsupported-media-type", "Unsupported Media Type")
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => named("payload-too-large", "Payload Too Large"),
+        StatusCode::TOO_MANY_REQUESTS => named("too-many-requests", "Too Many Requests"),
+        StatusCode::REQUEST_TIMEOUT => named("timeout", "Request Timeout"),
+        StatusCode::SERVICE_UNAVAILABLE => named("service-unavailable", "Service Unavailable"),
+        StatusCode::INTERNAL_SERVER_ERROR => named("internal-error", "Internal Error"),
+        other => {
+            let title = other.canonical_reason().unwrap_or("Error");
+            let slug = title.to_ascii_lowercase().replace([' ', '\''], "-");
+            (
+                Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
+                Cow::Borrowed(title),
+            )
+        }
+    }
+}
+
+/// A problem document as the answer, with its media type.
+pub(crate) fn problem(status: StatusCode, body: &impl Serialize) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(PROBLEM_JSON));
+    response
+}
+
+pub(crate) const PROBLEM_JSON: &str = "application/problem+json";
+
 #[derive(Debug, Serialize)]
 struct ProblemJson {
-    r#type: &'static str,
-    title: &'static str,
+    r#type: Cow<'static, str>,
+    title: Cow<'static, str>,
     status: u16,
     detail: String,
-    instance: Option<String>,
-    trace_id: Option<String>,
     reasoner_reject: Option<RejectExplanationView>,
 }

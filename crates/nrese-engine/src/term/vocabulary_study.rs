@@ -1,6 +1,6 @@
 //! What a compressed vocabulary would take, measured on a checkpoint's dictionary: for the
 //! decision on the store-size gap to QLever (design §3 item 4,
-//! docs/plan/2026-10-02-research-designs.md).
+//! docs/design/research-designs.md).
 //!
 //! ```text
 //! NRESE_STUDY_CHECKPOINT=/path/checkpoint-….nck \
