@@ -24,9 +24,9 @@ benchmark runs.
 
 | Win | Measured | Guard |
 |---|---|---|
-| Drivers read the batch store's runs in place, no copied drivers (P1-F1) | LUBM 1000 peak 22.2 → 12.9 GB, reasoning −31 % | missing: a byte counter on the batch store |
-| No list of derived facts; the input kept apart (P1-F4) | LUBM 1000 peak 15.2 → 13.4 GB | missing (as F1) |
-| Candidates deduplicated and probed in order per morsel (P1-F8) | LUBM 1000 reasoning −7.5 % | missing: a probe counter |
+| Drivers read the batch store's runs in place, no copied drivers (P1-F1) | LUBM 1000 peak 22.2 → 12.9 GB, reasoning −31 % | `rule_jobs_copy_no_drivers_and_rounds_keep_no_derived_facts_list` (no driver bytes copied; 3.85 MB without in-place drivers) |
+| No list of derived facts; the input kept apart (P1-F4) | LUBM 1000 peak 15.2 → 13.4 GB | the same test: after each round the heap beside the working set's runs (their byte counter) stays under 6 B per derived fact (38.8 kB on 5 Oct; a derived-facts list: 1.2 MB) |
+| Candidates deduplicated and probed in order per morsel (P1-F8) | LUBM 1000 reasoning −7.5 % | `membership_probes_are_distinct_and_ordered_per_morsel` (≤ 95,043 probes, none out of order; without the deduplication 160,601, unsorted 3,196 out of order) |
 | Permutations derived by a stable partition (P1-F7) | LUBM 1000 load 30.0 → 26.5 s | `planned_layouts_sort_as_few_times_as_designed` (2 sorts default graph, 3 named graphs) |
 | Group counts on the index (`COUNT … GROUP BY` one pattern) | Wikidata q07 2,101 → 0.18 ms | `group_counts_walk_the_index` (plan shows `group count`) |
 | Distinct values by a group walk (NOT EXISTS sides, sets) | DBpedia q13 25 → 3.1 ms | `distinct_values_walk_the_index` (`group walk`) |
@@ -38,8 +38,10 @@ benchmark runs.
 | DL: `∃R.D ⊑ C` over a non-simple R read as `D ⊑ ∀R⁻.C` (Horn), also at the top of a subclass axiom | ore_ont_10212 gave up at 60 s → 0.24 s (HermiT 0.19 s) | `existentials_over_transitive_roles_on_the_left_stay_horn` (no disjunction with an empty body) |
 | Canonicalisation without factorial branching | a thousand twins: linear | `many_equal_children_are_twins` (search leaves bounded) |
 
-Plan guards live in `crates/nrese-sparql/tests/it/plan_guard_tests.rs`. A new win gets its
-row and its guard in the same commit.
+Plan guards live in `crates/nrese-sparql/tests/it/plan_guard_tests.rs`, the
+materialisation's in `crates/nrese-reasoner/tests/memory_guards.rs` (OWL 2 RL over a
+LUBM-shaped input of 60 k facts on one thread, with a counting allocator: counts of bytes
+and probes, deterministic). A new win gets its row and its guard in the same commit.
 
 ## 1. Where NRESE stands (office batches A and B, 3-5 October 2026)
 
@@ -106,7 +108,10 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 ## 5. Method
 
 - **Profile before changing**: `perf` with frame pointers (`benches/probes/perf-profile.sh`).
-  Top-down, the approach first, then layout, then machine code.
+  Top-down, the approach first, then layout, then machine code. For memory, the perf lab
+  built with `RUSTFLAGS="--cfg alloc_profile"` prints a heap profile of `--reason` by phase
+  (`nrese_exec::heap`: each phase's peak and what it left, in bytes requested), and on
+  Windows the peak committed memory before and after reasoning.
 - **A/B with interleaved runs**, the median of at least three. A change that slows any
   other measured path by more than noise is not kept, or is kept only behind a switch
   with the reason written down.
