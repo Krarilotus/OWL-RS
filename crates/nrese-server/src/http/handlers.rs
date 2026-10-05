@@ -162,7 +162,13 @@ pub async fn admin_restore_dataset(
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     match build_ready_response(&state) {
         Ok(response) if state.is_ready() => (StatusCode::OK, Json(response)).into_response(),
-        Ok(response) => (StatusCode::SERVICE_UNAVAILABLE, Json(response)).into_response(),
+        // Not ready is a status document, not an error: probes read it as written.
+        Ok(response) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Extension(crate::error::Verbatim),
+            Json(response),
+        )
+            .into_response(),
         Err(error) => error.into_response(),
     }
 }

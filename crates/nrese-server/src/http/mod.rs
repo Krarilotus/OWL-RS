@@ -16,6 +16,7 @@ pub mod openapi;
 mod operator_api;
 mod operator_diagnostics;
 mod operator_ui;
+pub(crate) mod problems;
 pub(crate) mod rdf4j;
 mod rdf_payload;
 mod reasoning_view;

@@ -1,4 +1,4 @@
-//! The logical plan of a query (docs/plan/2026-10-02-plan-ir.md, step 1): the algebra's
+//! The logical plan of a query (docs/design/query-plan.md, step 1): the algebra's
 //! operators with joins and unions as lists, so that rewrites (step 2) can reorder and
 //! merge them; a basic graph pattern is a join of its triple patterns.
 //!
@@ -530,9 +530,22 @@ impl Plan {
     /// offers per product once, instead of making a row for every feature and offer of a
     /// product (BSBM BI q4: 155 M rows).
     ///
-    /// Applies to `COUNT`, `COUNT(*)` and `SUM` without `DISTINCT`, and only where `A` and
-    /// `B` share a variable (with none, an empty `B` would still leave one partial row).
-    /// Other aggregates leave the group as it is.
+    /// - `COUNT`, `COUNT(*)` and `SUM`: the group sums the partial results.
+    /// - `MIN` and `MAX` (with or without `DISTINCT`, which changes no extreme): the
+    ///   extreme of the partial extremes. `ORDER BY`'s order is total over distinct terms
+    ///   (`value::order`), so the extreme is the same term either way.
+    /// - `AVG`: a `SUM` and a `COUNT(*)` per partial group, summed by the group and divided
+    ///   after it. SPARQL's division is `AVG`'s own: integers and decimals give a decimal,
+    ///   a float or double total its type, a duration total a duration of its type. An
+    ///   error, an unbound value or mixed kinds (numbers and durations) make the partial
+    ///   sum unbound, and with it the sum of the partial sums and the quotient, as one
+    ///   error makes `AVG` unbound. A group is never empty (it has a key), so the count is
+    ///   at least one.
+    ///
+    /// Not with `DISTINCT` for the others, not over expressions with `EXISTS` or values
+    /// drawn per row (`RAND`, `BNODE`: the partial rows would draw fewer), and only where
+    /// `A` and `B` share a variable (with none, an empty `B` would still leave one partial
+    /// row). Other aggregates (`SAMPLE`, `GROUP_CONCAT`) leave the group as it is.
     pub fn eager_aggregation(self) -> Self {
         self.eager_aggregation_where(&|_, _| true)
     }
@@ -672,22 +685,21 @@ fn pre_aggregated(
     if keys.is_empty() || aggregates.is_empty() || input.ordered() {
         return None;
     }
+    // EXISTS reads the whole solution, which the partial rows don't have; RAND and the
+    // like are drawn once per row, and the partial rows are fewer.
+    let per_row = |expr: &Expression| crate::native::per_solution(expr);
     let decomposable = aggregates.iter().all(|(_, aggregate)| match aggregate {
         AggregateExpression::CountSolutions { distinct } => !distinct,
         AggregateExpression::FunctionCall {
-            name: AggregateFunction::Count | AggregateFunction::Sum,
+            name: AggregateFunction::Count | AggregateFunction::Sum | AggregateFunction::Avg,
             expr,
             distinct,
-        } => {
-            // EXISTS reads the whole solution, which the partial rows don't have.
-            !distinct
-                && !expr.find(&mut |node| {
-                    matches!(
-                        node,
-                        nrese_sparql_syntax::visit::Node::Expression(Expression::Exists(_))
-                    )
-                })
-        }
+        } => !distinct && !per_row(expr),
+        AggregateExpression::FunctionCall {
+            name: AggregateFunction::Min | AggregateFunction::Max,
+            expr,
+            ..
+        } => !per_row(expr),
         _ => false,
     });
     if !decomposable {
@@ -743,26 +755,69 @@ fn pre_aggregated(
             .any(|v| v.as_str() == name)
             || aggregates.iter().any(|(v, _)| v.as_str() == name)
     };
+    let mut n = 0;
+    let mut fresh = || loop {
+        let name = format!("__eager{n}");
+        n += 1;
+        if !taken(&name) {
+            break Variable::new_unchecked(name);
+        }
+    };
+    let over = |name: AggregateFunction, variable: &Variable| AggregateExpression::FunctionCall {
+        name,
+        expr: Expression::Variable(variable.clone()),
+        distinct: false,
+    };
     let mut partials = Vec::with_capacity(aggregates.len());
     let mut finals = Vec::with_capacity(aggregates.len());
-    let mut n = 0;
+    // AVG's quotients, computed after the group: (target, total, count).
+    let mut quotients: Vec<(Variable, Variable, Variable)> = Vec::new();
     for (variable, aggregate) in aggregates {
-        let partial = loop {
-            let name = format!("__eager{n}");
-            n += 1;
-            if !taken(&name) {
-                break Variable::new_unchecked(name);
-            }
-        };
-        partials.push((partial.clone(), aggregate.clone()));
-        finals.push((
-            variable.clone(),
+        let partial = fresh();
+        match aggregate {
             AggregateExpression::FunctionCall {
-                name: AggregateFunction::Sum,
-                expr: Expression::Variable(partial),
-                distinct: false,
-            },
-        ));
+                name: name @ (AggregateFunction::Min | AggregateFunction::Max),
+                expr,
+                ..
+            } => {
+                partials.push((
+                    partial.clone(),
+                    AggregateExpression::FunctionCall {
+                        name: name.clone(),
+                        expr: expr.clone(),
+                        distinct: false,
+                    },
+                ));
+                finals.push((variable.clone(), over(name.clone(), &partial)));
+            }
+            AggregateExpression::FunctionCall {
+                name: AggregateFunction::Avg,
+                expr,
+                ..
+            } => {
+                let partial_count = fresh();
+                partials.push((
+                    partial.clone(),
+                    AggregateExpression::FunctionCall {
+                        name: AggregateFunction::Sum,
+                        expr: expr.clone(),
+                        distinct: false,
+                    },
+                ));
+                partials.push((
+                    partial_count.clone(),
+                    AggregateExpression::CountSolutions { distinct: false },
+                ));
+                let (total, count) = (fresh(), fresh());
+                finals.push((total.clone(), over(AggregateFunction::Sum, &partial)));
+                finals.push((count.clone(), over(AggregateFunction::Sum, &partial_count)));
+                quotients.push((variable.clone(), total, count));
+            }
+            _ => {
+                partials.push((partial.clone(), aggregate.clone()));
+                finals.push((variable.clone(), over(AggregateFunction::Sum, &partial)));
+            }
+        }
     }
     let mut joined: Vec<Plan> = with_keys.into_iter().cloned().collect();
     joined.push(Plan::Group {
@@ -770,10 +825,30 @@ fn pre_aggregated(
         keys: shared,
         aggregates: partials,
     });
-    Some(Plan::Group {
+    let group = Plan::Group {
         input: Box::new(Plan::Join(joined)),
         keys: keys.to_vec(),
         aggregates: finals,
+    };
+    if quotients.is_empty() {
+        return Some(group);
+    }
+    // The averages from the totals and counts, and the group's own variables only.
+    let averaged = quotients
+        .into_iter()
+        .fold(group, |input, (variable, total, count)| Plan::Extend {
+            input: Box::new(input),
+            variable,
+            expression: Expression::Divide(
+                Box::new(Expression::Variable(total)),
+                Box::new(Expression::Variable(count)),
+            ),
+        });
+    let mut variables = keys.to_vec();
+    variables.extend(aggregates.iter().map(|(variable, _)| variable.clone()));
+    Some(Plan::Project {
+        input: Box::new(averaged),
+        variables,
     })
 }
 

@@ -380,6 +380,22 @@ impl Context<'_> {
         pattern: &GraphPattern,
         keep_matching: bool,
     ) -> NativeResult<Solutions> {
+        let start = std::time::Instant::now();
+        let input = solutions.table.len();
+        // EXPLAIN: how the EXISTS ran, with the filter's estimate (all rows for EXISTS,
+        // nine in ten for NOT EXISTS, as `pushdown::selectivity` has it).
+        let note = |operator: &str, detail: String, rows: usize| {
+            if self.trace.is_some() {
+                let kept = if keep_matching { 1.0 } else { 0.9 };
+                let estimate = Some((input as f64 * kept).round() as u64);
+                self.note(operator, detail, estimate, rows, start);
+            }
+        };
+        let joined = if keep_matching {
+            "semi join"
+        } else {
+            "anti join"
+        };
         let (conjuncts, inner) = top_filters(pattern);
         let correlated = conjuncts
             .iter()
@@ -392,6 +408,8 @@ impl Context<'_> {
                 solutions
                     .table
                     .retain_mask(&mask.iter().map(|m| *m == keep_matching).collect::<Vec<_>>());
+                let detail = "the pattern per distinct value of the row it reads".to_owned();
+                note("exists per value", detail, solutions.table.len());
                 return Ok(solutions);
             }
             // One evaluation, one semi- or anti-join. Only the shared variables' distinct
@@ -408,19 +426,33 @@ impl Context<'_> {
                 self.eval_set(pattern, &shared)?
             };
             let (lk, rk) = shared_columns(&solutions, &found);
+            let names: Vec<String> = lk.iter().map(|&c| solutions.vars[c].to_string()).collect();
+            let detail = format!(
+                "EXISTS once, as a set of {} row(s) over {}",
+                found.table.len(),
+                names.join(" ")
+            );
             if !has_undef(&solutions.table, &lk) && !has_undef(&found.table, &rk) {
                 match keep_matching {
                     true => semi_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
                     false => anti_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
                 }
                 self.consumed(&found);
+                note(joined, detail, solutions.table.len());
                 return Ok(solutions);
             }
             // An unbound variable isn't put into the pattern: any value matches.
             let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false);
             self.consumed(&found);
+            let kept = mask.iter().filter(|m| **m == keep_matching).count();
+            note(joined, detail, kept);
             mask
         };
+        if correlated {
+            let kept = mask.iter().filter(|m| **m == keep_matching).count();
+            let detail = "the pattern once, joined to the rows' distinct values".to_owned();
+            note("correlated exists", detail, kept);
+        }
         solutions
             .table
             .retain_mask(&mask.iter().map(|m| *m == keep_matching).collect::<Vec<_>>());

@@ -1,4 +1,4 @@
-//! EXPLAIN before running (the query plan's step 3, docs/plan/2026-10-02-plan-ir.md): the
+//! EXPLAIN before running (the query plan's step 3, docs/design/query-plan.md): the
 //! plan after the rewrites, each node with an estimate of its rows, read from the store's
 //! statistics without evaluating anything.
 //!
@@ -10,7 +10,7 @@
 //! | `OPTIONAL` | The join, at least the left side |
 //! | Filter | Its input times the conjuncts' selectivities ([`super::pushdown::selectivity`]) |
 //! | Union | The sum; `MINUS` the left side |
-//! | Path | The statements of its predicates (the edges it may follow) |
+//! | Path | Alone: one between constants, the fan-out from a constant end, the pairs between variables; from bound values, their number times the fan-out ([`Context::path_estimate`]) |
 //! | `GROUP BY` | One row without keys; at most its input with them |
 //! | Slice | Its input past the offset, at most the limit |
 //! | `VALUES` | Its rows |
@@ -18,12 +18,21 @@
 //!
 //! Projection, `DISTINCT`, `REDUCED`, `ORDER BY` and extensions keep their input's estimate
 //! (an upper bound for `DISTINCT`). The estimates order work; they aren't promises.
+//!
+//! EXPLAIN after running (`explain_query`) shows the same estimate for each operator the
+//! evaluation runs, beside its rows, and for the operators inside one: a basic graph
+//! pattern's steps (the orderer's), a pattern evaluated from rows already computed
+//! (`sideways`: the rows times each pattern's count over the distinct values it shares),
+//! filters (their selectivity), a `LIMIT` that stops a pattern (`limit pushdown`), closures,
+//! `EXISTS` as a semi- or anti-join (all rows, nine in ten), group walks (the key's
+//! distinct values). Full-text and vector searches have no statistics: no estimate.
 
 use nrese_rdf::Variable;
-use nrese_sparql_syntax::algebra::PropertyPathExpression;
-use nrese_sparql_syntax::term::NamedNodePattern;
+use nrese_sparql_syntax::algebra::{GraphPattern, PropertyPathExpression};
+use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
 
-use super::{Context, GraphScope, bound_variables, pushdown};
+use super::path_joins::PathJoin;
+use super::{Context, GraphScope, PathPattern, ScanPattern, bound_variables, pushdown};
 use crate::plan::Plan;
 use crate::query::PlannedStep;
 
@@ -87,14 +96,33 @@ impl Context<'_> {
                 subject,
                 path,
                 object,
-            } => (
-                "path",
-                format!("{subject} {path} {object}"),
-                Some(self.path_rows(path)),
-            ),
+            } => {
+                let pattern = PathPattern {
+                    subject,
+                    path,
+                    object,
+                    filter: None,
+                };
+                let rows = Some(self.path_size(&pattern));
+                ("path", format!("{subject} {path} {object}"), rows)
+            }
             Plan::Join(inputs) if inputs.iter().all(|i| matches!(i, Plan::Scan(_))) => {
                 let rows = self.bgp_rows(inputs, depth + 1, steps);
                 ("bgp", format!("{} triple patterns", inputs.len()), rows)
+            }
+            // Paths joined to triple patterns, ordered with them as the executor does.
+            Plan::Join(_)
+                if !self.as_written
+                    && let lowered = plan.lower()
+                    && let Some(join) = PathJoin::of(&lowered) =>
+            {
+                let rows = self.path_join_steps(&join, depth + 1, steps);
+                let detail = format!(
+                    "{} triple patterns and {} paths, ordered together",
+                    join.triples.len(),
+                    join.paths.len()
+                );
+                ("bgp", detail, Some(rows))
             }
             Plan::Join(inputs) => {
                 let mut rows = Some(1.0);
@@ -252,6 +280,10 @@ impl Context<'_> {
             }
             return Some(0.0);
         };
+        if scans.is_empty() {
+            // The empty pattern: one solution, binding nothing.
+            return Some(1.0);
+        }
         let counts: Vec<u64> = scans
             .iter()
             .map(|scan| self.snapshot.estimate_in(self.model, &scan.quad_pattern()))
@@ -270,36 +302,184 @@ impl Context<'_> {
         Some(rows.unwrap_or_else(|| counts.iter().copied().max().unwrap_or(0) as f64))
     }
 
-    /// The statements a path may follow: those of its predicates.
-    fn path_rows(&self, path: &PropertyPathExpression) -> f64 {
-        let mut predicates = Vec::new();
-        collect_predicates(path, &mut predicates);
-        predicates
-            .iter()
-            .map(|predicate| {
-                let triple = nrese_sparql_syntax::term::TriplePattern {
-                    subject: Variable::new_unchecked("_s").into(),
-                    predicate: predicate.clone().into(),
-                    object: Variable::new_unchecked("_o").into(),
+    /// The estimate of `pattern`'s rows ([`Self::estimate_plan`]): what EXPLAIN shows
+    /// beside the rows each operator gave.
+    pub(super) fn estimate_rows(&self, pattern: &GraphPattern) -> Option<u64> {
+        self.estimate_plan(&Plan::of(pattern), 0, &mut Vec::new())
+            .map(|rows| rows.max(0.0).round() as u64)
+    }
+
+    /// A basic graph pattern's rows by the join orderer; two patterns, which it only
+    /// sorts, by the larger (as [`Self::estimate_plan`]).
+    pub(super) fn bgp_estimate(&self, scans: &[ScanPattern], counts: &[u64]) -> Option<u64> {
+        let plan = self.join_order(scans, counts);
+        match plan.rows.last().copied().filter(|r| r.is_finite()) {
+            Some(rows) => Some(rows.max(0.0).round() as u64),
+            None => counts.iter().copied().max(),
+        }
+    }
+
+    /// The rows of a path pattern ([`Self::path_size`]); from `bound` values of one of its
+    /// variable ends where it is followed from rows already computed.
+    pub(super) fn path_estimate(
+        &self,
+        path: &PathPattern<'_>,
+        bound: Option<usize>,
+    ) -> Option<u64> {
+        let rows = match bound {
+            Some(values) => {
+                let forward = self.path_fanout(path.path, true);
+                let backward = self.path_fanout(path.path, false);
+                values as f64 * forward.min(backward)
+            }
+            None => self.path_size(path),
+        };
+        let kept = path.filter.map_or(1.0, pushdown::selectivity);
+        Some((rows * kept).max(0.0).round() as u64)
+    }
+
+    /// The rows of a path pattern alone. Both ends constant: one. One constant end: a
+    /// single link's exact count; a closure's reach from the constant by a bounded search
+    /// (exact up to [`REACH_BUDGET`] nodes, at least that beyond); otherwise the path's
+    /// fan-out from it. Both ends variables: [`Self::path_open`].
+    pub(super) fn path_size(&self, path: &PathPattern<'_>) -> f64 {
+        let constant = |term: &TermPattern| {
+            !matches!(term, TermPattern::Variable(_) | TermPattern::BlankNode(_))
+        };
+        match (constant(path.subject), constant(path.object)) {
+            (true, true) => 1.0,
+            (false, false) => self.path_open(path.path),
+            (forward, _) => {
+                let end = if forward { path.subject } else { path.object };
+                if let PropertyPathExpression::NamedNode(predicate) = path.path {
+                    let triple = nrese_sparql_syntax::term::TriplePattern {
+                        subject: path.subject.clone(),
+                        predicate: predicate.clone().into(),
+                        object: path.object.clone(),
+                    };
+                    return self.scan_rows(&triple);
+                }
+                let modelled = self.path_fanout(path.path, forward);
+                if let PropertyPathExpression::OneOrMore(_)
+                | PropertyPathExpression::ZeroOrMore(_) = path.path
+                {
+                    let resolved = super::paths::Path::resolve(path.path, &self.snapshot);
+                    let reached = match constant_id(self, end) {
+                        // A term the store doesn't have: only itself, with `*`.
+                        None => Some(usize::from(matches!(
+                            path.path,
+                            PropertyPathExpression::ZeroOrMore(_)
+                        ))),
+                        Some(id) => self.path_evaluator().ok().and_then(|evaluator| {
+                            evaluator.reach_within(&resolved, id, forward, REACH_BUDGET)
+                        }),
+                    };
+                    return match reached {
+                        Some(reached) => reached as f64,
+                        None => modelled.max(REACH_BUDGET as f64),
+                    };
+                }
+                modelled
+            }
+        }
+    }
+
+    /// The pairs of a path between two variables: a link's statements; a sequence's first
+    /// part times the second's fan-out; an alternative's sum; a closure's starts (the
+    /// step's pairs over its fan-out) times what each reaches ([`reach`]), and for `*`
+    /// each start with itself; a negated set every statement.
+    fn path_open(&self, path: &PropertyPathExpression) -> f64 {
+        match path {
+            PropertyPathExpression::NamedNode(predicate) => self.scan_rows(&link(predicate)),
+            PropertyPathExpression::Reverse(p) | PropertyPathExpression::ZeroOrOne(p) => {
+                self.path_open(p)
+            }
+            PropertyPathExpression::Sequence(a, b) => self.path_open(a) * self.path_fanout(b, true),
+            PropertyPathExpression::Alternative(a, b) => self.path_open(a) + self.path_open(b),
+            PropertyPathExpression::OneOrMore(p) | PropertyPathExpression::ZeroOrMore(p) => {
+                let (pairs, fanout) = (self.path_open(p), self.path_fanout(p, true));
+                let starts = if fanout > 0.0 { pairs / fanout } else { 0.0 };
+                let own = f64::from(u8::from(matches!(
+                    path,
+                    PropertyPathExpression::ZeroOrMore(_)
+                )));
+                starts * (reach(fanout, pairs) + own)
+            }
+            PropertyPathExpression::NegatedPropertySet(_) => {
+                self.snapshot.len_in(self.model) as f64
+            }
+        }
+    }
+
+    /// The ends a path reaches from one start (`forward`) or the starts that reach one end:
+    /// a link's statements per distinct subject (object); a sequence's product, an
+    /// alternative's sum; `p?` one more than `p`; a closure what one start reaches
+    /// ([`reach`]); a negated set one.
+    pub(super) fn path_fanout(&self, path: &PropertyPathExpression, forward: bool) -> f64 {
+        match path {
+            PropertyPathExpression::NamedNode(predicate) => {
+                let triple = link(predicate);
+                let Some(scan) = self.scan_pattern(&triple) else {
+                    return 0.0;
                 };
-                self.scan_rows(&triple)
-            })
-            .sum()
+                let count = self.snapshot.estimate_in(self.model, &scan.quad_pattern());
+                let end = Variable::new_unchecked(if forward { "_s" } else { "_o" });
+                let distinct = self.distinct(&scan, &end, count).max(1);
+                count as f64 / distinct as f64
+            }
+            PropertyPathExpression::Reverse(p) => self.path_fanout(p, !forward),
+            PropertyPathExpression::Sequence(a, b) => {
+                self.path_fanout(a, forward) * self.path_fanout(b, forward)
+            }
+            PropertyPathExpression::Alternative(a, b) => {
+                self.path_fanout(a, forward) + self.path_fanout(b, forward)
+            }
+            PropertyPathExpression::ZeroOrOne(p) => 1.0 + self.path_fanout(p, forward),
+            PropertyPathExpression::OneOrMore(p) => {
+                reach(self.path_fanout(p, forward), self.path_open(p))
+            }
+            PropertyPathExpression::ZeroOrMore(p) => {
+                1.0 + reach(self.path_fanout(p, forward), self.path_open(p))
+            }
+            PropertyPathExpression::NegatedPropertySet(_) => 1.0,
+        }
     }
 }
 
-fn collect_predicates(path: &PropertyPathExpression, out: &mut Vec<nrese_rdf::NamedNode>) {
-    match path {
-        PropertyPathExpression::NamedNode(n) => out.push(n.clone()),
-        PropertyPathExpression::NegatedPropertySet(set) => out.extend(set.iter().cloned()),
-        PropertyPathExpression::Reverse(p)
-        | PropertyPathExpression::ZeroOrMore(p)
-        | PropertyPathExpression::OneOrMore(p)
-        | PropertyPathExpression::ZeroOrOne(p) => collect_predicates(p, out),
-        PropertyPathExpression::Sequence(a, b) | PropertyPathExpression::Alternative(a, b) => {
-            collect_predicates(a, out);
-            collect_predicates(b, out);
-        }
+/// The nodes a bounded search from a path's constant end may expand for an estimate
+/// ([`Context::path_size`]).
+const REACH_BUDGET: usize = 4096;
+
+/// The id of a constant path end, if the store has the term.
+fn constant_id(ctx: &Context<'_>, term: &TermPattern) -> Option<u64> {
+    let term: nrese_rdf::Term = match term {
+        TermPattern::NamedNode(n) => n.clone().into(),
+        TermPattern::Literal(l) => l.clone().into(),
+        _ => return None,
+    };
+    ctx.lookup_const(term.as_ref())
+        .map(nrese_engine::TermId::raw)
+}
+
+/// What one start reaches over a step of fan-out `fanout` in one or more steps: the
+/// fan-outs of up to eight steps added up, at most the step's `pairs` (no more nodes than
+/// that can be reached).
+fn reach(fanout: f64, pairs: f64) -> f64 {
+    let mut reached = 0.0;
+    let mut level = 1.0;
+    for _ in 0..8 {
+        level *= fanout;
+        reached += level;
+    }
+    reached.min(pairs.max(fanout))
+}
+
+/// `?_s predicate ?_o`.
+fn link(predicate: &nrese_rdf::NamedNode) -> nrese_sparql_syntax::term::TriplePattern {
+    nrese_sparql_syntax::term::TriplePattern {
+        subject: Variable::new_unchecked("_s").into(),
+        predicate: predicate.clone().into(),
+        object: Variable::new_unchecked("_o").into(),
     }
 }
 

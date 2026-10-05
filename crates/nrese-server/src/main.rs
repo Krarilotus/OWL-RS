@@ -22,10 +22,10 @@ fn main() -> Result<()> {
     // Built for a CPU with more than this one has (NRESE_TARGET_CPU): stop here, with the
     // reason, before any code compiled for that CPU runs (the async runtime is built after
     // this), not on an illegal instruction later.
-    nrese_engine::cpu::exit_if_missing();
+    nrese_store::cpu::exit_if_missing();
     // What threads freed goes back to the system after bulk loads and reasoning.
     // SAFETY: mimalloc's `mi_collect` may be called at any time, from any thread.
-    nrese_engine::memory::set_release(|force| unsafe { libmimalloc_sys::mi_collect(force) });
+    nrese_store::set_memory_release(|force| unsafe { libmimalloc_sys::mi_collect(force) });
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -69,7 +69,7 @@ async fn run() -> Result<()> {
     if cli.command == CliCommand::CheckConfig {
         // Loading validated everything; show what takes effect.
         print!("{}", config.summary());
-        println!("cpu: {}", nrese_engine::cpu::summary());
+        println!("cpu: {}", nrese_store::cpu::summary());
         println!("configuration is valid");
         return Ok(());
     }

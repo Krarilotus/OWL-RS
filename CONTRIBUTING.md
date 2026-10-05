@@ -11,7 +11,7 @@ NRESE is licensed under the Apache License, Version 2.0 ([LICENSE-APACHE](LICENS
 
 - A new dependency must be permissively licensed, so that NRESE stays usable under MIT or Apache-2.0 alone: MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, and similar. MPL-2.0 only unmodified, and only after asking.
 - GPL, LGPL (statically linked), AGPL and source-available dependencies aren't accepted: they would impose their terms on everyone who uses NRESE.
-- Prefer none at all: see the rules in [docs/plan/2026-09-30-graphdb-parity-plan.md](docs/plan/2026-09-30-graphdb-parity-plan.md) §6.
+- Prefer none at all: the rules are in [ADR-0010](docs/adr/0010-standing-product-decisions.md) (libraries behind our own traits; no C or C++ for speed).
 
 ## Working rules
 

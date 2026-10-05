@@ -1,4 +1,4 @@
-# The query plan (work package C of the audit, with G4)
+# The query plan
 
 The native executor (`nrese-sparql/src/native/mod.rs`, 5,400 lines) walks the SPARQL
 algebra and decides as it goes: `eval_operator`'s match guards pick a strategy per node

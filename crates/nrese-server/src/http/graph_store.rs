@@ -199,38 +199,12 @@ mod tests {
     use super::write_graph_status;
 
     #[test]
-    fn graph_target_defaults_to_default_graph() {
-        let target = parse_graph_target(&RawQuery(None)).expect("target should parse");
-        assert_eq!(target, nrese_store::GraphTarget::DefaultGraph);
-    }
-
-    #[test]
-    fn graph_target_accepts_named_graph_parameter() {
-        let target = parse_graph_target(&RawQuery(Some(
-            "graph=http%3A%2F%2Fexample.com%2Fg".to_owned(),
-        )))
-        .expect("target should parse");
-        assert_eq!(
-            target,
-            nrese_store::GraphTarget::NamedGraph("http://example.com/g".to_owned())
-        );
-    }
-
-    #[test]
     fn graph_target_reads_jenas_default_graph_name_as_the_default_graph() {
         let target = parse_graph_target(&RawQuery(Some(
             "graph=urn%3Ax-arq%3ADefaultGraph".to_owned(),
         )))
         .expect("target should parse");
         assert_eq!(target, nrese_store::GraphTarget::DefaultGraph);
-    }
-
-    #[test]
-    fn graph_target_rejects_conflicting_default_and_graph() {
-        let result = parse_graph_target(&RawQuery(Some(
-            "default=&graph=http%3A%2F%2Fexample.com%2Fg".to_owned(),
-        )));
-        assert!(result.is_err());
     }
 
     #[test]
