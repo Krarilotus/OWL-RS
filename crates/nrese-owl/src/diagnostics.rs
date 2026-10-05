@@ -36,6 +36,13 @@ pub enum Diagnostic {
         axiom: usize,
         what: &'static str,
     },
+    /// Text the functional-syntax reader can't read (`crate::ofn`), where it is (from 1;
+    /// the column in characters): the axiom it is in is left out.
+    Syntax {
+        line: u32,
+        column: u32,
+        what: &'static str,
+    },
 }
 
 impl Diagnostic {
@@ -54,6 +61,9 @@ impl Diagnostic {
             ),
             Self::Unused { node } => (node, "unused"),
             Self::NonSimpleProperty { property, what, .. } => (property, what),
+            Self::Syntax { line, column, what } => {
+                ((u64::from(line) << 32) | u64::from(column), what)
+            }
         }
     }
 

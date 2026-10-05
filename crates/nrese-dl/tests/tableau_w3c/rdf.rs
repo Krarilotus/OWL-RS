@@ -1,10 +1,11 @@
-//! Reading the test cases' RDF/XML into the structural model (as nrese-owl's W3C test
-//! does).
+//! Reading the test cases' RDF/XML (as nrese-owl's W3C test does) and functional-syntax
+//! documents (`nrese_owl::read_functional`) into the structural model, over one table of
+//! terms.
 
 use std::collections::HashMap;
 
-use nrese_owl::{Ontology, Statement, Term, TermKind, Terms, read};
-use nrese_rdf::{BlankNode, NamedNode, NamedOrBlankNode, Term as RdfTerm, Triple};
+use nrese_owl::{Intern, Ontology, Statement, Term, TermKind, Terms, read, read_functional};
+use nrese_rdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term as RdfTerm, Triple};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 
 /// RDF/XML with its entity declarations in double quotes (the test cases write
@@ -59,6 +60,8 @@ fn relabelled(triples: Vec<Triple>, tag: usize) -> Vec<Triple> {
 pub struct Table {
     terms: Vec<RdfTerm>,
     ids: HashMap<RdfTerm, u64>,
+    /// Functional-syntax documents read: their anonymous individuals are their own.
+    documents: u32,
 }
 
 impl Table {
@@ -78,6 +81,22 @@ impl Table {
             Some(other) => other.to_string(),
             None => format!("fresh{t}"),
         }
+    }
+
+    /// The ontology of a functional-syntax document; why not, if it imports another (none
+    /// of the suite's does) or the reader has a fatal diagnostic.
+    pub fn functional(&mut self, text: &str) -> Result<Ontology, String> {
+        self.documents += 1;
+        let (o, header) = read_functional(text, self);
+        if let Some(import) = header.imports.first() {
+            return Err(format!(
+                "imports {import} (not read from the functional syntax)"
+            ));
+        }
+        if let Some(d) = o.diagnostics.iter().find(|d| d.is_fatal()) {
+            return Err(format!("reader: {d:?}"));
+        }
+        Ok(o)
     }
 
     pub fn is_blank(&self, t: Term) -> bool {
@@ -131,6 +150,28 @@ impl Table {
             return Err(format!("reader: {d:?}"));
         }
         Ok(o)
+    }
+}
+
+impl Intern for Table {
+    fn iri_id(&mut self, iri: &str) -> Term {
+        self.id(NamedNode::new_unchecked(iri).into())
+    }
+
+    fn literal_id(&mut self, lexical: &str, datatype: &str, language: Option<&str>) -> Term {
+        let literal = match language {
+            Some(tag) => Literal::new_language_tagged_literal(lexical, tag).unwrap_or_else(|_| {
+                Literal::new_language_tagged_literal_unchecked(lexical, tag.to_lowercase())
+            }),
+            None => Literal::new_typed_literal(lexical, NamedNode::new_unchecked(datatype)),
+        };
+        self.id(literal.into())
+    }
+
+    /// Per document the table read (a premise's `_:x` isn't its conclusion's).
+    fn blank_id(&mut self, label: &str, _document: u32) -> Term {
+        let label = format!("fs{}x{label}", self.documents);
+        self.id(BlankNode::new_unchecked(label).into())
     }
 }
 
