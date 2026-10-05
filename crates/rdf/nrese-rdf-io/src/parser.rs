@@ -90,10 +90,11 @@ impl RdfParser {
         self
     }
 
-    /// Goes on after a syntax error in Turtle or TriG: the error is returned, the rest of
-    /// its statement (up to the `.` ending it, or the `}` ending its graph block) skipped,
-    /// and the statements after it follow. N-Triples and N-Quads go on after a bad line
-    /// anyway; other formats stop at the first error. A read error always stops.
+    /// Goes on after a syntax error: the error is returned, the statements after it follow.
+    /// Turtle and TriG skip the rest of the statement (up to the `.` ending it, or the `}`
+    /// ending its graph block); RDF/XML skips the rest of the outermost node element the
+    /// error is in, unless the XML isn't well-formed. N-Triples and N-Quads go on after a
+    /// bad line anyway; other formats stop at the first error. A read error always stops.
     pub fn recovering(mut self) -> Self {
         self.recover = true;
         self
@@ -205,6 +206,7 @@ impl RdfParser {
             base: self.base_iri.clone(),
             blank_nodes: self.blank_nodes.clone(),
             unchecked: self.unchecked,
+            recover: self.recover,
         }
     }
 
