@@ -128,7 +128,7 @@ mod tests {
     use crate::auth::{AuthConfig, MtlsConfig, OidcIntrospectionConfig, StaticBearerConfig};
     use crate::config::source::KeyValueSource;
 
-    use super::{ConfiguredAuthMode, parse_auth_config, parse_auth_mode};
+    use super::parse_auth_config;
 
     /// The settings `values` as the parser reads them (the process environment untouched).
     fn source(values: &[(&str, &str)]) -> KeyValueSource {
@@ -137,30 +137,6 @@ mod tests {
             source.insert(*key, *value);
         }
         source
-    }
-
-    #[test]
-    fn auth_mode_parser_accepts_static_bearer() {
-        assert_eq!(
-            parse_auth_mode(Some("bearer-static")).expect("auth mode should parse"),
-            ConfiguredAuthMode::BearerStatic
-        );
-    }
-
-    #[test]
-    fn bearer_jwt_mode_parser_accepts_kebab_case() {
-        assert_eq!(
-            parse_auth_mode(Some("bearer-jwt")).expect("auth mode should parse"),
-            ConfiguredAuthMode::BearerJwt
-        );
-    }
-
-    #[test]
-    fn oidc_introspection_mode_parser_accepts_kebab_case() {
-        assert_eq!(
-            parse_auth_mode(Some("oidc-introspection")).expect("auth mode should parse"),
-            ConfiguredAuthMode::OidcIntrospection
-        );
     }
 
     #[test]

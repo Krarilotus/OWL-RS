@@ -150,6 +150,12 @@ impl Context<'_> {
         needed: &[Variable],
     ) -> NativeResult<Solutions> {
         let solutions = match pattern {
+            // Paths joined to triple patterns: ordered with them (`path_joins`).
+            GraphPattern::Join { .. }
+                if !self.as_written && super::path_joins::PathJoin::of(pattern).is_some() =>
+            {
+                self.eval(pattern)?
+            }
             GraphPattern::Join { left, right } => {
                 let (left_scope, right_scope) = (in_scope(left), in_scope(right));
                 let mut keep = needed.to_vec();
@@ -278,7 +284,9 @@ impl Context<'_> {
             };
             if self.trace.is_some() {
                 let detail = format!("distinct {kept} of {triple}");
-                self.note("group walk", detail, None, groups.len(), start);
+                let count = self.snapshot.estimate_in(self.model, &scan.quad_pattern());
+                let estimate = Some(self.distinct(&scan, kept, count));
+                self.note("group walk", detail, estimate, groups.len(), start);
             }
             // The column at once: a row at a time cost as much as the walk (DBpedia q13,
             // 363 k subjects).
@@ -409,13 +417,17 @@ impl Context<'_> {
             );
         }
         let start = std::time::Instant::now();
+        let core_estimate = match self.trace {
+            Some(_) => self.estimate_rows(&core),
+            None => None,
+        };
         let core = self.eval_set(&core, &needed)?;
         if self.trace.is_some() {
             let detail = format!(
                 "the pattern without {} detached OPTIONAL(s), as a set",
                 detached.iter().filter(|d| **d).count()
             );
-            self.note("group core", detail, None, core.table.len(), start);
+            self.note("group core", detail, core_estimate, core.table.len(), start);
         }
 
         // The groups, from the core.
@@ -468,7 +480,9 @@ impl Context<'_> {
         compute(&core, &members, &core_aggregates, &mut values)?;
         if self.trace.is_some() {
             let detail = format!("{} aggregate(s) of the core", core_aggregates.len());
-            self.note("aggregate", detail, None, group_count, start);
+            // At most a group per row of the core (`estimate`'s rule for GROUP BY).
+            let estimate = Some(core.table.len() as u64);
+            self.note("aggregate", detail, estimate, group_count, start);
         }
 
         // HAVING over what is known by now drops groups before the OPTIONALs are read.
@@ -594,6 +608,8 @@ impl Context<'_> {
                 right.table.dedup_preserving_order();
             }
             let start = std::time::Instant::now();
+            // A left join keeps its left rows, and meets about one partner per row.
+            let estimate = Some(left.table.len().max(right.table.len()) as u64);
             let joined = self.left_join(left, right, *expression)?;
             let column = joined.column(&group).expect("the left side's first column");
             let members = members_of(&mut joined.table.column(column).iter().map(|&g| g as usize));
@@ -602,13 +618,14 @@ impl Context<'_> {
                     "a detached OPTIONAL joined to {} kept group(s)",
                     kept_groups
                 );
-                self.note("optional", detail, None, joined.table.len(), start);
+                self.note("optional", detail, estimate, joined.table.len(), start);
             }
             let start = std::time::Instant::now();
             compute(&joined, &members, &selected, &mut values)?;
             if self.trace.is_some() {
                 let detail = format!("{} aggregate(s) of the detached OPTIONAL", selected.len());
-                self.note("aggregate", detail, None, kept_groups, start);
+                let estimate = Some(kept_groups as u64);
+                self.note("aggregate", detail, estimate, kept_groups, start);
             }
             self.consumed(&joined);
         }

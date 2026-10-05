@@ -1,0 +1,5 @@
+# A path from a constant joined to labels: the taxa under Asteraceae, English names
+PREFIX schema: <http://schema.org/>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?t ?name WHERE { ?t schema:parentTaxon+ yago:Asteraceae ; rdfs:label ?name FILTER(LANG(?name) = "en") }

@@ -31,6 +31,7 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   - against the expected answers (LUBM's published counts, the W3C suites' results);
   - against a reference (owlrl's or Nemo's closure, the DL reference reasoners);
   - or against the other systems within the same regime (the driver's cross-check).
+- **Rulesets before times.** The OWL 2 RL rules are complete only for ground assertions over RL ontologies without punning or annotation-property axioms (OWL 2 Profiles, Theorem PR1); elsewhere they are sound only, and stores add or omit axiomatic triples and some RDFS rules. When answer counts differ between rule reasoners, compare their rulesets first: a difference there is a semantics difference, not a wrong answer.
 - **A wrong answer is a finding.** It is reported as `wrong`, never as a time. The report and the comparison list wrong answers first.
 - **No majority votes.** When references disagree, a person settles the case with a minimised witness and records it (`reasoning/dl/disputed.tsv`).
 - **Timeouts aren't answers.** An exact service never turns a timeout into "not entailed" or an empty result.
@@ -43,6 +44,10 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   - Both lines are reported.
 - **Defaults first, tuning documented.** Each system runs with its documented defaults and the vendor's recommended settings for the workload. Any further tuning is in its adapter, with the reason, and applies to every run.
 - **Regimes are compared only within themselves.** A reasoning workload names the regimes it accepts, in order of preference, and each system runs the first one it has.
+  - **NRESE runs every case,** in every profile it has (RDFS variants, OWL-Horst, OWL 2 QL, RL, EL, DL). Each case keeps its own NRESE baseline. Competitors run only the cases whose semantics they support.
+  - **Stores without reasoning** (QLever, Oxigraph, Virtuoso, …) run the plain-SPARQL cases. They also run a reasoning workload's queries over NRESE's closure loaded as data. That compares the query side fairly and puts a number on what reasoning in the store buys.
+  - **A profile no competitor supports** is reported in a column of its own, not as a comparison.
+  - **Home turf:** each competitor also runs on what it documents as its strength (the v2 merge checklist, §3).
 - **Licensed systems** follow [competitors/README.md](competitors/README.md):
   - their rows carry `publish = permission`, and their numbers stay on the machine;
   - their records say only that they ran (`restricted`).

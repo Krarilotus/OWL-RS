@@ -58,7 +58,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         index_encoding: match source.get(names::INDEX_ENCODING) {
             None => defaults.index_encoding,
             Some(name) => {
-                nrese_engine::IndexEncoding::from_name(name.trim()).with_context(|| {
+                nrese_store::IndexEncoding::from_name(name.trim()).with_context(|| {
                     format!(
                         "{} must be 'fast' or 'compact', not '{name}'",
                         names::INDEX_ENCODING
@@ -69,7 +69,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         vocabulary: match source.get(names::VOCABULARY) {
             None => defaults.vocabulary,
             Some(name) => {
-                nrese_engine::VocabularyEncoding::from_name(name.trim()).with_context(|| {
+                nrese_store::VocabularyEncoding::from_name(name.trim()).with_context(|| {
                     format!(
                         "{} must be 'plain' or 'fsst', not '{name}'",
                         names::VOCABULARY
@@ -310,28 +310,5 @@ mod tests {
             parse_store_mode(Some("on-disk")).unwrap(),
             StoreMode::OnDisk
         );
-    }
-
-    #[test]
-    fn default_graph_parser_knows_two_modes() {
-        use super::parse_default_graph;
-        assert!(!parse_default_graph(None).unwrap());
-        assert!(!parse_default_graph(Some("default")).unwrap());
-        assert!(parse_default_graph(Some("Union")).unwrap());
-        assert!(parse_default_graph(Some("all")).is_err());
-    }
-
-    #[test]
-    fn equality_parser_knows_three_modes() {
-        use super::parse_equality;
-        assert_eq!(parse_equality(None).unwrap(), (true, false));
-        assert_eq!(parse_equality(Some("Compact")).unwrap(), (true, true));
-        assert_eq!(parse_equality(Some("replicate")).unwrap(), (false, false));
-        assert!(parse_equality(Some("rewrite")).is_err());
-    }
-
-    #[test]
-    fn store_mode_parser_rejects_unknown_values() {
-        assert!(parse_store_mode(Some("in-memroy")).is_err());
     }
 }

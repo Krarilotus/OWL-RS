@@ -3,6 +3,7 @@ use axum::extract::DefaultBodyLimit;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 
+use crate::http::problems::problems;
 use crate::http::request_metrics::track;
 use crate::http::router;
 use crate::state::AppState;
@@ -24,6 +25,8 @@ pub fn build_app(state: AppState) -> Router {
         .layer(proxies)
         .layer(metrics)
         .layer(DefaultBodyLimit::max(body_limit))
+        // Inside the request id, so each problem document carries it.
+        .layer(axum::middleware::from_fn(problems))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TraceLayer::new_for_http())

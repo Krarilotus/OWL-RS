@@ -1,12 +1,9 @@
 //! Shared helpers for `nrese-store` integration tests.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
-    MutationCommand, MutationPipeline, MutationTicket, ReadModel, SolutionsResultFormat,
-    SparqlQueryRequest, SparqlUpdateRequest, StoreConfig, StoreService,
+    ReadModel, SolutionsResultFormat, SparqlQueryRequest, StoreConfig, StoreService,
 };
 
 pub fn catalog_fixture_path(filename: &str) -> PathBuf {
@@ -47,31 +44,6 @@ pub fn inferred_statements(store: &StoreService) -> Result<Inferred, Box<dyn std
             ))
         })
         .collect())
-}
-
-/// Loads an official catalog ontology, applies `update` through the mutation pipeline
-/// under reasoner v2 (`owl2-rl`), and returns the inferred statements.
-pub fn run_owl2_rl_catalog_fixture(
-    filename: &str,
-    update: &str,
-) -> Result<Inferred, Box<dyn std::error::Error>> {
-    let store = Arc::new(StoreService::new(StoreConfig {
-        ontology_path: Some(catalog_fixture_path(filename)),
-        ..in_memory_store_config()
-    })?);
-    store.rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)?;
-    let pipeline = MutationPipeline::new(
-        Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
-    );
-    pipeline.apply(
-        MutationCommand::Update(SparqlUpdateRequest::new(update)),
-        &nrese_store::Requester::all(),
-        &MutationTicket::new(),
-    )?;
-    inferred_statements(&store)
 }
 
 pub fn assert_inferred_triple(inferred: &Inferred, subject: &str, predicate: &str, object: &str) {
