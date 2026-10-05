@@ -1,6 +1,6 @@
 # Reasoner v2: design and plan to state-of-the-art reasoning
 
-Status: **plan** (2026-09-25). Decision record: [ADR-0003](../adr/0003-materialised-reasoning.md). Roadmap: Milestone 3 in [ROADMAP.md](../ROADMAP.md). The v1 reasoner this replaces is described in [spec/03](../spec/03-reasoner-and-owl-profile.md).
+Status: **plan** (2026-09-25). Decision record: [ADR-0003](../adr/0003-materialised-reasoning.md). Roadmap: Milestone 3 in [ROADMAP.md](../ROADMAP.md). The v1 reasoner this replaces is described in [spec/03](../spec/reasoning-semantics.md).
 
 This document answers three questions:
 - what "industry-leading reasoning" means in measurable terms
