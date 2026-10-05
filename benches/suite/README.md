@@ -61,7 +61,7 @@ One CSV row per measured step (`suitekit/schema.py`): `date, host, runtime, syst
 | Variable | Default | |
 |---|---|---|
 | `JAVA_HEAP` | 16g | JVM systems |
-| `DOCKER_MEMORY` | none | a hard memory cap per container on a shared machine |
+| `DOCKER_MEMORY` | 90 % of Docker's memory | a hard memory cap per container, without swap (`0`: none); a run past it is killed in its container, not the host made to thrash |
 | `QUERY_MEMORY_MIB` | NRESE's default | NRESE's per-query memory budget |
 | `JENA_OWL_REASONER` | `OWLMicroFBRuleReasoner` | Jena's rule reasoner for OWL-Horst workloads |
 | `RGGS_REPO`, `ONTOLOGY` | | the integration workload's checkout, and `gndo` for the GND ontology |
