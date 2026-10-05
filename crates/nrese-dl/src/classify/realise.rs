@@ -18,10 +18,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
 use nrese_owl::{Axiom, ClassExpr, EntityKind, Ontology, Term};
-use rayon::prelude::*;
 
 use super::driver::{insert_sorted, intersect_opt, reason, union_into};
-use super::{Classification, Deadline, Options, Profile, Taxonomy, classify, with_pool};
+use super::{Classification, Deadline, Options, Profile, Taxonomy, Workers, classify};
 use crate::tableau::{self, Answer, At, Labels, Prepared, Probe, ProbeOutcome, Want};
 
 const THING: &str = "http://www.w3.org/2002/07/owl#Thing";
@@ -85,6 +84,8 @@ pub fn realise(ontology: &Ontology, options: &Options) -> Realisation {
         ..Realisation::default()
     };
     if !taxonomy.classification.consistent {
+        // Every individual is an instance of every class: nothing to list.
+        r.types = vec![taxonomy.classification.classes.clone(); individuals.len()];
         r.taxonomy = taxonomy;
         return r;
     }
@@ -246,6 +247,7 @@ impl<'a> Work<'a> {
                 p.iter().filter(|d| types.binary_search(d).is_err()).count()
             }) as u64;
         }
+        let workers = Workers::new(self.options.threads);
         // Waves: each individual's most general open candidate, over the workers.
         let wave = (self.options.threads * 4).max(1);
         let mut cursor = 0usize;
@@ -268,18 +270,13 @@ impl<'a> Work<'a> {
                 break;
             }
             cursor = (batch.last().map_or(0, |b| b.0 as usize) + 1) % n.max(1);
-            let outcomes: Vec<(u32, u32, ProbeOutcome)> = with_pool(self.options.threads, || {
-                batch
-                    .par_iter()
-                    .map(|&(a, d)| {
-                        let probe = Probe {
-                            at: At::Individual(a),
-                            positive: &[],
-                            negative: std::slice::from_ref(&d),
-                        };
-                        (a, d, program.probe(&probe, &config, want))
-                    })
-                    .collect()
+            let outcomes: Vec<(u32, u32, ProbeOutcome)> = workers.map(&batch, |&(a, d)| {
+                let probe = Probe {
+                    at: At::Individual(a),
+                    positive: &[],
+                    negative: std::slice::from_ref(&d),
+                };
+                (a, d, program.probe(&probe, &config, want))
             });
             for (a, d, out) in outcomes {
                 let a = a as usize;
@@ -347,6 +344,10 @@ impl Realisation {
     /// type; `name` gives an IRI.
     pub fn canonical(&self, name: &dyn Fn(Term) -> String) -> String {
         let c = &self.taxonomy.classification;
+        if !c.consistent {
+            // The runner answers `inconsistent` instead of a realisation.
+            return String::new();
+        }
         let index: HashMap<Term, usize> =
             c.classes.iter().enumerate().map(|(i, &t)| (t, i)).collect();
         let n = c.classes.len();

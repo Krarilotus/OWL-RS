@@ -31,6 +31,8 @@ pub struct Profile {
     pub tbox_only: bool,
     /// The Horn part's taxonomy was exact: no hypertableau test of a class.
     pub exact: bool,
+    /// Classes whose Horn subsumers were exact (their saturation reached nothing left out).
+    pub exact_classes: usize,
     /// Which engine decided consistency (`context-core`, `tableau`).
     pub consistency_by: &'static str,
     /// Subsumptions and unsatisfiable classes the Horn part proved.
@@ -73,7 +75,7 @@ impl Profile {
             s,
             "path={} normalise={:.1} compile={:.1} lower_bound={:.1} consistency={:.1} \
              satisfiability={:.1} top={:.1} subsumption={:.1} realisation={:.1} total={:.1} \
-             threads={} classes={} eliminated={} flipped={} wide={}->{} tbox_only={} exact={} consistency_by={} lower_known={} lower_unsat={} tests={} \
+             threads={} classes={} eliminated={} flipped={} wide={}->{} tbox_only={} exact={} exact_classes={} consistency_by={} lower_known={} lower_unsat={} tests={} \
              sat_tests={} sat_skipped={} labels_seen={} candidates={} candidate_tests={} \
              positive={} pruned={} type_candidates={} type_tests={} type_positive={} \
              nodes_created={} branch_points={} clashes={}",
@@ -95,6 +97,7 @@ impl Profile {
             self.inlined.wide_after,
             self.tbox_only,
             self.exact,
+            self.exact_classes,
             self.consistency_by,
             self.lower_known,
             self.lower_unsat,

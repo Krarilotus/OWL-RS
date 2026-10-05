@@ -20,11 +20,10 @@
 use std::time::Instant;
 
 use nrese_owl::{Normalised, Ontology, Term};
-use rayon::prelude::*;
 
 use super::consistency::{self, Verdict};
 use super::known::{self, Lower};
-use super::{Classification, Deadline, Options, Profile, Taxonomy, with_pool};
+use super::{Classification, Deadline, Options, Profile, Taxonomy, Workers};
 use crate::tableau::{Answer, At, Labels, Prepared, Probe, ProbeOutcome, Want};
 
 /// A class's state.
@@ -53,6 +52,9 @@ pub(crate) struct Driver<'a> {
     possible: Vec<Option<Vec<u32>>>,
     /// The classes in every label seen (`owl:Thing`'s possible subsumers).
     top_possible: Option<Vec<u32>>,
+    /// `owl:Thing`'s subsumers where the Horn part has all of them.
+    top_known: Option<Vec<u32>>,
+    workers: Workers,
 }
 
 impl<'a> Driver<'a> {
@@ -81,6 +83,8 @@ impl<'a> Driver<'a> {
             known: vec![Vec::new(); n],
             possible: vec![None; n],
             top_possible: None,
+            top_known: None,
+            workers: Workers::new(options.threads),
         }
     }
 
@@ -106,9 +110,13 @@ impl<'a> Driver<'a> {
                 if lower.inconsistent {
                     return self.inconsistent();
                 }
-                exact = lower.exact && self.options.exact_lower_bound;
+                let shortcut = self.options.exact_lower_bound;
+                exact = shortcut && lower.exact;
                 lower_top.clone_from(&lower.top);
-                self.apply_lower(&lower);
+                if shortcut && lower.top_exact {
+                    self.top_known = Some(lower.top.clone());
+                }
+                self.apply_lower(&lower, shortcut);
             }
             self.profile.lower_bound = t.elapsed();
         }
@@ -255,7 +263,10 @@ impl<'a> Driver<'a> {
         // 3. owl:Thing.
         super::trace("owl:Thing");
         let t = Instant::now();
-        let top = self.top(tests);
+        let top = match self.top_known.take() {
+            Some(top) => top,
+            None => self.top(tests),
+        };
         self.profile.top = t.elapsed();
         // 4. Subsumption tests.
         super::trace("subsumption tests");
@@ -279,11 +290,17 @@ impl<'a> Driver<'a> {
         }
     }
 
-    fn apply_lower(&mut self, lower: &Lower) {
+    fn apply_lower(&mut self, lower: &Lower, shortcut: bool) {
         for (i, k) in lower.known.iter().enumerate() {
             union_into(&mut self.known[i], k);
             if lower.unsat[i] {
                 self.status[i] = Status::Unsat;
+            } else if shortcut && lower.exact_for[i] {
+                // Its saturation reaches nothing left out: satisfiable, and its known
+                // subsumers are all.
+                self.status[i] = Status::Sat;
+                self.possible[i] = Some(self.known[i].clone());
+                self.profile.exact_classes += 1;
             }
         }
         self.profile.lower_known = lower.known.iter().map(Vec::len).sum();
@@ -354,18 +371,13 @@ impl<'a> Driver<'a> {
                 elements: self.options.model_pruning,
                 individuals: false,
             };
-            let outcomes: Vec<(u32, ProbeOutcome)> = with_pool(self.options.threads, || {
-                batch
-                    .par_iter()
-                    .map(|&c| {
-                        let probe = Probe {
-                            at: At::Fresh,
-                            positive: std::slice::from_ref(&c),
-                            negative: &[],
-                        };
-                        (c, tests.probe(&probe, &config, want))
-                    })
-                    .collect()
+            let outcomes: Vec<(u32, ProbeOutcome)> = self.workers.map(&batch, |&c| {
+                let probe = Probe {
+                    at: At::Fresh,
+                    positive: std::slice::from_ref(&c),
+                    negative: &[],
+                };
+                (c, tests.probe(&probe, &config, want))
             });
             for (c, out) in outcomes {
                 self.profile.tests += 1;
@@ -479,13 +491,9 @@ impl<'a> Driver<'a> {
             .filter(|&c| self.status[c as usize] == Status::Sat)
             .collect();
         let this = &*self;
-        let results: Vec<(u32, Vec<u32>, Stats)> = with_pool(self.options.threads, || {
-            todo.par_iter()
-                .map(|&c| {
-                    let (s, stats) = this.subsumers_of(tests, c, top, &unsat, &config);
-                    (c, s, stats)
-                })
-                .collect()
+        let results: Vec<(u32, Vec<u32>, Stats)> = this.workers.map(&todo, |&c| {
+            let (s, stats) = this.subsumers_of(tests, c, top, &unsat, &config);
+            (c, s, stats)
         });
         let mut out = vec![Vec::new(); n];
         for (c, s, stats) in results {
