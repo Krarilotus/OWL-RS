@@ -8,17 +8,21 @@ measured here (benches/PROTOCOL.md, interleaved, confidence intervals).
 
 ## 1. Finish the current goals
 
-- [ ] DL classification and realisation (3.4) merged; the Konclude outliers worked through
-      (cause, fix, A/B, guard), the task that differs from HermiT and Konclude settled.
-- [ ] The store's DL mode (G3): classification through `/classification`, the 7 OWL 2 RL
-      W3C cases through the DL path.
-- [ ] Queries (G4): `MIN`/`MAX`/`AVG` in eager aggregation, paths planned with the rest,
-      characteristic pairs.
-- [ ] Materialisation memory (P1): the transient fold, unused relations pruned.
-- [ ] OWL 2 QL: tree-witness rewriting of the existential part over the RL closure.
-- [x] Usability: one error envelope across CLI, HTTP and console (every error a problem
-      document with its request id; the console and its CLI print it).
-- [ ] EXPLAIN with estimated against actual rows for every operator (with G4).
+An item is done when it is merged into `refactor/engine-v2` with its tests and guards.
+State as of 5 October, evening:
+
+| Item | Branch | State | Done so far | Left |
+|---|---|---|---|---|
+| DL classification and realisation (3.4); Konclude outliers (cause, fix, A/B, guard); the task that differs from HermiT and Konclude | `dl/classify` | in progress | soundness fix (heads about successors), detached probes, 60 s Horn bound; `b1659c9` fixes 7127 and 7956; W2 (tests start from the consistency model) written, in its test campaign | W2 committed and measured; W1 (a saturation that never refuses); W3–W7 as they pay; re-time the dev set; merge |
+| The store's DL mode (G3): `/classification`, the 7 RL W3C cases through the DL path | – | waiting for 3.4 | – | all |
+| Queries (G4): `MIN`/`MAX`/`AVG` in eager aggregation, paths planned with the rest | `g4/eager-aggregates` | in progress | – (characteristic pairs were done on 3 October) | all three, then merge |
+| EXPLAIN: estimated against actual rows for every operator, the §0 operators that don't report themselves | `g4/eager-aggregates` | in progress | estimates for sets and late operators being added | guards per operator |
+| Materialisation memory (P1): the transient fold, unused relations | `p1/transient-fold` | in progress | guards for F1, F4 and F8, each shown to catch its revert | heap profile of LUBM 1000 (running), the fold, pruning, A/B |
+| OWL 2 QL: tree-witness rewriting over the RL closure | `ql/tree-witness` | in progress | design note; witness computation (11 tests, Ontop's example) | SPARQL integration, W3C QL tests, differential test, cost |
+| One error envelope across HTTP, console and CLI | – | **done** (`9dcf78c`) | every error a problem document with its request id; the fuzz test requires it | – |
+| Fast regression suite (for §4's gate) | `bench/catalog-and-fast-suite` | in progress | the catalogue (`d9e580a`) | about 35 cases, NRESE in every profile, home-turf cases |
+
+Paused until v2 is merged: the Zebratlas workstreams and every other side thread.
 
 ## 2. Measurements that decide the next reasoning gains
 
