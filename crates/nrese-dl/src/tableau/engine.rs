@@ -124,6 +124,8 @@ pub struct Engine<'a> {
     pub theory: crate::datatypes::DatatypeTheory,
     /// Why a datatype check was only approximate, if one was: a model is then no answer.
     pub data_approximate: Option<String>,
+    /// The root the test's concepts were asserted on (`NONE`: no test).
+    pub probe: u32,
 }
 
 impl<'a> Engine<'a> {
@@ -148,6 +150,7 @@ impl<'a> Engine<'a> {
             data_done: super::data::DataDone::default(),
             theory: crate::datatypes::DatatypeTheory::default(),
             data_approximate: None,
+            probe: NONE,
         }
     }
 
