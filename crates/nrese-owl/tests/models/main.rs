@@ -847,3 +847,79 @@ fn clauses_and_ontologies_have_the_same_models() {
     eprintln!("{compared} interpretations compared, {models} models");
     assert!(models > 0 && models < compared, "{models} of {compared}");
 }
+
+/// A transitive role over forty transitive subroles, under thirty universals (the shape of
+/// ore_ont_1066: one `DisjointClasses(A, ∃part_of.B)` made 4,451 clauses). Minimal automata
+/// and transitions the role inclusions imply keep the clauses near a handful per universal
+/// (docs/design/performance.md §0, P3); this fails at once if that is lost.
+#[test]
+fn universals_over_a_large_role_hierarchy_stay_small() {
+    let mut o = Ontology::default();
+    let r = 1000;
+    let mut axioms = vec![Axiom::ObjectCharacteristic(
+        Characteristic::Transitive,
+        ObjProp::Named(r),
+    )];
+    for i in 1..=40 {
+        let s = r + i;
+        axioms.push(Axiom::ObjectCharacteristic(
+            Characteristic::Transitive,
+            ObjProp::Named(s),
+        ));
+        axioms.push(Axiom::SubObjectPropertyOf(
+            vec![ObjProp::Named(s)],
+            ObjProp::Named(r),
+        ));
+    }
+    for j in 0..30u64 {
+        let a = ExprId(o.classes.intern(ClassExpr::Class(2 * j)));
+        let b = ExprId(o.classes.intern(ClassExpr::Class(2 * j + 1)));
+        let some = ExprId(o.classes.intern(ClassExpr::Some(ObjProp::Named(r), b)));
+        axioms.push(Axiom::DisjointClasses(vec![a, some]));
+    }
+    o.sources = vec![Vec::new(); axioms.len()];
+    o.axioms = axioms;
+    let count = |exact_provenance| {
+        normalise_with(
+            &o,
+            Options {
+                exact_provenance,
+                ..Options::default()
+            },
+        )
+        .clauses
+        .len()
+    };
+    let (minimal, exact) = (count(false), count(true));
+    // 220 and 4,990 on 5 October.
+    assert!(minimal <= 400, "{minimal} clauses with minimal automata");
+    assert!(exact <= 6000, "{exact} clauses with exact provenance");
+}
+
+/// `C ≡ ∃R.D` over a transitive R: the reverse direction `∃R.D ⊑ C` is read as
+/// `D ⊑ ∀R⁻.C`, Horn through R⁻'s automaton. Read as `∀R.¬D ⊔ C` it put a disjunction with
+/// an empty body on every node, and the model grew without end (ore_ont_10212: gave up at
+/// 60 s; 0.24 s after; docs/design/performance.md §0).
+#[test]
+fn existentials_over_transitive_roles_on_the_left_stay_horn() {
+    let mut o = Ontology::default();
+    let (r, s) = (1000, 1001);
+    let class = |o: &mut Ontology, t| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    let (c, a, b) = (class(&mut o, 1), class(&mut o, 2), class(&mut o, 3));
+    // D = A ⊓ ∃S.B: not a literal, as in the real definitions (∃bearer_of.Q ⊓ ∃part_of.…).
+    let s_b = ExprId(o.classes.intern(ClassExpr::Some(ObjProp::Named(s), b)));
+    let d = ExprId(o.classes.intern(ClassExpr::And(vec![a, s_b])));
+    let some = ExprId(o.classes.intern(ClassExpr::Some(ObjProp::Named(r), d)));
+    o.axioms = vec![
+        Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(r)),
+        Axiom::EquivalentClasses(vec![c, some]),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let normalised = normalise_with(&o, Options::default());
+    let universal: Vec<&Clause> = normalised
+        .clauses
+        .iter()
+        .filter(|clause| clause.body.is_empty() && clause.head.len() > 1)
+        .collect();
+    assert!(universal.is_empty(), "{universal:#?}");
+}

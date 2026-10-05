@@ -404,8 +404,10 @@ fn read_cases(text: &str) -> Vec<Case> {
 }
 
 /// W3C tests that are hard for the search, decided within a budget: DL-202 (a modal
-/// formula as definitions, 20 s and given up before disjunct learning; HermiT 0.3 s) and
-/// DL-206 (HermiT 3 s).
+/// formula as definitions, 20 s and given up before disjunct learning; HermiT 0.3 s),
+/// DL-206 (HermiT 3 s), DL-204 (k_grz: decided only with lazily unfolded definitions, in
+/// the portfolio) and DL-661 (k_branch: lazily unfolding definitions by restrictions too
+/// made it eight times slower). Guards of docs/design/performance.md §0.
 #[test]
 fn hard_search_tests_are_decided() {
     let Ok(text) = std::fs::read_to_string(suite_path()) else {
@@ -414,6 +416,8 @@ fn hard_search_tests_are_decided() {
     for name in [
         "WebOnt-description-logic-202",
         "WebOnt-description-logic-206",
+        "WebOnt-description-logic-204",
+        "WebOnt-description-logic-661",
     ] {
         let case = read_cases(&text)
             .into_iter()

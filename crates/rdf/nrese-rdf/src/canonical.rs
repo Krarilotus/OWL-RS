@@ -667,6 +667,8 @@ impl<'s, 'a> Search<'s, 'a> {
     }
 
     fn leaf(&mut self, colours: Vec<u64>, path: &[usize]) -> Option<usize> {
+        #[cfg(test)]
+        tests::count_leaf();
         let certificate = self.component.certificate(&colours);
         let Some(best) = &self.best else {
             self.best = Some(Leaf {
@@ -787,10 +789,29 @@ mod tests {
             .collect()
     }
 
-    fn timed(quads: BTreeSet<Quad>) -> (BTreeSet<Quad>, std::time::Duration) {
-        let start = std::time::Instant::now();
+    thread_local! {
+        /// Leaves of the search tree visited on this thread: the work a canonicalisation
+        /// does, which branching multiplies (timing it fails on a loaded machine), and the
+        /// most a test allows.
+        static LEAVES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, usize::MAX)) };
+    }
+
+    /// Counts a leaf; past the test's bound, the test fails at once rather than running on.
+    pub(super) fn count_leaf() {
+        LEAVES.with(|cell| {
+            let (n, bound) = cell.get();
+            assert!(n < bound, "the search passed {bound} leaves");
+            cell.set((n + 1, bound));
+        });
+    }
+
+    /// The canonical form and the leaves its search visited, at most `bound`.
+    fn counted(quads: BTreeSet<Quad>, bound: usize) -> (BTreeSet<Quad>, usize) {
+        LEAVES.with(|cell| cell.set((0, bound)));
         let result = canonical(quads);
-        (result, start.elapsed())
+        let (n, _) = LEAVES.with(std::cell::Cell::get);
+        LEAVES.with(|cell| cell.set((0, usize::MAX)));
+        (result, n)
     }
 
     #[test]
@@ -798,8 +819,8 @@ mod tests {
         let chain: BTreeSet<Quad> = (0..2000)
             .map(|i| quad(&format!("n{i}"), "p", &format!("n{}", i + 1)))
             .collect();
-        let (a, _) = timed(chain.clone());
-        let (b, _) = timed(renamed(&chain, |n| format!("x{n}")));
+        let (a, _) = counted(chain.clone(), usize::MAX);
+        let (b, _) = counted(renamed(&chain, |n| format!("x{n}")), usize::MAX);
         assert_eq!(a, b);
         assert_eq!(a.len(), 2000);
     }
@@ -817,9 +838,9 @@ mod tests {
                 GraphName::DefaultGraph,
             ));
         }
-        let (a, elapsed) = timed(star.clone());
-        assert!(elapsed.as_secs() < 5, "{elapsed:?}");
-        let (b, _) = timed(renamed(&star, |n| format!("z{n}")));
+        // A leaf per child or so (1,001 on 5 October), never a branch per ordering.
+        let (a, _) = counted(star.clone(), 2000);
+        let (b, _) = counted(renamed(&star, |n| format!("z{n}")), 2000);
         assert_eq!(a, b);
         assert_eq!(a.len(), 2000);
         // Every child keeps a name of its own.
@@ -847,13 +868,16 @@ mod tests {
                 .collect()
         };
         let five = cycles(5, 8);
-        let (a, elapsed) = timed(five.clone());
-        assert!(elapsed.as_secs() < 5, "{elapsed:?}");
-        let (b, _) = timed(renamed(&five, |n| {
-            format!("r{}", n.chars().rev().collect::<String>())
-        }));
+        // 10 leaves on 5 October.
+        let (a, _) = counted(five.clone(), 100);
+        let (b, _) = counted(
+            renamed(&five, |n| {
+                format!("r{}", n.chars().rev().collect::<String>())
+            }),
+            100,
+        );
         assert_eq!(a, b);
-        assert_ne!(a, timed(cycles(4, 10)).0);
+        assert_ne!(a, counted(cycles(4, 10), 100).0);
         assert_eq!(a.len(), 40);
     }
 

@@ -115,22 +115,31 @@ pub async fn image_backup(state: AppState, repository: &str) -> Result<Response,
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    let dir = backups.join(match repository {
+    let name = match repository {
         crate::repositories::DEFAULT_REPOSITORY => seconds.to_string(),
         other => format!("{other}-{seconds}"),
-    });
-    let target = dir.clone();
+    };
     let started = std::time::Instant::now();
-    let manifest = tokio::task::spawn_blocking(move || store.backup_image(&target))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))
-        .and_then(|result| result.map_err(map_backup_error));
+    let written = tokio::task::spawn_blocking(move || {
+        let dir = claim_backup_dir(&backups, &name)
+            .map_err(|error| ApiError::internal(format!("{}: {error}", backups.display())))?;
+        let manifest = store.backup_image(&dir).map_err(map_backup_error)?;
+        Ok::<_, ApiError>((dir, manifest))
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))
+    .and_then(|result| result);
+    let (dir, manifest) = match written {
+        Ok((dir, manifest)) => (Some(dir), Ok(manifest)),
+        Err(error) => (None, Err(error)),
+    };
     state.request_metrics().record_backup(
         BackupKind::Image,
         manifest.as_ref().ok().map(|manifest| manifest.bytes),
         started.elapsed(),
     );
     let manifest = manifest?;
+    let dir = dir.unwrap_or_default();
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
@@ -139,6 +148,26 @@ pub async fn image_backup(state: AppState, repository: &str) -> Result<Response,
         })),
     )
         .into_response())
+}
+
+/// A new, empty directory for a backup in `backups`: `name`, or `name-1`, `name-2`, … where
+/// it is taken (two backups within a second; creating the directory claims it, so
+/// concurrent backups can't share one).
+fn claim_backup_dir(backups: &std::path::Path, name: &str) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(backups)?;
+    for n in 0u32.. {
+        let dir = if n == 0 {
+            backups.join(name)
+        } else {
+            backups.join(format!("{name}-{n}"))
+        };
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && n < 10_000 => {}
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the loop returns")
 }
 
 fn parse_restore_format(
