@@ -8,6 +8,8 @@
 //! string type is a union of the regions from one on, so sets of strings are sets of
 //! lengths per region, which count and complement exactly.
 
+use super::regular::{NAME_MORE, NAME_START, in_table};
+
 /// The regions, by index: what each holds and is not.
 pub const REGIONS: usize = 7;
 
@@ -17,17 +19,11 @@ pub fn is_xml_char(c: char) -> bool {
 }
 
 fn is_name_start(c: char) -> bool {
-    matches!(c,
-        ':' | 'A'..='Z' | '_' | 'a'..='z'
-        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
-        | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}'
-        | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
-        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+    in_table(NAME_START, c)
 }
 
 fn is_name_char(c: char) -> bool {
-    is_name_start(c)
-        || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+    is_name_start(c) || in_table(NAME_MORE, c)
 }
 
 pub fn is_normalized(s: &str) -> bool {
