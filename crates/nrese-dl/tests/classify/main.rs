@@ -191,6 +191,15 @@ fn variants() -> Vec<(&'static str, Options)> {
             },
         ),
         (
+            "no-detached-probes",
+            Options {
+                context_core: false,
+                exact_lower_bound: false,
+                detached_probes: false,
+                ..base.clone()
+            },
+        ),
+        (
             "no-tbox-only",
             Options {
                 context_core: false,
@@ -295,6 +304,7 @@ fn taxonomies_equal_brute_force() {
                     tableau::Want {
                         elements: true,
                         individuals: false,
+                        detached: true,
                     },
                 );
                 eprintln!(
@@ -307,6 +317,13 @@ fn taxonomies_equal_brute_force() {
             }
         }
         let mut decided = false;
+        if env("NRESE_FUZZ_ONLY").is_some() {
+            // Every variant first, for the diagnosis.
+            for (name, opts) in variants() {
+                let t = classify::classify(&o, &opts);
+                eprintln!("variant {name}: {:?}", t.classification);
+            }
+        }
         for (name, opts) in variants() {
             let t = classify::classify(&o, &opts);
             if env("NRESE_FUZZ_ONLY").is_some() {
@@ -552,4 +569,85 @@ fn an_exact_horn_part_needs_no_class_test() {
     );
     assert!(t.classification.subsumptions.contains(&(0, 1)));
     assert!(!t.classification.subsumptions.contains(&(1, 2)));
+}
+
+/// Found by the campaign (seed 55, case 6108): `C1 ≡ ∃r.C3`, `range(r) = C0 ⊔ C2`,
+/// `C0 ⊑ C2`, `C2 ⊓ C3 ⊑ ⊥`: `C1` is unsatisfiable. The Horn part (without the range's
+/// disjunction) has `C1` satisfiable, and its context for `C1` holds the range's fresh
+/// name only as a head about the successor, `Q(f(x))` (no clause of the part reads `Q`,
+/// so the successor's context never gets it): the exactness check must see such heads.
+#[test]
+fn a_disjunctive_range_on_a_successor_is_not_exact() {
+    use nrese_owl::ObjProp;
+    let mut o = Ontology::default();
+    let class = |o: &mut Ontology, t: Term| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    let (c0, c1, c2, c3) = (
+        class(&mut o, 0),
+        class(&mut o, 1),
+        class(&mut o, 2),
+        class(&mut o, 3),
+    );
+    let r = ObjProp::Named(4);
+    let some = ExprId(o.classes.intern(ClassExpr::Some(r, c3)));
+    let or = ExprId(o.classes.intern(ClassExpr::Or(vec![c0, c2])));
+    let both = ExprId(o.classes.intern(ClassExpr::And(vec![c2, c3])));
+    let nothing = ExprId(o.classes.intern(ClassExpr::Nothing));
+    o.axioms = vec![
+        Axiom::SubClassOf(c0, c2),
+        Axiom::SubClassOf(both, nothing),
+        Axiom::EquivalentClasses(vec![c1, some]),
+        Axiom::ObjectPropertyRange(r, or),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    for (name, opts) in variants() {
+        let t = classify::classify(&o, &opts);
+        assert!(t.complete(), "{name}: {:?}", t.incomplete);
+        assert_eq!(t.classification.unsatisfiable, vec![1], "{name}");
+    }
+}
+
+/// Guard (detached probes): with a nominal in the terminology the individuals can
+/// matter, but a class whose model never reaches one is answered on the terminology
+/// alone: here `A ⊑ ∃r.B` and `B ⊑ C` never reach `a` (only `D ⊑ {a}` does), so only
+/// `D`'s test runs again with the 100 assertions (ore_ont_9881: 77.8 -> 64.0 s).
+#[test]
+fn classes_away_from_the_individuals_need_no_assertions() {
+    use nrese_owl::ObjProp;
+    let mut o = Ontology::default();
+    let class = |o: &mut Ontology, t: Term| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    let (a, b, c, d, e) = (
+        class(&mut o, 1),
+        class(&mut o, 2),
+        class(&mut o, 3),
+        class(&mut o, 4),
+        class(&mut o, 5),
+    );
+    let ind: Term = 100;
+    let r = ObjProp::Named(50);
+    let some = ExprId(o.classes.intern(ClassExpr::Some(r, b)));
+    let one = ExprId(o.classes.intern(ClassExpr::OneOf(vec![ind])));
+    let or = ExprId(o.classes.intern(ClassExpr::Or(vec![c, e])));
+    o.axioms = vec![
+        Axiom::SubClassOf(a, some),
+        Axiom::SubClassOf(b, c),
+        Axiom::SubClassOf(d, one),
+        Axiom::SubClassOf(e, or),
+    ];
+    for i in 0..50 {
+        o.axioms.push(Axiom::ClassAssertion(e, 200 + i));
+        o.axioms
+            .push(Axiom::ObjectPropertyAssertion(50, 200 + i, ind));
+    }
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let opts = Options {
+        context_core: false,
+        exact_lower_bound: false,
+        ..options()
+    };
+    let t = classify::classify(&o, &opts);
+    assert!(t.complete(), "{:?}", t.incomplete);
+    // Every test but `D`'s (its model is `a`) stays on the terminology.
+    assert_eq!(t.profile.detached, 4, "{}", t.profile.line());
+    assert_eq!(t.profile.fallbacks, 1, "{}", t.profile.line());
+    assert!(t.classification.subsumptions.contains(&(2, 3)));
 }

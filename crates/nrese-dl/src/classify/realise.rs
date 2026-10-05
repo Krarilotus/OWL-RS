@@ -197,6 +197,7 @@ impl<'a> Work<'a> {
         let want = Want {
             elements: false,
             individuals: true,
+            detached: false,
         };
         let out = program.probe(
             &Probe {
