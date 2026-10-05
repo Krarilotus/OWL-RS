@@ -34,6 +34,12 @@ pub enum Strategy {
     /// One context per set `K₁` of what certainly holds for the successor: more, smaller
     /// contexts.
     Eager,
+    /// As `Cautious`, but a successor whose filler isn't certain gets an empty-core
+    /// context of its own Skolem function instead of the one shared by all: the possible
+    /// atoms of unrelated successors then never combine in one context (on the ORE
+    /// development set the shared one held 25-80 % of all clauses, 99 % of what it
+    /// derived redundant).
+    Split,
 }
 
 /// A context: its inbox, activation flag, core and state.
@@ -102,13 +108,16 @@ impl Arena {
 }
 
 /// The program and the contexts saturating it.
+/// A context's key in the registry: its core and its tag ([`Engine::context_tagged`]).
+type CoreKey = (Box<[Atom]>, u32);
+
 pub struct Engine {
     pub program: Program,
     pub strategy: Strategy,
     /// Record each clause's derivation (for proofs).
     pub proofs: bool,
     contexts: Arena,
-    registry: Mutex<HashMap<Box<[Atom]>, ContextId>>,
+    registry: Mutex<HashMap<CoreKey, ContextId>>,
     budget: Budget,
     /// The budget ran out: the workers drop what is left (the saturation is then
     /// incomplete and says so).
@@ -188,13 +197,21 @@ impl Engine {
     /// # Panics
     /// Past 2³² contexts or the arena's segments (some 17 billion contexts).
     pub fn context_for(&self, core: &[Atom]) -> (ContextId, bool) {
+        self.context_tagged(core, 0)
+    }
+
+    /// The context with core `core` and tag `tag`: contexts with the same core and
+    /// different tags are separate (Succ may pick any context whose core holds, so
+    /// several with one core keep the calculus sound and complete; `Strategy::Split`).
+    pub fn context_tagged(&self, core: &[Atom], tag: u32) -> (ContextId, bool) {
         let mut registry = lock(&self.registry);
-        if let Some(&id) = registry.get(core) {
+        let key = (core.into(), tag);
+        if let Some(&id) = registry.get(&key) {
             return (id, false);
         }
         let id = self.contexts.push().expect("the context arena has room");
         let _ = self.context(id).core.set(core.into());
-        registry.insert(core.into(), id);
+        registry.insert(key, id);
         (id, true)
     }
 

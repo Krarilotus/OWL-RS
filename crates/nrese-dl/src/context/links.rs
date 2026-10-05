@@ -161,20 +161,27 @@ impl Worker<'_> {
             return;
         }
         // No edge holds K₂: the strategy picks the successor.
+        let mut tag = 0;
         let core: Vec<Atom> = match self.engine.strategy {
-            Strategy::Cautious => program.funcs[f as usize]
-                .filler
-                .map(|b| Atom::concept(b, CTerm::X))
-                .filter(|a| entry.k1.contains(a))
-                .into_iter()
-                .collect(),
+            Strategy::Cautious | Strategy::Split => {
+                let core: Vec<Atom> = program.funcs[f as usize]
+                    .filler
+                    .map(|b| Atom::concept(b, CTerm::X))
+                    .filter(|a| entry.k1.contains(a))
+                    .into_iter()
+                    .collect();
+                if core.is_empty() && self.engine.strategy == Strategy::Split {
+                    tag = f + 1;
+                }
+                core
+            }
             Strategy::Eager => {
                 let mut k1 = entry.k1.clone();
                 k1.sort_unstable();
                 k1
             }
         };
-        let (to, created) = self.engine.context_for(&core);
+        let (to, created) = self.engine.context_tagged(&core, tag);
         if created {
             self.out.send(to, Message::Init);
         }
