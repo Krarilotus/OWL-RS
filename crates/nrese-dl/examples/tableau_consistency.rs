@@ -5,7 +5,7 @@
 //! cargo run --release -p nrese-dl --example tableau_consistency -- [--timeout SECS]
 //!     [--no-semantic-branching] [--no-backjumping] [--ancestor-blocking] [--pairwise-always]
 //!     [--disjunctions-first] [--no-disjunct-learning] [--full-blocking] [--expand-at-most N]
-//!     [--exact-provenance] FILE...
+//!     [--exact-provenance] [--no-lazy-definitions] FILE...
 //! ```
 //!
 //! `NRESE_CLAUSE_STATS=1` also prints, on standard error, the clauses per kind of axiom
@@ -178,6 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--no-disjunct-learning" => config.disjunct_learning = false,
             "--full-blocking" => config.incremental_blocking = false,
             "--exact-provenance" => exact_provenance = true,
+            "--no-lazy-definitions" => config.lazy_definitions = false,
             "--expand-at-most" => {
                 config.expand_at_most_up_to = args.next().ok_or("--expand-at-most N")?.parse()?;
             }
