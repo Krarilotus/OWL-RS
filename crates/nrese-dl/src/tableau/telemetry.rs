@@ -18,6 +18,8 @@ pub struct Telemetry {
     pub expand: Duration,
     /// Choosing disjuncts and backtracking.
     pub search: Duration,
+    /// The datatype theory's checks.
+    pub datatypes: Duration,
     pub total: Duration,
 
     pub nodes_created: u64,
@@ -35,6 +37,9 @@ pub struct Telemetry {
     pub blocking_hits: u64,
     pub clauses_fired: u64,
     pub facts: u64,
+    /// Components of data values checked, and key rule instances applied.
+    pub data_checks: u64,
+    pub key_firings: u64,
     /// The hot node's size (one cache line) and the amortised bytes per node at the peak
     /// (every table, index and the trail, by capacity).
     pub bytes_per_hot_node: u64,
@@ -48,14 +53,16 @@ impl fmt::Display for Telemetry {
         write!(
             f,
             "compile_ms={:.3} saturate_ms={:.3} blocking_ms={:.3} expand_ms={:.3} search_ms={:.3} \
-             total_ms={:.3} nodes_created={} peak_nodes={} branch_points={} backjumps={} \
-             levels_skipped={} clashes={} merges={} ni={} blocking_tests={} blocking_hits={} \
-             clauses_fired={} facts={} bytes_per_hot_node={} bytes_per_node={} dependency_sets={}",
+             datatypes_ms={:.3} total_ms={:.3} nodes_created={} peak_nodes={} branch_points={} \
+             backjumps={} levels_skipped={} clashes={} merges={} ni={} blocking_tests={} \
+             blocking_hits={} clauses_fired={} facts={} data_checks={} key_firings={} \
+             bytes_per_hot_node={} bytes_per_node={} dependency_sets={}",
             ms(self.compile),
             ms(self.saturate),
             ms(self.blocking),
             ms(self.expand),
             ms(self.search),
+            ms(self.datatypes),
             ms(self.total),
             self.nodes_created,
             self.peak_nodes,
@@ -69,6 +76,8 @@ impl fmt::Display for Telemetry {
             self.blocking_hits,
             self.clauses_fired,
             self.facts,
+            self.data_checks,
+            self.key_firings,
             self.bytes_per_hot_node,
             self.bytes_per_node,
             self.dependency_sets

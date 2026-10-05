@@ -141,9 +141,14 @@ impl Engine<'_> {
                         ),
                     ));
                 }
+                let data = self.p.data_roles.get(number.role.role as usize) == Some(&true);
                 let mut fresh = Vec::with_capacity(number.n as usize);
                 for _ in 0..number.n {
                     let t = self.new_node(s, NONE)?;
+                    if data {
+                        // A data value: a leaf of its own kind.
+                        self.g.nodes[t as usize].flags |= flag::CONCRETE;
+                    }
                     let (a, b) = if number.role.inverse { (t, s) } else { (s, t) };
                     self.assert(Lit::Role(number.role.role, a, b), dep, proof::EXPANSION)?;
                     match number.filler {
@@ -190,6 +195,11 @@ impl Engine<'_> {
                 .collect();
             for (index, dep) in facts {
                 let number = self.p.at_most[index as usize];
+                if self.p.data_roles.get(number.role.role as usize) == Some(&true)
+                    && self.data_choice(s, &number, dep)?
+                {
+                    return Ok(true);
+                }
                 let mut found = self.neighbours(s, &number);
                 let annot = Annot {
                     root: if self.g.nodes[s as usize].flags & flag::ROOT != 0 {
