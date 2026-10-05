@@ -31,6 +31,7 @@ use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{GraphPattern, PropertyPathExpression};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
 
+use super::path_joins::PathJoin;
 use super::{Context, GraphScope, PathPattern, ScanPattern, bound_variables, pushdown};
 use crate::plan::Plan;
 use crate::query::PlannedStep;
@@ -108,6 +109,20 @@ impl Context<'_> {
             Plan::Join(inputs) if inputs.iter().all(|i| matches!(i, Plan::Scan(_))) => {
                 let rows = self.bgp_rows(inputs, depth + 1, steps);
                 ("bgp", format!("{} triple patterns", inputs.len()), rows)
+            }
+            // Paths joined to triple patterns, ordered with them as the executor does.
+            Plan::Join(_)
+                if !self.as_written
+                    && let lowered = plan.lower()
+                    && let Some(join) = PathJoin::of(&lowered) =>
+            {
+                let rows = self.path_join_steps(&join, depth + 1, steps);
+                let detail = format!(
+                    "{} triple patterns and {} paths, ordered together",
+                    join.triples.len(),
+                    join.paths.len()
+                );
+                ("bgp", detail, Some(rows))
             }
             Plan::Join(inputs) => {
                 let mut rows = Some(1.0);
@@ -323,9 +338,10 @@ impl Context<'_> {
         Some((rows * kept).max(0.0).round() as u64)
     }
 
-    /// The rows of a path pattern alone. Both ends constant: one. One constant end: the
-    /// path's fan-out from it (a single link's exact count). Both ends variables:
-    /// [`Self::path_open`].
+    /// The rows of a path pattern alone. Both ends constant: one. One constant end: a
+    /// single link's exact count; a closure's reach from the constant by a bounded search
+    /// (exact up to [`REACH_BUDGET`] nodes, at least that beyond); otherwise the path's
+    /// fan-out from it. Both ends variables: [`Self::path_open`].
     pub(super) fn path_size(&self, path: &PathPattern<'_>) -> f64 {
         let constant = |term: &TermPattern| {
             !matches!(term, TermPattern::Variable(_) | TermPattern::BlankNode(_))
@@ -333,7 +349,8 @@ impl Context<'_> {
         match (constant(path.subject), constant(path.object)) {
             (true, true) => 1.0,
             (false, false) => self.path_open(path.path),
-            (subject, _) => {
+            (forward, _) => {
+                let end = if forward { path.subject } else { path.object };
                 if let PropertyPathExpression::NamedNode(predicate) = path.path {
                     let triple = nrese_sparql_syntax::term::TriplePattern {
                         subject: path.subject.clone(),
@@ -342,7 +359,27 @@ impl Context<'_> {
                     };
                     return self.scan_rows(&triple);
                 }
-                self.path_fanout(path.path, subject)
+                let modelled = self.path_fanout(path.path, forward);
+                if let PropertyPathExpression::OneOrMore(_)
+                | PropertyPathExpression::ZeroOrMore(_) = path.path
+                {
+                    let resolved = super::paths::Path::resolve(path.path, &self.snapshot);
+                    let reached = match constant_id(self, end) {
+                        // A term the store doesn't have: only itself, with `*`.
+                        None => Some(usize::from(matches!(
+                            path.path,
+                            PropertyPathExpression::ZeroOrMore(_)
+                        ))),
+                        Some(id) => self.path_evaluator().ok().and_then(|evaluator| {
+                            evaluator.reach_within(&resolved, id, forward, REACH_BUDGET)
+                        }),
+                    };
+                    return match reached {
+                        Some(reached) => reached as f64,
+                        None => modelled.max(REACH_BUDGET as f64),
+                    };
+                }
+                modelled
             }
         }
     }
@@ -378,7 +415,7 @@ impl Context<'_> {
     /// a link's statements per distinct subject (object); a sequence's product, an
     /// alternative's sum; `p?` one more than `p`; a closure what one start reaches
     /// ([`reach`]); a negated set one.
-    fn path_fanout(&self, path: &PropertyPathExpression, forward: bool) -> f64 {
+    pub(super) fn path_fanout(&self, path: &PropertyPathExpression, forward: bool) -> f64 {
         match path {
             PropertyPathExpression::NamedNode(predicate) => {
                 let triple = link(predicate);
@@ -407,6 +444,21 @@ impl Context<'_> {
             PropertyPathExpression::NegatedPropertySet(_) => 1.0,
         }
     }
+}
+
+/// The nodes a bounded search from a path's constant end may expand for an estimate
+/// ([`Context::path_size`]).
+const REACH_BUDGET: usize = 4096;
+
+/// The id of a constant path end, if the store has the term.
+fn constant_id(ctx: &Context<'_>, term: &TermPattern) -> Option<u64> {
+    let term: nrese_rdf::Term = match term {
+        TermPattern::NamedNode(n) => n.clone().into(),
+        TermPattern::Literal(l) => l.clone().into(),
+        _ => return None,
+    };
+    ctx.lookup_const(term.as_ref())
+        .map(nrese_engine::TermId::raw)
 }
 
 /// What one start reaches over a step of fan-out `fanout` in one or more steps: the

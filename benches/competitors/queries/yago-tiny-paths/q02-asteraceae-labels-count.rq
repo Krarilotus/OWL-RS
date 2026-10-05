@@ -1,0 +1,5 @@
+# COUNT of the same join, every label
+PREFIX schema: <http://schema.org/>
+PREFIX yago: <http://yago-knowledge.org/resource/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT (COUNT(*) AS ?n) WHERE { ?t schema:parentTaxon+ yago:Asteraceae ; rdfs:label ?name }

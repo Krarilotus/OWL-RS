@@ -30,6 +30,7 @@ pub fn geometry_literal(term: &nrese_rdf::Term) -> Option<(String, ::geo::Geomet
     geo::parse(term).map(|shape| (shape.crs, shape.geometry))
 }
 mod output;
+mod path_joins;
 mod paths;
 mod plan;
 mod pushdown;
@@ -1527,8 +1528,14 @@ impl<'a> Context<'a> {
                 object,
             } => self.path(subject, path, object),
             GraphPattern::Join { left, right } => {
-                // A path joined to a pattern is evaluated second, from the values the
-                // pattern binds to one of its ends.
+                // Paths joined to triple patterns: ordered with them (`path_joins`).
+                if !self.as_written
+                    && let Some(join) = path_joins::PathJoin::of(pattern)
+                {
+                    return self.join_with_paths(&join);
+                }
+                // A path joined to another pattern is evaluated second, from the values
+                // the pattern binds to one of its ends.
                 match (as_path(left), as_path(right)) {
                     (_, Some(path)) => {
                         let bound = self.eval(left)?;
