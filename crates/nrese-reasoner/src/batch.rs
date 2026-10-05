@@ -186,6 +186,9 @@ pub struct Counters {
     /// Checks that came out of (predicate, subject, object) order within their morsel
     /// (P1-F8: none).
     pub unordered_probes: u64,
+    /// Lookups by object alone in relations kept without their object order (P1-F11:
+    /// none).
+    pub lookups_without_order: u64,
 }
 
 /// The bytes the working set's runs hold (both orders, spare capacity included; a run
@@ -399,22 +402,29 @@ fn merge(a: Arc<Pairs>, b: Arc<Pairs>) -> Pairs {
     out
 }
 
-/// A sorted run of pairs, by subject and by object. Cloning shares the pairs, so the
-/// recent run can be the delta itself instead of a copy.
+/// A sorted run of pairs, by subject and, where a rule can look the relation up by object
+/// alone, by object. Cloning shares the pairs, so the recent run can be the delta itself
+/// instead of a copy.
 #[derive(Default, Clone)]
 struct Run {
     so: Arc<Pairs>,
-    /// `(object, subject)` pairs.
-    os: Arc<Pairs>,
+    /// `(object, subject)` pairs, if kept.
+    os: Option<Arc<Pairs>>,
+}
+
+/// The `(object, subject)` order of `so`.
+fn objects_of(so: &Pairs) -> Pairs {
+    sort_chunked(so.chunks.iter().map(Vec::as_slice).collect(), true)
 }
 
 impl Run {
-    /// A run of `so` (in chunks: it will be merged), with its `(object, subject)` order.
-    fn new(so: Pairs) -> Self {
-        let os = sort_chunked(so.chunks.iter().map(Vec::as_slice).collect(), true);
+    /// A run of `so` (in chunks: it will be merged), with its `(object, subject)` order if
+    /// `objects`.
+    fn new(so: Pairs, objects: bool) -> Self {
+        let os = objects.then(|| Arc::new(objects_of(&so)));
         Self {
             so: Arc::new(so),
-            os: Arc::new(os),
+            os,
         }
     }
 
@@ -425,7 +435,7 @@ impl Run {
         so.par_sort_unstable();
         Self {
             so: Arc::new(Pairs::whole(so)),
-            os: Arc::new(Pairs::whole(os)),
+            os: Some(Arc::new(Pairs::whole(os))),
         }
     }
 
@@ -435,12 +445,39 @@ impl Run {
 
     /// The bytes of both orders, spare capacity included.
     fn bytes(&self) -> usize {
-        self.so.bytes() + self.os.bytes()
+        self.so.bytes() + self.os.as_ref().map_or(0, |os| os.bytes())
     }
 
     /// Whether `other` holds the same pairs (shared, not a copy).
     fn shares(&self, other: &Run) -> bool {
-        Arc::ptr_eq(&self.so, &other.so) && Arc::ptr_eq(&self.os, &other.os)
+        Arc::ptr_eq(&self.so, &other.so)
+    }
+
+    /// Keeps the `(object, subject)` order if `objects` (built if missing; the input's,
+    /// given with spare capacity, made exact), drops it if not.
+    fn objects(&mut self, objects: bool) {
+        if objects && self.os.is_none() && self.len() > 0 {
+            self.os = Some(Arc::new(objects_of(&self.so)));
+            return;
+        }
+        match (&mut self.os, objects) {
+            (os @ Some(_), false) => *os = None,
+            (Some(os), true) => {
+                if let Some(pairs) = Arc::get_mut(os)
+                    && pairs
+                        .chunks
+                        .iter()
+                        .any(|chunk| chunk.len() < chunk.capacity())
+                {
+                    let chunks = std::mem::take(&mut pairs.chunks);
+                    *pairs = Pairs::default();
+                    for chunk in chunks {
+                        pairs.push(chunk.as_slice().to_vec());
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn contains(&self, s: u64, o: u64) -> bool {
@@ -453,6 +490,7 @@ impl Run {
         s: Option<u64>,
         o: Option<u64>,
         keep: &dyn Fn(u64, u64) -> bool,
+        missed: &std::sync::atomic::AtomicU64,
         f: &mut dyn FnMut(u64, u64),
     ) {
         match (s, o) {
@@ -468,13 +506,27 @@ impl Run {
                     }
                 }
             }
-            (None, Some(o)) => {
-                for &(_, s) in self.os.range(o).flatten() {
-                    if keep(s, o) {
-                        f(s, o);
+            (None, Some(o)) => match &self.os {
+                Some(os) => {
+                    for &(_, s) in os.range(o).flatten() {
+                        if keep(s, o) {
+                            f(s, o);
+                        }
                     }
                 }
-            }
+                // Without the object order: every pair read. Never by the rules that
+                // decided it isn't kept; counted where it happens all the same.
+                None => {
+                    if self.len() > 0 {
+                        missed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    for &(s, other) in self.so.iter() {
+                        if other == o && keep(s, o) {
+                            f(s, o);
+                        }
+                    }
+                }
+            },
             (None, None) => {
                 for &(s, o) in self.so.iter() {
                     if keep(s, o) {
@@ -486,8 +538,15 @@ impl Run {
     }
 
     /// The pairs matching the bound positions, as slices of one order (a slice per chunk
-    /// they are in), with whether that order is `(object, subject)` and `old`.
-    fn matching<'a>(&'a self, s: Option<u64>, o: Option<u64>, old: bool, out: &mut Slices<'a>) {
+    /// they are in), with whether that order is `(object, subject)` and `old`; `false` if
+    /// they aren't one slice per chunk (an object without its order).
+    fn matching<'a>(
+        &'a self,
+        s: Option<u64>,
+        o: Option<u64>,
+        old: bool,
+        out: &mut Slices<'a>,
+    ) -> bool {
         match (s, o) {
             (Some(s), Some(o)) => {
                 if let Some(chunk) = self.so.chunk_of((s, o))
@@ -497,16 +556,23 @@ impl Run {
                 }
             }
             (Some(s), None) => out.extend(self.so.range(s).map(|pairs| (pairs, false, old))),
-            (None, Some(o)) => out.extend(self.os.range(o).map(|pairs| (pairs, true, old))),
+            (None, Some(o)) => match &self.os {
+                Some(os) => out.extend(os.range(o).map(|pairs| (pairs, true, old))),
+                None => return self.len() == 0,
+            },
             (None, None) => out.extend(self.so.chunks.iter().map(|pairs| (&pairs[..], false, old))),
         }
+        true
     }
 
     fn estimate(&self, s: Option<u64>, o: Option<u64>) -> usize {
         match (s, o) {
             (Some(s), Some(o)) => usize::from(self.contains(s, o)),
             (Some(s), None) => self.so.range(s).map(<[Pair]>::len).sum(),
-            (None, Some(o)) => self.os.range(o).map(<[Pair]>::len).sum(),
+            (None, Some(o)) => match &self.os {
+                Some(os) => os.range(o).map(<[Pair]>::len).sum(),
+                None => self.so.len(),
+            },
             (None, None) => self.so.len(),
         }
     }
@@ -519,7 +585,10 @@ impl Run {
             return other;
         }
         let so = Arc::new(merge(self.so, other.so));
-        let os = Arc::new(merge(self.os, other.os));
+        let os = match (self.os, other.os) {
+            (Some(a), Some(b)) => Some(Arc::new(merge(a, b))),
+            _ => None,
+        };
         Run { so, os }
     }
 }
@@ -546,6 +615,12 @@ pub(crate) struct Relation {
     delta: Run,
     /// Whether the delta is still the input (the store's first round is to come).
     fresh: bool,
+    /// Whether no rule looks the relation up by object alone, so its runs keep no
+    /// `(object, subject)` order (unused relations, P1-F11).
+    by_subject_only: bool,
+    /// Lookups by object alone in its runs without that order: the analysis that drops
+    /// the order ([`Reads`]) says there are none, and the closure tests check it.
+    missed: std::sync::atomic::AtomicU64,
 }
 
 /// The pairs whose first component is `key`.
@@ -581,17 +656,46 @@ impl Relation {
 
     /// Whether the delta has a pair with object `o`.
     pub(crate) fn delta_has_object(&self, o: u64) -> bool {
-        self.delta.os.range(o).any(|pairs| !pairs.is_empty())
+        let mut found = false;
+        let all = |_: u64, _: u64| true;
+        self.delta
+            .scan(None, Some(o), &all, &self.missed, &mut |_, _| found = true);
+        found
     }
 
     /// Calls `f` with each distinct object of the delta.
     pub(crate) fn delta_objects(&self, f: &mut dyn FnMut(u64)) {
-        let mut last = None;
-        for &(o, _) in self.delta.os.iter() {
-            if last != Some(o) {
-                f(o);
-                last = Some(o);
+        match &self.delta.os {
+            Some(os) => {
+                let mut last = None;
+                for &(o, _) in os.iter() {
+                    if last != Some(o) {
+                        f(o);
+                        last = Some(o);
+                    }
+                }
             }
+            None => {
+                let mut objects: Vec<u64> = self.delta.so.iter().map(|&(_, o)| o).collect();
+                objects.sort_unstable();
+                objects.dedup();
+                objects.into_iter().for_each(f);
+            }
+        }
+    }
+
+    /// Keeps the runs' `(object, subject)` orders if `objects`, else drops them (see
+    /// [`Relation::by_subject_only`]).
+    fn objects(&mut self, objects: bool) {
+        self.by_subject_only = !objects;
+        for run in [&mut self.input, &mut self.base, &mut self.recent] {
+            run.objects(objects);
+        }
+        // The delta shares the recent run's pairs or is its own.
+        if self.delta.shares(&self.recent) {
+            self.delta.os = self.recent.os.clone();
+        } else {
+            self.delta.objects(objects);
         }
     }
 
@@ -611,36 +715,38 @@ impl Relation {
     /// Calls `f` with every `(s, o)` matching the bound positions in `seg`.
     fn scan(&self, s: Option<u64>, o: Option<u64>, seg: Seg, f: &mut dyn FnMut(u64, u64)) {
         let all = |_: u64, _: u64| true;
+        let missed = &self.missed;
         match seg {
-            Seg::Delta => self.delta.scan(s, o, &all, f),
+            Seg::Delta => self.delta.scan(s, o, &all, missed, f),
             Seg::All => {
-                self.input.scan(s, o, &all, f);
-                self.base.scan(s, o, &all, f);
-                self.recent.scan(s, o, &all, f);
+                self.input.scan(s, o, &all, missed, f);
+                self.base.scan(s, o, &all, missed, f);
+                self.recent.scan(s, o, &all, missed, f);
             }
             // The delta is in `recent` only, so the input and the base need no filter.
             Seg::Old => {
-                self.input.scan(s, o, &all, f);
-                self.base.scan(s, o, &all, f);
+                self.input.scan(s, o, &all, missed, f);
+                self.base.scan(s, o, &all, missed, f);
                 let old = |s: u64, o: u64| !self.delta.contains(s, o);
-                self.recent.scan(s, o, &old, f);
+                self.recent.scan(s, o, &old, missed, f);
             }
         }
     }
 
     /// The matches of the bound positions in `seg`, as the slices of the runs that
-    /// hold them, in [`Relation::scan`]'s order (see [`Slices`]).
-    fn matching(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> Slices<'_> {
+    /// hold them, in [`Relation::scan`]'s order (see [`Slices`]); `None` if a run can't
+    /// give them as slices (an object without its order).
+    fn matching(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> Option<Slices<'_>> {
         let mut out = Slices::new();
-        match seg {
+        let whole = match seg {
             Seg::Delta => self.delta.matching(s, o, false, &mut out),
             Seg::All | Seg::Old => {
-                self.input.matching(s, o, false, &mut out);
-                self.base.matching(s, o, false, &mut out);
-                self.recent.matching(s, o, seg == Seg::Old, &mut out);
+                self.input.matching(s, o, false, &mut out)
+                    && self.base.matching(s, o, false, &mut out)
+                    && self.recent.matching(s, o, seg == Seg::Old, &mut out)
             }
-        }
-        out
+        };
+        whole.then_some(out)
     }
 
     /// An upper bound on the matches of the bound positions in `seg`.
@@ -668,7 +774,7 @@ impl Relation {
             let recent = std::mem::take(&mut self.recent);
             self.base = std::mem::take(&mut self.base).merge(recent);
         }
-        self.delta = Run::new(new);
+        self.delta = Run::new(new, !self.by_subject_only);
         if self.delta.len() > 0 {
             // An empty recent run becomes the delta itself (shared, not copied).
             self.recent = std::mem::take(&mut self.recent).merge(self.delta.clone());
@@ -713,6 +819,8 @@ impl Store {
                     recent: delta.clone(),
                     delta,
                     fresh: true,
+                    by_subject_only: false,
+                    missed: Default::default(),
                 }
             })
             .collect();
@@ -738,6 +846,15 @@ impl Store {
                 added: sum.added + bytes.added,
                 delta: sum.delta + bytes.delta,
             })
+    }
+
+    /// Keeps the `(object, subject)` order of the relations whose predicate `objects`
+    /// accepts and drops the others' (see [`Relation::by_subject_only`]).
+    fn objects(&mut self, objects: &(dyn Fn(u64) -> bool + Sync)) {
+        self.relations
+            .par_iter_mut()
+            .zip(self.predicates.par_iter())
+            .for_each(|(relation, &p)| relation.objects(objects(p)));
     }
 
     pub(crate) fn relation(&self, p: u64) -> Option<&Relation> {
@@ -894,14 +1011,12 @@ impl Source for Store {
     }
 
     fn matches_len(&self, [s, p, o]: [Option<u64>; 3], seg: Seg) -> Option<usize> {
-        Some(
-            self.relations_of(p)
-                .map(|(_, relation)| {
-                    let slices = relation.matching(s, o, seg);
-                    slices.iter().map(|(pairs, ..)| pairs.len()).sum::<usize>()
-                })
-                .sum(),
-        )
+        self.relations_of(p)
+            .map(|(_, relation)| {
+                let slices = relation.matching(s, o, seg)?;
+                Some(slices.iter().map(|(pairs, ..)| pairs.len()).sum::<usize>())
+            })
+            .sum()
     }
 
     fn scan_range(
@@ -913,7 +1028,10 @@ impl Source for Store {
     ) {
         let mut at = 0;
         for (p, relation) in self.relations_of(p) {
-            for &(pairs, swapped, old) in &relation.matching(s, o, seg) {
+            let slices = relation
+                .matching(s, o, seg)
+                .expect("matches_len gave slices");
+            for &(pairs, swapped, old) in &slices {
                 let (start, end) = (at, at + pairs.len());
                 at = end;
                 if end <= range.start {
@@ -1240,6 +1358,13 @@ fn run(
                 transitive.register(p);
             }
         }
+        // The object orders the rules can use, built where they became needed and
+        // dropped where nothing reads them (P1-F11).
+        let equal = equality
+            .as_ref()
+            .is_some_and(|e| store.estimate([None, Some(e.same_as), None], Seg::All) > 0);
+        let reads = Reads::of(program.rules.iter());
+        store.objects(&|p| equal || reads.by_object(p) || schema.read_in_grounding(p));
         phases.grounding += clock.elapsed();
         heap::phase("reasoner: joins");
         let clock = std::time::Instant::now();
@@ -1294,6 +1419,18 @@ fn run(
     heap::phase("reasoner: consistency");
     let clock = std::time::Instant::now();
     program.ground(&store, schema, &consistency_rules(&store, rules, lists));
+    let reads = Reads::of(
+        program.rules.iter().chain(
+            program
+                .consistency
+                .iter()
+                .map(|(_, grounded)| &grounded.rule),
+        ),
+    );
+    let equal = equality
+        .as_ref()
+        .is_some_and(|e| store.estimate([None, Some(e.same_as), None], Seg::All) > 0);
+    store.objects(&|p| equal || reads.by_object(p) || schema.read_in_grounding(p));
     let mut found = HashSet::new();
     check(
         &store,
@@ -1303,6 +1440,11 @@ fn run(
         &mut found,
     );
     result.violations = sorted(found);
+    result.counters.lookups_without_order = store
+        .relations
+        .iter()
+        .map(|relation| relation.missed.load(std::sync::atomic::Ordering::Relaxed))
+        .sum();
     phases.consistency = clock.elapsed();
     result.phases = phases;
     heap::phase("reasoner: derived");
@@ -1311,6 +1453,50 @@ fn run(
     result.derived = derived;
     heap::phase("reasoner: done");
     Ok(result)
+}
+
+/// What ground rules read of the relations: which relations they can look up by object
+/// alone, where the `(object, subject)` order is needed. An atom is looked up by object
+/// alone if its object is a constant or a variable another atom binds, and its subject
+/// isn't a constant; a variable predicate can be any relation. Every other lookup goes
+/// by subject (both bound: a membership check by subject; nothing bound: a scan).
+#[derive(Default)]
+struct Reads {
+    by_object: HashSet<u64>,
+    everything: bool,
+}
+
+impl Reads {
+    fn of<'a>(rules: impl Iterator<Item = &'a Rule>) -> Self {
+        use super::ir::Term;
+        let mut reads = Self::default();
+        for rule in rules {
+            for (i, atom) in rule.body.iter().enumerate() {
+                let [subject, predicate, object] = atom.0;
+                let bound = match object {
+                    Term::Const(_) => true,
+                    Term::Var(_) => rule
+                        .body
+                        .iter()
+                        .enumerate()
+                        .any(|(j, other)| j != i && other.0.contains(&object)),
+                };
+                if bound && !matches!(subject, Term::Const(_)) {
+                    match predicate {
+                        Term::Const(p) => {
+                            reads.by_object.insert(p);
+                        }
+                        Term::Var(_) => reads.everything = true,
+                    }
+                }
+            }
+        }
+        reads
+    }
+
+    fn by_object(&self, p: u64) -> bool {
+        self.everything || self.by_object.contains(&p)
+    }
 }
 
 /// Violations sorted by rule and bindings.

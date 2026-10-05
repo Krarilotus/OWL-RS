@@ -226,6 +226,12 @@ impl Schema {
         }
     }
 
+    /// Whether grounding reads relation `p` (schema atoms: a schema predicate, or
+    /// `rdf:type` with a schema class), where any order may be needed.
+    pub(crate) fn read_in_grounding(&self, p: u64) -> bool {
+        p == self.rdf_type || self.predicates.contains(&p)
+    }
+
     pub fn is_schema_fact(&self, [_, p, o]: Triple) -> bool {
         self.predicates.contains(&p) || (p == self.rdf_type && self.classes.contains(&o))
     }
