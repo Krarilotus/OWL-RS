@@ -93,6 +93,8 @@ pub enum Head {
     /// An at-most restriction (by its index in [`Program::at_most`]).
     AtMost(u32, u8),
     Equal(u8, u8),
+    /// Two data values differ (`DisjointDataProperties`): the datatype theory decides.
+    Unequal(u8, u8),
     /// The variable is the individual with this index.
     Nominal(u32, u8),
 }
@@ -686,6 +688,10 @@ impl Program {
                     Head::Concept(self.range_concept(*r), var(&mut vars, *v)?)
                 }
                 HeadAtom::DataEqual(a, b) => Head::Equal(var(&mut vars, *a)?, var(&mut vars, *b)?),
+                HeadAtom::DataUnequal(a, b) => {
+                    self.data()?;
+                    Head::Unequal(var(&mut vars, *a)?, var(&mut vars, *b)?)
+                }
                 HeadAtom::DataRole(p, a, b) => {
                     let (a, b) = (var(&mut vars, *a)?, var(&mut vars, *b)?);
                     Head::Role(self.data_role(*p), a, b)
@@ -830,7 +836,7 @@ fn heads_after(clause: &HtClause, trigger: usize, steps: &[Step]) -> Vec<Vec<u8>
     let head_vars = |h: &Head| -> Option<u32> {
         Some(match *h {
             Head::Concept(_, v) | Head::AtLeast(_, v) | Head::AtMost(_, v) => mask(&[v]),
-            Head::Role(_, a, b) | Head::Equal(a, b) => mask(&[a, b]),
+            Head::Role(_, a, b) | Head::Equal(a, b) | Head::Unequal(a, b) => mask(&[a, b]),
             Head::Nominal(..) => return None,
         })
     };

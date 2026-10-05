@@ -310,6 +310,34 @@ fn data_values_are_decided_by_the_datatype_theory() {
     assert_eq!(answer(&b.o), Answer::Inconsistent);
 }
 
+/// Disjoint data properties compare values, not data nodes: the literal 10 of one and the
+/// value `∃dp2.integer[10, 10]` makes for the other are two nodes with one value. W3C
+/// "Inconsistent Disjoint Dataproperties" was answered consistent while the clause
+/// shared one data variable (5 October 2026).
+#[test]
+fn disjoint_data_properties_compare_values() {
+    for (bound, expected) in [(10, Answer::Inconsistent), (11, Answer::Consistent)] {
+        let mut b = Build::default();
+        b.axiom(Axiom::DisjointDataProperties(vec![400, 401]));
+        let ten = b.literal("10", "integer");
+        b.axiom(Axiom::DataPropertyAssertion(400, 100, ten));
+        let range = b.restricted(
+            "integer",
+            &[("minInclusive", bound), ("maxInclusive", bound)],
+        );
+        let some = b.e(ClassExpr::DataSome(401, range));
+        b.assert(some, 100);
+        assert_eq!(answer(&b.o), expected, "dp2 in [{bound}, {bound}]");
+    }
+    // The same literal for both: one node, as before.
+    let mut b = Build::default();
+    b.axiom(Axiom::DisjointDataProperties(vec![400, 401]));
+    let ten = b.literal("10", "integer");
+    b.axiom(Axiom::DataPropertyAssertion(400, 100, ten));
+    b.axiom(Axiom::DataPropertyAssertion(401, 100, ten));
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
 /// Cardinalities against the values a range has: 256 bytes, but not 257.
 #[test]
 fn data_cardinalities_count_values() {
