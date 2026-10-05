@@ -28,10 +28,13 @@ use rayon::prelude::*;
 
 use super::delta::Interrupted;
 pub use super::eval::Schema;
-use super::eval::{AllFacts, GroundProgram, Job, NEVER, Seg, Source, guards_hold, run_jobs};
+use super::eval::{
+    AllFacts, GroundProgram, Job, NEVER, Probes, Seg, Source, guards_hold, run_jobs_counted,
+};
 use super::ir::{Head, Rule};
 use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
+use nrese_exec::heap;
 
 type Pair = (u64, u64);
 
@@ -50,6 +53,43 @@ pub struct Materialisation {
     pub transitive: usize,
     /// Time per phase: grounding, rule joins, modules, merging, consistency.
     pub phases: Phases,
+    /// What the rounds held and did, in counts.
+    pub counters: Counters,
+}
+
+/// Deterministic counts of a materialisation's rounds, for the guards of
+/// `docs/design/performance.md` §0: they don't depend on the machine or the thread count.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Counters {
+    /// Per round: the working set's bytes after it.
+    pub store_bytes: Vec<StoreBytes>,
+    /// Bytes of driver matches the rule jobs copied out of the working set before they
+    /// ran (P1-F1: none, they read the runs in place).
+    pub driver_bytes_copied: usize,
+    /// Per round: how often the rule jobs' candidates were checked against the working
+    /// set (P1-F8: once per distinct candidate of a morsel).
+    pub probes: Vec<u64>,
+    /// Checks that came out of (predicate, subject, object) order within their morsel
+    /// (P1-F8: none).
+    pub unordered_probes: u64,
+}
+
+/// The bytes the working set's runs hold (both orders, spare capacity included; a run
+/// shared by two roles counted once).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StoreBytes {
+    /// The store's input, apart.
+    pub input: usize,
+    /// What was added since: the base and recent runs.
+    pub added: usize,
+    /// The delta where it doesn't share another run.
+    pub delta: usize,
+}
+
+impl StoreBytes {
+    pub fn total(&self) -> usize {
+        self.input + self.added + self.delta
+    }
 }
 
 /// Time spent per phase of [`materialise`].
@@ -85,6 +125,16 @@ impl Run {
 
     fn len(&self) -> usize {
         self.so.len()
+    }
+
+    /// The bytes of both orders, spare capacity included.
+    fn bytes(&self) -> usize {
+        (self.so.capacity() + self.os.capacity()) * std::mem::size_of::<Pair>()
+    }
+
+    /// Whether `other` holds the same pairs (shared, not a copy).
+    fn shares(&self, other: &Run) -> bool {
+        Arc::ptr_eq(&self.so, &other.so) && Arc::ptr_eq(&self.os, &other.os)
     }
 
     fn contains(&self, s: u64, o: u64) -> bool {
@@ -221,6 +271,25 @@ fn merge(a: &[Pair], b: &[Pair]) -> Vec<Pair> {
 impl Relation {
     pub(crate) fn delta_len(&self) -> usize {
         self.delta.len()
+    }
+
+    fn bytes(&self) -> StoreBytes {
+        let (input, base, recent) = (&self.input, &self.base, &self.recent);
+        let shared = |run: &Run| [input, base, recent].iter().any(|other| run.shares(other));
+        StoreBytes {
+            input: input.bytes(),
+            added: base.bytes()
+                + if recent.shares(base) {
+                    0
+                } else {
+                    recent.bytes()
+                },
+            delta: if shared(&self.delta) {
+                0
+            } else {
+                self.delta.bytes()
+            },
+        }
     }
 
     /// Whether the delta has a pair with object `o`.
@@ -381,6 +450,18 @@ impl Store {
             .map(|(&p, r)| (p, r))
     }
 
+    /// The bytes the runs hold.
+    pub(crate) fn bytes(&self) -> StoreBytes {
+        self.relations
+            .iter()
+            .map(Relation::bytes)
+            .fold(StoreBytes::default(), |sum, bytes| StoreBytes {
+                input: sum.input + bytes.input,
+                added: sum.added + bytes.added,
+                delta: sum.delta + bytes.delta,
+            })
+    }
+
     pub(crate) fn relation(&self, p: u64) -> Option<&Relation> {
         self.index.get(&p).map(|&i| &self.relations[i])
     }
@@ -418,6 +499,7 @@ impl Store {
             .par_iter()
             .zip(self.predicates.par_iter())
             .any(|(pairs, &p)| pairs.iter().any(|&(s, o)| schema.is_schema_fact([s, p, o])));
+        heap::phase("reasoner: install");
         self.install(news);
         (count, schema_facts)
     }
@@ -836,6 +918,7 @@ fn run(
     loop {
         check_stop()?;
         result.rounds += 1;
+        heap::phase("reasoner: grounding");
         let clock = std::time::Instant::now();
         // Rules from `evaluated` on were added this round: evaluated once in full.
         let evaluated = program.rules.len();
@@ -856,6 +939,7 @@ fn run(
             }
         }
         phases.grounding += clock.elapsed();
+        heap::phase("reasoner: joins");
         let clock = std::time::Instant::now();
         // Semi-naive variants of the evaluated rules that can match the delta, full
         // evaluation of the new ones.
@@ -870,10 +954,17 @@ fn run(
         for rule in &program.rules[evaluated..] {
             jobs.extend(Job::full(&store, rule));
         }
-        candidates.extend(run_jobs(&store, &jobs, &|fact| !store.contains(fact), stop));
+        let probes = Probes::default();
+        let keep = |fact| !store.contains(fact);
+        candidates.extend(run_jobs_counted(&store, &jobs, &keep, stop, &probes));
+        let counters = &mut result.counters;
+        counters.driver_bytes_copied += jobs.iter().map(Job::copied_bytes).sum::<usize>();
+        counters.probes.push(probes.probes.into_inner());
+        counters.unordered_probes += probes.unordered.into_inner();
         drop(jobs);
         check_stop()?;
         phases.joins += clock.elapsed();
+        heap::phase("reasoner: modules");
         let clock = std::time::Instant::now();
         candidates.extend(transitive.run(&store, stop).ok_or(Interrupted)?);
         if let Some(equality) = &mut equality {
@@ -881,10 +972,12 @@ fn run(
         }
         check_stop()?;
         phases.modules += clock.elapsed();
+        heap::phase("reasoner: merge");
         let clock = std::time::Instant::now();
         // Every candidate was checked against the store, which a round doesn't change.
         let (new, schema_facts) = store.advance_new(candidates, schema);
         phases.merge += clock.elapsed();
+        result.counters.store_bytes.push(store.bytes());
         if new == 0 {
             break;
         }
@@ -893,6 +986,7 @@ fn run(
     }
     result.ground_rules = program.rules.len();
     result.transitive = transitive.predicates.len();
+    heap::phase("reasoner: consistency");
     let clock = std::time::Instant::now();
     program.ground(&store, schema, &consistency_rules(&store, rules, lists));
     let mut found = HashSet::new();
@@ -906,10 +1000,12 @@ fn run(
     result.violations = sorted(found);
     phases.consistency = clock.elapsed();
     result.phases = phases;
+    heap::phase("reasoner: derived");
     let mut derived = store.derived();
     drop(store);
     derived.par_sort_unstable();
     result.derived = derived;
+    heap::phase("reasoner: done");
     Ok(result)
 }
 
