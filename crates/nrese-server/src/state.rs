@@ -200,9 +200,20 @@ impl AppState {
             .repositories
             .get(id)
             .ok_or_else(|| ApiError::not_found(format!("no repository '{id}'")))?;
+        // A repository with its own query budget answers with it; the rest of the policy
+        // is the server's.
+        let policy = match repository.settings.read().query_timeout() {
+            Some(timeout) => {
+                let mut policy = (*self.policy).clone();
+                policy.timeouts.query = timeout;
+                Arc::new(policy)
+            }
+            None => Arc::clone(&self.policy),
+        };
         Ok(Self {
             pipeline: repository.pipeline,
             repository: Arc::from(id),
+            policy,
             ..self.clone()
         })
     }
