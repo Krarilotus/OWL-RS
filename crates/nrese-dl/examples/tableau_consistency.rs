@@ -9,7 +9,8 @@
 //! ```
 //!
 //! `NRESE_CLAUSE_STATS=1` also prints, on standard error, the clauses per kind of axiom
-//! they come from and the axioms with the most clauses.
+//! they come from and the axioms with the most clauses; `NRESE_CLAUSE_DUMP=1` every clause
+//! and what each fresh name stands for.
 //!
 //! Each FILE is N-Triples (`.nt`, as the reference runner's `ntriples` task writes it),
 //! OWL functional syntax (a file that starts with `Prefix(` or `Ontology(`, as the ORE
@@ -211,6 +212,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let normalise_time = at.elapsed();
         if std::env::var_os("NRESE_CLAUSE_STATS").is_some() {
             clause_stats(&ontology, &normalised);
+        }
+        if std::env::var_os("NRESE_CLAUSE_DUMP").is_some() {
+            for c in &normalised.clauses {
+                eprintln!("{:?} -> {:?}", c.body, c.head);
+            }
+            for (i, f) in normalised.fresh.iter().enumerate() {
+                eprintln!("fresh {i}: {f:?}");
+            }
         }
         let out = consistency_of(&ontology, &normalised, &config);
         let reason = match &out.answer {
