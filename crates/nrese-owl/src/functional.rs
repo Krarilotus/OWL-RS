@@ -1,6 +1,7 @@
 //! Axioms in the OWL 2 Functional-Style Syntax (W3C *OWL 2 Structural Specification*),
 //! terms named by the caller: for diagnostics, explanations and tests (two readings of
-//! one ontology compare equal by their text, whatever ids they interned).
+//! one ontology compare equal by their text, whatever ids they interned), and whole
+//! documents that [`crate::read_functional`] reads back.
 
 use crate::mapping::Ontology;
 use crate::model::{
@@ -16,6 +17,50 @@ impl Ontology {
             name,
         };
         f.axiom(axiom)
+    }
+
+    /// The ontology as a functional-syntax document: the standard prefixes, then
+    /// `Ontology(<iri>` and an axiom per line. `name` must write terms as the syntax does
+    /// ([`iri_text`], [`literal_text`], `_:label` for an anonymous individual).
+    pub fn functional_document(&self, iri: Option<&str>, name: &dyn Fn(Term) -> String) -> String {
+        let mut out = String::new();
+        for (prefix, namespace) in [
+            ("rdf", crate::vocab::RDF),
+            ("rdfs", crate::vocab::RDFS),
+            ("xsd", crate::vocab::XSD),
+            ("owl", crate::vocab::OWL),
+        ] {
+            out.push_str(&format!("Prefix({prefix}:=<{namespace}>)\n"));
+        }
+        out.push_str("Ontology(");
+        if let Some(iri) = iri {
+            out.push_str(&iri_text(iri));
+        }
+        out.push('\n');
+        for axiom in &self.axioms {
+            out.push_str(&self.functional(axiom, name));
+            out.push('\n');
+        }
+        out.push_str(")\n");
+        out
+    }
+}
+
+/// An IRI as the functional syntax writes it.
+pub fn iri_text(iri: &str) -> String {
+    format!("<{iri}>")
+}
+
+/// A literal as the functional syntax writes it: `"…"` (`xsd:string`), `"…"@tag`, or
+/// `"…"^^<datatype>`, with `"` and `\` escaped.
+pub fn literal_text(lexical: &str, datatype: Option<&str>, language: Option<&str>) -> String {
+    let escaped = lexical.replace('\\', "\\\\").replace('"', "\\\"");
+    match (language, datatype) {
+        (Some(tag), _) => format!("\"{escaped}\"@{tag}"),
+        (None, Some(d)) if d != format!("{}string", crate::vocab::XSD) => {
+            format!("\"{escaped}\"^^<{d}>")
+        }
+        _ => format!("\"{escaped}\""),
     }
 }
 
