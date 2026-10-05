@@ -95,6 +95,9 @@ pub enum HeadAtom {
     DataIn(RangeId, Var),
     /// Two data values are the same.
     DataEqual(Var, Var),
+    /// Two data values differ (`DisjointDataProperties`: the values two properties give
+    /// one individual are never the same value, whichever data nodes hold them).
+    DataUnequal(Var, Var),
     /// `property(a, v)` for a data property.
     DataRole(Term, Var, Var),
 }
@@ -164,6 +167,7 @@ impl Clause {
                             | HeadAtom::DataAtMost { .. }
                             | HeadAtom::DataIn(..)
                             | HeadAtom::DataEqual(..)
+                            | HeadAtom::DataUnequal(..)
                             | HeadAtom::DataRole(..)
                     )
                 }),
