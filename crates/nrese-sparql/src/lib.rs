@@ -19,6 +19,7 @@ pub mod dataset;
 pub mod plan;
 pub use dataset::GraphAccess;
 mod native;
+pub mod ql;
 pub mod query;
 pub mod results;
 pub mod service;

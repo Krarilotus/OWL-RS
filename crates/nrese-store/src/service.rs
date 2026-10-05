@@ -104,6 +104,7 @@ impl StoreService {
             equality_closed: std::sync::Arc::default(),
             equality_canonical: config.equality_canonical_answers,
             equality_early_expansion: config.equality_early_expansion,
+            ql: std::sync::Arc::default(),
         };
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
@@ -137,6 +138,7 @@ impl StoreService {
     /// A stack kept over representatives (`reasoner.equality = "compact"`) is read
     /// expanded: the engine learns `owl:sameAs` ([`nrese_engine::Engine::set_equality`]).
     fn note_equality(&self, state: &crate::ReasoningState) {
+        self.note_ql(state);
         let closed = nrese_reasoner::RuleProgram::closes_equality(&state.ruleset);
         self.settings
             .equality_closed
@@ -150,6 +152,24 @@ impl StoreService {
             })
             .flatten();
         self.engine.set_equality(same_as);
+    }
+
+    /// Switches the QL rewriting on for a closure it can rewrite over (docs/design/
+    /// ql-rewriting.md §4): `owl2-ql` and `owl2-rl` make the data H-complete, `owl2-rl`
+    /// with its list rules; the others don't close inverses or the domains of restrictions.
+    fn note_ql(&self, state: &crate::ReasoningState) {
+        use nrese_sparql::ql::{Closure, QlRewriting};
+        let closure = match state.ruleset.as_str() {
+            "owl2-rl" => Some(Closure { lists: true }),
+            "owl2-ql" => Some(Closure { lists: false }),
+            _ => None,
+        };
+        let closure = closure.filter(|_| self.config.ql_rewriting);
+        let mut ql = self.settings.ql.write().unwrap_or_else(|p| p.into_inner());
+        // The same closure keeps its compiled schema.
+        if ql.as_ref().map(|q| q.closure()) != closure {
+            *ql = closure.map(|closure| std::sync::Arc::new(QlRewriting::new(closure)));
+        }
     }
 
     /// The store's namespace prefixes ([`crate::namespaces`]).
@@ -192,6 +212,7 @@ impl StoreService {
         self.settings
             .equality_closed
             .store(false, Ordering::Release);
+        *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
         if !self.marker.swap(false, Ordering::AcqRel) {
             return Ok(());

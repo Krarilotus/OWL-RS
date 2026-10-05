@@ -19,6 +19,7 @@ pub mod normalise;
 pub mod ofn;
 pub mod proof;
 mod properties;
+pub mod ql;
 mod universal;
 pub mod vocab;
 pub mod write;
