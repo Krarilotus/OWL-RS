@@ -16,6 +16,41 @@ use std::time::Instant;
 use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step, Stop, proof};
 use super::graph::{Annot, NONE};
+use super::program::ConceptId;
+
+/// Where a run's test goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Site {
+    /// No test: the ontology's consistency.
+    Nothing,
+    /// A fresh root.
+    Fresh,
+    /// An individual's root, by its index.
+    Individual(u32),
+}
+
+/// A run's test: concepts asserted and refuted at one root.
+#[derive(Debug, Clone)]
+pub struct Seed {
+    pub site: Site,
+    pub positive: Vec<ConceptId>,
+    pub negative: Vec<ConceptId>,
+}
+
+impl Seed {
+    /// No test.
+    pub fn none() -> Self {
+        Self {
+            site: Site::Nothing,
+            positive: Vec::new(),
+            negative: Vec::new(),
+        }
+    }
+}
+
+/// Why a resumed run stops: it would have to undo a choice of the base it was resumed
+/// from.
+pub const FLOOR: &str = "a choice of the base would have to be undone";
 
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,19 +63,40 @@ pub enum End {
 }
 
 impl Engine<'_> {
-    /// Roots for the individuals and the assertions, at level 0.
-    pub fn init(&mut self, test: Option<u32>) -> Step<()> {
+    /// Roots for the individuals, the test and the assertions, at level 0.
+    pub fn init(&mut self, seed: &Seed) -> Step<()> {
         for i in 0..self.p.individuals.len() as u32 {
             let n = self.new_node(NONE, i)?;
             self.roots.push(n);
         }
-        if let Some(concept) = test {
-            let n = self.new_node(NONE, NONE)?;
-            self.assert(Lit::Concept(concept, n), DepSetId::EMPTY, proof::ASSERTED)?;
-        } else if self.p.individuals.is_empty() {
-            // A model has at least one element (the calculus's non-empty ABox).
-            self.new_node(NONE, NONE)?;
+        self.init_probe(seed)?;
+        self.init_assertions()
+    }
+
+    /// The test's root and concepts (with no dependency: they hold in every branch).
+    pub fn init_probe(&mut self, seed: &Seed) -> Step<()> {
+        let at = match seed.site {
+            Site::Fresh => self.new_node(NONE, NONE)?,
+            Site::Individual(i) => self.roots[i as usize],
+            Site::Nothing if self.p.individuals.is_empty() => {
+                // A model has at least one element (the calculus's non-empty ABox).
+                self.new_node(NONE, NONE)?;
+                NONE
+            }
+            Site::Nothing => NONE,
+        };
+        self.probe = at;
+        for &c in &seed.positive {
+            self.assert(Lit::Concept(c, at), DepSetId::EMPTY, proof::ASSERTED)?;
         }
+        for &c in &seed.negative {
+            self.add_negative(at, c, DepSetId::EMPTY, proof::ASSERTED)?;
+        }
+        Ok(())
+    }
+
+    /// The assertions on the individuals' roots.
+    fn init_assertions(&mut self) -> Step<()> {
         let a = &self.p.assertions;
         for &(c, i) in &a.concepts {
             let lit = Lit::Concept(c, self.roots[i as usize]);
@@ -67,20 +123,35 @@ impl Engine<'_> {
     }
 
     /// Runs to a model, a refutation or a stop.
-    pub fn run(&mut self, test: Option<u32>) -> End {
-        if let Err(stop) = self.init(test) {
+    pub fn run(&mut self, seed: &Seed) -> End {
+        if let Err(stop) = self.init(seed) {
             return match stop {
                 Stop::Clash(_) => End::Refuted,
                 Stop::GaveUp(why) | Stop::Abandon(_, why) => End::GaveUp(why),
             };
         }
+        self.search(None)
+    }
+
+    /// Adds a test to a state a run left (a base, [`super::probe::Base`]) and runs on:
+    /// the base's choices stay below [`Engine::floor`].
+    pub fn resume(&mut self, seed: &Seed) -> End {
+        let first = self.init_probe(seed).err();
+        self.search(first)
+    }
+
+    /// The search from the state as it is (`first`: a stop already met).
+    pub fn search(&mut self, mut first: Option<Stop>) -> End {
         // Why a branch was abandoned, if one was: a refutation is then no answer.
         let mut abandoned: Option<String> = None;
         loop {
-            let stop = match self.step() {
-                Ok(true) => continue,
-                Ok(false) => return End::Model,
-                Err(stop) => stop,
+            let stop = match first.take() {
+                Some(stop) => stop,
+                None => match self.step() {
+                    Ok(true) => continue,
+                    Ok(false) => return End::Model,
+                    Err(stop) => stop,
+                },
             };
             let dep = match stop {
                 Stop::GaveUp(why) => return End::GaveUp(why),
@@ -241,6 +312,10 @@ impl Engine<'_> {
             } else {
                 top
             };
+            if self.floor > 0 && k <= self.floor {
+                // The clash needs a choice of the base undone: not this run's to decide.
+                break Err(FLOOR.into());
+            }
             if k < top {
                 self.stats.backjumps += 1;
                 self.stats.levels_skipped += u64::from(top - k);
@@ -290,6 +365,34 @@ impl Engine<'_> {
         };
         self.stats.search += started.elapsed();
         out
+    }
+
+    /// A point to come back to: the state as it is, with its queues processed (as a
+    /// run leaves it, or a branch point finds it).
+    pub fn checkpoint(&self) -> super::engine::Frame {
+        super::engine::Frame {
+            mark: self.g.mark(),
+            pending: self.pending.len() as u32,
+            bindings: self.bindings.len() as u32,
+            pending_open: self.pending_open,
+            ni_pending: self.ni.pending.len() as u32,
+            ni_open: self.ni.open,
+            semantic: false,
+            alternatives: Vec::new(),
+            clause: NONE,
+            heads: Vec::new(),
+            next: 0,
+            premise: DepSetId::EMPTY,
+            failed: DepSetId::EMPTY,
+        }
+    }
+
+    /// Back to `point` (taken with `frames` branch points open): what a test added since
+    /// is cut away and its changes undone through the trail, as a backtrack does.
+    pub fn rollback(&mut self, point: &super::engine::Frame, frames: usize) {
+        self.frames.truncate(frames);
+        self.restore(point);
+        self.probe = NONE;
     }
 
     /// Cuts everything back to the state the branch point was opened in.

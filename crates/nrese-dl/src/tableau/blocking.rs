@@ -52,7 +52,7 @@ struct Cached {
 }
 
 /// The blocking pass's reusable state (cold data beside the hot nodes).
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Blocking {
     cache: Vec<Cached>,
     table: HashMap<u128, Vec<u32>>,
