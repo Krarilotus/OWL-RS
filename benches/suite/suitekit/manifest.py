@@ -23,6 +23,7 @@ Nothing in it is secret: licence paths are recorded as set/unset only.
 from __future__ import annotations
 
 import datetime
+import functools
 import json
 import os
 import platform
@@ -85,6 +86,14 @@ def memory_bytes() -> int | None:
     except OSError:
         pass
     return None
+
+
+@functools.cache
+def docker_memory_bytes() -> int | None:
+    """The memory Docker's containers share: the host's on Linux, the VM's on Docker
+    Desktop."""
+    out = _out(["docker", "info", "--format", "{{.MemTotal}}"])
+    return int(out) if out and out.isdigit() else None
 
 
 def container_start_ms() -> float | None:
