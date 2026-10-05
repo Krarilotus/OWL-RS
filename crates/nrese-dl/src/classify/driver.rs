@@ -25,7 +25,7 @@ use nrese_owl::{Normalised, Ontology, Term};
 use super::consistency::{self, Verdict};
 use super::known::{self, Lower};
 use super::{Classification, Deadline, Options, Profile, Taxonomy, Workers};
-use crate::tableau::{Answer, At, Labels, Prepared, Probe, ProbeOutcome, Want};
+use crate::tableau::{Answer, At, Base, From, Labels, Prepared, Probe, ProbeOutcome, Want};
 
 /// A class's state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,28 +250,32 @@ impl<'a> Driver<'a> {
         let terminology_first = self.options.tbox_only
             && has_facts(self.normalised)
             && (!nominals || self.options.detached_probes);
-        let tests = if terminology_first {
+        // The individuals' part, built once, where tests run with the assertions.
+        let base_config = self.config();
+        let needs_full = !terminology_first || nominals;
+        let base = (needs_full && self.options.reuse_model)
+            .then(|| full.base(&base_config))
+            .flatten();
+        let first = if terminology_first {
             let mut terminology = self.normalised.clone();
             terminology.facts = Default::default();
             tbox = Prepared::new(self.ontology, &terminology, self.classes, &[]);
             self.profile.compile += tbox.compile_time();
             self.profile.tbox_only = true;
-            Tests {
-                first: &tbox,
-                // With nominals, the individuals can matter: a model counts only where
-                // the probed part is detached from them, else the test runs again with
-                // the assertions.
-                full: nominals.then_some(&full),
-                detached: AtomicU64::new(0),
-                fallbacks: AtomicU64::new(0),
-            }
+            // With nominals, the individuals can matter: a model counts only where the
+            // probed part is detached from them, else the test runs again with them.
+            Some((&tbox, nominals))
         } else {
-            Tests {
-                first: &full,
-                full: None,
-                detached: AtomicU64::new(0),
-                fallbacks: AtomicU64::new(0),
-            }
+            None
+        };
+        let tests = Tests {
+            first,
+            base,
+            full: &full,
+            detached: AtomicU64::new(0),
+            fallbacks: AtomicU64::new(0),
+            from_model: AtomicU64::new(0),
+            from_deterministic: AtomicU64::new(0),
         };
         let tests = &tests;
         // 2. Satisfiability.
@@ -294,6 +298,8 @@ impl<'a> Driver<'a> {
         self.profile.subsumption = t.elapsed();
         self.profile.detached = tests.detached.load(Relaxed);
         self.profile.fallbacks = tests.fallbacks.load(Relaxed);
+        self.profile.from_model = tests.from_model.load(Relaxed);
+        self.profile.from_deterministic = tests.from_deterministic.load(Relaxed);
         (subsumers, top)
     }
 
@@ -608,15 +614,25 @@ impl<'a> Driver<'a> {
     }
 }
 
-/// The programs class tests run on: one, or the terminology first and the whole
-/// ontology where the terminology's model isn't detached from the individuals
-/// ([`crate::tableau::Labels::detached`]).
+/// The programs class tests run on, cheapest first:
+/// 1. the terminology alone, where it says enough: always without nominals; with them,
+///    a refutation, or a model whose probed part is detached from the individuals
+///    ([`crate::tableau::Labels::detached`]);
+/// 2. the individuals' part built once ([`Base`]): from their model, else from their
+///    deterministic state;
+/// 3. the whole program from scratch (no base).
 struct Tests<'p> {
-    first: &'p Prepared,
-    full: Option<&'p Prepared>,
-    /// Tests the terminology answered with a detached model, and tests run again.
+    /// The terminology's program, and whether its models must be detached.
+    first: Option<(&'p Prepared, bool)>,
+    base: Option<Base<'p>>,
+    full: &'p Prepared,
+    /// Tests the terminology answered with a detached model, tests that went on with the
+    /// individuals, and of those, how many the base answered from the model or from the
+    /// deterministic state.
     detached: AtomicU64,
     fallbacks: AtomicU64,
+    from_model: AtomicU64,
+    from_deterministic: AtomicU64,
 }
 
 impl Tests<'_> {
@@ -626,28 +642,36 @@ impl Tests<'_> {
         config: &crate::tableau::Config,
         want: Want,
     ) -> ProbeOutcome {
-        let Some(full) = self.full else {
-            return self.first.probe(probe, config, want);
-        };
-        let out = self.first.probe(
-            probe,
-            config,
-            Want {
-                detached: true,
+        if let Some((terminology, check)) = self.first {
+            let want_first = Want {
+                detached: check,
                 ..want
-            },
-        );
-        match &out.answer {
-            // Refuted without the assertions: refuted with them.
-            Answer::Inconsistent => return out,
-            Answer::Consistent if out.labels.as_ref().is_some_and(|l| l.detached) => {
-                self.detached.fetch_add(1, Relaxed);
+            };
+            let out = terminology.probe(probe, config, want_first);
+            if !check {
                 return out;
             }
-            _ => {}
+            match &out.answer {
+                // Refuted without the assertions: refuted with them.
+                Answer::Inconsistent => return out,
+                Answer::Consistent if out.labels.as_ref().is_some_and(|l| l.detached) => {
+                    self.detached.fetch_add(1, Relaxed);
+                    return out;
+                }
+                _ => {}
+            }
+            self.fallbacks.fetch_add(1, Relaxed);
         }
-        self.fallbacks.fetch_add(1, Relaxed);
-        full.probe(probe, config, want)
+        if let Some(base) = &self.base {
+            let (out, from) = base.probe(probe, want);
+            let counter = match from {
+                From::Model => &self.from_model,
+                From::Deterministic => &self.from_deterministic,
+            };
+            counter.fetch_add(1, Relaxed);
+            return out;
+        }
+        self.full.probe(probe, config, want)
     }
 }
 

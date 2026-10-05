@@ -33,6 +33,10 @@ pub struct Profile {
     /// tests run again with the assertions.
     pub detached: u64,
     pub fallbacks: u64,
+    /// Tests with the individuals answered from their model, and from their
+    /// deterministic state (completion-graph reuse).
+    pub from_model: u64,
+    pub from_deterministic: u64,
     /// The Horn part's taxonomy was exact: no hypertableau test of a class.
     pub exact: bool,
     /// Classes whose Horn subsumers were exact (their saturation reached nothing left out).
@@ -79,7 +83,7 @@ impl Profile {
             s,
             "path={} normalise={:.1} compile={:.1} lower_bound={:.1} consistency={:.1} \
              satisfiability={:.1} top={:.1} subsumption={:.1} realisation={:.1} total={:.1} \
-             threads={} classes={} eliminated={} flipped={} wide={}->{} tbox_only={} detached={} fallbacks={} exact={} exact_classes={} consistency_by={} lower_known={} lower_unsat={} tests={} \
+             threads={} classes={} eliminated={} flipped={} wide={}->{} tbox_only={} detached={} fallbacks={} from_model={} from_deterministic={} exact={} exact_classes={} consistency_by={} lower_known={} lower_unsat={} tests={} \
              sat_tests={} sat_skipped={} labels_seen={} candidates={} candidate_tests={} \
              positive={} pruned={} type_candidates={} type_tests={} type_positive={} \
              nodes_created={} branch_points={} clashes={}",
@@ -102,6 +106,8 @@ impl Profile {
             self.tbox_only,
             self.detached,
             self.fallbacks,
+            self.from_model,
+            self.from_deterministic,
             self.exact,
             self.exact_classes,
             self.consistency_by,

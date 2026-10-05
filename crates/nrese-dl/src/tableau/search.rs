@@ -48,6 +48,10 @@ impl Seed {
     }
 }
 
+/// Why a resumed run stops: it would have to undo a choice of the base it was resumed
+/// from.
+pub const FLOOR: &str = "a choice of the base would have to be undone";
+
 /// How a run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum End {
@@ -65,6 +69,12 @@ impl Engine<'_> {
             let n = self.new_node(NONE, i)?;
             self.roots.push(n);
         }
+        self.init_probe(seed)?;
+        self.init_assertions()
+    }
+
+    /// The test's root and concepts (with no dependency: they hold in every branch).
+    pub fn init_probe(&mut self, seed: &Seed) -> Step<()> {
         let at = match seed.site {
             Site::Fresh => self.new_node(NONE, NONE)?,
             Site::Individual(i) => self.roots[i as usize],
@@ -82,6 +92,11 @@ impl Engine<'_> {
         for &c in &seed.negative {
             self.add_negative(at, c, DepSetId::EMPTY, proof::ASSERTED)?;
         }
+        Ok(())
+    }
+
+    /// The assertions on the individuals' roots.
+    fn init_assertions(&mut self) -> Step<()> {
         let a = &self.p.assertions;
         for &(c, i) in &a.concepts {
             let lit = Lit::Concept(c, self.roots[i as usize]);
@@ -115,13 +130,28 @@ impl Engine<'_> {
                 Stop::GaveUp(why) | Stop::Abandon(_, why) => End::GaveUp(why),
             };
         }
+        self.search(None)
+    }
+
+    /// Adds a test to a state a run left (a base, [`super::probe::Base`]) and runs on:
+    /// the base's choices stay below [`Engine::floor`].
+    pub fn resume(&mut self, seed: &Seed) -> End {
+        let first = self.init_probe(seed).err();
+        self.search(first)
+    }
+
+    /// The search from the state as it is (`first`: a stop already met).
+    pub fn search(&mut self, mut first: Option<Stop>) -> End {
         // Why a branch was abandoned, if one was: a refutation is then no answer.
         let mut abandoned: Option<String> = None;
         loop {
-            let stop = match self.step() {
-                Ok(true) => continue,
-                Ok(false) => return End::Model,
-                Err(stop) => stop,
+            let stop = match first.take() {
+                Some(stop) => stop,
+                None => match self.step() {
+                    Ok(true) => continue,
+                    Ok(false) => return End::Model,
+                    Err(stop) => stop,
+                },
             };
             let dep = match stop {
                 Stop::GaveUp(why) => return End::GaveUp(why),
@@ -282,6 +312,10 @@ impl Engine<'_> {
             } else {
                 top
             };
+            if self.floor > 0 && k <= self.floor {
+                // The clash needs a choice of the base undone: not this run's to decide.
+                break Err(FLOOR.into());
+            }
             if k < top {
                 self.stats.backjumps += 1;
                 self.stats.levels_skipped += u64::from(top - k);

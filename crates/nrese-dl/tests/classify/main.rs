@@ -191,6 +191,15 @@ fn variants() -> Vec<(&'static str, Options)> {
             },
         ),
         (
+            "no-reuse-model",
+            Options {
+                context_core: false,
+                exact_lower_bound: false,
+                reuse_model: false,
+                ..base.clone()
+            },
+        ),
+        (
             "no-detached-probes",
             Options {
                 context_core: false,
@@ -650,4 +659,56 @@ fn classes_away_from_the_individuals_need_no_assertions() {
     assert_eq!(t.profile.detached, 4, "{}", t.profile.line());
     assert_eq!(t.profile.fallbacks, 1, "{}", t.profile.line());
     assert!(t.classification.subsumptions.contains(&(2, 3)));
+}
+
+/// Guard (completion-graph reuse): class tests that reach an individual start from the
+/// individuals' model built once: 20 classes `Dᵢ ⊑ ∃r.{n}` with 300 individuals beside
+/// `n`, each test adds a node or two instead of rebuilding the 300 (ore_ont_16542:
+/// unsolved in 150 s -> 5.8 s; ore_ont_9881 81.3 -> 2.9 s).
+#[test]
+fn tests_with_individuals_start_from_their_model() {
+    use nrese_owl::ObjProp;
+    let mut o = Ontology::default();
+    let class = |o: &mut Ontology, t: Term| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    let n: Term = 1000;
+    let r = 999;
+    let one = ExprId(o.classes.intern(ClassExpr::OneOf(vec![n])));
+    let to_n = ExprId(o.classes.intern(ClassExpr::Some(ObjProp::Named(r), one)));
+    let (e, f) = (class(&mut o, 50), class(&mut o, 51));
+    let either = ExprId(o.classes.intern(ClassExpr::Or(vec![e, f])));
+    for i in 0..20 {
+        let d = class(&mut o, i);
+        o.axioms.push(Axiom::SubClassOf(d, to_n));
+    }
+    for i in 0..300 {
+        o.axioms.push(Axiom::ClassAssertion(either, 2000 + i));
+        o.axioms
+            .push(Axiom::ObjectPropertyAssertion(r, 2000 + i, n));
+    }
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let opts = Options {
+        context_core: false,
+        exact_lower_bound: false,
+        ..options()
+    };
+    let t = classify::classify(&o, &opts);
+    assert!(t.complete(), "{:?}", t.incomplete);
+    let p = &t.profile;
+    assert!(p.from_model >= 20, "{}", p.line());
+    assert_eq!(p.from_deterministic, 0, "{}", p.line());
+    // Without the base every one of these tests builds the 301 individuals again.
+    assert!(p.nodes_created < 2_000, "{}", p.line());
+    let off = classify::classify(
+        &o,
+        &Options {
+            reuse_model: false,
+            ..opts
+        },
+    );
+    assert_eq!(off.classification, t.classification);
+    assert!(
+        off.profile.nodes_created > 20 * 300,
+        "{}",
+        off.profile.line()
+    );
 }
