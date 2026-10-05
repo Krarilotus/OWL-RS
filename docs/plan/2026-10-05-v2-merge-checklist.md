@@ -13,11 +13,11 @@ State as of 5 October, evening:
 
 | Item | Branch | State | Done so far | Left |
 |---|---|---|---|---|
-| DL classification and realisation (3.4); Konclude outliers (cause, fix, A/B, guard); the task that differs from HermiT and Konclude | `dl/classify` | in progress | soundness fix (heads about successors), detached probes, 60 s Horn bound; `b1659c9` fixes 7127 and 7956; W2 (tests start from the consistency model) written, in its test campaign | W2 committed and measured; W1 (a saturation that never refuses); W3–W7 as they pay; re-time the dev set; merge |
-| The store's DL mode (G3): `/classification`, the 7 RL W3C cases through the DL path | – | waiting for 3.4 | – | all |
-| Queries (G4): `MIN`/`MAX`/`AVG` in eager aggregation, paths planned with the rest | `g4/eager-aggregates` | in progress | – (characteristic pairs were done on 3 October) | all three, then merge |
-| EXPLAIN: estimated against actual rows for every operator, the §0 operators that don't report themselves | `g4/eager-aggregates` | in progress | estimates for sets and late operators being added | guards per operator |
-| Materialisation memory (P1): the transient fold, unused relations | `p1/transient-fold` | in progress | guards for F1, F4 and F8, each shown to catch its revert | heap profile of LUBM 1000 (running), the fold, pruning, A/B |
+| DL classification and realisation (3.4); Konclude outliers (cause, fix, A/B, guard); the task that differs from HermiT and Konclude | `dl/classify` | in progress | soundness fix (heads about successors), detached probes, 60 s Horn bound; `b1659c9` fixes 7127 and 7956; W2 (class tests start from the individuals' model) committed (`7aaba8f`) | W2 measured on the outliers; W1 (a saturation that never refuses); W3–W7 as they pay; re-time the dev set; merge |
+| The store's DL mode (G3): `/classification`, the 7 RL W3C cases through the DL path; answers as bounds with a completeness status (conjunctive queries over OWL 2 DL have no known decision procedure); routing by profile (EL parts to the consequence-based core, RL/Horn parts to rules, the rest to the tableau) with a per-axiom profile checker from the spec's grammars | – | waiting for 3.4 | – | all |
+| Queries (G4): `MIN`/`MAX`/`AVG` in eager aggregation, paths planned with the rest | `g4/eager-aggregates` | in progress | `MIN`/`MAX`/`AVG` committed (`42040b7`; a first A/B under load: AVG 214 → 56 ms, MIN/MAX 361 → 62 ms, same 2,474 rows); characteristic pairs were done on 3 October | the regression sets, paths, merge |
+| EXPLAIN: estimated against actual rows for every operator, the §0 operators that don't report themselves | `g4/eager-aggregates` | in progress | every operator with estimated and actual rows, the missing guards (`3c146e9`) | review, merge |
+| Materialisation memory (P1): the transient fold, unused relations | `p1/transient-fold` | in progress | guards for F1, F4 and F8, each shown to catch its revert; a heap profile by phase (`6411987`) | the fold, pruning, A/B |
 | OWL 2 QL: tree-witness rewriting over the RL closure | `ql/tree-witness` | in progress | design note; witness computation (11 tests, Ontop's example) | SPARQL integration, W3C QL tests, differential test, cost |
 | One error envelope across HTTP, console and CLI | – | **done** (`9dcf78c`) | every error a problem document with its request id; the fuzz test requires it | – |
 | Fast regression suite (for §4's gate) | `bench/catalog-and-fast-suite` | in progress | the catalogue (`d9e580a`) | about 35 cases, NRESE in every profile, home-turf cases |
@@ -31,10 +31,10 @@ ranking of 5 October).
 
 | # | Idea | Check first | Build when |
 |---|---|---|---|
-| 1 | **Store less:** only asserted or rule-produced types and sub-property facts stored; inherited ones from an exact closure of the class hierarchy that queries and rules both read | **checked on LUBM (5 Oct):** inherited types 71.5 % of the inferred facts, inverses 18.2 %, sub-properties 6.2 %: 96 % of the inferred facts, 38 % of all stored ones, follow from the schema (the same at LUBM 10 and 100). **Still to check:** OWL2Bench, DBpedia with its ontology, Claros | the share holds beyond LUBM; the design keeps access labels, explanations, deletions and statistics exact |
+| 1 | **Store less** (a materialisation policy per dataset, never the default: it is QL-style answering for the class hierarchy inside an RL store; it pays with deep hierarchies and few type queries, and costs on raw-triple reads, `rdf:type` with a variable class, exports, frequent schema changes, per-fact access labels, explanations and statistics): only asserted or rule-produced types and sub-property facts stored; inherited ones from an exact closure of the class hierarchy that queries and rules both read | **checked on LUBM (5 Oct):** inherited types 71.5 % of the inferred facts, inverses 18.2 %, sub-properties 6.2 %: 96 % of the inferred facts, 38 % of all stored ones, follow from the schema (the same at LUBM 10 and 100). **Still to check:** OWL2Bench, DBpedia with its ontology, Claros | measured per workload, against the same baseline as P1's memory changes and after them; the share holds beyond LUBM; the design keeps access labels, explanations, deletions and statistics exact |
 | 2 | **Avoid rule applications** before adding cores: deltas routed only to the rule positions that consume them (GLog's trigger graphs) | **check:** a counter of redundant derivations per round on LUBM and Claros | the redundant share is large (the schema compiler already removes part of it) |
 | 3 | **Equality:** canonical ids are in (compact equality, late expansion); open: incremental merges and splits | **check:** e-graph rebuilding (egg/egglog, batched congruence closure) for the open part; a differential test against axiomatised equality on `sameAs`-heavy data | the differential test passes and merges or splits are measured |
-| 4 | **Machine level:** vqsort for 128-bit keys, an Eytzinger index with prefetch for membership checks (13 % of a LUBM(1000) run), SIMD intersections, PGO | **check:** each one by A/B; vqsort's licence and build (Highway, C++) | each wins beyond the confidence interval and slows nothing |
+| 4 | **Machine level:** a SIMD sort for 128-bit keys in Rust (a radix sort, or a vectorised sorting network after vqsort's published method; no C++ dependency: Rust first, assembly second, decided 6 October), an Eytzinger index with prefetch for membership checks (13 % of a LUBM(1000) run), SIMD intersections, PGO | **check:** each one by A/B against today's sort; vqsort itself only as a reference point outside the build | each wins beyond the confidence interval and slows nothing |
 | 5 | **Bounded tails:** a work budget per deletion with a fallback (overdelete-rederive, local counts, rematerialisation) | **check:** SSPE and clique-targeted Claros-LE in the suite | p99 over the bar below |
 | 6 | **DL from the persistent closure:** bounds kept per commit, the DL engine only on the gap | part of G3 above | — |
 
@@ -56,7 +56,10 @@ Deferred to v3 or later: GPU, distribution, worst-case-optimal joins inside rule
 - [ ] The headline track with equal resources and the best-configuration track; a 2–32-core
       curve; outcome classes; confidence intervals.
 - [ ] DL: the reference comparison re-run on equal resources (the 3 October references ran
-      in 2-CPU containers).
+      in 2-CPU containers), all outliers against Konclude and HermiT in one run once the
+      classification fixes are merged.
+- [ ] A **defaults track** beside the best-configuration track: every system, NRESE included,
+      on its out-of-the-box settings. "No tuning needed" is a claim only with this track.
 - [ ] **Home turf:** each competitor measured on what it is best at, not only on our
       workloads. For example: QLever on full Wikidata or UniProt queries and text search;
       Virtuoso on many parallel clients (BSBM explore, multi-client); Oxigraph embedded and
