@@ -17,6 +17,7 @@
 //! Everything a test can't decide (a budget, a part of the ontology left out) is
 //! reported, never guessed: the taxonomy then holds what was proven.
 
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use nrese_owl::{Normalised, Ontology, Term};
@@ -152,6 +153,7 @@ impl<'a> Driver<'a> {
                     Want {
                         elements: self.options.model_pruning && !exact,
                         individuals: false,
+                        detached: false,
                     },
                 );
                 self.profile.tests += 1;
@@ -244,17 +246,34 @@ impl<'a> Driver<'a> {
             p
         });
         let tbox;
-        let tests = if self.options.tbox_only && !has_nominals(&full) && has_facts(self.normalised)
-        {
+        let nominals = has_nominals(&full);
+        let terminology_first = self.options.tbox_only
+            && has_facts(self.normalised)
+            && (!nominals || self.options.detached_probes);
+        let tests = if terminology_first {
             let mut terminology = self.normalised.clone();
             terminology.facts = Default::default();
             tbox = Prepared::new(self.ontology, &terminology, self.classes, &[]);
             self.profile.compile += tbox.compile_time();
             self.profile.tbox_only = true;
-            &tbox
+            Tests {
+                first: &tbox,
+                // With nominals, the individuals can matter: a model counts only where
+                // the probed part is detached from them, else the test runs again with
+                // the assertions.
+                full: nominals.then_some(&full),
+                detached: AtomicU64::new(0),
+                fallbacks: AtomicU64::new(0),
+            }
         } else {
-            &full
+            Tests {
+                first: &full,
+                full: None,
+                detached: AtomicU64::new(0),
+                fallbacks: AtomicU64::new(0),
+            }
         };
+        let tests = &tests;
         // 2. Satisfiability.
         super::trace("satisfiability");
         let t = Instant::now();
@@ -273,6 +292,8 @@ impl<'a> Driver<'a> {
         let t = Instant::now();
         let subsumers = self.subsumptions(tests, &top);
         self.profile.subsumption = t.elapsed();
+        self.profile.detached = tests.detached.load(Relaxed);
+        self.profile.fallbacks = tests.fallbacks.load(Relaxed);
         (subsumers, top)
     }
 
@@ -337,7 +358,7 @@ impl<'a> Driver<'a> {
         self.profile.labels_seen += 1;
     }
 
-    fn satisfiability(&mut self, tests: &Prepared) {
+    fn satisfiability(&mut self, tests: &Tests<'_>) {
         let n = self.classes.len();
         // Most specific first: their models show their superclasses.
         let mut order: Vec<u32> = (0..n as u32).collect();
@@ -370,6 +391,7 @@ impl<'a> Driver<'a> {
             let want = Want {
                 elements: self.options.model_pruning,
                 individuals: false,
+                detached: false,
             };
             let outcomes: Vec<(u32, ProbeOutcome)> = self.workers.map(&batch, |&c| {
                 let probe = Probe {
@@ -411,7 +433,7 @@ impl<'a> Driver<'a> {
     }
 
     /// The classes equivalent to `owl:Thing`.
-    fn top(&mut self, tests: &Prepared) -> Vec<u32> {
+    fn top(&mut self, tests: &Tests<'_>) -> Vec<u32> {
         let config = self.config();
         let out = tests.probe(
             &Probe {
@@ -483,7 +505,7 @@ impl<'a> Driver<'a> {
     }
 
     /// The subsumers of every satisfiable class.
-    fn subsumptions(&mut self, tests: &Prepared, top: &[u32]) -> Vec<Vec<u32>> {
+    fn subsumptions(&mut self, tests: &Tests<'_>, top: &[u32]) -> Vec<Vec<u32>> {
         let n = self.classes.len();
         let unsat: Vec<bool> = self.status.iter().map(|s| *s == Status::Unsat).collect();
         let config = self.config();
@@ -513,7 +535,7 @@ impl<'a> Driver<'a> {
     /// `C`'s subsumers: the known ones, `owl:Thing`'s, and the candidates the tests prove.
     fn subsumers_of(
         &self,
-        tests: &Prepared,
+        tests: &Tests<'_>,
         c: u32,
         top: &[u32],
         unsat: &[bool],
@@ -583,6 +605,49 @@ impl<'a> Driver<'a> {
         }
         s.retain(|&d| d != c);
         (s, stats)
+    }
+}
+
+/// The programs class tests run on: one, or the terminology first and the whole
+/// ontology where the terminology's model isn't detached from the individuals
+/// ([`crate::tableau::Labels::detached`]).
+struct Tests<'p> {
+    first: &'p Prepared,
+    full: Option<&'p Prepared>,
+    /// Tests the terminology answered with a detached model, and tests run again.
+    detached: AtomicU64,
+    fallbacks: AtomicU64,
+}
+
+impl Tests<'_> {
+    fn probe(
+        &self,
+        probe: &Probe<'_>,
+        config: &crate::tableau::Config,
+        want: Want,
+    ) -> ProbeOutcome {
+        let Some(full) = self.full else {
+            return self.first.probe(probe, config, want);
+        };
+        let out = self.first.probe(
+            probe,
+            config,
+            Want {
+                detached: true,
+                ..want
+            },
+        );
+        match &out.answer {
+            // Refuted without the assertions: refuted with them.
+            Answer::Inconsistent => return out,
+            Answer::Consistent if out.labels.as_ref().is_some_and(|l| l.detached) => {
+                self.detached.fetch_add(1, Relaxed);
+                return out;
+            }
+            _ => {}
+        }
+        self.fallbacks.fetch_add(1, Relaxed);
+        full.probe(probe, config, want)
     }
 }
 

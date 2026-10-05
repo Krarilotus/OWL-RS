@@ -252,7 +252,8 @@ impl Saturated {
     /// Saturation coupling (docs/design/owl2-dl.md §7): per named concept of the program
     /// ([`Program::names`]), and for `owl:Thing` last, whether no context its query
     /// context reaches (through successor links) has a clause with a head `B(x)` for a
-    /// `B` in `triggers`, or a head over a role in `roles`. The model the calculus builds for the concept then has no
+    /// `B` in `triggers` (about any term: `B(f(x))` is about a successor), or a head over
+    /// a role in `roles`. The model the calculus builds for the concept then has no
     /// element in a trigger, so clauses left out of the program whose bodies need one
     /// hold in it: what was derived for the concept is all that holds.
     pub fn untouched(&self, triggers: &[ConceptId], roles: &[super::atoms::RoleId]) -> Vec<bool> {
@@ -265,7 +266,14 @@ impl Saturated {
             let role = roles
                 .iter()
                 .any(|r| c.out_terms.contains_key(r) || c.in_terms.contains_key(r));
-            if role || c.concepts.iter().any(|c| triggers.contains(c)) {
+            // Every head, whatever its term: a head `B(f(x))` here is about a successor
+            // whose own context never hears of `B` when no clause of the part reads it
+            // (only successor triggers are passed on), and the model's element has it.
+            let concept = c
+                .heads
+                .keys()
+                .any(|a| a.kind() == super::atoms::Kind::Concept && triggers.contains(&a.pred()));
+            if role || concept {
                 tainted[id as usize] = true;
                 stack.push(id);
             }
