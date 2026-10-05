@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # A bug hunt over many seeds: the random differential and property tests (SPARQL against
 # the reference evaluator, reasoner closures, index models, the inferred stack, compact
-# equality, incremental SHACL, the parsers of untrusted input) run again and again, each run with another
-# NRESE_FUZZ_SEED, until the time budget is spent. A failing run's output is kept with
-# its seed, which replays it:
+# equality, incremental SHACL, the parsers of untrusted input, random HTTP requests) run
+# again and again, each run with another NRESE_FUZZ_SEED, until the time budget is
+# spent. A failing run's output is kept with its seed, which replays it:
 #
 #   NRESE_FUZZ_SEED=<seed> cargo test --release -p <crate> --test <target> -- <test>
 #
@@ -26,6 +26,7 @@ targets=(
   "nrese-engine:lib:index::model_tests"
   "nrese-reasoner:lib:"
   "nrese-fuzz:it:parsers_hold"
+  "nrese-server:it:http_fuzz_tests::"
 )
 
 declare -A binary

@@ -18,9 +18,10 @@ pub struct Feature {
 ///
 /// On x86-64 the CPU is asked directly (CPUID, and XGETBV for the vector registers the
 /// operating system saves). `is_x86_feature_detected!` can't serve here: it answers true
-/// for every feature the binary was compiled with, without asking. On aarch64 the standard
-/// detection has the same shortcut, so there `available` is only meaningful for features
-/// the binary wasn't compiled with.
+/// for every feature the binary was compiled with, without asking. The standard detection
+/// on aarch64 has the same shortcut, so there the kernel's answer is read instead (the
+/// hardware capabilities in `/proc/self/auxv` on Linux, where the images run); elsewhere on
+/// aarch64 `available` is only meaningful for features the binary wasn't compiled with.
 pub fn features() -> Vec<Feature> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -54,16 +55,28 @@ pub fn features() -> Vec<Feature> {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        #[cfg(target_os = "linux")]
+        let caps = arm::hwcaps();
         macro_rules! feature {
             ($($name:tt),*) => {
                 vec![$(Feature {
                     name: $name,
                     compiled: cfg!(target_feature = $name),
+                    #[cfg(target_os = "linux")]
+                    available: match caps {
+                        Some(caps) => arm::has($name, caps),
+                        None => std::arch::is_aarch64_feature_detected!($name),
+                    },
+                    #[cfg(not(target_os = "linux"))]
                     available: std::arch::is_aarch64_feature_detected!($name),
                 }),*]
             };
         }
-        feature!("neon", "crc", "lse", "sve", "sve2", "dotprod")
+        // What `-C target-cpu=neoverse-n1` (the images' default for arm64) compiles in,
+        // besides the vector and atomic features the engine uses.
+        feature!(
+            "neon", "crc", "lse", "rcpc", "rdm", "dotprod", "fp16", "aes", "sha2", "sve", "sve2"
+        )
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
@@ -92,7 +105,7 @@ pub fn exit_if_missing() {
         eprintln!(
             "error: this binary was built for a CPU with {}, which this one lacks; rebuild it \
              here (NRESE_TARGET_CPU=native, the default) or for a lower level \
-             (NRESE_TARGET_CPU=portable or x86-64-v3)",
+             (NRESE_TARGET_CPU=portable, x86-64-v3 or neoverse-n1)",
             missing.join(", ")
         );
         std::process::exit(1);
@@ -217,6 +230,49 @@ mod x86 {
     unsafe fn xgetbv0() -> u64 {
         // SAFETY: the caller checked OSXSAVE.
         unsafe { std::arch::x86_64::_xgetbv(0) }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+mod arm {
+    /// The kernel's hardware capabilities: `AT_HWCAP` and `AT_HWCAP2` from the process's
+    /// auxiliary vector, read from `/proc/self/auxv` (no C library call needed).
+    pub(super) fn hwcaps() -> Option<(u64, u64)> {
+        const AT_NULL: u64 = 0;
+        const AT_HWCAP: u64 = 16;
+        const AT_HWCAP2: u64 = 26;
+        let bytes = std::fs::read("/proc/self/auxv").ok()?;
+        let (mut hwcap, mut hwcap2) = (None, 0);
+        for entry in bytes.as_chunks::<16>().0 {
+            let key = u64::from_ne_bytes(entry[..8].try_into().ok()?);
+            let value = u64::from_ne_bytes(entry[8..].try_into().ok()?);
+            match key {
+                AT_NULL => break,
+                AT_HWCAP => hwcap = Some(value),
+                AT_HWCAP2 => hwcap2 = value,
+                _ => {}
+            }
+        }
+        hwcap.map(|h| (h, hwcap2))
+    }
+
+    /// Whether the capabilities include `name` (Linux `arch/arm64/include/uapi/asm/hwcap.h`).
+    pub(super) fn has(name: &str, (hwcap, hwcap2): (u64, u64)) -> bool {
+        let bit = |word: u64, bit: u32| word & (1 << bit) != 0;
+        match name {
+            "neon" => bit(hwcap, 1),
+            "aes" => bit(hwcap, 3),
+            "sha2" => bit(hwcap, 6),
+            "crc" => bit(hwcap, 7),
+            "lse" => bit(hwcap, 8),
+            "fp16" => bit(hwcap, 9) && bit(hwcap, 10),
+            "rdm" => bit(hwcap, 12),
+            "rcpc" => bit(hwcap, 15),
+            "dotprod" => bit(hwcap, 20),
+            "sve" => bit(hwcap, 22),
+            "sve2" => bit(hwcap2, 1),
+            _ => false,
+        }
     }
 }
 

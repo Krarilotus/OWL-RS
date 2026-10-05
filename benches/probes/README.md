@@ -22,4 +22,5 @@ Cross-platform (Windows or Linux, Python with psutil), each with its usage at it
 | `serve-memory.py` | a server's resident memory every 100 ms over the suite's query mix, by phase |
 | `query-memory.py` | the peak memory each query adds on a fresh server, several builds side by side |
 | `perf-profile.sh` | a CPU profile (Linux perf, in Docker, works without an elevated Windows session) of any server command, built with frame pointers: flat, inclusive and by caller |
+| `soak.py` | a server under a mixed load for a while (queries, updates, Graph Store, sessions, EXPLAIN, listings over kept-alive connections): errors, resident memory's slope, handles and threads, and whether the soak graph holds exactly what the workers committed |
 | `image-cap-check.sh` | a server image under a container memory cap without swap: a release's bulk load, its queries over HTTP (sequential and 8 streams), a restart, the cgroup peak of each ([the Zebratlas record](../baselines/zebratlas/2026-10-04-image-4g.md)) |

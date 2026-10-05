@@ -176,6 +176,47 @@ mod tests {
             .collect()
     }
 
+    /// The permutations of each layout cost the sorts the design says (P1-F7, docs/design/
+    /// performance.md §0): default-graph quads two instead of four, quads in named graphs
+    /// three instead of seven. A planner change that falls back to sorting fails here.
+    #[test]
+    fn planned_layouts_sort_as_few_times_as_designed() {
+        // Subjects and objects past the partition's bucket limit, as in real data (with few
+        // objects, even OSPG derives and one sort does).
+        let wide = |n: u64, graphs: u64| -> Vec<EncodedQuad> {
+            (0..n)
+                .map(|i| {
+                    let x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    EncodedQuad::from_components([
+                        x % 1_000_003,
+                        i % 7,
+                        (x >> 20) % 2_000_003,
+                        i % graphs,
+                    ])
+                })
+                .collect()
+        };
+        for (layout, graphs, expected) in [
+            (crate::index::Layout::DefaultGraph, 1, 2),
+            (crate::index::Layout::Quads, 5, 3),
+        ] {
+            let quads = wide(200_000, graphs);
+            let mut builder = crate::index::run::PermutationBuilder::planned(
+                quads.clone(),
+                layout.permutations(),
+            );
+            for &permutation in layout.permutations() {
+                let keys = builder.packed(permutation);
+                assert_eq!(
+                    keys.len(),
+                    sorted(&quads, permutation).len(),
+                    "{permutation:?}"
+                );
+            }
+            assert_eq!(builder.sorts(), expected, "{layout:?}");
+        }
+    }
+
     fn sorted(quads: &[EncodedQuad], permutation: Permutation) -> Vec<Key> {
         let mut keys: Vec<Key> = quads.iter().map(|q| permutation.to_key(q)).collect();
         keys.sort_unstable();

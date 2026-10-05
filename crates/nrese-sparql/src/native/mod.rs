@@ -3883,11 +3883,16 @@ impl<'a> Context<'a> {
             && let Some(component) = (0..4).find(|&c| scan.slots[c].is_var(key))
         {
             let permutation = scan.permutation_for(Some(key));
+            let start = std::time::Instant::now();
             if scan.first_free(permutation) == Some(component)
                 && let Some(groups) =
                     self.snapshot
                         .group_counts_in(self.model, &scan.quad_pattern(), permutation)
             {
+                if self.trace.is_some() {
+                    let detail = format!("{key} of {triple}");
+                    self.note("group count", detail, None, groups.len(), start);
+                }
                 let mut columns = vec![
                     groups
                         .iter()
