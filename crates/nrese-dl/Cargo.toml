@@ -9,6 +9,8 @@ license.workspace = true
 
 [dependencies]
 nrese-owl = { path = "../nrese-owl" }
+# The OWL 2 datatype map's value spaces, for the datatype theory.
+nrese-xsd = { path = "../rdf/nrese-xsd" }
 hashbrown = { workspace = true }
 rayon = { workspace = true }
 

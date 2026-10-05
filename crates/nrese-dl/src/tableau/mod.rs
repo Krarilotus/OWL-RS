@@ -15,15 +15,18 @@
 //! inconsistency found without it stands and a model found without it is `unsupported`;
 //! a budget ends a run as `gave-up`.
 //!
-//! Not yet: datatypes (package 3.5),
-//! satisfiability caching and completion-graph reuse (3.7).
+//! Datatypes (package 3.5) are concrete nodes checked by the datatype theory
+//! (`data.rs`, `crate::datatypes`); keys are DL-safe rules over the named individuals
+//! (`keys.rs`). Not yet: satisfiability caching and completion-graph reuse (3.7).
 
 mod blocking;
-mod depset;
+mod data;
+pub(crate) mod depset;
 mod engine;
 mod expand;
 mod graph;
 mod hyper;
+mod keys;
 mod merge;
 mod model;
 mod ni;
@@ -135,6 +138,8 @@ pub struct Features {
     pub nominals: bool,
     /// Disjunctive clauses.
     pub disjunctions: bool,
+    /// Data values (the datatype theory) or keys.
+    pub datatypes: bool,
     /// Something was left out.
     pub weakened: bool,
 }
@@ -206,6 +211,7 @@ fn features(p: &Program) -> Features {
         numbers: !p.at_most.is_empty() || p.at_least.iter().any(|n| n.n > 1),
         nominals: p.nominals,
         disjunctions: false,
+        datatypes: p.data.is_some() || !p.keys.is_empty(),
         weakened: !p.weakened.is_empty(),
     };
     for c in &p.clauses {
@@ -233,8 +239,16 @@ fn run(
     let answer = match end {
         End::Refuted => Answer::Inconsistent,
         End::GaveUp(why) => Answer::GaveUp(why),
-        End::Model if program.weakened.is_empty() => Answer::Consistent,
-        End::Model => Answer::Unsupported(program.weakened.join("; ")),
+        End::Model if program.weakened.is_empty() && engine.data_approximate.is_none() => {
+            Answer::Consistent
+        }
+        End::Model => {
+            let mut why = program.weakened.clone();
+            if let Some(a) = &engine.data_approximate {
+                why.push(format!("datatypes approximated: {a}"));
+            }
+            Answer::Unsupported(why.join("; "))
+        }
     };
     let model = (config.keep_model && end_is_model(&answer, &program)).then(|| engine.model());
     let mut telemetry = engine.stats.clone();
@@ -250,7 +264,6 @@ fn run(
     }
 }
 
-fn end_is_model(answer: &Answer, program: &Program) -> bool {
-    matches!(answer, Answer::Consistent)
-        || (matches!(answer, Answer::Unsupported(_)) && !program.weakened.is_empty())
+fn end_is_model(answer: &Answer, _program: &Program) -> bool {
+    matches!(answer, Answer::Consistent | Answer::Unsupported(_))
 }

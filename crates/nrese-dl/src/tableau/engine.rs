@@ -55,6 +55,8 @@ pub enum Lit {
     },
     /// `a ≈ b` with its annotation (the at-most restriction at a root that raised it).
     Equal(u32, u32, Annot),
+    /// `a ≉ b` (a key's alternative: two data values differ).
+    Unequal(u32, u32),
 }
 
 /// A disjunction waiting for a choice: the clause and its binding.
@@ -117,6 +119,11 @@ pub struct Engine<'a> {
     pub ni: super::ni::Ni,
     /// Per clause and head atom: how often that disjunct failed (disjunct learning).
     pub failures: Vec<Vec<u32>>,
+    /// How far the datatype stage has read the fact tables.
+    pub data_done: super::data::DataDone,
+    pub theory: crate::datatypes::DatatypeTheory,
+    /// Why a datatype check was only approximate, if one was: a model is then no answer.
+    pub data_approximate: Option<String>,
 }
 
 impl<'a> Engine<'a> {
@@ -138,6 +145,9 @@ impl<'a> Engine<'a> {
             blocking: super::blocking::Blocking::default(),
             ni: super::ni::Ni::default(),
             failures: Vec::new(),
+            data_done: super::data::DataDone::default(),
+            theory: crate::datatypes::DatatypeTheory::default(),
+            data_approximate: None,
         }
     }
 
@@ -220,6 +230,10 @@ impl<'a> Engine<'a> {
                     .equalities
                     .push(super::graph::Equality { a, b, dep, annot });
             }
+            Lit::Unequal(a, b) => {
+                let (a, b, dep) = self.canonical_pair(a, b, dep);
+                return self.add_inequality(a, b, dep, proof);
+            }
         }
         Ok(())
     }
@@ -232,6 +246,7 @@ impl<'a> Engine<'a> {
                 let (a, b, dep) = self.canonical_pair(a, b, dep);
                 self.add_inequality(a, b, dep, proof::NEGATION)
             }
+            Lit::Unequal(a, b) => self.assert(Lit::Equal(a, b, Annot::NONE), dep, proof::NEGATION),
             Lit::Role(..) | Lit::Number { .. } => Ok(()),
         }
     }
@@ -295,6 +310,13 @@ impl<'a> Engine<'a> {
                 }
                 false
             }
+            Lit::Unequal(a, b) => {
+                let (s, t, d) = self.canonical_pair(a, b, DepSetId::EMPTY);
+                if s == t {
+                    return Err(d);
+                }
+                self.g.unequal(s, t).is_some()
+            }
         })
     }
 
@@ -312,7 +334,8 @@ impl<'a> Engine<'a> {
         let root = self.g.find(annot.root);
         let (a, b) = (self.g.find(a), self.g.find(b));
         let node = |n: u32| &self.g.nodes[n as usize];
-        let blockable = |n: u32| node(n).flags & super::graph::flag::ROOT == 0;
+        use super::graph::flag::{CONCRETE, ROOT};
+        let blockable = |n: u32| node(n).flags & (ROOT | CONCRETE) == 0;
         blockable(a) && blockable(b) && !(node(a).parent == root && node(b).parent == root)
     }
 
@@ -418,7 +441,9 @@ impl<'a> Engine<'a> {
             if (self.done.nodes as usize) < self.g.nodes.len() {
                 let n = self.done.nodes;
                 self.done.nodes += 1;
-                if self.g.live(n) {
+                if self.g.live(n)
+                    && self.g.nodes[n as usize].flags & super::graph::flag::CONCRETE == 0
+                {
                     for i in 0..self.p.everywhere.len() {
                         let clause = self.p.everywhere[i];
                         self.fire(clause, &[n], DepSetId::EMPTY)?;

@@ -51,6 +51,10 @@ fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
     v
 }
 
+fn range(o: &mut Ontology, r: DataRange) -> RangeId {
+    RangeId(o.ranges.intern(r))
+}
+
 /// Builds negations in the premise's interner, with fresh individuals.
 pub struct Negator<'a> {
     pub o: &'a mut Ontology,
@@ -122,8 +126,26 @@ impl<'a> Negator<'a> {
         out
     }
 
+    /// `x : ∃p.⊤` for a fresh `x`.
+    fn some_value(&mut self, p: Term) -> Axiom {
+        let literal = range(self.o, DataRange::Literal);
+        let some = self.e(ClassExpr::DataSome(p, literal));
+        Axiom::ClassAssertion(some, self.fresh())
+    }
+
+    /// `(x, w) ∈ a` and not in `b`: a fresh data property `c ⊑ a` disjoint with `b`, and
+    /// `x : ∃c.⊤` (a model of the premise with such a pair extends to `c`).
+    fn data_outside(&mut self, a: Term, b: Term) -> Vec<Axiom> {
+        let c = self.fresh();
+        vec![
+            Axiom::SubDataPropertyOf(c, a),
+            Axiom::DisjointDataProperties(sorted(vec![c, b])),
+            self.some_value(c),
+        ]
+    }
+
     /// The cases of `¬α` (`α` already in the premise's interner); `None` where the
-    /// reduction isn't available (data axioms, keys).
+    /// reduction isn't available (keys, datatype definitions).
     pub fn cases(&mut self, axiom: &Axiom) -> Option<Vec<Vec<Axiom>>> {
         let pairs = |xs: &[ExprId]| -> Vec<(ExprId, ExprId)> {
             let mut out = Vec::new();
@@ -251,6 +273,53 @@ impl<'a> Negator<'a> {
                 }
                 out
             }
+            Axiom::DataPropertyAssertion(p, a, v) => {
+                vec![vec![Axiom::NegativeDataPropertyAssertion(*p, *a, *v)]]
+            }
+            Axiom::NegativeDataPropertyAssertion(p, a, v) => {
+                vec![vec![Axiom::DataPropertyAssertion(*p, *a, *v)]]
+            }
+            Axiom::DataPropertyRange(p, r) => {
+                let not = range(self.o, DataRange::Not(*r));
+                let some = self.e(ClassExpr::DataSome(*p, not));
+                vec![vec![Axiom::ClassAssertion(some, self.fresh())]]
+            }
+            Axiom::DataPropertyDomain(p, c) => {
+                let literal = range(self.o, DataRange::Literal);
+                let some = self.e(ClassExpr::DataSome(*p, literal));
+                let not = self.not(*c);
+                let both = self.e(ClassExpr::And(sorted(vec![some, not])));
+                vec![vec![Axiom::ClassAssertion(both, self.fresh())]]
+            }
+            Axiom::FunctionalDataProperty(p) => {
+                let literal = range(self.o, DataRange::Literal);
+                let two = self.e(ClassExpr::DataMin(2, *p, literal));
+                vec![vec![Axiom::ClassAssertion(two, self.fresh())]]
+            }
+            Axiom::SubDataPropertyOf(a, b) => vec![self.data_outside(*a, *b)],
+            Axiom::EquivalentDataProperties(ps) => {
+                let mut out = Vec::new();
+                for w in ps.windows(2) {
+                    out.push(self.data_outside(w[0], w[1]));
+                    out.push(self.data_outside(w[1], w[0]));
+                }
+                out
+            }
+            Axiom::DisjointDataProperties(ps) => {
+                let mut out = Vec::new();
+                for (i, &a) in ps.iter().enumerate() {
+                    for &b in &ps[i + 1..] {
+                        // A pair in both: a fresh c below each, with a value.
+                        let c = self.fresh();
+                        out.push(vec![
+                            Axiom::SubDataPropertyOf(c, a),
+                            Axiom::SubDataPropertyOf(c, b),
+                            self.some_value(c),
+                        ]);
+                    }
+                }
+                out
+            }
             _ => return None,
         })
     }
@@ -271,6 +340,7 @@ pub fn import(from: &Ontology, axiom: &Axiom, to: &mut Ontology) -> Axiom {
         Axiom::ObjectPropertyDomain(r, x) => Axiom::ObjectPropertyDomain(*r, c(*x)),
         Axiom::ObjectPropertyRange(r, x) => Axiom::ObjectPropertyRange(*r, c(*x)),
         Axiom::DataPropertyDomain(p, x) => Axiom::DataPropertyDomain(*p, c(*x)),
+        Axiom::DataPropertyRange(p, r) => Axiom::DataPropertyRange(*p, copy_range(from, *r, to)),
         Axiom::ClassAssertion(x, a) => Axiom::ClassAssertion(c(*x), *a),
         Axiom::HasKey(x, ps, ds) => Axiom::HasKey(c(*x), ps.clone(), ds.clone()),
         other => other.clone(),

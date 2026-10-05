@@ -290,19 +290,101 @@ fn class_satisfiability() {
     );
 }
 
+/// Data values are values: two literals of one value are one (`1` and `1.0`), two of
+/// different values two.
 #[test]
-fn datatypes_are_unsupported_not_consistent() {
+fn data_values_are_decided_by_the_datatype_theory() {
     let mut b = Build::default();
-    let a = b.class(1);
-    b.assert(a, 100);
-    b.o.axioms
-        .push(nrese_owl::Axiom::FunctionalDataProperty(400));
-    b.o.sources.push(Vec::new());
-    assert!(matches!(answer(&b.o), Answer::Unsupported(_)));
-    // An inconsistency without the data part still stands.
-    let na = b.not(a);
-    b.assert(na, 100);
+    b.axiom(Axiom::FunctionalDataProperty(400));
+    let one = b.literal("1", "integer");
+    let also_one = b.literal("1.0", "decimal");
+    b.axiom(Axiom::DataPropertyAssertion(400, 100, one));
+    b.axiom(Axiom::DataPropertyAssertion(400, 100, also_one));
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    let float_one = b.literal("1", "float");
+    let mut c = Build { o: b.o.clone() };
+    c.axiom(Axiom::DataPropertyAssertion(400, 100, float_one));
+    assert_eq!(answer(&c.o), Answer::Inconsistent, "a float isn't a real");
+    let two = b.literal("2", "integer");
+    b.axiom(Axiom::DataPropertyAssertion(400, 100, two));
     assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+/// Cardinalities against the values a range has: 256 bytes, but not 257.
+#[test]
+fn data_cardinalities_count_values() {
+    for (n, expected) in [(256, Answer::Consistent), (257, Answer::Inconsistent)] {
+        let mut b = Build::default();
+        let byte = b.datatype("byte");
+        b.axiom(Axiom::DataPropertyRange(400, byte));
+        let literal = b.range(nrese_owl::DataRange::Literal);
+        let at_least = b.e(ClassExpr::DataMin(n, 400, literal));
+        b.assert(at_least, 100);
+        assert_eq!(answer(&b.o), expected, "{n}");
+    }
+}
+
+/// A disjunction whose every branch only a facet combination refutes: the clashes carry
+/// the facts' dependencies, so the search backjumps soundly through both.
+#[test]
+fn facet_clashes_refute_each_branch() {
+    for (lo, hi, expected) in [(4, 4, Answer::Inconsistent), (3, 4, Answer::Consistent)] {
+        let mut b = Build::default();
+        let (a, bb) = (b.class(1), b.class(2));
+        let either = b.or(&[a, bb]);
+        b.assert(either, 100);
+        let big = b.restricted("integer", &[("minInclusive", 5)]);
+        let small = b.restricted("integer", &[("maxInclusive", 3)]);
+        let some_big = b.e(ClassExpr::DataSome(400, big));
+        let some_small = b.e(ClassExpr::DataSome(400, small));
+        b.sub(a, some_big);
+        b.sub(bb, some_small);
+        let range = b.restricted("integer", &[("minInclusive", lo), ("maxInclusive", hi)]);
+        b.axiom(Axiom::DataPropertyRange(400, range));
+        assert_eq!(answer(&b.o), expected, "[{lo}, {hi}]");
+    }
+}
+
+/// A datatype outside the map is approximated: a model is no answer, a clash still is.
+#[test]
+fn approximated_datatypes_are_unsupported_not_consistent() {
+    let mut b = Build::default();
+    let date = b.datatype("date");
+    b.axiom(Axiom::DataPropertyRange(400, date));
+    let some = b.e(ClassExpr::DataSome(400, date));
+    b.assert(some, 100);
+    assert!(matches!(answer(&b.o), Answer::Unsupported(_)));
+    let literal = b.range(nrese_owl::DataRange::Literal);
+    let none = b.e(ClassExpr::DataMax(0, 400, literal));
+    b.assert(none, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+/// Keys make named individuals with equal key values equal, never anonymous ones.
+#[test]
+fn keys_merge_named_individuals_only() {
+    let base = |second: &str, anonymous: bool| {
+        let mut b = Build::default();
+        let (c, d) = (b.class(1), b.class(2));
+        b.axiom(Axiom::HasKey(c, Vec::new(), vec![400]));
+        let one = b.literal("1", "integer");
+        let other = b.literal(second, "integer");
+        b.assert(c, 100);
+        b.assert(c, 101);
+        b.axiom(Axiom::DataPropertyAssertion(400, 100, one));
+        b.axiom(Axiom::DataPropertyAssertion(400, 101, other));
+        // 100 is D, 101 isn't: equal, they clash.
+        b.assert(d, 100);
+        let not_d = b.not(d);
+        b.assert(not_d, 101);
+        if anonymous {
+            b.o.anonymous.insert(101);
+        }
+        answer(&b.o)
+    };
+    assert_eq!(base("01", false), Answer::Inconsistent);
+    assert_eq!(base("2", false), Answer::Consistent);
+    assert_eq!(base("01", true), Answer::Consistent);
 }
 
 #[test]

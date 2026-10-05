@@ -3,28 +3,36 @@
 //! body atom (docs/design/owl2-dl.md §6, "compiled clause triggers").
 //!
 //! How the clauses map onto HT-clauses:
-//! - variables: `x` is variable 0, each `y(i)` the next free one; data variables have no
-//!   place here (datatypes are package 3.5);
+//! - variables: `x` is variable 0, each `y(i)` and `v(i)` the next free one;
+//! - data properties are roles whose successors are data values (concrete nodes), data
+//!   ranges are concepts of those ([`ConceptName::Range`]), data equalities equalities:
+//!   the datatype theory checks the values (`data.rs`);
 //! - `Nominal(a, v)` in a body is the nominal guard `O_a(v)` with the assertion `O_a(a)`
 //!   (Definition 5); in a head it is the equality `v ≈ a`, resolved to `a`'s node when
 //!   the clause fires, which is what the guard construction amounts to;
 //! - negative object property assertions over simple properties become the clause
 //!   `R(x, y) ∧ O_a(x) ∧ O_b(y) → ⊥`.
 //!
-//! What the engine can't take is left out and recorded in [`Program::weakened`]: data
-//! clauses and assertions, the axioms the normalisation reports unsupported, the axioms
-//! the reader couldn't read (its fatal diagnostics), and negative assertions over
-//! non-simple properties. Leaving clauses out only weakens the ontology,
-//! so "inconsistent" stays a sound answer and "consistent" becomes `unsupported`.
+//! - negative data property assertions `¬p(a, v)` become `p(x, w) ∧ O_a(x) → ¬{v}(w)`;
+//! - keys (DL-safe rules) become [`KeyRule`]s, applied to named individuals (`keys.rs`).
+//!
+//! What the engine can't take is left out and recorded in [`Program::weakened`]: the
+//! axioms the normalisation reports unsupported (but keys and datatype definitions, which
+//! the engine reads from the rules and definitions), the axioms the reader couldn't read
+//! (its fatal diagnostics), and negative assertions over non-simple properties. Leaving
+//! clauses out only weakens the ontology, so "inconsistent" stays a sound answer and
+//! "consistent" becomes `unsupported`.
 
 use std::collections::BTreeSet;
 
 use hashbrown::HashMap;
 
 use super::graph::NONE;
+use crate::datatypes::Ranges;
 use nrese_owl::{
-    Axiom, BodyAtom, Characteristic, Clause, Concept, Filler as OwlFiller, HeadAtom, Normalised,
-    ObjProp, Ontology, Term, Var,
+    Axiom, BodyAtom, Characteristic, Clause, Concept, DataRange, Filler as OwlFiller, HeadAtom,
+    Normalised, ObjProp, Ontology, RangeId, SafeRule, Term, UNSUPPORTED_DATATYPE_DEFINITIONS,
+    UNSUPPORTED_KEYS, Var,
 };
 
 /// A dense concept id.
@@ -41,6 +49,8 @@ pub enum ConceptName {
     Clause(Concept),
     /// The nominal guard `O_a` of the individual with this index.
     Guard(u32),
+    /// A data range, as a concept of data values.
+    Range(RangeId),
 }
 
 /// The filler of a number restriction.
@@ -135,6 +145,30 @@ pub struct Assertions {
     pub roles: Vec<(RoleId, u32, u32)>,
     pub same: Vec<(u32, u32)>,
     pub different: Vec<(u32, u32)>,
+    /// `(data property, individual, literal)`, the literal by its index in
+    /// [`DataProgram::literals`].
+    pub data: Vec<(RoleId, u32, u32)>,
+}
+
+/// The datatype part of a program (where it has data clauses or assertions).
+#[derive(Debug, Clone, Default)]
+pub struct DataProgram {
+    pub ranges: Ranges,
+    /// Per literal of the data assertions (one node each): the concept of its singleton.
+    pub literals: Vec<ConceptId>,
+    literal_ids: HashMap<Term, u32>,
+    /// The filler of an at-most data restriction, as a range concept: its complement's.
+    pub complement: HashMap<ConceptId, ConceptId>,
+}
+
+/// A key: named individuals in `class` (any, if `None`) that share a named neighbour by
+/// each object property and a value by each data property are equal.
+#[derive(Debug, Clone)]
+pub struct KeyRule {
+    pub class: Option<ConceptId>,
+    pub objects: Vec<RoleExpr>,
+    pub data: Vec<RoleId>,
+    pub source: u32,
 }
 
 /// The compiled program.
@@ -167,6 +201,13 @@ pub struct Program {
     /// number restriction), so that single blocking is complete.
     pub simple: bool,
     pub nominals: bool,
+    /// The datatype part, if the program has data values.
+    pub data: Option<Box<DataProgram>>,
+    /// By role: whether it is a data property (its successors are data values).
+    pub data_roles: Vec<bool>,
+    pub keys: Vec<KeyRule>,
+    /// By individual: whether it is anonymous (keys don't apply to it).
+    pub anonymous: Vec<bool>,
 }
 
 impl Program {
@@ -176,9 +217,25 @@ impl Program {
             simple: true,
             ..Program::default()
         };
-        let reasons: BTreeSet<&str> = normalised.unsupported.iter().map(|(_, r)| *r).collect();
+        // Datatype definitions are the datatype theory's; keys are rules (below).
+        let reasons: BTreeSet<&str> = normalised
+            .unsupported
+            .iter()
+            .map(|(_, r)| *r)
+            .filter(|r| *r != UNSUPPORTED_DATATYPE_DEFINITIONS && *r != UNSUPPORTED_KEYS)
+            .collect();
         for reason in reasons {
             p.weakened.push(format!("axioms left out: {reason}"));
+        }
+        let facts = &normalised.facts;
+        if normalised.clauses.iter().any(|c| c.flags.datatype)
+            || !facts.data.is_empty()
+            || !facts.not_data.is_empty()
+        {
+            p.data = Some(Box::new(DataProgram {
+                ranges: Ranges::new(ontology, normalised),
+                ..DataProgram::default()
+            }));
         }
         // What the reader couldn't take as OWL 2 DL: the axioms it is part of are left out.
         let fatal = ontology.diagnostics.iter().filter(|d| d.is_fatal()).count();
@@ -187,24 +244,148 @@ impl Program {
                 "{fatal} reader diagnostics (not OWL 2 DL, left out)"
             ));
         }
-        let mut data_clauses = 0usize;
         for (index, clause) in normalised.clauses.iter().enumerate() {
-            if clause.flags.datatype {
-                data_clauses += 1;
-                continue;
-            }
             match p.clause(clause, index as u32) {
                 Ok(ht) => p.clauses.push(ht),
                 Err(why) => p.weakened.push(format!("clause {index} left out: {why}")),
             }
         }
-        if data_clauses > 0 {
-            p.weakened
-                .push(format!("{data_clauses} data clauses left out (datatypes)"));
-        }
         p.facts(ontology, normalised);
+        for rule in &normalised.rules {
+            match p.key(rule) {
+                Ok(key) => p.keys.push(key),
+                Err(why) => p
+                    .weakened
+                    .push(format!("a key left out (axiom {}): {why}", rule.source)),
+            }
+        }
+        p.anonymous = p
+            .individuals
+            .iter()
+            .map(|t| ontology.anonymous.contains(t))
+            .collect();
+        if let Some(data) = &mut p.data {
+            data.ranges.finish();
+        }
+        p.data_roles.resize(p.roles.len(), false);
         p.plans();
         p
+    }
+
+    /// A data property's role id.
+    fn data_role(&mut self, term: Term) -> RoleId {
+        let id = self.role(term);
+        if self.data_roles.len() <= id as usize {
+            self.data_roles.resize(id as usize + 1, false);
+        }
+        self.data_roles[id as usize] = true;
+        id
+    }
+
+    fn data(&mut self) -> Result<&mut DataProgram, String> {
+        self.data
+            .as_deref_mut()
+            .ok_or_else(|| "a data atom without data clauses".to_owned())
+    }
+
+    /// The concept of the data range `r`.
+    fn range_concept(&mut self, r: RangeId) -> ConceptId {
+        self.concept(ConceptName::Range(r))
+    }
+
+    /// The filler of a data number restriction: `rdfs:Literal` is any value.
+    fn data_filler(&mut self, r: RangeId) -> Result<Filler, String> {
+        if self.data()?.ranges.is_literal(r) {
+            return Ok(Filler::Top);
+        }
+        Ok(Filler::Is(self.range_concept(r)))
+    }
+
+    /// The node index of a literal of the data assertions.
+    fn literal(&mut self, term: Term) -> Result<u32, String> {
+        if let Some(&id) = self.data()?.literal_ids.get(&term) {
+            return Ok(id);
+        }
+        let one = self.data()?.ranges.intern(DataRange::OneOf(vec![term]));
+        let c = self.range_concept(one);
+        let data = self.data()?;
+        let id = data.literals.len() as u32;
+        data.literals.push(c);
+        data.literal_ids.insert(term, id);
+        Ok(id)
+    }
+
+    /// A key rule from the normalisation's DL-safe rule.
+    fn key(&mut self, rule: &SafeRule) -> Result<KeyRule, String> {
+        let (x, y) = (Var::X, Var::Y(0));
+        if rule.head != [HeadAtom::Equal(x, y)] {
+            return Err("a DL-safe rule other than a key's".into());
+        }
+        let mut class: Option<(Option<Concept>, Option<Concept>)> = None;
+        let mut objects: std::collections::BTreeMap<Var, [Option<RoleExpr>; 2]> =
+            Default::default();
+        let mut data: std::collections::BTreeMap<Var, [Option<Term>; 2]> = Default::default();
+        let side = |v: Var| -> Result<usize, String> {
+            match v {
+                Var::X => Ok(0),
+                Var::Y(0) => Ok(1),
+                _ => Err("a key atom off x and y".into()),
+            }
+        };
+        for atom in &rule.body {
+            match *atom {
+                BodyAtom::Concept(c, v) => {
+                    let entry = class.get_or_insert((None, None));
+                    if side(v)? == 0 {
+                        entry.0 = Some(c);
+                    } else {
+                        entry.1 = Some(c);
+                    }
+                }
+                BodyAtom::Role(r, a, b) => {
+                    let (from, to, inverse) = match (a, b) {
+                        (Var::Y(i), _) if i > 0 => (b, a, true),
+                        _ => (a, b, false),
+                    };
+                    let role = RoleExpr {
+                        role: self.role(r),
+                        inverse,
+                    };
+                    objects.entry(to).or_default()[side(from)?] = Some(role);
+                }
+                BodyAtom::Data(d, a, v) => {
+                    data.entry(v).or_default()[side(a)?] = Some(d);
+                }
+                BodyAtom::Nominal(..) => return Err("a nominal in a key".into()),
+            }
+        }
+        let class = match class {
+            None => None,
+            Some((Some(a), Some(b))) if a == b => Some(self.concept(ConceptName::Clause(a))),
+            Some(_) => return Err("a key's class differs between x and y".into()),
+        };
+        let mut key = KeyRule {
+            class,
+            objects: Vec::new(),
+            data: Vec::new(),
+            source: rule.source as u32,
+        };
+        for (_, pair) in objects {
+            match pair {
+                [Some(a), Some(b)] if a == b => key.objects.push(a),
+                _ => return Err("a key's object property differs between x and y".into()),
+            }
+        }
+        for (_, pair) in data {
+            match pair {
+                [Some(a), Some(b)] if a == b => {
+                    let role = self.data_role(a);
+                    key.data.push(role);
+                }
+                _ => return Err("a key's data property differs between x and y".into()),
+            }
+        }
+        Ok(key)
     }
 
     pub fn concept(&mut self, name: ConceptName) -> ConceptId {
@@ -384,7 +565,14 @@ impl Program {
                     let i = self.individual(*t);
                     Body::Concept(self.guard(i), var(&mut vars, *v)?)
                 }
-                BodyAtom::Data(..) => return Err("a data atom".into()),
+                BodyAtom::Data(p, a, b) => {
+                    self.data()?;
+                    let (a, b) = (var(&mut vars, *a)?, var(&mut vars, *b)?);
+                    if a != 0 {
+                        return Err("a data edge off x".into());
+                    }
+                    Body::Role(self.data_role(*p), a, b)
+                }
             });
         }
         let bound = vars.len();
@@ -450,7 +638,58 @@ impl Program {
                     self.guard(i);
                     Head::Nominal(i, var(&mut vars, *v)?)
                 }
-                _ => return Err("a data atom".into()),
+                HeadAtom::DataAtLeast {
+                    n,
+                    property,
+                    range,
+                    var: v,
+                } => {
+                    let number = Number {
+                        n: *n,
+                        role: RoleExpr {
+                            role: self.data_role(*property),
+                            inverse: false,
+                        },
+                        filler: self.data_filler(*range)?,
+                    };
+                    Head::AtLeast(self.number(false, number), var(&mut vars, *v)?)
+                }
+                HeadAtom::DataAtMost {
+                    n,
+                    property,
+                    range,
+                    var: v,
+                } => {
+                    let filler = self.data_filler(*range)?;
+                    if let Filler::Is(c) = filler {
+                        let not = self.data()?.ranges.intern(DataRange::Not(*range));
+                        let not = self.range_concept(not);
+                        self.data()?.complement.insert(c, not);
+                    }
+                    let number = Number {
+                        n: *n,
+                        role: RoleExpr {
+                            role: self.data_role(*property),
+                            inverse: false,
+                        },
+                        filler,
+                    };
+                    let id = self.number(true, number);
+                    if self.at_most_annotation.len() <= id as usize {
+                        let annotation = self.annotation(number);
+                        self.at_most_annotation.push(annotation);
+                    }
+                    Head::AtMost(id, var(&mut vars, *v)?)
+                }
+                HeadAtom::DataIn(r, v) => {
+                    self.data()?;
+                    Head::Concept(self.range_concept(*r), var(&mut vars, *v)?)
+                }
+                HeadAtom::DataEqual(a, b) => Head::Equal(var(&mut vars, *a)?, var(&mut vars, *b)?),
+                HeadAtom::DataRole(p, a, b) => {
+                    let (a, b) = (var(&mut vars, *a)?, var(&mut vars, *b)?);
+                    Head::Role(self.data_role(*p), a, b)
+                }
             };
             head.push(h);
         }
@@ -486,9 +725,30 @@ impl Program {
             let (a, b) = (self.individual(a), self.individual(b));
             self.assertions.different.push((a, b));
         }
-        if !facts.data.is_empty() || !facts.not_data.is_empty() {
-            self.weakened
-                .push("data assertions left out (datatypes)".into());
+        for &(p, a, v, _) in &facts.data {
+            let (role, a) = (self.data_role(p), self.individual(a));
+            match self.literal(v) {
+                Ok(l) => self.assertions.data.push((role, a, l)),
+                Err(why) => self
+                    .weakened
+                    .push(format!("a data assertion left out: {why}")),
+            }
+        }
+        for &(p, a, v, source) in &facts.not_data {
+            // ¬p(a, v): p(x, w) ∧ O_a(x) → ¬{v}(w).
+            let (role, a) = (self.data_role(p), self.individual(a));
+            let ga = self.guard(a);
+            let Ok(data) = self.data() else { continue };
+            let one = data.ranges.intern(DataRange::OneOf(vec![v]));
+            let not = data.ranges.intern(DataRange::Not(one));
+            let not = self.range_concept(not);
+            self.clauses.push(HtClause {
+                body: vec![Body::Role(role, 0, 1), Body::Concept(ga, 0)],
+                head: vec![Head::Concept(not, 1)],
+                vars: 2,
+                source: source as u32,
+                annotation: NONE,
+            });
         }
         let non_simple = non_simple(ontology);
         for &(r, a, b, source) in &facts.not_roles {
@@ -554,9 +814,6 @@ impl Program {
 
 /// The index of the clause variable `v`, added if new.
 fn var(vars: &mut Vec<Var>, v: Var) -> Result<u8, String> {
-    if matches!(v, Var::V(_)) {
-        return Err("a data variable".into());
-    }
     if let Some(i) = vars.iter().position(|&w| w == v) {
         return Ok(i as u8);
     }
