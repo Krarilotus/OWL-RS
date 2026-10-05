@@ -12,12 +12,13 @@ measured here (benches/PROTOCOL.md, interleaved, confidence intervals).
       (cause, fix, A/B, guard), the task that differs from HermiT and Konclude settled.
 - [ ] The store's DL mode (G3): classification through `/classification`, the 7 OWL 2 RL
       W3C cases through the DL path.
-- [ ] Queries (G4): `MIN`/`MAX`/`AVG` in eager aggregation, paths planned with the rest,
-      characteristic pairs.
+- [x] Queries (G4): `MIN`/`MAX`/`AVG` in eager aggregation (42040b7, measured in 450c3e7),
+      paths planned with the rest (81144f2), characteristic pairs (be7aeef, 3 October).
 - [ ] Materialisation memory (P1): the transient fold, unused relations pruned.
 - [ ] OWL 2 QL: tree-witness rewriting of the existential part over the RL closure.
-- [ ] Usability: one error envelope across CLI, HTTP and console; EXPLAIN with estimated
-      against actual rows.
+- [ ] Usability: one error envelope across CLI, HTTP and console (open); EXPLAIN with
+      estimated against actual rows (done, 3c146e9: every operator, guard
+      `explain_estimates_every_operator`).
 
 ## 2. Measurements that decide the next reasoning gains
 
