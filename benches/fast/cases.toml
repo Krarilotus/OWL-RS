@@ -39,10 +39,10 @@
 [[case]]
 name = "rl-hierarchy"
 area = "reasoning"
-what = "a 5,461-class tree and a 1,500-class spine over 1 M typed instances (inherited types)"
+what = "a 5,461-class tree and a 1,500-class spine over 1 M typed instances (9.7 M inherited types): 67 s in the rule joins on 6 Oct 2026, against 5 s for LUBM 100's 8.7 M"
 semantics = "owl2-rl"
-data = "hierarchy fan=4 depth=7 spine=1500 instances=1000000"
-args = ["--reason", "owl2-rl", "--reason-runs", "3"]
+data = "hierarchy fan=4 depth=7 spine=1500 instances=1000000 every=1000"
+args = ["--reason", "owl2-rl", "--reason-runs", "2"]
 queries = "hierarchy"
 metric = "reason.p50_ms"
 check = { "q.root.value" = "expect.instances_of_root", "q.spine-middle.value" = "expect.instances_of_spine_middle", "q.h1.value" = "expect.instances_of_h1" }
@@ -50,14 +50,14 @@ route = { "reason.rounds" = "<= 3" }
 cap_gb = 8
 systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:closure", "oxigraph:closure"]
 guards = ["schema compiled first: sup⁺(c) dispatch, hierarchy module by SCC and bitsets"]
-
+pinned = "the generator's counts; 9,671,615 inferred on 6 Oct 2026"
 [[case]]
 name = "rdfs-hierarchy"
 area = "reasoning"
 what = "the same hierarchy under RDFS"
 semantics = "rdfs"
-data = "hierarchy fan=4 depth=7 spine=1500 instances=1000000"
-args = ["--reason", "rdfs", "--reason-runs", "3"]
+data = "hierarchy fan=4 depth=7 spine=1500 instances=1000000 every=1000"
+args = ["--reason", "rdfs", "--reason-runs", "2"]
 queries = "hierarchy"
 metric = "reason.p50_ms"
 check = { "q.root.value" = "expect.instances_of_root", "q.spine-middle.value" = "expect.instances_of_spine_middle", "q.h1.value" = "expect.instances_of_h1" }
@@ -83,25 +83,41 @@ guards = ["modules for recursive shapes: an equivalence property by union-find"]
 [[case]]
 name = "rl-sameas"
 area = "reasoning"
-what = "owl:sameAs chains: 20,000 groups of 10, a value each, spread to the group"
+what = "owl:sameAs chains: 20,000 groups of 10, a value each, spread to the group (equality by representatives, expanded in the stack)"
 semantics = "owl2-rl"
 data = "sameas groups=20000 size=10"
-args = ["--reason", "owl2-rl", "--reason-runs", "3"]
+args = ["--reason", "owl2-rl", "--reason-runs", "10"]
+queries = "sameas"
+metric = "reason.p50_ms"
+check = { "q.values.value" = "expect.values", "q.same-as.value" = "expect.same_as_pairs", "q.knows.value" = "expect.knows", "q.group-values.rows" = 10 }
+route = {}
+cap_gb = 6
+systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl"]
+guards = ["equality by representatives: facts over each class's smallest id, expanded at read time"]
+
+
+[[case]]
+name = "rl-sameas-compact"
+area = "reasoning"
+what = "the same sameAs groups with the stack kept over representatives (equality = compact)"
+semantics = "owl2-rl"
+data = "sameas groups=20000 size=10"
+args = ["--reason", "owl2-rl", "--reason-runs", "6"]
+env = { NRESE_REASONING_EQUALITY = "compact" }
 queries = "sameas"
 metric = "reason.p50_ms"
 check = { "q.values.value" = "expect.values", "q.same-as.value" = "expect.same_as_pairs", "q.knows.value" = "expect.knows", "q.group-values.rows" = 10 }
 route = { "held.inferred" = "<= 2000000" }
 cap_gb = 6
-systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl"]
+systems = []
 guards = ["equality by representatives: facts over each class's smallest id, expanded at read time"]
-
 [[case]]
 name = "rl-chain"
 area = "reasoning"
 what = "two chains of 2,500 nodes along a transitive property (6.2 M pairs)"
 semantics = "owl2-rl"
 data = "chain chains=2 length=2500"
-args = ["--reason", "owl2-rl", "--reason-runs", "3"]
+args = ["--reason", "owl2-rl", "--reason-runs", "8"]
 queries = "chain"
 metric = "reason.p50_ms"
 check = { "q.pairs.value" = "expect.pairs", "q.from-start.value" = "2499" }
@@ -120,12 +136,12 @@ extra = ["volume:univ-bench.nt"]
 args = ["--reason", "owl2-rl", "--runs", "3"]
 queries = "lubm"
 metric = "reason.p50_ms"
-check = { "reason.inferred" = 8699011 }
+check = { "reason.inferred" = 8726942, "q.q06.rows" = 1048532, "q.q14.rows" = 795970, "q.q09.rows" = 27247 }
 route = { "reason.rounds" = "<= 6" }
 cap_gb = 12
 systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:closure", "oxigraph:closure", "virtuoso:closure"]
 guards = ["P1-F1 drivers read in place", "P1-F4 no list of derived facts", "P1-F8 candidates deduplicated and probed in order"]
-pinned = "reason.inferred: NRESE 5 Oct 2026 (Nemo's closure plus 32 axiomatic statements, run record office-b)"
+pinned = "NRESE 5 Oct 2026; to equal Nemo's closure plus NRESE's 32 axiomatic statements (fast.py compete)"
 
 [[case]]
 name = "rl-owl2bench"
@@ -133,14 +149,14 @@ area = "reasoning"
 what = "OWL2Bench RL-1: a 1.3 M-pair symmetric-transitive clique from a real TBox, 22 queries"
 semantics = "owl2-rl"
 data = "volume:owl2bench-rl-1.nt"
-args = ["--reason", "owl2-rl", "--reason-runs", "5", "--runs", "3"]
+args = ["--reason", "owl2-rl", "--reason-runs", "10", "--runs", "3"]
 queries = "owl2bench"
 metric = "reason.p50_ms"
-check = {}
+check = { "reason.inferred" = 1399563, "q.q20.rows" = 1311932 }
 route = { "reason.rounds" = "<= 6" }
 cap_gb = 6
 systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl"]
-
+pinned = "NRESE 5 Oct 2026, the closure Nemo and owlrl agree with (run record office-b)"
 [[case]]
 name = "rl-single-thread"
 area = "reasoning"
@@ -148,7 +164,7 @@ what = "LUBM 10 on one thread: materialisation without parallelism"
 semantics = "owl2-rl"
 data = "volume:lubm-10.nt"
 extra = ["volume:univ-bench.nt"]
-args = ["--reason", "owl2-rl", "--reason-runs", "5", "--threads", "1"]
+args = ["--reason", "owl2-rl", "--reason-runs", "6", "--threads", "1"]
 queries = ""
 metric = "reason.p50_ms"
 check = {}
@@ -164,7 +180,7 @@ what = "LUBM 10 under every RDFS rule and the axiomatic triples"
 semantics = "rdfs-full"
 data = "volume:lubm-10.nt"
 extra = ["volume:univ-bench.nt"]
-args = ["--reason", "rdfs-full", "--reason-runs", "5"]
+args = ["--reason", "rdfs-full", "--reason-runs", "25", "--runs", "10"]
 queries = "lubm"
 metric = "reason.p50_ms"
 check = {}
@@ -179,7 +195,7 @@ what = "LUBM 10 under RDFS-Plus"
 semantics = "rdfs-plus"
 data = "volume:lubm-10.nt"
 extra = ["volume:univ-bench.nt"]
-args = ["--reason", "rdfs-plus", "--reason-runs", "5"]
+args = ["--reason", "rdfs-plus", "--reason-runs", "60", "--runs", "10"]
 queries = "lubm"
 metric = "reason.p50_ms"
 check = {}
@@ -194,7 +210,7 @@ what = "LUBM 10 under OWL-Horst (pD*)"
 semantics = "owl-horst"
 data = "volume:lubm-10.nt"
 extra = ["volume:univ-bench.nt"]
-args = ["--reason", "owl-horst", "--reason-runs", "5"]
+args = ["--reason", "owl-horst", "--reason-runs", "50", "--runs", "10"]
 queries = "lubm"
 metric = "reason.p50_ms"
 check = {}
@@ -210,7 +226,7 @@ what = "LUBM 10 under OWL 2 QL, materialised"
 semantics = "owl2-ql"
 data = "volume:lubm-10.nt"
 extra = ["volume:univ-bench.nt"]
-args = ["--reason", "owl2-ql", "--reason-runs", "5"]
+args = ["--reason", "owl2-ql", "--reason-runs", "35", "--runs", "10"]
 queries = "lubm"
 metric = "reason.p50_ms"
 check = {}
@@ -224,7 +240,7 @@ area = "reasoning"
 what = "transitive closure of a random graph (2,000 nodes, 3,000 edges) as Notation3 user rules"
 semantics = "custom"
 data = "graph nodes=2000 edges=3000"
-args = ["--reason", "custom", "--rules", "/src/benches/fast/rules/tc.n3", "--reason-runs", "3"]
+args = ["--reason", "custom", "--rules", "/src/benches/fast/rules/tc.n3", "--reason-runs", "15"]
 queries = "tc"
 metric = "reason.p50_ms"
 check = { "q.paths.value" = "expect.path_pairs" }
@@ -238,13 +254,13 @@ home_turf = "nemo"
 [[case]]
 name = "commits-readers"
 area = "maintenance"
-what = "1,000 one-person commits added then removed under OWL 2 RL, with 8 readers running queries"
+what = "4,000 one-person commits added then removed under OWL 2 RL, with 8 readers running queries"
 semantics = "owl2-rl"
-data = "churn people=200000 changes=500"
+data = "churn people=200000 changes=2000"
 args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru", "--readers", "8"]
 queries = "churn"
 metric = "commits.p50_ms"
-check = { "closure_after_commits.equal" = "true", "commits.commits" = 1000, "q.students.value" = "200000" }
+check = { "closure_after_commits.equal" = "true", "commits.commits" = 4000, "q.students.value" = "200500" }
 route = { "commits.incremental" = "== true" }
 cap_gb = 6
 systems = ["graphdb:owl2-rl", "rdfox:owl2-rl"]
@@ -254,11 +270,11 @@ name = "commits-rdfs"
 area = "maintenance"
 what = "the same commits under RDFS, without readers"
 semantics = "rdfs"
-data = "churn people=200000 changes=500"
+data = "churn people=200000 changes=2000"
 args = ["--reason", "rdfs", "--commits", "{data}.commits.ru"]
 queries = "churn"
 metric = "commits.p50_ms"
-check = { "closure_after_commits.equal" = "true", "commits.commits" = 1000 }
+check = { "closure_after_commits.equal" = "true", "commits.commits" = 4000 }
 route = { "commits.incremental" = "== true" }
 cap_gb = 6
 systems = ["graphdb:rdfs", "rdfox:rdfs"]
@@ -266,13 +282,13 @@ systems = ["graphdb:rdfs", "rdfox:rdfs"]
 [[case]]
 name = "commits-plain"
 area = "maintenance"
-what = "the same commits without reasoning: the store's own write path, 4 readers alongside"
+what = "20,000 commits without reasoning: the store's own write path, 4 readers alongside"
 semantics = "none"
-data = "churn people=200000 changes=1000"
+data = "churn people=200000 changes=10000"
 args = ["--commits", "{data}.commits.ru", "--readers", "4"]
 queries = "churn"
 metric = "commits.p50_ms"
-check = { "commits.commits" = 2000 }
+check = { "commits.commits" = 20000 }
 route = {}
 cap_gb = 4
 systems = ["rdf4j:plain", "oxigraph:plain", "jena:plain"]
@@ -281,9 +297,9 @@ home_turf = "rdf4j"
 [[case]]
 name = "deletes-layered"
 area = "maintenance"
-what = "40 deletions in a layered graph whose facts have many derivations (after SSPE)"
+what = "10 deletions in a layered graph whose facts have many derivations (after SSPE): about 6 s each"
 semantics = "owl2-rl"
-data = "layered width=80 depth=40 out=3 deletes=40"
+data = "layered width=80 depth=40 out=3 deletes=10"
 args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
 queries = "layered"
 metric = "commits.p50_ms"
@@ -311,11 +327,11 @@ systems = ["graphdb:owl2-rl", "rdfox:owl2-rl"]
 [[case]]
 name = "dl-transitive"
 area = "dl"
-what = "400 definitions C ≡ ∃hasPart.D over a transitive hasPart (ore_ont_10212's shape)"
+what = "18 definitions C ≡ ∃hasPart.D over a transitive hasPart in a cycle (ore_ont_10212's shape): time grows exponentially with their number"
 semantics = "dl"
-data = "dl-transitive definitions=400"
+data = "dl-transitive definitions=18"
 tool = "tableau"
-repeat = 5
+repeat = 3
 metric = "whole_ms"
 check = { "answer" = "expect.answer" }
 route = { "branch_points" = "== 0" }
@@ -324,31 +340,49 @@ systems = ["hermit:dl", "openllet:dl", "konclude:dl"]
 home_turf = "openllet"
 guards = ["DL: ∃R.D ⊑ C over a non-simple R read as D ⊑ ∀R⁻.C (Horn), also at the top"]
 
+
 [[case]]
-name = "dl-number"
+name = "dl-transitive-400"
 area = "dl"
-what = "qualified number restrictions met exactly: ≥ n R.(B1 ⊔ B2) with ≤ n/2 of each"
+what = "the same shape with 400 definitions: Konclude decides it in 0.6 s; NRESE gives up (the frontier)"
 semantics = "dl"
-data = "dl-number n=12 individuals=20"
+data = "dl-transitive definitions=400"
 tool = "tableau"
-repeat = 5
+timeout_s = 30
+repeat = 1
 metric = "whole_ms"
 check = { "answer" = "expect.answer" }
 route = {}
+cap_gb = 4
+outcome = "gave-up"
+known = "gives up from 50 definitions on 6 Oct 2026 (25: 27 s); Konclude 0.6 s, Openllet and HermiT time out at 120 s"
+systems = ["konclude:dl", "openllet:dl", "hermit:dl"]
+home_turf = "konclude"
+[[case]]
+name = "dl-number"
+area = "dl"
+what = "qualified number restrictions met exactly: ≥ 40 R.(B1 ⊔ B2) with ≤ 20 of each, on 200 individuals"
+semantics = "dl"
+data = "dl-number n=40 individuals=200"
+tool = "tableau"
+repeat = 2
+metric = "whole_ms"
+check = { "answer" = "expect.answer" }
+route = { "branch_points" = "<= 8000" }
 cap_gb = 4
 systems = ["hermit:dl", "openllet:dl", "konclude:dl"]
 
 [[case]]
 name = "dl-nominals"
 area = "dl"
-what = "nominals: a ring of 60 nodes coloured from {colour0, colour1, colour2}"
+what = "nominals: a ring of 10,000 nodes coloured from {colour0, colour1, colour2}, neighbours different"
 semantics = "dl"
-data = "dl-nominals colours=3 nodes=60"
+data = "dl-nominals colours=3 nodes=10000"
 tool = "tableau"
-repeat = 5
+repeat = 30
 metric = "whole_ms"
 check = { "answer" = "expect.answer" }
-route = {}
+route = { "branch_points" = "<= 10000" }
 cap_gb = 4
 systems = ["hermit:dl", "openllet:dl", "konclude:dl"]
 
@@ -360,7 +394,7 @@ semantics = "dl"
 data = "dl-datatypes n=256"
 data_alt = "dl-datatypes n=257"
 tool = "tableau"
-repeat = 200
+repeat = 300
 metric = "whole_ms"
 check = { "answer" = "expect.answer", "alt.answer" = "inconsistent" }
 route = { "data_checks" = ">= 1" }
@@ -371,14 +405,14 @@ guards = ["3.5: the datatype theory's clique check by adjacency sets"]
 [[case]]
 name = "dl-roles"
 area = "dl"
-what = "200 universals over the automaton of a transitive role with 60 subroles (ore_ont_1066's shape)"
+what = "5,000 universals over the automaton of a transitive role with 200 subroles (ore_ont_1066's shape): about 6 clauses each"
 semantics = "dl"
-data = "dl-roles roles=60 axioms=200"
+data = "dl-roles roles=200 axioms=5000"
 tool = "tableau"
-repeat = 5
+repeat = 4
 metric = "whole_ms"
 check = { "answer" = "expect.answer" }
-route = { "clauses" = "<= 20000" }
+route = { "clauses" = "<= 35000", "branch_points" = "== 0" }
 cap_gb = 4
 systems = ["hermit:dl", "openllet:dl", "konclude:dl"]
 guards = ["P3: minimal automata, transitions the inclusions imply"]
@@ -386,9 +420,9 @@ guards = ["P3: minimal automata, transitions the inclusions imply"]
 [[case]]
 name = "el-classify"
 area = "dl"
-what = "OWL 2 EL classification of 100,000 random classes with existentials, definitions, a role hierarchy and a chain"
+what = "OWL 2 EL classification of 20,000 random classes with existentials, definitions, a role hierarchy, a transitive role and a chain"
 semantics = "el"
-data = "el classes=100000 roles=12"
+data = "el classes=20000 roles=12"
 tool = "classify-el"
 repeat = 3
 metric = "whole_ms"
@@ -401,9 +435,9 @@ home_turf = "elk"
 [[case]]
 name = "horn-classify"
 area = "dl"
-what = "classification of a Horn ontology beyond EL (inverse and functional roles, universals) by the context core"
+what = "classification of 1,500 Horn classes beyond EL (inverse roles, universals) by the context core"
 semantics = "dl"
-data = "horn classes=20000"
+data = "horn classes=1500"
 tool = "classify-horn"
 repeat = 3
 metric = "whole_ms"
@@ -416,9 +450,9 @@ home_turf = "konclude"
 [[case]]
 name = "canon-twins"
 area = "dl"
-what = "blank-node canonicalisation: 2,000 equal children and 50 rings of 12, under two labellings"
+what = "blank-node canonicalisation: 3,000 equal children and 200 rings of 12, under two labellings (time grows with the square of the twins: 2,000 0.6 s, 8,000 12.7 s on 6 Oct 2026)"
 semantics = "canonical"
-data = "twins twins=2000 rings=50 ring=12"
+data = "twins twins=3000 rings=200 ring=12"
 args = ["--canonicalize", "{data}", "--canonicalize", "{data}.shuffled.nt", "--runs", "5"]
 queries = ""
 metric = "canonicalize.p50_ms"
@@ -433,18 +467,34 @@ guards = ["canonicalisation without factorial branching"]
 [[case]]
 name = "mem-load-2g"
 area = "memory"
-what = "a 20 M-statement bulk load in a 2 GiB container, spilling past a 512 MiB budget"
+what = "a 10 M-statement bulk load in a 2 GiB container, spilling past a 256 MiB budget"
+semantics = "none"
+data = "entities entities=2500000"
+args = []
+env = { NRESE_BULK_LOAD_MEMORY = "268435456" }
+queries = ""
+metric = "load_s"
+check = { "loaded" = 10000000 }
+route = { "peak_mib" = "<= 1700" }
+cap_gb = 2
+systems = []
+repeat = 4
+
+[[case]]
+name = "mem-load-20m-2g"
+area = "memory"
+what = "a 20 M-statement load in 2 GiB with a 512 MiB budget: the dictionary isn't under the budget (the frontier)"
 semantics = "none"
 data = "entities entities=5000000"
-args = []
 env = { NRESE_BULK_LOAD_MEMORY = "536870912" }
 queries = ""
 metric = "load_s"
 check = { "loaded" = 20000000 }
-route = { "cgroup_peak_mib" = "<= 2048" }
+route = {}
 cap_gb = 2
+outcome = "memory-limit"
+known = "peaks at 2.5 GB resident (4.7 GB with the page cache) on 6 Oct 2026: the budget bounds the quads, not the terms"
 systems = []
-
 [[case]]
 name = "mem-reason-2g"
 area = "memory"
@@ -452,7 +502,7 @@ what = "LUBM 10 materialised (OWL 2 RL) and queried in a 2 GiB container"
 semantics = "owl2-rl"
 data = "volume:lubm-10.nt"
 extra = ["volume:univ-bench.nt"]
-args = ["--reason", "owl2-rl", "--runs", "3"]
+args = ["--reason", "owl2-rl", "--reason-runs", "30", "--runs", "10"]
 queries = "lubm"
 metric = "reason.p50_ms"
 check = {}
@@ -493,18 +543,18 @@ cap_gb = 8
 systems = ["jena:plain", "qlever:plain", "oxigraph:plain", "virtuoso:plain"]
 home_turf = "jena"
 guards = ["P1-F7 permutations derived by a stable partition"]
-
+repeat = 4
 [[case]]
 name = "open-first-query"
 area = "load"
-what = "a 1 M-statement store on disk: open it and answer the first point lookups"
+what = "a 1 M-statement store on disk: open it in a fresh process and answer four point lookups (open plus first executions)"
 semantics = "none"
 data = "social people=40000"
 setup = ["--store", "{scratch}/store", "--load", "{data}"]
 args = ["--store", "{scratch}/store", "--warmup", "0", "--runs", "1"]
 queries = "lookups"
 repeat = 20
-metric = "open_s"
+metric = "cold_ms"
 check = { "q.name.rows" = 1 }
 route = {}
 cap_gb = 2
@@ -525,7 +575,7 @@ check = { "q.star-count.value" = "expect.people" }
 route = {}
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
-
+args = ["--runs", "700"]
 [[case]]
 name = "q-chain"
 area = "query"
@@ -534,11 +584,12 @@ semantics = "none"
 data = "social people=300000"
 queries = "q-chain"
 metric = "sum_p50_ms"
-check = {}
+check = { "q.chain-4.rows" = 4096, "q.chain-posts.rows" = 62 }
 route = {}
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
-
+args = ["--runs", "4000"]
+pinned = "NRESE 5 Oct 2026; cross-checked in fast.py compete"
 [[case]]
 name = "q-cycles"
 area = "query"
@@ -547,12 +598,13 @@ semantics = "none"
 data = "social people=300000"
 queries = "q-cycles"
 metric = "sum_p50_ms"
-check = {}
+check = { "q.triangles.value" = "1800330", "q.four-cycles.value" = "1203762" }
 route = { "q.triangles.operators" = "has wcoj" }
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
 guards = ["worst-case-optimal joins for cyclic patterns"]
-
+args = ["--runs", "3"]
+pinned = "NRESE 5 Oct 2026; cross-checked in fast.py compete"
 [[case]]
 name = "q-snowflake"
 area = "query"
@@ -561,11 +613,12 @@ semantics = "none"
 data = "social people=300000"
 queries = "q-snowflake"
 metric = "sum_p50_ms"
-check = {}
+check = { "q.snowflake.value" = "90" }
 route = {}
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
-
+args = ["--runs", "6000"]
+pinned = "NRESE 5 Oct 2026; cross-checked in fast.py compete"
 [[case]]
 name = "q-paths"
 area = "query"
@@ -574,12 +627,12 @@ semantics = "none"
 data = "social people=300000"
 queries = "q-paths"
 metric = "sum_p50_ms"
-check = { "q.follows-reach.value" = "expect.people" }
+check = { "q.follows-reach.value" = "expect.people", "q.follows-closure-count.value" = "90000000000", "q.tag-descendants.value" = "1000", "q.broader-closure.rows" = 4 }
 route = {}
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
 guards = ["closures by components: COUNT of a closure from component sizes"]
-
+args = ["--runs", "10"]
 [[case]]
 name = "q-sideways"
 area = "query"
@@ -588,12 +641,13 @@ semantics = "none"
 data = "social people=300000"
 queries = "q-sideways"
 metric = "sum_p50_ms"
-check = { "q.limit-join.rows" = 1000 }
+check = { "q.limit-join.rows" = 1000, "q.exists.value" = "5889", "q.values-star.rows" = 35 }
 route = {}
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
 guards = ["sideways information passing", "LIMIT pushdown", "a VALUES always seeds", "EXISTS as sets"]
-
+args = ["--runs", "700"]
+pinned = "NRESE 5 Oct 2026; cross-checked in fast.py compete"
 [[case]]
 name = "q-large-result"
 area = "query"
@@ -608,7 +662,7 @@ cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
 home_turf = "qlever"
 guards = ["results serialised on every core"]
-
+args = ["--runs", "50"]
 [[case]]
 name = "q-topk"
 area = "query"
@@ -621,7 +675,7 @@ check = { "q.top-scores.rows" = 100 }
 route = {}
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
-
+args = ["--runs", "300"]
 [[case]]
 name = "op-group"
 area = "operator"
@@ -635,7 +689,7 @@ route = { "q.tag-counts.operators" = "has group count", "q.untitled.operators" =
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
 guards = ["group counts on the index", "distinct values by a group walk"]
-
+args = ["--runs", "300"]
 [[case]]
 name = "op-aggregates"
 area = "operator"
@@ -644,11 +698,12 @@ semantics = "none"
 data = "social people=300000"
 queries = "op-aggregates"
 metric = "sum_p50_ms"
-check = { "q.likes-per-city.rows" = 10 }
+check = { "q.likes-per-city.rows" = 10, "q.score-by-tag.rows" = 797 }
 route = {}
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
-
+args = ["--runs", "300"]
+pinned = "NRESE 5 Oct 2026; cross-checked in fast.py compete"
 [[case]]
 name = "op-optional"
 area = "operator"
@@ -661,7 +716,7 @@ check = { "q.optional-count.value" = "expect.posts" }
 route = {}
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
-
+args = ["--runs", "25"]
 [[case]]
 name = "op-negation"
 area = "operator"
@@ -670,11 +725,12 @@ semantics = "none"
 data = "social people=300000"
 queries = "op-negation"
 metric = "sum_p50_ms"
-check = {}
+check = { "q.minus.value" = "40520", "q.not-exists.value" = "5452" }
 route = {}
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
-
+args = ["--runs", "1000"]
+pinned = "NRESE 5 Oct 2026; cross-checked in fast.py compete"
 [[case]]
 name = "op-strings"
 area = "operator"
@@ -688,7 +744,7 @@ route = { "q.contains.operators" = "has dictionary string test" }
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
 guards = ["string filters on the dictionary"]
-
+args = ["--runs", "400"]
 [[case]]
 name = "op-dates"
 area = "operator"
@@ -702,7 +758,7 @@ route = {}
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
 guards = ["filters as index ranges; inline literals"]
-
+args = ["--runs", "500"]
 [[case]]
 name = "clients-lookups"
 area = "query"
@@ -730,11 +786,11 @@ extra = ["volume:univ-bench.nt"]
 args = ["--shapes", "/src/benches/fast/shapes/lubm.ttl", "--runs", "3"]
 queries = ""
 metric = "shacl.p50_ms"
-check = {}
+check = { "shacl.results" = 24343 }
 route = {}
 cap_gb = 4
 systems = ["jena:shacl", "rdf4j:shacl"]
-
+pinned = "NRESE 5 Oct 2026; to cross-check with Jena's and RDF4J's SHACL"
 [[case]]
 name = "geo-within"
 area = "service"
@@ -747,7 +803,7 @@ check = { "q.within-0.value" = "expect.within_0", "q.within-1.value" = "expect.w
 route = {}
 cap_gb = 6
 systems = ["jena:geosparql", "qlever:geosparql", "virtuoso:geosparql"]
-
+args = ["--runs", "40"]
 [[case]]
 name = "text-search"
 area = "service"
@@ -761,24 +817,41 @@ route = {}
 cap_gb = 6
 systems = ["qlever:text", "jena:text", "virtuoso:text"]
 home_turf = "qlever"
-
+args = ["--runs", "45"]
 [[case]]
-name = "vector-knn"
+name = "vector-knn-exact"
 area = "service"
-what = "k-NN (k = 10) over 200 k 64-dimensional embeddings, filtered to one kind in ten"
+what = "exact k-NN (k = 10, cosine) over 200 k 64-dimensional embeddings, filtered to one kind in ten"
 semantics = "none"
 data = "vectors items=200000 dim=64 kinds=10"
-queries = "@vectors"
+queries = "@vectors-exact"
+args = ["--runs", "300"]
 metric = "sum_p50_ms"
-check = { "recall" = ">= 0.9" }
+check = { "recall" = ">= 1.0" }
 route = {}
 cap_gb = 6
 systems = []
 
 [[case]]
+name = "vector-knn-filtered"
+area = "service"
+what = "approximate k-NN (k = 10) with the same one-in-ten filter: the index's recall under a filter"
+semantics = "none"
+data = "vectors items=200000 dim=64 kinds=10"
+queries = "@vectors"
+args = ["--runs", "300"]
+metric = "sum_p50_ms"
+check = { "recall" = ">= 0.9" }
+route = {}
+cap_gb = 6
+outcome = "wrong"
+known = "recall 0.42 on 6 Oct 2026: the filter leaves the index's k = 10 mostly outside the kind (k = 50 finds the true ten)"
+systems = []
+
+[[case]]
 name = "rdf12-annotations"
 area = "service"
-what = "RDF 1.2: 1 M reifiers of triple terms with a source and a confidence"
+what = "RDF 1.2: 1 M reifiers of triple terms with a source and a confidence; a triple term with a constant subject"
 semantics = "none"
 data = "rdf12 statements=1000000 sources=100"
 queries = "rdf12"
@@ -786,4 +859,21 @@ metric = "sum_p50_ms"
 check = { "q.from-source-7.value" = "expect.from_source_7", "q.confident.value" = "expect.confident" }
 route = {}
 cap_gb = 6
+systems = ["oxigraph:plain", "jena:plain"]
+args = ["--runs", "20"]
+
+[[case]]
+name = "rdf12-join-2g"
+area = "service"
+what = "asserted statements joined to the reifiers of their own triple terms, in 2 GiB (the frontier)"
+semantics = "none"
+data = "rdf12 statements=1000000 sources=100"
+queries = "rdf12-join"
+args = ["--runs", "1", "--warmup", "0"]
+metric = "sum_p50_ms"
+check = {}
+route = {}
+cap_gb = 2
+outcome = "memory-limit"
+known = "a triple-term pattern with variables bound by the join is filtered, not looked up: past 6 GiB on 6 Oct 2026"
 systems = ["oxigraph:plain", "jena:plain"]

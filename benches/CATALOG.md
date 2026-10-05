@@ -54,7 +54,7 @@ materialisation about 100 B per final statement at peak.
 |---|---|---|---|
 | RDF load and storage | basics mix (5 real datasets), entities load curve | | yes: both ready |
 | SPARQL, synthetic | Sparqloscope on our datasets | WatDiv | LUBM materialised, basics mix |
-| SPARQL, real logs | | WDBench (Wikidata, from logs) | basics mix's hand-written mixes only |
+| SPARQL, real logs | | WDBench (Wikidata, from logs): later, on Draco | basics mix's hand-written mixes only |
 | Updates, writes under readers | LDBC SPB; commit latency under 0-64 readers (ours) | BSBM explore and update | write scaling, concurrency scorecard, soak |
 | Rule reasoning | LUBM, OWL2Bench RL | real ontologies (DBpedia, YAGO); Datalog graph programs (TC, SG, CSPA) | LUBM, OWL2Bench (QL wrong today) |
 | Incremental maintenance | SSPE, Claros (clique-targeted), LUBM batches | | commit latency on LUBM (`local-bulk.sh`) only |
@@ -106,7 +106,7 @@ the suite's driver.
 | BSBM (Berlin) | e-commerce explore, BI, explore and update; most vendors published | its qualification mode | see 3.3; BI queries stress aggregates | representative (3.3) | probes `bsbm-http.sh`, `bsbm-bi-lab.sh` |
 | SP2Bench | DBLP-shaped data, 17 queries (OPTIONAL, negation, long chains) | its reference counts | OPTIONAL and negation at scale | later | – |
 | LUBM materialised | the 14 LUBM queries over a closure every engine loads | published answers (LUBM 1), counts | engines on their own turf | covered | ready |
-| WDBench (ISWC 2022) | about 2,650 queries (reported) from Wikidata's logs over 1.2 B direct-property statements: BGPs, OPTIONAL, paths, navigational; Jena, Virtuoso, Blazegraph and Neo4j published (MillenniumDB's authors left their own out) | row counts across systems | real query shapes and path queries at scale | representative (real logs) | – |
+| WDBench (ISWC 2022) | about 2,650 queries (reported) from Wikidata's logs over 1.2 B direct-property statements: BGPs, OPTIONAL, paths, navigational; Jena, Virtuoso, Blazegraph and Neo4j published (MillenniumDB's authors left their own out) | row counts across systems | real query shapes and path queries at scale | representative (real logs); later, a Draco run, not in the fast suite (owner, 5 Oct 2026) | – |
 | FEASIBLE | mixes sampled from real logs (DBpedia, SWDF) by feature coverage | counts | the log mix of a given endpoint, e.g. HisQu's | later | – |
 | DBpedia SPARQL Benchmark | the 2011 log-derived DBpedia benchmark | counts | superseded by FEASIBLE and WDBench | later | – |
 | LSQ, Wikidata SPARQL logs | query logs as data (sources, not benchmarks) | – | input for FEASIBLE-style mixes; Saleem et al. 2019 justify a mix's features | source | – |
@@ -115,7 +115,7 @@ the suite's driver.
 | Benchmark | Licence, redistribution | Data: disk / NRESE RAM | Setup | Runtime (est.) | Systems |
 |---|---|---|---|---|---|
 | Sparqloscope | Apache-2.0 | none of its own: our datasets (DBpedia core 9.2 GB); its own tier DBLP, about 500 M statements (to confirm at download) | 1 | DBpedia core: 105 queries × 3 runs, under 10 min per system for the fast engines, an hour or more for Jena; DBLP: NRESE load 3 min, QLever 10 min | all SPARQL systems |
-| WatDiv | no licence stated (generator source on GitHub); data generated, not redistributed | 100 M: 15 GB N-Triples, 5.6 GB store; 1 B on Draco | 1.5 (C++ generator with Boost, in Docker) | 100 M: NRESE load 30 s, QLever 2 min, Jena 20 min; 400 queries: minutes | all SPARQL systems |
+| WatDiv | no licence stated (generator source on GitHub); data generated, not redistributed; internal use only: ask the authors before publishing (owner, 5 Oct 2026) | 100 M: 15 GB N-Triples, 5.6 GB store; 1 B on Draco | 1.5 (C++ generator with Boost, in Docker) | 100 M: NRESE load 30 s, QLever 2 min, Jena 20 min; 400 queries: minutes | all SPARQL systems |
 | SP2Bench | its site (to check) | generated, 10 M-1 B | 1 | as WatDiv | all |
 | WDBench | data CC0 (Wikidata), on Figshare; queries in the repo (no licence stated: to check) | 1.2 B: about 150 GB N-Triples (est.), NRESE store 70 GB; load peak capped by the bulk-load budget | 2 | NRESE load 6-10 min, QLever 25 min, Jena 4 h (est.); queries with a 60 s limit each, about 2 h per system | QLever, Virtuoso, Jena, Oxigraph (slow load), MillenniumDB, NRESE |
 | FEASIBLE | AGPL-3.0 (code; we run it, don't ship it) | the log's dataset | 2 | – | all |
@@ -162,7 +162,7 @@ the suite's driver.
 | Claros, Reactome, UniProt | Claros: research data from RDFox's test sets, licence unstated (ask Oxford); Reactome CC-BY 4.0; UniProt CC-BY 4.0 | Claros: about 19 M facts in (reported); LE's closure is many times that: size it on Draco first | 2 | Claros-L minutes; LE hours | NRESE, Nemo, VLog, RDFox, GraphDB |
 | SSPE | ours to generate, from the paper's description | small: millions of edges | 1 | seconds to minutes per batch | NRESE, RDFox, GraphDB |
 | TC, SG, CSPA | ours (generated graphs); SNAP graphs where needed (licences per graph) | 1-100 M edges, closures to billions: capped | 1 | seconds to minutes | NRESE, Nemo, Soufflé (UPL-1.0), VLog |
-| ChaseBench | no licence stated | to 1 GB | 3 | – | Nemo, VLog, RDFox |
+| ChaseBench | no licence stated; internal use only: ask the authors before publishing (owner, 5 Oct 2026) | to 1 GB | 3 | – | Nemo, VLog, RDFox |
 
 ### 3.5 OWL 2 DL: consistency, classification, realisation
 
@@ -206,7 +206,7 @@ the suite's driver.
 
 | Benchmark | Licence | Data | Setup | Runtime | Systems |
 |---|---|---|---|---|---|
-| ERA-SHACL | none stated in the repository (ERA's data terms; to check) | 55 M statements: 8 GB N-Triples (est.), NRESE store 3 GB | 1.5 | minutes per engine for NRESE and RDF4J; pySHACL hours (reported scale) | NRESE, Jena, RDF4J, TopBraid SHACL, pySHACL |
+| ERA-SHACL | none stated in the repository (ERA's data terms); internal use only: ask the authors before publishing (owner, 5 Oct 2026) | 55 M statements: 8 GB N-Triples (est.), NRESE store 3 GB | 1.5 | minutes per engine for NRESE and RDF4J; pySHACL hours (reported scale) | NRESE, Jena, RDF4J, TopBraid SHACL, pySHACL |
 
 ### 3.8 GeoSPARQL
 
@@ -218,7 +218,7 @@ the suite's driver.
 
 | Benchmark | Licence | Data | Setup | Runtime | Systems |
 |---|---|---|---|---|---|
-| Geographica 2 | not stated (Mercurial repo at strabon.di.uoa.gr; ask the authors before publishing) | real set a few GB; synthetic scalable | 2 (Java runner) | minutes to an hour per system | NRESE, Jena (GeoSPARQL), RDF4J, QLever (subset), GraphDB, Stardog |
+| Geographica 2 | not stated (Mercurial repo at strabon.di.uoa.gr); internal use only: ask the authors before publishing (owner, 5 Oct 2026) | real set a few GB; synthetic scalable | 2 (Java runner) | minutes to an hour per system | NRESE, Jena (GeoSPARQL), RDF4J, QLever (subset), GraphDB, Stardog |
 | osm2rdf extracts | ODbL (redistribution with attribution, share-alike) | a country: 100 M-1 B statements | 1 | as WatDiv by size | NRESE, QLever, Virtuoso |
 
 ### 3.9 Full-text search
@@ -231,7 +231,7 @@ the suite's driver.
 
 | Benchmark | Licence | Data | Setup | Runtime | Systems |
 |---|---|---|---|---|---|
-| LUBMft | none stated (l3s.de; to check) | as LUBM | 1.5 | minutes | NRESE, Jena (text), Virtuoso, QLever, RDF4J, GraphDB |
+| LUBMft | none stated (l3s.de); internal use only: ask the authors before publishing (owner, 5 Oct 2026) | as LUBM | 1.5 | minutes | NRESE, Jena (text), Virtuoso, QLever, RDF4J, GraphDB |
 | BEIR | Apache-2.0 code; per set (SciFact CC-BY-NC, NFCorpus and FiQA see BEIR's table: internal results until checked) | 5 k-60 k documents: MBs | 1 | seconds per set | NRESE, Lucene/Pyserini BM25 as reference |
 
 ### 3.10 RDF 1.2 and RDF-star
@@ -349,7 +349,7 @@ per system; the clients on separate cores (`--cpuset-cpus` on Linux).
 | Benchmark | Measures | Check | Mark | Now |
 |---|---|---|---|---|
 | Memory-budget series (report item 20): LUBM 1000 load, reasoning and queries under 16, 12, 8, 6, 4, 2 GB caps | the slowdown curve, or where it stops | the same closure and answers as uncapped | core | bulk-load budget measured on DBpedia only (5.47 → 4.02 GB peak, +18 % time) |
-| WDBench under a cap | real queries on 1.2 B statements with less RAM than the data | counts | representative | – |
+| WDBench under a cap | real queries on 1.2 B statements with less RAM than the data | counts | representative; later, on Draco | – |
 | Wikidata truthy | 8 B statements on one node | counts | later (Draco) | – |
 
 Costs: LUBM 1000 is in the volume (24.7 GB); six points × (82 s to a few times that) per
@@ -416,33 +416,100 @@ through an adapter.
 | Representatives without a G8/G10/G11 dependency: WatDiv, WDBench, BSBM, real ontologies, TC/SG/CSPA, OWL2Bench EL/DL, PAGOdA, NPD, LUBM∃, ERA-SHACL, Geographica 2, LUBMft, BEIR, StarBench, FedShop, VIBE, big-ann filtered, ann-benchmarks | 30 days | 230 GB (WDBench 150, WatDiv 15, BSBM 25, rest small): above the 300 GB budget with the present 63 GB, so WDBench lives on Draco or replaces Wikidata lexemes | 20-30 h |
 | Representatives waiting on capabilities: SNB, openCypher TCK, Graphalytics (G8); GTFS/KGCW (G10); GraphRAG-Bench, chat-with-data, QALD-10, Text2KGBench (G11) | 20 days | 20 GB | plus LLM costs |
 
-## 6. The fast regression suite (phase 2, proposed)
+## 6. The fast suite (built; benches/fast)
 
 The benchmarks above take hours and run in bulk. The fast suite is the opposite: many small
-cases, each 10-300 s, all of them in under an hour on the main PC, run like unit tests
-for performance. Each case is one bottleneck, on generated data with a fixed seed,
-checked (counts or a hash) before its time counts, with time and peak memory recorded,
-also under a memory cap, and where a plan or engine path should handle the case, that path
-asserted (EXPLAIN operators, counters). It extends the perf lab
-(`crates/nrese-store/examples/perf_lab.rs`) rather than adding a framework; results go to
-`baselines/` as JSON, compared beyond the confidence interval.
+cases, each 10-300 s, all of them in under an hour on the main PC, run like unit tests for
+performance ([fast/README.md](fast/README.md)). Each case is one bottleneck, on generated
+data with a fixed seed or a pinned file, checked before its time counts, with time and
+peak memory under a memory cap and, where a plan or engine path should handle it, that
+path asserted. Results go to `baselines/fast/` and are compared beyond a confidence
+interval.
 
-Proposed cases, by the category each one stands for (the owner may change the list at the
-gate):
+**Who runs a case** (owner, 5 October 2026):
+- **NRESE runs every case:** every reasoning profile (rdfs, rdfs-full, rdfs-plus,
+  owl-horst, owl2-ql, owl2-rl, N3 rules, compact equality, EL, DL), every feature,
+  operator and route. Each case keeps its own NRESE baseline.
+- **Competitors run only what they support, under the same semantics,** and their times
+  count only when their answers equal NRESE's. The stores without reasoning (QLever,
+  Oxigraph, Virtuoso) run the plain cases, and the reasoning cases' queries on NRESE's
+  exported closure (`closure`): the query side on equal terms, and what reasoning buys.
+- **Each case declares its comparators** (`system: semantics`) in `fast/cases.toml`; the
+  table below is generated from it (`fast.py table --write`), and `fast.py compete` picks
+  the comparators from it. A case only NRESE can run has no comparator: its own column.
+- **Home turf:** a win counts only where NRESE beats each competitor on what that
+  competitor does best. Each open competitor has at least one case on its own turf,
+  chosen from what the literature wiki documents (QLever: large read-only data, large
+  results and text; Konclude: DL classification; ELK: EL classification; Openllet: DL
+  consistency; Nemo: Datalog; HermiT: hypertableau classification) or, where the wiki is
+  thin (Jena, Virtuoso, Oxigraph, RDF4J, GLog/VLog), from the owner's examples: Jena's bulk
+  load and rules, Virtuoso's many small concurrent requests, Oxigraph's small embedded store
+  opened for a first query, RDF4J's small transactions, GLog/VLog's single-threaded
+  materialisation (no runner yet: Nemo stands in).
 
-| Area | Cases |
-|---|---|
-| Query shapes | star (5-way), chain (6 hops), triangle and 4-cycle (`wcoj`), snowflake, `p+` closure (components), LIMIT pushdown, `VALUES`-seeded star (sideways) |
-| Operators | `COUNT … GROUP BY` (`group count`), distinct by a group walk, OPTIONAL-heavy, MINUS / NOT EXISTS (sets), string filters (`dictionary string test`), date ranges (inline literals), a large result serialised |
-| Load and writes | bulk load of 20 M statements; the same under a 1 GiB bulk-load budget (spill); 10 k one-statement commits under 8 readers; deletions: an SSPE-like path, a clique |
-| Rule reasoning | deep class hierarchy, symmetric-transitive clique, sameAs-heavy (representatives), long transitive chain, LUBM 10 closure, a TC/SG Datalog program |
-| DL | definitions over transitive roles, large number restrictions, nominals, datatypes (256 pairwise-unequal values), random EL classification |
-| Other services | SHACL on LUBM 10 (Core and SPARQL), GeoSPARQL within and distance joins, full-text over 1 M literals, filtered k-NN, RDF 1.2 annotations on triple terms |
-| Memory | LUBM 100 reasoning and the query set under a 2 GiB cap |
+Frontier cases expect a known limit (`outcome`): they show the gap until it closes, and a
+fix shows as a changed status.
 
-Where a case is plain SPARQL over the generated data, Oxigraph, QLever and Jena run it too,
-so each case shows who wins. Each guarded win of [performance.md](../docs/design/performance.md)
-§0 gets a case that measures its effect.
+<!-- fast-cases:start (fast.py table --write) -->
+| Case | Area | NRESE runs | Comparators (system: semantics) | Home turf of | Measures |
+|---|---|---|---|---|---|
+| `rl-hierarchy` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl, qlever: closure, oxigraph: closure |  | a 5,461-class tree and a 1,500-class spine over 1 M typed instances (9.7 M inherited types): 67 s in the rule joins on 6 Oct 2026, against 5 s for LUBM 100's 8.7 M |
+| `rdfs-hierarchy` | reasoning | rdfs | jena: rdfs, rdf4j: rdfs, graphdb: rdfs, rdfox: rdfs |  | the same hierarchy under RDFS |
+| `rl-clique` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl |  | a symmetric and transitive property closing 40 random trees of 300 to cliques (3.6 M pairs) |
+| `rl-sameas` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl |  | owl:sameAs chains: 20,000 groups of 10, a value each, spread to the group (equality by representatives, expanded in the stack) |
+| `rl-sameas-compact` | reasoning | owl2-rl | none: NRESE's own column |  | the same sameAs groups with the stack kept over representatives (equality = compact) |
+| `rl-chain` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl |  | two chains of 2,500 nodes along a transitive property (6.2 M pairs) |
+| `rl-lubm100` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl, qlever: closure, oxigraph: closure, virtuoso: closure |  | LUBM 100 (13.4 M asserted, 8.7 M inferred) and its 14 queries: the headline materialisation |
+| `rl-owl2bench` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl |  | OWL2Bench RL-1: a 1.3 M-pair symmetric-transitive clique from a real TBox, 22 queries |
+| `rl-single-thread` | reasoning | owl2-rl | nemo: owl2-rl | GLog/VLog (no runner: Nemo stands in) | LUBM 10 on one thread: materialisation without parallelism |
+| `rdfs-full-lubm10` | reasoning | rdfs-full | none: NRESE's own column |  | LUBM 10 under every RDFS rule and the axiomatic triples |
+| `rdfs-plus-lubm10` | reasoning | rdfs-plus | graphdb: rdfs-plus |  | LUBM 10 under RDFS-Plus |
+| `horst-lubm10` | reasoning | owl-horst | jena: owl-horst, graphdb: owl-horst, anzograph: owl-horst | Jena | LUBM 10 under OWL-Horst (pD*) |
+| `ql-lubm10` | reasoning | owl2-ql | graphdb: owl2-ql, stardog: owl2-ql |  | LUBM 10 under OWL 2 QL, materialised |
+| `custom-tc` | reasoning | custom | nemo: custom, jena: custom | Nemo | transitive closure of a random graph (2,000 nodes, 3,000 edges) as Notation3 user rules |
+| `commits-readers` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 4,000 one-person commits added then removed under OWL 2 RL, with 8 readers running queries |
+| `commits-rdfs` | maintenance | rdfs | graphdb: rdfs, rdfox: rdfs |  | the same commits under RDFS, without readers |
+| `commits-plain` | maintenance | none | rdf4j: plain, oxigraph: plain, jena: plain | RDF4J | 20,000 commits without reasoning: the store's own write path, 4 readers alongside |
+| `deletes-layered` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 10 deletions in a layered graph whose facts have many derivations (after SSPE): about 6 s each |
+| `deletes-clique` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 4 edge deletions splitting a 300-node symmetric-transitive clique (the worst case for proofs) |
+| `dl-transitive` | dl | dl | hermit: dl, openllet: dl, konclude: dl | Openllet | 18 definitions C ≡ ∃hasPart.D over a transitive hasPart in a cycle (ore_ont_10212's shape): time grows exponentially with their number |
+| `dl-transitive-400` | dl | dl | konclude: dl, openllet: dl, hermit: dl | Konclude | the same shape with 400 definitions: Konclude decides it in 0.6 s; NRESE gives up (the frontier) |
+| `dl-number` | dl | dl | hermit: dl, openllet: dl, konclude: dl |  | qualified number restrictions met exactly: ≥ 40 R.(B1 ⊔ B2) with ≤ 20 of each, on 200 individuals |
+| `dl-nominals` | dl | dl | hermit: dl, openllet: dl, konclude: dl |  | nominals: a ring of 10,000 nodes coloured from {colour0, colour1, colour2}, neighbours different |
+| `dl-datatypes` | dl | dl | hermit: dl, openllet: dl, konclude: dl |  | at least 256 values of xsd:byte (consistent) and 257 (inconsistent): the datatype theory's clique check |
+| `dl-roles` | dl | dl | hermit: dl, openllet: dl, konclude: dl |  | 5,000 universals over the automaton of a transitive role with 200 subroles (ore_ont_1066's shape): about 6 clauses each |
+| `el-classify` | dl | el | elk: el, konclude: dl, hermit: dl | ELK | OWL 2 EL classification of 20,000 random classes with existentials, definitions, a role hierarchy, a transitive role and a chain |
+| `horn-classify` | dl | dl | hermit: dl, konclude: dl, openllet: dl | Konclude | classification of 1,500 Horn classes beyond EL (inverse roles, universals) by the context core |
+| `canon-twins` | dl | canonical | none: NRESE's own column |  | blank-node canonicalisation: 3,000 equal children and 200 rings of 12, under two labellings (time grows with the square of the twins: 2,000 0.6 s, 8,000 12.7 s on 6 Oct 2026) |
+| `mem-load-2g` | memory | none | none: NRESE's own column |  | a 10 M-statement bulk load in a 2 GiB container, spilling past a 256 MiB budget |
+| `mem-load-20m-2g` | memory | none | none: NRESE's own column |  | a 20 M-statement load in 2 GiB with a 512 MiB budget: the dictionary isn't under the budget (the frontier) |
+| `mem-reason-2g` | memory | owl2-rl | none: NRESE's own column |  | LUBM 10 materialised (OWL 2 RL) and queried in a 2 GiB container |
+| `mem-reason-lubm100-2g` | memory | owl2-rl | none: NRESE's own column |  | LUBM 100 materialised in a 2 GiB container: the frontier until reasoning spills |
+| `load-entities` | load | none | jena: plain, qlever: plain, oxigraph: plain, virtuoso: plain | Jena | bulk load of 20 M statements (the harness's entity shape) into memory |
+| `open-first-query` | load | none | oxigraph: plain | Oxigraph | a 1 M-statement store on disk: open it in a fresh process and answer four point lookups (open plus first executions) |
+| `q-star` | query | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | 5-way stars: a selective one and a count over all people |
+| `q-chain` | query | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | 4-hop chains from one person, and a chain through posts and likes |
+| `q-cycles` | query | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | counts of directed triangles and 4-cycles in the follows graph |
+| `q-snowflake` | query | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | a snowflake: posts with author, tag and likes, each joined further and filtered |
+| `q-paths` | query | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | property paths: a tag's ancestors, the people one reaches, the closure's size, a tag's descendants |
+| `q-sideways` | query | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | LIMIT pushed into a join, a VALUES-seeded star, EXISTS as a set |
+| `q-large-result` | query | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain | QLever | large results serialised: 2.4 M follows edges, 600 k dated posts |
+| `q-topk` | query | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | ORDER BY with LIMIT over 600 k scores and 300 k dates |
+| `op-group` | operator | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | COUNT … GROUP BY on one pattern, NOT EXISTS by a group walk, COUNT DISTINCT |
+| `op-aggregates` | operator | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | AVG, MAX, SUM and HAVING over a join; a grouped count ordered and cut |
+| `op-optional` | operator | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | OPTIONAL-heavy: two optionals over 600 k posts, nested optionals |
+| `op-negation` | operator | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | MINUS and NOT EXISTS over all people |
+| `op-strings` | operator | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | CONTAINS, STRSTARTS and LANG over 300 k names |
+| `op-dates` | operator | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | YEAR ranges, integer and dateTime comparisons as index ranges on inline literals |
+| `clients-lookups` | query | none | virtuoso: plain, qlever: plain, oxigraph: plain, jena: plain | Virtuoso | 32 concurrent clients doing point lookups for 20 s: throughput and p99 |
+| `shacl-lubm` | service | none | jena: shacl, rdf4j: shacl |  | SHACL Core and SHACL-SPARQL over LUBM 10's asserted data |
+| `geo-within` | service | none | jena: geosparql, qlever: geosparql, virtuoso: geosparql |  | GeoSPARQL sfWithin over 1 M points in four squares |
+| `text-search` | service | none | qlever: text, jena: text, virtuoso: text | QLever | full-text search over 1 M short documents: four words and a prefix |
+| `vector-knn-exact` | service | none | none: NRESE's own column |  | exact k-NN (k = 10, cosine) over 200 k 64-dimensional embeddings, filtered to one kind in ten |
+| `vector-knn-filtered` | service | none | none: NRESE's own column |  | approximate k-NN (k = 10) with the same one-in-ten filter: the index's recall under a filter |
+| `rdf12-annotations` | service | none | oxigraph: plain, jena: plain |  | RDF 1.2: 1 M reifiers of triple terms with a source and a confidence; a triple term with a constant subject |
+| `rdf12-join-2g` | service | none | oxigraph: plain, jena: plain |  | asserted statements joined to the reifiers of their own triple terms, in 2 GiB (the frontier) |
+<!-- fast-cases:end -->
 
 ## 7. Sources
 

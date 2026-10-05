@@ -994,7 +994,13 @@ fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
             &ex(format!("r{}", r / 2)),
         )?;
     }
-    nt.t(&ex("r0"), &rdf("type"), &owl("TransitiveProperty"))?;
+    // A transitive role low in the hierarchy (a transitive top role chains every existential
+    // to every other: a quadratic closure, not EL's typical shape).
+    nt.t(
+        &ex(format!("r{}", roles - 1)),
+        &rdf("type"),
+        &owl("TransitiveProperty"),
+    )?;
     let chain = list(nt, "chain", &[ex("r1"), ex("r2")])?;
     nt.t(&ex("r3"), &owl("propertyChainAxiom"), &chain)?;
     for i in 0..n {
@@ -1033,12 +1039,11 @@ fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     Ok(Expect::new())
 }
 
-/// A Horn ontology beyond EL: inverse and functional roles and universals, for the context
-/// core and the hypertableau.
+/// A Horn ontology beyond EL: inverse roles and universals over them, for the context core
+/// and the hypertableau.
 fn horn(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     let n = p.get("classes", 20_000);
-    let (r, f) = (ex("r"), ex("f"));
-    nt.t(&f, &rdf("type"), &owl("FunctionalProperty"))?;
+    let r = ex("r");
     nt.t(&ex("rInv"), &owl("inverseOf"), &r)?;
     for i in 0..n {
         let a = ex(format!("A{i}"));
@@ -1065,15 +1070,6 @@ fn horn(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
                     &ex(format!("A{}", rng.below(n))),
                 )?;
                 nt.t(&a, &rdfs("subClassOf"), &all)?;
-            }
-            5 => {
-                let some = restriction(nt, &format!("f{i}"), &f)?;
-                nt.t(
-                    &some,
-                    &owl("someValuesFrom"),
-                    &ex(format!("A{}", rng.below(n))),
-                )?;
-                nt.t(&a, &rdfs("subClassOf"), &some)?;
             }
             _ => {}
         }

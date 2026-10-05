@@ -200,6 +200,9 @@ def fast(root: Path, tier: str, settings: dict) -> Plan:
         plan.queries = root / "benches/reasoning/queries" / queries
     elif queries and not queries.startswith("@"):
         plan.queries = root / "benches/fast/queries" / queries
+    if settings.get("FAST_QUERIES"):
+        # Several cases on the same data in one run: their queries merged (compete.py).
+        plan.queries = Path(settings["FAST_QUERIES"])
     args = case.get("args", [])
     if "--clients" in args:
         plan.clients = int(args[args.index("--clients") + 1])
