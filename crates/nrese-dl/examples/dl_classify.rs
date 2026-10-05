@@ -8,6 +8,7 @@
 //!   --threads N           workers (default 1)
 //!   --timeout SECS        a deadline for the whole run
 //!   --test-timeout SECS   a budget per hypertableau test
+//!   --lower-bound-timeout SECS  the Horn lower bound's budget
 //!   --repeat N            run N times; times are the median of the runs
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
 //!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
@@ -159,6 +160,10 @@ fn args() -> Result<Args, String> {
             "--threads" => a.options.threads = number("--threads")?.max(1) as usize,
             "--repeat" => a.repeat = number("--repeat")?.max(1) as usize,
             "--timeout" => a.options.timeout = Some(Duration::from_secs(number("--timeout")?)),
+            "--lower-bound-timeout" => {
+                a.options.lower_bound_timeout =
+                    Duration::from_secs(number("--lower-bound-timeout")?);
+            }
             "--test-timeout" => {
                 a.options.tableau.timeout = Some(Duration::from_secs(number("--test-timeout")?));
             }

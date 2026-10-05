@@ -221,6 +221,8 @@ struct Tally {
     with_subsumptions: u64,
     with_unsat: u64,
     candidate_tests: u64,
+    /// Classes the Horn part decided alone (in the tableau-path variant).
+    exact_classes: u64,
     realised: u64,
     with_types: u64,
 }
@@ -324,6 +326,9 @@ fn taxonomies_equal_brute_force() {
             if name == "default" {
                 tally.candidate_tests += t.profile.candidate_tests;
             }
+            if name == "no-context-core" {
+                tally.exact_classes += t.profile.exact_classes as u64;
+            }
             assert_eq!(
                 t.classification,
                 expected,
@@ -389,6 +394,10 @@ fn taxonomies_equal_brute_force() {
         tally.candidate_tests > 0,
         "no candidate was ever tested: {tally:?}"
     );
+    assert!(
+        tally.exact_classes > 0,
+        "no class was ever exact: {tally:?}"
+    );
 }
 
 #[test]
@@ -415,7 +424,16 @@ fn types_equal_brute_force() {
         }
         match consistent(&o) {
             Some(true) => {}
-            Some(false) => continue,
+            Some(false) => {
+                // Every individual has every type; the canonical form is empty.
+                let r = classify::realise(&o, &options());
+                if r.incomplete.is_empty() {
+                    assert!(!r.taxonomy.classification.consistent, "case {case}");
+                    assert!(r.types.iter().all(|t| *t == classes), "case {case}");
+                    assert_eq!(r.canonical(&|t| format!("t{t}")), "");
+                }
+                continue;
+            }
             None => {
                 tally.brute_undecided += 1;
                 continue;

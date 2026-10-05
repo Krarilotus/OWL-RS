@@ -9,13 +9,17 @@
 //! clauses with more than one head atom go too, and where it still refuses a clause (its
 //! shapes), that axiom's clauses are dropped and it tries again, a few times.
 //!
-//! **Exact:** where nothing was dropped but data clauses, and no clause requires a data
-//! value (so data properties may be empty and data clauses hold trivially, as the Horn
-//! stage argues), the part has the ontology's subsumptions: then the lower bound *is* the
-//! terminology's taxonomy, and only consistency is left to decide.
+//! **Exact, per class** (saturation coupling, Konclude's idea in the context core's
+//! terms): where the saturation of a class never reaches a context in which a clause
+//! left out of the part could fire, the model the calculus builds for the class is a
+//! model of every clause, and the part's subsumers of the class are all of them: the
+//! class needs no hypertableau test ([`exact_for`]). Where that holds for every class
+//! and `owl:Thing`, the part's taxonomy is the terminology's, and only consistency is
+//! left to decide.
 
 use nrese_owl::{
-    Clause, HeadAtom, Normalised, Term, UNSUPPORTED_DATATYPE_DEFINITIONS, UNSUPPORTED_KEYS,
+    BodyAtom, Clause, HeadAtom, Normalised, Term, UNSUPPORTED_DATATYPE_DEFINITIONS,
+    UNSUPPORTED_KEYS,
 };
 
 /// What the Horn part proves, by class index.
@@ -28,6 +32,11 @@ pub struct Lower {
     pub top: Vec<u32>,
     /// The part had every subsumption of the ontology's terminology.
     pub exact: bool,
+    /// Per class: its known subsumers are all its subsumers (and it is satisfiable unless
+    /// `unsat` says otherwise), as the part's saturation of it reaches nothing left out.
+    pub exact_for: Vec<bool>,
+    /// The same for `owl:Thing`: `top` is complete.
+    pub top_exact: bool,
     /// The part has no model: neither has the ontology.
     pub inconsistent: bool,
 }
@@ -40,21 +49,6 @@ fn admissible(c: &Clause) -> bool {
     !c.flags.equality && !c.flags.nominal && !c.flags.datatype
 }
 
-/// Whether leaving out `normalised`'s data clauses keeps its subsumptions: no clause
-/// requires a data value, nothing else was left out of the clauses.
-fn data_droppable(normalised: &Normalised) -> bool {
-    let requires_data = normalised.clauses.iter().any(|c| {
-        c.head
-            .iter()
-            .any(|h| matches!(h, HeadAtom::DataAtLeast { .. }))
-    });
-    let unsupported = normalised
-        .unsupported
-        .iter()
-        .any(|(_, r)| *r != UNSUPPORTED_DATATYPE_DEFINITIONS && *r != UNSUPPORTED_KEYS);
-    !requires_data && !unsupported
-}
-
 /// The Horn part's consequences over `classes` (sorted), or `None` if the context core
 /// takes none of it.
 pub fn horn_lower_bound(
@@ -63,26 +57,9 @@ pub fn horn_lower_bound(
     threads: usize,
     budget: crate::context::Budget,
 ) -> Option<Lower> {
-    let kept: Vec<Clause> = normalised
-        .clauses
-        .iter()
-        .filter(|c| admissible(c))
-        .cloned()
-        .collect();
-    let dropped = kept.len()
-        < normalised
-            .clauses
-            .iter()
-            .filter(|c| !c.flags.datatype)
-            .count();
-    let exact = !dropped && data_droppable(normalised);
-    let part = |clauses: Vec<Clause>| Normalised {
-        clauses,
-        fresh: normalised.fresh.clone(),
-        classes: normalised.classes.clone(),
-        ranges: normalised.ranges.clone(),
-        ..Normalised::default()
-    };
+    let all = &normalised.clauses;
+    // The clauses of the part, by index into the normalisation's.
+    let kept: Vec<usize> = (0..all.len()).filter(|&i| admissible(&all[i])).collect();
     // First everything admissible (the context core renames what it can into Horn
     // clauses), with half the time; then the Horn clauses alone.
     let half = budget.deadline.map(|d| {
@@ -93,45 +70,57 @@ pub fn horn_lower_bound(
         deadline: half,
         ..budget
     };
-    let horn: Vec<Clause> = kept.iter().filter(|c| c.flags.horn).cloned().collect();
+    let horn: Vec<usize> = kept
+        .iter()
+        .copied()
+        .filter(|&i| all[i].flags.horn)
+        .collect();
     let all_horn = horn.len() == kept.len();
-    if let Some(l) = saturate(part(kept), classes, threads, first, exact) {
+    if let Some(l) = saturate(normalised, kept, classes, threads, first) {
         return Some(l);
     }
     if all_horn {
         return None;
     }
-    saturate(part(horn), classes, threads, budget, false)
+    saturate(normalised, horn, classes, threads, budget)
 }
 
-/// The context core on `part`, dropping clauses it refuses a few times.
+/// The context core on the clauses `part` (indexes) of `n`, dropping clauses it refuses a
+/// few times; with which classes the part is exact for.
 fn saturate(
-    mut part: Normalised,
+    n: &Normalised,
+    mut part: Vec<usize>,
     classes: &[Term],
     threads: usize,
     budget: crate::context::Budget,
-    mut exact: bool,
 ) -> Option<Lower> {
-    if part.clauses.is_empty() && !exact {
-        return None;
-    }
     let options = crate::context::Options {
         threads,
         proofs: false,
         budget,
         ..crate::context::Options::default()
     };
+    let build = |part: &[usize]| Normalised {
+        clauses: part.iter().map(|&i| n.clauses[i].clone()).collect(),
+        fresh: n.fresh.clone(),
+        classes: n.classes.clone(),
+        ranges: n.ranges.clone(),
+        ..Normalised::default()
+    };
     for _ in 0..RETRIES {
-        let why = match crate::context::saturate_normalised(&part, classes, &options) {
-            Ok(saturated) => return Some(lower(&saturated.classification(), classes, exact)),
+        let why = match crate::context::saturate_normalised(&build(&part), classes, &options) {
+            Ok(saturated) => {
+                let mut lower = lower(&saturated.classification(), classes);
+                exact_for(&mut lower, &saturated, n, &part, classes);
+                return Some(lower);
+            }
             Err(why) => why,
         };
-        exact = false;
         use crate::context::Unsupported as U;
         match why {
-            U::NotHorn { .. } if part.clauses.iter().any(|c| !c.flags.horn) => {
+            U::NotHorn { .. } if part.iter().any(|&i| !n.clauses[i].flags.horn) => {
                 // No renaming makes it Horn: the Horn clauses alone.
-                part.clauses.retain(|c| c.flags.horn);
+                part.retain(|&i| n.clauses[i].flags.horn);
             }
             U::NotHorn { axiom: Some(a) }
             | U::Equality { axiom: a }
@@ -139,10 +128,9 @@ fn saturate(
             | U::Datatypes { axiom: a }
             | U::ClauseShape { axiom: a }
             | U::Normalisation { axiom: a, .. } => {
-                let before = part.clauses.len();
-                part.clauses
-                    .retain(|c| !c.sources.iter().any(|set| set.contains(&a)));
-                if part.clauses.len() == before {
+                let before = part.len();
+                part.retain(|&i| !n.clauses[i].sources.iter().any(|set| set.contains(&a)));
+                if part.len() == before {
                     return None;
                 }
             }
@@ -153,13 +141,106 @@ fn saturate(
     None
 }
 
-fn lower(c: &crate::context::Classification, classes: &[Term], exact: bool) -> Lower {
+/// Which classes the part is exact for: those whose saturation reaches nothing a clause
+/// left out of the part needs in its body (`Saturated::untouched`). Per left-out clause:
+/// - concepts in its body: they are its triggers (a flipped one, standing for the
+///   complement, could hold anywhere: then none is exact);
+/// - else roles: those roles, and the roles below them by the part's role inclusions;
+/// - else data atoms or nominals alone: no trigger. Data values exist only where a clause
+///   with a data at-least head fires, and that clause is left out too (its body concepts
+///   are triggers); individuals are in no class's model while the part has no nominal
+///   (the ontology's consistency is decided apart, and a model of the individuals joins
+///   the class's as a disjoint union);
+/// - an empty body: it fires everywhere, none is exact.
+fn exact_for(
+    lower: &mut Lower,
+    saturated: &crate::context::Saturated,
+    n: &Normalised,
+    part: &[usize],
+    classes: &[Term],
+) {
+    // Axioms the clauses don't cover: no part of them is exact.
+    if n.unsupported
+        .iter()
+        .any(|(_, r)| *r != UNSUPPORTED_DATATYPE_DEFINITIONS && *r != UNSUPPORTED_KEYS)
+    {
+        return;
+    }
+    let mut inside = vec![false; n.clauses.len()];
+    for &i in part {
+        inside[i] = true;
+    }
+    let mut triggers = Vec::new();
+    let mut roles: Vec<Term> = Vec::new();
+    for (i, c) in n.clauses.iter().enumerate() {
+        if inside[i] {
+            continue;
+        }
+        if c.body.is_empty() {
+            return;
+        }
+        let mut concepts = false;
+        for b in &c.body {
+            if let BodyAtom::Concept(concept, _) = b {
+                concepts = true;
+                match saturated.concept_of(*concept) {
+                    // Not in the part: no context has it.
+                    None => {}
+                    Some((_, true)) => return,
+                    Some((id, false)) => triggers.push(id),
+                }
+            }
+        }
+        if !concepts {
+            roles.extend(c.body.iter().filter_map(|b| match b {
+                BodyAtom::Role(r, _, _) => Some(*r),
+                _ => None,
+            }));
+        }
+    }
+    // The roles below a trigger role (an edge of a subrole is one of the role).
+    let mut below: std::collections::HashMap<Term, Vec<Term>> = std::collections::HashMap::new();
+    for &i in part {
+        let c = &n.clauses[i];
+        if let ([BodyAtom::Role(s, _, _)], [HeadAtom::Role(r, _, _)]) = (&c.body[..], &c.head[..]) {
+            below.entry(*r).or_default().push(*s);
+        }
+    }
+    let mut seen: std::collections::HashSet<Term> = roles.iter().copied().collect();
+    let mut stack = roles.clone();
+    while let Some(r) = stack.pop() {
+        for &s in below.get(&r).map_or(&[][..], |v| v) {
+            if seen.insert(s) {
+                stack.push(s);
+            }
+        }
+    }
+    let role_ids: Vec<crate::context::atoms::RoleId> =
+        seen.iter().filter_map(|&r| saturated.role_of(r)).collect();
+    if triggers.is_empty() && role_ids.is_empty() && part.len() == n.clauses.len() {
+        lower.exact = true;
+    }
+    let untouched = saturated.untouched(&triggers, &role_ids);
+    let names = &saturated.program().names;
+    lower.exact_for = classes
+        .iter()
+        .map(|t| names.binary_search(t).is_ok_and(|i| untouched[i]))
+        .collect();
+    lower.top_exact = untouched.last().copied().unwrap_or(false);
+    if lower.exact_for.iter().all(|&e| e) && lower.top_exact {
+        lower.exact = true;
+    }
+}
+
+fn lower(c: &crate::context::Classification, classes: &[Term]) -> Lower {
     let n = classes.len();
     let mut lower = Lower {
         known: vec![Vec::new(); n],
         unsat: vec![false; n],
         top: Vec::new(),
-        exact,
+        exact: false,
+        exact_for: vec![false; n],
+        top_exact: false,
         inconsistent: !c.consistent,
     };
     let index = |t: &Term| classes.binary_search(t).ok();

@@ -231,6 +231,65 @@ impl Saturated {
         out
     }
 
+    /// The concept of `c` in the program, and whether it stands for `c`'s complement (a
+    /// fresh name the renaming flipped); `None` for a name the clauses don't have.
+    pub fn concept_of(&self, c: nrese_owl::Concept) -> Option<(ConceptId, bool)> {
+        let p = &self.engine.program;
+        match c {
+            nrese_owl::Concept::Named(t) => self.concept(t).map(|id| (id, false)),
+            nrese_owl::Concept::Fresh(q) => {
+                let flipped = *p.flipped.get(q as usize)?;
+                Some((p.order.named + q, flipped))
+            }
+        }
+    }
+
+    /// The role of a property, if the program has it.
+    pub fn role_of(&self, property: Term) -> Option<super::atoms::RoleId> {
+        self.engine.program.role_ids.get(&property).copied()
+    }
+
+    /// Saturation coupling (docs/design/owl2-dl.md §7): per named concept of the program
+    /// ([`Program::names`]), and for `owl:Thing` last, whether no context its query
+    /// context reaches (through successor links) has a clause with a head `B(x)` for a
+    /// `B` in `triggers`, or a head over a role in `roles`. The model the calculus builds for the concept then has no
+    /// element in a trigger, so clauses left out of the program whose bodies need one
+    /// hold in it: what was derived for the concept is all that holds.
+    pub fn untouched(&self, triggers: &[ConceptId], roles: &[super::atoms::RoleId]) -> Vec<bool> {
+        let triggers: std::collections::HashSet<ConceptId> = triggers.iter().copied().collect();
+        let n = self.engine.count();
+        let mut tainted = vec![false; n];
+        let mut stack = Vec::new();
+        for (id, state) in self.engine.states() {
+            let c = &state.clauses;
+            let role = roles
+                .iter()
+                .any(|r| c.out_terms.contains_key(r) || c.in_terms.contains_key(r));
+            if role || c.concepts.iter().any(|c| triggers.contains(c)) {
+                tainted[id as usize] = true;
+                stack.push(id);
+            }
+        }
+        while let Some(k) = stack.pop() {
+            let preds: Vec<ContextId> = lock(&self.engine.context(k).state)
+                .preds
+                .iter()
+                .map(|&(p, _)| p)
+                .collect();
+            for p in preds {
+                if !tainted[p as usize] {
+                    tainted[p as usize] = true;
+                    stack.push(p);
+                }
+            }
+        }
+        self.query
+            .iter()
+            .chain(std::iter::once(&self.top))
+            .map(|&c| !tainted[c as usize])
+            .collect()
+    }
+
     fn concept(&self, class: Term) -> Option<ConceptId> {
         self.engine
             .program
