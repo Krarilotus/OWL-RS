@@ -27,7 +27,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::clauses::{BodyAtom, Clause, Concept, Filler, FreshOf, HeadAtom, Normalised, Var};
+use crate::clauses::{
+    BodyAtom, Clause, Concept, Filler, FreshOf, HeadAtom, Normalised, SafeRule, Var,
+};
 use crate::mapping::Ontology;
 use crate::model::{
     Axiom, Characteristic, ClassExpr, DataRange, ExprId, Interner, ObjProp, RangeId, Term,
@@ -102,6 +104,14 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
     n.drain();
     n.finish()
 }
+
+/// Why a datatype definition is in [`Normalised::unsupported`]: the clauses don't cover
+/// it; a datatype theory reads it from [`Normalised::definitions`].
+pub const UNSUPPORTED_DATATYPE_DEFINITIONS: &str = "datatype definitions (the datatype theory)";
+
+/// Why a key is in [`Normalised::unsupported`]: the clauses don't cover it; an engine with
+/// DL-safe rules reads it from [`Normalised::rules`].
+pub const UNSUPPORTED_KEYS: &str = "keys (a DL-safe rule over named individuals)";
 
 /// The most GCIs one GCI is distributed into over its conjunctions.
 const MAX_DISTRIBUTED: usize = 16;
@@ -577,15 +587,15 @@ impl<'a> Normaliser<'a> {
                     index,
                 );
             }
-            Axiom::DatatypeDefinition(..) => {
+            Axiom::DatatypeDefinition(t, r) => {
                 self.out
                     .unsupported
-                    .push((index, "datatype definitions (the datatype theory)"));
+                    .push((index, UNSUPPORTED_DATATYPE_DEFINITIONS));
+                self.out.definitions.push((*t, *r));
             }
-            Axiom::HasKey(..) => {
-                self.out
-                    .unsupported
-                    .push((index, "keys (a DL-safe rule over named individuals)"));
+            Axiom::HasKey(c, objects, data) => {
+                self.out.unsupported.push((index, UNSUPPORTED_KEYS));
+                self.key(index, *c, objects, data);
             }
             Axiom::ClassAssertion(c, a) => {
                 let c = self.nnf(*c);
@@ -619,6 +629,37 @@ impl<'a> Normaliser<'a> {
                 }
             }
         }
+    }
+
+    /// A key as a DL-safe rule (`SafeRule`).
+    fn key(&mut self, index: usize, class: ExprId, objects: &[ObjProp], data: &[Term]) {
+        let (x, y) = (Var::X, Var::Y(0));
+        let mut body = Vec::new();
+        let c = self.nnf(class);
+        let concept = match self.get(c) {
+            ClassExpr::Thing => None,
+            ClassExpr::Class(a) => Some(Concept::Named(a)),
+            _ => Some(Concept::Fresh(self.fresh_negative(c, index))),
+        };
+        if let Some(concept) = concept {
+            body.push(BodyAtom::Concept(concept, x));
+            body.push(BodyAtom::Concept(concept, y));
+        }
+        for (i, &p) in objects.iter().enumerate() {
+            let z = Var::Y(i as u16 + 1);
+            body.push(Self::edge(p, x, z));
+            body.push(Self::edge(p, y, z));
+        }
+        for (j, &d) in data.iter().enumerate() {
+            let v = Var::V(j as u16);
+            body.push(BodyAtom::Data(d, x, v));
+            body.push(BodyAtom::Data(d, y, v));
+        }
+        self.out.rules.push(SafeRule {
+            body,
+            head: vec![HeadAtom::Equal(x, y)],
+            source: index,
+        });
     }
 
     // Fresh names ----------------------------------------------------------------------

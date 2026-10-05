@@ -95,6 +95,27 @@ impl Terms for Table {
             .get(&RdfTerm::NamedNode(NamedNode::new_unchecked(iri)))
             .copied()
     }
+
+    fn datatype(&self, term: Term) -> Option<String> {
+        match &self.terms[term as usize] {
+            RdfTerm::Literal(l) => Some(l.datatype().as_str().to_owned()),
+            _ => None,
+        }
+    }
+
+    fn language(&self, term: Term) -> Option<String> {
+        match &self.terms[term as usize] {
+            RdfTerm::Literal(l) => l.language().map(str::to_owned),
+            _ => None,
+        }
+    }
+
+    fn iri_text(&self, term: Term) -> Option<String> {
+        match &self.terms[term as usize] {
+            RdfTerm::NamedNode(n) => Some(n.as_str().to_owned()),
+            _ => None,
+        }
+    }
 }
 
 impl Make for Table {
@@ -238,6 +259,82 @@ fn every_construct_is_read() {
         1 + 4,
         "the axiom and the restriction's four"
     );
+}
+
+/// What a datatype theory and key rules need reaches the model and the normalisation:
+/// literals with their datatype and language tag, datatype and facet IRIs, anonymous
+/// individuals, keys as DL-safe rules, datatype definitions (both still reported as
+/// unsupported to engines that don't read them).
+#[test]
+fn literals_keys_and_definitions_reach_the_model() {
+    let mut table = Table::default();
+    let text = format!(
+        "{PREFIXES}
+ex:p a owl:DatatypeProperty . ex:q a owl:ObjectProperty . ex:C a owl:Class .
+ex:C owl:hasKey ( ex:q ex:p ) .
+ex:a ex:p \"1.50\"^^xsd:decimal , \"chat\"@fr .
+_:b ex:p \"x\" .
+ex:D a rdfs:Datatype ; owl:equivalentClass [ a rdfs:Datatype ; owl:onDatatype xsd:integer ;
+    owl:withRestrictions ( [ xsd:maxInclusive 5 ] ) ] .
+"
+    );
+    let statements = load(&mut table, &text);
+    let o = read(&statements, &table);
+    assert!(
+        o.diagnostics.iter().all(|d| !d.is_fatal()),
+        "{:?}",
+        o.diagnostics
+    );
+    let lexicals: Vec<(String, Option<String>, Option<String>)> = {
+        let mut v: Vec<_> = o
+            .data
+            .literals
+            .values()
+            .map(|l| (l.lexical.clone(), l.datatype.clone(), l.language.clone()))
+            .collect();
+        v.sort();
+        v
+    };
+    assert!(lexicals.contains(&("1.50".into(), Some(format!("{XSD}decimal")), None)));
+    assert!(
+        lexicals
+            .iter()
+            .any(|(l, _, lang)| l == "chat" && lang.as_deref() == Some("fr"))
+    );
+    assert!(
+        lexicals
+            .iter()
+            .any(|(l, d, _)| l == "5" && d.as_deref() == Some(&format!("{XSD}integer")[..]))
+    );
+    let iris: Vec<&String> = o.data.iris.values().collect();
+    assert!(iris.contains(&&format!("{XSD}integer")));
+    assert!(iris.contains(&&format!("{XSD}maxInclusive")));
+    assert_eq!(o.anonymous.len(), 1);
+    let n = nrese_owl::normalise(&o);
+    assert_eq!(n.rules.len(), 1);
+    let rule = &n.rules[0];
+    assert_eq!(
+        rule.head,
+        vec![nrese_owl::HeadAtom::Equal(
+            nrese_owl::Var::X,
+            nrese_owl::Var::Y(0)
+        )]
+    );
+    let q = table.iri(&format!("{EX}q")).unwrap();
+    let p = table.iri(&format!("{EX}p")).unwrap();
+    use nrese_owl::{BodyAtom, Var};
+    for atom in [
+        BodyAtom::Role(q, Var::X, Var::Y(1)),
+        BodyAtom::Role(q, Var::Y(0), Var::Y(1)),
+        BodyAtom::Data(p, Var::X, Var::V(0)),
+        BodyAtom::Data(p, Var::Y(0), Var::V(0)),
+    ] {
+        assert!(rule.body.contains(&atom), "{atom:?} in {:?}", rule.body);
+    }
+    assert_eq!(n.definitions.len(), 1);
+    let reasons: Vec<&str> = n.unsupported.iter().map(|(_, r)| *r).collect();
+    assert!(reasons.contains(&nrese_owl::UNSUPPORTED_KEYS));
+    assert!(reasons.contains(&nrese_owl::UNSUPPORTED_DATATYPE_DEFINITIONS));
 }
 
 #[test]
