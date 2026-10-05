@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""The fast suite: many small performance cases, each 10-300 s, all of them in under an
+hour, run like unit tests for performance (README.md here; cases.toml).
+
+    python benches/fast/fast.py list                     the cases, their semantics and comparators
+    python benches/fast/fast.py build                    perf lab and DL tools, Linux, in a capped container
+    python benches/fast/fast.py run [--cases A,B] [--areas X,Y] [--reps 2] [--label L]
+    python benches/fast/fast.py compare BASE.json NEW.json
+    python benches/fast/fast.py compete [--cases A,B] [--systems S,T]   NRESE beside its comparators
+    python benches/fast/fast.py clean                    removes the generated data and scratch
+
+`run` generates each case's data once (deterministic; kept in the volume nrese-fast-data),
+runs each case in its own container under the case's memory cap, checks the answers
+before a time counts, asserts the plan or engine path the case must take, and writes
+benches/baselines/fast/<date>-<label>.json. Repetitions are interleaved: every case once,
+then every case again. `compare` reports regressions and wins beyond a bootstrap 95 %
+confidence interval of the ratio of medians.
+
+The build runs scripts/cargo-guarded.sh inside the pinned Rust image, into this
+worktree's own target volume (nrese-target-<worktree>), with CARGO_BUILD_JOBS and
+NRESE_MEMORY_CAP_GB from the environment (defaults 4 and 8) and the container capped
+to match.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import random
+import re
+import statistics
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+sys.path.insert(0, str(ROOT / "benches" / "suite"))
+from suitekit import manifest  # noqa: E402
+from suitekit.workloads import fast_data_name  # noqa: E402
+
+DATA_VOLUME = "nrese-fast-data"
+BENCH_VOLUME = "nrese-bench-data"
+TARGET_VOLUME = os.environ.get("NRESE_TARGET_VOLUME", f"nrese-target-{ROOT.name}")
+CARGO_VOLUME = "nrese-cargo"
+SCRATCH = ROOT / "tmp" / "fast"
+BASELINES = ROOT / "benches" / "baselines" / "fast"
+CASE_TIMEOUT_S = 900
+ENV = {**os.environ, "MSYS_NO_PATHCONV": "1"}
+
+
+def rust_image() -> str:
+    channel = re.search(r'channel = "(.*)"', (ROOT / "rust-toolchain.toml").read_text()).group(1)
+    return os.environ.get("RUST_IMAGE", f"rust:{channel}-bookworm")
+
+
+def host_path(path: Path) -> str:
+    return path.as_posix()
+
+
+def load_cases() -> list[dict]:
+    cases = tomllib.loads((HERE / "cases.toml").read_text(encoding="utf-8"))["case"]
+    names = [c["name"] for c in cases]
+    assert len(names) == len(set(names)), "case names must be unique"
+    return cases
+
+
+def select(cases: list[dict], args) -> list[dict]:
+    if args.cases:
+        wanted = args.cases.split(",")
+        unknown = set(wanted) - {c["name"] for c in cases}
+        if unknown:
+            sys.exit(f"unknown cases: {', '.join(sorted(unknown))}")
+        cases = [c for c in cases if c["name"] in wanted]
+    if getattr(args, "areas", None):
+        cases = [c for c in cases if c["area"] in args.areas.split(",")]
+    return cases
+
+
+# --- docker ----------------------------------------------------------------------------------
+
+def docker(args: list[str], timeout: float | None = None, capture: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(["docker", *args], capture_output=capture, text=True, timeout=timeout, env=ENV,
+                          encoding="utf-8", errors="replace")
+
+
+def container(name: str, cap_gb: float, command: list[str], env: dict | None = None,
+              timeout: float = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
+    """Runs `command` in the Rust image under a memory cap without swap; (exit code,
+    stdout, stderr, wall seconds). Exit 137: killed at the cap."""
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    argv = ["run", "--rm", "--name", name, f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g",
+            "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{DATA_VOLUME}:/fast",
+            "-v", f"{BENCH_VOLUME}:/data:ro", "-v", f"{host_path(ROOT)}:/src:ro",
+            "-v", f"{host_path(SCRATCH)}:/out"]
+    for key, value in (env or {}).items():
+        argv += ["-e", f"{key}={value}"]
+    argv += [rust_image(), *command]
+    started = time.monotonic()
+    try:
+        done = docker(argv, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        docker(["rm", "-f", name])
+        return 124, "", f"timed out after {timeout} s", time.monotonic() - started
+    return done.returncode, done.stdout, done.stderr, time.monotonic() - started
+
+
+# --- build -----------------------------------------------------------------------------------
+
+BUILD = [
+    ["-p", "nrese-store", "--example", "perf_lab"],
+    ["-p", "nrese-dl", "--example", "tableau_consistency", "--example", "context_classify"],
+    ["-p", "nrese-reasoner", "--example", "classify"],
+    ["-p", "nrese-server"],
+]
+
+
+def build(args) -> int:
+    jobs = os.environ.get("CARGO_BUILD_JOBS", "4")
+    cap = os.environ.get("NRESE_MEMORY_CAP_GB", "8")
+    for volume in (TARGET_VOLUME, CARGO_VOLUME):
+        docker(["volume", "create", volume])
+    for packages in BUILD:
+        command = ["run", "--rm", "--name", f"fast-build-{ROOT.name}", f"--memory={cap}g", f"--memory-swap={cap}g",
+                   f"--cpus={jobs}", "-v", f"{host_path(ROOT)}:/src:ro", "-v", f"{TARGET_VOLUME}:/target",
+                   "-v", f"{CARGO_VOLUME}:/usr/local/cargo/registry", "-e", "CARGO_TARGET_DIR=/target",
+                   "-e", f"CARGO_BUILD_JOBS={jobs}", "-e", f"NRESE_MEMORY_CAP_GB={cap}", "-w", "/src", rust_image(),
+                   "bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet", *packages]
+        print("build:", " ".join(packages), flush=True)
+        done = docker(command, capture=False)
+        if done.returncode != 0:
+            return done.returncode
+    return 0
+
+
+# --- data ------------------------------------------------------------------------------------
+
+def data_file(spec: str) -> str:
+    """The container path of a data spec: `volume:FILE` from the dataset volume, or a
+    generated file in the fast suite's volume."""
+    return ("/data/" if spec.startswith("volume:") else "/fast/") + fast_data_name(spec)
+
+
+def ensure_data(spec: str) -> dict:
+    """Generates `spec` once; its `expect` (the generator's own answers)."""
+    if spec.startswith("volume:"):
+        return {}
+    path = data_file(spec)
+    found = docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "cat", f"{path}.expect.json"])
+    if found.returncode == 0 and found.stdout.strip():
+        return json.loads(found.stdout)["expect"]
+    kind, *params = spec.split()
+    print(f"  generating {path}", flush=True)
+    code, out, err, _ = container(f"fast-gen-{ROOT.name}", 8, [
+        "bash", "-c", f"/target/release/examples/perf_lab generate {kind} {path} {' '.join(params)} > {path}.expect.json"
+                      f" && cat {path}.expect.json"])
+    if code != 0:
+        raise RuntimeError(f"generating {spec} failed: {err[-500:]}")
+    return json.loads(out)["expect"]
+
+
+def vector_queries(expect: dict) -> Path:
+    """The vector case's queries, written from the generator's query vectors."""
+    directory = SCRATCH / "queries" / "vectors"
+    directory.mkdir(parents=True, exist_ok=True)
+    for q in range(5):
+        (directory / f"knn-{q}.rq").write_text(
+            "PREFIX e: <http://example.org/fast/>\nPREFIX nrv: <urn:nrese:vector:>\n"
+            f"SELECT ?item WHERE {{ ?item e:kind e:k3 ; e:embedding ?v .\n"
+            f"  SERVICE nrv:search {{ ?v nrv:near \"{expect[f'query_{q}']}\"^^nrv:vector ; nrv:k 10 ; nrv:rank ?r }} }}\n"
+            "ORDER BY ?r\n", encoding="utf-8")
+    return directory
+
+
+def queries_path(case: dict, expect: dict) -> str | None:
+    name = case.get("queries", "")
+    if not name:
+        return None
+    if name == "@vectors":
+        return "/out/queries/vectors"
+    if name in ("lubm", "owl2bench"):
+        return f"/src/benches/reasoning/queries/{name}"
+    return f"/src/benches/fast/queries/{name}"
+
+
+# --- one case --------------------------------------------------------------------------------
+
+def substitute(values: list[str], data: str, scratch: str) -> list[str]:
+    return [v.replace("{data}", data).replace("{scratch}", scratch) for v in values]
+
+
+def parse_tableau(stdout: str) -> list[dict]:
+    """tableau_consistency's lines: file, answer, `key=value` metrics, reason."""
+    rows = []
+    for line in stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        row = {"file": parts[0], "answer": parts[1]}
+        for pair in parts[2].split():
+            key, _, value = pair.partition("=")
+            try:
+                row[key] = float(value)
+            except ValueError:
+                row[key] = value
+        rows.append(row)
+    return rows
+
+
+def profile_line(stderr: str, stdout: str, prefix: str = "profile ") -> dict:
+    for line in reversed((stderr + "\n" + stdout).splitlines()):
+        if line.startswith(prefix):
+            out = {}
+            for pair in line[len(prefix):].split():
+                key, _, value = pair.partition("=")
+                try:
+                    out[key] = float(value)
+                except ValueError:
+                    out[key] = value
+            return out
+    return {}
+
+
+def run_case(case: dict, label: str, rep: int) -> dict:
+    """Runs a case once; the record: status, metric, samples, memory, checks, routes."""
+    expect = ensure_data(case["data"])
+    alt_expect = ensure_data(case["data_alt"]) if case.get("data_alt") else {}
+    for extra in case.get("extra", []):
+        ensure_data(extra)
+    data = data_file(case["data"])
+    if case.get("queries") == "@vectors":
+        vector_queries(expect)
+    name = f"fast-{case['name']}-{ROOT.name}"
+    tool = case.get("tool", "perf_lab")
+    out_json = f"/out/{case['name']}.json"
+    record = {"case": case["name"], "rep": rep, "status": "ok", "notes": []}
+    scratch = f"/fast/scratch/{case['name']}"
+    repeat = int(case.get("repeat", 1))
+    result: dict = {}
+    if tool == "perf_lab":
+        base = ["/target/release/examples/perf_lab", "--label", label, "--routes", "--json", out_json]
+        loads = [] if "setup" in case else [x for f in [case["data"], *case.get("extra", [])] for x in ("--load", data_file(f))]
+        if case.get("tool_loads") is False:
+            loads = []
+        # The canonicalisation case reads its files itself.
+        if any(a == "--canonicalize" for a in case.get("args", [])):
+            loads = []
+        queries = queries_path(case, expect)
+        command = [*base, *loads, *(["--queries", queries] if queries else []),
+                   *substitute(case.get("args", []), data, scratch)]
+        script = ""
+        if "setup" in case:
+            setup = ["/target/release/examples/perf_lab", *substitute(case["setup"], data, scratch)]
+            script = f"rm -rf {scratch} && mkdir -p {scratch} && {' '.join(setup)} >/dev/null 2>&1 && "
+        if case.get("queries") == "@vectors":
+            command += ["--results", f"/out/results/{case['name']}"]
+        samples_runs = []
+        code = 0
+        err = ""
+        wall = 0.0
+        for _ in range(repeat):
+            # Each repeat of a case with a setup is a fresh process opening the store.
+            shell = script + " ".join(f"'{c}'" for c in command)
+            code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"))
+            wall += w
+            path = SCRATCH / f"{case['name']}.json"
+            if not path.exists():
+                break
+            result = json.loads(path.read_text(encoding="utf-8"))
+            path.unlink()
+            samples_runs.append(result)
+            if code != 0:
+                break
+        if samples_runs:
+            result = samples_runs[-1]
+            if repeat > 1:
+                result["_repeats"] = samples_runs
+        record["wall_s"] = round(wall, 2)
+        if code != 0:
+            record["status"] = classify_failure(code, err, result)
+            record["notes"].append(err.strip().splitlines()[-1][:300] if err.strip() else f"exit {code}")
+    elif tool == "tableau":
+        files = [data] * repeat + ([data_file(case["data_alt"])] * repeat if case.get("data_alt") else [])
+        command = ["/target/release/examples/tableau_consistency", "--timeout", "300", *files]
+        code, out, err, wall = container(name, case["cap_gb"], command)
+        rows = parse_tableau(out)
+        main = [r for r in rows if r["file"] == data]
+        alt = [r for r in rows if r["file"] != data]
+        result = dict(main[0]) if main else {}
+        result["samples_ms"] = [r.get("whole_ms", 0.0) for r in rows]
+        result["whole_ms"] = statistics.median(result["samples_ms"]) if rows else None
+        if alt:
+            result["alt"] = {"answer": alt[0]["answer"]}
+        record["wall_s"] = round(wall, 2)
+        if code != 0 or not rows:
+            record["status"] = classify_failure(code, err, result)
+            record["notes"].append(err.strip()[-300:])
+    elif tool in ("classify-el", "classify-horn"):
+        binary = "classify" if tool == "classify-el" else "context_classify"
+        out_tsv = f"/out/{case['name']}.tsv"
+        command = ["bash", "-c", f"/target/release/examples/{binary} --out {out_tsv} --repeat {repeat} {data}"
+                                 f" && sha256sum {out_tsv} | cut -c1-16 && wc -l < {out_tsv}"]
+        code, out, err, wall = container(name, case["cap_gb"], command)
+        result = profile_line(err, out)
+        lines = out.split()
+        if code == 0 and len(lines) >= 2:
+            result["hash"], result["subsumptions"] = lines[-2], int(lines[-1])
+        total = next((result[k] for k in ("total_ms", "whole_ms", "classify_ms", "saturate_ms") if k in result), None)
+        result["whole_ms"] = total
+        result["samples_ms"] = [total] if total is not None else []
+        record["wall_s"] = round(wall, 2)
+        if code != 0:
+            record["status"] = classify_failure(code, err, result)
+            record["notes"].append(err.strip()[-300:])
+    record["metric"] = metric_value(case, result)
+    record["samples"] = samples(case, result)
+    record["peak_mib"] = result.get("cgroup_peak_mib") or result.get("peak_mib")
+    if case.get("queries") == "@vectors" and record["status"] == "ok":
+        result["recall"] = vector_recall(case, expect)
+    record["checks"] = [check(path, want, result, expect, alt_expect) for path, want in case.get("check", {}).items()]
+    record["routes"] = [route(path, want, result) for path, want in case.get("route", {}).items()]
+    wanted = case.get("outcome", "ok")
+    if record["status"] == "ok":
+        if any(not c["ok"] for c in record["checks"]):
+            record["status"] = "wrong"
+        elif any(not r["ok"] for r in record["routes"]):
+            record["status"] = "off-route"
+    record["expected_outcome"] = wanted
+    record["result"] = slim(result)
+    return record
+
+
+def classify_failure(code: int, err: str, result: dict) -> str:
+    text = (err or "") + json.dumps(result.get("error", ""))
+    if code == 137 or "memory limit" in text.lower() or "ProcessMemoryLimit" in text:
+        return "memory-limit"
+    if code == 124:
+        return "timeout"
+    return "failed"
+
+
+def slim(result: dict) -> dict:
+    """The result without per-sample arrays (they are kept in `samples`)."""
+    out = {}
+    for key, value in result.items():
+        if key == "_repeats":
+            continue
+        if key == "queries":
+            out["queries"] = {q["name"]: {k: v for k, v in q.items() if k not in ("samples_ms", "name")}
+                              for q in value}
+        elif isinstance(value, dict):
+            out[key] = {k: v for k, v in value.items() if k != "samples_ms"}
+        elif key != "samples_ms":
+            out[key] = value
+    return out
+
+
+def lookup(path: str, result: dict):
+    """A value by its path: q.NAME.FIELD into the query list, else dotted keys."""
+    if path.startswith("q."):
+        _, name, field = path.split(".", 2)
+        for q in result.get("queries", []):
+            if q["name"] == name:
+                return q.get(field)
+        return None
+    value = result
+    for part in path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def resolve(want, expect: dict):
+    if isinstance(want, str) and want.startswith("expect."):
+        return expect.get(want[len("expect."):])
+    return want
+
+
+def same(a, b) -> bool:
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return str(a).lower() == str(b).lower()
+
+
+def check(path: str, want, result: dict, expect: dict, alt_expect: dict) -> dict:
+    expected = resolve(want, alt_expect if path.startswith("alt.") else expect)
+    got = lookup(path, result)
+    if isinstance(want, str) and want[:2] in (">=", "<="):
+        ok = compare_op(got, want)
+    else:
+        ok = got is not None and expected is not None and same(got, expected)
+    return {"path": path, "expected": expected if not isinstance(want, str) or not want[:2] in (">=", "<=") else want,
+            "got": got, "ok": ok}
+
+
+def compare_op(got, want: str) -> bool:
+    op, _, value = want.partition(" ")
+    if got is None:
+        return False
+    if op in ("has", "lacks"):
+        present = value in (got if isinstance(got, list) else [got])
+        return present if op == "has" else not present
+    try:
+        g, v = float(got), float(value)
+    except (TypeError, ValueError):
+        return op == "==" and str(got).lower() == value.lower()
+    return {"==": g == v, "<=": g <= v, ">=": g >= v}[op]
+
+
+def route(path: str, want: str, result: dict) -> dict:
+    got = lookup(path, result)
+    return {"path": path, "expected": want, "got": got, "ok": compare_op(got, want)}
+
+
+def metric_value(case: dict, result: dict):
+    value = lookup(case["metric"], result)
+    if case["metric"] in ("load_s", "open_s") and value is not None:
+        value = value * 1000.0
+    if "_repeats" in result and case["metric"] in ("load_s", "open_s", "clients.p99_ms", "canonicalize.p50_ms"):
+        values = [lookup(case["metric"], r) for r in result["_repeats"]]
+        values = [v * (1000.0 if case["metric"] in ("load_s", "open_s") else 1.0) for v in values if v is not None]
+        value = statistics.median(values) if values else value
+    return value
+
+
+def samples(case: dict, result: dict) -> dict:
+    """Per series, the measured samples (ms) the metric is a median or sum of medians of."""
+    metric = case["metric"]
+    if metric == "sum_p50_ms":
+        return {q["name"]: q["samples_ms"] for q in result.get("queries", []) if "samples_ms" in q}
+    section = metric.split(".")[0]
+    if isinstance(result.get(section), dict) and "samples_ms" in result[section]:
+        return {"_": result[section]["samples_ms"]}
+    if "samples_ms" in result:
+        return {"_": [s for s in result["samples_ms"] if s is not None]}
+    if "_repeats" in result:
+        values = [lookup(metric, r) for r in result["_repeats"]]
+        scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
+        return {"_": [v * scale for v in values if v is not None]}
+    value = metric_value(case, result)
+    return {"_": [value]} if value is not None else {}
+
+
+def vector_recall(case: dict, expect: dict) -> float:
+    found = 0
+    for q in range(5):
+        path = SCRATCH / "results" / case["name"] / f"knn-{q}.out"
+        if not path.exists():
+            return 0.0
+        got = {m.group(1) for m in re.finditer(r"(item\d+)>", path.read_text(encoding="utf-8"))}
+        found += len(got & set(expect[f"nearest_{q}"]))
+    return found / 50.0
+
+
+# --- run -------------------------------------------------------------------------------------
+
+def run(args) -> int:
+    cases = select(load_cases(), args)
+    label = args.label or (manifest.git(ROOT).get("commit") or "nrese")[:8]
+    started = datetime.datetime.now()
+    BASELINES.mkdir(parents=True, exist_ok=True)
+    out = (Path(args.out) if args.out else BASELINES / f"{started:%Y-%m-%d}-{label}.json").resolve()
+    report = {"label": label, "started": started.isoformat(timespec="seconds"),
+              "git": manifest.git(ROOT), "machine": manifest.machine("docker"), "image": rust_image(),
+              "reps": args.reps, "records": []}
+    order = list(cases)
+    for rep in range(1, args.reps + 1):
+        # Interleaved, each round in an order rotated by one.
+        order = order[1:] + order[:1] if rep > 1 else order
+        for case in order:
+            t0 = time.monotonic()
+            try:
+                record = run_case(case, label, rep)
+            except Exception as error:  # a case that breaks mustn't stop the suite
+                record = {"case": case["name"], "rep": rep, "status": "failed", "notes": [str(error)[:300]],
+                          "checks": [], "routes": [], "samples": {}, "metric": None}
+            record["case_s"] = round(time.monotonic() - t0, 1)
+            report["records"].append(record)
+            mark = "" if record["status"] == record.get("expected_outcome", "ok") else "  <<<"
+            metric = record.get("metric")
+            print(f"rep {rep} {case['name']:<24} {record['status']:<13} "
+                  f"{(f'{metric:,.1f} ms' if isinstance(metric, (int, float)) else '-'):>14} "
+                  f"peak {record.get('peak_mib') or '-':>6} MiB  {record['case_s']:>6.1f} s{mark}", flush=True)
+            for c in record["checks"] + record["routes"]:
+                if not c["ok"]:
+                    print(f"      {c['path']}: expected {c['expected']}, got {c['got']}")
+            for note in record.get("notes", []):
+                print(f"      {note}")
+            out.write_text(json.dumps(report, indent=1), encoding="utf-8")
+    report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
+    report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
+    out.write_text(json.dumps(report, indent=1), encoding="utf-8")
+    bad = [r for r in report["records"] if r["status"] != r.get("expected_outcome", "ok")]
+    print(f"\n{len(report['records'])} runs of {len(cases)} cases in {report['duration_s'] / 60:.1f} min; "
+          f"{len(bad)} not as expected; report: {out.relative_to(ROOT)}")
+    return 1 if bad else 0
+
+
+# --- compare ---------------------------------------------------------------------------------
+
+def pooled(report: dict) -> dict[str, dict]:
+    """Per case: its samples pooled over the repetitions, statuses, peak memory."""
+    out: dict[str, dict] = {}
+    for r in report["records"]:
+        entry = out.setdefault(r["case"], {"samples": {}, "status": [], "peaks": [], "metrics": []})
+        entry["status"].append(r["status"])
+        if r.get("peak_mib"):
+            entry["peaks"].append(r["peak_mib"])
+        if isinstance(r.get("metric"), (int, float)):
+            entry["metrics"].append(r["metric"])
+        for series, values in (r.get("samples") or {}).items():
+            entry["samples"].setdefault(series, []).extend(v for v in values if v is not None)
+    return out
+
+
+def statistic(samples: dict[str, list[float]]) -> float:
+    return sum(statistics.median(v) for v in samples.values() if v)
+
+
+def bootstrap_ratio(base: dict, new: dict, rounds: int = 2000, seed: int = 1) -> tuple[float, float, float]:
+    """The ratio new/base of the summed medians, and its 95 % bootstrap interval."""
+    rng = random.Random(seed)
+    series = [s for s in base if s in new and base[s] and new[s]]
+    if not series:
+        return float("nan"), float("nan"), float("nan")
+
+    def draw(samples):
+        return sum(statistics.median(rng.choices(samples[s], k=len(samples[s]))) for s in series)
+
+    point = statistic({s: new[s] for s in series}) / max(statistic({s: base[s] for s in series}), 1e-9)
+    ratios = sorted(draw(new) / max(draw(base), 1e-9) for _ in range(rounds))
+    return point, ratios[int(0.025 * rounds)], ratios[int(0.975 * rounds) - 1]
+
+
+def compare(args) -> int:
+    base_report = json.loads(Path(args.base).read_text(encoding="utf-8"))
+    new_report = json.loads(Path(args.new).read_text(encoding="utf-8"))
+    base, new = pooled(base_report), pooled(new_report)
+    print(f"{'case':<26} {'base ms':>11} {'new ms':>11} {'ratio':>7} {'95% CI':>15} {'peak MiB':>17}  verdict")
+    regressions = 0
+    for case in sorted(set(base) | set(new)):
+        b, n = base.get(case), new.get(case)
+        if not b or not n:
+            print(f"{case:<26} {'only in one run':>45}")
+            continue
+        if any(s not in ("ok",) for s in n["status"]) and set(n["status"]) != set(b["status"]):
+            print(f"{case:<26} status {','.join(sorted(set(b['status'])))} -> {','.join(sorted(set(n['status'])))}  CHANGED")
+            regressions += 1
+            continue
+        ratio, low, high = bootstrap_ratio(b["samples"], n["samples"])
+        bm, nm = statistic(b["samples"]), statistic(n["samples"])
+        verdict = "same"
+        if low > 1.0 and ratio >= 1.10 and nm - bm >= 2.0:
+            verdict, regressions = "SLOWER", regressions + 1
+        elif high < 1.0 and ratio <= 1 / 1.10 and bm - nm >= 2.0:
+            verdict = "faster"
+        bp, np_ = (max(b["peaks"]) if b["peaks"] else None), (max(n["peaks"]) if n["peaks"] else None)
+        if bp and np_ and np_ > bp * 1.10 and np_ - bp > 64:
+            verdict += ", MORE MEMORY"
+            regressions += 1
+        peaks = f"{bp or '-'} -> {np_ or '-'}"
+        print(f"{case:<26} {bm:>11.1f} {nm:>11.1f} {ratio:>7.2f} {f'[{low:.2f}, {high:.2f}]':>15} {peaks:>17}  {verdict}")
+    print(f"\n{regressions} regression(s) beyond the interval (a change counts at ≥ 10 % and ≥ 2 ms, "
+          "with the 95 % interval of the ratio excluding 1)")
+    return 1 if regressions else 0
+
+
+# --- list, clean -----------------------------------------------------------------------------
+
+def list_cases(args) -> int:
+    for c in select(load_cases(), args):
+        systems = ", ".join(c.get("systems", [])) or "NRESE only"
+        turf = f"  [home turf: {c['home_turf']}]" if c.get("home_turf") else ""
+        print(f"{c['name']:<24} {c['area']:<12} {c['semantics']:<10} {systems}{turf}")
+    return 0
+
+
+def clean(args) -> int:
+    docker(["volume", "rm", DATA_VOLUME])
+    import shutil
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+    print(f"removed {DATA_VOLUME} and {SCRATCH}")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+    for name in ("list", "run", "compete"):
+        s = sub.add_parser(name)
+        s.add_argument("--cases")
+        s.add_argument("--areas")
+        if name == "run":
+            s.add_argument("--reps", type=int, default=2)
+            s.add_argument("--label")
+            s.add_argument("--out")
+        if name == "compete":
+            s.add_argument("--systems")
+            s.add_argument("--runs", type=int, default=1)
+            s.add_argument("--licensed", action="store_true",
+                           help="also the licensed systems (results stay in benches/fast/results)")
+    sub.add_parser("build")
+    sub.add_parser("clean")
+    c = sub.add_parser("compare")
+    c.add_argument("base")
+    c.add_argument("new")
+    args = p.parse_args()
+    if args.command == "compete":
+        from compete import compete
+        return compete(args)
+    return {"list": list_cases, "build": build, "run": run, "compare": compare, "clean": clean}[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

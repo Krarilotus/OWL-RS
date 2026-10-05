@@ -4,8 +4,11 @@
 //! cargo run --release -p nrese-store --example perf_lab -- \
 //!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
-//!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE] [--reason RULESET]
-//!     [--results DIR]
+//!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE] [--reason MODE]
+//!     [--rules FILE.n3] [--reason-runs 1] [--results DIR] [--routes] [--commits FILE]
+//!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
+//!     [--canonicalize FILE]...
+//! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
 //!
 //! - **Data:** `--load` bulk-loads files, into memory or, with `--store`, into an on-disk
@@ -27,10 +30,26 @@
 //!   `--explain` prints each query's plan after its measurement: every operator with its
 //!   estimated and actual rows and its time (inputs included), where the time goes when a
 //!   profiler isn't at hand.
+//!   `--routes` records the operators each query ran with (from EXPLAIN) in the JSON
+//!   report, for the fast suite's route checks; a query with one row also records its
+//!   first value there (`value`), the answer of a count.
 //!   `--qerror` measures the planner's estimates: every operator with an estimate, over
 //!   every query, gets its q-error, `max(estimate, rows) / min(estimate, rows)` (both at
 //!   least 1; Moerkotte et al., VLDB 2009), summarised per operator (median, p90, max, the
 //!   share within 2×) and in the JSON report.
+//!
+//! - **The fast suite's measurements** (`benches/fast`): `--reason` takes every reasoning
+//!   mode (`rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl`, `custom`)
+//!   and `--rules` adds Notation3 user rules; `--reason-runs N` rematerialises N times (rounds
+//!   and phases in the report). `--commits FILE` applies one SPARQL update per line as a
+//!   commit through the mutation pipeline, which maintains the closure, with `--readers N`
+//!   threads running the query set meanwhile; after the commits the closure is computed
+//!   afresh and must have the same size. `--clients N` runs the query set on N threads for
+//!   `--duration-s`. `--threads N` sizes the thread pool (1: single-threaded). `--export`
+//!   writes the store's statements, inferred ones included, as N-Triples (the closure the
+//!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
+//!   `generate` writes the suite's data (`generate.rs`). A failure still writes the report, with
+//!   its `error`.
 //!
 //! This is the loop every Phase 2–5 work package is measured with before the Docker
 //! scorecard confirms it against other systems. It runs anywhere the data is; the wrapper
@@ -38,12 +57,18 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+mod generate;
+mod modes;
+
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
 use nrese_store::{
-    BulkLoadRequest, CancellationToken, GraphTarget, PreparedQuery, QueryResultKind,
-    ShaclValidationRequest, SolutionsResultFormat, SparqlQueryRequest, StoreConfig, StoreService,
+    BulkLoadRequest, CancellationToken, GraphTarget, MutationPipeline, PreparedQuery,
+    QueryResultKind, ShaclValidationRequest, SolutionsResultFormat, SparqlQueryRequest,
+    StoreConfig, StoreService,
 };
 
 /// mimalloc, as in the server; `RUSTFLAGS="--cfg system_alloc"` measures the system allocator.
@@ -66,8 +91,18 @@ struct Args {
     qerror: bool,
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
-    reason: Option<nrese_reasoner::rulesets::Ruleset>,
+    reason: Option<ReasoningMode>,
+    rules: Option<PathBuf>,
+    reason_runs: usize,
     results: Option<PathBuf>,
+    routes: bool,
+    commits: Option<PathBuf>,
+    readers: usize,
+    clients: usize,
+    duration: Duration,
+    threads: Option<usize>,
+    export: Option<PathBuf>,
+    canonicalize: Vec<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -87,7 +122,17 @@ fn parse_args() -> Result<Args, String> {
         format: SolutionsResultFormat::Tsv,
         shapes: None,
         reason: None,
+        rules: None,
+        reason_runs: 1,
         results: None,
+        routes: false,
+        commits: None,
+        readers: 0,
+        clients: 0,
+        duration: Duration::from_secs(10),
+        threads: None,
+        export: None,
+        canonicalize: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -113,10 +158,37 @@ fn parse_args() -> Result<Args, String> {
             "--reason" => {
                 let name = value()?;
                 args.reason = Some(
-                    nrese_reasoner::rulesets::Ruleset::from_name(&name)
-                        .ok_or(format!("--reason: unknown ruleset {name}"))?,
+                    ReasoningMode::REASONING
+                        .into_iter()
+                        .chain([ReasoningMode::Custom])
+                        .find(|mode| mode.as_str() == name)
+                        .ok_or(format!("--reason: unknown mode {name}"))?,
                 );
             }
+            "--rules" => args.rules = Some(value()?.into()),
+            "--reason-runs" => {
+                args.reason_runs = value()?
+                    .parse()
+                    .map_err(|e| format!("--reason-runs: {e}"))?
+            }
+            "--routes" => args.routes = true,
+            "--commits" => args.commits = Some(value()?.into()),
+            "--readers" => {
+                args.readers = value()?.parse().map_err(|e| format!("--readers: {e}"))?
+            }
+            "--clients" => {
+                args.clients = value()?.parse().map_err(|e| format!("--clients: {e}"))?
+            }
+            "--duration-s" => {
+                args.duration = Duration::from_secs_f64(
+                    value()?.parse().map_err(|e| format!("--duration-s: {e}"))?,
+                )
+            }
+            "--threads" => {
+                args.threads = Some(value()?.parse().map_err(|e| format!("--threads: {e}"))?)
+            }
+            "--export" => args.export = Some(value()?.into()),
+            "--canonicalize" => args.canonicalize.push(value()?.into()),
             "--format" => {
                 args.format = match value()?.as_str() {
                     "tsv" => SolutionsResultFormat::Tsv,
@@ -129,15 +201,15 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if args.queries.as_os_str().is_empty() || args.runs == 0 {
-        return Err("--queries DIR is required and --runs must be > 0".into());
+    if args.runs == 0 || args.reason_runs == 0 {
+        return Err("--runs and --reason-runs must be > 0".into());
     }
     Ok(args)
 }
 
 /// Counts bytes and lines written, discarding the data.
 #[derive(Default)]
-struct CountingSink {
+pub(crate) struct CountingSink {
     bytes: u64,
     lines: u64,
 }
@@ -402,11 +474,122 @@ fn read_baseline(path: &PathBuf) -> BTreeMap<String, f64> {
     out
 }
 
+/// The first value of a one-row result (a count's answer), as its lexical form.
+fn first_value(store: &StoreService, text: &str) -> Option<String> {
+    let mut request = SparqlQueryRequest::all(text);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    let prepared = PreparedQuery::parse(&request).ok()?;
+    if prepared.kind() != QueryResultKind::Solutions {
+        return None;
+    }
+    let mut out = Vec::new();
+    store
+        .run_query(&prepared, &CancellationToken::new(), &mut out)
+        .ok()?;
+    let text = String::from_utf8(out).ok()?;
+    let cell = text.lines().nth(1)?.split('\t').next()?;
+    // `"12"^^<…#integer>` or a plain term: the lexical form.
+    Some(
+        cell.strip_prefix('"')
+            .and_then(|c| c.split('"').next())
+            .unwrap_or(cell)
+            .to_owned(),
+    )
+}
+
+/// The distinct operators `text` runs with, in the order EXPLAIN lists them.
+fn operators(store: &StoreService, text: &str) -> Vec<String> {
+    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+        return Vec::new();
+    };
+    let Ok(explanation) = store.explain_query(&prepared, &CancellationToken::new()) else {
+        return Vec::new();
+    };
+    let mut seen = Vec::new();
+    for step in explanation.steps {
+        if !seen.contains(&step.operator) {
+            seen.push(step.operator);
+        }
+    }
+    seen
+}
+
+/// The container's peak memory in MiB, where it runs under cgroup v2 (Docker on Linux).
+fn cgroup_peak_mib() -> Option<u64> {
+    std::fs::read_to_string("/sys/fs/cgroup/memory.peak")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|bytes| bytes / 1048576)
+}
+
+/// What a run measured, written as the JSON report even when the run fails.
+#[derive(Default)]
+struct Report {
+    open_s: f64,
+    load_s: f64,
+    sum_p50: f64,
+    /// `"key": value` members beyond the query set (reasoning, commits, clients, ...).
+    sections: Vec<(&'static str, String)>,
+    queries: Vec<String>,
+    qerror: Option<String>,
+}
+
+impl Report {
+    fn json(&self, label: &str) -> String {
+        let memory = memory_mib();
+        let sections: String = self
+            .sections
+            .iter()
+            .map(|(key, value)| format!("\n  \"{key}\": {value},"))
+            .collect();
+        format!(
+            "{{\n  \"label\": {label:?},\n  \"open_s\": {:.3},\n  \"load_s\": {:.3},\n  \"peak_mib\": {},\n  \"cgroup_peak_mib\": {},\n  \"sum_p50_ms\": {:.3},{}{}\n  \"queries\": [\n{}\n  ]\n}}\n",
+            self.open_s,
+            self.load_s,
+            memory.map_or(0, |(peak, _)| peak),
+            cgroup_peak_mib().map_or("null".to_owned(), |m| m.to_string()),
+            self.sum_p50,
+            sections,
+            self.qerror
+                .as_ref()
+                .map_or(String::new(), |q| format!("\n  \"qerror\": {q},")),
+            self.queries.join(",\n")
+        )
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().map(String::as_str) == Some("generate") {
+        return generate::main(&raw[1..]);
+    }
     #[cfg(not(system_alloc))]
     // SAFETY: mimalloc's `mi_collect` may be called at any time, from any thread.
     nrese_engine::memory::set_release(|force| unsafe { libmimalloc_sys::mi_collect(force) });
-    let args = parse_args().map_err(|e| format!("{e}\nsee the usage at the top of perf_lab.rs"))?;
+    let args =
+        parse_args().map_err(|e| format!("{e}\nsee the usage at the top of perf_lab/main.rs"))?;
+    let mut report = Report::default();
+    let result = run(&args, &mut report);
+    if let Err(error) = &result {
+        eprintln!("error: {error}");
+        report
+            .sections
+            .push(("error", format!("{:?}", error.to_string())));
+    }
+    if let Some(path) = &args.json {
+        std::fs::write(path, report.json(&args.label))?;
+    }
+    result
+}
+
+fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(threads) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()?;
+    }
     let config = match &args.store {
         Some(dir) => StoreConfig::on_disk(dir),
         None => StoreConfig::in_memory(),
@@ -446,29 +629,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..config
     };
     let started = Instant::now();
-    let store = StoreService::new(config)?;
-    let open_s = started.elapsed().as_secs_f64();
-    let mut load_s = 0.0;
+    let store = Arc::new(StoreService::new(config)?);
+    report.open_s = started.elapsed().as_secs_f64();
     if !args.load.is_empty() {
         let started = Instant::now();
-        let report = store.bulk_load(&BulkLoadRequest {
+        let loaded = store.bulk_load(&BulkLoadRequest {
             files: args.load.clone(),
             replace: false,
             graph: GraphTarget::DefaultGraph,
             skip_errors: false,
         })?;
-        load_s = started.elapsed().as_secs_f64();
-        eprintln!("loaded {} quads in {load_s:.2} s", report.inserted);
+        report.load_s = started.elapsed().as_secs_f64();
+        eprintln!("loaded {} quads in {:.2} s", loaded.inserted, report.load_s);
+        report
+            .sections
+            .push(("loaded", loaded.inserted.to_string()));
+        if let Some((peak, _)) = memory_mib() {
+            report.sections.push(("load_peak_mib", peak.to_string()));
+        }
     }
-    if let Some(ruleset) = args.reason {
-        let started = Instant::now();
-        let report = store.rematerialise(ruleset)?;
+    let rules = match &args.rules {
+        Some(path) => Some(Arc::new(UserRules::n3(
+            path.display().to_string(),
+            std::fs::read_to_string(path)?,
+        )?)),
+        None => None,
+    };
+    let reasoner = ReasonerConfig::for_mode(args.reason.unwrap_or(ReasoningMode::Disabled))
+        .with_rules(rules)?;
+    let program = reasoner.materialised_program();
+    if let Some(program) = &program {
+        let mut times = Vec::new();
+        let mut last = None;
+        for _ in 0..args.reason_runs {
+            let done = store.rematerialise(program)?;
+            times.push(done.elapsed);
+            last = Some(done);
+        }
+        let done = last.expect("at least one run");
+        let (p50, _, max) = modes::percentiles(&mut times);
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
         eprintln!(
-            "reasoned ({}): {} inferred in {:.2} s",
-            ruleset.name(),
-            report.inferred,
-            started.elapsed().as_secs_f64()
+            "reasoned ({}): {} inferred, {} rounds, p50 {p50:.1} ms over {} runs (modules {:.1} ms)",
+            done.ruleset,
+            done.inferred,
+            done.rounds,
+            args.reason_runs,
+            ms(done.phases.modules)
         );
+        let samples: Vec<String> = times.iter().map(|t| format!("{:.3}", ms(*t))).collect();
+        report.sections.push((
+            "reason",
+            format!(
+                "{{\"program\": {:?}, \"asserted\": {}, \"inferred\": {}, \"violations\": {}, \"rounds\": {}, \
+                 \"runs\": {}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}], \"grounding_ms\": {:.3}, \
+                 \"joins_ms\": {:.3}, \"modules_ms\": {:.3}, \"merge_ms\": {:.3}, \"consistency_ms\": {:.3}}}",
+                done.ruleset,
+                done.asserted,
+                done.inferred,
+                done.violations,
+                done.rounds,
+                args.reason_runs,
+                samples.join(", "),
+                ms(done.phases.grounding),
+                ms(done.phases.joins),
+                ms(done.phases.modules),
+                ms(done.phases.merge),
+                ms(done.phases.consistency),
+            ),
+        ));
+        if let Some((peak, _)) = memory_mib() {
+            report.sections.push(("reason_peak_mib", peak.to_string()));
+        }
     }
     if let Some(shapes) = &args.shapes {
         store.bulk_load(&BulkLoadRequest {
@@ -488,16 +720,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             times.push(started.elapsed());
             results = validation.report.results.len();
         }
-        times.sort();
-        eprintln!(
-            "shacl: {results} results, p50 {:.2} ms (min {:.2})",
-            ms(times[times.len() / 2]),
-            ms(times[0])
+        let samples: Vec<String> = times
+            .iter()
+            .map(|t| format!("{:.3}", t.as_secs_f64() * 1e3))
+            .collect();
+        let (p50, _, max) = modes::percentiles(&mut times);
+        eprintln!("shacl: {results} results, p50 {p50:.2} ms (max {max:.2})");
+        report.sections.push((
+            "shacl",
+            format!(
+                "{{\"results\": {results}, \"runs\": {}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}]}}",
+                args.runs,
+                samples.join(", ")
+            ),
+        ));
+    }
+    let mut files: Vec<PathBuf> = if args.queries.as_os_str().is_empty() {
+        Vec::new()
+    } else {
+        std::fs::read_dir(&args.queries)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rq"))
+            .filter(|p| {
+                args.only.as_ref().is_none_or(|only| {
+                    p.file_stem()
+                        .is_some_and(|s| s.to_string_lossy().contains(only.as_str()))
+                })
+            })
+            .collect()
+    };
+    files.sort();
+    let texts: Vec<String> = files
+        .iter()
+        .map(std::fs::read_to_string)
+        .collect::<Result<_, _>>()?;
+    if let Some(file) = &args.commits {
+        let pipeline = MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(reasoner.clone())),
         );
+        report.sections.push((
+            "commits",
+            modes::commits(&pipeline, file, &texts, args.readers)?,
+        ));
+        if let Some(program) = &program {
+            // The maintained closure against one computed afresh.
+            let held = store.engine_stats().inferred;
+            let fresh = store.rematerialise(program)?;
+            eprintln!(
+                "closure after the commits: maintained {held}, recomputed {}",
+                fresh.inferred
+            );
+            report.sections.push((
+                "closure_after_commits",
+                format!(
+                    "{{\"maintained\": {held}, \"recomputed\": {}, \"equal\": {}}}",
+                    fresh.inferred,
+                    held == fresh.inferred
+                ),
+            ));
+        }
+    }
+    if args.clients > 0 {
+        report.sections.push((
+            "clients",
+            modes::clients(&store, &texts, args.clients, args.duration)?,
+        ));
+    }
+    if !args.canonicalize.is_empty() {
+        report.sections.push((
+            "canonicalize",
+            modes::canonicalize(&args.canonicalize, args.runs)?,
+        ));
+    }
+    if let Some(path) = &args.export {
+        let started = Instant::now();
+        let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(
+            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+        ))?;
+        let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        store.run_query(&prepared, &CancellationToken::new(), file)?;
+        eprintln!("exported in {:.2} s", started.elapsed().as_secs_f64());
     }
     let memory_after_load = memory_mib();
     eprintln!(
-        "open {open_s:.2} s{}",
+        "open {:.2} s{}",
+        report.open_s,
         memory_after_load.map_or(String::new(), |(peak, rss)| format!(
             ", memory: peak {peak} MiB, resident {rss} MiB"
         ))
@@ -518,47 +826,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mib(stats.dictionary.index_bytes),
         mib(stats.dictionary.mapped_bytes),
     );
+    report.sections.push((
+        "held",
+        format!(
+            "{{\"quads\": {}, \"inferred\": {}, \"index_mib\": {}, \"dictionary_terms\": {}}}",
+            stats.quads,
+            stats.inferred,
+            mib(stats.index_bytes),
+            stats.dictionary.terms
+        ),
+    ));
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&args.queries)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "rq"))
-        .filter(|p| {
-            args.only.as_ref().is_none_or(|only| {
-                p.file_stem()
-                    .is_some_and(|s| s.to_string_lossy().contains(only.as_str()))
-            })
-        })
-        .collect();
-    files.sort();
     let baseline = args
         .baseline
         .as_ref()
         .map(read_baseline)
         .unwrap_or_default();
-
-    println!(
-        "{:<28} {:>10} {:>11} {:>10} {:>10} {:>9}",
-        "query", "rows", "p50 ms", "min", "max", "vs base"
-    );
-    let mut report = Vec::new();
-    let mut sum_p50 = 0.0;
+    if !files.is_empty() {
+        println!(
+            "{:<28} {:>10} {:>11} {:>10} {:>10} {:>9}",
+            "query", "rows", "p50 ms", "min", "max", "vs base"
+        );
+    }
     let mut estimates: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    for file in &files {
+    for (file, text) in files.iter().zip(&texts) {
         let name = file.file_stem().unwrap().to_string_lossy().into_owned();
-        let text = std::fs::read_to_string(file)?;
-        let m = measure(&store, &text, &args);
+        let m = measure(&store, text, args);
         if let Some(dir) = &args.results {
-            write_results(&store, &text, &args, &dir.join(format!("{name}.out")))?;
+            write_results(&store, text, args, &dir.join(format!("{name}.out")))?;
         }
         if args.explain {
-            explain(&store, &text);
+            explain(&store, text);
         }
         if args.qerror {
-            qerrors(&store, &text, &mut estimates);
+            qerrors(&store, text, &mut estimates);
         }
         if let Some(error) = &m.error {
             println!("{name:<28} error: {error}");
-            report.push(format!(
+            report.queries.push(format!(
                 "    {{\n      \"name\": \"{name}\",\n      \"error\": {:?}\n    }}",
                 error
             ));
@@ -566,7 +871,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let p50 = ms(m.times[m.times.len() / 2]);
         let (min, max) = (ms(m.times[0]), ms(*m.times.last().unwrap()));
-        sum_p50 += p50;
+        report.sum_p50 += p50;
         let ratio = baseline
             .get(&name)
             .map_or(String::from("-"), |base| format!("{:.2}x", base / p50));
@@ -574,26 +879,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "{name:<28} {:>10} {p50:>11.2} {min:>10.2} {max:>10.2} {ratio:>9}",
             m.rows
         );
-        report.push(format!(
-            "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.3},\n      \"min_ms\": {min:.3},\n      \"max_ms\": {max:.3}\n    }}",
-            m.rows
+        let mut extra = String::new();
+        if args.routes {
+            if m.rows == 1
+                && let Some(value) = first_value(&store, text)
+            {
+                extra.push_str(&format!(",\n      \"value\": {value:?}"));
+            }
+            extra.push_str(&format!(
+                ",\n      \"operators\": {:?}",
+                operators(&store, text)
+            ));
+        }
+        let samples: Vec<String> = m.times.iter().map(|t| format!("{:.3}", ms(*t))).collect();
+        report.queries.push(format!(
+            "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.3},\n      \"min_ms\": {min:.3},\n      \"max_ms\": {max:.3},\n      \"samples_ms\": [{}]{extra}\n    }}",
+            m.rows,
+            samples.join(", ")
         ));
     }
-    let memory = memory_mib();
-    println!("sum of p50: {sum_p50:.1} ms");
-    let qerror_json = (args.qerror && !estimates.is_empty()).then(|| qerror_summary(&estimates));
-    if let Some((peak, rss)) = memory {
-        println!("memory: peak {peak} MiB, resident {rss} MiB");
+    if !files.is_empty() {
+        println!("sum of p50: {:.1} ms", report.sum_p50);
     }
-    if let Some(path) = &args.json {
-        let json = format!(
-            "{{\n  \"label\": {:?},\n  \"open_s\": {open_s:.3},\n  \"load_s\": {load_s:.3},\n  \"peak_mib\": {},\n  \"sum_p50_ms\": {sum_p50:.3},{}\n  \"queries\": [\n{}\n  ]\n}}\n",
-            args.label,
-            memory.map_or(0, |(peak, _)| peak),
-            qerror_json.map_or(String::new(), |q| format!("\n  \"qerror\": {q},")),
-            report.join(",\n")
-        );
-        std::fs::write(path, json)?;
+    report.qerror = (args.qerror && !estimates.is_empty()).then(|| qerror_summary(&estimates));
+    if let Some((peak, rss)) = memory_mib() {
+        println!("memory: peak {peak} MiB, resident {rss} MiB");
     }
     Ok(())
 }
