@@ -60,7 +60,7 @@ benches/
 | [reasoning](reasoning/README.md) | inferred sets fact by fact against a reference closure (precision, recall); the LUBM and OWL2Bench data | `reasoning-scorecard.sh` | `reasoning/results/` | — |
 | [reasoning/dl](reasoning/dl/README.md) | OWL 2 DL correctness and classification speed; the reference reasoners | `reference.py`, `w3c.py`, `ore.py`, `nrese.py` | `reasoning/dl/results/` | the TSVs (free systems only) and a record |
 | [reasoning/el-classification](reasoning/el-classification/README.md) | NRESE's EL classifier against ELK on random ontologies | `run_elk.sh`, `el_check.py` | scratch | — |
-| [competitors](competitors/README.md) | throughput with concurrent clients, writes under read load; the datasets of the basics mix | `scorecard.sh` | `competitors/results/` | `SCORECARD.md` (historical) |
+| [competitors](competitors/README.md) | throughput with concurrent clients, writes under read load; the datasets of the basics mix | `scorecard.sh` | `competitors/results/` | the run records in `runs/` |
 | [integration](integration/README.md) | the RG × GS × GND workload | its scripts; the suite's `integration-rg-gs-gnd` | `integration/results/` | — |
 | [clients](clients/README.md) | client libraries end to end | `run-all.sh` | stdout | — |
 | [oracle](oracle/README.md) | NRESE's SPARQL answers against Jena's | its script | `oracle/results/` | — |
@@ -68,6 +68,20 @@ benches/
 | perf lab | the store and query engine without HTTP, per query p50 | `perf-lab.sh` | — | `baselines/perf-lab/*.json` |
 | [probes](probes/README.md) | one property at a time | one script each | stdout | — |
 | [cluster](cluster/README.md) | the suite on Draco | `suite.sbatch` | the job's directory | record in `runs/` |
+
+## Lab tools
+
+Single measurements and diagnoses outside the kits, run with
+`scripts/cargo-guarded.sh run --release -p <crate> --example <name> -- …` (each file's
+header says how). `benches/probes/` has the HTTP-level probes.
+
+| Area | Examples |
+|---|---|
+| Store, load, restart | `nrese-store`: `perf_lab` (the perf lab), `restart`, `reason_query`, `support_sets`, `vector_search`; `nrese-engine`: `insert_latency`, `image` (a store image in the current format); `nrese-rdf-io`: `parse_parallel` (why a parallel load rejects a file) |
+| Rule reasoning | `nrese-reasoner`: `v2_closure` (closures for the oracle), `v2_delta` (commit latency against rematerialisation), `graph_sets`, `classify` (EL, against ELK) |
+| DL | `nrese-dl`: `tableau_consistency` (per-phase times, search counters), `context_classify`, `bounds_eval` (the L and U1 bounds), `tableau_fuzz`; `nrese-owl`: `fuzz` (random OWL 2 DL ontologies), `ofn_speed` (the functional-syntax reader's speed gate) |
+| Studies kept for open targets | `nrese-engine`'s ignored tests `compression_study` and `vocabulary_study` (store-size options, P2 in [performance.md](../docs/design/performance.md) §6) |
+| Office PC | `scripts/office/`: dataset preparation (`dbpedia.sh`, `wikidata.sh`) and the perf lab there (`perflab.sh`) |
 
 ## A run, step by step
 
