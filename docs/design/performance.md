@@ -4,7 +4,7 @@ The ideas behind NRESE's performance, each with where it lives and what it measu
 is the source for the paper's performance sections. The DL engine's ideas are in
 [owl2-dl-performance.md](owl2-dl-performance.md); this document covers the store, the
 query engine and rule reasoning, and the performance phase that started on 5 October 2026
-([plan](../plan/2026-10-05-performance-phase.md)).
+([plan](performance.md)).
 
 Rules for every entry:
 - An idea is listed with its measurement before and after, the machine and the commit or
@@ -115,6 +115,23 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
   recompute, HermiT and Konclude for DL).
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
+
+**The phase's targets,** as set on 5 October (start values; progress is in the log below):
+
+| # | Target | At the start | Goal |
+|---|---|---|---|
+| P1 | Materialisation memory at scale | LUBM 1000 peak 21.7 GiB (about 100 B per final statement) | half, at no more than 10 % more time |
+| P2 | Serving memory and store size | QLever smaller (DBpedia 2.7 against 3.6 GB; LUBM-mat 100 251 against 536 MB); OWL2Bench RL-1 serves at 1.0 GiB on a 16 MiB store | the store within 1.2× of QLever's; serving memory explained and bounded |
+| P3 | The DL pipeline outside the engine | ore_ont_1066: 982 ms whole, 258 ms engine; the Horn context core 9× slower than the EL classifier | the pipeline below the engine's time; the context core within 2× of EL |
+| P4 | The heaviest queries | LUBM 1000 q06 1.7 s, q14 1.4 s, q09 0.6 s; OWL2Bench RL-1 q20 0.39 s | each cost explained by a profile; serialisation at memory bandwidth |
+| P5 | Load throughput | 3.3 M quads/s overall at LUBM 1000 | parse and index build each scaling with cores |
+| P6 | First executions | DBpedia: first 250 ms, repeated 148 ms | the gap explained |
+
+**Discipline:** one target at a time on the measuring machine; every change starts from a
+hypothesis out of a profile, has a differential test, is measured interleaved (medians of
+at least three) on its own target and on the standard sets so no other path gets slower,
+and gets a line here, kept or rejected. Two changes that shrink the same structures are
+measured one at a time against the same baseline.
 
 One line per idea tried: what, where, the measurement before and after (machine, data,
 medians), and kept or rejected.

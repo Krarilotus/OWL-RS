@@ -26,8 +26,7 @@ handling by explicit rules, without a published reason. LOD reality (Raad et al.
 whose pairwise closure alone would be 31.6 billion pairs; erroneous bridge links create
 such giants.
 
-**Design** (extends the existing W4 stages A–D of the
-[completion plan](2026-09-30-completion-plan.md)):
+**Design** (extends the equality stages A–D, see STATUS):
 
 - A stable internal class id per equality class, apart from the union-find root and from
   the term shown in answers (display representative configurable: smallest id,
@@ -107,7 +106,7 @@ L v2.0 (Apache-2.0); model licences are checked apart from runtime licences.
 
 **Evidence.** Measured here: palettes alone save 8.6 % of Wikidata lexemes' store with
 queries even, 3.3 % of DBpedia core's with queries 7 % slower
-([suite results](../reviews/2026-10-02-suite-results.md)); now `store.index_encoding =
+(the suite run of 2 October, `benches/runs/2026-10-02.toml`); now `store.index_encoding =
 "compact"`. QLever's current writer stores a permutation relation by relation (the
 leading key per block in metadata, two columns per row), compresses each id column of a
 block with Zstd, and compresses its vocabulary with FSST applied twice (FSST: MIT).

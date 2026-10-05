@@ -1,7 +1,7 @@
 //! What a query gives back, and what it runs under: results (solutions, a boolean, or
 //! triples), their errors, cancellation, and the dataset a request names.
 //!
-//! These are the evaluator's own types (docs/plan/2026-10-01-oxigraph-migration.md); their
+//! These are the evaluator's own types (docs/design/rdf-bundle.md); their
 //! methods follow the shape the store and the server use.
 
 use std::error::Error;
