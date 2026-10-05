@@ -24,6 +24,8 @@ pub(crate) struct Problem {
     /// For a commit a consistency check rejected: the violated rule and the statements
     /// that clash.
     reasoner_reject: Option<serde_json::Value>,
+    /// The request's id, as in the `x-request-id` header and the server's log.
+    request_id: Option<String>,
 }
 
 const ID: &str = "The repository's id (`nrese` is the default one)";
