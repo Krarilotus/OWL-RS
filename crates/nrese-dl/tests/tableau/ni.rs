@@ -14,7 +14,9 @@ fn configs() -> impl Iterator<Item = Config> {
         backjumping: bits & 2 != 0,
         anywhere_blocking: bits & 4 != 0,
         single_blocking: bits & 8 != 0,
-        timeout: Some(Duration::from_secs(2)),
+        // Bounded by branch points, not the clock; the timeout is only a safety net.
+        max_branch_points: Some(200_000),
+        timeout: Some(Duration::from_secs(300)),
         max_nodes: 100_000,
         max_memory: 512 << 20,
         check_blocking: true,
@@ -29,7 +31,7 @@ fn configs() -> impl Iterator<Item = Config> {
 /// spelled out (what gives up elsewhere would take the budget each time).
 fn decided(o: &Ontology, quick: bool) -> Answer {
     let default = Config {
-        timeout: Some(Duration::from_secs(20)),
+        max_branch_points: Some(2_000_000),
         ..configs().last().expect("16 configs")
     };
     let default = consistency(o, &default).answer;
@@ -45,8 +47,10 @@ fn decided(o: &Ontology, quick: bool) -> Answer {
                 ..config
             };
             let answer = consistency(o, &config).answer;
+            // Giving up is allowed on the deterministic budget only, never on the clock.
             assert!(
-                answer == default || matches!(answer, Answer::GaveUp(_)),
+                answer == default
+                    || matches!(&answer, Answer::GaveUp(why) if !why.contains("time budget")),
                 "{answer:?}, not {default:?}, under {config:?}"
             );
         }

@@ -31,6 +31,7 @@ mod merge;
 mod model;
 mod ni;
 mod portfolio;
+mod probe;
 mod program;
 mod search;
 mod telemetry;
@@ -41,11 +42,12 @@ use nrese_owl::{Concept, Normalised, Ontology, Options, Term, normalise_with};
 
 pub use model::Model;
 pub use portfolio::Cancel;
+pub use probe::{At, Base, From, Label, Labels, Prepared, Probe, ProbeOutcome, Want};
 pub use telemetry::Telemetry;
 
 use engine::Engine;
 use program::{ConceptName, Head, Program};
-use search::End;
+use search::{End, Seed, Site};
 
 /// What a run may use, and which optimisations are on (each has a switch: "on" and
 /// "off" must give the same answers).
@@ -77,6 +79,9 @@ pub struct Config {
     pub disjunct_learning: bool,
     /// The most nodes a run may create at once.
     pub max_nodes: usize,
+    /// The most branch points a run may open (`None`: no limit): a deterministic bound
+    /// on the search, for tests that must not depend on the machine's speed.
+    pub max_branch_points: Option<u64>,
     pub timeout: Option<Duration>,
     /// The most memory a run may hold (its tables, indexes and arenas), in bytes.
     pub max_memory: usize,
@@ -110,6 +115,7 @@ impl Default for Config {
             incremental_blocking: true,
             check_blocking: false,
             max_nodes: 2_000_000,
+            max_branch_points: None,
             timeout: None,
             max_memory: 4 << 30,
             keep_model: false,
@@ -120,6 +126,9 @@ impl Default for Config {
         }
     }
 }
+
+/// Why a run gave up when [`Config::max_branch_points`] ran out.
+pub const BRANCH_BUDGET: &str = "the branch-point budget ran out";
 
 /// The answer of a consistency or satisfiability test.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,7 +245,7 @@ pub fn satisfiable(
     run(ontology, normalised, Some(Concept::Named(class)), config)
 }
 
-fn features(p: &Program) -> Features {
+pub(crate) fn features(p: &Program) -> Features {
     let mut f = Features {
         inverses: !p.simple,
         numbers: !p.at_most.is_empty() || p.at_least.iter().any(|n| n.n > 1),
@@ -250,6 +259,24 @@ fn features(p: &Program) -> Features {
         f.numbers |= c.head.iter().any(|h| matches!(h, Head::Equal(..)));
     }
     f
+}
+
+/// The answer a run's end gives: a model is an answer only if nothing was left out.
+pub(crate) fn answer_of(end: End, program: &Program, engine: &Engine<'_>) -> Answer {
+    match end {
+        End::Refuted => Answer::Inconsistent,
+        End::GaveUp(why) => Answer::GaveUp(why),
+        End::Model if program.weakened.is_empty() && engine.data_approximate.is_none() => {
+            Answer::Consistent
+        }
+        End::Model => {
+            let mut why = program.weakened.clone();
+            if let Some(a) = &engine.data_approximate {
+                why.push(format!("datatypes approximated: {a}"));
+            }
+            Answer::Unsupported(why.join("; "))
+        }
+    }
 }
 
 fn run(
@@ -266,21 +293,16 @@ fn run(
     let features = features(&program);
     let mut engine = Engine::new(&program, config);
     engine.stats.compile = compiled;
-    let end = engine.run(test);
-    let answer = match end {
-        End::Refuted => Answer::Inconsistent,
-        End::GaveUp(why) => Answer::GaveUp(why),
-        End::Model if program.weakened.is_empty() && engine.data_approximate.is_none() => {
-            Answer::Consistent
-        }
-        End::Model => {
-            let mut why = program.weakened.clone();
-            if let Some(a) = &engine.data_approximate {
-                why.push(format!("datatypes approximated: {a}"));
-            }
-            Answer::Unsupported(why.join("; "))
-        }
+    let seed = match test {
+        Some(c) => Seed {
+            site: Site::Fresh,
+            positive: vec![c],
+            negative: Vec::new(),
+        },
+        None => Seed::none(),
     };
+    let end = engine.run(&seed);
+    let answer = answer_of(end, &program, &engine);
     let model = (config.keep_model && end_is_model(&answer, &program)).then(|| engine.model());
     let mut telemetry = engine.stats.clone();
     telemetry.total = started.elapsed();

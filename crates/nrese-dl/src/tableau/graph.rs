@@ -189,7 +189,7 @@ fn key(a: u32, b: u32) -> u64 {
 }
 
 /// The completion graph.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Graph {
     pub nodes: Vec<HotNode>,
     pub unary: Vec<Unary>,
