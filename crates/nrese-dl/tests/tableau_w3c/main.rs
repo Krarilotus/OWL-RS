@@ -92,12 +92,29 @@ enum Verdict {
     Open(String),
 }
 
+thread_local! {
+    /// Set by tests whose assertions must not depend on the machine's speed: their runs
+    /// are bounded by branch points, and the clock is only a safety net.
+    static DETERMINISTIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn config() -> Config {
+    if DETERMINISTIC.with(std::cell::Cell::get) {
+        return Config {
+            max_branch_points: Some(5_000_000),
+            ..base_config(600)
+        };
+    }
     let secs = std::env::var("NRESE_W3C_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
-    // `NRESE_W3C_SWITCHES`: optimisations to switch off, for A/B runs.
+    base_config(secs)
+}
+
+/// The suite's configuration with a time budget of `secs` per test;
+/// `NRESE_W3C_SWITCHES` names optimisations to switch off, for A/B runs.
+fn base_config(secs: u64) -> Config {
     let off = std::env::var("NRESE_W3C_SWITCHES").unwrap_or_default();
     let off = |name: &str| off.split(',').any(|s| s.trim() == name);
     Config {
@@ -413,6 +430,7 @@ fn hard_search_tests_are_decided() {
     let Ok(text) = std::fs::read_to_string(suite_path()) else {
         return;
     };
+    DETERMINISTIC.with(|d| d.set(true));
     for name in [
         "WebOnt-description-logic-202",
         "WebOnt-description-logic-206",

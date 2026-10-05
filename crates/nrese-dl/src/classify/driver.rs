@@ -257,6 +257,16 @@ impl<'a> Driver<'a> {
         let base = (needs_full && self.options.reuse_model)
             .then(|| full.base(&base_config))
             .flatten();
+        if self.options.model_pruning
+            && let Some(labels) = base.as_ref().and_then(|b| {
+                b.labels(Want {
+                    elements: true,
+                    ..Want::default()
+                })
+            })
+        {
+            self.observe(&labels, None);
+        }
         let first = if terminology_first {
             let mut terminology = self.normalised.clone();
             terminology.facts = Default::default();

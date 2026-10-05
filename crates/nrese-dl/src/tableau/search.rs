@@ -367,6 +367,34 @@ impl Engine<'_> {
         out
     }
 
+    /// A point to come back to: the state as it is, with its queues processed (as a
+    /// run leaves it, or a branch point finds it).
+    pub fn checkpoint(&self) -> super::engine::Frame {
+        super::engine::Frame {
+            mark: self.g.mark(),
+            pending: self.pending.len() as u32,
+            bindings: self.bindings.len() as u32,
+            pending_open: self.pending_open,
+            ni_pending: self.ni.pending.len() as u32,
+            ni_open: self.ni.open,
+            semantic: false,
+            alternatives: Vec::new(),
+            clause: NONE,
+            heads: Vec::new(),
+            next: 0,
+            premise: DepSetId::EMPTY,
+            failed: DepSetId::EMPTY,
+        }
+    }
+
+    /// Back to `point` (taken with `frames` branch points open): what a test added since
+    /// is cut away and its changes undone through the trail, as a backtrack does.
+    pub fn rollback(&mut self, point: &super::engine::Frame, frames: usize) {
+        self.frames.truncate(frames);
+        self.restore(point);
+        self.probe = NONE;
+    }
+
     /// Cuts everything back to the state the branch point was opened in.
     fn restore(&mut self, frame: &super::engine::Frame) {
         self.g.cut(&frame.mark);
