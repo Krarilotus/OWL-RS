@@ -42,6 +42,16 @@ LICENSED = {"graphdb", "rdfox", "stardog", "anzograph"}
 RESULTS = fast.HERE / "results"
 
 
+def unsupported_mode(case: dict) -> str | None:
+    """What a case measures that the suite's cycle (load, count, queries, clients) doesn't."""
+    args = case.get("args", [])
+    for flag, what in (("--commits", "a commit series"), ("--shapes", "SHACL validation"),
+                       ("--canonicalize", "canonicalisation")):
+        if flag in args:
+            return what
+    return None
+
+
 def comparators(case: dict, only: set[str] | None) -> list[tuple[str, str]]:
     out = []
     for entry in case.get("systems", []):
@@ -93,7 +103,7 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
         env["FAST_QUERIES"] = str(queries)
     command = [sys.executable, str(fast.ROOT / "benches/suite/suite.py"), "run",
                "--systems", ",".join(["nrese", *systems]), "--workloads", "fast", "--tier", f"fast={tier}",
-               "--runs", str(runs), "--query-runs", "3", "--cache", "off", "--skip-build",
+               "--runs", str(runs), "--query-runs", "2", "--cache", "off", "--skip-build",
                "--data", f"volume:{fast.DATA_VOLUME}", "--results", str(out), "--query-timeout-s", "120",
                "--timeout-s", "900"]
     print(f"  suite: {tier} on nrese, {', '.join(systems)}", flush=True)
@@ -300,6 +310,8 @@ def compete(args) -> int:
                 dl.append(system)
             elif system == "nemo" and semantics == "custom":
                 result["comparisons"]["nemo:custom"] = nemo_custom(case)
+            elif system in SUITE_SYSTEMS and semantics in FAST_REGIMES and unsupported_mode(case):
+                result["no_runner"].append(f"{system}:{semantics} ({unsupported_mode(case)} has no suite runner yet)")
             elif system in SUITE_SYSTEMS and semantics in FAST_REGIMES:
                 clients = "--clients" in case.get("args", [])
                 data = (case["name"],) if semantics == "closure" else (case["data"], *case.get("extra", []))
