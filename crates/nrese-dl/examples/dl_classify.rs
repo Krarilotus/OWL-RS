@@ -11,9 +11,10 @@
 //!   --test-timeout SECS   a budget per hypertableau test
 //!   --lower-bound-timeout SECS  the Horn lower bound's budget
 //!   --repeat N            run N times; times are the median of the runs
+//!   --expand-at-most N    spell `≤ n` out as clauses up to this `n` (else at-most atoms)
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
 //!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
-//!   --no-skip-seen --no-tbox-only
+//!   --no-skip-seen --no-tbox-only --no-detached-probes
 //!                         switch an optimisation off (the taxonomy must not change)
 //! ```
 //!
@@ -207,7 +208,13 @@ fn args() -> Result<Args, String> {
             "--no-model-pruning" => a.options.model_pruning = false,
             "--no-skip-seen" => a.options.skip_seen = false,
             "--no-tbox-only" => a.options.tbox_only = false,
+            "--no-detached-probes" => a.options.detached_probes = false,
             "--clauses" => a.clauses = true,
+            "--expand-at-most" => {
+                let n = number("--expand-at-most")? as u32;
+                a.options.normalise.expand_at_most_up_to = n;
+                a.options.tableau.expand_at_most_up_to = n;
+            }
             _ if arg.starts_with("--") => return Err(format!("unknown option {arg}")),
             _ => a.inputs.push(arg),
         }

@@ -29,6 +29,10 @@ pub struct Profile {
     pub classes: usize,
     /// Whether the tests ran without the individuals.
     pub tbox_only: bool,
+    /// Tests the terminology answered with a model detached from the individuals, and
+    /// tests run again with the assertions.
+    pub detached: u64,
+    pub fallbacks: u64,
     /// The Horn part's taxonomy was exact: no hypertableau test of a class.
     pub exact: bool,
     /// Classes whose Horn subsumers were exact (their saturation reached nothing left out).
@@ -75,7 +79,7 @@ impl Profile {
             s,
             "path={} normalise={:.1} compile={:.1} lower_bound={:.1} consistency={:.1} \
              satisfiability={:.1} top={:.1} subsumption={:.1} realisation={:.1} total={:.1} \
-             threads={} classes={} eliminated={} flipped={} wide={}->{} tbox_only={} exact={} exact_classes={} consistency_by={} lower_known={} lower_unsat={} tests={} \
+             threads={} classes={} eliminated={} flipped={} wide={}->{} tbox_only={} detached={} fallbacks={} exact={} exact_classes={} consistency_by={} lower_known={} lower_unsat={} tests={} \
              sat_tests={} sat_skipped={} labels_seen={} candidates={} candidate_tests={} \
              positive={} pruned={} type_candidates={} type_tests={} type_positive={} \
              nodes_created={} branch_points={} clashes={}",
@@ -96,6 +100,8 @@ impl Profile {
             self.inlined.wide_before,
             self.inlined.wide_after,
             self.tbox_only,
+            self.detached,
+            self.fallbacks,
             self.exact,
             self.exact_classes,
             self.consistency_by,

@@ -65,6 +65,9 @@ pub struct Want {
     pub elements: bool,
     /// The individuals' labels.
     pub individuals: bool,
+    /// Whether the probed element's part of the model reaches an individual
+    /// ([`Labels::detached`]); with it, `elements` holds that part's elements only.
+    pub detached: bool,
 }
 
 /// A label: its classes, sorted, and the deterministic ones among them.
@@ -84,6 +87,14 @@ pub struct Labels {
     /// By the caller's individual index (if wanted; `None` for individuals the program
     /// doesn't have: their classes are those of a fresh element without assertions).
     pub individuals: Vec<Option<Label>>,
+    /// If asked for ([`Want::detached`]): the probed element's connected part of the
+    /// model (by edges, parents and merges) holds no individual. Such a part, with any
+    /// model of the individuals beside it as a disjoint union, satisfies every clause:
+    /// clause bodies are trees joined by role atoms, a nominal in a head would have merged
+    /// an element into its individual, and guards hold at individuals only. So a model of
+    /// the clauses without the assertions is then one with them, as far as the probed
+    /// element goes.
+    pub detached: bool,
 }
 
 /// A probe's answer: `Inconsistent` refutes it (a subsumption or a type holds),
@@ -211,12 +222,22 @@ impl Prepared {
                 .map(|&p| (p != NONE).then(|| self.label(engine, engine.roots[p as usize])))
                 .collect();
         }
+        let part = (want.detached && probe != NONE).then(|| self.part(engine, probe));
+        if let Some(part) = &part {
+            out.detached = !part.iter().enumerate().any(|(n, &inside)| {
+                inside && engine.g.nodes[n].named != NONE && engine.g.nodes[n].live()
+            });
+        }
         if want.elements {
             let mut seen: hashbrown::HashSet<Vec<u32>> = hashbrown::HashSet::new();
             for n in 0..engine.g.nodes.len() as u32 {
                 let node = &engine.g.nodes[n as usize];
                 if n == probe || !node.live() || node.flags & (flag::BLOCKED | flag::CONCRETE) != 0
                 {
+                    continue;
+                }
+                if part.as_ref().is_some_and(|p| !p[n as usize]) {
+                    // Outside the probed part: individuals without their assertions.
                     continue;
                 }
                 let mut classes: Vec<u32> = engine
@@ -233,6 +254,44 @@ impl Prepared {
             out.elements.sort_unstable();
         }
         out
+    }
+
+    /// The nodes connected to `probe` (a representative) by edges and parents, over
+    /// representatives.
+    fn part(&self, engine: &Engine<'_>, probe: u32) -> Vec<bool> {
+        let g = &engine.g;
+        let len = g.nodes.len();
+        let mut parent: Vec<u32> = (0..len as u32).collect();
+        fn root(p: &mut [u32], mut x: u32) -> u32 {
+            while p[x as usize] != x {
+                p[x as usize] = p[p[x as usize] as usize];
+                x = p[x as usize];
+            }
+            x
+        }
+        let join = |p: &mut Vec<u32>, a: u32, b: u32| {
+            let (a, b) = (root(p, a), root(p, b));
+            if a != b {
+                p[a as usize] = b;
+            }
+        };
+        for n in 0..len as u32 {
+            let node = &g.nodes[n as usize];
+            let me = g.find(n);
+            if node.parent != NONE {
+                join(&mut parent, me, g.find(node.parent));
+            }
+        }
+        for e in &g.edges {
+            join(&mut parent, g.find(e.from), g.find(e.to));
+        }
+        let mine = root(&mut parent, probe);
+        (0..len as u32)
+            .map(|n| {
+                let r = g.find(n);
+                root(&mut parent, r) == mine
+            })
+            .collect()
     }
 
     /// The classes of the node `n` stands for now, and the deterministic ones: derived
