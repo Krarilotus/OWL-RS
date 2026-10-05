@@ -443,6 +443,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         equality_compact,
         equality_early_expansion: setting("NRESE_REASONING_EQUALITY_EXPANSION") == "early",
         equality_canonical_answers: setting("NRESE_REASONING_EQUALITY_ANSWERS") == "canonical",
+        // The OWL 2 QL rewriting as the server takes it (`NRESE_REASONING_QL_REWRITING`).
+        ql_rewriting: setting("NRESE_REASONING_QL_REWRITING") != "off",
         ..config
     };
     let started = Instant::now();

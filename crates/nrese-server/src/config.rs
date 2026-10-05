@@ -120,6 +120,10 @@ impl ServerConfig {
                 }
                 .to_owned(),
             ),
+            (
+                "reasoner.ql_rewriting",
+                if store.ql_rewriting { "auto" } else { "off" }.to_owned(),
+            ),
             ("reasoner.support_sets", store.support_sets.to_string()),
             (
                 "reasoner.semantics",

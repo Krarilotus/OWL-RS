@@ -56,6 +56,17 @@ pub(crate) struct StoreSettings {
     pub equality_canonical: bool,
     /// [`StoreConfig::equality_early_expansion`](crate::StoreConfig).
     pub equality_early_expansion: bool,
+    /// The QL rewriting, while the inferred stack is current under a ruleset that makes the
+    /// data H-complete ([`StoreConfig::ql_rewriting`](crate::StoreConfig)).
+    pub ql:
+        std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>>>>,
+}
+
+impl StoreSettings {
+    /// The QL rewriting queries get now.
+    fn ql(&self) -> Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>> {
+        self.ql.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 /// A parsed query with its protocol dataset and output format. Preparing is cheap and
@@ -395,6 +406,7 @@ pub(crate) fn run_query(
         cross_chunk_rows: None,
         stream_rows: None,
         access: prepared.access.clone(),
+        ql: store.ql(),
     };
     let alive = || match cancellation.is_cancelled() {
         true => Err(StoreError::SparqlEvaluation(
@@ -510,5 +522,6 @@ fn explain_options(
         cross_chunk_rows: None,
         stream_rows: None,
         access: prepared.access.clone(),
+        ql: store.ql(),
     }
 }
