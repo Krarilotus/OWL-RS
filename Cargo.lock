@@ -1390,6 +1390,7 @@ dependencies = [
 name = "nrese-xsd"
 version = "0.1.0"
 dependencies = [
+ "regex-syntax",
  "thiserror 2.0.21",
 ]
 

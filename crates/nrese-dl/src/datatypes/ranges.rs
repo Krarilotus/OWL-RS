@@ -2,16 +2,18 @@
 //! engine adds: complements, a literal's singleton) evaluated once into `nrese-xsd`'s
 //! value sets.
 //!
-//! Where a range can't be decided exactly (a pattern, a language range, a datatype
-//! outside the map, a literal whose value isn't represented), it is evaluated twice: a
+//! Where a range can't be decided exactly (a datatype outside the map, a pattern of binary
+//! data, a literal whose value isn't represented, an ontology with more distinct patterns
+//! and language ranges than one set of values combines, `MAX_PATTERNS`), it is evaluated
+//! twice: a
 //! superset (`over`) and a subset (`under`), each the right way round under complements.
 //! A clash found with the supersets is a clash; a model found where a superset was used
 //! is no answer (`approximate` says why).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nrese_owl::{DataRange, DataTerms, Interner, Normalised, Ontology, RangeId, Term};
-use nrese_xsd::owl::{Datatype, Facet, LiteralError, Value, ValueSet, facet};
+use nrese_xsd::owl::{Datatype, Facet, LiteralError, MAX_PATTERNS, Value, ValueSet, facet};
 
 /// A data range's values: exactly (`over == under`), or between two sets.
 #[derive(Debug, Clone)]
@@ -76,6 +78,8 @@ pub struct Ranges {
     /// Datatype definitions: a datatype is its range.
     definitions: HashMap<Term, RangeId>,
     evals: Vec<Eval>,
+    /// More distinct patterns and language ranges than a set combines: they aren't decided.
+    too_many_patterns: bool,
 }
 
 impl Ranges {
@@ -86,6 +90,7 @@ impl Ranges {
             data: ontology.data.clone(),
             definitions: normalised.definitions.iter().copied().collect(),
             evals: Vec::new(),
+            too_many_patterns: false,
         }
     }
 
@@ -100,6 +105,7 @@ impl Ranges {
             data,
             definitions,
             evals: Vec::new(),
+            too_many_patterns: false,
         }
     }
 
@@ -118,6 +124,21 @@ impl Ranges {
 
     /// Evaluates every range (call once all are interned).
     pub fn finish(&mut self) {
+        let patterns: HashSet<(Term, Term)> = (0..self.table.len() as u32)
+            .filter_map(|id| match self.get(RangeId(id)) {
+                DataRange::Restriction(_, facets) => Some(facets.clone()),
+                _ => None,
+            })
+            .flatten()
+            .filter(|(f, _)| {
+                self.data
+                    .iris
+                    .get(f)
+                    .and_then(|iri| Facet::from_iri(iri))
+                    .is_some_and(|f| matches!(f, Facet::Pattern | Facet::LangRange))
+            })
+            .collect();
+        self.too_many_patterns = patterns.len() > MAX_PATTERNS;
         let mut evals: Vec<Option<Eval>> = vec![None; self.table.len()];
         for id in 0..self.table.len() as u32 {
             self.compute(RangeId(id), &mut evals, &mut Vec::new());
@@ -227,6 +248,12 @@ impl Ranges {
                     .ok_or_else(|| format!("facet term {f} has no IRI the source gives"))?;
                 let facet_kind =
                     Facet::from_iri(iri).ok_or_else(|| format!("{iri} isn't a facet"))?;
+                if self.too_many_patterns && matches!(facet_kind, Facet::Pattern | Facet::LangRange)
+                {
+                    return Err(format!(
+                        "more than {MAX_PATTERNS} patterns and language ranges in the ontology"
+                    ));
+                }
                 let value = self.value(v)?;
                 facet(d, facet_kind, &value)
                     .ok_or_else(|| format!("the facet {iri} on {d:?} isn't decided"))
