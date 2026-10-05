@@ -1059,6 +1059,7 @@ impl StoreService {
             violations: closure.violations.len(),
             rounds: closure.rounds,
             elapsed: started.elapsed(),
+            phases: closure.phases,
             ..reported
         };
         *self
