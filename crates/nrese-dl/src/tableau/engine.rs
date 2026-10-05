@@ -375,6 +375,7 @@ impl<'a> Engine<'a> {
             // The individual's own node: whoever asserts or tests the equality follows it
             // to its representative with the merges' dependencies.
             Head::Nominal(i, v) => Lit::Equal(b(v), self.roots[i as usize], Annot::NONE),
+            Head::Unequal(x, y) => Lit::Unequal(b(x), b(y)),
         }
     }
 
