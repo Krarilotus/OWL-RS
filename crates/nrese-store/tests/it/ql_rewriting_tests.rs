@@ -809,7 +809,11 @@ fn store(turtle: &str, dir: &std::path::Path, ruleset: Ruleset, ql: bool) -> Sto
     let file = dir.join("case.ttl");
     std::fs::write(&file, turtle).unwrap();
     let store = StoreService::new(StoreConfig {
-        ql_rewriting: ql,
+        ql_rewriting: if ql {
+            nrese_store::QlRewritingMode::On
+        } else {
+            nrese_store::QlRewritingMode::Off
+        },
         ..StoreConfig::in_memory()
     })
     .unwrap();
@@ -1164,7 +1168,12 @@ fn rewritten_answers_follow_the_readers_graph_access() {
     use nrese_sparql::GraphAccess;
     use nrese_store::{ReadScope, SparqlUpdateRequest};
 
-    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    // Rewriting over the owl2-rl closure is asked for (`auto` is owl2-ql only).
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::On,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
     store
         .execute_update(&SparqlUpdateRequest::new(
             "PREFIX ex: <http://e/> PREFIX owl: <http://www.w3.org/2002/07/owl#>

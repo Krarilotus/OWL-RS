@@ -252,8 +252,9 @@ pub const SETTINGS: &[Setting] = &[
     setting(
         "reasoner.ql_rewriting",
         names::REASONING_QL_REWRITING,
-        Choice(&["auto", "off"]),
-        "OWL 2 QL answers through existentials by tree-witness rewriting of queries: auto          (the default) while the inferred stack is current under owl2-ql or owl2-rl, or off.",
+        Choice(&["auto", "on", "off"]),
+        "OWL 2 QL answers through existentials by tree-witness rewriting of queries: auto \
+         (the default) under owl2-ql, on under owl2-ql and owl2-rl, or off.",
     ),
     setting(
         "reasoner.support_sets",

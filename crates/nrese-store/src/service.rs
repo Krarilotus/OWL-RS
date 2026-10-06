@@ -38,6 +38,9 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
+    /// When queries are rewritten for OWL 2 QL ([`StoreConfig::ql_rewriting`], or the
+    /// repository's own, [`Self::set_ql_rewriting`]).
+    ql_mode: std::sync::Arc<std::sync::RwLock<crate::QlRewritingMode>>,
     /// The latest full materialisation's report (startup, load, ruleset change).
     last_materialisation:
         std::sync::Arc<std::sync::Mutex<Option<crate::reasoning::MaterialisationReport>>>,
@@ -95,6 +98,7 @@ impl StoreService {
         let query_cache = std::sync::Arc::new(crate::query_cache::QueryCache::new(
             config.query_cache_bytes,
         ));
+        let ql_mode = config.ql_rewriting;
         let settings = crate::query_executor::StoreSettings {
             union_default_graph: config.union_default_graph,
             geosparql_stated_only: config.geosparql_stated_only,
@@ -121,6 +125,7 @@ impl StoreService {
             preloaded_ontology,
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             materialised: std::sync::Arc::default(),
+            ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             last_materialisation: std::sync::Arc::default(),
         };
         if service.engine.snapshot().revision() != before {
@@ -164,11 +169,24 @@ impl StoreService {
             "owl2-ql" => Some(Closure { lists: false }),
             _ => None,
         };
-        let closure = closure.filter(|_| self.config.ql_rewriting);
+        let closure = closure.filter(|_| self.ql_rewriting().applies_to(&state.ruleset));
         let mut ql = self.settings.ql.write().unwrap_or_else(|p| p.into_inner());
         // The same closure keeps its compiled schema.
         if ql.as_ref().map(|q| q.closure()) != closure {
             *ql = closure.map(|closure| std::sync::Arc::new(QlRewriting::new(closure)));
+        }
+    }
+
+    /// When queries are rewritten for OWL 2 QL.
+    pub fn ql_rewriting(&self) -> crate::QlRewritingMode {
+        *self.ql_mode.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Changes when queries are rewritten for OWL 2 QL (a repository's setting), at once.
+    pub fn set_ql_rewriting(&self, mode: crate::QlRewritingMode) {
+        *self.ql_mode.write().unwrap_or_else(|p| p.into_inner()) = mode;
+        if let Some(state) = self.reasoning_state() {
+            self.note_ql(&state);
         }
     }
 
@@ -446,8 +464,13 @@ impl StoreService {
         if !self.query_cache.enabled() || prepared.volatile() {
             return run_query(&snapshot, prepared, settings, cancellation, out);
         }
+        // The rewriting's mode changes answers without a new revision.
         let key = crate::query_cache::CacheKey {
-            request: prepared.cache_request(),
+            request: format!(
+                "{}\u{0}ql={}",
+                prepared.cache_request(),
+                self.ql_rewriting().name()
+            ),
             revision: snapshot.revision(),
         };
         let mut out = out;
