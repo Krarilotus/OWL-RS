@@ -1001,6 +1001,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrese-dl"
+version = "0.1.0"
+dependencies = [
+ "hashbrown 0.16.1",
+ "nrese-exec",
+ "nrese-owl",
+ "nrese-xsd",
+ "rayon",
+]
+
+[[package]]
 name = "nrese-engine"
 version = "0.1.0"
 dependencies = [
@@ -1010,6 +1021,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "memchr",
  "memmap2",
+ "nrese-exec",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-vector",
@@ -1106,6 +1118,7 @@ dependencies = [
  "md-5",
  "nrese-engine",
  "nrese-exec",
+ "nrese-owl",
  "nrese-rdf",
  "nrese-sparql-results",
  "nrese-sparql-syntax",
@@ -1148,8 +1161,10 @@ dependencies = [
  "argon2",
  "getrandom 0.4.2",
  "hashbrown 0.16.1",
+ "nrese-dl",
  "nrese-engine",
  "nrese-exec",
+ "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-reasoner",

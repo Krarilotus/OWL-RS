@@ -118,6 +118,9 @@ pub struct Counters {
     pub slots: u64,
     /// Premise lists looked up by the joins.
     pub lookups: u64,
+    /// Inclusion tests of the redundancy checks: forward, one set-trie query per head
+    /// looked up; backward, each candidate past its signature.
+    pub subset_checks: u64,
     /// The Eq rule's merges, and its copies.
     pub merges: u64,
     pub eq: u64,
@@ -210,6 +213,7 @@ impl Clauses {
         proofs: bool,
     ) -> Option<ClauseId> {
         self.counters.generated += 1;
+        self.counters.subset_checks += if head.is_bottom() { 1 } else { 2 };
         if self.unsat || self.subsumed(body, head) {
             self.counters.forward += 1;
             return None;
@@ -312,18 +316,24 @@ impl Clauses {
         };
         let (recs, bodies) = (&mut self.recs, &self.bodies);
         let mut removed = 0u32;
+        let mut checks = 0u64;
         list.retain(|&c| {
             let rec = &mut recs[c as usize];
             if !rec.live {
                 return false;
             }
-            if sig & !rec.sig == 0 && is_subset(body, bodies.get(rec.body)) {
+            if sig & !rec.sig != 0 {
+                return true;
+            }
+            checks += 1;
+            if is_subset(body, bodies.get(rec.body)) {
                 rec.live = false;
                 removed += 1;
                 return false;
             }
             true
         });
+        self.counters.subset_checks += checks;
         if removed > 0 {
             let dead = self.dead.entry(head).or_default();
             *dead += removed;

@@ -1,0 +1,6 @@
+# Transitive closure of `edge` as user rules (the custom-tc case); Nemo runs the same
+# program as rules/tc.rls.
+@prefix e: <http://example.org/fast/> .
+
+{ ?x e:edge ?y } => { ?x e:path ?y } .
+{ ?x e:edge ?y . ?y e:path ?z } => { ?x e:path ?z } .

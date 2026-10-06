@@ -344,7 +344,7 @@ pub async fn autocomplete(
     Ok(Json(serde_json::json!({ "suggestions": suggestions })).into_response())
 }
 
-/// The OWL 2 EL class hierarchy of the asserted ontology.
+/// The OWL 2 DL class hierarchy of the asserted ontology.
 pub async fn classification_get(
     authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
@@ -352,6 +352,16 @@ pub async fn classification_get(
 ) -> Result<Response, ApiError> {
     let scope = guard::enforce_whole_read(&state, &authenticated).await?;
     super::classification::classify(state, &headers, scope).await
+}
+
+/// The named individuals' types under the asserted ontology (OWL 2 DL).
+pub async fn realisation_get(
+    authenticated: crate::auth::Authenticated,
+    Repository(state): Repository,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let scope = guard::enforce_whole_read(&state, &authenticated).await?;
+    super::classification::realise(state, &headers, scope).await
 }
 
 /// Validates the data against the repository's shapes graph.
