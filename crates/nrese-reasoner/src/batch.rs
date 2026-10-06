@@ -216,6 +216,9 @@ pub struct Counters {
     /// Lookups by object alone in relations kept without their object order (P1-F11:
     /// none).
     pub lookups_without_order: u64,
+    /// Pairs of a recent run read as old that were checked against the delta (#10 of
+    /// the investigation of 6 October 2026).
+    pub old_checks: u64,
     /// Per round: the complete bindings the rule jobs enumerated, each a candidate fact
     /// per head atom (the joins' work).
     pub bindings: Vec<u64>,
@@ -653,6 +656,8 @@ pub(crate) struct Relation {
     /// Lookups by object alone in its runs without that order: the analysis that drops
     /// the order ([`Reads`]) says there are none, and the closure tests check it.
     missed: std::sync::atomic::AtomicU64,
+    /// Pairs of the recent run read as old that were looked up in the delta.
+    old_checks: std::sync::atomic::AtomicU64,
 }
 
 /// The pairs whose first component is `key`.
@@ -665,6 +670,12 @@ fn range(pairs: &[Pair], key: u64) -> &[Pair] {
 impl Relation {
     pub(crate) fn delta_len(&self) -> usize {
         self.delta.len()
+    }
+
+    /// Whether the recent run holds nothing but the delta (it is the delta, shared: right
+    /// after a fold, or the first round's input), so its old part is empty.
+    fn recent_is_delta(&self) -> bool {
+        self.recent.shares(&self.delta)
     }
 
     fn bytes(&self) -> StoreBytes {
@@ -759,7 +770,14 @@ impl Relation {
             Seg::Old => {
                 self.input.scan(s, o, &all, missed, f);
                 self.base.scan(s, o, &all, missed, f);
-                let old = |s: u64, o: u64| !self.delta.contains(s, o);
+                if self.recent_is_delta() {
+                    return;
+                }
+                let old = |s: u64, o: u64| {
+                    self.old_checks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    !self.delta.contains(s, o)
+                };
                 self.recent.scan(s, o, &old, missed, f);
             }
         }
@@ -775,7 +793,8 @@ impl Relation {
             Seg::All | Seg::Old => {
                 self.input.matching(s, o, false, &mut out)
                     && self.base.matching(s, o, false, &mut out)
-                    && self.recent.matching(s, o, seg == Seg::Old, &mut out)
+                    && (seg == Seg::Old && self.recent_is_delta()
+                        || self.recent.matching(s, o, seg == Seg::Old, &mut out))
             }
         };
         whole.then_some(out)
@@ -853,6 +872,7 @@ impl Store {
                     fresh: true,
                     by_subject_only: false,
                     missed: Default::default(),
+                    old_checks: Default::default(),
                 }
             })
             .collect();
@@ -1181,6 +1201,11 @@ impl Source for Store {
                     return;
                 }
                 let part = &pairs[range.start.max(start) - start..range.end.min(end) - start];
+                if old {
+                    relation
+                        .old_checks
+                        .fetch_add(part.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 for &(a, b) in part {
                     let (s, o) = if swapped { (b, a) } else { (a, b) };
                     if !(old && relation.delta.contains(s, o)) {
@@ -1976,6 +2001,15 @@ fn run(
         .relations
         .iter()
         .map(|relation| relation.missed.load(std::sync::atomic::Ordering::Relaxed))
+        .sum();
+    result.counters.old_checks = store
+        .relations
+        .iter()
+        .map(|relation| {
+            relation
+                .old_checks
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
         .sum();
     phases.consistency = clock.elapsed();
     result.phases = phases;
