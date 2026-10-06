@@ -3,8 +3,15 @@
 //! `nrese_owl::ql`, and its rewriting back as algebra.
 //!
 //! Where it applies: patterns reached through joins, `OPTIONAL`, `UNION`, filters, `BIND`,
-//! projections, `DISTINCT`, slices, ordering, grouping and `LATERAL`; not inside `GRAPH`,
-//! `SERVICE`, `MINUS`'s right side or `EXISTS`.
+//! projections, `DISTINCT`, slices, ordering, grouping and `LATERAL`, inside `EXISTS` and
+//! `NOT EXISTS`, on `MINUS`'s right side, and in `GRAPH` naming the default graph under
+//! another store's name (`compat`). Not inside `GRAPH` over a named graph, which holds its
+//! asserted statements only (the inferences are the default graph's), nor `SERVICE`.
+//!
+//! A pattern under a negation (`NOT EXISTS`, `MINUS`'s right side, `EXISTS` where its truth
+//! value can be turned either way) is read as a set, its variables bound outside as answer
+//! variables, the others existential. There an answer it misses can make an answer of the
+//! query wrong: its incompleteness makes the query's answers `unsound`.
 
 use std::collections::HashSet;
 
@@ -43,6 +50,48 @@ impl Needed {
                 Self::Only(set)
             }
         }
+    }
+}
+
+/// Where an `EXISTS` stands: under no negation, under one, or where its truth value can go
+/// either way (a comparison, `IF`'s condition, a function's argument, a bound value).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Polarity {
+    Positive,
+    Negative,
+    Both,
+}
+
+impl Polarity {
+    fn not(self) -> Self {
+        match self {
+            Self::Positive => Self::Negative,
+            Self::Negative => Self::Positive,
+            Self::Both => Self::Both,
+        }
+    }
+}
+
+/// The solutions an expression is evaluated on: the variables they may bind, and those
+/// some of them leave unbound.
+struct Outer {
+    bound: HashSet<Variable>,
+    maybe: HashSet<Variable>,
+}
+
+impl Outer {
+    /// The solutions of `patterns` joined.
+    fn of(patterns: &[&GraphPattern]) -> Self {
+        let mut bound = HashSet::new();
+        let mut certain = HashSet::new();
+        for pattern in patterns {
+            pattern.on_in_scope_variable(|v| {
+                bound.insert(v.clone());
+            });
+            certain.extend(super::pushdown::certain(pattern));
+        }
+        let maybe = bound.difference(&certain).cloned().collect();
+        Self { bound, maybe }
     }
 }
 
@@ -100,16 +149,20 @@ impl Rewriter<'_> {
         use GraphPattern as P;
         let boxed = |p: GraphPattern| Box::new(p);
         // What the rewriting doesn't enter here may miss answers (design §7).
-        for node in pattern.children() {
-            if matches!(node, Node::Expression(_)) {
-                self.unread(node, "EXISTS");
-            }
-        }
         match pattern {
-            P::Minus { right, .. } => self.unread(Node::Pattern(right), "MINUS"),
-            P::Graph { .. } => self.unread(Node::Pattern(pattern), "GRAPH"),
             P::Service { .. } => self.unread(Node::Pattern(pattern), "SERVICE"),
             P::Path { .. } => self.unread(Node::Pattern(pattern), "a property path"),
+            P::Group { aggregates, .. } => {
+                for (_, aggregate) in aggregates {
+                    if let nrese_sparql_syntax::algebra::AggregateExpression::FunctionCall {
+                        expr,
+                        ..
+                    } = aggregate
+                    {
+                        self.unread(Node::Expression(expr), "an aggregate's EXISTS");
+                    }
+                }
+            }
             _ => {}
         }
         match pattern {
@@ -124,7 +177,11 @@ impl Rewriter<'_> {
                 expression,
             } => {
                 let condition: Vec<Variable> = expression.iter().flat_map(used).collect();
+                let outer = Outer::of(&[left, right]);
                 P::LeftJoin {
+                    expression: expression
+                        .as_ref()
+                        .map(|e| self.expression(e, &outer, Polarity::Positive)),
                     left: boxed(self.walk(
                         left,
                         &needed.with(mentioned(right)).with(condition.clone()),
@@ -135,7 +192,6 @@ impl Rewriter<'_> {
                         &needed.with(mentioned(left)).with(condition),
                         set,
                     )),
-                    expression: expression.clone(),
                 }
             }
             P::Lateral { left, right } => P::Lateral {
@@ -143,7 +199,7 @@ impl Rewriter<'_> {
                 right: boxed(self.walk(right, &needed.with(mentioned(left)), set)),
             },
             P::Filter { expr, inner } => P::Filter {
-                expr: expr.clone(),
+                expr: self.expression(expr, &Outer::of(&[inner]), Polarity::Positive),
                 inner: boxed(self.walk(inner, &needed.with(used(expr)), set)),
             },
             P::Union { left, right } => P::Union {
@@ -155,22 +211,53 @@ impl Rewriter<'_> {
                 variable,
                 expression,
             } => P::Extend {
+                expression: self.expression(expression, &Outer::of(&[inner]), Polarity::Both),
                 inner: boxed(self.walk(inner, &needed.with(used(expression)), set)),
                 variable: variable.clone(),
-                expression: expression.clone(),
             },
-            P::Minus { left, right } => P::Minus {
-                left: boxed(self.walk(left, &needed.with(mentioned(right)), set)),
-                right: right.clone(),
+            P::Minus { left, right } => {
+                // The right side removes what it is compatible with: read as a set, the
+                // variables it shares with the left as answer variables.
+                let on_left = mentioned(left);
+                let shared: HashSet<Variable> = mentioned(right)
+                    .into_iter()
+                    .filter(|v| on_left.contains(v))
+                    .collect();
+                let rewritten = self.negated(Polarity::Negative, "MINUS", |this| {
+                    this.walk(right, &Needed::Only(shared), true)
+                });
+                P::Minus {
+                    left: boxed(self.walk(left, &needed.with(mentioned(right)), set)),
+                    right: boxed(rewritten),
+                }
+            }
+            // Another store's name for the default graph: read as the default graph is.
+            P::Graph {
+                name: NamedNodePattern::NamedNode(name),
+                inner,
+            } if crate::compat::names_default_graph(name.as_str()) => P::Graph {
+                name: NamedNodePattern::NamedNode(name.clone()),
+                inner: boxed(self.walk(inner, needed, set)),
             },
             P::OrderBy { inner, expression } => {
                 let keys: Vec<Variable> = expression
                     .iter()
                     .flat_map(|e| used(e.expression()))
                     .collect();
+                let outer = Outer::of(&[inner]);
+                let expression = expression
+                    .iter()
+                    .map(|key| {
+                        use nrese_sparql_syntax::algebra::OrderExpression as O;
+                        match key {
+                            O::Asc(e) => O::Asc(self.expression(e, &outer, Polarity::Both)),
+                            O::Desc(e) => O::Desc(self.expression(e, &outer, Polarity::Both)),
+                        }
+                    })
+                    .collect();
                 P::OrderBy {
                     inner: boxed(self.walk(inner, &needed.with(keys), set)),
-                    expression: expression.clone(),
+                    expression,
                 }
             }
             P::Project { inner, variables } => {
@@ -230,6 +317,105 @@ impl Rewriter<'_> {
                 pattern.clone()
             }
         }
+    }
+
+    /// `EXISTS` patterns in `expression` rewritten; `outer`: the solutions it reads.
+    fn expression(
+        &mut self,
+        expression: &Expression,
+        outer: &Outer,
+        polarity: Polarity,
+    ) -> Expression {
+        use Expression as E;
+        let go =
+            |this: &mut Self, e: &Expression, p: Polarity| Box::new(this.expression(e, outer, p));
+        let both = Polarity::Both;
+        match expression {
+            E::Exists(pattern) => E::Exists(Box::new(self.exists(pattern, outer, polarity))),
+            E::Not(a) => E::Not(go(self, a, polarity.not())),
+            E::And(a, b) => E::And(go(self, a, polarity), go(self, b, polarity)),
+            E::Or(a, b) => E::Or(go(self, a, polarity), go(self, b, polarity)),
+            E::If(a, b, c) => E::If(
+                go(self, a, both),
+                go(self, b, polarity),
+                go(self, c, polarity),
+            ),
+            E::Coalesce(list) => E::Coalesce(list.iter().map(|e| *go(self, e, polarity)).collect()),
+            E::Equal(a, b) => E::Equal(go(self, a, both), go(self, b, both)),
+            E::SameTerm(a, b) => E::SameTerm(go(self, a, both), go(self, b, both)),
+            E::Greater(a, b) => E::Greater(go(self, a, both), go(self, b, both)),
+            E::GreaterOrEqual(a, b) => E::GreaterOrEqual(go(self, a, both), go(self, b, both)),
+            E::Less(a, b) => E::Less(go(self, a, both), go(self, b, both)),
+            E::LessOrEqual(a, b) => E::LessOrEqual(go(self, a, both), go(self, b, both)),
+            E::Add(a, b) => E::Add(go(self, a, both), go(self, b, both)),
+            E::Subtract(a, b) => E::Subtract(go(self, a, both), go(self, b, both)),
+            E::Multiply(a, b) => E::Multiply(go(self, a, both), go(self, b, both)),
+            E::Divide(a, b) => E::Divide(go(self, a, both), go(self, b, both)),
+            E::UnaryPlus(a) => E::UnaryPlus(go(self, a, both)),
+            E::UnaryMinus(a) => E::UnaryMinus(go(self, a, both)),
+            E::In(a, list) => E::In(
+                go(self, a, both),
+                list.iter().map(|e| *go(self, e, both)).collect(),
+            ),
+            E::FunctionCall(f, list) => {
+                E::FunctionCall(f.clone(), list.iter().map(|e| *go(self, e, both)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// The pattern of an `EXISTS`, read as a set: its variables the outer solutions bind are
+    /// answer variables (each solution substitutes its values), the others existential.
+    fn exists(
+        &mut self,
+        pattern: &GraphPattern,
+        outer: &Outer,
+        polarity: Polarity,
+    ) -> GraphPattern {
+        let correlated: HashSet<Variable> = mentioned(pattern)
+            .into_iter()
+            .filter(|v| outer.bound.contains(v))
+            .collect();
+        self.negated(polarity, "a negated EXISTS", |this| {
+            let before = this.report.patterns;
+            let out = this.walk(pattern, &Needed::Only(correlated.clone()), true);
+            // Where an outer solution leaves such a variable unbound, it is free inside and
+            // could be an anonymous individual, which an answer variable can't.
+            if this.report.patterns > before
+                && let Some(v) = correlated.iter().find(|v| outer.maybe.contains(*v))
+            {
+                this.report.completeness.incomplete(
+                    "ql",
+                    format!(
+                        "{v} may be unbound where an EXISTS reads it: its matches through \
+                         anonymous individuals may be missing"
+                    ),
+                );
+            }
+            out
+        })
+    }
+
+    /// Runs `f` on a pattern under `polarity`: under a negation (or either way) an answer
+    /// the pattern misses can make one of the query's wrong, so its incompleteness makes
+    /// the answers `unsound`.
+    fn negated<T>(&mut self, polarity: Polarity, place: &str, f: impl FnOnce(&mut Self) -> T) -> T {
+        if polarity == Polarity::Positive {
+            return f(self);
+        }
+        let saved = std::mem::take(&mut self.report.completeness);
+        let out = f(self);
+        let inner = std::mem::replace(&mut self.report.completeness, saved);
+        for reason in inner.reasons {
+            self.report.completeness.unsound(
+                reason.source,
+                format!(
+                    "under {place}, answers may be wrong as well as missing: {}",
+                    reason.text
+                ),
+            );
+        }
+        out
     }
 
     /// A basic graph pattern, rewritten if the QL part of the schema adds to it.
