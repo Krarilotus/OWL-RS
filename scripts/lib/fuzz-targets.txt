@@ -9,3 +9,7 @@ nrese-engine:lib:index::model_tests
 nrese-reasoner:lib:
 nrese-fuzz:it:parsers_hold
 nrese-server:it:http_fuzz_tests::
+nrese-dl:classify:brute_force
+nrese-dl:tableau_fuzz:agree_with_the_semantics
+nrese-dl:bounds:fuzz::
+nrese-owl:models:same_models
