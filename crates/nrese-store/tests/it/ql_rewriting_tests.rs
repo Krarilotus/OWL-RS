@@ -1130,6 +1130,11 @@ fn existentials_feeding_a_transitive_role_miss_with_the_flag() {
     for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
         let store = store(&turtle, dir.path(), ruleset, true);
         let (rows, completeness) = store_answer(&store, &query.sparql(true));
+        // Repeated: from the result cache, with the status a fresh run reports.
+        let hits = store.query_cache_stats().hits;
+        let again = store_answer(&store, &query.sparql(true));
+        assert_eq!((&again.0, &again.1), (&rows, &completeness));
+        assert!(store.query_cache_stats().hits > hits, "{}", ruleset.name());
         let answered: BTreeSet<Vec<usize>> = rows.into_iter().collect();
         assert!(
             answered.is_subset(&certain),
