@@ -105,6 +105,9 @@ pub fn classify(
     options: &Options,
 ) -> Result<(Classification, Profile), Unsupported> {
     let saturated = saturate(ontology, options)?;
+    if saturated.profile.contexts_joins_left > 0 {
+        return Err(Unsupported::Budget);
+    }
     if !saturated.complete() {
         return Err(Unsupported::Equality {
             axiom: saturated.unmerged_axiom(),
@@ -173,7 +176,11 @@ pub fn saturate_normalised(
         profile.add(&state.clauses.counters);
         profile.proof_steps += state.clauses.derivations.len() as u64;
         profile.largest_context = profile.largest_context.max(state.clauses.recs.len() as u64);
-        profile.contexts_unmerged += u64::from(state.unmerged);
+        match state.incomplete {
+            Some(super::rules::Incomplete::Merge) => profile.contexts_unmerged += 1,
+            Some(super::rules::Incomplete::Join) => profile.contexts_joins_left += 1,
+            None => {}
+        }
     }
     // The program's named concepts: the signature's classes and any the clauses add.
     let classes = engine.program.names.clone();
@@ -275,9 +282,10 @@ impl Saturated {
     /// element in a trigger, so clauses left out of the program whose bodies need one
     /// hold in it: what was derived for the concept is all that holds.
     /// Whether the saturation is a complete answer: every merge the Eq rule had to make
-    /// was made (else what it derived still holds, but may not be all).
+    /// was made and no join was left (else what it derived still holds, but may not be
+    /// all).
     pub fn complete(&self) -> bool {
-        self.profile.contexts_unmerged == 0
+        self.profile.contexts_unmerged == 0 && self.profile.contexts_joins_left == 0
     }
 
     /// An axiom of an at-most-one clause whose merge was left out (for the error).
@@ -313,7 +321,7 @@ impl Saturated {
                 .keys()
                 .any(|a| a.kind() == super::atoms::Kind::Concept && triggers.contains(&a.pred()));
             let fires = || local.iter().any(|l| l.may_fire(c));
-            if state.unmerged || role || concept || fires() {
+            if state.incomplete.is_some() || role || concept || fires() {
                 tainted[id as usize] = true;
                 stack.push(id);
             }

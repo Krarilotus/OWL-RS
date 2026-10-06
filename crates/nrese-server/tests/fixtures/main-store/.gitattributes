@@ -1,0 +1,5 @@
+# The data directory and backup exactly as main's server wrote them: no line-ending
+# conversion on any checkout.
+data/** -text
+backup/** -text
+expected/** -text

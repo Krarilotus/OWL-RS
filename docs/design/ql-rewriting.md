@@ -33,8 +33,25 @@ known through a source read; *ours* = measured or tested here).
   and rebuilt only when the schema statements change (a hash of them, checked once per
   snapshot revision); data commits never rebuild it.
 - **Only where the closure applies:** the default graph of a query without a dataset of
-  its own, read with the inferred statements; not inside `GRAPH`, `SERVICE`, `MINUS`'s
-  right side or `EXISTS` (negation and graph scopes keep their materialised meaning).
+  its own, read with the inferred statements, also as `GRAPH <urn:x-arq:DefaultGraph>`
+  (another store's name for it, `compat`). Not inside `GRAPH` over a named graph, which
+  holds what was asserted in it (the inferences are the default graph's: reasoning
+  semantics, "Graph scope"), nor `SERVICE`.
+- **Negation reads the entailments too** (6 October). A pattern inside `EXISTS`,
+  `NOT EXISTS` or on `MINUS`'s right side is rewritten as a set: its variables the outer
+  solutions bind are answer variables (each solution substitutes its values), the others
+  existential, so `?x a :Employee FILTER NOT EXISTS { ?x :worksFor [] }` has no answer
+  when every employee works for some organisation. Before, negation kept the
+  materialised meaning, and its answers contradicted the same pattern's outside it.
+  What such a pattern may miss can make an answer of the query wrong: its incompleteness
+  makes the answers `unsound` (§7), as does an `EXISTS` whose truth value can be turned
+  either way (`BIND`, a comparison, `IF`'s condition). A variable an outer solution may
+  leave unbound (from `OPTIONAL`) is free inside the `EXISTS` and could be an anonymous
+  individual: `sound-only`, said. Tested against the chase
+  (`negation_and_exists_answer_as_the_chase`: for random queries `Q1` and `Q2` sharing a
+  variable, `Q1`'s certain answers kept where `Q2` has (or hasn't) a certain answer that
+  agrees; pure QL exact and complete, mixed ontologies never silently wrong; on 6 October
+  22,586 queries on two seeds, 672 of them answered otherwise than over the closure alone).
 - **Graph access, as the RL path has it.** A rewritten query reads data through the
   reader's access like any other. The schema it is rewritten with matches the closure the
   reader sees: with `inferred = "supported"` (inferences only where the reader's graphs
@@ -165,13 +182,19 @@ Tree witnesses can be exponential in the query: k independent ones give 2^k bran
   conclusion of the suite goes through an anonymous individual, so the suite checks that
   the rewriting breaks nothing; the differential test checks what it adds.
 - NPD (Lanti et al., EDBT 2015; ontology and queries at a pinned commit,
-  `benches/reasoning/prepare-npd.sh`): 10 of its 31 queries are rewritten, each with one
-  tree witness, 2 branches and 4–17 triple patterns; none comes near a bound. Ontop's
+  `benches/reasoning/prepare-npd.sh`): 12 of its 31 queries are rewritten (q17,
+  q20–q30), each with one tree witness, 2 branches and 4–17 triple patterns; none comes
+  near a bound. Ontop's
   5,000-subquery rewritings of NPD come from unfolding through mappings and hierarchies,
   which the closure makes unnecessary here; its 73 rewriting branches for q6 don't arise,
-  because each of q6's blank nodes touches a projected variable. NPD's data is relational
-  (a MySQL dump and R2RML mappings) and no longer published as RDF: query times on it are
-  the next measurement.
+  because each of q6's blank nodes touches a projected variable. On its data (6 October;
+  the PostgreSQL dump materialised by Ontop, 2.0 M statements,
+  `benches/reasoning/prepare-npd-data.sh`): all 31 queries give the row counts of Ontop
+  answering over the database with its existential reasoning, all `complete`; without the
+  rewriting q28–q30 miss 62, 113 and 28 answers. Times in
+  `benches/reasoning/queries/npd-stress/README.md`: the queries not rewritten unchanged,
+  those gaining answers +0.5–0.9 ms, the others rewritten +0.9–6.1 ms (the bag form's
+  second evaluation).
 - Measured cost and answers gained: performance.md §6.
 
 ## 7. Completeness, reported with every answer
@@ -198,8 +221,9 @@ conservatively:
 
 **Per query:** `sound-only` when an atom reads an affected term, when a pattern reached a
 bound (§5), when a predicate or class is a variable, or when a pattern the rewriting doesn't
-enter (`EXISTS`, `MINUS`, `GRAPH`, `SERVICE`, a property path) reads a term the rewriting
-would change; otherwise `complete`. Each reason names the term and the hazard.
+enter (`SERVICE`, a property path, an aggregate's `EXISTS`) reads a term the rewriting
+would change; otherwise `complete`. Under a negation each of these is `unsound` instead
+(§1). Each reason names the term and the hazard.
 
 **Reported** in EXPLAIN (`ql.completeness`, `ql.sound`, `ql.complete`, `ql.reasons`, both
 forms), in the store's results, and with every answer over HTTP: the header

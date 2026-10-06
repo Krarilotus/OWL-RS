@@ -3,7 +3,7 @@
 
 use super::atoms::{Atom, CTerm, FuncId, is_subset, union_into};
 use super::engine::Strategy;
-use super::rules::{Edge, Message, Scratch, Worker};
+use super::rules::{Edge, Incomplete, Message, Scratch, Worker};
 use super::state::{ClauseId, ClauseRef, ContextId, Rule};
 
 const NONE: u32 = u32::MAX;
@@ -51,6 +51,7 @@ impl Worker<'_> {
         s.waiting.clear();
         s.waiting.extend_from_slice(waiting);
         s.found.clear();
+        s.batch.clear();
         let waiting = std::mem::take(&mut s.waiting);
         for &r in &waiting {
             let at = self.state.remote[r as usize]
@@ -59,7 +60,12 @@ impl Worker<'_> {
                 .position(|&a| a == head)
                 .unwrap_or(0);
             s.premises.clear();
+            s.steps = 0;
+            s.left = false;
             self.pred_join(r, Some((at, c)), 0, &[], true, &mut s);
+            if s.left {
+                self.state.incomplete.get_or_insert(Incomplete::Join);
+            }
         }
         s.waiting = waiting;
         self.conclude(&s.found);
@@ -77,7 +83,19 @@ impl Worker<'_> {
         grew: bool,
         s: &mut Scratch,
     ) {
-        if self.engine.exhausted() {
+        if self.engine.exhausted() || s.left {
+            return;
+        }
+        // A join past its step budget is left: what it found holds, and the context is
+        // marked incomplete (not exact) instead of the run giving up.
+        s.steps += 1;
+        if self
+            .engine
+            .budget()
+            .max_join_steps
+            .is_some_and(|m| s.steps > m)
+        {
+            s.left = true;
             return;
         }
         let found = s.found.len();
@@ -90,15 +108,26 @@ impl Worker<'_> {
         let remote = &self.state.remote[r as usize];
         // The body only grows along the join: where a clause already makes `acc → head`
         // redundant, it makes every conclusion below redundant too, so none is made.
-        // Checked where the body grew, and not at the last level (`derive` checks there).
-        if self.engine.prune_pred
-            && grew
-            && i < remote.body.len()
-            && self.state.clauses.subsumed(acc, remote.head)
-        {
-            return;
+        // Checked where the body grew, and not at the last level (`derive` checks there),
+        // against the context's clauses and the bodies found earlier in this batch (at the
+        // last level too: each found one counts against the join's cap).
+        let last = i == remote.body.len();
+        if self.engine.prune_pred {
+            let found = |s: &Scratch| {
+                s.batch
+                    .get(&remote.head)
+                    .is_some_and(|t| t.has_subset(acc, &|_| true))
+            };
+            if (grew && !last && self.state.clauses.subsumed(acc, remote.head))
+                || ((grew || last) && found(s))
+            {
+                return;
+            }
         }
-        if i == remote.body.len() {
+        if last {
+            if self.engine.prune_pred {
+                s.batch.entry(remote.head).or_default().insert(acc, 0);
+            }
             s.refs.clear();
             if self.engine.proofs {
                 let me = self.out.me;

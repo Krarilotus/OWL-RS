@@ -560,3 +560,28 @@ fn a_commit_that_merges_classes_publishes_its_inferences_with_it() {
         }
     }
 }
+
+/// The fuzz campaign's `NRESE_FUZZ_SEED=4` (its first commit), reduced: a commit asserts
+/// facts whose objects a functional property merges, and the representative's form of
+/// them is asserted only in a named graph. The compact stack must store that form (the
+/// default graph's reads expand it to the other identities): the delta executor doesn't
+/// report it, as it is asserted.
+#[test]
+fn a_merging_commit_stores_the_representative_form_of_what_it_asserts() {
+    let modes = [Mode::Replicate, Mode::Compact];
+    let pipelines = modes.map(pipeline);
+    let steps = [
+        "INSERT DATA { ex:e3 ex:r ex:e3 }",
+        "INSERT DATA { ex:f a owl:FunctionalProperty . ex:e0 ex:f ex:e9 . ex:e0 ex:f ex:e1 .
+                       GRAPH ex:g { ex:e0 ex:f ex:e3 } }",
+    ];
+    for step in steps {
+        for pipeline in &pipelines {
+            update(pipeline, step);
+        }
+        let (reference, seen) = (observe(&pipelines[0]), observe(&pipelines[1]));
+        for (i, (got, want)) in seen.iter().zip(&reference).enumerate() {
+            assert_eq!(got, want, "observation {i}, after: {step}");
+        }
+    }
+}

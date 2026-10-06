@@ -347,7 +347,10 @@ impl Engine<'_> {
             )));
         }
         self.stats.branch_points += 1;
+        let id = self.next_level;
+        self.next_level += 1;
         self.frames.push(Frame {
+            id,
             mark: self.g.mark(),
             pending: self.pending.len() as u32,
             bindings: self.bindings.len() as u32,
