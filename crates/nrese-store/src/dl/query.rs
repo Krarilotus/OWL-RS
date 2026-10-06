@@ -319,10 +319,19 @@ struct Counts {
 
 /// A DL answer's status as it is built: the shared [`Completeness`] (reasons from `dl`)
 /// and what decided it ([`DlDetail`]).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Status {
     completeness: Completeness,
     detail: DlDetail,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Self {
+            completeness: Completeness::under(nrese_sparql::Regime::Owl2Dl),
+            detail: DlDetail::default(),
+        }
+    }
 }
 
 impl Status {
@@ -338,6 +347,13 @@ impl Status {
 
     fn add(&mut self, reason: String) {
         self.completeness.incomplete("dl", reason);
+    }
+
+    /// Names an unresolved candidate (the first [`super::UNRESOLVED_SHOWN`]).
+    fn unresolved(&mut self, candidate: String) {
+        if self.detail.unresolved.len() < super::UNRESOLVED_SHOWN {
+            self.detail.unresolved.push(candidate);
+        }
     }
 
     fn path(&mut self, path: &'static str) {
@@ -356,8 +372,8 @@ impl Status {
         });
     }
 
-    fn stream(self, view: Option<Snapshot>) -> Outcome {
-        Outcome::Stream(self.completeness, view, self.detail)
+    fn stream(self, read: Read) -> Outcome {
+        Outcome::Stream(self.completeness, read, self.detail)
     }
 
     fn answers(self, answers: Answers) -> Outcome {
@@ -406,8 +422,15 @@ pub(crate) fn answer(
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
     };
     if mode == DlAnswers::Exact && !status.complete {
-        let reasons: Vec<&str> = status.reasons.iter().map(|r| r.text.as_str()).collect();
-        return Err(StoreError::Incomplete(reasons.join("; ")));
+        let unresolved = match &outcome {
+            Outcome::Stream(_, _, detail) | Outcome::Answers(_, _, detail) => {
+                detail.unresolved.clone()
+            }
+        };
+        return Err(StoreError::Incomplete(Box::new(crate::IncompleteAnswer {
+            status: status.clone(),
+            unresolved,
+        })));
     }
     Ok(outcome)
 }
@@ -415,9 +438,21 @@ pub(crate) fn answer(
 /// How a query is answered: over the lower bound as it streams (its status known before
 /// it runs), or with answers collected and completed through the bounds.
 pub(crate) enum Outcome {
-    /// Over the store's snapshot, or over the lower bound's view where it adds to it.
-    Stream(Completeness, Option<Snapshot>, DlDetail),
+    /// Streamed over what [`Read`] says.
+    Stream(Completeness, Read, DlDetail),
     Answers(Answers, Completeness, DlDetail),
+}
+
+/// What a streamed answer reads: the revision its status was decided on, never a later
+/// one (a commit in between could add what only U1 finds).
+pub(crate) enum Read {
+    /// The store's latest snapshot as the reader sees it: for a status decided without the
+    /// bounds (sound only, whatever the revision).
+    Latest,
+    /// The snapshot the status was decided on, where L adds nothing to it (cacheable).
+    At(Snapshot),
+    /// L's view of that snapshot, with the memberships the taxonomy adds (uncached).
+    Lower(Snapshot),
 }
 
 fn decide_answers(
@@ -432,14 +467,14 @@ fn decide_answers(
             "the reader sees part of the data: answers are checked against the bounds only \
              for readers of every graph",
         )
-        .stream(None));
+        .stream(Read::Latest));
     }
     if prepared.has_dataset() {
         return Ok(Status::sound_only(
             "the query names its dataset: answers are over those graphs, not checked \
              against the bounds",
         )
-        .stream(None));
+        .stream(Read::Latest));
     }
     let (snapshot, view) = super::bounds::view(store);
     let analysis = analyse(prepared.query());
@@ -531,6 +566,7 @@ fn decide_answers(
                 }
                 Entailed::Unknown(_) => {
                     counts.unresolved = 1;
+                    status.unresolved("ASK".to_owned());
                     false
                 }
             };
@@ -580,7 +616,10 @@ fn decide_answers(
                             rows.push(row);
                         }
                         Entailed::No => counts.refuted += 1,
-                        Entailed::Unknown(_) => counts.unresolved += 1,
+                        Entailed::Unknown(_) => {
+                            counts.unresolved += 1;
+                            status.unresolved(render_row(&variables, &row));
+                        }
                     }
                 }
             }
@@ -605,9 +644,23 @@ fn decide_answers(
     Ok(status.answers(answers))
 }
 
-/// The lower bound's view where it adds to the store's snapshot.
-fn lower_view(view: &View) -> Option<Snapshot> {
-    (view.lower_facts > 0).then(|| view.lower.clone())
+/// A candidate row as `?x=<…> ?y=<…>` (unbound variables left out).
+fn render_row(variables: &[Variable], row: &[Option<Term>]) -> String {
+    let bound: Vec<String> = variables
+        .iter()
+        .zip(row)
+        .filter_map(|(v, t)| t.as_ref().map(|t| format!("?{}={t}", v.as_str())))
+        .collect();
+    bound.join(" ")
+}
+
+/// The lower bound's view: the snapshot the bounds describe, with L's memberships where
+/// it adds some.
+fn lower_view(view: &View) -> Read {
+    match view.lower_facts {
+        0 => Read::At(view.lower.clone()),
+        _ => Read::Lower(view.lower.clone()),
+    }
 }
 
 fn lower_counts(n: u64) -> Counts {

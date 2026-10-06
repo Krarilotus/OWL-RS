@@ -294,8 +294,15 @@ fn ql_stage(
         return (None, None);
     };
     let tbox = ql.tbox(snapshot, options.access.as_deref());
+    // What its `complete` refers to: the closure it rewrites over.
+    let regime = match ql.closure().lists {
+        true => crate::Regime::Owl2Rl,
+        false => crate::Regime::Owl2Ql,
+    };
     if tbox.is_empty() {
-        return (None, Some(crate::ql::QlReport::default()));
+        let mut report = crate::ql::QlReport::default();
+        report.completeness.regime = Some(regime);
+        return (None, Some(report));
     }
     let (needed, set) = match form {
         Form::Select => (None, false),
@@ -310,7 +317,8 @@ fn ql_stage(
         }
         Form::Describe => (None, true),
     };
-    let (out, report) = ql::rewrite_query(pattern, &tbox, snapshot, ql.limits(), needed, set);
+    let (out, mut report) = ql::rewrite_query(pattern, &tbox, snapshot, ql.limits(), needed, set);
+    report.completeness.regime = Some(regime);
     let changed = report.patterns > 0;
     (changed.then_some(out), Some(report))
 }
