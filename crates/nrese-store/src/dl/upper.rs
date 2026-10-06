@@ -204,10 +204,18 @@ impl Values {
         }
     }
 
-    /// Notes the literals among the objects of `facts`.
-    fn add_objects(&mut self, view: &Snapshot, facts: &[Triple]) {
+    /// Notes the literals among the objects of `facts` whose predicate U1's rules compare
+    /// values of (`compared`).
+    fn add_objects<'a>(
+        &mut self,
+        view: &Snapshot,
+        facts: impl IntoIterator<Item = &'a Triple>,
+        compared: &HashSet<u64>,
+    ) {
         for t in facts {
-            self.add(view, t[2]);
+            if compared.contains(&t[1]) {
+                self.add(view, t[2]);
+            }
         }
     }
 
@@ -229,6 +237,36 @@ impl Values {
             .copied()
             .chain(all.is_none().then_some(rep))
     }
+}
+
+/// The predicates whose object values U1's rules compare: in a rule body, with a constant
+/// object or an object variable another atom reads (a key's values, a `hasValue`). Other
+/// literals are never compared, so they needn't be read by value (LUBM's names, e-mail
+/// addresses and telephone numbers: 107,410 literals at LUBM(10)). The equality rules'
+/// atoms with a variable predicate join only over `owl:sameAs`, which no literal has in U1.
+fn compared_predicates(program: &bounds::Program) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    for rule in &program.rules {
+        for (i, atom) in rule.body.iter().enumerate() {
+            let [_, bounds::Slot::Const(p), object] = atom.0 else {
+                continue;
+            };
+            let compared = match object {
+                bounds::Slot::Const(_) => true,
+                bounds::Slot::Var(v) => {
+                    rule.body
+                        .iter()
+                        .enumerate()
+                        .any(|(j, other)| j != i && other.0.contains(&bounds::Slot::Var(v)))
+                        || atom.0[..2].contains(&bounds::Slot::Var(v))
+                }
+            };
+            if compared {
+                out.insert(p);
+            }
+        }
+    }
+    out
 }
 
 /// The OWL 2 data value of the literal `id`; `None` for anything else, or a literal whose
@@ -367,10 +405,12 @@ pub struct Upper {
     signature: HashSet<u64>,
     /// The ground program of the delta executor, for the next commit.
     ground: Option<GroundProgram>,
-    /// The literals U1 met and their values' representatives. A commit's new literals
-    /// are noted when its change is computed: a representative stays one whether the
-    /// commit happens or not.
+    /// The literals U1 compares and their values' representatives. A commit's new
+    /// literals are noted when its change is computed: a representative stays one
+    /// whether the commit happens or not.
     values: Mutex<Values>,
+    /// The predicates whose values U1's rules compare ([`compared_predicates`]).
+    compared: HashSet<u64>,
     rdf_type: u64,
     same_as: u64,
     /// How long the last evaluation or maintenance took.
@@ -456,12 +496,13 @@ impl Upper {
                     .to_owned(),
             ));
         }
-        // Every literal of the view and of the program, by value.
+        // The literals U1 compares, by value: of the view, the program's facts, its rules.
+        let compared = compared_predicates(&program);
         let mut values = Values::default();
         let mut input = view_facts(view);
-        values.add_objects(view, &input);
+        values.add_objects(view, &input, &compared);
         let program_facts: Vec<Triple> = program.facts.iter().map(|(f, _)| *f).collect();
-        values.add_objects(view, &program_facts);
+        values.add_objects(view, &program_facts, &compared);
         for rule in &program.rules {
             for atom in rule.body.iter().chain(&rule.head) {
                 for slot in atom.0 {
@@ -504,6 +545,7 @@ impl Upper {
             signature,
             ground: None,
             values: Mutex::new(values),
+            compared,
             elapsed: started.elapsed(),
         })
     }
@@ -541,7 +583,7 @@ impl Upper {
     ) -> Result<Change, GaveUp> {
         let started = Instant::now();
         let mut values = self.values.lock().unwrap_or_else(|p| p.into_inner());
-        values.add_objects(view, inserted);
+        values.add_objects(view, inserted, &self.compared);
         let mut inserted: Vec<Triple> = inserted
             .iter()
             .map(|&t| values.map(t))
@@ -649,6 +691,15 @@ impl Upper {
     /// U1 checks every `⊥` ([`bounds::Program::proves_consistency`]).
     pub fn proves_consistency(&self) -> bool {
         self.program.proves_consistency() && self.clashes() == 0
+    }
+
+    /// How many literals U1 reads by value ([`Values`]).
+    pub fn literals_by_value(&self) -> usize {
+        self.values
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .seen
+            .len()
     }
 
     /// Whether `term` is one of U1's own (a Skolem constant, a fresh class, the clash).

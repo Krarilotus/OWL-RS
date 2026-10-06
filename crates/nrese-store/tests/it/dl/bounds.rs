@@ -175,9 +175,13 @@ fn data_values_are_compared_by_value() {
          :d1 a :D ; :k \"07\"^^xsd:integer . :d2 a :D ; :k \"7\"^^xsd:integer . :d1 a :E . \
          :Seven owl:equivalentClass [ a owl:Restriction ; owl:onProperty :age ; \
            owl:hasValue \"7.0\"^^xsd:decimal ] . \
-         :p :age \"7\"^^xsd:integer .",
+         :p :age \"7\"^^xsd:integer ; :name \"Seven\" , \"7\" .",
     )
     .expect("data");
+    // Only the literals the rules compare are read by value (the key's and the
+    // `hasValue`'s: "07", "7" and 7.0), never a name nothing compares (LUBM's names,
+    // e-mail addresses and telephone numbers: 107,410 literals at LUBM(10)).
+    assert_eq!(dl.store().dl_bounds().literals_by_value, 3);
     for (q, want) in [
         ("SELECT ?x { ?x a :E }", vec!["d1", "d2"]),
         ("SELECT ?x { ?x a :Seven }", vec!["p"]),

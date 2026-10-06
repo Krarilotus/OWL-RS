@@ -516,20 +516,24 @@ pub struct BoundsReport {
     pub gap_predicates: usize,
     /// How U1 got to this revision: `delta`, `rebuilt`, `read` or `kept`.
     pub last: &'static str,
+    /// The literals U1 reads by value: those of predicates its rules compare.
+    pub literals_by_value: usize,
 }
 
 /// The bounds at the latest revision (U1 built afresh if it doesn't describe it).
 pub(crate) fn report(store: &StoreService) -> BoundsReport {
     let (_, view) = self::view(store);
-    let last = store
+    let state = store
         .dl()
         .bounds
         .state
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .filter(|s| s.revision == view.revision)
-        .map_or("read", |s| s.last);
+        .unwrap_or_else(|p| p.into_inner());
+    let current = state.as_ref().filter(|s| s.revision == view.revision);
+    let last = current.map_or("read", |s| s.last);
+    let literals_by_value = current
+        .and_then(|s| s.upper.as_ref().ok())
+        .map_or(0, Upper::literals_by_value);
     BoundsReport {
         revision: view.revision,
         unavailable: view.unavailable.clone(),
@@ -538,6 +542,7 @@ pub(crate) fn report(store: &StoreService) -> BoundsReport {
         gap_classes: view.gap_classes.len(),
         gap_predicates: view.gap_predicates.len(),
         last,
+        literals_by_value,
     }
 }
 
