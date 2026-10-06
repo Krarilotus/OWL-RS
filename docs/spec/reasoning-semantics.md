@@ -12,8 +12,8 @@ This is the contract for what NRESE's reasoning computes, as implemented on 30 S
 | `rdfs-full` | rdfD2, rdfs2 to rdfs13 (rdfs4a/b included) and 50 axiomatic triples: the RDF and RDFS axioms without the infinitely many about `rdf:_1`, `rdf:_2`, …, and rdfs1 for `rdf:langString`, `rdf:HTML`, `rdf:XMLLiteral` and `xsd:string`. rdfD1 (a blank node per literal) is left out. Axioms seed every closure and no deletion retracts them |
 | `rdfs-plus` | `rdfs` + eq-sym, eq-trans, eq-rep-s/p/o, prp-fp, prp-ifp, prp-symp, prp-trp, prp-eqp1/2, prp-inv1/2, cax-eqc1/2, scm-eqc1/2, scm-eqp1/2 |
 | `owl-horst` | `rdfs-plus` + cls-hv1/2, cls-svf1/2, cls-avf |
-| `owl2-ql` | prp-dom, prp-rng, prp-spo1, prp-eqp1/2, prp-inv1/2, prp-symp, cax-sco, cax-eqc1/2, cls-svf2, the schema rules scm-cls, sco, eqc1/2, op, dp, spo, eqp1/2, dom1/2, rng1/2, and the checks prp-asyp, prp-irp, prp-pdw, cls-nothing2, cax-dw. Existentials on the right of `SubClassOf` are not materialised (they would invent individuals); queries get the answers through them by tree-witness rewriting (`reasoner.ql_rewriting`, [design](../design/ql-rewriting.md)), also under `owl2-rl` |
-| `owl2-rl` | below |
+| `owl2-ql` | prp-dom, prp-rng, prp-spo1, prp-eqp1/2, prp-inv1/2, prp-symp, cax-sco, cax-eqc1/2, cls-svf2, the schema rules scm-cls, sco, eqc1/2, op, dp, spo, eqp1/2, dom1/2, rng1/2, and the checks prp-asyp, prp-irp, prp-pdw, cls-nothing2, cax-dw. Existentials on the right of `SubClassOf` are not materialised (they would invent individuals); queries get the answers through them by tree-witness rewriting (`reasoner.ql_rewriting = "auto"`, the default; [design](../design/ql-rewriting.md)), each answer saying whether it is complete |
+| `owl2-rl` | below. Its standard semantics: the OWL 2 RL/RDF rules' closure, no answers through existentials on the right, so answer counts equal other systems' `owl2-rl`. A repository may add the QL rewriting (`ql_rewriting = "on"`, per repository or `reasoner.ql_rewriting`); `owl2-dl` mode gets those answers through its bounds |
 
 ### Unnamed union classes
 
