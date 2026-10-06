@@ -86,6 +86,7 @@ check = { "q.pairs.value" = "expect.pairs", "q.one-component.value" = "300" }
 route = { "reason.rounds" = "<= 3" }
 cap_gb = 6
 systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+hangs = { "jena:owl-horst" = "6 Oct 2026: Jena's OWL rules gave no answer to the count within 900 s, and both queries timed out at 120 s (lazy reasoning over 3.6 M clique pairs); recorded, not run again" }
 guards = ["modules for recursive shapes: an equivalence property by union-find"]
 rewrite = "expressible"
 [[case]]
@@ -166,6 +167,7 @@ check = { "reason.inferred" = 1399563, "q.q20.rows" = 1311932 }
 route = { "reason.rounds" = "<= 6" }
 cap_gb = 6
 systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+hangs = { "jena:owl-horst" = "6 Oct 2026: Jena's OWL rules gave no answer to the count within 900 s nor to q01 after 27 min in all (lazy reasoning over a 1.3 M-pair clique); stopped, recorded, not run again" }
 pinned = "NRESE 5 Oct 2026, the closure Nemo and owlrl agree with (run record office-b)"
 [[case]]
 name = "rl-single-thread"
@@ -1454,7 +1456,8 @@ metric = "commits.p50_ms"
 check = { "commits.commits" = 4000, "closure_after_commits.equal" = "true" }
 route = { "commits.incremental" = "== true" }
 cap_gb = 4
-systems = ["graphdb:owl2-rl", "rdfox:owl2-rl"]
+# No comparator: the others maintain OWL 2 RL, not a DL consistency check per commit.
+systems = []
 guards = ["DL in the store (owl2-dl): a commit's consistency proved by the upper bound U1"]
 
 [[case]]
@@ -1467,7 +1470,8 @@ args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru"]
 queries = ""
 metric = "commits.p50_ms"
 check = { "commits.commits" = 200, "commits.error" = "has violates 1 consistency check" }
-route = {}
+# Decided by the RL check, before any DL engine.
+route = { "commits.error" = "lacks OWL 2 DL" }
 cap_gb = 4
 systems = []
 
@@ -1509,7 +1513,7 @@ args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru"]
 queries = ""
 metric = "commits.p50_ms"
 check = { "commits.commits" = 200, "commits.error" = "has inconsistent under OWL 2 DL" }
-route = {}
+route = { "commits.error" = "has hypertableau" }
 cap_gb = 4
 systems = []
 guards = ["DL in the store: a commit's consistency proved by U1, a clash sent to a DL engine"]
