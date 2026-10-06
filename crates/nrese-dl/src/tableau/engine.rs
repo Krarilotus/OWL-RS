@@ -70,6 +70,11 @@ pub struct Pending {
 /// A branch point.
 #[derive(Debug, Clone)]
 pub struct Frame {
+    /// The level its choices' dependency sets name: stable, and increasing along the
+    /// stack (a frame is only ever pushed on top, with the next id), so a level's frame is
+    /// found by binary search and the largest level is the most recent decision
+    /// (docs/design/owl2-dl-dynamic-backtracking.md §3).
+    pub id: u32,
     pub mark: Mark,
     pub pending: u32,
     pub bindings: u32,
@@ -133,6 +138,8 @@ pub struct Engine<'a> {
     /// ([`super::probe::Base`]): a backtrack that would go there stops the run instead
     /// (`GaveUp` with [`super::search::FLOOR`]).
     pub floor: u32,
+    /// The next branch point's level ([`Frame::id`]); never reused within a run.
+    pub next_level: u32,
 }
 
 impl<'a> Engine<'a> {
@@ -147,6 +154,7 @@ impl<'a> Engine<'a> {
             bindings: Vec::new(),
             pending_open: 0,
             frames: Vec::new(),
+            next_level: 1,
             roots: Vec::new(),
             stats: Telemetry::default(),
             started: Instant::now(),
@@ -469,7 +477,14 @@ impl<'a> Engine<'a> {
                 self.done.unary += 1;
                 let f = self.g.unary[i as usize];
                 if self.g.live(f.node) {
-                    join_concept(self.p, &self.g, &mut self.deps, i, &mut self.firings);
+                    join_concept(
+                        self.p,
+                        &self.g,
+                        &mut self.deps,
+                        i,
+                        &mut self.firings,
+                        &mut self.stats.plans_tried,
+                    );
                     self.apply_firings()?;
                 }
                 continue;
@@ -479,7 +494,14 @@ impl<'a> Engine<'a> {
                 self.done.edges += 1;
                 let e = self.g.edges[i as usize];
                 if self.g.live(e.from) && self.g.live(e.to) {
-                    join_edge(self.p, &self.g, &mut self.deps, i, &mut self.firings);
+                    join_edge(
+                        self.p,
+                        &self.g,
+                        &mut self.deps,
+                        i,
+                        &mut self.firings,
+                        &mut self.stats.plans_tried,
+                    );
                     self.apply_firings()?;
                 }
                 continue;

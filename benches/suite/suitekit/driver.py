@@ -374,10 +374,15 @@ class Suite:
             base["version"] = system.version(ctx, endpoint)
             if system.persistent and not in_memory:
                 self.emit(base, task="restart", ms=endpoint.restart_ms if endpoint.restart_ms is not None else "")
-            n, ms, error = count_all(ctx, endpoint)
-            self.emit(base, task="count", status="failed" if error else "ok",
-                      ms="" if system.answers_only else ms, rows=n if n is not None else "",
-                      note=error or ("the rules run at this first query" if system.lazy(regime) else ""))
+            if self.settings.get("SKIP_COUNT") == "1":
+                # A lazy reasoner's count of everything forces its whole closure (Jena's
+                # rules on LUBM 10 ran out of heap there); the queries alone then decide.
+                self.emit(base, task="count", status="skipped", note="SKIP_COUNT=1")
+            else:
+                n, ms, error = count_all(ctx, endpoint)
+                self.emit(base, task="count", status="failed" if error else "ok",
+                          ms="" if system.answers_only else ms, rows=n if n is not None else "",
+                          note=error or ("the rules run at this first query" if system.lazy(regime) else ""))
             if plan.queries:
                 for i, mode in enumerate(modes):
                     if i > 0:

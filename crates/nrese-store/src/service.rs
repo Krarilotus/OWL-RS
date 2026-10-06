@@ -76,6 +76,9 @@ impl StoreService {
         config.validate()?;
         nrese_engine::set_index_encoding(config.index_encoding);
         nrese_engine::set_vocabulary_encoding(config.vocabulary);
+        // Reasoning stops at the process's memory limit on every path, the DL bounds'
+        // own evaluations included, not only where the store passes its watch.
+        nrese_exec::memory::set_process_limit(config.process_memory_bytes);
         let engine = match config.mode {
             StoreMode::InMemory => Engine::new(EngineConfig::default())?,
             StoreMode::OnDisk => {

@@ -135,6 +135,9 @@ pub struct Budget {
     /// The most conclusions one join of the Pred rule may produce (its premises'
     /// combinations can grow as their product).
     pub max_join: Option<usize>,
+    /// The most steps one Pred join may take: past them it is left and its context marked
+    /// incomplete (the run goes on).
+    pub max_join_steps: Option<usize>,
     /// The most memory the process may hold (bytes, `nrese_exec::memory`): a saturation
     /// that grows past it stops instead of taking the machine.
     pub max_memory: Option<u64>,

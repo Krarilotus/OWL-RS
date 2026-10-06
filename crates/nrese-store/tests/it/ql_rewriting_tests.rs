@@ -303,19 +303,30 @@ struct Query {
 }
 
 impl Query {
-    fn sparql(&self, distinct: bool) -> String {
+    /// The triple patterns.
+    fn body(&self) -> String {
         let term = |t: &T| match t {
             T::Var(v) => format!("?v{v}"),
             T::Ind(i) => format!(":a{i}"),
         };
-        let body: Vec<String> = self
-            .atoms
+        self.atoms
             .iter()
             .map(|a| match a {
                 QAtom::Class(t, c) => format!("{} a :C{c} .", term(t)),
                 QAtom::Role(s, p, o) => format!("{} :P{p} {} .", term(s), term(o)),
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The variables the atoms mention, in order.
+    fn variables(&self) -> Vec<usize> {
+        let used: BTreeSet<usize> = self.atoms.iter().flat_map(atom_vars).collect();
+        used.into_iter().collect()
+    }
+
+    fn sparql(&self, distinct: bool) -> String {
+        let body = self.body();
         let head = if self.answers.is_empty() {
             "(1 AS ?k)".to_owned()
         } else {
@@ -326,9 +337,8 @@ impl Query {
                 .join(" ")
         };
         format!(
-            "PREFIX : <{E}> SELECT {}{head} WHERE {{ {} }}",
+            "PREFIX : <{E}> SELECT {}{head} WHERE {{ {body} }}",
             if distinct { "DISTINCT " } else { "" },
-            body.join(" ")
         )
     }
 }
@@ -1425,4 +1435,238 @@ fn inclusions_through_inverse_expressions_are_materialised() {
             assert_eq!(rows, [expected], "{}: {axioms}", ruleset.name());
         }
     }
+}
+
+/// `EXISTS`, `NOT EXISTS` and `MINUS` read the entailments as the rest of the query does
+/// (design §2): for random queries `Q1` and `Q2` over the same variables, `Q1`'s certain
+/// answers kept where `Q2` has a certain answer agreeing on their shared variables (or
+/// where it hasn't), by the chase. Pure QL: exactly those, complete. Mixed ontologies: an
+/// answer that isn't the chase's says `unsound`, a missing one says so too (the
+/// negation's pattern may miss what makes an answer wrong).
+#[test]
+fn negation_and_exists_answer_as_the_chase() {
+    let cases: usize = std::env::var("NRESE_QL_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(150);
+    let dir = tempfile::tempdir().unwrap();
+    let seed = std::env::var("NRESE_QL_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x6a09_e667_f3bc_c908);
+    let mut rng = Rng(seed);
+    let (mut checked, mut skipped, mut decided_by_rewriting) = (0, 0, 0);
+    let (mut flagged, mut silent_ok) = (0, 0);
+    for case in 0..cases {
+        let mixed = case % 2 == 1;
+        let tbox = random_tbox(&mut rng);
+        let roles: Vec<usize> = tbox.generating.iter().map(|g| g.1.property).collect();
+        let extras = if mixed {
+            random_extras(&mut rng, &roles)
+        } else {
+            Extras::default()
+        };
+        let (mut types, mut edges, mut data) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..1 + rng.below(6) {
+            if rng.chance(50) {
+                let (a, c) = (rng.below(INDIVIDUALS), rng.below(CLASSES));
+                types.push((a, c));
+                data.push(format!(":a{a} a :C{c} ."));
+            } else {
+                let (a, p, b) = (
+                    rng.below(INDIVIDUALS),
+                    rng.below(PROPERTIES),
+                    rng.below(INDIVIDUALS),
+                );
+                edges.push((a, p, b));
+                data.push(format!(":a{a} :P{p} :a{b} ."));
+            }
+        }
+        // `Q2` shares one variable with `Q1` (its `?v0`), its others its own: existential
+        // inside the negation.
+        let pairs: Vec<(Query, Query)> = (0..4)
+            .map(|_| {
+                if rng.chance(50) {
+                    // "Instances of C with (or without) some P-edge (into D)": what an
+                    // existential decides.
+                    let q1 = Query {
+                        atoms: vec![QAtom::Class(T::Var(0), rng.below(CLASSES))],
+                        vars: 2,
+                        answers: vec![0],
+                    };
+                    let p = rng.below(PROPERTIES);
+                    let mut atoms = vec![if rng.chance(50) {
+                        QAtom::Role(T::Var(0), p, T::Var(1))
+                    } else {
+                        QAtom::Role(T::Var(1), p, T::Var(0))
+                    }];
+                    if rng.chance(50) {
+                        atoms.push(QAtom::Class(T::Var(1), rng.below(CLASSES)));
+                    }
+                    let q2 = Query {
+                        atoms,
+                        vars: 2,
+                        answers: Vec::new(),
+                    };
+                    return (q1, q2);
+                }
+                let q1 = random_query(&mut rng);
+                let q2 = random_query(&mut rng);
+                let used = q1.variables();
+                let target = if used.is_empty() {
+                    0
+                } else {
+                    used[rng.below(used.len())]
+                };
+                let rename = |t: T| match t {
+                    T::Var(0) => T::Var(target),
+                    T::Var(v) => T::Var(q1.vars + v),
+                    ind => ind,
+                };
+                let atoms = q2
+                    .atoms
+                    .iter()
+                    .map(|a| match *a {
+                        QAtom::Class(t, c) => QAtom::Class(rename(t), c),
+                        QAtom::Role(s, p, o) => QAtom::Role(rename(s), p, rename(o)),
+                    })
+                    .collect();
+                let q2 = Query {
+                    atoms,
+                    vars: q1.vars + q2.vars,
+                    answers: Vec::new(),
+                };
+                (q1, q2)
+            })
+            .collect();
+        let kinds: HashSet<(Role, Option<usize>)> =
+            tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
+        let max_vars = pairs
+            .iter()
+            .map(|(a, b)| a.vars.max(b.vars))
+            .max()
+            .unwrap_or(1);
+        let Some(chase) = Chase::run(
+            &tbox,
+            &extras,
+            &types,
+            &edges,
+            kinds.len() + max_vars + 2,
+            if mixed { 5_000 } else { 20_000 },
+        ) else {
+            skipped += 1;
+            continue;
+        };
+        let turtle = format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             {}\n{}\n{}",
+            tbox.turtle.join("\n"),
+            extras.turtle.join("\n"),
+            data.join("\n")
+        );
+        let with = store(&turtle, dir.path(), Ruleset::Owl2Rl, true);
+        let without = store(&turtle, dir.path(), Ruleset::Owl2Rl, false);
+        let certain = |q: &Query| {
+            if mixed {
+                chase.named_answers(q)
+            } else {
+                chase.answers(q)
+            }
+        };
+        for (q1, q2) in &pairs {
+            let outer = Query {
+                atoms: q1.atoms.clone(),
+                vars: q1.vars.max(q2.vars),
+                answers: q1.variables(),
+            };
+            if outer.answers.is_empty() {
+                continue;
+            }
+            let shared: Vec<usize> = q2
+                .variables()
+                .into_iter()
+                .filter(|v| outer.answers.contains(v))
+                .collect();
+            let inner = Query {
+                atoms: q2.atoms.clone(),
+                vars: outer.vars,
+                answers: shared.clone(),
+            };
+            let holds = certain(&inner);
+            let at: Vec<usize> = shared
+                .iter()
+                .map(|v| outer.answers.iter().position(|w| w == v).unwrap())
+                .collect();
+            let agrees =
+                |t: &Vec<usize>| holds.contains(&at.iter().map(|&i| t[i]).collect::<Vec<_>>());
+            let ones = certain(&outer);
+            let head = outer
+                .answers
+                .iter()
+                .map(|v| format!("?v{v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut forms = vec![
+                ("EXISTS", format!("FILTER EXISTS {{ {} }}", q2.body()), true),
+                (
+                    "NOT EXISTS",
+                    format!("FILTER NOT EXISTS {{ {} }}", q2.body()),
+                    false,
+                ),
+            ];
+            // MINUS removes only what shares a variable with it.
+            if !shared.is_empty() {
+                forms.push(("MINUS", format!("MINUS {{ {} }}", q2.body()), false));
+            }
+            for (name, tail, keep) in forms {
+                let text = format!(
+                    "PREFIX : <{E}> SELECT DISTINCT {head} WHERE {{ {} {tail} }}",
+                    outer.body()
+                );
+                let expected: BTreeSet<Vec<usize>> =
+                    ones.iter().filter(|t| agrees(t) == keep).cloned().collect();
+                let (rows, status) = store_answer(&with, &text);
+                let answered: BTreeSet<Vec<usize>> = rows.into_iter().collect();
+                let context = || format!("case {case} {name}:\n{turtle}\n{text}\n{status:?}");
+                if !mixed {
+                    assert_eq!(answered, expected, "{}", context());
+                    assert!(status.complete && status.sound, "{}", context());
+                } else {
+                    let wrong = answered.difference(&expected).count();
+                    let missing = expected.difference(&answered).count();
+                    assert!(
+                        wrong == 0 || !status.sound,
+                        "{wrong} wrong, silently: {}",
+                        context()
+                    );
+                    assert!(
+                        missing == 0 || !status.complete,
+                        "{missing} missing, silently: {}",
+                        context()
+                    );
+                    if status.complete {
+                        silent_ok += 1;
+                    } else {
+                        flagged += 1;
+                    }
+                }
+                let (plain, _) = store_answer(&without, &text);
+                if plain.into_iter().collect::<BTreeSet<_>>() != answered {
+                    decided_by_rewriting += 1;
+                }
+                checked += 1;
+            }
+        }
+    }
+    eprintln!(
+        "QL negation: {checked} queries checked, {decided_by_rewriting} answered otherwise than \
+         over the closure alone, {skipped} cases skipped (chase too large); mixed: {flagged} \
+         flagged, {silent_ok} complete"
+    );
+    assert!(checked >= cases * 2, "too few checked: {checked}");
+    assert!(
+        decided_by_rewriting > 0,
+        "no query needed the rewriting inside the negation"
+    );
 }

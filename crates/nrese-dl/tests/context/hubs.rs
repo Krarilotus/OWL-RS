@@ -99,3 +99,76 @@ fn a_memory_limit_stops_the_saturation() {
         Err(context::Unsupported::Budget)
     ));
 }
+
+/// `W ⊑ ∃r.U ⊓ ∀r.Pᵢ` (i < m), `U ⊑ ∃r.V`, `Pᵢ ⊑ ∀r.Aⱼ` (j < k), `A₀ ⊓ … ⊓ Aₖ₋₁ ⊑
+/// ∀r⁻.H`: in `U`'s context each `Aⱼ(f(x))` holds under each possible `Pᵢ(x)`, so the
+/// Pred join of `V`'s clause meets `mᵏ` combinations, of which `m` aren't redundant.
+fn products(table: &mut Table, m: usize, k: usize) -> Ontology {
+    let mut b = Build::new(table);
+    let r = b.r("r");
+    let s = b.r("s");
+    b.axiom(Axiom::InverseObjectProperties(r, s));
+    let (w, u, v, h) = (b.c("W"), b.c("U"), b.c("V"), b.c("H"));
+    let to_u = b.some(r, u);
+    b.sub(w, to_u);
+    let to_v = b.some(r, v);
+    b.sub(u, to_v);
+    let a: Vec<_> = (0..k).map(|j| b.c(&format!("A{j}"))).collect();
+    for i in 0..m {
+        let p = b.c(&format!("P{i}"));
+        let all_p = b.all(r, p);
+        b.sub(w, all_p);
+        for &aj in &a {
+            let all_a = b.all(r, aj);
+            b.sub(p, all_a);
+        }
+    }
+    let all_a = b.and(&a);
+    let back = b.all(s, h);
+    b.sub(all_a, back);
+    b.done()
+}
+
+/// Guard (Pred's pruning within a batch): the conclusions of one join are derived after
+/// it, so a body found earlier in the join must prune the later ones that contain it
+/// (one join on ore_ont_9835 went past a million conclusions; Pred conclusions there
+/// 361 k -> 129 k, on ore_ont_7914 323 k -> 58 k).
+#[test]
+fn pred_joins_prune_by_the_bodies_they_found() {
+    let (m, k) = (4, 3);
+    let mut table = Table::default();
+    let o = products(&mut table, m, k);
+    for strategy in [Strategy::Cautious, Strategy::Split] {
+        let (all, unpruned) = run(&o, strategy, false);
+        let (pruned_taxonomy, pruned) = run(&o, strategy, true);
+        assert_eq!(pruned_taxonomy, all);
+        // The join meets every combination: mᵏ = 64.
+        assert!(unpruned.pred_inferences >= 64, "{}", unpruned.line());
+        assert!(pruned.pred_inferences <= m as u64, "{}", pruned.line());
+    }
+}
+
+/// Guard (never refuse): a join past `Budget::max_join_steps` is left and its context
+/// marked incomplete, while the run goes on (before, one exploding join ended the whole
+/// lower bound): the saturation finishes, isn't complete, and isn't a complete answer.
+#[test]
+fn a_join_past_its_steps_leaves_its_context_incomplete() {
+    let mut table = Table::default();
+    let o = products(&mut table, 4, 3);
+    let options = Options {
+        strategy: Strategy::Split,
+        proofs: false,
+        budget: context::Budget {
+            max_join_steps: Some(2),
+            ..context::Budget::default()
+        },
+        ..Options::default()
+    };
+    let saturated = context::saturate(&o, &options).expect("left joins don't end the run");
+    assert!(!saturated.complete());
+    assert!(saturated.profile().contexts_joins_left > 0);
+    assert!(matches!(
+        context::classify(&o, &options),
+        Err(context::Unsupported::Budget)
+    ));
+}
