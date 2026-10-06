@@ -24,7 +24,7 @@ python benches/fast/fast.py clean                         the generated data and
 | `compete.py` | `fast.py compete`: each case on its comparators, under the semantics each supports |
 | `queries/` | the cases' SPARQL (LUBM's and OWL2Bench's come from `../reasoning/queries`) |
 | `rules/`, `shapes/` | the user-rules case's N3 and Datalog programs; the SHACL case's shapes |
-| `crates/nrese-store/examples/perf_lab/` | the measuring tool: `generate.rs` (the data), `modes.rs` (commits with readers, clients, canonicalisation), `main.rs` |
+| `crates/nrese-store/examples/perf_lab/` | the measuring tool: `generate.rs` (the data), `modes.rs` (commits with readers, clients, canonicalisation, the store's classification), `main.rs` (with `--routes`: each query's rewrites, operators and, under `owl2-dl`, its status and path) |
 | `../baselines/fast/` | committed NRESE results (`<date>-<label>.json`) |
 
 ## A case
@@ -49,7 +49,8 @@ Every case names, in `cases.toml`:
 - **comparators:** `system:semantics`, each run only under a semantics it supports;
 - **home turf:** the competitor whose documented strength the case is.
 
-Statuses: `ok`, `wrong`, `off-route`, `memory-limit`, `timeout`, `failed`.
+Statuses: `ok`, `wrong`, `off-route`, `memory-limit`, `timeout`, `failed`; for a
+comparator also `hangs`, `unsupported` and `not expressible`.
 
 ## How it measures
 
@@ -89,6 +90,8 @@ repetitions of one run isn't judged). Times decide where they must, with the int
 | Equality | `rl-sameas`, `rl-sameas-compact`, `eq-lubm10-one`, `eq-cascade-4`, `eq-cascade-16`, `eq-giant-split`, `eq-merge-compact` | stored facts, rounds (counts); time against the same data without equality |
 | Maintenance | `commits-*`, `deletes-*` (`deletes-tail`: p99) | incremental route; closure equals a fresh one; p50 and p99 |
 | DL pipeline | the `dl-*` cases (phases parse, read, normalise, compile, saturate, search as series), `dl-pipeline`, `ctx-ore-*`, `el-classify`, `horn-classify` | clauses, nodes, branch points, subsumption checks per generated clause (counts); time per phase |
+| QL rewriting | `ql-owl2bench` (OWL2Bench under owl2-ql) | the tree-witness rewrite on the queries that need it, absent on the others (routes); answers |
+| DL mode (`owl2-dl`) | `dlmode-lubm1` (LUBM 1's 14 queries), `dlmode-commits`, `dlmode-reject`, `dlmode-reject-dl`, `classify-store-horn`, `classify-store-tableau` | each answer's status (sound, complete) and the path that decided it; the gate that rejects an inconsistent commit (RL or the hypertableau); the classification engine (`context-core` or `tableau`); time |
 | Loads and opening | `load-entities`, `load-threads` (1 to 16 threads), `open-first-query`, `reopen-dbpedia` (first against repeated execution, page faults, resident after open) | time; faults |
 
 The investigation of 6 October 2026 (v2-performance-investigation, §5) asked for: rule work
@@ -120,8 +123,12 @@ semantics it names, and on nothing else:
   runs the path form with reasoning off too, which shows what precomputing buys. RDFS, OWL 2
   QL and property axioms between named individuals are expressible; RL and EL only per query;
   `sameAs`, DL and recursive RL/EL rules not (`rewrite` in `cases.toml`): those cases report
-  "not expressible" per system, which is where reasoning in the store wins. The printer comes
-  with the `ql/tree-witness` work; until it lands, `compete` lists these comparators as waiting.
+  "not expressible" per system, which is where reasoning in the store wins. `compete` runs
+  the printer first (the `ql_print_check` example: each printed query on a store without
+  reasoning against NRESE's rows under OWL 2 RL); only the printed queries with NRESE's rows
+  go to the other stores, so counts come before times.
+- **Known hangs:** a pair that gave no answer in a past run is recorded in its case
+  (`hangs = { "jena:owl-horst" = "why" }`), reported as `hangs` and not run again.
 - **Licensed systems** (GraphDB, RDFox, Stardog, AnzoGraph) only with `--licensed` and their
   licences; their results stay in `results/` (git-ignored).
 
