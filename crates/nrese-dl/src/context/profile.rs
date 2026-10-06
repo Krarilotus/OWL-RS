@@ -31,6 +31,9 @@ pub struct Profile {
     pub clauses_generated: u64,
     pub clauses_kept: u64,
     pub redundant_forward: u64,
+    /// Body inclusion tests of the redundancy checks: per generated clause, the work a
+    /// subsumption index would save.
+    pub subset_checks: u64,
     pub redundant_backward: u64,
     pub hyper_inferences: u64,
     pub pred_inferences: u64,
@@ -55,6 +58,7 @@ impl Profile {
         self.clauses_generated += c.generated;
         self.clauses_kept += c.kept;
         self.redundant_forward += c.forward;
+        self.subset_checks += c.subset_checks;
         self.redundant_backward += c.backward;
         self.hyper_inferences += c.hyper;
         self.pred_inferences += c.pred;
@@ -78,7 +82,7 @@ impl Profile {
              functions={} renamed={} split={} recentred={} dropped_data={} contexts_created={} \
              contexts_saturated={} clauses_generated={} clauses_kept={} redundant_forward={} \
              redundant_backward={} hyper={} pred={} max_head={} max_body={} edges={} \
-             peak_agenda={} messages={} slots={} proof_steps={} threads={}",
+             peak_agenda={} messages={} slots={} proof_steps={} threads={} subset_checks={}",
             ms(self.normalise),
             ms(self.compile),
             ms(self.saturate),
@@ -107,6 +111,7 @@ impl Profile {
             self.slots,
             self.proof_steps,
             self.threads,
+            self.subset_checks,
         );
         out
     }

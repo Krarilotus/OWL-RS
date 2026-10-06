@@ -27,7 +27,7 @@ use nrese_sparql::{
 };
 use nrese_sparql_syntax::SparqlParser;
 
-const EX: &str = "http://example.com/";
+pub(crate) const EX: &str = "http://example.com/";
 
 /// The reference evaluator's answer on what `snapshot` holds in `options.read_model`.
 fn reference(
@@ -76,12 +76,12 @@ fn update_engine(
 }
 
 /// SplitMix64: deterministic test-case generation.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
     /// The generator of a test's base seed, varied by `NRESE_FUZZ_SEED` (a number) for bug
     /// hunts over many seeds; without it, the same cases on every run.
-    fn seeded(base: u64) -> Self {
+    pub(crate) fn seeded(base: u64) -> Self {
         let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
             .ok()
             .and_then(|seed| seed.trim().parse().ok())
@@ -89,7 +89,7 @@ impl Rng {
         Self(base ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15))
     }
 
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -97,11 +97,11 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    fn below(&mut self, n: u64) -> u64 {
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
 
-    fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+    pub(crate) fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.below(items.len() as u64) as usize]
     }
 }
@@ -203,11 +203,11 @@ impl Dump {
     }
 }
 
-fn ex(local: &str) -> NamedNode {
+pub(crate) fn ex(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{EX}{local}"))
 }
 
-fn random_object(rng: &mut Rng) -> Term {
+pub(crate) fn random_object(rng: &mut Rng) -> Term {
     match rng.below(12) {
         // Range pruning edge cases: dates with timezones next to the FILTER bounds, a
         // non-canonical integer (a dictionary typed literal), and integer-derived literals
@@ -254,7 +254,7 @@ fn random_object(rng: &mut Rng) -> Term {
     }
 }
 
-fn random_dataset(rng: &mut Rng) -> Vec<Quad> {
+pub(crate) fn random_dataset(rng: &mut Rng) -> Vec<Quad> {
     (0..10 + rng.below(50))
         .map(|_| {
             Quad::new(
@@ -428,7 +428,7 @@ fn group_pattern(rng: &mut Rng, depth: u32) -> String {
     parts.join(" ")
 }
 
-fn random_query(rng: &mut Rng) -> (String, bool) {
+pub(crate) fn random_query(rng: &mut Rng) -> (String, bool) {
     let pattern = group_pattern(rng, 0);
     if rng.below(8) == 0 {
         // LIMIT over one filtered pattern (the streamed scan); see `limited` below.
@@ -589,7 +589,11 @@ fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
 /// [`rows`], with integer literals by value where SPARQL leaves open which of equal values
 /// comes out: `ORDER BY` puts `"02"` and `"2"` in either order (and a `LIMIT` may cut
 /// between them), and `MIN`/`MAX` may give either as the extreme (`open` for those).
-fn rows_up_to_equal_values(results: QueryResults<'_>, ordered: bool, open: bool) -> Vec<String> {
+pub(crate) fn rows_up_to_equal_values(
+    results: QueryResults<'_>,
+    ordered: bool,
+    open: bool,
+) -> Vec<String> {
     rows_with(results, ordered, ordered || open)
 }
 
@@ -663,12 +667,12 @@ fn cell_by_value(cell: &str) -> String {
 }
 
 /// Whether a query's results hold a `MIN` or `MAX`, whose extreme may be any of equal values.
-fn has_extremes(text: &str) -> bool {
+pub(crate) fn has_extremes(text: &str) -> bool {
     text.contains("MIN(") || text.contains("MAX(")
 }
 
 /// The LIMIT of a generated `SELECT * … LIMIT n` query without ORDER BY.
-fn limited(text: &str) -> Option<usize> {
+pub(crate) fn limited(text: &str) -> Option<usize> {
     (!text.contains("ORDER BY"))
         .then(|| text.rsplit_once(" LIMIT ")?.1.parse().ok())
         .flatten()
@@ -1542,7 +1546,7 @@ fn open_closures_and_their_counts_equal_the_reference() {
 /// deduplicating, joining and filtering on the results of `BIND` and `SELECT` expressions
 /// and of aggregates in subqueries. The patterns are single statements and joins on `?a`,
 /// so nearly every query has solutions. Returns the query and whether its rows are ordered.
-fn computed_query(rng: &mut Rng) -> (String, bool) {
+pub(crate) fn computed_query(rng: &mut Rng) -> (String, bool) {
     let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
     let base = match rng.below(3) {
         0 => format!("?a {} ?b", p(rng)),
@@ -1764,7 +1768,7 @@ fn computed_values_equal_the_reference() {
 /// BINDs. Some queries mix in an aggregate that does count duplicates, which switches the
 /// set evaluation off. Returns the query and whether its results depend on the order of
 /// the rows (`GROUP_CONCAT`, `SAMPLE`).
-fn set_query(rng: &mut Rng) -> (String, bool) {
+pub(crate) fn set_query(rng: &mut Rng) -> (String, bool) {
     let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
     let mut pattern = format!("?a {} ?b .", p(rng));
     for _ in 0..1 + rng.below(3) {

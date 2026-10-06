@@ -225,6 +225,10 @@ impl AppState {
 
     /// This state with `replication` as its part in replication (set once at start).
     pub fn with_replication(mut self, replication: crate::replication::ReplicationConfig) -> Self {
+        if replication.mode == crate::replication::ReplicationMode::Replica {
+            // Its dictionary continues the primary's: nothing here may intern a term.
+            self.store().mark_replica();
+        }
         self.replication = Arc::new(crate::replication::ReplicationState::new(replication));
         self
     }

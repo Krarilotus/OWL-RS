@@ -185,6 +185,7 @@ impl Engine {
         let publish = move |current: &Version| {
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             Version {
+                content: super::Content::fresh(),
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,

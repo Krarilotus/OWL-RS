@@ -18,6 +18,16 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             .unwrap_or(defaults.data_dir),
         ontology_path: source.get(names::ONTOLOGY_PATH).map(PathBuf::from),
         query_cache_bytes: parse_cache_bytes(source.get(names::QUERY_CACHE_BYTES).as_deref())?,
+        pinned_queries: source
+            .get(names::PINNED_QUERIES)
+            .map(|list| {
+                list.split(';')
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
         shapes_graph: source
             .get(names::SHACL_SHAPES_GRAPH)
             .unwrap_or(defaults.shapes_graph),
@@ -35,6 +45,15 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         hide_unnamed_classes: parse_unnamed_classes(
             source.get(names::REASONING_UNNAMED_CLASSES).as_deref(),
         )?,
+        ql_rewriting: match choice(
+            source,
+            names::REASONING_QL_REWRITING,
+            &["auto", "on", "off"],
+        )? {
+            Some(1) => nrese_store::QlRewritingMode::On,
+            Some(2) => nrese_store::QlRewritingMode::Off,
+            _ => nrese_store::QlRewritingMode::Auto,
+        },
         equality_by_representatives: equality.0,
         equality_compact: equality.1,
         equality_canonical_answers: choice(
@@ -83,6 +102,60 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         shacl_gate: parse_shacl_gate(
             source.get(names::SHACL_GATE).as_deref(),
             source.get(names::SHACL_GATE_SEVERITY).as_deref(),
+        )?,
+        dl: parse_dl(source)?,
+    })
+}
+
+/// The `owl2-dl` mode's settings (`dl.*`).
+fn parse_dl(source: &dyn ConfigSource) -> Result<nrese_store::DlConfig> {
+    use nrese_store::{DlAnswers, DlConsistency};
+    let defaults = nrese_store::DlConfig::default();
+    let answers = match choice(
+        source,
+        names::DL_ANSWERS,
+        &["certain-where-complete", "sound", "exact"],
+    )? {
+        None => defaults.answers,
+        Some(at) => [
+            DlAnswers::CertainWhereComplete,
+            DlAnswers::Sound,
+            DlAnswers::Exact,
+        ][at],
+    };
+    let consistency = match choice(source, names::DL_CONSISTENCY, &["inline", "off"])? {
+        None => defaults.consistency,
+        Some(at) => [DlConsistency::Inline, DlConsistency::Off][at],
+    };
+    let timeout = match source.get(names::DL_TIMEOUT_MS) {
+        Some(text) => std::time::Duration::from_millis(
+            super::units::parse_duration_ms(&text)
+                .with_context(|| format!("failed to parse {}", names::DL_TIMEOUT_MS))?,
+        ),
+        None => defaults.timeout,
+    };
+    let memory_bytes = match source.get(names::DL_MEMORY) {
+        Some(text) => super::units::parse_size(&text)
+            .with_context(|| format!("failed to parse {}", names::DL_MEMORY))?
+            as usize,
+        None => defaults.memory_bytes,
+    };
+    Ok(nrese_store::DlConfig {
+        answers,
+        consistency,
+        timeout,
+        memory_bytes,
+        max_candidates: super::env_values::parse_usize(
+            source,
+            names::DL_MAX_CANDIDATES,
+            defaults.max_candidates,
+        )?,
+        threads: super::env_values::parse_usize(source, names::DL_THREADS, defaults.threads)?,
+        max_nodes: super::env_values::parse_usize(source, names::DL_MAX_NODES, defaults.max_nodes)?,
+        max_branch_points: super::env_values::parse_u64(
+            source,
+            names::DL_MAX_BRANCH_POINTS,
+            defaults.max_branch_points,
         )?,
     })
 }
@@ -292,9 +365,32 @@ const fn default_store_mode() -> StoreMode {
 
 #[cfg(test)]
 mod tests {
-    use nrese_store::StoreMode;
+    use nrese_store::{DlAnswers, DlConfig, DlConsistency, StoreMode};
 
-    use super::parse_store_mode;
+    use super::super::source::KeyValueSource;
+    use super::{names, parse_dl, parse_store_mode};
+
+    #[test]
+    fn dl_settings_parse_and_unknown_values_are_errors() {
+        let source = KeyValueSource::default();
+        assert_eq!(parse_dl(&source).unwrap(), DlConfig::default());
+        let mut source = KeyValueSource::default();
+        source.insert(names::DL_ANSWERS, "exact");
+        source.insert(names::DL_CONSISTENCY, "off");
+        source.insert(names::DL_TIMEOUT_MS, "90s");
+        source.insert(names::DL_MEMORY, "1GiB");
+        source.insert(names::DL_MAX_CANDIDATES, "50");
+        source.insert(names::DL_THREADS, "2");
+        let dl = parse_dl(&source).unwrap();
+        assert_eq!(dl.answers, DlAnswers::Exact);
+        assert_eq!(dl.consistency, DlConsistency::Off);
+        assert_eq!(dl.timeout, std::time::Duration::from_secs(90));
+        assert_eq!(dl.memory_bytes, 1 << 30);
+        assert_eq!((dl.max_candidates, dl.threads), (50, 2));
+        let mut source = KeyValueSource::default();
+        source.insert(names::DL_ANSWERS, "complete");
+        assert!(parse_dl(&source).is_err());
+    }
 
     #[test]
     fn store_mode_parser_accepts_aliases() {

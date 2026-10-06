@@ -65,6 +65,7 @@ fn parse_reasoning_mode(input: Option<&str>) -> Result<ReasoningMode> {
         "none" | "off" => Ok(ReasoningMode::Disabled),
         "owl2rl" => Ok(ReasoningMode::Owl2Rl),
         "owl2ql" => Ok(ReasoningMode::Owl2Ql),
+        "owl2dl" => Ok(ReasoningMode::Owl2Dl),
         "rulesmvp" | "rules-mvp" => bail!(
             "{}: the rules-mvp reasoner was removed; use 'owl2-rl' (OWL 2 RL, with consistency \
              checks) or 'rdfs'",
@@ -72,7 +73,7 @@ fn parse_reasoning_mode(input: Option<&str>) -> Result<ReasoningMode> {
         ),
         unknown => bail!(
             "unsupported value '{unknown}' in {} (expected 'disabled', 'rdfs', 'rdfs-full', \
-             'rdfs-plus', 'owl-horst', 'owl2-ql', 'owl2-rl' or 'custom')",
+             'rdfs-plus', 'owl-horst', 'owl2-ql', 'owl2-rl', 'owl2-dl' or 'custom')",
             names::REASONING_MODE
         ),
     }
@@ -147,6 +148,10 @@ mod tests {
         assert_eq!(
             parse_reasoning_mode(Some("OWL_HORST")).unwrap(),
             nrese_reasoner::ReasoningMode::OwlHorst
+        );
+        assert_eq!(
+            parse_reasoning_mode(Some("owl2-dl")).unwrap(),
+            nrese_reasoner::ReasoningMode::Owl2Dl
         );
     }
 }
