@@ -36,6 +36,22 @@ struct State {
     /// The TBox's taxonomy for L's memberships ([`super::lower`]): computed on the first
     /// read, kept as long as U1's compilation (both change only with the schema).
     taxonomy: std::sync::OnceLock<Arc<nrese_dl::classify::Taxonomy>>,
+    /// The ontology is in OWL 2 RL: the RL rules decide it (theorem PR1 of OWL 2
+    /// Profiles: complete for its assertions and its consistency), and U1 isn't compiled.
+    rules: bool,
+}
+
+/// The route the ontology's profile gives (`nrese_owl::profile`): an OWL 2 RL ontology
+/// to the RL rules alone.
+fn routed_to_rules(ontology: &Ontology) -> bool {
+    nrese_owl::profile::of_ontology(ontology).rl
+}
+
+/// U1's place on the RL route: not compiled.
+fn not_compiled() -> Result<Upper, GaveUp> {
+    Err(GaveUp(
+        "not compiled: the ontology is in OWL 2 RL, which the RL rules decide".to_owned(),
+    ))
 }
 
 /// The store's bounds: U1 for the revision it describes, and the read view of the latest
@@ -74,6 +90,9 @@ pub(crate) struct View {
     pub facts: usize,
     /// U1 has no clash and checks every `⊥`: the data is consistent.
     pub proves_consistency: bool,
+    /// The ontology is in OWL 2 RL: L is complete for every predicate, and consistent
+    /// (the RL rules decide it).
+    pub rules: bool,
 }
 
 fn triple(q: EncodedTriple) -> Triple {
@@ -93,6 +112,8 @@ pub(crate) enum Prepared {
     Rebuilt(Box<Result<Upper, GaveUp>>),
     /// U1 had given up, and nothing it was compiled from changed.
     Unavailable,
+    /// The ontology is (still) in OWL 2 RL: the RL rules decide it, no U1.
+    Rules,
 }
 
 /// A commit's preparation: what to install, and what U1 after the commit says about
@@ -100,8 +121,11 @@ pub(crate) enum Prepared {
 pub(crate) struct Preparation {
     base: u64,
     prepared: Prepared,
-    /// U1 after the commit proves the data consistent.
+    /// U1 after the commit proves the data consistent (or, on the RL route, the RL
+    /// rules do: [`Preparation::decided_by`]).
     pub proves_consistency: bool,
+    /// `upper-bound`, or `rules` on the RL route.
+    pub decided_by: &'static str,
     /// The ontology the commit leaves, where the preparation had to read it (for the
     /// consistency check, which then needn't read it again).
     pub ontology: Option<Ontology>,
@@ -123,6 +147,17 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         .unwrap_or_else(|p| p.into_inner());
     let current = state.as_ref().filter(|s| s.revision == base);
     let asserted: Vec<Triple> = tx.inserted().chain(tx.deleted()).map(quad_triple).collect();
+    if let Some(State { rules: true, .. }) = current
+        && !asserted.iter().any(|t| changes_schema(tx, *t))
+    {
+        return Preparation {
+            base,
+            prepared: Prepared::Rules,
+            proves_consistency: true,
+            decided_by: "rules",
+            ontology: None,
+        };
+    }
     if let Some(State { upper, .. }) = current {
         match upper {
             Ok(upper) if asserted.iter().all(|t| upper.is_assertion(*t)) => {
@@ -141,6 +176,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                 return match upper.change(&pending, &inserted, &deleted, &stop) {
                     Ok(change) => Preparation {
                         base,
+                        decided_by: "upper-bound",
                         proves_consistency: upper.program.proves_consistency()
                             && upper.clashes_after(&change) == 0,
                         prepared: Prepared::Delta(Box::new(change)),
@@ -149,6 +185,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                     Err(gave_up) => Preparation {
                         base,
                         prepared: Prepared::Rebuilt(Box::new(Err(gave_up))),
+                        decided_by: "upper-bound",
                         proves_consistency: false,
                         ontology: None,
                     },
@@ -158,6 +195,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                 return Preparation {
                     base,
                     prepared: Prepared::Unavailable,
+                    decided_by: "upper-bound",
                     proves_consistency: false,
                     ontology: None,
                 };
@@ -168,6 +206,16 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     drop(state);
     source::intern_vocabulary(tx);
     let ontology = source::read_pending(tx);
+    if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
+        // The RL gate that ran before has decided the commit's consistency.
+        return Preparation {
+            base,
+            prepared: Prepared::Rules,
+            proves_consistency: true,
+            decided_by: "rules",
+            ontology: None,
+        };
+    }
     let normalised = nrese_owl::normalise(&ontology);
     let upper = Upper::build(
         &ontology,
@@ -178,6 +226,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     );
     Preparation {
         base,
+        decided_by: "upper-bound",
         proves_consistency: upper.as_ref().is_ok_and(Upper::proves_consistency),
         prepared: Prepared::Rebuilt(Box::new(upper)),
         ontology: Some(ontology),
@@ -242,6 +291,16 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
                 upper: *upper,
                 last: "rebuilt",
                 taxonomy: std::sync::OnceLock::new(),
+                rules: false,
+            });
+        }
+        Prepared::Rules => {
+            *state = Some(State {
+                revision,
+                upper: not_compiled(),
+                last: "rules",
+                taxonomy: std::sync::OnceLock::new(),
+                rules: true,
             });
         }
         Prepared::Delta(change) => match state.as_mut() {
@@ -286,25 +345,36 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
             source::intern_vocabulary(&tx);
         }
         let ontology = source::read_snapshot(&snapshot);
-        let normalised = nrese_owl::normalise(&ontology);
-        let deadline = Instant::now() + store.config().dl.timeout;
-        let stop = move || Instant::now() >= deadline;
-        let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
-        let upper = Upper::build(&ontology, &normalised, &snapshot, &resolve, &stop);
+        let rules =
+            routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal());
+        let upper = match rules {
+            true => not_compiled(),
+            false => {
+                let normalised = nrese_owl::normalise(&ontology);
+                let deadline = Instant::now() + store.config().dl.timeout;
+                let stop = move || Instant::now() >= deadline;
+                let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
+                Upper::build(&ontology, &normalised, &snapshot, &resolve, &stop)
+            }
+        };
         *state = Some(State {
             revision,
             upper,
-            last: "read",
+            last: match rules {
+                true => "rules",
+                false => "read",
+            },
             taxonomy: std::sync::OnceLock::new(),
+            rules,
         });
     }
     let s = state.as_ref().expect("built above");
     let taxonomy = match &s.upper {
-        Ok(_) => Some(Arc::clone(s.taxonomy.get_or_init(|| {
+        Ok(_) if !s.rules => Some(Arc::clone(s.taxonomy.get_or_init(|| {
             let ontology = super::query::ontology_at(store, &snapshot);
             Arc::new(super::lower::tbox_taxonomy(store, &ontology))
         }))),
-        Err(_) => None,
+        _ => None,
     };
     let view = Arc::new(build_view(&snapshot, s, taxonomy.as_deref()));
     *bounds.view.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&view));
@@ -316,6 +386,21 @@ fn build_view(
     state: &State,
     taxonomy: Option<&nrese_dl::classify::Taxonomy>,
 ) -> View {
+    if state.rules {
+        return View {
+            revision: state.revision,
+            lower: snapshot.clone(),
+            lower_facts: 0,
+            upper: None,
+            unavailable: None,
+            gap_classes: HashSet::new(),
+            gap_predicates: HashSet::new(),
+            internal: HashSet::new(),
+            facts: 0,
+            proves_consistency: true,
+            rules: true,
+        };
+    }
     let upper = match &state.upper {
         Ok(upper) => upper,
         Err(GaveUp(why)) => {
@@ -330,6 +415,7 @@ fn build_view(
                 internal: HashSet::new(),
                 facts: 0,
                 proves_consistency: false,
+                rules: false,
             };
         }
     };
@@ -369,6 +455,7 @@ fn build_view(
         internal: HashSet::new(),
         facts: upper.stack.len(),
         proves_consistency: upper.proves_consistency(),
+        rules: false,
     };
     let mut quads = lower_quads;
     for [s, p, o] in upper.stack.iter() {

@@ -239,6 +239,10 @@ fn unbounded(analysis: &Analysis) -> Option<String> {
 
 /// Whether every predicate and class `analysis` reads has no fact in U1 beyond L.
 fn closed(analysis: &Analysis, view: &View, snapshot: &Snapshot) -> bool {
+    // The RL route: the RL closure is complete for an OWL 2 RL ontology.
+    if view.rules {
+        return true;
+    }
     if view.upper.is_none() {
         return false;
     }
