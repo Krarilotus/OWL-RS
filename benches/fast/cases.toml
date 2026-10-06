@@ -39,9 +39,9 @@
 [[case]]
 name = "rl-hierarchy"
 area = "reasoning"
-what = "a 5,461-class tree and a 1,500-class spine over 1 M typed instances (9.7 M inherited types): 67 s in the rule joins on 6 Oct 2026, against 5 s for LUBM 100's 8.7 M"
+what = "a 5,461-class tree and a 1,000-class spine over 1 M typed instances: deep hierarchies cost the rule joins far more than LUBM's (67 s for 9.7 M inherited types with a 1,500 spine, 6 Oct 2026, against 5 s for LUBM 100's 8.7 M)"
 semantics = "owl2-rl"
-data = "hierarchy fan=4 depth=7 spine=1500 instances=1000000 every=1000"
+data = "hierarchy fan=4 depth=7 spine=1000 instances=1000000 every=1000"
 args = ["--reason", "owl2-rl", "--reason-runs", "2"]
 queries = "hierarchy"
 metric = "reason.p50_ms"
@@ -50,13 +50,13 @@ route = { "reason.rounds" = "<= 3" }
 cap_gb = 8
 systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:closure", "oxigraph:closure"]
 guards = ["schema compiled first: sup⁺(c) dispatch, hierarchy module by SCC and bitsets"]
-pinned = "the generator's counts; 9,671,615 inferred on 6 Oct 2026"
+pinned = "the generator's counts"
 [[case]]
 name = "rdfs-hierarchy"
 area = "reasoning"
 what = "the same hierarchy under RDFS"
 semantics = "rdfs"
-data = "hierarchy fan=4 depth=7 spine=1500 instances=1000000 every=1000"
+data = "hierarchy fan=4 depth=7 spine=1000 instances=1000000 every=1000"
 args = ["--reason", "rdfs", "--reason-runs", "2"]
 queries = "hierarchy"
 metric = "reason.p50_ms"
@@ -86,7 +86,7 @@ area = "reasoning"
 what = "owl:sameAs chains: 20,000 groups of 10, a value each, spread to the group (equality by representatives, expanded in the stack)"
 semantics = "owl2-rl"
 data = "sameas groups=20000 size=10"
-args = ["--reason", "owl2-rl", "--reason-runs", "10"]
+args = ["--reason", "owl2-rl", "--reason-runs", "16"]
 queries = "sameas"
 metric = "reason.p50_ms"
 check = { "q.values.value" = "expect.values", "q.same-as.value" = "expect.same_as_pairs", "q.knows.value" = "expect.knows", "q.group-values.rows" = 10 }
@@ -297,9 +297,9 @@ home_turf = "rdf4j"
 [[case]]
 name = "deletes-layered"
 area = "maintenance"
-what = "10 deletions in a layered graph whose facts have many derivations (after SSPE): about 6 s each"
+what = "6 deletions in a layered graph whose facts have many derivations (after SSPE): 4-10 s each on 6 Oct 2026"
 semantics = "owl2-rl"
-data = "layered width=80 depth=40 out=3 deletes=10"
+data = "layered width=80 depth=40 out=3 deletes=6"
 args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
 queries = "layered"
 metric = "commits.p50_ms"
@@ -446,7 +446,7 @@ route = {}
 cap_gb = 6
 systems = ["hermit:dl", "konclude:dl", "openllet:dl"]
 home_turf = "konclude"
-
+guards = ["investigation #5: subsumption checks per generated clause (subset_checks), until the ORE cases classify"]
 [[case]]
 name = "canon-twins"
 area = "dl"
@@ -603,7 +603,7 @@ route = { "q.triangles.operators" = "has wcoj" }
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
 guards = ["worst-case-optimal joins for cyclic patterns"]
-args = ["--runs", "3"]
+args = ["--runs", "2"]
 pinned = "NRESE 5 Oct 2026; cross-checked in fast.py compete"
 [[case]]
 name = "q-snowflake"
@@ -783,7 +783,7 @@ what = "SHACL Core and SHACL-SPARQL over LUBM 10's asserted data"
 semantics = "none"
 data = "volume:lubm-10.nt"
 extra = ["volume:univ-bench.nt"]
-args = ["--shapes", "/src/benches/fast/shapes/lubm.ttl", "--runs", "3"]
+args = ["--shapes", "/src/benches/fast/shapes/lubm.ttl", "--runs", "2"]
 queries = ""
 metric = "shacl.p50_ms"
 check = { "shacl.results" = 24343 }
@@ -877,3 +877,445 @@ cap_gb = 2
 outcome = "memory-limit"
 known = "a triple-term pattern with variables bound by the join is filtered, not looked up: past 6 GiB on 6 Oct 2026"
 systems = ["oxigraph:plain", "jena:plain"]
+
+# --- the performance phase's levels: kernels, layout, rule work, memory, parsing, plans ------
+# Counts and routes decide where they can (every case records its work counters; fast.py
+# compare reports them exactly); times where they must.
+
+[[case]]
+name = "kernel-sort-u128"
+area = "kernel"
+what = "20 M random 128-bit keys (two id columns) sorted by the executor's IdTable::sort_by; std's unstable sort of the same keys as u128 beside it for scale"
+semantics = "none"
+data = "none"
+args = ["--kernel", "sort-u128-20000000", "--runs", "15"]
+queries = ""
+metric = "kernel.p50_ms"
+check = { "kernel.sorted" = "true" }
+route = {}
+cap_gb = 6
+systems = []
+guards = ["R3-S4: vqsort for 128-bit run keys (1,142 MB/s AVX-512 vs 128 MB/s std::sort, reported)"]
+
+[[case]]
+name = "kernel-intersect"
+area = "kernel"
+what = "directed triangles in two graphs of 50,000 nodes and 12 edges each: uniform targets, and targets skewed to hubs (intersections of very different lengths)"
+semantics = "none"
+data = "dense nodes=50000 degree=12"
+queries = "dense"
+args = ["--runs", "16"]
+metric = "sum_p50_ms"
+check = { "q.triangles-uniform.value" = "expect.triangles_u", "q.triangles-skewed.value" = "expect.triangles_s" }
+route = { "q.triangles-uniform.operators" = "has wcoj", "q.triangles-skewed.operators" = "has wcoj" }
+cap_gb = 6
+systems = ["qlever:plain", "oxigraph:plain", "jena:plain"]
+guards = ["R3-S4: adaptive SIMD intersection on 32-bit ids (merge for similar lengths, galloping at high skew)"]
+
+[[case]]
+name = "layout-plain"
+area = "layout"
+what = "the social network's store as laid out by default: index and dictionary bytes per statement, and star queries reading it"
+semantics = "none"
+data = "social people=300000"
+queries = "q-star"
+args = ["--runs", "500"]
+metric = "sum_p50_ms"
+check = { "loaded" = "expect.distinct_statements" }
+route = {}
+cap_gb = 6
+counters = ["held.index_bytes", "held.dictionary_text_bytes", "held.dictionary_index_bytes"]
+systems = []
+
+[[case]]
+name = "layout-compact"
+area = "layout"
+what = "the same with the compact index encoding (NRESE_INDEX_ENCODING = compact)"
+semantics = "none"
+data = "social people=300000"
+queries = "q-star"
+args = ["--runs", "800"]
+env = { NRESE_INDEX_ENCODING = "compact" }
+metric = "sum_p50_ms"
+check = { "loaded" = "expect.distinct_statements" }
+route = {}
+cap_gb = 6
+counters = ["held.index_bytes", "held.dictionary_text_bytes", "held.dictionary_index_bytes"]
+systems = []
+
+[[case]]
+name = "layout-fsst"
+area = "layout"
+what = "the same with the FSST-compressed vocabulary (NRESE_VOCABULARY = fsst)"
+semantics = "none"
+data = "social people=300000"
+queries = "q-star"
+args = ["--runs", "800"]
+env = { NRESE_VOCABULARY = "fsst" }
+metric = "sum_p50_ms"
+check = { "loaded" = "expect.distinct_statements" }
+route = {}
+cap_gb = 6
+counters = ["held.index_bytes", "held.dictionary_text_bytes", "held.dictionary_index_bytes"]
+systems = []
+
+[[case]]
+name = "rule-delta-sweep"
+area = "rules"
+what = "commits of 1, 10, 100, 1,000, 10,000 and 100,000 people under OWL 2 RL, added then removed: maintenance cost against the delta's size"
+semantics = "owl2-rl"
+data = "batches people=200000 steps=6"
+args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru", "--reason-runs", "4"]
+queries = "churn"
+metric = "commits.whole_s"
+check = { "closure_after_commits.equal" = "true", "commits.commits" = 12 }
+route = { "commits.incremental" = "== true" }
+cap_gb = 6
+systems = []
+guards = ["R3-S2: the |Δ|/|R| sweep from one tuple to full evaluation"]
+
+[[case]]
+name = "alloc-lubm10"
+area = "memory"
+what = "LUBM 10 loaded, materialised (OWL 2 RL) and queried, with allocations and peak memory counted per phase"
+semantics = "owl2-rl"
+data = "volume:lubm-10.nt"
+extra = ["volume:univ-bench.nt"]
+args = ["--reason", "owl2-rl", "--reason-runs", "30", "--runs", "30", "--count-allocations"]
+queries = "lubm"
+metric = "reason.p50_ms"
+check = {}
+route = {}
+cap_gb = 4
+systems = []
+
+[[case]]
+name = "alloc-load"
+area = "memory"
+what = "a 10 M-statement bulk load with allocations and peak memory counted"
+semantics = "none"
+data = "entities entities=2500000"
+args = ["--count-allocations"]
+repeat = 6
+queries = ""
+metric = "load_s"
+check = { "loaded" = 10000000 }
+route = {}
+cap_gb = 6
+systems = []
+
+[[case]]
+name = "eq-giant-split"
+area = "reasoning"
+what = "a 300-member owl:sameAs class (two chains and a bridge link) beside 5,000 small ones; one commit deletes the bridge and the class splits (6 Oct 2026: a 500-member split took 68 s in one commit, 1,000 failed after 242 s, while materialising took 0.2-0.8 s)"
+semantics = "owl2-rl"
+data = "sameas-giant size=300 groups=5000"
+args = ["--reason", "owl2-rl", "--reason-runs", "3", "--commits", "{data}.commits.ru"]
+queries = "sameas-giant"
+metric = "reason.p50_ms"
+check = { "closure_after_commits.equal" = "true", "q.values.value" = "expect.values_after_split" }
+route = {}
+cap_gb = 8
+systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl"]
+guards = ["Store-2: equality by class ids; a deletion splits a class (B/F style)"]
+
+[[case]]
+name = "deletes-tail"
+area = "maintenance"
+what = "3,000 people of the data deleted one per commit under OWL 2 RL: the tail of deletion latency (p99)"
+semantics = "owl2-rl"
+data = "churn people=200000 changes=0 existing=3000"
+args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
+queries = "churn"
+metric = "commits.p99_ms"
+check = { "closure_after_commits.equal" = "true", "commits.commits" = 3000 }
+route = { "commits.incremental" = "== true" }
+cap_gb = 6
+systems = ["graphdb:owl2-rl", "rdfox:owl2-rl"]
+
+[[case]]
+name = "dl-pipeline"
+area = "dl"
+what = "a 60,000-class Horn ontology through the DL pipeline: reading, normalisation and the tableau's phases timed apart"
+semantics = "dl"
+data = "horn classes=60000"
+tool = "tableau"
+timeout_s = 120
+repeat = 15
+metric = "whole_ms"
+check = { "answer" = "consistent" }
+route = { "branch_points" = "== 0" }
+cap_gb = 6
+systems = ["hermit:dl", "openllet:dl", "konclude:dl"]
+guards = ["DL-F: phases (parse, preprocess, reason) timed apart"]
+
+[[case]]
+name = "parse-large"
+area = "parse"
+what = "parsing and planning without running: 5,000 VALUES, a 1,000-pattern BGP, 500 UNIONs, 120 nested OPTIONALs, 50 nested subqueries, 2,000 ORs, 300 path alternatives, an expression 120 deep (the parser stops at 128 levels)"
+semantics = "none"
+data = "social people=40000"
+queries = "@parse"
+args = ["--parse-only", "--runs", "100"]
+metric = "sum_p50_ms"
+check = {}
+route = {}
+cap_gb = 4
+systems = []
+
+[[case]]
+name = "plan-estimates"
+area = "plan"
+what = "the planner's estimates on nine query shapes: q-errors per operator (counts), beside the queries' times"
+semantics = "none"
+data = "social people=300000"
+queries = "plan-mix"
+args = ["--qerror", "--runs", "200"]
+metric = "sum_p50_ms"
+check = {}
+route = {}
+cap_gb = 6
+counters = ["qerror.all.median", "qerror.all.p90", "qerror.all.within_2x"]
+systems = []
+guards = ["characteristic sets and pairs (Store-5); q-error measured"]
+
+# --- the investigation's §5 (v2-performance-investigation-2026-10-06.md) ---------------------
+
+[[case]]
+name = "rule-work-lubm10"
+area = "rules"
+what = "LUBM 10 under OWL 2 RL: rule bindings, membership probes, candidates and new facts per materialisation (§5.1; 6.74 M bindings for 0.83 M new facts on 6 Oct 2026)"
+semantics = "owl2-rl"
+data = "volume:lubm-10.nt"
+extra = ["volume:univ-bench.nt"]
+args = ["--reason", "owl2-rl", "--reason-runs", "30"]
+queries = ""
+metric = "reason.p50_ms"
+check = {}
+route = {}
+cap_gb = 4
+systems = []
+guards = ["investigation #1 (tautological ground instances), #2 (projection-driven variants): bindings per derived fact"]
+
+[[case]]
+name = "rule-work-owl2bench"
+area = "rules"
+what = "OWL2Bench RL-1 under OWL 2 RL: the same work counters on a clique-heavy closure (§5.1)"
+semantics = "owl2-rl"
+data = "volume:owl2bench-rl-1.nt"
+args = ["--reason", "owl2-rl", "--reason-runs", "15"]
+queries = ""
+metric = "reason.p50_ms"
+check = {}
+route = {}
+cap_gb = 4
+systems = []
+guards = ["investigation #1, #2, B2"]
+
+[[case]]
+name = "eq-lubm10-one"
+area = "reasoning"
+what = "LUBM 10 with one asserted owl:sameAs between two students (§5.2a): the cost of equality appearing at all, against rule-work-lubm10"
+semantics = "owl2-rl"
+data = "volume:lubm-10.nt"
+extra = ["volume:univ-bench.nt", "eq-addon one=1"]
+args = ["--reason", "owl2-rl", "--reason-runs", "20"]
+queries = ""
+metric = "reason.p50_ms"
+check = {}
+route = {}
+cap_gb = 4
+systems = []
+guards = ["investigation #4: equality by an incremental rebuild instead of re-materialising"]
+
+[[case]]
+name = "eq-cascade-4"
+area = "reasoning"
+what = "LUBM 10 with 1,000 functional-property cascades of depth 4 (§5.2b): each merge triggers the next"
+semantics = "owl2-rl"
+data = "volume:lubm-10.nt"
+extra = ["volume:univ-bench.nt", "eq-addon depth=4 chains=1000"]
+args = ["--reason", "owl2-rl", "--reason-runs", "8"]
+queries = "eq-cascade"
+metric = "reason.p50_ms"
+check = {}
+route = {}
+cap_gb = 4
+systems = ["nemo:owl2-rl"]
+guards = ["investigation #4, G8"]
+
+[[case]]
+name = "eq-cascade-16"
+area = "reasoning"
+what = "the same with cascades of depth 16 (§5.2b)"
+semantics = "owl2-rl"
+data = "volume:lubm-10.nt"
+extra = ["volume:univ-bench.nt", "eq-addon depth=16 chains=1000"]
+args = ["--reason", "owl2-rl", "--reason-runs", "3"]
+queries = "eq-cascade"
+metric = "reason.p50_ms"
+check = {}
+route = {}
+cap_gb = 4
+systems = ["nemo:owl2-rl"]
+guards = ["investigation #4, G8"]
+
+[[case]]
+name = "eq-merge-compact"
+area = "maintenance"
+what = "20 commits that each merge two owl:sameAs groups, the stack kept over representatives (compact), 4 readers alongside (§5.7): the maintained closure must equal a fresh one"
+semantics = "owl2-rl"
+data = "sameas groups=20000 size=10 merges=20"
+args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru", "--readers", "4"]
+env = { NRESE_REASONING_EQUALITY = "compact" }
+queries = "sameas"
+metric = "commits.p50_ms"
+check = { "closure_after_commits.equal" = "true", "q.values.value" = "expect.values_after_merges" }
+route = {}
+cap_gb = 6
+systems = []
+guards = ["investigation G5: a compact-mode commit that merges sameAs"]
+outcome = "wrong"
+known = "6 Oct 2026, 200 merges: the maintained stack held 380,845 inferred facts, a fresh materialisation 440,032; the values query agreed; commits not incremental, p50 2.2 s"
+[[case]]
+name = "rl-fed-chain"
+area = "reasoning"
+what = "a transitive property fed over several rounds through an inverse, a subproperty and a property chain: two chains of 1,500 (§5.9)"
+semantics = "owl2-rl"
+data = "fed-chain chains=2 length=1500"
+args = ["--reason", "owl2-rl", "--reason-runs", "12"]
+queries = "fed-chain"
+metric = "reason.p50_ms"
+check = { "q.pairs.value" = "expect.pairs" }
+route = {}
+cap_gb = 6
+systems = ["nemo:owl2-rl"]
+guards = ["investigation #11: incremental transitive closure in the batch executor (modules phase)"]
+
+[[case]]
+name = "index-join-keys"
+area = "operator"
+what = "index joins driven by sorted keys: 25 k and 2.5 M keys into a 2.5 M link pattern, allocations counted (§5.3)"
+semantics = "none"
+data = "entities entities=2500000"
+queries = "index-join"
+args = ["--runs", "120", "--count-allocations"]
+metric = "sum_p50_ms"
+check = {}
+route = {}
+cap_gb = 6
+systems = ["qlever:plain", "oxigraph:plain"]
+guards = ["investigation #3: a seekable cursor kernel (searches from the root per probe today)"]
+
+[[case]]
+name = "reopen-dbpedia"
+area = "load"
+what = "DBpedia core (67 M) on disk, reopened in fresh processes: open, the first and the repeated executions of its 13 queries, page faults, resident after open (§5.4)"
+semantics = "none"
+data = "volume:dbpedia-core.nt"
+setup = ["--store", "{scratch}/store", "--load", "{data}"]
+args = ["--store", "{scratch}/store", "--warmup", "0", "--runs", "3"]
+queries = "@dbpedia-core"
+repeat = 3
+metric = "cold_ms"
+check = {}
+route = {}
+cap_gb = 10
+systems = []
+guards = ["investigation #7: prefetch the index directory when a store opens; the mmap restart win"]
+
+[[case]]
+name = "load-threads"
+area = "load"
+what = "a 10 M-statement bulk load on 1, 2, 4, 8 and 16 threads: the load's scaling curve (§5.5)"
+semantics = "none"
+data = "entities entities=2500000"
+args = []
+sweep = [["--threads", "1"], ["--threads", "2"], ["--threads", "4"], ["--threads", "8"], ["--threads", "16"]]
+queries = ""
+metric = "load_s"
+check = { "loaded" = 10000000 }
+route = {}
+cap_gb = 6
+systems = []
+guards = ["investigation #8: interning without the global lock; P5"]
+
+[[case]]
+name = "ctx-ore-9724"
+area = "dl"
+what = "the context core's classification of ORE 2015's ore_ont_9724: subsumption checks per generated clause (§5.6)"
+semantics = "dl"
+data = "ore:ore_ont_9724"
+tool = "classify-horn"
+repeat = 1
+metric = "whole_ms"
+check = {}
+route = {}
+cap_gb = 6
+systems = ["hermit:dl", "konclude:dl"]
+guards = ["investigation #5: a SAT-style subsumption index in the context core"]
+outcome = "unsupported"
+known = "the context core's Horn stage: unsupported equality (6 Oct 2026); the case counts subsumption checks once it classifies"
+[[case]]
+name = "ctx-ore-2738"
+area = "dl"
+what = "the same on ore_ont_2738 (§5.6)"
+semantics = "dl"
+data = "ore:ore_ont_2738"
+tool = "classify-horn"
+repeat = 1
+metric = "whole_ms"
+check = {}
+route = {}
+cap_gb = 6
+systems = ["hermit:dl", "konclude:dl"]
+guards = ["investigation #5"]
+outcome = "unsupported"
+known = "unsupported nominals in the Horn stage (6 Oct 2026)"
+[[case]]
+name = "ctx-ore-9835"
+area = "dl"
+what = "the same on ore_ont_9835 (§5.6)"
+semantics = "dl"
+data = "ore:ore_ont_9835"
+tool = "classify-horn"
+repeat = 1
+metric = "whole_ms"
+check = {}
+route = {}
+cap_gb = 6
+systems = ["hermit:dl", "konclude:dl"]
+guards = ["investigation #5"]
+outcome = "unsupported"
+known = "not Horn (6 Oct 2026)"
+[[case]]
+name = "ctx-ore-7914"
+area = "dl"
+what = "the same on ore_ont_7914 (§5.6)"
+semantics = "dl"
+data = "ore:ore_ont_7914"
+tool = "classify-horn"
+repeat = 1
+metric = "whole_ms"
+check = {}
+route = {}
+cap_gb = 6
+systems = ["hermit:dl", "konclude:dl"]
+guards = ["investigation #5"]
+outcome = "unsupported"
+known = "unsupported equality in the Horn stage (6 Oct 2026)"
+[[case]]
+name = "dl-abox-lubm1"
+area = "dl"
+what = "LUBM 1's ontology and ABox through the hypertableau: individuals with many edges, each Extend firing over them (§5.8)"
+semantics = "dl"
+data = "concat:volume:univ-bench.nt+volume:lubm-1.nt"
+tool = "tableau"
+timeout_s = 120
+repeat = 30
+metric = "whole_ms"
+check = { "answer" = "consistent" }
+route = {}
+cap_gb = 6
+systems = ["hermit:dl", "openllet:dl", "konclude:dl"]
+guards = ["investigation #13: edges per (node, role) in the completion graph"]

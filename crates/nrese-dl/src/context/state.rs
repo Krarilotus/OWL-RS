@@ -100,6 +100,8 @@ pub struct Counters {
     pub forward: u64,
     /// Clauses removed by backward redundancy (a new clause was stronger).
     pub backward: u64,
+    /// Body inclusion tests (`is_subset`) the redundancy checks made, forward and backward.
+    pub subset_checks: u64,
     pub hyper: u64,
     pub pred: u64,
     pub messages: u64,
@@ -163,15 +165,20 @@ impl Clauses {
             })
     }
 
-    /// Whether a live clause makes `body → head` redundant (Definition 4, case 2).
-    fn subsumed(&self, body: &[Atom], head: Atom) -> bool {
-        let stronger = |key: Atom| {
+    /// Whether a live clause makes `body → head` redundant (Definition 4, case 2), and the
+    /// inclusion tests that took.
+    fn subsumed(&self, body: &[Atom], head: Atom) -> (bool, u64) {
+        let mut checks = 0;
+        let mut stronger = |key: Atom| {
             self.heads.get(&key).is_some_and(|list| {
-                list.iter()
-                    .any(|&c| is_subset(self.bodies.get(self.recs[c as usize].body), body))
+                list.iter().any(|&c| {
+                    checks += 1;
+                    is_subset(self.bodies.get(self.recs[c as usize].body), body)
+                })
             })
         };
-        stronger(Atom::BOTTOM) || (!head.is_bottom() && stronger(head))
+        let found = stronger(Atom::BOTTOM) || (!head.is_bottom() && stronger(head));
+        (found, checks)
     }
 
     /// Adds `body → head` unless it is redundant (the paper's Derive, Algorithm 3);
@@ -185,7 +192,13 @@ impl Clauses {
         proofs: bool,
     ) -> Option<ClauseId> {
         self.counters.generated += 1;
-        if self.unsat || self.subsumed(body, head) {
+        if self.unsat {
+            self.counters.forward += 1;
+            return None;
+        }
+        let (subsumed, checks) = self.subsumed(body, head);
+        self.counters.subset_checks += checks;
+        if subsumed {
             self.counters.forward += 1;
             return None;
         }
@@ -195,6 +208,7 @@ impl Clauses {
         if let Some(list) = self.heads.get_mut(&head) {
             let (recs, bodies) = (&mut self.recs, &self.bodies);
             let before = list.len();
+            self.counters.subset_checks += before as u64;
             list.retain(|&c| {
                 let rec = &mut recs[c as usize];
                 if is_subset(body, bodies.get(rec.body)) {

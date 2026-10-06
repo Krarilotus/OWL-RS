@@ -717,7 +717,29 @@ pub fn run_jobs<S: Source + ?Sized>(
     keep: &(dyn Fn(Triple) -> bool + Sync),
     stop: Stop<'_>,
 ) -> Vec<Triple> {
-    run_jobs_with(source, jobs, keep, false, stop)
+    run_jobs_with(source, jobs, keep, false, stop, None)
+}
+
+/// The work [`run_jobs_counted`] did, summed over its morsels: deterministic for a given
+/// program and input, so a change in it is a change in the work, whatever the machine.
+#[derive(Debug, Default)]
+pub struct JobWork {
+    /// Head facts the bindings produced (one per binding and head).
+    pub emitted: std::sync::atomic::AtomicU64,
+    /// Those left after each morsel's deduplication: the membership probes `keep` made.
+    pub probed: std::sync::atomic::AtomicU64,
+}
+
+/// [`run_jobs`], adding its work to `work` (once per morsel, so the hot loop stays free of
+/// shared counters).
+pub fn run_jobs_counted<S: Source + ?Sized>(
+    source: &S,
+    jobs: &[Job<'_>],
+    keep: &(dyn Fn(Triple) -> bool + Sync),
+    stop: Stop<'_>,
+    work: &JobWork,
+) -> Vec<Triple> {
+    run_jobs_with(source, jobs, keep, false, stop, Some(work))
 }
 
 /// [`run_jobs`] without circular derivations: those whose head is one of their own
@@ -730,7 +752,7 @@ pub fn run_jobs_acyclic<S: Source + ?Sized>(
     keep: &(dyn Fn(Triple) -> bool + Sync),
     stop: Stop<'_>,
 ) -> Vec<Triple> {
-    run_jobs_with(source, jobs, keep, true, stop)
+    run_jobs_with(source, jobs, keep, true, stop, None)
 }
 
 fn run_jobs_with<S: Source + ?Sized>(
@@ -739,6 +761,7 @@ fn run_jobs_with<S: Source + ?Sized>(
     keep: &(dyn Fn(Triple) -> bool + Sync),
     acyclic: bool,
     stop: Stop<'_>,
+    work: Option<&JobWork>,
 ) -> Vec<Triple> {
     let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
         .iter()
@@ -778,8 +801,14 @@ fn run_jobs_with<S: Source + ?Sized>(
             // run in (predicate, subject, object) order: about half of an OWL 2 RL round's
             // candidates repeat within it, and sorted probes walk a relation's sorted run
             // forward instead of missing the cache at every level of every search.
+            let emitted = out.len();
             out.sort_unstable_by_key(|&[s, p, o]| (p, s, o));
             out.dedup();
+            if let Some(work) = work {
+                use std::sync::atomic::Ordering::Relaxed;
+                work.emitted.fetch_add(emitted as u64, Relaxed);
+                work.probed.fetch_add(out.len() as u64, Relaxed);
+            }
             out.retain(|&fact| keep(fact));
             out
         })

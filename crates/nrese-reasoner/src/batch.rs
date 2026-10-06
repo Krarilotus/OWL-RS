@@ -28,7 +28,9 @@ use rayon::prelude::*;
 
 use super::delta::Interrupted;
 pub use super::eval::Schema;
-use super::eval::{AllFacts, GroundProgram, Job, NEVER, Seg, Source, guards_hold, run_jobs};
+use super::eval::{
+    AllFacts, GroundProgram, Job, JobWork, NEVER, Seg, Source, guards_hold, run_jobs_counted,
+};
 use super::ir::{Head, Rule};
 use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
@@ -52,7 +54,7 @@ pub struct Materialisation {
     pub phases: Phases,
 }
 
-/// Time spent per phase of [`materialise`].
+/// Time spent per phase of [`materialise`], and the work it did.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Phases {
     pub load: std::time::Duration,
@@ -61,6 +63,38 @@ pub struct Phases {
     pub modules: std::time::Duration,
     pub merge: std::time::Duration,
     pub consistency: std::time::Duration,
+    /// Head facts the rule joins' bindings produced, before any deduplication: with
+    /// `new_facts`, the bindings per derived fact (tautological and re-derived ones
+    /// included).
+    pub bindings: u64,
+    /// Membership probes against the store: the rule joins' facts left after each morsel's
+    /// deduplication.
+    pub probes: u64,
+    /// Candidate facts the rounds produced (rule joins and modules) that the store didn't
+    /// hold yet, before their deduplication across morsels.
+    pub candidates: u64,
+    /// The new facts among them: `candidates - new_facts` is work that added nothing.
+    pub new_facts: u64,
+    /// Whole materialisations run: one, or one per pass of equality by representatives
+    /// (each pass that rules derive a new `owl:sameAs` in starts again from the facts).
+    pub passes: u64,
+}
+
+impl Phases {
+    /// Adds `other`'s times and work to these.
+    pub fn add(&mut self, other: &Self) {
+        self.load += other.load;
+        self.grounding += other.grounding;
+        self.joins += other.joins;
+        self.modules += other.modules;
+        self.merge += other.merge;
+        self.consistency += other.consistency;
+        self.bindings += other.bindings;
+        self.probes += other.probes;
+        self.candidates += other.candidates;
+        self.new_facts += other.new_facts;
+        self.passes += other.passes;
+    }
 }
 
 /// A sorted run of pairs, by subject and by object. Cloning shares the pairs, so the
@@ -826,6 +860,7 @@ fn run(
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut phases = Phases {
         load,
+        passes: 1,
         ..Phases::default()
     };
     let mut result = Materialisation::default();
@@ -870,7 +905,16 @@ fn run(
         for rule in &program.rules[evaluated..] {
             jobs.extend(Job::full(&store, rule));
         }
-        candidates.extend(run_jobs(&store, &jobs, &|fact| !store.contains(fact), stop));
+        let work = JobWork::default();
+        candidates.extend(run_jobs_counted(
+            &store,
+            &jobs,
+            &|fact| !store.contains(fact),
+            stop,
+            &work,
+        ));
+        phases.bindings += work.emitted.into_inner();
+        phases.probes += work.probed.into_inner();
         drop(jobs);
         check_stop()?;
         phases.joins += clock.elapsed();
@@ -883,7 +927,9 @@ fn run(
         phases.modules += clock.elapsed();
         let clock = std::time::Instant::now();
         // Every candidate was checked against the store, which a round doesn't change.
+        phases.candidates += candidates.len() as u64;
         let (new, schema_facts) = store.advance_new(candidates, schema);
+        phases.new_facts += new as u64;
         phases.merge += clock.elapsed();
         if new == 0 {
             break;

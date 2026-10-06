@@ -450,10 +450,22 @@ interval.
 Frontier cases expect a known limit (`outcome`): they show the gap until it closes, and a
 fix shows as a changed status.
 
+**The performance phase** (owner, 6 October 2026): every level it optimises has cases that
+show a gain or a regression there, deciding by deterministic counts and routes where they
+can and by times where they must ([fast/README.md](fast/README.md), "a case per level"):
+kernels (128-bit sorts, intersections of skewed lengths), layout (bytes per statement under
+each encoding), allocation and peak per phase, operators, plans (q-error), parsing and
+rewriting of large and nested queries, rule work (bindings, probes, candidates and new facts
+per materialisation), equality (cascades, giant classes, merges and splits), deletion tails
+(p99), the DL pipeline's phases and subsumption checks, loads by thread count and reopening.
+The micro-benchmarks follow what the fastest systems publish (research notes R3-S4, R3-S1,
+R3-S2, R3-S3, R3-G1, Store-2, DL-D, DL-F of the literature wiki) and the investigation of 6
+October (its §5, all nine items).
+
 <!-- fast-cases:start (fast.py table --write) -->
 | Case | Area | NRESE runs | Comparators (system: semantics) | Home turf of | Measures |
 |---|---|---|---|---|---|
-| `rl-hierarchy` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl, qlever: closure, oxigraph: closure |  | a 5,461-class tree and a 1,500-class spine over 1 M typed instances (9.7 M inherited types): 67 s in the rule joins on 6 Oct 2026, against 5 s for LUBM 100's 8.7 M |
+| `rl-hierarchy` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl, qlever: closure, oxigraph: closure |  | a 5,461-class tree and a 1,000-class spine over 1 M typed instances: deep hierarchies cost the rule joins far more than LUBM's (67 s for 9.7 M inherited types with a 1,500 spine, 6 Oct 2026, against 5 s for LUBM 100's 8.7 M) |
 | `rdfs-hierarchy` | reasoning | rdfs | jena: rdfs, rdf4j: rdfs, graphdb: rdfs, rdfox: rdfs |  | the same hierarchy under RDFS |
 | `rl-clique` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl |  | a symmetric and transitive property closing 40 random trees of 300 to cliques (3.6 M pairs) |
 | `rl-sameas` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl |  | owl:sameAs chains: 20,000 groups of 10, a value each, spread to the group (equality by representatives, expanded in the stack) |
@@ -470,7 +482,7 @@ fix shows as a changed status.
 | `commits-readers` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 4,000 one-person commits added then removed under OWL 2 RL, with 8 readers running queries |
 | `commits-rdfs` | maintenance | rdfs | graphdb: rdfs, rdfox: rdfs |  | the same commits under RDFS, without readers |
 | `commits-plain` | maintenance | none | rdf4j: plain, oxigraph: plain, jena: plain | RDF4J | 20,000 commits without reasoning: the store's own write path, 4 readers alongside |
-| `deletes-layered` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 10 deletions in a layered graph whose facts have many derivations (after SSPE): about 6 s each |
+| `deletes-layered` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 6 deletions in a layered graph whose facts have many derivations (after SSPE): 4-10 s each on 6 Oct 2026 |
 | `deletes-clique` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 4 edge deletions splitting a 300-node symmetric-transitive clique (the worst case for proofs) |
 | `dl-transitive` | dl | dl | hermit: dl, openllet: dl, konclude: dl | Openllet | 18 definitions C ≡ ∃hasPart.D over a transitive hasPart in a cycle (ore_ont_10212's shape): time grows exponentially with their number |
 | `dl-transitive-400` | dl | dl | konclude: dl, openllet: dl, hermit: dl | Konclude | the same shape with 400 definitions: Konclude decides it in 0.6 s; NRESE gives up (the frontier) |
@@ -509,6 +521,34 @@ fix shows as a changed status.
 | `vector-knn-filtered` | service | none | none: NRESE's own column |  | approximate k-NN (k = 10) with the same one-in-ten filter: the index's recall under a filter |
 | `rdf12-annotations` | service | none | oxigraph: plain, jena: plain |  | RDF 1.2: 1 M reifiers of triple terms with a source and a confidence; a triple term with a constant subject |
 | `rdf12-join-2g` | service | none | oxigraph: plain, jena: plain |  | asserted statements joined to the reifiers of their own triple terms, in 2 GiB (the frontier) |
+| `kernel-sort-u128` | kernel | none | none: NRESE's own column |  | 20 M random 128-bit keys (two id columns) sorted by the executor's IdTable::sort_by; std's unstable sort of the same keys as u128 beside it for scale |
+| `kernel-intersect` | kernel | none | qlever: plain, oxigraph: plain, jena: plain |  | directed triangles in two graphs of 50,000 nodes and 12 edges each: uniform targets, and targets skewed to hubs (intersections of very different lengths) |
+| `layout-plain` | layout | none | none: NRESE's own column |  | the social network's store as laid out by default: index and dictionary bytes per statement, and star queries reading it |
+| `layout-compact` | layout | none | none: NRESE's own column |  | the same with the compact index encoding (NRESE_INDEX_ENCODING = compact) |
+| `layout-fsst` | layout | none | none: NRESE's own column |  | the same with the FSST-compressed vocabulary (NRESE_VOCABULARY = fsst) |
+| `rule-delta-sweep` | rules | owl2-rl | none: NRESE's own column |  | commits of 1, 10, 100, 1,000, 10,000 and 100,000 people under OWL 2 RL, added then removed: maintenance cost against the delta's size |
+| `alloc-lubm10` | memory | owl2-rl | none: NRESE's own column |  | LUBM 10 loaded, materialised (OWL 2 RL) and queried, with allocations and peak memory counted per phase |
+| `alloc-load` | memory | none | none: NRESE's own column |  | a 10 M-statement bulk load with allocations and peak memory counted |
+| `eq-giant-split` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl |  | a 300-member owl:sameAs class (two chains and a bridge link) beside 5,000 small ones; one commit deletes the bridge and the class splits (6 Oct 2026: a 500-member split took 68 s in one commit, 1,000 failed after 242 s, while materialising took 0.2-0.8 s) |
+| `deletes-tail` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 3,000 people of the data deleted one per commit under OWL 2 RL: the tail of deletion latency (p99) |
+| `dl-pipeline` | dl | dl | hermit: dl, openllet: dl, konclude: dl |  | a 60,000-class Horn ontology through the DL pipeline: reading, normalisation and the tableau's phases timed apart |
+| `parse-large` | parse | none | none: NRESE's own column |  | parsing and planning without running: 5,000 VALUES, a 1,000-pattern BGP, 500 UNIONs, 120 nested OPTIONALs, 50 nested subqueries, 2,000 ORs, 300 path alternatives, an expression 120 deep (the parser stops at 128 levels) |
+| `plan-estimates` | plan | none | none: NRESE's own column |  | the planner's estimates on nine query shapes: q-errors per operator (counts), beside the queries' times |
+| `rule-work-lubm10` | rules | owl2-rl | none: NRESE's own column |  | LUBM 10 under OWL 2 RL: rule bindings, membership probes, candidates and new facts per materialisation (§5.1; 6.74 M bindings for 0.83 M new facts on 6 Oct 2026) |
+| `rule-work-owl2bench` | rules | owl2-rl | none: NRESE's own column |  | OWL2Bench RL-1 under OWL 2 RL: the same work counters on a clique-heavy closure (§5.1) |
+| `eq-lubm10-one` | reasoning | owl2-rl | none: NRESE's own column |  | LUBM 10 with one asserted owl:sameAs between two students (§5.2a): the cost of equality appearing at all, against rule-work-lubm10 |
+| `eq-cascade-4` | reasoning | owl2-rl | nemo: owl2-rl |  | LUBM 10 with 1,000 functional-property cascades of depth 4 (§5.2b): each merge triggers the next |
+| `eq-cascade-16` | reasoning | owl2-rl | nemo: owl2-rl |  | the same with cascades of depth 16 (§5.2b) |
+| `eq-merge-compact` | maintenance | owl2-rl | none: NRESE's own column |  | 20 commits that each merge two owl:sameAs groups, the stack kept over representatives (compact), 4 readers alongside (§5.7): the maintained closure must equal a fresh one |
+| `rl-fed-chain` | reasoning | owl2-rl | nemo: owl2-rl |  | a transitive property fed over several rounds through an inverse, a subproperty and a property chain: two chains of 1,500 (§5.9) |
+| `index-join-keys` | operator | none | qlever: plain, oxigraph: plain |  | index joins driven by sorted keys: 25 k and 2.5 M keys into a 2.5 M link pattern, allocations counted (§5.3) |
+| `reopen-dbpedia` | load | none | none: NRESE's own column |  | DBpedia core (67 M) on disk, reopened in fresh processes: open, the first and the repeated executions of its 13 queries, page faults, resident after open (§5.4) |
+| `load-threads` | load | none | none: NRESE's own column |  | a 10 M-statement bulk load on 1, 2, 4, 8 and 16 threads: the load's scaling curve (§5.5) |
+| `ctx-ore-9724` | dl | dl | hermit: dl, konclude: dl |  | the context core's classification of ORE 2015's ore_ont_9724: subsumption checks per generated clause (§5.6) |
+| `ctx-ore-2738` | dl | dl | hermit: dl, konclude: dl |  | the same on ore_ont_2738 (§5.6) |
+| `ctx-ore-9835` | dl | dl | hermit: dl, konclude: dl |  | the same on ore_ont_9835 (§5.6) |
+| `ctx-ore-7914` | dl | dl | hermit: dl, konclude: dl |  | the same on ore_ont_7914 (§5.6) |
+| `dl-abox-lubm1` | dl | dl | hermit: dl, openllet: dl, konclude: dl |  | LUBM 1's ontology and ABox through the hypertableau: individuals with many edges, each Extend firing over them (§5.8) |
 <!-- fast-cases:end -->
 
 ## 7. Sources

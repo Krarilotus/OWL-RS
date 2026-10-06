@@ -69,6 +69,40 @@ Statuses: `ok`, `wrong`, `off-route`, `memory-limit`, `timeout`, `failed`.
   10 % and the difference at least 2 ms (as PROTOCOL.md §5); 10 % more peak memory (and
   64 MiB) is a regression too. A status change (an `ok` case now `wrong`) comes first.
 
+## The performance phase: a case per level
+
+Each level the performance phase optimises has cases that show a gain or a regression
+there. Counts and routes decide where they can: every case records its deterministic work
+counters, and `compare` reports any change in them exactly, whatever the machine's noise
+(a work counter that grows by more than 2 % is a regression; one that varies between
+repetitions of one run isn't judged). Times decide where they must, with the interval.
+
+| Level | Cases | Signal |
+|---|---|---|
+| Machine code, kernels | `kernel-sort-u128` (the executor's sort of 128-bit keys, std's beside it), `kernel-intersect` (triangles, uniform and skewed lengths) | time; WCOJ route |
+| Data layout | `layout-plain`, `layout-compact`, `layout-fsst` | index and dictionary bytes (counts); time of the reads |
+| Allocation, memory per phase | `alloc-lubm10`, `alloc-load`, every case's `phases` | allocations and bytes per phase (counts, `--count-allocations`); peak per phase (the high-water mark reset at each phase) |
+| Operators | `index-join-keys`, the `op-*` cases, `q-sideways` | allocations per query phase; routes (`group count`, `group walk`, `dictionary string test`, `wcoj`); time |
+| Plans | `plan-estimates` | q-error median, p90, share within 2× (counts) |
+| Parsing and rewriting | `parse-large` | plan steps and rewrites (counts); parse and plan time |
+| Rule programs | `rule-work-lubm10`, `rule-work-owl2bench`, `rule-delta-sweep`, every reasoning case | bindings, probes, candidates, new facts per materialisation (counts); rounds |
+| Equality | `rl-sameas`, `rl-sameas-compact`, `eq-lubm10-one`, `eq-cascade-4`, `eq-cascade-16`, `eq-giant-split`, `eq-merge-compact` | stored facts, rounds (counts); time against the same data without equality |
+| Maintenance | `commits-*`, `deletes-*` (`deletes-tail`: p99) | incremental route; closure equals a fresh one; p50 and p99 |
+| DL pipeline | the `dl-*` cases (phases parse, read, normalise, compile, saturate, search as series), `dl-pipeline`, `ctx-ore-*`, `el-classify`, `horn-classify` | clauses, nodes, branch points, subsumption checks per generated clause (counts); time per phase |
+| Loads and opening | `load-entities`, `load-threads` (1 to 16 threads), `open-first-query`, `reopen-dbpedia` (first against repeated execution, page faults, resident after open) | time; faults |
+
+The investigation of 6 October 2026 (v2-performance-investigation, §5) asked for: rule work
+counters (`rule-work-*`, bindings and probes in every reasoning case), the equality series
+(`eq-*`; UOBM and Claros-LE are not in the volume yet), index joins with sorted keys
+(`index-join-keys`), first against repeated execution after reopening DBpedia core
+(`reopen-dbpedia`), the load thread curve (`load-threads`; time inside the dictionary lock
+needs an engine counter not there yet), context-core subsumption on ore 9724, 2738, 9835
+and 7914 (`ctx-ore-*`, `subset_checks` added to the context core's profile), a compact-mode
+commit merging `sameAs` (`eq-merge-compact`; whether a reader at the committed revision
+sees a consistent closure isn't checked yet), the DL mode over an ABox (`dl-abox-lubm1`,
+through the tableau; edges visited per Extend firing need a tableau counter), and a
+transitive relation fed over rounds (`rl-fed-chain`).
+
 ## Comparators
 
 `fast.py compete` runs each case on NRESE and on the systems it declares, each under the
