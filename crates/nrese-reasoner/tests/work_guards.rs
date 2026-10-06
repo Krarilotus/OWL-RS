@@ -126,3 +126,30 @@ fn old_reads_of_a_recent_run_that_is_the_delta_check_nothing() {
         "pairs checked against the delta"
     );
 }
+
+/// #12 of the investigation of 6 October 2026: equality by copying (the module that
+/// replaces `eq-rep-*` when equality isn't by representatives) expands only the facts
+/// that mention a term with a `sameAs` partner. It scanned the partners of every term of
+/// every new fact before: 117,216 scans here (5,733 since), where one merge touches a few
+/// facts.
+#[test]
+fn equality_by_copying_expands_only_facts_with_partners() {
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = Ruleset::Owl2Rl
+        .rules(&mut vocabulary)
+        .expect("OWL 2 RL parses");
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let mut facts = lubm_like(&mut vocabulary, DEPARTMENTS);
+    let extra = cascade(&mut vocabulary, &facts, 1);
+    facts.extend(extra);
+    let result = batch::materialise_grouped(grouped(facts), &rules, Some(&lists), &schema);
+    assert!(
+        result.counters.member_scans <= MEMBER_SCANS,
+        "{} scans for sameAs partners, at most {MEMBER_SCANS}",
+        result.counters.member_scans
+    );
+}
+
+/// See [`equality_by_copying_expands_only_facts_with_partners`].
+const MEMBER_SCANS: u64 = 5_733;
