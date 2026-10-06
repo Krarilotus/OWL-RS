@@ -302,3 +302,43 @@ pub fn parse_and_plan(
     );
     Ok((json, p50))
 }
+
+/// The store's OWL 2 DL classification (`/classification`), `runs` times on fresh stores'
+/// state: the engine that classified, the hierarchy's size, whether it is complete.
+pub fn classification(
+    store: &StoreService,
+    runs: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut times = Vec::new();
+    let mut last = None;
+    for _ in 0..runs {
+        let at = Instant::now();
+        let report = store.classify(&nrese_store::ReadScope::All)?;
+        times.push(at.elapsed());
+        last = Some(report);
+    }
+    let report = last.ok_or("--runs must be > 0")?;
+    let samples: Vec<String> = times
+        .iter()
+        .map(|t| format!("{:.3}", t.as_secs_f64() * 1e3))
+        .collect();
+    let (p50, _, max) = percentiles(&mut times);
+    eprintln!(
+        "classification ({}): {} subsumptions, {} unsatisfiable, consistent {}, {} reasons it may be incomplete; p50 {p50:.1} ms",
+        report.engine,
+        report.subsumptions.len(),
+        report.unsatisfiable.len(),
+        report.consistent,
+        report.incomplete.len()
+    );
+    Ok(format!(
+        "{{\"engine\": {:?}, \"subsumptions\": {}, \"unsatisfiable\": {}, \"consistent\": {}, \"incomplete\": {}, \
+         \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}]}}",
+        report.engine,
+        report.subsumptions.len(),
+        report.unsatisfiable.len(),
+        report.consistent,
+        report.incomplete.len(),
+        samples.join(", ")
+    ))
+}
