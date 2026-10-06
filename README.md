@@ -9,12 +9,16 @@ Konclude, HermiT and RDFox. Thanks to their authors.
 
 ## State
 
-**`main`** (this branch):
+**`main`** (this branch) runs on its own storage engine, SPARQL executor and RDF
+parsers. The v1 prototype was built on Oxigraph; since October 2026 none of it is used.
+It offers:
 
 - SPARQL 1.1 query and update, the Graph Store Protocol, the RDF4J protocol;
 - reasoning in the `rdfs`, `owl2-rl`, `owl2-ql`, `owl-horst` and `custom` (Notation3
   rules) modes. What each mode computes and omits: [reasoning-semantics.md](docs/spec/reasoning-semantics.md);
-- SHACL Core and SHACL-SPARQL, full-text search, and a small console.
+- SHACL Core and SHACL-SPARQL, on request or as a check on every commit;
+- full-text search and autocompletion; users, workspaces and access per named graph;
+  a small console.
 
 Work in progress, OWL 2 DL among it, happens on
 [`refactor/engine-v2`](https://github.com/Krarilotus/OWL-RS/tree/refactor/engine-v2).
