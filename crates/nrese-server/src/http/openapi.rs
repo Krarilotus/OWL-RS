@@ -308,7 +308,20 @@ protocol!(
     params(("id" = String, Path, description = ID)),
     responses((
         status = 200,
-        description = "The class hierarchy as the reasoner computed it",
+        description = "The class hierarchy under OWL 2 DL, with whether it is complete",
+        body = serde_json::Value
+    ))
+);
+protocol!(
+    realisation,
+    get,
+    path = "/api/v1/repositories/{id}/realisation",
+    tag = "reasoning",
+    params(("id" = String, Path, description = ID)),
+    responses((
+        status = 200,
+        description =
+            "Each named individual's types under OWL 2 DL, with whether they are complete",
         body = serde_json::Value
     ))
 );
@@ -367,6 +380,7 @@ protocol!(
         shacl,
         autocomplete,
         classification,
+        realisation,
         backup,
         restore,
         image,
@@ -385,6 +399,10 @@ protocol!(
         super::api_v1::explain,
         super::api_v1::running_queries,
         super::api_v1::cancel_query,
+        super::cache_api::cache_get,
+        super::cache_api::cache_delete,
+        super::cache_api::pin_put,
+        super::cache_api::pin_delete,
         super::api_v1::graphs,
         super::api_v1::shapes_get,
         super::api_v1::shapes_put,

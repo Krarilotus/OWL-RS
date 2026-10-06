@@ -347,3 +347,34 @@ fn selective_paths_join_first() {
         "the labels probed from the path's rows: {steps:#?}"
     );
 }
+
+/// Plan parts cached and shared across queries (the result cache, QLever's level): a
+/// query whose join another query computed before, under other variable names, gets the
+/// join from the cache, and EXPLAIN marks it; the answer is the one computed afresh.
+#[test]
+fn parts_are_shared_across_queries_through_the_result_cache() {
+    let engine = engine();
+    let cache = std::sync::Arc::new(nrese_sparql::ResultCache::new(16 << 20).admitting_all());
+    let cached = QueryOptions {
+        result_cache: Some(std::sync::Arc::clone(&cache)),
+        ..QueryOptions::default()
+    };
+    let run = |query: &str, options: &QueryOptions| {
+        let text = format!("PREFIX e: <{EX}> {query}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        explain_query(&engine.snapshot(), &query, options).unwrap()
+    };
+    run(
+        "SELECT ?a ?b WHERE { ?a e:knows ?b . ?b e:kind e:k3 }",
+        &cached,
+    );
+    let shared = "SELECT ?x (COUNT(?l) AS ?n) WHERE { ?x e:knows ?y . ?y e:kind e:k3 . ?x e:label ?l } GROUP BY ?x";
+    let explanation = run(shared, &cached);
+    let hit = explanation.steps.iter().find(|s| s.cache == Some("hit"));
+    assert!(
+        hit.is_some_and(|s| s.rows == 900),
+        "the join of knows and kind from the cache: {:#?}",
+        explanation.steps
+    );
+    assert_eq!(explanation.rows, run(shared, &QueryOptions::default()).rows);
+}

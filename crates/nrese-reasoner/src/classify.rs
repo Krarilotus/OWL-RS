@@ -1108,6 +1108,49 @@ mod tests {
         assert!(result.skipped.is_empty(), "{:?}", result.skipped);
     }
 
+    /// The fast suite's el-classify witness (6 October 2026), delta-debugged from 20,000
+    /// classes: `A ⊑ D` through the chain `r1 ∘ r2 ⊑ r3` with `r3 ⊑ r1` (an irregular
+    /// hierarchy), applied twice. Entailed: x r1 y r2 z gives x r3 z, so x r1 z, and z r2 w
+    /// gives x r3 w ⊑ r0 with w in A. ELK agrees once the input declares its terms; the
+    /// hypertableau decides the regular variant (`r1 ∘ r2 ⊑ r1`) the same way.
+    #[test]
+    fn a_chain_into_a_sub_property_of_its_first_role_applies_again() {
+        let axioms = "ex:A rdfs:subClassOf ex:A0
+             ex:A rdfs:subClassOf _:e1
+             _:e1 owl:onProperty ex:r6
+             _:e1 owl:someValuesFrom ex:B
+             ex:B rdfs:subClassOf _:e2
+             _:e2 owl:onProperty ex:r8
+             _:e2 owl:someValuesFrom ex:C
+             ex:C rdfs:subClassOf _:e3
+             _:e3 owl:onProperty ex:r4
+             _:e3 owl:someValuesFrom ex:A
+             ex:D owl:equivalentClass _:i
+             _:i owl:intersectionOf _:l1
+             _:l1 rdf:first ex:A0
+             _:l1 rdf:rest _:l2
+             _:l2 rdf:first _:e4
+             _:l2 rdf:rest rdf:nil
+             _:e4 owl:onProperty ex:r0
+             _:e4 owl:someValuesFrom ex:A
+             ex:r1 rdfs:subPropertyOf ex:r0
+             ex:r3 rdfs:subPropertyOf ex:r1
+             ex:r6 rdfs:subPropertyOf ex:r3
+             ex:r4 rdfs:subPropertyOf ex:r2
+             ex:r8 rdfs:subPropertyOf ex:r4";
+        let chain = "ex:r3 owl:propertyChainAxiom _:c1
+             _:c1 rdf:first ex:r1
+             _:c1 rdf:rest _:c2
+             _:c2 rdf:first ex:r2
+             _:c2 rdf:rest rdf:nil";
+        let (mut v, result) = run(&format!("{axioms}\n{chain}"));
+        assert!(holds(&mut v, &result, "A", "D"));
+        assert!(!holds(&mut v, &result, "B", "D") && !holds(&mut v, &result, "D", "A"));
+        // Without the chain, A's r0-successors (B) aren't in A.
+        let (mut v, result) = run(axioms);
+        assert!(!holds(&mut v, &result, "A", "D"));
+    }
+
     #[test]
     fn roles_domains_ranges_disjointness_and_transitivity() {
         let (mut v, result) = run("ex:hasParent rdfs:subPropertyOf ex:hasAncestor

@@ -50,6 +50,10 @@ pub enum StoreError {
     /// committed.
     #[error("the load was cancelled; nothing of it was committed")]
     LoadCancelled,
+    /// Under `owl2-dl` with exact answers asked for (`dl.answers = exact`): the store
+    /// can't prove the answers complete, for the reasons given.
+    #[error("the answers can't be proven complete under OWL 2 DL: {0}")]
+    Incomplete(String),
     /// Graph-level access control refused the request; nothing of it is applied.
     #[error(transparent)]
     Forbidden(#[from] Refusal),
@@ -131,7 +135,10 @@ impl StoreError {
             | Self::OntologyFileNotFound { .. }
             | Self::MaterialisationCancelled
             | Self::ProcessMemoryLimit { .. }
-            | Self::LoadCancelled => false,
+            | Self::LoadCancelled
+            // Answered by the transport as what it is (the query is fine; its answers
+            // can't be proven complete).
+            | Self::Incomplete(_) => false,
         }
     }
 }

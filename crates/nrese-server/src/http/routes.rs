@@ -6,6 +6,7 @@ use axum::routing::{MethodRouter, delete, get, post, put};
 
 use crate::http::access_api;
 use crate::http::api_v1;
+use crate::http::cache_api;
 use crate::http::draft_check;
 use crate::http::handlers;
 use crate::http::rdf4j;
@@ -48,6 +49,7 @@ fn repository_routes() -> Router<AppState> {
         )
         .route("/autocomplete", get(handlers::autocomplete))
         .route("/classification", get(handlers::classification_get))
+        .route("/realisation", get(handlers::realisation_get))
         .route("/backup", get(handlers::admin_backup_dataset))
         .route("/restore", post(handlers::admin_restore_dataset))
         .route("/image", post(handlers::repository_image_backup))
@@ -59,6 +61,14 @@ fn repository_routes() -> Router<AppState> {
         .route("/explain", get(api_v1::explain))
         .route("/queries", get(api_v1::running_queries))
         .route("/queries/{query}", delete(api_v1::cancel_query))
+        .route(
+            "/cache",
+            get(cache_api::cache_get).delete(cache_api::cache_delete),
+        )
+        .route(
+            "/cache/pins/{name}",
+            put(cache_api::pin_put).delete(cache_api::pin_delete),
+        )
         .route("/graphs", get(api_v1::graphs))
         .route("/import", post(api_v1::import))
         .route(
@@ -268,6 +278,7 @@ pub fn router(state: AppState) -> Router {
             get(handlers::shacl_get).post(handlers::shacl_post),
         )
         .route("/dataset/classification", get(handlers::classification_get))
+        .route("/dataset/realisation", get(handlers::realisation_get))
         // The engine API (ADR-0007): every capability for every repository, by the same
         // handlers as the default repository's `/dataset/…` routes.
         .route("/api/v1/repositories", get(api_v1::repositories))
