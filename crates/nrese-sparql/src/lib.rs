@@ -49,11 +49,11 @@ pub mod expression {
     pub use crate::native::expr::Evaluator;
 }
 
-pub use completeness::Completeness;
+pub use completeness::{Completeness, Regime};
 pub use native::{ResultsFormat, geometry_literal};
 pub use nrese_exec::{BudgetExceeded, SharedBudget};
 pub use query::{
-    Explanation, PlanStep, PlannedQuery, PlannedStep, QueryOptions, WriteResultsError,
+    Candidates, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryOptions, WriteResultsError,
     cached_output, evaluate_query, explain_query, plan_query, ql_report, runs_natively,
     write_results,
 };

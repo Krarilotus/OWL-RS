@@ -56,7 +56,7 @@ pub use draft_check::{
     DraftOperation, DraftOutcome, DraftStatus, DraftTerm, input_hash_mismatch, run_draft_check,
 };
 pub use entailment::{DlEntailment, Entailment};
-pub use error::{Refusal, StoreError, StoreResult};
+pub use error::{IncompleteAnswer, Refusal, StoreError, StoreResult};
 pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
