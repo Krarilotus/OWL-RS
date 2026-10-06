@@ -180,7 +180,7 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
     print(f"  suite: {tier} on nrese, {', '.join(systems)}", flush=True)
     log = out.with_suffix(".log")
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "w", encoding="utf-8") as f:
+    with open(log, "w", encoding="utf-8") as f, fast.quiet_slot(f"compete {tier} {track}".strip()):
         subprocess.run(command, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=fast.ROOT)
     path = out / "results.csv"
     if not path.exists():
@@ -234,7 +234,8 @@ def verdicts(summary: dict[str, dict]) -> dict[str, dict]:
         same = [q for q in shared if q not in differ]
         theirs = sum(s["queries"][q]["median_ms"] for q in same)
         ours = sum(nrese["queries"][q]["median_ms"] for q in same)
-        v = {"status": s["status"], "answers": "differ: " + ",".join(differ) if differ else "match",
+        answers = "differ: " + ",".join(differ) if differ else ("match" if same else "none compared")
+        v = {"status": s["status"], "answers": answers,
              "queries_compared": len(same), "their_query_ms": round(theirs, 2), "nrese_query_ms": round(ours, 2),
              "query_winner": None, "load_ms": s.get("load_ms"), "nrese_load_ms": nrese.get("load_ms"),
              "statements": s.get("statements"), "nrese_statements": nrese.get("statements"),
@@ -269,10 +270,11 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
         left = fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c", rest])
         if left.stdout.strip() in ("", "0"):
             break
-        done = fast.docker(["run", "--rm", "--name", f"{work}-{fast.ROOT.name}", f"--memory={DL_MEMORY_GB}g",
-                            f"--memory-swap={DL_MEMORY_GB}g", "-v", f"{fast.DATA_VOLUME}:/work",
-                            "nrese-bench/dl-reference", "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
-                            f"/work/{work}-tax", str(timeout_s)], timeout=timeout_s * len(systems) + 300)
+        with fast.quiet_slot(f"compete {case['name']} dl"):
+            done = fast.docker(["run", "--rm", "--name", f"{work}-{fast.ROOT.name}", f"--memory={DL_MEMORY_GB}g",
+                                f"--memory-swap={DL_MEMORY_GB}g", *fast.cpu_args(), "-v", f"{fast.DATA_VOLUME}:/work",
+                                "nrese-bench/dl-reference", "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
+                                f"/work/{work}-tax", str(timeout_s)], timeout=timeout_s * len(systems) + 300)
         # Results so far, and a timeout for the task the runner stopped at.
         merge = (f"cat /work/{work}.part.tsv >> /work/{work}.results.tsv 2>/dev/null; rm -f /work/{work}.part.tsv; "
                  f"cut -f1,2 /work/{work}.results.tsv > /tmp/done; "
@@ -342,11 +344,12 @@ def nemo_custom(case: dict) -> dict:
     data = fast.data_file(case["data"])
     script = (f"mkdir -p /tmp/in /tmp/nemo && cp {data} /tmp/in/input.nt && "
               "nmo -I /tmp/in -D /tmp/nemo -o --report short /rules/tc.rls 2>&1 && wc -l < /tmp/nemo/path.csv")
-    started = time.monotonic()
-    done = fast.docker(["run", "--rm", f"--memory={case['cap_gb']}g", f"--memory-swap={case['cap_gb']}g",
-                        "-v", f"{fast.DATA_VOLUME}:/fast", "-v", f"{rules.parent.as_posix()}:/rules:ro",
-                        "--entrypoint", "sh", "nrese-bench/nemo", "-c", script], timeout=900)
-    wall = time.monotonic() - started
+    with fast.quiet_slot(f"compete {case['name']} nemo"):
+        started = time.monotonic()
+        done = fast.docker(["run", "--rm", f"--memory={case['cap_gb']}g", f"--memory-swap={case['cap_gb']}g",
+                            *fast.cpu_args(), "-v", f"{fast.DATA_VOLUME}:/fast", "-v", f"{rules.parent.as_posix()}:/rules:ro",
+                            "--entrypoint", "sh", "nrese-bench/nemo", "-c", script], timeout=900)
+        wall = time.monotonic() - started
     text = done.stdout
     import re
     reasoning = re.search(r"Reasoning: +(\d+)ms", text)
@@ -422,7 +425,8 @@ def compete(args) -> int:
             if system in LICENSED and not licensed:
                 result["no_runner"].append(f"{system}:{semantics} (licensed; --licensed)")
             elif system in DL_SYSTEMS and semantics in ("dl", "el"):
-                dl.append(system)
+                if not args.counts_only:
+                    dl.append(system)
             elif semantics == "rewritten":
                 # The case's queries as NRESE's OWL 2 QL rewriter prints them (headline:
                 # property paths; secondary: VALUES lists of the hierarchy NRESE computed),
@@ -437,12 +441,18 @@ def compete(args) -> int:
                 else:
                     rewritten.append(system)
             elif system == "nemo" and semantics == "custom":
-                result["comparisons"]["nemo:custom"] = nemo_custom(case)
+                if not args.counts_only:
+                    result["comparisons"]["nemo:custom"] = nemo_custom(case)
             elif system in SUITE_SYSTEMS and semantics in FAST_REGIMES and unsupported_mode(case):
                 result["no_runner"].append(f"{system}:{semantics} ({unsupported_mode(case)} has no suite runner yet)")
             elif system in SUITE_SYSTEMS and semantics in FAST_REGIMES:
+                if args.counts_only:
+                    continue
                 clients = "--clients" in case.get("args", [])
                 data = (case["name"],) if semantics == "closure" else (case["data"], *case.get("extra", []))
+                # Per case unless merged: each suite run holds the quiet slot for one case.
+                if not args.merge:
+                    data = (*data, case["name"])
                 group = groups.setdefault((data, semantics, clients), {"cases": [], "systems": set()})
                 if case not in group["cases"]:
                     group["cases"].append(case)
@@ -450,7 +460,8 @@ def compete(args) -> int:
             else:
                 result["no_runner"].append(f"{system}:{semantics}")
         if dl:
-            metric, record = nrese_metric(case)
+            # NRESE under the same memory as the reference reasoners (and the same CPUs, DOCKER_CPUS).
+            metric, record = nrese_metric({**case, "cap_gb": max(int(case["cap_gb"]), DL_MEMORY_GB)})
             dl_result = dl_run(case, dl, metric, stamp)
             dl_result["nrese_answer"] = record.get("result", {}).get("answer")
             dl_result["nrese_hash"] = record.get("result", {}).get("hash")
@@ -465,7 +476,7 @@ def compete(args) -> int:
             not_expressible = sum(1 for f in printed["verdicts"].values() if not f.get("paths", {}).get("expressible", True))
             print(f"  printer: {len(printed['verdicts'])} queries; same rows as NRESE: paths {fast_counts['paths']}, "
                   f"values {fast_counts['values']}; not expressible: {not_expressible}")
-            for form in ("paths", "values"):
+            for form in () if args.counts_only else ("paths", "values"):
                 directory = printed_dir(case, form, printed["verdicts"])
                 if directory is None:
                     result["no_runner"].append(f"rewritten-{form}: no printed query with NRESE's rows")
