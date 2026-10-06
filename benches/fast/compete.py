@@ -36,6 +36,9 @@ import fast
 from suitekit.workloads import FAST_REGIMES, fast_data_name
 
 DL_TIMEOUT_S = 120  # per reference reasoner and task in the comparisons
+# The reference image starts its JVM with -Xmx8g: its container gets that and room around it,
+# whatever the case's own cap (below it the kernel kills the JVM before it reports).
+DL_MEMORY_GB = 10
 
 SUITE_SYSTEMS = {"qlever", "oxigraph", "virtuoso", "jena", "rdf4j", "nemo", "owlrl",
                  "graphdb", "rdfox", "anzograph", "stardog"}
@@ -67,6 +70,52 @@ def unsupported_mode(case: dict) -> str | None:
         if flag in args:
             return what
     return None
+
+
+def print_queries(case: dict) -> dict:
+    """The case's queries printed by NRESE's OWL 2 QL printer in both forms
+    (`ql_print_check`: each printed query run on a store without reasoning and its rows
+    compared with NRESE's own under owl2-rl, the counts first). Per query and form: the
+    rows, whether they are the same, the status, or why it isn't expressible; the printed
+    queries in tmp/fast/printed/CASE."""
+    queries = fast.queries_path(case, {})
+    files = [fast.data_file(f) for f in [case["data"], *case.get("extra", [])]]
+    out = f"/out/printed/{case['name']}"
+    code, stdout, err, wall = fast.container(
+        f"fast-print-{fast.ROOT.name}", max(int(case["cap_gb"]) * 2, 8),
+        ["/target/release/examples/ql_print_check", "--queries", queries, "--out", out, *files])
+    verdicts: dict[str, dict] = {}
+    for line in stdout.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        name, form = fields[0], fields[1]
+        entry = verdicts.setdefault(name, {})
+        if "not expressible:" in line:
+            entry[form] = {"nrese_rows": fields[2], "expressible": False,
+                           "why": line.split("not expressible:", 1)[1].strip()[:200]}
+        elif len(fields) >= 6:
+            entry[form] = {"nrese_rows": fields[2], "printed_rows": fields[3], "same": fields[4] == "yes",
+                           "status": fields[5], "expressible": True}
+    return {"verdicts": verdicts, "exit": code, "wall_s": round(wall, 1),
+            "error": err.strip().splitlines()[-1][:200] if code not in (0, 1) and err.strip() else ""}
+
+
+def printed_dir(case: dict, form: str, verdicts: dict) -> Path | None:
+    """The printed queries of one form whose rows equal NRESE's, as a query directory."""
+    source = fast.SCRATCH / "printed" / case["name"]
+    target = fast.SCRATCH / "queries" / f"printed-{case['name']}-{form}"
+    target.mkdir(parents=True, exist_ok=True)
+    for old in target.glob("*.rq"):
+        old.unlink()
+    kept = 0
+    for name, forms in verdicts.items():
+        entry = forms.get(form, {})
+        printed = source / f"{name}.{form}.rq"
+        if entry.get("same") and printed.exists():
+            (target / f"{name}.rq").write_text(printed.read_text(encoding="utf-8"), encoding="utf-8")
+            kept += 1
+    return target if kept else None
 
 
 def comparators(case: dict, only: set[str] | None) -> list[tuple[str, str]]:
@@ -107,10 +156,12 @@ def export_closure(case: dict) -> str | None:
 
 
 def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: str,
-              queries: Path | None = None, track: str = "", settings: dict | None = None) -> list[dict]:
+              queries: Path | None = None, track: str = "", settings: dict | None = None,
+              cache: str = "off") -> list[dict]:
     """The suite's driver on tier CASE~SEMANTICS for NRESE and `systems`; its rows. A track
     (the case's `tracks`) adds its settings, such as how many queries a store answers at
-    once."""
+    once; `cache` the result-cache modes of the systems that have one (`off,on` for a
+    replayed log)."""
     tier = f"{case['name']}~{semantics}"
     out = RESULTS / stamp / (tier.replace("~", "-") + (f"-{track}" if track else ""))
     cap = max(int(case["cap_gb"]), 8)
@@ -123,7 +174,7 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
     env.update(settings or {})
     command = [sys.executable, str(fast.ROOT / "benches/suite/suite.py"), "run",
                "--systems", ",".join(["nrese", *systems]), "--workloads", "fast", "--tier", f"fast={tier}",
-               "--runs", str(runs), "--query-runs", "2", "--cache", "off", "--skip-build",
+               "--runs", str(runs), "--query-runs", "2", "--cache", cache, "--skip-build",
                "--data", f"volume:{fast.DATA_VOLUME}", "--results", str(out), "--query-timeout-s", "120",
                "--timeout-s", "900"]
     print(f"  suite: {tier} on nrese, {', '.join(systems)}", flush=True)
@@ -139,10 +190,12 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
 
 
 def summarise_suite(rows: list[dict]) -> dict[str, dict]:
-    """Per system: load (with reasoning), statements, per-query median ms and rows, status."""
+    """Per system: load (with reasoning), statements, per-query median ms and rows, status.
+    With its result cache on, a system is its own entry (`qlever (cache on)`)."""
     out: dict[str, dict] = {}
     for r in rows:
-        s = out.setdefault(r["system"], {"queries": {}, "status": "ok", "notes": [], "publish": r["publish"]})
+        system = r["system"] + (" (cache on)" if r.get("cache") == "on" else "")
+        s = out.setdefault(system, {"queries": {}, "status": "ok", "notes": [], "publish": r["publish"]})
         if r["status"] not in ("ok", ""):
             s["status"] = r["status"] if s["status"] == "ok" else s["status"]
             if r.get("note"):
@@ -169,11 +222,12 @@ def summarise_suite(rows: list[dict]) -> dict[str, dict]:
 
 
 def verdicts(summary: dict[str, dict]) -> dict[str, dict]:
-    """Per system against NRESE: answers match?, query sum ratio, load ratio."""
-    nrese = summary.get("nrese")
+    """Per system against NRESE (in the same cache mode): answers match?, query sum ratio,
+    load ratio."""
     out = {}
     for system, s in summary.items():
-        if system == "nrese" or nrese is None:
+        nrese = summary.get("nrese (cache on)" if system.endswith("(cache on)") else "nrese")
+        if system.startswith("nrese") or nrese is None:
             continue
         shared = [q for q in s["queries"] if q in nrese["queries"]]
         differ = [q for q in shared if str(s["queries"][q]["rows"]) != str(nrese["queries"][q]["rows"])]
@@ -215,8 +269,8 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
         left = fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c", rest])
         if left.stdout.strip() in ("", "0"):
             break
-        done = fast.docker(["run", "--rm", "--name", f"{work}-{fast.ROOT.name}", f"--memory={case['cap_gb']}g",
-                            f"--memory-swap={case['cap_gb']}g", "-v", f"{fast.DATA_VOLUME}:/work",
+        done = fast.docker(["run", "--rm", "--name", f"{work}-{fast.ROOT.name}", f"--memory={DL_MEMORY_GB}g",
+                            f"--memory-swap={DL_MEMORY_GB}g", "-v", f"{fast.DATA_VOLUME}:/work",
                             "nrese-bench/dl-reference", "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
                             f"/work/{work}-tax", str(timeout_s)], timeout=timeout_s * len(systems) + 300)
         # Results so far, and a timeout for the task the runner stopped at.
@@ -225,6 +279,10 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
                  f"next=$(grep -v -F -f /tmp/done /work/{work}.rest.tsv | head -1); "
                  f"if [ {done.returncode} -eq 3 ] && [ -n \"$next\" ]; then "
                  f"echo \"$next\" | awk -F'\\t' -v OFS='\\t' '{{print $1,$2,$3,\"timeout\",{timeout_s * 1000},\"\"}}' "
+                 f">> /work/{work}.results.tsv; fi; "
+                 # Killed at the memory cap (137): the task it stopped at is recorded as such.
+                 f"if [ {done.returncode} -eq 137 ] && [ -n \"$next\" ]; then "
+                 f"echo \"$next\" | awk -F'\\t' -v OFS='\\t' '{{print $1,$2,$3,\"memory-limit\",0,\"killed at {DL_MEMORY_GB} GB\"}}' "
                  f">> /work/{work}.results.tsv; fi")
         fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c", merge])
     wall = time.monotonic() - started
@@ -287,7 +345,7 @@ def nemo_custom(case: dict) -> dict:
     started = time.monotonic()
     done = fast.docker(["run", "--rm", f"--memory={case['cap_gb']}g", f"--memory-swap={case['cap_gb']}g",
                         "-v", f"{fast.DATA_VOLUME}:/fast", "-v", f"{rules.parent.as_posix()}:/rules:ro",
-                        "nrese-bench/nemo", "sh", "-c", script], timeout=900)
+                        "--entrypoint", "sh", "nrese-bench/nemo", "-c", script], timeout=900)
     wall = time.monotonic() - started
     text = done.stdout
     import re
@@ -354,7 +412,13 @@ def compete(args) -> int:
         result = report["cases"].setdefault(case["name"], {"semantics": case["semantics"], "comparisons": {},
                                                             "no_runner": []})
         dl: list[str] = []
+        rewritten: list[str] = []
         for system, semantics in entries:
+            hang = (case.get("hangs") or {}).get(f"{system}:{semantics}")
+            if hang:
+                # A pair known to hang is recorded as such, not run again.
+                result["comparisons"][f"{system}:{semantics}"] = {"status": "hangs", "why": hang}
+                continue
             if system in LICENSED and not licensed:
                 result["no_runner"].append(f"{system}:{semantics} (licensed; --licensed)")
             elif system in DL_SYSTEMS and semantics in ("dl", "el"):
@@ -368,9 +432,10 @@ def compete(args) -> int:
                     result["comparisons"][f"{system}:rewritten"] = {
                         "status": "not expressible",
                         "why": "needs sameAs, DL or recursive RL/EL rules: reasoning in the store wins here"}
+                elif not case.get("queries") or case["queries"].startswith("@"):
+                    result["no_runner"].append(f"{system}:rewritten (no query set)")
                 else:
-                    result["no_runner"].append(
-                        f"{system}:rewritten ({verdict}; waits for the OWL 2 QL rewriter's SPARQL printer, ql/tree-witness)")
+                    rewritten.append(system)
             elif system == "nemo" and semantics == "custom":
                 result["comparisons"]["nemo:custom"] = nemo_custom(case)
             elif system in SUITE_SYSTEMS and semantics in FAST_REGIMES and unsupported_mode(case):
@@ -391,6 +456,24 @@ def compete(args) -> int:
             dl_result["nrese_hash"] = record.get("result", {}).get("hash")
             dl_result["nrese_status"] = record.get("status")
             result["comparisons"]["dl"] = dl_result
+        if rewritten:
+            # Counts first: the printer's queries answer as NRESE does before any store runs them.
+            printed = print_queries(case)
+            result["printer"] = printed
+            fast_counts = {form: sum(1 for f in printed["verdicts"].values() if f.get(form, {}).get("same"))
+                           for form in ("paths", "values")}
+            not_expressible = sum(1 for f in printed["verdicts"].values() if not f.get("paths", {}).get("expressible", True))
+            print(f"  printer: {len(printed['verdicts'])} queries; same rows as NRESE: paths {fast_counts['paths']}, "
+                  f"values {fast_counts['values']}; not expressible: {not_expressible}")
+            for form in ("paths", "values"):
+                directory = printed_dir(case, form, printed["verdicts"])
+                if directory is None:
+                    result["no_runner"].append(f"rewritten-{form}: no printed query with NRESE's rows")
+                    continue
+                copy_volume_files(case)
+                rows = suite_run(case, "plain", rewritten, args.runs, stamp, directory, f"rewritten-{form}")
+                summary = summarise_suite(rows)
+                result["comparisons"][f"rewritten-{form}"] = {"summary": summary, "verdicts": verdicts(summary)}
         if "nemo:custom" in result["comparisons"]:
             metric, record = nrese_metric(case)
             result["comparisons"]["nemo:custom"]["nrese_reason_ms"] = record.get("metric")
@@ -406,11 +489,14 @@ def compete(args) -> int:
             continue
         key = f"{first['name']}-{semantics}" + ("-clients" if clients else "")
         queries = merged_queries(group["cases"], key) if len(group["cases"]) > 1 else None
+        if first.get("queries") == "@cache-log":
+            queries = fast.cache_log()
         # A case's tracks (defaults, best configuration) each run with their own settings.
         tracks = first.get("tracks") or {"": {}}
         for track, settings in tracks.items():
             rows = suite_run(first, semantics, sorted(group["systems"]), args.runs, stamp, queries,
-                             track, {k: str(v) for k, v in settings.items()})
+                             track, {k: str(v) for k, v in settings.items()},
+                             "off,on" if first.get("queries") == "@cache-log" else "off")
             summary = summarise_suite(rows)
             label = f"{semantics}@{track}" if track else semantics
             for case in group["cases"]:
@@ -441,6 +527,9 @@ def print_case(name: str, result: dict):
             continue
         if semantics == "nemo:custom":
             print(f"  nemo (custom rules): {comparison}")
+            continue
+        if comparison.get("status") == "hangs":
+            print(f"  {semantics:<20} hangs: {comparison['why']}")
             continue
         if semantics.endswith(":rewritten"):
             print(f"  rewritten  {semantics.split(':')[0]:<9} {comparison['status']}: {comparison['why']}")

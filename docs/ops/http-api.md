@@ -18,26 +18,32 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 - `POST` with `Content-Type: application/sparql-query` and the query as the body
 
 Where the OWL 2 QL rewriting applies (`reasoner.ql_rewriting`), every answer carries the
-header `NRESE-Completeness`: `complete`, or `sound-only; reasons="ql: …"` when answers
+header `NRESE-Completeness`: `complete; regime=owl2-ql`, or `sound-only; regime=owl2-ql; reasons="ql: …"` when answers
 through anonymous individuals may be missing (an axiom outside OWL 2 QL meets them, a
 pattern reached a bound or runs without the rewriting; at most five reasons, the rest
 counted, non-ASCII characters escaped as `\u{…}`). Each reason starts with its source
 (`ql`); the same header carries the DL bounds' status (`lower=…; upper=…; unresolved=…`).
+`regime` says what `complete` refers to: `owl2-ql`, `owl2-rl` (every answer the closure's
+rules and the rewriting's existentials entail, not every certain answer under OWL 2 DL),
+`owl2-dl` (the certain answers under the Direct Semantics), `rdfs` or `custom`
+([semantics](../spec/reasoning-semantics.md)).
 The answers are never changed for it ([design](../design/ql-rewriting.md) §7).
 
 | Parameter | Meaning |
 |---|---|
 | `default-graph-uri`, `named-graph-uri` (repeatable) | The query's dataset; replaces its `FROM` clauses |
 | `infer=false` | Asserted statements only (the default reads asserted and inferred) |
-| `explain=true` | Run the query and return how it ran, as JSON: `executor`, `rewrites` (the rewrites that changed the query before it ran, in order: `triple-terms`, `ql-tree-witness`, `ql-limit`, `join-groups`, `filter-pushdown`, `ask-limit`), `rows`, `micros`, `ql` (the OWL 2 QL rewriting, `null` where it doesn't apply: `completeness` (`complete` or `sound-only`), `sound`, `complete`, `reasons` (each `{source, text}`), `patterns`, `witnesses`, `branches`, `atoms`, `limits`; [design](../design/ql-rewriting.md)), `completeness` (the status below), and `steps` (one per operator: `depth`, `operator`, `detail`, `estimated_rows`, `rows`, `micros`) |
+| `explain=true` | Run the query and return how it ran, as JSON: `executor`, `rewrites` (the rewrites that changed the query before it ran, in order: `triple-terms`, `ql-tree-witness`, `ql-limit`, `join-groups`, `filter-pushdown`, `ask-limit`), `rows`, `micros`, `ql` (the OWL 2 QL rewriting, `null` where it doesn't apply: `completeness` (`complete` or `sound-only`), `sound`, `complete`, `reasons` (each `{source, text}`), `patterns`, `witnesses`, `branches`, `atoms`, `limits`; [design](../design/ql-rewriting.md)), `completeness` (the status below), `candidates` (under `owl2-dl`, the candidates of the bounds' gap the exact services decided: `proved`, returned, and `refuted`; `null` otherwise), and `steps` (one per operator: `depth`, `operator`, `detail`, `estimated_rows`, `rows`, `micros`, and `cache`: `"hit"` where the operator's result came from the result cache, `"shared"` where another query computing the same part at the same time gave it, else `null`; an operator from the cache has no steps below it) |
 | `explain=plan` | Return the plan the query would run as, without running it, as JSON: `executor`, `rewrites`, `ql`, `completeness`, and `steps` (one per plan node from the top down: `depth`, `operator`, `detail`, `estimated_rows` from the store's statistics, `null` where unknown, as below a `SERVICE`) |
-| `dl-answers` | Under `reasoner.mode = "owl2-dl"`: which answers this query asks for, over `dl.answers`: `certain-where-complete`, `sound` or `exact` (fails with 409 when the answers can't be proven complete). Anything else is a 400 |
+| `dl-answers` | Under `reasoner.mode = "owl2-dl"`: which answers this query asks for, over `dl.answers`: `certain-where-complete`, `sound` or `exact` (fails with 422 when the answers can't be proven complete, below). Anything else is a 400 |
 
-**Under `owl2-dl`, every answer carries its status** in the same `NRESE-Completeness` header ([design](../design/owl2-dl.md) §8; [reasoning-semantics.md](../spec/reasoning-semantics.md)). Answers are always sound. `complete`, or `sound-only; …; reasons="dl: …"`; where the query went through the bounds, with `lower=…; upper=…; unresolved=…` (answers in the lower bound; in the upper bound; candidates of the gap no exact service decided, which are not returned). A query with its status is computed in full before the first byte (the status is a header); one whose predicates are closed streams as usual. Inside a transaction, answers are the pending data's closure, `sound-only`.
+**Under `owl2-dl`, every answer carries its status** in the same `NRESE-Completeness` header ([design](../design/owl2-dl.md) §8; [reasoning-semantics.md](../spec/reasoning-semantics.md)). Answers are always sound. `complete; regime=owl2-dl`, or `sound-only; regime=owl2-dl; …; reasons="dl: …"`; where the query went through the bounds, with `lower=…; upper=…; unresolved=…` (answers in the lower bound; in the upper bound; candidates of the gap no exact service decided, which are not returned). A query with its status is computed in full before the first byte (the status is a header); one whose predicates are closed streams as usual. Inside a transaction with nothing pending, answers are as outside it; with operations pending (not reasoned over before the commit) they are `sound-only`, or `unsound` where an operation may delete statements whose inferences remain.
 
-Under a ruleset's closure where the QL rewriting doesn't apply, answers carry `NRESE-Completeness: sound-only; reasons="rules: …"`: the closure's, not every certain answer under OWL 2 DL; with reasoning disabled, and for `infer=false`, no status is sent.
+Exact answers asked for (`dl-answers=exact`, or `dl.answers = "exact"`) that can't be proven complete answer **422** with a problem document: `type` `https://nrese.dev/problems/incomplete-answer`, `title`, `status`, `detail`, `regime`, `reasons` (each `{source, text}`), `bounds` (`lower`, `upper`, `unresolved`, or `null`) and `unresolved` (the first 20 candidates neither proved nor refuted, as `?x=<…> ?y=<…>`, `ASK` for a boolean query).
 
-`explain=true` and `explain=plan` carry the same status as `completeness` (`null` where no status is sent): `status`, `sound`, `complete`, `reasons` (each `{source, text}`), `bounds` (`lower`, `upper`, `unresolved`, or `null`) and `decided_by` (what decided under `owl2-dl`: `closed-predicates`, `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`).
+Under a ruleset's closure where the QL rewriting doesn't apply, answers carry `NRESE-Completeness: sound-only; regime=owl2-rl; reasons="rules: …"` (the ruleset's regime): the closure's, not every certain answer under OWL 2 DL; with reasoning disabled, and for `infer=false`, no status is sent.
+
+`explain=true` and `explain=plan` carry the same status as `completeness` (`null` where no status is sent): `status`, `regime`, `sound`, `complete`, `reasons` (each `{source, text}`), `bounds` (`lower`, `upper`, `unresolved`, or `null`) and `decided_by` (what decided under `owl2-dl`: `closed-predicates`, `skolem-only-gap`, `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`).
 
 Other parameters are ignored, so clients that send their own (`queryLn`, `timeout`) work.
 
@@ -251,6 +257,8 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 | `GET`, `PUT`, `DELETE …/repositories/{id}/shapes` | The repository's SHACL shapes (its shapes graph, `shacl.shapes_graph`), read and written as the Graph Store Protocol does. Shapes are checked before they are stored, by every write to the shapes graph through any protocol and whether the SHACL gate is on or not: shapes that don't compile are refused (`400`, one message per problem) and the graph stays as it was |
 | `GET …/repositories/{id}/graphs` | The graphs with statements the requester may read, each with its number of asserted statements (`graph` absent for the default graph) |
 | `GET …/repositories/{id}/queries`, `DELETE …/queries/{query}` | The queries running now (`id`, `query`, `origin`, `started`, `elapsed_ms`; operators), and cancelling one (administrators): it stops at its next check and its client gets a 408 |
+| `GET …/repositories/{id}/cache`, `DELETE …/cache` | The result cache ([config-reference.md](config-reference.md), `budgets.result_cache`): `capacity`, `bytes`, `pinned_bytes`, `entries`, `answers` (entries holding a whole answer's bytes in one format), `hits`, `misses`, `shared` (parts taken from a query computing them at the same time), `stored`, `rejected`, `evicted`, and `pins` (operators); `DELETE` drops every result that isn't pinned (administrators) |
+| `PUT …/repositories/{id}/cache/pins/{name}`, `DELETE …/cache/pins/{name}` | Runs the query in the body (`application/sparql-query`) with the requester's access and pins its result under `name`, replacing what the name pinned (administrators): `{"name", "query", "revision", "rows", "bytes"}`. The result is never evicted while the store doesn't change; after a commit `revision` is absent until the query runs again and is pinned at the new revision. 400 for a query that can't be cached (`RAND`, `NOW`, `UUID`, `STRUUID`, `BNODE`, `SERVICE`), a result larger than the budget leaves beside the other pins, or with the cache off. `DELETE` unpins (the result stays cached like any other); 404 if nothing is pinned under the name |
 
 ### Users, workspaces and policies (`/api/v1/access`)
 
@@ -290,7 +298,8 @@ With access enforced (the access state's `enforced` setting, on once a policy fi
 |---|---|
 | 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) |
 | 401, 403 | Authentication or authorisation failed; 403 also for a write to a graph the access policy doesn't let the user write |
-| 409 | The resource exists already (a repository), or the change would leave a workspace without an owner; under `owl2-dl`, exact answers asked for (`dl-answers=exact`, `dl.answers = "exact"`) that can't be proven complete (the detail gives the reasons) |
+| 409 | The resource exists already (a repository), or the change would leave a workspace without an owner |
+| 422 | Under `owl2-dl`, exact answers asked for (`dl-answers=exact`, `dl.answers = "exact"`) that can't be proven complete: type `incomplete-answer`, with the reasons, the bounds and the unresolved candidates |
 | 404 | The surface is disabled, or the named graph doesn't exist |
 | 406 | The client accepts no format the result has |
 | 408 | The policy timeout passed; a timed-out write was not committed |
@@ -340,7 +349,7 @@ Every error is an `application/problem+json` document (RFC 9457), whoever answer
 |---|---|
 | `nrese_ready`, `nrese_dataset_revision`, `nrese_store_quads`, `nrese_store_inferred`, `nrese_store_named_graphs` | Readiness and the dataset |
 | `nrese_reasoner_mode_info`, `nrese_store_mode_info` | Modes, as labels |
-| `nrese_query_cache_hits_total`, `nrese_query_cache_misses_total`, `nrese_query_cache_bytes` | The result cache |
+| `nrese_query_cache_hits_total`, `nrese_query_cache_misses_total`, `nrese_query_cache_bytes` | The result cache: query parts answered from it, parts computed that could have been, bytes held |
 | `nrese_query_memory_bytes`, `nrese_query_memory_peak_bytes`, `nrese_query_memory_limit_bytes` | Intermediate results of running queries, against `budgets.total_query_memory` |
 | `nrese_http_responses_total{kind, status}` | Responses by kind of request (`query`, `update`, `sparql` for the single endpoint, `graph_store`, `shacl`, `other`) and status class (`2xx` … `5xx`) |
 | `nrese_http_request_duration_seconds{kind}` | Histogram of the time to the response's start, by kind |

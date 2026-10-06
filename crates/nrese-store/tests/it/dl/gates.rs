@@ -41,6 +41,24 @@ fn a_spent_deterministic_budget_leaves_candidates_unresolved_never_wrong() {
         "{:?}",
         status.reasons()
     );
+    // Exact answers asked for: refused, naming the candidates left unresolved.
+    let failed = super::queries::query_with(
+        &dl,
+        "SELECT ?x { ?x a :D }",
+        Some(nrese_store::DlAnswers::Exact),
+    );
+    let Err(nrese_store::StoreError::Incomplete(answer)) = failed else {
+        panic!("exact answers refused: {failed:?}");
+    };
+    assert_eq!(answer.unresolved.len() as u64, b.unresolved, "{answer:?}");
+    assert!(
+        answer
+            .unresolved
+            .iter()
+            .all(|c| c == "?x=<http://example.com/x>" || c == "?x=<http://example.com/w>"),
+        "{answer:?}"
+    );
+    assert_eq!(answer.status.regime, Some(nrese_sparql::Regime::Owl2Dl));
     // The same store with the default budgets decides them all.
     let decided = pipeline();
     insert(&decided, UNION).expect("data");

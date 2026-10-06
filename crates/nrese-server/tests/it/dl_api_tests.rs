@@ -42,7 +42,10 @@ async fn answers_carry_their_status() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(response.status(), StatusCode::OK);
     let headers = response.headers().clone();
     let status = headers["nrese-completeness"].to_str()?;
-    assert_eq!(status, "complete; lower=2; upper=3; unresolved=0");
+    assert_eq!(
+        status,
+        "complete; regime=owl2-dl; lower=2; upper=3; unresolved=0"
+    );
     let text = body_text(response).await?;
     assert!(text.contains("http://example.com/x") && text.contains("http://example.com/y"));
 
@@ -51,23 +54,49 @@ async fn answers_carry_their_status() -> Result<(), Box<dyn std::error::Error>> 
     let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
     assert_eq!(json["completeness"]["status"], "complete");
     assert_eq!(json["completeness"]["bounds"]["lower"], 2);
+    assert_eq!(json["completeness"]["regime"], "owl2-dl");
+    // The candidates the exact services decided: diagnostics, in EXPLAIN only.
+    assert_eq!(json["candidates"]["proved"], 1);
+    assert_eq!(json["candidates"]["refuted"], 0);
     assert!(
         json["completeness"]["decided_by"]
             .as_array()
             .is_some_and(|p| p.contains(&serde_json::json!("exact-ground-entailment")))
     );
 
-    // Exact answers a union query can't get: 409, never a partial answer.
+    // Exact answers a union query can't get: 422 with a problem document saying why,
+    // never a partial answer.
     let union =
         "SELECT ?x { { ?x a <http://example.com/D> } UNION { ?x a <http://example.com/C> } }";
     let response = app
         .clone()
         .oneshot(get(union, "&dl-answers=exact")?)
         .await?;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/problem+json"
+    );
+    let problem: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    assert_eq!(
+        problem["type"],
+        "https://nrese.dev/problems/incomplete-answer"
+    );
+    assert_eq!(problem["status"], 422);
+    assert_eq!(problem["regime"], "owl2-dl");
+    assert!(
+        problem["reasons"]
+            .as_array()
+            .is_some_and(|r| !r.is_empty() && r.iter().all(|r| r["source"] == "dl")),
+        "{problem}"
+    );
+    assert!(problem["unresolved"].is_array(), "{problem}");
     let response = app.clone().oneshot(get(union, "")?).await?;
     let status = response.headers()["nrese-completeness"].to_str()?;
-    assert!(status.starts_with("sound-only; "), "{status}");
+    assert!(
+        status.starts_with("sound-only; regime=owl2-dl; "),
+        "{status}"
+    );
     // Why w is a D: not derived by the rules, explained by OWL 2 DL's axioms.
     let explain = serde_urlencoded::to_string([
         ("subj", "<http://example.com/w>"),

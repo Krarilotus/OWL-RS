@@ -487,6 +487,8 @@ fn late_expansion_answers_as_early_expansion_and_replication() {
     let early = pipeline_with(compact(true, false));
     update(&early, data);
     let operators = |pipeline: &MutationPipeline| {
+        // Evaluated afresh: the answer above left the query in the result cache.
+        pipeline.store().clear_query_cache();
         let prepared = pipeline
             .store()
             .prepare_query(&nrese_store::SparqlQueryRequest::new(

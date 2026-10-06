@@ -1,5 +1,7 @@
 //! SPARQL query execution over a [`ReadView`].
 
+use std::borrow::Cow;
+
 use nrese_sparql_syntax::Query;
 
 use crate::results::{
@@ -69,6 +71,11 @@ pub struct QueryOptions {
     /// statements that assert them: GeoSPARQL's topology vocabulary without its
     /// query-rewrite extension, which by default also computes them from the geometries.
     pub geosparql_stated_only: bool,
+    /// The store's result cache ([`crate::cache`]): the results of the query's parts are
+    /// looked up in it and offered to it. `None`: everything is computed.
+    pub result_cache: Option<std::sync::Arc<crate::ResultCache>>,
+    /// Pin the query's result in the result cache under a name.
+    pub pin: Option<crate::PinRequest>,
     /// OWL 2 QL answers through existentials (docs/design/ql-rewriting.md): the store's
     /// tree-witness rewriting, set while its closure is current under a ruleset that makes
     /// the data H-complete; `None`: off. Applies to queries over the default graph that read
@@ -85,7 +92,44 @@ pub fn evaluate_query<'a, V: ReadView>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
-    crate::native::evaluate(view.evaluation_snapshot(), query, options)
+    crate::native::evaluate(view.evaluation_snapshot(), query, &for_view(view, options))
+}
+
+/// `options` for evaluating on `view`: a transaction's pending state is read once, so its
+/// parts are not offered to the result cache (their snapshot identity is the pending
+/// state's own: they could never be hit).
+fn for_view<'o>(view: &impl ReadView, options: &'o QueryOptions) -> Cow<'o, QueryOptions> {
+    match (&options.result_cache, view.snapshot()) {
+        (Some(_), None) => Cow::Owned(QueryOptions {
+            result_cache: None,
+            ..options.clone()
+        }),
+        _ => Cow::Borrowed(options),
+    }
+}
+
+/// What the result cache holds of `query`'s whole answer on `view` written in `format`
+/// (the media type with its parameters, as sent) and `context` (what else the caller's
+/// answer depends on: the store's reasoning mode, the status it reports): its bytes, or a slot to offer them to
+/// once written, or nothing to do with the cache ([`crate::cache`]). A transaction's
+/// pending state, a pin and pre-bound variables are never answered from it.
+pub fn cached_output<V: ReadView>(
+    view: &V,
+    query: &Query,
+    options: &QueryOptions,
+    format: &str,
+    context: &str,
+) -> crate::cache::CachedOutput {
+    use crate::cache::CachedOutput;
+    let (Some(cache), Some(snapshot), None) =
+        (&options.result_cache, view.snapshot(), &options.pin)
+    else {
+        return CachedOutput::Off;
+    };
+    match crate::native::output_key(snapshot, query, options, format, context) {
+        Some(key) => cache.output(key),
+        None => CachedOutput::Off,
+    }
 }
 
 /// A failure while writing results directly ([`write_results`]).
@@ -129,6 +173,9 @@ pub struct PlanStep {
     pub rows: u64,
     /// Wall time including the operator's inputs.
     pub micros: u64,
+    /// Where the result came from if not computed here: `hit` (the result cache) or
+    /// `shared` (another query computing the same part at the same time).
+    pub cache: Option<&'static str>,
 }
 
 /// How a query ran ([`explain_query`]).
@@ -151,8 +198,21 @@ pub struct Explanation {
     /// status the answers carry (set by the store: QL's, the DL bounds', a closure's).
     pub completeness: Option<crate::completeness::Completeness>,
     /// What decided the status (the DL bounds' paths: `closed-predicates`,
-    /// `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`).
+    /// `skolem-only-gap`, `bounds-equal`, `exact-ground-entailment`,
+    /// `exact-internalisable-cq`).
     pub decided_by: Vec<&'static str>,
+    /// The candidates of the DL bounds' gap the exact services decided; `None` where the
+    /// bounds didn't run. Diagnostics: the status says what the answers are.
+    pub candidates: Option<Candidates>,
+}
+
+/// The candidates of the DL bounds' gap (in the upper bound, not the lower) the exact
+/// services decided: proved (returned) and refuted (dropped). The rest are the status's
+/// `unresolved`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Candidates {
+    pub proved: u64,
+    pub refuted: u64,
 }
 
 /// Runs `query` like [`evaluate_query`], consuming its results, and reports how it ran:
@@ -164,7 +224,8 @@ pub fn explain_query<V: ReadView>(
 ) -> Result<Explanation, QueryEvaluationError> {
     let start = std::time::Instant::now();
     let snapshot = view.evaluation_snapshot();
-    let (rewrites, steps, rows, ql) = crate::native::explain(&snapshot, query, options)?;
+    let (rewrites, steps, rows, ql) =
+        crate::native::explain(&snapshot, query, &for_view(view, options))?;
     Ok(Explanation {
         executor: "native",
         rewrites,
@@ -174,6 +235,7 @@ pub fn explain_query<V: ReadView>(
         ql,
         completeness: None,
         decided_by: Vec::new(),
+        candidates: None,
     })
 }
 
