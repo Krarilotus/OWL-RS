@@ -198,8 +198,21 @@ pub struct Explanation {
     /// status the answers carry (set by the store: QL's, the DL bounds', a closure's).
     pub completeness: Option<crate::completeness::Completeness>,
     /// What decided the status (the DL bounds' paths: `closed-predicates`,
-    /// `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`).
+    /// `skolem-only-gap`, `bounds-equal`, `exact-ground-entailment`,
+    /// `exact-internalisable-cq`).
     pub decided_by: Vec<&'static str>,
+    /// The candidates of the DL bounds' gap the exact services decided; `None` where the
+    /// bounds didn't run. Diagnostics: the status says what the answers are.
+    pub candidates: Option<Candidates>,
+}
+
+/// The candidates of the DL bounds' gap (in the upper bound, not the lower) the exact
+/// services decided: proved (returned) and refuted (dropped). The rest are the status's
+/// `unresolved`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Candidates {
+    pub proved: u64,
+    pub refuted: u64,
 }
 
 /// Runs `query` like [`evaluate_query`], consuming its results, and reports how it ran:
@@ -222,6 +235,7 @@ pub fn explain_query<V: ReadView>(
         ql,
         completeness: None,
         decided_by: Vec::new(),
+        candidates: None,
     })
 }
 
