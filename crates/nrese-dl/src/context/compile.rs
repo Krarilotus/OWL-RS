@@ -129,6 +129,8 @@ pub fn compile(n: &Normalised, classes: &[Term]) -> Result<Compiled, Unsupported
     if c.next > MAX_ID || c.program.funcs.len() > (MAX_ID / 2) as usize {
         return Err(Unsupported::TooLarge);
     }
+    c.program.flipped = c.flips.clone();
+    c.program.role_ids = c.roles.iter().map(|(&t, &r)| (t, r)).collect();
     c.program.concepts = c.next;
     c.program.roles = c.roles.len() as u32;
     c.program.index();

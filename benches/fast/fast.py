@@ -474,7 +474,7 @@ DL_PHASES = ("parse", "read", "normalise", "compile", "saturate", "blocking", "e
 
 # Deterministic work counters, recorded for every case and compared exactly: a change in
 # them is a change in the work done, whatever the machine's noise.
-COUNTERS = ("reason.candidates", "reason.new_facts", "reason.inferred", "reason.rounds",
+COUNTERS = ("reason.new_facts", "reason.inferred", "reason.rounds",
             "commits.inferred_inserted", "commits.inferred_deleted", "commits.max_rounds",
             "held.index_mib", "held.dictionary_terms", "held.inferred",
             "clauses", "nodes_created", "branch_points", "backjumps", "clashes", "merges", "facts", "clauses_fired",
