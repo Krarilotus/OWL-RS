@@ -13,6 +13,7 @@
 
 mod cache_key;
 mod cached;
+pub(crate) use cached::output_key;
 mod calendar;
 mod equality;
 mod equijoin;

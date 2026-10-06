@@ -4,7 +4,7 @@
 //! ```text
 //! cargo run --release -p nrese-store --example cache_replay -- \
 //!     --store DIR [--load FILE]... --queries DIR [--queries DIR]... \
-//!     [--cache BYTES] [--rounds 5] [--seed 1] [--label NAME]
+//!     [--cache BYTES] [--rounds 5] [--seed 1] [--label NAME] [--explain QUERY]
 //! ```
 //!
 //! **The log.** Every SELECT of the query directories, and for each two variants that
@@ -37,6 +37,8 @@ struct Args {
     rounds: usize,
     seed: u64,
     label: String,
+    /// A query of the log (by name) to explain after the replay.
+    explain: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -48,6 +50,7 @@ fn parse_args() -> Result<Args, String> {
         rounds: 5,
         seed: 1,
         label: "replay".to_owned(),
+        explain: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -60,6 +63,7 @@ fn parse_args() -> Result<Args, String> {
             "--rounds" => args.rounds = value()?.parse().map_err(|e| format!("--rounds: {e}"))?,
             "--seed" => args.seed = value()?.parse().map_err(|e| format!("--seed: {e}"))?,
             "--label" => args.label = value()?,
+            "--explain" => args.explain = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -257,6 +261,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  {:<36} {median:8.3} ms  {:>10} bytes",
             log[*i].0, sizes[*i]
         );
+    }
+    if let Some(name) = &args.explain {
+        let (_, text) = log.iter().find(|(n, _)| n == name).ok_or("no such query")?;
+        let prepared = store.prepare_query(&SparqlQueryRequest::all(text.as_str()))?;
+        let explanation = store.explain_query(&prepared, &nrese_store::CancellationToken::new())?;
+        for step in &explanation.steps {
+            eprintln!("  {step:?}");
+        }
     }
     Ok(())
 }

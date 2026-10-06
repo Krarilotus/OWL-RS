@@ -9,7 +9,9 @@ use std::sync::Arc;
 use nrese_engine::{Engine, EngineConfig};
 use nrese_exec::heap;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
-use nrese_sparql::{QueryOptions, ResultCache, evaluate_query};
+use nrese_sparql::{
+    CachedOutput, QueryOptions, ResultCache, cached_output, evaluate_query, write_results,
+};
 use nrese_sparql_syntax::SparqlParser;
 
 #[global_allocator]
@@ -84,11 +86,24 @@ fn the_result_cache_holds_no_more_heap_than_its_budget() {
                     if let nrese_sparql::QueryResults::Solutions(solutions) = results {
                         assert!(solutions.count() > 0);
                     }
+                    // The answer's bytes too, as the store keeps them.
+                    let format = "text/tab-separated-values";
+                    if let CachedOutput::Miss(slot) =
+                        cached_output(&snapshot, query, &options, format)
+                    {
+                        let mut written = Vec::new();
+                        let tsv = nrese_sparql::ResultsFormat::Tsv;
+                        write_results(&snapshot, query, &options, tsv, None, &mut written)
+                            .unwrap()
+                            .unwrap();
+                        slot.offer(written, std::time::Duration::from_millis(1));
+                    }
                 }
             }
         }
         let stats = cache.stats();
         assert!(stats.stored > 0 && stats.hits > 0, "{stats:?}");
+        assert!(stats.answers > 0, "{stats:?}");
         assert!(stats.bytes <= budget, "{stats:?}");
         let with = heap::live();
         drop(cache);

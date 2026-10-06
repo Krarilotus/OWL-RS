@@ -300,3 +300,175 @@ fn volatile_parts_are_computed_every_time() {
     // The join below the BIND is cached and hit; the BIND is not.
     assert!(cache.stats().hits >= 1, "{:?}", cache.stats());
 }
+
+/// `query`'s answer on `view` written as TSV, as the store writes it.
+fn tsv(
+    view: &impl nrese_sparql::ReadView,
+    query: &nrese_sparql_syntax::Query,
+    options: &QueryOptions,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    nrese_sparql::write_results(
+        view,
+        query,
+        options,
+        nrese_sparql::ResultsFormat::Tsv,
+        None,
+        &mut out,
+    )
+    .expect("written directly")
+    .unwrap();
+    out
+}
+
+const TSV: &str = "text/tab-separated-values";
+
+#[test]
+fn serialised_answers_are_kept_per_format_form_and_snapshot() {
+    use nrese_sparql::{CachedOutput, cached_output};
+    let engine = store_of(&[("a", "p", "b"), ("b", "q", "c")]);
+    let cache = Arc::new(ResultCache::new(1 << 20).admitting_all());
+    let options = with_cache(&cache, ReadModel::Materialised);
+    let select = parse(&format!("SELECT ?s ?o WHERE {{ ?s <{EX}p> ?o }}"));
+    let snapshot = engine.snapshot();
+    let CachedOutput::Miss(slot) = cached_output(&snapshot, &select, &options, TSV) else {
+        panic!("nothing cached yet")
+    };
+    let written = tsv(&snapshot, &select, &options);
+    slot.offer(written.clone(), std::time::Duration::from_millis(5));
+    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV) else {
+        panic!("the bytes just offered")
+    };
+    assert_eq!(&*bytes, written.as_slice());
+    // Another format, another form or template over the same pattern: not these bytes.
+    let json = "application/sparql-results+json";
+    assert!(matches!(
+        cached_output(&snapshot, &select, &options, json),
+        CachedOutput::Miss(_)
+    ));
+    for other in [
+        format!("ASK {{ ?s <{EX}p> ?o }}"),
+        format!("CONSTRUCT {{ ?s <{EX}r> ?o }} WHERE {{ ?s <{EX}p> ?o }}"),
+        format!("CONSTRUCT {{ ?o <{EX}r> ?s }} WHERE {{ ?s <{EX}p> ?o }}"),
+    ] {
+        let other = parse(&other);
+        let CachedOutput::Miss(slot) = cached_output(&snapshot, &other, &options, TSV) else {
+            panic!("another query")
+        };
+        slot.offer(b"other".to_vec(), std::time::Duration::from_millis(5));
+    }
+    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV) else {
+        panic!("still cached")
+    };
+    assert_eq!(&*bytes, written.as_slice());
+    // Never answered from bytes: a volatile query, a pin, a transaction's pending state.
+    let volatile = parse(&format!(
+        "SELECT ?s ?r WHERE {{ ?s <{EX}p> ?o BIND(RAND() AS ?r) }}"
+    ));
+    assert!(matches!(
+        cached_output(&snapshot, &volatile, &options, TSV),
+        CachedOutput::Off
+    ));
+    let pinning = QueryOptions {
+        pin: Some(nrese_sparql::PinRequest {
+            name: "p".into(),
+            query: String::new(),
+        }),
+        ..options.clone()
+    };
+    assert!(matches!(
+        cached_output(&snapshot, &select, &pinning, TSV),
+        CachedOutput::Off
+    ));
+    let mut tx = engine.transaction();
+    tx.insert(Quad::new(ex("c"), ex("p"), ex("d"), GraphName::DefaultGraph).as_ref());
+    assert!(matches!(
+        cached_output(&tx, &select, &options, TSV),
+        CachedOutput::Off
+    ));
+    tx.commit().unwrap();
+    // A commit: the older bytes don't answer the newer snapshot.
+    assert!(matches!(
+        cached_output(&engine.snapshot(), &select, &options, TSV),
+        CachedOutput::Miss(_)
+    ));
+}
+
+#[test]
+fn serialised_answers_equal_fresh_ones_over_random_commits() {
+    use nrese_sparql::{CachedOutput, cached_output};
+    let mut rng = Rng::seeded(20_261_007);
+    let (mut checked, mut from_bytes) = (0, 0);
+    for _ in 0..12 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in random_dataset(&mut rng) {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let cache = Arc::new(ResultCache::new(256 << 10).admitting_all());
+        let pool: Vec<(String, bool)> = (0..16)
+            .map(|i| match i % 2 {
+                0 => random_query(&mut rng),
+                _ => computed_query(&mut rng),
+            })
+            .filter(|(text, _)| limited(text).is_none())
+            .collect();
+        for round in 0..5 {
+            if round > 0 {
+                random_commit(&engine, &mut rng);
+            }
+            let snapshot = engine.snapshot();
+            for _ in 0..20 {
+                let (text, ordered) = &pool[rng.below(pool.len() as u64) as usize];
+                let query = parse(text);
+                if !runs_natively(&query) {
+                    continue;
+                }
+                let model = *rng.pick(&[ReadModel::Materialised, ReadModel::Asserted]);
+                let options = with_cache(&cache, model);
+                let fresh = tsv(
+                    &snapshot,
+                    &query,
+                    &QueryOptions {
+                        read_model: model,
+                        ..QueryOptions::default()
+                    },
+                );
+                let answer = match cached_output(&snapshot, &query, &options, TSV) {
+                    CachedOutput::Hit(bytes) => {
+                        from_bytes += 1;
+                        bytes.to_vec()
+                    }
+                    CachedOutput::Miss(slot) => {
+                        let written = tsv(&snapshot, &query, &options);
+                        slot.offer(written.clone(), std::time::Duration::from_millis(1));
+                        written
+                    }
+                    CachedOutput::Off => continue,
+                };
+                // Rows in any order unless ordered; equal values may be written alike.
+                let lines = |bytes: &[u8]| {
+                    let text = String::from_utf8(bytes.to_vec()).unwrap();
+                    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+                    if !ordered {
+                        lines[1..].sort();
+                    }
+                    lines
+                };
+                assert_eq!(
+                    lines(&answer),
+                    lines(&fresh),
+                    "round {round}, {model:?}: {text}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 800, "{checked}");
+    // 278 of 1,200 on 7 October: the pool's repeats on an unchanged snapshot and model.
+    assert!(
+        from_bytes * 6 > checked,
+        "{from_bytes} of {checked} from bytes"
+    );
+}
