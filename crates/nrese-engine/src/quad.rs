@@ -114,6 +114,13 @@ impl QuadPattern {
         }
     }
 
+    /// The components (subject 0, predicate 1, object 2, graph 3) in the order the index
+    /// reads patterns of this shape, its bound ones first: patterns whose bound values
+    /// ascend in this order are read forward by a [`crate::ProbeCursor`].
+    pub fn read_order(&self) -> [usize; 4] {
+        AccessPlan::for_pattern(self).permutation.order()
+    }
+
     pub fn matches(&self, quad: &EncodedQuad) -> bool {
         self.subject.is_none_or(|s| s == quad.subject)
             && self.predicate.is_none_or(|p| p == quad.predicate)

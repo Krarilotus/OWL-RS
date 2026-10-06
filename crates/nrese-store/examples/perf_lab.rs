@@ -288,7 +288,11 @@ fn explain(store: &StoreService, text: &str) {
     match explained {
         Ok(explanation) => {
             for step in &explanation.steps {
-                let mut detail = step.detail.clone();
+                // Long patterns are cut; counts after ` | ` (seeks, lookups) are kept.
+                let (mut detail, counts) = match step.detail.split_once(" | ") {
+                    Some((pattern, counts)) => (pattern.to_owned(), format!(" | {counts}")),
+                    None => (step.detail.clone(), String::new()),
+                };
                 if detail.len() > 90 {
                     let cut = (0..=90)
                         .rev()
@@ -297,6 +301,7 @@ fn explain(store: &StoreService, text: &str) {
                     detail.truncate(cut);
                     detail.push('…');
                 }
+                detail.push_str(&counts);
                 println!(
                     "    {:indent$}{} {detail}  [est {} rows {} {:.2} ms]",
                     "",
