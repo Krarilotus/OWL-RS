@@ -27,6 +27,9 @@
 //!   `--explain` prints each query's plan after its measurement: every operator with its
 //!   estimated and actual rows and its time (inputs included), where the time goes when a
 //!   profiler isn't at hand.
+//!   `--faults` prints, per query, the first execution's time and page faults beside the
+//!   later runs' median faults (the first execution after opening a mapped store, P6),
+//!   and the working set after opening.
 //!   `--qerror` measures the planner's estimates: every operator with an estimate, over
 //!   every query, gets its q-error, `max(estimate, rows) / min(estimate, rows)` (both at
 //!   least 1; Moerkotte et al., VLDB 2009), summarised per operator (median, p90, max, the
@@ -71,6 +74,7 @@ struct Args {
     json: Option<PathBuf>,
     baseline: Option<PathBuf>,
     explain: bool,
+    faults: bool,
     qerror: bool,
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
@@ -91,6 +95,7 @@ fn parse_args() -> Result<Args, String> {
         json: None,
         baseline: None,
         explain: false,
+        faults: false,
         qerror: false,
         format: SolutionsResultFormat::Tsv,
         shapes: None,
@@ -115,6 +120,7 @@ fn parse_args() -> Result<Args, String> {
             "--json" => args.json = Some(value()?.into()),
             "--baseline" => args.baseline = Some(value()?.into()),
             "--explain" => args.explain = true,
+            "--faults" => args.faults = true,
             "--results" => args.results = Some(value()?.into()),
             "--qerror" => args.qerror = true,
             "--shapes" => args.shapes = Some(value()?.into()),
@@ -166,6 +172,9 @@ struct Measured {
     rows: u64,
     times: Vec<Duration>,
     error: Option<String>,
+    /// The first execution's time and page faults, and each later one's faults.
+    first: Option<(Duration, u64)>,
+    faults: Vec<u64>,
 }
 
 fn run_once(
@@ -245,6 +254,8 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
                 rows: 0,
                 times: Vec::new(),
                 error: Some(e.to_string()),
+                first: None,
+                faults: Vec::new(),
             };
         }
     };
@@ -252,11 +263,19 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
         rows: 0,
         times: Vec::new(),
         error: None,
+        first: None,
+        faults: Vec::new(),
     };
     for i in 0..args.warmup + args.runs {
+        let faults = nrese_exec::memory::page_faults().unwrap_or(0);
         match run_once(store, &prepared, args.timeout) {
             Ok((rows, elapsed)) => {
+                let faults = nrese_exec::memory::page_faults().unwrap_or(0) - faults;
                 measured.rows = rows;
+                match i {
+                    0 => measured.first = Some((elapsed, faults)),
+                    _ => measured.faults.push(faults),
+                }
                 if i >= args.warmup {
                     measured.times.push(elapsed);
                 }
@@ -268,6 +287,7 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
         }
     }
     measured.times.sort();
+    measured.faults.sort();
     measured
 }
 
@@ -600,6 +620,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let memory_after_load = memory_mib();
+    if args.faults
+        && let Some(resident) = nrese_exec::memory::resident_bytes()
+    {
+        eprintln!("working set after open: {} MiB", resident / 1048576);
+    }
     eprintln!(
         "open {open_s:.2} s{}",
         memory_after_load.map_or(String::new(), |(peak, rss)| format!(
@@ -678,6 +703,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "{name:<28} {:>10} {p50:>11.2} {min:>10.2} {max:>10.2} {ratio:>9}",
             m.rows
         );
+        if args.faults
+            && let Some((first, faults)) = m.first
+        {
+            let repeated = m.faults.get(m.faults.len() / 2).copied().unwrap_or(0);
+            println!(
+                "    first {:.2} ms, {faults} page faults; later runs {repeated} faults (median)",
+                ms(first)
+            );
+        }
         report.push(format!(
             "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.3},\n      \"min_ms\": {min:.3},\n      \"max_ms\": {max:.3}\n    }}",
             m.rows
