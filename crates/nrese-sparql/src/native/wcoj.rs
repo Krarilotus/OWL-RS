@@ -56,6 +56,15 @@ const CHUNKS_PER_THREAD: usize = 4;
 /// Solutions a thread produces between two checks of the shared row count.
 const ROW_STEP: usize = 4096;
 
+/// Candidates of the first variable a sampled estimate joins ([`Query::estimate`]).
+const SAMPLES: usize = 32;
+
+/// Lookups after which a sampled estimate scales what it has.
+const SAMPLE_LOOKUPS: usize = 100_000;
+
+/// Solutions after which a sampled estimate stops ([`Query::max_rows`] of its query).
+pub(super) const SAMPLE_ROWS: usize = 1 << 20;
+
 /// State shared by the threads of one join.
 struct Shared<'t> {
     cancelled: AtomicBool,
@@ -361,6 +370,49 @@ impl<'a> Query<'a> {
         }
         bindings[var] = None;
         Ok(())
+    }
+
+    /// The solutions estimated by sampling (index-based join sampling, Leis et al., CIDR
+    /// 2017): the join run for up to [`SAMPLES`] candidates of the first variable, evenly
+    /// spaced over them, scaled by their number. Deterministic; stops early past
+    /// [`SAMPLE_LOOKUPS`] lookups or the query's `max_rows`, scaling what it has.
+    pub(super) fn estimate(&self) -> f64 {
+        let order = self.order();
+        let mut bindings = vec![None; self.variables];
+        let Some((first, enforced)) = self.candidates(order[0], &bindings) else {
+            return 0.0;
+        };
+        if first.is_empty() {
+            return 0.0;
+        }
+        let stats = Stats {
+            candidates: (0..order.len()).map(|_| AtomicUsize::new(0)).collect(),
+            ..Stats::default()
+        };
+        let never = || false;
+        let shared = Shared {
+            cancelled: AtomicBool::new(false),
+            rows: AtomicUsize::new(0),
+            token: &never,
+        };
+        let picked = first.len().min(SAMPLES);
+        let (mut rows, mut sampled) = (Vec::new(), 0);
+        for k in 0..picked {
+            bindings[order[0]] = Some(first[k * first.len() / picked]);
+            sampled += 1;
+            if self.consistent(order[0], &bindings, &enforced, &stats)
+                && self
+                    .extend(&order, 1, &mut bindings, &mut rows, &shared, &stats)
+                    .is_err()
+            {
+                break;
+            }
+            if stats.lookups.load(Ordering::Relaxed) > SAMPLE_LOOKUPS {
+                break;
+            }
+        }
+        let found = rows.len() / self.variables.max(1);
+        found as f64 * first.len() as f64 / sampled as f64
     }
 
     /// Every solution, as rows of `variables` ids (row-major).
