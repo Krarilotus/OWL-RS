@@ -22,7 +22,8 @@ for n in $(seq 1 "$PAIRS"); do
   order="off on"
   [ $((n % 2)) = 0 ] && order="on off"
   for mode in $order; do
-    setting=$([ "$mode" = on ] && echo auto || echo off)
+    # `on`: rewritten under owl2-rl too (`auto` is owl2-ql only).
+    setting=$([ "$mode" = on ] && echo on || echo off)
     NRESE_REASONING_QL_REWRITING=$setting "$LAB" "${loads[@]}" --queries "$queries" \
       --reason "$ruleset" --runs "${RUNS:-5}" --warmup 1 --label "$label-$mode" \
       --json "$OUT/$label-$mode-$n.json" > "$OUT/$label-$mode-$n.log"

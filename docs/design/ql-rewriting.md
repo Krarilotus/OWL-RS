@@ -99,11 +99,19 @@ for it; `COUNT(?x)` reads only `?x`.
 
 ## 4. Switching it on
 
-`reasoner.ql_rewriting` (`NRESE_REASONING_QL_REWRITING`): `auto` (the default) rewrites
-when the inferred stack is current under `owl2-ql` or `owl2-rl`, the rulesets whose closure
-is H-complete; `off` never. Other rulesets don't close inverses or domains of restrictions,
-so they are never rewritten. A request reading only asserted statements (`infer=false`) or
-only inferred ones isn't rewritten either.
+`reasoner.ql_rewriting` (`NRESE_REASONING_QL_REWRITING`), and per repository its settings'
+`ql_rewriting`, changed at once:
+- `auto` (the default) rewrites when the inferred stack is current under `owl2-ql`, the
+  profile that names these answers;
+- `on` under `owl2-rl` too. Not the default there (the owner's decision of 6 October): a
+  user choosing `owl2-rl` chooses its standard semantics, which also keeps answer counts
+  equal to other systems' `owl2-rl` (the benchmark protocol compares rulesets before
+  times); `owl2-dl` mode gets these answers through the DL bounds;
+- `off` never.
+
+Only `owl2-ql` and `owl2-rl` close the data enough (H-complete); other rulesets don't close
+inverses or domains of restrictions and are never rewritten. A request reading only
+asserted statements (`infer=false`) or only inferred ones isn't rewritten either.
 
 **No cost without existentials.** With the switch off, or a schema without generating
 axioms or existential-only memberships, the pattern isn't touched: the same plan and the

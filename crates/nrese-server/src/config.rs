@@ -122,7 +122,7 @@ impl ServerConfig {
             ),
             (
                 "reasoner.ql_rewriting",
-                if store.ql_rewriting { "auto" } else { "off" }.to_owned(),
+                store.ql_rewriting.name().to_owned(),
             ),
             ("reasoner.support_sets", store.support_sets.to_string()),
             (
