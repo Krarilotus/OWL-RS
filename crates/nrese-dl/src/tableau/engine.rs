@@ -469,7 +469,14 @@ impl<'a> Engine<'a> {
                 self.done.unary += 1;
                 let f = self.g.unary[i as usize];
                 if self.g.live(f.node) {
-                    join_concept(self.p, &self.g, &mut self.deps, i, &mut self.firings);
+                    join_concept(
+                        self.p,
+                        &self.g,
+                        &mut self.deps,
+                        i,
+                        &mut self.firings,
+                        &mut self.stats.plans_tried,
+                    );
                     self.apply_firings()?;
                 }
                 continue;
@@ -479,7 +486,14 @@ impl<'a> Engine<'a> {
                 self.done.edges += 1;
                 let e = self.g.edges[i as usize];
                 if self.g.live(e.from) && self.g.live(e.to) {
-                    join_edge(self.p, &self.g, &mut self.deps, i, &mut self.firings);
+                    join_edge(
+                        self.p,
+                        &self.g,
+                        &mut self.deps,
+                        i,
+                        &mut self.firings,
+                        &mut self.stats.plans_tried,
+                    );
                     self.apply_firings()?;
                 }
                 continue;
