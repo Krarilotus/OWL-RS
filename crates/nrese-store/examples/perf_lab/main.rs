@@ -950,6 +950,8 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     if !args.load.is_empty() {
         let phase = Phase::start();
         let started = Instant::now();
+        // `--cfg alloc_profile`: the load's heap by phase (the engine names them).
+        nrese_exec::heap::start("load: parsing and interning");
         let loaded = store.bulk_load(&BulkLoadRequest {
             files: args.load.clone(),
             replace: false,
@@ -957,6 +959,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             skip_errors: false,
         })?;
         report.load_s = started.elapsed().as_secs_f64();
+        heap_profile(nrese_exec::heap::finish());
         eprintln!("loaded {} quads in {:.2} s", loaded.inserted, report.load_s);
         report
             .sections

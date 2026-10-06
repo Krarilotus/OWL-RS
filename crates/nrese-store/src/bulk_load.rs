@@ -144,6 +144,9 @@ pub(crate) fn bulk_load(
         skipped: AtomicU64::new(0),
     });
     let mut parsed = 0;
+    // Chunks are numbered in input order over all files, from 1 (the engine's own `add`
+    // numbers chunk 0): new terms take their ids in the order they first occur.
+    let mut next_chunk = 1;
     progress
         .files
         .store(sources.len() as u64, Ordering::Relaxed);
@@ -152,7 +155,13 @@ pub(crate) fn bulk_load(
         if progress.is_cancelled() {
             return Err(StoreError::LoadCancelled);
         }
-        let quads = source.load_into(&load, &graph, &blank_nodes, skipping.as_ref())?;
+        let quads = source.load_into(
+            &load,
+            &mut next_chunk,
+            &graph,
+            &blank_nodes,
+            skipping.as_ref(),
+        )?;
         parsed += quads;
         progress.parsed.fetch_add(quads, Ordering::Relaxed);
         progress.files_done.fetch_add(1, Ordering::Relaxed);
@@ -193,10 +202,12 @@ impl<'a> Source<'a> {
         Ok(Self { path, format })
     }
 
-    /// Parses the file into `load`; returns the number of quads parsed.
+    /// Parses the file into `load`, its chunks numbered from `next_chunk` on (which moves
+    /// past them); returns the number of quads parsed.
     fn load_into(
         &self,
         load: &BulkLoad<'_>,
+        next_chunk: &mut u32,
         graph: &GraphName,
         blank_nodes: &BlankNodeScope,
         skipping: Option<&Skipping>,
@@ -219,9 +230,15 @@ impl<'a> Source<'a> {
                 };
                 let chunks =
                     recovering(parser).split_file_for_parallel_parsing(self.path, threads)?;
+                let first = *next_chunk;
+                *next_chunk += u32::try_from(chunks.len()).expect("fewer than 2^32 chunks");
                 chunks
                     .into_par_iter()
-                    .map(|chunk| feed(load, chunk, blank_nodes, skipping, self.path))
+                    .enumerate()
+                    .map(|(i, chunk)| {
+                        let chunk_number = first + i as u32;
+                        feed(load, chunk_number, chunk, blank_nodes, skipping, self.path)
+                    })
                     .sum()
             }
             format => {
@@ -233,10 +250,13 @@ impl<'a> Source<'a> {
                     false => parser.with_default_graph(graph.clone()),
                 };
                 let quads = recovering(parser).for_reader(BufReader::new(File::open(self.path)?));
-                // Parse here, intern on the pool.
+                // Parse here, intern on the pool; one chunk, its batches in order.
+                let chunk = *next_chunk;
+                *next_chunk += 1;
                 rayon::scope(|scope| {
                     let mut batch = Vec::with_capacity(BATCH);
                     let mut parsed = 0;
+                    let mut number = 0;
                     for quad in quads {
                         let quad = match (quad, skipping) {
                             (Ok(quad), _) => quad,
@@ -250,11 +270,13 @@ impl<'a> Source<'a> {
                         if batch.len() == BATCH {
                             parsed += batch.len() as u64;
                             let full = std::mem::replace(&mut batch, Vec::with_capacity(BATCH));
-                            scope.spawn(move |_| load.add(&full));
+                            let at = number;
+                            number += 1;
+                            scope.spawn(move |_| load.add_at(chunk, at, &full));
                         }
                     }
                     parsed += batch.len() as u64;
-                    load.add(&batch);
+                    load.add_at(chunk, number, &batch);
                     Ok(parsed)
                 })
             }
@@ -269,10 +291,11 @@ impl<'a> Source<'a> {
     }
 }
 
-/// Parses `quads` (of the file `path`) in batches into `load` on the current thread;
-/// returns the count.
+/// Parses `quads` (of the file `path`, its chunk `chunk`) in batches into `load` on the
+/// current thread, the batches numbered in order; returns the count.
 fn feed(
     load: &BulkLoad<'_>,
+    chunk: u32,
     quads: impl Iterator<Item = Result<Quad, RdfParseError>>,
     blank_nodes: &BlankNodeScope,
     skipping: Option<&Skipping>,
@@ -280,6 +303,7 @@ fn feed(
 ) -> StoreResult<u64> {
     let mut batch = Vec::with_capacity(BATCH);
     let mut parsed = 0;
+    let mut number = 0;
     for quad in quads {
         let quad = match (quad, skipping) {
             (Ok(quad), _) => quad,
@@ -291,7 +315,8 @@ fn feed(
         };
         batch.push(blank_nodes.scope(quad));
         if batch.len() == BATCH {
-            load.add(&batch);
+            load.add_at(chunk, number, &batch);
+            number += 1;
             parsed += batch.len() as u64;
             batch.clear();
             if (parsed / BATCH as u64).is_multiple_of(BATCHES_PER_RELEASE) {
@@ -299,7 +324,7 @@ fn feed(
             }
         }
     }
-    load.add(&batch);
+    load.add_at(chunk, number, &batch);
     Ok(parsed + batch.len() as u64)
 }
 

@@ -86,6 +86,43 @@ pub(super) struct Stats {
     pub roots: AtomicUsize,
     /// Candidates skipped: a check named a next value past them.
     pub skipped: AtomicUsize,
+    /// For a count ([`Query::count_solutions`]): the variables bound before the rest was counted as
+    /// a forest, a prefix of the order.
+    pub counted_after: Option<usize>,
+}
+
+/// Where a join's solutions go.
+enum Sink<'f> {
+    /// Rows of all the variables (row-major).
+    Rows(Vec<u64>),
+    /// Their number. With a forest, the bindings of the order's prefix it leaves are
+    /// enumerated and the rest counted; without, every solution.
+    Count {
+        forest: Option<&'f Forest>,
+        total: u64,
+    },
+}
+
+/// The variables a count leaves after a prefix of the order: patterns over one or two of
+/// them (the others bound or constant), no two over the same pair, and no cycle, so a
+/// forest whose solutions are counted from the leaves up ([`Query::count_forest`]).
+struct Forest {
+    /// The prefix of the order bound before counting.
+    depth: usize,
+    /// Per variable: its patterns with no other variable of the forest.
+    unary: Vec<Vec<usize>>,
+    /// Per variable: its children, each with the pattern joining it to them.
+    children: Vec<Vec<(usize, usize)>>,
+    /// A root per tree: its center.
+    roots: Vec<usize>,
+}
+
+impl Forest {
+    /// A variable with neither a pattern of its own nor children: its parent counts its
+    /// values per value of its own instead of joining them.
+    fn lazy(&self, var: usize) -> bool {
+        self.unary[var].is_empty() && self.children[var].is_empty()
+    }
 }
 
 /// Whether the variable graph of `patterns` has a cycle: patterns connect the variables
@@ -351,7 +388,7 @@ impl<'a> Query<'a> {
         values: &[u64],
         enforced: &[bool],
         work: &mut Work<'a>,
-        rows: &mut Vec<u64>,
+        sink: &mut Sink<'_>,
         shared: &Shared<'_>,
         stats: &Stats,
     ) -> Result<(), Stop> {
@@ -417,7 +454,7 @@ impl<'a> Query<'a> {
                 break;
             }
             if passed {
-                self.extend(order, depth + 1, work, rows, shared, stats)?;
+                self.extend(order, depth + 1, work, sink, shared, stats)?;
                 i += 1;
             } else if skip_to > value {
                 let next = i + 1 + values[i + 1..].partition_point(|&v| v < skip_to);
@@ -436,21 +473,48 @@ impl<'a> Query<'a> {
         order: &[usize],
         depth: usize,
         work: &mut Work<'a>,
-        rows: &mut Vec<u64>,
+        sink: &mut Sink<'_>,
         shared: &Shared<'_>,
         stats: &Stats,
     ) -> Result<(), Stop> {
-        let Some(&var) = order.get(depth) else {
-            rows.extend(
-                work.bindings
-                    .iter()
-                    .map(|b| b.expect("every variable is bound")),
-            );
-            if (rows.len() / self.variables.max(1)).is_multiple_of(ROW_STEP) {
-                let total = shared.rows.fetch_add(ROW_STEP, Ordering::Relaxed) + ROW_STEP;
-                if total > self.max_rows {
-                    return Err(Stop::TooManyRows);
+        if let Sink::Count {
+            forest: Some(forest),
+            total,
+        } = sink
+            && depth == forest.depth
+        {
+            match self.count_forest(forest, work) {
+                Some(n) => *total = total.saturating_add(n),
+                // A list the index couldn't give: the rest enumerated instead.
+                None => {
+                    let mut rest = Sink::Count {
+                        forest: None,
+                        total: 0,
+                    };
+                    self.extend(order, depth, work, &mut rest, shared, stats)?;
+                    if let Sink::Count { total: n, .. } = rest {
+                        *total = total.saturating_add(n);
+                    }
                 }
+            }
+            return Ok(());
+        }
+        let Some(&var) = order.get(depth) else {
+            match sink {
+                Sink::Rows(rows) => {
+                    rows.extend(
+                        work.bindings
+                            .iter()
+                            .map(|b| b.expect("every variable is bound")),
+                    );
+                    if (rows.len() / self.variables.max(1)).is_multiple_of(ROW_STEP) {
+                        let total = shared.rows.fetch_add(ROW_STEP, Ordering::Relaxed) + ROW_STEP;
+                        if total > self.max_rows {
+                            return Err(Stop::TooManyRows);
+                        }
+                    }
+                }
+                Sink::Count { total, .. } => *total = total.saturating_add(1),
             }
             return Ok(());
         };
@@ -458,7 +522,186 @@ impl<'a> Query<'a> {
             return Ok(());
         };
         stats.candidates[depth].fetch_add(values.len(), Ordering::Relaxed);
-        self.extend_values(order, depth, &values, &enforced, work, rows, shared, stats)
+        self.extend_values(order, depth, &values, &enforced, work, sink, shared, stats)
+    }
+
+    /// The forest the variables after `depth` of `order` form, if they do ([`Forest`]).
+    fn forest(&self, order: &[usize], depth: usize) -> Option<Forest> {
+        let mut free = vec![false; self.variables];
+        for &v in &order[depth..] {
+            free[v] = true;
+        }
+        let mut unary = vec![Vec::new(); self.variables];
+        let mut adjacent: Vec<Vec<(usize, usize)>> = vec![Vec::new(); self.variables];
+        for (i, pattern) in self.patterns.iter().enumerate() {
+            let mut vars: Vec<usize> = pattern
+                .iter()
+                .filter_map(|p| match *p {
+                    Pos::Var(v) if free[v] => Some(v),
+                    _ => None,
+                })
+                .collect();
+            let positions = vars.len();
+            vars.sort_unstable();
+            vars.dedup();
+            if vars.len() != positions {
+                // A variable twice: its positions must bind one term.
+                return None;
+            }
+            match *vars.as_slice() {
+                [] => {}
+                [x] => unary[x].push(i),
+                [x, y] => {
+                    if adjacent[x].iter().any(|&(other, _)| other == y) {
+                        return None;
+                    }
+                    adjacent[x].push((y, i));
+                    adjacent[y].push((x, i));
+                }
+                _ => return None,
+            }
+        }
+        // Hops from `from` to each variable of its tree.
+        let hops = |from: usize| {
+            let mut hops = vec![usize::MAX; self.variables];
+            hops[from] = 0;
+            let mut queue = std::collections::VecDeque::from([from]);
+            while let Some(x) = queue.pop_front() {
+                for &(y, _) in &adjacent[x] {
+                    if hops[y] == usize::MAX {
+                        hops[y] = hops[x] + 1;
+                        queue.push_back(y);
+                    }
+                }
+            }
+            hops
+        };
+        let mut children = vec![Vec::new(); self.variables];
+        let mut roots = Vec::new();
+        let mut seen = vec![false; self.variables];
+        for &first in &order[depth..] {
+            if seen[first] {
+                continue;
+            }
+            let reached = hops(first);
+            let tree: Vec<usize> = order[depth..]
+                .iter()
+                .copied()
+                .filter(|&v| reached[v] != usize::MAX)
+                .collect();
+            if tree.len() != tree.iter().map(|&v| adjacent[v].len()).sum::<usize>() / 2 + 1 {
+                return None;
+            }
+            // The root: the tree's center (fewest hops to its farthest variable), first in
+            // the order on ties. What a child sends grows with each hop: rooted at the
+            // 4-cycle's `?b`, `?c` received 64 values per `?a` and read the patterns
+            // into each; rooted at `?c`, both sides read 8.
+            let root = *tree
+                .iter()
+                .min_by_key(|&&v| hops(v).iter().filter(|&&h| h != usize::MAX).max().copied())
+                .expect("a tree has its first variable");
+            roots.push(root);
+            let mut stack = vec![(root, usize::MAX)];
+            seen[root] = true;
+            while let Some((x, parent)) = stack.pop() {
+                for &(y, pattern) in &adjacent[x] {
+                    if y != parent {
+                        seen[y] = true;
+                        children[x].push((y, pattern));
+                        stack.push((y, x));
+                    }
+                }
+            }
+        }
+        let forest = Forest {
+            depth,
+            unary,
+            children,
+            roots,
+        };
+        // Each variable read needs values from a pattern of its own or from a child that
+        // reads them.
+        let sourced = |v: usize| {
+            !forest.unary[v].is_empty() || forest.children[v].iter().any(|&(c, _)| !forest.lazy(c))
+        };
+        order[depth..]
+            .iter()
+            .all(|&v| forest.lazy(v) || sourced(v))
+            .then_some(forest)
+    }
+
+    /// The solutions of the forest's variables under the bindings of the order's prefix:
+    /// the product over its trees of each root's weights. `None` if a list the counting
+    /// reads isn't an index range.
+    fn count_forest(&self, forest: &Forest, work: &mut Work<'a>) -> Option<u64> {
+        let mut total = 1u64;
+        for &root in &forest.roots {
+            let sum = self
+                .weights(forest, root, work)?
+                .iter()
+                .fold(0u64, |sum, &(_, w)| sum.saturating_add(w));
+            if sum == 0 {
+                return Some(0);
+            }
+            total = total.saturating_mul(sum);
+        }
+        Some(total)
+    }
+
+    /// The values `var` can take and, per value, the solutions of its subtree with `var`
+    /// bound to it, sorted by value: its own patterns' values joined with what each child
+    /// sends (per value of `var`, the sum of the child's weights over the values the
+    /// joining pattern pairs with it), each lazy child's matches counted per value.
+    fn weights(&self, forest: &Forest, var: usize, work: &mut Work<'a>) -> Option<Vec<(u64, u64)>> {
+        // The cursors' depth past the order's: a count's work has one more.
+        let slot = self.variables;
+        let mut lists: Vec<Vec<(u64, u64)>> = Vec::new();
+        for &pattern in &forest.unary[var] {
+            let values = self.sorted_values(pattern, var, slot, work)?;
+            lists.push(values.iter().map(|&v| (v, 1)).collect());
+        }
+        let mut lazy = Vec::new();
+        for &(child, pattern) in &forest.children[var] {
+            if forest.lazy(child) {
+                lazy.push((child, pattern));
+                continue;
+            }
+            let mut message = Vec::new();
+            for (value, weight) in self.weights(forest, child, work)? {
+                work.bindings[child] = Some(value);
+                let values = self.sorted_values(pattern, var, slot, work);
+                work.bindings[child] = None;
+                message.extend(values?.iter().map(|&v| (v, weight)));
+            }
+            message.sort_unstable_by_key(|&(v, _)| v);
+            message.dedup_by(|later, kept| {
+                let same = later.0 == kept.0;
+                if same {
+                    kept.1 = kept.1.saturating_add(later.1);
+                }
+                same
+            });
+            lists.push(message);
+        }
+        let mut weights = join_weighted(lists);
+        // A lazy child's matches per value, read (an index count can over-approximate
+        // where equality classes are expanded).
+        for (child, pattern) in lazy {
+            let mut kept = Vec::with_capacity(weights.len());
+            for (value, weight) in weights {
+                work.bindings[var] = Some(value);
+                let n = self
+                    .sorted_values(pattern, child, slot, work)
+                    .map(|values| values.len() as u64);
+                work.bindings[var] = None;
+                match n? {
+                    0 => {}
+                    n => kept.push((value, weight.saturating_mul(n))),
+                }
+            }
+            weights = kept;
+        }
+        Some(weights)
     }
 
     /// The solutions estimated by sampling (index-based join sampling, Leis et al., CIDR
@@ -485,17 +728,20 @@ impl<'a> Query<'a> {
             token: &never,
         };
         let picked = first.len().min(SAMPLES);
-        let (mut rows, mut sampled) = (Vec::new(), 0);
+        let (mut sink, mut sampled) = (Sink::Rows(Vec::new()), 0);
         for k in 0..picked {
             let value = [first[k * first.len() / picked]];
             sampled += 1;
             let done = self.extend_values(
-                &order, 0, &value, &enforced, &mut work, &mut rows, &shared, &stats,
+                &order, 0, &value, &enforced, &mut work, &mut sink, &shared, &stats,
             );
             if done.is_err() || stats.lookups.load(Ordering::Relaxed) > SAMPLE_LOOKUPS {
                 break;
             }
         }
+        let Sink::Rows(rows) = sink else {
+            unreachable!("the sample collects rows")
+        };
         let found = rows.len() / self.variables.max(1);
         found as f64 * first.len() as f64 / sampled as f64
     }
@@ -507,10 +753,59 @@ impl<'a> Query<'a> {
         stats: &mut Stats,
     ) -> Result<Vec<u64>, Stop> {
         let order = self.order();
-        stats.order.clone_from(&order);
+        let depths = order.len();
+        let sinks = self.drive(&order, depths, token, stats, || Sink::Rows(Vec::new()))?;
+        let mut rows = Vec::new();
+        for sink in sinks {
+            if let Sink::Rows(chunk) = sink {
+                rows.extend(chunk);
+            }
+        }
+        if rows.len() / self.variables.max(1) > self.max_rows {
+            return Err(Stop::TooManyRows);
+        }
+        Ok(rows)
+    }
+
+    /// The number of solutions, without producing them. The variables are bound in the
+    /// join's order only until the rest form a [`Forest`]; under each binding of that
+    /// prefix the forest's solutions are counted from its leaves up (variable
+    /// elimination: per value of a variable, the product of what its children send).
+    /// The 4-cycle `a→b→c→d→a` binds `a` and counts `Σ_c #{b: a→b→c} · #{d: c→d→a}`:
+    /// two lists of 2-paths per `a`, where enumerating it checked every 2-path's
+    /// `c→d` against `d→a`. A forest is found at the latest when one variable is left.
+    pub(super) fn count_solutions(
+        &self,
+        token: &(dyn Fn() -> bool + Sync),
+        stats: &mut Stats,
+    ) -> Result<u64, Stop> {
+        let order = self.order();
+        let forest = (1..=order.len()).find_map(|depth| self.forest(&order, depth));
+        stats.counted_after = forest.as_ref().map(|f| f.depth);
+        let sinks = self.drive(&order, order.len() + 1, token, stats, || Sink::Count {
+            forest: forest.as_ref(),
+            total: 0,
+        })?;
+        Ok(sinks.iter().fold(0u64, |sum, sink| match sink {
+            Sink::Count { total, .. } => sum.saturating_add(*total),
+            Sink::Rows(_) => sum,
+        }))
+    }
+
+    /// The join over `order`: the first variable's candidates split across threads, each
+    /// share extended into its own sink. `depths` is the cursors' per thread.
+    fn drive<'f>(
+        &self,
+        order: &[usize],
+        depths: usize,
+        token: &(dyn Fn() -> bool + Sync),
+        stats: &mut Stats,
+        sink: impl Fn() -> Sink<'f> + Sync,
+    ) -> Result<Vec<Sink<'f>>, Stop> {
+        stats.order = order.to_vec();
         stats.candidates = (0..order.len()).map(|_| AtomicUsize::new(0)).collect();
         let stats = &*stats;
-        let mut work = Work::new(self, order.len());
+        let mut work = Work::new(self, depths);
         let first = self.candidates(order[0], 0, &mut work);
         work.finish(stats);
         let Some((first, enforced)) = first else {
@@ -528,27 +823,41 @@ impl<'a> Query<'a> {
             .len()
             .div_ceil(rayon::current_num_threads() * CHUNKS_PER_THREAD)
             .clamp(1, 256);
-        let chunks: Vec<Result<Vec<u64>, Stop>> = first
+        first
             .par_chunks(chunk)
             .map(|chunk| {
-                let mut work = Work::new(self, order.len());
-                let mut rows = Vec::new();
+                let mut work = Work::new(self, depths);
+                let mut sink = sink();
                 let done = self.extend_values(
-                    &order, 0, chunk, &enforced, &mut work, &mut rows, &shared, stats,
+                    order, 0, chunk, &enforced, &mut work, &mut sink, &shared, stats,
                 );
                 work.finish(stats);
-                done.map(|()| rows)
+                done.map(|()| sink)
             })
-            .collect();
-        let mut rows = Vec::new();
-        for chunk in chunks {
-            rows.extend(chunk?);
-        }
-        if rows.len() / self.variables.max(1) > self.max_rows {
-            return Err(Stop::TooManyRows);
-        }
-        Ok(rows)
+            .collect()
     }
+}
+
+/// The values in all of `lists` (each sorted by value, distinct), with the product of
+/// their weights.
+fn join_weighted(mut lists: Vec<Vec<(u64, u64)>>) -> Vec<(u64, u64)> {
+    lists.sort_by_key(Vec::len);
+    let mut lists = lists.into_iter();
+    let mut joined = lists.next().unwrap_or_default();
+    for list in lists {
+        let mut rest = list.as_slice();
+        joined.retain_mut(|(value, weight)| {
+            rest = &rest[rest.partition_point(|&(v, _)| v < *value)..];
+            match rest.first() {
+                Some(&(v, w)) if v == *value => {
+                    *weight = weight.saturating_mul(w);
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+    joined
 }
 
 /// A thread's state in a join: its bindings, and a probe cursor per depth and pattern,

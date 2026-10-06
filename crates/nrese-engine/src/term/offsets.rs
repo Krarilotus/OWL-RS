@@ -52,6 +52,17 @@ impl Ends for [u64] {
     }
 }
 
+impl Ends for [u32] {
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    #[inline]
+    fn end(&self, i: usize) -> usize {
+        self[i] as usize
+    }
+}
+
 /// Block offsets (module docs), mapped from a checkpoint.
 pub(crate) struct BlockEnds {
     pub(crate) count: usize,
