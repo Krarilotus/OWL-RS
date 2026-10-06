@@ -577,6 +577,22 @@ fn churn(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
     nt.t(&ex("advisor"), &rdfs("range"), &ex("Professor"))?;
     nt.t(&ex("advisee"), &owl("inverseOf"), &ex("advisor"))?;
     nt.t(&ex("memberOf"), &rdfs("subPropertyOf"), &ex("worksWith"))?;
+    // `violate=1`: students and professors are disjoint, and the last commit makes a
+    // student a professor: the OWL 2 RL gate rejects it (cax-dw). `violate=2`: a visitor is
+    // faculty or a professor (a union on the right, outside RL) and disjoint from both, and
+    // the last commit adds a visitor: inconsistent only under OWL 2 DL, so only the DL gate
+    // can reject it.
+    let violate = p.get("violate", 0);
+    if violate == 1 {
+        nt.t(&ex("Student"), &owl("disjointWith"), &ex("Professor"))?;
+    }
+    if violate == 2 {
+        let union = list(nt, "visitor", &[ex("Faculty"), ex("Professor")])?;
+        nt.t("_:visitorOf", &owl("unionOf"), &union)?;
+        nt.t(&ex("Visitor"), &rdfs("subClassOf"), "_:visitorOf")?;
+        nt.t(&ex("Visitor"), &owl("disjointWith"), &ex("Faculty"))?;
+        nt.t(&ex("Visitor"), &owl("disjointWith"), &ex("Professor"))?;
+    }
     for i in 0..people {
         let x = ex(format!("s{i}"));
         nt.t(&x, &rdf("type"), &ex("GraduateStudent"))?;
@@ -596,6 +612,12 @@ fn churn(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
     }
     for i in 0..changes {
         writeln!(out, "DELETE DATA {{ {} }}", statements(i))?;
+    }
+    if violate == 1 {
+        writeln!(out, "INSERT DATA {{ <{EX}s0> a <{EX}Professor> }}")?;
+    }
+    if violate == 2 {
+        writeln!(out, "INSERT DATA {{ <{EX}guest0> a <{EX}Visitor> }}")?;
     }
     // `existing=N`: N people of the data deleted, one per commit (the deletion tail).
     for i in 0..p.get("existing", 0) {
