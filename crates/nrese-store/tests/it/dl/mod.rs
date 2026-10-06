@@ -1,5 +1,6 @@
 //! The `owl2-dl` mode (docs/design/owl2-dl.md §8), through the store's normal interfaces.
 
+mod classification;
 mod consistency;
 mod mode;
 

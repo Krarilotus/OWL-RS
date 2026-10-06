@@ -118,10 +118,12 @@ On the combined URL a form is a query or an update by its field, and a body by i
 
 ## Classification
 
-`GET /dataset/classification`: the OWL 2 EL class hierarchy of the asserted statements (all graphs), computed on request with the completion rules of CEL and ELK (conjunctions, existential restrictions, property hierarchies, chains and transitivity, domains, ranges, disjointness). On random EL ontologies it equals ELK's hierarchy.
+`GET /dataset/classification`: the OWL 2 DL class hierarchy of the asserted statements (all graphs), computed on request by the DL engines ([design](../design/owl2-dl.md) §7): the context core where its Horn stage takes the ontology (EL and Horn ontologies), else the hypertableau driver (known and possible subsumers, tests in parallel on `dl.threads` workers, within `dl.timeout`). The result is kept per revision, so a second request on an unchanged store is free.
 
-- `application/json` (the default): `subsumptions` (pairs `[sub, super]` of class IRIs, every one, equivalent classes both ways, without `owl:Thing`), `unsatisfiable` (classes that can have no instance), `skipped` (axioms outside EL by kind: unions, universal restrictions, cardinalities, inverses, nominals; the hierarchy is complete for the EL part), `micros`
+- `application/json` (the default): `subsumptions` (pairs `[sub, super]` of class IRIs, every one, equivalent classes both ways, without `owl:Thing`), `unsatisfiable` (classes that can have no instance), `equivalent_to_thing`, `consistent` (false: the ontology has no model, and every class is unsatisfiable), `engine` (`context-core` or `tableau`), `complete` and `incomplete` (why subsumptions may be missing: a budget ran out, or a construct the engines lack; what is listed is entailed either way), `micros`
 - `application/n-triples`: the same as `rdfs:subClassOf` statements, `owl:Nothing` as the superclass of unsatisfiable classes
+
+`GET /dataset/realisation`: each named individual's types under OWL 2 DL, by the same engines (a type is tested by whether its negation makes the ontology inconsistent, candidates cut by the models found). JSON: `types` (individual IRI → every named class it is an instance of), `consistent`, `engine`, `complete`, `incomplete`, `micros`; N-Triples: `rdf:type` statements.
 
 The hierarchy isn't stored; the reasoning modes materialise instance-level inferences (see [config-reference.md](config-reference.md)).
 
@@ -219,7 +221,7 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 | `GET`/`PUT`/`PATCH`/`DELETE /api/v1/repositories/{id}` | One repository (`title`, `reasoning` in effect, `settings`); `PUT` creates it with JSON settings (`title`, `reasoning` by mode name, `rules`, `query_timeout_ms`: its own query timeout, 1 ms to 1 h, the server's when absent; the default repository always keeps the server's), 201, 409 if it exists; `PATCH` changes the settings given (`null` removes one), a new `reasoning` or `rules` at once: the inferences are recomputed, and writes waiting meanwhile are answered 503 (send them again); `DELETE` removes it and its data (administrators). The default repository's changed settings are kept in `repository.json` of the data directory and override the configuration's reasoning at the next start |
 | `…/repositories/{id}/query`, `/update`, `/sparql` | SPARQL Protocol, as `/dataset/query`, `/dataset/update`, `/dataset` |
 | `…/repositories/{id}/data` | Graph Store Protocol (`?graph=` or `?default`), as `/dataset/data` |
-| `…/repositories/{id}/tell`, `/shacl`, `/autocomplete`, `/classification` | as their `/dataset/…` counterparts |
+| `…/repositories/{id}/tell`, `/shacl`, `/autocomplete`, `/classification`, `/realisation` | as their `/dataset/…` counterparts |
 | `…/repositories/{id}/info`, `/summary`, `/reasoning`, `/service-description` | readiness and statistics, reasoning diagnostics, the service description |
 | `…/repositories/{id}/backup`, `/restore` | N-Quads backup and restore |
 | `POST …/repositories/{id}/image` | An image backup into `backups/` of the data directory (administrators) |
@@ -265,7 +267,7 @@ With access enforced (the access state's `enforced` setting, on once a policy fi
 - **Inferred statements** come from statements in any graph; users who may not read every graph see the asserted statements only, unless the policy sets `inferred = "visible"` (all inferred statements, to users who may read the default graph) or `inferred = "supported"` (those one of whose derivations uses graphs the user may read alone; [configuration](config-reference.md)). Queries, counts, statement reads and explanations agree on which.
 - **Graph Store reads** of an unreadable graph answer 404, as for a graph that doesn't exist.
 - **Writes** that would insert or delete a statement in a graph the user may not write are refused as a whole with 403, whether the statement is there or not, so the answer says nothing about graphs the user can't read. `CLEAR`/`DROP ALL` and `NAMED`, and RDF4J deletions without a context, act on the readable graphs only; clearing an unreadable graph does nothing.
-- **Endpoints over the whole dataset** (autocomplete, classification, SHACL validation, query suggestions) answer 403 to users who may not read every graph.
+- **Endpoints over the whole dataset** (autocomplete, classification, realisation, SHACL validation, query suggestions) answer 403 to users who may not read every graph.
 
 ## Status codes
 

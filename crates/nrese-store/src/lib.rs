@@ -45,7 +45,7 @@ pub use backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
 };
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
-pub use classification::ClassificationReport;
+pub use classification::{ClassificationReport, RealisationReport};
 pub use config::{
     DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity, ShaclGate,
     StoreConfig, StoreMode,
