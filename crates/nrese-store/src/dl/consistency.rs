@@ -54,9 +54,35 @@ pub struct Budget {
     pub cancel: Option<tableau::Cancel>,
 }
 
+/// Why a model of `ontology` says nothing for the source: parts of the source weren't
+/// read (fatal diagnostics), so they may have no model. An inconsistency found stands.
+pub fn left_out(ontology: &Ontology) -> Option<String> {
+    let fatal: Vec<_> = ontology
+        .diagnostics
+        .iter()
+        .filter(|d| d.is_fatal())
+        .collect();
+    let first = fatal.first()?;
+    Some(format!(
+        "{} part(s) of the data aren't OWL 2 DL and were left out; first: {first:?}",
+        fatal.len()
+    ))
+}
+
 /// Whether `ontology` is consistent: the context core's Horn stage where it takes the
-/// ontology, else the hypertableau within `budget`.
+/// ontology, else the hypertableau within `budget`. `Consistent` only if nothing of the
+/// source was left out ([`left_out`]).
 pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
+    let mut checked = check_read(ontology, budget);
+    if checked.verdict == Verdict::Consistent
+        && let Some(why) = left_out(ontology)
+    {
+        checked.verdict = Verdict::Unknown(why);
+    }
+    checked
+}
+
+fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
     let started = Instant::now();
     let options = nrese_dl::context::Options {
         threads: budget.threads.max(1),
