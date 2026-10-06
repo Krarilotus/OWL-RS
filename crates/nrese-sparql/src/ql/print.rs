@@ -527,6 +527,11 @@ impl Printer<'_> {
                 pattern.clone()
             }
             GraphPattern::Values { .. } => pattern.clone(),
+            // Another store's name for the default graph: the default graph, expanded.
+            GraphPattern::Graph {
+                name: NamedNodePattern::NamedNode(name),
+                inner,
+            } if crate::compat::names_default_graph(name.as_str()) => self.pattern(inner),
             // Named graphs and remote endpoints have no inferences.
             GraphPattern::Graph { .. } | GraphPattern::Service { .. } => pattern.clone(),
             GraphPattern::Join { left, right } => GraphPattern::Join {

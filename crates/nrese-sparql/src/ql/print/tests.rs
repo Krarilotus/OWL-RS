@@ -225,3 +225,27 @@ fn what_the_printer_cant_write_exactly_it_reports() {
     };
     assert!(!q.contains("DISTINCT"), "{q}");
 }
+
+#[test]
+fn negations_and_the_default_graph_alias_print_with_the_rewriting() {
+    let turtle = ":Employee rdfs:subClassOf [ a owl:Restriction ;
+            owl:onProperty :worksFor ; owl:someValuesFrom :Organisation ] .
+        :Manager rdfs:subClassOf :Employee , :Person .
+        :Visitor rdfs:subClassOf :Person .
+        :cat a :Manager . :dan a :Visitor .";
+    answers_as(
+        turtle,
+        "SELECT ?x WHERE { ?x a :Person FILTER NOT EXISTS { ?x :worksFor [] } }",
+        &["<dan>"],
+    );
+    answers_as(
+        turtle,
+        "SELECT ?x WHERE { ?x a :Person MINUS { ?x :worksFor ?y } }",
+        &["<dan>"],
+    );
+    answers_as(
+        turtle,
+        "SELECT ?x WHERE { GRAPH <urn:x-arq:DefaultGraph> { ?x :worksFor [] } }",
+        &["<cat>"],
+    );
+}
