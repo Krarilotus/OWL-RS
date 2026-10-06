@@ -19,6 +19,8 @@ pub struct QueryOperation {
     pub access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
     /// Who sent it (shown in the running queries).
     pub origin: Option<String>,
+    /// `dl-answers=certain-where-complete|sound|exact`: under `owl2-dl`, which answers.
+    pub dl_answers: Option<nrese_store::DlAnswers>,
 }
 
 impl QueryOperation {
@@ -44,6 +46,15 @@ impl QueryOperation {
                 "default-graph-uri" => self.default_graphs.push(value),
                 "named-graph-uri" => self.named_graphs.push(value),
                 "infer" => self.infer = Some(boolean("infer", &value)?),
+                "dl-answers" => {
+                    self.dl_answers =
+                        Some(nrese_store::DlAnswers::from_name(&value).ok_or_else(|| {
+                            ApiError::bad_request(format!(
+                                "dl-answers must be 'certain-where-complete', 'sound' or \
+                                 'exact', not '{value}'"
+                            ))
+                        })?);
+                }
                 "explain" => {
                     self.explain = match value.as_str() {
                         "plan" => Explain::Plan,
@@ -276,6 +287,7 @@ mod tests {
                 explain: Explain::No,
                 access: None,
                 origin: None,
+                dl_answers: None,
             }
         );
     }

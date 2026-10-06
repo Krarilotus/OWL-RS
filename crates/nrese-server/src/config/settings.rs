@@ -211,9 +211,11 @@ pub const SETTINGS: &[Setting] = &[
             "owl-horst",
             "owl2-ql",
             "owl2-rl",
+            "owl2-dl",
             "custom",
         ]),
-        "The ruleset materialised into the inferred stack (default disabled).",
+        "The ruleset materialised into the inferred stack (default disabled); owl2-dl \
+         materialises OWL 2 RL and adds the OWL 2 DL engines (the dl settings).",
     ),
     setting(
         "reasoner.rules",
@@ -261,6 +263,60 @@ pub const SETTINGS: &[Setting] = &[
         Integer,
         "Support graph sets kept per inferred statement for inferred = \"supported\" in the \
          access policy (default 16, at least 1); fewer can only hide statements.",
+    ),
+    // [dl]
+    setting(
+        "dl.answers",
+        names::DL_ANSWERS,
+        Choice(&["certain-where-complete", "sound", "exact"]),
+        "Under owl2-dl, which answers a query returns: the certain ones where they can be \
+         proven complete and the sound ones otherwise (the default), the sound lower bound \
+         alone, or certain answers or an error.",
+    ),
+    setting(
+        "dl.consistency",
+        names::DL_CONSISTENCY,
+        Choice(&["inline", "off"]),
+        "Under owl2-dl, whether each commit is checked for consistency and rejected if it \
+         makes the data inconsistent (inline, the default) or not checked (off).",
+    ),
+    setting(
+        "dl.timeout",
+        names::DL_TIMEOUT_MS,
+        Amount(Duration),
+        "Under owl2-dl, the time one DL task may take: a commit's consistency check, a \
+         query's exact services, a classification (default 30min).",
+    ),
+    setting(
+        "dl.memory",
+        names::DL_MEMORY,
+        Amount(Bytes),
+        "Under owl2-dl, the memory one DL task may hold (default 4GiB).",
+    ),
+    setting(
+        "dl.max_candidates",
+        names::DL_MAX_CANDIDATES,
+        Integer,
+        "Under owl2-dl, the candidate answers a query checks with the exact services at \
+         most; the rest are reported unresolved (default 1000).",
+    ),
+    setting(
+        "dl.threads",
+        names::DL_THREADS,
+        Integer,
+        "Under owl2-dl, the workers of a classification (default 0: every core).",
+    ),
+    setting(
+        "dl.max_nodes",
+        names::DL_MAX_NODES,
+        Integer,
+        "Under owl2-dl, the most nodes one hypertableau run may hold (default 2000000).",
+    ),
+    setting(
+        "dl.max_branch_points",
+        names::DL_MAX_BRANCH_POINTS,
+        Integer,
+        "Under owl2-dl, the most branch points one hypertableau run may open (default 1000000): a deterministic budget; past it the run decides nothing.",
     ),
     // [federation]
     setting(

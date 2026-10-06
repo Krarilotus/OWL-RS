@@ -147,6 +147,12 @@ pub struct Explanation {
     /// What the OWL 2 QL rewriting did, and whether the answers are complete; `None` where
     /// it doesn't apply.
     pub ql: Option<crate::ql::QlReport>,
+    /// Whether the answers are complete, where a reasoning path can leave some out: the
+    /// status the answers carry (set by the store: QL's, the DL bounds', a closure's).
+    pub completeness: Option<crate::completeness::Completeness>,
+    /// What decided the status (the DL bounds' paths: `closed-predicates`,
+    /// `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`).
+    pub decided_by: Vec<&'static str>,
 }
 
 /// Runs `query` like [`evaluate_query`], consuming its results, and reports how it ran:
@@ -166,6 +172,8 @@ pub fn explain_query<V: ReadView>(
         rows,
         micros: start.elapsed().as_micros() as u64,
         ql,
+        completeness: None,
+        decided_by: Vec::new(),
     })
 }
 
@@ -190,6 +198,8 @@ pub struct PlannedQuery {
     pub steps: Vec<PlannedStep>,
     /// As in [`Explanation`].
     pub ql: Option<crate::ql::QlReport>,
+    /// What the store can say about completeness before running (set by the store).
+    pub completeness: Option<crate::completeness::Completeness>,
 }
 
 /// The plan `query` would run as on `view`, after the rewrites, each node with an estimate
@@ -205,6 +215,7 @@ pub fn plan_query<V: ReadView>(
         rewrites,
         steps,
         ql,
+        completeness: None,
     })
 }
 

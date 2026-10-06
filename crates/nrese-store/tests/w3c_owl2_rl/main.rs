@@ -13,9 +13,13 @@
 //!   `owl:AllDifferent`, complements, negative property assertions) are decided by
 //!   refutation (`StoreService::entails`).
 //! - The OWL 2 RL/RDF rules are complete only for ground atomic conclusions from RL
-//!   premises (theorem PR1 of the profiles document); the tests they can't pass are listed
-//!   in `expected-failures.txt`. The run fails on any failure not in the list, and on any
-//!   listed test that passes.
+//!   premises (theorem PR1 of the profiles document). A positive entailment they can't
+//!   show goes to the store's OWL 2 DL path (`StoreService::entails_dl`, the owl2-dl
+//!   mode's engines): the Direct Semantics' entailment implies the RDF-Based Semantics'
+//!   for OWL 2 DL ontologies (the correspondence theorem, OWL 2 RDF-Based Semantics §7.2),
+//!   and a conclusion or premise outside OWL 2 DL is never decided so. The tests neither
+//!   path passes are listed in `expected-failures.txt`. The run fails on any failure not
+//!   in the list, and on any listed test that passes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,6 +32,24 @@ mod suite;
 use suite::{Case, cases, parse_rdf_xml, quoted_entities, suite_path};
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
+
+/// The positive entailments the rules can't show, decided through the OWL 2 DL path.
+/// Exactly these: one more would hide a regression of the rules.
+const THROUGH_DL: &[&str] = &[
+    // Bare class expressions as the conclusion (a minCardinality restriction, a union):
+    // no axiom under the Direct Semantics; their existence follows from the RDF-Based
+    // Semantics' comprehension conditions.
+    "WebOnt-I5.26-010",
+    "WebOnt-I5.5-005",
+    // Reflexivity, which OWL 2 RL leaves out.
+    "New-Feature-ReflexiveProperty-001",
+    // A chain p o p -> p makes p transitive.
+    "chain2trans1",
+    // Datatype subsumption and intersection (the datatype theory).
+    "WebOnt-I5.8-006",
+    "WebOnt-I5.8-008",
+    "WebOnt-I5.8-009",
+];
 
 /// Premises the suite gives in functional syntax only, in RDF (Turtle) by the OWL 2
 /// mapping to RDF graphs; the others of that kind are skipped.
@@ -61,7 +83,16 @@ const TRANSLATIONS: &[(&str, &str)] = &[
 :a a [ a owl:Restriction ; owl:onProperty :hasAge ; owl:hasValue "19"^^xsd:integer ] ."#,
     ),
 ];
-fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<(), String> {
+/// How a test passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Passed {
+    /// By the OWL 2 RL rules alone.
+    Rules,
+    /// A positive entailment through the OWL 2 DL path.
+    Dl,
+}
+
+fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<Passed, String> {
     let stem = name.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
     let file = match (&case.premise, TRANSLATIONS.iter().find(|(n, _)| *n == name)) {
         (Some(premise), _) => {
@@ -99,6 +130,7 @@ fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<(), String> {
             .map(nrese_store::Entailment::holds)
             .map_err(|e| e.to_string())
     };
+    let mut passed = Passed::Rules;
     for kind in &case.kinds {
         match kind.as_str() {
             "ConsistencyTest" if inconsistent => {
@@ -113,7 +145,16 @@ fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<(), String> {
             "PositiveEntailmentTest" if !inconsistent => {
                 let conclusion = case.conclusion.as_ref().ok_or("no RDF/XML conclusion")?;
                 if !entailed(conclusion)? {
-                    return Err("the conclusion isn't entailed".to_owned());
+                    let dl = store
+                        .entails_dl(&parse_rdf_xml(conclusion)?)
+                        .map_err(|e| e.to_string())?;
+                    if !dl.holds() {
+                        return Err(format!(
+                            "the conclusion isn't entailed (OWL 2 DL: {:?})",
+                            dl.answer
+                        ));
+                    }
+                    passed = Passed::Dl;
                 }
             }
             "NegativeEntailmentTest" => {
@@ -128,7 +169,7 @@ fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<(), String> {
             _ => {}
         }
     }
-    Ok(())
+    Ok(passed)
 }
 
 #[test]
@@ -148,6 +189,7 @@ fn w3c_owl2_rl_test_cases() {
     let dir = tempfile::tempdir().unwrap();
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
     let (mut passed, mut skipped) = (0, Vec::new());
+    let mut through_dl = Vec::new();
     for (name, case) in &all {
         if !(case.profiles.contains("RL") && case.semantics.contains("RDF-BASED")) || case.rejected
         {
@@ -162,7 +204,12 @@ fn w3c_owl2_rl_test_cases() {
             continue;
         }
         match run(name, case, dir.path()) {
-            Ok(()) => passed += 1,
+            Ok(how) => {
+                passed += 1;
+                if how == Passed::Dl {
+                    through_dl.push(name.clone());
+                }
+            }
             Err(reason) => {
                 failed.insert(name.clone(), reason);
             }
@@ -188,6 +235,20 @@ fn w3c_owl2_rl_test_cases() {
     for s in &skipped {
         eprintln!("  skipped {s}");
     }
+    for (name, reason) in &failed {
+        eprintln!("  failed {name}: {reason}");
+    }
+    eprintln!(
+        "  {} positive entailments through the OWL 2 DL path: {through_dl:?}",
+        through_dl.len()
+    );
+    let mut expected_dl: Vec<&str> = THROUGH_DL.to_vec();
+    expected_dl.sort_unstable();
+    through_dl.sort();
+    assert_eq!(
+        through_dl, expected_dl,
+        "the positive entailments decided through the OWL 2 DL path changed"
+    );
     assert!(
         new.is_empty() && fixed.is_empty(),
         "failures not in expected-failures.txt: {new:#?}\nlisted but now passing (remove from expected-failures.txt): {fixed:#?}"

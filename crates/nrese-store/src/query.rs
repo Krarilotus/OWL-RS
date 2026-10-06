@@ -102,6 +102,8 @@ pub struct SparqlQueryRequest {
     /// Whose read it is (graph-level access control): the query's dataset is restricted
     /// to the graphs the scope reads.
     pub scope: crate::ReadScope,
+    /// Under `owl2-dl`: which answers this query asks for, over `dl.answers`.
+    pub dl_answers: Option<crate::DlAnswers>,
 }
 
 impl SparqlQueryRequest {
@@ -121,6 +123,7 @@ impl SparqlQueryRequest {
             memory_limit: None,
             as_written: false,
             scope,
+            dl_answers: None,
         }
     }
 }
@@ -140,4 +143,7 @@ pub struct SerializedQueryResult {
     /// What the OWL 2 QL rewriting did and whether the answers are complete; `None` where
     /// it doesn't apply.
     pub ql: Option<nrese_sparql::ql::QlReport>,
+    /// Whether the answers are complete, where a reasoning path can leave some out (the
+    /// status [`crate::StoreService::run_query_reporting`] reports).
+    pub completeness: Option<nrese_sparql::Completeness>,
 }
