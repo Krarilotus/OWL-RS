@@ -76,6 +76,12 @@ pub struct QueryOptions {
     pub result_cache: Option<std::sync::Arc<crate::ResultCache>>,
     /// Pin the query's result in the result cache under a name.
     pub pin: Option<crate::PinRequest>,
+    /// OWL 2 QL answers through existentials (docs/design/ql-rewriting.md): the store's
+    /// tree-witness rewriting, set while its closure is current under a ruleset that makes
+    /// the data H-complete; `None`: off. Applies to queries over the default graph that read
+    /// the inferred statements, without a dataset, access restrictions or pre-bound
+    /// variables.
+    pub ql: Option<std::sync::Arc<crate::ql::QlRewriting>>,
 }
 
 /// Evaluates `query` against `view` over the engine's id tables (`native`); a transaction
@@ -103,7 +109,8 @@ fn for_view<'o>(view: &impl ReadView, options: &'o QueryOptions) -> Cow<'o, Quer
 }
 
 /// What the result cache holds of `query`'s whole answer on `view` written in `format`
-/// (the media type with its parameters, as sent): its bytes, or a slot to offer them to
+/// (the media type with its parameters, as sent) and `context` (what else the caller's
+/// answer depends on: the store's reasoning mode, the status it reports): its bytes, or a slot to offer them to
 /// once written, or nothing to do with the cache ([`crate::cache`]). A transaction's
 /// pending state, a pin and pre-bound variables are never answered from it.
 pub fn cached_output<V: ReadView>(
@@ -111,6 +118,7 @@ pub fn cached_output<V: ReadView>(
     query: &Query,
     options: &QueryOptions,
     format: &str,
+    context: &str,
 ) -> crate::cache::CachedOutput {
     use crate::cache::CachedOutput;
     let (Some(cache), Some(snapshot), None) =
@@ -118,7 +126,7 @@ pub fn cached_output<V: ReadView>(
     else {
         return CachedOutput::Off;
     };
-    match crate::native::output_key(snapshot, query, options, format) {
+    match crate::native::output_key(snapshot, query, options, format, context) {
         Some(key) => cache.output(key),
         None => CachedOutput::Off,
     }
@@ -176,12 +184,22 @@ pub struct Explanation {
     /// `native`: the executor (one; the field stays for the report's format).
     pub executor: &'static str,
     /// The rewrites that changed the query before it ran, in the order applied:
-    /// `triple-terms`, `join-groups`, `filter-pushdown`, `ask-limit`.
+    /// `triple-terms`, `ql-tree-witness` (and `ql-limit` where a pattern reached a bound of
+    /// the QL rewriting), `join-groups`, `filter-pushdown`, `ask-limit`.
     pub rewrites: Vec<&'static str>,
     pub steps: Vec<PlanStep>,
     /// Solutions (1 or 0 for ASK); CONSTRUCT and DESCRIBE count triples.
     pub rows: u64,
     pub micros: u64,
+    /// What the OWL 2 QL rewriting did, and whether the answers are complete; `None` where
+    /// it doesn't apply.
+    pub ql: Option<crate::ql::QlReport>,
+    /// Whether the answers are complete, where a reasoning path can leave some out: the
+    /// status the answers carry (set by the store: QL's, the DL bounds', a closure's).
+    pub completeness: Option<crate::completeness::Completeness>,
+    /// What decided the status (the DL bounds' paths: `closed-predicates`,
+    /// `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`).
+    pub decided_by: Vec<&'static str>,
 }
 
 /// Runs `query` like [`evaluate_query`], consuming its results, and reports how it ran:
@@ -193,7 +211,7 @@ pub fn explain_query<V: ReadView>(
 ) -> Result<Explanation, QueryEvaluationError> {
     let start = std::time::Instant::now();
     let snapshot = view.evaluation_snapshot();
-    let (rewrites, steps, rows) =
+    let (rewrites, steps, rows, ql) =
         crate::native::explain(&snapshot, query, &for_view(view, options))?;
     Ok(Explanation {
         executor: "native",
@@ -201,6 +219,9 @@ pub fn explain_query<V: ReadView>(
         steps,
         rows,
         micros: start.elapsed().as_micros() as u64,
+        ql,
+        completeness: None,
+        decided_by: Vec::new(),
     })
 }
 
@@ -223,6 +244,10 @@ pub struct PlannedQuery {
     /// The rewrites that changed the query, in the order applied (as in [`Explanation`]).
     pub rewrites: Vec<&'static str>,
     pub steps: Vec<PlannedStep>,
+    /// As in [`Explanation`].
+    pub ql: Option<crate::ql::QlReport>,
+    /// What the store can say about completeness before running (set by the store).
+    pub completeness: Option<crate::completeness::Completeness>,
 }
 
 /// The plan `query` would run as on `view`, after the rewrites, each node with an estimate
@@ -233,8 +258,24 @@ pub fn plan_query<V: ReadView>(
     options: &QueryOptions,
 ) -> Result<PlannedQuery, QueryEvaluationError> {
     let snapshot = view.evaluation_snapshot();
-    let (rewrites, steps) = crate::native::plan(&snapshot, query, options)?;
-    Ok(PlannedQuery { rewrites, steps })
+    let (rewrites, steps, ql) = crate::native::plan(&snapshot, query, options)?;
+    Ok(PlannedQuery {
+        rewrites,
+        steps,
+        ql,
+        completeness: None,
+    })
+}
+
+/// What the OWL 2 QL rewriting does to `query` on `view` and whether its answers are
+/// complete (docs/design/ql-rewriting.md), without running it; `None` where the rewriting
+/// doesn't apply. The status [`evaluate_query`]'s answers on the same view go with.
+pub fn ql_report<V: ReadView>(
+    view: &V,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<Option<crate::ql::QlReport>, QueryEvaluationError> {
+    crate::native::ql_report(&view.evaluation_snapshot(), query, options)
 }
 
 /// True if `query` would run on the native executor over a snapshot with default options.

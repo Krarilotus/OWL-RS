@@ -194,6 +194,29 @@ impl Snapshot {
         }
     }
 
+    /// This snapshot with `added` statements in its inferred stack, for a reader of facts
+    /// the store keeps apart from its stacks (the `owl2-dl` mode's upper bound): never
+    /// published, so no other reader sees them. Like [`Self::with_inferred_subset`] it has
+    /// statistics and equality classes of its own. O(k log k) for k statements, as one
+    /// more run.
+    pub fn with_inferred_added(&self, added: &[EncodedQuad]) -> Snapshot {
+        Snapshot {
+            version: Arc::new(Version {
+                // Other statements than this snapshot's, at its revision.
+                content: super::Content::fresh(),
+                asserted: self.version.asserted.clone(),
+                inferred: self.version.inferred.with_delta(added, &[]),
+                revision: self.version.revision,
+                dictionary_len: self.version.dictionary_len,
+                equality: Default::default(),
+            }),
+            dictionary: Arc::clone(&self.dictionary),
+            statistics: Arc::default(),
+            equality: self.equality,
+            canonical: self.canonical,
+        }
+    }
+
     /// This snapshot with the inferred statements `mask` hides removed, as
     /// [`Self::with_inferred_subset`] does, by stacking its runs: O(r) for its r runs.
     /// `None` if the mask was built for another layout of the stack.

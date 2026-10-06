@@ -34,6 +34,22 @@ pub struct ReadyResponse {
     pub reasoning_profile: &'static str,
     pub reasoning_read_model: &'static str,
     pub reasoning_semantic_tier: &'static str,
+    /// Under `owl2-dl`: the data's consistency under OWL 2 DL, as last checked.
+    pub dl: Option<DlReady>,
+}
+
+/// The `owl2-dl` mode's status.
+#[derive(Debug, Serialize)]
+pub struct DlReady {
+    /// `consistent`, `inconsistent` or `unknown` (not checked yet, not decided, or off).
+    pub consistency: &'static str,
+    /// Why it is `unknown`.
+    pub reason: Option<String>,
+    /// The engine that decided: `context-core`, `hypertableau`, or `none`.
+    pub engine: &'static str,
+    /// The revision it was checked at (older than `revision` after a write past the
+    /// pipeline).
+    pub revision: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +202,24 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
         reasoning_profile: posture.reasoning_profile,
         reasoning_read_model: posture.reasoning_read_model,
         reasoning_semantic_tier: posture.reasoning_semantic_tier,
+        dl: state
+            .store()
+            .dl()
+            .active()
+            .then(|| match state.store().dl().status() {
+                Some(status) => DlReady {
+                    consistency: status.consistency.verdict.as_str(),
+                    reason: status.consistency.verdict.reason().map(str::to_owned),
+                    engine: status.consistency.engine,
+                    revision: Some(status.revision),
+                },
+                None => DlReady {
+                    consistency: "unknown",
+                    reason: Some("not checked since the start".to_owned()),
+                    engine: "none",
+                    revision: None,
+                },
+            }),
     })
 }
 

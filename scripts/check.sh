@@ -69,7 +69,8 @@ dependents_of() {
 
 package_args() { local name; for name in "$@"; do printf -- '-p %s ' "$name"; done; }
 
-# Tests of `all` crates, with the slow binaries of `fast_only` left out.
+# Tests of `all` crates, with the slow binaries of `fast_only` left out. Python's output is
+# read without carriage returns: Windows writes them, and cargo rejects names with them.
 run_tests() {
   local -a all=() fast_only=()
   local into=all arg
@@ -80,7 +81,7 @@ run_tests() {
   [ ${#all[@]} -eq 0 ] && return 0
   if nextest; then
     local filter=""
-    [ ${#fast_only[@]} -gt 0 ] && filter=$(python scripts/lib/test-targets.py exclude "${fast_only[@]}")
+    [ ${#fast_only[@]} -gt 0 ] && filter=$(python scripts/lib/test-targets.py exclude "${fast_only[@]}" | tr -d '\r')
     # shellcheck disable=SC2046
     "$guarded" nextest run --locked --no-fail-fast $(package_args "${all[@]}") \
       ${filter:+-E "$filter"}
@@ -90,7 +91,7 @@ run_tests() {
     for arg in "${fast_only[@]}"; do fast[$arg]=1; done
     for arg in "${all[@]}"; do
       if [ -n "${fast[$arg]:-}" ]; then
-        line=$(python scripts/lib/test-targets.py fast "$arg")
+        line=$(python scripts/lib/test-targets.py fast "$arg" | tr -d '\r')
         [ -n "$line" ] || continue
         # shellcheck disable=SC2086
         "$guarded" test --locked --no-fail-fast $line || code=$?
@@ -164,7 +165,8 @@ case "$mode" in
     step fmt cargo fmt --all --check
     step clippy "$guarded" clippy --locked --workspace --all-targets -- -D warnings
     mapfile -t everything < <(cargo metadata --no-deps --format-version 1 --offline \
-      | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))")
+      | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
+      | tr -d '\r')
     step test run_tests "${everything[@]}"
     step "doc tests" "$guarded" test --locked --workspace --doc
     harness

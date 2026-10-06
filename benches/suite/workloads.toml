@@ -64,7 +64,7 @@ tasks = ["RT3", "RT5"]
 needs = ["load", "query", "update", "reason-rdfs"]
 scales = "50 M, 256 M, 1 B statements"
 source = "github.com/ldbc/ldbc_spb_bm_2.0"
-licence = "to check before use"
+licence = "Apache-2.0; unaudited results are \"not an LDBC benchmark result\" (LDBC fair-use policy)"
 tiers = ["50m", "256m"]
 state = "planned"
 check = "the benchmark's own validation of query results and of its OWL 2 RL rules"
@@ -186,7 +186,7 @@ tasks = ["basics"]
 needs = ["load", "query"]
 scales = "DBLP (about 500 M statements), Wikidata truthy (about 8 B)"
 source = "github.com/ad-freiburg/sparqloscope (ISWC 2025)"
-licence = "to check before use"
+licence = "Apache-2.0"
 tiers = ["dblp"]
 state = "planned"
 check = "result sizes across systems"
@@ -212,7 +212,7 @@ tasks = ["basics"]
 needs = ["load", "query"]
 scales = "10 M to 1 B statements"
 source = "dsg.uwaterloo.ca/watdiv"
-licence = "to check before use"
+licence = "none stated (generator on GitHub); data generated, not redistributed"
 tiers = ["10m", "100m"]
 state = "planned"
 check = "row counts across systems"
@@ -303,6 +303,24 @@ licence = "to check before use"
 tiers = ["-"]
 state = "planned"
 check = "answers against the single-store run"
+
+# --- the fast suite -----------------------------------------------------------------------
+
+[fast]
+title = "The fast suite's cases on their comparators: each case under the semantics a system supports"
+kind = "performance"
+tasks = ["basics", "RT1", "RT3"]
+# load only: rule engines without SPARQL (Nemo) have their closure answered by Oxigraph, as
+# for LUBM; the plain cases' stores all have query.
+needs = ["load"]
+scales = "generated, 10-300 s per case (benches/fast/cases.toml)"
+source = "benches/fast: perf_lab generate (deterministic, seeded) and the reasoning kit's LUBM and OWL2Bench"
+licence = "ours; LUBM GPL-2.0 (generator), OWL2Bench queries CC-BY-4.0"
+tiers = ["q-cycles~plain", "rl-hierarchy~closure", "rl-clique"]
+state = "partial"
+kit = "benches/fast"
+check = "the generator's own answers and pinned counts (fast.py run); answer counts across systems"
+note = "Tier = CASE~SEMANTICS (benches/fast/compete.py prepares the data in the volume nrese-fast-data). NRESE runs every case in benches/fast/fast.py; this workload is the comparison"
 
 # --- the consumers ---------------------------------------------------------------------------
 
