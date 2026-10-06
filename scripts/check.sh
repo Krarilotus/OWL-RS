@@ -108,20 +108,41 @@ run_tests() {
 # ones and a failure replays (NRESE_FUZZ_SEED=<seed>). The fuzz campaign runs many more.
 run_seeds() {
   local -A wanted=()
-  local name entry crate target filter seed code=0
+  local -a crates=() exprs=()
+  local name crate target filter seed binary code=0
   for name in "$@"; do wanted[$name]=1; done
   local base=$(( 16#$(git rev-parse --short=6 HEAD) % 100000 + 1000 ))
   while IFS=: read -r crate target filter; do
     [ -n "${wanted[$crate]:-}" ] || continue
-    local kind=(--test "$target")
-    [ "$target" = lib ] && kind=(--lib)
-    for seed in $base $((base + 1)) $((base + 2)); do
+    crates+=("$crate")
+    binary=$crate
+    [ "$target" = lib ] || binary="$crate::$target"
+    exprs+=("(binary_id($binary)${filter:+ & test($filter)})")
+  done < <(grep -v '^#' scripts/lib/fuzz-targets.txt | tr -d '\r' | grep .)
+  [ ${#exprs[@]} -gt 0 ] || return 0
+  local expr
+  expr=$(IFS='|'; echo "${exprs[*]}")
+  for seed in $base $((base + 1)) $((base + 2)); do
+    if nextest; then
+      # One run per seed: every random test of every changed crate in parallel.
+      # shellcheck disable=SC2046
+      if ! NRESE_FUZZ_SEED=$seed "$guarded" nextest run --locked --no-fail-fast \
+          $(package_args "${crates[@]}") -E "$expr" > /dev/null 2>&1; then
+        echo "random tests fail: NRESE_FUZZ_SEED=$seed cargo nextest run -E '$expr'"
+        code=1
+      fi
+      continue
+    fi
+    while IFS=: read -r crate target filter; do
+      [ -n "${wanted[$crate]:-}" ] || continue
+      local kind=(--test "$target")
+      [ "$target" = lib ] && kind=(--lib)
       if ! NRESE_FUZZ_SEED=$seed "$guarded" test --locked -q -p "$crate" "${kind[@]}" -- $filter > /dev/null 2>&1; then
         echo "random tests fail: NRESE_FUZZ_SEED=$seed cargo test -p $crate ${kind[*]} -- $filter"
         code=1
       fi
-    done
-  done < <(grep -v '^#' scripts/lib/fuzz-targets.txt | tr -d '\r' | grep .)
+    done < <(grep -v '^#' scripts/lib/fuzz-targets.txt | tr -d '\r' | grep .)
+  done
   return $code
 }
 

@@ -20,13 +20,14 @@ Read [docs/README.md](docs/README.md) (which document answers what),
 
 ## Boundaries
 
-- Work in your own branch and worktree. The lead merges and pushes. Never skip the hooks.
+- Work in your own branch and worktree. The maintainer merges and pushes. Never skip the hooks.
 - Delete only what you created; stop processes by PID. Large datasets live once, read-only,
   in `C:\Users\Johannes\nrese-data\` on the main PC; point to them, never copy them into a
   worktree.
 - `literature/` is read-only. Results of licensed systems are never committed.
 - Write files with the editor tools; the shell mangles backslashes.
-- Commit messages end with `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`.
+- A commit written by an AI agent ends with its `Co-Authored-By` trailer (Claude's:
+  `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`).
 
 ## Reporting
 
