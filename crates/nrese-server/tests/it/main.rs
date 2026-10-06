@@ -26,3 +26,4 @@ mod rdf4j_protocol_tests;
 mod replication_tests;
 mod shacl_api_tests;
 mod tell_api_tests;
+mod upgrade_tests;

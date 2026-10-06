@@ -1,0 +1,30 @@
+@prefix : <http://e/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+# The schema: a hierarchy, sub-properties, a domain and range, an inverse, a transitive
+# property, an intersection and a someValuesFrom on the left (OWL 2 RL rules), and an
+# existential on the right (answers only the QL rewriting finds).
+:Professor rdfs:subClassOf :Faculty .
+:Faculty rdfs:subClassOf :Person .
+:Student rdfs:subClassOf :Person .
+:headOf rdfs:subPropertyOf :worksFor .
+:worksFor rdfs:domain :Person ; rdfs:range :Organisation .
+:member owl:inverseOf :memberOf .
+:subOrganisationOf a owl:TransitiveProperty .
+:Chair owl:equivalentClass [ owl:intersectionOf ( :Person
+        [ a owl:Restriction ; owl:onProperty :headOf ; owl:someValuesFrom :Department ] ) ] .
+:Employee rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :worksFor ;
+        owl:someValuesFrom :Organisation ] .
+:Faculty rdfs:subClassOf :Employee .
+
+:ann a :Professor ; :headOf :dept1 ; :name "Ann" ; :age "52"^^xsd:integer .
+:bob a :Student ; :memberOf :dept1 ; :name "Bob"@en .
+:cat a :Faculty .
+:dept1 a :Department ; :subOrganisationOf :school1 .
+:school1 :subOrganisationOf :uni1 .
+:uni1 :name "University One" .
+# Equality: one individual under two names.
+:ann owl:sameAs :annie .
+:annie :email "ann@example.org" .

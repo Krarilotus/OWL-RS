@@ -1,0 +1,3 @@
+# Answers v2 gives on purpose that main didn't (upgrade_tests.rs applies them to main's).
+# repository<TAB>query<TAB>+row or -row<TAB>why
+ql	works-somewhere	+<http://e/jo>	the QL rewriting: under owl2-ql it is on by default (reasoner.ql_rewriting = auto); jo is an Employee, and Employee ⊑ ∃worksFor.Organisation
