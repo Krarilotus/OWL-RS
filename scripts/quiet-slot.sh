@@ -43,4 +43,5 @@ while [ "$(compilers)" -gt 0 ] && [ $((SECONDS - start)) -lt "$DRAIN" ]; do
   sleep 5
 done
 [ "$(compilers)" -gt 0 ] && echo "quiet slot: compilers still running after ${DRAIN} s; measuring anyway" >&2
-"$@"
+# What the measurement builds itself doesn't wait for the slot it holds.
+NRESE_QUIET_HOLDER=1 "$@"
