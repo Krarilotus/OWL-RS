@@ -7,6 +7,11 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+
+# Test binaries that take more than ~15 s (the W3C N3 suites): the push tier runs them when this
+# crate changed, the commit tier never (scripts/check.sh).
+[package.metadata.nrese]
+slow-tests = ["w3c_n3"]
 [dependencies]
 foldhash = { workspace = true }
 memchr = { workspace = true }
