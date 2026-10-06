@@ -185,7 +185,8 @@ struct Args {
     routes: bool,
     commits: Option<PathBuf>,
     readers: usize,
-    clients: usize,
+    clients: Vec<usize>,
+    cache_bytes: usize,
     duration: Duration,
     threads: Option<usize>,
     export: Option<PathBuf>,
@@ -218,7 +219,8 @@ fn parse_args() -> Result<Args, String> {
         routes: false,
         commits: None,
         readers: 0,
-        clients: 0,
+        clients: Vec::new(),
+        cache_bytes: 0,
         duration: Duration::from_secs(10),
         threads: None,
         export: None,
@@ -269,8 +271,17 @@ fn parse_args() -> Result<Args, String> {
             "--readers" => {
                 args.readers = value()?.parse().map_err(|e| format!("--readers: {e}"))?
             }
+            "--cache-bytes" => {
+                args.cache_bytes = value()?
+                    .parse()
+                    .map_err(|e| format!("--cache-bytes: {e}"))?
+            }
             "--clients" => {
-                args.clients = value()?.parse().map_err(|e| format!("--clients: {e}"))?
+                args.clients = value()?
+                    .split(',')
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| format!("--clients: {e}"))?
             }
             "--duration-s" => {
                 args.duration = Duration::from_secs_f64(
@@ -741,7 +752,8 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     // `NRESE_REASONING_EQUALITY_ANSWERS`).
     let setting = |name: &str| std::env::var(name).unwrap_or_default();
     let config = StoreConfig {
-        query_cache_bytes: 0,
+        // No result cache unless --cache-bytes: repeated runs measure evaluation.
+        query_cache_bytes: args.cache_bytes,
         bulk_load_memory_bytes,
         index_encoding,
         vocabulary,
@@ -929,11 +941,26 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         }
         phases.push(("commits", phase.json()));
     }
-    if args.clients > 0 {
-        report.sections.push((
-            "clients",
-            modes::clients(&store, &texts, args.clients, args.duration)?,
-        ));
+    if !args.clients.is_empty() {
+        // One level per count of clients, each with its own peak memory.
+        let mut levels = Vec::new();
+        for &clients in &args.clients {
+            let phase = Phase::start();
+            let level = modes::clients(&store, &texts, clients, args.duration)?;
+            levels.push(format!(
+                "{}, \"memory\": {}}}",
+                level.trim_end_matches('}'),
+                phase.json()
+            ));
+        }
+        report
+            .sections
+            .push(("clients", levels.last().cloned().unwrap_or_default()));
+        if levels.len() > 1 {
+            report
+                .sections
+                .push(("client_sweep", format!("[{}]", levels.join(", "))));
+        }
     }
     if !args.canonicalize.is_empty() {
         report.sections.push((
@@ -1067,6 +1094,16 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         phases.push(("queries", queries_phase.json()));
     }
     report.sections.push(("faults_at_end", faults()));
+    if args.cache_bytes > 0 {
+        let cache = store.query_cache_stats();
+        report.sections.push((
+            "cache",
+            format!(
+                "{{\"hits\": {}, \"misses\": {}, \"entries\": {}, \"bytes\": {}}}",
+                cache.hits, cache.misses, cache.entries, cache.bytes
+            ),
+        ));
+    }
     if !phases.is_empty() {
         let members: Vec<String> = phases
             .iter()

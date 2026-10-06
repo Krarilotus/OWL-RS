@@ -42,6 +42,21 @@ LICENSED = {"graphdb", "rdfox", "stardog", "anzograph"}
 RESULTS = fast.HERE / "results"
 
 
+# How far the stores without reasoning can be given a reasoning case's queries as SPARQL
+# (benches/PROTOCOL.md §3): RDFS, OWL 2 QL and property axioms between named individuals
+# (sub-properties, inverse, symmetric, transitive, regular chains) as property paths; RL
+# and EL only per query (paths are NLogSpace, RL and EL PTime-complete); sameAs and DL not.
+REWRITE_BY_SEMANTICS = {"rdfs": "expressible", "rdfs-full": "expressible", "owl2-ql": "expressible",
+                        "rdfs-plus": "per-query", "owl-horst": "per-query", "owl2-rl": "per-query",
+                        "custom": "per-query", "el": "not-expressible", "dl": "not-expressible"}
+
+
+def rewrite_class(case: dict) -> str:
+    """`expressible`, `per-query` or `not-expressible`: the case's own `rewrite`, else its
+    semantics'."""
+    return case.get("rewrite") or REWRITE_BY_SEMANTICS.get(case["semantics"], "expressible")
+
+
 def unsupported_mode(case: dict) -> str | None:
     """What a case measures that the suite's cycle (load, count, queries, clients) doesn't."""
     args = case.get("args", [])
@@ -90,10 +105,12 @@ def export_closure(case: dict) -> str | None:
 
 
 def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: str,
-              queries: Path | None = None) -> list[dict]:
-    """The suite's driver on tier CASE~SEMANTICS for NRESE and `systems`; its rows."""
+              queries: Path | None = None, track: str = "", settings: dict | None = None) -> list[dict]:
+    """The suite's driver on tier CASE~SEMANTICS for NRESE and `systems`; its rows. A track
+    (the case's `tracks`) adds its settings, such as how many queries a store answers at
+    once."""
     tier = f"{case['name']}~{semantics}"
-    out = RESULTS / stamp / tier.replace("~", "-")
+    out = RESULTS / stamp / (tier.replace("~", "-") + (f"-{track}" if track else ""))
     cap = max(int(case["cap_gb"]), 8)
     env = {**fast.ENV, "NRESE_TARGET_VOLUME": fast.TARGET_VOLUME, "DOCKER_MEMORY": f"{cap}g",
            "JAVA_HEAP": f"{max(cap - 2, 2)}g", "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS", "4"),
@@ -101,6 +118,7 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
            "CARGO_TARGET_DIR": str(fast.ROOT / "target")}
     if queries:
         env["FAST_QUERIES"] = str(queries)
+    env.update(settings or {})
     command = [sys.executable, str(fast.ROOT / "benches/suite/suite.py"), "run",
                "--systems", ",".join(["nrese", *systems]), "--workloads", "fast", "--tier", f"fast={tier}",
                "--runs", str(runs), "--query-runs", "2", "--cache", "off", "--skip-build",
@@ -134,6 +152,10 @@ def summarise_suite(rows: list[dict]) -> dict[str, dict]:
             s["reason_ms"] = float(r["ms"])
         if r["task"] == "count" and r["rows"]:
             s["statements"] = int(r["rows"])
+        if r["task"] == "query" and r["item"].startswith("clients-") and r["ms"]:
+            s.setdefault("clients", {})[r["item"]] = {"p99_ms": float(r["ms"]), "completed": r["rows"],
+                                                       "note": r.get("note", "")}
+            continue
         if r["task"] == "query" and r["status"] in ("ok", "wrong") and r["repeat"] not in ("0", "") and r["ms"]:
             q = s["queries"].setdefault(r["item"], {"ms": [], "rows": r["rows"]})
             q["ms"].append(float(r["ms"]))
@@ -308,6 +330,18 @@ def compete(args) -> int:
                 result["no_runner"].append(f"{system}:{semantics} (licensed; --licensed)")
             elif system in DL_SYSTEMS and semantics in ("dl", "el"):
                 dl.append(system)
+            elif semantics == "rewritten":
+                # The case's queries as NRESE's OWL 2 QL rewriter prints them (headline:
+                # property paths; secondary: VALUES lists of the hierarchy NRESE computed),
+                # never written by hand; NRESE runs the path form with reasoning off too.
+                verdict = rewrite_class(case)
+                if verdict == "not-expressible":
+                    result["comparisons"][f"{system}:rewritten"] = {
+                        "status": "not expressible",
+                        "why": "needs sameAs, DL or recursive RL/EL rules: reasoning in the store wins here"}
+                else:
+                    result["no_runner"].append(
+                        f"{system}:rewritten ({verdict}; waits for the OWL 2 QL rewriter's SPARQL printer, ql/tree-witness)")
             elif system == "nemo" and semantics == "custom":
                 result["comparisons"]["nemo:custom"] = nemo_custom(case)
             elif system in SUITE_SYSTEMS and semantics in FAST_REGIMES and unsupported_mode(case):
@@ -343,14 +377,19 @@ def compete(args) -> int:
             continue
         key = f"{first['name']}-{semantics}" + ("-clients" if clients else "")
         queries = merged_queries(group["cases"], key) if len(group["cases"]) > 1 else None
-        rows = suite_run(first, semantics, sorted(group["systems"]), args.runs, stamp, queries)
-        summary = summarise_suite(rows)
-        for case in group["cases"]:
-            mine = split(summary, case["name"]) if queries else summary
-            report["cases"][case["name"]]["comparisons"][semantics] = {"summary": mine, "verdicts": verdicts(mine)}
-            print(f"\n{case['name']} ({semantics})")
-            print_case(case["name"], {"comparisons": {semantics: report["cases"][case["name"]]["comparisons"][semantics]},
-                                      "no_runner": []})
+        # A case's tracks (defaults, best configuration) each run with their own settings.
+        tracks = first.get("tracks") or {"": {}}
+        for track, settings in tracks.items():
+            rows = suite_run(first, semantics, sorted(group["systems"]), args.runs, stamp, queries,
+                             track, {k: str(v) for k, v in settings.items()})
+            summary = summarise_suite(rows)
+            label = f"{semantics}@{track}" if track else semantics
+            for case in group["cases"]:
+                mine = split(summary, case["name"]) if queries else summary
+                report["cases"][case["name"]]["comparisons"][label] = {"summary": mine, "verdicts": verdicts(mine)}
+                print(f"\n{case['name']} ({label})")
+                print_case(case["name"], {"comparisons": {label: report["cases"][case["name"]]["comparisons"][label]},
+                                          "no_runner": []})
         save()
     save()
     print(f"\nresults: {(RESULTS / stamp / 'compete.json').relative_to(fast.ROOT)}")
@@ -373,6 +412,9 @@ def print_case(name: str, result: dict):
             continue
         if semantics == "nemo:custom":
             print(f"  nemo (custom rules): {comparison}")
+            continue
+        if semantics.endswith(":rewritten"):
+            print(f"  rewritten  {semantics.split(':')[0]:<9} {comparison['status']}: {comparison['why']}")
             continue
         for system, v in comparison["verdicts"].items():
             restricted = " (restricted: stays local)" if v["publish"] != "free" else ""
