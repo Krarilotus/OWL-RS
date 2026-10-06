@@ -171,8 +171,6 @@ pub async fn stream_blocking(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use futures_util::StreamExt;
@@ -205,13 +203,16 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// On tokio's paused clock: the deadline passes when the test advances the clock, and
+    /// the test waits for the producer's own signal that it stopped, so no timing under
+    /// load decides it (it failed once under the gate's parallel load when it slept 1.5 s
+    /// of real time and then looked).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn an_unread_body_stops_its_producer_at_the_deadline() {
         let deadline = Instant::now() + Duration::from_millis(300);
         let cancellation = CancellationToken::new();
         let token = cancellation.clone();
-        let done = Arc::new(AtomicBool::new(false));
-        let finished = done.clone();
+        let (stopped, on_stop) = std::sync::mpsc::channel();
         let response = stream_blocking(
             deadline,
             cancellation,
@@ -227,18 +228,24 @@ mod tests {
                         break Err(ApiError::internal(error.to_string()));
                     }
                 };
-                finished.store(true, Ordering::SeqCst);
+                stopped.send(()).expect("the test waits");
                 result
             },
         )
         .await
         .unwrap();
-        // The response is held, its body never polled: the channel fills and stays full.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(
-            done.load(Ordering::SeqCst),
-            "the producer still waits for a reader"
-        );
+        // The response is held, its body never polled: the channel fills and stays full,
+        // and the producer waits for room until the deadline. The clock reaches it now.
+        tokio::time::advance(Duration::from_millis(301)).await;
+        // The producer lets go: its wait for room ends, and the deadline's timer cancels
+        // it. Received on a blocking thread, so this runtime keeps driving the timers the
+        // producer waits on; the bound is a guard against a hang, not part of the check.
+        let stopped = tokio::task::spawn_blocking(move || {
+            on_stop.recv_timeout(std::time::Duration::from_secs(120))
+        })
+        .await
+        .unwrap();
+        assert!(stopped.is_ok(), "the producer still waits for a reader");
         drop(response);
     }
 }
