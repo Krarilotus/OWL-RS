@@ -69,7 +69,7 @@ materialisation about 100 B per final statement at peak.
 | Vector search | | VIBE; big-ann filtered track; ann-benchmarks | `vector_search` example only |
 | GraphRAG, text-to-SPARQL | | GraphRAG-Bench; data.world chat-with-data; QALD-10 | none |
 | KG construction | | Text2KGBench; GTFS-Madrid-Bench / KGCW challenge | none |
-| Concurrency and soak | commit latency under readers (as above) | SPB's concurrent mode; BSBM multi-client | scorecard, `soak.py` |
+| Concurrency and soak | commit latency under readers (as above); the client sweep (1-64 clients, Sparqloscope DBLP and BSBM explore) | SPB's concurrent mode; BSBM multi-client | scorecard, `soak.py`; fast cases `clients-sweep`, `writes-under-readers` |
 | Larger than memory | the memory-budget series (16 to 2 GB) on LUBM 1000 | WDBench under a cap | `image-cap-check.sh`, bulk-load budget |
 | Distribution | | LUBM 8000 and WatDiv 1 B on Draco | none (G6 not built) |
 
@@ -120,6 +120,27 @@ the suite's driver.
 | WDBench | data CC0 (Wikidata), on Figshare; queries in the repo (no licence stated: to check) | 1.2 B: about 150 GB N-Triples (est.), NRESE store 70 GB; load peak capped by the bulk-load budget | 2 | NRESE load 6-10 min, QLever 25 min, Jena 4 h (est.); queries with a 60 s limit each, about 2 h per system | QLever, Virtuoso, Jena, Oxigraph (slow load), MillenniumDB, NRESE |
 | FEASIBLE | AGPL-3.0 (code; we run it, don't ship it) | the log's dataset | 2 | – | all |
 | gMark, BeSEPPI | to check | small, generated | 1 each | seconds to minutes | all |
+
+**QLever's published bars for the basics** (from its papers and documentation; hypotheses
+until measured here, PROTOCOL.md):
+
+| Bar | QLever's figure | Our run | Mark |
+|---|---|---|---|
+| Sparqloscope on DBLP (502 M statements) | 0.18 s geometric mean over about 105 queries (penalty 2), the best of six engines (sparqloscope2025 Table 2) | planned (3.2 above) | core |
+| Sparqloscope on Wikidata truthy (7.9 B) | 2.43 s geometric mean, 2.0 % of the queries failed (Table 2) | later, on Draco | core (Draco) |
+| SPARQL with text (`ql:contains-word`, `ql:contains-entity`) | QLever's text search joined with patterns | `text-search` (fast suite) on NRESE's text index; QLever's text index to wire into its adapter | representative |
+| Export of large results | streamed results of millions of rows (TSV, CSV, JSON) | `q-large-result`, `http-large-results.sh` | representative |
+| Load and serve DBLP, then Wikidata truthy | DBLP index in minutes; full Wikidata (about 21 B) in about 5 h with about 20 GB RAM | DBLP planned; Wikidata truthy on Draco | core |
+
+Later goals, from QLever's other strengths (catalogue rows only; no work now):
+
+| Goal | QLever's feature | Our goal | Mark |
+|---|---|---|---|
+| Autocompletion | SPARQL autocompletion while typing (its UI) | G12 exploration (`probes/autocomplete.sh` measures NRESE's) | later (G12) |
+| Maps | the result map view over geometries | G12 | later (G12) |
+| GeoSPARQL spatial joins on OSM | osm2rdf extracts, spatial joins of large geometry sets | 3.8's osm2rdf row | later (G5/G12) |
+| NL to SPARQL (GRASP, GRISP) | question answering over the endpoint | G11 (3.14) | later (G11) |
+| Vector search (QUIVER) | `SERVICE`-based vector search inside SPARQL (September 2026) | G5 (3.13) | later (G5) |
 
 ### 3.3 Updates and writes under readers
 
@@ -340,9 +361,13 @@ model, temperature 0, a token budget, and the API cost recorded per run.
 | SPB's concurrent mode (3.3) | editorial and aggregation agents together | official validator | core | planned |
 | BSBM multi-client | query mixes per hour with 1-64 clients | qualification | representative | probes |
 | Soak (`probes/soak.py`) | errors, memory slope, handles over hours | the soak graph holds exactly what was committed | covered | ready |
+| **The client sweep** (merge checklist §3; measured for no system yet) | `query-mix` with 1, 2, 4, 8, 16, 32 and 64 clients on Sparqloscope's DBLP queries and BSBM explore, and write latency under that read load: throughput against p99, peak memory per concurrent client, throughput per GB. QLever answers one query at a time by default (`--num-simultaneous-queries` 1) and Virtuoso has its `ServerThreads`: both run with their defaults on the defaults track and set to the core count on the best-configuration track (`QLEVER_SIMULTANEOUS_QUERIES`, `VIRTUOSO_SERVER_THREADS`) | answer counts as in the sequential run | core | the fast case `clients-sweep` (social network, lookups) and `writes-under-readers`; the full case planned (needs Sparqloscope and BSBM) |
+| Caching on a repeating log | a realistic query log replayed in order, caches off and on: QLever caches every plan subtree, NRESE whole results (the caching work package) | answers as without the cache | representative | the fast case `cache-replay` (a power-law log over the social network); a real log (HisQu, Wikidata's) planned |
 
 Costs: our own data (LUBM 10 and 100 in the volume); a curve of 5 reader counts × 10 min
-per system; the clients on separate cores (`--cpuset-cpus` on Linux).
+per system; the clients on separate cores (`--cpuset-cpus` on Linux). The client sweep on
+DBLP: the load (NRESE 3 min, QLever 10 min, est.) plus 7 levels × 60 s × 2 tracks per system,
+about 30 min per system. This is QLever's and Virtuoso's home turf.
 
 ### 3.17 Larger than memory
 
@@ -434,6 +459,14 @@ interval.
   count only when their answers equal NRESE's. The stores without reasoning (QLever,
   Oxigraph, Virtuoso) run the plain cases, and the reasoning cases' queries on NRESE's
   exported closure (`closure`): the query side on equal terms, and what reasoning buys.
+  Beside that, they run the reasoning cases' queries rewritten by NRESE's own OWL 2 QL
+  rewriter and printed as SPARQL (`rewritten`; never by hand): property paths as the
+  headline form, `VALUES` lists of NRESE's hierarchy as the second; NRESE runs the path form
+  with reasoning off as well. Answer counts equal NRESE's before a time is compared. RDFS,
+  OWL 2 QL and property axioms between named individuals are expressible this way; RL and EL
+  only per query; `sameAs`, DL and recursive RL/EL rules are not, and are reported per system
+  as "not expressible" (QLever has no reasoning, per its maintainers on 1 February 2026; three
+  RDFS/RL pull requests, #2904, #2905 and #2907, are open and unmerged).
 - **Each case declares its comparators** (`system: semantics`) in `fast/cases.toml`; the
   table below is generated from it (`fast.py table --write`), and `fast.py compete` picks
   the comparators from it. A case only NRESE can run has no comparator: its own column.
@@ -465,20 +498,20 @@ October (its §5, all nine items).
 <!-- fast-cases:start (fast.py table --write) -->
 | Case | Area | NRESE runs | Comparators (system: semantics) | Home turf of | Measures |
 |---|---|---|---|---|---|
-| `rl-hierarchy` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl, qlever: closure, oxigraph: closure |  | a 5,461-class tree and a 1,000-class spine over 1 M typed instances: deep hierarchies cost the rule joins far more than LUBM's (67 s for 9.7 M inherited types with a 1,500 spine, 6 Oct 2026, against 5 s for LUBM 100's 8.7 M) |
-| `rdfs-hierarchy` | reasoning | rdfs | jena: rdfs, rdf4j: rdfs, graphdb: rdfs, rdfox: rdfs |  | the same hierarchy under RDFS |
-| `rl-clique` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl |  | a symmetric and transitive property closing 40 random trees of 300 to cliques (3.6 M pairs) |
-| `rl-sameas` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl |  | owl:sameAs chains: 20,000 groups of 10, a value each, spread to the group (equality by representatives, expanded in the stack) |
-| `rl-sameas-compact` | reasoning | owl2-rl | none: NRESE's own column |  | the same sameAs groups with the stack kept over representatives (equality = compact) |
-| `rl-chain` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl |  | two chains of 2,500 nodes along a transitive property (6.2 M pairs) |
-| `rl-lubm100` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl, qlever: closure, oxigraph: closure, virtuoso: closure |  | LUBM 100 (13.4 M asserted, 8.7 M inferred) and its 14 queries: the headline materialisation |
-| `rl-owl2bench` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl |  | OWL2Bench RL-1: a 1.3 M-pair symmetric-transitive clique from a real TBox, 22 queries |
+| `rl-hierarchy` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl, qlever: closure, oxigraph: closure, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | a 5,461-class tree and a 1,000-class spine over 1 M typed instances: deep hierarchies cost the rule joins far more than LUBM's (67 s for 9.7 M inherited types with a 1,500 spine, 6 Oct 2026, against 5 s for LUBM 100's 8.7 M) |
+| `rdfs-hierarchy` | reasoning | rdfs | jena: rdfs, rdf4j: rdfs, graphdb: rdfs, rdfox: rdfs, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | the same hierarchy under RDFS |
+| `rl-clique` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | a symmetric and transitive property closing 40 random trees of 300 to cliques (3.6 M pairs) |
+| `rl-sameas` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | owl:sameAs chains: 20,000 groups of 10, a value each, spread to the group (equality by representatives, expanded in the stack) |
+| `rl-sameas-compact` | reasoning | owl2-rl | qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | the same sameAs groups with the stack kept over representatives (equality = compact) |
+| `rl-chain` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | two chains of 2,500 nodes along a transitive property (6.2 M pairs) |
+| `rl-lubm100` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl, qlever: closure, oxigraph: closure, virtuoso: closure, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | LUBM 100 (13.4 M asserted, 8.7 M inferred) and its 14 queries: the headline materialisation |
+| `rl-owl2bench` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | OWL2Bench RL-1: a 1.3 M-pair symmetric-transitive clique from a real TBox, 22 queries |
 | `rl-single-thread` | reasoning | owl2-rl | nemo: owl2-rl | GLog/VLog (no runner: Nemo stands in) | LUBM 10 on one thread: materialisation without parallelism |
-| `rdfs-full-lubm10` | reasoning | rdfs-full | none: NRESE's own column |  | LUBM 10 under every RDFS rule and the axiomatic triples |
-| `rdfs-plus-lubm10` | reasoning | rdfs-plus | graphdb: rdfs-plus |  | LUBM 10 under RDFS-Plus |
-| `horst-lubm10` | reasoning | owl-horst | jena: owl-horst, graphdb: owl-horst, anzograph: owl-horst | Jena | LUBM 10 under OWL-Horst (pD*) |
-| `ql-lubm10` | reasoning | owl2-ql | graphdb: owl2-ql, stardog: owl2-ql |  | LUBM 10 under OWL 2 QL, materialised |
-| `custom-tc` | reasoning | custom | nemo: custom, jena: custom | Nemo | transitive closure of a random graph (2,000 nodes, 3,000 edges) as Notation3 user rules |
+| `rdfs-full-lubm10` | reasoning | rdfs-full | qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | LUBM 10 under every RDFS rule and the axiomatic triples |
+| `rdfs-plus-lubm10` | reasoning | rdfs-plus | graphdb: rdfs-plus, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | LUBM 10 under RDFS-Plus |
+| `horst-lubm10` | reasoning | owl-horst | jena: owl-horst, graphdb: owl-horst, anzograph: owl-horst, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten | Jena | LUBM 10 under OWL-Horst (pD*) |
+| `ql-lubm10` | reasoning | owl2-ql | graphdb: owl2-ql, stardog: owl2-ql, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | LUBM 10 under OWL 2 QL, materialised |
+| `custom-tc` | reasoning | custom | nemo: custom, jena: custom, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten | Nemo | transitive closure of a random graph (2,000 nodes, 3,000 edges) as Notation3 user rules |
 | `commits-readers` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 4,000 one-person commits added then removed under OWL 2 RL, with 8 readers running queries |
 | `commits-rdfs` | maintenance | rdfs | graphdb: rdfs, rdfox: rdfs |  | the same commits under RDFS, without readers |
 | `commits-plain` | maintenance | none | rdf4j: plain, oxigraph: plain, jena: plain | RDF4J | 20,000 commits without reasoning: the store's own write path, 4 readers alongside |
@@ -529,7 +562,7 @@ October (its §5, all nine items).
 | `rule-delta-sweep` | rules | owl2-rl | none: NRESE's own column |  | commits of 1, 10, 100, 1,000, 10,000 and 100,000 people under OWL 2 RL, added then removed: maintenance cost against the delta's size |
 | `alloc-lubm10` | memory | owl2-rl | none: NRESE's own column |  | LUBM 10 loaded, materialised (OWL 2 RL) and queried, with allocations and peak memory counted per phase |
 | `alloc-load` | memory | none | none: NRESE's own column |  | a 10 M-statement bulk load with allocations and peak memory counted |
-| `eq-giant-split` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl |  | a 300-member owl:sameAs class (two chains and a bridge link) beside 5,000 small ones; one commit deletes the bridge and the class splits (6 Oct 2026: a 500-member split took 68 s in one commit, 1,000 failed after 242 s, while materialising took 0.2-0.8 s) |
+| `eq-giant-split` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | a 300-member owl:sameAs class (two chains and a bridge link) beside 5,000 small ones; one commit deletes the bridge and the class splits (6 Oct 2026: a 500-member split took 68 s in one commit, 1,000 failed after 242 s, while materialising took 0.2-0.8 s) |
 | `deletes-tail` | maintenance | owl2-rl | graphdb: owl2-rl, rdfox: owl2-rl |  | 3,000 people of the data deleted one per commit under OWL 2 RL: the tail of deletion latency (p99) |
 | `dl-pipeline` | dl | dl | hermit: dl, openllet: dl, konclude: dl |  | a 60,000-class Horn ontology through the DL pipeline: reading, normalisation and the tableau's phases timed apart |
 | `parse-large` | parse | none | none: NRESE's own column |  | parsing and planning without running: 5,000 VALUES, a 1,000-pattern BGP, 500 UNIONs, 120 nested OPTIONALs, 50 nested subqueries, 2,000 ORs, 300 path alternatives, an expression 120 deep (the parser stops at 128 levels) |
@@ -537,10 +570,10 @@ October (its §5, all nine items).
 | `rule-work-lubm10` | rules | owl2-rl | none: NRESE's own column |  | LUBM 10 under OWL 2 RL: rule bindings, membership probes, candidates and new facts per materialisation (§5.1; 6.74 M bindings for 0.83 M new facts on 6 Oct 2026) |
 | `rule-work-owl2bench` | rules | owl2-rl | none: NRESE's own column |  | OWL2Bench RL-1 under OWL 2 RL: the same work counters on a clique-heavy closure (§5.1) |
 | `eq-lubm10-one` | reasoning | owl2-rl | none: NRESE's own column |  | LUBM 10 with one asserted owl:sameAs between two students (§5.2a): the cost of equality appearing at all, against rule-work-lubm10 |
-| `eq-cascade-4` | reasoning | owl2-rl | nemo: owl2-rl |  | LUBM 10 with 1,000 functional-property cascades of depth 4 (§5.2b): each merge triggers the next |
-| `eq-cascade-16` | reasoning | owl2-rl | nemo: owl2-rl |  | the same with cascades of depth 16 (§5.2b) |
+| `eq-cascade-4` | reasoning | owl2-rl | nemo: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | LUBM 10 with 1,000 functional-property cascades of depth 4 (§5.2b): each merge triggers the next |
+| `eq-cascade-16` | reasoning | owl2-rl | nemo: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | the same with cascades of depth 16 (§5.2b) |
 | `eq-merge-compact` | maintenance | owl2-rl | none: NRESE's own column |  | 20 commits that each merge two owl:sameAs groups, the stack kept over representatives (compact), 4 readers alongside (§5.7): the maintained closure must equal a fresh one |
-| `rl-fed-chain` | reasoning | owl2-rl | nemo: owl2-rl |  | a transitive property fed over several rounds through an inverse, a subproperty and a property chain: two chains of 1,500 (§5.9) |
+| `rl-fed-chain` | reasoning | owl2-rl | nemo: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | a transitive property fed over several rounds through an inverse, a subproperty and a property chain: two chains of 1,500 (§5.9) |
 | `index-join-keys` | operator | none | qlever: plain, oxigraph: plain |  | index joins driven by sorted keys: 25 k and 2.5 M keys into a 2.5 M link pattern, allocations counted (§5.3) |
 | `reopen-dbpedia` | load | none | none: NRESE's own column |  | DBpedia core (67 M) on disk, reopened in fresh processes: open, the first and the repeated executions of its 13 queries, page faults, resident after open (§5.4) |
 | `load-threads` | load | none | none: NRESE's own column |  | a 10 M-statement bulk load on 1, 2, 4, 8 and 16 threads: the load's scaling curve (§5.5) |
@@ -549,6 +582,9 @@ October (its §5, all nine items).
 | `ctx-ore-9835` | dl | dl | hermit: dl, konclude: dl |  | the same on ore_ont_9835 (§5.6) |
 | `ctx-ore-7914` | dl | dl | hermit: dl, konclude: dl |  | the same on ore_ont_7914 (§5.6) |
 | `dl-abox-lubm1` | dl | dl | hermit: dl, openllet: dl, konclude: dl |  | LUBM 1's ontology and ABox through the hypertableau: individuals with many edges, each Extend firing over them (§5.8) |
+| `clients-sweep` | concurrency | none | qlever: plain, virtuoso: plain, oxigraph: plain, jena: plain | QLever | 1 to 64 concurrent clients on point lookups and small joins, 4 s per level: throughput against p99, peak memory per level, throughput per GB (NRESE's snapshot reads) |
+| `writes-under-readers` | concurrency | none | none: NRESE's own column | Virtuoso | 10,000 commits without reasoning under 0, 8 and 32 readers: write latency (p99) under read load |
+| `cache-replay` | cache | none | qlever: plain | QLever | a repeating query log (1,000 entries: a few queries recurring by a power law, a long tail of lookups) replayed in order with NRESE's result cache off and on (256 MiB) |
 <!-- fast-cases:end -->
 
 ## 7. Sources

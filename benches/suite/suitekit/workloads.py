@@ -34,7 +34,7 @@ class Plan:
     systems: set[str] | None = None  # kit and writes: the systems it runs on
     unavailable: str | None = None  # why it can't run here at all
     note: str = ""
-    clients: int = 0  # the queries again from this many concurrent clients (throughput, p99)
+    clients: list[int] = field(default_factory=list)  # the queries again from this many concurrent clients each (throughput, p99)
     duration_s: int = 20
 
 
@@ -205,7 +205,7 @@ def fast(root: Path, tier: str, settings: dict) -> Plan:
         plan.queries = Path(settings["FAST_QUERIES"])
     args = case.get("args", [])
     if "--clients" in args:
-        plan.clients = int(args[args.index("--clients") + 1])
+        plan.clients = [int(n) for n in args[args.index("--clients") + 1].split(",")]
         plan.duration_s = int(float(args[args.index("--duration-s") + 1])) if "--duration-s" in args else 20
     return plan
 

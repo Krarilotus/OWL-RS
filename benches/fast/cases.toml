@@ -24,7 +24,14 @@
 #            semantics (fast.py compete): plain = the same SPARQL on the same data;
 #            closure = the same queries on NRESE's exported closure (stores without
 #            reasoning); rdfs, owl-horst, owl2-rl, custom, el, dl = the system's own
-#            reasoner under that semantics. Empty: NRESE only (its own column).
+#            reasoner under that semantics; rewritten = the stores without reasoning
+#            (QLever, Oxigraph, Virtuoso) on the case's queries as NRESE's OWL 2 QL
+#            rewriter prints them (property paths as the headline, VALUES lists of NRESE's
+#            hierarchy as the second form; never by hand), answer counts equal to NRESE's
+#            first. Empty: NRESE only (its own column).
+# rewrite    what that rewriting can express: expressible (RDFS, OWL 2 QL, property axioms
+#            between named individuals), per-query (RL, EL), not-expressible (sameAs, DL,
+#            recursive RL/EL rules: reported per system as a result); default by semantics
 # home_turf  the competitor whose documented strength the case is (CATALOG.md §6)
 # guards     the wins of docs/design/performance.md §0 the case measures
 #
@@ -48,7 +55,7 @@ metric = "reason.p50_ms"
 check = { "q.root.value" = "expect.instances_of_root", "q.spine-middle.value" = "expect.instances_of_spine_middle", "q.h1.value" = "expect.instances_of_h1" }
 route = { "reason.rounds" = "<= 3" }
 cap_gb = 8
-systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:closure", "oxigraph:closure"]
+systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:closure", "oxigraph:closure", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["schema compiled first: sup⁺(c) dispatch, hierarchy module by SCC and bitsets"]
 pinned = "the generator's counts"
 [[case]]
@@ -63,8 +70,8 @@ metric = "reason.p50_ms"
 check = { "q.root.value" = "expect.instances_of_root", "q.spine-middle.value" = "expect.instances_of_spine_middle", "q.h1.value" = "expect.instances_of_h1" }
 route = { "reason.rounds" = "<= 3" }
 cap_gb = 8
-systems = ["jena:rdfs", "rdf4j:rdfs", "graphdb:rdfs", "rdfox:rdfs"]
-
+systems = ["jena:rdfs", "rdf4j:rdfs", "graphdb:rdfs", "rdfox:rdfs", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+rewrite = "expressible"
 [[case]]
 name = "rl-clique"
 area = "reasoning"
@@ -77,9 +84,9 @@ metric = "reason.p50_ms"
 check = { "q.pairs.value" = "expect.pairs", "q.one-component.value" = "300" }
 route = { "reason.rounds" = "<= 3" }
 cap_gb = 6
-systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl"]
+systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["modules for recursive shapes: an equivalence property by union-find"]
-
+rewrite = "expressible"
 [[case]]
 name = "rl-sameas"
 area = "reasoning"
@@ -92,10 +99,9 @@ metric = "reason.p50_ms"
 check = { "q.values.value" = "expect.values", "q.same-as.value" = "expect.same_as_pairs", "q.knows.value" = "expect.knows", "q.group-values.rows" = 10 }
 route = {}
 cap_gb = 6
-systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl"]
+systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["equality by representatives: facts over each class's smallest id, expanded at read time"]
-
-
+rewrite = "not-expressible"
 [[case]]
 name = "rl-sameas-compact"
 area = "reasoning"
@@ -109,8 +115,9 @@ metric = "reason.p50_ms"
 check = { "q.values.value" = "expect.values", "q.same-as.value" = "expect.same_as_pairs", "q.knows.value" = "expect.knows", "q.group-values.rows" = 10 }
 route = { "held.inferred" = "<= 2000000" }
 cap_gb = 6
-systems = []
+systems = ["qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["equality by representatives: facts over each class's smallest id, expanded at read time"]
+rewrite = "not-expressible"
 [[case]]
 name = "rl-chain"
 area = "reasoning"
@@ -123,9 +130,9 @@ metric = "reason.p50_ms"
 check = { "q.pairs.value" = "expect.pairs", "q.from-start.value" = "2499" }
 route = { "reason.rounds" = "<= 3" }
 cap_gb = 6
-systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl"]
+systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["transitive properties by SCC condensation and bitset reachability"]
-
+rewrite = "expressible"
 [[case]]
 name = "rl-lubm100"
 area = "reasoning"
@@ -139,7 +146,7 @@ metric = "reason.p50_ms"
 check = { "reason.inferred" = 8726942, "q.q06.rows" = 1048532, "q.q14.rows" = 795970, "q.q09.rows" = 27247 }
 route = { "reason.rounds" = "<= 6" }
 cap_gb = 12
-systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:closure", "oxigraph:closure", "virtuoso:closure"]
+systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:closure", "oxigraph:closure", "virtuoso:closure", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["P1-F1 drivers read in place", "P1-F4 no list of derived facts", "P1-F8 candidates deduplicated and probed in order"]
 pinned = "NRESE 5 Oct 2026; to equal Nemo's closure plus NRESE's 32 axiomatic statements (fast.py compete)"
 
@@ -155,7 +162,7 @@ metric = "reason.p50_ms"
 check = { "reason.inferred" = 1399563, "q.q20.rows" = 1311932 }
 route = { "reason.rounds" = "<= 6" }
 cap_gb = 6
-systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl"]
+systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 pinned = "NRESE 5 Oct 2026, the closure Nemo and owlrl agree with (run record office-b)"
 [[case]]
 name = "rl-single-thread"
@@ -186,7 +193,7 @@ metric = "reason.p50_ms"
 check = {}
 route = {}
 cap_gb = 4
-systems = []
+systems = ["qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 
 [[case]]
 name = "rdfs-plus-lubm10"
@@ -201,7 +208,7 @@ metric = "reason.p50_ms"
 check = {}
 route = {}
 cap_gb = 4
-systems = ["graphdb:rdfs-plus"]
+systems = ["graphdb:rdfs-plus", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 
 [[case]]
 name = "horst-lubm10"
@@ -216,7 +223,7 @@ metric = "reason.p50_ms"
 check = {}
 route = {}
 cap_gb = 4
-systems = ["jena:owl-horst", "graphdb:owl-horst", "anzograph:owl-horst"]
+systems = ["jena:owl-horst", "graphdb:owl-horst", "anzograph:owl-horst", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 home_turf = "jena"
 
 [[case]]
@@ -232,8 +239,8 @@ metric = "reason.p50_ms"
 check = {}
 route = {}
 cap_gb = 4
-systems = ["graphdb:owl2-ql", "stardog:owl2-ql"]
-
+systems = ["graphdb:owl2-ql", "stardog:owl2-ql", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+rewrite = "expressible"
 [[case]]
 name = "custom-tc"
 area = "reasoning"
@@ -246,9 +253,9 @@ metric = "reason.p50_ms"
 check = { "q.paths.value" = "expect.path_pairs" }
 route = {}
 cap_gb = 6
-systems = ["nemo:custom", "jena:custom"]
+systems = ["nemo:custom", "jena:custom", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 home_turf = "nemo"
-
+rewrite = "expressible"
 # --- maintenance: commits, deletions, readers -------------------------------------------------
 
 [[case]]
@@ -1016,9 +1023,9 @@ metric = "reason.p50_ms"
 check = { "closure_after_commits.equal" = "true", "q.values.value" = "expect.values_after_split" }
 route = {}
 cap_gb = 8
-systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl"]
+systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["Store-2: equality by class ids; a deletion splits a class (B/F style)"]
-
+rewrite = "not-expressible"
 [[case]]
 name = "deletes-tail"
 area = "maintenance"
@@ -1141,9 +1148,9 @@ metric = "reason.p50_ms"
 check = {}
 route = {}
 cap_gb = 4
-systems = ["nemo:owl2-rl"]
+systems = ["nemo:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["investigation #4, G8"]
-
+rewrite = "not-expressible"
 [[case]]
 name = "eq-cascade-16"
 area = "reasoning"
@@ -1157,9 +1164,9 @@ metric = "reason.p50_ms"
 check = {}
 route = {}
 cap_gb = 4
-systems = ["nemo:owl2-rl"]
+systems = ["nemo:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["investigation #4, G8"]
-
+rewrite = "not-expressible"
 [[case]]
 name = "eq-merge-compact"
 area = "maintenance"
@@ -1189,9 +1196,9 @@ metric = "reason.p50_ms"
 check = { "q.pairs.value" = "expect.pairs" }
 route = {}
 cap_gb = 6
-systems = ["nemo:owl2-rl"]
+systems = ["nemo:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["investigation #11: incremental transitive closure in the batch executor (modules phase)"]
-
+rewrite = "expressible"
 [[case]]
 name = "index-join-keys"
 area = "operator"
@@ -1319,3 +1326,55 @@ route = {}
 cap_gb = 6
 systems = ["hermit:dl", "openllet:dl", "konclude:dl"]
 guards = ["investigation #13: edges per (node, role) in the completion graph"]
+
+# --- concurrency and caching (merge checklist §3, 6 Oct 2026) -------------------------------
+
+[[case]]
+name = "clients-sweep"
+area = "concurrency"
+what = "1 to 64 concurrent clients on point lookups and small joins, 4 s per level: throughput against p99, peak memory per level, throughput per GB (NRESE's snapshot reads)"
+semantics = "none"
+data = "social people=300000"
+queries = "lookups"
+args = ["--clients", "1,2,4,8,16,32,64", "--duration-s", "4", "--runs", "3"]
+metric = "clients.p99_ms"
+check = { "q.name.rows" = 1 }
+route = {}
+cap_gb = 6
+systems = ["qlever:plain", "virtuoso:plain", "oxigraph:plain", "jena:plain"]
+tracks = { defaults = { QLEVER_SIMULTANEOUS_QUERIES = "1", VIRTUOSO_SERVER_THREADS = "10" }, best = { QLEVER_SIMULTANEOUS_QUERIES = "16", VIRTUOSO_SERVER_THREADS = "16" } }
+home_turf = "qlever"
+
+[[case]]
+name = "writes-under-readers"
+area = "concurrency"
+what = "10,000 commits without reasoning under 0, 8 and 32 readers: write latency (p99) under read load"
+semantics = "none"
+data = "churn people=200000 changes=5000"
+args = ["--commits", "{data}.commits.ru"]
+sweep = [["--readers", "0"], ["--readers", "8"], ["--readers", "32"]]
+queries = "churn"
+metric = "commits.p99_ms"
+check = { "commits.commits" = 10000 }
+route = {}
+cap_gb = 6
+systems = []
+home_turf = "virtuoso"
+
+[[case]]
+name = "cache-replay"
+area = "cache"
+what = "a repeating query log (1,000 entries: a few queries recurring by a power law, a long tail of lookups) replayed in order with NRESE's result cache off and on (256 MiB)"
+semantics = "none"
+data = "social people=300000"
+queries = "@cache-log"
+args = ["--warmup", "0", "--runs", "1"]
+sweep = [["--cache-bytes", "0"], ["--cache-bytes", "268435456"]]
+metric = "sum_p50_ms"
+check = {}
+route = {}
+cap_gb = 6
+counters = ["cache.hits"]
+systems = ["qlever:plain"]
+home_turf = "qlever"
+guards = ["the caching work package: QLever caches every plan subtree, NRESE whole results"]
