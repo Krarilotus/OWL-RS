@@ -1022,7 +1022,9 @@ impl StoreService {
         if stop() {
             return Err(stopped());
         }
+        nrese_exec::heap::phase("store: inferred stack");
         let summary = rematerialisation.finish(closure.inferred)?;
+        nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
         self.record_reasoning(crate::ReasoningState::of_with(
             rules,
