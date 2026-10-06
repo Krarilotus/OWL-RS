@@ -40,3 +40,19 @@ reference evaluator, the fuzz campaign, and the perf lab (no query set slower).
    choices, EXPLAIN before running.
 4. The executor reads the plan instead of the algebra, node kind by node kind; the algebra
    interpreter shrinks with each.
+
+## Plan parts in the result cache
+
+Every operator the executor evaluates is a part of the result cache (`nrese_sparql::cache`,
+merge checklist §2 item 7): its result is kept as id columns and shared by every query of
+the store, as QLever keeps the result of every subtree of its plan. A part's key is its
+algebra with the variables numbered in the order they occur (so `?s ?p ?o` and `?x ?y ?z`
+are one part), after the context its result depends on: the snapshot's identity, the read
+model, the dataset as resolved for the user's access, the active graph, the equality
+reading, the base IRI and the executor's options. A basic graph pattern is one node of the
+algebra but several joins of the plan: each prefix of its join order (two patterns or
+more, the whole pattern included) is a part, keyed by its triples, their range hints and
+the filter conjuncts applied within it, and a pattern starts from the longest prefix
+cached. Single patterns are scans, not parts: an index read costs what a copy would.
+Until the executor reads the physical plan (step 4), the parts are the algebra's nodes and
+the join prefixes; then they become the physical plan's subtrees.

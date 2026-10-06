@@ -1,5 +1,7 @@
 //! SPARQL query execution over a [`ReadView`].
 
+use std::borrow::Cow;
+
 use nrese_sparql_syntax::Query;
 
 use crate::results::{
@@ -69,6 +71,11 @@ pub struct QueryOptions {
     /// statements that assert them: GeoSPARQL's topology vocabulary without its
     /// query-rewrite extension, which by default also computes them from the geometries.
     pub geosparql_stated_only: bool,
+    /// The store's result cache ([`crate::cache`]): the results of the query's parts are
+    /// looked up in it and offered to it. `None`: everything is computed.
+    pub result_cache: Option<std::sync::Arc<crate::ResultCache>>,
+    /// Pin the query's result in the result cache under a name.
+    pub pin: Option<crate::PinRequest>,
 }
 
 /// Evaluates `query` against `view` over the engine's id tables (`native`); a transaction
@@ -79,7 +86,20 @@ pub fn evaluate_query<'a, V: ReadView>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
-    crate::native::evaluate(view.evaluation_snapshot(), query, options)
+    crate::native::evaluate(view.evaluation_snapshot(), query, &for_view(view, options))
+}
+
+/// `options` for evaluating on `view`: a transaction's pending state is read once, so its
+/// parts are not offered to the result cache (their snapshot identity is the pending
+/// state's own: they could never be hit).
+fn for_view<'o>(view: &impl ReadView, options: &'o QueryOptions) -> Cow<'o, QueryOptions> {
+    match (&options.result_cache, view.snapshot()) {
+        (Some(_), None) => Cow::Owned(QueryOptions {
+            result_cache: None,
+            ..options.clone()
+        }),
+        _ => Cow::Borrowed(options),
+    }
 }
 
 /// A failure while writing results directly ([`write_results`]).
@@ -123,6 +143,9 @@ pub struct PlanStep {
     pub rows: u64,
     /// Wall time including the operator's inputs.
     pub micros: u64,
+    /// Where the result came from if not computed here: `hit` (the result cache) or
+    /// `shared` (another query computing the same part at the same time).
+    pub cache: Option<&'static str>,
 }
 
 /// How a query ran ([`explain_query`]).
@@ -148,7 +171,8 @@ pub fn explain_query<V: ReadView>(
 ) -> Result<Explanation, QueryEvaluationError> {
     let start = std::time::Instant::now();
     let snapshot = view.evaluation_snapshot();
-    let (rewrites, steps, rows) = crate::native::explain(&snapshot, query, options)?;
+    let (rewrites, steps, rows) =
+        crate::native::explain(&snapshot, query, &for_view(view, options))?;
     Ok(Explanation {
         executor: "native",
         rewrites,

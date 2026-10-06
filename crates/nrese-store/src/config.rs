@@ -20,9 +20,12 @@ pub struct StoreConfig {
     /// Ontology file loaded at startup. `None` means no preload; there are no implicit
     /// fallback locations.
     pub ontology_path: Option<PathBuf>,
-    /// Bytes of serialised query results kept for repeated queries on an unchanged store
-    /// (see `query_cache`); 0 disables the cache.
+    /// Bytes of query part results kept for repeated queries and shared sub-patterns on an
+    /// unchanged store (`nrese_sparql::cache`); 0 disables the cache.
     pub query_cache_bytes: usize,
+    /// SPARQL query files whose results are pinned in the result cache at startup, each
+    /// under its file name without the extension.
+    pub pinned_queries: Vec<PathBuf>,
     /// The graph that holds the repository's SHACL shapes.
     pub shapes_graph: String,
     /// The default graph of queries and update `WHERE` clauses that name no dataset is
@@ -178,6 +181,7 @@ impl StoreConfig {
             data_dir: PathBuf::from("./data"),
             ontology_path: None,
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
+            pinned_queries: Vec::new(),
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
             geosparql_stated_only: false,
@@ -206,6 +210,7 @@ impl StoreConfig {
             data_dir: data_dir.into(),
             ontology_path: None,
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
+            pinned_queries: Vec::new(),
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
             geosparql_stated_only: false,
