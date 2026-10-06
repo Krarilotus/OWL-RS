@@ -23,7 +23,9 @@ mod source;
 mod store_env;
 pub mod units;
 
-pub use cli::{CliCommand, CliConfig, ConvertCommand, LoadCommand, QueryCommand};
+pub use cli::{
+    CliCommand, CliConfig, ConvertCommand, LoadCommand, PrintQueryCommand, QueryCommand,
+};
 
 use ai_env::parse_ai_config;
 use env_names as names;
