@@ -68,6 +68,24 @@ async fn answers_carry_their_status() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let response = app.clone().oneshot(get(union, "")?).await?;
     assert_eq!(response.headers()["nrese-completeness"], "sound-only");
+    // Why w is a D: not derived by the rules, explained by OWL 2 DL's axioms.
+    let explain = serde_urlencoded::to_string([
+        ("subj", "<http://example.com/w>"),
+        ("pred", "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"),
+        ("obj", "<http://example.com/D>"),
+    ])?;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/repositories/nrese/explain?{explain}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    assert_eq!(json["owl2_dl"]["minimal"], true);
+    assert_eq!(json["owl2_dl"]["axioms"].as_array().map(Vec::len), Some(3));
     let response = app.oneshot(get(query, "&dl-answers=everything")?).await?;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     Ok(())

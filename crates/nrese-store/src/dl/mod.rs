@@ -6,7 +6,8 @@
 //! - [`consistency`]: consistency by the engine the ontology allows; [`gate`]: the check
 //!   on commit.
 //! - [`classification`]: classification and realisation, kept per revision.
-//! - [`entailment`]: axiom entailment, reduced to consistency.
+//! - [`entailment`]: axiom entailment, reduced to consistency; [`explain`]: why
+//!   something holds, as a minimal set of the ontology's axioms.
 //! - [`lower`]: L's memberships beyond the RL closure, from the TBox's taxonomy.
 //! - [`upper`]: the upper bound U1 in a stack of its own; [`bounds`]: U1 per revision,
 //!   maintained per commit, and the read view queries take.
@@ -22,6 +23,7 @@ pub(crate) mod classification;
 pub mod config;
 pub mod consistency;
 pub mod entailment;
+pub mod explain;
 pub(crate) mod gate;
 pub(crate) mod lower;
 pub(crate) mod query;
