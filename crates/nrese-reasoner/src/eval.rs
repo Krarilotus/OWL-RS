@@ -1368,7 +1368,13 @@ impl GroundProgram {
         // Source-level transitivity rules (`scm-sco`, `scm-spo`) don't depend on the
         // delta: full grounding registers them, delta grounding leaves them alone.
         if let Some(p) = transitive_predicate(rule) {
-            if !delta {
+            // A property chain `p ∘ p ⊑ p` from a list axiom that holds only now (its
+            // facts derived, or rewritten by equality, during a materialisation) is new
+            // in delta grounding too; the vocabulary's (`scm-sco`, over schema atoms)
+            // were registered by full grounding.
+            let new_chain = !self.transitive.contains(&p)
+                && !rule.body.iter().any(|a| schema.is_schema_atom(a));
+            if !delta || new_chain {
                 // With the facts it came from (a property chain `p ∘ p ⊑ p` from a list
                 // axiom); vocabulary rules (`scm-sco`, `eq-trans`) come with none.
                 self.transitive_with(p, extra.to_vec());
