@@ -497,6 +497,20 @@ pub(crate) fn plan_prepared(
     Ok(plan_query(view, &prepared.query, &options)?)
 }
 
+/// What the OWL 2 QL rewriting does to `prepared` on `view`, and whether its answers are
+/// complete (docs/design/ql-rewriting.md §7); `None` where it doesn't apply or the query
+/// doesn't run natively.
+pub(crate) fn ql_status(
+    view: &impl ReadView,
+    prepared: &PreparedQuery,
+    store: &StoreSettings,
+) -> Option<nrese_sparql::ql::QlReport> {
+    let options = explain_options(prepared, store, &CancellationToken::new());
+    nrese_sparql::ql_report(view, &prepared.query, &options)
+        .ok()
+        .flatten()
+}
+
 /// The options `prepared` runs with, for an explanation.
 fn explain_options(
     prepared: &PreparedQuery,

@@ -52,7 +52,8 @@ generalisations):
   RL constructs on the left (`∃R.C ⊑ A`, intersections). The rewriting is complete for
   OWL 2 QL ontologies; for ontologies that also use these, it is sound (the QL part is a
   subset of the ontology, and the closure holds only entailed facts) but may miss answers
-  that need an RL rule to fire on an anonymous individual.
+  that need an RL rule to fire on an anonymous individual. Such a miss is never silent:
+  §7.
 
 **Tree witnesses** (Kikot et al.), per basic graph pattern: a connected set `tᵢ` of the
 pattern's existential variables (blank nodes, and variables nothing outside the pattern
@@ -145,3 +146,44 @@ Tree witnesses can be exponential in the query: k independent ones give 2^k bran
   (a MySQL dump and R2RML mappings) and no longer published as RDF: query times on it are
   the next measurement.
 - Measured cost and answers gained: performance.md §6.
+
+## 7. Completeness, reported with every answer
+
+The rewriting is complete for OWL 2 QL. Over the RL closure, axioms outside QL can meet
+the anonymous individuals it reasons about: a transitive property or a chain links them to
+other individuals, a functional property, key or cardinality makes one equal to a named
+individual, `∃R.C ⊑ A` or an intersection on the left classifies one. Answers through those
+may then be missing. The rewriting doesn't change any answer for it; it says so.
+
+**Detected from the schema at the snapshot** (`nrese-owl::ql`, when the TBox is compiled),
+conservatively:
+- *hazards*: properties that are transitive, in a chain, functional or inverse functional,
+  in a key, or under `allValuesFrom`, `hasValue`, `hasSelf`, a cardinality restriction or a
+  qualified `someValuesFrom` on the left; classes in an intersection, a filler or an
+  enumeration on the left; generating axioms whose filler the rewriting reads only in part;
+  individuals asserted to be in an existential restriction;
+- an anonymous individual's type is *affected* when a property connected to its role (by
+  inclusions, inverses, equivalences or chains) or one of its classes has a hazard;
+- the *affected terms* are the properties and classes of affected types, closed upward
+  along every axiom (from the terms of its premise to those of its conclusion); a hazard
+  that can make individuals equal (functional, keys, cardinality, enumerations) affects
+  every term.
+
+**Per query:** `sound-only` when an atom reads an affected term, when a pattern reached a
+bound (§5), when a predicate or class is a variable, or when a pattern the rewriting doesn't
+enter (`EXISTS`, `MINUS`, `GRAPH`, `SERVICE`, a property path) reads a term the rewriting
+would change; otherwise `complete`. Each reason names the term and the hazard.
+
+**Reported** in EXPLAIN (`ql.completeness` and `ql.reasons`, both forms), in the store's
+results, and with every answer over HTTP: the header `NRESE-QL-Completeness: complete` or
+`sound-only; reasons="…"`, computed on the snapshot the query reads before its first byte.
+
+**Tested** with mixed ontologies in the differential test: QL axioms with transitive,
+chain, functional and inverse functional properties and `owl:sameAs` in the data, under
+`owl2-rl`, against a chase that applies them all (equality by merging elements). Every
+answer must be certain; every query that misses one must say `sound-only`. On 6 October,
+23,828 queries on two seeds: none wrong, 349 missed answers and all said so, none
+silently. The test found two bugs on the way: chains weren't read from the store's
+schema, and a transitive property hid that its inverse was inverse functional. The
+detection is conservative: 15,953 queries said `sound-only` and missed nothing (98 % of
+those flagged), most of them because a functional property makes every term suspect.

@@ -39,6 +39,14 @@ const SCHEMA: &[(&str, &str)] = &[
     (OWL, "intersectionOf"),
     (OWL, "unionOf"),
     (OWL, "disjointUnionOf"),
+    // What the rewriting doesn't follow, for the completeness it reports (design §7).
+    (OWL, "propertyChainAxiom"),
+    (OWL, "hasKey"),
+    (OWL, "oneOf"),
+    (OWL, "complementOf"),
+    (OWL, "hasSelf"),
+    (OWL, "maxCardinality"),
+    (OWL, "maxQualifiedCardinality"),
 ];
 
 /// The classes whose members' `rdf:type` statements are read: what the mapping needs to
@@ -59,7 +67,14 @@ const DECLARATIONS: &[(&str, &str)] = &[
 ];
 
 /// The list-valued properties whose lists are read.
-const LISTS: &[&str] = &["intersectionOf", "unionOf", "disjointUnionOf"];
+const LISTS: &[&str] = &[
+    "intersectionOf",
+    "unionOf",
+    "disjointUnionOf",
+    "propertyChainAxiom",
+    "hasKey",
+    "oneOf",
+];
 
 /// What the QL rewriting did to one query (EXPLAIN, and with every answer).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

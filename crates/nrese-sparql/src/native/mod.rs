@@ -253,8 +253,64 @@ pub(crate) fn ql_report(
     if ql_rewriting(query, options).is_none() {
         return Ok(None);
     }
-    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    Ok(native_pattern(query, options, &ctx)?.3)
+    // Only the steps before the rewriting, not the optimiser: this runs once more per
+    // query, ahead of its answers.
+    let (pattern, form) = pattern_and_form(query);
+    let rewritten;
+    let pattern = if triple_terms::has_open(pattern) {
+        rewritten = triple_terms::rewrite(pattern);
+        &rewritten
+    } else {
+        pattern
+    };
+    Ok(ql_stage(query, options, snapshot, pattern, &form).1)
+}
+
+/// A query's pattern and form.
+fn pattern_and_form(query: &Query) -> (&GraphPattern, Form<'_>) {
+    match query {
+        Query::Select { pattern, .. } => (pattern, Form::Select),
+        Query::Ask { pattern, .. } => (pattern, Form::Ask),
+        Query::Construct {
+            template, pattern, ..
+        } => (pattern, Form::Construct(template)),
+        Query::Describe { pattern, .. } => (pattern, Form::Describe),
+    }
+}
+
+/// The QL rewriting of a query's pattern: the pattern rewritten (`None` if unchanged), and
+/// what it did (`None` where it doesn't apply). A schema with nothing to rewrite leaves the
+/// pattern unread.
+fn ql_stage(
+    query: &Query,
+    options: &QueryOptions,
+    snapshot: &Snapshot,
+    pattern: &GraphPattern,
+    form: &Form<'_>,
+) -> (Option<GraphPattern>, Option<crate::ql::QlReport>) {
+    let Some(ql) = ql_rewriting(query, options) else {
+        return (None, None);
+    };
+    let tbox = ql.tbox(snapshot);
+    if tbox.is_empty() {
+        return (None, Some(crate::ql::QlReport::default()));
+    }
+    let (needed, set) = match form {
+        Form::Select => (None, false),
+        Form::Ask => (Some(Vec::new()), true),
+        Form::Construct(template) => {
+            let mut vars = Vec::new();
+            GraphPattern::Bgp {
+                patterns: template.to_vec(),
+            }
+            .on_in_scope_variable(|v| vars.push(v.clone()));
+            (Some(vars), true)
+        }
+        Form::Describe => (None, true),
+    };
+    let (out, report) = ql::rewrite_query(pattern, &tbox, snapshot, ql.limits(), needed, set);
+    let changed = report.patterns > 0;
+    (changed.then_some(out), Some(report))
 }
 
 pub use output::ResultsFormat;
@@ -438,14 +494,7 @@ fn native_pattern<'q>(
     options: &QueryOptions,
     ctx: &Context<'_>,
 ) -> Result<NativePattern<'q>, QueryEvaluationError> {
-    let (pattern, form) = match query {
-        Query::Select { pattern, .. } => (pattern, Form::Select),
-        Query::Ask { pattern, .. } => (pattern, Form::Ask),
-        Query::Construct {
-            template, pattern, ..
-        } => (pattern, Form::Construct(template)),
-        Query::Describe { pattern, .. } => (pattern, Form::Describe),
-    };
+    let (pattern, form) = pattern_and_form(query);
     let mut rewrites = Vec::new();
     // SPARQL 1.2 triple-term patterns with variables, as plain algebra.
     let rewritten;
@@ -458,37 +507,18 @@ fn native_pattern<'q>(
     };
     // OWL 2 QL answers through existentials, before the optimiser, also as written: it
     // changes the answers, not just the plan.
+    let (ql_pattern, ql_report) = ql_stage(query, options, &ctx.snapshot, pattern, &form);
+    if let Some(report) = &ql_report {
+        if report.patterns > 0 {
+            rewrites.push("ql-tree-witness");
+        }
+        if !report.limits.is_empty() {
+            rewrites.push("ql-limit");
+        }
+    }
     let rewritten_ql;
-    let active = ql_rewriting(query, options);
-    // A schema with nothing to rewrite leaves the query alone, unread.
-    let ql = active
-        .map(|ql| (ql, ql.tbox(&ctx.snapshot)))
-        .filter(|(_, tbox)| !tbox.is_empty());
-    let mut ql_report = active.map(|_| crate::ql::QlReport::default());
-    let pattern = match ql {
-        Some((ql, tbox)) => {
-            let (needed, set) = match &form {
-                Form::Select => (None, false),
-                Form::Ask => (Some(Vec::new()), true),
-                Form::Construct(template) => {
-                    let mut vars = Vec::new();
-                    GraphPattern::Bgp {
-                        patterns: template.to_vec(),
-                    }
-                    .on_in_scope_variable(|v| vars.push(v.clone()));
-                    (Some(vars), true)
-                }
-                Form::Describe => (None, true),
-            };
-            let (out, report) =
-                ql::rewrite_query(pattern, &tbox, &ctx.snapshot, ql.limits(), needed, set);
-            if report.patterns > 0 {
-                rewrites.push("ql-tree-witness");
-            }
-            if !report.limits.is_empty() {
-                rewrites.push("ql-limit");
-            }
-            ql_report = Some(report);
+    let pattern = match ql_pattern {
+        Some(out) => {
             rewritten_ql = out;
             &rewritten_ql
         }

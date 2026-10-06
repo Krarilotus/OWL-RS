@@ -7,6 +7,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use super::hazards::Hazard;
+use super::{Atom, Cq};
 use crate::mapping::Ontology;
 use crate::model::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp, Term};
 
@@ -76,6 +78,11 @@ pub struct Tbox {
     /// Whether some inclusion isn't one the materialisation applies.
     gaps: bool,
     thing: Option<Term>,
+    /// The axioms outside QL that meet anonymous individuals, and the terms they reach.
+    hazards: super::hazards::Hazards,
+    /// The terms an atom of a query may be rewritten for: roles that reach anonymous
+    /// individuals, their classes, and classes with alternatives.
+    rewritable: HashSet<Term>,
     /// [`Self::class_alternatives`] per class, as queries ask for them.
     alternatives: std::sync::RwLock<HashMap<Term, Option<Vec<Basic>>>>,
 }
@@ -109,7 +116,84 @@ impl Tbox {
         for axiom in &ontology.axioms {
             b.axiom(ontology, axiom);
         }
-        b.finish()
+        let mut tbox = b.finish();
+        tbox.hazards =
+            super::hazards::hazards(ontology, &tbox.types, &|id| tbox.basics[id as usize]);
+        tbox.rewritable = tbox.rewritable_terms();
+        tbox
+    }
+
+    /// Why answers to `cq` through anonymous individuals may be missing
+    /// (docs/design/ql-rewriting.md §7): each atom's term reached by a hazard, with the
+    /// hazard; a hazard that reaches every term once, under the first atom. Empty: none.
+    pub fn concerns(&self, cq: &Cq) -> Vec<(Term, Hazard)> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<(Term, Hazard)> = Vec::new();
+        for atom in &cq.atoms {
+            let term = match atom {
+                Atom::Class(_, c) => *c,
+                Atom::Role(_, p, _) => *p,
+                Atom::Other(..) => continue,
+            };
+            let hazard = self
+                .hazards
+                .global
+                .or_else(|| self.hazards.affected.get(&term).copied());
+            if let Some(h) = hazard
+                && !out.iter().any(|&(t, _)| t == term)
+            {
+                out.push((term, h));
+            }
+        }
+        out
+    }
+
+    /// Whether the rewriting may change an atom on `term` (a class or property): for the
+    /// patterns it doesn't enter, which then may miss answers.
+    pub fn rewrites_term(&self, term: Term) -> bool {
+        !self.is_empty() && self.rewritable.contains(&term)
+    }
+
+    /// The hazard that reaches every term, if there is one.
+    pub fn global_hazard(&self) -> Option<Hazard> {
+        self.hazards.global
+    }
+
+    fn rewritable_terms(&self) -> HashSet<Term> {
+        let mut out = HashSet::new();
+        for ty in &self.types {
+            for sigma in self
+                .sup
+                .get(&ty.role)
+                .into_iter()
+                .flatten()
+                .chain([&ty.role])
+            {
+                out.insert(sigma.named());
+            }
+            out.extend(ty.concepts.iter().filter_map(|&id| match self.basic(id) {
+                Basic::Class(c) => Some(c),
+                _ => None,
+            }));
+        }
+        // Classes above an inclusion the materialisation doesn't apply.
+        let seeds: Vec<u32> = self
+            .up
+            .iter()
+            .zip(&self.base_up)
+            .flat_map(|(up, base)| up.iter().filter(move |v| !base.contains(v)).copied())
+            .collect();
+        out.extend(
+            reach(&self.up, seeds)
+                .into_iter()
+                .filter_map(|id| match self.basic(id) {
+                    Basic::Class(c) => Some(c),
+                    _ => None,
+                }),
+        );
+        out
     }
 
     /// Whether rewriting can't change any query: no generating axiom, and every concept

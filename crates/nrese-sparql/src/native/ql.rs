@@ -13,6 +13,7 @@ use nrese_owl::ql::{Atom, Branch, Cq, Limits, Outcome, Part, QTerm, Tbox, rewrit
 use nrese_rdf::{NamedNode, NamedNodeRef, Term, Variable};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
+use nrese_sparql_syntax::visit::Node;
 
 use crate::ql::QlReport;
 
@@ -98,6 +99,19 @@ impl Rewriter<'_> {
     fn walk(&mut self, pattern: &GraphPattern, needed: &Needed, set: bool) -> GraphPattern {
         use GraphPattern as P;
         let boxed = |p: GraphPattern| Box::new(p);
+        // What the rewriting doesn't enter here may miss answers (design §7).
+        for node in pattern.children() {
+            if matches!(node, Node::Expression(_)) {
+                self.unread(node, "EXISTS");
+            }
+        }
+        match pattern {
+            P::Minus { right, .. } => self.unread(Node::Pattern(right), "MINUS"),
+            P::Graph { .. } => self.unread(Node::Pattern(pattern), "GRAPH"),
+            P::Service { .. } => self.unread(Node::Pattern(pattern), "SERVICE"),
+            P::Path { .. } => self.unread(Node::Pattern(pattern), "a property path"),
+            _ => {}
+        }
         match pattern {
             P::Bgp { patterns } => self.bgp(patterns, needed, set),
             P::Join { left, right } => P::Join {
@@ -224,6 +238,19 @@ impl Rewriter<'_> {
             patterns: patterns.to_vec(),
         };
         let (cq, terms) = self.query(patterns, needed);
+        for (term, hazard) in self.tbox.concerns(&cq) {
+            let name = |t: u64| self.name(t);
+            self.report.completeness.add(format!(
+                "answers on {} through anonymous individuals may be missing: {}",
+                name(term),
+                hazard.describe(&name)
+            ));
+        }
+        if patterns.iter().any(open) {
+            self.report.completeness.add(
+                "a variable predicate or class: the rewriting reads constant ones only".to_owned(),
+            );
+        }
         let rewriting = match rewrite(self.tbox, &cq, self.limits) {
             Outcome::Unchanged => return original,
             Outcome::Exceeded(what) => {
@@ -279,6 +306,75 @@ impl Rewriter<'_> {
         GraphPattern::Union {
             left: Box::new(original),
             right: Box::new(added),
+        }
+    }
+
+    /// A term as a reason names it.
+    fn name(&self, t: u64) -> String {
+        match self.snapshot.decode(TermId::from_raw(t)) {
+            Some(term) => term.to_string(),
+            None => format!("term {t}"),
+        }
+    }
+
+    /// Notes that patterns under `node` (`place` says where) run without the rewriting,
+    /// if they read a term it would change, or a variable predicate or class.
+    fn unread(&mut self, node: Node<'_>, place: &str) {
+        let tbox = self.tbox;
+        let snapshot = self.snapshot;
+        let rewritten = |n: &NamedNode| {
+            snapshot
+                .lookup(n.as_ref().into())
+                .is_some_and(|id| tbox.rewrites_term(id.raw()))
+        };
+        let mut hit: Option<String> = None;
+        let mut look = |n: Node<'_>| {
+            match n {
+                Node::Pattern(GraphPattern::Bgp { patterns }) => {
+                    for t in patterns {
+                        if open(t) {
+                            hit.get_or_insert_with(|| "a variable predicate or class".to_owned());
+                        }
+                        let mut check = |n: &NamedNode| {
+                            if rewritten(n) {
+                                hit.get_or_insert_with(|| n.to_string());
+                            }
+                        };
+                        if let NamedNodePattern::NamedNode(p) = &t.predicate {
+                            check(p);
+                            if p.as_str() == RDF_TYPE
+                                && let TermPattern::NamedNode(c) = &t.object
+                            {
+                                check(c);
+                            }
+                        }
+                    }
+                }
+                Node::Pattern(GraphPattern::Path { path, .. }) => {
+                    let mut names = Vec::new();
+                    match path_names(path, &mut names) {
+                        None => {
+                            hit.get_or_insert_with(|| "a negated property set".to_owned());
+                        }
+                        Some(()) => {
+                            if let Some(n) = names.into_iter().find(|n| rewritten(n)) {
+                                hit.get_or_insert_with(|| n.to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            false
+        };
+        match node {
+            Node::Pattern(p) => p.find(&mut look),
+            Node::Expression(e) => e.find(&mut look),
+        };
+        if let Some(what) = hit {
+            self.report.completeness.add(format!(
+                "a pattern inside {place} runs without the rewriting, which changes {what}"
+            ));
         }
     }
 
@@ -487,6 +583,41 @@ impl Rewriter<'_> {
             },
         }
     }
+}
+
+/// Whether a triple pattern has a variable predicate, or a variable class under
+/// `rdf:type`: atoms the rewriting doesn't read.
+fn open(t: &TriplePattern) -> bool {
+    match &t.predicate {
+        NamedNodePattern::Variable(_) => true,
+        NamedNodePattern::NamedNode(p) => {
+            p.as_str() == RDF_TYPE
+                && matches!(
+                    t.object,
+                    TermPattern::Variable(_) | TermPattern::BlankNode(_)
+                )
+        }
+    }
+}
+
+/// The properties of a path; `None` for a negated property set (any other property).
+fn path_names(
+    path: &nrese_sparql_syntax::algebra::PropertyPathExpression,
+    out: &mut Vec<NamedNode>,
+) -> Option<()> {
+    use nrese_sparql_syntax::algebra::PropertyPathExpression as E;
+    match path {
+        E::NamedNode(n) => out.push(n.clone()),
+        E::Reverse(p) | E::ZeroOrMore(p) | E::OneOrMore(p) | E::ZeroOrOne(p) => {
+            path_names(p, out)?;
+        }
+        E::Sequence(a, b) | E::Alternative(a, b) => {
+            path_names(a, out)?;
+            path_names(b, out)?;
+        }
+        E::NegatedPropertySet(_) => return None,
+    }
+    Some(())
 }
 
 /// How the variables of a rewritten pattern are written: the query's own, and new ones
