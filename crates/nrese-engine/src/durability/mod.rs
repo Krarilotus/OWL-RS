@@ -168,6 +168,7 @@ impl Durable {
                     ),
                 };
                 Version {
+                    content: crate::engine::Content::fresh(),
                     asserted,
                     inferred,
                     revision: loaded.revision,

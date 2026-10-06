@@ -1042,8 +1042,13 @@ fn dl_roles(p: &Params, nt: &mut Nt) -> std::io::Result<Expect> {
 
 /// A random OWL 2 EL ontology of `classes` classes: a subclass DAG, existentials,
 /// definitions by conjunctions, a role hierarchy with a transitive role and a chain.
+/// Every class and property is declared: OWL API readers (ELK, Konclude, HermiT through the
+/// DL kit) drop axioms about undeclared terms, and so classified a weaker ontology.
 fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     let (n, roles) = (p.get("classes", 100_000), p.get("roles", 12));
+    for r in 0..roles {
+        nt.t(&ex(format!("r{r}")), &rdf("type"), &owl("ObjectProperty"))?;
+    }
     for r in 1..roles {
         nt.t(
             &ex(format!("r{r}")),
@@ -1090,7 +1095,9 @@ fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
             )?;
             let and = format!("_:i{i}");
             nt.t(&and, &owl("intersectionOf"), &parts)?;
-            nt.t(&ex(format!("D{i}")), &owl("equivalentClass"), &and)?;
+            let d = ex(format!("D{i}"));
+            nt.t(&d, &rdf("type"), &owl("Class"))?;
+            nt.t(&d, &owl("equivalentClass"), &and)?;
         }
     }
     Ok(Expect::new())
@@ -1101,6 +1108,10 @@ fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
 fn horn(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     let n = p.get("classes", 20_000);
     let r = ex("r");
+    // Declared, as in `el`.
+    for property in [&r, &ex("rInv")] {
+        nt.t(property, &rdf("type"), &owl("ObjectProperty"))?;
+    }
     nt.t(&ex("rInv"), &owl("inverseOf"), &r)?;
     for i in 0..n {
         let a = ex(format!("A{i}"));

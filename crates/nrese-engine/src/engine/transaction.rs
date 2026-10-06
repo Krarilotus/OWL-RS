@@ -167,6 +167,7 @@ impl<'e> Transaction<'e> {
         }));
         let base = self.base.version();
         let version = Version {
+            content: super::Content::fresh(),
             asserted: base
                 .asserted
                 .with_delta(&asserted_inserts, &asserted_deletes),
@@ -499,6 +500,7 @@ impl<'e> Transaction<'e> {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             Version {
+                content: super::Content::fresh(),
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,

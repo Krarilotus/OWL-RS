@@ -501,22 +501,21 @@ def counters(case: dict, result: dict) -> dict:
     return out
 
 
-def same_taxonomy(case: dict) -> bool | None:
+def same_taxonomy(case: dict) -> str | None:
     """Whether NRESE's closure (the classifier's `--out`) is the reference's taxonomy, in the
-    DL kit's canonical form over the reference's signature (benches/reasoning/dl/canonical.py).
-    The reference is a `.tax` file a reference reasoner wrote into the fast volume
-    (`fast.py compete` keeps ELK's); None if it isn't there."""
+    DL kit's canonical form (benches/reasoning/dl/canonical.py `compare`): `"true"`,
+    `"false"`, or `"signature-differs"` when the reference lacks classes NRESE classifies (it
+    read a different ontology). The reference is a `.tax` file a reference reasoner wrote
+    into the fast volume (`fast.py compete` keeps ELK's); None if it isn't there."""
     sys.path.insert(0, str(ROOT / "benches" / "reasoning" / "dl"))
     import canonical
     found = docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "cat", case["reference"]])
     closure = SCRATCH / f"{case['name']}.tsv"
     if found.returncode != 0 or not closure.exists():
         return None
-    reference = SCRATCH / f"{case['name']}.reference.tax"
-    reference.write_text(found.stdout, encoding="utf-8")
+    (SCRATCH / f"{case['name']}.reference.tax").write_text(found.stdout, encoding="utf-8")
     pairs = [tuple(line.rstrip("\n").split("\t")[:2]) for line in open(closure, encoding="utf-8") if "\t" in line]
-    ours = set(canonical.canonical(canonical.signature(reference), pairs).splitlines())
-    return ours == set(found.stdout.splitlines())
+    return canonical.compare(found.stdout, pairs)
 
 
 def classify_failure(code: int, err: str, result: dict) -> str:

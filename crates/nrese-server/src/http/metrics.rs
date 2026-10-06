@@ -69,10 +69,10 @@ nrese_replication_healthy {}
         ));
     }
     body.push_str(&format!(
-        "# HELP nrese_query_cache_hits_total Queries answered from the result cache.
+        "# HELP nrese_query_cache_hits_total Query parts answered from the result cache.
 # TYPE nrese_query_cache_hits_total counter
 nrese_query_cache_hits_total {}
-# HELP nrese_query_cache_misses_total Cacheable queries evaluated.
+# HELP nrese_query_cache_misses_total Query parts computed that could have been cached.
 # TYPE nrese_query_cache_misses_total counter
 nrese_query_cache_misses_total {}
 # HELP nrese_query_cache_bytes Bytes held by the query result cache.
