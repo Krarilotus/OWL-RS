@@ -1486,11 +1486,12 @@ data = "horn classes=3000"
 args = ["--classify", "--runs", "1"]
 queries = ""
 metric = "classification.max_ms"
-check = { "classification.consistent" = "true" }
+check = { "classification.consistent" = "true", "classification.subsumptions" = 1161634 }
 route = { "classification.engine" = "== context-core" }
 cap_gb = 6
 systems = ["hermit:dl", "konclude:dl"]
 repeat = 5
+pinned = "subsumptions: NRESE 6 Oct 2026, after the declared Horn generator"
 [[case]]
 name = "classify-store-tableau"
 area = "dl"
@@ -1500,7 +1501,7 @@ data = "dl-number n=24 individuals=100"
 args = ["--classify", "--runs", "1"]
 queries = ""
 metric = "classification.max_ms"
-check = { "classification.consistent" = "true" }
+check = { "classification.consistent" = "true", "classification.subsumptions" = 2 }
 route = { "classification.engine" = "== tableau" }
 cap_gb = 6
 systems = ["hermit:dl", "konclude:dl"]

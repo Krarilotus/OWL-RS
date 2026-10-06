@@ -171,7 +171,7 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
     replayed log)."""
     tier = f"{case['name']}~{semantics}"
     out = RESULTS / stamp / (tier.replace("~", "-") + (f"-{track}" if track else ""))
-    cap = max(int(case["cap_gb"]), 8)
+    cap = int(fast.capped(max(int(case["cap_gb"]), 8)))
     env = {**fast.ENV, "NRESE_TARGET_VOLUME": fast.TARGET_VOLUME, "DOCKER_MEMORY": f"{cap}g",
            "JAVA_HEAP": f"{max(cap - 2, 2)}g", "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS", "4"),
            "NRESE_MEMORY_CAP_GB": os.environ.get("NRESE_MEMORY_CAP_GB", "8"),
