@@ -10,6 +10,9 @@ use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{Dictionary, TermId};
 
+mod cursor;
+pub use cursor::{ProbeCursor, Seek};
+
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
 /// revision's runs alive but never blocks writers or compaction.
 ///
