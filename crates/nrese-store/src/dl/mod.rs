@@ -5,11 +5,13 @@
 //! - [`source`]: the ontology of the asserted statements, read for the engines.
 //! - [`consistency`]: consistency by the engine the ontology allows; [`gate`]: the check
 //!   on commit.
+//! - [`classification`]: classification and realisation, kept per revision.
 //!
 //! The mode is the reasoner's (`ReasoningMode::Owl2Dl`): its OWL 2 RL closure is the
 //! inferred stack, the lower bound L. What the store adds is switched on by the mutation
 //! pipeline that runs the mode ([`crate::StoreService::use_dl`]).
 
+pub(crate) mod classification;
 pub mod config;
 pub mod consistency;
 pub(crate) mod gate;
@@ -34,6 +36,7 @@ pub struct DlStatus {
 pub struct Dl {
     active: AtomicBool,
     status: Mutex<Option<DlStatus>>,
+    pub(crate) classification: classification::Cache,
 }
 
 impl Dl {
