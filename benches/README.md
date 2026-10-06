@@ -7,10 +7,11 @@ has been measured so far. Start here.
 |---|---|
 | What is measured, what isn't, and how did it last come out? | [STATUS.md](STATUS.md), generated: `python benches/suite/suite.py status --write` |
 | How is it measured, and why can the numbers be trusted? | [PROTOCOL.md](PROTOCOL.md): the rules every kit follows |
+| Which benchmarks exist in each field, what do they cost, and which do we run? | [CATALOG.md](CATALOG.md) |
 | What did a given run cover, on which commit and machine? | [runs/](runs/README.md): one record per run |
 | Which workloads and systems exist, and which pair can run? | [suite/workloads.toml](suite/workloads.toml), [suite/systems.toml](suite/systems.toml); `suite.py` prints the matrix |
 | How do I run something? | §"A run, step by step" below |
-| Did a change make NRESE slower? | `suite.py compare BASE NEW` (suite runs), `perf-lab-compare.py` (perf lab), the kits' own `compare` |
+| Did a change make NRESE slower? | `fast/fast.py run` then `fast/fast.py compare BASE NEW` (the fast suite, under an hour); `suite.py compare BASE NEW` (suite runs), `perf-lab-compare.py` (perf lab), the kits' own `compare` |
 
 ## The hierarchy
 
@@ -18,9 +19,11 @@ has been measured so far. Start here.
 benches/
 ├── README.md            this map
 ├── PROTOCOL.md          the rules: fairness, correctness first, repetitions, statistics, records, publishing
+├── CATALOG.md           the benchmarks per field: what each measures, its cost, core / representative / later
 ├── STATUS.md            generated: coverage matrix, tier tables, gaps, problems, runs
 ├── runs/                one record per run: scope, commit, machine, protocol, outcome per pair (committed)
 ├── baselines/           committed NRESE reference numbers the regression gates compare against
+├── fast/                the fast suite: many small cases, checked and route-checked, under an hour
 ├── suite/               the registries and the driver
 │   ├── systems.toml     systems, capabilities, publishing rule, how they start
 │   ├── workloads.toml   workloads, needs, standard tiers, source, licence, check, state
@@ -65,7 +68,8 @@ benches/
 | [clients](clients/README.md) | client libraries end to end | `run-all.sh` | stdout | — |
 | [oracle](oracle/README.md) | NRESE's SPARQL answers against Jena's | its script | `oracle/results/` | — |
 | [oxigraph-comparison](oxigraph-comparison/README.md) | parsers, serialisers and evaluators against Oxigraph's | `cargo test`, `cargo run --bin bench` | `oxigraph-comparison/results/` | — |
-| perf lab | the store and query engine without HTTP, per query p50 | `perf-lab.sh` | — | `baselines/perf-lab/*.json` |
+| [fast](fast/README.md) | many small cases (10-300 s each, under an hour): every reasoning profile, maintenance, DL, memory caps, query shapes and operators, services; checks and route checks before times; home-turf cases per competitor | `fast/fast.py run`, `compare`, `compete` | `tmp/fast/`, `fast/results/` | `baselines/fast/*.json` |
+| perf lab | the store and query engine without HTTP, per query p50; the fast suite's measuring tool | `perf-lab.sh` | — | `baselines/perf-lab/*.json` |
 | [probes](probes/README.md) | one property at a time | one script each | stdout | — |
 | [cluster](cluster/README.md) | the suite on Draco | `suite.sbatch` | the job's directory | record in `runs/` |
 

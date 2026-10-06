@@ -26,11 +26,12 @@ pub mod term;
 
 pub use durability::{DurabilityConfig, SyncPolicy};
 pub use engine::{
-    BulkLoad, BulkMode, CommitSummary, Engine, EngineConfig, EngineStats, EqualityClasses,
-    ImageInfo, InferredMask, InferredSubset, LogBatch, ReadModel, Rematerialisation, Snapshot,
-    Transaction,
+    BulkLoad, BulkMode, CommitSummary, Content, Engine, EngineConfig, EngineStats, EqualityClasses,
+    ImageInfo, InferredMask, InferredSubset, LogBatch, ProbeCursor, ReadModel, Rematerialisation,
+    Seek, Snapshot, SnapshotIdentity, Transaction,
 };
 pub use error::{EngineError, EngineResult};
+pub use index::cursor::SeekStats;
 pub use index::{CompactionPolicy, IndexEncoding, set_index_encoding};
 /// Vector literals, metrics and indexes ([`Snapshot::vector_search`]).
 pub use nrese_vector as vector;

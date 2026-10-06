@@ -34,6 +34,21 @@ owns its tests, and benchmarks never run in a gate.
   cargo-nextest`): every test of every binary in parallel. Without it, `cargo test` runs
   crate by crate.
 - Enable the hooks with `git config core.hooksPath .githooks`.
+
+## Building and measuring on a shared machine
+
+- **While editing:** `scripts/cargo-guarded.sh check` and the changed crate's tests; for a
+  long edit loop on one crate, `CARGO_INCREMENTAL=1` (the build directory's budget still
+  applies). The full suite runs at the push tier and at milestones.
+- **Iterating on an A/B:** `--profile lab` (release code with thin LTO and parallel code
+  generation, much faster to link). Numbers that are kept, logged or published are measured
+  on `release` (fat LTO, one codegen unit).
+- **Timings in a quiet slot:** `scripts/quiet-slot.sh <command>` takes a machine-wide lock
+  and waits until no compiler of ours runs; builds started meanwhile wait for the slot. Counts
+  and other deterministic measures need no slot.
+- **The build directory's budget:** over it, `scripts/cargo-guarded.sh` first removes the stale
+  builds cargo keeps of every crate, then the debug output, then everything; each removal is
+  logged in `tmp/guard-wipes.log`.
 - CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on
   merges to `main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise
   (`oracle.yml`).

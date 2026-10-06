@@ -238,6 +238,9 @@ fn both_with(
         "asserted fact reported as derived"
     );
     assert_eq!(grouped.derived, batch.derived, "grouped input");
+    // The relations kept without their object order are never looked up by object.
+    assert_eq!(batch.counters.lookups_without_order, 0);
+    assert_eq!(grouped.counters.lookups_without_order, 0);
     assert_eq!(grouped.violations, batch.violations, "grouped input");
     let mut expected: Vec<Triple> = naive.derived.iter().copied().collect();
     expected.sort_unstable();

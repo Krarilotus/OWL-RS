@@ -1,0 +1,4 @@
+PREFIX e: <http://example.org/fast/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?u ?n ?a ?b WHERE { ?u a e:Person ; e:name ?n ; e:age ?a ; e:born ?b ; e:city e:c7 }

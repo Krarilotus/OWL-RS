@@ -1,0 +1,45 @@
+# A run record (benches/runs/README.md), written by hand: the fast suite has its own driver
+# (benches/fast). Outcomes only; times are in benches/baselines/fast/ (NRESE's own) and in
+# benches/fast/results/ (the comparisons, git-ignored).
+
+id = "2026-10-06-fast-suite"
+kit = "fast"
+purpose = "Phase 2 of the benchmark work: the fast suite's first baselines (NRESE on every case) and its first comparisons with the systems each case declares"
+baseline = ""
+findings = [
+  "Baseline e8b9aea9: 84 cases, 2 interleaved repetitions, 49.8 min; every case as expected (79 ok, 5 frontier cases at their known limit). Spread between repetitions on the shared main PC: median 20 %, 26 of 77 cases within 10 %",
+  "Rule work on LUBM 10 (OWL 2 RL): 6,735,963 bindings for 829,971 new facts, the investigation's 6.74 M against 0.83 M, deterministic",
+  "Equality: one asserted sameAs costs LUBM 10 about 25 %; functional cascades of depth 4 and 16 cost 3.5 and 11 times; one commit splitting a 500-member sameAs class takes 68 s (1,000 fails after 242 s)",
+  "Compact equality: after merge commits the maintained stack held 380,845 inferred facts, a fresh materialisation 440,032 (eq-merge-compact, known wrong)",
+  "EL: on 20,000 random EL classes NRESE's taxonomy has 4,526 direct subsumptions that ELK and Konclude (which agree) lack (el-classify, known wrong, to adjudicate)",
+  "DL: definitions over a transitive role (ore_ont_10212's shape) grow exponentially (18: 5-7 s, 50: gives up); Konclude decides 400 in 0.6-0.9 s",
+  "Deep hierarchies: a 1,500-class spine over 1 M instances took 67 s in the rule joins for 9.7 M inherited types, against about 5 s for LUBM 100's 8.7 M",
+  "Canonicalisation time grows with the square of the twins (2,000: 0.6 s, 8,000: 12.7 s)",
+  "Memory frontiers: a 20 M load in 2 GiB (the bulk-load budget bounds quads, not terms), LUBM 100 reasoning in 2 GiB, a join on triple-term patterns (past 6 GiB); filtered vector search recall 0.42-0.6 at k = 10",
+  "Comparisons (main PC): NRESE ahead of HermiT, Openllet and Konclude on number restrictions, nominals, datatypes, the DL pipeline, LUBM 1's ABox and Horn classification; Konclude ahead on transitive definitions; QLever and Oxigraph on NRESE's exported closure of rl-hierarchy: slower queries and loads",
+  "Not completed: Nemo pairs were skipped (workload fast needed `query`; fixed in 24bcc6b), Jena's rules on rl-chain didn't answer in 16 min and the run was stopped; the SPARQL stores' plain cases, the client sweep and the cache replay are still to run",
+]
+started = "2026-10-06"
+host = "Kraris-GPTler"
+machine = "AMD Ryzen 7 7800X3D, 16 threads, 63 GiB; Windows 11; Docker Desktop (31 GiB VM); other agents building alongside"
+commit = "8233ea5 (first baseline), e8b9aea (second baseline), acf1003 and 24bcc6b (comparisons)"
+protocol = "fast.py run --reps 2 (interleaved, rotated order); each case in its own container under its memory cap; checks and route checks before times; comparisons through the suite's driver (cache off, 1 warm-up and 2 measured runs per query) and the DL kit's image (120 s per task)"
+commands = [
+  "python benches/fast/fast.py run --reps 2",
+  "python benches/fast/fast.py compete --areas dl; compete --cases ... (rule reasoners, closure)",
+]
+results = "benches/baselines/fast/2026-10-06-8233ea59.json, 2026-10-06-e8b9aea9.json (committed); benches/fast/results/2026-10-06-* (git-ignored)"
+publishable = "all"
+
+pairs = [
+  { workload = "fast", tier = "84 cases", system = "nrese", regime = "per case", outcome = "ok", items = "79/84 ok, 5 frontier", note = "the baseline" },
+  { workload = "fast", tier = "dl cases", system = "hermit", regime = "direct", outcome = "partial", note = "timeouts at 120 s on most generated ontologies; parse and classify ok on the others" },
+  { workload = "fast", tier = "dl cases", system = "konclude", regime = "direct", outcome = "partial", note = "an error on dl-number; timeouts on nominals and Horn classification" },
+  { workload = "fast", tier = "dl cases", system = "openllet", regime = "direct", outcome = "partial", note = "timeouts on most" },
+  { workload = "fast", tier = "el-classify", system = "elk", regime = "el", outcome = "ok", note = "taxonomy equals Konclude's; NRESE's differs" },
+  { workload = "fast", tier = "rl-hierarchy~closure", system = "qlever", regime = "none", outcome = "ok" },
+  { workload = "fast", tier = "rl-hierarchy~closure", system = "oxigraph", regime = "none", outcome = "ok" },
+  { workload = "fast", tier = "rdfs-hierarchy~rdfs", system = "jena", regime = "rdfs", outcome = "partial" },
+  { workload = "fast", tier = "rl-clique~owl-horst", system = "jena", regime = "owl-horst", outcome = "partial" },
+  { workload = "fast", tier = "rule cases~owl2-rl", system = "nemo", regime = "owl2-rl", outcome = "skipped", note = "registry slip, fixed in 24bcc6b" },
+]

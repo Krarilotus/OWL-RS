@@ -1,21 +1,7 @@
 # Known failures of the OWL 2 RL ruleset on the W3C OWL 2 test cases (RL profile, RDF-based
 # semantics; scripts/fetch-w3c-tests.sh). Format: <test identifier> # reason.
 #
-# The OWL 2 RL/RDF rules are complete for ground atomic conclusions from RL premises
-# (theorem PR1, OWL 2 Profiles section 4.3). Every entry below asks for something outside
-# that: a conclusion the rules have no rule for. None is a missing rule of the ruleset.
-
-# Class expressions in the conclusion (the rules derive memberships in named classes only):
-WebOnt-I5.26-010 # an anonymous owl:minCardinality restriction
-WebOnt-I5.5-005 # an anonymous owl:unionOf class
-
-# Difference and complements (owl:differentFrom, owl:AllDifferent, owl:complementOf,
-# negative property assertions) pass since 3 October: the store's entailment check
-# refutes their opposite (StoreService::entails).
-
-# Axioms about properties and datatypes:
-New-Feature-ReflexiveProperty-001 # reflexivity (not in OWL 2 RL)
-chain2trans1 # a property chain p o p -> p makes p transitive
-WebOnt-I5.8-006 # datatype subsumption: xsd:byte is within xsd:short
-WebOnt-I5.8-008 # datatype intersection: xsd:short and xsd:unsignedInt give xsd:unsignedShort
-WebOnt-I5.8-009 # datatype intersection: the non-negative and non-positive integers are {0}
+# None since 6 October: the positive entailments the OWL 2 RL/RDF rules have no rule for
+# (theorem PR1 of OWL 2 Profiles section 4.3 covers ground atomic conclusions only) are
+# decided through the owl2-dl mode's engines (StoreService::entails_dl), and are listed in
+# THROUGH_DL in main.rs.

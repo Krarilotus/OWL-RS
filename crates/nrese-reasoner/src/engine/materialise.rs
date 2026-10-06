@@ -35,6 +35,7 @@ pub fn materialise_until(
     snapshot: &Snapshot,
     stop: crate::eval::Stop<'_>,
 ) -> Result<Closure, delta::Interrupted> {
+    nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
     let result = match program.same_as.filter(|_| program.by_representatives) {
@@ -54,6 +55,7 @@ pub fn materialise_until(
             stop,
         )?,
     };
+    nrese_exec::heap::phase("reasoner: datatype checks");
     let mut violations = result.violations;
     violations.extend(super::datatypes::violations(
         &result.derived,
@@ -61,14 +63,20 @@ pub fn materialise_until(
         program.same_as,
         &|id| snapshot.decode(TermId::from_raw(id)),
     ));
-    Ok(Closure {
-        inferred: result
+    nrese_exec::heap::phase("store: encode");
+    // At its exact size: collected by doubling, the list held up to twice the facts, and
+    // at a doubling three times, beside them (LUBM 1000: 6.6 GB at this step's peak).
+    let mut inferred = Vec::with_capacity(result.derived.len() + axioms.len());
+    inferred.extend(
+        result
             .derived
             .into_iter()
             .chain(axioms)
             .filter(|&t| storable(t))
-            .map(encode)
-            .collect(),
+            .map(encode),
+    );
+    Ok(Closure {
+        inferred,
         violations,
         diagnostics: result.diagnostics,
         rounds: result.rounds,
@@ -124,6 +132,7 @@ fn by_representatives(
         .binary_search_by_key(&same_as, |(p, _)| *p)
         .is_ok_and(|at| equal(&input[at].1));
     let mut seeds: Vec<Triple> = Vec::new();
+    let mut phases = batch::Phases::default();
     let input = if asserts_equality {
         input
     } else {
@@ -137,6 +146,7 @@ fn by_representatives(
         {
             return Ok(first);
         }
+        phases.add(&first.phases);
         seeds = first.derived;
         rebuild()
     };
@@ -163,6 +173,7 @@ fn by_representatives(
         stop,
     )?;
     drop(start);
+    phases.add(&closure.phases);
     let classes = &closure.classes;
     if program.store_representatives {
         // The closure as it is, and each identity's place in its class. A fact asserted
@@ -188,6 +199,7 @@ fn by_representatives(
             violations: closure.violations,
             diagnostics: closure.diagnostics,
             rounds: closure.rounds,
+            phases,
             ..batch::Materialisation::default()
         });
     }
@@ -213,6 +225,7 @@ fn by_representatives(
         violations: closure.violations,
         diagnostics: closure.diagnostics,
         rounds: closure.rounds,
+        phases,
         ..batch::Materialisation::default()
     })
 }

@@ -33,8 +33,9 @@ version = "0.1.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-# `--cfg system_alloc` switches the perf lab to the system allocator (benches/perf-lab.sh).
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_alloc)"] }
+# `--cfg system_alloc` switches the perf lab to the system allocator (benches/perf-lab.sh),
+# `--cfg alloc_profile` to a counting one with a heap profile of reasoning by phase.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_alloc)", "cfg(alloc_profile)"] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
@@ -70,6 +71,13 @@ utoipa = "6.0.0"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# `--profile lab`: release code built fast, for iterating on an A/B (thin LTO, parallel code
+# generation). Numbers that are kept or published are measured on `release`.
+[profile.lab]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
 
 # `cargo build --profile profiling`: release code with symbols, for perf/samply.
 [profile.profiling]

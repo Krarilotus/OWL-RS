@@ -10,6 +10,9 @@ use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{Dictionary, TermId};
 
+mod cursor;
+pub use cursor::{ProbeCursor, Seek};
+
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
 /// revision's runs alive but never blocks writers or compaction.
 ///
@@ -70,6 +73,18 @@ impl InferredMask {
     pub fn runs(&self) -> usize {
         self.runs.len()
     }
+}
+
+/// What a snapshot reads ([`Snapshot::identity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SnapshotIdentity {
+    pub revision: u64,
+    /// Its version's statements.
+    pub content: super::Content,
+    /// `owl:sameAs`, when reads expand equality classes.
+    pub equality: Option<TermId>,
+    /// Whether reads give equality classes canonically.
+    pub canonical: bool,
 }
 
 /// The inferred statements a restricted snapshot keeps ([`Snapshot::with_inferred_subset`]).
@@ -168,8 +183,32 @@ impl Snapshot {
         };
         Snapshot {
             version: Arc::new(Version {
+                content: super::Content::fresh(),
                 asserted: self.version.asserted.clone(),
                 inferred,
+                revision: self.version.revision,
+                dictionary_len: self.version.dictionary_len,
+                equality: Default::default(),
+            }),
+            dictionary: Arc::clone(&self.dictionary),
+            statistics: Arc::default(),
+            equality: self.equality,
+            canonical: self.canonical,
+        }
+    }
+
+    /// This snapshot with `added` statements in its inferred stack, for a reader of facts
+    /// the store keeps apart from its stacks (the `owl2-dl` mode's upper bound): never
+    /// published, so no other reader sees them. Like [`Self::with_inferred_subset`] it has
+    /// statistics and equality classes of its own. O(k log k) for k statements, as one
+    /// more run.
+    pub fn with_inferred_added(&self, added: &[EncodedQuad]) -> Snapshot {
+        Snapshot {
+            version: Arc::new(Version {
+                // Other statements than this snapshot's, at its revision.
+                content: super::Content::fresh(),
+                asserted: self.version.asserted.clone(),
+                inferred: self.version.inferred.with_delta(added, &[]),
                 revision: self.version.revision,
                 dictionary_len: self.version.dictionary_len,
                 equality: Default::default(),
@@ -191,6 +230,7 @@ impl Snapshot {
         }
         Some(Snapshot {
             version: Arc::new(Version {
+                content: super::Content::fresh(),
                 asserted: self.version.asserted.clone(),
                 inferred: stack.with_runs(&mask.runs),
                 revision: self.version.revision,
@@ -425,6 +465,18 @@ impl Snapshot {
 
     pub fn revision(&self) -> u64 {
         self.version.revision
+    }
+
+    /// What this snapshot reads, for caches of results computed on it: two snapshots with
+    /// the same identity answer every read alike. A transaction's pending state or a
+    /// masked view has an identity of its own, though it keeps its base's revision.
+    pub fn identity(&self) -> SnapshotIdentity {
+        SnapshotIdentity {
+            revision: self.version.revision,
+            content: self.version.content,
+            equality: self.equality,
+            canonical: self.canonical,
+        }
     }
 
     /// Number of asserted and inferred quads. O(1).

@@ -29,6 +29,9 @@ pub enum ApiError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// Exact answers asked for (`dl-answers=exact`) that can't be proven complete (422).
+    #[error("incomplete answer: {0}")]
+    IncompleteAnswer(Box<nrese_store::IncompleteAnswer>),
     /// What was asked for is gone for good (a replica's log a checkpoint covered).
     #[error("gone: {0}")]
     Gone(String),
@@ -131,6 +134,9 @@ impl IntoResponse for ApiError {
             tracing::error!(%detail, "request failed on the server side");
         }
         let rejected = matches!(self, Self::ReasonerReject { .. });
+        if let Self::IncompleteAnswer(answer) = self {
+            return incomplete_answer(&answer);
+        }
         let (status, detail, reasoner_reject) = match self {
             Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail, None),
             Self::BadRequestPlainText(detail) => {
@@ -146,6 +152,7 @@ impl IntoResponse for ApiError {
             Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
             Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
             Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
+            Self::IncompleteAnswer(_) => unreachable!("answered above"),
             Self::Gone(detail) => (StatusCode::GONE, detail, None),
             Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail, None),
             Self::UnsupportedMediaType(detail) => {
@@ -176,6 +183,37 @@ impl IntoResponse for ApiError {
             },
         )
     }
+}
+
+/// The problem document of exact answers that can't be proven complete: 422, type
+/// `incomplete-answer`, with the status's reasons, its bounds and the first unresolved
+/// candidates.
+fn incomplete_answer(answer: &nrese_store::IncompleteAnswer) -> Response {
+    let status = StatusCode::UNPROCESSABLE_ENTITY;
+    let completeness = &answer.status;
+    problem(
+        status,
+        &serde_json::json!({
+            "type": "https://nrese.dev/problems/incomplete-answer",
+            "title": "Incomplete Answer",
+            "status": status.as_u16(),
+            "detail": format!(
+                "the answers can't be proven complete under OWL 2 DL: {answer}"
+            ),
+            "regime": completeness.regime.map(|r| r.as_str()),
+            "reasons": completeness
+                .reasons
+                .iter()
+                .map(|r| serde_json::json!({"source": r.source, "text": r.text}))
+                .collect::<Vec<_>>(),
+            "bounds": completeness.bounds.map(|b| serde_json::json!({
+                "lower": b.lower,
+                "upper": b.upper,
+                "unresolved": b.unresolved,
+            })),
+            "unresolved": answer.unresolved,
+        }),
+    )
 }
 
 /// Marks an error status whose body must stay as written: the plain-text profile for

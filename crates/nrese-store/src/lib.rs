@@ -10,6 +10,7 @@ pub mod catalog;
 mod classification;
 pub mod config;
 mod delta;
+pub mod dl;
 pub mod draft_check;
 mod entailment;
 pub mod error;
@@ -23,7 +24,6 @@ mod loader;
 pub mod mutation;
 pub mod namespaces;
 pub mod query;
-mod query_cache;
 mod query_executor;
 mod rdf_io;
 pub mod reasoning;
@@ -44,18 +44,19 @@ pub use backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
 };
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
-pub use classification::ClassificationReport;
+pub use classification::{ClassificationReport, RealisationReport};
 pub use config::{
-    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity, ShaclGate,
-    StoreConfig, StoreMode,
+    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity,
+    QlRewritingMode, ShaclGate, StoreConfig, StoreMode,
 };
 pub use delta::MutationDeltaPreview;
+pub use dl::{DlAnswers, DlConfig, DlConsistency, DlDetail};
 pub use draft_check::{
     DRAFT_CHECK_PROFILES, DRAFT_CHECK_PROTOCOL, DRAFT_CHECK_SEMANTICS, DraftInputs, DraftLimits,
     DraftOperation, DraftOutcome, DraftStatus, DraftTerm, input_hash_mismatch, run_draft_check,
 };
-pub use entailment::Entailment;
-pub use error::{Refusal, StoreError, StoreResult};
+pub use entailment::{DlEntailment, Entailment};
+pub use error::{IncompleteAnswer, Refusal, StoreError, StoreResult};
 pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
@@ -83,7 +84,6 @@ pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
     SparqlQueryRequest,
 };
-pub use query_cache::QueryCacheStats;
 pub use query_executor::PreparedQuery;
 pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
