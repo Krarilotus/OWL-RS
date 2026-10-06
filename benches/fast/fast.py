@@ -25,6 +25,7 @@ to match.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
@@ -88,12 +89,40 @@ def docker(args: list[str], timeout: float | None = None, capture: bool = True) 
                           encoding="utf-8", errors="replace")
 
 
+def cpu_args() -> list[str]:
+    """`--cpus N` when a run gives every container the same CPUs (DOCKER_CPUS, as the suite)."""
+    cpus = os.environ.get("DOCKER_CPUS")
+    return ["--cpus", cpus] if cpus else []
+
+
+@contextlib.contextmanager
+def quiet_slot(what: str):
+    """Holds the machine's quiet slot (scripts/quiet-slot.sh: one timing at a time, no build of
+    ours running, new builds waiting) while the block runs. A shell holds it until its stdin
+    closes, so waiting for the slot doesn't count against a case's timeout and the slot is
+    freed if this process dies. NRESE_QUIET_SLOT=0 skips it (counts need no slot)."""
+    if os.environ.get("NRESE_QUIET_SLOT") == "0":
+        yield
+        return
+    bash = os.environ.get("NRESE_BASH") or (r"C:\Program Files\Git\bin\bash.exe" if os.name == "nt" else "bash")
+    holder = subprocess.Popen([bash, str(ROOT / "scripts" / "quiet-slot.sh"), "bash", "-c", "echo held; read _", what],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=ENV)
+    if holder.stdout.readline().strip() != "held":
+        holder.kill()
+        raise RuntimeError(f"quiet slot not taken for {what}")
+    try:
+        yield
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=60)
+
+
 def container(name: str, cap_gb: float, command: list[str], env: dict | None = None,
               timeout: float = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
     """Runs `command` in the Rust image under a memory cap without swap; (exit code,
     stdout, stderr, wall seconds). Exit 137: killed at the cap."""
     SCRATCH.mkdir(parents=True, exist_ok=True)
-    argv = ["run", "--rm", "--name", name, f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g",
+    argv = ["run", "--rm", "--name", name, f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
             "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{DATA_VOLUME}:/fast",
             "-v", f"{BENCH_VOLUME}:/data:ro", "-v", f"{host_path(ROOT)}:/src:ro",
             "-v", f"{host_path(SCRATCH)}:/out"]
@@ -340,6 +369,14 @@ def run_case(case: dict, label: str, rep: int) -> dict:
     data = data_file(case["data"])
     if case.get("queries", "").startswith("@vectors"):
         vector_queries(expect, exact=case["queries"] == "@vectors-exact")
+    # Times count only from the machine's quiet slot, held for this case's repetitions alone,
+    # so other agents' builds wait for one case, not for the whole run.
+    with quiet_slot(f"fast {case['name']}"):
+        return measure(case, label, rep, expect, alt_expect, data)
+
+
+def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
+    """run_case's measurement, its data ready: the record."""
     name = f"fast-{case['name']}-{ROOT.name}"
     tool = case.get("tool", "perf_lab")
     out_json = f"/out/{case['name']}.json"
@@ -959,6 +996,12 @@ def main() -> int:
             s.add_argument("--runs", type=int, default=1)
             s.add_argument("--licensed", action="store_true",
                            help="also the licensed systems (results stay in benches/fast/results)")
+            s.add_argument("--merge", action="store_true",
+                           help="cases on the same data in one suite run per system (fewer loads, one long "
+                                "quiet slot: for a night batch); default one run and slot per case")
+            s.add_argument("--counts-only", action="store_true",
+                           help="the printer's verdicts for the rewritten comparators only: rows against "
+                                "NRESE's, no timings, no slot")
     t = sub.add_parser("table")
     t.add_argument("--baseline", help="a run's report, for each case's time and peak")
     t.add_argument("--write", action="store_true", help="into benches/CATALOG.md between its markers")
