@@ -4,153 +4,30 @@
 //! its terms: a class of k identities turns one fact into up to k³ copies, and the store,
 //! the joins and the answers carry all of them. Here each `owl:sameAs` class has one
 //! representative (its smallest id), every fact is rewritten to representatives, and the
-//! rules run on the rewritten facts without the replacement rules. When the rules derive
-//! a new `sameAs` between two representatives, their classes merge, the facts are
-//! rewritten again, and the closure continues.
+//! rules run on the rewritten facts without the replacement rules.
+//!
+//! The batch executor does it within its semi-naive rounds (egglog's rebuild; Zhang et
+//! al., POPL 2023): a round's new `sameAs` between two representatives merges their
+//! classes, and only the facts that mention the representative that lost its place are
+//! rewritten, into the next round's delta ([`super::batch`]). So equality costs one
+//! materialisation plus the facts its merges touch, however long a cascade of merges is;
+//! before 6 October 2026 every merge re-materialised the whole closure, until a pass
+//! merged nothing.
 //!
 //! The replicated closure is the representative closure expanded: a fact holds iff the
 //! fact of its terms' representatives is in the representative closure
 //! ([`EqualityClasses::expand`]). The property test checks exactly that, and that the
 //! same consistency rules fire.
 
-use std::collections::HashMap;
-
-use rayon::prelude::*;
-
-use super::batch::{self, Materialisation, Schema};
+use super::batch::{self, Schema};
 use super::ir::Rule;
 use super::ir::{Triple, Violation};
 use super::lists::ListVocabulary;
 
 /// The `owl:sameAs` classes of a closure: each term's representative, and each
-/// representative's members (only for classes of two or more).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EqualityClasses {
-    representative: HashMap<u64, u64>,
-    members: HashMap<u64, Vec<u64>>,
-}
-
-impl EqualityClasses {
-    /// The representative of `term` (the term itself outside every class).
-    pub fn representative(&self, term: u64) -> u64 {
-        self.representative.get(&term).copied().unwrap_or(term)
-    }
-
-    /// The identities of `term`'s class, sorted, if it has two or more.
-    pub fn class_of(&self, term: u64) -> Option<&[u64]> {
-        self.members
-            .get(&self.representative(term))
-            .map(Vec::as_slice)
-    }
-
-    /// The identities of `term`'s class (`[term]` outside every class), sorted.
-    pub fn members(&self, term: u64) -> Vec<u64> {
-        self.class_of(term)
-            .map_or_else(|| vec![term], <[u64]>::to_vec)
-    }
-
-    /// Whether `term` is the representative of its class (or in no class).
-    pub fn is_representative(&self, term: u64) -> bool {
-        self.representative(term) == term
-    }
-
-    /// The classes of two or more identities: representative and members.
-    pub fn classes(&self) -> impl Iterator<Item = (u64, &[u64])> {
-        self.members.iter().map(|(&r, m)| (r, m.as_slice()))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
-    }
-
-    /// `fact` with every term replaced by its representative.
-    pub fn rewrite(&self, [s, p, o]: Triple) -> Triple {
-        [
-            self.representative(s),
-            self.representative(p),
-            self.representative(o),
-        ]
-    }
-
-    /// Every fact a representative fact stands for.
-    pub fn expand(&self, [s, p, o]: Triple) -> Vec<Triple> {
-        let (ms, mp, mo) = (self.members(s), self.members(p), self.members(o));
-        let mut out = Vec::with_capacity(ms.len() * mp.len() * mo.len());
-        for &s in &ms {
-            for &p in &mp {
-                for &o in &mo {
-                    out.push([s, p, o]);
-                }
-            }
-        }
-        out
-    }
-
-    /// Merges the classes of each pair; returns whether any class changed.
-    fn merge(&mut self, pairs: &[(u64, u64)]) -> bool {
-        let mut parent: HashMap<u64, u64> = HashMap::new();
-        fn find(parent: &mut HashMap<u64, u64>, x: u64) -> u64 {
-            let mut root = x;
-            while let Some(&p) = parent.get(&root) {
-                if p == root {
-                    break;
-                }
-                root = p;
-            }
-            let mut node = x;
-            while let Some(&p) = parent.get(&node) {
-                if p == root {
-                    break;
-                }
-                parent.insert(node, root);
-                node = p;
-            }
-            root
-        }
-        let union = |parent: &mut HashMap<u64, u64>, a: u64, b: u64| -> bool {
-            let (ra, rb) = (find(parent, a), find(parent, b));
-            parent.entry(ra).or_insert(ra);
-            parent.entry(rb).or_insert(rb);
-            if ra == rb {
-                return false;
-            }
-            // The smaller id stays the root, so a root is its class's smallest id.
-            parent.insert(ra.max(rb), ra.min(rb));
-            true
-        };
-        for (&r, members) in &self.members {
-            for &x in members {
-                union(&mut parent, r, x);
-            }
-        }
-        let mut changed = false;
-        for &(a, b) in pairs {
-            changed |= union(&mut parent, a, b);
-        }
-        if !changed {
-            return false;
-        }
-        let nodes: Vec<u64> = parent.keys().copied().collect();
-        let mut members: HashMap<u64, Vec<u64>> = HashMap::new();
-        for node in nodes {
-            let root = find(&mut parent, node);
-            members.entry(root).or_default().push(node);
-        }
-        members.retain(|_, m| m.len() > 1);
-        let mut representative = HashMap::new();
-        for (r, m) in &mut members {
-            m.sort_unstable();
-            // The smallest id represents the class.
-            debug_assert_eq!(m[0], *r);
-            for &x in m.iter() {
-                representative.insert(x, *r);
-            }
-        }
-        self.members = members;
-        self.representative = representative;
-        true
-    }
-}
+/// representative's members (only for classes of two or more). The union kernel the
+/// engine shares ([`nrese_exec::classes`]).
+pub use nrese_exec::classes::Classes as EqualityClasses;
 
 /// A closure over representatives.
 #[derive(Debug, Default)]
@@ -162,9 +39,11 @@ pub struct RepresentativeClosure {
     /// Violations over representatives, sorted.
     pub violations: Vec<Violation>,
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
-    /// Rounds of the last closure, and how many times classes merged.
+    /// Rounds of the closure, and in how many of them classes merged.
     pub rounds: usize,
     pub merges: usize,
+    /// The batch materialisations run: one (merges are rebuilt within its rounds).
+    pub passes: usize,
     /// The times and work of every pass, summed (`passes` counts them).
     pub phases: batch::Phases,
 }
@@ -198,7 +77,7 @@ pub fn materialise(
     materialise_until(input, rules, lists, schema, super::eval::NEVER).expect("never stopped")
 }
 
-/// [`materialise`], polling `stop` in every round of every closure.
+/// [`materialise`], polling `stop` in every round.
 pub fn materialise_until(
     input: &[Triple],
     rules: &[Rule],
@@ -206,113 +85,22 @@ pub fn materialise_until(
     schema: &Schema,
     stop: super::eval::Stop<'_>,
 ) -> Result<RepresentativeClosure, super::delta::Interrupted> {
-    let Some(same_as) = same_as(rules) else {
-        let result = batch::materialise_owned_until(input.to_vec(), rules, lists, schema, stop)?;
-        let mut facts: Vec<Triple> = input.iter().copied().chain(result.derived).collect();
-        facts.par_sort_unstable();
-        facts.dedup();
-        return Ok(RepresentativeClosure {
-            facts,
-            violations: result.violations,
-            diagnostics: result.diagnostics,
-            rounds: result.rounds,
-            phases: result.phases,
-            ..RepresentativeClosure::default()
-        });
-    };
-    let rules = without_replacement(rules);
-    let mut classes = EqualityClasses::default();
-    let mut facts: Vec<Triple> = input.to_vec();
-    let mut merges = 0;
-    let mut phases = batch::Phases::default();
-    loop {
-        // Classes from the sameAs facts known so far.
-        let pairs: Vec<(u64, u64)> = facts
-            .iter()
-            .filter(|t| t[1] == same_as && t[0] != t[2])
-            .map(|t| (t[0], t[2]))
-            .collect();
-        if classes.merge(&pairs) {
-            merges += 1;
-        }
-        let mut rewritten: Vec<Triple> = facts.par_iter().map(|&t| classes.rewrite(t)).collect();
-        // The sameAs facts that made a class are now `r sameAs r`: expanded, every pair of
-        // its members, as eq-sym and eq-trans derive them.
-        rewritten.par_sort_unstable();
-        rewritten.dedup();
-        let Materialisation {
-            derived,
-            violations,
-            diagnostics,
-            rounds,
-            phases: pass,
-            ..
-        } = batch::materialise_owned_until(rewritten.clone(), &rules, lists, schema, stop)?;
-        phases.add(&pass);
-        let input_len = rewritten.len();
-        let mut closure = rewritten;
-        closure.extend(derived);
-        closure.par_sort_unstable();
-        closure.dedup();
-        // Done when no class grows and the round added nothing modulo equality. A rule
-        // head naming a constant that isn't its class's representative derives a fact
-        // over that constant in every round (a `sameAs` too): only its rewrite says
-        // whether it is new, and the rewrite can feed rules that join on the
-        // representative, hence one more round. Without such heads every fact is over
-        // representatives, and a round that merges nothing ends it.
-        let grows = closure.iter().any(|t| {
-            t[1] == same_as && classes.representative(t[0]) != classes.representative(t[2])
-        });
-        if !grows {
-            let finished =
-                if classes.is_empty() || closure.par_iter().all(|&t| classes.rewrite(t) == t) {
-                    Some(std::mem::take(&mut closure))
-                } else {
-                    let mut rewritten: Vec<Triple> =
-                        closure.par_iter().map(|&t| classes.rewrite(t)).collect();
-                    rewritten.par_sort_unstable();
-                    rewritten.dedup();
-                    // The round's input was over representatives, so it is in `rewritten`:
-                    // the same length means the same facts.
-                    if rewritten.len() == input_len {
-                        Some(rewritten)
-                    } else {
-                        closure = rewritten;
-                        None
-                    }
-                };
-            if let Some(facts) = finished {
-                return Ok(RepresentativeClosure {
-                    facts,
-                    classes,
-                    violations,
-                    diagnostics,
-                    rounds,
-                    merges,
-                    phases,
-                });
-            }
-        }
-        facts = closure;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classes_merge_expand_and_rewrite() {
-        let mut classes = EqualityClasses::default();
-        assert!(classes.merge(&[(5, 3), (7, 9)]));
-        assert!(!classes.merge(&[(3, 5)]));
-        assert!(classes.merge(&[(9, 5)]));
-        assert_eq!(classes.members(7), &[3, 5, 7, 9]);
-        assert_eq!(classes.representative(9), 3);
-        assert_eq!(classes.members(42), vec![42]);
-        assert!(classes.is_representative(3) && !classes.is_representative(5));
-        assert_eq!(classes.rewrite([9, 1, 42]), [3, 1, 42]);
-        let expanded: Vec<Triple> = classes.expand([3, 1, 42]);
-        assert_eq!(expanded.len(), 4);
-    }
+    let result = batch::materialise_representatives_until(
+        batch::Input::Facts(input.to_vec()),
+        rules,
+        lists,
+        schema,
+        batch::Listing::Representatives,
+        stop,
+    )?;
+    Ok(RepresentativeClosure {
+        facts: result.derived,
+        classes: result.classes,
+        violations: result.violations,
+        diagnostics: result.diagnostics,
+        rounds: result.rounds,
+        merges: result.merges,
+        passes: 1,
+        phases: result.phases,
+    })
 }

@@ -1138,6 +1138,56 @@ fn a_head_constant_that_is_no_representative_ends_the_closure() {
     );
 }
 
+/// G13 of the investigation of 6 October 2026, as it describes it: rule heads name
+/// constants that aren't their class's representative and derive `rep sameAs c` (and
+/// facts over `c`) in every pass, and a rule joins on the representative. The closure
+/// ends after the pass that merges and one that confirms, with the replicated closure's
+/// facts. (Fixed by da4e92c before the investigation's commit; kept as its reproduction.)
+#[test]
+fn head_constants_deriving_their_own_class_end_the_closure() {
+    use super::ir::parse_rules;
+    use super::representatives;
+    let mut vocabulary = LocalVocabulary::default();
+    // (The rule parser knows the OWL namespace, not ex:, so the constants live there.)
+    // owl:a is interned first: it represents its class with owl:b and owl:c.
+    let input = load(
+        &mut vocabulary,
+        "owl:a owl:sameAs owl:b
+         ex:x rdf:type owl:K
+         ex:y owl:q owl:c",
+    );
+    let text = [
+        "eq-sym:   (?x owl:sameAs ?y) -> (?y owl:sameAs ?x)",
+        "eq-trans: (?x owl:sameAs ?y), (?y owl:sameAs ?z) -> (?x owl:sameAs ?z)",
+        "eq-rep-s: (?s owl:sameAs ?t), (?s ?p ?o) -> (?t ?p ?o)",
+        "eq-rep-p: (?p owl:sameAs ?q), (?s ?p ?o) -> (?s ?q ?o)",
+        "eq-rep-o: (?o owl:sameAs ?t), (?s ?p ?o) -> (?s ?p ?t)",
+        "skolem: (?x rdf:type owl:K) -> (owl:a owl:sameAs owl:b), (owl:b owl:sameAs owl:c), (?x owl:p owl:c)",
+        "join: (?x owl:p owl:a), (?y owl:q owl:a) -> (?x owl:r ?y)",
+    ];
+    let rules = parse_rules(&text.join("\n"), &mut vocabulary).unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let replicated = batch::materialise(&input, &rules, None, &schema);
+    let mut expected: HashSet<Triple> = input.iter().copied().collect();
+    expected.extend(replicated.derived.iter().copied());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let stop = move || std::time::Instant::now() >= deadline;
+    let closure = representatives::materialise_until(&input, &rules, None, &schema, &stop)
+        .expect("the closure ends");
+    let expanded: HashSet<Triple> = closure
+        .facts
+        .iter()
+        .flat_map(|&f| closure.classes.expand(f))
+        .collect();
+    assert_eq!(expanded, expected);
+    let joined = load(&mut vocabulary, "ex:x owl:r ex:y")[0];
+    assert!(
+        closure.facts.contains(&joined),
+        "the join on the representative"
+    );
+    assert!(closure.passes <= 3, "{} passes", closure.passes);
+}
+
 /// Equality-heavy data: the batch executor's equality module equals the generic
 /// `eq-rep-*` rules of the naive evaluator (chains of `sameAs` that merge classes over
 /// several rounds, equal predicates, equal objects).
