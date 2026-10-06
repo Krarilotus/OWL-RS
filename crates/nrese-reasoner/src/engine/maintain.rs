@@ -304,10 +304,16 @@ fn store_over_representatives(
         .is_some()
     };
     let mut removals: Vec<Triple> = update.remove.iter().map(|&t| rewrite(t)).collect();
-    // A statement asserted now needs no inferred copy, unless its terms have identities.
+    // A statement asserted now needs no inferred copy, unless its terms have identities:
+    // then its form over representatives is stored, which reads expand to the other
+    // identities (the delta executor never reports it, as it is asserted, here or in a
+    // named graph alone).
+    let mut asserted_copies: Vec<Triple> = Vec::new();
     for quad in tx.inserted().collect::<Vec<_>>() {
         let fact = rewrite(triple(quad));
-        if !touches(&fact) {
+        if touches(&fact) {
+            asserted_copies.push(fact);
+        } else {
             removals.push(fact);
         }
     }
@@ -324,6 +330,7 @@ fn store_over_representatives(
         .chain(missing_axioms)
         .map(|&t| rewrite(t))
         .chain(moved)
+        .chain(asserted_copies)
         .filter(|&t| storable(t))
         .collect();
     // A statement deleted from the default graph but still asserted in another stays a

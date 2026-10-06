@@ -30,6 +30,22 @@ pub enum Seg {
     Delta,
     /// Both.
     All,
+    /// The facts the last round added but those a closed rule family produced, the one
+    /// whose schema link is this predicate (`rdfs:subClassOf` for `cax-sco`): what the
+    /// family's own instances read, as they would derive nothing new from them (the
+    /// batch executor's partitioned delta). Sources that don't partition their delta
+    /// read it as [`Seg::Delta`] ([`Seg::plain`]).
+    DeltaNotBy(u64),
+}
+
+impl Seg {
+    /// The segment with [`Seg::DeltaNotBy`] read as the whole delta.
+    pub fn plain(self) -> Seg {
+        match self {
+            Seg::DeltaNotBy(_) => Seg::Delta,
+            seg => seg,
+        }
+    }
 }
 
 /// Facts, split into the last round's delta and the rest.
@@ -649,9 +665,20 @@ impl<'r> Job<'r> {
     /// The semi-naive variant with atom `i` on the delta: atoms before it read the old
     /// facts, atoms after it all facts.
     pub fn variant<S: Source + ?Sized>(source: &S, rule: &'r Rule, i: usize) -> Option<Self> {
+        Self::variant_reading(source, rule, i, Seg::Delta)
+    }
+
+    /// [`Job::variant`] with atom `i` reading `delta` (the delta, or the delta without
+    /// what a closed family produced: [`Seg::DeltaNotBy`]).
+    pub fn variant_reading<S: Source + ?Sized>(
+        source: &S,
+        rule: &'r Rule,
+        i: usize,
+        delta: Seg,
+    ) -> Option<Self> {
         Self::new(source, rule, i, |j| match j.cmp(&i) {
             std::cmp::Ordering::Less => Seg::Old,
-            std::cmp::Ordering::Equal => Seg::Delta,
+            std::cmp::Ordering::Equal => delta,
             std::cmp::Ordering::Greater => Seg::All,
         })
     }
@@ -724,6 +751,15 @@ fn never() -> bool {
 /// A [`Stop`] that never fires.
 pub const NEVER: Stop<'static> = &never;
 
+/// Whether the process holds more than its memory limit
+/// ([`nrese_exec::memory::set_process_limit`]): materialisations and commits stop then,
+/// whatever `stop` their caller passes ([`super::delta::Interrupted`]). A collected
+/// closure can outgrow any time budget (a DL bound's evaluation reached 49 GB under a
+/// deadline, 6 October 2026); the caller tells the two apart by asking this again.
+pub fn over_memory_limit() -> bool {
+    nrese_exec::memory::process_limit_exceeded()
+}
+
 /// Every fact `jobs` derive that `keep` accepts. If `stop` fires, the remaining morsels
 /// are skipped and the result is incomplete: the caller must check `stop` and discard it.
 pub fn run_jobs<S: Source + ?Sized>(
@@ -760,7 +796,7 @@ impl Probes {
 }
 
 /// [`run_jobs`] by morsel: each morsel's facts, sorted by (predicate, subject, object) and
-/// distinct, are handed to `finish`, and its results come back in the morsels' order,
+/// distinct, are handed to `finish` with the index of the job they come from, and its results come back in the morsels' order,
 /// not concatenated (a caller that regroups them needs no copy of all of them). Counts
 /// the probes into `probes` (once per morsel). `rewrite`, if given, maps each derived
 /// fact before it is checked (equality by representatives: to its representatives).
@@ -771,7 +807,7 @@ pub fn run_jobs_by_morsel<S: Source + ?Sized, T: Send>(
     rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
     stop: Stop<'_>,
     probes: &Probes,
-    finish: &(dyn Fn(Vec<Triple>) -> T + Sync),
+    finish: &(dyn Fn(usize, Vec<Triple>) -> T + Sync),
 ) -> Vec<T> {
     run_morsels(
         source,
@@ -808,9 +844,16 @@ fn run_jobs_with<S: Source + ?Sized>(
     stop: Stop<'_>,
     probes: Option<&Probes>,
 ) -> Vec<Triple> {
-    run_morsels(source, jobs, keep, acyclic, None, stop, probes, &|facts| {
-        facts
-    })
+    run_morsels(
+        source,
+        jobs,
+        keep,
+        acyclic,
+        None,
+        stop,
+        probes,
+        &|_, facts| facts,
+    )
     .concat()
 }
 
@@ -823,7 +866,7 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
     rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
     stop: Stop<'_>,
     probes: Option<&Probes>,
-    finish: &(dyn Fn(Vec<Triple>) -> T + Sync),
+    finish: &(dyn Fn(usize, Vec<Triple>) -> T + Sync),
 ) -> Vec<T> {
     let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
         .iter()
@@ -839,10 +882,10 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
         .map(|(j, range)| {
             let job = &jobs[*j];
             let Head::Facts(heads) = &job.rule.head else {
-                return finish(Vec::new());
+                return finish(*j, Vec::new());
             };
             if stop() {
-                return finish(Vec::new());
+                return finish(*j, Vec::new());
             }
             let mut out = Vec::new();
             let mut enumerated = 0u64;
@@ -884,7 +927,7 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                 }
                 probes.emitted.fetch_add(emitted, Relaxed);
             }
-            finish(out)
+            finish(*j, out)
         })
         .collect()
 }
@@ -977,6 +1020,47 @@ fn without_tautologies(mut rule: Rule) -> Option<Rule> {
         }
     }
     Some(rule)
+}
+
+/// The schema link of `rule` if it is a closed family: one schema atom `(?a S ?b)` over
+/// two variables, one instance atom `A` mentioning `?a` and not `?b`, no guard, and one
+/// head atom, `A` with `?a` replaced by `?b`. `cax-sco` (`S` = `rdfs:subClassOf`:
+/// `(?x type ?a) -> (?x type ?b)`) and `prp-spo1` (`rdfs:subPropertyOf`:
+/// `(?x ?a ?y) -> (?x ?b ?y)`) are such families.
+///
+/// With `S` transitive (its closure complete when the program has grounded the rule
+/// over it), an instance's output needs no further work from the family: a fact
+/// `A[b]` the instance for `a S b` derived from `A[a]` has, for every `b S c`, the
+/// instance for `a S c` derive `A[c]` from the same `A[a]` (grounded now, or later and
+/// then evaluated over all facts). So the family's instances needn't read what it
+/// produced: the investigation's idempotent propagators, which the batch executor uses
+/// to keep a deep hierarchy from re-deriving every inherited type once per ancestor.
+pub fn closed_family(schema: &Schema, rule: &Rule) -> Option<u64> {
+    let ([first, second], Head::Facts(heads)) = (rule.body.as_slice(), &rule.head) else {
+        return None;
+    };
+    let [head] = heads.as_slice() else {
+        return None;
+    };
+    if !rule.guards.is_empty() {
+        return None;
+    }
+    let (link, instance) = match (schema.is_schema_atom(first), schema.is_schema_atom(second)) {
+        (true, false) => (first, second),
+        (false, true) => (second, first),
+        _ => return None,
+    };
+    let Atom([Term::Var(a), Term::Const(s), Term::Var(b)]) = *link else {
+        return None;
+    };
+    if a == b || !instance.0.contains(&Term::Var(a)) || instance.0.contains(&Term::Var(b)) {
+        return None;
+    }
+    let replaced = instance.0.map(|t| match t {
+        Term::Var(v) if v == a => Term::Var(b),
+        t => t,
+    });
+    (head.0 == replaced).then_some(s)
 }
 
 /// Identity of a ground rule, for deduplication (the name doesn't matter).
@@ -1083,6 +1167,11 @@ impl Dispatch {
 #[derive(Default, Clone)]
 pub struct GroundProgram {
     pub rules: Vec<Rule>,
+    /// Per rule: the closed family it is an instance of, if any ([`closed_family`]).
+    families: Vec<Option<u64>>,
+    /// The relations closed families read and produce by name (`cax-sco`'s `rdf:type`),
+    /// each with its family: the family claims the relation's closed part.
+    pub family_relations: std::collections::BTreeMap<u64, u64>,
     known: hashbrown::HashMap<RuleKey, usize>,
     dispatch: Dispatch,
     pub transitive: std::collections::BTreeSet<u64>,
@@ -1123,11 +1212,17 @@ impl std::fmt::Debug for GroundProgram {
 impl GroundProgram {
     /// Files one ground fact rule; returns its index if it is new and has a body.
     pub fn add(&mut self, rule: Rule) -> Option<usize> {
-        self.add_with(rule, Vec::new())
+        self.add_with(rule, Vec::new(), None)
     }
 
-    /// [`Self::add`], with the schema facts the instance was grounded on.
-    fn add_with(&mut self, rule: Rule, premises: Vec<Triple>) -> Option<usize> {
+    /// [`Self::add`], with the schema facts the instance was grounded on, and the closed
+    /// family it is an instance of, if any ([`closed_family`]).
+    fn add_with(
+        &mut self,
+        rule: Rule,
+        premises: Vec<Triple>,
+        family: Option<u64>,
+    ) -> Option<usize> {
         if let Some(p) = transitive_predicate(&rule) {
             self.transitive_with(p, premises);
             None
@@ -1160,6 +1255,7 @@ impl GroundProgram {
             }
             self.rules.push(rule);
             self.premises.push(premises);
+            self.families.push(family);
             Some(self.rules.len() - 1)
         }
     }
@@ -1281,7 +1377,13 @@ impl GroundProgram {
         // Source-level transitivity rules (`scm-sco`, `scm-spo`) don't depend on the
         // delta: full grounding registers them, delta grounding leaves them alone.
         if let Some(p) = transitive_predicate(rule) {
-            if !delta {
+            // A property chain `p ∘ p ⊑ p` from a list axiom that holds only now (its
+            // facts derived, or rewritten by equality, during a materialisation) is new
+            // in delta grounding too; the vocabulary's (`scm-sco`, over schema atoms)
+            // were registered by full grounding.
+            let new_chain = !self.transitive.contains(&p)
+                && !rule.body.iter().any(|a| schema.is_schema_atom(a));
+            if !delta || new_chain {
                 // With the facts it came from (a property chain `p ∘ p ⊑ p` from a list
                 // axiom); vocabulary rules (`scm-sco`, `eq-trans`) come with none.
                 self.transitive_with(p, extra.to_vec());
@@ -1290,6 +1392,17 @@ impl GroundProgram {
         }
         let mut grounded = Vec::new();
         let has_schema_atoms = rule.body.iter().any(|a| schema.is_schema_atom(a));
+        // Hidden unnamed classes rewrite heads (W7): the family's shape no longer holds.
+        let family = closed_family(schema, rule).filter(|_| schema.hidden().is_empty());
+        if let Some(family) = family
+            && let Some(Term::Const(p)) = rule
+                .body
+                .iter()
+                .find(|a| !schema.is_schema_atom(a))
+                .map(|a| a.0[1])
+        {
+            self.family_relations.entry(p).or_insert(family);
+        }
         if delta && has_schema_atoms {
             ground_delta(source, schema, rule, &mut |g| grounded.push(g));
         } else {
@@ -1307,7 +1420,7 @@ impl GroundProgram {
                     .chain(extra.iter().copied())
                     .collect();
                 if let Some(rule) = schema.rewrite_heads(g.rule) {
-                    facts.extend(self.add_with(rule, premises));
+                    facts.extend(self.add_with(rule, premises, family));
                 }
             }
         }
@@ -1512,6 +1625,17 @@ impl GroundProgram {
 }
 
 impl GroundProgram {
+    /// The closed family rule `r` is an instance of (its schema link), if it is one and
+    /// the link is transitive in this program, so that its instances are grounded on a
+    /// closed hierarchy ([`closed_family`]).
+    pub fn closed_family(&self, r: usize) -> Option<u64> {
+        self.families
+            .get(r)
+            .copied()
+            .flatten()
+            .filter(|link| self.transitive.contains(link))
+    }
+
     /// The rules (indexes into `rules`) whose head can give `fact`, each once.
     pub fn producers(&self, fact: Triple) -> Vec<usize> {
         let mut found = Vec::new();
