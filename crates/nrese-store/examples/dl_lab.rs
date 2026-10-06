@@ -13,6 +13,8 @@
 //! - Prints, per mode, the medians over rounds of the first commit and of the per-commit
 //!   median, the engine that decided the last commit's consistency, and U1's size; counts
 //!   (statements) before times.
+//! - `DL_LAB_TIMEOUT_MS`: a shorter `dl.timeout`, to see where a DL task gives up;
+//!   `DL_LAB_RL_ONLY`: both stores under `owl2-rl` (an ontology `owl2-dl` can't take).
 //! - `--queries DIR`: then each `.rq` file of DIR in both modes (one warm-up, then the
 //!   median of 5, interleaved): rows, under `owl2-dl` the status and the paths that
 //!   decided, and the times.
@@ -54,9 +56,18 @@ struct Run {
 }
 
 fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, property: &str) -> Run {
-    // No result cache: every run evaluates (the DL path never caches).
+    // No result cache: every run evaluates (repeats would be copies from it).
+    // `DL_LAB_TIMEOUT_MS`: a shorter `dl.timeout`, to see where a DL task gives up.
+    let mut dl = nrese_store::DlConfig::default();
+    if let Some(ms) = std::env::var("DL_LAB_TIMEOUT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        dl.timeout = Duration::from_millis(ms);
+    }
     let store = StoreService::new(StoreConfig {
         query_cache_bytes: 0,
+        dl,
         ..StoreConfig::in_memory()
     })
     .expect("store");
@@ -110,7 +121,7 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
                         .unavailable
                         .map(|why| format!(" ({why})"))
                         .unwrap_or_default()
-                ),
+                ) + &gap(&store),
             )
         }
         false => ("rules".to_owned(), String::new()),
@@ -123,6 +134,29 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
         engine,
         upper,
     }
+}
+
+/// U1's facts beyond L per predicate (`a C` for a class), and how many of them name no
+/// Skolem constant: the facts that can make an answer of their own.
+fn gap(store: &StoreService) -> String {
+    const SKOLEM: &str = "urn:nrese:u1:";
+    const TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
+    let mut by: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    for [s, p, o] in store.dl_upper_facts(false).unwrap_or_default() {
+        let key = match p == TYPE {
+            true => format!("a {o}"),
+            false => p,
+        };
+        let named = !s.contains(SKOLEM) && !o.contains(SKOLEM);
+        let entry = by.entry(key).or_default();
+        entry.0 += 1;
+        entry.1 += usize::from(named);
+    }
+    by.iter()
+        .map(|(key, (all, named))| {
+            format!("\n  gap {key}: {all} facts, {named} without a Skolem constant")
+        })
+        .collect()
 }
 
 fn main() {
@@ -151,7 +185,10 @@ fn main() {
         })
         .map(PathBuf::from)
         .collect();
-    let modes = [ReasoningMode::Owl2Dl, ReasoningMode::Owl2Rl];
+    let modes = match std::env::var("DL_LAB_RL_ONLY").is_ok() {
+        true => [ReasoningMode::Owl2Rl, ReasoningMode::Owl2Rl],
+        false => [ReasoningMode::Owl2Dl, ReasoningMode::Owl2Rl],
+    };
     let mut results: Vec<Vec<Run>> = modes.iter().map(|_| Vec::new()).collect();
     for round in 0..rounds {
         // Interleaved, in alternating order.

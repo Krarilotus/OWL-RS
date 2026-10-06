@@ -33,6 +33,9 @@
 //!   `--routes` records the operators each query ran with (from EXPLAIN) in the JSON
 //!   report, for the fast suite's route checks; a query with one row also records its
 //!   first value there (`value`), the answer of a count.
+//!   `--faults` prints, per query, the first execution's time and page faults beside the
+//!   later runs' median faults (the first execution after opening a mapped store, P6),
+//!   and the working set after opening; the report gets `first_faults` and `faults`.
 //!   `--qerror` measures the planner's estimates: every operator with an estimate, over
 //!   every query, gets its q-error, `max(estimate, rows) / min(estimate, rows)` (both at
 //!   least 1; Moerkotte et al., VLDB 2009), summarised per operator (median, p90, max, the
@@ -183,6 +186,7 @@ struct Args {
     json: Option<PathBuf>,
     baseline: Option<PathBuf>,
     explain: bool,
+    faults: bool,
     qerror: bool,
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
@@ -218,6 +222,7 @@ fn parse_args() -> Result<Args, String> {
         json: None,
         baseline: None,
         explain: false,
+        faults: false,
         qerror: false,
         format: SolutionsResultFormat::Tsv,
         shapes: None,
@@ -257,6 +262,7 @@ fn parse_args() -> Result<Args, String> {
             "--json" => args.json = Some(value()?.into()),
             "--baseline" => args.baseline = Some(value()?.into()),
             "--explain" => args.explain = true,
+            "--faults" => args.faults = true,
             "--results" => args.results = Some(value()?.into()),
             "--qerror" => args.qerror = true,
             "--shapes" => args.shapes = Some(value()?.into()),
@@ -347,6 +353,9 @@ struct Measured {
     /// The query's first execution in this process (the warm-up, or the first measured run).
     first: Option<Duration>,
     error: Option<String>,
+    /// Page faults of the first execution, and of each later one (sorted).
+    first_faults: Option<u64>,
+    faults: Vec<u64>,
 }
 
 fn run_once(
@@ -427,6 +436,8 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
                 times: Vec::new(),
                 first: None,
                 error: Some(e.to_string()),
+                first_faults: None,
+                faults: Vec::new(),
             };
         }
     };
@@ -435,10 +446,19 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
         times: Vec::new(),
         first: None,
         error: None,
+        first_faults: None,
+        faults: Vec::new(),
     };
     for i in 0..args.warmup + args.runs {
+        let faults = nrese_exec::memory::page_faults();
         match run_once(store, &prepared, args.timeout) {
             Ok((rows, elapsed)) => {
+                if let (Some(before), Some(after)) = (faults, nrese_exec::memory::page_faults()) {
+                    match measured.first_faults {
+                        None => measured.first_faults = Some(after - before),
+                        Some(_) => measured.faults.push(after - before),
+                    }
+                }
                 measured.rows = rows;
                 measured.first.get_or_insert(elapsed);
                 if i >= args.warmup {
@@ -452,6 +472,7 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
         }
     }
     measured.times.sort();
+    measured.faults.sort();
     measured
 }
 
@@ -488,7 +509,11 @@ fn explain(store: &StoreService, text: &str) {
                 );
             }
             for step in &explanation.steps {
-                let mut detail = step.detail.clone();
+                // Long patterns are cut; counts after ` | ` (seeks, lookups) are kept.
+                let (mut detail, counts) = match step.detail.split_once(" | ") {
+                    Some((pattern, counts)) => (pattern.to_owned(), format!(" | {counts}")),
+                    None => (step.detail.clone(), String::new()),
+                };
                 if detail.len() > 90 {
                     let cut = (0..=90)
                         .rev()
@@ -497,6 +522,7 @@ fn explain(store: &StoreService, text: &str) {
                     detail.truncate(cut);
                     detail.push('…');
                 }
+                detail.push_str(&counts);
                 println!(
                     "    {:indent$}{} {detail}  [est {} rows {} {:.2} ms]",
                     "",
@@ -1102,19 +1128,23 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             modes::commits(&pipeline, file, &texts, args.readers)?,
         ));
         if let Some(program) = &program {
-            // The maintained closure against one computed afresh.
+            // The maintained closure against one computed afresh, both as stored: the
+            // report's count is the closure handed to the engine, which in compact mode
+            // also lists asserted facts that mention a class (stored only where they are
+            // asserted in a named graph alone), so it exceeds what is stored.
             let held = store.engine_stats().inferred;
             let fresh = store.rematerialise(program)?;
+            let recomputed = store.engine_stats().inferred;
             eprintln!(
-                "closure after the commits: maintained {held}, recomputed {}",
+                "closure after the commits: maintained {held}, recomputed {recomputed} (listed {})",
                 fresh.inferred
             );
             report.sections.push((
                 "closure_after_commits",
                 format!(
-                    "{{\"maintained\": {held}, \"recomputed\": {}, \"equal\": {}}}",
+                    "{{\"maintained\": {held}, \"recomputed\": {recomputed}, \"listed\": {}, \"equal\": {}}}",
                     fresh.inferred,
-                    held == fresh.inferred
+                    held == recomputed
                 ),
             ));
         }
@@ -1162,6 +1192,11 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         eprintln!("exported in {:.2} s", started.elapsed().as_secs_f64());
     }
     let memory_after_load = memory_mib();
+    if args.faults
+        && let Some(resident) = nrese_exec::memory::resident_bytes()
+    {
+        eprintln!("working set after open: {} MiB", resident / 1048576);
+    }
     eprintln!(
         "open {:.2} s{}",
         report.open_s,
@@ -1252,6 +1287,18 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         let mut extra = String::new();
         if let Some(first) = m.first {
             extra.push_str(&format!(",\n      \"first_ms\": {:.3}", ms(first)));
+        }
+        if let Some(first) = m.first_faults {
+            let later = m.faults.get(m.faults.len() / 2).copied().unwrap_or(0);
+            extra.push_str(&format!(
+                ",\n      \"first_faults\": {first},\n      \"faults\": {later}"
+            ));
+            if args.faults {
+                println!(
+                    "    first {:.2} ms, {first} page faults; later runs {later} faults (median)",
+                    m.first.map_or(0.0, ms)
+                );
+            }
         }
         if args.routes {
             if m.rows == 1

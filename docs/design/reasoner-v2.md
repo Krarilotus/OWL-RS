@@ -176,19 +176,20 @@ Both are covered by the parity tests.
 
 Used for initial loads, restores, ruleset changes and deltas above a size threshold.
 
-- **Working set: vertical partitioning.** It is built from one snapshot scan as per-predicate binary relations of `(u64, u64)` pairs, in both **SO and OS order**. `rdf:type` is further split per class as unary sets.
+What the code does (`batch.rs`, `eval.rs`; checked against the code on 6 October 2026):
+
+- **Working set: vertical partitioning.** It is built from one snapshot scan (the store streams its POSG order, already grouped) as per-predicate binary relations of `(u64, u64)` pairs, sorted by subject. The **OS order** is kept only for relations a ground rule looks up by object alone, or grounding reads (P1-F11), so a fact costs 16–32 B. `rdf:type` is one relation like the others (no per-class sets).
   - This is Inferray's layout, and it is also what QLever's permutations amount to per predicate.
-  - It costs 32 B per fact for two orders, versus 128 B in the inferred stack's four-permutation runs (224 B in the asserted stack's seven).
-  - Building it means a parallel radix sort of u64 pairs.
-- **Semi-naive evaluation per stratum.** Each relation has `old | Δ | new` segments. A rule with n atoms runs n delta variants (atom i on Δ, atoms before i on old, atoms after i on old ∪ Δ), so no derivation is repeated across rounds.
-- **Joins:**
-  - **Binary joins** (the vast majority after specialisation) are sort-merge joins on sorted columns, or galloping when sizes differ by more than 32×.
-  - **Rules with ≥ 3 atoms** (chains, keys, intersections) use **Leapfrog Triejoin** over the sorted columns (Veldhuizen, ICDT 2014; Nemo's choice), which is worst-case-optimal for cyclic shapes.
-  - **Dispatch-table rules** (§3.2) are a scan with a table lookup and no join.
-- **Deduplication without locks.** Each worker writes derivations into thread-local buffers. At the end of a round they are partitioned by predicate, radix-sorted, merged and deduplicated against `old ∪ Δ` by one merge pass. There's no shared hash set, so there's no contention, and the output is deterministic regardless of thread count (T4).
+  - Each relation holds its input in a run of its own and what was added in a base run and a small recent run, which takes each round's delta and is folded into the base once it reaches a quarter of it; runs that are merged are held in chunks of 1 Mi pairs (P1-F4, F10).
+  - Sorting is comparison-based (rayon's parallel unstable sort; a sample sort into chunks for large unions), not radix (kernel #9 of the 6 October investigation is open).
+- **Semi-naive evaluation.** A rule with n atoms runs n delta variants (atom i on Δ, atoms before i on old, atoms after i on old ∪ Δ), so no derivation is repeated across rounds.
+- **Joins: index nested loops.** A variant's driver atom's matches are read in place, by position, from the runs (P1-F1); each further atom, ordered by bound positions and then estimated matches, is a lookup by binary search in each run. There is no sort-merge join, galloping or Leapfrog Triejoin yet (a seekable cursor kernel, #3 of the investigation, would make the lookups of sorted probes cheap).
+  - **Dispatch** (§3.2): ground instances are indexed by the predicate (and class) of each atom, so a round runs only the variants whose atom can match its delta. Instances whose head is one of their body atoms (`(?x type C) → (?x type C)` from `C ⊑ C`) are dropped at grounding (R1).
+- **Deduplication without locks.** Each morsel sorts its candidate facts by (predicate, subject, object), drops duplicates and checks them against the working set in that order (P1-F8). The round's new facts stay in their morsels' per-predicate lists until each predicate's are merged into chunked runs by a sample sort (P1-F9). There's no shared hash set, so there's no contention, and the output is deterministic regardless of thread count (T4).
 - **Parallelism:** morsel-driven (Leis et al., SIGMOD 2014) through rayon.
-  - Work units are (rule variant × Δ-morsel of 16–64 k facts), so skewed predicates split instead of serialising.
+  - Work units are (rule variant × morsel of 4,096 driver matches), so skewed predicates split instead of serialising.
   - RDFox's lock-free design is the benchmark to meet (T3). We deliberately take the sort-based route instead: it is simpler to make deterministic, and it matches our immutable-run storage.
+- **Equality** by representatives runs within the rounds (§4.4).
 - **Output:** the new inferred facts are sorted once more, into the inferred stack's permutations, and installed as base runs through the bulk run builder shared with E5. They never go through the per-commit path.
 
 ### 4.2 Delta executor: the commit path
@@ -227,10 +228,10 @@ Generic semi-naive evaluation of transitive or equality rules makes O(n·closure
 
 | Module | Rules covered | Algorithm |
 |---|---|---|
-| Hierarchy | `scm-sco`, `scm-spo`, `scm-eqc*`, `scm-eqp*`, `cax-sco` fan-out | SCC condensation, then reachability over the DAG with bitsets. Produces the `sup⁺` dispatch tables. Deletes recompute only the affected sub-DAG. |
-| Transitive property | `prp-trp` per transitive property | SCC condensation plus per-component reachability; the closure is materialised (GraphDB semantics) but computed without redundant joins. Deletes: the affected components only. |
-| Equality | `eq-sym`, `eq-trans`, `eq-rep-*`, and `prp-fp`, `prp-ifp` and `prp-key` as producers | Union-find over `TermId`s with **rewriting** (Motik et al., AAAI 2015). Facts are stored over class representatives (the smallest id), and the read view expands members at scan time. The equivalence classes are persisted with the inferred stack. Deletes follow Motik et al., IJCAI 2015 (rewriting combined with maintenance). |
-| Symmetric / inverse | `prp-symp`, `prp-inv1/2` | Pairwise mirroring; no recursion beyond depth 2 |
+| Hierarchy | `scm-sco`, `scm-spo`, `scm-eqc*`, `scm-eqp*`, `cax-sco` fan-out | As built: `scm-sco` and `scm-spo` are transitivity rules, so the transitive module below closes `subClassOf` and `subPropertyOf` (no bitset reachability), and `cax-sco` is grounded into one ground rule per edge of the closed hierarchy (`c ↦ sup⁺(c)` as dispatch entries). Deletes go through DRed/B/F like other rules. |
+| Transitive property | `prp-trp` per transitive property | SCC condensation (`nrese-exec::graph`); the closure is materialised (GraphDB semantics) but computed without redundant joins. As built, the batch executor recomputes a predicate's closure in each round other rules added edges to it; the delta executor closes per new edge. Deletes: the affected components only. |
+| Equality | `eq-sym`, `eq-trans`, `eq-rep-*`, and `prp-fp`, `prp-ifp` and `prp-key` as producers | Union-find over `TermId`s with **rewriting** (Motik et al., AAAI 2015), the smallest id representing its class. As built (6 October 2026), the batch executor merges classes within its semi-naive rounds: a round's new `sameAs` between two representatives merges their classes, and only the facts mentioning the representative that lost its place are rewritten into the next round's delta (egglog's rebuild; the rules read only facts over representatives). Stored over representatives with the read view expanding members at scan time (`equality = "compact"`), or expanded. Commits: the delta executor reasons over the expanded view; in compact mode a commit that merges classes rewrites the stored facts that mention a former representative in the same transaction (G5, 6 October 2026), while one that deletes an equality (a possible split) commits without its inferences and re-materialises after it (B3 of the investigation; Motik et al., IJCAI 2015 is the plan). |
+| Symmetric / inverse | `prp-symp`, `prp-inv1/2` | As built: ground one-atom rules (`(?x p ?y) → (?y q ?x)`), no module |
 | Equivalence property | `prp-trp` + `prp-symp` on the same property (plus reflexivity if declared): an equivalence relation | Union-find over the property's edges gives the components in O(n + m). The closure is every pair within a component. It's either materialised in one pass without joins, or stored as components and expanded at read time like sameAs. That choice is a profile setting (D7): `materialise` by default for GraphDB parity, `compact` for large components. |
 
 **Evidence (reasoning benchmark, 2026-09-27).** In OWL2Bench RL(1) and DL(1), 55 k asserted triples, `hasSameHomeTownWith` is symmetric and transitive. Its closure is 1.31 M triples: hometown groups of about a thousand people, each closed into a clique. With generic rule evaluation, which is O(k³) per group, every baseline takes 15 to 31 minutes:
