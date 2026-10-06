@@ -78,19 +78,33 @@ pub(crate) struct SignedMerge<'a> {
 impl<'a> SignedMerge<'a> {
     /// `parts` are `(run, start, end)` index ranges; empty ranges are dropped up front.
     pub(crate) fn new(parts: impl IntoIterator<Item = (&'a PermutationRun, usize, usize)>) -> Self {
-        let cursors = parts
-            .into_iter()
-            .filter(|&(_, start, end)| start < end)
-            .map(|(run, pos, end)| Cursor {
-                run,
-                pos,
-                end,
-                key: run.keys.get(pos),
-                buffer: Vec::new(),
-                buffered: pos + 1,
-            })
-            .collect();
-        Self { cursors }
+        let mut merge = Self {
+            cursors: Vec::new(),
+        };
+        merge.refill(parts);
+        merge
+    }
+
+    /// The merge of `parts` in place of what this one had left, its cursors' memory reused
+    /// (a probe cursor's per-probe merge: [`super::cursor`]).
+    pub(crate) fn refill(
+        &mut self,
+        parts: impl IntoIterator<Item = (&'a PermutationRun, usize, usize)>,
+    ) {
+        self.cursors.clear();
+        self.cursors.extend(
+            parts
+                .into_iter()
+                .filter(|&(_, start, end)| start < end)
+                .map(|(run, pos, end)| Cursor {
+                    run,
+                    pos,
+                    end,
+                    key: run.keys.get(pos),
+                    buffer: Vec::new(),
+                    buffered: pos + 1,
+                }),
+        );
     }
 
     /// Upper bound on the remaining entries.
