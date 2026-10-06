@@ -1,0 +1,11 @@
+# The tests that draw random cases from NRESE_FUZZ_SEED, as crate:target:filter (target
+# `lib` for the unit tests). Read by scripts/fuzz-campaign.sh (many seeds, hours) and by the
+# push tier of scripts/check.sh (a few seeds, for the crates a push changes).
+nrese-sparql:it:native_differential_tests::
+nrese-store:it:equality_compact_tests::
+nrese-shacl:it:incremental_tests::
+nrese-engine:it:inferred_stack_tests::
+nrese-engine:lib:index::model_tests
+nrese-reasoner:lib:
+nrese-fuzz:it:parsers_hold
+nrese-server:it:http_fuzz_tests::
