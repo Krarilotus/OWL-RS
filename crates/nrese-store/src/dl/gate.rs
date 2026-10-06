@@ -95,7 +95,7 @@ pub(crate) fn check_commit(
         return Gate {
             checked: Checked {
                 verdict: Verdict::Consistent,
-                engine: "upper-bound",
+                engine: preparation.decided_by,
                 elapsed: Duration::ZERO,
             },
             reject: None,

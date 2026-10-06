@@ -9,6 +9,7 @@ mod gates;
 mod mode;
 mod queries;
 mod review;
+mod routing;
 
 use std::sync::Arc;
 
