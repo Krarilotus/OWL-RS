@@ -5,6 +5,7 @@
 //! cargo run --release -p nrese-dl --example tableau_consistency -- [--timeout SECS]
 //!     [--no-semantic-branching] [--no-backjumping] [--ancestor-blocking] [--pairwise-always]
 //!     [--disjunctions-first] [--no-disjunct-learning] [--full-blocking] [--expand-at-most N]
+//!     [--conflict-order] [--no-merge-filter]
 //!     [--exact-provenance] [--no-lazy-definitions] FILE...
 //! ```
 //!
@@ -178,6 +179,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--disjunctions-first" => config.disjunctions_first = true,
             "--no-disjunct-learning" => config.disjunct_learning = false,
             "--full-blocking" => config.incremental_blocking = false,
+            "--conflict-order" => config.conflict_order = true,
+            "--no-merge-filter" => config.merge_filter = false,
             "--exact-provenance" => exact_provenance = true,
             "--no-lazy-definitions" => config.lazy_definitions = false,
             "--expand-at-most" => {

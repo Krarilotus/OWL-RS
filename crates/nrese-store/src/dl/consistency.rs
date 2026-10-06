@@ -97,6 +97,7 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
         budget: nrese_dl::context::Budget {
             deadline: Some(started + budget.timeout),
             max_join: Some(MAX_JOIN),
+            ..nrese_dl::context::Budget::default()
         },
         ..nrese_dl::context::Options::default()
     };

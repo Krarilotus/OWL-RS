@@ -12,6 +12,7 @@
 //! - **Succ** runs at `u`: a clause about `f(x)` adds the atom to `K₂` (and `K₁` if
 //!   unconditional); when no edge for `f` holds every atom of `K₂`, the expansion strategy
 //!   picks the successor, which gets `A → A` for the atoms it lacks.
+//! - **Eq** ([`super::equality`]) merges neighbours under at-most-one clauses.
 
 use hashbrown::HashMap;
 
@@ -80,6 +81,12 @@ pub struct State {
     pub remote: Vec<Remote>,
     pub remote_by_atom: HashMap<Atom, Vec<u32>>,
     pub succ: HashMap<FuncId, Successor>,
+    /// The Eq rule's merges of neighbour terms, by term and by pair (the smaller first).
+    pub merges: Vec<super::equality::Merge>,
+    pub merges_by_term: HashMap<CTerm, Vec<u32>>,
+    pub merges_by_pair: HashMap<(CTerm, CTerm), Vec<u32>>,
+    /// A merge of `x` with a neighbour was due and not made ([`super::equality`]).
+    pub unmerged: bool,
 }
 
 /// Messages for other contexts, and for this one.
@@ -201,7 +208,7 @@ impl Worker<'_> {
                 // One context's agenda can run for minutes (its redundancy checks grow with
                 // its clauses): the budget is checked inside it too. Stopping leaves the
                 // run exhausted, which ends it as `Unsupported::Budget`, never an answer.
-                if given.is_multiple_of(256) && self.engine.out_of_time() {
+                if given.is_multiple_of(256) && self.engine.out_of_budget() {
                     return;
                 }
             }
@@ -281,7 +288,7 @@ impl Worker<'_> {
                 let mut s = std::mem::take(&mut self.scratch);
                 s.found.clear();
                 s.premises.clear();
-                self.pred_join(id, None, 0, &[], &mut s);
+                self.pred_join(id, None, 0, &[], true, &mut s);
                 self.conclude(&s.found);
                 self.scratch = s;
             }
@@ -312,6 +319,7 @@ impl Worker<'_> {
             self.pred_local(c, head);
             self.succ(c, head);
         }
+        self.equality(c, head);
     }
 
     pub(super) fn conclude(&mut self, found: &Found) {
