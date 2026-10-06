@@ -300,6 +300,18 @@ pub const SETTINGS: &[Setting] = &[
         Integer,
         "Under owl2-dl, the workers of a classification (default 0: every core).",
     ),
+    setting(
+        "dl.max_nodes",
+        names::DL_MAX_NODES,
+        Integer,
+        "Under owl2-dl, the most nodes one hypertableau run may hold (default 2000000).",
+    ),
+    setting(
+        "dl.max_branch_points",
+        names::DL_MAX_BRANCH_POINTS,
+        Integer,
+        "Under owl2-dl, the most branch points one hypertableau run may open (default 1000000): a deterministic budget; past it the run decides nothing.",
+    ),
     // [federation]
     setting(
         "federation.allow",

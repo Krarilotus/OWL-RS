@@ -381,6 +381,13 @@ impl StoreService {
         self.dl.set_active(active, user_rules);
     }
 
+    /// Marks the store as a read replica: it follows a primary's log, whose dictionary
+    /// its own must continue, so the `owl2-dl` mode interns no term here (it reads the
+    /// terms the primary's records bring).
+    pub fn mark_replica(&self) {
+        self.dl.set_replica();
+    }
+
     /// The `owl2-dl` mode's state.
     pub fn dl(&self) -> &crate::dl::Dl {
         &self.dl

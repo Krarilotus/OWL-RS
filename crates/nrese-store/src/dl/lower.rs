@@ -42,6 +42,7 @@ pub(crate) fn tbox_taxonomy(store: &StoreService, ontology: &Ontology) -> Taxono
         &classify::Options {
             threads: dl.workers(),
             timeout: Some(dl.timeout),
+            tableau: dl.tableau(dl.timeout, classify::Options::default().tableau.max_memory),
             ..classify::Options::default()
         },
     )

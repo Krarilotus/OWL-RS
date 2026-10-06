@@ -4,6 +4,7 @@ mod bounds;
 mod classification;
 mod consistency;
 mod entailment;
+mod gates;
 mod mode;
 mod queries;
 mod review;

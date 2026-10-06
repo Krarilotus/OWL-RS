@@ -6,12 +6,39 @@ use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, Tran
 use nrese_owl::{Ontology, Statement, TermKind, Terms};
 use nrese_rdf::{NamedNodeRef, Term};
 
+/// The individuals entailment tests add to an ontology (`¬(C ⊑ D)` as `(C ⊓ ¬D)(x)`):
+/// IRIs no data uses, the same in every store.
+pub(crate) const FRESH: usize = 8;
+
+/// The `i`th of the [`FRESH`] individuals' IRIs.
+pub(crate) fn fresh_iri(i: usize) -> String {
+    format!("urn:nrese:dl:fresh:{i}")
+}
+
 /// The OWL vocabulary's IRIs, interned so the reader finds every term it looks for
 /// (`rdfs:Literal` in a data cardinality, which the data may not name: without its id the
-/// axiom would be lost).
+/// axiom would be lost), and the fresh individuals of entailment tests. Interned in the
+/// commits of a primary, so its replicas, which intern nothing, find them in the records.
 pub(crate) fn intern_vocabulary(tx: &Transaction<'_>) {
     for (_, iri) in nrese_owl::Vocabulary::iris() {
         tx.intern(NamedNodeRef::new_unchecked(&iri).into());
+    }
+    for i in 0..FRESH {
+        tx.intern(NamedNodeRef::new_unchecked(&fresh_iri(i)).into());
+    }
+}
+
+/// The id of `term` for the DL engines' own use: interned on a primary, looked up on a
+/// read replica, whose dictionary must continue its primary's (it interns nothing;
+/// `nrese_engine`'s replication). `None` there for a term no record has brought yet.
+pub(crate) fn resolve(
+    replica: bool,
+    tx: &Transaction<'_>,
+    term: nrese_rdf::TermRef<'_>,
+) -> Option<TermId> {
+    match replica {
+        true => tx.lookup(term),
+        false => Some(tx.intern(term)),
     }
 }
 
