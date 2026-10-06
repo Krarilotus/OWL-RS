@@ -181,9 +181,11 @@ console() {
 case "$mode" in
   commit | push)
     if [ "$mode" = commit ] && git rev-parse -q --verify MERGE_HEAD > /dev/null; then
-      # A merge: what the merged tree has the same as the branch merged in was tested there.
-      # New is what differs from it: this side's changes and the resolved conflicts.
-      mapfile -t files < <(git diff --name-only --cached MERGE_HEAD; git ls-files --others --exclude-standard)
+      # A merge: a file the same as on one side was tested on that side. New is what
+      # differs from both: the resolved conflicts and the files both sides changed.
+      mapfile -t files < <(comm -12 <(git diff --name-only --cached HEAD | sort) \
+                                    <(git diff --name-only --cached MERGE_HEAD | sort);
+                           git ls-files --others --exclude-standard)
     elif [ "$mode" = commit ]; then
       mapfile -t files < <(git diff --name-only HEAD; git ls-files --others --exclude-standard)
     else
