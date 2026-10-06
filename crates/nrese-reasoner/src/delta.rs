@@ -159,6 +159,7 @@ impl<B: Base + ?Sized> Overlay<'_, B> {
 
 impl<B: Base + ?Sized> Source for Overlay<'_, B> {
     fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
+        let seg = seg.plain();
         self.extra.scan(pattern, seg, f);
         if seg != Seg::Delta {
             self.base.scan(pattern, &mut |fact| {
@@ -170,10 +171,11 @@ impl<B: Base + ?Sized> Source for Overlay<'_, B> {
     }
 
     fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
+        let seg = seg.plain();
         let extra = self.extra.estimate(pattern, seg);
         match seg {
-            Seg::Delta => extra,
             Seg::Old | Seg::All => extra + self.base.estimate(pattern),
+            _ => extra,
         }
     }
 
@@ -223,6 +225,8 @@ pub fn update_until<B: Base + ?Sized>(
     cache: Option<&GroundProgram>,
     stop: Stop<'_>,
 ) -> Result<Update, Interrupted> {
+    // The process's memory limit stops it too, whatever the caller polls.
+    let stop: Stop<'_> = &|| stop() || super::eval::over_memory_limit();
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut result = Update::default();
     let mut clock = std::time::Instant::now();

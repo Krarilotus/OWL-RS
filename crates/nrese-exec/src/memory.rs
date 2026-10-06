@@ -46,6 +46,57 @@ pub fn available_bytes() -> Option<u64> {
     imp::available_bytes()
 }
 
+/// The process's memory limit, for long operations whose caller passes no watch of its
+/// own: set by whoever owns the process's configuration (the store, from
+/// `process_memory_bytes`), polled through [`process_limit_exceeded`] by the operations
+/// that can grow without bound (the reasoner's materialisations and commits). 0: none.
+static PROCESS_LIMIT: AtomicU64 = AtomicU64::new(0);
+/// Microseconds since [`PROCESS_EPOCH`] of the last reading for the process limit.
+static PROCESS_LAST: AtomicU64 = AtomicU64::new(0);
+/// Whether that reading was over the limit.
+static PROCESS_OVER: AtomicBool = AtomicBool::new(false);
+static PROCESS_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Sets the process's memory limit in bytes (0: none). See [`process_limit_exceeded`].
+pub fn set_process_limit(limit: u64) {
+    PROCESS_LIMIT.store(limit, Ordering::Relaxed);
+    PROCESS_LAST.store(0, Ordering::Relaxed);
+    PROCESS_OVER.store(false, Ordering::Relaxed);
+}
+
+/// The process's memory limit, if one is set ([`set_process_limit`]).
+pub fn process_limit() -> Option<u64> {
+    Some(PROCESS_LIMIT.load(Ordering::Relaxed)).filter(|&limit| limit > 0)
+}
+
+/// Whether the process holds more than its memory limit ([`set_process_limit`]), as of a
+/// reading at most [`MemoryWatch::INTERVAL_MICROS`] old: an atomic load and a clock read
+/// in a hot loop. Unlike a [`MemoryWatch`] it doesn't stay over: an operation the limit
+/// stopped frees its memory, and the next one may run.
+pub fn process_limit_exceeded() -> bool {
+    let Some(limit) = process_limit() else {
+        return false;
+    };
+    let epoch = PROCESS_EPOCH.get_or_init(Instant::now);
+    let now = u64::try_from(epoch.elapsed().as_micros())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let last = PROCESS_LAST.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < MemoryWatch::INTERVAL_MICROS {
+        return PROCESS_OVER.load(Ordering::Relaxed);
+    }
+    // One reader per interval; the others go on with the last answer.
+    if PROCESS_LAST
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return PROCESS_OVER.load(Ordering::Relaxed);
+    }
+    let over = process_bytes().is_some_and(|held| held > limit);
+    PROCESS_OVER.store(over, Ordering::Relaxed);
+    over
+}
+
 /// Whether the process has gone past a memory limit, for the stop callbacks of long
 /// operations. The memory is read at most every [`MemoryWatch::INTERVAL_MICROS`], so a
 /// check in a hot loop costs an atomic load and a clock read; once over, it stays over.
@@ -315,6 +366,23 @@ mod cgroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The process limit is read as set, holds past it, and doesn't latch: under a limit
+    /// no process meets again, it no longer holds.
+    #[test]
+    fn the_process_limit_follows_the_process() {
+        if process_bytes().is_none() {
+            return;
+        }
+        set_process_limit(1);
+        assert_eq!(process_limit(), Some(1));
+        assert!(process_limit_exceeded(), "one byte is exceeded");
+        set_process_limit(u64::MAX);
+        assert!(!process_limit_exceeded(), "no process holds that much");
+        set_process_limit(0);
+        assert_eq!(process_limit(), None);
+        assert!(!process_limit_exceeded());
+    }
 
     #[test]
     fn a_cgroup_limit_is_the_smallest_on_the_path_up() {
