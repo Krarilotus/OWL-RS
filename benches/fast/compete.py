@@ -218,12 +218,15 @@ def summarise_suite(rows: list[dict]) -> dict[str, dict]:
             s.setdefault("clients", {})[r["item"]] = {"p99_ms": float(r["ms"]), "completed": r["rows"],
                                                        "note": r.get("note", "")}
             continue
-        if r["task"] == "query" and r["status"] in ("ok", "wrong") and r["repeat"] not in ("0", "") and r["ms"]:
+        # Rows count even without a time: a closure-only system's answers (Nemo's, answered
+        # by Oxigraph over its closure) are compared, though not timed.
+        if r["task"] == "query" and r["status"] in ("ok", "wrong") and r["repeat"] not in ("0", ""):
             q = s["queries"].setdefault(r["item"], {"ms": [], "rows": r["rows"]})
-            q["ms"].append(float(r["ms"]))
+            if r["ms"]:
+                q["ms"].append(float(r["ms"]))
     for s in out.values():
         for q in s["queries"].values():
-            q["median_ms"] = statistics.median(q["ms"])
+            q["median_ms"] = statistics.median(q["ms"]) if q["ms"] else None
             del q["ms"]
     return out
 
@@ -239,15 +242,16 @@ def verdicts(summary: dict[str, dict]) -> dict[str, dict]:
         shared = [q for q in s["queries"] if q in nrese["queries"]]
         differ = [q for q in shared if str(s["queries"][q]["rows"]) != str(nrese["queries"][q]["rows"])]
         same = [q for q in shared if q not in differ]
-        theirs = sum(s["queries"][q]["median_ms"] for q in same)
-        ours = sum(nrese["queries"][q]["median_ms"] for q in same)
+        timed = [q for q in same if s["queries"][q]["median_ms"] is not None and nrese["queries"][q]["median_ms"] is not None]
+        theirs = sum(s["queries"][q]["median_ms"] for q in timed)
+        ours = sum(nrese["queries"][q]["median_ms"] for q in timed)
         answers = "differ: " + ",".join(differ) if differ else ("match" if same else "none compared")
         v = {"status": s["status"], "answers": answers,
              "queries_compared": len(same), "their_query_ms": round(theirs, 2), "nrese_query_ms": round(ours, 2),
              "query_winner": None, "load_ms": s.get("load_ms"), "nrese_load_ms": nrese.get("load_ms"),
              "statements": s.get("statements"), "nrese_statements": nrese.get("statements"),
              "publish": s["publish"], "notes": s["notes"][:3]}
-        if same:
+        if timed:
             v["query_winner"] = "nrese" if ours < theirs else system
         if v["load_ms"] and v["nrese_load_ms"]:
             v["load_winner"] = "nrese" if v["nrese_load_ms"] < v["load_ms"] else system
