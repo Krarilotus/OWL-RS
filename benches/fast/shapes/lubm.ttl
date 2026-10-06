@@ -1,0 +1,29 @@
+# Shapes over LUBM's asserted data (the shacl-lubm case): SHACL Core on graduate students,
+# publications and courses, and one SHACL-SPARQL constraint.
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ub: <http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#> .
+@prefix ex: <http://example.org/fast/shapes#> .
+
+ex:GraduateStudent a sh:NodeShape ;
+  sh:targetClass ub:GraduateStudent ;
+  sh:property [ sh:path ub:name ; sh:minCount 1 ; sh:maxCount 1 ] ;
+  sh:property [ sh:path ub:emailAddress ; sh:minCount 1 ; sh:pattern "@" ] ;
+  sh:property [ sh:path ub:memberOf ; sh:minCount 1 ; sh:nodeKind sh:IRI ] ;
+  sh:property [ sh:path ub:takesCourse ; sh:minCount 2 ; sh:maxCount 3 ] ;
+  sh:property [ sh:path ub:advisor ; sh:minCount 1 ; sh:class ub:FullProfessor ] .
+
+ex:Publication a sh:NodeShape ;
+  sh:targetClass ub:Publication ;
+  sh:property [ sh:path ub:publicationAuthor ; sh:minCount 1 ; sh:maxCount 5 ] .
+
+ex:Teacher a sh:NodeShape ;
+  sh:targetSubjectsOf ub:teacherOf ;
+  sh:sparql [
+    sh:message "teaches a course nobody takes" ;
+    sh:select """
+      PREFIX ub: <http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#>
+      SELECT $this ?course WHERE {
+        $this ub:teacherOf ?course .
+        FILTER NOT EXISTS { ?student ub:takesCourse ?course }
+      }""" ] .

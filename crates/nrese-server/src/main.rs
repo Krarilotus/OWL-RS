@@ -10,7 +10,8 @@ use tracing_subscriber::EnvFilter;
 
 use nrese_server::ai::AiSuggestionService;
 use nrese_server::{
-    AppState, CliCommand, CliConfig, LoadCommand, QueryCommand, ServerConfig, build_app,
+    AppState, CliCommand, CliConfig, LoadCommand, PrintQueryCommand, QueryCommand, ServerConfig,
+    build_app,
 };
 
 /// mimalloc (Pf7a): 7-20% faster query sets and 30% faster bulk loads than the system
@@ -50,6 +51,20 @@ async fn run() -> Result<()> {
             serde_json::to_string_pretty(&nrese_server::config::settings::schema())?
         );
         return Ok(());
+    }
+    if let CliCommand::PrintQuery(print) = &cli.command
+        && !print.schema.is_empty()
+    {
+        // Against the schema files alone: no configured store.
+        let store = StoreService::new(nrese_store::StoreConfig::in_memory())?;
+        bulk_load(
+            &store,
+            LoadCommand {
+                files: print.schema.clone(),
+                ..LoadCommand::default()
+            },
+        )?;
+        return print_query(&store, print.clone());
     }
     let mut config = ServerConfig::load_with(cli.config_path.as_deref(), &cli.overrides)?;
     // The default repository's reasoning as changed through the engine API overrides the
@@ -124,6 +139,9 @@ async fn run() -> Result<()> {
     }
     if let CliCommand::Query(query) = cli.command {
         return query_once(&store, query);
+    }
+    if let CliCommand::PrintQuery(print) = cli.command {
+        return print_query(&store, print);
     }
     let program = config.reasoner.materialised_program();
     if let CliCommand::Load(load) = cli.command {
@@ -272,6 +290,42 @@ fn query_once(store: &StoreService, command: QueryCommand) -> Result<()> {
         .context("the query failed")?;
     out.flush()?;
     Ok(())
+}
+
+/// `nrese-server print-query`: the query as standard SPARQL 1.1 for a store without
+/// reasoning on standard output, after a comment with the completeness of its answers; what
+/// keeps it from being written exactly on standard error, with exit status 2.
+fn print_query(store: &StoreService, command: PrintQueryCommand) -> Result<()> {
+    use nrese_sparql::ql::{PrintForm, Printed};
+    let text = match (command.query, command.file) {
+        (Some(text), _) => text,
+        (None, Some(file)) => {
+            std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?
+        }
+        (None, None) => anyhow::bail!("`print-query` needs a query or --file"),
+    };
+    let form = command
+        .form
+        .as_deref()
+        .map_or(Some(PrintForm::Paths), PrintForm::from_name)
+        .context("--form is paths or values")?;
+    match store
+        .print_query(&text, form)
+        .context("printing the query failed")?
+    {
+        Printed::Query { text, completeness } => {
+            println!("# NRESE completeness: {}", completeness.header());
+            println!("{text}");
+            Ok(())
+        }
+        Printed::NotExpressible(reasons) => {
+            eprintln!("not expressible in SPARQL 1.1 without reasoning:");
+            for reason in reasons {
+                eprintln!("  {reason}");
+            }
+            std::process::exit(2);
+        }
+    }
 }
 
 /// `nrese-server load`: bulk-loads files into the configured store and exits.

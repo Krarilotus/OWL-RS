@@ -77,6 +77,10 @@ pub struct RepositorySettings {
     /// Applies to repositories other than the default, which keeps the server's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_timeout_ms: Option<u64>,
+    /// When queries get OWL 2 QL answers through existentials (`auto`, `on`, `off`;
+    /// docs/design/ql-rewriting.md §4); the server's `reasoner.ql_rewriting` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ql_rewriting: Option<String>,
 }
 
 /// The longest per-repository query timeout: one hour.
@@ -86,6 +90,13 @@ impl RepositorySettings {
     /// The repository's own query timeout, if its settings give one.
     pub fn query_timeout(&self) -> Option<std::time::Duration> {
         self.query_timeout_ms.map(std::time::Duration::from_millis)
+    }
+
+    /// The QL rewriting's mode, if the settings choose one.
+    pub fn ql_rewriting_mode(&self) -> Option<crate::QlRewritingMode> {
+        self.ql_rewriting
+            .as_deref()
+            .and_then(crate::QlRewritingMode::from_name)
     }
 
     /// The reasoning mode, if the settings choose one.
@@ -310,6 +321,9 @@ impl Catalog {
                 .as_ref()
                 .map_or_else(|| self.template.data_dir.clone(), |root| root.join(id)),
             ontology_path: None,
+            ql_rewriting: settings
+                .ql_rewriting_mode()
+                .unwrap_or(self.template.ql_rewriting),
             ..self.template.clone()
         };
         let store = StoreService::new(config).map_err(|error| error.to_string())?;
@@ -359,6 +373,12 @@ impl Catalog {
         if (&before.reasoning, &before.rules) != (&settings.reasoning, &settings.rules) {
             reconfigure(&repository.pipeline, &settings, &self.reasoner)?;
         }
+        if before.ql_rewriting != settings.ql_rewriting {
+            let mode = settings
+                .ql_rewriting_mode()
+                .unwrap_or(self.template.ql_rewriting);
+            repository.pipeline.read().store().set_ql_rewriting(mode);
+        }
         let file = match id {
             DEFAULT_REPOSITORY => default_settings_file(&self.template),
             id => self
@@ -385,6 +405,13 @@ pub fn check(settings: &RepositorySettings) -> Result<(), CatalogError> {
         && settings.reasoning_mode().is_none()
     {
         return Err(CatalogError::Invalid(format!("no reasoning mode '{name}'")));
+    }
+    if let Some(name) = &settings.ql_rewriting
+        && settings.ql_rewriting_mode().is_none()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "ql_rewriting must be 'auto', 'on' or 'off', not '{name}'"
+        )));
     }
     if let Some(ms) = settings.query_timeout_ms
         && !(1..=MAX_QUERY_TIMEOUT_MS).contains(&ms)

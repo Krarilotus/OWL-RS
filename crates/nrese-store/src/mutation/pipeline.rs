@@ -60,6 +60,10 @@ fn touched(tx: &nrese_engine::Transaction<'_>) -> Vec<nrese_reasoner::ir::Triple
 impl MutationPipeline {
     pub fn new(store: Arc<StoreService>, reasoner: Arc<ReasonerService>) -> Self {
         store.use_reasoning_rules(reasoner.config().materialised_program());
+        store.use_dl(
+            reasoner.config().mode().is_dl(),
+            reasoner.config().rules.is_some(),
+        );
         Self {
             store,
             reasoner,
@@ -231,6 +235,26 @@ impl MutationPipeline {
                 None,
                 None,
             ));
+            // The owl2-dl mode: the state the commit leaves, under OWL 2 DL.
+            let dl = self.store.dl().active().then(|| {
+                let mut bounds = crate::dl::bounds::prepare(&self.store, &tx, &stop);
+                let gate = crate::dl::gate::check_commit(&self.store, &tx, &stop, &mut bounds);
+                (gate, bounds)
+            });
+            if let Some((gate, _)) = &dl
+                && let Some(detail) = &gate.reject
+            {
+                return Err(MutationError::Rejected(Box::new(MutationReject {
+                    detail: detail.clone(),
+                    explanation: Some(nrese_reasoner::RejectExplanation {
+                        summary: detail.clone(),
+                        violated_constraint: "owl2-dl-consistency".to_owned(),
+                        focus_resource: String::new(),
+                        evidence: gate.evidence.clone(),
+                    }),
+                    attribution: None,
+                })));
+            }
             crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph)
                 .map_err(store_error)?;
             self.shacl_gate(&tx)?;
@@ -248,6 +272,13 @@ impl MutationPipeline {
             })?;
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
+            }
+            if let Some((gate, bounds)) = dl {
+                crate::dl::bounds::install(&self.store, bounds, summary.revision);
+                self.store.dl().record(crate::dl::DlStatus {
+                    revision: summary.revision,
+                    consistency: gate.checked,
+                });
             }
             // The program now describes the committed state.
             match changed {
