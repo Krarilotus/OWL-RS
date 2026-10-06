@@ -114,11 +114,16 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "social" => social(&params, &mut rng, &mut nt)?,
         "hierarchy" => hierarchy(&params, &mut rng, &mut nt)?,
         "clique" => clique(&params, &mut rng, &mut nt, &commits)?,
-        "sameas" => sameas(&params, &mut nt)?,
+        "sameas" => sameas(&params, &mut nt, &commits)?,
+        "eq-addon" => eq_addon(&params, &mut nt)?,
+        "fed-chain" => fed_chain(&params, &mut nt)?,
+        "sameas-giant" => sameas_giant(&params, &mut nt, &commits)?,
+        "dense" => dense(&params, &mut rng, &mut nt)?,
         "chain" => chain(&params, &mut nt)?,
         "layered" => layered(&params, &mut rng, &mut nt, &commits)?,
         "entities" => entities(&params, &mut rng, &mut nt)?,
         "churn" => churn(&params, &mut nt, &commits)?,
+        "batches" => batches(&params, &mut nt, &commits)?,
         "geo" => geo(&params, &mut rng, &mut nt)?,
         "text" => text(&params, &mut rng, &mut nt)?,
         "vectors" => vectors(&params, &mut rng, &mut nt)?,
@@ -198,6 +203,7 @@ fn social(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     }
     let posts = 2 * n;
     let mut titled = 0u64;
+    let mut duplicates = 0u64;
     let mut used_tags = BTreeSet::new();
     for j in 0..posts {
         let post = ex(format!("p{j}"));
@@ -214,8 +220,11 @@ fn social(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
         let tag = rng.skewed(tags);
         used_tags.insert(tag);
         nt.t(&post, &ex("tag"), &ex(format!("t{tag}")))?;
-        for _ in 0..2 {
-            nt.t(&post, &ex("likes"), &ex(format!("u{}", rng.below(n))))?;
+        // Two likes; the same person twice is one statement once loaded.
+        let likes = [rng.below(n), rng.below(n)];
+        duplicates += u64::from(likes[0] == likes[1]);
+        for like in likes {
+            nt.t(&post, &ex("likes"), &ex(format!("u{like}")))?;
         }
         nt.t(&post, &ex("score"), &typed(rng.below(101), "integer"))?;
         if j % 3 == 0 {
@@ -233,6 +242,7 @@ fn social(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     e.insert("older_than_60".into(), json!(over_60));
     e.insert("titled_posts".into(), json!(titled));
     e.insert("tags_used".into(), json!(used_tags.len()));
+    e.insert("distinct_statements".into(), json!(nt.count - duplicates));
     Ok(e)
 }
 
@@ -370,8 +380,20 @@ fn clique(p: &Params, rng: &mut Rng, nt: &mut Nt, commits: &str) -> std::io::Res
 
 /// `owl:sameAs` chains of `size` individuals in `groups` groups, each with a value of its
 /// own: equality spreads every value to the whole group.
-fn sameas(p: &Params, nt: &mut Nt) -> std::io::Result<Expect> {
+fn sameas(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
     let (groups, size) = (p.get("groups", 20_000), p.get("size", 10));
+    // `merges=M`: commits that each join group 2k with group 2k + 1 by one sameAs.
+    let merges = p.get("merges", 0).min(groups / 2);
+    let mut out = BufWriter::new(File::create(commits)?);
+    for k in 0..merges {
+        writeln!(
+            out,
+            "INSERT DATA {{ <{EX}i{}_0> <{OWL}sameAs> <{EX}i{}_0> }}",
+            2 * k,
+            2 * k + 1
+        )?;
+    }
+    out.flush()?;
     let same = owl("sameAs");
     for g in 0..groups {
         for j in 0..size {
@@ -392,6 +414,10 @@ fn sameas(p: &Params, nt: &mut Nt) -> std::io::Result<Expect> {
     e.insert("values".into(), json!(groups * size * size));
     e.insert("same_as_pairs".into(), json!(groups * size * size));
     e.insert("knows".into(), json!(groups * size * size));
+    e.insert(
+        "values_after_merges".into(),
+        json!((groups - 2 * merges) * size * size + merges * 4 * size * size),
+    );
     Ok(e)
 }
 
@@ -571,10 +597,19 @@ fn churn(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
     for i in 0..changes {
         writeln!(out, "DELETE DATA {{ {} }}", statements(i))?;
     }
+    // `existing=N`: N people of the data deleted, one per commit (the deletion tail).
+    for i in 0..p.get("existing", 0) {
+        writeln!(
+            out,
+            "DELETE DATA {{ <{EX}s{i}> a <{EX}GraduateStudent> ; <{EX}advisor> <{EX}prof{}> ; <{EX}memberOf> <{EX}dept{}> }}",
+            i % 500,
+            i % 50
+        )?;
+    }
     out.flush()?;
     let mut e = Expect::new();
     e.insert("people".into(), json!(people));
-    e.insert("commits".into(), json!(2 * changes));
+    e.insert("commits".into(), json!(2 * changes + p.get("existing", 0)));
     Ok(e)
 }
 
@@ -1075,4 +1110,201 @@ fn horn(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
         }
     }
     Ok(Expect::new())
+}
+
+/// One giant `owl:sameAs` class of `size` individuals (two chains joined by one bridge
+/// link, as erroneous LOD links make them), each with a value, beside `groups` small
+/// classes of 10. The commit deletes the bridge: the class splits in two.
+fn sameas_giant(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
+    let (size, groups) = (p.get("size", 20_000), p.get("groups", 5_000));
+    let same = owl("sameAs");
+    let half = size / 2;
+    for j in 0..size {
+        let x = ex(format!("g{j}"));
+        nt.t(&x, &ex("val"), &format!("\"g{j}\""))?;
+        if j + 1 < size && j + 1 != half {
+            nt.t(&x, &same, &ex(format!("g{}", j + 1)))?;
+        }
+    }
+    let (left, right) = (ex(format!("g{}", half - 1)), ex(format!("g{half}")));
+    nt.t(&left, &same, &right)?;
+    for g in 0..groups {
+        for j in 0..10 {
+            let x = ex(format!("s{g}_{j}"));
+            nt.t(&x, &ex("val"), &format!("\"s{g}_{j}\""))?;
+            if j < 9 {
+                nt.t(&x, &same, &ex(format!("s{g}_{}", j + 1)))?;
+            }
+        }
+    }
+    let mut out = BufWriter::new(File::create(commits)?);
+    writeln!(out, "DELETE DATA {{ {left} {same} {right} }}")?;
+    out.flush()?;
+    let mut e = Expect::new();
+    e.insert("values".into(), json!(size * size + groups * 100));
+    e.insert(
+        "values_after_split".into(),
+        json!(2 * half * half + groups * 100),
+    );
+    e.insert("giant_values".into(), json!(size));
+    Ok(e)
+}
+
+/// Two directed graphs on `nodes` nodes with `degree` out-edges each: `u` with uniform
+/// targets, `s` with targets skewed towards a few hubs (the high length ratios that make
+/// intersections gallop). Their directed triangles, counted here.
+fn dense(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
+    let (n, degree) = (
+        p.get("nodes", 50_000) as usize,
+        p.get("degree", 12) as usize,
+    );
+    let mut e = Expect::new();
+    for (name, skewed) in [("u", false), ("s", true)] {
+        let mut out: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+        for (a, targets) in out.iter_mut().enumerate() {
+            while targets.len() < degree {
+                let b = if skewed {
+                    rng.skewed(n as u64) as usize
+                } else {
+                    rng.below(n as u64) as usize
+                };
+                if b != a {
+                    targets.insert(b);
+                }
+            }
+        }
+        let predicate = ex(name);
+        for (a, targets) in out.iter().enumerate() {
+            for &b in targets {
+                nt.t(&ex(format!("v{a}")), &predicate, &ex(format!("v{b}")))?;
+            }
+        }
+        // Directed triangles a -> b -> c -> a, each counted once per starting node.
+        let mut triangles = 0u64;
+        for (a, targets) in out.iter().enumerate() {
+            for &b in targets {
+                for &c in &out[b] {
+                    triangles += u64::from(out[c].contains(&a));
+                }
+            }
+        }
+        e.insert(format!("triangles_{name}"), json!(triangles));
+    }
+    Ok(e)
+}
+
+/// The churn schema and people, and commits of growing size: `sizes` people added in one
+/// commit each (1, 10, 100, ...), then removed again in one commit each, from the largest.
+/// The sweep of delta against store size that decides when maintenance beats
+/// rematerialisation (R3-S2's missing experiment).
+fn batches(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
+    let people = p.get("people", 200_000);
+    let steps = p.get("steps", 5) as u32;
+    // The schema and data are churn's; its own commits are not written.
+    let base = Params(BTreeMap::from([
+        ("people".to_owned(), people.to_string()),
+        ("changes".to_owned(), "0".to_owned()),
+    ]));
+    churn(&base, nt, &format!("{commits}.unused"))?;
+    let _ = std::fs::remove_file(format!("{commits}.unused"));
+    let person = |i: u64| {
+        format!(
+            "<{EX}batch{i}> a <{EX}GraduateStudent> ; <{EX}advisor> <{EX}prof{}> ; <{EX}memberOf> <{EX}dept{}> .",
+            i % 500,
+            i % 50
+        )
+    };
+    let mut out = BufWriter::new(File::create(commits)?);
+    let mut first = 0u64;
+    let mut ranges = Vec::new();
+    for step in 0..steps {
+        let size = 10u64.pow(step);
+        ranges.push((first, first + size));
+        let body: Vec<String> = (first..first + size).map(person).collect();
+        writeln!(out, "INSERT DATA {{ {} }}", body.join(" "))?;
+        first += size;
+    }
+    for &(from, to) in ranges.iter().rev() {
+        let body: Vec<String> = (from..to).map(person).collect();
+        writeln!(out, "DELETE DATA {{ {} }}", body.join(" "))?;
+    }
+    out.flush()?;
+    let mut e = Expect::new();
+    e.insert("people".into(), json!(people));
+    e.insert("commits".into(), json!(2 * steps));
+    Ok(e)
+}
+
+/// Equality added to LUBM (loaded beside it): `one=1` asserts one `owl:sameAs` between two
+/// of LUBM 10's graduate students; `depth=D` adds `chains` functional-property cascades of
+/// depth D: `a fp b1`, `a fp c1` equate b1 and c1, whose own `fp` values then equate, D
+/// levels down, so each merge triggers the next.
+fn eq_addon(p: &Params, nt: &mut Nt) -> std::io::Result<Expect> {
+    let (one, depth, chains) = (p.get("one", 0), p.get("depth", 0), p.get("chains", 1000));
+    let lubm = |local: &str| format!("<http://www.Department0.University0.edu/{local}>");
+    if one > 0 {
+        nt.t(
+            &lubm("GraduateStudent1"),
+            &owl("sameAs"),
+            &lubm("GraduateStudent2"),
+        )?;
+    }
+    let fp = ex("fp");
+    if depth > 0 {
+        nt.t(&fp, &rdf("type"), &owl("FunctionalProperty"))?;
+    }
+    for c in 0..if depth > 0 { chains } else { 0 } {
+        nt.t(&ex(format!("a{c}")), &fp, &ex(format!("b{c}_1")))?;
+        nt.t(&ex(format!("a{c}")), &fp, &ex(format!("c{c}_1")))?;
+        for d in 1..depth {
+            nt.t(
+                &ex(format!("b{c}_{d}")),
+                &fp,
+                &ex(format!("b{c}_{}", d + 1)),
+            )?;
+            nt.t(
+                &ex(format!("c{c}_{d}")),
+                &fp,
+                &ex(format!("c{c}_{}", d + 1)),
+            )?;
+        }
+    }
+    let mut e = Expect::new();
+    // Each cascade equates b_d with c_d at every depth: `depth` classes of two per chain,
+    // and the asserted pair: sameAs pairs (reflexive included) are 4 per class.
+    e.insert("same_as_pairs".into(), json!(4 * depth * chains + 4 * one));
+    Ok(e)
+}
+
+/// A transitive property `p` fed over several rounds: of each chain's edges, a third are
+/// asserted as `p`, a third as its inverse `r`, and a third through a property chain
+/// `h ∘ h ⊑ p` whose `h` edges come from `g ⊑ h` and the inverse of `hInv`. The modules
+/// then close `p` again in each round that rules add to it.
+fn fed_chain(p: &Params, nt: &mut Nt) -> std::io::Result<Expect> {
+    let (chains, length) = (p.get("chains", 2), p.get("length", 1500));
+    let (pp, r, h) = (ex("p"), ex("r"), ex("h"));
+    nt.t(&pp, &rdf("type"), &owl("TransitiveProperty"))?;
+    nt.t(&r, &owl("inverseOf"), &pp)?;
+    nt.t(&ex("g"), &rdfs("subPropertyOf"), &h)?;
+    nt.t(&ex("hInv"), &owl("inverseOf"), &h)?;
+    let chain = list(nt, "hh", &[h.clone(), h.clone()])?;
+    nt.t(&pp, &owl("propertyChainAxiom"), &chain)?;
+    for c in 0..chains {
+        let n = |i: u64| ex(format!("n{c}_{i}"));
+        for i in 0..length {
+            let (a, b) = (n(i), n(i + 1));
+            match i % 3 {
+                0 => nt.t(&a, &pp, &b)?,
+                1 => nt.t(&b, &r, &a)?,
+                _ => {
+                    let m = ex(format!("m{c}_{i}"));
+                    nt.t(&a, &ex("g"), &m)?;
+                    nt.t(&b, &ex("hInv"), &m)?;
+                }
+            }
+        }
+    }
+    let mut e = Expect::new();
+    e.insert("pairs".into(), json!(chains * length * (length + 1) / 2));
+    Ok(e)
 }
