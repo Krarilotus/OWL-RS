@@ -29,7 +29,9 @@
 //! individuals). A nominal in a body only reads an individual's identity: the role atoms
 //! beside it read across their edges, so their assertions join its island.
 //!
-//! Islands are packed into batches of about [`BATCH`] assertions, each decided as one
+//! Islands are packed into batches of about [`BATCH`] assertions (fewer where the node
+//! budget is smaller: a quarter of it, so a batch fits where the whole ABox didn't), each
+//! decided as one
 //! ontology: the TBox, the batch's assertions, the stubs of its split edges.
 
 use std::collections::{HashMap, HashSet};
@@ -63,6 +65,16 @@ pub struct Islands {
 
 /// The ABox of `ontology` in islands, or why it is decided whole.
 pub fn split(ontology: &Ontology) -> Split {
+    split_into(ontology, BATCH)
+}
+
+/// The batch size for `config`: [`BATCH`] assertions, at most a quarter of its node budget.
+fn batch_for(config: &tableau::Config) -> usize {
+    BATCH.min((config.max_nodes / 4).max(16))
+}
+
+/// [`split`] with batches of about `batch` assertions.
+fn split_into(ontology: &Ontology, batch: usize) -> Split {
     // What the tableau decides: a negative assertion over a non-simple property is a
     // universal there (`tableau::prepared`), which reads the edges the property's chains
     // compose, so the analysis must see it too.
@@ -111,38 +123,79 @@ pub fn split(ontology: &Ontology) -> Split {
             }
         }
     }
-    parts.islands(ontology, &roles)
+    parts.islands(ontology, &roles, batch)
+}
+
+/// Whether `ontology` is consistent: the whole ABox first, and island by island
+/// ([`by_islands`]) where that gives up within its budget and the ABox splits. Deciding
+/// by islands costs the split and a run per batch, more than one model of an easy ABox
+/// (LUBM(1): whole 149–160 ms, by islands 167–204 ms; OWL2Bench QL-1: 189–217 against
+/// 256–434 ms); it pays where one model of the whole ABox exceeds the budget.
+pub fn consistency(ontology: &Ontology, config: &tableau::Config) -> tableau::Outcome {
+    let started = std::time::Instant::now();
+    let whole = tableau::consistency(ontology, config);
+    if !matches!(whole.answer, tableau::Answer::GaveUp(_)) {
+        return whole;
+    }
+    let mut rest = config.clone();
+    rest.timeout = config.timeout.map(|t| t.saturating_sub(started.elapsed()));
+    if rest.timeout.is_some_and(|t| t.is_zero()) {
+        return whole;
+    }
+    match split_into(ontology, batch_for(config)) {
+        Split::Whole(_) => whole,
+        Split::Islands(islands) => match decide(&islands, &rest) {
+            Some(outcome)
+                if matches!(
+                    outcome.answer,
+                    tableau::Answer::Consistent | tableau::Answer::Inconsistent
+                ) =>
+            {
+                outcome
+            }
+            _ => whole,
+        },
+    }
 }
 
 /// The ABox of `ontology` decided island by island (the whole ABox where it can't split,
 /// [`split`]): inconsistent as soon as an island is, consistent once every island is;
 /// otherwise the first island's reason for not deciding. `config`'s timeout holds for the
 /// whole check.
-pub fn consistency(ontology: &Ontology, config: &tableau::Config) -> tableau::Outcome {
-    let islands = match split(ontology) {
-        Split::Whole(_) => return tableau::consistency(ontology, config),
-        Split::Islands(islands) => islands,
-    };
-    let started = std::time::Instant::now();
+pub fn by_islands(ontology: &Ontology, config: &tableau::Config) -> tableau::Outcome {
+    match split_into(ontology, batch_for(config)) {
+        Split::Whole(_) => tableau::consistency(ontology, config),
+        Split::Islands(islands) => {
+            decide(&islands, config).unwrap_or_else(|| tableau::consistency(ontology, config))
+        }
+    }
+}
+
+/// The islands' verdict (`None` without a batch: no assertion).
+fn decide(islands: &Islands, config: &tableau::Config) -> Option<tableau::Outcome> {
+    // The batches are independent: decided in parallel, each with its share of the
+    // memory budget and the whole check's deadline.
+    use rayon::prelude::*;
+    let threads = rayon::current_num_threads().clamp(1, islands.batches.len().max(1));
+    let mut batch_config = config.clone();
+    batch_config.max_memory = (config.max_memory / threads).max(64 << 20);
+    let outcomes: Vec<tableau::Outcome> = islands
+        .batches
+        .par_iter()
+        .map(|batch| tableau::consistency(batch, &batch_config))
+        .collect();
     let mut undecided: Option<tableau::Outcome> = None;
     let mut last = None;
-    for batch in &islands.batches {
-        let mut config = config.clone();
-        config.timeout = config.timeout.map(|t| t.saturating_sub(started.elapsed()));
-        let outcome = tableau::consistency(batch, &config);
+    for outcome in outcomes {
         match outcome.answer {
-            tableau::Answer::Inconsistent => return outcome,
+            tableau::Answer::Inconsistent => return Some(outcome),
             tableau::Answer::Consistent => last = Some(outcome),
             _ => {
                 undecided.get_or_insert(outcome);
             }
         }
     }
-    match undecided {
-        Some(outcome) => outcome,
-        // No batch: no assertion, the TBox alone.
-        None => last.unwrap_or_else(|| tableau::consistency(ontology, config)),
-    }
+    undecided.or(last)
 }
 
 /// The roles whose assertions carry information between their individuals (the module
@@ -418,7 +471,7 @@ impl Parts {
     }
 
     /// The islands of the assertions, packed into batches.
-    fn islands(mut self, ontology: &Ontology, roles: &HashSet<Term>) -> Split {
+    fn islands(mut self, ontology: &Ontology, roles: &HashSet<Term>, batch: usize) -> Split {
         let n = self.parent.len();
         let roots: Vec<usize> = (0..n).map(|i| self.find(i)).collect();
         let mut island_of: HashMap<usize, usize> = HashMap::new();
@@ -478,7 +531,7 @@ impl Parts {
                 _ => {}
             }
         }
-        // Largest islands first, packed into batches of about `BATCH` assertions.
+        // Largest islands first, packed into batches of about `batch` assertions.
         let mut order: Vec<usize> = (0..count).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(per[i].len()));
         let mut batches = Vec::new();
@@ -499,7 +552,7 @@ impl Parts {
             batches.push(o);
         };
         for i in order {
-            if !current.is_empty() && current.len() + per[i].len() > BATCH {
+            if !current.is_empty() && current.len() + per[i].len() > batch {
                 flush(&mut current, &mut batches);
             }
             current.append(&mut per[i]);
