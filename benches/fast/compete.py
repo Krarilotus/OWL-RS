@@ -87,16 +87,23 @@ def print_queries(case: dict) -> dict:
     verdicts: dict[str, dict] = {}
     for line in stdout.splitlines()[1:]:
         fields = line.split()
-        if len(fields) < 4:
+        if len(fields) < 3:
             continue
-        name, form = fields[0], fields[1]
+        # The name is padded to 10 characters: a longer one runs into the form (`spine-middlepaths`).
+        if fields[1] in ("paths", "values"):
+            name, form, rest = fields[0], fields[1], fields[2:]
+        else:
+            form = next((f for f in ("values", "paths") if fields[0].endswith(f)), None)
+            if form is None:
+                continue
+            name, rest = fields[0][:-len(form)], fields[1:]
         entry = verdicts.setdefault(name, {})
         if "not expressible:" in line:
-            entry[form] = {"nrese_rows": fields[2], "expressible": False,
+            entry[form] = {"nrese_rows": rest[0], "expressible": False,
                            "why": line.split("not expressible:", 1)[1].strip()[:200]}
-        elif len(fields) >= 6:
-            entry[form] = {"nrese_rows": fields[2], "printed_rows": fields[3], "same": fields[4] == "yes",
-                           "status": fields[5], "expressible": True}
+        elif len(rest) >= 4:
+            entry[form] = {"nrese_rows": rest[0], "printed_rows": rest[1], "same": rest[2] == "yes",
+                           "status": rest[3], "expressible": True}
     return {"verdicts": verdicts, "exit": code, "wall_s": round(wall, 1),
             "error": err.strip().splitlines()[-1][:200] if code not in (0, 1) and err.strip() else ""}
 
