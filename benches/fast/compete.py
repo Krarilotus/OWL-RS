@@ -35,6 +35,8 @@ from pathlib import Path
 import fast
 from suitekit.workloads import FAST_REGIMES, fast_data_name
 
+DL_TIMEOUT_S = 120  # per reference reasoner and task in the comparisons
+
 SUITE_SYSTEMS = {"qlever", "oxigraph", "virtuoso", "jena", "rdf4j", "nemo", "owlrl",
                  "graphdb", "rdfox", "anzograph", "stardog"}
 DL_SYSTEMS = {"hermit", "openllet", "konclude", "elk"}
@@ -193,38 +195,65 @@ def verdicts(summary: dict[str, dict]) -> dict[str, dict]:
 
 def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -> dict:
     """The DL kit's reference reasoners on the case's ontology."""
-    file = fast_data_name(case["data"])
+    # The ontology as the fast suite's volume holds it, mounted at /work here.
+    file = fast.data_file(case["data"]).removeprefix("/fast/")
     task = "consistency" if case.get("tool", "") == "tableau" else "classify"
     work = f"fast-dl-{case['name']}"
     lines = "\n".join(f"{case['name']}\t{s}\t{task}\t/work/{file}" for s in systems) + "\n"
     manifest_path = f"/work/{work}.manifest.tsv"
-    script = (f"printf '%s' '{lines}' > {manifest_path} && rm -f /work/{work}.results.tsv && "
+    script = (f"printf '%s' '{lines}' > {manifest_path} && rm -f /work/{work}.results.tsv /work/{work}.part.tsv && "
               f"mkdir -p /work/{work}-tax")
     fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c", script])
     started = time.monotonic()
-    done = fast.docker(["run", "--rm", "--name", f"{work}-{fast.ROOT.name}", f"--memory={case['cap_gb']}g",
-                        f"--memory-swap={case['cap_gb']}g", "-v", f"{fast.DATA_VOLUME}:/work",
-                        "nrese-bench/dl-reference", "batch", manifest_path, f"/work/{work}.results.tsv",
-                        f"/work/{work}-tax", "300"], timeout=1800)
+    # One JVM per batch; after a timeout the runner exits (3) for a fresh one, so the rest
+    # of the manifest runs again until every reasoner has a result (as reference.py does).
+    timeout_s = DL_TIMEOUT_S
+    for _ in systems:
+        rest = (f"cut -f1,2 /work/{work}.results.tsv 2>/dev/null > /tmp/done; "
+                f"grep -v -F -f /tmp/done {manifest_path} > /work/{work}.rest.tsv || true; "
+                f"test -s /tmp/done || cp {manifest_path} /work/{work}.rest.tsv; wc -l < /work/{work}.rest.tsv")
+        left = fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c", rest])
+        if left.stdout.strip() in ("", "0"):
+            break
+        done = fast.docker(["run", "--rm", "--name", f"{work}-{fast.ROOT.name}", f"--memory={case['cap_gb']}g",
+                            f"--memory-swap={case['cap_gb']}g", "-v", f"{fast.DATA_VOLUME}:/work",
+                            "nrese-bench/dl-reference", "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
+                            f"/work/{work}-tax", str(timeout_s)], timeout=timeout_s * len(systems) + 300)
+        # Results so far, and a timeout for the task the runner stopped at.
+        merge = (f"cat /work/{work}.part.tsv >> /work/{work}.results.tsv 2>/dev/null; rm -f /work/{work}.part.tsv; "
+                 f"cut -f1,2 /work/{work}.results.tsv > /tmp/done; "
+                 f"next=$(grep -v -F -f /tmp/done /work/{work}.rest.tsv | head -1); "
+                 f"if [ {done.returncode} -eq 3 ] && [ -n \"$next\" ]; then "
+                 f"echo \"$next\" | awk -F'\\t' -v OFS='\\t' '{{print $1,$2,$3,\"timeout\",{timeout_s * 1000},\"\"}}' "
+                 f">> /work/{work}.results.tsv; fi")
+        fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c", merge])
     wall = time.monotonic() - started
     out = fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c",
-                       f"cat /work/{work}.results.tsv; for f in /work/{work}-tax/*.tax; do "
+                       f"cat /work/{work}.results.tsv; for f in /work/{work}-tax/*.tax; do [ -e \"$f\" ] || continue; "
                        f"echo \"TAX $(basename $f) $(sha256sum < $f | cut -c1-16)\"; done"])
     results = {}
     for line in out.stdout.splitlines():
         parts = line.split("\t")
         if line.startswith("TAX "):
-            _, name, digest = line.split()
+            fields = line.split()
+            if len(fields) != 3:
+                continue
+            _, name, digest = fields
             reasoner = name.split(".")[-2]
             results.setdefault(reasoner, {})["taxonomy"] = digest
         elif len(parts) >= 5:
             results.setdefault(parts[1], {}).update({"status": parts[3], "ms": float(parts[4]),
                                                      "detail": parts[5] if len(parts) > 5 else ""})
-    if done.returncode not in (0, 3):
-        print(f"  the DL runner exited {done.returncode}: {done.stderr.strip()[-200:]}")
     out = {"results": results, "wall_s": round(wall, 1), "nrese_ms": nrese_ms}
     if task == "classify":
         out["nrese_taxonomy"] = nrese_taxonomy(case, work, results)
+        # A reference taxonomy for the fast run's check (`reference` in cases.toml): ELK's
+        # for EL cases, else the first reasoner's that classified.
+        keep = next((r for r in ("elk", "konclude", "hermit", "openllet") if results.get(r, {}).get("status") == "classified"), None)
+        if keep and case.get("reference"):
+            fast.docker(["run", "--rm", "-v", f"{fast.DATA_VOLUME}:/work", "alpine", "sh", "-c",
+                         f"mkdir -p /work/ref && cp /work/{work}-tax/{case['name']}.{keep}.tax "
+                         f"/work/{case['reference'].removeprefix('/fast/')}"])
     return out
 
 
