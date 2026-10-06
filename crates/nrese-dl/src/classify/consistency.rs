@@ -35,8 +35,7 @@ pub(crate) fn by_context_core(
     normalised: &Normalised,
     classes: &[Term],
     config: &tableau::Config,
-    threads: usize,
-    budget: crate::context::Budget,
+    core: &crate::context::Options,
 ) -> Option<Verdict> {
     let has_data = !normalised.facts.data.is_empty();
     if has_data && reads_data(normalised) {
@@ -44,15 +43,13 @@ pub(crate) fn by_context_core(
     }
     let mut rest = normalised.clone();
     rest.facts.data.clear();
-    let options = crate::context::Options {
-        threads,
-        proofs: false,
-        budget,
-        ..crate::context::Options::default()
-    };
-    let saturated = crate::context::saturate_normalised(&rest, classes, &options).ok()?;
+    let saturated = crate::context::saturate_normalised(&rest, classes, core).ok()?;
     if !saturated.consistent() {
         return Some(Verdict::Inconsistent);
+    }
+    // A merge left out may hide a clash.
+    if !saturated.complete() {
+        return None;
     }
     if !has_data {
         return Some(Verdict::Consistent);

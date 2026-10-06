@@ -744,3 +744,48 @@ fn a_branch_too_large_to_expand_is_abandoned_not_the_run() {
         Answer::GaveUp(_)
     ));
 }
+
+/// Guard (the ≤-rule's merge filter, W3C DL-903): `a: ≥k p.A ⊓ ≥k q.B ⊓ ≤(2k-1) r` with
+/// `p, q ⊑ r` and `A ⊓ B ⊑ ⊥` is inconsistent: the `p`- and the `q`-successors are
+/// pairwise unequal among themselves, and a `p`- and a `q`-successor can't merge. Every
+/// pair is ruled out before a choice, so the clash comes without a branch point
+/// (DL-903, k = 200/300: a 60 s timeout before, 9 ms after); with the filter off the
+/// ≤-rule branches over the k² mixed pairs.
+#[test]
+fn disjoint_successors_are_no_merge_candidates() {
+    let k = 40;
+    let mut b = Build::default();
+    let (p, q, r) = (200, 201, 202);
+    let [x, a, bb] = [1, 2, 3].map(|t| b.class(t));
+    let thing = b.e(ClassExpr::Thing);
+    let nothing = b.e(ClassExpr::Nothing);
+    for s in [p, q] {
+        b.axiom(Axiom::SubObjectPropertyOf(
+            vec![ObjProp::Named(s)],
+            ObjProp::Named(r),
+        ));
+    }
+    let both = b.and(&[a, bb]);
+    b.sub(both, nothing);
+    let at_least_p = b.e(ClassExpr::Min(k, ObjProp::Named(p), a));
+    let at_least_q = b.e(ClassExpr::Min(k, ObjProp::Named(q), bb));
+    let at_most_r = b.e(ClassExpr::Max(2 * k - 1, ObjProp::Named(r), thing));
+    let all = b.and(&[at_least_p, at_least_q, at_most_r]);
+    b.sub(x, all);
+    b.assert(x, 100);
+    let config = Config {
+        max_branch_points: Some(10_000),
+        ..Config::default()
+    };
+    let out = consistency(&b.o, &config);
+    assert_eq!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
+    assert_eq!(out.telemetry.branch_points, 0, "{}", out.telemetry);
+    let off = consistency(
+        &b.o,
+        &Config {
+            merge_filter: false,
+            ..config
+        },
+    );
+    assert!(off.telemetry.branch_points > 0, "{}", off.telemetry);
+}

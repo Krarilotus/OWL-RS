@@ -15,6 +15,8 @@ license.workspace = true
 slow-tests = ["tableau_w3c", "tableau_fuzz", "bounds"]
 [dependencies]
 nrese-owl = { path = "../nrese-owl" }
+# The process's memory, for the context core's budget.
+nrese-exec = { path = "../nrese-exec" }
 # The OWL 2 datatype map's value spaces, for the datatype theory.
 nrese-xsd = { path = "../rdf/nrese-xsd" }
 hashbrown = { workspace = true }

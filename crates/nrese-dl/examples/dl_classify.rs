@@ -12,8 +12,11 @@
 //!   --lower-bound-timeout SECS  the Horn lower bound's budget
 //!   --repeat N            run N times; times are the median of the runs
 //!   --expand-at-most N    spell `≤ n` out as clauses up to this `n` (else at-most atoms)
-//!   --split-lower-bound   the lower bound's context core with Strategy::Split
+//!   --cautious-lower-bound  the lower bound's context core with Strategy::Cautious
+//!   --eager-lower-bound     ... with Strategy::Eager
+//!   --equality            the context core takes functional properties (its Eq rule)
 //!   --max-join N          the most conclusions one context-core join may make
+//!   --max-memory-mb N     the most memory the process may hold while the context core runs
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
 //!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
 //!   --no-skip-seen --no-tbox-only --no-detached-probes --no-reuse-model
@@ -213,10 +216,17 @@ fn args() -> Result<Args, String> {
             "--no-detached-probes" => a.options.detached_probes = false,
             "--no-reuse-model" => a.options.reuse_model = false,
             "--clauses" => a.clauses = true,
-            "--split-lower-bound" => {
-                a.options.lower_bound_strategy = nrese_dl::context::Strategy::Split;
+            "--cautious-lower-bound" => {
+                a.options.lower_bound_strategy = nrese_dl::context::Strategy::Cautious;
+            }
+            "--equality" => a.options.equality = true,
+            "--eager-lower-bound" => {
+                a.options.lower_bound_strategy = nrese_dl::context::Strategy::Eager;
             }
             "--max-join" => a.options.max_join = number("--max-join")? as usize,
+            "--max-memory-mb" => {
+                a.options.max_memory = Some(number("--max-memory-mb")? << 20);
+            }
             "--expand-at-most" => {
                 let n = number("--expand-at-most")? as u32;
                 a.options.normalise.expand_at_most_up_to = n;
