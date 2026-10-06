@@ -13,6 +13,8 @@
 //! - Prints, per mode, the medians over rounds of the first commit and of the per-commit
 //!   median, the engine that decided the last commit's consistency, and U1's size; counts
 //!   (statements) before times.
+//! - `DL_LAB_TIMEOUT_MS`: a shorter `dl.timeout`, to see where a DL task gives up;
+//!   `DL_LAB_RL_ONLY`: both stores under `owl2-rl` (an ontology `owl2-dl` can't take).
 //! - `--queries DIR`: then each `.rq` file of DIR in both modes (one warm-up, then the
 //!   median of 5, interleaved): rows, under `owl2-dl` the status and the paths that
 //!   decided, and the times.
@@ -54,9 +56,18 @@ struct Run {
 }
 
 fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, property: &str) -> Run {
-    // No result cache: every run evaluates (the DL path never caches).
+    // No result cache: every run evaluates (repeats would be copies from it).
+    // `DL_LAB_TIMEOUT_MS`: a shorter `dl.timeout`, to see where a DL task gives up.
+    let mut dl = nrese_store::DlConfig::default();
+    if let Some(ms) = std::env::var("DL_LAB_TIMEOUT_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        dl.timeout = Duration::from_millis(ms);
+    }
     let store = StoreService::new(StoreConfig {
         query_cache_bytes: 0,
+        dl,
         ..StoreConfig::in_memory()
     })
     .expect("store");
@@ -174,7 +185,10 @@ fn main() {
         })
         .map(PathBuf::from)
         .collect();
-    let modes = [ReasoningMode::Owl2Dl, ReasoningMode::Owl2Rl];
+    let modes = match std::env::var("DL_LAB_RL_ONLY").is_ok() {
+        true => [ReasoningMode::Owl2Rl, ReasoningMode::Owl2Rl],
+        false => [ReasoningMode::Owl2Dl, ReasoningMode::Owl2Rl],
+    };
     let mut results: Vec<Vec<Run>> = modes.iter().map(|_| Vec::new()).collect();
     for round in 0..rounds {
         // Interleaved, in alternating order.
