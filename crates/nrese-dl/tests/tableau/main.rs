@@ -789,3 +789,40 @@ fn disjoint_successors_are_no_merge_candidates() {
     );
     assert!(off.telemetry.branch_points > 0, "{}", off.telemetry);
 }
+
+/// Guard (keyed role plans): `Aᵢ ⊑ ¬∃partOf.Bᵢ` over a transitive `partOf` with a
+/// hierarchy of subroles gives each role a transition per axiom, nearly all failing their
+/// first check; an edge tries only the plans its ends' concepts key (the fast suite's
+/// dl-roles, 5,000 axioms: saturation 1.2-2.3 s -> 18-27 ms, the same 58,724 firings).
+#[test]
+fn an_edge_tries_only_the_plans_its_ends_key() {
+    let mut b = Build::default();
+    let (roles, axioms) = (20u64, 400u64);
+    let part_of = 500;
+    b.characteristic(Characteristic::Transitive, ObjProp::Named(part_of));
+    for r in 1..roles {
+        let parent = if r < 2 { part_of } else { 500 + r / 2 };
+        if r % 2 == 0 {
+            b.characteristic(Characteristic::Transitive, ObjProp::Named(500 + r));
+        }
+        b.axiom(Axiom::SubObjectPropertyOf(
+            vec![ObjProp::Named(500 + r)],
+            ObjProp::Named(parent),
+        ));
+    }
+    for i in 0..axioms {
+        let (a, bi) = (b.class(10_000 + i), b.class(20_000 + i));
+        let some = b.some(ObjProp::Named(part_of), bi);
+        b.disjoint(a, some);
+        b.role_assertion(500 + 1 + i % (roles - 1), 30_000 + i, 40_000 + i);
+        let next = b.class(20_000 + (i + 1) % axioms);
+        b.assert(next, 40_000 + i);
+    }
+    let out = consistency(&b.o, &Config::default());
+    assert_eq!(out.answer, Answer::Consistent, "{}", out.telemetry);
+    assert!(
+        out.telemetry.plans_tried <= 2 * out.telemetry.facts,
+        "{}",
+        out.telemetry
+    );
+}

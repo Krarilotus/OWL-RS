@@ -20,12 +20,20 @@ pub struct Firing {
     pub dep: DepSetId,
 }
 
-/// The clause instances the concept fact `fact` completes.
-pub fn join_concept(p: &Program, g: &Graph, deps: &mut DepSets, fact: u32, out: &mut Vec<Firing>) {
+/// The clause instances the concept fact `fact` completes; `tried` counts the plans run.
+pub fn join_concept(
+    p: &Program,
+    g: &Graph,
+    deps: &mut DepSets,
+    fact: u32,
+    out: &mut Vec<Firing>,
+    tried: &mut u64,
+) {
     let f = g.unary[fact as usize];
     let Some(plans) = p.by_concept.get(f.concept as usize) else {
         return;
     };
+    *tried += plans.len() as u64;
     for plan in plans {
         let clause = &p.clauses[plan.clause as usize];
         let Body::Concept(_, v) = clause.body[plan.trigger as usize] else {
@@ -37,24 +45,58 @@ pub fn join_concept(p: &Program, g: &Graph, deps: &mut DepSets, fact: u32, out: 
     }
 }
 
-/// The clause instances the edge `edge` completes.
-pub fn join_edge(p: &Program, g: &Graph, deps: &mut DepSets, edge: u32, out: &mut Vec<Firing>) {
+/// The clause instances the edge `edge` completes; `tried` counts the plans run.
+pub fn join_edge(
+    p: &Program,
+    g: &Graph,
+    deps: &mut DepSets,
+    edge: u32,
+    out: &mut Vec<Firing>,
+    tried: &mut u64,
+) {
     let e = g.edges[edge as usize];
-    let Some(plans) = p.by_role.get(e.role as usize) else {
-        return;
-    };
-    for plan in plans {
+    let r = e.role as usize;
+    let mut start = |plan: &Plan| {
         let clause = &p.clauses[plan.clause as usize];
         let Body::Role(_, a, b) = clause.body[plan.trigger as usize] else {
-            continue;
+            return;
         };
         if a == b && e.from != e.to {
-            continue;
+            return;
         }
+        *tried += 1;
         let mut bind = [NONE; MAX_VARS];
         bind[a as usize] = e.from;
         bind[b as usize] = e.to;
         run(g, deps, plan, clause, 0, &mut bind, e.dep, out);
+    };
+    for plan in p.by_role.get(r).into_iter().flatten() {
+        start(plan);
+    }
+    // The keyed plans start with a check of a concept of `from` or `to`: those the ends
+    // have, through their labels, where they are fewer (the check runs either way).
+    let Some(keyed) = p.keyed.get(r).filter(|k| !k.is_empty()) else {
+        return;
+    };
+    let labels = g.labels(e.from).count() + g.labels(e.to).count();
+    if keyed.len() <= labels {
+        keyed.iter().for_each(&mut start);
+        return;
+    }
+    for (node, end) in [(e.from, false), (e.to, true)] {
+        if end && e.from == e.to {
+            break;
+        }
+        for f in g.labels(node) {
+            for &k in p
+                .keyed_by
+                .get(&(e.role, f.concept, end))
+                .into_iter()
+                .flatten()
+            {
+                start(&keyed[k as usize]);
+            }
+        }
     }
 }
 
