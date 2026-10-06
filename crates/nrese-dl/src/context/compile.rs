@@ -8,7 +8,10 @@
 //!    (exact for subsumptions between classes). Otherwise: unsupported.
 //! 2. **Assertions:** class assertions become query contexts per individual (after
 //!    `SameIndividual`); property assertions are unsupported (they need the nominal stage).
-//! 3. **Nominals and equality** (at-most atoms, `≤ n` spelled out) are unsupported.
+//! 3. **Nominals and equality** (at-most atoms, `≤ n` spelled out) are unsupported, but
+//!    for unqualified at-most-one clauses (functional and inverse-functional properties,
+//!    maybe under concepts of the centre) where equality is on: those become
+//!    [`AtMostOne`] constraints, which the Eq rule applies ([`super::equality`]).
 //! 4. **Renaming** of fresh names to make clauses Horn ([`super::horn`]).
 //! 5. **Shapes:** a DL-clause has its concept body atoms on the centre (Bate et al.,
 //!    §2.4). A neighbour with body concepts that the head doesn't mention is split off
@@ -18,6 +21,7 @@
 //! 6. **Existentials:** `≥ n R.B` in a head is `R(x, f(x))` and `B(f(x))`, `f` the Skolem
 //!    function of `∃R.B` (shared by every axiom with that restriction); without equality
 //!    `≥ n` and `≥ 1` have the same models up to copying successors, so `n` is dropped.
+//!    Not where `R` or a role above it is at most one: such a clause is unsupported.
 //!    A complemented filler `¬B` gets a fresh name `N` with `N(x) ∧ B(x) → ⊥`.
 
 use std::collections::{BTreeSet, HashMap};
@@ -27,9 +31,9 @@ use nrese_owl::{
 };
 
 use super::abox::Abox;
-use super::atoms::{ConceptId, FuncId, MAX_ID, RoleId, TermOrder};
+use super::atoms::{ConceptId, FuncId, Kind, MAX_ID, RoleId, TermOrder};
 use super::horn;
-use super::program::{BodyPat, DlClause, Func, HeadPat, KindPat, Program, TermPat, Var};
+use super::program::{AtMostOne, BodyPat, DlClause, Func, HeadPat, KindPat, Program, TermPat, Var};
 pub use super::unsupported::Unsupported;
 
 /// What the compilation did, for the profile.
@@ -60,13 +64,14 @@ fn axiom_of(clause: &Clause) -> usize {
 }
 
 /// Compiles `n` for the Horn stage; `classes` are the named classes to classify (every
-/// class of the signature, also those no clause mentions).
-pub fn compile(n: &Normalised, classes: &[Term]) -> Result<Compiled, Unsupported> {
+/// class of the signature, also those no clause mentions); `equality`: take at-most-one
+/// clauses (step 3).
+pub fn compile(n: &Normalised, classes: &[Term], equality: bool) -> Result<Compiled, Unsupported> {
     let mut stats = CompileStats {
         input_clauses: n.clauses.len(),
         ..CompileStats::default()
     };
-    let kept = admissible(n, &mut stats)?;
+    let kept = admissible(n, &mut stats, equality)?;
     let flips = horn::renaming(&kept, n.fresh.len()).map_err(|e| Unsupported::NotHorn {
         axiom: e.clause.map(|i| axiom_of(kept[i])),
     })?;
@@ -120,11 +125,13 @@ pub fn compile(n: &Normalised, classes: &[Term]) -> Result<Compiled, Unsupported
         negations: HashMap::new(),
         splits: HashMap::new(),
         clauses: HashMap::new(),
+        numbers: Vec::new(),
         stats,
     };
     for clause in &kept {
         c.clause(clause)?;
     }
+    c.numbers()?;
     let abox = c.abox(n)?;
     if c.next > MAX_ID || c.program.funcs.len() > (MAX_ID / 2) as usize {
         return Err(Unsupported::TooLarge);
@@ -146,6 +153,7 @@ pub fn compile(n: &Normalised, classes: &[Term]) -> Result<Compiled, Unsupported
 fn admissible<'n>(
     n: &'n Normalised,
     stats: &mut CompileStats,
+    equality: bool,
 ) -> Result<Vec<&'n Clause>, Unsupported> {
     let requires_data = n.clauses.iter().find(|c| {
         c.head
@@ -188,7 +196,7 @@ fn admissible<'n>(
                 axiom: axiom_of(clause),
             });
         }
-        if clause.flags.equality {
+        if clause.flags.equality && !(equality && at_most_one(clause).is_some()) {
             return Err(Unsupported::Equality {
                 axiom: axiom_of(clause),
             });
@@ -211,7 +219,34 @@ pub(super) struct Compiler {
     /// Split-off neighbour parts, by their DL-clause body: the name they define.
     splits: HashMap<Box<[BodyPat]>, ConceptId>,
     clauses: HashMap<(Box<[BodyPat]>, Option<HeadPat>), usize>,
+    /// The `≥ n` heads with `n > 1`: their role atom's kind and role, and their axiom.
+    numbers: Vec<(Kind, RoleId, usize)>,
     stats: CompileStats,
+}
+
+/// An unqualified at-most-one clause `C₁(x) ∧ … ∧ R(x, y₀) ∧ R(x, y₁) → y₀ ≈ y₁` (or over
+/// `R(yᵢ, x)`): its property, whether over the inverse, and the concepts `Cᵢ`.
+pub fn at_most_one(c: &Clause) -> Option<(Term, bool, Vec<Concept>)> {
+    let [HeadAtom::Equal(a, b)] = c.head[..] else {
+        return None;
+    };
+    if a == b || a == OwlVar::X || b == OwlVar::X {
+        return None;
+    }
+    let mut guard = Vec::new();
+    let mut roles = Vec::new();
+    for atom in &c.body {
+        match *atom {
+            BodyAtom::Concept(k, OwlVar::X) => guard.push(k),
+            BodyAtom::Role(r, OwlVar::X, y) if y == a || y == b => roles.push((r, false, y)),
+            BodyAtom::Role(r, y, OwlVar::X) if y == a || y == b => roles.push((r, true, y)),
+            _ => return None,
+        }
+    }
+    let [(r, inverse, y0), (r1, inverse1, y1)] = roles[..] else {
+        return None;
+    };
+    (r == r1 && inverse == inverse1 && y0 != y1).then_some((r, inverse, guard))
 }
 
 /// A clause being shaped: body and head over `nrese-owl`'s variables.
@@ -307,6 +342,9 @@ impl Compiler {
                 set.into_boxed_slice()
             })
             .collect();
+        if let Some((role, inverse, guard)) = at_most_one(clause) {
+            return self.at_most_one(role, inverse, &guard, &sources, axiom);
+        }
         let mut work = Work {
             body: Vec::new(),
             head: None,
@@ -551,13 +589,16 @@ impl Compiler {
                 })
             }
             Some(HeadAtom::AtLeast {
+                n,
                 role,
                 filler,
                 var: OwlVar::X,
-                ..
             }) => {
                 let f = self.func(role, filler);
                 let func = self.program.funcs[f as usize];
+                if n > 1 {
+                    self.numbers.push((func.role.0.kind(), func.role.1, axiom));
+                }
                 self.add(
                     body.clone(),
                     Some(HeadPat {
@@ -579,6 +620,86 @@ impl Compiler {
             Some(_) => return Err(shape),
         };
         self.add(body, head, sources);
+        Ok(())
+    }
+
+    /// An at-most-one clause over `role` (its inverse if `inverse`) under `guard`.
+    fn at_most_one(
+        &mut self,
+        role: Term,
+        inverse: bool,
+        guard: &[Concept],
+        sources: &[Box<[u32]>],
+        axiom: usize,
+    ) -> Result<(), Unsupported> {
+        let mut ids = Vec::with_capacity(guard.len());
+        for &g in guard {
+            let (id, flipped) = self.concept(g);
+            // A flipped guard is a second head atom: not Horn.
+            if flipped {
+                return Err(Unsupported::Equality { axiom });
+            }
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let role = self.role(role);
+        self.program.at_most_one.push(AtMostOne {
+            kind: if inverse { Kind::In } else { Kind::Out },
+            role,
+            guard: ids.into_boxed_slice(),
+            sources: sources.to_vec().into_boxed_slice(),
+        });
+        Ok(())
+    }
+
+    /// Refuses a `≥ n R.B` with `n > 1` where `R` or a role above it (by the role
+    /// inclusions, inverses followed) is at most one in the same direction: step 6 keeps
+    /// one successor, and the Eq rule would merge what must stay apart.
+    fn numbers(&self) -> Result<(), Unsupported> {
+        if self.numbers.is_empty() || self.program.at_most_one.is_empty() {
+            return Ok(());
+        }
+        let flip = |k: Kind| if k == Kind::In { Kind::Out } else { Kind::In };
+        let mut up: HashMap<(Kind, RoleId), Vec<(Kind, RoleId)>> = HashMap::new();
+        for c in &self.program.clauses {
+            let ([b], Some(h)) = (&c.body[..], c.head) else {
+                continue;
+            };
+            let (kb, s, z) = match *b {
+                BodyPat::Out(s, Var::Z(z)) => (Kind::Out, s, z),
+                BodyPat::In(s, z) => (Kind::In, s, z),
+                _ => continue,
+            };
+            if h.term != TermPat::Var(Var::Z(z)) || h.kind == KindPat::Concept {
+                continue;
+            }
+            let kh = h.kind.kind();
+            up.entry((kb, s)).or_default().push((kh, h.pred));
+            up.entry((flip(kb), s))
+                .or_default()
+                .push((flip(kh), h.pred));
+        }
+        let limited: std::collections::HashSet<(Kind, RoleId)> = self
+            .program
+            .at_most_one
+            .iter()
+            .map(|a| (a.kind, a.role))
+            .collect();
+        for &(kind, role, axiom) in &self.numbers {
+            let mut seen = std::collections::HashSet::from([(kind, role)]);
+            let mut stack = vec![(kind, role)];
+            while let Some(at) = stack.pop() {
+                if limited.contains(&at) {
+                    return Err(Unsupported::Equality { axiom });
+                }
+                for &next in up.get(&at).map_or(&[][..], |v| v) {
+                    if seen.insert(next) {
+                        stack.push(next);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

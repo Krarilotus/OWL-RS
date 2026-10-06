@@ -1005,6 +1005,7 @@ name = "nrese-dl"
 version = "0.1.0"
 dependencies = [
  "hashbrown 0.16.1",
+ "nrese-exec",
  "nrese-owl",
  "nrese-xsd",
  "rayon",
