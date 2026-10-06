@@ -19,6 +19,13 @@ pub fn process_bytes() -> Option<u64> {
     imp::process_bytes()
 }
 
+/// The most [`process_bytes`] has been since the process started, where the platform
+/// keeps it (Windows: the peak committed private bytes; Linux: the peak resident set,
+/// mapped files included).
+pub fn peak_process_bytes() -> Option<u64> {
+    imp::peak_process_bytes()
+}
+
 /// The memory this process may use: the container's limit if there is one (cgroup v2,
 /// then v1, on Linux), else the machine's physical memory; `None` where the platform
 /// doesn't say.
@@ -90,7 +97,7 @@ mod imp {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    pub fn process_bytes() -> Option<u64> {
+    fn counters() -> Option<PROCESS_MEMORY_COUNTERS_EX> {
         let mut counters = PROCESS_MEMORY_COUNTERS_EX {
             cb: u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>()).ok()?,
             ..Default::default()
@@ -105,7 +112,15 @@ mod imp {
                 counters.cb,
             )
         };
-        (ok != 0).then_some(counters.PrivateUsage as u64)
+        (ok != 0).then_some(counters)
+    }
+
+    pub fn process_bytes() -> Option<u64> {
+        counters().map(|counters| counters.PrivateUsage as u64)
+    }
+
+    pub fn peak_process_bytes() -> Option<u64> {
+        counters().map(|counters| counters.PeakPagefileUsage as u64)
     }
 
     pub fn available_bytes() -> Option<u64> {
@@ -138,6 +153,13 @@ mod imp {
         Some(resident.saturating_sub(shared) * PAGE)
     }
 
+    pub fn peak_process_bytes() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib * 1024)
+    }
+
     pub fn available_bytes() -> Option<u64> {
         let read = |path: &str| std::fs::read_to_string(path).ok();
         let machine = read("/proc/meminfo").and_then(|text| {
@@ -160,6 +182,10 @@ mod imp {
 #[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
     pub fn process_bytes() -> Option<u64> {
+        None
+    }
+
+    pub fn peak_process_bytes() -> Option<u64> {
         None
     }
 
