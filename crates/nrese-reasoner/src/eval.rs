@@ -751,6 +751,15 @@ fn never() -> bool {
 /// A [`Stop`] that never fires.
 pub const NEVER: Stop<'static> = &never;
 
+/// Whether the process holds more than its memory limit
+/// ([`nrese_exec::memory::set_process_limit`]): materialisations and commits stop then,
+/// whatever `stop` their caller passes ([`super::delta::Interrupted`]). A collected
+/// closure can outgrow any time budget (a DL bound's evaluation reached 49 GB under a
+/// deadline, 6 October 2026); the caller tells the two apart by asking this again.
+pub fn over_memory_limit() -> bool {
+    nrese_exec::memory::process_limit_exceeded()
+}
+
 /// Every fact `jobs` derive that `keep` accepts. If `stop` fires, the remaining morsels
 /// are skipped and the result is incomplete: the caller must check `stop` and discard it.
 pub fn run_jobs<S: Source + ?Sized>(

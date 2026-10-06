@@ -2019,6 +2019,8 @@ fn run(
     mut representatives: Option<Representatives>,
     stop: super::eval::Stop<'_>,
 ) -> Result<Materialisation, Interrupted> {
+    // The process's memory limit stops it too, whatever the caller polls.
+    let stop: super::eval::Stop<'_> = &|| stop() || super::eval::over_memory_limit();
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut phases = Phases {
         load,
