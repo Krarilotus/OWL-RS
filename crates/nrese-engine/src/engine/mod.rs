@@ -47,7 +47,7 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
-pub use snapshot::{InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot};
+pub use snapshot::{InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity};
 pub use transaction::{CommitSummary, Transaction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +182,29 @@ pub(crate) struct Version {
     pub(crate) dictionary_len: u64,
     /// Its `owl:sameAs` classes, once a read needs them ([`equality`]).
     pub(crate) equality: Arc<equality::EqualityCell>,
+    /// What its statements are: kept where only their layout changes (compaction, a
+    /// checkpoint mapped), new for any other version ([`Content`]).
+    pub(crate) content: Content,
+}
+
+/// The identity of a version's statements: two versions with the same one show the same
+/// statements, whatever their runs. Every commit, transaction's pending state and masked
+/// view gets a new one, so a result computed on one is never taken for another's, even
+/// at the same revision ([`Snapshot::identity`](crate::Snapshot::identity)). Unique within
+/// the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Content(u64);
+
+impl Content {
+    pub(crate) fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The identity as a number.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 impl Version {
@@ -193,6 +216,7 @@ impl Version {
             revision: 0,
             dictionary_len: 0,
             equality: Default::default(),
+            content: Content::fresh(),
         }
     }
 
@@ -217,6 +241,8 @@ impl Version {
             revision: self.revision,
             dictionary_len: self.dictionary_len,
             equality: Arc::clone(&self.equality),
+            // Only compaction replaces a stack this way: the same statements.
+            content: self.content,
         };
         *next.stack_mut(stack) = index;
         next
@@ -412,6 +438,7 @@ impl Shared {
                     revision: current.revision,
                     dictionary_len: current.dictionary_len,
                     equality: Arc::clone(&current.equality),
+                    content: current.content,
                 }
             });
         }

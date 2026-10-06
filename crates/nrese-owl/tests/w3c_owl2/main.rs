@@ -108,6 +108,13 @@ impl Terms for Table {
             .get(&RdfTerm::NamedNode(NamedNode::new_unchecked(iri)))
             .copied()
     }
+
+    fn iri_text(&self, term: Term) -> Option<String> {
+        match &self.terms[term as usize] {
+            RdfTerm::NamedNode(n) => Some(n.as_str().to_owned()),
+            _ => None,
+        }
+    }
 }
 
 impl Make for Table {
@@ -296,5 +303,165 @@ fn the_dl_test_ontologies_read_and_round_trip() {
         "failures not listed:\n{}\nlisted but passing:\n{}",
         unexpected.join("\n"),
         passing_listed.join("\n")
+    );
+}
+
+/// The ontology of an RDF/XML text, or why it can't be read without loss.
+fn ontology_of(text: &str) -> Result<(Ontology, Table), String> {
+    let triples = parse_rdf_xml(text)?;
+    let mut table = Table::default();
+    let statements: Vec<Statement> = triples
+        .into_iter()
+        .map(|t| Statement {
+            triple: [
+                table.id(t.subject.into()),
+                table.id(t.predicate.into()),
+                table.id(t.object),
+            ],
+            graph: 0,
+        })
+        .collect();
+    let ontology = read(&statements, &table);
+    match ontology.diagnostics.iter().any(Diagnostic::is_fatal) {
+        true => Err("a fatal diagnostic".to_owned()),
+        false => Ok((ontology, table)),
+    }
+}
+
+/// The first axiom of `read` whose profiles differ from `want` in profile `which`.
+fn first_differing(read: &[(Ontology, Table)], which: &str, want: bool) -> String {
+    for (o, table) in read {
+        for a in &o.axioms {
+            let p = nrese_owl::profile::of(o, a);
+            let has = match which {
+                "EL" => p.el,
+                "QL" => p.ql,
+                _ => p.rl,
+            };
+            if !has && want {
+                return format!("{which}: {}", o.functional(a, &|t| table.name(t)));
+            }
+        }
+    }
+    format!("{which}: no single axiom")
+}
+
+const PROFILE_DISAGREEMENTS: &str = include_str!("profile-disagreements.txt");
+
+/// The per-axiom profile checker (`nrese_owl::profile`) against the test cases' own
+/// annotations: each case of species DL whose ontologies read is in exactly the profiles
+/// it is annotated with (EL, QL, RL), its premise and conclusions together.
+#[test]
+fn the_profile_checker_agrees_with_the_test_cases() {
+    let path = suite_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        assert!(
+            std::env::var_os("NRESE_W3C_REQUIRED").is_none(),
+            "the W3C OWL 2 test cases are required: {}",
+            path.display()
+        );
+        eprintln!("skipped: no {}", path.display());
+        return;
+    };
+    let triples = parse_rdf_xml(&text).expect("the test case collection parses");
+    let mut names: HashMap<NamedOrBlankNode, String> = HashMap::new();
+    let mut dl: HashMap<NamedOrBlankNode, bool> = HashMap::new();
+    let mut annotated: HashMap<NamedOrBlankNode, Vec<String>> = HashMap::new();
+    let mut ontologies: HashMap<NamedOrBlankNode, Vec<String>> = HashMap::new();
+    for t in &triples {
+        let Some(local) = t.predicate.as_str().strip_prefix(TEST) else {
+            continue;
+        };
+        match (local, &t.object) {
+            ("identifier", RdfTerm::Literal(l)) => {
+                names.insert(t.subject.clone(), l.value().to_owned());
+            }
+            ("species", RdfTerm::NamedNode(n)) if n.as_str() == format!("{TEST}DL") => {
+                dl.insert(t.subject.clone(), true);
+            }
+            ("profile", RdfTerm::NamedNode(n)) => {
+                if let Some(p) = n.as_str().strip_prefix(TEST) {
+                    annotated
+                        .entry(t.subject.clone())
+                        .or_default()
+                        .push(p.to_owned());
+                }
+            }
+            (
+                "rdfXmlPremiseOntology"
+                | "rdfXmlConclusionOntology"
+                | "rdfXmlNonConclusionOntology"
+                | "rdfXmlInputOntology",
+                RdfTerm::Literal(l),
+            ) => ontologies
+                .entry(t.subject.clone())
+                .or_default()
+                .push(l.value().to_owned()),
+            _ => {}
+        }
+    }
+    let expected: BTreeMap<&str, &str> = PROFILE_DISAGREEMENTS
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            l.split_once('\t')
+                .map_or((l.trim(), ""), |(n, why)| (n.trim(), why))
+        })
+        .collect();
+    let (mut compared, mut unexpected, mut listed_agree) = (0, Vec::new(), Vec::new());
+    let mut cases: Vec<_> = ontologies
+        .iter()
+        .filter(|(node, _)| dl.get(*node).copied().unwrap_or(false))
+        .filter_map(|(node, texts)| Some((names.get(node)?, node, texts)))
+        .collect();
+    cases.sort_by_key(|(name, _, _)| (*name).clone());
+    for (name, node, texts) in cases {
+        let Ok(read) = texts
+            .iter()
+            .map(|t| ontology_of(t))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            continue;
+        };
+        compared += 1;
+        let ours = read.iter().fold(nrese_owl::Profiles::ALL, |acc, (o, _)| {
+            acc.and(nrese_owl::profile::of_ontology(o))
+        });
+        let mut theirs: Vec<String> = annotated.get(node).cloned().unwrap_or_default();
+        theirs.sort();
+        let ours: Vec<String> = ours.names().into_iter().map(str::to_owned).collect();
+        let agree = ours == theirs;
+        match (agree, expected.contains_key(name.as_str())) {
+            (false, false) => {
+                let missing: Vec<String> = theirs
+                    .iter()
+                    .filter(|p| !ours.contains(p))
+                    .map(|p| first_differing(&read, p, true))
+                    .collect();
+                let extra: Vec<String> = match ours.iter().any(|p| !theirs.contains(p)) {
+                    true => read
+                        .iter()
+                        .flat_map(|(o, t)| o.axioms.iter().map(|a| o.functional(a, &|x| t.name(x))))
+                        .filter(|a| !a.starts_with("Declaration"))
+                        .take(6)
+                        .collect(),
+                    false => Vec::new(),
+                };
+                unexpected.push(format!(
+                    "{name}: ours {ours:?}, annotated {theirs:?} {missing:?} {extra:?}"
+                ));
+            }
+            (true, true) => listed_agree.push(name.clone()),
+            _ => {}
+        }
+    }
+    eprintln!("{compared} test cases compared");
+    assert!(compared > 250, "only {compared}");
+    assert!(
+        unexpected.is_empty() && listed_agree.is_empty(),
+        "disagreements not listed ({}):\n{}\nlisted but agreeing:\n{}",
+        unexpected.len(),
+        unexpected.join("\n"),
+        listed_agree.join("\n")
     );
 }

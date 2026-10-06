@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Perf lab in Docker: builds crates/nrese-store/examples/perf_lab.rs with the pinned
+# Perf lab in Docker: builds crates/nrese-store/examples/perf_lab/ with the pinned
 # toolchain and runs it on Linux against a dataset in the volume `nrese-bench-data`.
 #
 #   benches/perf-lab.sh <dataset> [perf_lab args...]

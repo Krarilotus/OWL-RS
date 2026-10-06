@@ -116,9 +116,11 @@ nrese-server load [--config .\config.toml] [--replace] [--graph <IRI>] [--skip-e
 nrese-server query [--config .\config.toml] [--format json|xml|csv|tsv|nt|ttl|nq|trig|rdf|jsonld] "SELECT ..."
 nrese-server query [--config .\config.toml] --file query.rq
 nrese-server convert data.ttl data.nt
+nrese-server print-query [--config .\config.toml] [--form paths|values] [--schema ontology.ttl]... "SELECT ..."
 ```
 
 - `query` answers one query from the configured store as it is (no reasoning first; the inferred stack is what the last load or start materialised) and writes the results to standard output: SELECT and ASK in the results format (default JSON), CONSTRUCT and DESCRIBE in the RDF format (default N-Triples). Offline, like `load`.
+- `print-query` prints the query as standard SPARQL 1.1 for a store without reasoning that holds the same statements: it answers as NRESE does under `owl2-rl` with the QL rewriting on (`docs/design/ql-rewriting.md` §8). `--form paths` (the default) reaches the hierarchy with property paths over the schema, `values` enumerates it. Against the configured store, or with `--schema` against those files alone. The first line, `# NRESE completeness: …`, is NRESE's status for the answers; a query that can't be written exactly (equality, recursive rules, …) gets its reasons on standard error and exit status 2.
 - `convert` reads one RDF file and writes it in another format, both taken from the extensions, statement by statement and without a store, so the file can be larger than memory. Blank node labels are kept; a named graph is an error for a format without graphs. The output appears only when complete.
 
 ### 5.4.2 Moving Data In from Another Store
