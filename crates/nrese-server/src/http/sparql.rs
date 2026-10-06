@@ -84,21 +84,44 @@ pub async fn execute_query_in(
         )
         .await;
     }
-    stream_blocking(
+    // The completeness goes with the answers, in a header: the store reports it on the
+    // snapshot it reads before writing any answer, and the response starts after that.
+    let status: std::sync::Arc<std::sync::Mutex<Option<nrese_sparql::ql::QlReport>>> =
+        std::sync::Arc::default();
+    let slot = std::sync::Arc::clone(&status);
+    let report = move |r: Option<nrese_sparql::ql::QlReport>| {
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = r;
+    };
+    let mut response = stream_blocking(
         deadline,
         cancellation,
         media_type,
         QUERY_TIMEOUT_MESSAGE,
         move |out| {
             match &pending {
-                None => store.run_query(&prepared, &token, out),
-                Some(pending) => store.run_query_pending(pending, &prepared, &token, out),
+                None => store.run_query_reporting(&prepared, &token, out, report),
+                Some(pending) => {
+                    store.run_query_pending_reporting(pending, &prepared, &token, out, report)
+                }
             }
             .map_err(|error| map_query_error(&policy, error))
         },
     )
-    .await
+    .await?;
+    if let Some(report) = status.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        response.headers_mut().insert(
+            COMPLETENESS,
+            axum::http::HeaderValue::from_str(&report.completeness.header()).unwrap_or_else(|_| {
+                axum::http::HeaderValue::from_static(report.completeness.as_str())
+            }),
+        );
+    }
+    Ok(response)
 }
+
+/// The header that says whether the answers are sound and complete, and why not
+/// ([`nrese_sparql::Completeness::header`]; docs/design/ql-rewriting.md §7).
+pub const COMPLETENESS: &str = "nrese-completeness";
 
 /// The JSON form of an EXPLAIN: the executor, the rewrites that changed the query, totals,
 /// and one object per operator in evaluation order (`depth` gives the nesting).
@@ -122,7 +145,31 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
         "rewrites": explanation.rewrites,
         "rows": explanation.rows,
         "micros": explanation.micros,
+        "ql": ql_json(explanation.ql.as_ref()),
         "steps": steps,
+    })
+}
+
+/// What the OWL 2 QL rewriting did and whether the answers are complete (`null` where it
+/// doesn't apply).
+fn ql_json(report: Option<&nrese_sparql::ql::QlReport>) -> serde_json::Value {
+    report.map_or(serde_json::Value::Null, |r| {
+        serde_json::json!({
+            "completeness": r.completeness.as_str(),
+            "sound": r.completeness.sound,
+            "complete": r.completeness.complete,
+            "reasons": r
+                .completeness
+                .reasons
+                .iter()
+                .map(|reason| serde_json::json!({"source": reason.source, "text": reason.text}))
+                .collect::<Vec<_>>(),
+            "patterns": r.patterns,
+            "witnesses": r.witnesses,
+            "branches": r.branches,
+            "atoms": r.atoms,
+            "limits": r.limits,
+        })
     })
 }
 
@@ -145,6 +192,7 @@ fn plan_json(planned: &nrese_store::PlannedQuery) -> serde_json::Value {
     serde_json::json!({
         "executor": "native",
         "rewrites": planned.rewrites,
+        "ql": ql_json(planned.ql.as_ref()),
         "steps": steps,
     })
 }
