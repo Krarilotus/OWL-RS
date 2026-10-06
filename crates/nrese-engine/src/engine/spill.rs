@@ -1,16 +1,19 @@
 //! External sorting for bulk loads with bounded memory, as QLever's index builder does it.
 //!
 //! A bulk load whose quads outgrow its budget ([`DurabilityConfig::bulk_load_memory`]
-//! (crate::DurabilityConfig)) hands them over in chunks to a spilling thread. That thread
-//! sorts each chunk in every permutation of the smallest layout that holds it and writes
-//! each permutation packed ([`PackedKeys`], 6 to 12 bytes per key) to its own file. At the
-//! end, each permutation is the merge of its chunk files, read through memory maps, with
-//! duplicates dropped. A chunk without named graphs gives the graph-first permutations of
+//! (crate::DurabilityConfig)) hands them over in chunks to a spilling thread, which writes
+//! each as it is: its new terms have provisional ids until the load finishes
+//! ([`crate::term::pending`]), and sorted by those a chunk would be out of order once
+//! renumbered. At the end each chunk is read back, renumbered and sorted in every
+//! permutation of the smallest layout that holds it, each permutation written packed
+//! ([`PackedKeys`], 6 to 12 bytes per key) to its own file, one chunk at a time
+//! ([`Spill::sort_raw`]). Then each permutation is the merge of its chunk files, read
+//! through memory maps, with duplicates dropped. A chunk without named graphs gives the graph-first permutations of
 //! the quad layout (if another chunk needs that layout) from its graph-last ones, the
 //! graph moved to the front of each key: they sort alike when every graph is the default.
 //! The merged permutation is packed on the fly and goes into the checkpoint before the
 //! next is merged. So the load's quads take the budget plus one packed permutation,
-//! whatever the data's size, at the cost of writing and reading each key once more.
+//! whatever the data's size, at the cost of writing and reading each key twice more.
 //!
 //! The spilling thread sorts on a thread pool of its own. The loader's threads, which add
 //! the quads from the global pool, wait for it when the next chunk is full: a sort on
@@ -43,11 +46,14 @@ fn concat(batches: Vec<Vec<EncodedQuad>>) -> Vec<EncodedQuad> {
     quads
 }
 
-/// Chunks spilled to disk: per chunk, one packed file per permutation of its layout.
+/// Chunks spilled to disk: as written (raw, until [`Spill::sort_raw`]), then per chunk one
+/// packed file per permutation of its layout.
 pub(crate) struct Spill {
     dir: PathBuf,
-    /// The layout of each chunk.
+    /// The layout of each sorted chunk.
     chunks: Vec<Layout>,
+    /// The raw chunks' files, in the order they came.
+    raw: Vec<PathBuf>,
 }
 
 impl Spill {
@@ -61,7 +67,51 @@ impl Spill {
         Ok(Self {
             dir,
             chunks: Vec::new(),
+            raw: Vec::new(),
         })
+    }
+
+    /// Writes `quads` as they are (32 bytes each, little-endian components).
+    fn write_raw(&mut self, quads: &[EncodedQuad]) -> std::io::Result<()> {
+        let path = self.dir.join(format!("raw-{:05}.quads", self.raw.len()));
+        let mut out = BufWriter::with_capacity(1 << 20, File::create(&path)?);
+        for quad in quads {
+            for component in quad.components() {
+                out.write_all(&component.to_le_bytes())?;
+            }
+        }
+        out.into_inner()
+            .map_err(|error| error.into_error())?
+            .sync_all()?;
+        self.raw.push(path);
+        Ok(())
+    }
+
+    /// Reads each raw chunk back, renumbers its quads with `renumber` and writes it sorted
+    /// ([`Self::write_chunk`]), one chunk at a time; the raw files go.
+    pub(crate) fn sort_raw(
+        &mut self,
+        renumber: &dyn Fn(&mut [EncodedQuad]),
+    ) -> std::io::Result<()> {
+        for path in std::mem::take(&mut self.raw) {
+            let bytes = fs::read(&path)?;
+            let mut quads: Vec<EncodedQuad> = bytes
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .map(|raw| {
+                    let word = |i: usize| {
+                        u64::from_le_bytes(raw[8 * i..8 * i + 8].try_into().expect("8 bytes"))
+                    };
+                    EncodedQuad::from_components([word(0), word(1), word(2), word(3)])
+                })
+                .collect();
+            drop(bytes);
+            renumber(&mut quads);
+            self.write_chunk(quads)?;
+            fs::remove_file(&path)?;
+        }
+        Ok(())
     }
 
     /// The layout of the merged quads: the quad layout if a chunk has a named graph.
@@ -233,7 +283,7 @@ impl Spiller {
             .name("nrese-spill".into())
             .spawn(move || {
                 for batches in received {
-                    pool.install(|| spill.write_chunk(concat(batches)))?;
+                    pool.install(|| spill.write_raw(&concat(batches)))?;
                     pool.broadcast(|_| crate::memory::release_thread());
                     crate::memory::release_thread();
                 }

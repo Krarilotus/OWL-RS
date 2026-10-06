@@ -2137,7 +2137,7 @@ fn cyclic_bgps_equal_the_reference() {
                     format!("{b} {predicate} {a} .")
                 }
             };
-            let mut body = match rng.below(6) {
+            let mut body = match rng.below(9) {
                 0 | 1 => format!(
                     "{} {} {}",
                     edge(&mut rng, "?a", "?b"),
@@ -2161,6 +2161,34 @@ fn cyclic_bgps_equal_the_reference() {
                     edge(&mut rng, "?a", "?b"),
                     edge(&mut rng, "?b", "?a")
                 ),
+                5 => format!(
+                    "{} {} {} {} {}",
+                    edge(&mut rng, "?a", "?b"),
+                    edge(&mut rng, "?b", "?c"),
+                    edge(&mut rng, "?c", "?d"),
+                    edge(&mut rng, "?d", "?e"),
+                    edge(&mut rng, "?e", "?a")
+                ),
+                // Two triangles sharing `?a`.
+                6 => format!(
+                    "{} {} {} {} {} {}",
+                    edge(&mut rng, "?a", "?b"),
+                    edge(&mut rng, "?b", "?c"),
+                    edge(&mut rng, "?c", "?a"),
+                    edge(&mut rng, "?a", "?d"),
+                    edge(&mut rng, "?d", "?e"),
+                    edge(&mut rng, "?e", "?a")
+                ),
+                // A 4-cycle with a tail and a chord.
+                7 => format!(
+                    "{} {} {} {} {} {}",
+                    edge(&mut rng, "?a", "?b"),
+                    edge(&mut rng, "?b", "?c"),
+                    edge(&mut rng, "?c", "?d"),
+                    edge(&mut rng, "?d", "?a"),
+                    edge(&mut rng, "?c", "?e"),
+                    edge(&mut rng, "?a", "?c")
+                ),
                 _ => {
                     let (x, y) = (
                         format!("<{EX}e{}>", rng.below(8)),
@@ -2182,6 +2210,15 @@ fn cyclic_bgps_equal_the_reference() {
                 .parse_query(&text)
                 .unwrap_or_else(|e| panic!("{e}: {text}"));
             assert!(runs_natively(&query), "{text}");
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
+            assert_eq!(native, expected, "{text}");
+            // Counted by the join (`wcoj::Query::count_solutions`), not from its rows.
+            let text = format!("SELECT (COUNT(*) AS ?n) WHERE {{ {body} }}");
+            let query = SparqlParser::new().parse_query(&text).unwrap();
             let native = rows(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
