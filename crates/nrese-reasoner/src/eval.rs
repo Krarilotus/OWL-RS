@@ -759,16 +759,27 @@ impl Probes {
 /// [`run_jobs`] by morsel: each morsel's facts, sorted by (predicate, subject, object) and
 /// distinct, are handed to `finish`, and its results come back in the morsels' order,
 /// not concatenated (a caller that regroups them needs no copy of all of them). Counts
-/// the probes into `probes` (once per morsel).
+/// the probes into `probes` (once per morsel). `rewrite`, if given, maps each derived
+/// fact before it is checked (equality by representatives: to its representatives).
 pub fn run_jobs_by_morsel<S: Source + ?Sized, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
     keep: &(dyn Fn(Triple) -> bool + Sync),
+    rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
     stop: Stop<'_>,
     probes: &Probes,
     finish: &(dyn Fn(Vec<Triple>) -> T + Sync),
 ) -> Vec<T> {
-    run_morsels(source, jobs, keep, false, stop, Some(probes), finish)
+    run_morsels(
+        source,
+        jobs,
+        keep,
+        false,
+        rewrite,
+        stop,
+        Some(probes),
+        finish,
+    )
 }
 
 /// [`run_jobs`] without circular derivations: those whose head is one of their own
@@ -794,14 +805,19 @@ fn run_jobs_with<S: Source + ?Sized>(
     stop: Stop<'_>,
     probes: Option<&Probes>,
 ) -> Vec<Triple> {
-    run_morsels(source, jobs, keep, acyclic, stop, probes, &|facts| facts).concat()
+    run_morsels(source, jobs, keep, acyclic, None, stop, probes, &|facts| {
+        facts
+    })
+    .concat()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_morsels<S: Source + ?Sized, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
     keep: &(dyn Fn(Triple) -> bool + Sync),
     acyclic: bool,
+    rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
     stop: Stop<'_>,
     probes: Option<&Probes>,
     finish: &(dyn Fn(Vec<Triple>) -> T + Sync),
@@ -838,7 +854,7 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                             .iter()
                             .any(|atom| instantiate_head(atom, bindings) == fact);
                     if !circular {
-                        out.push(fact);
+                        out.push(rewrite.map_or(fact, |rewrite| rewrite(fact)));
                     }
                 }
             });

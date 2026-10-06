@@ -13,7 +13,7 @@ use nrese_reasoner::vocabulary::LocalVocabulary;
 
 #[path = "support/lubm.rs"]
 mod lubm;
-use lubm::{DEPARTMENTS, grouped, lubm_like};
+use lubm::{DEPARTMENTS, cascade, grouped, lubm_like};
 
 #[global_allocator]
 static ALLOCATOR: heap::Counting<std::alloc::System> = heap::Counting(std::alloc::System);
@@ -176,6 +176,56 @@ fn membership_probes_are_distinct_and_ordered_per_morsel() {
 /// 5 October 2026 (37,014, 49,813, 8,016 and 200 in its four rounds). Deterministic: a
 /// change of the rules or the input shape that adds probes for a reason re-measures it.
 const PROBES: u64 = 95_043;
+
+/// G8 and #4 of the investigation of 6 October 2026: with equality by representatives
+/// the closure is computed in the working set, from the grouped input, whatever
+/// `sameAs` merges it meets. Before (133671c), one `sameAs` moved the store's
+/// materialisation off the grouped input onto lists of triples (24 bytes each: the
+/// input, a copy with what a first pass derived, each outer pass's rewrite and closure).
+/// The heap's peak with a cascade of 8 merges is within 1.1 times the peak without.
+#[test]
+fn equality_keeps_the_working_set_as_the_only_copy() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let peak = |depth: usize| {
+        let mut vocabulary = LocalVocabulary::default();
+        let rules = Ruleset::Owl2Rl
+            .rules(&mut vocabulary)
+            .expect("OWL 2 RL parses");
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let mut facts = lubm_like(&mut vocabulary, DEPARTMENTS);
+        if depth > 0 {
+            let extra = cascade(&mut vocabulary, &facts, depth);
+            facts.extend(extra);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a pool");
+        let input = grouped(facts);
+        let before = heap::live();
+        heap::start("input");
+        let result = pool.install(|| {
+            batch::materialise_representatives_until(
+                batch::Input::Grouped(input),
+                &rules,
+                Some(&lists),
+                &schema,
+                batch::Listing::Expanded,
+                nrese_reasoner::eval::NEVER,
+            )
+            .expect("never stopped")
+        });
+        let phases = heap::finish();
+        assert_eq!(result.merges, usize::from(depth > 0) * depth);
+        phases.iter().map(|phase| phase.peak).max().expect("phases") - before
+    };
+    let (plain, merged) = (peak(0), peak(8));
+    assert!(
+        merged * 10 <= plain * 11,
+        "heap peak {merged} bytes with 8 merges, {plain} without: at most 1.1 times"
+    );
+}
 
 /// See [`relations_keep_no_object_order_their_rules_never_use`].
 const BYTES_PER_FACT: usize = 26;
