@@ -113,6 +113,35 @@ fn triangles_join_worst_case_optimally() {
     );
 }
 
+/// `COUNT(*)` of a cyclic BGP: the worst-case-optimal join binds the order's prefix and
+/// counts the rest as a forest, never producing the solutions. 4-cycles bind `?a` and
+/// join two lists of 2-paths per node: one check per `?a` candidate, where enumerating
+/// them checked each of the 27,000 2-paths' last step.
+#[test]
+fn cycles_are_counted_without_their_solutions() {
+    let plan = steps(
+        &engine(),
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:knows ?d . ?d e:knows ?a }",
+    );
+    let order = plan
+        .iter()
+        .find(|s| s.operator == "wcoj order")
+        .unwrap_or_else(|| panic!("{plan:#?}"));
+    assert!(
+        order.detail.ends_with("?b, ?c, ?d counted as a forest"),
+        "{}",
+        order.detail
+    );
+    let lookups: u64 = order
+        .detail
+        .split(" | ")
+        .nth(1)
+        .and_then(|d| d.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{}", order.detail));
+    assert!(lookups <= 3000, "{}", order.detail);
+}
+
 /// Eager aggregation: a group over a join aggregates the side its aggregates read before
 /// the join, `AVG`, `MIN` and `MAX` included (BSBM BI q4's shape, an average of offer
 /// prices per product feature).
