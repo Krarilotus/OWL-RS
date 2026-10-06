@@ -33,6 +33,9 @@ struct State {
     /// and evaluated afresh on commit), `read` (afresh for a query), `kept` (U1 gave up
     /// and nothing it is compiled from changed).
     last: &'static str,
+    /// The TBox's taxonomy for L's memberships ([`super::lower`]): computed on the first
+    /// read, kept as long as U1's compilation (both change only with the schema).
+    taxonomy: std::sync::OnceLock<Arc<nrese_dl::classify::Taxonomy>>,
 }
 
 /// The store's bounds: U1 for the revision it describes, and the read view of the latest
@@ -52,6 +55,11 @@ impl std::fmt::Debug for Bounds {
 /// What a query reads of the bounds at a revision.
 pub(crate) struct View {
     pub revision: u64,
+    /// L: the inferred stack with the memberships the TBox's taxonomy adds
+    /// ([`super::lower`]); the snapshot itself where it adds none.
+    pub lower: Snapshot,
+    /// Those memberships.
+    pub lower_facts: usize,
     /// L ∪ U1 as a snapshot (`None`: U1 isn't available).
     pub upper: Option<Snapshot>,
     /// Why U1 can't bound the answers (not built, gave up, or axioms it doesn't cover).
@@ -227,6 +235,7 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
                 revision,
                 upper: *upper,
                 last: "rebuilt",
+                taxonomy: std::sync::OnceLock::new(),
             });
         }
         Prepared::Delta(change) => match state.as_mut() {
@@ -276,20 +285,34 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
             revision,
             upper,
             last: "read",
+            taxonomy: std::sync::OnceLock::new(),
         });
     }
     let s = state.as_ref().expect("built above");
-    let view = Arc::new(build_view(&snapshot, s));
+    let taxonomy = match &s.upper {
+        Ok(_) => Some(Arc::clone(s.taxonomy.get_or_init(|| {
+            let ontology = super::query::ontology_at(store, &snapshot);
+            Arc::new(super::lower::tbox_taxonomy(store, &ontology))
+        }))),
+        Err(_) => None,
+    };
+    let view = Arc::new(build_view(&snapshot, s, taxonomy.as_deref()));
     *bounds.view.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&view));
     (snapshot, view)
 }
 
-fn build_view(snapshot: &Snapshot, state: &State) -> View {
+fn build_view(
+    snapshot: &Snapshot,
+    state: &State,
+    taxonomy: Option<&nrese_dl::classify::Taxonomy>,
+) -> View {
     let upper = match &state.upper {
         Ok(upper) => upper,
         Err(GaveUp(why)) => {
             return View {
                 revision: state.revision,
+                lower: snapshot.clone(),
+                lower_facts: 0,
                 upper: None,
                 unavailable: Some(format!("the upper bound isn't available: {why}")),
                 gap_classes: HashSet::new(),
@@ -302,8 +325,27 @@ fn build_view(snapshot: &Snapshot, state: &State) -> View {
     };
     let rdf_type = upper.program.names.rdf_type;
     let clash = upper.program.names.clash;
+    let lower: HashSet<Triple> = taxonomy
+        .map(|t| super::lower::memberships(snapshot, t, rdf_type))
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let encode = |[s, p, o]: Triple| {
+        EncodedTriple::new(
+            TermId::from_raw(s),
+            TermId::from_raw(p),
+            TermId::from_raw(o),
+        )
+        .in_default_graph()
+    };
+    let lower_quads: Vec<EncodedQuad> = lower.iter().map(|&t| encode(t)).collect();
     let mut view = View {
         revision: state.revision,
+        lower: match lower_quads.is_empty() {
+            true => snapshot.clone(),
+            false => snapshot.with_inferred_added(&lower_quads),
+        },
+        lower_facts: lower.len(),
         upper: None,
         unavailable: (!upper.program.incomplete.is_empty()).then(|| {
             format!(
@@ -318,8 +360,12 @@ fn build_view(snapshot: &Snapshot, state: &State) -> View {
         facts: upper.stack.len(),
         proves_consistency: upper.proves_consistency(),
     };
-    let mut quads = Vec::with_capacity(upper.stack.len());
+    let mut quads = lower_quads;
     for [s, p, o] in upper.stack.iter() {
+        // L's memberships from the taxonomy are certain: no gap.
+        if lower.contains(&[s, p, o]) {
+            continue;
+        }
         for t in [s, p, o] {
             if upper.is_internal(t) {
                 view.internal.insert(t);
@@ -335,14 +381,7 @@ fn build_view(snapshot: &Snapshot, state: &State) -> View {
         } else if !upper.is_internal(p) {
             view.gap_predicates.insert(p);
         }
-        quads.push(
-            EncodedTriple::new(
-                TermId::from_raw(s),
-                TermId::from_raw(p),
-                TermId::from_raw(o),
-            )
-            .in_default_graph(),
-        );
+        quads.push(encode([s, p, o]));
     }
     view.upper = Some(snapshot.with_inferred_added(&quads));
     view
@@ -356,6 +395,8 @@ pub struct BoundsReport {
     pub unavailable: Option<String>,
     /// U1's facts beyond L.
     pub upper_facts: usize,
+    /// L's memberships beyond the RL closure, from the TBox's taxonomy.
+    pub lower_facts: usize,
     /// Classes and other predicates with facts in U1 beyond L.
     pub gap_classes: usize,
     pub gap_predicates: usize,
@@ -379,6 +420,7 @@ pub(crate) fn report(store: &StoreService) -> BoundsReport {
         revision: view.revision,
         unavailable: view.unavailable.clone(),
         upper_facts: view.facts,
+        lower_facts: view.lower_facts,
         gap_classes: view.gap_classes.len(),
         gap_predicates: view.gap_predicates.len(),
         last,

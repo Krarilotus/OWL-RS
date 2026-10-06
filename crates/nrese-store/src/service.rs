@@ -446,7 +446,12 @@ impl StoreService {
                     return Ok(Some(status));
                 }
                 // Over the lower bound as every query runs, its status known already.
-                crate::dl::query::Outcome::Stream(status) => dl_status = Some(status),
+                crate::dl::query::Outcome::Stream(status, None) => dl_status = Some(status),
+                // L adds memberships to the snapshot: streamed over its view, uncached.
+                crate::dl::query::Outcome::Stream(status, Some(lower)) => {
+                    run_query(&lower, prepared, &self.settings, cancellation, out)?;
+                    return Ok(Some(status));
+                }
             }
         }
         let snapshot = self.read_snapshot(prepared.access());
@@ -518,7 +523,7 @@ impl StoreService {
             explanation.completeness = Some(
                 match crate::dl::query::answer(self, prepared, cancellation, mode)? {
                     crate::dl::query::Outcome::Answers(_, status)
-                    | crate::dl::query::Outcome::Stream(status) => status,
+                    | crate::dl::query::Outcome::Stream(status, _) => status,
                 },
             );
         }

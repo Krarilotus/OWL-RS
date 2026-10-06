@@ -52,7 +52,8 @@ fn query(pipeline: &MutationPipeline, query: &str) -> (Vec<String>, Completeness
 }
 
 const UNION: &str = ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :B rdfs:subClassOf :D . \
-     :C rdfs:subClassOf :D . :x a :A . :y a :B . :z :knows :y .";
+     :C rdfs:subClassOf :D . :x a :A . :y a :B . :z :knows :y . \
+     :w a [ owl:unionOf ( :B :C ) ] .";
 
 const EMPLOYEE: &str = ":Employee rdfs:subClassOf [ a owl:Restriction ; \
        owl:onProperty :worksFor ; owl:someValuesFrom :Org ] . \
@@ -73,15 +74,35 @@ fn closed_predicates_answer_from_the_lower_bound_alone() {
 }
 
 #[test]
-fn a_membership_through_a_union_is_proved_by_ground_entailment() {
+fn memberships_through_a_union_come_from_the_taxonomy_or_ground_entailment() {
     let dl = pipeline();
     insert(&dl, UNION).expect("data");
     let (rows, status) = query(&dl, "SELECT ?x { ?x a :D }");
-    assert_eq!(rows, ["x", "y"], "x is a D through the union, y by RL");
+    // y by RL; x by the TBox's taxonomy (A ⊑ D), in L; w only by reasoning over its
+    // assertion, proved by ground entailment.
+    assert_eq!(rows, ["w", "x", "y"]);
     assert!(status.is_complete(), "{:?}", status.reasons());
     assert!(status.paths.contains(&"exact-ground-entailment"));
     let b = status.bounds.expect("bounds");
-    assert_eq!((b.lower, b.upper, b.proved), (1, Some(2), 1));
+    assert_eq!((b.lower, b.upper, b.proved), (2, Some(3), 1));
+    // The guard of L's memberships from the taxonomy: x a D, one fact.
+    assert_eq!(dl.store().dl_bounds().lower_facts, 1);
+}
+
+#[test]
+fn a_membership_the_taxonomy_gives_closes_its_class() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :B rdfs:subClassOf :D . \
+         :C rdfs:subClassOf :D . :x a :A .",
+    )
+    .expect("data");
+    // U1's only fact on D (x a D) is in L: D is closed, the query runs once.
+    let (rows, status) = query(&dl, "SELECT ?x { ?x a :D }");
+    assert_eq!(rows, ["x"]);
+    assert!(status.is_complete());
+    assert_eq!(status.paths, ["closed-predicates"]);
 }
 
 #[test]
@@ -92,7 +113,7 @@ fn a_candidate_the_union_splits_into_is_refuted() {
     assert!(rows.is_empty(), "{rows:?}");
     assert!(status.is_complete());
     let b = status.bounds.expect("bounds");
-    assert_eq!((b.refuted, b.unresolved), (1, 0));
+    assert_eq!((b.refuted, b.unresolved), (2, 0), "x and w");
 }
 
 #[test]
@@ -126,8 +147,11 @@ fn an_existential_answer_is_proved_by_rolling_up_the_query() {
 fn non_monotone_operators_over_an_open_gap_are_sound_only() {
     let dl = pipeline();
     insert(&dl, UNION).expect("data");
-    let (rows, status) = query(&dl, "SELECT ?x { ?x a :A FILTER NOT EXISTS { ?x a :D } }");
-    assert_eq!(rows, ["x"], "over the lower bound");
+    let (rows, status) = query(
+        &dl,
+        "SELECT ?x { ?x :knows ?y FILTER NOT EXISTS { ?y a :C } }",
+    );
+    assert_eq!(rows, ["z"], "over the lower bound");
     assert!(!status.is_complete());
     assert!(
         status.reasons()[0].contains("EXISTS"),
@@ -164,12 +188,12 @@ fn the_sound_and_exact_modes() {
     });
     insert(&dl, UNION).expect("data");
     let (rows, status) = query(&dl, "SELECT ?x { ?x a :D }");
-    assert_eq!(rows, ["y"], "the lower bound alone");
+    assert_eq!(rows, ["x", "y"], "the lower bound alone");
     assert!(!status.is_complete());
     // Asked per query: exact answers, which a union query can't get.
     let (rows, status) =
         query_with(&dl, "SELECT ?x { ?x a :D }", Some(DlAnswers::Exact)).expect("exact");
-    assert_eq!(rows, ["x", "y"]);
+    assert_eq!(rows, ["w", "x", "y"]);
     assert!(status.is_complete());
     let failed = query_with(
         &dl,
@@ -186,7 +210,7 @@ fn the_sound_and_exact_modes() {
         Some(DlAnswers::CertainWhereComplete),
     )
     .expect("certain where complete");
-    assert_eq!(rows, ["y"]);
+    assert_eq!(rows, ["x", "y"]);
     assert!(status.reasons()[0].contains("neither proved nor refuted"));
 }
 
