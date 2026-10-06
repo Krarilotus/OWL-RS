@@ -5,7 +5,7 @@
 //! | Node | Estimate |
 //! |---|---|
 //! | Triple pattern | Its exact count (an index range) |
-//! | Join of triple patterns (a basic graph pattern) | The join orderer's ([`super::plan`]): counts, distinct values, independence |
+//! | Join of triple patterns (a basic graph pattern) | The join orderer's ([`super::plan`]): counts, distinct values, independence, degree bounds; a cyclic one by sampling its worst-case-optimal join |
 //! | Other joins, `LATERAL` | Inputs sharing a variable: the larger (each row meets about one partner); none shared: the product |
 //! | `OPTIONAL` | The join, at least the left side |
 //! | Filter | Its input times the conjuncts' selectivities ([`super::pushdown::selectivity`]) |
@@ -32,7 +32,7 @@ use nrese_sparql_syntax::algebra::{GraphPattern, PropertyPathExpression};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
 
 use super::path_joins::PathJoin;
-use super::{Context, GraphScope, PathPattern, ScanPattern, bound_variables, pushdown};
+use super::{Context, GraphScope, PathPattern, bound_variables, pushdown};
 use crate::plan::Plan;
 use crate::query::PlannedStep;
 
@@ -288,7 +288,7 @@ impl Context<'_> {
             .iter()
             .map(|scan| self.snapshot.estimate_in(self.model, &scan.quad_pattern()))
             .collect();
-        let plan = self.join_order(&scans, &counts);
+        let plan = self.join_order(&scans, &counts, true);
         for &i in &plan.order {
             steps.push(PlannedStep {
                 depth,
@@ -297,9 +297,9 @@ impl Context<'_> {
                 estimated_rows: Some(counts[i]),
             });
         }
-        // Two patterns: the orderer only sorts them; the larger bounds the join.
-        let rows = plan.rows.last().copied().filter(|r| r.is_finite());
-        Some(rows.unwrap_or_else(|| counts.iter().copied().max().unwrap_or(0) as f64))
+        // A cyclic one runs as a worst-case-optimal join, sampled.
+        self.cyclic_estimate(&scans, &counts)
+            .or_else(|| plan.rows.last().copied())
     }
 
     /// The estimate of `pattern`'s rows ([`Self::estimate_plan`]): what EXPLAIN shows
@@ -307,16 +307,6 @@ impl Context<'_> {
     pub(super) fn estimate_rows(&self, pattern: &GraphPattern) -> Option<u64> {
         self.estimate_plan(&Plan::of(pattern), 0, &mut Vec::new())
             .map(|rows| rows.max(0.0).round() as u64)
-    }
-
-    /// A basic graph pattern's rows by the join orderer; two patterns, which it only
-    /// sorts, by the larger (as [`Self::estimate_plan`]).
-    pub(super) fn bgp_estimate(&self, scans: &[ScanPattern], counts: &[u64]) -> Option<u64> {
-        let plan = self.join_order(scans, counts);
-        match plan.rows.last().copied().filter(|r| r.is_finite()) {
-            Some(rows) => Some(rows.max(0.0).round() as u64),
-            None => counts.iter().copied().max(),
-        }
     }
 
     /// The rows of a path pattern ([`Self::path_size`]); from `bound` values of one of its

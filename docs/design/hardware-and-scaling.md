@@ -14,7 +14,14 @@ that cost no performance.
   workload yet.
 - **Memory.** Per-query and server-wide memory budgets; indexes in RAM as bit-packed
   runs. Data larger than RAM isn't possible yet (memory-mapped runs, Pf2).
-- **CPU.** Generic `x86-64` builds: no use of AVX2, AVX-512 or NEON where present, no
+- **CPU.** Code is generated for a CPU level, not generic `x86-64`
+  (`scripts/lib/target-cpu.sh`): local builds, the perf lab and benchmark images for the
+  building machine (`target-cpu=native`, every instruction set it has), the Docker image
+  for `x86-64-v3` (AVX2) or `neoverse-n1`, `portable` on request; the server refuses to
+  start on a CPU without what it was built for. That is the compiler's vectorisation: no
+  kernel has explicit SIMD yet, and `cpu.rs` only detects features. The kernels are
+  written for the cache instead: the radix sort keeps all but its first pass in cache
+  (`nrese_exec::sort`), probes seek from where the last one landed (`ProbeCursor`). No
   awareness of NUMA nodes or cache sizes.
 - **GPU, several machines.** None.
 - **Interfaces.** HTTP (SPARQL 1.1 Protocol, Graph Store Protocol, the console's API)

@@ -121,6 +121,7 @@ impl super::Context<'_> {
             budget: std::sync::Arc::clone(&self.budget),
             trace: None,
             depth: Cell::new(0),
+            probed: Cell::default(),
             limit: Cell::new(None),
             graph: RefCell::new(self.graph.borrow().clone()),
             as_written: self.as_written,
