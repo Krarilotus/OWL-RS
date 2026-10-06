@@ -91,13 +91,78 @@ pub async fn execute_query_in(
         QUERY_TIMEOUT_MESSAGE,
         move |out| {
             match &pending {
-                None => store.run_query(&prepared, &token, out),
-                Some(pending) => store.run_query_pending(pending, &prepared, &token, out),
+                // Answers with a status are computed in full before the first byte (the
+                // status is a header); every other query streams.
+                None if store.reports_completeness(&prepared) => {
+                    let mut body = Vec::new();
+                    let status = store
+                        .run_query_reporting(&prepared, &token, &mut body)
+                        .map_err(|error| map_query_error(&policy, error))?;
+                    if let Some(status) = &status {
+                        for (name, value) in completeness_headers(status) {
+                            out.set_header(name, value);
+                        }
+                    }
+                    std::io::Write::write_all(out, &body)
+                        .map_err(|error| ApiError::internal(error.to_string()))
+                }
+                None => store
+                    .run_query(&prepared, &token, out)
+                    .map_err(|error| map_query_error(&policy, error)),
+                Some(pending) => store
+                    .run_query_pending(pending, &prepared, &token, out)
+                    .map_err(|error| map_query_error(&policy, error)),
             }
-            .map_err(|error| map_query_error(&policy, error))
         },
     )
     .await
+}
+
+/// The response headers of an answer's status: `nrese-completeness` (`complete` or
+/// `sound-only`), with the bounds' counts in `nrese-completeness-bounds` where it went
+/// through them. The reasons are in EXPLAIN.
+fn completeness_headers(
+    status: &nrese_sparql::Completeness,
+) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+    use axum::http::{HeaderName, HeaderValue};
+    let mut out = vec![(
+        HeaderName::from_static("nrese-completeness"),
+        HeaderValue::from_static(status.as_str()),
+    )];
+    if let Some(b) = &status.bounds {
+        let upper = b
+            .upper
+            .map_or_else(|| "unknown".to_owned(), |u| u.to_string());
+        let text = format!(
+            "lower={}; upper={upper}; proved={}; refuted={}; unresolved={}",
+            b.lower, b.proved, b.refuted, b.unresolved
+        );
+        if let Ok(value) = HeaderValue::from_str(&text) {
+            out.push((HeaderName::from_static("nrese-completeness-bounds"), value));
+        }
+    }
+    out
+}
+
+/// The JSON form of an answer's status (`null` where no reasoning path can leave answers
+/// out): `complete`, `sound` (always), the reasons, the paths that decided, the bounds.
+fn completeness_json(status: Option<&nrese_sparql::Completeness>) -> serde_json::Value {
+    status.map_or(serde_json::Value::Null, |c| {
+        serde_json::json!({
+            "status": c.as_str(),
+            "complete": c.is_complete(),
+            "sound": true,
+            "reasons": c.reasons(),
+            "paths": c.paths,
+            "bounds": c.bounds.map(|b| serde_json::json!({
+                "lower": b.lower,
+                "upper": b.upper,
+                "proved": b.proved,
+                "refuted": b.refuted,
+                "unresolved": b.unresolved,
+            })),
+        })
+    })
 }
 
 /// The JSON form of an EXPLAIN: the executor, the rewrites that changed the query, totals,
@@ -122,6 +187,7 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
         "rewrites": explanation.rewrites,
         "rows": explanation.rows,
         "micros": explanation.micros,
+        "completeness": completeness_json(explanation.completeness.as_ref()),
         "steps": steps,
     })
 }
@@ -145,6 +211,7 @@ fn plan_json(planned: &nrese_store::PlannedQuery) -> serde_json::Value {
     serde_json::json!({
         "executor": "native",
         "rewrites": planned.rewrites,
+        "completeness": completeness_json(planned.completeness.as_ref()),
         "steps": steps,
     })
 }
@@ -171,6 +238,8 @@ fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
         error if error.is_request_error() => {
             policy.bad_request_for_sparql_parse_error(error.to_string())
         }
+        // Exact answers asked for under owl2-dl, and the store can't prove them complete.
+        StoreError::Incomplete(_) => ApiError::conflict(error.to_string()),
         error => ApiError::internal(error.to_string()),
     }
 }
@@ -222,6 +291,7 @@ fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
     if operation.infer == Some(false) {
         request.read_model = Some(nrese_store::ReadModel::Asserted);
     }
+    request.dl_answers = operation.dl_answers;
     request
 }
 

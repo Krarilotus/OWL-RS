@@ -5,6 +5,7 @@ mod classification;
 mod consistency;
 mod entailment;
 mod mode;
+mod queries;
 
 use std::sync::Arc;
 
