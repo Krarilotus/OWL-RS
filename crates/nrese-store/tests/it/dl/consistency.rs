@@ -61,9 +61,11 @@ fn an_inconsistency_through_a_union_is_rejected_by_the_hypertableau() {
         current.consistency.verdict,
         nrese_store::dl::Verdict::Consistent
     );
-    assert_eq!(current.consistency.engine, "hypertableau");
+    // The schema alone: the upper bound proves it consistent, no DL engine runs.
+    assert_eq!(current.consistency.engine, "upper-bound");
     let detail = rejected(insert(&dl, ":x a :A , :D ."));
     assert!(detail.contains("OWL 2 DL"), "{detail}");
+    assert!(detail.contains("hypertableau"), "{detail}");
     assert!(!ask(&dl, ":x a :D"));
     // The status still describes the committed revision.
     assert_eq!(status(&dl).revision, revision);
@@ -77,8 +79,8 @@ fn an_inconsistency_through_an_existential_is_rejected_by_the_context_core() {
 
     let dl = pipeline();
     insert(&dl, EXISTENTIAL).expect("schema");
-    assert_eq!(status(&dl).consistency.engine, "context-core");
-    rejected(insert(&dl, ":x a :A ."));
+    let detail = rejected(insert(&dl, ":x a :A ."));
+    assert!(detail.contains("context-core"), "{detail}");
     assert!(!ask(&dl, ":x a :A"));
 }
 

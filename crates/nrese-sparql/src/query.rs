@@ -137,6 +137,9 @@ pub struct Explanation {
     /// Solutions (1 or 0 for ASK); CONSTRUCT and DESCRIBE count triples.
     pub rows: u64,
     pub micros: u64,
+    /// Whether the answers are complete, where a reasoning path can leave some out (set
+    /// by the store; `None` where nothing can).
+    pub completeness: Option<crate::completeness::Completeness>,
 }
 
 /// Runs `query` like [`evaluate_query`], consuming its results, and reports how it ran:
@@ -155,6 +158,7 @@ pub fn explain_query<V: ReadView>(
         steps,
         rows,
         micros: start.elapsed().as_micros() as u64,
+        completeness: None,
     })
 }
 
@@ -177,6 +181,8 @@ pub struct PlannedQuery {
     /// The rewrites that changed the query, in the order applied (as in [`Explanation`]).
     pub rewrites: Vec<&'static str>,
     pub steps: Vec<PlannedStep>,
+    /// What the store can say about completeness before running (set by the store).
+    pub completeness: Option<crate::completeness::Completeness>,
 }
 
 /// The plan `query` would run as on `view`, after the rewrites, each node with an estimate
@@ -188,7 +194,11 @@ pub fn plan_query<V: ReadView>(
 ) -> Result<PlannedQuery, QueryEvaluationError> {
     let snapshot = view.evaluation_snapshot();
     let (rewrites, steps) = crate::native::plan(&snapshot, query, options)?;
-    Ok(PlannedQuery { rewrites, steps })
+    Ok(PlannedQuery {
+        rewrites,
+        steps,
+        completeness: None,
+    })
 }
 
 /// True if `query` would run on the native executor over a snapshot with default options.
