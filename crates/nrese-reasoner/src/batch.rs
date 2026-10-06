@@ -33,9 +33,10 @@ pub use super::eval::Schema;
 use super::eval::{
     AllFacts, GroundProgram, Job, NEVER, Probes, Seg, Source, guards_hold, run_jobs_by_morsel,
 };
-use super::ir::{Head, Rule};
+use super::ir::{Head, Rule, Term};
 use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
+use super::representatives::EqualityClasses;
 use nrese_exec::heap;
 
 type Pair = (u64, u64);
@@ -171,6 +172,30 @@ pub struct Materialisation {
     pub phases: Phases,
     /// What the rounds held and did, in counts.
     pub counters: Counters,
+    /// With equality by representatives ([`materialise_representatives_until`]): the
+    /// `owl:sameAs` classes, and in how many rounds (the start included) they merged.
+    pub classes: EqualityClasses,
+    pub merges: usize,
+}
+
+/// A materialisation's input: facts, or facts grouped as the store streams them (each
+/// predicate once, its `(object, subject)` pairs sorted and distinct).
+pub enum Input {
+    Facts(Vec<Triple>),
+    Grouped(Vec<(u64, Vec<(u64, u64)>)>),
+}
+
+/// What [`materialise_representatives_until`] lists as [`Materialisation::derived`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listing {
+    /// Every fact of the closure over representatives, the rewritten input included.
+    Representatives,
+    /// The closure over representatives as an inferred stack keeps it beside the input:
+    /// the facts not in the input, and those of the input that mention a class.
+    Stored,
+    /// The closure expanded to every identity, without the input's facts: what the
+    /// replacement rules derive.
+    Expanded,
 }
 
 /// Deterministic counts of a materialisation's rounds, for the guards of
@@ -191,6 +216,18 @@ pub struct Counters {
     /// Lookups by object alone in relations kept without their object order (P1-F11:
     /// none).
     pub lookups_without_order: u64,
+    /// Pairs of a recent run read as old that were checked against the delta (#10 of
+    /// the investigation of 6 October 2026).
+    pub old_checks: u64,
+    /// Per round: the pairs the transitive module read to close its predicates (#11).
+    pub closure_pairs: Vec<u64>,
+    /// Scans for `sameAs` partners by the equality module (equality by copying, #12).
+    pub member_scans: u64,
+    /// Per round: the complete bindings the rule jobs enumerated, each a candidate fact
+    /// per head atom (the joins' work).
+    pub bindings: Vec<u64>,
+    /// The bindings of all rounds by the name of the rule the jobs' instances come from.
+    pub bindings_by_rule: std::collections::BTreeMap<String, u64>,
 }
 
 /// The bytes the working set's runs hold (both orders, spare capacity included; a run
@@ -228,8 +265,8 @@ pub struct Phases {
     pub probes: u64,
     /// The new facts the rounds added.
     pub new_facts: u64,
-    /// Whole materialisations run: one, or one per pass of equality by representatives
-    /// (each pass that rules derive a new `owl:sameAs` in starts again from the facts).
+    /// Whole materialisations run: one (equality by representatives merges classes
+    /// within the rounds since R4; it ran one per pass that derived a new `owl:sameAs`).
     pub passes: u64,
 }
 
@@ -650,6 +687,8 @@ pub(crate) struct Relation {
     /// Lookups by object alone in its runs without that order: the analysis that drops
     /// the order ([`Reads`]) says there are none, and the closure tests check it.
     missed: std::sync::atomic::AtomicU64,
+    /// Pairs of the recent run read as old that were looked up in the delta.
+    old_checks: std::sync::atomic::AtomicU64,
 }
 
 /// The pairs whose first component is `key`.
@@ -662,6 +701,12 @@ fn range(pairs: &[Pair], key: u64) -> &[Pair] {
 impl Relation {
     pub(crate) fn delta_len(&self) -> usize {
         self.delta.len()
+    }
+
+    /// Whether the recent run holds nothing but the delta (it is the delta, shared: right
+    /// after a fold, or the first round's input), so its old part is empty.
+    fn recent_is_delta(&self) -> bool {
+        self.recent.shares(&self.delta)
     }
 
     fn bytes(&self) -> StoreBytes {
@@ -756,7 +801,14 @@ impl Relation {
             Seg::Old => {
                 self.input.scan(s, o, &all, missed, f);
                 self.base.scan(s, o, &all, missed, f);
-                let old = |s: u64, o: u64| !self.delta.contains(s, o);
+                if self.recent_is_delta() {
+                    return;
+                }
+                let old = |s: u64, o: u64| {
+                    self.old_checks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    !self.delta.contains(s, o)
+                };
                 self.recent.scan(s, o, &old, missed, f);
             }
         }
@@ -772,7 +824,8 @@ impl Relation {
             Seg::All | Seg::Old => {
                 self.input.matching(s, o, false, &mut out)
                     && self.base.matching(s, o, false, &mut out)
-                    && self.recent.matching(s, o, seg == Seg::Old, &mut out)
+                    && (seg == Seg::Old && self.recent_is_delta()
+                        || self.recent.matching(s, o, seg == Seg::Old, &mut out))
             }
         };
         whole.then_some(out)
@@ -850,6 +903,7 @@ impl Store {
                     fresh: true,
                     by_subject_only: false,
                     missed: Default::default(),
+                    old_checks: Default::default(),
                 }
             })
             .collect();
@@ -955,6 +1009,114 @@ impl Store {
             }
         }
         out
+    }
+
+    /// The input's facts passing `input` and the added ones passing `added`, in no
+    /// particular order, taking the store apart as [`Self::into_derived`] does: the
+    /// input's are read first, then each relation's added runs, freed once read.
+    fn into_listed(
+        self,
+        input: &(dyn Fn(Triple) -> bool + Sync),
+        added: &(dyn Fn(Triple) -> bool + Sync),
+        mut out: Vec<Triple>,
+    ) -> Vec<Triple> {
+        let from_input: Vec<Triple> = self
+            .relations
+            .par_iter()
+            .zip(self.predicates.par_iter())
+            .flat_map_iter(|(relation, &p)| {
+                relation
+                    .input
+                    .so
+                    .iter()
+                    .map(move |&(s, o)| [s, p, o])
+                    .filter(|&fact| input(fact))
+            })
+            .collect();
+        let runs: Vec<(u64, [Arc<Pairs>; 2])> = self
+            .relations
+            .into_iter()
+            .zip(self.predicates)
+            .map(|(relation, p)| (p, [relation.base.so, relation.recent.so]))
+            .collect();
+        // At most this many, so the list never grows by doubling.
+        out.reserve(
+            from_input.len()
+                + runs
+                    .iter()
+                    .map(|(_, [a, b])| a.len() + b.len())
+                    .sum::<usize>(),
+        );
+        out.extend(from_input);
+        for (p, pairs) in runs {
+            for pairs in pairs {
+                let list = |chunk: &[Pair], out: &mut Vec<Triple>| {
+                    out.extend(
+                        chunk
+                            .iter()
+                            .map(|&(s, o)| [s, p, o])
+                            .filter(|&fact| added(fact)),
+                    );
+                };
+                // Each chunk freed once its facts are out, where nothing else holds it.
+                match Arc::try_unwrap(pairs) {
+                    Ok(pairs) => pairs.chunks.into_iter().for_each(|c| list(&c, &mut out)),
+                    Err(pairs) => pairs.chunks.iter().for_each(|c| list(c, &mut out)),
+                }
+            }
+        }
+        out
+    }
+
+    /// Every stored fact (input and added) passing `keep`, in no particular order.
+    fn facts_where(&self, keep: &(dyn Fn(Triple) -> bool + Sync)) -> Vec<Triple> {
+        self.relations
+            .par_iter()
+            .zip(self.predicates.par_iter())
+            .flat_map_iter(|(relation, &p)| {
+                [&relation.input, &relation.base, &relation.recent]
+                    .into_iter()
+                    .flat_map(|run| run.so.iter())
+                    .map(move |&(s, o)| [s, p, o])
+                    .filter(|&fact| keep(fact))
+            })
+            .collect()
+    }
+
+    /// Every stored fact mentioning one of `terms`, in any position (some more than once).
+    /// By the subject and object orders where a run has them; a run without its object
+    /// order is read whole for the objects.
+    fn mentioning(&self, terms: &HashSet<u64>) -> Vec<Triple> {
+        self.relations
+            .par_iter()
+            .zip(self.predicates.par_iter())
+            .flat_map_iter(|(relation, &p)| {
+                let mut out = Vec::new();
+                for run in [&relation.input, &relation.base, &relation.recent] {
+                    if terms.contains(&p) {
+                        out.extend(run.so.iter().map(|&(s, o)| [s, p, o]));
+                        continue;
+                    }
+                    for &t in terms {
+                        out.extend(run.so.range(t).flatten().map(|&(s, o)| [s, p, o]));
+                    }
+                    match &run.os {
+                        Some(os) => {
+                            for &t in terms {
+                                out.extend(os.range(t).flatten().map(|&(o, s)| [s, p, o]));
+                            }
+                        }
+                        None => out.extend(
+                            run.so
+                                .iter()
+                                .filter(|(_, o)| terms.contains(o))
+                                .map(|&(s, o)| [s, p, o]),
+                        ),
+                    }
+                }
+                out
+            })
+            .collect()
     }
 
     /// Makes `news` (per relation) the relations' deltas.
@@ -1070,6 +1232,11 @@ impl Source for Store {
                     return;
                 }
                 let part = &pairs[range.start.max(start) - start..range.end.min(end) - start];
+                if old {
+                    relation
+                        .old_checks
+                        .fetch_add(part.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 for &(a, b) in part {
                     let (s, o) = if swapped { (b, a) } else { (a, b) };
                     if !(old && relation.delta.contains(s, o)) {
@@ -1092,6 +1259,11 @@ pub(crate) struct Equality {
     same_as: u64,
     /// The module's output of the last round: already expanded, so skipped once.
     produced: HashSet<Triple>,
+    /// Scans for a term's partners so far (three per expanded fact).
+    pub(crate) member_scans: u64,
+    /// The terms with a partner, once a round's delta was large enough to collect them
+    /// all; kept current from each later round's `sameAs` facts.
+    partners: Option<TermSet>,
 }
 
 /// The `owl:sameAs` id of `rules`, if they reason with equality (`eq-rep-s`).
@@ -1113,6 +1285,8 @@ impl Equality {
             super::ir::Term::Const(same_as) => Some(Self {
                 same_as,
                 produced: HashSet::new(),
+                member_scans: 0,
+                partners: None,
             }),
             super::ir::Term::Var(_) => None,
         }
@@ -1131,19 +1305,54 @@ impl Equality {
 
     /// The expansions of the delta of `store` (see the type's docs), not yet in it.
     pub(crate) fn run<S: Source + ?Sized>(&mut self, store: &S) -> Vec<Triple> {
-        if store.estimate([None, Some(self.same_as), None], Seg::All) == 0 {
+        let equalities = store.estimate([None, Some(self.same_as), None], Seg::All);
+        if equalities == 0 {
             self.produced.clear();
             return Vec::new();
         }
         let same_as = self.same_as;
+        // A fact mentioning no term with a partner expands to itself only (#12 of the
+        // investigation of 6 October 2026). Which terms have one: for a small delta (a
+        // commit's, beside a store's many equalities) each term of it is looked up; for
+        // a large one (the batch executor's rounds) they are collected once from all
+        // `sameAs` facts and then kept current from each round's.
+        if self.partners.is_none()
+            && store.estimate([None, None, None], Seg::Delta) * 8 >= equalities
+        {
+            let mut all = TermSet::default();
+            store.scan([None, Some(same_as), None], Seg::All, &mut |[s, _, o]| {
+                if s != o {
+                    all.insert(s);
+                    all.insert(o);
+                }
+            });
+            self.partners = Some(all);
+        } else if let Some(partners) = &mut self.partners {
+            store.scan([None, Some(same_as), None], Seg::Delta, &mut |[s, _, o]| {
+                if s != o {
+                    partners.insert(s);
+                    partners.insert(o);
+                }
+            });
+        }
+        let mut looked_up: HashMap<u64, bool> = HashMap::new();
+        let mut has_partner = |term: u64| match &self.partners {
+            Some(partners) => partners.contains(term),
+            None => *looked_up.entry(term).or_insert_with(|| {
+                // An upper bound: zero means no equality mentions the term.
+                store.estimate([Some(term), Some(same_as), None], Seg::All) > 0
+                    || store.estimate([None, Some(same_as), Some(term)], Seg::All) > 0
+            }),
+        };
         let mut seeds: Vec<Triple> = Vec::new();
         let mut merged: Vec<u64> = Vec::new();
+        let produced = &self.produced;
         store.scan([None, None, None], Seg::Delta, &mut |t| {
             if t[1] == same_as {
                 if t[0] != t[2] {
                     merged.push(t[0]);
                 }
-            } else if !self.produced.contains(&t) {
+            } else if t.iter().any(|&term| has_partner(term)) && !produced.contains(&t) {
                 seeds.push(t);
             }
         });
@@ -1162,6 +1371,7 @@ impl Equality {
         }
         seeds.par_sort_unstable();
         seeds.dedup();
+        self.member_scans += 3 * seeds.len() as u64;
         let out: Vec<Triple> = seeds
             .par_iter()
             .flat_map_iter(|&[s, p, o]| {
@@ -1189,6 +1399,169 @@ impl Equality {
     }
 }
 
+/// A set of terms with a bitmap in front: most terms are in no such set, and a bit test
+/// answers for them without hashing (a term per position of every fact read).
+#[derive(Default)]
+struct TermSet {
+    bits: Vec<u64>,
+    terms: HashSet<u64>,
+}
+
+impl TermSet {
+    /// Bits in the bitmap (8 KiB).
+    const BITS: usize = 1 << 16;
+
+    fn slot(term: u64) -> usize {
+        (term.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 48) as usize
+    }
+
+    fn insert(&mut self, term: u64) {
+        if self.bits.is_empty() {
+            self.bits = vec![0; Self::BITS / 64];
+        }
+        let slot = Self::slot(term);
+        self.bits[slot / 64] |= 1 << (slot % 64);
+        self.terms.insert(term);
+    }
+
+    fn contains(&self, term: u64) -> bool {
+        if self.bits.is_empty() {
+            return false;
+        }
+        let slot = Self::slot(term);
+        self.bits[slot / 64] & (1 << (slot % 64)) != 0 && self.terms.contains(&term)
+    }
+
+    /// Whether a term of `fact` is in the set.
+    fn mentioned(&self, [s, p, o]: Triple) -> bool {
+        self.contains(s) || self.contains(p) || self.contains(o)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+}
+
+/// Equality by representatives within the rounds ([`super::representatives`]): the
+/// classes so far, and the terms that lost their place as representative. A fact that
+/// mentions one is stale: its rewrite is in the store too, and the rules, grounding and
+/// the listing read only current facts ([`Current`]).
+struct Representatives {
+    same_as: u64,
+    classes: EqualityClasses,
+    /// Former representatives.
+    stale: TermSet,
+    /// The representatives of classes of two or more.
+    shared: TermSet,
+    listing: Listing,
+    merges: usize,
+}
+
+impl Representatives {
+    /// Merges the classes `pairs` equate; returns the terms that lost their place.
+    fn merge(&mut self, pairs: &[(u64, u64)]) -> HashSet<u64> {
+        let lost: HashSet<u64> = self.classes.union_all(pairs).into_iter().collect();
+        if !lost.is_empty() {
+            self.merges += 1;
+            for &term in &lost {
+                self.stale.insert(term);
+            }
+            for (representative, _) in self.classes.classes() {
+                if !self.shared.terms.contains(&representative) {
+                    self.shared.insert(representative);
+                }
+            }
+        }
+        lost
+    }
+
+    /// The facts the merge that took the places of `lost` makes stale, rewritten.
+    fn rewrites(&self, store: &Store, lost: &HashSet<u64>) -> Vec<Triple> {
+        let mut facts = store.mentioning(lost);
+        facts
+            .par_iter_mut()
+            .for_each(|fact| *fact = self.classes.rewrite(*fact));
+        facts
+    }
+}
+
+/// `rule` with every constant replaced by its representative.
+fn rewrite_rule(rule: &Rule, classes: &EqualityClasses) -> Rule {
+    let term = |t: Term| match t {
+        Term::Const(c) => Term::Const(classes.representative(c)),
+        variable => variable,
+    };
+    let atom = |a: &super::ir::Atom| super::ir::Atom(a.0.map(term));
+    Rule {
+        name: rule.name.clone(),
+        body: rule.body.iter().map(atom).collect(),
+        guards: rule.guards.clone(),
+        head: match &rule.head {
+            Head::Facts(atoms) => Head::Facts(atoms.iter().map(atom).collect()),
+            Head::Inconsistent => Head::Inconsistent,
+        },
+    }
+}
+
+/// Whether a constant of `rule` is in `terms`.
+fn names_any(rule: &Rule, terms: &HashSet<u64>) -> bool {
+    let atoms = match &rule.head {
+        Head::Facts(atoms) => rule.body.iter().chain(atoms),
+        Head::Inconsistent => rule.body.iter().chain(&[]),
+    };
+    atoms
+        .flat_map(|atom| atom.0)
+        .any(|t| matches!(t, Term::Const(c) if terms.contains(&c)))
+}
+
+/// The store as the rules read it: without stale facts (a former representative in them).
+struct Current<'a> {
+    store: &'a Store,
+    stale: &'a TermSet,
+}
+
+impl Source for Current<'_> {
+    fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
+        if self.stale.is_empty() {
+            return self.store.scan(pattern, seg, f);
+        }
+        self.store.scan(pattern, seg, &mut |fact| {
+            if !self.stale.mentioned(fact) {
+                f(fact);
+            }
+        });
+    }
+
+    fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
+        self.store.estimate(pattern, seg)
+    }
+
+    fn contains(&self, fact: Triple) -> bool {
+        !self.stale.mentioned(fact) && self.store.contains(fact)
+    }
+
+    fn matches_len(&self, pattern: [Option<u64>; 3], seg: Seg) -> Option<usize> {
+        self.store.matches_len(pattern, seg)
+    }
+
+    fn scan_range(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        range: std::ops::Range<usize>,
+        f: &mut dyn FnMut(Triple),
+    ) {
+        if self.stale.is_empty() {
+            return self.store.scan_range(pattern, seg, range, f);
+        }
+        self.store.scan_range(pattern, seg, range, &mut |fact| {
+            if !self.stale.mentioned(fact) {
+                f(fact);
+            }
+        });
+    }
+}
+
 /// The transitive module, batch form: for each transitive predicate, its closure by SCC
 /// condensation, recomputed in any round after other rules added facts over it.
 #[derive(Default)]
@@ -1197,6 +1570,8 @@ struct Transitive {
     predicates: std::collections::BTreeMap<u64, bool>,
     /// New facts each predicate's last recomputation produced.
     produced: HashMap<u64, usize>,
+    /// The pairs read in the last [`Transitive::run`].
+    read: u64,
 }
 
 impl Transitive {
@@ -1204,10 +1579,22 @@ impl Transitive {
         self.predicates.entry(p).or_insert(true);
     }
 
+    /// Every predicate needs recomputing: a merge of `sameAs` classes rewrote facts, so
+    /// what the module produced says nothing about what the rules added.
+    fn recompute_all(&mut self) {
+        self.predicates.values_mut().for_each(|dirty| *dirty = true);
+    }
+
     /// The closure facts of every predicate that needs it, not yet in `store`; `None` if
     /// `stop` fired.
-    fn run(&mut self, store: &Store, stop: super::eval::Stop<'_>) -> Option<Vec<Triple>> {
+    fn run(
+        &mut self,
+        store: &Store,
+        representatives: Option<&Representatives>,
+        stop: super::eval::Stop<'_>,
+    ) -> Option<Vec<Triple>> {
         self.produced.clear();
+        self.read = 0;
         let mut out = Vec::new();
         for (&p, dirty) in &mut self.predicates {
             if !std::mem::take(dirty) {
@@ -1217,8 +1604,26 @@ impl Transitive {
                 continue;
             };
             let before = out.len();
+            let mut pairs = relation.pairs();
+            self.read += pairs.len() as u64;
+            if let Some(representatives) = representatives.filter(|r| !r.stale.is_empty()) {
+                // Over current facts only (every term a representative), which closes them.
+                let stale = &representatives.stale;
+                if stale.contains(p) {
+                    continue;
+                }
+                pairs.retain(|&(s, o)| !stale.contains(s) && !stale.contains(o));
+                out.extend(
+                    nrese_exec::graph::transitive_closure_until(&pairs, stop)?
+                        .into_iter()
+                        .filter(|&(s, o)| !relation.contains(s, o))
+                        .map(|(s, o)| [s, p, o]),
+                );
+                self.produced.insert(p, out.len() - before);
+                continue;
+            }
             out.extend(
-                nrese_exec::graph::transitive_closure_until(&relation.pairs(), stop)?
+                nrese_exec::graph::transitive_closure_until(&pairs, stop)?
                     .into_iter()
                     .filter(|&(s, o)| !relation.contains(s, o))
                     .map(|(s, o)| [s, p, o]),
@@ -1302,7 +1707,7 @@ pub fn materialise_owned(
 ) -> Materialisation {
     let clock = std::time::Instant::now();
     let store = Store::new(input);
-    run(store, clock.elapsed(), rules, lists, schema, NEVER).expect("never stopped")
+    run(store, clock.elapsed(), rules, lists, schema, None, NEVER).expect("never stopped")
 }
 
 /// [`materialise_owned`], polling `stop` as [`materialise_grouped_until`] does.
@@ -1315,7 +1720,7 @@ pub fn materialise_owned_until(
 ) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = Store::new(input);
-    run(store, clock.elapsed(), rules, lists, schema, stop)
+    run(store, clock.elapsed(), rules, lists, schema, None, stop)
 }
 
 /// [`materialise`] over input already grouped the way the working set stores it: per
@@ -1342,16 +1747,76 @@ pub fn materialise_grouped_until(
 ) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = Store::from_groups(input);
-    run(store, clock.elapsed(), rules, lists, schema, stop)
+    run(store, clock.elapsed(), rules, lists, schema, None, stop)
 }
 
-/// Semi-naive evaluation to the fixpoint, from a store holding the input as its delta.
+/// The closure of `input` under `rules` with equality by representatives
+/// ([`super::representatives`]): each `owl:sameAs` class one term, its smallest id, the
+/// replacement rules (`eq-rep-*`) and `eq-sym`/`eq-trans` replaced by the classes
+/// themselves. A round's new `sameAs` between two representatives merges their classes,
+/// and the facts mentioning the representative that lost its place are rewritten into the
+/// next round's delta: no outer loop, however long a cascade of merges. `listing` says
+/// what [`Materialisation::derived`] holds; rules without equality reasoning give the
+/// plain closure.
+pub fn materialise_representatives_until(
+    input: Input,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    listing: Listing,
+    stop: super::eval::Stop<'_>,
+) -> Result<Materialisation, Interrupted> {
+    let clock = std::time::Instant::now();
+    let store = match input {
+        Input::Facts(facts) => Store::new(facts),
+        Input::Grouped(groups) => Store::from_groups(groups),
+    };
+    let representatives = super::representatives::same_as(rules).map(|same_as| Representatives {
+        same_as,
+        classes: EqualityClasses::default(),
+        stale: TermSet::default(),
+        shared: TermSet::default(),
+        listing,
+        merges: 0,
+    });
+    if representatives.is_none() && listing == Listing::Representatives {
+        // Every fact: the input's too.
+        let input_facts = store.facts_where(&|_| true);
+        let mut result = run(store, clock.elapsed(), rules, lists, schema, None, stop)?;
+        result.derived.extend(input_facts);
+        result.derived.par_sort_unstable();
+        result.derived.dedup();
+        return Ok(result);
+    }
+    run(
+        store,
+        clock.elapsed(),
+        rules,
+        lists,
+        schema,
+        representatives,
+        stop,
+    )
+}
+
+/// The rules equality by representatives runs: without the ones the classes stand for.
+fn under_representatives(rules: &[Rule]) -> Vec<Rule> {
+    rules
+        .iter()
+        .filter(|r| !is_replacement_rule(r) && !matches!(r.name.as_str(), "eq-sym" | "eq-trans"))
+        .cloned()
+        .collect()
+}
+
+/// Semi-naive evaluation to the fixpoint, from a store holding the input as its delta;
+/// with equality by representatives if `representatives` is given.
 fn run(
     mut store: Store,
     load: std::time::Duration,
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
     schema: &Schema,
+    mut representatives: Option<Representatives>,
     stop: super::eval::Stop<'_>,
 ) -> Result<Materialisation, Interrupted> {
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
@@ -1363,27 +1828,66 @@ fn run(
     let mut result = Materialisation::default();
     let mut program = GroundProgram::default();
     let mut transitive = Transitive::default();
-    let mut equality = Equality::for_rules(rules);
+    // Equality by copying (the module), unless it is by representatives.
+    let mut equality = Equality::for_rules(rules).filter(|_| representatives.is_none());
+    let mut rules: std::borrow::Cow<'_, [Rule]> = match &representatives {
+        Some(_) => under_representatives(rules).into(),
+        None => rules.into(),
+    };
     let mut regrounding = true;
+    // Ground every rule again (rules whose constants were merged, rewritten).
+    let mut reground_all = false;
+    // Facts to add in the first round, checked against the store: the input's stale
+    // facts rewritten, where the input asserts equalities.
+    let mut pending: Vec<Triple> = Vec::new();
+    if let Some(reps) = &mut representatives {
+        let mut pairs = Vec::new();
+        store.scan([None, Some(reps.same_as), None], Seg::All, &mut |[
+            s,
+            _,
+            o,
+        ]| {
+            if s != o {
+                pairs.push((s, o));
+            }
+        });
+        let lost = reps.merge(&pairs);
+        if !lost.is_empty() {
+            pending = reps.rewrites(&store, &lost);
+            if rules.iter().any(|rule| names_any(rule, &lost)) {
+                rules = rules
+                    .iter()
+                    .map(|r| rewrite_rule(r, &reps.classes))
+                    .collect();
+            }
+        }
+    }
+    let none = TermSet::default();
     loop {
         check_stop()?;
         result.rounds += 1;
         heap::phase("reasoner: grounding");
         let clock = std::time::Instant::now();
+        let stale = representatives.as_ref().map_or(&none, |r| &r.stale);
         // Rules from `evaluated` on were added this round: evaluated once in full.
         let evaluated = program.rules.len();
-        if regrounding {
-            let mut source = fact_rules(&store, rules, lists, &mut result.diagnostics);
+        if regrounding || reground_all {
+            let current = Current {
+                store: &store,
+                stale,
+            };
+            let mut source = fact_rules(&current, &rules, lists, &mut result.diagnostics);
             if equality.is_some() {
                 source.retain(|r| !is_replacement_rule(r));
             }
             // The first round grounds everything; later ones through new schema facts
             // only (list rules in full, deduplicated).
-            if result.rounds == 1 {
-                program.ground(&store, schema, &source);
+            if result.rounds == 1 || reground_all {
+                program.ground(&current, schema, &source);
             } else {
-                program.ground_delta(&store, schema, &source);
+                program.ground_delta(&current, schema, &source);
             }
+            reground_all = false;
             for &p in &program.transitive {
                 transitive.register(p);
             }
@@ -1398,30 +1902,63 @@ fn run(
         phases.grounding += clock.elapsed();
         heap::phase("reasoner: joins");
         let clock = std::time::Instant::now();
+        let current = Current {
+            store: &store,
+            stale,
+        };
+        // Heads naming a former representative (constants of rules grounded before it
+        // lost its place) derive its representative's fact instead.
+        let classes = representatives.as_ref().map(|r| &r.classes);
+        let rewrite = |fact: Triple| match classes {
+            Some(classes) if stale.mentioned(fact) => classes.rewrite(fact),
+            _ => fact,
+        };
+        let rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)> =
+            (!stale.is_empty()).then_some(&rewrite);
         // Semi-naive variants of the evaluated rules that can match the delta, full
         // evaluation of the new ones.
         let mut facts = program.take_facts();
+        if let Some(rewrite) = rewrite {
+            facts.iter_mut().for_each(|fact| *fact = rewrite(*fact));
+        }
         facts.retain(|&f| !store.contains(f));
         let mut candidates: Vec<Segments> = vec![segments(facts)];
+        pending.retain(|&fact| !store.contains(fact));
+        candidates.push(segments(std::mem::take(&mut pending)));
         let mut jobs = Vec::new();
         for (r, i) in program.variants(&store) {
             if r < evaluated {
-                jobs.extend(Job::variant(&store, &program.rules[r], i));
+                jobs.extend(Job::variant(&current, &program.rules[r], i));
             }
         }
         for rule in &program.rules[evaluated..] {
-            jobs.extend(Job::full(&store, rule));
+            jobs.extend(Job::full(&current, rule));
         }
-        let probes = Probes::default();
+        let probes = Probes::for_jobs(jobs.len());
         let keep = |fact| !store.contains(fact);
         candidates.extend(run_jobs_by_morsel(
-            &store, &jobs, &keep, stop, &probes, &split,
+            &current, &jobs, &keep, rewrite, stop, &probes, &split,
         ));
         let counters = &mut result.counters;
         counters.driver_bytes_copied += jobs.iter().map(Job::copied_bytes).sum::<usize>();
         let asked = probes.probes.into_inner();
         counters.probes.push(asked);
         counters.unordered_probes += probes.unordered.into_inner();
+        let mut round = 0;
+        for (job, count) in jobs.iter().zip(probes.bindings) {
+            let count = count.into_inner();
+            round += count;
+            match counters.bindings_by_rule.get_mut(&job.rule.name) {
+                Some(total) => *total += count,
+                None if count > 0 => {
+                    counters
+                        .bindings_by_rule
+                        .insert(job.rule.name.clone(), count);
+                }
+                None => {}
+            }
+        }
+        counters.bindings.push(round);
         phases.probes += asked;
         phases.bindings += probes.emitted.into_inner();
         drop(jobs);
@@ -1429,9 +1966,62 @@ fn run(
         phases.joins += clock.elapsed();
         heap::phase("reasoner: modules");
         let clock = std::time::Instant::now();
-        candidates.push(segments(transitive.run(&store, stop).ok_or(Interrupted)?));
+        candidates.push(segments(
+            transitive
+                .run(&store, representatives.as_ref(), stop)
+                .ok_or(Interrupted)?,
+        ));
+        result.counters.closure_pairs.push(transitive.read);
         if let Some(equality) = &mut equality {
             candidates.push(segments(equality.run(&store)));
+        }
+        let mut merged = false;
+        // New equalities merge classes: the round's candidates and the stored facts that
+        // mention a representative that lost its place are rewritten (egglog's rebuild,
+        // within the round). The other candidates stay as they are, in their lists.
+        if let Some(reps) = &mut representatives {
+            let same_as = reps.same_as;
+            let pairs: Vec<(u64, u64)> = candidates
+                .iter()
+                .flatten()
+                .filter(|(p, _)| *p == same_as)
+                .flat_map(|(_, pairs)| pairs.iter().copied().filter(|(s, o)| s != o))
+                .collect();
+            let lost = reps.merge(&pairs);
+            if !lost.is_empty() {
+                let mut moved: Vec<Triple> = Vec::new();
+                for list in &mut candidates {
+                    for (p, pairs) in list.iter_mut() {
+                        let p = *p;
+                        if lost.contains(&p) {
+                            moved.extend(pairs.drain(..).map(|(s, o)| [s, p, o]));
+                        } else {
+                            // Sorted and distinct still.
+                            pairs.retain(|&(s, o)| {
+                                let stale = lost.contains(&s) || lost.contains(&o);
+                                if stale {
+                                    moved.push([s, p, o]);
+                                }
+                                !stale
+                            });
+                        }
+                    }
+                }
+                moved.extend(reps.rewrites(&store, &lost));
+                moved
+                    .par_iter_mut()
+                    .for_each(|fact| *fact = reps.classes.rewrite(*fact));
+                moved.retain(|&fact| !store.contains(fact));
+                candidates.push(segments(moved));
+                merged = true;
+                if rules.iter().any(|rule| names_any(rule, &lost)) {
+                    rules = rules
+                        .iter()
+                        .map(|r| rewrite_rule(r, &reps.classes))
+                        .collect();
+                    reground_all = true;
+                }
+            }
         }
         check_stop()?;
         phases.modules += clock.elapsed();
@@ -1442,17 +2032,32 @@ fn run(
         phases.merge += clock.elapsed();
         phases.new_facts += new as u64;
         result.counters.store_bytes.push(store.bytes());
-        if new == 0 {
+        if new == 0 && !reground_all {
             break;
         }
         transitive.observe(&store);
+        if merged {
+            transitive.recompute_all();
+        }
         regrounding = schema_facts;
     }
     result.ground_rules = program.rules.len();
     result.transitive = transitive.predicates.len();
+    result.counters.member_scans = equality.as_ref().map_or(0, |e| e.member_scans);
     heap::phase("reasoner: consistency");
     let clock = std::time::Instant::now();
-    program.ground(&store, schema, &consistency_rules(&store, rules, lists));
+    let stale = representatives.as_ref().map_or(&none, |r| &r.stale);
+    {
+        let current = Current {
+            store: &store,
+            stale,
+        };
+        program.ground(
+            &current,
+            schema,
+            &consistency_rules(&current, &rules, lists),
+        );
+    }
     let reads = Reads::of(
         program.rules.iter().chain(
             program
@@ -1467,7 +2072,10 @@ fn run(
     store.objects(&|p| equal || reads.by_object(p) || schema.read_in_grounding(p));
     let mut found = HashSet::new();
     check(
-        &store,
+        &Current {
+            store: &store,
+            stale,
+        },
         &program,
         0..program.consistency.len(),
         &[],
@@ -1479,14 +2087,66 @@ fn run(
         .iter()
         .map(|relation| relation.missed.load(std::sync::atomic::Ordering::Relaxed))
         .sum();
+    result.counters.old_checks = store
+        .relations
+        .iter()
+        .map(|relation| {
+            relation
+                .old_checks
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .sum();
     phases.consistency = clock.elapsed();
     result.phases = phases;
     heap::phase("reasoner: derived");
-    let mut derived = store.into_derived();
+    let mut derived = match representatives {
+        None => store.into_derived(),
+        Some(reps) => {
+            let derived = list(store, &reps);
+            result.classes = reps.classes;
+            result.merges = reps.merges;
+            derived
+        }
+    };
     derived.par_sort_unstable();
     result.derived = derived;
     heap::phase("reasoner: done");
     Ok(result)
+}
+
+/// What a materialisation with equality by representatives lists ([`Listing`]).
+fn list(store: Store, reps: &Representatives) -> Vec<Triple> {
+    let (stale, shared) = (&reps.stale, &reps.shared);
+    let current = |fact: Triple| !stale.mentioned(fact);
+    match reps.listing {
+        Listing::Representatives => store.into_listed(&current, &current, Vec::new()),
+        // Without classes, what was added.
+        Listing::Stored | Listing::Expanded if reps.classes.is_empty() => store.into_derived(),
+        Listing::Stored => store.into_listed(
+            &|fact| current(fact) && shared.mentioned(fact),
+            &current,
+            Vec::new(),
+        ),
+        Listing::Expanded => {
+            // The facts that mention a class, expanded while the input is there to leave
+            // its facts out; the others as they are.
+            let expanded: Vec<Triple> = store
+                .facts_where(&|fact| current(fact) && shared.mentioned(fact))
+                .into_par_iter()
+                .flat_map_iter(|fact| reps.classes.expand(fact))
+                .filter(|&[s, p, o]| {
+                    !store
+                        .relation(p)
+                        .is_some_and(|relation| relation.input.contains(s, o))
+                })
+                .collect();
+            store.into_listed(
+                &|_| false,
+                &|fact| current(fact) && !shared.mentioned(fact),
+                expanded,
+            )
+        }
+    }
 }
 
 /// What ground rules read of the relations: which relations they can look up by object
