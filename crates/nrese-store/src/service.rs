@@ -636,7 +636,7 @@ impl StoreService {
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         if let Some(mode) = self.dl_mode(prepared) {
-            use crate::dl::query::Outcome;
+            use crate::dl::query::{Outcome, Read};
             let dl = format!("owl2-dl {mode:?}");
             return Ok(Some(
                 match crate::dl::query::answer(self, prepared, cancellation, mode)? {
@@ -645,13 +645,14 @@ impl StoreService {
                         crate::query_executor::write_answers(prepared, answers, out)?;
                         detail
                     }
-                    // L adds memberships to the snapshot: streamed over its view, kept per
-                    // revision, whose identity is its own (never the snapshot's parts).
-                    Outcome::Stream(status, Some(lower), detail) => {
+                    // Streamed over the snapshot the status was decided on (L's view where
+                    // L adds memberships, kept per revision, whose identity is its own),
+                    // never a later revision's.
+                    Outcome::Stream(status, Read::Lower(snapshot) | Read::At(snapshot), detail) => {
                         let context = format!("{dl} {status:?}");
                         report(Some(status));
                         run_query(
-                            &lower,
+                            &snapshot,
                             prepared,
                             &self.settings,
                             cancellation,
@@ -660,8 +661,8 @@ impl StoreService {
                         )?;
                         detail
                     }
-                    // Over the lower bound as every query runs, its status known already.
-                    Outcome::Stream(status, None, detail) => {
+                    // A status that holds whatever the revision (sound only).
+                    Outcome::Stream(status, Read::Latest, detail) => {
                         let context = format!("{dl} {status:?}");
                         report(Some(status));
                         let snapshot = self.read_snapshot(prepared.access());
@@ -714,11 +715,13 @@ impl StoreService {
             .as_ref()?
             .ruleset
             .clone();
-        let mut status = nrese_sparql::Completeness::default();
+        let mut status =
+            nrese_sparql::Completeness::under(nrese_sparql::Regime::of_ruleset(&ruleset));
         status.incomplete(
             "rules",
             format!(
-                "answers over the {ruleset} closure: what its rules derive, not every \
+                "answers over the {ruleset} closure: what its rules derive, complete for \
+                 the ontologies of their profile, which isn't checked per query; not every \
                  certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
             ),
         );
@@ -766,6 +769,10 @@ impl StoreService {
                 };
             explanation.completeness = Some(status);
             explanation.decided_by = detail.paths;
+            explanation.candidates = Some(nrese_sparql::Candidates {
+                proved: detail.proved,
+                refuted: detail.refuted,
+            });
         } else {
             explanation.completeness = explanation
                 .ql
@@ -902,8 +909,11 @@ impl StoreService {
     }
 
     /// [`Self::run_query_pending`], handing `report` the answers' status as
-    /// [`Self::run_query_reporting`] does. The pending data has no DL bounds: under
-    /// `owl2-dl` its answers are its closure's, sound only.
+    /// [`Self::run_query_reporting`] does. A transaction reads the latest revision: with
+    /// no operations pending, exactly as a query outside it (under `owl2-dl`, through that
+    /// revision's bounds). Pending operations aren't reasoned over until the commit: the
+    /// status says so, sound only, and not sound where they may delete statements whose
+    /// inferences remain.
     pub fn run_query_pending_reporting(
         &self,
         pending: &crate::StatementsRequest,
@@ -912,20 +922,40 @@ impl StoreService {
         out: impl std::io::Write,
         report: impl FnOnce(Option<nrese_sparql::Completeness>),
     ) -> StoreResult<()> {
+        if pending.ops.is_empty() {
+            return self.run_query_reporting(prepared, cancellation, out, report);
+        }
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let scope = crate::ReadScope::of(prepared.access().cloned());
         let in_dl = self.dl_mode(prepared).is_some();
+        let deletes = pending
+            .ops
+            .iter()
+            .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
         self.with_pending(pending, &scope, cancellation, |snapshot| {
-            let mut status = crate::query_executor::ql_status(snapshot, prepared, &self.settings)
-                .map(|ql| ql.completeness)
-                .or_else(|| self.status_without_dl(prepared));
-            if in_dl {
-                status.get_or_insert_with(Default::default).incomplete(
-                    "dl",
-                    "a read inside a transaction: the pending data's closure, without the \
-                     DL bounds"
+            let mut status = match in_dl {
+                true => {
+                    let mut status =
+                        nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+                    status.incomplete(
+                        "dl",
+                        "a read inside a transaction: its pending operations aren't reasoned \
+                         over before the commit (the committed closure, no DL bounds)"
+                            .to_owned(),
+                    );
+                    Some(status)
+                }
+                false => crate::query_executor::ql_status(snapshot, prepared, &self.settings)
+                    .map(|ql| ql.completeness)
+                    .or_else(|| self.status_without_dl(prepared)),
+            };
+            if deletes && let Some(status) = &mut status {
+                status.unsound(
+                    "transaction",
+                    "the pending operations may delete statements whose inferences remain \
+                     until the commit"
                         .to_owned(),
                 );
             }

@@ -8,6 +8,28 @@ use thiserror::Error;
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// Exact answers that can't be proven complete ([`StoreError::Incomplete`]): their status,
+/// and the first candidates neither proved nor refuted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteAnswer {
+    pub status: nrese_sparql::Completeness,
+    /// Unresolved candidates as `?x=<…> ?y=<…>` (`ASK` for a boolean query), at most
+    /// [`crate::dl::UNRESOLVED_SHOWN`]; the status's bounds count them all.
+    pub unresolved: Vec<String>,
+}
+
+impl std::fmt::Display for IncompleteAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reasons: Vec<&str> = self
+            .status
+            .reasons
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        f.write_str(&reasons.join("; "))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("invalid store configuration: {0}")]
@@ -53,7 +75,7 @@ pub enum StoreError {
     /// Under `owl2-dl` with exact answers asked for (`dl.answers = exact`): the store
     /// can't prove the answers complete, for the reasons given.
     #[error("the answers can't be proven complete under OWL 2 DL: {0}")]
-    Incomplete(String),
+    Incomplete(Box<IncompleteAnswer>),
     /// Graph-level access control refused the request; nothing of it is applied.
     #[error(transparent)]
     Forbidden(#[from] Refusal),

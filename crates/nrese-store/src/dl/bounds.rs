@@ -84,6 +84,11 @@ pub(crate) struct View {
     /// beyond L (Skolem constants included): the gap's signature.
     pub gap_classes: HashSet<u64>,
     pub gap_predicates: HashSet<u64>,
+    /// Those of them with a fact beyond L that names no Skolem constant (a membership of
+    /// a named individual; a property value between two): the others' facts beyond L
+    /// all have a Skolem constant, which is never an answer.
+    pub named_gap_classes: HashSet<u64>,
+    pub named_gap_predicates: HashSet<u64>,
     /// U1's own terms among its facts: never answers.
     pub internal: HashSet<u64>,
     /// U1's facts beyond L.
@@ -395,6 +400,8 @@ fn build_view(
             unavailable: None,
             gap_classes: HashSet::new(),
             gap_predicates: HashSet::new(),
+            named_gap_classes: HashSet::new(),
+            named_gap_predicates: HashSet::new(),
             internal: HashSet::new(),
             facts: 0,
             proves_consistency: true,
@@ -412,6 +419,8 @@ fn build_view(
                 unavailable: Some(format!("the upper bound isn't available: {why}")),
                 gap_classes: HashSet::new(),
                 gap_predicates: HashSet::new(),
+                named_gap_classes: HashSet::new(),
+                named_gap_predicates: HashSet::new(),
                 internal: HashSet::new(),
                 facts: 0,
                 proves_consistency: false,
@@ -452,6 +461,8 @@ fn build_view(
         }),
         gap_classes: HashSet::new(),
         gap_predicates: HashSet::new(),
+        named_gap_classes: HashSet::new(),
+        named_gap_predicates: HashSet::new(),
         internal: HashSet::new(),
         facts: upper.stack.len(),
         proves_consistency: upper.proves_consistency(),
@@ -474,9 +485,15 @@ fn build_view(
         if p == rdf_type {
             if !upper.is_internal(o) {
                 view.gap_classes.insert(o);
+                if !upper.is_internal(s) {
+                    view.named_gap_classes.insert(o);
+                }
             }
         } else if !upper.is_internal(p) {
             view.gap_predicates.insert(p);
+            if !upper.is_internal(s) && !upper.is_internal(o) {
+                view.named_gap_predicates.insert(p);
+            }
         }
         quads.push(encode([s, p, o]));
     }
