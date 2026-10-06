@@ -72,6 +72,18 @@ impl InferredMask {
     }
 }
 
+/// What a snapshot reads ([`Snapshot::identity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SnapshotIdentity {
+    pub revision: u64,
+    /// Its version's statements.
+    pub content: super::Content,
+    /// `owl:sameAs`, when reads expand equality classes.
+    pub equality: Option<TermId>,
+    /// Whether reads give equality classes canonically.
+    pub canonical: bool,
+}
+
 /// The inferred statements a restricted snapshot keeps ([`Snapshot::with_inferred_subset`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InferredSubset {
@@ -168,6 +180,7 @@ impl Snapshot {
         };
         Snapshot {
             version: Arc::new(Version {
+                content: super::Content::fresh(),
                 asserted: self.version.asserted.clone(),
                 inferred,
                 revision: self.version.revision,
@@ -191,6 +204,7 @@ impl Snapshot {
         }
         Some(Snapshot {
             version: Arc::new(Version {
+                content: super::Content::fresh(),
                 asserted: self.version.asserted.clone(),
                 inferred: stack.with_runs(&mask.runs),
                 revision: self.version.revision,
@@ -425,6 +439,18 @@ impl Snapshot {
 
     pub fn revision(&self) -> u64 {
         self.version.revision
+    }
+
+    /// What this snapshot reads, for caches of results computed on it: two snapshots with
+    /// the same identity answer every read alike. A transaction's pending state or a
+    /// masked view has an identity of its own, though it keeps its base's revision.
+    pub fn identity(&self) -> SnapshotIdentity {
+        SnapshotIdentity {
+            revision: self.version.revision,
+            content: self.version.content,
+            equality: self.equality,
+            canonical: self.canonical,
+        }
     }
 
     /// Number of asserted and inferred quads. O(1).
