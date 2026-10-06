@@ -113,7 +113,7 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
         n.axiom(index, axiom);
     }
     if let Some(r) = &rewritten {
-        // ⊤ ⊑ ∃u.{h}, from every axiom that uses the universal property.
+        // ⊤ ⊑ ∃u.{h}, from every axiom whose encoding goes through the hub.
         let hub = n.e(ClassExpr::OneOf(vec![r.hub]));
         let to_hub = n.e(ClassExpr::Some(ObjProp::Named(r.hub), hub));
         for &index in &r.uses {
