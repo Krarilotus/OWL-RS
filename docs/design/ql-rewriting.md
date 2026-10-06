@@ -33,9 +33,16 @@ known through a source read; *ours* = measured or tested here).
   and rebuilt only when the schema statements change (a hash of them, checked once per
   snapshot revision); data commits never rebuild it.
 - **Only where the closure applies:** the default graph of a query without a dataset of
-  its own and without access restrictions, read with the inferred statements; not inside
-  `GRAPH`, `SERVICE`, `MINUS`'s right side or `EXISTS` (negation and graph scopes keep
-  their materialised meaning).
+  its own, read with the inferred statements; not inside `GRAPH`, `SERVICE`, `MINUS`'s
+  right side or `EXISTS` (negation and graph scopes keep their materialised meaning).
+- **Graph access, as the RL path has it.** A rewritten query reads data through the
+  reader's access like any other. The schema it is rewritten with matches the closure the
+  reader sees: with `inferred = "supported"` (inferences only where the reader's graphs
+  support them) the existentials of readable graphs only, compiled per reader; with
+  `"visible"` (every inference, whatever graphs it came from) the whole schema, so schema
+  graphs are exempt exactly as they are for the RL inferences that reader already sees;
+  with `"hidden"` no rewriting and no status. Test
+  `rewritten_answers_follow_the_readers_graph_access`.
 
 ## 2. What it reads, and how it combines with the closure
 
@@ -116,6 +123,17 @@ Tree witnesses can be exponential in the query: k independent ones give 2^k bran
   the answer says it may be incomplete (§7). On NPD the same arms without the class atom
   hit the size bound at k = 8, the branch bound at k = 9 and 12, the variable bound at
   k = 17 and 47, each within 0.7 ms.
+- **A budget for the time.** The bounds above limit the result, not the work: the
+  witness search backtracks over the anonymous types, and a query that fails late can
+  try exponentially many places within every size bound. So the rewriting also counts
+  its steps (candidate interiors, places tried, sets of witnesses): at most 50,000,
+  counted rather than timed, so the same query trips the same way everywhere. Past it,
+  the pattern runs as written, flagged `sound-only` like any bound (test
+  `the_work_bound_stops_a_search_the_size_bounds_dont`). A TBox where every anonymous
+  element has ten successor types, queried with a chain of twelve existential arms ending
+  in a class none has (about 10^11 places): flagged after 30.5 ms (main PC, release),
+  where the search would not have finished. NPD's 31 queries and stress set don't reach
+  it.
 - **Reported.** EXPLAIN (`explain=true` and `explain=plan`) gives `ql`: the patterns
   rewritten, their witnesses, branches and triple patterns, the bounds reached, and the
   completeness.
