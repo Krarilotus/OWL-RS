@@ -85,6 +85,18 @@ pub struct Func {
     pub filler: Option<ConceptId>,
 }
 
+/// An at-most-one clause `C₁(x) ∧ … ∧ R(x, z₀) ∧ R(x, z₁) → z₀ ≈ z₁` (`kind` [`Kind::Out`];
+/// [`Kind::In`] for `R(z₀, x) ∧ R(z₁, x)`): a functional (or inverse-functional) property,
+/// maybe under concepts of `x`. The Eq rule merges `x`'s R-neighbours by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtMostOne {
+    pub kind: Kind,
+    pub role: RoleId,
+    /// The concepts `Cᵢ` (sorted).
+    pub guard: Box<[ConceptId]>,
+    pub sources: Sources,
+}
+
 /// Where a body atom of a DL-clause sits: clause and position, with a guard: another
 /// concept body atom of the clause (its least common one), or [`Slot::NO_GUARD`]. Hyper
 /// rejects most clauses on the guard alone, without reading the clause.
@@ -123,6 +135,10 @@ pub struct Program {
     pub keyed_all: [Vec<Vec<Slot>>; 2],
     pub keyed: hashbrown::HashMap<(u8, RoleId, ConceptId), Vec<Slot>>,
     pub funcs: Vec<Func>,
+    pub at_most_one: Vec<AtMostOne>,
+    /// The at-most-one clauses by their role atom's kind and role, and by guard concept.
+    pub at_most_one_by_role: hashbrown::HashMap<(Kind, RoleId), Vec<u32>>,
+    pub at_most_one_by_guard: hashbrown::HashMap<ConceptId, Vec<u32>>,
     /// The successor triggers `Su(O)` (Definition 2), with the fillers of existentials
     /// added: `B(x)`, `S(x, y)`, `S(y, x)`.
     pub su_concept: Vec<bool>,
@@ -301,6 +317,27 @@ impl Program {
         for f in &self.funcs {
             if let Some(b) = f.filler {
                 self.su_concept[b as usize] = true;
+            }
+        }
+        // An at-most-one clause reads its role atoms like a body: a successor must hear of
+        // its edge to the predecessor, and a predecessor of the edges a successor derives.
+        self.at_most_one_by_role.clear();
+        self.at_most_one_by_guard.clear();
+        for (i, a) in self.at_most_one.iter().enumerate() {
+            match a.kind {
+                Kind::In => self.su_in[a.role as usize] = true,
+                _ => self.su_out[a.role as usize] = true,
+            }
+            self.at_most_one_by_role
+                .entry((a.kind, a.role))
+                .or_default()
+                .push(i as u32);
+            for &g in a.guard.iter() {
+                self.su_concept[g as usize] = true;
+                self.at_most_one_by_guard
+                    .entry(g)
+                    .or_default()
+                    .push(i as u32);
             }
         }
     }

@@ -76,7 +76,6 @@ impl DepSets {
     }
 
     /// The points of `set`, newest first.
-    #[cfg(test)]
     pub fn points(&self, mut set: DepSetId) -> Vec<u32> {
         let mut out = Vec::new();
         while !set.is_empty() {
