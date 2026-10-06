@@ -61,8 +61,9 @@ pub(crate) fn split(payload: u64) -> Option<(usize, u32)> {
 #[derive(Default)]
 pub(crate) struct Shard {
     pub(crate) bytes: Vec<u8>,
-    /// Each key's end offset in `bytes`.
-    pub(crate) ends: Vec<u64>,
+    /// Each key's end offset in `bytes` (a shard's text stays under 4 GiB: the
+    /// dictionary's under 1 TiB).
+    pub(crate) ends: Vec<u32>,
     /// Each key's hash, for the table to grow by (dropped once numbered).
     hashes: Vec<u64>,
     /// Each key's first position while loading; its final id once numbered.
@@ -99,7 +100,8 @@ impl Shard {
         }
         let local = u32::try_from(self.ends.len()).expect("a shard holds fewer than 2^32 terms");
         self.bytes.extend_from_slice(key);
-        self.ends.push(self.bytes.len() as u64);
+        let end = u32::try_from(self.bytes.len()).expect("a shard's text under 4 GiB");
+        self.ends.push(end);
         self.hashes.push(hash);
         self.slots.push(at);
         let Shard { table, hashes, .. } = self;
@@ -185,8 +187,25 @@ impl Pending {
                     }
                 }
                 order.sort_unstable_by_key(|&local| shard.slots[local as usize]);
-                // The table finds keys without them from now on.
+                // The table finds keys without the hashes from now on, and the arrays
+                // shed what growing by doubling left over (a shard at a time, so the
+                // copies are small).
                 shard.hashes = Vec::new();
+                shard.bytes.shrink_to_fit();
+                shard.ends.shrink_to_fit();
+                shard.slots.shrink_to_fit();
+                let Shard {
+                    table, bytes, ends, ..
+                } = shard;
+                table.shrink_to_fit(|&local| {
+                    let local = local as usize;
+                    let start = if local == 0 {
+                        0
+                    } else {
+                        ends[local - 1] as usize
+                    };
+                    super::hash::key_hash(&bytes[start..ends[local] as usize])
+                });
                 order
             })
             .collect();
@@ -258,7 +277,7 @@ impl Adopted {
             .shards
             .iter()
             .map(|s| {
-                (s.ends.capacity() * 8 + s.slots.capacity() * 8 + s.table.capacity() * 5) as u64
+                (s.ends.capacity() * 4 + s.slots.capacity() * 8 + s.table.capacity() * 5) as u64
             })
             .sum::<u64>()
             + self.locals.capacity() as u64 * 8;
