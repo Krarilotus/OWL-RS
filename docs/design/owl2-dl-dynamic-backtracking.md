@@ -1,6 +1,6 @@
 # Dynamic backtracking in the hypertableau (W3C DL-662, 663, 664)
 
-Status: proposed (7 October 2026), for the v2 gate. Owner: `nrese-dl::tableau`. It touches
+Status: approved (7 October 2026, with the two changes below folded in), for the v2 gate. Owner: `nrese-dl::tableau`. It touches
 ADR-0011's rollback equality backend (§4).
 
 ## 1. The problem, measured
@@ -46,15 +46,20 @@ The tableau's case is the friendliest one: every fact already carries its depend
    contains `k` is retracted. So is every frame above `k` whose premise does (none, on these
    cases).
 2. Frame `k` takes its next alternative, with the failed one's negation under `C \ {k}`
-   (semantic branching: Ginsberg's eliminating explanation).
+   (semantic branching: Ginsberg's eliminating explanation). It moves to the top of the
+   decision order: it gets a fresh id, the largest, and its new alternative's facts carry
+   that id, as in dynamic backtracking, where a variable given a new value moves to the end
+   of the assignment order.
 3. The other frames above `k` stay, with everything they built.
 4. A frame with no alternative left still pops as now (its clash goes to
    `max(premise ∪ failed)`). The first version may fall back to truncation there; the counters
    say how often.
 
 **Level identity.** Dependency sets name stack positions today. Frames get stable,
-increasing ids instead; `max` is still "the most recent". A frame removed in the middle then
-renumbers nothing.
+increasing ids instead, and a re-decided frame a fresh one: `max(C)` then always means the
+most recently decided level. A frame removed in the middle renumbers nothing. The stack is
+then no longer in the order of the frames' graph marks, so a fallback truncation to a frame's
+mark pops every frame whose mark is at or after it, not only those above it.
 
 **Graph.**
 - The arenas stay append-only.
@@ -93,11 +98,19 @@ types fit as they are: a reason already carries the dependency set.
   what the calculus derives from the remaining decisions, minus some redundant work.
 - Completeness follows Ginsberg's argument: each retracted value keeps its eliminating
   explanation (the negated alternative under `C \ {k}`) while that explanation's levels stand.
-- Termination by the same argument (reported, to verify).
+- Termination by the same argument: with the re-decided frame moved to the end of the
+  decision order (a fresh id), the eliminating explanations in that order form the
+  lexicographically decreasing measure Ginsberg's proof uses (reported, to verify when the
+  paper is in `literature/`).
 - The 3.9 proof obligation covers this together with learning.
 
 **Gates:**
 - A switch `Config::dynamic_backtracking`, off until the A/B.
+- Checkable invariants (`Config::check_retraction`, on in debug builds and in the
+  campaigns): after each `retract(level)`, no surviving fact, edge, merge pointer or pending
+  disjunction has a dependency set containing a retracted level, and every node in
+  `touched` has been re-checked for blocking. A missed dependency then fails at once, not
+  as a wrong answer three levels later.
 - Metamorphic: no answer changes on or off, on the tableau suites and the W3C suite.
 - The brute-force campaigns with the switch on.
 
