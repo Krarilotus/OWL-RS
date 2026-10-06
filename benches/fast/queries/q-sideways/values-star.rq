@@ -1,0 +1,4 @@
+PREFIX e: <http://example.org/fast/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?u ?p ?l WHERE { VALUES ?u { e:u1 e:u2 e:u3 e:u5 e:u8 e:u13 e:u21 e:u34 e:u55 e:u89 e:u144 e:u233 e:u377 e:u610 e:u987 } ?p e:author ?u ; e:tag ?t . ?t rdfs:label ?l }

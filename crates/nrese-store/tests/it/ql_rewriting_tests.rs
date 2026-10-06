@@ -809,7 +809,11 @@ fn store(turtle: &str, dir: &std::path::Path, ruleset: Ruleset, ql: bool) -> Sto
     let file = dir.join("case.ttl");
     std::fs::write(&file, turtle).unwrap();
     let store = StoreService::new(StoreConfig {
-        ql_rewriting: ql,
+        ql_rewriting: if ql {
+            nrese_store::QlRewritingMode::On
+        } else {
+            nrese_store::QlRewritingMode::Off
+        },
         ..StoreConfig::in_memory()
     })
     .unwrap();
@@ -1126,6 +1130,11 @@ fn existentials_feeding_a_transitive_role_miss_with_the_flag() {
     for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
         let store = store(&turtle, dir.path(), ruleset, true);
         let (rows, completeness) = store_answer(&store, &query.sparql(true));
+        // Repeated: from the result cache, with the status a fresh run reports.
+        let hits = store.query_cache_stats().hits;
+        let again = store_answer(&store, &query.sparql(true));
+        assert_eq!((&again.0, &again.1), (&rows, &completeness));
+        assert!(store.query_cache_stats().hits > hits, "{}", ruleset.name());
         let answered: BTreeSet<Vec<usize>> = rows.into_iter().collect();
         assert!(
             answered.is_subset(&certain),
@@ -1164,7 +1173,12 @@ fn rewritten_answers_follow_the_readers_graph_access() {
     use nrese_sparql::GraphAccess;
     use nrese_store::{ReadScope, SparqlUpdateRequest};
 
-    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    // Rewriting over the owl2-rl closure is asked for (`auto` is owl2-ql only).
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::On,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
     store
         .execute_update(&SparqlUpdateRequest::new(
             "PREFIX ex: <http://e/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
@@ -1205,4 +1219,210 @@ fn rewritten_answers_follow_the_readers_graph_access() {
     assert_eq!(ask(reader(true, false)), (true, Some("complete")));
     // It sees no inferences: no rewriting, no status.
     assert_eq!(ask(reader(false, false)), (false, None));
+}
+
+/// The printer (design §8): each query printed as standard SPARQL 1.1, in both forms, and
+/// run on a store holding the same statements without any reasoning, answers as the store
+/// with reasoning (`owl2-rl`, the rewriting on) does: the same rows, as bags and with
+/// DISTINCT, and the same completeness. On the pure and the mixed random cases; what the
+/// printer can't write exactly it says, and those are counted.
+#[test]
+fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
+    use nrese_sparql::ql::{PrintForm, Printed};
+
+    let cases: usize = std::env::var("NRESE_QL_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(150);
+    let dir = tempfile::tempdir().unwrap();
+    let seed = std::env::var("NRESE_QL_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x5851_f42d_4c95_7f2d);
+    let mut rng = Rng(seed);
+    // Printed queries of pure and mixed cases, those NRESE answers sound-only, answers only
+    // through reasoning.
+    let (mut pure, mut mixed_printed, mut sound_only, mut gained) = (0, 0, 0, 0);
+    let mut refused: std::collections::BTreeMap<String, usize> = Default::default();
+    for case in 0..cases {
+        let mixed = case % 2 == 1;
+        let tbox = random_tbox(&mut rng);
+        let roles: Vec<usize> = tbox.generating.iter().map(|g| g.1.property).collect();
+        let extras = if mixed {
+            random_extras(&mut rng, &roles)
+        } else {
+            Extras::default()
+        };
+        let data: Vec<String> = (0..1 + rng.below(8))
+            .map(|_| {
+                if rng.chance(50) {
+                    format!(":a{} a :C{} .", rng.below(INDIVIDUALS), rng.below(CLASSES))
+                } else {
+                    format!(
+                        ":a{} :P{} :a{} .",
+                        rng.below(INDIVIDUALS),
+                        rng.below(PROPERTIES),
+                        rng.below(INDIVIDUALS)
+                    )
+                }
+            })
+            .collect();
+        let queries: Vec<Query> = (0..4).map(|_| random_query(&mut rng)).collect();
+        let turtle = format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             {}\n{}\n{}",
+            tbox.turtle.join("\n"),
+            extras.turtle.join("\n"),
+            data.join("\n")
+        );
+        let with = store(&turtle, dir.path(), Ruleset::Owl2Rl, true);
+        let without = raw_store(&turtle, dir.path());
+        for query in &queries {
+            for distinct in [true, false] {
+                let text = query.sparql(distinct);
+                let (mut expected, completeness) = store_answer(&with, &text);
+                expected.sort();
+                let asserted: BTreeSet<Vec<usize>> =
+                    store_rows(&without, &text).into_iter().collect();
+                for form in [PrintForm::Paths, PrintForm::Values] {
+                    let context = format!("case {case}, {}:\n{turtle}\n{text}", form.name());
+                    match with.print_query(&text, form).unwrap() {
+                        Printed::NotExpressible(_) if !distinct || form != PrintForm::Paths => {}
+                        Printed::NotExpressible(reasons) => {
+                            for reason in reasons {
+                                let kind = reason
+                                    .split_once(" (")
+                                    .map_or(reason.as_str(), |(kind, _)| kind);
+                                let kind = kind.rsplit(": ").next().unwrap_or(kind);
+                                *refused.entry(kind.replace(E, ":")).or_default() += 1;
+                            }
+                        }
+                        Printed::Query {
+                            text: q,
+                            completeness: theirs,
+                        } => {
+                            let (mut rows, none) = store_answer(&without, &q);
+                            rows.sort();
+                            assert_eq!(rows, expected, "{context}\nprinted:\n{q}");
+                            assert_eq!(
+                                theirs.as_str(),
+                                completeness.as_str(),
+                                "{context}\n{theirs:?}"
+                            );
+                            // The store without reasoning had nothing to say about it.
+                            assert!(none.complete && none.reasons.is_empty(), "{context}");
+                            if distinct && form == PrintForm::Paths {
+                                if mixed {
+                                    mixed_printed += 1;
+                                } else {
+                                    pure += 1;
+                                }
+                                sound_only += usize::from(!completeness.complete);
+                                gained += expected
+                                    .iter()
+                                    .filter(|row| !asserted.contains(*row))
+                                    .count();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "QL printer: {pure} pure and {mixed_printed} mixed queries printed (both forms, \
+         DISTINCT and bags; {sound_only} sound-only as NRESE's), {gained} answers only \
+         through reasoning; not expressible (queries): {refused:?}"
+    );
+    // Pure QL prints whole.
+    assert_eq!(pure, cases.div_ceil(2) * 4, "{refused:?}");
+    assert!(mixed_printed > 0 && sound_only > 0, "{refused:?}");
+    assert!(gained > 0, "no printed query needed reasoning");
+}
+
+/// A store holding `turtle` as asserted: no reasoning, no rewriting.
+fn raw_store(turtle: &str, dir: &std::path::Path) -> StoreService {
+    let file = dir.join("raw.ttl");
+    std::fs::write(&file, turtle).unwrap();
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::Off,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    store
+        .bulk_load(&BulkLoadRequest {
+            files: vec![file],
+            replace: false,
+            graph: GraphTarget::DefaultGraph,
+            skip_errors: false,
+        })
+        .unwrap();
+    store
+}
+
+/// The TBox counts inclusions through inverse expressions among those the materialisation
+/// applies (`nrese-owl::ql`, the base ones): both rulesets derive them, their facts being
+/// generalised triples (`x [owl:inverseOf p] y`).
+#[test]
+fn inclusions_through_inverse_expressions_are_materialised() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            ":Q rdfs:subPropertyOf [ owl:inverseOf :P ] . :a1 :Q :a2 .",
+            "?x :P ?y",
+            "2 1",
+        ),
+        (
+            "[ owl:inverseOf :P ] rdfs:subPropertyOf :Q . :a1 :P :a2 .",
+            "?x :Q ?y",
+            "2 1",
+        ),
+        (
+            ":Q owl:equivalentProperty [ owl:inverseOf :P ] . :a1 :P :a2 .",
+            "?x :Q ?y",
+            "2 1",
+        ),
+        (
+            ":Q owl:inverseOf [ owl:inverseOf :P ] . :a1 :P :a2 .",
+            "?x :Q ?y",
+            "1 2",
+        ),
+        (
+            "[ owl:inverseOf :P ] rdfs:domain :C . :a1 :P :a2 .",
+            "?x a :C",
+            "2",
+        ),
+        (
+            "[ owl:inverseOf :P ] rdfs:range :C . :a1 :P :a2 .",
+            "?x a :C",
+            "1",
+        ),
+        (
+            "[ a owl:Restriction ; owl:onProperty [ owl:inverseOf :P ] ;
+               owl:someValuesFrom owl:Thing ] rdfs:subClassOf :C . :a1 :P :a2 .",
+            "?x a :C",
+            "2",
+        ),
+    ];
+    for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+        for (axioms, pattern, expected) in cases {
+            let turtle = format!(
+                "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+                 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . {axioms}"
+            );
+            let store = store(&turtle, dir.path(), ruleset, false);
+            let rows = store_rows(&store, &format!("PREFIX : <{E}> SELECT * {{ {pattern} }}"));
+            let rows: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            assert_eq!(rows, [expected], "{}: {axioms}", ruleset.name());
+        }
+    }
 }

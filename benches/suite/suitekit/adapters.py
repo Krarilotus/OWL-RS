@@ -289,7 +289,8 @@ class Nrese(Adapter):
     regimes = {"none": "disabled", "rdfs": "rdfs", "owl-horst": "owl-horst",
                "owl2-rl": "owl2-rl", "owl2-ql": "owl2-ql"}
     runtimes = {"docker", "apptainer", "process"}
-    target_volume = "nrese-target"  # the Docker build's output, mounted at /target
+    # The Docker build's output, mounted at /target (NRESE_TARGET_VOLUME: a worktree's own).
+    target_volume = os.environ.get("NRESE_TARGET_VOLUME", "nrese-target")
     bin_setting = "NRESE_BIN"
 
     def source(self, ctx: Context) -> Path:
@@ -428,8 +429,12 @@ class Qlever(Adapter):
         # result, such as a count, so a repeated run would be a cache hit). On: QLever's
         # default cache.
         cache = ["-k", "0"] if ctx.cache == "off" else []
+        # Queries answered at once (`-j`, --num-simultaneous-queries; QLever's own default
+        # is 1): QLEVER_SIMULTANEOUS_QUERIES, 8 unless set (the concurrency case's defaults
+        # track sets 1, its best-configuration track the core count).
+        simultaneous = ctx.setting("QLEVER_SIMULTANEOUS_QUERIES", "8")
         spec = Spec(ctx.name("serve"), self.images(ctx)[0],
-                    ["/qlever/qlever-server", "-i", "/index/idx", "-p", str(port), "-n", "-j", "8",
+                    ["/qlever/qlever-server", "-i", "/index/idx", "-p", str(port), "-n", "-j", simultaneous,
                      "-m", ctx.setting("QLEVER_MEMORY", "16G"), *cache, "-s", f"{ctx.timeout_s}s"],
                     mounts=ctx.mounts(Mount(store, "/index", readonly=False)), port=port,
                     workdir="/index", user="root", memory=ctx.memory)
@@ -557,7 +562,12 @@ class Virtuoso(Adapter):
         return [ctx.setting("VIRTUOSO_IMAGE", "openlink/virtuoso-opensource-7:7.2.17")]
 
     def spec(self, ctx, name, store, port=None):
-        return Spec(name, self.images(ctx)[0], [], dict(VIRTUOSO_ENV),
+        env = dict(VIRTUOSO_ENV)
+        # Worker threads (ServerThreads; Virtuoso's default 10): VIRTUOSO_SERVER_THREADS,
+        # set by the concurrency case's tracks.
+        if ctx.setting("VIRTUOSO_SERVER_THREADS"):
+            env["VIRT_PARAMETERS_SERVERTHREADS"] = ctx.setting("VIRTUOSO_SERVER_THREADS")
+        return Spec(name, self.images(ctx)[0], [], env,
                     ctx.mounts(Mount(store, "/database", readonly=False)), port=port, entrypoint=True,
                     memory=ctx.memory)
 

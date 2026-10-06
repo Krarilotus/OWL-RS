@@ -402,3 +402,44 @@ fn class_queries_answer_as_the_realisation_on_random_ontologies() {
     assert!(complete > 0, "no complete answer");
     eprintln!("{compared} ontologies, {complete} complete class queries");
 }
+
+/// A repeated query is answered from the result cache with the status a fresh evaluation
+/// reports, and a query asked under another `dl-answers` mode never gets the first
+/// mode's answer.
+#[test]
+fn cached_answers_carry_the_status_of_fresh_ones() {
+    let dl = pipeline_with(DlConfig {
+        answers: DlAnswers::Sound,
+        ..DlConfig::default()
+    });
+    insert(&dl, UNION).expect("data");
+    let ask = |query: &str, mode: Option<DlAnswers>| {
+        let (rows, status) = query_with(&dl, query, mode).expect("answered");
+        (rows, status.shared, status.paths)
+    };
+    // Closed predicates: evaluated over the snapshot as any query, so through the cache.
+    let closed = "SELECT ?x { ?z :knows ?x }";
+    let first = ask(closed, None);
+    assert_eq!(first.0, ["y"]);
+    let hits = dl.store().query_cache_stats().hits;
+    assert_eq!(ask(closed, None), first);
+    assert!(
+        dl.store().query_cache_stats().hits > hits,
+        "the repeat came from the cache: {:?}",
+        dl.store().query_cache_stats()
+    );
+    let open = ask(closed, Some(DlAnswers::Exact));
+    assert_eq!(
+        (open.0.clone(), open.1.complete),
+        (vec!["y".to_owned()], true)
+    );
+    // The bounds' modes: each answer as the mode decides, repeated.
+    let union = "SELECT ?x { ?x a :D }";
+    let sound = ask(union, None);
+    assert_eq!(sound.0, ["x", "y"], "the lower bound alone");
+    let exact = ask(union, Some(DlAnswers::Exact));
+    assert_eq!(exact.0, ["w", "x", "y"]);
+    assert!(exact.1.complete && !sound.1.complete);
+    assert_eq!(ask(union, Some(DlAnswers::Exact)), exact);
+    assert_eq!(ask(union, None), sound);
+}

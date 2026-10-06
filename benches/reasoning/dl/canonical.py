@@ -68,6 +68,24 @@ def canonical(classes, pairs):
     return "\n".join(sorted(lines)) + "\n"
 
 
+def compare(reference_text, pairs):
+    """NRESE's closure `pairs` against a reference `.tax` text: `"true"`, `"false"`, or
+    `"signature-differs"` when the closure names classes the reference lacks. A reference
+    over fewer classes read fewer axioms (an OWL API reader drops axioms about undeclared
+    terms), so its taxonomy isn't the same ontology's: on 6 October 2026 the fast suite's
+    el-classify counted the 2,000 undeclared defined classes as 4,526 wrong subsumptions."""
+    classes = set()
+    for line in reference_text.splitlines():
+        if line.startswith("= "):
+            classes.add(line.split(" ")[2])
+    classes |= {THING, NOTHING}
+    named = {ALIASES.get(c, c) for pair in pairs for c in pair}
+    if named - classes:
+        return "signature-differs"
+    ours = set(canonical(classes, pairs).splitlines())
+    return "true" if ours == set(reference_text.splitlines()) else "false"
+
+
 def main():
     if len(sys.argv) != 4:
         sys.exit(__doc__)
