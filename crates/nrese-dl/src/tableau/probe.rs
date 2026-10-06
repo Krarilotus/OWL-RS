@@ -446,7 +446,8 @@ impl Base<'_> {
                 None => fresh(model),
             };
             let approximate = engine.data_approximate.clone();
-            engine.floor = *frames as u32;
+            // The base's levels: its top frame's and below.
+            engine.floor = engine.frames.last().map_or(0, |f| f.id);
             let since = (model.g.nodes.len() as u32, model.g.unary.len() as u32);
             let end = engine.resume(&seed);
             let done = end != End::GaveUp(super::search::FLOOR.into());
