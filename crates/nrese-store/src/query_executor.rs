@@ -15,9 +15,9 @@ use nrese_engine::ReadModel;
 use nrese_rdf::{GraphName, NamedNode, NamedOrBlankNode};
 use nrese_rdf_io::RdfSerializer;
 use nrese_sparql::{
-    CancellationToken, Explanation, PlannedQuery, QueryDatasetSpecification, QueryEvaluationError,
-    QueryOptions, QueryResults, ReadView, ResultsFormat, WriteResultsError, evaluate_query,
-    explain_query, plan_query, write_results,
+    CachedOutput, CancellationToken, Explanation, PlannedQuery, QueryDatasetSpecification,
+    QueryEvaluationError, QueryOptions, QueryResults, ReadView, ResultsFormat, WriteResultsError,
+    evaluate_query, explain_query, plan_query, write_results,
 };
 use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 use nrese_sparql_syntax::Query;
@@ -361,6 +361,65 @@ pub(crate) fn run_query(
         result_cache: store.result_cache.clone(),
         pin: prepared.pin.clone(),
     };
+    // A repeated query's answer as written before, in this format; else written, and its
+    // bytes offered to the cache with the time writing them took (`nrese_sparql::cache`).
+    let mut out = out;
+    let slot =
+        match nrese_sparql::cached_output(view, &prepared.query, &options, prepared.media_type()) {
+            CachedOutput::Hit(bytes) => return Ok(out.write_all(&bytes)?),
+            CachedOutput::Miss(slot) => slot,
+            CachedOutput::Off => return serialize(view, prepared, &options, cancellation, out),
+        };
+    let mut tee = Tee {
+        inner: out,
+        copy: Some(Vec::new()),
+        limit: slot.limit(),
+    };
+    // What the bytes save: this answer's evaluation, as far as the cache didn't answer
+    // its parts, and its serialisation (written at the end, on every core, for JSON).
+    let started = std::time::Instant::now();
+    serialize(view, prepared, &options, cancellation, &mut tee)?;
+    if let Some(copy) = tee.copy {
+        slot.offer(copy, started.elapsed());
+    }
+    Ok(())
+}
+
+/// A writer that forwards to `inner` and keeps a copy of what it writes up to `limit`
+/// bytes.
+struct Tee<W> {
+    inner: W,
+    copy: Option<Vec<u8>>,
+    limit: usize,
+}
+
+impl<W: Write> Write for Tee<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        if let Some(copy) = &mut self.copy {
+            if copy.len() + written > self.limit {
+                self.copy = None;
+            } else {
+                copy.extend_from_slice(&buf[..written]);
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Evaluates `prepared` on `view` with `options` and writes its serialised results to
+/// `out` as they are produced.
+fn serialize(
+    view: &impl ReadView,
+    prepared: &PreparedQuery,
+    options: &QueryOptions,
+    cancellation: &CancellationToken,
+    out: impl Write,
+) -> StoreResult<()> {
     let alive = || match cancellation.is_cancelled() {
         true => Err(StoreError::SparqlEvaluation(
             QueryEvaluationError::Cancelled,
@@ -378,14 +437,14 @@ pub(crate) fn run_query(
     if let Some(format) = format
         && matches!(prepared.query, Query::Select { .. } | Query::Ask { .. })
         && let Some(written) =
-            write_results(view, &prepared.query, &options, format, version, &mut out)
+            write_results(view, &prepared.query, options, format, version, &mut out)
     {
         return written.map_err(|error| match error {
             WriteResultsError::Evaluation(error) => StoreError::SparqlEvaluation(error),
             WriteResultsError::Io(error) => StoreError::Io(error),
         });
     }
-    match evaluate_query(view, &prepared.query, &options)? {
+    match evaluate_query(view, &prepared.query, options)? {
         QueryResults::Boolean(value) => {
             results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;
         }

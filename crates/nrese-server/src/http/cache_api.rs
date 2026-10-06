@@ -48,6 +48,8 @@ pub(crate) struct CacheView {
     bytes: usize,
     pinned_bytes: usize,
     entries: usize,
+    /// Entries holding a whole answer's serialised bytes, in one format.
+    answers: usize,
     /// Query parts answered from the cache.
     hits: u64,
     /// Query parts computed that could have been cached.
@@ -79,6 +81,7 @@ pub async fn cache_get(
         bytes: stats.bytes,
         pinned_bytes: stats.pinned_bytes,
         entries: stats.entries,
+        answers: stats.answers,
         hits: stats.hits,
         misses: stats.misses,
         shared: stats.shared,

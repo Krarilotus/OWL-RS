@@ -19,7 +19,9 @@ pub mod cache;
 pub mod compat;
 pub mod dataset;
 pub mod plan;
-pub use cache::{PinRequest, PinnedResult, ResultCache, ResultCacheStats};
+pub use cache::{
+    CachedOutput, OutputSlot, PinRequest, PinnedResult, ResultCache, ResultCacheStats,
+};
 pub use dataset::GraphAccess;
 mod native;
 pub mod query;
@@ -49,7 +51,7 @@ pub use native::{ResultsFormat, geometry_literal};
 pub use nrese_exec::{BudgetExceeded, SharedBudget};
 pub use query::{
     Explanation, PlanStep, PlannedQuery, PlannedStep, QueryOptions, WriteResultsError,
-    evaluate_query, explain_query, plan_query, runs_natively, write_results,
+    cached_output, evaluate_query, explain_query, plan_query, runs_natively, write_results,
 };
 pub use results::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,
