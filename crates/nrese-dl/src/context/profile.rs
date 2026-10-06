@@ -50,8 +50,10 @@ pub struct Profile {
     pub subset_checks: u64,
     /// Merges of neighbour terms the Eq rule made.
     pub merges: u64,
-    /// Contexts where a merge of `x` with a neighbour was due and not made.
+    /// Contexts where a merge of `x` with a neighbour was due and not made, and where a
+    /// Pred join was left past its step budget.
     pub contexts_unmerged: u64,
+    pub contexts_joins_left: u64,
     pub nominal_contexts: u64,
     pub threads: usize,
     /// The most clauses one context holds (a context shared by many successors grows).
@@ -90,7 +92,7 @@ impl Profile {
              contexts_saturated={} clauses_generated={} clauses_kept={} redundant_forward={} \
              redundant_backward={} hyper={} pred={} max_head={} max_body={} edges={} \
              peak_agenda={} messages={} slots={} proof_steps={} threads={} largest_context={} \
-             merges={} eq={} unmerged={} subset_checks={}",
+             merges={} eq={} unmerged={} joins_left={} subset_checks={}",
             ms(self.normalise),
             ms(self.compile),
             ms(self.saturate),
@@ -123,6 +125,7 @@ impl Profile {
             self.merges,
             self.equality_literals_generated,
             self.contexts_unmerged,
+            self.contexts_joins_left,
             self.subset_checks,
         );
         out

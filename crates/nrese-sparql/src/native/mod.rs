@@ -3208,44 +3208,109 @@ impl<'a> Context<'a> {
         for row in rows.chunks_exact(width) {
             table.push_row(row);
         }
-        if let Some(trace) = &self.trace {
-            let order: Vec<String> = stats
-                .order
-                .iter()
-                .zip(&stats.candidates)
-                .map(|(&v, n)| {
-                    format!(
-                        "{} ({} candidates)",
-                        vars[v],
-                        n.load(std::sync::atomic::Ordering::Relaxed)
-                    )
-                })
-                .collect();
-            trace.borrow_mut().push(PlanStep {
-                depth: self.depth.get() + 1,
-                operator: "wcoj order".to_owned(),
-                detail: {
-                    let load = |n: &AtomicUsize| n.load(AtomicOrdering::Relaxed);
-                    format!(
-                        "{} | {} lookups ({} seeks, {} from the root), {} candidates skipped",
-                        order.join(", "),
-                        load(&stats.lookups),
-                        load(&stats.seeks),
-                        load(&stats.roots),
-                        load(&stats.skipped)
-                    )
-                },
-                estimated_rows: estimate,
-                rows: table.len() as u64,
-                micros: 0,
-                cache: None,
-            });
-        }
+        self.wcoj_step(&vars, &stats, estimate, table.len() as u64);
         Ok(Some(self.produced(Solutions {
             vars,
             table,
             ordered: false,
         })?))
+    }
+
+    /// `COUNT(*)` of a BGP that is cyclic ([`Self::cyclic_patterns`]), by its
+    /// worst-case-optimal join counting instead of producing its solutions
+    /// ([`wcoj::Query::count_solutions`]); `None` if it isn't one.
+    fn cyclic_count(&self, triples: &[TriplePattern]) -> NativeResult<Option<u64>> {
+        if triples
+            .iter()
+            .any(|t| search::is_search(t, triples) || self.is_spatial(t))
+        {
+            return Ok(None);
+        }
+        let Some(scans) = triples
+            .iter()
+            .map(|t| self.scan_pattern(t))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let Some((vars, patterns)) = self.cyclic_patterns(&scans) else {
+            return Ok(None);
+        };
+        let start = Instant::now();
+        let counts: Vec<u64> = scans
+            .iter()
+            .map(|s| self.snapshot.estimate_in(self.model, &s.quad_pattern()))
+            .collect();
+        let estimate = self
+            .trace
+            .as_ref()
+            .and_then(|_| self.cyclic_estimate(&scans, &counts))
+            .map(|rows| rows.round() as u64);
+        let mut stats = wcoj::Stats::default();
+        let count = if counts.contains(&0) {
+            0
+        } else {
+            let patterns: Vec<[wcoj::Pos; 3]> = patterns
+                .into_iter()
+                .filter(|p| p.iter().any(|x| matches!(x, wcoj::Pos::Var(_))))
+                .collect();
+            let query =
+                wcoj::Query::new(&self.snapshot, self.model, patterns, vars.len(), usize::MAX);
+            let token = self.cancellation.clone();
+            let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
+            match query.count_solutions(&cancelled, &mut stats) {
+                Ok(count) => count,
+                Err(wcoj::Stop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
+                Err(wcoj::Stop::TooManyRows) => unreachable!("a count keeps no rows"),
+            }
+        };
+        if self.trace.is_some() {
+            self.wcoj_step(&vars, &stats, estimate, count);
+            let detail = triples.iter().map(ToString::to_string).collect::<Vec<_>>();
+            self.note("wcoj", detail.join(" . "), estimate, count as usize, start);
+        }
+        Ok(Some(count))
+    }
+
+    /// EXPLAIN's step for a worst-case-optimal join: its variable order with each one's
+    /// candidates, its checks, and for a count the variables counted rather than bound.
+    fn wcoj_step(&self, vars: &[Variable], stats: &wcoj::Stats, estimate: Option<u64>, rows: u64) {
+        let Some(trace) = &self.trace else {
+            return;
+        };
+        let load = |n: &AtomicUsize| n.load(AtomicOrdering::Relaxed);
+        let order: Vec<String> = stats
+            .order
+            .iter()
+            .zip(&stats.candidates)
+            .map(|(&v, n)| format!("{} ({} candidates)", vars[v], load(n)))
+            .collect();
+        let counted = match stats.counted_after {
+            Some(depth) if depth < stats.order.len() => {
+                let rest: Vec<String> = stats.order[depth..]
+                    .iter()
+                    .map(|&v| vars[v].to_string())
+                    .collect();
+                format!(", {} counted as a forest", rest.join(", "))
+            }
+            _ => String::new(),
+        };
+        trace.borrow_mut().push(PlanStep {
+            depth: self.depth.get() + 1,
+            operator: "wcoj order".to_owned(),
+            detail: format!(
+                "{} | {} lookups ({} seeks, {} from the root), {} candidates skipped{counted}",
+                order.join(", "),
+                load(&stats.lookups),
+                load(&stats.seeks),
+                load(&stats.roots),
+                load(&stats.skipped)
+            ),
+            estimated_rows: estimate,
+            rows,
+            micros: 0,
+            cache: None,
+        });
     }
 
     /// `DESCRIBE` (its answer is implementation-defined, §16.4): each term the solutions bind, once, with the
@@ -4321,6 +4386,22 @@ impl<'a> Context<'a> {
                 Some(scan) => self.scan(&scan, None)?.table.len() as u64,
                 None => 0,
             };
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(count))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // COUNT(*) of a cyclic BGP: its worst-case-optimal join counts the solutions
+        // instead of producing them (4-cycles of a social graph: 19.2 M two-paths
+        // checked → two lists of 2-paths per node).
+        if variables.is_empty()
+            && let [(target, AggregateExpression::CountSolutions { distinct: false })] = aggregates
+            && let GraphPattern::Bgp { patterns } = inner
+            && let Some(count) = self.cyclic_count(patterns)?
+        {
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
             return Ok(Solutions {

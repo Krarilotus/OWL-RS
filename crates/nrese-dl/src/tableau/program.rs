@@ -191,14 +191,24 @@ pub struct Program {
     /// By at-most atom (index into `at_most`): its annotation.
     pub at_most_annotation: Vec<u32>,
     pub clauses: Vec<HtClause>,
-    /// Plans by the concept and by the role of their trigger atom.
+    /// Plans by the concept and by the role of their trigger atom; a role's plans whose
+    /// first step checks a concept of an end of the edge apart (`keyed`).
     pub by_concept: Vec<Vec<Plan>>,
     pub by_role: Vec<Vec<Plan>>,
+    /// A role's keyed plans, and where each is by `(role, concept, end)` (`end`: the
+    /// edge's target). An edge looks them up through its ends' labels where those are
+    /// fewer than the role's keyed plans (Sequoia's keyed slots, §5.3.2): with a
+    /// universal's automaton per axiom, a role has a transition per axiom, and nearly
+    /// every one fails its first check.
+    pub keyed: Vec<Vec<Plan>>,
+    pub keyed_by: HashMap<(RoleId, ConceptId, bool), Vec<u32>>,
     /// Clauses with an empty body: they apply to every node.
     pub everywhere: Vec<u32>,
     pub assertions: Assertions,
     /// What was left out, and why.
     pub weakened: Vec<String>,
+    /// Why the clauses' class sizes contradict each other, if they do ([`crate::numbers`]).
+    pub refuted: Option<String>,
     /// Whether every clause is simple (Definition 10: no edge towards `x`, no inverse in a
     /// number restriction), so that single blocking is complete.
     pub simple: bool,
@@ -247,6 +257,7 @@ impl Program {
             ..Program::default()
         };
         p.weakened = left_out(ontology, normalised);
+        p.refuted = crate::numbers::refute(normalised).map(|r| r.why);
         let facts = &normalised.facts;
         if normalised.clauses.iter().any(|c| c.flags.datatype)
             || !facts.data.is_empty()
@@ -815,6 +826,8 @@ impl Program {
         }
         self.by_concept = vec![Vec::new(); self.concepts.len()];
         self.by_role = vec![Vec::new(); self.roles.len()];
+        self.keyed = vec![Vec::new(); self.roles.len()];
+        self.keyed_by.clear();
         for (index, clause) in self.clauses.iter().enumerate() {
             if clause.body.is_empty() {
                 self.everywhere.push(index as u32);
@@ -829,9 +842,26 @@ impl Program {
                     steps,
                     heads_after,
                 };
-                match atom {
-                    Body::Concept(c, _) => self.by_concept[*c as usize].push(plan),
-                    Body::Role(r, _, _) => self.by_role[*r as usize].push(plan),
+                match *atom {
+                    Body::Concept(c, _) => self.by_concept[c as usize].push(plan),
+                    Body::Role(r, a, b) => {
+                        let key = match plan.steps.first() {
+                            Some(&Step::Check(i)) => match clause.body[i as usize] {
+                                Body::Concept(c, v) if v == a => Some((r, c, false)),
+                                Body::Concept(c, v) if v == b => Some((r, c, true)),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        match key {
+                            Some(key) => {
+                                let at = self.keyed[r as usize].len() as u32;
+                                self.keyed[r as usize].push(plan);
+                                self.keyed_by.entry(key).or_default().push(at);
+                            }
+                            None => self.by_role[r as usize].push(plan),
+                        }
+                    }
                 }
             }
         }
@@ -841,6 +871,7 @@ impl Program {
     pub fn ensure_tables(&mut self) {
         self.by_concept.resize(self.concepts.len(), Vec::new());
         self.by_role.resize(self.roles.len(), Vec::new());
+        self.keyed.resize(self.roles.len(), Vec::new());
     }
 }
 

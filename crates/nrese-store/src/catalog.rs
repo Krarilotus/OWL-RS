@@ -229,8 +229,23 @@ fn valid(id: &str) -> bool {
         && !device
 }
 
-/// What a repository's directory is renamed to while it is removed.
-const TRASH: &str = ".trash-";
+/// Whether a directory of `repositories/` named `id` is a repository an earlier version
+/// created: letters, digits, `-`, `_` and `.`, at most 64, not `.` or `..` (the rule
+/// before 3 October 2026). It is opened as it is, though [`valid`] refuses new ones like it
+/// (`.staging`, `con` on Linux): a store written by `main` keeps all its repositories.
+fn existing(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && id != "."
+        && id != ".."
+}
+
+/// What a repository's directory is renamed to while it is removed: a name no repository
+/// can have, now or before ([`existing`]: no `~`), so that the start never deletes one.
+const TRASH: &str = "~trash-";
 
 impl Catalog {
     /// The repositories of a server whose default store is `store`, reasoning with
@@ -273,8 +288,11 @@ impl Catalog {
                     }
                     continue;
                 }
-                if !valid(&id) || !entry.path().is_dir() {
+                if !existing(&id) || !entry.path().is_dir() {
                     continue;
+                }
+                if !valid(&id) {
+                    tracing::warn!(repository = %id, "a repository id that can't be created any more (it starts or ends with '.' or is a device name): opened as it is; copy it into a repository with another id to move the data directory between systems");
                 }
                 let settings = match std::fs::read(entry.path().join(SETTINGS_FILE)) {
                     Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -516,7 +534,7 @@ impl Catalog {
 
 #[cfg(test)]
 mod tests {
-    use super::valid;
+    use super::{TRASH, existing, valid};
 
     #[test]
     fn repository_ids() {
@@ -533,5 +551,18 @@ mod tests {
             assert!(!valid(device), "{device}");
         }
         assert!(valid("console") && valid("com10") && valid("nullable"));
+    }
+
+    /// Repositories created before the rule above are opened (the main-store fixture
+    /// has `.staging` and `.trash-kept`), and no repository's directory looks like trash.
+    #[test]
+    fn earlier_repository_ids_are_kept() {
+        for id in [".staging", ".trash-kept", "repo.", "con", "my-repo_2.v1"] {
+            assert!(existing(id), "{id}");
+        }
+        for id in ["", ".", "..", "a/b", "~x"] {
+            assert!(!existing(id), "{id}");
+        }
+        assert!(!existing(&format!("{TRASH}a-0")));
     }
 }
