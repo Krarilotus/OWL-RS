@@ -95,16 +95,16 @@ struct Changed<'a, S: ?Sized> {
 
 impl<S: Source + ?Sized> Source for Changed<'_, S> {
     fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
-        match seg {
-            Seg::Delta => self.changed.scan(pattern, Seg::All, f),
+        match seg.plain() {
             Seg::Old | Seg::All => self.all.scan(pattern, Seg::All, f),
+            _ => self.changed.scan(pattern, Seg::All, f),
         }
     }
 
     fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
-        match seg {
-            Seg::Delta => self.changed.estimate(pattern, Seg::All),
+        match seg.plain() {
             Seg::Old | Seg::All => self.all.estimate(pattern, Seg::All),
+            _ => self.changed.estimate(pattern, Seg::All),
         }
     }
 
