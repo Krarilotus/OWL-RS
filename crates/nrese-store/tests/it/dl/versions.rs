@@ -72,6 +72,10 @@ fn queries_during_commits_read_u1_at_their_snapshots_revision() {
     let store = dl.store();
     assert_eq!(store.dl_bounds().revision, store.current_revision());
     assert_eq!(store.dl_upper_facts(false), store.dl_upper_facts(true));
+    // With the result cache in front: repeats between commits came from it, keyed by
+    // the snapshot each answer was decided on (a stale one would break the counts).
+    let cache = store.query_cache_stats();
+    assert!(cache.hits + cache.shared > 0, "{cache:?}");
 }
 
 /// Runs `q` inside a transaction with `ops` pending: its rows and status.
