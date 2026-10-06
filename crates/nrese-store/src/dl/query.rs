@@ -216,6 +216,27 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
     analysis
 }
 
+/// The vocabulary the bounds don't cover: U1 bounds facts about individuals (class
+/// memberships, property values, equality); entailed schema statements (subclass,
+/// equivalence, subproperty, disjointness axioms as triples) are classification's. A
+/// variable predicate reads them too.
+fn unbounded(analysis: &Analysis) -> Option<String> {
+    const RESERVED: [&str; 3] = [
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "http://www.w3.org/2000/01/rdf-schema#",
+        "http://www.w3.org/2002/07/owl#",
+    ];
+    analysis
+        .reads
+        .iter()
+        .find_map(|(predicate, _)| match predicate {
+            None => Some("a variable predicate".to_owned()),
+            Some(p) if p == RDF_TYPE || p == OWL_SAME_AS => None,
+            Some(p) if RESERVED.iter().any(|ns| p.starts_with(ns)) => Some(format!("<{p}>")),
+            Some(_) => None,
+        })
+}
+
 /// Whether every predicate and class `analysis` reads has no fact in U1 beyond L.
 fn closed(analysis: &Analysis, view: &View, snapshot: &Snapshot) -> bool {
     if view.upper.is_none() {
@@ -290,7 +311,13 @@ pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Com
         );
     }
     let (snapshot, view) = super::bounds::view(store);
-    if closed(&analyse(prepared.query()), &view, &snapshot) {
+    let analysis = analyse(prepared.query());
+    if let Some(what) = unbounded(&analysis) {
+        return Completeness::sound_only(format!(
+            "the query reads {what}: entailed schema statements aren't bounded"
+        ));
+    }
+    if closed(&analysis, &view, &snapshot) {
         let mut status = Completeness::complete();
         status.path("closed-predicates");
         return status;
@@ -353,6 +380,13 @@ fn decide_answers(
         Verdict::Unknown(why) => status.add(format!(
             "the data's consistency under OWL 2 DL isn't known ({why})"
         )),
+    }
+    if let Some(what) = unbounded(&analysis) {
+        status.add(format!(
+            "the query reads {what}: entailed schema statements aren't bounded (the RL \
+             closure's are sound; /classification has the subsumptions under OWL 2 DL)"
+        ));
+        return Ok(Outcome::Stream(status));
     }
     if closed(&analysis, &view, &snapshot) {
         // One evaluation, streamed: L's answers are the certain ones.
