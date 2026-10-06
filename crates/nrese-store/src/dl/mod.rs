@@ -9,6 +9,8 @@
 //! - [`entailment`]: axiom entailment, reduced to consistency.
 //! - [`upper`]: the upper bound U1 in a stack of its own; [`bounds`]: U1 per revision,
 //!   maintained per commit, and the read view queries take.
+//! - [`query`]: the query path: closed predicates, the bounds, the exact services, the
+//!   status of every answer.
 //!
 //! The mode is the reasoner's (`ReasoningMode::Owl2Dl`): its OWL 2 RL closure is the
 //! inferred stack, the lower bound L. What the store adds is switched on by the mutation
@@ -20,6 +22,7 @@ pub mod config;
 pub mod consistency;
 pub mod entailment;
 pub(crate) mod gate;
+pub(crate) mod query;
 pub(crate) mod source;
 pub mod upper;
 
@@ -45,6 +48,7 @@ pub struct Dl {
     status: Mutex<Option<DlStatus>>,
     pub(crate) classification: classification::Cache,
     pub(crate) bounds: bounds::Bounds,
+    pub(crate) query_ontology: query::OntologyCache,
 }
 
 impl Dl {

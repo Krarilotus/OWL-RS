@@ -102,6 +102,8 @@ pub struct SparqlQueryRequest {
     /// Whose read it is (graph-level access control): the query's dataset is restricted
     /// to the graphs the scope reads.
     pub scope: crate::ReadScope,
+    /// Under `owl2-dl`: which answers this query asks for, over `dl.answers`.
+    pub dl_answers: Option<crate::DlAnswers>,
 }
 
 impl SparqlQueryRequest {
@@ -121,6 +123,7 @@ impl SparqlQueryRequest {
             memory_limit: None,
             as_written: false,
             scope,
+            dl_answers: None,
         }
     }
 }

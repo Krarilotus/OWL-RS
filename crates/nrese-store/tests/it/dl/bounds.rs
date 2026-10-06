@@ -95,7 +95,17 @@ fn the_upper_bound_is_never_visible_as_inferred_data() {
         .expect("query");
     let text = String::from_utf8(result.payload).expect("utf8");
     assert!(!text.contains("urn:nrese:u1:"), "{text}");
-    assert!(!ask(&dl, ":ann :parent ?someone"));
+    // That ann has a parent is certain; who isn't.
+    assert!(ask(&dl, ":ann :parent ?someone"));
+    let result = dl
+        .store()
+        .execute_query_str(&format!(
+            "{}SELECT ?p {{ :ann :parent ?p }}",
+            super::PREFIXES
+        ))
+        .expect("query");
+    let text = String::from_utf8(result.payload).expect("utf8");
+    assert!(!text.contains("\"value\""), "{text}");
 }
 
 #[test]

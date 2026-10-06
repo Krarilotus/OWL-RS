@@ -23,6 +23,13 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 | `infer=false` | Asserted statements only (the default reads asserted and inferred) |
 | `explain=true` | Run the query and return how it ran, as JSON: `executor`, `rewrites` (the rewrites that changed the query before it ran, in order: `triple-terms`, `join-groups`, `filter-pushdown`, `ask-limit`), `rows`, `micros`, and `steps` (one per operator: `depth`, `operator`, `detail`, `estimated_rows`, `rows`, `micros`) |
 | `explain=plan` | Return the plan the query would run as, without running it, as JSON: `executor`, `rewrites`, and `steps` (one per plan node from the top down: `depth`, `operator`, `detail`, `estimated_rows` from the store's statistics, `null` where unknown, as below a `SERVICE`) |
+| `dl-answers` | Under `reasoner.mode = "owl2-dl"`: which answers this query asks for, over `dl.answers`: `certain-where-complete`, `sound` or `exact` (fails with 409 when the answers can't be proven complete). Anything else is a 400 |
+
+**Under `owl2-dl`, every answer carries its status** ([design](../design/owl2-dl.md) §8; [reasoning-semantics.md](../spec/reasoning-semantics.md)). Answers are always sound. The response headers say whether they are complete:
+- `nrese-completeness`: `complete` or `sound-only`;
+- `nrese-completeness-bounds`, where the query went through the bounds: `lower=…; upper=…; proved=…; refuted=…; unresolved=…` (answers in the lower bound; in the upper bound; candidates of the gap an exact service proved, which are returned, or refuted; and those neither, which are not returned).
+
+`explain=true` and `explain=plan` carry the same status as `completeness`: `status`, `complete`, `sound`, `reasons` (why answers may be missing), `paths` (what decided: `closed-predicates`, `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`) and `bounds`; `null` outside `owl2-dl`. A query with its status is computed in full before the first byte (the status is a header); one whose predicates are closed streams as usual.
 
 Other parameters are ignored, so clients that send their own (`queryLn`, `timeout`) work.
 
@@ -275,7 +282,7 @@ With access enforced (the access state's `enforced` setting, on once a policy fi
 |---|---|
 | 400 | The request is wrong: syntax error, invalid IRI, malformed RDF, a commit rejected by a consistency check (with an explanation) |
 | 401, 403 | Authentication or authorisation failed; 403 also for a write to a graph the access policy doesn't let the user write |
-| 409 | The resource exists already (a repository), or the change would leave a workspace without an owner |
+| 409 | The resource exists already (a repository), or the change would leave a workspace without an owner; under `owl2-dl`, exact answers asked for (`dl-answers=exact`, `dl.answers = "exact"`) that can't be proven complete (the detail gives the reasons) |
 | 404 | The surface is disabled, or the named graph doesn't exist |
 | 406 | The client accepts no format the result has |
 | 408 | The policy timeout passed; a timed-out write was not committed |

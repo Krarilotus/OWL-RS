@@ -64,6 +64,8 @@ pub(crate) struct View {
     pub internal: HashSet<u64>,
     /// U1's facts beyond L.
     pub facts: usize,
+    /// U1 has no clash and checks every `⊥`: the data is consistent.
+    pub proves_consistency: bool,
 }
 
 fn triple(q: EncodedTriple) -> Triple {
@@ -294,6 +296,7 @@ fn build_view(snapshot: &Snapshot, state: &State) -> View {
                 gap_predicates: HashSet::new(),
                 internal: HashSet::new(),
                 facts: 0,
+                proves_consistency: false,
             };
         }
     };
@@ -313,6 +316,7 @@ fn build_view(snapshot: &Snapshot, state: &State) -> View {
         gap_predicates: HashSet::new(),
         internal: HashSet::new(),
         facts: upper.stack.len(),
+        proves_consistency: upper.proves_consistency(),
     };
     let mut quads = Vec::with_capacity(upper.stack.len());
     for [s, p, o] in upper.stack.iter() {
