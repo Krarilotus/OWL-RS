@@ -1,6 +1,8 @@
 % The custom-tc case's program for Nemo: the transitive closure of `edge`, as rules/tc.n3.
+% Left-recursive: nemo 0.10.1 panics on the right-recursive form (`edge(?x, ?y), path(?y, ?z)`,
+% index out of bounds in nemo-physical's rowscan.rs:83, 6 Oct 2026); both give the same closure.
 @import triple :- ntriples{resource="input.nt"} .
 edge(?x, ?y) :- triple(?x, <http://example.org/fast/edge>, ?y) .
 path(?x, ?y) :- edge(?x, ?y) .
-path(?x, ?z) :- edge(?x, ?y), path(?y, ?z) .
+path(?x, ?z) :- path(?x, ?y), edge(?y, ?z) .
 @export path :- csv{resource="path.csv"} .
