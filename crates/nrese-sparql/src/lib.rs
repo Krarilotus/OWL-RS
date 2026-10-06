@@ -13,10 +13,13 @@
 //! - [`query`] evaluates queries ([`evaluate_query`]) over id tables (`native`, the
 //!   execution core of D11)
 //! - [`update`] applies SPARQL Update requests ([`apply_update`])
+//! - [`cache`]: the results of query plan parts, shared by a store's queries
 
+pub mod cache;
 pub mod compat;
 pub mod dataset;
 pub mod plan;
+pub use cache::{PinRequest, PinnedResult, ResultCache, ResultCacheStats};
 pub use dataset::GraphAccess;
 mod native;
 pub mod query;

@@ -6,6 +6,7 @@ use axum::routing::{MethodRouter, delete, get, post, put};
 
 use crate::http::access_api;
 use crate::http::api_v1;
+use crate::http::cache_api;
 use crate::http::draft_check;
 use crate::http::handlers;
 use crate::http::rdf4j;
@@ -59,6 +60,14 @@ fn repository_routes() -> Router<AppState> {
         .route("/explain", get(api_v1::explain))
         .route("/queries", get(api_v1::running_queries))
         .route("/queries/{query}", delete(api_v1::cancel_query))
+        .route(
+            "/cache",
+            get(cache_api::cache_get).delete(cache_api::cache_delete),
+        )
+        .route(
+            "/cache/pins/{name}",
+            put(cache_api::pin_put).delete(cache_api::pin_delete),
+        )
         .route("/graphs", get(api_v1::graphs))
         .route("/import", post(api_v1::import))
         .route(

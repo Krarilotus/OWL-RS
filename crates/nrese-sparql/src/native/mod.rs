@@ -11,6 +11,8 @@
 //! smaller than the next pattern, and otherwise by merge joins on sorted scans or hash joins.
 //! `COUNT(*)` over a single pattern reads the count from the index.
 
+mod cache_key;
+mod cached;
 mod calendar;
 mod equality;
 mod equijoin;
@@ -160,7 +162,7 @@ pub(crate) fn evaluate<'a>(
         }
         None => pattern,
     };
-    let solutions = ctx.eval(&pattern)?;
+    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
     match form {
         Form::Select => {}
         Form::Describe => {
@@ -202,7 +204,7 @@ pub(crate) fn explain(
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, rewrites) = native_pattern(query, options, &ctx)?;
     ctx.trace = Some(RefCell::default());
-    let solutions = ctx.eval(&pattern)?;
+    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
     let steps = ctx.trace.take().unwrap_or_default().into_inner();
     // CONSTRUCT and DESCRIBE count triples.
     let rows = match form {
@@ -253,7 +255,7 @@ pub(crate) fn write_results(
         _ => {}
     }
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let solutions = match ctx.eval(&pattern) {
+    let solutions = match ctx.eval_root(&pattern, options.pin.as_ref()) {
         Ok(solutions) => solutions,
         Err(error) => return Some(Err(QueryEvaluationError::from(error).into())),
     };
@@ -1083,6 +1085,12 @@ struct Context<'a> {
     /// Whether GeoSPARQL relations in triple patterns are computed from geometries too
     /// (the query-rewrite extension; not [`QueryOptions::geosparql_stated_only`]).
     spatial_rewrite: bool,
+    /// The result cache and this context's part of its keys ([`cached`]); `None` without
+    /// one.
+    cache: Option<Arc<cached::CacheScope>>,
+    /// The name to pin the next part evaluated under: the query's whole pattern
+    /// ([`Context::eval_root`]).
+    pin: RefCell<Option<crate::cache::PinRequest>>,
 }
 
 /// The active graph of triple patterns.
@@ -1143,7 +1151,7 @@ impl<'a> Context<'a> {
             DefaultGraph::Merge(graphs) => (GraphScope::Union, graphs),
             DefaultGraph::Empty => (GraphScope::Missing, None),
         };
-        Self {
+        let mut ctx = Self {
             merge_set,
             named: resolved.named,
             as_written: options.as_written,
@@ -1183,7 +1191,16 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(|access| !access.service),
             equality_closed: options.equality_closed,
+            cache: None,
+            pin: RefCell::default(),
+        };
+        if let Some(cache) = &options.result_cache {
+            // Besides the context's options, a result depends on the base IRI (`IRI()`)
+            // and on the user's access, which may hide inferred statements.
+            let fixed = format!("{base:?} {:?}", options.access);
+            ctx.cache = Some(ctx.cache_scope(Arc::clone(cache), fixed.into_bytes().into()));
         }
+        ctx
     }
 
     /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
@@ -1226,6 +1243,7 @@ impl<'a> Context<'a> {
                 estimated_rows,
                 rows: rows as u64,
                 micros: start.elapsed().as_micros() as u64,
+                cache: None,
             });
         }
     }
@@ -1347,7 +1365,7 @@ impl<'a> Context<'a> {
 
     fn eval(&self, pattern: &GraphPattern) -> NativeResult<Solutions> {
         let Some(trace) = &self.trace else {
-            return self.eval_operator(pattern);
+            return self.eval_cached(pattern, None);
         };
         let depth = self.depth.get();
         // The plan's estimate of what this operator gives (`estimate`), as `plan_query`
@@ -1363,12 +1381,13 @@ impl<'a> Context<'a> {
                 estimated_rows,
                 rows: 0,
                 micros: 0,
+                cache: None,
             });
             trace.len() - 1
         };
         self.depth.set(depth + 1);
         let start = Instant::now();
-        let result = self.eval_operator(pattern);
+        let result = self.eval_cached(pattern, Some(index));
         self.depth.set(depth);
         if let Ok(solutions) = &result {
             let step = &mut trace.borrow_mut()[index];
@@ -2285,6 +2304,7 @@ impl<'a> Context<'a> {
             })
             .collect();
         let start = Instant::now();
+        let start_joins = start;
         if scans.len() >= 3
             && ranged.iter().all(Option::is_none)
             && scans.iter().all(ScanPattern::in_default_graph)
@@ -2332,6 +2352,17 @@ impl<'a> Context<'a> {
             })
         };
         let order = &plan.order;
+        // Each prefix of the order is a part of the result cache ([`cached::Joins`]): the
+        // longest one cached is where the joins start.
+        let given = filters.clone();
+        let joins = cached::Joins {
+            triples,
+            scans: &scans,
+            ranged: &ranged,
+            order,
+            filters: &given,
+        };
+        let reused = self.cached_prefix(&joins, filters, limit.is_some())?;
         let first = order[0];
         let join_var = order.get(1).and_then(|&i| {
             scans[first]
@@ -2339,24 +2370,39 @@ impl<'a> Context<'a> {
                 .into_iter()
                 .find(|v| scans[i].vars().contains(v))
         });
-        let mut result = match ranged[first] {
-            Some((permutation, ranges)) => self.scan_ranges(&scans[first], permutation, ranges)?,
-            None => self.scan(&scans[first], join_var.as_ref())?,
+        let (mut result, joined) = match reused {
+            Some(prefix) => prefix,
+            None => {
+                let result = match ranged[first] {
+                    Some((permutation, ranges)) => {
+                        self.scan_ranges(&scans[first], permutation, ranges)?
+                    }
+                    None => self.scan(&scans[first], join_var.as_ref())?,
+                };
+                if self.trace.is_some() {
+                    let operator = if ranged[first].is_some() {
+                        "range scan"
+                    } else {
+                        "scan"
+                    };
+                    let detail = triples[first].to_string();
+                    self.note(operator, detail, estimate(0), result.table.len(), start);
+                }
+                (self.filter_bound(result, filters)?, 1)
+            }
         };
-        if self.trace.is_some() {
-            let operator = if ranged[first].is_some() {
-                "range scan"
-            } else {
-                "scan"
-            };
-            let detail = triples[first].to_string();
-            self.note(operator, detail, estimate(0), result.table.len(), start);
+        // The whole pattern from the cache.
+        if joined > 1 && joined == order.len() {
+            return Ok(result);
         }
-        result = self.filter_bound(result, filters)?;
+        // Joins from `from` patterns on; the prefixes they make are offered to the cache
+        // (`offer`: not for a morsel, whose rows are some of the prefix's).
         let join_rest = |mut result: Solutions,
-                         filters: &mut Vec<(&Expression, Vec<Variable>)>|
+                         filters: &mut Vec<(&Expression, Vec<Variable>)>,
+                         from: usize,
+                         offer: bool|
          -> NativeResult<Solutions> {
-            for (step, &next) in order.iter().enumerate().skip(1) {
+            for (step, &next) in order.iter().enumerate().skip(from) {
                 let start = Instant::now();
                 let shared: Vec<Variable> = scans[next]
                     .vars()
@@ -2396,6 +2442,9 @@ impl<'a> Context<'a> {
                     self.note(operator, detail, estimate(step), result.table.len(), start);
                 }
                 result = self.filter_bound(result, filters)?;
+                if offer {
+                    self.offer_prefix(&joins, step + 1, &result, start_joins.elapsed());
+                }
             }
             Ok(result)
         };
@@ -2406,7 +2455,7 @@ impl<'a> Context<'a> {
         // most eight times the last. Small morsels also make the later joins probe the
         // index instead of scanning whole patterns.
         let Some(limit) = limit.filter(|_| result.table.width() > 0) else {
-            return join_rest(result, filters);
+            return join_rest(result, filters, joined, true);
         };
         // EXPLAIN: the rows the limit lets the pattern stop at, against what it would give.
         let limited = |detail: String, rows: usize, start: Instant| {
@@ -2425,7 +2474,7 @@ impl<'a> Context<'a> {
             return Ok(result);
         }
         if result.table.len() <= MIN_MORSEL {
-            return join_rest(result, filters);
+            return join_rest(result, filters, joined, false);
         }
         let sorted = result.table.sorted_by().to_vec();
         let mut parts: Vec<Solutions> = Vec::new();
@@ -2446,7 +2495,7 @@ impl<'a> Context<'a> {
             };
             // Each morsel applies the same conjuncts at the same steps.
             let mut left = filters.clone();
-            let part = join_rest(morsel, &mut left)?;
+            let part = join_rest(morsel, &mut left, joined, false)?;
             applied = Some(left);
             rows += part.table.len();
             parts.push(part);
@@ -2936,6 +2985,7 @@ impl<'a> Context<'a> {
                 estimated_rows: self.bgp_estimate(scans, counts),
                 rows: table.len() as u64,
                 micros: 0,
+                cache: None,
             });
         }
         Ok(Some(self.produced(Solutions {
