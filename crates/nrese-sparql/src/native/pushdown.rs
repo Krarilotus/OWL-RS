@@ -315,7 +315,7 @@ pub(super) fn movable(conjunct: &Expression) -> bool {
 }
 
 /// Whether the expression reads the whole solution (`EXISTS`) or draws a value per row.
-pub(super) fn per_solution(expression: &Expression) -> bool {
+pub(crate) fn per_solution(expression: &Expression) -> bool {
     match expression {
         Expression::Exists(_) => true,
         Expression::NamedNode(_)

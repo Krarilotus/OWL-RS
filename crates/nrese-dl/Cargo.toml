@@ -7,6 +7,12 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+
+# Test binaries that take more than ~15 s (the W3C OWL 2 DL suite, fuzzed ontologies, the
+# bounds on ORE samples): the push tier runs them when this crate changed, the commit
+# tier never (scripts/check.sh).
+[package.metadata.nrese]
+slow-tests = ["tableau_w3c", "tableau_fuzz", "bounds"]
 [dependencies]
 nrese-owl = { path = "../nrese-owl" }
 # The OWL 2 datatype map's value spaces, for the datatype theory.

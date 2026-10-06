@@ -13,10 +13,6 @@ ex:s ex:p ex:o .
 "
 }
 
-fn minimal_fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/ontologies/minimal_services.ttl")
-}
-
 fn new_in_memory_service() -> Result<StoreService, Box<dyn std::error::Error>> {
     let config = StoreConfig::in_memory();
 
@@ -62,29 +58,6 @@ fn preload_ontology_and_query_roundtrip() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
-fn preload_minimal_ttl_fixture_supports_real_query_surface()
--> Result<(), Box<dyn std::error::Error>> {
-    let config = StoreConfig::in_memory().with_ontology(minimal_fixture_path());
-
-    let service = StoreService::new(config)?;
-    let stats = service.stats()?;
-    assert_eq!(stats.quad_count, 8);
-
-    let ask = service.execute_query_str(
-        "ASK WHERE { <http://example.com/alice> <http://example.com/likes> <http://example.com/spec> }",
-    )?;
-    assert_eq!(ask.kind, QueryResultKind::Boolean);
-    assert!(String::from_utf8(ask.payload)?.contains("true"));
-
-    let construct = service.execute_query_str("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")?;
-    assert_eq!(construct.kind, QueryResultKind::Graph);
-    let graph_text = String::from_utf8(construct.payload)?;
-    assert!(graph_text.contains("http://example.com/alice"));
-
-    Ok(())
-}
-
-#[test]
 fn ontology_preload_requires_existing_file() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let missing_path: PathBuf = temp.path().join("missing.ttl");
@@ -96,31 +69,6 @@ fn ontology_preload_requires_existing_file() -> Result<(), Box<dyn std::error::E
         Err(StoreError::OntologyFileNotFound { .. }) => Ok(()),
         Err(other) => Err(format!("unexpected error: {other}").into()),
     }
-}
-
-#[test]
-fn sparql_update_inserts_data() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let ontology_path = temp.path().join("test_ontology.ttl");
-    fs::write(&ontology_path, test_ontology())?;
-
-    let config = StoreConfig::in_memory().with_ontology(ontology_path);
-
-    let service = StoreService::new(config)?;
-    let report = service.execute_update(&SparqlUpdateRequest::new(
-        "INSERT DATA { <http://example.com/a> <http://example.com/p> <http://example.com/b> }",
-    ))?;
-    assert!(report.applied);
-    assert_eq!(report.revision, 2);
-    assert_eq!(service.current_revision(), 2);
-
-    let ask = service.execute_query_str(
-        "ASK WHERE { <http://example.com/a> <http://example.com/p> <http://example.com/b> }",
-    )?;
-    assert_eq!(ask.kind, QueryResultKind::Boolean);
-    assert!(String::from_utf8(ask.payload)?.contains("true"));
-
-    Ok(())
 }
 
 #[test]

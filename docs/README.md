@@ -1,45 +1,48 @@
-# NRESE documentation index
+# NRESE documentation
 
-Where each concern is decided, and in which document the binding state lives.
-
-## Goal
-
-NRESE is an RDF database and ontology platform that **reads like QLever and governs data
-like GraphDB**: its own storage engine, materialised and incrementally maintained
-reasoning (RDFS, OWL 2 RL, user rules) on the way to OWL 2 DL, SHACL at commit, full-text
-search, the SPARQL 1.2 and RDF4J protocols, and one engine API under every client. It is a
-platform in its own right; ResearchSpace and the datamodel workflow are integrations that
-must work end to end ([vision](spec/00-vision-and-scope.md)). Fuseki is not a parity
-target ([ADR-0004](adr/0004-parity-targets-qlever-graphdb.md)).
-
-## Binding sources
+Each question has one document that answers it. When two disagree, the one higher in this
+list wins and the lower one is corrected in the same change.
 
 | Question | Document |
 |---|---|
-| Who owns what, in which layer is a fix made? | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| Why was something decided so? | [adr/](adr/) |
-| What is done, deferred, open? | [STATUS.md](STATUS.md), the one place for status |
-| What is built in which order? | [The roadmap](plan/2026-10-02-roadmap.md) (the current order), [ROADMAP.md](ROADMAP.md) and the plans in [plan/](plan/) (design and order, no status) |
+| Who owns what; in which layer is a problem fixed? | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Why was it decided so? | [adr/](adr/), the standing decisions in [ADR-0010](adr/0010-standing-product-decisions.md) |
+| In which order is it built? | [ROADMAP.md](ROADMAP.md) |
+| What is done, what is open? | [STATUS.md](STATUS.md); before v2 goes to `main`: the status table of the [merge checklist](plan/2026-10-05-v2-merge-checklist.md) |
+| Where are the gaps, who owns each? | [plan/2026-10-05-coverage.md](plan/2026-10-05-coverage.md) |
+| How is NRESE fast, which ideas worked and which didn't? | [design/performance.md](design/performance.md): the wins to keep with their guards (§0), the ideas by layer, the lab log |
+| How does a component work? | [design/](#design) |
+| What does reasoning compute? | [spec/reasoning-semantics.md](spec/reasoning-semantics.md) |
 | Where do we stand against QLever and GraphDB? | [spec/06-target-capability-matrix.md](spec/06-target-capability-matrix.md) |
-| What reasoning computes (rules, omissions, graph scope, consistency) | [spec/reasoning-semantics.md](spec/reasoning-semantics.md) |
-| Behaviour of the v1 implementation (historical) | [spec/02](spec/02-storage-and-transactions.md), [03](spec/03-reasoner-and-owl-profile.md), [04](spec/04-api-and-protocols.md) |
-| Operation and configuration | [ops/](ops/), above all [config-reference.md](ops/config-reference.md) |
-| The HTTP interface (endpoints, formats, status codes) | [ops/http-api.md](ops/http-api.md) |
-| ResearchSpace and the datamodel workflow | [integration/](integration/) |
-| Code rules | [dev/code-structure-guidelines.md](dev/code-structure-guidelines.md) |
+| How is it run and configured? | [ops/](#operations) |
+| How is it measured? | [benches/README.md](../benches/README.md), the rules in [benches/PROTOCOL.md](../benches/PROTOCOL.md) |
+| What should research find out next? | [plan/2026-10-05-research-tasks.md](plan/2026-10-05-research-tasks.md) |
 
-Superseded documents (the Fuseki gap matrix, the old implementation plan) are in
-[archive/](archive/).
+## Design
 
-## When documents disagree
+| Document | What |
+|---|---|
+| [performance.md](design/performance.md) | the performance ideas and their evidence; wins, guards, lab log |
+| [execution-core.md](design/execution-core.md) | the shared execution core (`nrese-exec`) |
+| [query-plan.md](design/query-plan.md) | the query plan: logical plan, rewrites, physical choices, EXPLAIN |
+| [reasoner-v2.md](design/reasoner-v2.md) | materialisation, maintenance, rulesets |
+| [reasoner-provenance.md](design/reasoner-provenance.md) | provenance, explanations, justifications |
+| [ql-rewriting.md](design/ql-rewriting.md) | OWL 2 QL answers through existentials: tree-witness rewriting over the closure, and the completeness each answer reports |
+| [owl2-dl.md](design/owl2-dl.md), [owl2-dl-performance.md](design/owl2-dl-performance.md) | the OWL 2 DL engines and their performance plan |
+| [shacl.md](design/shacl.md) | SHACL compilation and validation |
+| [rdf-bundle.md](design/rdf-bundle.md) | NRESE's own RDF, SPARQL-syntax and XSD crates |
+| [research-designs.md](design/research-designs.md) | equality, vectors, compression, graph access, transactions: what the research of 2 October decided |
+| [hardware-and-scaling.md](design/hardware-and-scaling.md) | using the hardware, scaling out, integration interfaces |
+| [reasoning-benchmark.md](design/reasoning-benchmark.md) | the reasoning benchmark's tasks, datasets and oracles |
 
-ARCHITECTURE before ADRs before the specs. The capability matrix alone holds the status,
-the roadmap and the current plan alone the order. Whoever finds a contradiction corrects
-the lower-ranked document in the same change.
+## Operations
 
-## Reading order
-
-1. this file;
-2. [ARCHITECTURE.md](ARCHITECTURE.md);
-3. [ROADMAP.md](ROADMAP.md) and the newest plan in [plan/](plan/);
-4. the spec or ADR of the concern at hand.
+[server-setup.md](ops/server-setup.md) (deploying, loading, moving data in),
+[config-reference.md](ops/config-reference.md) (every setting),
+[http-api.md](ops/http-api.md) (every endpoint),
+[replication.md](ops/replication.md), [backup-restore-drills.md](ops/backup-restore-drills.md).
+Integrations: [ResearchSpace](integration/researchspace.md),
+[the Datamodel Workflow](integration/datamodel-workflow.md).
+Contributing: [CONTRIBUTING.md](../CONTRIBUTING.md), [code rules](dev/code-structure-guidelines.md),
+the console: [frontend contract](dev/frontend-backend-contract.md),
+[extending it](dev/frontend-extension-guide.md).

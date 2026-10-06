@@ -11,7 +11,7 @@ use nrese_owl::{Axiom, ClassExpr, EntityKind, Ontology, ProofGraph, Term, normal
 use super::abox::Individuals;
 use super::atoms::{Atom, CTerm, ConceptId};
 use super::compile::{Compiled, Unsupported, compile};
-use super::engine::{Engine, Strategy, lock};
+use super::engine::{Budget, Engine, Strategy, lock};
 use super::profile::Profile;
 use super::state::{ClauseRef, ContextId, Rule};
 
@@ -25,6 +25,8 @@ pub struct Options {
     pub proofs: bool,
     /// How `nrese-owl` normalises.
     pub normalise: nrese_owl::Options,
+    /// What the saturation may use (unlimited by default); past it, [`Unsupported::Budget`].
+    pub budget: Budget,
 }
 
 impl Default for Options {
@@ -34,6 +36,7 @@ impl Default for Options {
             strategy: Strategy::Cautious,
             proofs: true,
             normalise: nrese_owl::Options::default(),
+            budget: Budget::default(),
         }
     }
 }
@@ -102,16 +105,28 @@ pub fn classify(
 
 /// Normalises, compiles and saturates `ontology`.
 pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Unsupported> {
+    let started = Instant::now();
+    let normalised = normalise_with(ontology, options.normalise);
+    let normalise = started.elapsed();
+    let classes = signature(ontology);
+    let mut saturated = saturate_normalised(&normalised, &classes, options)?;
+    saturated.profile.normalise = normalise;
+    Ok(saturated)
+}
+
+/// Compiles and saturates DL-clauses for the named classes `classes` (the classification
+/// driver's Horn lower bound runs it on the Horn part of an ontology's clauses).
+pub fn saturate_normalised(
+    normalised: &nrese_owl::Normalised,
+    classes: &[Term],
+    options: &Options,
+) -> Result<Saturated, Unsupported> {
     let mut profile = Profile {
         threads: options.threads.max(1),
         ..Profile::default()
     };
     let started = Instant::now();
-    let normalised = normalise_with(ontology, options.normalise);
-    profile.normalise = started.elapsed();
-    let started = Instant::now();
-    let classes = signature(ontology);
-    let compiled = compile(&normalised, &classes)?;
+    let compiled = compile(normalised, classes)?;
     profile.compile = started.elapsed();
     profile.compiled = compiled.stats;
     profile.dl_clauses = compiled.program.clauses.len();
@@ -121,7 +136,7 @@ pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Uns
     let started = Instant::now();
     let Compiled { program, abox, .. } = compiled;
     let named = program.named();
-    let engine = Engine::new(program, options.strategy, options.proofs);
+    let engine = Engine::new(program, options.strategy, options.proofs).with_budget(options.budget);
     let query: Vec<ContextId> = (0..named)
         .map(|c| engine.context_for(&[Atom::concept(c, CTerm::X)]).0)
         .collect();
@@ -130,6 +145,9 @@ pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Uns
     seeds.push(top);
     engine.run(&seeds, options.threads);
     let individuals = Individuals::saturate(&engine, &abox, options.threads);
+    if engine.exhausted() {
+        return Err(Unsupported::Budget);
+    }
     profile.saturate = started.elapsed();
     profile.contexts_created = engine.count();
     for (_, state) in engine.states() {
@@ -211,6 +229,73 @@ impl Saturated {
         out.unsatisfiable.sort_unstable();
         out.top.sort_unstable();
         out
+    }
+
+    /// The concept of `c` in the program, and whether it stands for `c`'s complement (a
+    /// fresh name the renaming flipped); `None` for a name the clauses don't have.
+    pub fn concept_of(&self, c: nrese_owl::Concept) -> Option<(ConceptId, bool)> {
+        let p = &self.engine.program;
+        match c {
+            nrese_owl::Concept::Named(t) => self.concept(t).map(|id| (id, false)),
+            nrese_owl::Concept::Fresh(q) => {
+                let flipped = *p.flipped.get(q as usize)?;
+                Some((p.order.named + q, flipped))
+            }
+        }
+    }
+
+    /// The role of a property, if the program has it.
+    pub fn role_of(&self, property: Term) -> Option<super::atoms::RoleId> {
+        self.engine.program.role_ids.get(&property).copied()
+    }
+
+    /// Saturation coupling (docs/design/owl2-dl.md §7): per named concept of the program
+    /// ([`Program::names`]), and for `owl:Thing` last, whether no context its query
+    /// context reaches (through successor links) has a clause with a head `B(x)` for a
+    /// `B` in `triggers` (about any term: `B(f(x))` is about a successor), or a head over
+    /// a role in `roles`. The model the calculus builds for the concept then has no
+    /// element in a trigger, so clauses left out of the program whose bodies need one
+    /// hold in it: what was derived for the concept is all that holds.
+    pub fn untouched(&self, triggers: &[ConceptId], roles: &[super::atoms::RoleId]) -> Vec<bool> {
+        let triggers: std::collections::HashSet<ConceptId> = triggers.iter().copied().collect();
+        let n = self.engine.count();
+        let mut tainted = vec![false; n];
+        let mut stack = Vec::new();
+        for (id, state) in self.engine.states() {
+            let c = &state.clauses;
+            let role = roles
+                .iter()
+                .any(|r| c.out_terms.contains_key(r) || c.in_terms.contains_key(r));
+            // Every head, whatever its term: a head `B(f(x))` here is about a successor
+            // whose own context never hears of `B` when no clause of the part reads it
+            // (only successor triggers are passed on), and the model's element has it.
+            let concept = c
+                .heads
+                .keys()
+                .any(|a| a.kind() == super::atoms::Kind::Concept && triggers.contains(&a.pred()));
+            if role || concept {
+                tainted[id as usize] = true;
+                stack.push(id);
+            }
+        }
+        while let Some(k) = stack.pop() {
+            let preds: Vec<ContextId> = lock(&self.engine.context(k).state)
+                .preds
+                .iter()
+                .map(|&(p, _)| p)
+                .collect();
+            for p in preds {
+                if !tainted[p as usize] {
+                    tainted[p as usize] = true;
+                    stack.push(p);
+                }
+            }
+        }
+        self.query
+            .iter()
+            .chain(std::iter::once(&self.top))
+            .map(|&c| !tainted[c as usize])
+            .collect()
     }
 
     fn concept(&self, class: Term) -> Option<ConceptId> {

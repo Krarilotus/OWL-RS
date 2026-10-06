@@ -12,8 +12,9 @@
 //!   look a core up or create its context.
 //! - **Termination:** the scope ends when no context is active or has mail.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 
 use hashbrown::HashMap;
 
@@ -33,6 +34,12 @@ pub enum Strategy {
     /// One context per set `K₁` of what certainly holds for the successor: more, smaller
     /// contexts.
     Eager,
+    /// As `Cautious`, but a successor whose filler isn't certain gets an empty-core
+    /// context of its own Skolem function instead of the one shared by all: the possible
+    /// atoms of unrelated successors then never combine in one context (on the ORE
+    /// development set the shared one held 25-80 % of all clauses, 99 % of what it
+    /// derived redundant).
+    Split,
 }
 
 /// A context: its inbox, activation flag, core and state.
@@ -101,13 +108,30 @@ impl Arena {
 }
 
 /// The program and the contexts saturating it.
+/// A context's key in the registry: its core and its tag ([`Engine::context_tagged`]).
+type CoreKey = (Box<[Atom]>, u32);
+
 pub struct Engine {
     pub program: Program,
     pub strategy: Strategy,
     /// Record each clause's derivation (for proofs).
     pub proofs: bool,
     contexts: Arena,
-    registry: Mutex<HashMap<Box<[Atom]>, ContextId>>,
+    registry: Mutex<HashMap<CoreKey, ContextId>>,
+    budget: Budget,
+    /// The budget ran out: the workers drop what is left (the saturation is then
+    /// incomplete and says so).
+    exhausted: AtomicBool,
+}
+
+/// What a saturation may use (the dynamic fallback's budgets, design §4, in their first
+/// form): past it, the run stops and is reported, never answered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Budget {
+    pub deadline: Option<Instant>,
+    /// The most conclusions one join of the Pred rule may produce (its premises'
+    /// combinations can grow as their product).
+    pub max_join: Option<usize>,
 }
 
 impl Engine {
@@ -118,7 +142,41 @@ impl Engine {
             proofs,
             contexts: Arena::new(),
             registry: Mutex::new(HashMap::new()),
+            budget: Budget::default(),
+            exhausted: AtomicBool::new(false),
         }
+    }
+
+    /// The engine with a budget.
+    pub fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    pub fn budget(&self) -> Budget {
+        self.budget
+    }
+
+    /// Whether the budget ran out (then the saturation is incomplete).
+    pub fn exhausted(&self) -> bool {
+        self.exhausted.load(Relaxed)
+    }
+
+    /// Marks the budget spent.
+    pub fn exhaust(&self) {
+        self.exhausted.store(true, Relaxed);
+    }
+
+    /// Whether the deadline passed (marks the budget spent if so).
+    pub(super) fn out_of_time(&self) -> bool {
+        if self.exhausted() {
+            return true;
+        }
+        if self.budget.deadline.is_some_and(|d| Instant::now() >= d) {
+            self.exhaust();
+            return true;
+        }
+        false
     }
 
     pub fn count(&self) -> usize {
@@ -139,13 +197,21 @@ impl Engine {
     /// # Panics
     /// Past 2³² contexts or the arena's segments (some 17 billion contexts).
     pub fn context_for(&self, core: &[Atom]) -> (ContextId, bool) {
+        self.context_tagged(core, 0)
+    }
+
+    /// The context with core `core` and tag `tag`: contexts with the same core and
+    /// different tags are separate (Succ may pick any context whose core holds, so
+    /// several with one core keep the calculus sound and complete; `Strategy::Split`).
+    pub fn context_tagged(&self, core: &[Atom], tag: u32) -> (ContextId, bool) {
         let mut registry = lock(&self.registry);
-        if let Some(&id) = registry.get(core) {
+        let key = (core.into(), tag);
+        if let Some(&id) = registry.get(&key) {
             return (id, false);
         }
         let id = self.contexts.push().expect("the context arena has room");
         let _ = self.context(id).core.set(core.into());
-        registry.insert(core.into(), id);
+        registry.insert(key, id);
         (id, true)
     }
 
@@ -197,7 +263,11 @@ impl Engine {
     fn work(&self, c: ContextId, deliver: &mut dyn FnMut(ContextId, Message)) {
         let context = self.context(c);
         loop {
-            let batch = std::mem::take(&mut *lock(&context.inbox));
+            let mut batch = std::mem::take(&mut *lock(&context.inbox));
+            if !batch.is_empty() && self.out_of_time() {
+                // Out of budget: the messages are dropped, the run reports it.
+                batch.clear();
+            }
             if batch.is_empty() {
                 context.active.store(false, SeqCst);
                 // A message delivered between the take and the store found the context

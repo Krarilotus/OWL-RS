@@ -66,17 +66,6 @@ fn started(
     Ok(store)
 }
 
-/// The revision `/readyz` reports.
-pub async fn ready_revision(app: axum::Router) -> Result<u64, Box<dyn std::error::Error>> {
-    let text = readyz_text(app).await?;
-    let at = text.find("\"revision\":").ok_or("no revision in /readyz")? + "\"revision\":".len();
-    let digits: String = text[at..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    Ok(digits.parse()?)
-}
-
 /// An app serving `store` as it is (already loaded or materialised).
 pub fn test_app_with_store(
     store: StoreService,
@@ -98,12 +87,6 @@ pub fn test_app_with_store(
 pub fn minimal_fixture_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/ontologies/minimal_services.ttl")
-}
-
-pub fn catalog_fixture_path(filename: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../benches/nrese-bench-harness/fixtures/catalog-cache")
-        .join(filename)
 }
 
 pub async fn body_text(
