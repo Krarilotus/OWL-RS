@@ -202,6 +202,7 @@ struct Args {
     count_allocations: bool,
     parse_only: bool,
     kernel: Option<String>,
+    classify: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -236,6 +237,7 @@ fn parse_args() -> Result<Args, String> {
         count_allocations: false,
         parse_only: false,
         kernel: None,
+        classify: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -261,10 +263,7 @@ fn parse_args() -> Result<Args, String> {
             "--reason" => {
                 let name = value()?;
                 args.reason = Some(
-                    ReasoningMode::REASONING
-                        .into_iter()
-                        .chain([ReasoningMode::Custom])
-                        .find(|mode| mode.as_str() == name)
+                    ReasoningMode::from_name(&name)
                         .ok_or(format!("--reason: unknown mode {name}"))?,
                 );
             }
@@ -304,6 +303,7 @@ fn parse_args() -> Result<Args, String> {
             "--count-allocations" => args.count_allocations = true,
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
+            "--classify" => args.classify = true,
             "--format" => {
                 args.format = match value()?.as_str() {
                     "tsv" => SolutionsResultFormat::Tsv,
@@ -699,6 +699,52 @@ fn first_value(store: &StoreService, text: &str) -> Option<String> {
     )
 }
 
+/// The rewrites EXPLAIN reports for `text` (`ql-tree-witness`, `join-groups`, ...).
+fn rewrites(store: &StoreService, text: &str) -> Vec<&'static str> {
+    PreparedQuery::parse(&SparqlQueryRequest::all(text))
+        .ok()
+        .and_then(|prepared| {
+            store
+                .explain_query(&prepared, &CancellationToken::new())
+                .ok()
+        })
+        .map(|explanation| explanation.rewrites)
+        .unwrap_or_default()
+}
+
+/// The status of `text`'s answers, as JSON (`null` where nothing can leave answers out):
+/// sound, complete, the bounds' counts and, under `owl2-dl`, the paths that decided.
+fn query_status(store: &StoreService, text: &str) -> String {
+    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+        return "null".to_owned();
+    };
+    match store.run_query_dl(
+        &prepared,
+        &CancellationToken::new(),
+        CountingSink::default(),
+    ) {
+        Ok(Some((status, detail))) => {
+            let bounds = status.bounds.as_ref().map_or("null".to_owned(), |b| {
+                format!(
+                    "{{\"lower\": {}, \"upper\": {}, \"unresolved\": {}}}",
+                    b.lower, b.upper, b.unresolved
+                )
+            });
+            format!(
+                "{{\"sound\": {}, \"complete\": {}, \"reasons\": {}, \"bounds\": {bounds}, \"paths\": {:?}, \"proved\": {}, \"refuted\": {}}}",
+                status.sound,
+                status.complete,
+                status.reasons.len(),
+                detail.paths,
+                detail.proved,
+                detail.refuted
+            )
+        }
+        Ok(None) => "null".to_owned(),
+        Err(e) => format!("{{\"error\": {:?}}}", e.to_string()),
+    }
+}
+
 /// The distinct operators `text` runs with, in the order EXPLAIN lists them.
 fn operators(store: &StoreService, text: &str) -> Vec<String> {
     let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
@@ -904,6 +950,14 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     let reasoner = ReasonerConfig::for_mode(args.reason.unwrap_or(ReasoningMode::Disabled))
         .with_rules(rules)?;
     let program = reasoner.materialised_program();
+    // Under `owl2-dl` the store enters the mode with its pipeline (the bounds, the
+    // consistency gate, a status on every answer); the commits below use the same one.
+    let mut dl_pipeline = reasoner.mode().is_dl().then(|| {
+        MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(reasoner.clone())),
+        )
+    });
     if let Some(program) = &program {
         if let Some((peak, rss)) = memory_mib() {
             eprintln!("before reasoning: memory peak {peak} MiB, resident {rss} MiB");
@@ -1037,10 +1091,12 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         .collect::<Result<_, _>>()?;
     if let Some(file) = &args.commits {
         let phase = Phase::start();
-        let pipeline = MutationPipeline::new(
-            Arc::clone(&store),
-            Arc::new(ReasonerService::new(reasoner.clone())),
-        );
+        let pipeline = dl_pipeline.take().unwrap_or_else(|| {
+            MutationPipeline::new(
+                Arc::clone(&store),
+                Arc::new(ReasonerService::new(reasoner.clone())),
+            )
+        });
         report.sections.push((
             "commits",
             modes::commits(&pipeline, file, &texts, args.readers)?,
@@ -1063,6 +1119,11 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             ));
         }
         phases.push(("commits", phase.json()));
+    }
+    if args.classify {
+        report
+            .sections
+            .push(("classification", modes::classification(&store, args.runs)?));
     }
     if !args.clients.is_empty() {
         // One level per count of clients, each with its own peak memory.
@@ -1198,6 +1259,14 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             {
                 extra.push_str(&format!(",\n      \"value\": {value:?}"));
             }
+            extra.push_str(&format!(
+                ",\n      \"rewrites\": {:?}",
+                rewrites(&store, text)
+            ));
+            extra.push_str(&format!(
+                ",\n      \"status\": {}",
+                query_status(&store, text)
+            ));
             extra.push_str(&format!(
                 ",\n      \"operators\": {:?}",
                 operators(&store, text)
