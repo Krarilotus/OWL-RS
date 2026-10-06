@@ -852,7 +852,10 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         equality_early_expansion: setting("NRESE_REASONING_EQUALITY_EXPANSION") == "early",
         equality_canonical_answers: setting("NRESE_REASONING_EQUALITY_ANSWERS") == "canonical",
         // The OWL 2 QL rewriting as the server takes it (`NRESE_REASONING_QL_REWRITING`).
-        ql_rewriting: setting("NRESE_REASONING_QL_REWRITING") != "off",
+        ql_rewriting: nrese_store::QlRewritingMode::from_name(&setting(
+            "NRESE_REASONING_QL_REWRITING",
+        ))
+        .unwrap_or_default(),
         ..config
     };
     COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
