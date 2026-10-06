@@ -32,7 +32,7 @@ import subprocess
 from pathlib import Path
 
 # The variables the suite and its adapters read; licence variables are recorded as set or not.
-SETTINGS = ["JAVA_HEAP", "DOCKER_MEMORY", "DOCKER_CPUS", "QUERY_MEMORY_MIB", "JENA_OWL_REASONER", "ONTOLOGY",
+SETTINGS = ["JAVA_HEAP", "DOCKER_MEMORY", "DOCKER_CPUS", "SKIP_COUNT", "QUERY_MEMORY_MIB", "JENA_OWL_REASONER", "ONTOLOGY",
             "NRESE_BENCH_SCRATCH", "NRESE_BENCH_KEEP", "NRESE_OXIGRAPH_SRC", "CARGO_TARGET_DIR"]
 SECRET_SETTINGS = ["NRESE_LICENSES", "GRAPHDB_LICENSE", "RDFOX_LICENSE", "RGGS_REPO"]
 
