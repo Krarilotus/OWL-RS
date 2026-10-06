@@ -1261,6 +1261,9 @@ pub(crate) struct Equality {
     produced: HashSet<Triple>,
     /// Scans for a term's partners so far (three per expanded fact).
     pub(crate) member_scans: u64,
+    /// The terms with a partner, once a round's delta was large enough to collect them
+    /// all; kept current from each later round's `sameAs` facts.
+    partners: Option<TermSet>,
 }
 
 /// The `owl:sameAs` id of `rules`, if they reason with equality (`eq-rep-s`).
@@ -1283,6 +1286,7 @@ impl Equality {
                 same_as,
                 produced: HashSet::new(),
                 member_scans: 0,
+                partners: None,
             }),
             super::ir::Term::Var(_) => None,
         }
@@ -1301,28 +1305,54 @@ impl Equality {
 
     /// The expansions of the delta of `store` (see the type's docs), not yet in it.
     pub(crate) fn run<S: Source + ?Sized>(&mut self, store: &S) -> Vec<Triple> {
-        if store.estimate([None, Some(self.same_as), None], Seg::All) == 0 {
+        let equalities = store.estimate([None, Some(self.same_as), None], Seg::All);
+        if equalities == 0 {
             self.produced.clear();
             return Vec::new();
         }
         let same_as = self.same_as;
-        // The terms with a partner: a fact mentioning none of them expands to itself only
-        // (#12 of the investigation of 6 October 2026).
-        let mut partners = TermSet::default();
-        store.scan([None, Some(same_as), None], Seg::All, &mut |[s, _, o]| {
-            if s != o {
-                partners.insert(s);
-                partners.insert(o);
-            }
-        });
+        // A fact mentioning no term with a partner expands to itself only (#12 of the
+        // investigation of 6 October 2026). Which terms have one: for a small delta (a
+        // commit's, beside a store's many equalities) each term of it is looked up; for
+        // a large one (the batch executor's rounds) they are collected once from all
+        // `sameAs` facts and then kept current from each round's.
+        if self.partners.is_none()
+            && store.estimate([None, None, None], Seg::Delta) * 8 >= equalities
+        {
+            let mut all = TermSet::default();
+            store.scan([None, Some(same_as), None], Seg::All, &mut |[s, _, o]| {
+                if s != o {
+                    all.insert(s);
+                    all.insert(o);
+                }
+            });
+            self.partners = Some(all);
+        } else if let Some(partners) = &mut self.partners {
+            store.scan([None, Some(same_as), None], Seg::Delta, &mut |[s, _, o]| {
+                if s != o {
+                    partners.insert(s);
+                    partners.insert(o);
+                }
+            });
+        }
+        let mut looked_up: HashMap<u64, bool> = HashMap::new();
+        let mut has_partner = |term: u64| match &self.partners {
+            Some(partners) => partners.contains(term),
+            None => *looked_up.entry(term).or_insert_with(|| {
+                // An upper bound: zero means no equality mentions the term.
+                store.estimate([Some(term), Some(same_as), None], Seg::All) > 0
+                    || store.estimate([None, Some(same_as), Some(term)], Seg::All) > 0
+            }),
+        };
         let mut seeds: Vec<Triple> = Vec::new();
         let mut merged: Vec<u64> = Vec::new();
+        let produced = &self.produced;
         store.scan([None, None, None], Seg::Delta, &mut |t| {
             if t[1] == same_as {
                 if t[0] != t[2] {
                     merged.push(t[0]);
                 }
-            } else if partners.mentioned(t) && !self.produced.contains(&t) {
+            } else if t.iter().any(|&term| has_partner(term)) && !produced.contains(&t) {
                 seeds.push(t);
             }
         });
