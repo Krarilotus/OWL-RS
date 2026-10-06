@@ -202,6 +202,141 @@ pub fn closure_sizes_until(
     )
 }
 
+/// The strongly connected components of a graph over the nodes `0..n`: each node's
+/// component, and each component's nodes. Components are numbered sinks first (reverse
+/// topological order), so a component's successors come before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Components {
+    /// Per node, its component.
+    pub component: Vec<u32>,
+    /// `members[starts[c]..starts[c + 1]]` are component c's nodes.
+    pub members: Vec<u32>,
+    pub starts: Vec<usize>,
+}
+
+impl Components {
+    /// The number of components.
+    pub fn len(&self) -> usize {
+        self.starts.len() - 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The strongly connected components of the graph whose node `v` has the successors
+/// `targets[offsets[v]..offsets[v + 1]]` (so `offsets` has one entry more than the
+/// graph has nodes): Tarjan's algorithm (1972), iterative, in O(n + m). `None` if `stop`
+/// fired. The SCC kernel the transitive closures here (the reasoner's transitive module,
+/// SPARQL's property paths) and the reasoner's recursion analysis share (G7 of the
+/// investigation of 6 October 2026).
+pub fn components_csr(
+    offsets: &[u32],
+    targets: &[u32],
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Option<Components> {
+    const UNSEEN: u32 = u32::MAX;
+    let n = offsets.len() - 1;
+    let successors =
+        |v: u32| &targets[offsets[v as usize] as usize..offsets[v as usize + 1] as usize];
+    let mut out = Components {
+        component: vec![0; n],
+        members: Vec::with_capacity(n),
+        starts: vec![0],
+    };
+    let mut order = vec![UNSEEN; n];
+    let mut low = vec![0u32; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<u32> = Vec::new();
+    // The depth-first path: each node with the index of its next successor.
+    let mut calls: Vec<(u32, usize)> = Vec::new();
+    let mut counter = 0u32;
+    let mut visit = |v: u32,
+                     order: &mut [u32],
+                     low: &mut [u32],
+                     on_stack: &mut [bool],
+                     stack: &mut Vec<u32>,
+                     calls: &mut Vec<(u32, usize)>| {
+        order[v as usize] = counter;
+        low[v as usize] = counter;
+        counter += 1;
+        stack.push(v);
+        on_stack[v as usize] = true;
+        calls.push((v, 0));
+    };
+    for root in 0..n as u32 {
+        if root % 4096 == 0 && stop() {
+            return None;
+        }
+        if order[root as usize] != UNSEEN {
+            continue;
+        }
+        visit(
+            root,
+            &mut order,
+            &mut low,
+            &mut on_stack,
+            &mut stack,
+            &mut calls,
+        );
+        while let Some(&(v, next)) = calls.last() {
+            if let Some(&w) = successors(v).get(next) {
+                calls.last_mut().expect("not empty").1 += 1;
+                if order[w as usize] == UNSEEN {
+                    visit(
+                        w,
+                        &mut order,
+                        &mut low,
+                        &mut on_stack,
+                        &mut stack,
+                        &mut calls,
+                    );
+                } else if on_stack[w as usize] {
+                    low[v as usize] = low[v as usize].min(order[w as usize]);
+                }
+                continue;
+            }
+            calls.pop();
+            if let Some(&(u, _)) = calls.last() {
+                low[u as usize] = low[u as usize].min(low[v as usize]);
+            }
+            if low[v as usize] == order[v as usize] {
+                let c = out.starts.len() as u32 - 1;
+                loop {
+                    let w = stack.pop().expect("v is on the stack");
+                    on_stack[w as usize] = false;
+                    out.component[w as usize] = c;
+                    out.members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                out.starts.push(out.members.len());
+            }
+        }
+    }
+    Some(out)
+}
+
+/// [`components_csr`] of the graph over the nodes `0..n` with `edges`.
+pub fn components(n: usize, edges: &[(u32, u32)]) -> Components {
+    let mut offsets = vec![0u32; n + 1];
+    for &(a, _) in edges {
+        offsets[a as usize + 1] += 1;
+    }
+    for i in 0..n {
+        offsets[i + 1] += offsets[i];
+    }
+    let mut targets = vec![0u32; edges.len()];
+    let mut at: Vec<u32> = offsets[..n].to_vec();
+    for &(a, b) in edges {
+        targets[at[a as usize] as usize] = b;
+        at[a as usize] += 1;
+    }
+    components_csr(&offsets, &targets, &|| false).expect("never stopped")
+}
+
 /// A relation's strongly connected components and, per component, the components it
 /// reaches.
 ///
@@ -250,17 +385,21 @@ impl Condensation {
             offsets[i + 1] += offsets[i];
         }
         let targets: Vec<u32> = pairs.iter().map(|&(_, b)| b).collect();
+        let Components {
+            component,
+            members,
+            starts,
+        } = components_csr(&offsets, &targets, stop)?;
         let mut g = Self {
             nodes,
             offsets,
             targets,
-            component: vec![0; n],
-            members: Vec::with_capacity(n),
-            starts: vec![0],
+            component,
+            members,
+            starts,
             cyclic: Vec::new(),
             reach: Vec::new(),
         };
-        g.tarjan(stop)?;
         g.reach(stop)?;
         Some(g)
     }
@@ -283,77 +422,6 @@ impl Condensation {
             Some(&[start, end]) => &self.members[start..end],
             _ => &[],
         }
-    }
-
-    /// Tarjan's algorithm, iterative. Components come out sinks first.
-    fn tarjan(&mut self, stop: &(dyn Fn() -> bool + Sync)) -> Option<()> {
-        const UNSEEN: u32 = u32::MAX;
-        struct Tarjan {
-            order: Vec<u32>,
-            low: Vec<u32>,
-            on_stack: Vec<bool>,
-            stack: Vec<u32>,
-            /// The depth-first path: each node with the index of its next successor.
-            calls: Vec<(u32, usize)>,
-            counter: u32,
-        }
-        impl Tarjan {
-            fn visit(&mut self, v: u32) {
-                self.order[v as usize] = self.counter;
-                self.low[v as usize] = self.counter;
-                self.counter += 1;
-                self.stack.push(v);
-                self.on_stack[v as usize] = true;
-                self.calls.push((v, 0));
-            }
-        }
-        let n = self.nodes.len();
-        let mut t = Tarjan {
-            order: vec![UNSEEN; n],
-            low: vec![0; n],
-            on_stack: vec![false; n],
-            stack: Vec::new(),
-            calls: Vec::new(),
-            counter: 0,
-        };
-        for root in 0..n as u32 {
-            if root % 4096 == 0 && stop() {
-                return None;
-            }
-            if t.order[root as usize] != UNSEEN {
-                continue;
-            }
-            t.visit(root);
-            while let Some(&(v, next)) = t.calls.last() {
-                if let Some(&w) = self.successors(v).get(next) {
-                    t.calls.last_mut().expect("not empty").1 += 1;
-                    if t.order[w as usize] == UNSEEN {
-                        t.visit(w);
-                    } else if t.on_stack[w as usize] {
-                        t.low[v as usize] = t.low[v as usize].min(t.order[w as usize]);
-                    }
-                    continue;
-                }
-                t.calls.pop();
-                if let Some(&(u, _)) = t.calls.last() {
-                    t.low[u as usize] = t.low[u as usize].min(t.low[v as usize]);
-                }
-                if t.low[v as usize] == t.order[v as usize] {
-                    let c = self.starts.len() as u32 - 1;
-                    loop {
-                        let w = t.stack.pop().expect("v is on the stack");
-                        t.on_stack[w as usize] = false;
-                        self.component[w as usize] = c;
-                        self.members.push(w);
-                        if w == v {
-                            break;
-                        }
-                    }
-                    self.starts.push(self.members.len());
-                }
-            }
-        }
-        Some(())
     }
 
     /// Reach per component, successors first.
@@ -513,5 +581,21 @@ mod tests {
         assert_eq!(adjacency.neighbours(9), &[] as &[u64]);
         assert_eq!(adjacency.reversed().neighbours(1), &[4]);
         assert_eq!(adjacency.sources(), &[1, 4]);
+    }
+
+    /// The SCC kernel: components, each once, sinks first.
+    #[test]
+    fn components_come_sinks_first() {
+        // 0 -> 1 <-> 2 -> 3 <-> 4, 5 alone, 6 -> 6.
+        let edges = [(0, 1), (1, 2), (2, 1), (2, 3), (3, 4), (4, 3), (6, 6)];
+        let found = components(7, &edges);
+        assert_eq!(found.len(), 5);
+        let c = &found.component;
+        assert_eq!((c[1], c[3]), (c[2], c[4]));
+        assert!(c[3] < c[1] && c[1] < c[0], "{c:?}");
+        let mut members: Vec<u32> = found.members.clone();
+        members.sort_unstable();
+        assert_eq!(members, (0..7).collect::<Vec<_>>());
+        assert_eq!(components(0, &[]).len(), 0);
     }
 }
