@@ -631,9 +631,10 @@ async fn the_console_is_served_from_the_binary() -> Result<(), Box<dyn std::erro
 #[tokio::test]
 async fn query_answers_say_whether_answers_through_existentials_are_complete()
 -> Result<(), Box<dyn std::error::Error>> {
+    // `auto`, the default: on under owl2-ql.
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Ql),
     )?;
     let update = |text: &'static str| {
         Request::builder()

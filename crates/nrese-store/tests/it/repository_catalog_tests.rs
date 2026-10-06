@@ -179,3 +179,56 @@ fn a_repository_keeps_its_own_query_timeout() {
     assert!(catalog.settings("broken").is_none());
     assert!(catalog.settings("public").is_some());
 }
+
+/// A repository chooses when its queries get OWL 2 QL answers through existentials
+/// (`ql_rewriting`), at once: `auto` (the server's default here) leaves `owl2-rl` with its
+/// standard semantics, `on` adds them.
+#[test]
+fn a_repository_switches_the_ql_rewriting() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let catalog = open(dir.path());
+    let rl = |ql: Option<&str>| RepositorySettings {
+        reasoning: Some("owl2-rl".to_owned()),
+        ql_rewriting: ql.map(str::to_owned),
+        ..RepositorySettings::default()
+    };
+    catalog.create("rl", rl(None)).expect("created");
+    let store = catalog
+        .get("rl")
+        .expect("rl")
+        .pipeline
+        .read()
+        .store()
+        .clone();
+    store
+        .execute_update_str(
+            "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {
+                <urn:Employee> rdfs:subClassOf [ a owl:Restriction ;
+                    owl:onProperty <urn:worksFor> ; owl:someValuesFrom owl:Thing ] .
+                <urn:bob> a <urn:Employee> .
+             }",
+        )
+        .expect("written");
+    store
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
+        .expect("materialised");
+    let employed = || {
+        let result = store
+            .execute_query_str("SELECT ?x WHERE { ?x <urn:worksFor> ?y }")
+            .expect("answered");
+        String::from_utf8(result.payload)
+            .expect("utf-8")
+            .contains("urn:bob")
+    };
+    assert!(!employed(), "auto: owl2-rl's own semantics");
+    catalog.change("rl", rl(Some("on"))).expect("changed");
+    assert!(employed(), "on: through the existential");
+    catalog.change("rl", rl(Some("off"))).expect("changed");
+    assert!(!employed(), "off");
+    assert!(matches!(
+        catalog.change("rl", rl(Some("sometimes"))),
+        Err(CatalogError::Invalid(_))
+    ));
+}

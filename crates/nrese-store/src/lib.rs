@@ -47,8 +47,8 @@ pub use backup::{
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
 pub use classification::{ClassificationReport, RealisationReport};
 pub use config::{
-    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity, ShaclGate,
-    StoreConfig, StoreMode,
+    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity,
+    QlRewritingMode, ShaclGate, StoreConfig, StoreMode,
 };
 pub use delta::MutationDeltaPreview;
 pub use dl::{DlAnswers, DlConfig, DlConsistency, DlDetail};

@@ -35,7 +35,7 @@ mod paths;
 mod plan;
 mod pushdown;
 pub(crate) use pushdown::per_solution;
-mod ql;
+pub(crate) mod ql;
 mod ranges;
 mod search;
 mod sets;
