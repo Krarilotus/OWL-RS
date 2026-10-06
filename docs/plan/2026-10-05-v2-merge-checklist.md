@@ -40,6 +40,8 @@ ranking of 5 October).
 | 5 | **Bounded tails:** a work budget per deletion with a fallback (overdelete-rederive, local counts, rematerialisation) | **check:** SSPE and clique-targeted Claros-LE in the suite | p99 over the bar below |
 | 6 | **DL from the persistent closure:** bounds kept per commit, the DL engine only on the gap | part of G3 above | — |
 
+| 7 | **Caching at least at QLever's level, then below it** (behind today: only whole serialised results per revision; QLever caches every plan subtree, shared across queries, computed once when concurrent, pinnable) | **check:** hit rates and serving memory on replayed query logs, caches on and off | v2: (1) plan-subtree results as id columns, shared, computed once, pinnable; (2) invalidation by each entry's footprint (predicates, graphs, inferred stack), then delta maintenance of cached aggregates and joins; (3) common subexpressions once per query (QL rewritings: NPD over 5,000 subqueries). Performance phase: (4) reuse what operators build (sorted runs, hash tables, semi-join filters, closures, compiled plans; MonetDB's recycler, HashStash); (5) the cache compressed, admitted and evicted by benefit: more hits per GB than QLever |
+
 Deferred to v3 or later: GPU, distribution, worst-case-optimal joins inside rules.
 
 **Targets** (to test, not promises):
@@ -60,6 +62,8 @@ Deferred to v3 or later: GPU, distribution, worst-case-optimal joins inside rule
 - [ ] DL: the reference comparison re-run on equal resources (the 3 October references ran
       in 2-CPU containers), all outliers against Konclude and HermiT in one run once the
       classification fixes are merged.
+- [ ] **Concurrent load** (measured for no system yet): clients 1 to 64 with `query-mix` on Sparqloscope (DBLP) and BSBM explore, writes under read load; throughput against p99, peak memory per concurrent client, throughput per GB. QLever with `--num-simultaneous-queries` 1 (defaults) and = cores (best configuration).
+- [ ] **QLever's published bars** for the basics: Sparqloscope on DBLP (502 M) and Wikidata truthy (7.9 B; QLever 2.43 s geometric mean, 2.0 % failed), SPARQL with text, export of large results, loading and serving dblp then Wikidata truthy. Later goals take theirs: autocompletion and maps (G11/G12), GeoSPARQL spatial joins on OSM, natural language to SPARQL (GRASP/GRISP), vector search (QUIVER).
 - [ ] A **defaults track** beside the best-configuration track: every system, NRESE included,
       on its out-of-the-box settings. "No tuning needed" is a claim only with this track.
 - [ ] **Home turf:** each competitor measured on what it is best at, not only on our
