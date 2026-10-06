@@ -121,7 +121,8 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
                         .unavailable
                         .map(|why| format!(" ({why})"))
                         .unwrap_or_default()
-                ) + &gap(&store),
+                ) + &gap(&store)
+                    + &realisation(&store),
             )
         }
         false => ("rules".to_owned(), String::new()),
@@ -134,6 +135,50 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
         engine,
         upper,
     }
+}
+
+/// With `DL_LAB_REALISE`: the store's realisation against U1's memberships beyond L of
+/// named individuals in named classes (the named gap): how many it entails.
+fn realisation(store: &StoreService) -> String {
+    const SKOLEM: &str = "urn:nrese:u1:";
+    const TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
+    if std::env::var("DL_LAB_REALISE").is_err() {
+        return String::new();
+    }
+    let gap: Vec<(String, String)> = store
+        .dl_upper_facts(false)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|[s, p, o]| p == TYPE && !s.contains(SKOLEM) && !o.contains(SKOLEM))
+        .map(|[s, _, o]| (s, o))
+        .collect();
+    let started = Instant::now();
+    let r = store
+        .realise(&nrese_store::ReadScope::All)
+        .expect("realisation");
+    let elapsed = started.elapsed();
+    let types: std::collections::HashMap<String, std::collections::HashSet<String>> = r
+        .types
+        .into_iter()
+        .map(|(a, cs)| {
+            (
+                format!("<{a}>"),
+                cs.into_iter().map(|c| format!("<{c}>")).collect(),
+            )
+        })
+        .collect();
+    let entailed = gap
+        .iter()
+        .filter(|(a, c)| types.get(a).is_some_and(|cs| cs.contains(c)))
+        .count();
+    format!(
+        "\n  realisation: {entailed} of {} named gap memberships entailed; complete {}, \
+         engine {}, {:.1} s (indicative)",
+        gap.len(),
+        r.incomplete.first().map_or("yes", String::as_str),
+        r.engine,
+        elapsed.as_secs_f64()
+    )
 }
 
 /// U1's facts beyond L per predicate (`a C` for a class), and how many of them name no
