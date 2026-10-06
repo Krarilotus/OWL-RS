@@ -38,6 +38,9 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
+    /// When queries are rewritten for OWL 2 QL ([`StoreConfig::ql_rewriting`], or the
+    /// repository's own, [`Self::set_ql_rewriting`]).
+    ql_mode: std::sync::Arc<std::sync::RwLock<crate::QlRewritingMode>>,
     /// The latest full materialisation's report (startup, load, ruleset change).
     last_materialisation:
         std::sync::Arc<std::sync::Mutex<Option<crate::reasoning::MaterialisationReport>>>,
@@ -53,6 +56,8 @@ pub struct StoreService {
     running: std::sync::Arc<crate::running::RunningQueries>,
     /// Inferred statements under graph access ([`crate::support`]).
     supports: std::sync::Arc<crate::support::Supports>,
+    /// The `owl2-dl` mode's state ([`crate::dl`]).
+    dl: std::sync::Arc<crate::dl::Dl>,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -95,6 +100,7 @@ impl StoreService {
         let query_cache = std::sync::Arc::new(crate::query_cache::QueryCache::new(
             config.query_cache_bytes,
         ));
+        let ql_mode = config.ql_rewriting;
         let settings = crate::query_executor::StoreSettings {
             union_default_graph: config.union_default_graph,
             geosparql_stated_only: config.geosparql_stated_only,
@@ -104,6 +110,7 @@ impl StoreService {
             equality_closed: std::sync::Arc::default(),
             equality_canonical: config.equality_canonical_answers,
             equality_early_expansion: config.equality_early_expansion,
+            ql: std::sync::Arc::default(),
         };
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
@@ -115,11 +122,13 @@ impl StoreService {
             sessions: std::sync::Arc::default(),
             running: std::sync::Arc::default(),
             supports: std::sync::Arc::default(),
+            dl: std::sync::Arc::default(),
             config,
             engine,
             preloaded_ontology,
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             materialised: std::sync::Arc::default(),
+            ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             last_materialisation: std::sync::Arc::default(),
         };
         if service.engine.snapshot().revision() != before {
@@ -127,6 +136,11 @@ impl StoreService {
         }
         if let Some(state) = service.reasoning_state() {
             service.note_equality(&state);
+            // Kept in memory too: reads ask for it per query ([`Self::status_without_dl`]).
+            *service
+                .materialised
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(state);
         }
         Ok(service)
     }
@@ -137,6 +151,7 @@ impl StoreService {
     /// A stack kept over representatives (`reasoner.equality = "compact"`) is read
     /// expanded: the engine learns `owl:sameAs` ([`nrese_engine::Engine::set_equality`]).
     fn note_equality(&self, state: &crate::ReasoningState) {
+        self.note_ql(state);
         let closed = nrese_reasoner::RuleProgram::closes_equality(&state.ruleset);
         self.settings
             .equality_closed
@@ -150,6 +165,39 @@ impl StoreService {
             })
             .flatten();
         self.engine.set_equality(same_as);
+    }
+
+    /// Switches the QL rewriting on for a closure it can rewrite over (docs/design/
+    /// ql-rewriting.md §4): `owl2-ql` and `owl2-rl` make the data H-complete, `owl2-rl`
+    /// with its list rules; the others don't close inverses or the domains of restrictions.
+    /// Under `owl2-dl` the bounds give those answers ([`crate::dl`]): no rewriting.
+    fn note_ql(&self, state: &crate::ReasoningState) {
+        use nrese_sparql::ql::{Closure, QlRewriting};
+        let closure = match state.ruleset.as_str() {
+            "owl2-rl" => Some(Closure { lists: true }),
+            "owl2-ql" => Some(Closure { lists: false }),
+            _ => None,
+        };
+        let closure =
+            closure.filter(|_| self.ql_rewriting().applies_to(&state.ruleset) && !self.dl.active());
+        let mut ql = self.settings.ql.write().unwrap_or_else(|p| p.into_inner());
+        // The same closure keeps its compiled schema.
+        if ql.as_ref().map(|q| q.closure()) != closure {
+            *ql = closure.map(|closure| std::sync::Arc::new(QlRewriting::new(closure)));
+        }
+    }
+
+    /// When queries are rewritten for OWL 2 QL.
+    pub fn ql_rewriting(&self) -> crate::QlRewritingMode {
+        *self.ql_mode.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Changes when queries are rewritten for OWL 2 QL (a repository's setting), at once.
+    pub fn set_ql_rewriting(&self, mode: crate::QlRewritingMode) {
+        *self.ql_mode.write().unwrap_or_else(|p| p.into_inner()) = mode;
+        if let Some(state) = self.reasoning_state() {
+            self.note_ql(&state);
+        }
     }
 
     /// The store's namespace prefixes ([`crate::namespaces`]).
@@ -192,6 +240,7 @@ impl StoreService {
         self.settings
             .equality_closed
             .store(false, Ordering::Release);
+        *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
         if !self.marker.swap(false, Ordering::AcqRel) {
             return Ok(());
@@ -366,17 +415,69 @@ impl StoreService {
         self.supports.use_rules(rules);
     }
 
+    /// Switches the `owl2-dl` mode's work on or off ([`crate::dl`]): the mutation
+    /// pipeline running the reasoner's `owl2-dl` mode registers it, and whether user rules
+    /// run with it.
+    pub fn use_dl(&self, active: bool, user_rules: bool) {
+        self.dl.set_active(active, user_rules);
+        if active {
+            // The bounds give the answers through existentials (see `note_ql`).
+            *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
+    /// Marks the store as a read replica: it follows a primary's log, whose dictionary
+    /// its own must continue, so the `owl2-dl` mode interns no term here (it reads the
+    /// terms the primary's records bring).
+    pub fn mark_replica(&self) {
+        self.dl.set_replica();
+    }
+
+    /// The `owl2-dl` mode's state.
+    pub fn dl(&self) -> &crate::dl::Dl {
+        &self.dl
+    }
+
+    /// The `owl2-dl` mode's bounds at the latest revision ([`crate::dl::bounds`]): the
+    /// upper bound U1 built afresh if it doesn't describe that revision.
+    pub fn dl_bounds(&self) -> crate::dl::BoundsReport {
+        crate::dl::bounds::report(self)
+    }
+
+    /// U1's facts beyond L, as maintained or (`afresh`) evaluated anew; for the
+    /// differential tests of its maintenance.
+    #[doc(hidden)]
+    pub fn dl_upper_facts(&self, afresh: bool) -> Option<Vec<[String; 3]>> {
+        crate::dl::bounds::upper_facts(self, afresh)
+    }
+
     pub fn execute_query(
         &self,
         request: &SparqlQueryRequest,
     ) -> StoreResult<SerializedQueryResult> {
         let prepared = self.prepare_query(request)?;
         let mut payload = Vec::new();
-        self.run_query(&prepared, &CancellationToken::new(), &mut payload)?;
+        let mut completeness = None;
+        self.run_query_reporting(
+            &prepared,
+            &CancellationToken::new(),
+            &mut payload,
+            |status| completeness = status,
+        )?;
+        let ql = match self.dl_mode(&prepared) {
+            Some(_) => None,
+            None => crate::query_executor::ql_status(
+                &self.read_snapshot(prepared.access()),
+                &prepared,
+                &self.settings,
+            ),
+        };
         Ok(SerializedQueryResult {
             kind: prepared.kind(),
             media_type: prepared.media_type(),
             payload,
+            ql,
+            completeness,
         })
     }
 
@@ -394,16 +495,105 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
+        self.run_query_reporting(prepared, cancellation, out, |_| {})
+    }
+
+    /// [`Self::run_query`], handing `report` whether the answers are complete, where a
+    /// reasoning path can leave some out (`None` where none can), before any answer is
+    /// written: a transport sends it ahead of them. Under `owl2-dl` the bounds' status
+    /// ([`crate::dl`]; the answers are then completed before the first byte), else the
+    /// OWL 2 QL rewriting's where it applies, else a ruleset closure's
+    /// ([`Self::status_without_dl`]). One status, [`nrese_sparql::Completeness`].
+    pub fn run_query_reporting(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+    ) -> StoreResult<()> {
+        self.run_reporting(prepared, cancellation, out, report)
+            .map(|_| ())
+    }
+
+    /// [`Self::run_query`] with the answers' status and, under `owl2-dl`, what decided it
+    /// (the paths, the candidates proved and refuted; empty outside the mode); `None`
+    /// where no reasoning path can leave answers out. For tests and the lab.
+    #[doc(hidden)]
+    pub fn run_query_dl(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+    ) -> StoreResult<Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>> {
+        let mut status = None;
+        let detail = self.run_reporting(prepared, cancellation, out, |s| status = s)?;
+        Ok(status.map(|s| (s, detail.unwrap_or_default())))
+    }
+
+    fn run_reporting(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+    ) -> StoreResult<Option<crate::dl::DlDetail>> {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
+        if let Some(mode) = self.dl_mode(prepared) {
+            use crate::dl::query::Outcome;
+            return Ok(Some(
+                match crate::dl::query::answer(self, prepared, cancellation, mode)? {
+                    Outcome::Answers(answers, status, detail) => {
+                        report(Some(status));
+                        crate::query_executor::write_answers(prepared, answers, out)?;
+                        detail
+                    }
+                    // L adds memberships to the snapshot: streamed over its view, uncached.
+                    Outcome::Stream(status, Some(lower), detail) => {
+                        report(Some(status));
+                        run_query(&lower, prepared, &self.settings, cancellation, out)?;
+                        detail
+                    }
+                    // Over the lower bound as every query runs, its status known already.
+                    Outcome::Stream(status, None, detail) => {
+                        report(Some(status));
+                        let snapshot = self.read_snapshot(prepared.access());
+                        self.run_cached(&snapshot, prepared, cancellation, out)?;
+                        detail
+                    }
+                },
+            ));
+        }
         let snapshot = self.read_snapshot(prepared.access());
+        let status = match crate::query_executor::ql_status(&snapshot, prepared, &self.settings) {
+            Some(ql) => Some(ql.completeness),
+            None => self.status_without_dl(prepared),
+        };
+        report(status);
+        self.run_cached(&snapshot, prepared, cancellation, out)?;
+        Ok(None)
+    }
+
+    /// Runs `prepared` on `snapshot` through the result cache.
+    fn run_cached(
+        &self,
+        snapshot: &nrese_engine::Snapshot,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+    ) -> StoreResult<()> {
         let settings = &self.settings;
         if !self.query_cache.enabled() || prepared.volatile() {
-            return run_query(&snapshot, prepared, settings, cancellation, out);
+            return run_query(snapshot, prepared, settings, cancellation, out);
         }
+        // The rewriting's mode changes answers without a new revision.
         let key = crate::query_cache::CacheKey {
-            request: prepared.cache_request(),
+            request: format!(
+                "{}\u{0}ql={}",
+                prepared.cache_request(),
+                self.ql_rewriting().name()
+            ),
             revision: snapshot.revision(),
         };
         let mut out = out;
@@ -416,11 +606,52 @@ impl StoreService {
             copy: Some(Vec::new()),
             limit: self.query_cache.max_entry(),
         };
-        run_query(&snapshot, prepared, settings, cancellation, &mut tee)?;
+        run_query(snapshot, prepared, settings, cancellation, &mut tee)?;
         if let Some(copy) = tee.copy {
             self.query_cache.insert(key, copy);
         }
         Ok(())
+    }
+
+    /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
+    /// without reasoning, or for asserted statements only): sound, and complete only for
+    /// what the ruleset derives, never certain answers under OWL 2 DL. Known before the
+    /// query runs.
+    pub fn status_without_dl(
+        &self,
+        prepared: &PreparedQuery,
+    ) -> Option<nrese_sparql::Completeness> {
+        if self.dl.active() || prepared.read_model() == ReadModel::Asserted {
+            return None;
+        }
+        let ruleset = self
+            .materialised
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()?
+            .ruleset
+            .clone();
+        let mut status = nrese_sparql::Completeness::default();
+        status.incomplete(
+            "rules",
+            format!(
+                "answers over the {ruleset} closure: what its rules derive, not every \
+                 certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
+            ),
+        );
+        Some(status)
+    }
+
+    /// Under `owl2-dl`, the answers a query reading the inferred statements asks for;
+    /// `None` for any other query (or mode).
+    fn dl_mode(&self, prepared: &PreparedQuery) -> Option<crate::DlAnswers> {
+        (self.dl.active() && prepared.read_model() == ReadModel::Materialised)
+            .then(|| prepared.dl_answers().unwrap_or(self.config.dl.answers))
+    }
+
+    /// What every query gets from the store.
+    pub(crate) fn query_settings(&self) -> &crate::query_executor::StoreSettings {
+        &self.settings
     }
 
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
@@ -433,22 +664,52 @@ impl StoreService {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
-        explain_prepared(
+        let mut explanation = explain_prepared(
             &self.read_snapshot(prepared.access()),
             prepared,
             &self.settings,
             cancellation,
-        )
+        )?;
+        if let Some(mode) = self.dl_mode(prepared) {
+            // The status as the query would answer, never failing for it.
+            let mode = match mode {
+                crate::DlAnswers::Exact => crate::DlAnswers::CertainWhereComplete,
+                other => other,
+            };
+            let (status, detail) =
+                match crate::dl::query::answer(self, prepared, cancellation, mode)? {
+                    crate::dl::query::Outcome::Answers(_, status, detail)
+                    | crate::dl::query::Outcome::Stream(status, _, detail) => (status, detail),
+                };
+            explanation.completeness = Some(status);
+            explanation.decided_by = detail.paths;
+        } else {
+            explanation.completeness = explanation
+                .ql
+                .as_ref()
+                .map(|ql| ql.completeness.clone())
+                .or_else(|| self.status_without_dl(prepared));
+        }
+        Ok(explanation)
     }
 
     /// The plan `prepared` would run as, each node with its estimated rows, without
     /// running it (EXPLAIN without ANALYZE).
     pub fn plan_query(&self, prepared: &PreparedQuery) -> StoreResult<crate::PlannedQuery> {
-        plan_prepared(
+        let mut planned = plan_prepared(
             &self.read_snapshot(prepared.access()),
             prepared,
             &self.settings,
-        )
+        )?;
+        planned.completeness = match self.dl_mode(prepared) {
+            Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
+            None => planned
+                .ql
+                .as_ref()
+                .map(|ql| ql.completeness.clone())
+                .or_else(|| self.status_without_dl(prepared)),
+        };
+        Ok(planned)
     }
 
     /// Bytes of intermediate results the running queries hold now, the most they held at
@@ -457,6 +718,20 @@ impl StoreService {
     pub fn query_memory(&self) -> Option<(usize, usize, usize)> {
         let budget = self.settings.query_memory.as_ref()?;
         Some((budget.used(), budget.peak(), budget.limit()))
+    }
+
+    /// `query` printed as standard SPARQL 1.1 for a store without reasoning that holds
+    /// this store's asserted statements (its schema included): answering as this store does
+    /// under `owl2-rl` with the QL rewriting on (docs/design/ql-rewriting.md §8), or why it
+    /// can't be written exactly. For benchmarks of stores without reasoning.
+    pub fn print_query(
+        &self,
+        query: &str,
+        form: nrese_sparql::ql::PrintForm,
+    ) -> StoreResult<nrese_sparql::ql::Printed> {
+        let query = nrese_sparql::compat::parse_query(query, None)?;
+        let snapshot = self.read_snapshot(None);
+        Ok(nrese_sparql::ql::print(&snapshot, &query, form)?)
     }
 
     /// A query over every graph (the server's own work, tests).
@@ -540,11 +815,38 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
+        self.run_query_pending_reporting(pending, prepared, cancellation, out, |_| {})
+    }
+
+    /// [`Self::run_query_pending`], handing `report` the answers' status as
+    /// [`Self::run_query_reporting`] does. The pending data has no DL bounds: under
+    /// `owl2-dl` its answers are its closure's, sound only.
+    pub fn run_query_pending_reporting(
+        &self,
+        pending: &crate::StatementsRequest,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+    ) -> StoreResult<()> {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let scope = crate::ReadScope::of(prepared.access().cloned());
+        let in_dl = self.dl_mode(prepared).is_some();
         self.with_pending(pending, &scope, cancellation, |snapshot| {
+            let mut status = crate::query_executor::ql_status(snapshot, prepared, &self.settings)
+                .map(|ql| ql.completeness)
+                .or_else(|| self.status_without_dl(prepared));
+            if in_dl {
+                status.get_or_insert_with(Default::default).incomplete(
+                    "dl",
+                    "a read inside a transaction: the pending data's closure, without the \
+                     DL bounds"
+                        .to_owned(),
+                );
+            }
+            report(status);
             run_query(snapshot, prepared, &self.settings, cancellation, out)
         })
     }
@@ -1061,6 +1363,7 @@ impl StoreService {
             violations: closure.violations.len(),
             rounds: closure.rounds,
             elapsed: started.elapsed(),
+            phases: closure.phases,
             ..reported
         };
         *self

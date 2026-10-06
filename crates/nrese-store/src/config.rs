@@ -45,6 +45,10 @@ pub struct StoreConfig {
     /// Reasoning leaves out memberships in unnamed union classes that nothing consumes
     /// (`reasoner.unnamed_classes = "skip"`; work package W7).
     pub hide_unnamed_classes: bool,
+    /// OWL 2 QL answers through existentials by tree-witness rewriting
+    /// (`reasoner.ql_rewriting`, docs/design/ql-rewriting.md §4); a repository's settings
+    /// may choose another.
+    pub ql_rewriting: QlRewritingMode,
     /// Full materialisations with equality rules compute the closure over representatives
     /// of the `owl:sameAs` classes and expand it (`reasoner.equality = "representatives"`,
     /// the default) instead of copying every fact to every identity while computing it
@@ -91,6 +95,47 @@ pub struct StoreConfig {
     /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
+    /// The `owl2-dl` mode's settings (`dl.*`), used when the reasoner runs that mode.
+    pub dl: crate::dl::DlConfig,
+}
+
+/// When queries get the OWL 2 QL answers through existentials (`reasoner.ql_rewriting`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QlRewritingMode {
+    /// Under `owl2-ql`, the profile that names them; not under `owl2-rl`, whose users chose
+    /// its standard semantics (and answer counts equal to other systems' `owl2-rl`).
+    #[default]
+    Auto,
+    /// Under `owl2-ql` and `owl2-rl`.
+    On,
+    Off,
+}
+
+impl QlRewritingMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    /// The mode named `name` (`auto`, `on`, `off`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Auto, Self::On, Self::Off]
+            .into_iter()
+            .find(|mode| mode.name() == name)
+    }
+
+    /// Whether queries over a closure of `ruleset` are rewritten.
+    pub fn applies_to(self, ruleset: &str) -> bool {
+        match (self, ruleset) {
+            (Self::Off, _) => false,
+            (_, "owl2-ql") => true,
+            (Self::On, "owl2-rl") => true,
+            _ => false,
+        }
+    }
 }
 
 /// The SHACL commit gate's policy.
@@ -185,6 +230,7 @@ impl StoreConfig {
             process_memory_bytes: default_process_memory_bytes(),
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            ql_rewriting: QlRewritingMode::Auto,
             equality_by_representatives: true,
             equality_compact: false,
             equality_canonical_answers: false,
@@ -197,6 +243,7 @@ impl StoreConfig {
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
+            dl: crate::dl::DlConfig::default(),
         }
     }
 
@@ -213,6 +260,7 @@ impl StoreConfig {
             process_memory_bytes: default_process_memory_bytes(),
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            ql_rewriting: QlRewritingMode::Auto,
             equality_by_representatives: true,
             equality_compact: false,
             equality_canonical_answers: false,
@@ -225,6 +273,7 @@ impl StoreConfig {
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
+            dl: crate::dl::DlConfig::default(),
         }
     }
 
@@ -240,6 +289,11 @@ impl StoreConfig {
                 "compact equality storage computes over representatives; it needs \
                  equality_by_representatives"
                     .to_owned(),
+            ));
+        }
+        if self.dl.max_candidates == 0 || self.dl.timeout.is_zero() {
+            return Err(StoreError::Configuration(
+                "dl.max_candidates and dl.timeout must be above 0".to_owned(),
             ));
         }
         if self.support_sets == 0 {

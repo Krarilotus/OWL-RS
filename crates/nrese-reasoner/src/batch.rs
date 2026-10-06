@@ -257,6 +257,33 @@ pub struct Phases {
     pub modules: std::time::Duration,
     pub merge: std::time::Duration,
     pub consistency: std::time::Duration,
+    /// Head facts the rule joins' bindings produced, before any deduplication: with
+    /// `new_facts`, the bindings per derived fact (tautological and re-derived ones
+    /// included; the fast suite's rule-work cases).
+    pub bindings: u64,
+    /// Membership probes of the rule joins' facts against the working set.
+    pub probes: u64,
+    /// The new facts the rounds added.
+    pub new_facts: u64,
+    /// Whole materialisations run: one (equality by representatives merges classes
+    /// within the rounds since R4; it ran one per pass that derived a new `owl:sameAs`).
+    pub passes: u64,
+}
+
+impl Phases {
+    /// Adds `other`'s times and work to these.
+    pub fn add(&mut self, other: &Self) {
+        self.load += other.load;
+        self.grounding += other.grounding;
+        self.joins += other.joins;
+        self.modules += other.modules;
+        self.merge += other.merge;
+        self.consistency += other.consistency;
+        self.bindings += other.bindings;
+        self.probes += other.probes;
+        self.new_facts += other.new_facts;
+        self.passes += other.passes;
+    }
 }
 
 /// Pairs per chunk of a run that is merged later: 16 MiB. Tiny in the unit tests, so
@@ -1765,6 +1792,7 @@ fn run(
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut phases = Phases {
         load,
+        passes: 1,
         ..Phases::default()
     };
     let mut result = Materialisation::default();
@@ -1883,7 +1911,8 @@ fn run(
         ));
         let counters = &mut result.counters;
         counters.driver_bytes_copied += jobs.iter().map(Job::copied_bytes).sum::<usize>();
-        counters.probes.push(probes.probes.into_inner());
+        let asked = probes.probes.into_inner();
+        counters.probes.push(asked);
         counters.unordered_probes += probes.unordered.into_inner();
         let mut round = 0;
         for (job, count) in jobs.iter().zip(probes.bindings) {
@@ -1900,6 +1929,8 @@ fn run(
             }
         }
         counters.bindings.push(round);
+        phases.probes += asked;
+        phases.bindings += probes.emitted.into_inner();
         drop(jobs);
         check_stop()?;
         phases.joins += clock.elapsed();
@@ -1969,6 +2000,7 @@ fn run(
         // Every candidate was checked against the store, which a round doesn't change.
         let (new, schema_facts) = store.advance_new(candidates, schema);
         phases.merge += clock.elapsed();
+        phases.new_facts += new as u64;
         result.counters.store_bytes.push(store.bytes());
         if new == 0 && !reground_all {
             break;

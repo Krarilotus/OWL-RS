@@ -15,10 +15,12 @@
 //! - [`update`] applies SPARQL Update requests ([`apply_update`])
 
 pub mod compat;
+pub mod completeness;
 pub mod dataset;
 pub mod plan;
 pub use dataset::GraphAccess;
 mod native;
+pub mod ql;
 pub mod query;
 pub mod results;
 pub mod service;
@@ -42,11 +44,12 @@ pub mod expression {
     pub use crate::native::expr::Evaluator;
 }
 
+pub use completeness::Completeness;
 pub use native::{ResultsFormat, geometry_literal};
 pub use nrese_exec::{BudgetExceeded, SharedBudget};
 pub use query::{
     Explanation, PlanStep, PlannedQuery, PlannedStep, QueryOptions, WriteResultsError,
-    evaluate_query, explain_query, plan_query, runs_natively, write_results,
+    evaluate_query, explain_query, plan_query, ql_report, runs_natively, write_results,
 };
 pub use results::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,

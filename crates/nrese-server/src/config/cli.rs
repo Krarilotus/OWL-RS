@@ -11,6 +11,11 @@ use anyhow::{Result, bail};
 /// directory; the engine's directory lock enforces that);
 /// `nrese-server query [--config PATH] [--format F] (QUERY | --file PATH)` answers one query
 /// from the configured store on standard output (the same lock);
+/// `nrese-server print-query [--config PATH] [--form paths|values] [--schema FILE]...
+/// (QUERY | --file PATH)` prints the query as standard SPARQL 1.1 that answers, on a store
+/// without reasoning holding the same statements, as NRESE answers it under `owl2-rl` with
+/// the QL rewriting on (against the configured store, or with `--schema` against those files
+/// alone; exit status 2 if it can't be written exactly);
 /// `nrese-server convert INPUT OUTPUT` converts an RDF file into another format (by the
 /// extensions), without a store;
 /// `nrese-server backup DIR` writes an image backup of the configured store into `DIR`
@@ -40,6 +45,8 @@ pub enum CliCommand {
     /// `config-schema`: print the JSON Schema of the configuration file and exit.
     ConfigSchema,
     Query(QueryCommand),
+    /// `print-query`: the query as standard SPARQL 1.1 for a store without reasoning.
+    PrintQuery(PrintQueryCommand),
     Convert(ConvertCommand),
     /// `backup DIR`: an image backup of the store into `DIR`.
     Backup(PathBuf),
@@ -126,6 +133,18 @@ pub struct QueryCommand {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrintQueryCommand {
+    /// The query text, or the file holding it.
+    pub query: Option<String>,
+    pub file: Option<PathBuf>,
+    /// `paths` (property paths over the schema, the default) or `values` (the hierarchy
+    /// enumerated).
+    pub form: Option<String>,
+    /// Schema files to print against, in an in-memory store, instead of the configured store.
+    pub schema: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConvertCommand {
     pub input: PathBuf,
     pub output: PathBuf,
@@ -166,6 +185,12 @@ impl CliConfig {
         } else if args.peek().is_some_and(|argument| argument == "query") {
             args.next();
             config.command = CliCommand::Query(QueryCommand::default());
+        } else if args
+            .peek()
+            .is_some_and(|argument| argument == "print-query")
+        {
+            args.next();
+            config.command = CliCommand::PrintQuery(PrintQueryCommand::default());
         } else if args.peek().is_some_and(|argument| argument == "convert") {
             args.next();
             config.command = CliCommand::Convert(ConvertCommand::default());
@@ -232,6 +257,29 @@ impl CliConfig {
                         query.file = Some(PathBuf::from(file));
                     } else if query.query.is_none() && query.file.is_none() {
                         query.query = Some(text(argument, "query")?);
+                    } else {
+                        bail!("unsupported argument: {:?}", argument);
+                    }
+                    continue;
+                }
+                CliCommand::PrintQuery(print) => {
+                    if argument == "--form" {
+                        let Some(form) = args.next() else {
+                            bail!("missing value for --form");
+                        };
+                        print.form = Some(text(form, "form")?);
+                    } else if argument == "--file" {
+                        let Some(file) = args.next() else {
+                            bail!("missing value for --file");
+                        };
+                        print.file = Some(PathBuf::from(file));
+                    } else if argument == "--schema" {
+                        let Some(file) = args.next() else {
+                            bail!("missing value for --schema");
+                        };
+                        print.schema.push(PathBuf::from(file));
+                    } else if print.query.is_none() && print.file.is_none() {
+                        print.query = Some(text(argument, "query")?);
                     } else {
                         bail!("unsupported argument: {:?}", argument);
                     }
@@ -329,6 +377,18 @@ impl CliConfig {
         {
             bail!("`query` needs a query or --file (one of them)");
         }
+        if let CliCommand::PrintQuery(print) = &config.command {
+            if print.query.is_some() == print.file.is_some() {
+                bail!("`print-query` needs a query or --file (one of them)");
+            }
+            if print
+                .form
+                .as_deref()
+                .is_some_and(|form| !matches!(form, "paths" | "values"))
+            {
+                bail!("--form is paths or values");
+            }
+        }
         if let CliCommand::Convert(convert) = &config.command
             && convert.output.as_os_str().is_empty()
         {
@@ -352,7 +412,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{CliCommand, CliConfig, ConvertCommand, LoadCommand, QueryCommand, RestoreCommand};
+    use super::{
+        CliCommand, CliConfig, ConvertCommand, LoadCommand, PrintQueryCommand, QueryCommand,
+        RestoreCommand,
+    };
 
     fn parse(args: &[&str]) -> anyhow::Result<CliConfig> {
         CliConfig::from_args(
@@ -456,6 +519,29 @@ mod tests {
         assert_eq!(config.config_path, Some(PathBuf::from("n.toml")));
         assert!(parse(&["query"]).is_err());
         assert!(parse(&["query", "--file", "q.rq", "SELECT * {}"]).is_err());
+        let config = parse(&[
+            "print-query",
+            "--form",
+            "values",
+            "--schema",
+            "a.ttl",
+            "--schema",
+            "b.nt",
+            "SELECT * {}",
+        ])
+        .expect("cli config");
+        assert_eq!(
+            config.command,
+            CliCommand::PrintQuery(PrintQueryCommand {
+                query: Some("SELECT * {}".to_owned()),
+                file: None,
+                form: Some("values".to_owned()),
+                schema: vec![PathBuf::from("a.ttl"), PathBuf::from("b.nt")],
+            })
+        );
+        assert!(parse(&["print-query", "--file", "q.rq"]).is_ok());
+        assert!(parse(&["print-query"]).is_err());
+        assert!(parse(&["print-query", "--form", "flat", "SELECT * {}"]).is_err());
         let config = parse(&["convert", "a.ttl", "b.nt"]).expect("cli config");
         assert_eq!(
             config.command,

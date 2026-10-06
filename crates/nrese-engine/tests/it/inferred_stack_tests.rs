@@ -564,6 +564,35 @@ fn inferred_subsets_restrict_every_read() {
     assert_eq!(whole.len_in(ReadModel::Inferred), 6);
 }
 
+/// A snapshot with statements added to its inferred stack reads them in every read path,
+/// counts and sorted scans included; the whole snapshot is unchanged.
+#[test]
+fn inferred_additions_are_read_by_that_snapshot_alone() {
+    let engine = engine();
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(triple(1, 2, 3).in_default_graph()));
+    assert!(tx.insert_inferred(EncodedTriple::new(id(1), id(2), id(4))));
+    tx.commit().expect("commit");
+    let whole = engine.snapshot();
+    let added: Vec<EncodedQuad> = (5..8).map(|o| triple(1, 2, o).in_default_graph()).collect();
+    let extended = whole.with_inferred_added(&added);
+    assert_eq!(extended.len_in(ReadModel::Inferred), 4);
+    let pattern = QuadPattern {
+        subject: Some(id(1)),
+        ..QuadPattern::all()
+    };
+    assert_eq!(extended.count_in(ReadModel::Materialised, &pattern), 5);
+    let sorted: Vec<EncodedQuad> = extended
+        .scan_sorted_in(ReadModel::Materialised, &pattern, Permutation::Spog)
+        .expect("sorted scan")
+        .collect();
+    assert_eq!(sorted.len(), 5);
+    assert!(extended.contains_in(ReadModel::Materialised, &added[0]));
+    assert!(!whole.contains_in(ReadModel::Materialised, &added[0]));
+    assert_eq!(whole.len_in(ReadModel::Inferred), 1);
+    assert_eq!(extended.revision(), whole.revision());
+}
+
 /// A mask of hidden inferred statements carried across a commit by a run per change:
 /// reads see exactly the statements neither hidden nor gone, counts included.
 #[test]

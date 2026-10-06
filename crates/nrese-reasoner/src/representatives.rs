@@ -44,6 +44,8 @@ pub struct RepresentativeClosure {
     pub merges: usize,
     /// The batch materialisations run: one (merges are rebuilt within its rounds).
     pub passes: usize,
+    /// The times and work of every pass, summed (`passes` counts them).
+    pub phases: batch::Phases,
 }
 
 /// The `owl:sameAs` id of rules that do equality reasoning (`eq-rep-s`), if they do.
@@ -99,5 +101,6 @@ pub fn materialise_until(
         rounds: result.rounds,
         merges: result.merges,
         passes: 1,
+        phases: result.phases,
     })
 }
