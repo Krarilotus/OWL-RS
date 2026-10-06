@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
-# The whole gate before a push (what CI runs): scripts/check.sh.
+# The push tier: the crates changed since the upstream branch, all their tests, and the
+# fast tests of the crates depending on them. Milestones run scripts/check.sh all.
 # Enable the hooks with: git config core.hooksPath .githooks
-exec scripts/check.sh
+exec scripts/check.sh push

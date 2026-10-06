@@ -36,7 +36,8 @@ working rules on top of them.
 
 ## Finishing a change
 
-`scripts/check.sh --changed` (the pre-commit hook) runs fmt, clippy and the tests of the
-changed crates; the pre-push hook runs the whole gate ([CONTRIBUTING.md](../../CONTRIBUTING.md)).
+The gate's tiers (`scripts/check.sh commit|push|all`, [CONTRIBUTING.md](../../CONTRIBUTING.md))
+run a crate's tests when it changed and only compile the crates depending on it; a test
+that only fails when another crate changes sits at the wrong level.
 Before closing a work package: dead code and stale helpers removed, duplicated builders
 collapsed, large files split, the docs it changes updated.
