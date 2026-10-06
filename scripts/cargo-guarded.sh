@@ -96,7 +96,7 @@ require_free_gb "$MIN_FREE_GB" "cargo $*" "$ROOT"
 # most NRESE_QUIET_WAIT_S (default 1800 s), so the measurement isn't timing our compilers.
 QUIET="${NRESE_QUIET_DIR:-$HOME/.nrese-quiet-slot}"
 waited=0
-while [ -d "$QUIET" ] && [ "$waited" -lt "${NRESE_QUIET_WAIT_S:-1800}" ]; do
+while [ -z "${NRESE_QUIET_HOLDER:-}" ] && [ -d "$QUIET" ] && [ "$waited" -lt "${NRESE_QUIET_WAIT_S:-1800}" ]; do
   owner=$(cat "$QUIET/pid" 2>/dev/null || echo "")
   if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
     break
@@ -129,7 +129,49 @@ if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
   cores=$(nproc 2>/dev/null || printf 4)
   export CARGO_BUILD_JOBS=$(( cores > 3 ? cores / 2 : 2 ))
 fi
-if command -v nice >/dev/null 2>&1; then
-  exec nice -n 15 cargo "$@"
+
+# A machine-wide limit on builds: at most NRESE_BUILD_SLOTS (default 3) cargo runs of ours at
+# once, so that agents sharing a machine don't run more compilers than it has cores. A build
+# waits for a free slot (at most NRESE_BUILD_SLOT_WAIT_S, default 3600 s, then it runs
+# anyway); a slot whose owner died is taken over. Waits are logged in tmp/guard-slots.log.
+# NRESE_BUILD_SLOTS=0 switches the limit off.
+SLOTS="${NRESE_BUILD_SLOTS:-3}"
+SLOT_DIR="${NRESE_BUILD_SLOT_DIR:-$HOME/.nrese-build-slots}"
+slot=""
+take_slot() {
+  local i owner waited=0 limit="${NRESE_BUILD_SLOT_WAIT_S:-3600}"
+  mkdir -p "$SLOT_DIR"
+  while :; do
+    for i in $(seq 1 "$SLOTS"); do
+      if mkdir "$SLOT_DIR/$i" 2>/dev/null; then
+        echo $$ > "$SLOT_DIR/$i/pid"
+        printf '%s %s\n' "$ROOT" "cargo $*" > "$SLOT_DIR/$i/who"
+        slot="$SLOT_DIR/$i"
+        [ "$waited" -gt 0 ] && mkdir -p "$ROOT/tmp" && printf '%s waited %s s for a build slot: cargo %s\n' \
+          "$(date '+%Y-%m-%d %H:%M:%S')" "$waited" "$*" >> "$ROOT/tmp/guard-slots.log"
+        return 0
+      fi
+      owner=$(cat "$SLOT_DIR/$i/pid" 2>/dev/null || echo "")
+      if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+        rm -rf "$SLOT_DIR/$i"
+      fi
+    done
+    if [ "$waited" -ge "$limit" ]; then
+      printf 'no build slot free after %s s: building anyway\n' "$waited" >&2
+      return 0
+    fi
+    [ "$waited" -eq 0 ] && printf 'all %s build slots are taken: waiting\n' "$SLOTS" >&2
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
+if [ "$SLOTS" -gt 0 ]; then
+  take_slot "$@"
+  trap '[ -n "$slot" ] && rm -rf "$slot"' EXIT
 fi
-exec cargo "$@"
+
+if command -v nice >/dev/null 2>&1; then
+  nice -n 15 cargo "$@"
+else
+  cargo "$@"
+fi
