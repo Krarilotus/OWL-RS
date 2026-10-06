@@ -10,7 +10,8 @@ Konclude, HermiT and RDFox. Thanks to their authors.
 ## State
 
 This is the development branch, `refactor/engine-v2`; it goes to `main` when its work is
-complete and tested. Beyond `main`, it has:
+complete and tested. Like `main`, it runs on its own storage engine, SPARQL executor and
+RDF parsers (the v1 prototype was built on Oxigraph). Beyond `main`, it has:
 
 - an `owl2-dl` mode: consistency checks on commit, classification and realisation, and
   query answers with a completeness status where OWL 2 DL can't promise exact ones;
