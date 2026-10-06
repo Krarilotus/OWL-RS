@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-store --example dl_lab -- \
-//!     [--commits N] [--rounds R] [--class IRI] [--property IRI] input.nt...
+//!     [--commits N] [--rounds R] [--class IRI] [--property IRI] [--queries DIR] input.nt...
 //! ```
 //!
 //! - Each round builds one store per mode from the same files (bulk loaded), commits
@@ -13,6 +13,9 @@
 //! - Prints, per mode, the medians over rounds of the first commit and of the per-commit
 //!   median, the engine that decided the last commit's consistency, and U1's size; counts
 //!   (statements) before times.
+//! - `--queries DIR`: then each `.rq` file of DIR in both modes (one warm-up, then the
+//!   median of 5, interleaved): rows, under `owl2-dl` the status and the paths that
+//!   decided, and the times.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +45,7 @@ fn median(mut v: Vec<Duration>) -> Duration {
 }
 
 struct Run {
+    pipeline: MutationPipeline,
     first: Duration,
     per_commit: Duration,
     statements: u64,
@@ -50,7 +54,12 @@ struct Run {
 }
 
 fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, property: &str) -> Run {
-    let store = StoreService::new(StoreConfig::in_memory()).expect("store");
+    // No result cache: every run evaluates (the DL path never caches).
+    let store = StoreService::new(StoreConfig {
+        query_cache_bytes: 0,
+        ..StoreConfig::in_memory()
+    })
+    .expect("store");
     store
         .bulk_load(&BulkLoadRequest {
             files: files.to_vec(),
@@ -78,7 +87,7 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
         };
         times.push(commit(&pipeline, &update));
     }
-    let store = pipeline.store();
+    let store = pipeline.store().clone();
     let statements = store.stats().map(|s| s.quad_count as u64).unwrap_or(0);
     let (engine, upper) = match mode.is_dl() {
         true => {
@@ -106,6 +115,7 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
         false => ("rules".to_owned(), String::new()),
     };
     Run {
+        pipeline,
         first,
         per_commit: median(times),
         statements,
@@ -125,10 +135,11 @@ fn main() {
     let commits: usize = flag("--commits").and_then(|n| n.parse().ok()).unwrap_or(50);
     let rounds: usize = flag("--rounds").and_then(|n| n.parse().ok()).unwrap_or(3);
     let class = flag("--class").unwrap_or_else(|| {
-        "http://swat.cse.lehigh.edu/onto/univ-bench.owl#GraduateStudent".to_owned()
+        "http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#GraduateStudent".to_owned()
     });
-    let property = flag("--property")
-        .unwrap_or_else(|| "http://swat.cse.lehigh.edu/onto/univ-bench.owl#advisor".to_owned());
+    let property = flag("--property").unwrap_or_else(|| {
+        "http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#advisor".to_owned()
+    });
     let mut skip = false;
     let files: Vec<PathBuf> = args
         .iter()
@@ -151,10 +162,19 @@ fn main() {
             results[m].push(run(modes[m], &files, commits, &class, &property));
         }
     }
-    for (mode, runs) in modes.iter().zip(results) {
+    let queries = flag("--queries");
+    let last: Vec<&MutationPipeline> = results
+        .iter()
+        .map(|runs| &runs.last().expect("a round").pipeline)
+        .collect();
+    if let Some(dir) = &queries {
+        compare_queries(dir, &last);
+    }
+    for (mode, runs) in modes.iter().zip(&results) {
         let first = median(runs.iter().map(|r| r.first).collect());
         let per = median(runs.iter().map(|r| r.per_commit).collect());
         let last = runs.last().expect("a round");
+        let _ = &last.pipeline;
         println!(
             "{}: {} statements; first commit {:.1?} (median of {rounds}); single-assertion \
              commit {:.2?} (median of {rounds} per-run medians of {commits}); consistency by {}",
@@ -167,5 +187,71 @@ fn main() {
         if !last.upper.is_empty() {
             println!("  {}", last.upper);
         }
+    }
+}
+
+/// One query's rows (each row once) and status, timed.
+fn timed(
+    pipeline: &MutationPipeline,
+    text: &str,
+) -> (usize, Option<nrese_sparql::Completeness>, Duration) {
+    let store = pipeline.store();
+    let prepared = store
+        .prepare_query(&nrese_store::SparqlQueryRequest::all(text))
+        .expect("query parses");
+    let started = Instant::now();
+    let mut out = Vec::new();
+    let status = store
+        .run_query_reporting(&prepared, &nrese_store::CancellationToken::new(), &mut out)
+        .expect("query runs");
+    let elapsed = started.elapsed();
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
+    let rows = json["results"]["bindings"].as_array().map_or(0, |rows| {
+        rows.iter()
+            .map(|r| r.to_string())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    });
+    (rows, status, elapsed)
+}
+
+/// Each query of `dir` on both stores (owl2-dl first), interleaved medians of 5 runs.
+fn compare_queries(dir: &str, stores: &[&MutationPipeline]) {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .expect("queries")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "rq"))
+        .collect();
+    files.sort();
+    println!("query	dl rows	rl rows	dl status	dl paths	dl ms	rl ms");
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("query file");
+        let name = file.file_stem().unwrap_or_default().to_string_lossy();
+        let mut times = [Vec::new(), Vec::new()];
+        let mut rows = [0, 0];
+        let mut status = None;
+        for run in 0..6 {
+            for (i, pipeline) in stores.iter().enumerate() {
+                let (n, s, t) = timed(pipeline, &text);
+                if run > 0 {
+                    times[i].push(t);
+                }
+                rows[i] = n;
+                if i == 0 {
+                    status = s;
+                }
+            }
+        }
+        let [dl, rl] = times;
+        let (label, paths) = status.map_or(("-".to_owned(), String::new()), |s| {
+            (s.as_str().to_owned(), s.paths.join(","))
+        });
+        println!(
+            "{name}	{}	{}	{label}	{paths}	{:.2}	{:.2}",
+            rows[0],
+            rows[1],
+            median(dl).as_secs_f64() * 1000.0,
+            median(rl).as_secs_f64() * 1000.0
+        );
     }
 }

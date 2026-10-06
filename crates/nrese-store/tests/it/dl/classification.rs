@@ -38,8 +38,20 @@ fn a_subsumption_through_a_union_is_found_by_the_tableau_driver() {
     assert!(has(&report.subsumptions, "A", "D"));
     assert!(has(&report.subsumptions, "E", "D"));
     assert!(!has(&report.subsumptions, "A", "B"));
-    // Realisation: x is a D, which the RL closure doesn't know.
-    assert!(!super::ask(&dl, ":x a :D"));
+    // Realisation: x is a D, which the RL closure doesn't know (queries prove it).
+    let inferred = dl
+        .store()
+        .execute_query(&nrese_store::SparqlQueryRequest {
+            read_model: Some(nrese_store::ReadModel::Inferred),
+            ..nrese_store::SparqlQueryRequest::all(format!("{}ASK {{ :x a :D }}", super::PREFIXES))
+        })
+        .expect("ask the inferred stack");
+    assert!(
+        String::from_utf8(inferred.payload)
+            .unwrap()
+            .contains("false")
+    );
+    assert!(super::ask(&dl, ":x a :D"));
     let real = dl.store().realise(&ReadScope::All).expect("realisation");
     assert!(real.complete(), "{:?}", real.incomplete);
     let types = &real

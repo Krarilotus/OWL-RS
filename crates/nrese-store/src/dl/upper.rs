@@ -32,6 +32,8 @@ pub struct Stack {
     spo: BTreeSet<[u64; 3]>,
     pos: BTreeSet<[u64; 3]>,
     osp: BTreeSet<[u64; 3]>,
+    /// Facts per predicate, for the delta executor's estimates.
+    per_predicate: std::collections::HashMap<u64, usize>,
 }
 
 impl Stack {
@@ -53,6 +55,7 @@ impl Stack {
         }
         self.pos.insert([p, o, s]);
         self.osp.insert([o, s, p]);
+        *self.per_predicate.entry(p).or_default() += 1;
         true
     }
 
@@ -62,11 +65,47 @@ impl Stack {
         }
         self.pos.remove(&[p, o, s]);
         self.osp.remove(&[o, s, p]);
+        if let Some(n) = self.per_predicate.get_mut(&p) {
+            *n -= 1;
+        }
         true
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Triple> + '_ {
         self.spo.iter().copied()
+    }
+
+    /// An upper bound on the facts matching `pattern`, zero only if none does. O(log n).
+    pub fn estimate(&self, pattern: [Option<u64>; 3]) -> usize {
+        let bound = match pattern[1] {
+            Some(p) => self.per_predicate.get(&p).copied().unwrap_or(0),
+            None => self.len(),
+        };
+        if bound == 0 {
+            return 0;
+        }
+        let mut any = false;
+        self.first(pattern, &mut any);
+        if any { bound } else { 0 }
+    }
+
+    /// Whether a fact matches `pattern`, by the index whose prefix it binds.
+    fn first(&self, pattern: [Option<u64>; 3], any: &mut bool) {
+        let hit = |set: &BTreeSet<[u64; 3]>, prefix: &[u64], test: &dyn Fn(&[u64; 3]) -> bool| {
+            let mut low = [0u64; 3];
+            let mut high = [u64::MAX; 3];
+            low[..prefix.len()].copy_from_slice(prefix);
+            high[..prefix.len()].copy_from_slice(prefix);
+            set.range(low..=high).any(test)
+        };
+        *any = match pattern {
+            [Some(s), Some(p), o] => hit(&self.spo, &[s, p], &|t| o.is_none_or(|o| t[2] == o)),
+            [Some(s), None, o] => hit(&self.spo, &[s], &|t| o.is_none_or(|o| t[2] == o)),
+            [None, Some(p), Some(o)] => hit(&self.pos, &[p, o], &|_| true),
+            [None, Some(p), None] => hit(&self.pos, &[p], &|_| true),
+            [None, None, Some(o)] => hit(&self.osp, &[o], &|_| true),
+            [None, None, None] => !self.is_empty(),
+        };
     }
 
     /// The facts matching `pattern`, by the index whose prefix it binds. O(log n + k).
@@ -156,9 +195,7 @@ impl Base for UpperBase<'_> {
 
     fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
         let view = self.view.count_in(ReadModel::Materialised, &pattern(bound));
-        let mut stack = 0;
-        self.stack.scan(bound, &mut |_| stack += 1);
-        usize::try_from(view).unwrap_or(usize::MAX) + stack + self.facts.len()
+        usize::try_from(view).unwrap_or(usize::MAX) + self.stack.estimate(bound) + self.facts.len()
     }
 
     fn contains(&self, fact: Triple) -> bool {
@@ -485,4 +522,44 @@ fn base_has(view: &Snapshot, facts: &HashSet<Triple>, [s, p, o]: Triple) -> bool
             )
             .next()
             .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Stack;
+
+    /// The delta executor reads estimates per job: they must be upper bounds, and zero
+    /// only where nothing matches (a zero skips the job), and cost an index probe, not a
+    /// count of the matches.
+    #[test]
+    fn stack_estimates_are_bounds_and_zero_only_without_a_match() {
+        let mut stack = Stack::default();
+        for s in 0..50u64 {
+            stack.insert([s, 1, s + 100]);
+            stack.insert([s, 2, 7]);
+        }
+        stack.remove([0, 1, 100]);
+        let patterns = [
+            [None, None, None],
+            [Some(3), None, None],
+            [Some(3), Some(1), None],
+            [Some(3), Some(1), Some(103)],
+            [Some(3), Some(1), Some(104)],
+            [None, Some(2), Some(7)],
+            [None, Some(2), Some(8)],
+            [None, None, Some(7)],
+            [None, Some(9), None],
+            [Some(0), Some(1), None],
+        ];
+        for pattern in patterns {
+            let mut matches = 0;
+            stack.scan(pattern, &mut |_| matches += 1);
+            let estimate = stack.estimate(pattern);
+            assert!(estimate >= matches, "{pattern:?}: {estimate} < {matches}");
+            assert_eq!(estimate == 0, matches == 0, "{pattern:?}");
+        }
+        // Bounded by the predicate's facts, not the stack's.
+        assert_eq!(stack.estimate([None, Some(2), Some(7)]), 50);
+        assert_eq!(stack.estimate([Some(3), Some(1), None]), 49);
+    }
 }

@@ -82,6 +82,8 @@ pub struct PreparedQuery {
     /// Whether the results may use RDF 1.2 (triple terms): then they announce
     /// `version=1.2` ([`Self::announce_rdf12`]).
     rdf12: bool,
+    /// Under `owl2-dl`: which answers this query asks for (`None`: `dl.answers`).
+    dl_answers: Option<crate::DlAnswers>,
 }
 
 impl PreparedQuery {
@@ -147,6 +149,7 @@ impl PreparedQuery {
             origin: None,
             implicit_prefixes,
             rdf12: false,
+            dl_answers: request.dl_answers,
         })
     }
 
@@ -202,6 +205,21 @@ impl PreparedQuery {
     /// Names who sent the query (shown in the list of running queries).
     pub fn set_origin(&mut self, origin: impl Into<String>) {
         self.origin = Some(origin.into());
+    }
+
+    /// The parsed query.
+    pub(crate) fn query(&self) -> &Query {
+        &self.query
+    }
+
+    /// Whether the query names its dataset (`FROM`, or the protocol's graphs).
+    pub(crate) fn has_dataset(&self) -> bool {
+        self.dataset.is_some() || self.query.dataset().is_some()
+    }
+
+    /// Under `owl2-dl`: which answers the query asks for (`None`: the store's setting).
+    pub fn dl_answers(&self) -> Option<crate::DlAnswers> {
+        self.dl_answers
     }
 
     /// The graphs the query may read; `None`: every graph.
@@ -442,6 +460,77 @@ pub(crate) fn run_query(
             for triple in triples {
                 alive()?;
                 writer.serialize_triple(&triple?)?;
+            }
+            writer.finish()?;
+        }
+    }
+    Ok(())
+}
+
+/// A query's answers, collected (the `owl2-dl` mode compares and completes them before
+/// writing).
+pub(crate) enum Answers {
+    Boolean(bool),
+    Solutions {
+        variables: std::sync::Arc<[nrese_sparql_syntax::term::Variable]>,
+        rows: Vec<Vec<Option<nrese_rdf::Term>>>,
+    },
+    Graph(Vec<nrese_rdf::Triple>),
+}
+
+/// Evaluates `prepared` on `view` and collects its answers.
+pub(crate) fn evaluate_prepared(
+    view: &impl ReadView,
+    prepared: &PreparedQuery,
+    store: &StoreSettings,
+    cancellation: &CancellationToken,
+) -> StoreResult<Answers> {
+    let options = explain_options(prepared, store, cancellation);
+    Ok(match evaluate_query(view, &prepared.query, &options)? {
+        QueryResults::Boolean(value) => Answers::Boolean(value),
+        QueryResults::Solutions(solutions) => {
+            let variables: std::sync::Arc<[nrese_sparql_syntax::term::Variable]> =
+                solutions.variables().into();
+            let mut rows = Vec::new();
+            for solution in solutions {
+                rows.push(solution?.values().to_vec());
+            }
+            Answers::Solutions { variables, rows }
+        }
+        QueryResults::Graph(triples) => Answers::Graph(triples.collect::<Result<Vec<_>, _>>()?),
+    })
+}
+
+/// Writes collected answers in `prepared`'s format.
+pub(crate) fn write_answers(
+    prepared: &PreparedQuery,
+    answers: Answers,
+    out: impl Write,
+) -> StoreResult<()> {
+    let version = prepared.rdf12.then_some("1.2");
+    match answers {
+        Answers::Boolean(value) => {
+            results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;
+        }
+        Answers::Solutions { variables, rows } => {
+            let mut writer = results_serializer(prepared, version)
+                .serialize_solutions_to_writer(out, variables.to_vec())?;
+            for values in rows {
+                writer.serialize(&nrese_sparql::QuerySolution::new(
+                    std::sync::Arc::clone(&variables),
+                    values,
+                ))?;
+            }
+            writer.finish()?;
+        }
+        Answers::Graph(triples) => {
+            let mut serializer = RdfSerializer::from_format(prepared.graph_format.rdf_format());
+            if let Some(version) = version {
+                serializer = serializer.with_version(version);
+            }
+            let mut writer = serializer.for_writer(out);
+            for triple in &triples {
+                writer.serialize_triple(triple)?;
             }
             writer.finish()?;
         }

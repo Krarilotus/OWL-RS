@@ -421,13 +421,38 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
+        self.run_query_reporting(prepared, cancellation, out)
+            .map(|_| ())
+    }
+
+    /// [`Self::run_query`], with whether the answers are complete where a reasoning path
+    /// can leave some out (`None` where none can): under `owl2-dl`, every query that reads
+    /// the inferred statements goes through the bounds ([`crate::dl`]); its answers are
+    /// computed before the first byte is written.
+    pub fn run_query_reporting(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+    ) -> StoreResult<Option<nrese_sparql::Completeness>> {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
+        let mut dl_status = None;
+        if let Some(mode) = self.dl_mode(prepared) {
+            match crate::dl::query::answer(self, prepared, cancellation, mode)? {
+                crate::dl::query::Outcome::Answers(answers, status) => {
+                    crate::query_executor::write_answers(prepared, answers, out)?;
+                    return Ok(Some(status));
+                }
+                // Over the lower bound as every query runs, its status known already.
+                crate::dl::query::Outcome::Stream(status) => dl_status = Some(status),
+            }
+        }
         let snapshot = self.read_snapshot(prepared.access());
         let settings = &self.settings;
         if !self.query_cache.enabled() || prepared.volatile() {
-            return run_query(&snapshot, prepared, settings, cancellation, out);
+            return run_query(&snapshot, prepared, settings, cancellation, out).map(|()| dl_status);
         }
         let key = crate::query_cache::CacheKey {
             request: prepared.cache_request(),
@@ -436,7 +461,7 @@ impl StoreService {
         let mut out = out;
         if let Some(bytes) = self.query_cache.get(&key) {
             out.write_all(&bytes)?;
-            return Ok(());
+            return Ok(dl_status);
         }
         let mut tee = crate::query_cache::Tee {
             inner: out,
@@ -447,7 +472,25 @@ impl StoreService {
         if let Some(copy) = tee.copy {
             self.query_cache.insert(key, copy);
         }
-        Ok(())
+        Ok(dl_status)
+    }
+
+    /// Whether [`Self::run_query_reporting`] reports `prepared`'s completeness (computing
+    /// its answers in full before writing them).
+    pub fn reports_completeness(&self, prepared: &PreparedQuery) -> bool {
+        self.dl_mode(prepared).is_some()
+    }
+
+    /// Under `owl2-dl`, the answers a query reading the inferred statements asks for;
+    /// `None` for any other query (or mode).
+    fn dl_mode(&self, prepared: &PreparedQuery) -> Option<crate::DlAnswers> {
+        (self.dl.active() && prepared.read_model() == ReadModel::Materialised)
+            .then(|| prepared.dl_answers().unwrap_or(self.config.dl.answers))
+    }
+
+    /// What every query gets from the store.
+    pub(crate) fn query_settings(&self) -> &crate::query_executor::StoreSettings {
+        &self.settings
     }
 
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
@@ -460,22 +503,40 @@ impl StoreService {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
-        explain_prepared(
+        let mut explanation = explain_prepared(
             &self.read_snapshot(prepared.access()),
             prepared,
             &self.settings,
             cancellation,
-        )
+        )?;
+        if let Some(mode) = self.dl_mode(prepared) {
+            // The status as the query would answer, never failing for it.
+            let mode = match mode {
+                crate::DlAnswers::Exact => crate::DlAnswers::CertainWhereComplete,
+                other => other,
+            };
+            explanation.completeness = Some(
+                match crate::dl::query::answer(self, prepared, cancellation, mode)? {
+                    crate::dl::query::Outcome::Answers(_, status)
+                    | crate::dl::query::Outcome::Stream(status) => status,
+                },
+            );
+        }
+        Ok(explanation)
     }
 
     /// The plan `prepared` would run as, each node with its estimated rows, without
     /// running it (EXPLAIN without ANALYZE).
     pub fn plan_query(&self, prepared: &PreparedQuery) -> StoreResult<crate::PlannedQuery> {
-        plan_prepared(
+        let mut planned = plan_prepared(
             &self.read_snapshot(prepared.access()),
             prepared,
             &self.settings,
-        )
+        )?;
+        if self.dl_mode(prepared).is_some() {
+            planned.completeness = Some(crate::dl::query::plan_status(self, prepared));
+        }
+        Ok(planned)
     }
 
     /// Bytes of intermediate results the running queries hold now, the most they held at

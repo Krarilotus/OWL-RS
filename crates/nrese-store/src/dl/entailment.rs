@@ -315,6 +315,20 @@ pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget
     answer
 }
 
+/// Whether `premise` (consistent) entails that some individual is an instance of
+/// `class` (of `premise`'s interners): `class ⊑ ⊥` makes it inconsistent.
+pub fn nonempty(premise: &Ontology, class: ExprId, budget: &Budget) -> Entailed {
+    let mut o = premise.clone();
+    let nothing = intern(&mut o, ClassExpr::Nothing);
+    o.axioms.push(Axiom::SubClassOf(class, nothing));
+    o.sources.push(Vec::new());
+    match consistency::check(&o, budget).verdict {
+        Verdict::Inconsistent => Entailed::Yes,
+        Verdict::Consistent => Entailed::No,
+        Verdict::Unknown(why) => Entailed::Unknown(why),
+    }
+}
+
 /// Whether `premise` (consistent) entails every logical axiom of `conclusion` (an
 /// ontology read over the same term ids).
 pub fn entails_ontology(
