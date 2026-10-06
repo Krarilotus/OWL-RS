@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::tbox::{Basic, Tbox};
-use super::witness::{TreeWitness, tree_witnesses};
+use super::witness::{TreeWitness, Work, tree_witnesses};
 use super::{Atom, Cq, QTerm};
 use crate::model::{ObjProp, Term};
 
@@ -23,6 +23,9 @@ pub struct Limits {
     pub branches: usize,
     /// Atoms of the rewriting, alternatives counted.
     pub size: usize,
+    /// Steps of work to build it (candidate interiors, places a witness search tries,
+    /// sets of witnesses): bounds the time the other bounds don't.
+    pub work: usize,
 }
 
 impl Default for Limits {
@@ -33,6 +36,7 @@ impl Default for Limits {
             witnesses: 64,
             branches: 256,
             size: 4096,
+            work: 50_000,
         }
     }
 }
@@ -97,8 +101,10 @@ pub fn rewrite(tbox: &Tbox, cq: &Cq, limits: &Limits) -> Outcome {
     if tbox.is_empty() {
         return Outcome::Unchanged;
     }
-    let Some(mut witnesses) = tree_witnesses(tbox, cq, limits.witnesses, limits.candidates) else {
-        return Outcome::Exceeded("tree witnesses");
+    let work = Work::new(limits.work);
+    let mut witnesses = match tree_witnesses(tbox, cq, limits.witnesses, limits.candidates, &work) {
+        Ok(witnesses) => witnesses,
+        Err(bound) => return Outcome::Exceeded(bound),
     };
     // A witness the rest of the query implies goes, with its atoms: its root is stated to
     // be a class that generates it, so every model has the tree it maps into. The query
@@ -139,8 +145,10 @@ pub fn rewrite(tbox: &Tbox, cq: &Cq, limits: &Limits) -> Outcome {
             atoms,
             ..reduced.into_owned()
         });
-        let Some(next) = tree_witnesses(tbox, &reduced, limits.witnesses, limits.candidates) else {
-            return Outcome::Exceeded("tree witnesses");
+        let next = match tree_witnesses(tbox, &reduced, limits.witnesses, limits.candidates, &work)
+        {
+            Ok(next) => next,
+            Err(bound) => return Outcome::Exceeded(bound),
         };
         witnesses = next;
     }
@@ -172,8 +180,8 @@ pub fn rewrite(tbox: &Tbox, cq: &Cq, limits: &Limits) -> Outcome {
             witnesses: 0,
         });
     }
-    let Some(sets) = independent_sets(&witnesses, limits.branches) else {
-        return Outcome::Exceeded("branches");
+    let Some(sets) = independent_sets(&witnesses, limits.branches, &work) else {
+        return Outcome::Exceeded(if work.exhausted() { "work" } else { "branches" });
     };
     let mut builder = Build {
         cq,
@@ -225,8 +233,13 @@ fn implied(tbox: &Tbox, cq: &Cq, witness: &TreeWitness) -> Option<usize> {
 
 /// Every set of witnesses whose atoms are disjoint (the empty set first); `None` past
 /// `limit`.
-fn independent_sets(witnesses: &[TreeWitness], limit: usize) -> Option<Vec<Vec<usize>>> {
+fn independent_sets(
+    witnesses: &[TreeWitness],
+    limit: usize,
+    work: &Work,
+) -> Option<Vec<Vec<usize>>> {
     fn grow(
+        work: &Work,
         witnesses: &[TreeWitness],
         from: usize,
         current: &mut Vec<usize>,
@@ -235,7 +248,7 @@ fn independent_sets(witnesses: &[TreeWitness], limit: usize) -> Option<Vec<Vec<u
         limit: usize,
     ) -> bool {
         out.push(current.clone());
-        if out.len() > limit {
+        if out.len() > limit || !work.spend() {
             return false;
         }
         for i in from..witnesses.len() {
@@ -244,7 +257,7 @@ fn independent_sets(witnesses: &[TreeWitness], limit: usize) -> Option<Vec<Vec<u
             }
             current.push(i);
             used.extend(witnesses[i].atoms.iter().copied());
-            let ok = grow(witnesses, i + 1, current, used, out, limit);
+            let ok = grow(work, witnesses, i + 1, current, used, out, limit);
             for a in &witnesses[i].atoms {
                 used.remove(a);
             }
@@ -257,6 +270,7 @@ fn independent_sets(witnesses: &[TreeWitness], limit: usize) -> Option<Vec<Vec<u
     }
     let mut out = Vec::new();
     grow(
+        work,
         witnesses,
         0,
         &mut Vec::new(),

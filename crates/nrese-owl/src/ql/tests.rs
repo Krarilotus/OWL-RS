@@ -433,3 +433,27 @@ fn an_equating_hazard_is_not_hidden_by_another_on_the_same_role() {
         ["R: P is functional or inverse functional"]
     );
 }
+
+/// A TBox where every anonymous element has ten successor types, and a chain of twelve
+/// existential arms ending in a class none of them has: the witness search would try
+/// about 10^11 places before failing.
+fn dense() -> (String, String) {
+    let axioms: Vec<String> = (0..10)
+        .flat_map(|i| {
+            (0..10).map(move |j| format!("SubClassOf(:C{i} ObjectSomeValuesFrom(:P :C{j}))"))
+        })
+        .collect();
+    let mut chain: Vec<String> = vec!["P(?x ?v1)".to_owned()];
+    chain.extend((1..12).map(|i| format!("P(?v{i} ?v{})", i + 1)));
+    chain.push("D(?v12)".to_owned());
+    (axioms.join("\n"), chain.join(", "))
+}
+
+#[test]
+fn the_work_bound_stops_a_search_the_size_bounds_dont() {
+    let (axioms, atoms) = dense();
+    let existential: Vec<String> = (1..=12).map(|i| format!("v{i}")).collect();
+    let existential: Vec<&str> = existential.iter().map(String::as_str).collect();
+    // Within every size bound (12 existential variables, few witnesses), but not the work.
+    assert_eq!(rewritten(&axioms, &atoms, &existential), ["exceeded work"]);
+}

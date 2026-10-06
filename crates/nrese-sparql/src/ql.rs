@@ -11,6 +11,8 @@ use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_owl::ql::Tbox;
 use nrese_rdf::{NamedNodeRef, Term};
 
+use crate::GraphAccess;
+
 pub use nrese_owl::ql::{Closure, Limits};
 
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -94,16 +96,22 @@ pub struct QlReport {
 }
 
 /// A store's QL rewriting: what its closure applies, the bounds, and the schema compiled
-/// for the last snapshot read.
+/// for the last snapshots read (one per reader's graph access, design §1).
 #[derive(Debug)]
 pub struct QlRewriting {
     closure: Closure,
     limits: Limits,
-    cached: Mutex<Option<Cached>>,
+    cached: Mutex<Vec<Cached>>,
 }
+
+/// Schemas compiled for different readers kept at once.
+const READERS: usize = 8;
 
 #[derive(Debug)]
 struct Cached {
+    /// The graphs the schema was read from: every graph (`None`), or a reader's who sees
+    /// only the inferences its graphs support.
+    access: Option<GraphAccess>,
     /// The snapshot it was read from: revision and sizes of the two stacks.
     key: (u64, u64, u64),
     /// A hash of the schema statements: a snapshot with the same schema reuses the TBox.
@@ -117,7 +125,7 @@ impl QlRewriting {
         Self {
             closure,
             limits: Limits::default(),
-            cached: Mutex::new(None),
+            cached: Mutex::new(Vec::new()),
         }
     }
 
@@ -138,29 +146,46 @@ impl QlRewriting {
 
     /// The QL part of `snapshot`'s schema, compiled. Read once per snapshot, and compiled
     /// only when the schema statements changed: data commits reuse it.
-    pub(crate) fn tbox(&self, snapshot: &Snapshot) -> Arc<Tbox> {
+    ///
+    /// Graph access (design §1) matches what the reader sees of the RL closure: a reader
+    /// who sees only the inferences its graphs support (`inferred = "supported"`) gets the
+    /// schema of those graphs only; one who sees every inference (`"visible"`) the whole
+    /// schema, as the closure it reads was computed with it.
+    pub(crate) fn tbox(&self, snapshot: &Snapshot, access: Option<&GraphAccess>) -> Arc<Tbox> {
+        let access = access.filter(|a| a.inferred_by_support);
         let key = (
             snapshot.revision(),
             snapshot.len_in(ReadModel::Asserted),
             snapshot.len_in(ReadModel::Inferred),
         );
         let mut cached = self.cached.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(c) = cached.as_ref().filter(|c| c.key == key) {
+        let at = cached.iter().position(|c| c.access.as_ref() == access);
+        if let Some(c) = at.map(|i| &cached[i]).filter(|c| c.key == key) {
             return Arc::clone(&c.tbox);
         }
-        let statements = schema_statements(snapshot);
+        let mut statements = schema_statements(snapshot);
+        if let Some(access) = access {
+            statements.retain(|s| access.allows_id(snapshot, TermId::from_raw(s.graph)));
+        }
         let schema = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             statements.hash(&mut hasher);
             hasher.finish()
         };
-        if let Some(c) = cached.as_mut().filter(|c| c.schema == schema) {
+        if let Some(c) = at.map(|i| &mut cached[i]).filter(|c| c.schema == schema) {
             c.key = key;
             return Arc::clone(&c.tbox);
         }
         let tbox = Arc::new(compile(snapshot, &statements, self.closure));
-        *cached = Some(Cached {
+        if let Some(i) = at {
+            cached.remove(i);
+        }
+        if cached.len() == READERS {
+            cached.remove(0);
+        }
+        cached.push(Cached {
+            access: access.cloned(),
             key,
             schema,
             tbox: Arc::clone(&tbox),
