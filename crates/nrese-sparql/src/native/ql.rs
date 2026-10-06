@@ -240,14 +240,18 @@ impl Rewriter<'_> {
         let (cq, terms) = self.query(patterns, needed);
         for (term, hazard) in self.tbox.concerns(&cq) {
             let name = |t: u64| self.name(t);
-            self.report.completeness.add(format!(
-                "answers on {} through anonymous individuals may be missing: {}",
-                name(term),
-                hazard.describe(&name)
-            ));
+            self.report.completeness.incomplete(
+                "ql",
+                format!(
+                    "answers on {} through anonymous individuals may be missing: {}",
+                    name(term),
+                    hazard.describe(&name)
+                ),
+            );
         }
         if patterns.iter().any(open) {
-            self.report.completeness.add(
+            self.report.completeness.incomplete(
+                "ql",
                 "a variable predicate or class: the rewriting reads constant ones only".to_owned(),
             );
         }
@@ -255,7 +259,7 @@ impl Rewriter<'_> {
             Outcome::Unchanged => return original,
             Outcome::Exceeded(what) => {
                 self.report.limits.push(what);
-                self.report.completeness.add(format!(
+                self.report.completeness.incomplete("ql", format!(
                     "a basic graph pattern reached the rewriting's bound on {what} and ran as written"
                 ));
                 return original;
@@ -372,9 +376,12 @@ impl Rewriter<'_> {
             Node::Expression(e) => e.find(&mut look),
         };
         if let Some(what) = hit {
-            self.report.completeness.add(format!(
-                "a pattern inside {place} runs without the rewriting, which changes {what}"
-            ));
+            self.report.completeness.incomplete(
+                "ql",
+                format!(
+                    "a pattern inside {place} runs without the rewriting, which changes {what}"
+                ),
+            );
         }
     }
 
