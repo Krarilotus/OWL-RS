@@ -288,6 +288,9 @@ class DockerRuntime(Runtime):
             args += ["-u", spec.user]
         if spec.memory:
             args += ["--memory", spec.memory, "--memory-swap", spec.memory]
+        # Every system on the same CPUs when a run asks for it (DOCKER_CPUS, e.g. "8").
+        if os.environ.get("DOCKER_CPUS"):
+            args += ["--cpus", os.environ["DOCKER_CPUS"]]
         for key, value in spec.env.items():
             args += ["-e", f"{key}={value}"]
         for m in spec.mounts:
