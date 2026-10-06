@@ -84,20 +84,67 @@ pub async fn execute_query_in(
         )
         .await;
     }
-    stream_blocking(
+    // The QL completeness goes with the answers, in a header: the store reports it on the
+    // snapshot it reads before writing any answer, and the response starts after that.
+    let status: std::sync::Arc<std::sync::Mutex<Option<nrese_sparql::ql::QlReport>>> =
+        std::sync::Arc::default();
+    let slot = std::sync::Arc::clone(&status);
+    let report = move |r: Option<nrese_sparql::ql::QlReport>| {
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = r;
+    };
+    let mut response = stream_blocking(
         deadline,
         cancellation,
         media_type,
         QUERY_TIMEOUT_MESSAGE,
         move |out| {
             match &pending {
-                None => store.run_query(&prepared, &token, out),
-                Some(pending) => store.run_query_pending(pending, &prepared, &token, out),
+                None => store.run_query_reporting(&prepared, &token, out, report),
+                Some(pending) => {
+                    store.run_query_pending_reporting(pending, &prepared, &token, out, report)
+                }
             }
             .map_err(|error| map_query_error(&policy, error))
         },
     )
-    .await
+    .await?;
+    if let Some(report) = status.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        response
+            .headers_mut()
+            .insert(QL_COMPLETENESS, completeness_header(&report.completeness));
+    }
+    Ok(response)
+}
+
+/// The header that says whether the answers through anonymous individuals are complete
+/// (docs/design/ql-rewriting.md §7).
+pub const QL_COMPLETENESS: &str = "nrese-ql-completeness";
+
+/// `complete`, or `sound-only; reasons="…"` with the first reasons, ASCII only (other
+/// characters escaped as `\u{…}`, quotes and backslashes with a backslash).
+fn completeness_header(completeness: &nrese_sparql::ql::Completeness) -> axum::http::HeaderValue {
+    const SHOWN: usize = 5;
+    let reasons = completeness.reasons();
+    if reasons.is_empty() {
+        return axum::http::HeaderValue::from_static("complete");
+    }
+    let mut text: Vec<String> = reasons.iter().take(SHOWN).cloned().collect();
+    if reasons.len() > SHOWN {
+        text.push(format!("and {} more", reasons.len() - SHOWN));
+    }
+    let mut escaped = String::new();
+    for c in text.join("; ").chars() {
+        match c {
+            '"' | '\\' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            c if c.is_ascii_graphic() || c == ' ' => escaped.push(c),
+            c => escaped.extend(c.escape_unicode()),
+        }
+    }
+    axum::http::HeaderValue::from_str(&format!("sound-only; reasons=\"{escaped}\""))
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("sound-only"))
 }
 
 /// The JSON form of an EXPLAIN: the executor, the rewrites that changed the query, totals,

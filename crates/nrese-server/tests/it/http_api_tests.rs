@@ -849,3 +849,75 @@ async fn the_console_is_served_from_the_binary() -> Result<(), Box<dyn std::erro
     );
     Ok(())
 }
+
+/// The OWL 2 QL rewriting's completeness goes with every answer, in a header
+/// (docs/design/ql-rewriting.md §7); the answers don't change for it.
+#[tokio::test]
+async fn query_answers_say_whether_answers_through_existentials_are_complete()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_settings(
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
+    )?;
+    let update = |text: &'static str| {
+        Request::builder()
+            .uri("/dataset/update")
+            .method(Method::POST)
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(text))
+    };
+    let query = || {
+        Request::builder()
+            .uri("/dataset/query")
+            .method(Method::POST)
+            .header("content-type", "application/sparql-query")
+            .header("accept", "text/tab-separated-values")
+            .body(Body::from(
+                "SELECT ?x WHERE { ?x <http://example.com/worksFor> ?y }",
+            ))
+    };
+    let response = app
+        .clone()
+        .oneshot(update(
+            "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {
+                <http://example.com/Employee> rdfs:subClassOf [ a owl:Restriction ;
+                    owl:onProperty <http://example.com/worksFor> ;
+                    owl:someValuesFrom owl:Thing ] .
+                <http://example.com/bob> a <http://example.com/Employee> .
+             }",
+        )?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = app.clone().oneshot(query()?).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["nrese-ql-completeness"],
+        "complete",
+        "{:?}",
+        response.headers()
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(body.to_vec())?.contains("<http://example.com/bob>"));
+
+    // A transitive worksFor meets the existential: the same answers, sound only.
+    let response = app
+        .clone()
+        .oneshot(update(
+            "INSERT DATA { <http://example.com/worksFor> a <http://www.w3.org/2002/07/owl#TransitiveProperty> }",
+        )?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = app.oneshot(query()?).await?;
+    let header = response.headers()["nrese-ql-completeness"]
+        .to_str()?
+        .to_owned();
+    assert!(
+        header.starts_with("sound-only; reasons=\"") && header.contains("is transitive"),
+        "{header}"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(body.to_vec())?.contains("<http://example.com/bob>"));
+    Ok(())
+}

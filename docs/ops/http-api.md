@@ -17,6 +17,13 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 - `POST` with `Content-Type: application/x-www-form-urlencoded` and a `query` field
 - `POST` with `Content-Type: application/sparql-query` and the query as the body
 
+Where the OWL 2 QL rewriting applies (`reasoner.ql_rewriting`), every answer carries the
+header `NRESE-QL-Completeness`: `complete`, or `sound-only; reasons="…"` when answers
+through anonymous individuals may be missing (an axiom outside OWL 2 QL meets them, a
+pattern reached a bound or runs without the rewriting; at most five reasons, the rest
+counted, non-ASCII characters escaped as `\u{…}`). The answers are never changed for it
+([design](../design/ql-rewriting.md) §7).
+
 | Parameter | Meaning |
 |---|---|
 | `default-graph-uri`, `named-graph-uri` (repeatable) | The query's dataset; replaces its `FROM` clauses |

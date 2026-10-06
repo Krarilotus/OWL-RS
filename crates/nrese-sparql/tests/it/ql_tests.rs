@@ -350,3 +350,73 @@ fn rewritings_stay_within_their_bounds() {
     let plan = plan_query(&snapshot, &parse(&chain(8)), &tight).unwrap();
     assert!(plan.rewrites.contains(&"ql-limit"));
 }
+
+/// Incompleteness is never silent (design §7): what the rewriting doesn't follow is
+/// reported with the plan, and the answers stay as they are.
+#[test]
+fn incompleteness_is_reported_never_silent() {
+    let status = |e: &Engine, query: &str| {
+        let plan = plan_query(&e.snapshot(), &parse(query), &on()).unwrap();
+        let ql = plan.ql.expect("the rewriting applies");
+        (
+            ql.completeness.as_str(),
+            ql.completeness.reasons().join(" | "),
+        )
+    };
+    let pure = engine(STAFF);
+    assert_eq!(
+        status(&pure, "SELECT ?x WHERE { ?x :worksFor ?y }"),
+        ("complete", String::new())
+    );
+    // A transitive worksFor meets the existential: its answers may be missing.
+    let mixed = engine(&format!("{STAFF} :worksFor a owl:TransitiveProperty ."));
+    let (state, reasons) = status(&mixed, "SELECT ?x WHERE { ?x :worksFor ?y }");
+    assert_eq!(state, "sound-only");
+    assert!(reasons.contains("worksFor> is transitive"), "{reasons}");
+    // A term no hazard reaches stays complete.
+    assert_eq!(
+        status(&mixed, "SELECT ?x WHERE { ?x :knows ?y }").0,
+        "complete"
+    );
+    // Patterns the rewriting doesn't enter, and variable predicates.
+    let (state, reasons) = status(
+        &pure,
+        "SELECT ?x WHERE { ?x a :Person FILTER EXISTS { ?x :worksFor [] } }",
+    );
+    assert_eq!(state, "sound-only");
+    assert!(reasons.contains("inside EXISTS"), "{reasons}");
+    assert_eq!(
+        status(&pure, "SELECT ?x ?p WHERE { ?x ?p [] }").0,
+        "sound-only"
+    );
+    // The answers don't change for it.
+    assert_eq!(
+        rows(&mixed, "SELECT ?x WHERE { ?x :worksFor ?y }", &on()),
+        ["?x=<ann>", "?x=<bob>", "?x=<cat>"]
+    );
+}
+
+/// The schema read at the snapshot includes what the rewriting doesn't follow: a chain
+/// through the role of an existential is reported (found by the mixed differential test).
+#[test]
+fn chains_in_the_store_are_hazards() {
+    let e = engine(&format!(
+        "{STAFF} :leads owl:propertyChainAxiom ( :worksFor :partOf ) ."
+    ));
+    let plan = plan_query(
+        &e.snapshot(),
+        &parse("SELECT ?x WHERE { ?x :worksFor ?y }"),
+        &on(),
+    )
+    .unwrap();
+    let ql = plan.ql.expect("the rewriting applies");
+    assert_eq!(ql.completeness.as_str(), "sound-only");
+    assert!(
+        ql.completeness
+            .reasons()
+            .join(" ")
+            .contains("property chain"),
+        "{:?}",
+        ql.completeness
+    );
+}

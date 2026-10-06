@@ -10,11 +10,19 @@
 //! (the generated types, then the query's variables). A query's certain answers are its
 //! matches on the named individuals.
 //!
-//! `NRESE_QL_CASES` sets the number of cases (default 150), `NRESE_QL_SEED` the seed.
+//! Mixed ontologies add what OWL 2 QL leaves out on purpose: transitive properties,
+//! property chains, functional and inverse functional properties, and `owl:sameAs` in the
+//! data. The chase applies them too (equality by merging elements, named ones kept as
+//! representatives). The store's answers must all be certain, and every query that misses
+//! one must say `sound-only` (docs/design/ql-rewriting.md §7).
+//!
+//! `NRESE_QL_CASES` sets the number of cases (default 150 per test), `NRESE_QL_SEED` the
+//! seed.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use nrese_reasoner::rulesets::Ruleset;
+use nrese_sparql::ql::Completeness;
 use nrese_store::{
     BulkLoadRequest, GraphTarget, SolutionsResultFormat, SparqlQueryRequest, StoreConfig,
     StoreService,
@@ -24,6 +32,9 @@ const E: &str = "http://e/";
 const CLASSES: usize = 4;
 const PROPERTIES: usize = 3;
 const INDIVIDUALS: usize = 4;
+/// Edges a chase may hold: transitivity and chains over many anonymous elements are
+/// quadratic. A case past it is skipped (and counted).
+const MAX_EDGES: usize = 50_000;
 
 /// xorshift64*: deterministic cases without a dependency.
 struct Rng(u64);
@@ -93,6 +104,57 @@ impl Tbox {
         self.roles.push((sub, sup));
         self.roles.push((sub.inverse(), sup.inverse()));
     }
+}
+
+/// Axioms beyond OWL 2 QL, and equalities in the data.
+#[derive(Debug, Default)]
+struct Extras {
+    /// `p ∘ q ⊑ r` (a transitive `p` is `p ∘ p ⊑ p`).
+    chains: Vec<(usize, usize, usize)>,
+    functional: Vec<usize>,
+    inverse_functional: Vec<usize>,
+    same: Vec<(usize, usize)>,
+    turtle: Vec<String>,
+}
+
+/// Extras over the properties, mostly over `generating` ones (the roles of existentials),
+/// where they meet anonymous individuals.
+fn random_extras(rng: &mut Rng, generating: &[usize]) -> Extras {
+    let mut e = Extras::default();
+    for _ in 0..1 + rng.below(3) {
+        let p = if !generating.is_empty() && rng.chance(70) {
+            generating[rng.below(generating.len())]
+        } else {
+            rng.below(PROPERTIES)
+        };
+        match rng.below(5) {
+            0 | 1 => {
+                e.chains.push((p, p, p));
+                e.turtle.push(format!(":P{p} a owl:TransitiveProperty ."));
+            }
+            2 => {
+                let (q, r) = (rng.below(PROPERTIES), rng.below(PROPERTIES));
+                e.chains.push((p, q, r));
+                e.turtle
+                    .push(format!(":P{r} owl:propertyChainAxiom ( :P{p} :P{q} ) ."));
+            }
+            3 => {
+                e.functional.push(p);
+                e.turtle.push(format!(":P{p} a owl:FunctionalProperty ."));
+            }
+            _ => {
+                e.inverse_functional.push(p);
+                e.turtle
+                    .push(format!(":P{p} a owl:InverseFunctionalProperty ."));
+            }
+        }
+    }
+    if rng.chance(40) {
+        let (a, b) = (rng.below(INDIVIDUALS), rng.below(INDIVIDUALS));
+        e.same.push((a, b));
+        e.turtle.push(format!(":a{a} owl:sameAs :a{b} ."));
+    }
+    e
 }
 
 fn restriction(role: Role, filler: Option<usize>) -> String {
@@ -317,6 +379,9 @@ struct Chase {
     edges: HashSet<(usize, usize, usize)>,
     /// `(element, role)` for each element with an edge of the role.
     has: HashSet<(usize, Role)>,
+    /// Union-find: each element's representative is the least of its class, so a class
+    /// with an individual is represented by one.
+    rep: Vec<usize>,
 }
 
 impl Chase {
@@ -346,10 +411,74 @@ impl Chase {
         self.edges.insert(edge)
     }
 
-    /// Runs `tbox` over the facts, anonymous elements to `max_depth`; `None` past
-    /// `max_elements`.
+    fn find(&self, mut x: usize) -> usize {
+        while self.rep[x] != x {
+            x = self.rep[x];
+        }
+        x
+    }
+
+    /// Makes `a` and `b` one element; whether they were two.
+    fn merge(&mut self, a: usize, b: usize) -> bool {
+        let (a, b) = (self.find(a), self.find(b));
+        if a == b {
+            return false;
+        }
+        let (low, high) = (a.min(b), a.max(b));
+        self.rep[high] = low;
+        self.depth[low] = self.depth[low].min(self.depth[high]);
+        true
+    }
+
+    /// Every fact over representatives.
+    fn canonical(&mut self) {
+        let types: HashSet<(usize, usize)> =
+            self.types.iter().map(|&(x, c)| (self.find(x), c)).collect();
+        let edges: Vec<(usize, usize, usize)> = self
+            .edges
+            .iter()
+            .map(|&(x, p, y)| (self.find(x), p, self.find(y)))
+            .collect();
+        self.types = types;
+        self.edges.clear();
+        self.has.clear();
+        for edge in edges {
+            self.add_edge(edge);
+        }
+    }
+
+    /// The individuals an element stands for.
+    fn names(&self, x: usize) -> Vec<usize> {
+        (0..INDIVIDUALS).filter(|&i| self.find(i) == x).collect()
+    }
+
+    /// The certain answers with each element written as every individual it is.
+    fn named_answers(&self, query: &Query) -> BTreeSet<Vec<usize>> {
+        let mut out = BTreeSet::new();
+        for tuple in self.answers(query) {
+            let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
+            for &x in &tuple {
+                rows = rows
+                    .into_iter()
+                    .flat_map(|row| {
+                        self.names(x).into_iter().map(move |n| {
+                            let mut row = row.clone();
+                            row.push(n);
+                            row
+                        })
+                    })
+                    .collect();
+            }
+            out.extend(rows);
+        }
+        out
+    }
+
+    /// Runs `tbox` and `extras` over the facts, anonymous elements to `max_depth`; `None`
+    /// past `max_elements`.
     fn run(
         tbox: &Tbox,
+        extras: &Extras,
         types: &[(usize, usize)],
         edges: &[(usize, usize, usize)],
         max_depth: usize,
@@ -360,16 +489,74 @@ impl Chase {
             types: types.iter().copied().collect(),
             edges: HashSet::new(),
             has: HashSet::new(),
+            rep: (0..INDIVIDUALS).collect(),
         };
         for &edge in edges {
             chase.add_edge(edge);
         }
+        for &(a, b) in &extras.same {
+            chase.merge(a, b);
+        }
+        chase.canonical();
         let mut generated: HashSet<(usize, usize)> = HashSet::new();
         loop {
             let mut changed = false;
             let elements = chase.depth.len();
+            // Chains and transitivity, then the equalities functional properties force.
+            for &(p, q, r) in &extras.chains {
+                let mut out_q: HashMap<usize, Vec<usize>> = HashMap::new();
+                for &(y, s, z) in &chase.edges {
+                    if s == q {
+                        out_q.entry(y).or_default().push(z);
+                    }
+                }
+                let new: Vec<(usize, usize, usize)> = chase
+                    .edges
+                    .iter()
+                    .filter(|&&(_, s, _)| s == p)
+                    .flat_map(|&(x, _, y)| {
+                        out_q.get(&y).into_iter().flatten().map(move |&z| (x, r, z))
+                    })
+                    .collect();
+                for edge in new {
+                    changed |= chase.add_edge(edge);
+                }
+                if chase.edges.len() > MAX_EDGES {
+                    return None;
+                }
+            }
+            let mut merged = false;
+            let mut pairs: Vec<(usize, usize)> = Vec::new();
+            for (list, inverse) in [
+                (&extras.functional, false),
+                (&extras.inverse_functional, true),
+            ] {
+                for &p in list {
+                    let mut by: HashMap<usize, usize> = HashMap::new();
+                    for &(x, s, y) in &chase.edges {
+                        if s == p {
+                            let (key, value) = if inverse { (y, x) } else { (x, y) };
+                            match by.get(&key) {
+                                Some(&other) if other != value => pairs.push((other, value)),
+                                Some(_) => {}
+                                None => {
+                                    by.insert(key, value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (a, b) in pairs {
+                merged |= chase.merge(a, b);
+            }
+            if merged {
+                chase.canonical();
+                changed = true;
+            }
+            let reps: Vec<usize> = (0..elements).filter(|&x| chase.rep[x] == x).collect();
             for &(left, class) in &tbox.inclusions {
-                for x in 0..elements {
+                for &x in &reps {
                     if !chase.types.contains(&(x, class)) && chase.holds(x, left) {
                         chase.types.insert((x, class));
                         changed = true;
@@ -393,7 +580,7 @@ impl Chase {
                 }
             }
             for (g, &(left, role, filler)) in tbox.generating.iter().enumerate() {
-                for x in 0..elements {
+                for &x in &reps {
                     if chase.depth[x] < max_depth
                         && !generated.contains(&(x, g))
                         && chase.holds(x, left)
@@ -401,6 +588,7 @@ impl Chase {
                         generated.insert((x, g));
                         let n = chase.depth.len();
                         chase.depth.push(chase.depth[x] + 1);
+                        chase.rep.push(n);
                         chase.add_edge(if role.inverse {
                             (n, role.property, x)
                         } else {
@@ -413,7 +601,7 @@ impl Chase {
                     }
                 }
             }
-            if chase.depth.len() > max_elements {
+            if chase.depth.len() > max_elements || chase.edges.len() > MAX_EDGES {
                 return None;
             }
             if !changed {
@@ -485,13 +673,13 @@ impl Chase {
             return query.answers.is_empty();
         }
         let value = |t: T, assignment: &[Option<usize>]| match t {
-            T::Ind(i) => Some(i),
+            T::Ind(i) => Some(self.find(i)),
             T::Var(v) => assignment[v],
         };
         let answer = |v: usize| query.answers.contains(&v);
         let bind = |t: T, x: usize, assignment: &mut Vec<Option<usize>>| -> Option<Option<usize>> {
             match t {
-                T::Ind(i) => (i == x).then_some(None),
+                T::Ind(i) => (self.find(i) == x).then_some(None),
                 T::Var(v) => match assignment[v] {
                     Some(y) => (y == x).then_some(None),
                     None if answer(v) && x >= INDIVIDUALS => None,
@@ -584,13 +772,23 @@ fn parts(query: &Query) -> Vec<Vec<QAtom>> {
 
 /// The rows of a query's TSV results, as tuples of individuals (`k` for the boolean form).
 fn store_rows(store: &StoreService, query: &str) -> Vec<Vec<usize>> {
+    store_answer(store, query).0
+}
+
+/// [`store_rows`], and whether the store says they are complete (with its reasons).
+fn store_answer(store: &StoreService, query: &str) -> (Vec<Vec<usize>>, Completeness) {
     let mut request = SparqlQueryRequest::all(query);
     request.solutions_format = SolutionsResultFormat::Tsv;
     let result = store
         .execute_query(&request)
         .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let completeness = result
+        .ql
+        .map(|report| report.completeness)
+        .unwrap_or_default();
     let text = String::from_utf8(result.payload).unwrap();
-    text.lines()
+    let rows = text
+        .lines()
         .skip(1)
         .map(|line| {
             line.split('\t')
@@ -603,7 +801,8 @@ fn store_rows(store: &StoreService, query: &str) -> Vec<Vec<usize>> {
                 })
                 .collect()
         })
-        .collect()
+        .collect();
+    (rows, completeness)
 }
 
 fn store(turtle: &str, dir: &std::path::Path, ruleset: Ruleset, ql: bool) -> StoreService {
@@ -663,8 +862,14 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
         let kinds: HashSet<(Role, Option<usize>)> =
             tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
         let max_vars = queries.iter().map(|q| q.vars).max().unwrap_or(1);
-        let Some(chase) = Chase::run(&tbox, &types, &edges, kinds.len() + max_vars + 1, 20_000)
-        else {
+        let Some(chase) = Chase::run(
+            &tbox,
+            &Extras::default(),
+            &types,
+            &edges,
+            kinds.len() + max_vars + 1,
+            20_000,
+        ) else {
             skipped += 1;
             continue;
         };
@@ -684,8 +889,15 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
         let without = store(&turtle, dir.path(), ruleset, false);
         for query in &queries {
             let certain = chase.answers(query);
-            let distinct: BTreeSet<Vec<usize>> =
-                store_rows(&with, &query.sparql(true)).into_iter().collect();
+            let (rows, completeness) = store_answer(&with, &query.sparql(true));
+            let distinct: BTreeSet<Vec<usize>> = rows.into_iter().collect();
+            // Pure QL: nothing the rewriting doesn't follow.
+            assert_eq!(
+                completeness,
+                Completeness::Complete,
+                "case {case}:\n{turtle}\n{}",
+                query.sparql(true)
+            );
             assert_eq!(
                 distinct,
                 certain,
@@ -729,4 +941,107 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
     );
     assert!(checked >= cases * 3, "too many cases skipped: {skipped}");
     assert!(gained > 0, "no case exercised the rewriting");
+}
+
+#[test]
+fn mixed_ontologies_answer_soundly_and_say_when_they_may_miss() {
+    let cases: usize = std::env::var("NRESE_QL_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(150);
+    let dir = tempfile::tempdir().unwrap();
+    let seed = std::env::var("NRESE_QL_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x2545_f491_4f6c_dd1d);
+    let mut rng = Rng(seed);
+    let (mut checked, mut skipped) = (0, 0);
+    // Queries that missed answers (all flagged), flagged ones that missed none, complete ones.
+    let (mut missed, mut cautious, mut complete) = (0, 0, 0);
+    for case in 0..cases {
+        let tbox = random_tbox(&mut rng);
+        let roles: Vec<usize> = tbox.generating.iter().map(|g| g.1.property).collect();
+        let extras = random_extras(&mut rng, &roles);
+        let mut types = Vec::new();
+        let mut edges = Vec::new();
+        let mut data = Vec::new();
+        for _ in 0..1 + rng.below(8) {
+            if rng.chance(50) {
+                let (a, c) = (rng.below(INDIVIDUALS), rng.below(CLASSES));
+                types.push((a, c));
+                data.push(format!(":a{a} a :C{c} ."));
+            } else {
+                let (a, p, b) = (
+                    rng.below(INDIVIDUALS),
+                    rng.below(PROPERTIES),
+                    rng.below(INDIVIDUALS),
+                );
+                edges.push((a, p, b));
+                data.push(format!(":a{a} :P{p} :a{b} ."));
+            }
+        }
+        let queries: Vec<Query> = (0..4).map(|_| random_query(&mut rng)).collect();
+        let kinds: HashSet<(Role, Option<usize>)> =
+            tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
+        let max_vars = queries.iter().map(|q| q.vars).max().unwrap_or(1);
+        let Some(chase) = Chase::run(
+            &tbox,
+            &extras,
+            &types,
+            &edges,
+            kinds.len() + max_vars + 2,
+            5_000,
+        ) else {
+            skipped += 1;
+            continue;
+        };
+        let turtle = format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             {}\n{}\n{}",
+            tbox.turtle.join("\n"),
+            extras.turtle.join("\n"),
+            data.join("\n")
+        );
+        let store = store(&turtle, dir.path(), Ruleset::Owl2Rl, true);
+        for query in &queries {
+            let certain = chase.named_answers(query);
+            let (rows, completeness) = store_answer(&store, &query.sparql(true));
+            let answered: BTreeSet<Vec<usize>> = rows.into_iter().collect();
+            let context = || {
+                format!(
+                    "case {case}:\n{turtle}\n{}\n{completeness:?}",
+                    query.sparql(true)
+                )
+            };
+            // Sound: every answer is certain.
+            let wrong: Vec<_> = answered.difference(&certain).collect();
+            assert!(
+                wrong.is_empty(),
+                "answers that aren't certain {wrong:?}: {}",
+                context()
+            );
+            // Never silent: a miss says so.
+            let misses = certain.difference(&answered).count();
+            match (misses, &completeness) {
+                (0, Completeness::Complete) => complete += 1,
+                (0, Completeness::SoundOnly(_)) => cautious += 1,
+                (_, Completeness::SoundOnly(_)) => missed += 1,
+                (_, Completeness::Complete) => {
+                    panic!("{misses} answers missed without saying so: {}", context())
+                }
+            }
+            checked += 1;
+        }
+    }
+    eprintln!(
+        "QL mixed: {checked} queries checked, {skipped} cases skipped (chase too large); \
+         {missed} missed answers and said sound-only, {cautious} said sound-only and missed \
+         none, {complete} complete"
+    );
+    assert!(checked >= cases * 3, "too many cases skipped: {skipped}");
+    assert!(
+        missed > 0,
+        "no case missed an answer: the flag went untested"
+    );
 }
