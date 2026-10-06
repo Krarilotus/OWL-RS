@@ -66,8 +66,17 @@ mark pops every frame whose mark is at or after it, not only those above it.
 - A retracted fact gets a dead bit and leaves the indexes (`unary_ix`, `edge_ix`, …). Its
   slot is reclaimed at the next `cut` below it. `cut(mark)` stays for restarts, probes and
   base rollback.
-- In-place changes on the trail (flags, representative) record their dependency set, so
-  retraction undoes exactly the entries that contain `k`, in any order.
+- In-place changes on the trail (merge flags, representative) record their dependency set
+  and the bits they set, so retraction undoes exactly the entries that contain `k`, in any
+  order. Blocking writes its flags untrailed and recomputes them anyway.
+- Retraction then **removes** its level's entries from the trail, and patches the `old`
+  value of later entries on the same node. It must not append undo entries of its own: a
+  later `cut` to a mark taken before the retraction (a kept frame's) would pop them and
+  restore the retracted merge, while its copied facts stay dead. `PRUNED` is recomputed
+  from the live merged ancestors of the touched subtree.
+- Dead facts need no trail: they leave the indexes, and a `cut` truncates the arenas as
+  before (a fact re-derived after a retraction always sits above the dead one, so the
+  index stays consistent under any cut).
 
 **What depends on absence.**
 - Blocking and the ≥-rule's witnesses are re-evaluated on the nodes retraction touched (the
