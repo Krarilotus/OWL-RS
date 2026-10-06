@@ -221,8 +221,10 @@ impl<'e> BulkLoad<'e> {
             }
         }
         // The new terms numbered, the quads (and spilled chunks) renumbered to them.
+        nrese_exec::heap::phase("load: numbering");
         let mut renumbered = Ok(());
         shared.dictionary.adopt_pending(pending, |adopted| {
+            nrese_exec::heap::phase("load: renumbering");
             remap(adopted, &mut quads);
             if let Some(spill) = spilled.as_mut() {
                 renumbered = spill.sort_raw(&|quads: &mut [EncodedQuad]| remap(adopted, quads));
@@ -233,10 +235,12 @@ impl<'e> BulkLoad<'e> {
             return publish_spilled(engine, spill, current, started, _compaction);
         }
         // By radix over the bits the ids use ([`nrese_exec::sort`]).
+        nrese_exec::heap::phase("load: sorting");
         let kept = nrese_exec::sort::sort_dedup_keys(crate::quad::as_keys_mut(&mut quads));
         quads.truncate(kept);
 
         // Nothing else in the new version: its permutations go straight into the checkpoint.
+        nrese_exec::heap::phase("load: permutations");
         let streamed = streamable(engine, mode);
         let (next, summary) = match mode {
             _ if streamed => {
