@@ -59,20 +59,22 @@ impl Worker<'_> {
                 .position(|&a| a == head)
                 .unwrap_or(0);
             s.premises.clear();
-            self.pred_join(r, Some((at, c)), 0, &[], &mut s);
+            self.pred_join(r, Some((at, c)), 0, &[], true, &mut s);
         }
         s.waiting = waiting;
         self.conclude(&s.found);
         self.scratch = s;
     }
 
-    /// Joins remote clause `r`'s body from position `i` on with this context's clauses.
+    /// Joins remote clause `r`'s body from position `i` on with this context's clauses;
+    /// `grew`: the body so far gained an atom since the last redundancy check.
     pub(super) fn pred_join(
         &self,
         r: u32,
         fixed: Option<(usize, ClauseId)>,
         i: usize,
         acc: &[Atom],
+        grew: bool,
         s: &mut Scratch,
     ) {
         if self.engine.exhausted() {
@@ -86,6 +88,16 @@ impl Worker<'_> {
             return;
         }
         let remote = &self.state.remote[r as usize];
+        // The body only grows along the join: where a clause already makes `acc → head`
+        // redundant, it makes every conclusion below redundant too, so none is made.
+        // Checked where the body grew, and not at the last level (`derive` checks there).
+        if self.engine.prune_pred
+            && grew
+            && i < remote.body.len()
+            && self.state.clauses.subsumed(acc, remote.head)
+        {
+            return;
+        }
         if i == remote.body.len() {
             s.refs.clear();
             if self.engine.proofs {
@@ -121,14 +133,15 @@ impl Worker<'_> {
                 continue;
             }
             let body = clauses.body(p);
-            let next: &[Atom] = if body.is_empty() || is_subset(body, acc) {
+            let same = body.is_empty() || is_subset(body, acc);
+            let next: &[Atom] = if same {
                 acc
             } else {
                 union_into(acc, body, &mut union);
                 &union
             };
             s.premises.push(p);
-            self.pred_join(r, fixed, i + 1, next, s);
+            self.pred_join(r, fixed, i + 1, next, !same, s);
             s.premises.pop();
         }
     }

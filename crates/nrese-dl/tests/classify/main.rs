@@ -195,10 +195,10 @@ fn variants() -> Vec<(&'static str, Options)> {
             },
         ),
         (
-            "split-lower-bound",
+            "cautious-lower-bound",
             Options {
                 context_core: false,
-                lower_bound_strategy: nrese_dl::context::Strategy::Split,
+                lower_bound_strategy: nrese_dl::context::Strategy::Cautious,
                 ..base.clone()
             },
         ),
