@@ -47,6 +47,9 @@ pub struct DlStatus {
 #[derive(Debug, Default)]
 pub struct Dl {
     active: AtomicBool,
+    /// The reasoner runs user rules besides OWL 2 RL: their conclusions from OWL 2 DL's
+    /// entailments aren't computed, so no answer is claimed complete.
+    user_rules: AtomicBool,
     status: Mutex<Option<DlStatus>>,
     pub(crate) classification: classification::Cache,
     pub(crate) bounds: bounds::Bounds,
@@ -58,8 +61,15 @@ impl Dl {
         self.active.load(Ordering::Acquire)
     }
 
-    pub(crate) fn set_active(&self, active: bool) {
+    pub(crate) fn set_active(&self, active: bool, user_rules: bool) {
         self.active.store(active, Ordering::Release);
+        self.user_rules
+            .store(active && user_rules, Ordering::Release);
+    }
+
+    /// Whether user rules run with the mode ([`Dl::set_active`]).
+    pub fn user_rules(&self) -> bool {
+        self.user_rules.load(Ordering::Acquire)
     }
 
     /// The status recorded last (by a commit, or a check on request); for the current
