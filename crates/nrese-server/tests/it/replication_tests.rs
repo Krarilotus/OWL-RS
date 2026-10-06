@@ -189,3 +189,139 @@ async fn a_replica_follows_its_primary() -> Result<(), Box<dyn std::error::Error
     assert_eq!(reopened.current_revision(), reached);
     Ok(())
 }
+
+/// A query's body and its completeness header.
+async fn answered(
+    app: axum::Router,
+    query: &str,
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dataset/query")
+                .method(Method::POST)
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/sparql-results+json")
+                .body(Body::from(query.to_owned()))?,
+        )
+        .await?;
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let status = header("nrese-completeness");
+    Ok((body_text(response).await?, status))
+}
+
+/// Under `owl2-dl` a replica gives its primary's answers with the same status: it builds
+/// the bounds from the records, interning no term (its dictionary continues the
+/// primary's, which interns the bounds' terms in its commits).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::error::Error>> {
+    let dl = || ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Dl));
+    let primary_dir = tempfile::tempdir()?;
+    let primary_state = AppState::new(
+        StoreService::new(StoreConfig::on_disk(primary_dir.path()))?,
+        dl(),
+        PolicyConfig::default(),
+        AiSuggestionService::disabled(),
+        DeploymentPosture::OpenWorkbench,
+    )
+    .with_replication(ReplicationConfig {
+        mode: ReplicationMode::Primary,
+        ..ReplicationConfig::default()
+    });
+    primary_state.mark_ready();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let primary_app = build_app(primary_state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, primary_app).await.expect("primary");
+    });
+    let owl = "PREFIX owl: <http://www.w3.org/2002/07/owl#> ";
+    update(
+        &base,
+        &format!(
+            "{owl}INSERT DATA {{ ex:A rdfs:subClassOf [ owl:unionOf ( ex:B ex:C ) ] . \
+             ex:B rdfs:subClassOf ex:D . ex:C rdfs:subClassOf ex:D . ex:x a ex:A }}"
+        ),
+    )
+    .await;
+
+    let replica_dir = tempfile::tempdir()?;
+    let config = ReplicationConfig {
+        mode: ReplicationMode::Replica,
+        primary: Some(base.clone()),
+        poll: std::time::Duration::from_millis(20),
+        ..ReplicationConfig::default()
+    };
+    replication::bootstrap(&config, replica_dir.path()).await?;
+    let replica_state = AppState::new(
+        StoreService::new(StoreConfig::on_disk(replica_dir.path()))?,
+        dl(),
+        PolicyConfig::default(),
+        AiSuggestionService::disabled(),
+        DeploymentPosture::OpenWorkbench,
+    )
+    .with_replication(config);
+    replica_state.mark_ready();
+    assert!(replica_state.store().dl().replica());
+    // Commits after the image: an assertion of a union, and new schema (a new U1).
+    update(
+        &base,
+        &format!("{owl}INSERT DATA {{ ex:w a [ owl:unionOf ( ex:B ex:C ) ] }}"),
+    )
+    .await;
+    update(
+        &base,
+        "INSERT DATA { ex:D rdfs:subClassOf ex:E . ex:y a ex:B }",
+    )
+    .await;
+    catch_up(&base, &replica_state).await;
+    let replica_app = build_app(replica_state.clone());
+    let primary_app = build_app(primary_state.clone());
+    for query in [
+        "SELECT ?x WHERE { ?x a ex:E } ORDER BY ?x",
+        "SELECT ?x WHERE { ?x a ex:C } ORDER BY ?x",
+        "SELECT ?x WHERE { { ?x a ex:D } UNION { ?x a ex:C } } ORDER BY ?x",
+    ] {
+        let query = format!("{PREFIXES}{query}");
+        let want = answered(primary_app.clone(), &query).await?;
+        let got = answered(replica_app.clone(), &query).await?;
+        assert_eq!(got, want, "{query}");
+        assert!(want.1.is_some(), "a status: {query}");
+    }
+    let (text, status) = answered(
+        replica_app.clone(),
+        &format!("{PREFIXES}SELECT ?x WHERE {{ ?x a ex:E }}"),
+    )
+    .await?;
+    assert!(
+        status
+            .as_deref()
+            .is_some_and(|s| s == "complete" || s.starts_with("complete; ")),
+        "{status:?}"
+    );
+    for x in ["x", "w", "y"] {
+        assert!(text.contains(&format!("example.com/{x}")), "{text}");
+    }
+    // More commits still apply: the replica interned nothing of its own.
+    update(&base, "INSERT DATA { ex:z a ex:B }").await;
+    catch_up(&base, &replica_state).await;
+    assert_eq!(
+        replica_state.store().current_revision(),
+        primary_state.store().current_revision()
+    );
+    // At one revision, one U1: the replica's, built from the records, is the primary's,
+    // maintained by its commits.
+    let (primary, replica) = (primary_state.store(), replica_state.store());
+    assert_eq!(replica.dl_bounds().revision, replica.current_revision());
+    assert_eq!(
+        replica.dl_upper_facts(false).expect("the replica's U1"),
+        primary.dl_upper_facts(false).expect("the primary's U1")
+    );
+    Ok(())
+}

@@ -39,17 +39,33 @@ status() {
     "$TARGET" "$(dir_gb "$TARGET")" "$BUDGET_GB" "$(free_gb "$ROOT")" "$MIN_FREE_GB"
 }
 
-# Removes the debug output, then everything, until the directory fits the budget.
+# Every removal is logged, so a slow build can be told apart from one that started from
+# nothing (tmp/ is git-ignored).
+WIPES="$ROOT/tmp/guard-wipes.log"
+logged() {
+  mkdir -p "$ROOT/tmp"
+  printf '%s %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$TARGET" "$1" >> "$WIPES"
+  printf '%s\n' "$1" >&2
+}
+
+# Until the directory fits the budget: first the stale builds cargo keeps of every crate
+# (the newest of each stays, so the next build reuses it), then the debug output, then
+# everything.
 shrink() {
-  local size
+  local size freed
   size=$(dir_gb "$TARGET")
   if [ "$size" -gt "$BUDGET_GB" ]; then
-    printf 'build directory is %s GB, over its %s GB budget: removing the debug output\n' "$size" "$BUDGET_GB" >&2
+    freed=$(python "$ROOT/scripts/lib/prune-stale.py" "$TARGET" 2>/dev/null || printf 0)
+    logged "build directory was $size GB, over its $BUDGET_GB GB budget: stale builds removed ($((freed / 1048576)) MiB)"
+    size=$(dir_gb "$TARGET")
+  fi
+  if [ "$size" -gt "$BUDGET_GB" ]; then
+    logged "still $size GB: removing the debug output"
     (cd "$ROOT" && cargo clean --profile dev >&2)
     size=$(dir_gb "$TARGET")
   fi
   if [ "$size" -gt "$BUDGET_GB" ]; then
-    printf 'still %s GB: removing the whole build directory\n' "$size" >&2
+    logged "still $size GB: removing the whole build directory"
     (cd "$ROOT" && cargo clean >&2)
   fi
   mkdir -p "$TARGET"
@@ -75,6 +91,21 @@ if [ $((now - last)) -ge 600 ]; then
   shrink
 fi
 require_free_gb "$MIN_FREE_GB" "cargo $*" "$ROOT"
+
+# A timing measurement holds the quiet slot (scripts/quiet-slot.sh): builds wait for it, at
+# most NRESE_QUIET_WAIT_S (default 1800 s), so the measurement isn't timing our compilers.
+QUIET="${NRESE_QUIET_DIR:-$HOME/.nrese-quiet-slot}"
+waited=0
+while [ -d "$QUIET" ] && [ "$waited" -lt "${NRESE_QUIET_WAIT_S:-1800}" ]; do
+  owner=$(cat "$QUIET/pid" 2>/dev/null || echo "")
+  if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+    break
+  fi
+  [ "$waited" -eq 0 ] && printf 'a measurement holds the quiet slot (%s): waiting\n' \
+    "$(cat "$QUIET/who" 2>/dev/null || echo '?')" >&2
+  sleep 10
+  waited=$((waited + 10))
+done
 
 export_target_cpu_rustflags
 

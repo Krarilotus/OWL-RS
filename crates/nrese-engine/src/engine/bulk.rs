@@ -193,8 +193,9 @@ impl<'e> BulkLoad<'e> {
                 crate::memory::release_all();
             }
         }
-        quads.par_sort_unstable();
-        quads.dedup();
+        // By radix over the bits the ids use ([`nrese_exec::sort`]).
+        let kept = nrese_exec::sort::sort_dedup_keys(crate::quad::as_keys_mut(&mut quads));
+        quads.truncate(kept);
 
         // Nothing else in the new version: its permutations go straight into the checkpoint.
         let streamed = streamable(engine, mode);
@@ -225,6 +226,7 @@ impl<'e> BulkLoad<'e> {
                     inferred_deleted: current.inferred.len(),
                 };
                 let next = Version {
+                    content: super::Content::fresh(),
                     asserted: IndexVersion::from_quads(Layout::holding(&quads), quads),
                     inferred: IndexVersion::empty(Layout::DefaultGraph),
                     revision: summary.revision,
@@ -261,6 +263,7 @@ impl<'e> BulkLoad<'e> {
                 };
                 let run = Run::from_quads(asserted.layout(), inserts);
                 let next = Version {
+                    content: super::Content::fresh(),
                     asserted: asserted.with_run(run),
                     inferred: current.inferred.with_delta(&[], &explicit),
                     revision: summary.revision,
@@ -417,6 +420,8 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 Some(Ok((dictionary, [asserted, inferred]))) => {
                     base = Some(dictionary);
                     Arc::new(Version {
+                        // The same statements, mapped from the checkpoint.
+                        content: next.content,
                         asserted,
                         inferred,
                         equality: Arc::clone(&next.equality),
@@ -469,6 +474,7 @@ fn publish_streamed(
         let asserted =
             IndexVersion::from_packed(packed).map_err(crate::error::EngineError::Corruption)?;
         let next = Version {
+            content: super::Content::fresh(),
             asserted,
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision,
@@ -517,6 +523,7 @@ fn publish_streamed(
         }
     };
     let next = Arc::new(Version {
+        content: super::Content::fresh(),
         asserted,
         inferred,
         revision,
@@ -617,6 +624,7 @@ impl<'e> Rematerialisation<'e> {
             });
         }
         let next = Version {
+            content: super::Content::fresh(),
             asserted: current.asserted.clone(),
             inferred: IndexVersion::from_quads(Layout::DefaultGraph, quads),
             revision: summary.revision,

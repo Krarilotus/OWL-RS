@@ -20,9 +20,12 @@ pub struct StoreConfig {
     /// Ontology file loaded at startup. `None` means no preload; there are no implicit
     /// fallback locations.
     pub ontology_path: Option<PathBuf>,
-    /// Bytes of serialised query results kept for repeated queries on an unchanged store
-    /// (see `query_cache`); 0 disables the cache.
+    /// Bytes of query part results kept for repeated queries and shared sub-patterns on an
+    /// unchanged store (`nrese_sparql::cache`); 0 disables the cache.
     pub query_cache_bytes: usize,
+    /// SPARQL query files whose results are pinned in the result cache at startup, each
+    /// under its file name without the extension.
+    pub pinned_queries: Vec<PathBuf>,
     /// The graph that holds the repository's SHACL shapes.
     pub shapes_graph: String,
     /// The default graph of queries and update `WHERE` clauses that name no dataset is
@@ -45,6 +48,10 @@ pub struct StoreConfig {
     /// Reasoning leaves out memberships in unnamed union classes that nothing consumes
     /// (`reasoner.unnamed_classes = "skip"`; work package W7).
     pub hide_unnamed_classes: bool,
+    /// OWL 2 QL answers through existentials by tree-witness rewriting
+    /// (`reasoner.ql_rewriting`, docs/design/ql-rewriting.md §4); a repository's settings
+    /// may choose another.
+    pub ql_rewriting: QlRewritingMode,
     /// Full materialisations with equality rules compute the closure over representatives
     /// of the `owl:sameAs` classes and expand it (`reasoner.equality = "representatives"`,
     /// the default) instead of copying every fact to every identity while computing it
@@ -91,6 +98,47 @@ pub struct StoreConfig {
     /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
+    /// The `owl2-dl` mode's settings (`dl.*`), used when the reasoner runs that mode.
+    pub dl: crate::dl::DlConfig,
+}
+
+/// When queries get the OWL 2 QL answers through existentials (`reasoner.ql_rewriting`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QlRewritingMode {
+    /// Under `owl2-ql`, the profile that names them; not under `owl2-rl`, whose users chose
+    /// its standard semantics (and answer counts equal to other systems' `owl2-rl`).
+    #[default]
+    Auto,
+    /// Under `owl2-ql` and `owl2-rl`.
+    On,
+    Off,
+}
+
+impl QlRewritingMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    /// The mode named `name` (`auto`, `on`, `off`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Auto, Self::On, Self::Off]
+            .into_iter()
+            .find(|mode| mode.name() == name)
+    }
+
+    /// Whether queries over a closure of `ruleset` are rewritten.
+    pub fn applies_to(self, ruleset: &str) -> bool {
+        match (self, ruleset) {
+            (Self::Off, _) => false,
+            (_, "owl2-ql") => true,
+            (Self::On, "owl2-rl") => true,
+            _ => false,
+        }
+    }
 }
 
 /// The SHACL commit gate's policy.
@@ -178,6 +226,7 @@ impl StoreConfig {
             data_dir: PathBuf::from("./data"),
             ontology_path: None,
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
+            pinned_queries: Vec::new(),
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
             geosparql_stated_only: false,
@@ -185,6 +234,7 @@ impl StoreConfig {
             process_memory_bytes: default_process_memory_bytes(),
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            ql_rewriting: QlRewritingMode::Auto,
             equality_by_representatives: true,
             equality_compact: false,
             equality_canonical_answers: false,
@@ -197,6 +247,7 @@ impl StoreConfig {
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
+            dl: crate::dl::DlConfig::default(),
         }
     }
 
@@ -206,6 +257,7 @@ impl StoreConfig {
             data_dir: data_dir.into(),
             ontology_path: None,
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
+            pinned_queries: Vec::new(),
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
             geosparql_stated_only: false,
@@ -213,6 +265,7 @@ impl StoreConfig {
             process_memory_bytes: default_process_memory_bytes(),
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            ql_rewriting: QlRewritingMode::Auto,
             equality_by_representatives: true,
             equality_compact: false,
             equality_canonical_answers: false,
@@ -225,6 +278,7 @@ impl StoreConfig {
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
+            dl: crate::dl::DlConfig::default(),
         }
     }
 
@@ -240,6 +294,11 @@ impl StoreConfig {
                 "compact equality storage computes over representatives; it needs \
                  equality_by_representatives"
                     .to_owned(),
+            ));
+        }
+        if self.dl.max_candidates == 0 || self.dl.timeout.is_zero() {
+            return Err(StoreError::Configuration(
+                "dl.max_candidates and dl.timeout must be above 0".to_owned(),
             ));
         }
         if self.support_sets == 0 {

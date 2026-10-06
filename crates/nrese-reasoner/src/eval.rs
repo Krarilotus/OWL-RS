@@ -226,6 +226,12 @@ impl Schema {
         }
     }
 
+    /// Whether grounding reads relation `p` (schema atoms: a schema predicate, or
+    /// `rdf:type` with a schema class), where any order may be needed.
+    pub(crate) fn read_in_grounding(&self, p: u64) -> bool {
+        p == self.rdf_type || self.predicates.contains(&p)
+    }
+
     pub fn is_schema_fact(&self, [_, p, o]: Triple) -> bool {
         self.predicates.contains(&p) || (p == self.rdf_type && self.classes.contains(&o))
     }
@@ -658,6 +664,15 @@ impl<'r> Job<'r> {
         Self::new(source, rule, first, |_| Seg::All)
     }
 
+    /// The bytes of driver matches the job copied out of its source: none where the
+    /// source reads them in place.
+    pub fn copied_bytes(&self) -> usize {
+        match &self.drivers {
+            Drivers::Collected(drivers) => drivers.len() * std::mem::size_of::<Triple>(),
+            Drivers::InPlace(_) => 0,
+        }
+    }
+
     /// The driver positions, which [`Job::run`] takes ranges of.
     pub fn drivers(&self) -> usize {
         match &self.drivers {
@@ -717,7 +732,33 @@ pub fn run_jobs<S: Source + ?Sized>(
     keep: &(dyn Fn(Triple) -> bool + Sync),
     stop: Stop<'_>,
 ) -> Vec<Triple> {
-    run_jobs_with(source, jobs, keep, false, stop)
+    run_jobs_with(source, jobs, keep, false, stop, None)
+}
+
+/// How often [`run_jobs_counted`] asked `keep` (the membership probes), and how many of
+/// those asks came out of (predicate, subject, object) order within their morsel.
+#[derive(Debug, Default)]
+pub struct Probes {
+    pub probes: std::sync::atomic::AtomicU64,
+    pub unordered: std::sync::atomic::AtomicU64,
+    /// Head facts the bindings produced before each morsel's deduplication (one per
+    /// binding and head): with the new facts, the bindings per derived fact.
+    pub emitted: std::sync::atomic::AtomicU64,
+}
+
+/// [`run_jobs`] by morsel: each morsel's facts, sorted by (predicate, subject, object) and
+/// distinct, are handed to `finish`, and its results come back in the morsels' order,
+/// not concatenated (a caller that regroups them needs no copy of all of them). Counts
+/// the probes into `probes` (once per morsel).
+pub fn run_jobs_by_morsel<S: Source + ?Sized, T: Send>(
+    source: &S,
+    jobs: &[Job<'_>],
+    keep: &(dyn Fn(Triple) -> bool + Sync),
+    stop: Stop<'_>,
+    probes: &Probes,
+    finish: &(dyn Fn(Vec<Triple>) -> T + Sync),
+) -> Vec<T> {
+    run_morsels(source, jobs, keep, false, stop, Some(probes), finish)
 }
 
 /// [`run_jobs`] without circular derivations: those whose head is one of their own
@@ -730,7 +771,7 @@ pub fn run_jobs_acyclic<S: Source + ?Sized>(
     keep: &(dyn Fn(Triple) -> bool + Sync),
     stop: Stop<'_>,
 ) -> Vec<Triple> {
-    run_jobs_with(source, jobs, keep, true, stop)
+    run_jobs_with(source, jobs, keep, true, stop, None)
 }
 
 fn run_jobs_with<S: Source + ?Sized>(
@@ -739,7 +780,20 @@ fn run_jobs_with<S: Source + ?Sized>(
     keep: &(dyn Fn(Triple) -> bool + Sync),
     acyclic: bool,
     stop: Stop<'_>,
+    probes: Option<&Probes>,
 ) -> Vec<Triple> {
+    run_morsels(source, jobs, keep, acyclic, stop, probes, &|facts| facts).concat()
+}
+
+fn run_morsels<S: Source + ?Sized, T: Send>(
+    source: &S,
+    jobs: &[Job<'_>],
+    keep: &(dyn Fn(Triple) -> bool + Sync),
+    acyclic: bool,
+    stop: Stop<'_>,
+    probes: Option<&Probes>,
+    finish: &(dyn Fn(Vec<Triple>) -> T + Sync),
+) -> Vec<T> {
     let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
         .iter()
         .enumerate()
@@ -754,10 +808,10 @@ fn run_jobs_with<S: Source + ?Sized>(
         .map(|(j, range)| {
             let job = &jobs[*j];
             let Head::Facts(heads) = &job.rule.head else {
-                return Vec::new();
+                return finish(Vec::new());
             };
             if stop() {
-                return Vec::new();
+                return finish(Vec::new());
             }
             let mut out = Vec::new();
             job.run(source, range.clone(), &mut |bindings| {
@@ -778,12 +832,24 @@ fn run_jobs_with<S: Source + ?Sized>(
             // run in (predicate, subject, object) order: about half of an OWL 2 RL round's
             // candidates repeat within it, and sorted probes walk a relation's sorted run
             // forward instead of missing the cache at every level of every search.
+            let emitted = out.len() as u64;
             out.sort_unstable_by_key(|&[s, p, o]| (p, s, o));
             out.dedup();
-            out.retain(|&fact| keep(fact));
-            out
+            let (mut asked, mut unordered, mut last) = (0, 0, None);
+            out.retain(|&fact @ [s, p, o]| {
+                asked += 1;
+                unordered += u64::from(last.is_some_and(|last| last > (p, s, o)));
+                last = Some((p, s, o));
+                keep(fact)
+            });
+            if let Some(probes) = probes {
+                use std::sync::atomic::Ordering::Relaxed;
+                probes.probes.fetch_add(asked, Relaxed);
+                probes.unordered.fetch_add(unordered, Relaxed);
+                probes.emitted.fetch_add(emitted, Relaxed);
+            }
+            finish(out)
         })
-        .flatten()
         .collect()
 }
 

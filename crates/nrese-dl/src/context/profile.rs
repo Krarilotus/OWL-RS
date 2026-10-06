@@ -46,6 +46,8 @@ pub struct Profile {
     pub proof_steps: u64,
     /// The Eq rule's copies of clauses onto merged terms (§4's list).
     pub equality_literals_generated: u64,
+    /// Inclusion tests of the redundancy checks (per derived clause: `clauses_generated`).
+    pub subset_checks: u64,
     /// Merges of neighbour terms the Eq rule made.
     pub merges: u64,
     /// Contexts where a merge of `x` with a neighbour was due and not made.
@@ -69,6 +71,7 @@ impl Profile {
         self.slots += c.slots;
         self.equality_literals_generated += c.eq;
         self.merges += c.merges;
+        self.subset_checks += c.subset_checks;
         self.peak_agenda_size = self.peak_agenda_size.max(c.peak_agenda);
         self.max_clause_body_width = self.max_clause_body_width.max(c.max_body);
         if c.kept > 0 {
@@ -87,7 +90,7 @@ impl Profile {
              contexts_saturated={} clauses_generated={} clauses_kept={} redundant_forward={} \
              redundant_backward={} hyper={} pred={} max_head={} max_body={} edges={} \
              peak_agenda={} messages={} slots={} proof_steps={} threads={} largest_context={} \
-             merges={} eq={} unmerged={}",
+             merges={} eq={} unmerged={} subset_checks={}",
             ms(self.normalise),
             ms(self.compile),
             ms(self.saturate),
@@ -120,6 +123,7 @@ impl Profile {
             self.merges,
             self.equality_literals_generated,
             self.contexts_unmerged,
+            self.subset_checks,
         );
         out
     }
