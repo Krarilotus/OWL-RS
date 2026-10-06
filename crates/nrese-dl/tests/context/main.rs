@@ -4,6 +4,7 @@
 
 mod basics;
 mod el;
+mod functional;
 mod hubs;
 mod metamorphic;
 mod proofs;

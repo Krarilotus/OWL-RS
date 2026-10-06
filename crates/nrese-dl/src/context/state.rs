@@ -31,6 +31,9 @@ pub enum Rule {
     Pred,
     /// `A → A` for a possible atom of a successor.
     Succ,
+    /// A clause about a neighbour copied onto one merged with it (`dl`: the merge, an
+    /// index into the context's merges).
+    Eq,
 }
 
 /// How a clause was derived: the first derivation, recorded when proofs are on.
@@ -56,6 +59,9 @@ pub struct ClauseRec {
     pub processed: bool,
     /// The body's [`signature`].
     pub sig: u64,
+    /// A copy along an unconditional merge by the Eq rule, which is not copied on (the
+    /// unconditional merges are closed).
+    pub copy: bool,
 }
 
 /// Bodies of one context, interned: sorted, without repeats.
@@ -112,6 +118,9 @@ pub struct Counters {
     pub slots: u64,
     /// Premise lists looked up by the joins.
     pub lookups: u64,
+    /// The Eq rule's merges, and its copies.
+    pub merges: u64,
+    pub eq: u64,
 }
 
 /// A context's clauses and indexes.
@@ -236,6 +245,7 @@ impl Clauses {
             live: true,
             processed: false,
             sig,
+            copy: false,
         });
         for &a in body {
             self.occurrences.entry((head, a)).or_default().push(id);
