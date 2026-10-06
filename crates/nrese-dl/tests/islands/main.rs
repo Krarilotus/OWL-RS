@@ -138,6 +138,51 @@ fn abox(rng: &mut Rng, o: &mut Ontology, sig: &Signature) {
     o.sources = vec![Vec::new(); o.axioms.len()];
 }
 
+/// A chain of `n` individuals over a role nothing reads across, each in `A ⊑ B`; with
+/// `clash`, one individual is also in `C`, disjoint from `B`.
+fn chain(n: u64, clash: bool) -> Ontology {
+    let (a, b, c, r) = (1, 2, 3, 10);
+    let mut o = Ontology::default();
+    let class = |o: &mut Ontology, t: Term| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    let (ca, cb, cc) = (class(&mut o, a), class(&mut o, b), class(&mut o, c));
+    o.axioms.push(Axiom::SubClassOf(ca, cb));
+    o.axioms.push(Axiom::DisjointClasses(vec![cb, cc]));
+    for i in 0..n {
+        o.axioms.push(Axiom::ClassAssertion(ca, 100 + i));
+        if i + 1 < n {
+            o.axioms
+                .push(Axiom::ObjectPropertyAssertion(r, 100 + i, 101 + i));
+        }
+    }
+    if clash {
+        o.axioms.push(Axiom::ClassAssertion(cc, 100 + n / 2));
+    }
+    o.axioms.sort();
+    o.axioms.dedup();
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    o
+}
+
+/// The whole ABox first; where it gives up within its budget, the islands decide.
+#[test]
+fn islands_decide_where_the_whole_abox_gives_up() {
+    let config = Config {
+        max_nodes: 200,
+        timeout: Some(std::time::Duration::from_secs(60)),
+        ..Config::default()
+    };
+    for (clash, want) in [(false, Answer::Consistent), (true, Answer::Inconsistent)] {
+        let o = chain(400, clash);
+        let whole = tableau::consistency(&o, &config);
+        assert!(
+            matches!(whole.answer, Answer::GaveUp(_)),
+            "400 individuals exceed 200 nodes: {:?}",
+            whole.answer
+        );
+        assert_eq!(islands::consistency(&o, &config).answer, want);
+    }
+}
+
 fn decided(answer: &Answer) -> Option<bool> {
     match answer {
         Answer::Consistent => Some(true),
@@ -188,7 +233,7 @@ fn islands_decide_as_the_whole_abox_does() {
             split += 1;
         }
         let whole = tableau::consistency(&o, &config);
-        let parts = islands::consistency(&o, &config);
+        let parts = islands::by_islands(&o, &config);
         if let (Some(w), Some(p)) = (decided(&whole.answer), decided(&parts.answer)) {
             compared += 1;
             inconsistent += u64::from(!w);
