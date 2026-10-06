@@ -27,6 +27,7 @@ list wins and the lower one is corrected in the same change.
 | [query-plan.md](design/query-plan.md) | the query plan: logical plan, rewrites, physical choices, EXPLAIN |
 | [reasoner-v2.md](design/reasoner-v2.md) | materialisation, maintenance, rulesets |
 | [reasoner-provenance.md](design/reasoner-provenance.md) | provenance, explanations, justifications |
+| [ql-rewriting.md](design/ql-rewriting.md) | OWL 2 QL answers through existentials: tree-witness rewriting over the closure, and the completeness each answer reports |
 | [owl2-dl.md](design/owl2-dl.md), [owl2-dl-performance.md](design/owl2-dl-performance.md) | the OWL 2 DL engines and their performance plan |
 | [shacl.md](design/shacl.md) | SHACL compilation and validation |
 | [rdf-bundle.md](design/rdf-bundle.md) | NRESE's own RDF, SPARQL-syntax and XSD crates |

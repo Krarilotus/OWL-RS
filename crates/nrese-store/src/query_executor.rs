@@ -56,6 +56,17 @@ pub(crate) struct StoreSettings {
     pub equality_canonical: bool,
     /// [`StoreConfig::equality_early_expansion`](crate::StoreConfig).
     pub equality_early_expansion: bool,
+    /// The QL rewriting, while the inferred stack is current under a ruleset that makes the
+    /// data H-complete ([`StoreConfig::ql_rewriting`](crate::StoreConfig)).
+    pub ql:
+        std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>>>>,
+}
+
+impl StoreSettings {
+    /// The QL rewriting queries get now.
+    fn ql(&self) -> Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>> {
+        self.ql.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 /// A parsed query with its protocol dataset and output format. Preparing is cheap and
@@ -395,6 +406,7 @@ pub(crate) fn run_query(
         cross_chunk_rows: None,
         stream_rows: None,
         access: prepared.access.clone(),
+        ql: store.ql(),
     };
     let alive = || match cancellation.is_cancelled() {
         true => Err(StoreError::SparqlEvaluation(
@@ -485,6 +497,20 @@ pub(crate) fn plan_prepared(
     Ok(plan_query(view, &prepared.query, &options)?)
 }
 
+/// What the OWL 2 QL rewriting does to `prepared` on `view`, and whether its answers are
+/// complete (docs/design/ql-rewriting.md §7); `None` where it doesn't apply or the query
+/// doesn't run natively.
+pub(crate) fn ql_status(
+    view: &impl ReadView,
+    prepared: &PreparedQuery,
+    store: &StoreSettings,
+) -> Option<nrese_sparql::ql::QlReport> {
+    let options = explain_options(prepared, store, &CancellationToken::new());
+    nrese_sparql::ql_report(view, &prepared.query, &options)
+        .ok()
+        .flatten()
+}
+
 /// The options `prepared` runs with, for an explanation.
 fn explain_options(
     prepared: &PreparedQuery,
@@ -510,5 +536,6 @@ fn explain_options(
         cross_chunk_rows: None,
         stream_rows: None,
         access: prepared.access.clone(),
+        ql: store.ql(),
     }
 }

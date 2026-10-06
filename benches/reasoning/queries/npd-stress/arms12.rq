@@ -1,0 +1,4 @@
+# Arms without the class: a star of 12 existential arms on npdv:ExplorationWellbore, one per generating axiom:
+# 12 independent tree witnesses, 2^12 branches before the bounds (nothing implies them).
+PREFIX npdv: <http://sws.ifi.uio.no/vocab/npd-v2#>
+SELECT DISTINCT ?w WHERE { ?w npdv:belongsToWell ?v0 . ?w npdv:codeEW ?v1 . ?w npdv:codeNS ?v2 . ?w npdv:dateSyncNPD ?v3 . ?w npdv:dateUpdated ?v4 . ?w npdv:dateUpdatedMax ?v5 . ?w npdv:decimalDegreesEW ?v6 . ?w npdv:decimalDegreesNS ?v7 . ?w npdv:degreesEW ?v8 . ?w npdv:degreesNS ?v9 . ?w npdv:drillPermit ?v10 . ?w npdv:drillingFacility ?v11 . }
