@@ -82,6 +82,14 @@ pub struct Config {
     /// The most branch points a run may open (`None`: no limit): a deterministic bound
     /// on the search, for tests that must not depend on the machine's speed.
     pub max_branch_points: Option<u64>,
+    /// The ≤-rule leaves out merges that would clash at once (a concept against its
+    /// negation, a disjointness clause), with their reasons in its premise: a
+    /// pigeonhole of disjoint successors is a clash, not a branch per pair.
+    pub merge_filter: bool,
+    /// Conflict-guided choice order: each clash raises the activity of the clauses whose
+    /// choices it depended on, and the open disjunction of the most active clause is
+    /// decided first (else the oldest open one).
+    pub conflict_order: bool,
     pub timeout: Option<Duration>,
     /// The most memory a run may hold (its tables, indexes and arenas), in bytes.
     pub max_memory: usize,
@@ -116,6 +124,8 @@ impl Default for Config {
             check_blocking: false,
             max_nodes: 2_000_000,
             max_branch_points: None,
+            merge_filter: true,
+            conflict_order: false,
             timeout: None,
             max_memory: 4 << 30,
             keep_model: false,
