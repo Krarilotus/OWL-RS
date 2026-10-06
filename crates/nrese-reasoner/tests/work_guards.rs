@@ -5,7 +5,7 @@
 use nrese_reasoner::batch::{self, Materialisation, Schema};
 use nrese_reasoner::delta::{self, MemoryBase};
 use nrese_reasoner::eval::GroundProgram;
-use nrese_reasoner::ir::{Head, Rule};
+use nrese_reasoner::ir::{Head, OWL, RDF, RDFS, Rule, Vocabulary};
 use nrese_reasoner::lists::ListVocabulary;
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_reasoner::vocabulary::LocalVocabulary;
@@ -153,3 +153,59 @@ fn equality_by_copying_expands_only_facts_with_partners() {
 
 /// See [`equality_by_copying_expands_only_facts_with_partners`].
 const MEMBER_SCANS: u64 = 5_733;
+
+/// A deep hierarchy as the fast suite's `rl-hierarchy` has it, small: a spine of 200
+/// classes, each declared, with 1,000 instances at its bottom, and 10,000 instances of a
+/// shallow branch.
+fn spine() -> Materialisation {
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = Ruleset::Owl2Rl
+        .rules(&mut vocabulary)
+        .expect("OWL 2 RL parses");
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let ty = vocabulary.iri(&format!("{RDF}type"));
+    let sub = vocabulary.iri(&format!("{RDFS}subClassOf"));
+    let class = vocabulary.iri(&format!("{OWL}Class"));
+    let mut iri = |name: String| vocabulary.iri(&format!("{}{name}", lubm::EX));
+    let mut facts = Vec::new();
+    for s in 0..200 {
+        let c = iri(format!("S{s}"));
+        facts.push([c, ty, class]);
+        if s > 0 {
+            facts.push([c, sub, iri(format!("S{}", s - 1))]);
+        }
+    }
+    let leaf = iri("Leaf".to_owned());
+    facts.push([leaf, ty, class]);
+    facts.push([leaf, sub, iri("S0".to_owned())]);
+    for i in 0..11_000 {
+        let class = if i < 1_000 {
+            iri("S199".to_owned())
+        } else {
+            leaf
+        };
+        facts.push([iri(format!("x{i}")), ty, class]);
+    }
+    batch::materialise_grouped(grouped(facts), &rules, Some(&lists), &schema)
+}
+
+/// The fast suite's `rl-hierarchy` finding (6 October 2026): a deep hierarchy re-derived
+/// every inherited type once per ancestor, as `cax-sco` read the types it had derived
+/// itself (quadratic in the depth). Closed rule families read the delta without what
+/// they produced: 20,130,000 bindings on this input before, 428,000
+/// since (the derived facts the same 240,506).
+#[test]
+fn a_deep_hierarchy_derives_each_inherited_type_once() {
+    let result = spine();
+    let bindings: u64 = result.counters.bindings.iter().sum();
+    assert!(
+        bindings <= SPINE_BINDINGS,
+        "{bindings} bindings ({:?} by round) for {} derived facts, at most {SPINE_BINDINGS}",
+        result.counters.bindings,
+        result.derived.len()
+    );
+}
+
+/// See [`a_deep_hierarchy_derives_each_inherited_type_once`].
+const SPINE_BINDINGS: u64 = 428_000;

@@ -268,13 +268,13 @@ struct Whole<'a, B: ?Sized>(&'a B);
 
 impl<B: Base + ?Sized> Source for Whole<'_, B> {
     fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
-        if seg != Seg::Delta {
+        if seg.plain() != Seg::Delta {
             self.0.scan(pattern, f);
         }
     }
 
     fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
-        match seg {
+        match seg.plain() {
             Seg::Delta => 0,
             _ => self.0.estimate(pattern),
         }
