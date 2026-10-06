@@ -26,7 +26,7 @@
 //! saturates in 25 s.
 //!
 //! Not merged: `x` with a neighbour (`R(x, x)` and another R-neighbour). Such a context is
-//! marked `unmerged`, since its saturation may miss consequences. It then gives no
+//! marked incomplete, since its saturation may miss consequences. It then gives no
 //! complete answer ([`super::Saturated::complete`]) and is not exact for the driver.
 
 use super::atoms::{Atom, CTerm, Kind, union_into};
@@ -103,7 +103,9 @@ impl Worker<'_> {
         };
         let others: Vec<CTerm> = terms.iter().copied().filter(|&t| t != CTerm::X).collect();
         if others.len() < terms.len() && !others.is_empty() {
-            self.state.unmerged = true;
+            self.state
+                .incomplete
+                .get_or_insert(super::rules::Incomplete::Merge);
         }
         let mut pairs = Vec::new();
         match at {
