@@ -210,6 +210,9 @@ pub struct Program {
     pub keys: Vec<KeyRule>,
     /// By individual: whether it is anonymous (keys don't apply to it).
     pub anonymous: Vec<bool>,
+    /// Pairs of concepts no node may have together: `C(x) ∧ D(x) → ⊥` (each pair both
+    /// ways; `C` with itself for `C(x) → ⊥`). The ≤-rule skips merges they would refute.
+    pub disjoint: hashbrown::HashSet<(ConceptId, ConceptId)>,
 }
 
 impl Program {
@@ -787,6 +790,21 @@ impl Program {
 
     /// The join plans, one per body atom.
     fn plans(&mut self) {
+        for clause in &self.clauses {
+            if !clause.head.is_empty() {
+                continue;
+            }
+            match clause.body[..] {
+                [Body::Concept(a, 0), Body::Concept(b, 0)] => {
+                    self.disjoint.insert((a, b));
+                    self.disjoint.insert((b, a));
+                }
+                [Body::Concept(a, 0)] => {
+                    self.disjoint.insert((a, a));
+                }
+                _ => {}
+            }
+        }
         self.by_concept = vec![Vec::new(); self.concepts.len()];
         self.by_role = vec![Vec::new(); self.roles.len()];
         for (index, clause) in self.clauses.iter().enumerate() {
