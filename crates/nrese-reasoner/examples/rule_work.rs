@@ -108,12 +108,14 @@ fn report(result: &Materialisation, by_rule: bool) {
     let probes: u64 = counters.probes.iter().sum();
     let bytes = counters.store_bytes.last().map_or(0, |b| b.total());
     println!(
-        "counts: rounds {} | ground rules {} | bindings {bindings} {:?} | probes {probes} {:?} | old checks {} | derived {} | store bytes {bytes}",
+        "counts: rounds {} | ground rules {} | bindings {bindings} {:?} | probes {probes} {:?} | old checks {} | closure pairs {:?} | member scans {} | derived {} | store bytes {bytes}",
         result.rounds,
         result.ground_rules,
         counters.bindings,
         counters.probes,
         counters.old_checks,
+        counters.closure_pairs,
+        counters.member_scans,
         result.derived.len()
     );
     if by_rule {

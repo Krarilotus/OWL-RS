@@ -219,6 +219,10 @@ pub struct Counters {
     /// Pairs of a recent run read as old that were checked against the delta (#10 of
     /// the investigation of 6 October 2026).
     pub old_checks: u64,
+    /// Per round: the pairs the transitive module read to close its predicates (#11).
+    pub closure_pairs: Vec<u64>,
+    /// Scans for `sameAs` partners by the equality module (equality by copying, #12).
+    pub member_scans: u64,
     /// Per round: the complete bindings the rule jobs enumerated, each a candidate fact
     /// per head atom (the joins' work).
     pub bindings: Vec<u64>,
@@ -1228,6 +1232,8 @@ pub(crate) struct Equality {
     same_as: u64,
     /// The module's output of the last round: already expanded, so skipped once.
     produced: HashSet<Triple>,
+    /// Scans for a term's partners so far (three per expanded fact).
+    pub(crate) member_scans: u64,
 }
 
 /// The `owl:sameAs` id of `rules`, if they reason with equality (`eq-rep-s`).
@@ -1249,6 +1255,7 @@ impl Equality {
             super::ir::Term::Const(same_as) => Some(Self {
                 same_as,
                 produced: HashSet::new(),
+                member_scans: 0,
             }),
             super::ir::Term::Var(_) => None,
         }
@@ -1272,6 +1279,15 @@ impl Equality {
             return Vec::new();
         }
         let same_as = self.same_as;
+        // The terms with a partner: a fact mentioning none of them expands to itself only
+        // (#12 of the investigation of 6 October 2026).
+        let mut partners = TermSet::default();
+        store.scan([None, Some(same_as), None], Seg::All, &mut |[s, _, o]| {
+            if s != o {
+                partners.insert(s);
+                partners.insert(o);
+            }
+        });
         let mut seeds: Vec<Triple> = Vec::new();
         let mut merged: Vec<u64> = Vec::new();
         store.scan([None, None, None], Seg::Delta, &mut |t| {
@@ -1279,7 +1295,7 @@ impl Equality {
                 if t[0] != t[2] {
                     merged.push(t[0]);
                 }
-            } else if !self.produced.contains(&t) {
+            } else if partners.mentioned(t) && !self.produced.contains(&t) {
                 seeds.push(t);
             }
         });
@@ -1298,6 +1314,7 @@ impl Equality {
         }
         seeds.par_sort_unstable();
         seeds.dedup();
+        self.member_scans += 3 * seeds.len() as u64;
         let out: Vec<Triple> = seeds
             .par_iter()
             .flat_map_iter(|&[s, p, o]| {
@@ -1496,6 +1513,8 @@ struct Transitive {
     predicates: std::collections::BTreeMap<u64, bool>,
     /// New facts each predicate's last recomputation produced.
     produced: HashMap<u64, usize>,
+    /// The pairs read in the last [`Transitive::run`].
+    read: u64,
 }
 
 impl Transitive {
@@ -1518,6 +1537,7 @@ impl Transitive {
         stop: super::eval::Stop<'_>,
     ) -> Option<Vec<Triple>> {
         self.produced.clear();
+        self.read = 0;
         let mut out = Vec::new();
         for (&p, dirty) in &mut self.predicates {
             if !std::mem::take(dirty) {
@@ -1528,6 +1548,7 @@ impl Transitive {
             };
             let before = out.len();
             let mut pairs = relation.pairs();
+            self.read += pairs.len() as u64;
             if let Some(representatives) = representatives.filter(|r| !r.stale.is_empty()) {
                 // Over current facts only (every term a representative), which closes them.
                 let stale = &representatives.stale;
@@ -1889,6 +1910,7 @@ fn run(
                 .run(&store, representatives.as_ref(), stop)
                 .ok_or(Interrupted)?,
         ));
+        result.counters.closure_pairs.push(transitive.read);
         if let Some(equality) = &mut equality {
             candidates.push(segments(equality.run(&store)));
         }
@@ -1959,6 +1981,7 @@ fn run(
     }
     result.ground_rules = program.rules.len();
     result.transitive = transitive.predicates.len();
+    result.counters.member_scans = equality.as_ref().map_or(0, |e| e.member_scans);
     heap::phase("reasoner: consistency");
     let clock = std::time::Instant::now();
     let stale = representatives.as_ref().map_or(&none, |r| &r.stale);
